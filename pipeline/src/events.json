@@ -1,0 +1,41 @@
+{
+  "events": [
+    {
+      "id": 1,
+      "who": [
+        "主角"
+      ],
+      "where": "场景A",
+      "what": "发现关键线索",
+      "emotion": "紧张",
+      "visual": "主角在昏暗的房间中发现了一张神秘的地图",
+      "time": "夜晚",
+      "action_type": "discovery"
+    },
+    {
+      "id": 2,
+      "who": [
+        "主角",
+        "配角"
+      ],
+      "where": "场景B",
+      "what": "展开行动",
+      "emotion": "激动",
+      "visual": "两人在阳光下讨论计划，充满希望",
+      "time": "白天",
+      "action_type": "action"
+    },
+    {
+      "id": 3,
+      "who": [
+        "主角"
+      ],
+      "where": "场景C",
+      "what": "面临挑战",
+      "emotion": "坚定",
+      "visual": "主角独自站在山顶，眺望远方",
+      "time": "黄昏",
+      "action_type": "resolution"
+    }
+  ]
+}

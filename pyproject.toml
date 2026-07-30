@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "honcut-pipeline"
+version = "0.1.0"
+description = "HonCut AI Video Generation Pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "Doraemon", email = "soda804507080@gmail.com"}
+]
+dependencies = [
+    "openai>=1.0.0",
+    "requests>=2.31.0",
+    "pyyaml>=6.0",
+    "ffmpeg-python>=0.2.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.0.0",
+    "ruff>=0.0.280",
+]
+
+[project.scripts]
+honcut = "honcut.pipeline_runner:main"
+
+[tool.setuptools.packages.find]
+where = ["pipeline/src"]
+
+[tool.black]
+line-length = 100
+target-version = ['py311']
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["pipeline/tests"]
+python_files = ["test_*.py"]

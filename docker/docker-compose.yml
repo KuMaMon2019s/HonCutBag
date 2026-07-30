@@ -1,0 +1,65 @@
+version: '3.8'
+
+services:
+  # Vector Database - 存储视频素材的向量表示
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: honcut-qdrant
+    ports:
+      - "6333:6333"  # HTTP API
+      - "6334:6334"  # gRPC
+    volumes:
+      - ./data/qdrant_storage:/qdrant/storage
+    environment:
+      - QDRANT__SERVICE__GRPC_PORT=6334
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Object Storage - 存储视频、图片等大文件
+  minio:
+    image: minio/minio:latest
+    container_name: honcut-minio
+    ports:
+      - "9000:9000"  # API
+      - "9001:9001"  # Console
+    volumes:
+      - ./data/minio_data:/data
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    command: server /data --console-address ":9001"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Workflow Automation - 视频生成工作流编排
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: honcut-n8n
+    ports:
+      - "5678:5678"
+    volumes:
+      - ./data/n8n_data:/home/node/.n8n
+      - ./workflows:/workflows
+    environment:
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=admin
+      - N8N_BASIC_AUTH_PASSWORD=admin
+      - N8N_HOST=localhost
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - NODE_ENV=production
+      - WEBHOOK_URL=http://localhost:5678/
+    restart: unless-stopped
+
+volumes:
+  qdrant_storage:
+  minio_data:
+  n8n_data:
