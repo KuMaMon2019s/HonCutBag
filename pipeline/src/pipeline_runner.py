@@ -1613,6 +1613,13 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
     protagonist_b64 = char_list[0][2] if char_list else None
     protagonist_name = char_list[0][1] if char_list else None
 
+    # Load storyboard image as style reference
+    storyboard_b64 = None
+    storyboard_path = output_dir / "storyboard.png"
+    if storyboard_path.exists() and storyboard_path.stat().st_size > 10240:
+        storyboard_b64 = _b64.b64encode(storyboard_path.read_bytes()).decode()
+        print(f"  → 已加载故事板风格参考图")
+
     outputs = []
     for shot_dir in sorted(shots_dir.iterdir()):
         if not shot_dir.is_dir() or not shot_dir.name.startswith("S"):
@@ -1644,12 +1651,17 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
                 first_frame_b64 = protagonist_b64
                 print(f"    [ref] 注入主角参考 (fallback): {protagonist_name}")
 
+        # If still no reference, use storyboard as style reference
+        if first_frame_b64 is None and storyboard_b64:
+            first_frame_b64 = storyboard_b64
+            print(f"    [ref] 注入故事板风格参考")
+
         # Add style prefix to every prompt
         style_prefix = "Photorealistic, urban, Jiangnan aesthetic, lifelike skin texture, natural lighting, "
         if not prompt.lower().startswith("photorealistic"):
             prompt = style_prefix + prompt
 
-        max_retries = 2
+        max_retries = 3
         for attempt in range(max_retries + 1):
             try:
                 print(f"  → {shot_dir.name}: 提交视频生成...")
@@ -1667,6 +1679,17 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
                     break
             except Exception as e:
                 err_str = str(e)
+                # 429 QuotaExceeded — exponential backoff retry
+                if "QuotaExceeded" in err_str or "429" in err_str:
+                    wait_sec = min(30 * (2 ** attempt), 120)
+                    if attempt < max_retries:
+                        print(f"    ⚠ {shot_dir.name}: 配额超限(429)，等待 {wait_sec}s 后重试 ({attempt+1}/{max_retries})...")
+                        import time as _time
+                        _time.sleep(wait_sec)
+                        continue
+                    else:
+                        print(f"    ✗ {shot_dir.name}: 配额超限，已重试 {max_retries} 次，跳过")
+                        break
                 if "PrivacyInformation" in err_str and first_frame_b64 is not None:
                     # Seedance rejects real-person reference images — drop and retry text-only
                     print(f"    ⚠ {shot_dir.name}: 参考图被隐私检测拒绝，降级为纯文本生成")
@@ -2185,6 +2208,32 @@ def run_phase6(output_dir: Path, dry_run: bool, storyboard_data: dict = None) ->
     }
 
 
+def _select_transition(shot_meta: dict, default_transition: str = "dissolve") -> str:
+    """Select transition type based on shot emotion and context."""
+    # Check if shot already has a transition_to_next field (from adaptation_engine)
+    explicit = shot_meta.get("transition_to_next", "")
+    if explicit in ("cut", "dissolve", "fade"):
+        return explicit
+    
+    # Emotion-based selection
+    emotion = shot_meta.get("emotion", "").lower()
+    
+    # Gentle emotions → dissolve
+    gentle = ["温柔", "深情", "心动", "欣喜", "喜悦", "暧昧", "羞涩"]
+    if any(e in emotion for e in gentle):
+        return "dissolve"
+    
+    # Intense emotions → cut
+    intense = ["紧张", "愤怒", "惊讶", "震惊", "慌乱", "压迫"]
+    if any(e in emotion for e in intense):
+        return "cut"
+    
+    # Scene change indicators → fade
+    # (detected by comparing 'where' fields between consecutive shots)
+    
+    return default_transition
+
+
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # Phase 7: 组装引擎 (Assembly) — delegates to OM VideoStitch
@@ -2205,15 +2254,24 @@ def run_phase7(output_dir: Path, dry_run: bool,
         print("  ⊘ dry-run 模式，跳过视频组装")
         return {"status": "skipped", "reason": "dry-run", "duration_s": _elapsed(start)}
 
-    # 收集视频片段
+    # 收集视频片段和对应的 SHOT_META
     shots_dir = output_dir / "shots"
     clip_paths = []
+    shot_metas = []
     if shots_dir.exists():
         for shot_d in sorted(shots_dir.iterdir()):
             if shot_d.is_dir() and shot_d.name.startswith("S"):
                 video = shot_d / "output.mp4"
                 if video.exists():
                     clip_paths.append(str(video))
+                    # Load SHOT_META.json for this shot
+                    meta_path = shot_d / "SHOT_META.json"
+                    if meta_path.exists():
+                        import json
+                        with open(meta_path, 'r', encoding='utf-8') as f:
+                            shot_metas.append(json.load(f))
+                    else:
+                        shot_metas.append({})  # Empty meta if file doesn't exist
 
     if not clip_paths:
         return {"status": "error", "error": "No video clips found", "duration_s": _elapsed(start)}
@@ -2232,8 +2290,62 @@ def run_phase7(output_dir: Path, dry_run: bool,
         return {"status": "done", "duration_s": _elapsed(start),
                 "outputs": ["raw_assembly.mp4"], "method": "single_clip_copy"}
 
+    # Intelligent transition selection based on shot emotions
     print(f"  → 发现 {len(clip_paths)} 个视频片段")
-    print(f"  → 拼接模式: {transition} (duration={transition_duration}s)")
+    
+    # ── Smart transition: visual similarity + three-layer voting ──
+    smart_decisions = None
+    try:
+        from shot_embedder import embed_all_shots, compute_transition_similarity
+        from smart_transition import decide_all_transitions
+        
+        print("  → 智能转场: 抽帧 + 向量化 + 三层决策...")
+        embeddings = embed_all_shots(str(shots_dir), run_id=str(output_dir.name))
+        if embeddings:
+            similarities = compute_transition_similarity(embeddings)
+            smart_decisions = decide_all_transitions(shot_metas, similarities)
+            
+            # Log decisions
+            for d in smart_decisions:
+                sim_str = f"{d['layers']['visual']['similarity']:.2f}" if d['layers']['visual']['similarity'] >= 0 else "N/A"
+                print(f"    • {d['pair']}: {d['decision']} "
+                      f"(语义={d['layers']['semantic']['choice']}, "
+                      f"视觉={d['layers']['visual']['choice']}[{sim_str}], "
+                      f"节奏={d['layers']['rhythm']['choice']})")
+    except Exception as e:
+        print(f"  ⚠ 智能转场不可用: {e}，降级为情绪映射")
+        smart_decisions = None
+    
+    # Select transition for each shot (except last, which has no "next")
+    selected_transitions = []
+    for i, shot_meta in enumerate(shot_metas[:-1]):  # Last shot doesn't need a transition
+        if smart_decisions and i < len(smart_decisions):
+            sel_transition = smart_decisions[i]["decision"]
+        else:
+            sel_transition = _select_transition(shot_meta, default_transition=transition)
+        selected_transitions.append(sel_transition)
+        shot_name = f"S{i+1:03d}"
+        emotion = shot_meta.get("emotion", "N/A")
+        source = "智能" if (smart_decisions and i < len(smart_decisions)) else "情绪"
+        print(f"    • {shot_name} → {sel_transition} ({source}, emotion: {emotion})")
+    
+    # Determine the most common transition type for batch processing
+    if selected_transitions:
+        from collections import Counter
+        transition_counts = Counter(selected_transitions)
+        batch_transition = transition_counts.most_common(1)[0][0]
+        
+        # Check if all transitions are the same
+        all_same = len(transition_counts) == 1
+        
+        if all_same:
+            print(f"  → 拼接模式: {batch_transition} (所有镜头统一)")
+        else:
+            print(f"  → 拼接模式: {batch_transition} (混合模式，使用最常用类型)")
+            print(f"    分布: {dict(transition_counts)}")
+    else:
+        batch_transition = transition
+        print(f"  → 拼接模式: {batch_transition} (duration={transition_duration}s)")
 
     # 调用 OM VideoStitch
     try:
@@ -2243,7 +2355,7 @@ def run_phase7(output_dir: Path, dry_run: bool,
             "operation": "stitch",
             "clips": clip_paths,
             "output_path": str(output_dir / "raw_assembly.mp4"),
-            "transition": transition,
+            "transition": batch_transition,
             "transition_duration": transition_duration,
             "auto_normalize": True,
             "profile": media_profile,
@@ -2261,10 +2373,11 @@ def run_phase7(output_dir: Path, dry_run: bool,
                 "status": "done",
                 "duration_s": _elapsed(start),
                 "outputs": ["raw_assembly.mp4"],
-                "method": f"VideoStitch_{transition}",
-                "transition": transition,
+                "method": f"VideoStitch_{batch_transition}",
+                "transition": batch_transition,
                 "transition_duration": transition_duration,
                 "clip_count": len(clip_paths),
+                "transition_selections": selected_transitions if selected_transitions else None,
             }
         else:
             return {"status": "error", "error": result.error, "duration_s": _elapsed(start)}

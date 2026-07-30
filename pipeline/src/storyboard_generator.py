@@ -36,16 +36,45 @@ from openai import OpenAI
 # ─── LLM 配置 ───────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = (
-    "你是 AI 视频生成 prompt 专家。将中文场景描述转化为英文 Seedance 视频生成 prompt。"
-    "要求：电影感、具体、视觉化。同时生成一句中文字幕（≤15字）。"
-    "输出严格 JSON，不要输出任何解释文字。"
+    "你是 AI 视频生成 prompt 专家，专精真人写实摄影风格。\n"
+    "将中文场景描述转化为英文 Seedance 视频生成 prompt。\n\n"
+    "【输出结构】三段式，严格按以下顺序：\n"
+    "1. 【画面】（主干，最长）：完整保留场景描述中的所有视觉元素——主体、动作、空间关系、物件细节。\n"
+    "   角色外貌不写具体描述，改为参考图绑定语句：\n"
+    "   'Based on the reference image of {角色名}, maintain consistent: face features, hairstyle, costume details.'\n"
+    "2. 【光影】（独立段）：光源方向、色调倾向、明暗关系。\n"
+    "   雨天/阴天：漫射冷光，无主光源，灰蓝主调，空气潮湿感，低饱和度。\n"
+    "   傍晚：暖调侧逆光，斜射余晖，长影拉伸。\n"
+    "   夜间：窗光冷蓝，室内暖点光源，冷暖对比。\n"
+    "3. 【风格】（最短）：固定锚定词 + 画质锁定。\n"
+    "   必加：Photorealistic cinematography, cinematic quality, ultra-fine detail, "
+    "strong contrast, delicate skin texture, detailed facial rendering, "
+    "strand-by-strand hair detail, modern urban aesthetic, oriental temperament.\n"
+    "   画质：Ultra-sharp 4K, high detail, natural sharpness, no subtitles, no watermark.\n\n"
+    "【情绪→面容映射】\n"
+    "心动/欣喜：嘴角微扬，眼底笑意，眼神明亮 → subtle smile, bright eyes\n"
+    "悲伤/失落：面色沉静，眼神黯淡 → calm face, dim eyes\n"
+    "温柔/深情：神情柔和，眉目温润 → gentle expression, warm gaze\n"
+    "惊讶/震惊：神情微愣，目光骤聚 → stunned expression, wide eyes\n"
+    "紧张/慌乱：眼神飘忽，目光四顾 → nervous gaze, restless eyes\n"
+    "隐忍/克制：神情内敛，唇线收紧 → restrained expression, tight lips\n\n"
+    "同时生成一句中文字幕（≤15字）。\n"
+    "输出严格 JSON：{\"prompt\": \"英文prompt\", \"caption\": \"中文字幕\"}\n"
+    "不要输出任何解释文字。"
 )
 
 USER_PROMPT_TEMPLATE = (
     "场景：{visual}\n"
     "角色：{who}\n"
     "情绪：{emotion}\n"
-    "地点：{where}\n\n"
+    "地点：{where}\n"
+    "角色参考图绑定：{ref_binding}\n"
+    "风格/情绪/光影提示：{style_suffix}\n\n"
+    "要求：\n"
+    "1. 【画面】段完整保留场景描述的所有视觉元素，角色用参考图绑定语句替代外貌描述\n"
+    "2. 【光影】段根据地点和时间推导光影（雨天=漫射冷光灰蓝调，傍晚=暖调侧逆光）\n"
+    "3. 【风格】段使用固定锚定词\n"
+    "4. 三段合并为一个连贯的英文 prompt，不用中文标签\n\n"
     '输出 JSON：{{"prompt": "英文视频生成prompt", "caption": "中文字幕"}}'
 )
 
@@ -220,26 +249,49 @@ def _get_first_frame_for_shot(
     return characters_map.get(first_char)
 
 
-def _build_shot_prompt(shot: Dict[str, Any]) -> str:
+def _build_shot_prompt(shot: Dict[str, Any], characters: Optional[List[Dict[str, Any]]] = None) -> str:
     """
     为单个 shot 构建 LLM user prompt
 
     Args:
         shot: shot 字典
+        characters: 角色列表（可选）
 
     Returns:
         格式化后的 user prompt
     """
     visual = shot.get("visual", "")
-    who = ", ".join(shot.get("who", [])) if isinstance(shot.get("who"), list) else str(shot.get("who", ""))
+    who_list = shot.get("who", [])
+    who = ", ".join(who_list) if isinstance(who_list, list) else str(who_list)
     emotion = shot.get("emotion", "")
     where = shot.get("where", "")
-
+    
+    # Build reference binding for characters in this shot
+    ref_parts = []
+    if characters:
+        for char in characters:
+            char_name = char.get("name", "")
+            if char_name in who or any(alias in who for alias in char.get("aliases", [])):
+                ref_parts.append(
+                    f"Based on the reference image of {char_name}, "
+                    f"maintain consistent: face features, hairstyle, costume details."
+                )
+    ref_binding = " ".join(ref_parts) if ref_parts else "No character reference."
+    
+    # Add emotion and style enrichment
+    try:
+        from emotion_mapping import build_style_suffix
+        style_suffix = build_style_suffix(emotion=emotion, scene=where)
+    except ImportError:
+        style_suffix = ""
+    
     return USER_PROMPT_TEMPLATE.format(
         visual=visual,
         who=who,
         emotion=emotion,
         where=where,
+        ref_binding=ref_binding,
+        style_suffix=style_suffix,
     )
 
 
@@ -280,7 +332,7 @@ def generate_storyboard(
         duration = shot.get("suggested_duration", 5)
 
         # 调用 LLM 生成英文 prompt 和中文 caption
-        user_prompt = _build_shot_prompt(shot)
+        user_prompt = _build_shot_prompt(shot, characters)
         llm_result = None
 
         for attempt in range(1 + MAX_RETRIES):

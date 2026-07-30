@@ -65,6 +65,12 @@ USER_PROMPT_TEMPLATE = (
     "  - visual: 字符串，画面描述（用于视频生成）\n"
     "  - suggested_duration: 整数，建议时长（秒）\n"
     "  - transition_to_next: 字符串，转场方式 cut/dissolve/fade\n\n"
+    "【镜头连贯性规则】\n"
+    "每个镜头（除第一个外）必须在 visual 描述开头加入「承接上镜」段：\n"
+    "- 格式：'承接上镜：上镜定格于{{角色名}}{{位置/姿态/朝向}}，{{最后动作的终态}}——本镜由此延续'\n"
+    "- 目的：让视频生成时画面自然衔接，不跳跃\n"
+    "- 第一个镜头无需承接\n"
+    "- 跨场景切换时不写承接（硬切）\n\n"
     "注意：所有 shot 的 suggested_duration 总和应接近 target_duration（允许 ±10% 偏差）。"
 )
 
@@ -301,6 +307,23 @@ def adapt_events(
     # 确保 shot_order 连续
     for i, shot in enumerate(shots, 1):
         shot["shot_order"] = i
+
+    # Add continuity context between shots (镜头连贯性)
+    for i, shot in enumerate(shots):
+        if i > 0:
+            prev = shots[i - 1]
+            prev_visual = prev.get("visual", "")
+            # Only add continuity if same scene (same 'where')
+            if shot.get("where") == prev.get("where"):
+                shot["prev_shot_context"] = (
+                    f"承接上镜：{prev_visual[-80:]}"
+                    if len(prev_visual) > 80
+                    else f"承接上镜：{prev_visual}"
+                )
+            else:
+                shot["prev_shot_context"] = ""  # Scene change, hard cut
+        else:
+            shot["prev_shot_context"] = ""  # First shot
 
     # 计算总时长
     total_duration = sum(shot.get("suggested_duration", 0) for shot in shots)

@@ -168,7 +168,7 @@ class Models:
     ARK_VIDEO: str = "doubao-seedance-2.0-mini"
     
     # 火山方舟 - Embedding
-    ARK_EMBEDDING: str = "doubao-embedding-large"
+    ARK_EMBEDDING: str = "doubao-embedding-vision",
     
     # OpenAI
     OPENAI_TEXT: str = "gpt-4"
