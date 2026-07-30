@@ -17,6 +17,7 @@ import os
 import sys
 import json
 import argparse
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Tuple, List
@@ -205,31 +206,41 @@ NEGATIVE_PROMPT_CN = (
 # - Output: front=crop_top_third, side=crop_middle_third, back=crop_bottom_third
 
 THREE_VIEW_PREFIX = (
-    "Character reference sheet, professional character design, "
-    "clean white background, full body, centered composition, "
-    "consistent proportions across views, "
-    "studio lighting, high detail, sharp focus"
+    "【宏观描述】画面风格：真人写实风格，照片级渲染，细节超高清。"
+    "根据以下角色描述，生成一张纯白背景的角色三视图设定表，"
+    "清晰展示角色的正面、侧面、背面标准正交视图。"
+    "要求服装、发型、配饰等所有细节在三个视角中完全一致。"
 )
 
 VIEW_TEMPLATES = {
     "front": (
-        "{prefix}, FRONT VIEW, "
-        "facing camera directly, symmetrical pose, "
-        "arms relaxed at sides, standing straight, "
-        "eyes looking at viewer, neutral expression, "
-        "showing front details of outfit and features"
+        "{prefix}\n"
+        "【微观描述】\n"
+        "1. 角色描述：{character_desc}\n"
+        "2. 画面要求：纯白背景，无阴影。\n"
+        "3. 正面全身站立像：角色正面朝向镜头，面部五官清晰，表情自然，"
+        "展示完整正面轮廓、服装正面剪裁、发型正面形态。"
+        "质感十足，高质量，震撼的视觉效果。"
     ),
     "side": (
-        "{prefix}, SIDE VIEW (left profile), "
-        "facing right, perpendicular to camera, "
-        "arms relaxed at sides, standing straight, "
-        "showing profile silhouette and side details of outfit"
+        "{prefix}\n"
+        "【微观描述】\n"
+        "1. 角色描述：{character_desc}\n"
+        "2. 画面要求：纯白背景，无阴影。\n"
+        "3. 90度侧面全身像：角色左侧面朝向镜头，展示侧面轮廓、"
+        "发型侧面层次、服装侧面剪裁和身体比例。"
+        "与正面视图保持完全一致的服装、发型、配饰细节。"
+        "质感十足，高质量，震撼的视觉效果。"
     ),
     "back": (
-        "{prefix}, BACK VIEW, "
-        "facing away from camera, turned 180 degrees, "
-        "arms relaxed at sides, standing straight, "
-        "showing back details of outfit, hair, and accessories"
+        "{prefix}\n"
+        "【微观描述】\n"
+        "1. 角色描述：{character_desc}\n"
+        "2. 画面要求：纯白背景，无阴影。\n"
+        "3. 背面全身像：角色背面朝向镜头，展示背部轮廓、"
+        "发型后部层次、服装背面设计（拉链、纽扣、褶皱）。"
+        "与正面视图保持完全一致的服装、发型、配饰细节。"
+        "质感十足，高质量，震撼的视觉效果。"
     ),
 }
 
@@ -253,6 +264,90 @@ REFERENCE_WEIGHT_NOTE = (
 )
 
 
+def build_combined_sheet_prompt(
+    character_desc: str,
+    style: str = "",
+) -> str:
+    """Build a single prompt for a combined character sheet (all views in one image).
+    
+    Generates ONE image with all 4 views side-by-side (closeup, front, side, back).
+    This ensures character consistency across all views since they're generated together.
+    
+    Args:
+        character_desc: Character description (e.g. "7岁中国男孩，深色发髻...")
+        style: Art style string (e.g. "张艺谋式写实, 35mm film")
+    
+    Returns:
+        Single prompt string for combined character sheet generation
+    """
+    style_suffix = f"，{style}" if style else ""
+    full_desc = f"{character_desc}{style_suffix}"
+    
+    prompt = (
+        "【宏观描述】画面风格：真人写实风格，照片级渲染，细节超高清。"
+        "根据以下角色描述，生成一张纯白背景的角色四视图设定表。"
+        "要求服装、发型、配饰等所有细节在四个视角中完全一致。\n"
+        "【微观描述】\n"
+        f"1. 角色描述：{full_desc}\n"
+        "2. 画面要求：纯净中性灰背景 #E8E8E8，无阴影，均匀柔光。\n"
+        "3. 同一画面按2×2网格展示四个视图：\n"
+        "   - 左上：人像特写（头顶至锁骨，面部占60%+，五官清晰）\n"
+        "   - 右上：正面全身站立像（面对镜头，从头顶到脚底完整）\n"
+        "   - 左下：90度侧面全身站立像（纯侧面轮廓，从头顶到脚底完整）\n"
+        "   - 右下：背面全身站立像（后脑/背部/发尾清晰，从头顶到脚底完整）\n"
+        "4. 自然站立，双臂自然下垂，双脚平行微分。\n"
+        "5. 四视图一致性，面容细腻渲染，发丝根根分明，皮肤真实质感。\n"
+        "6. 画面比例 1:1 正方形，2×2网格布局。图中不要有任何文字。\n"
+        "质感十足，高质量，震撼的视觉效果。"
+    )
+    return prompt
+
+
+def crop_character_sheet(
+    sheet_path: str,
+    output_dir: str,
+    num_views: int = 4,
+) -> dict:
+    """Crop a combined character sheet (2×2 grid) into individual view images.
+    
+    Layout: 左上=closeup, 右上=front, 左下=side, 右下=back
+    
+    Args:
+        sheet_path: Path to the combined character sheet image (square, e.g. 1920x1920)
+        output_dir: Directory to save cropped view images
+        num_views: Number of views to crop (default 4)
+    
+    Returns:
+        dict mapping view names to file paths
+    """
+    # 2×2 grid positions: (col, row) — col 0=left, 1=right; row 0=top, 1=bottom
+    view_layout = [
+        ("closeup", 0, 0),  # 左上
+        ("front",   1, 0),  # 右上
+        ("side",    0, 1),  # 左下
+        ("back",    1, 1),  # 右下
+    ][:num_views]
+    views = {}
+    
+    for view_name, col, row in view_layout:
+        view_path = os.path.join(output_dir, f"{view_name}.png")
+        # Crop each quadrant: width=iw/2, height=ih/2, x=col*iw/2, y=row*ih/2
+        crop_cmd = [
+            "ffmpeg", "-y", "-i", sheet_path,
+            "-vf", f"crop=iw/2:ih/2:{col}*iw/2:{row}*ih/2",
+            view_path
+        ]
+        try:
+            subprocess.run(crop_cmd, capture_output=True, check=True)
+            views[view_name] = view_path
+            print(f"  [crop] {view_name} ✓ → {view_path}")
+        except subprocess.CalledProcessError as e:
+            print(f"  [crop] {view_name} ✗ → {e}")
+            views[view_name] = None
+    
+    return views
+
+
 def build_three_view_prompts(
     character_desc: str,
     style: str = "",
@@ -260,6 +355,9 @@ def build_three_view_prompts(
     use_enhanced: bool = True,
 ) -> dict:
     """Build professional three-view prompts from ComfyUI workflow templates.
+    
+    DEPRECATED: This function is kept for backward compatibility but is no longer used.
+    The new approach uses build_combined_sheet_prompt() to generate all views in one image.
 
     Args:
         character_desc: Character description (e.g. "7岁中国男孩，深色发髻...")
@@ -284,15 +382,12 @@ def build_three_view_prompts(
     neg = negative or NEGATIVE_PROMPT_CHARACTER
 
     # Build style suffix
-    style_suffix = f", {style}" if style else ""
-
-    # Build character block
-    character_block = f"{character_desc}{style_suffix}"
+    style_suffix = f"，{style}" if style else ""
+    full_desc = f"{character_desc}{style_suffix}"
 
     prompts = {}
     for view_name, template in VIEW_TEMPLATES.items():
-        prompt = template.format(prefix=THREE_VIEW_PREFIX)
-        prompt = f"{prompt}, {character_block}"
+        prompt = template.format(prefix=THREE_VIEW_PREFIX, character_desc=full_desc)
         prompts[view_name] = prompt
 
     prompts["negative"] = neg
@@ -313,12 +408,10 @@ def build_reference_prompt(character_desc: str, style: str = "", view: str = "si
     Returns:
         Prompt string optimized for image_to_image with reference
     """
-    style_suffix = f", {style}" if style else ""
+    style_suffix = f"，{style}" if style else ""
+    full_desc = f"{character_desc}{style_suffix}"
     template = VIEW_TEMPLATES.get(view, VIEW_TEMPLATES["side"])
-    base_prompt = template.format(prefix=THREE_VIEW_PREFIX)
-
-    # Add identity consistency instruction (replaces IPAdapter weight 0.9)
-    return f"{base_prompt}, {character_desc}{style_suffix}. {REFERENCE_WEIGHT_NOTE}"
+    return template.format(prefix=THREE_VIEW_PREFIX, character_desc=full_desc)
 
 
 def create_character_card(
@@ -328,7 +421,7 @@ def create_character_card(
     style: str = "",
     negative: str = "",
     seedream_model: str = "doubao-seedream-5.0-lite",
-    seedance_model: str = "doubao-seedance-2.0-fast",
+    seedance_model: str = "doubao-seedance-2.0-mini",
     reference_images: Optional[dict] = None,
 ) -> dict:
     """Create a character_card.json structure."""
@@ -404,133 +497,51 @@ def generate_character(
     print(f"  Output: {char_dir}")
     print(f"{'='*60}\n")
 
-    # Step 1: Generate three-view images
+    # Step 1: Generate character sheet (combined 4-view image)
     if not skip_images:
-        print("[Step 1/3] Generating three-view images (enhanced prompts)...")
+        print("[Step 1/3] Generating combined character sheet (4 views in one image)...")
         client = SeedreamClient(model=model or "doubao-seedream-5.0-lite")
 
-        # Build professional prompts from ComfyUI workflow templates
-        prompts = build_three_view_prompts(
+        # Build combined sheet prompt (all views in one image)
+        sheet_prompt = build_combined_sheet_prompt(
             character_desc=description,
             style=style,
-            negative=negative,
-            use_enhanced=True,
         )
-        neg_prompt = prompts["negative"]
 
-        # Validate prompts before calling API
+        # Validate prompt before calling API
         print("  [validation] Checking prompt completeness...")
         try:
-            for view_name in ["front", "side", "back"]:
-                validate_and_build_prompt(prompts[view_name], "three_view")
-            print("  [validation] ✓ All prompts passed validation")
+            validate_and_build_prompt(sheet_prompt, "three_view")
+            print("  [validation] ✓ Prompt passed validation")
         except ValueError as e:
             print(f"  [validation] ✗ {e}")
-            print("  [validation] Falling back to template-based prompt generation...")
-            # Try using the template-based approach
-            try:
-                character_dict = {
-                    "name": name,
-                    "appearance": description,
-                    "clothing": style if style else "",
-                    "features": ""
-                }
-                template_prompt = build_prompt_from_character(character_dict)
-                validate_and_build_prompt(template_prompt, "three_view")
-                print("  [validation] ✓ Template-based prompt passed validation")
-                # Use template prompt for all views
-                prompts["front"] = template_prompt
-                prompts["side"] = template_prompt
-                prompts["back"] = template_prompt
-            except ValueError as e2:
-                print(f"  [validation] ✗ Template-based prompt also failed: {e2}")
-                print("  [validation] Proceeding with original prompts (may have quality issues)")
+            print("  [validation] Proceeding with combined prompt (may have quality issues)")
 
-        views = {}
-
-        # Generate front view first (text-to-image)
-        print("  [three-view] generating front view (base)...")
+        # Generate combined character sheet (square 2x2 grid)
+        # Seedream API requires min 1920x1920; use square for 2x2 grid layout
+        sheet_path = os.path.join(char_dir, "character_sheet.png")
+        print("  [sheet] generating combined character sheet (2x2 grid)...")
         try:
-            front_path = os.path.join(char_dir, "front.png")
             url = client.text_to_image(
-                prompt=prompts["front"],
-                output_path=front_path,
-                size=size,
+                prompt=sheet_prompt,
+                output_path=sheet_path,
+                size="1920x1920",  # square for 2x2 grid
             )
-            views["front"] = front_path
-            print(f"  [three-view] front ✓ → {front_path}")
+            print(f"  [sheet] ✓ → {sheet_path}")
+            
+            # Crop into individual views using ffmpeg
+            print("  [crop] splitting character sheet into 4 views...")
+            views = crop_character_sheet(
+                sheet_path=sheet_path,
+                output_dir=char_dir,
+                num_views=4,  # closeup, front, side, back
+            )
         except Exception as e:
-            print(f"  [three-view] front ✗ → {e}")
-            views["front"] = None
-
-        # Generate side view using front as reference (IPAdapter → image_to_image)
-        if views["front"] and os.path.exists(views["front"]):
-            print("  [three-view] generating side view (with reference)...")
-            side_prompt = build_reference_prompt(description, style, view="side")
-            try:
-                side_path = os.path.join(char_dir, "side.png")
-                url = client.image_to_image(
-                    prompt=side_prompt,
-                    ref_image=views["front"],
-                    output_path=side_path,
-                    size=size,
-                )
-                views["side"] = side_path
-                print(f"  [three-view] side ✓ → {side_path}")
-            except Exception as e:
-                print(f"  [three-view] side ✗ → {e}")
-                views["side"] = None
-        else:
-            # Fallback: text-to-image without reference
-            print("  [three-view] generating side view (no reference, text-to-image)...")
-            try:
-                side_path = os.path.join(char_dir, "side.png")
-                url = client.text_to_image(
-                    prompt=prompts["side"],
-                    output_path=side_path,
-                    size=size,
-                )
-                views["side"] = side_path
-                print(f"  [three-view] side ✓ → {side_path}")
-            except Exception as e:
-                print(f"  [three-view] side ✗ → {e}")
-                views["side"] = None
-
-        # Generate back view using front as reference
-        if views["front"] and os.path.exists(views["front"]):
-            print("  [three-view] generating back view (with reference)...")
-            back_prompt = build_reference_prompt(description, style, view="back")
-            try:
-                back_path = os.path.join(char_dir, "back.png")
-                url = client.image_to_image(
-                    prompt=back_prompt,
-                    ref_image=views["front"],
-                    output_path=back_path,
-                    size=size,
-                )
-                views["back"] = back_path
-                print(f"  [three-view] back ✓ → {back_path}")
-            except Exception as e:
-                print(f"  [three-view] back ✗ → {e}")
-                views["back"] = None
-        else:
-            # Fallback: text-to-image without reference
-            print("  [three-view] generating back view (no reference, text-to-image)...")
-            try:
-                back_path = os.path.join(char_dir, "back.png")
-                url = client.text_to_image(
-                    prompt=prompts["back"],
-                    output_path=back_path,
-                    size=size,
-                )
-                views["back"] = back_path
-                print(f"  [three-view] back ✓ → {back_path}")
-            except Exception as e:
-                print(f"  [three-view] back ✗ → {e}")
-                views["back"] = None
+            print(f"  [sheet] ✗ → {e}")
+            views = {"closeup": None, "front": None, "side": None, "back": None}
     else:
         print("[Step 1/3] Skipping image generation (--skip-images)")
-        views = {"front": None, "side": None, "back": None}
+        views = {"closeup": None, "front": None, "side": None, "back": None}
 
     # Step 2: Create character_card.json
     print("[Step 2/3] Creating character_card.json...")

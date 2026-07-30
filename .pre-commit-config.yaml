@@ -1,0 +1,41 @@
+# Pre-commit hooks - https://pre-commit.com
+# 安装: pre-commit install
+# 运行所有 hooks: pre-commit run --all-files
+# 跳过 hooks: git commit --no-verify
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+        args: ['--maxkb=1000']
+      - id: check-merge-conflict
+      - id: debug-statements
+
+  - repo: https://github.com/psf/black
+    rev: 23.12.1
+    hooks:
+      - id: black
+        language_version: python3.11
+        args: [--check]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.1.9
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest
+        entry: pytest pipeline/tests/ -v
+        language: python
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]

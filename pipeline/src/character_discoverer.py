@@ -368,6 +368,63 @@ def _filter_non_human_characters(stats: Dict[str, Dict[str, Any]]) -> Dict[str, 
     return filtered
 
 
+def _filter_descriptive_phrases(stats: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """
+    过滤描述性短语（非真实角色名）
+    
+    移除：
+    - 包含描述性形容词/修饰语的名称（如"年轻的"、"没带伞的"、"都市"）
+    - 通用角色描述（如"路人"、"女性"、"男性"、"店员"）
+    - 超过 4 个中文字符的名称（真实中文姓名通常为 2-3 字）
+    
+    Args:
+        stats: 角色统计字典
+        
+    Returns:
+        过滤后的角色统计字典
+    """
+    filtered = {}
+    
+    # 描述性修饰语关键词
+    descriptive_keywords = [
+        "年轻的", "年老的", "中年的", "美丽的", "帅气的", "高大的", "瘦小的",
+        "没带伞的", "带伞的", "穿", "戴", "拿", "提", "背",
+        "都市", "城市", "乡村", "古代", "现代", "未来",
+        "神秘", "陌生", "熟悉", "友好", "冷漠",
+    ]
+    
+    # 通用角色描述词
+    generic_role_keywords = [
+        "路人", "行人", "游客", "观众", "听众", "读者",
+        "女性", "男性", "老人", "小孩", "孩子", "青年", "中年",
+        "店员", "服务员", "顾客", "司机", "乘客",
+        "人群", "群众", "观众", "大家",
+        "情侣", "夫妻", "朋友", "同事", "邻居",
+        "收银员", "保安", "警察", "医生", "护士",
+    ]
+    
+    for name, info in stats.items():
+        # 检查是否包含描述性修饰语
+        if any(keyword in name for keyword in descriptive_keywords):
+            print(f"  过滤描述性短语: {name}", file=sys.stderr)
+            continue
+        
+        # 检查是否是通用角色描述
+        if any(keyword in name for keyword in generic_role_keywords):
+            print(f"  过滤通用角色描述: {name}", file=sys.stderr)
+            continue
+        
+        # 检查长度：统计中文字符数（排除标点）
+        chinese_chars = [c for c in name if '\u4e00' <= c <= '\u9fff']
+        if len(chinese_chars) > 4:
+            print(f"  过滤过长名称: {name} ({len(chinese_chars)} 字)", file=sys.stderr)
+            continue
+        
+        filtered[name] = info
+    
+    return filtered
+
+
 def _post_filter_characters(characters: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     后处理过滤：移除 LLM 可能错误包含的非人物角色
@@ -429,6 +486,17 @@ def discover_characters(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     stats = _filter_non_human_characters(stats)
     if not stats:
         print("警告：过滤后未剩任何人物角色", file=sys.stderr)
+        return {
+            "version": "1.0",
+            "source_text_hash": _compute_text_hash(events),
+            "total_characters": 0,
+            "characters": [],
+        }
+
+    # 1.6 过滤描述性短语（非真实角色名）
+    stats = _filter_descriptive_phrases(stats)
+    if not stats:
+        print("警告：过滤描述性短语后未剩任何角色", file=sys.stderr)
         return {
             "version": "1.0",
             "source_text_hash": _compute_text_hash(events),

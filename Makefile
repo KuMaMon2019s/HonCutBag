@@ -24,7 +24,21 @@ run:
 		echo "Error: INPUT_FILE is required. Usage: make run INPUT_FILE=path/to/file.txt"; \
 		exit 1; \
 	fi
-	python pipeline/src/pipeline_runner.py --input $(INPUT_FILE) --output-dir data/output
+	@# 计算今天的日期和序号
+	@TODAY=$$(date +%Y-%m-%d); \
+	SEQ=01; \
+	while [ -d "workspaces/$${TODAY}_$${SEQ}" ]; do \
+		SEQ=$$(printf "%02d" $$(($$(echo $$SEQ | sed 's/^0//') + 1))); \
+	done; \
+	WORKSPACE="workspaces/$${TODAY}_$${SEQ}"; \
+	echo "Creating workspace: $$WORKSPACE"; \
+	mkdir -p "$$WORKSPACE/input" "$$WORKSPACE/output" "$$WORKSPACE/shots"; \
+	cp "$(INPUT_FILE)" "$$WORKSPACE/input/"; \
+	echo "Running pipeline in $$WORKSPACE..."; \
+	python pipeline/src/pipeline_runner.py \
+		--input "$$WORKSPACE/input/$$(basename $(INPUT_FILE))" \
+		--output-dir "$$WORKSPACE/output" \
+		--auto-approve
 
 clean:
 	@echo "Cleaning build artifacts..."

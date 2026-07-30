@@ -191,7 +191,7 @@ def detect_scene_cuts(video_path: str) -> list[float]:
     if OM_AVAILABLE:
         try:
             tool = SceneDetect()
-            result = tool.run(input_path=video_path)
+            result = tool.execute({"input_path": video_path})
             if isinstance(result, dict) and "cuts" in result:
                 return sorted(result["cuts"])
             if isinstance(result, list):

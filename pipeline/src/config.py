@@ -165,7 +165,7 @@ class Models:
     ARK_IMAGE: str = "doubao-seedream-5.0-lite"
     
     # 火山方舟 - 视频生成
-    ARK_VIDEO: str = "doubao-seedance-2.0-fast"
+    ARK_VIDEO: str = "doubao-seedance-2.0-mini"
     
     # 火山方舟 - Embedding
     ARK_EMBEDDING: str = "doubao-embedding-large"

@@ -453,7 +453,7 @@ def add_outro(
                 f"drawtext=text='{safe_credits}'"
                 f":fontcolor=0xCCCCCC:fontsize={fontsize}"
                 f":x=(w-text_w)/2:y=(h-text_h)/2"
-                f":font=Sans"
+                f":fontfile=/System/Library/Fonts/PingFang.ttc"
                 f":line_spacing=12,"
                 f"fade=t=in:st=0:d=0.8,"
                 f"fade=t=out:st={duration - 1.5}:d=1.5"

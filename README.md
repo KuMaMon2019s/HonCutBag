@@ -42,12 +42,31 @@ cp .env.example .env
 ### 4. 运行管线
 
 ```bash
-# 使用 make
+# 使用 make（自动创建日期工作空间）
 make run INPUT_FILE=path/to/script.txt
 
-# 或直接运行
-python pipeline/src/pipeline_runner.py --input path/to/script.txt --output-dir data/output
+# 或直接运行（指定输出目录）
+python pipeline/src/pipeline_runner.py \
+  --input path/to/script.txt \
+  --output-dir workspaces/$(date +%Y-%m-%d)_01
 ```
+
+## 工作空间结构
+
+工作空间（日期+序号）保存在 `workspaces/` 目录下（软链接到 `/Users/soda/knowledge-base`）：
+
+```
+workspaces/
+├── 2026-07-30_01/          # 日期_序号
+│   ├── input/              # 输入文件
+│   ├── output/             # 输出视频和中间文件
+│   ├── shots/              # 各镜头数据
+│   └── checkpoint.json     # 检查点（用于 --resume）
+├── 2026-07-31_01/
+└── ...
+```
+
+**命名规则**：`YYYY-MM-DD_XX`，其中 `XX` 是当天序号（01, 02, ...）
 
 ## 项目结构
 
@@ -100,9 +119,55 @@ honcut/
 
 ## 开发
 
+### 代码格式化与检查
+
+项目使用 **Black** 和 **Ruff** 进行代码格式化和检查：
+
+```bash
+# 安装开发依赖
+pip install -e ".[dev]"
+
+# 格式化代码
+black pipeline/src/ pipeline/tests/
+
+# 检查代码
+ruff check pipeline/src/ pipeline/tests/
+```
+
+### Pre-commit Hooks
+
+项目配置了 pre-commit hooks，在提交时自动运行代码检查和测试：
+
+```bash
+# 安装 pre-commit
+pip install pre-commit
+
+# 安装 git hooks
+pre-commit install
+
+# 手动运行所有 hooks
+pre-commit run --all-files
+```
+
+Pre-commit hooks 包括：
+- 代码格式化检查 (black)
+- 代码质量检查 (ruff)
+- 基础文件检查 (trailing whitespace, end-of-file, yaml/toml 语法等)
+- 运行测试 (pytest)
+
+跳过 hooks（不推荐）：
+```bash
+git commit --no-verify
+```
+
+### 运行测试
+
 ```bash
 # 运行测试
 make test
+
+# 或使用 pytest
+pytest pipeline/tests/ -v --cov=pipeline/src
 
 # 清理构建产物
 make clean

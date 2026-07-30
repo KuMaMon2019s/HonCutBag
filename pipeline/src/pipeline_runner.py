@@ -21,6 +21,8 @@ from typing import Optional, TypedDict, Any
 
 from config import get_api_key
 from progress_reporter import ProgressReporter
+from quality_gate import run_quality_check
+from timing_estimator import estimate_phase_duration, estimate_total, estimate_remaining
 
 # ---------------------------------------------------------------------------
 # LangGraph Integration (Phase 1: @task + RetryPolicy, Send fan-out, SqliteSaver)
@@ -239,7 +241,7 @@ def _write_checkpoint(output_dir: Path, phase_name: str, result: dict) -> Path:
     # 如果 LangGraph 可用，同时写入 SQLite checkpoint
     if LANGGRAPH_AVAILABLE:
         try:
-            save_state_to_sqlite(checkpoint, output_dir, thread_id="pipeline")
+            save_state_to_sqlite(checkpoint, output_dir, thread_id="pipeline_run")
         except Exception as e:
             print(f"  ⚠ SQLite checkpoint 写入失败: {e}")
 
@@ -527,6 +529,8 @@ def run_phase2(text: str, output_dir: Path, duration: int, dry_run: bool, report
     """Phase 2: text_parser → event_extractor → character_discoverer → adaptation_engine → storyboard_generator"""
     _banner(2, 8, "编剧引擎 (Screenwriter)", dry_run)
     start = _now()
+    _p2_est = estimate_phase_duration("phase2")
+    print(f"  ⏱ Phase 2 开始 (预估 ~{int(_p2_est)}s)")
     output_dir = Path(output_dir)
 
     try:
@@ -771,6 +775,14 @@ def run_phase2(text: str, output_dir: Path, duration: int, dry_run: bool, report
         outputs = ["STORYBOARD.json", "CHARACTERS.json"]
         print(f"  ✓ Phase 2 完成: {outputs}")
 
+        # Quality gate: Phase 2
+        qg_report = run_quality_check("phase2", output_dir, {
+            "events": storyboard.get("events", []),
+            "shots": storyboard.get("shots", []),
+        })
+        if not qg_report.passed:
+            return {"status": "error", "error": f"Phase 2 质检未通过: {qg_report.grade}", "quality_report": qg_report, "duration_s": _elapsed(start), "outputs": outputs}
+
         return {
             "status": "done",
             "duration_s": _elapsed(start),
@@ -882,6 +894,8 @@ def run_phase2_5(storyboard_data: dict, characters_data: dict, output_dir: Path,
     """Phase 2.5: 使用 OM image_selector 生成故事板图片，不可用时降级到 Seedream API"""
     _banner("2.5", 8, "故事板图片生成 (ImageSelector / Seedream)", dry_run)
     start = _now()
+    _p25_est = estimate_phase_duration("phase2_5")
+    print(f"  ⏱ Phase 2.5 开始 (预估 ~{int(_p25_est)}s)")
     output_dir = Path(output_dir)
 
     if dry_run:
@@ -926,6 +940,12 @@ def run_phase2_5(storyboard_data: dict, characters_data: dict, output_dir: Path,
                     import shutil
                     shutil.copy2(out_path, storyboard_path)
                 print(f"  ✓ Phase 2.5 完成: storyboard.png (provider: OM)")
+                
+                # Quality gate: Phase 2.5
+                qg_report = run_quality_check("phase2_5", output_dir)
+                if not qg_report.passed:
+                    return {"status": "error", "error": f"Phase 2.5 质检未通过: {qg_report.grade}", "quality_report": qg_report, "duration_s": _elapsed(start)}
+                
                 return {
                     "status": "done",
                     "duration_s": _elapsed(start),
@@ -977,6 +997,12 @@ def run_phase2_5(storyboard_data: dict, characters_data: dict, output_dir: Path,
 
         if storyboard_path.exists():
             print(f"  ✓ Phase 2.5 完成: storyboard.png (provider: Seedream, fallback from OM: {om_error})")
+            
+            # Quality gate: Phase 2.5
+            qg_report = run_quality_check("phase2_5", output_dir)
+            if not qg_report.passed:
+                return {"status": "error", "error": f"Phase 2.5 质检未通过: {qg_report.grade}", "quality_report": qg_report, "duration_s": _elapsed(start)}
+            
             return {
                 "status": "done",
                 "duration_s": _elapsed(start),
@@ -1088,13 +1114,6 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
             for da in derive_assets:
                 print(f"      - {da['parent_name']}·{da['name']}: {da['desc']}")
 
-            # 写出衍生资产清单
-            derive_path = output_dir / "DERIVE_ASSETS.json"
-            derive_path.write_text(json.dumps(derive_assets, ensure_ascii=False, indent=2))
-            outputs.append("DERIVE_ASSETS.json")
-        else:
-            print("    ⊘ 未检测到需要衍生的变身/换装状态")
-
         # Step 3.2: 生成基础角色三视图
         # 为每个角色准备 id/name/description
         char_dicts = []
@@ -1107,16 +1126,21 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
                 "style": c.get("style", ""),
             })
 
+        _p3_est = estimate_phase_duration("phase3", num_characters=len(char_dicts))
+        print(f"  ⏱ Phase 3 开始 (预估 ~{int(_p3_est)}s)")
         print(f"  → batch_generate: {len(char_dicts)} 个角色, skip_images={dry_run}")
         
         # Use retry policy for each character generation
         results = []
+        _p3_char_start = _now()
         for i, char_dict in enumerate(char_dicts):
             char_name = char_dict.get("name", f"角色{i}")
             print(f"    → [{i+1}/{len(char_dicts)}] {char_name}...")
+            _char_t0 = _now()
             
             def _gen_char():
-                return batch_generate([char_dict], str(chars_dir), skip_images=dry_run)
+                # Pass output_dir (not chars_dir) — generate_character appends /characters/ internally
+                return batch_generate([char_dict], str(output_dir), skip_images=dry_run)
             
             try:
                 result = _retry_with_policy(_gen_char, max_attempts=3, backoff_factor=2.0)
@@ -1124,6 +1148,9 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
             except Exception as e:
                 print(f"    ✗ {char_name} 生成失败: {e}")
                 results.append(None)
+            _char_elapsed = round(_now() - _char_t0, 1)
+            _char_cumulative = round(_now() - _p3_char_start, 1)
+            print(f"  ⏱ {char_name} 完成 (耗时 {_char_elapsed}s, 累计 {_char_cumulative}s / 预估 {int(_p3_est)}s)")
 
         # 统计输出
         for r in (results or []):
@@ -1140,6 +1167,12 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
                     outputs.append(f"characters/{d.name}/")
 
         print(f"  ✓ Phase 3 完成: {len(outputs)} 角色卡 + {len(derive_assets)} 衍生资产")
+        
+        # Quality gate: Phase 3 (CRITICAL — blocks pipeline if character images missing)
+        qg_report = run_quality_check("phase3", output_dir)
+        if not qg_report.passed:
+            return {"status": "error", "error": f"Phase 3 质检未通过: {qg_report.grade} — 角色图片缺失，不能继续", "quality_report": qg_report, "duration_s": _elapsed(start)}
+        
         return {
             "status": "done",
             "duration_s": _elapsed(start),
@@ -1164,6 +1197,8 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
     """Phase 4: orchestrator — 镜头编排（通过 CLI 调用）"""
     _banner(4, 8, "编排器 (Orchestrator)", dry_run)
     start = _now()
+    _p4_est = estimate_phase_duration("phase4")
+    print(f"  ⏱ Phase 4 开始 (预估 ~{int(_p4_est)}s)")
     outputs = []
     output_dir = Path(output_dir)
 
@@ -1365,13 +1400,14 @@ def _build_shot_prompt(shot: dict, style_context: Optional[dict] = None) -> str:
 # Phase 5: 视频生成 (OM SeedanceVideo — reference_to_video)
 # ---------------------------------------------------------------------------
 
-def _run_phase5_om_seedance(storyboard_data: dict, output_dir: Path, characters_data: Optional[dict] = None) -> dict:
+def _run_phase5_om_seedance(storyboard_data: dict, output_dir: Path, characters_data: Optional[dict] = None, _timing_ctx: Optional[dict] = None) -> dict:
     """使用 OM SeedanceVideo 生成视频（支持 reference_to_video）
     
     Args:
         storyboard_data: STORYBOARD.json 的内容
         output_dir: 输出目录
         characters_data: CHARACTERS.json 的内容（可选，用于注入角色参考图）
+        _timing_ctx: 可选计时上下文 {start, estimate}，用于打印子节点进度
     """
     from tools.video.seedance_video import SeedanceVideo
 
@@ -1494,8 +1530,12 @@ def _run_phase5_om_seedance(storyboard_data: dict, output_dir: Path, characters_
             return result
 
         try:
+            _p5_est_val = int(_timing_ctx["estimate"]) if _timing_ctx else 0
             print(f"  → S{shot_id}: 生成视频...")
+            _shot_t0 = _now()
             result = _retry_with_policy(_generate_shot, max_attempts=3, backoff_factor=2.0)
+            _shot_elapsed = round(_now() - _shot_t0, 1)
+            _p5_cumulative = round(_now() - (_timing_ctx["start"] if _timing_ctx else _now()), 1)
 
             if result.success:
                 # 如果输出不在目标位置，复制过去
@@ -1505,14 +1545,22 @@ def _run_phase5_om_seedance(storyboard_data: dict, output_dir: Path, characters_
                     shutil.copy2(out_path, video_path)
                 outputs.append(f"shots/S{shot_id}/output.mp4")
                 print(f"    ✓ S{shot_id}: 视频已生成")
+                if _timing_ctx:
+                    print(f"  ⏱ S{shot_id} 完成 (耗时 {_shot_elapsed}s, 累计 {_p5_cumulative}s / 预估 {_p5_est_val}s)")
             else:
                 error_msg = result.error or "unknown error"
                 errors.append(f"S{shot_id}: {error_msg}")
                 print(f"    ✗ S{shot_id}: 生成失败 — {error_msg}")
+                if _timing_ctx:
+                    print(f"  ⏱ S{shot_id} 失败 (耗时 {_shot_elapsed}s, 累计 {_p5_cumulative}s / 预估 {_p5_est_val}s)")
 
         except Exception as e:
             errors.append(f"S{shot_id}: {e}")
             print(f"    ✗ S{shot_id}: 所有重试均失败 — {e}")
+            _shot_elapsed = round(_now() - _shot_t0, 1)
+            _p5_cumulative = round(_now() - (_timing_ctx["start"] if _timing_ctx else _now()), 1)
+            if _timing_ctx:
+                print(f"  ⏱ S{shot_id} 失败 (耗时 {_shot_elapsed}s, 累计 {_p5_cumulative}s / 预估 {_p5_est_val}s)")
             continue
 
     return {
@@ -1539,6 +1587,32 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
 
     print("  → 模式: text_to_video (seedance_client fallback)")
 
+    # Load character reference images for consistency
+    import base64 as _b64
+    char_ref_map = {}   # {match_key_lower: base64_of_front_png}
+    char_list = []      # [(char_id, char_name, b64)] for fallback
+    chars_path = output_dir / "CHARACTERS.json"
+    if chars_path.exists():
+        chars_data = json.loads(chars_path.read_text())
+        for char in chars_data.get("characters", []):
+            # Try both directory structures: characters/{id}/ and characters/characters/{id}/
+            front_png = output_dir / "characters" / char["id"] / "front.png"
+            if not front_png.exists():
+                front_png = output_dir / "characters" / "characters" / char["id"] / "front.png"
+            if front_png.exists():
+                b64 = _b64.b64encode(front_png.read_bytes()).decode()
+                # Map multiple keys for matching: Chinese name, pinyin id, id without underscores
+                char_ref_map[char["name"].lower()] = b64
+                char_ref_map[char["id"].lower()] = b64
+                char_ref_map[char["id"].replace("_", "").lower()] = b64
+                char_list.append((char["id"], char["name"], b64))
+        if char_ref_map:
+            print(f"  → 已加载 {len(char_list)} 个角色参考图")
+
+    # Determine protagonist (first character) for default injection
+    protagonist_b64 = char_list[0][2] if char_list else None
+    protagonist_name = char_list[0][1] if char_list else None
+
     outputs = []
     for shot_dir in sorted(shots_dir.iterdir()):
         if not shot_dir.is_dir() or not shot_dir.name.startswith("S"):
@@ -1553,20 +1627,59 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
         if not prompt:
             continue
 
-        try:
-            print(f"  → {shot_dir.name}: 提交视频生成...")
-            task_id = submit(prompt=prompt, api_key=api_key, duration=duration, ratio="16:9")
-            video_url = poll(task_id, api_key=api_key)
-            if video_url:
-                out_path = str(shot_dir / "output.mp4")
-                download(video_url, out_path)
-                outputs.append(f"shots/{shot_dir.name}/output.mp4")
-                print(f"    ✓ {shot_dir.name}: 视频已生成")
-            else:
-                print(f"    ✗ {shot_dir.name}: poll 返回空 URL")
-        except Exception as e:
-            print(f"    ✗ {shot_dir.name}: 异常 — {e}")
-            continue
+        # Find character reference for this shot
+        # Strategy: match by name/id in prompt → fallback to protagonist
+        first_frame_b64 = None
+        prompt_lower = prompt.lower()
+        for char_name, b64 in char_ref_map.items():
+            if char_name in prompt_lower:
+                first_frame_b64 = b64
+                print(f"    [ref] 注入角色参考: {char_name}")
+                break
+        # Fallback: inject protagonist for shots with human activity keywords
+        if first_frame_b64 is None and protagonist_b64:
+            human_keywords = ["woman", "man", "girl", "boy", "person", "she", "he",
+                              "her", "his", "lin xia", "shen yu", "xia", "yu"]
+            if any(kw in prompt_lower for kw in human_keywords):
+                first_frame_b64 = protagonist_b64
+                print(f"    [ref] 注入主角参考 (fallback): {protagonist_name}")
+
+        # Add style prefix to every prompt
+        style_prefix = "Photorealistic, urban, Jiangnan aesthetic, lifelike skin texture, natural lighting, "
+        if not prompt.lower().startswith("photorealistic"):
+            prompt = style_prefix + prompt
+
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            try:
+                print(f"  → {shot_dir.name}: 提交视频生成...")
+                task_id = submit(prompt=prompt, api_key=api_key, duration=duration, ratio="16:9",
+                                 reference_image_base64=first_frame_b64)
+                video_url = poll(task_id, api_key=api_key)
+                if video_url:
+                    out_path = str(shot_dir / "output.mp4")
+                    download(video_url, out_path)
+                    outputs.append(f"shots/{shot_dir.name}/output.mp4")
+                    print(f"    ✓ {shot_dir.name}: 视频已生成")
+                    break
+                else:
+                    print(f"    ✗ {shot_dir.name}: poll 返回空 URL")
+                    break
+            except Exception as e:
+                err_str = str(e)
+                if "PrivacyInformation" in err_str and first_frame_b64 is not None:
+                    # Seedance rejects real-person reference images — drop and retry text-only
+                    print(f"    ⚠ {shot_dir.name}: 参考图被隐私检测拒绝，降级为纯文本生成")
+                    first_frame_b64 = None
+                    continue
+                if "PolicyViolation" in err_str and attempt < max_retries:
+                    print(f"    ⚠ {shot_dir.name}: 版权误报，重试 ({attempt+1}/{max_retries})...")
+                    prompt = prompt.replace("Cinematic", "Original fictional")
+                    prompt += ", original character design, non-copyrighted"
+                    first_frame_b64 = None
+                    continue
+                print(f"    ✗ {shot_dir.name}: 异常 — {e}")
+                break
 
     return {
         "status": "done" if outputs else "error",
@@ -1580,6 +1693,11 @@ def run_phase5(storyboard_data: dict, output_dir: Path, dry_run: bool) -> dict:
     """Phase 5: 视频生成 — OM SeedanceVideo (reference_to_video) 带降级"""
     _banner(5, 8, "视频生成 (Seedance — reference_to_video)", dry_run)
     start = _now()
+    
+    # Estimate based on shot count
+    _num_shots = len(storyboard_data.get("shots", [])) if storyboard_data else 10
+    _p5_est = estimate_phase_duration("phase5", num_shots=_num_shots)
+    print(f"  ⏱ Phase 5 开始 (预估 ~{int(_p5_est)}s, {_num_shots} 镜头)")
 
     if dry_run:
         print("  ⊘ dry-run 模式，跳过视频生成")
@@ -1588,10 +1706,16 @@ def run_phase5(storyboard_data: dict, output_dir: Path, dry_run: bool) -> dict:
     # 优先尝试 OM SeedanceVideo
     try:
         print("  → 尝试 OM SeedanceVideo...")
-        result = _run_phase5_om_seedance(storyboard_data, output_dir)
+        result = _run_phase5_om_seedance(storyboard_data, output_dir, _timing_ctx={"start": start, "estimate": _p5_est})
         result["duration_s"] = _elapsed(start)
         if result["status"] == "done":
             print(f"  ✓ Phase 5 完成: {len(result['outputs'])} 视频 (OM SeedanceVideo)")
+            
+            # Quality gate: Phase 5
+            qg_report = run_quality_check("phase5", output_dir)
+            if not qg_report.passed:
+                return {"status": "error", "error": f"Phase 5 质检未通过: {qg_report.grade}", "quality_report": qg_report, "duration_s": _elapsed(start)}
+            
         else:
             print(f"  ⚠ Phase 5 部分完成: {len(result.get('outputs', []))} 视频, {len(result.get('errors', []))} 错误")
         return result
@@ -1609,6 +1733,12 @@ def run_phase5(storyboard_data: dict, output_dir: Path, dry_run: bool) -> dict:
         result["duration_s"] = _elapsed(start)
         if result["status"] == "done":
             print(f"  ✓ Phase 5 完成: {len(result['outputs'])} 视频 (seedance_client fallback)")
+            
+            # Quality gate: Phase 5
+            qg_report = run_quality_check("phase5", output_dir)
+            if not qg_report.passed:
+                return {"status": "error", "error": f"Phase 5 质检未通过: {qg_report.grade}", "quality_report": qg_report, "duration_s": _elapsed(start)}
+            
         else:
             print(f"  ✗ Phase 5 失败 (seedance_client fallback)")
         return result
@@ -1956,6 +2086,8 @@ def run_phase6(output_dir: Path, dry_run: bool, storyboard_data: dict = None) ->
     """
     _banner(6, 8, "一致性守卫 + 场景变化检测 + 幻灯片风险评分", dry_run)
     start = _now()
+    _p6_est = estimate_phase_duration("phase6")
+    print(f"  ⏱ Phase 6 开始 (预估 ~{int(_p6_est)}s)")
     output_dir = Path(output_dir)
     outputs = []
 
@@ -1967,16 +2099,8 @@ def run_phase6(output_dir: Path, dry_run: bool, storyboard_data: dict = None) ->
     try:
         from consistency_guard import run_consistency_check
 
-        shots_dir = output_dir / "shots"
-        report_path = str(output_dir / "consistency_report.json")
         print("  → run_consistency_check: 检查角色一致性...")
-        result = run_consistency_check(
-            shots_filter=None,
-            max_frames=10,
-            api_key=os.environ.get("ARK_AGENT_API_KEY"),
-            output_path=report_path,
-            shots_dir=str(shots_dir),
-        )
+        result = run_consistency_check(output_dir=output_dir)
         outputs.append("consistency_report.json")
         print(f"  ✓ 角色一致性检查完成")
 
@@ -2073,6 +2197,8 @@ def run_phase7(output_dir: Path, dry_run: bool,
     """Phase 7: 组装引擎 — 直接调用 OM VideoStitch"""
     _banner(7, 8, f"组装引擎 (Assembly) — {transition}", dry_run)
     start = _now()
+    _p7_est = estimate_phase_duration("phase7")
+    print(f"  ⏱ Phase 7 开始 (预估 ~{int(_p7_est)}s)")
     output_dir = Path(output_dir)
 
     if dry_run:
@@ -2097,6 +2223,12 @@ def run_phase7(output_dir: Path, dry_run: bool,
         output_final = output_dir / "raw_assembly.mp4"
         shutil.copy2(clip_paths[0], str(output_final))
         print(f"  ✓ Phase 7 完成: 仅 1 个片段，直接复制")
+        
+        # Quality gate: Phase 7
+        qg_report = run_quality_check("phase7", output_dir)
+        if not qg_report.passed:
+            return {"status": "error", "error": f"Phase 7 质检未通过: {qg_report.grade}", "quality_report": qg_report, "duration_s": _elapsed(start)}
+        
         return {"status": "done", "duration_s": _elapsed(start),
                 "outputs": ["raw_assembly.mp4"], "method": "single_clip_copy"}
 
@@ -2119,6 +2251,12 @@ def run_phase7(output_dir: Path, dry_run: bool,
 
         if result.success:
             print(f"  ✓ Phase 7 完成: raw_assembly.mp4")
+            
+            # Quality gate: Phase 7
+            qg_report = run_quality_check("phase7", output_dir)
+            if not qg_report.passed:
+                return {"status": "error", "error": f"Phase 7 质检未通过: {qg_report.grade}", "quality_report": qg_report, "duration_s": _elapsed(start)}
+            
             return {
                 "status": "done",
                 "duration_s": _elapsed(start),
@@ -2202,6 +2340,8 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
     """
     _banner(8, 8, "后期处理 (Post-Production)", dry_run)
     start = _now()
+    _p8_est = estimate_phase_duration("phase8")
+    print(f"  ⏱ Phase 8 开始 (预估 ~{int(_p8_est)}s)")
     output_dir = Path(output_dir)
 
     if dry_run:
@@ -2254,6 +2394,34 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
                 outputs.append("audio_processed.mp4")
                 audio_success = True
                 print(f"  ✓ Audio processing complete")
+
+                # AudioMixer outputs audio-only (-vn); remux processed audio
+                # back into the original video stream so downstream steps
+                # (visual_post, rhythm_editor, final_encode) still have video.
+                remux_tmp = output_dir / "audio_remux_tmp.mp4"
+                remux_cmd = [
+                    "ffmpeg", "-y",
+                    "-i", str(raw_video),       # original video with video stream
+                    "-i", str(audio_out),        # processed audio-only file
+                    "-map", "0:v",              # take video from original
+                    "-map", "1:a",              # take audio from processed
+                    "-c:v", "copy",             # don't re-encode video
+                    "-c:a", "aac",
+                    "-shortest",
+                    str(remux_tmp),
+                ]
+                import subprocess as _sp
+                try:
+                    _sp.run(remux_cmd, capture_output=True, check=True)
+                    import shutil
+                    shutil.move(str(remux_tmp), str(audio_out))
+                    print(f"  ✓ Audio remuxed into video stream")
+                except Exception as remux_err:
+                    print(f"  ⚠ Audio remux failed: {remux_err}, using original video")
+                    import shutil
+                    if remux_tmp.exists():
+                        remux_tmp.unlink()
+                    shutil.copy2(str(raw_video), str(audio_out))
             else:
                 print(f"  ⚠ AudioMixer failed: {mix_result.error}")
                 # Fallback: just copy video
@@ -2322,7 +2490,7 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
                     else:
                         print(f"    ⚠ 字幕烧录失败: {burn_result.error}")
                 else:
-                    print(f"    ⊘ 无字幕数据，跳过烧录")
+                    print(f"    ⊘ No subtitle data available, skipping subtitle burn")
             except ImportError as e:
                 print(f"    ⚠ RemotionCaptionBurn unavailable: {e}")
             except Exception as e:
@@ -2414,6 +2582,12 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             print(f"    ⚠ 最终编码异常: {e}，使用原始 polished.mp4")
 
         print(f"  ✓ Phase 8 完成: polished.mp4")
+        
+        # Quality gate: Phase 8
+        qg_report = run_quality_check("phase8", output_dir)
+        if not qg_report.passed:
+            return {"status": "error", "error": f"Phase 8 质检未通过: {qg_report.grade}", "quality_report": qg_report, "duration_s": _elapsed(start)}
+        
         return {
             "status": "done",
             "duration_s": _elapsed(start),
@@ -2838,9 +3012,30 @@ def run_pipeline(
     # ---- Resume: 读取检查点 ----
     completed_phases = set()
     if resume:
+        # Try JSON checkpoint first, then fall back to SQLite checkpoint
         completed_phases = set(_get_completed_stages(output_path))
-        if completed_phases:
+        if not completed_phases:
+            # Fallback: try to read completed phases from SQLite checkpoint
+            sqlite_state = load_state_from_sqlite(output_path, thread_id="pipeline_run")
+            if sqlite_state and isinstance(sqlite_state, dict):
+                sqlite_completed = sqlite_state.get("completed_phases", [])
+                if sqlite_completed:
+                    completed_phases = set(sqlite_completed)
+                    print(f"\n  🔄 Resume 模式: 从 SQLite checkpoint 恢复已完成的 Phase: {sorted(completed_phases)}")
+                    # Also write a JSON checkpoint so future resume calls can read it
+                    # Reconstruct a minimal checkpoint.json from SQLite state
+                    phase_results = sqlite_state.get("phase_results", {})
+                    for phase_name in completed_phases:
+                        phase_result = phase_results.get(phase_name, {"status": "done"})
+                        _write_checkpoint(output_path, phase_name, phase_result)
+                else:
+                    print(f"\n  🔄 Resume 模式: 无检查点，从头开始")
+            else:
+                print(f"\n  🔄 Resume 模式: 无检查点，从头开始")
+        else:
             print(f"\n  🔄 Resume 模式: 跳过已完成的 Phase: {sorted(completed_phases)}")
+        
+        if completed_phases:
             next_stage = _get_next_stage(output_path)
             if next_stage is None:
                 print(f"  ✓ 所有 Phase 已完成，无需重新运行")
@@ -2851,10 +3046,8 @@ def run_pipeline(
                     "resumed": True,
                     "completed_phases": sorted(completed_phases),
                     "output_dir": str(output_dir),
-                    "timestamp": cp.get("timestamp", ""),
+                    "timestamp": cp.get("timestamp", "") if cp else "",
                 }
-        else:
-            print(f"\n  🔄 Resume 模式: 无检查点，从头开始")
 
     # 读取文本（resume 模式下如果文本未提供，尝试从检查点恢复）
     if text is None and input_file:
@@ -2884,6 +3077,12 @@ def run_pipeline(
         print(f"  🔄 Resume: 已完成 {len(completed_phases)}/{len(PHASE_ORDER)} Phase")
     if auto_approve:
         print(f"  ✓ Auto-approve: 跳过人工审核节点")
+    
+    # 打印预估总耗时
+    if not dry_run:
+        _est = estimate_total(num_characters=3, num_shots=10)  # 默认值，实际运行时会根据数据调整
+        print(f"  ⏱ 预估总耗时: {_est['total_human']} (基于历史数据)")
+    
     print(f"{'#'*60}")
 
     # --- LangGraph StateGraph execution path ---

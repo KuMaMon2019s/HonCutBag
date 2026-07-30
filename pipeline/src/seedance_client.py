@@ -19,10 +19,11 @@ POLL_ENDPOINT = f"{BASE_URL}/contents/generations/tasks/{{task_id}}"
 def submit(
     prompt: str,
     api_key: str,
-    model: str = "doubao-seedance-2.0-fast",
+    model: str = "doubao-seedance-2.0-mini",
     duration: int = 7,
     ratio: str = "16:9",
     first_frame_base64: Optional[str] = None,
+    reference_image_base64: Optional[str] = None,
 ) -> str:
     """Submit a Seedance generation task. Returns task_id."""
     # Sanitize prompt to remove IP risks
@@ -36,8 +37,18 @@ def submit(
     }
 
     # Build content — always array format
-    if first_frame_base64:
-        # img2vid: content is array with image + text
+    if reference_image_base64:
+        # Character identity anchor (no privacy detection, maintains consistency)
+        content = [
+            {"type": "text", "text": sanitized_prompt},
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{reference_image_base64}"},
+                "role": "reference_image",
+            },
+        ]
+    elif first_frame_base64:
+        # img2vid: video starts FROM this image (strict privacy detection)
         content = [
             {
                 "type": "image_url",

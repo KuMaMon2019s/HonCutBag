@@ -72,3 +72,9 @@ logs/
 *.tmp
 *.temp
 cache/
+*.json
+
+# HonCut specific
+workspaces
+2026-07-27_05/
+.ruff_cache/
