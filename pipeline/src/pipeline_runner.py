@@ -2347,7 +2347,53 @@ def run_phase7(output_dir: Path, dry_run: bool,
         batch_transition = transition
         print(f"  → 拼接模式: {batch_transition} (duration={transition_duration}s)")
 
-    # 调用 OM VideoStitch
+    # 调用 edit_decisions 架构（从 OpenMontage VideoCompose 学习）
+    try:
+        from edit_decisions import build_edit_decisions, execute_edit_decisions
+        
+        print("  → 构建 edit_decisions（帧精确裁切 + 音频归一化）...")
+        edit_decisions = build_edit_decisions(
+            shots_dir=shots_dir,
+            target_width=1920,
+            target_height=1080,
+            transition_decisions=smart_decisions,
+        )
+        
+        print(f"  → 执行 edit_decisions（{len(edit_decisions['cuts'])} 个片段）...")
+        ed_result = execute_edit_decisions(
+            edit_decisions,
+            output_path=str(output_dir / "raw_assembly.mp4")
+        )
+        
+        if ed_result.get("success"):
+            print(f"  ✓ Phase 7 完成: raw_assembly.mp4 (edit_decisions)")
+            
+            # Quality gate: Phase 7
+            qg_report = run_quality_check("phase7", output_dir)
+            if not qg_report.passed:
+                return {"status": "error", "error": f"Phase 7 质检未通过: {qg_report.grade}", "quality_report": qg_report, "duration_s": _elapsed(start)}
+            
+            return {
+                "status": "done",
+                "duration_s": _elapsed(start),
+                "outputs": ["raw_assembly.mp4"],
+                "method": "edit_decisions",
+                "transition": batch_transition,
+                "transition_duration": transition_duration,
+                "clip_count": len(clip_paths),
+                "transition_selections": selected_transitions if selected_transitions else None,
+                "edit_decisions_segments": ed_result.get("segments"),
+            }
+        else:
+            error_msg = ed_result.get("error", "Unknown error")
+            print(f"  ⚠ edit_decisions 失败: {error_msg}，降级为 VideoStitch")
+            # Fall through to VideoStitch fallback
+            
+    except Exception as e:
+        print(f"  ⚠ edit_decisions 异常: {e}，降级为 VideoStitch")
+        # Fall through to VideoStitch fallback
+    
+    # Fallback: OM VideoStitch（如果 edit_decisions 失败）
     try:
         from tools.video.video_stitch import VideoStitch
         stitcher = VideoStitch()
@@ -2362,7 +2408,7 @@ def run_phase7(output_dir: Path, dry_run: bool,
         })
 
         if result.success:
-            print(f"  ✓ Phase 7 完成: raw_assembly.mp4")
+            print(f"  ✓ Phase 7 完成: raw_assembly.mp4 (VideoStitch fallback)")
             
             # Quality gate: Phase 7
             qg_report = run_quality_check("phase7", output_dir)
@@ -2373,7 +2419,7 @@ def run_phase7(output_dir: Path, dry_run: bool,
                 "status": "done",
                 "duration_s": _elapsed(start),
                 "outputs": ["raw_assembly.mp4"],
-                "method": f"VideoStitch_{batch_transition}",
+                "method": f"VideoStitch_{batch_transition}_fallback",
                 "transition": batch_transition,
                 "transition_duration": transition_duration,
                 "clip_count": len(clip_paths),
