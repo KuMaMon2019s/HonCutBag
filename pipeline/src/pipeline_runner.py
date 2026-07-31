@@ -991,24 +991,81 @@ def run_phase2_5(storyboard_data: dict, characters_data: dict, output_dir: Path,
                     storyboard_images_dir = output_dir / "storyboard_images"
                     storyboard_images_dir.mkdir(exist_ok=True)
                     shots = storyboard_data.get("shots", [])
+
+                    # --- P0-1a: 加载角色参考图（用于分镜图角色一致性）---
+                    char_ref_map = {}  # {char_name_lower: front_png_path}
+                    protagonist_ref = None
+                    chars_path = output_dir / "CHARACTERS.json"
+                    if chars_path.exists():
+                        try:
+                            chars_data = json.loads(chars_path.read_text())
+                            for char in chars_data.get("characters", []):
+                                front_png = output_dir / "characters" / char["id"] / "front.png"
+                                if not front_png.exists():
+                                    front_png = output_dir / "characters" / "characters" / char["id"] / "front.png"
+                                if front_png.exists():
+                                    char_ref_map[char["name"].lower()] = front_png
+                                    char_ref_map[char["id"].lower()] = front_png
+                                    if protagonist_ref is None:
+                                        protagonist_ref = front_png
+                            if char_ref_map:
+                                print(f"  → [P0-1] 已加载 {len(char_ref_map)//2} 个角色参考图")
+                        except Exception as e:
+                            print(f"  ⚠ [P0-1] 角色参考图加载失败: {e}")
+
                     generated_count = 0
-                    for shot in shots:
-                        shot_id = shot.get("shot_id", f"S{shot.get('shot_order', 0):02d}")
-                        shot_prompt = shot.get("prompt", shot.get("visual", ""))
+                    
+                    # --- P2-5d: 并发生成分镜图（学 Toonflow concurrentCount）---
+                    def _gen_shot_image(shot_item):
+                        """单张分镜图生成逻辑（供并发调用）"""
+                        shot_id = shot_item.get("shot_id", f"S{shot_item.get('shot_order', 0):02d}")
+                        shot_prompt = shot_item.get("prompt", shot_item.get("visual", ""))
                         if not shot_prompt:
-                            continue
+                            return None
                         shot_image_path = storyboard_images_dir / f"{shot_id}.png"
                         if shot_image_path.exists():
-                            generated_count += 1
-                            continue
-                        try:
-                            # 复用现有 seedream_client
+                            return shot_id
+
+                        # --- P0-1c: 匹配角色参考图 ---
+                        ref_image_path = None
+                        shot_who = shot_item.get("who", [])
+                        for name in shot_who:
+                            if name.lower() in char_ref_map:
+                                ref_image_path = char_ref_map[name.lower()]
+                                break
+                        if ref_image_path is None and protagonist_ref:
+                            ref_image_path = protagonist_ref
+
+                        if ref_image_path and ref_image_path.exists():
+                            # P0-1c: 使用 image_to_image 模式（带参考图）
+                            from seedream_client import SeedreamClient
+                            client = SeedreamClient()
+                            client.image_to_image(
+                                prompt=shot_prompt,
+                                ref_image=str(ref_image_path),
+                                output_path=str(shot_image_path),
+                            )
+                            print(f"    [M2] 分镜图 {shot_id}.png ✓ (ref: {ref_image_path.name})")
+                        else:
+                            # 无参考图，纯文生图
                             from seedream_client import text_to_image
                             text_to_image(prompt=shot_prompt, output_path=str(shot_image_path))
-                            generated_count += 1
-                            print(f"    [M2] 分镜图 {shot_id}.png ✓")
-                        except Exception as e:
-                            print(f"    [M2] 分镜图 {shot_id}.png 失败（降级跳过）: {e}")
+                        print(f"    [M2] 分镜图 {shot_id}.png ✓")
+                        return shot_id
+
+                    # 并发执行（max_workers=3）
+                    from concurrent.futures import ThreadPoolExecutor, as_completed
+                    with ThreadPoolExecutor(max_workers=3) as executor:
+                        futures = {executor.submit(_gen_shot_image, s): s for s in shots}
+                        for future in as_completed(futures):
+                            try:
+                                result = future.result()
+                                if result is not None:
+                                    generated_count += 1
+                            except Exception as e:
+                                shot = futures[future]
+                                shot_id = shot.get("shot_id", f"S{shot.get('shot_order', 0):02d}")
+                                print(f"    [M2] 分镜图 {shot_id}.png 并发失败（降级跳过）: {e}")
                     print(f"  → [M2] 分镜图序列: {generated_count}/{len(shots)} 张")
                 except Exception as e:
                     print(f"  ⚠ [M2] 分镜图序列生成失败（降级跳过）: {e}")
@@ -3551,6 +3608,22 @@ def run_pipeline(
         reporter.phase_done("phase2", "编剧引擎完成", duration_s=p2.get("duration_s"))
         # 写入 checkpoint
         _write_checkpoint(output_path, "phase2", p2)
+
+    # --- P2-5b: 质检阻断（学 Toonflow 监督层）---
+    try:
+        p2_result = report["phases"].get("2") or report["phases"].get("phase2", {})
+        review = p2_result.get("storyboard_review", {})
+        if review.get("grade") == "D":
+            print(f"  🚫 [P2-5b] 分镜审核 D 级，管线中止（节省后续 token）")
+            report["status"] = "aborted_quality"
+            report["total_duration_s"] = _elapsed(total_start)
+            _write_report(report, output_dir)
+            return report
+        elif review.get("grade") == "C":
+            print(f"  ⚠ [P2-5b] 分镜审核 C 级，继续但需注意质量")
+    except Exception as e:
+        print(f"  ⚠ [P2-5b] 质检阻断检查失败（降级跳过）: {e}")
+
     # 如果 Phase 2 被跳过或数据为空，尝试从文件读
     if 2 in skip_phase or storyboard_data is None:
         sb_path = output_path / "STORYBOARD.json"

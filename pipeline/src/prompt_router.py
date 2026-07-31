@@ -23,6 +23,9 @@ def route_prompt(model_name: str, mode: str, shot_data: dict, assets: list = Non
     assets = assets or []
     model_lower = model_name.lower()
     
+    if mode == "multi_ref":
+        return _build_generic_multi_ref(shot_data, assets)
+    
     if "seedance" in model_lower and "2" in model_lower:
         if mode == "multi_shot":
             return _build_seedance2_multi(shot_data, assets)
@@ -64,6 +67,17 @@ def _build_seedance2_multi(shot_data: dict, assets: list) -> str:
         
         parts.append(f"分镜{i} {dur}s: 时间：{time_desc}，场景：{where}，"
                      f"镜头：{camera}，{who}，{visual}")
+        
+        # 12维编码补充（学 Toonflow）
+        dims = []
+        if shot.get("action"): dims.append(f"动作：{shot['action']}")
+        if shot.get("expression"): dims.append(f"表情：{shot['expression']}")
+        if shot.get("lighting"): dims.append(f"光影：{shot['lighting']}")
+        if shot.get("color_tone"): dims.append(f"色彩：{shot['color_tone']}")
+        if shot.get("sound_effect"): dims.append(f"音效：{shot['sound_effect']}")
+        if shot.get("rhythm"): dims.append(f"节奏：{shot['rhythm']}")
+        if dims:
+            parts.append("  " + "，".join(dims))
     
     return "\n".join(parts)
 
@@ -128,3 +142,26 @@ def _build_generic_first_last_frame(shot_data: dict) -> str:
         f"[Narrative] Emotional tone: {emotion or 'neutral'}.",
     ]
     return " ".join(parts)
+
+
+def _build_generic_multi_ref(shot_data: dict, assets: list) -> str:
+    """通用多参模式：[References] + [Instruction]（学 Toonflow）"""
+    parts = []
+    # References 段
+    if assets:
+        parts.append("[References]")
+        for i, asset in enumerate(assets, 1):
+            name = asset.get("name", f"Ref{i}")
+            desc = asset.get("description", "")
+            parts.append(f"Image {i}: {name} — {desc}")
+        parts.append("")
+    # Instruction 段
+    visual = shot_data.get("visual", shot_data.get("prompt", ""))
+    where = shot_data.get("where", "")
+    emotion = shot_data.get("emotion", "")
+    camera = shot_data.get("camera", "medium shot")
+    parts.append("[Instruction]")
+    parts.append(f"Scene: {where}. Camera: {camera}. Mood: {emotion}.")
+    parts.append(f"Action: {visual}")
+    parts.append("Maintain character consistency with reference images.")
+    return "\n".join(parts)

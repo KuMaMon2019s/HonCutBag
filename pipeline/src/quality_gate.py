@@ -18,6 +18,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional, Callable, List, Tuple, Dict, Any
 import json
+import re
 import os
 
 
@@ -348,8 +349,15 @@ def run_storyboard_review(storyboard_data: dict, script_text: str, characters: l
     char_names = {c.get("name", "").lower() for c in characters} if characters else set()
     char_ids = {c.get("id", "").lower() for c in characters} if characters else set()
     
-    # 抽象笼统词黑名单（R3）
-    abstract_words = ["美丽的", "漂亮的", "好看的", "某种", "一些", "很多", "非常", "很"]
+    # 抽象笼统词黑名单（R3）— 扩充至 30+ 词
+    abstract_words = [
+        "美丽的", "漂亮的", "好看的", "某种", "一些", "很多", "非常", "很",
+        "优雅地", "缓缓地", "轻轻地", "慢慢地", "渐渐地", "默默地",
+        "充满", "弥漫", "笼罩", "环绕", "萦绕",
+        "氛围感", "意境", "韵味", "格调", "质感",
+        "温暖的感觉", "悲伤的感觉", "幸福的感觉",
+        "如同", "仿佛", "好像", "似乎",
+    ]
     
     for i, shot in enumerate(shots):
         shot_id = shot.get("shot_id", f"S{i+1:02d}")
@@ -371,6 +379,52 @@ def run_storyboard_review(storyboard_data: dict, script_text: str, characters: l
         # R2: 剧本忠实（简单检查：visual 不应为空）
         if not visual or len(visual) < 10:
             moderate_issues.append(f"[R2] {shot_id}: visual 描述过短或为空")
+        
+        # P0-2a: R2 台词忠实度（检查 shot 中引用的台词是否在原文中存在）
+        what = shot.get("what", "")
+        if what and script_text:
+            # 提取引号内的台词
+            quoted = re.findall(r'["「](.+?)["」]', what)
+            for q in quoted:
+                if q not in script_text:
+                    severe_issues.append(f"[R2] {shot_id}: 台词 '{q[:20]}...' 不在原文中")
+        
+        # P0-2b: 片段时长检查（Toonflow 铁律: ≤15秒）
+        duration = shot.get("suggested_duration", shot.get("duration", 0))
+        if duration and duration > 15:
+            severe_issues.append(f"[时长] {shot_id}: {duration}s 超过15秒上限")
+        
+        # P0-2c: 长台词拆镜检查（Toonflow 铁律: >20字强制拆镜）
+        dialogue = shot.get("dialogue", shot.get("what", ""))
+        dialogue_text = re.findall(r'["「](.+?)["」]', dialogue)
+        for d in dialogue_text:
+            if len(d) > 20:
+                moderate_issues.append(f"[拆镜] {shot_id}: 台词'{d[:15]}...'({len(d)}字) 建议拆镜")
+        
+        # P0-2f: 禁光影色调词（Toonflow: 分镜不规划光影/色调/配乐）
+        banned_visual_words = ["色调", "光影", "配乐", "BGM", "背景音乐", "色温", "饱和度", "对比度"]
+        for bw in banned_visual_words:
+            if bw in visual:
+                moderate_issues.append(f"[禁词] {shot_id}: visual 含 '{bw}'（应由后期处理）")
+    
+    # P0-2d: 在场人物不消失检查（Toonflow 铁律）
+    for i in range(1, len(shots)):
+        prev_who = set(shots[i-1].get("who", []))
+        curr_who = set(shots[i].get("who", []))
+        # 同场景内（where 相同），人物不应无故减少
+        if shots[i-1].get("where") == shots[i].get("where") and prev_who:
+            disappeared = prev_who - curr_who
+            if disappeared:
+                moderate_issues.append(
+                    f"[消失] S{i+1:02d}: {', '.join(disappeared)} 在同场景中消失")
+    
+    # P0-2g: 景别视角错开检查（Toonflow: 相邻镜头不应同景别同角度）
+    for i in range(1, len(shots)):
+        prev_cam = shots[i-1].get("camera", "")
+        curr_cam = shots[i].get("camera", "")
+        if prev_cam and curr_cam and prev_cam == curr_cam:
+            moderate_issues.append(
+                f"[景别] S{i:02d}→S{i+1:02d}: 连续相同景别 '{curr_cam}'")
     
     # 评分
     severe_count = len(severe_issues)

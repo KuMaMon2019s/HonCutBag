@@ -95,3 +95,50 @@ def test_seedance2_multi_shot_without_assets():
 
     assert "分镜" in result
     assert "街道" in result
+
+
+def test_multi_ref_mode():
+    """multi_ref 模式 → 包含 '[References]' 和 '[Instruction]'。"""
+    shot_data = {
+        "visual": "a girl walking in the park",
+        "where": "park",
+        "emotion": "happy",
+        "camera": "medium shot",
+    }
+    assets = [
+        {"name": "Alice", "description": "blonde hair, blue dress"},
+        {"name": "Bob", "description": "brown hair, red shirt"},
+    ]
+    result = route_prompt("any-model", "multi_ref", shot_data, assets)
+
+    assert "[References]" in result, f"multi_ref 应包含 '[References]'，实际：{result[:100]}"
+    assert "[Instruction]" in result, f"multi_ref 应包含 '[Instruction]'，实际：{result[:100]}"
+    assert "Alice" in result
+    assert "Bob" in result
+    assert "park" in result
+
+
+def test_seedance_multi_12dims():
+    """seedance-2-0 multi_shot 包含 12 维编码字段（动作、表情等）。"""
+    shot_data = {
+        "shots": [
+            {
+                "duration": 5,
+                "time": "白天",
+                "where": "咖啡厅",
+                "camera": "中景",
+                "visual": "女孩低头搅拌咖啡",
+                "who": ["林夏"],
+                "action": "搅拌咖啡",
+                "expression": "专注",
+                "lighting": "柔和侧光",
+            }
+        ],
+    }
+    result = route_prompt("seedance-2-0", "multi_shot", shot_data, [])
+
+    assert "动作" in result, f"seedance-2-0 multi_shot 应包含 '动作'，实际：{result[:200]}"
+    assert "表情" in result, f"seedance-2-0 multi_shot 应包含 '表情'，实际：{result[:200]}"
+    assert "光影" in result, f"seedance-2-0 multi_shot 应包含 '光影'，实际：{result[:200]}"
+    assert "搅拌咖啡" in result
+    assert "专注" in result

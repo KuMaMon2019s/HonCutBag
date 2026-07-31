@@ -50,6 +50,18 @@ def save_checkpoint(phase: str, output_dir: Path, artifacts: dict = None) -> Pat
     }
     
     checkpoint_path = output_dir / f"checkpoint_{phase}.json"
+
+    # --- P2-5a: 历史归档（学 OpenMontage）---
+    try:
+        if checkpoint_path.exists():
+            history_dir = output_dir / "history"
+            history_dir.mkdir(exist_ok=True)
+            import shutil
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            shutil.move(str(checkpoint_path), str(history_dir / f"checkpoint_{phase}_{ts}.json"))
+    except Exception as e:
+        print(f"  ⚠ [P2-5a] checkpoint 历史归档失败（降级跳过）: {e}")
+
     checkpoint_path.write_text(json.dumps(checkpoint, indent=2, ensure_ascii=False), encoding="utf-8")
     return checkpoint_path
 

@@ -213,11 +213,21 @@ def execute_edit_decisions(edit_decisions: dict, output_path: str) -> dict:
             speed = cut.get("speed", 1.0)
             has_audio = cut.get("has_audio", False)
 
-            vf = [
-                f"scale={tw}:{th}:force_original_aspect_ratio=decrease",
-                f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2:color=black",
-                "setsar=1", f"fps={tfps}",
-            ]
+            # --- P2-5c: cover fit mode（裁切填充，无黑边）---
+            fit_mode = edit_decisions.get("metadata", {}).get("compose_target", {}).get("fit", "pad")
+            if fit_mode == "cover":
+                vf = [
+                    f"scale={tw}:{th}:force_original_aspect_ratio=increase",
+                    f"crop={tw}:{th}",
+                    "setsar=1", f"fps={tfps}",
+                ]
+            else:
+                # pad 模式（默认，带黑边）
+                vf = [
+                    f"scale={tw}:{th}:force_original_aspect_ratio=decrease",
+                    f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2:color=black",
+                    "setsar=1", f"fps={tfps}",
+                ]
             af = []
             if speed != 1.0:
                 vf.append(f"setpts={1.0/speed}*PTS")
