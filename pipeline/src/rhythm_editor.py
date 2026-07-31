@@ -25,7 +25,7 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 # OpenMontage 工具可选导入（graceful fallback 到 ffmpeg）
 # ---------------------------------------------------------------------------
-OM_TOOLS_DIR = "/Users/soda/projects/OpenMontage/tools"
+OM_TOOLS_DIR = str(Path(__file__).resolve().parent.parent.parent / "vendor" / "openmontage" / "tools")
 OM_AVAILABLE = False
 
 if os.path.isdir(OM_TOOLS_DIR):

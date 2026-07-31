@@ -61,8 +61,8 @@ except ImportError as e:
 # ---------------------------------------------------------------------------
 SCRIPT_DIR = Path(__file__).resolve().parent
 PHASE28_DIR = SCRIPT_DIR  # Phase 2,3,8 模块所在
-PHASE47_DIR = SCRIPT_DIR.parent.parent / "2026-07-27_05" / "scripts"
-OM_TOOLS_DIR = Path("/Users/soda/projects/OpenMontage")
+PHASE47_DIR = SCRIPT_DIR.parent.parent / "vendor" / "legacy"
+OM_TOOLS_DIR = SCRIPT_DIR.parent.parent / "vendor" / "openmontage"
 
 # 优先加载当前目录（2026-07-28_01/scripts），然后是旧目录
 for d in (PHASE28_DIR, PHASE47_DIR, str(OM_TOOLS_DIR)):

@@ -183,7 +183,7 @@ class ToolPaths:
     """外部工具路径配置"""
     
     # OpenMontage 工具目录
-    OM_TOOLS_DIR: Path = Path("/Users/soda/projects/OpenMontage")
+    OM_TOOLS_DIR: Path = Path(__file__).resolve().parent.parent.parent / "vendor" / "openmontage"
     
     # HonCut 项目目录
     HONCUT_DIR: Path = Path(__file__).parent.parent

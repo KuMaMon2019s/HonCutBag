@@ -29,7 +29,7 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 # OpenMontage 工具路径
 # ---------------------------------------------------------------------------
-OM_TOOLS_DIR = Path("/Users/soda/projects/OpenMontage/tools")
+OM_TOOLS_DIR = Path(__file__).resolve().parent.parent.parent / "vendor" / "openmontage" / "tools"
 OM_AVAILABLE = OM_TOOLS_DIR.exists()
 
 if OM_AVAILABLE:
