@@ -15,9 +15,24 @@ from typing import Optional, Dict, Any
 
 
 def _load_env_file():
-    """从项目根目录加载 .env 文件（手动解析，不依赖 python-dotenv）"""
-    env_file = Path(__file__).parent.parent / ".env"
-    if not env_file.exists():
+    """从项目根目录加载 .env 文件（手动解析，不依赖 python-dotenv）
+    
+    搜索策略（按优先级）：
+    1. 当前工作目录 (cwd)
+    2. config.py 所在包的父目录（pipeline/）
+    3. 再上一级（项目根目录）
+    """
+    candidates = [
+        Path.cwd() / ".env",
+        Path(__file__).parent.parent / ".env",      # pipeline/
+        Path(__file__).parent.parent.parent / ".env", # project root
+    ]
+    env_file = None
+    for candidate in candidates:
+        if candidate.exists():
+            env_file = candidate
+            break
+    if env_file is None:
         return
     
     try:
