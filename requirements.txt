@@ -1,0 +1,20 @@
+# HonCut — Python dependencies
+# Install: conda activate honcut && pip install -r requirements.txt
+# Generated: 2026-07-31 (from actual import scan of pipeline/src + vendor/)
+
+# --- Core (hard requirements) ---
+openai>=2.50.0            # LLM client (ARK-compatible) — adaptation/discovery/storyboard/director
+requests>=2.34.0          # HTTP — seedance_client, seedream_client, tos_uploader, shot_embedder
+PyYAML>=6.0               # pipeline_config.py
+
+# --- LangGraph (optional but recommended; pipeline falls back to sequential if missing) ---
+langgraph>=1.2.0
+langgraph-checkpoint-sqlite>=3.1.0
+langchain-core>=1.5.0
+
+# --- Numerical (used by smart-transition visual similarity; degrades if missing) ---
+numpy>=1.24.0
+
+# --- System binaries (NOT pip — install via Homebrew) ---
+#   brew install ffmpeg          # ffmpeg + ffprobe (64 + 15 call sites)
+#   brew install node            # node (Remotion caption burn)
