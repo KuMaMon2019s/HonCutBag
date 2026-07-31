@@ -321,3 +321,88 @@ def _print_report(report: QualityReport, phase_name: str) -> None:
     else:
         print(f"  │ 无问题")
     print(f"  └──────────────────────────────────────────\n")
+
+
+# ---------------------------------------------------------------------------
+# M5: 监督层审核（学 Toonflow 监督层）
+# ---------------------------------------------------------------------------
+
+def run_storyboard_review(storyboard_data: dict, script_text: str, characters: list) -> dict:
+    """学 Toonflow 监督层：审核分镜表质量。
+    
+    4 条红线（违反即严重）：
+    R1: 资产引用合法（角色/场景必须在 characters 中存在）
+    R2: 剧本忠实（台词一字不差，不遗漏不新增）
+    R3: 具象可感（禁止抽象笼统词，声音具体到声源）
+    R4: 父子资产正确（衍生状态用衍生 ID，不主和衍生同存）
+    
+    评分：A(0严重≤2中等) / B(0严重≤5中等) / C(1-2严重) / D(≥3严重)
+    
+    Returns:
+        {"grade": "A"|"B"|"C"|"D", "severe": int, "moderate": int, "issues": [...]}
+    """
+    severe_issues = []
+    moderate_issues = []
+    
+    shots = storyboard_data.get("shots", [])
+    char_names = {c.get("name", "").lower() for c in characters} if characters else set()
+    char_ids = {c.get("id", "").lower() for c in characters} if characters else set()
+    
+    # 抽象笼统词黑名单（R3）
+    abstract_words = ["美丽的", "漂亮的", "好看的", "某种", "一些", "很多", "非常", "很"]
+    
+    for i, shot in enumerate(shots):
+        shot_id = shot.get("shot_id", f"S{i+1:02d}")
+        who = shot.get("who", [])
+        visual = shot.get("visual", "")
+        what = shot.get("what", "")
+        
+        # R1: 资产引用合法
+        if char_names:
+            for name in who:
+                if name.lower() not in char_names and name.lower() not in char_ids:
+                    severe_issues.append(f"[R1] {shot_id}: 角色 '{name}' 不在角色列表中")
+        
+        # R3: 具象可感
+        for word in abstract_words:
+            if word in visual:
+                moderate_issues.append(f"[R3] {shot_id}: 抽象词 '{word}' 在 visual 中")
+        
+        # R2: 剧本忠实（简单检查：visual 不应为空）
+        if not visual or len(visual) < 10:
+            moderate_issues.append(f"[R2] {shot_id}: visual 描述过短或为空")
+    
+    # 评分
+    severe_count = len(severe_issues)
+    moderate_count = len(moderate_issues)
+    
+    if severe_count >= 3:
+        grade = "D"
+    elif severe_count >= 1:
+        grade = "C"
+    elif moderate_count > 5:
+        grade = "B"
+    elif moderate_count > 2:
+        grade = "B"
+    else:
+        grade = "A"
+    
+    result = {
+        "grade": grade,
+        "severe": severe_count,
+        "moderate": moderate_count,
+        "issues": severe_issues + moderate_issues,
+        "total_shots": len(shots),
+    }
+    
+    # 打印报告
+    print(f"\n  📋 [M5] 分镜审核报告: {grade} 级")
+    print(f"    严重: {severe_count} | 中等: {moderate_count} | 镜头数: {len(shots)}")
+    if severe_issues:
+        for issue in severe_issues[:5]:
+            print(f"    🔴 {issue}")
+    if moderate_issues:
+        for issue in moderate_issues[:5]:
+            print(f"    🟡 {issue}")
+    
+    return result

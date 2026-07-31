@@ -177,7 +177,7 @@ def _ensure_dir(p: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 # Phase 顺序定义（用于 resume 时判断哪些已完成）
-PHASE_ORDER = ["phase2", "phase2_5", "phase3", "phase4", "phase5", "phase6", "phase7", "phase8"]
+PHASE_ORDER = ["phase1", "phase2", "phase2_5", "phase3", "phase4", "phase5", "phase6", "phase7", "phase8"]
 
 
 def _checkpoint_path(output_dir: Path) -> Path:
@@ -522,6 +522,24 @@ def _get_next_stage(output_dir: Path, all_phases: list = None) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# Phase 1: 导演规划 (M1 增量模块)
+# ---------------------------------------------------------------------------
+
+def run_phase1(text: str, output_dir: Path, dry_run: bool) -> dict:
+    """Phase 1: 导演规划（M1 增量模块）"""
+    _banner("1", 9, "导演规划 (Director Planner)", dry_run)
+    start = _now()
+    try:
+        from director_planner import plan_director
+        result = plan_director(text, output_dir, dry_run)
+        result["duration_s"] = _elapsed(start)
+        return result
+    except Exception as e:
+        print(f"  ⚠ [M1] Phase 1 降级跳过: {e}")
+        return {"status": "skipped", "reason": str(e), "duration_s": _elapsed(start)}
+
+
+# ---------------------------------------------------------------------------
 # Phase 2: 编剧引擎 (text → STORYBOARD.json + CHARACTERS.json)
 # ---------------------------------------------------------------------------
 
@@ -783,6 +801,28 @@ def run_phase2(text: str, output_dir: Path, duration: int, dry_run: bool, report
         if not qg_report.passed:
             return {"status": "error", "error": f"Phase 2 质检未通过: {qg_report.grade}", "quality_report": qg_report, "duration_s": _elapsed(start), "outputs": outputs}
 
+        # --- M5: 监督层审核（增量，失败不影响后续）---
+        try:
+            from quality_gate import run_storyboard_review
+            review = run_storyboard_review(
+                storyboard_data=storyboard,
+                script_text=text,
+                characters=characters_result.get("characters", []),
+            )
+            result_data = {
+                "status": "done",
+                "duration_s": _elapsed(start),
+                "outputs": outputs,
+                "_storyboard": storyboard,
+                "_characters": characters_result,
+                "storyboard_review": review,
+            }
+            if review.get("grade") == "D":
+                print(f"  ⚠ [M5] 分镜审核 D 级，建议重做（但不阻断管线）")
+            return result_data
+        except Exception as e:
+            print(f"  ⚠ [M5] 分镜审核跳过: {e}")
+
         return {
             "status": "done",
             "duration_s": _elapsed(start),
@@ -946,6 +986,33 @@ def run_phase2_5(storyboard_data: dict, characters_data: dict, output_dir: Path,
                 if not qg_report.passed:
                     return {"status": "error", "error": f"Phase 2.5 质检未通过: {qg_report.grade}", "quality_report": qg_report, "duration_s": _elapsed(start)}
                 
+                # --- M2: 分镜图序列（每镜头一张）---
+                try:
+                    storyboard_images_dir = output_dir / "storyboard_images"
+                    storyboard_images_dir.mkdir(exist_ok=True)
+                    shots = storyboard_data.get("shots", [])
+                    generated_count = 0
+                    for shot in shots:
+                        shot_id = shot.get("shot_id", f"S{shot.get('shot_order', 0):02d}")
+                        shot_prompt = shot.get("prompt", shot.get("visual", ""))
+                        if not shot_prompt:
+                            continue
+                        shot_image_path = storyboard_images_dir / f"{shot_id}.png"
+                        if shot_image_path.exists():
+                            generated_count += 1
+                            continue
+                        try:
+                            # 复用现有 seedream_client
+                            from seedream_client import text_to_image
+                            text_to_image(prompt=shot_prompt, output_path=str(shot_image_path))
+                            generated_count += 1
+                            print(f"    [M2] 分镜图 {shot_id}.png ✓")
+                        except Exception as e:
+                            print(f"    [M2] 分镜图 {shot_id}.png 失败（降级跳过）: {e}")
+                    print(f"  → [M2] 分镜图序列: {generated_count}/{len(shots)} 张")
+                except Exception as e:
+                    print(f"  ⚠ [M2] 分镜图序列生成失败（降级跳过）: {e}")
+
                 return {
                     "status": "done",
                     "duration_s": _elapsed(start),
@@ -1630,6 +1697,23 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
 
         meta = json.loads(meta_path.read_text())
         prompt = meta.get("prompt", "")
+        # --- M4: 模型路由（增量，失败用原始 prompt）---
+        try:
+            from prompt_router import route_prompt
+            model_name = os.environ.get("SEEDANCE_MODEL", "seedance-2-0-mini")
+            routed_prompt = route_prompt(
+                model_name=model_name,
+                mode="single_shot",
+                shot_data=meta,
+                assets=[{"name": c.get("name", ""), "description": c.get("appearance", {}).get("summary", "")} 
+                        for c in (json.loads((output_dir / "CHARACTERS.json").read_text()).get("characters", [])
+                                  if (output_dir / "CHARACTERS.json").exists() else [])]
+            )
+            if routed_prompt:
+                prompt = routed_prompt
+                print(f"    [M4] 提示词路由: {model_name} → single_shot")
+        except Exception as e:
+            pass  # 降级用原始 prompt
         duration = meta.get("duration", 5)  # 从 SHOT_META 读取 duration
         if not prompt:
             continue
@@ -1655,6 +1739,13 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
         if first_frame_b64 is None and storyboard_b64:
             first_frame_b64 = storyboard_b64
             print(f"    [ref] 注入故事板风格参考")
+
+        # --- M2: 分镜图构图参考（优先级低于角色参考图）---
+        if first_frame_b64 is None:
+            shot_image = output_dir / "storyboard_images" / f"{shot_dir.name}.png"
+            if shot_image.exists() and shot_image.stat().st_size > 1024:
+                first_frame_b64 = _b64.b64encode(shot_image.read_bytes()).decode()
+                print(f"    [M2] 注入分镜图构图参考: {shot_dir.name}.png")
 
         # Add style prefix to every prompt
         style_prefix = "Photorealistic, urban, Jiangnan aesthetic, lifelike skin texture, natural lighting, "
@@ -3141,6 +3232,7 @@ def run_pipeline(
     media_profile: str = "1080p",
     resume: bool = False,
     auto_approve: bool = False,
+    resume_from: str = None,
 ) -> dict:
     """
     主入口：端到端管线
@@ -3165,8 +3257,28 @@ def run_pipeline(
     output_path = Path(output_dir).resolve()
     _ensure_dir(output_path)
 
+    # --- M6: --resume-from 支持 ---
+    if resume_from:
+        try:
+            from artifact_chain import PHASE_SEQUENCE, can_resume_from
+            if can_resume_from(resume_from, output_path):
+                idx = PHASE_SEQUENCE.index(resume_from) if resume_from in PHASE_SEQUENCE else 0
+                skip_phases = set(PHASE_SEQUENCE[:idx])
+                print(f"  🔄 [M6] Resume-from {resume_from}: 跳过 {sorted(skip_phases)}")
+            else:
+                print(f"  ⚠ [M6] Resume-from {resume_from}: 前置依赖不满足，从头开始")
+        except Exception as e:
+            print(f"  ⚠ [M6] resume-from 解析失败: {e}")
+
     # ---- 进度报告系统初始化 ----
     reporter = ProgressReporter(str(output_path), total_phases=len(PHASE_ORDER))
+
+    # --- M6: 产物链（增量）---
+    try:
+        from artifact_chain import save_checkpoint as save_artifact_checkpoint, can_resume_from, get_resumable_phase
+        M6_AVAILABLE = True
+    except ImportError:
+        M6_AVAILABLE = False
 
     # ---- Resume: 读取检查点 ----
     completed_phases = set()
@@ -3391,6 +3503,16 @@ def run_pipeline(
     else:
         print(f"\n  📋 Using sequential execution mode")
 
+    # --- M1: Phase 1 导演规划（增量，失败不影响后续）---
+    if 1 not in skip_phase:
+        try:
+            p1_result = run_phase1(text, output_path, dry_run)
+            report["phases"]["phase1"] = p1_result
+            _write_checkpoint(output_path, "phase1", p1_result)
+        except Exception as e:
+            print(f"  ⚠ Phase 1 降级跳过: {e}")
+            report["phases"]["phase1"] = {"status": "skipped", "reason": str(e)}
+
     # ---- Phase 2: 编剧引擎 (必须成功) ----
     storyboard_data = None
     characters_data = None
@@ -3613,6 +3735,17 @@ def run_pipeline(
     # 标记管线完成
     reporter.mark_completed()
 
+    # --- M6: 产物链验证 ---
+    if M6_AVAILABLE:
+        try:
+            from artifact_chain import verify_artifacts, save_checkpoint as save_artifact_checkpoint
+            for phase_name in PHASE_ORDER:
+                va = verify_artifacts(phase_name, output_path)
+                if va["exists"]:
+                    save_artifact_checkpoint(phase_name, output_path, va)
+        except Exception as e:
+            print(f"  ⚠ [M6] 产物链验证跳过: {e}")
+
     # 写报告
     _write_report(report, output_dir)
 
@@ -3680,6 +3813,8 @@ def main():
                         help="从检查点恢复，跳过已完成的 Phase（读取 output_dir/checkpoint.json）")
     parser.add_argument("--auto-approve", action="store_true",
                         help="自动批准人工审核节点（用于 CI/测试，跳过 interrupt）")
+    parser.add_argument("--resume-from", type=str, default=None,
+                        help="从指定阶段恢复（如 phase5），跳过之前的阶段")
 
     args = parser.parse_args()
 
@@ -3695,6 +3830,7 @@ def main():
         media_profile=args.media_profile,
         resume=args.resume,
         auto_approve=args.auto_approve,
+        resume_from=args.resume_from,
     )
 
     sys.exit(0 if report["status"] in ("completed", "partial") else 1)

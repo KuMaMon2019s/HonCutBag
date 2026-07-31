@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""
+artifact_chain.py — M6: 产物链 + Checkpoint（学 OpenMontage）
+每阶段产出结构化 JSON 产物，支持从任意阶段恢复。
+"""
+
+import json
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+
+# 产物链定义（学 OpenMontage cinematic.yaml）
+ARTIFACT_CHAIN = {
+    "phase1":   {"produces": "director_plan.json",                    "requires": []},
+    "phase2":   {"produces": "events.json + characters.json + storyboard.json", "requires": ["director_plan.json"]},
+    "phase2_5": {"produces": "storyboard_images/",                    "requires": ["storyboard.json"]},
+    "phase3":   {"produces": "characters/",                           "requires": ["characters.json"]},
+    "phase4":   {"produces": "shots/",                                "requires": ["storyboard.json"]},
+    "phase5":   {"produces": "shots/*/output.mp4",                    "requires": ["shots/"]},
+    "phase6":   {"produces": "quality_report.json",                   "requires": ["shots/"]},
+    "phase7":   {"produces": "edit_decisions.json + raw_assembly.mp4", "requires": ["shots/"]},
+    "phase8":   {"produces": "polished.mp4 + render_report.json",     "requires": ["raw_assembly.mp4"]},
+}
+
+# Phase 执行顺序
+PHASE_SEQUENCE = ["phase1", "phase2", "phase2_5", "phase3", "phase4", "phase5", "phase6", "phase7", "phase8"]
+
+
+def save_checkpoint(phase: str, output_dir: Path, artifacts: dict = None) -> Path:
+    """每阶段完成后写 checkpoint。
+    
+    Args:
+        phase: 阶段名（如 "phase1"）
+        output_dir: 输出目录
+        artifacts: 该阶段产出的文件列表/信息
+    
+    Returns:
+        checkpoint 文件路径
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    checkpoint = {
+        "phase": phase,
+        "timestamp": datetime.now().isoformat(),
+        "artifacts": artifacts or {},
+        "produces": ARTIFACT_CHAIN.get(phase, {}).get("produces", ""),
+        "status": "done",
+    }
+    
+    checkpoint_path = output_dir / f"checkpoint_{phase}.json"
+    checkpoint_path.write_text(json.dumps(checkpoint, indent=2, ensure_ascii=False), encoding="utf-8")
+    return checkpoint_path
+
+
+def can_resume_from(phase: str, output_dir: Path) -> bool:
+    """检查是否可以从指定阶段恢复（前置依赖是否满足）。
+    
+    Args:
+        phase: 目标阶段名
+        output_dir: 输出目录
+    
+    Returns:
+        True 如果所有前置依赖文件存在
+    """
+    output_dir = Path(output_dir)
+    required = ARTIFACT_CHAIN.get(phase, {}).get("requires", [])
+    
+    for artifact in required:
+        # 处理 glob 模式（如 "shots/*/output.mp4"）
+        if "*" in artifact:
+            import glob
+            matches = list(output_dir.glob(artifact))
+            if not matches:
+                return False
+        elif artifact.endswith("/"):
+            # 目录
+            if not (output_dir / artifact.rstrip("/")).exists():
+                return False
+        else:
+            # 处理 "A + B" 格式（多产物）
+            for single in artifact.split(" + "):
+                single = single.strip()
+                if single and not (output_dir / single).exists():
+                    return False
+    return True
+
+
+def get_resumable_phase(output_dir: Path) -> Optional[str]:
+    """找到可以恢复的最早未完成阶段。
+    
+    Returns:
+        阶段名，如果全部完成则返回 None
+    """
+    output_dir = Path(output_dir)
+    
+    for phase in PHASE_SEQUENCE:
+        checkpoint = output_dir / f"checkpoint_{phase}.json"
+        if not checkpoint.exists():
+            # 检查是否可以从此阶段恢复
+            if can_resume_from(phase, output_dir):
+                return phase
+            else:
+                # 前置不满足，从头开始
+                return PHASE_SEQUENCE[0]
+    
+    return None  # 全部完成
+
+
+def verify_artifacts(phase: str, output_dir: Path) -> dict:
+    """验证指定阶段的产物是否存在。
+    
+    Returns:
+        {"phase": str, "exists": bool, "missing": [...], "found": [...]}
+    """
+    output_dir = Path(output_dir)
+    produces = ARTIFACT_CHAIN.get(phase, {}).get("produces", "")
+    
+    found = []
+    missing = []
+    
+    for artifact in produces.split(" + "):
+        artifact = artifact.strip()
+        if not artifact:
+            continue
+        if "*" in artifact:
+            import glob
+            matches = list(output_dir.glob(artifact))
+            if matches:
+                found.append(artifact)
+            else:
+                missing.append(artifact)
+        elif artifact.endswith("/"):
+            if (output_dir / artifact.rstrip("/")).exists():
+                found.append(artifact)
+            else:
+                missing.append(artifact)
+        else:
+            if (output_dir / artifact).exists():
+                found.append(artifact)
+            else:
+                missing.append(artifact)
+    
+    return {
+        "phase": phase,
+        "exists": len(missing) == 0,
+        "found": found,
+        "missing": missing,
+    }
