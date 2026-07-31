@@ -24,7 +24,7 @@ def submit(
     ratio: str = "16:9",
     first_frame_base64: Optional[str] = None,
     reference_image_base64: Optional[str] = None,
-    generate_audio: str = "true",  # P0-D: 默认开启（学 OpenMontage: "sync audio is the moat"）
+    generate_audio: Optional[str] = None,  # P0-D: Agent Plan 不支持此参数，仅按量计费可用
     seed: int = None,  # P1-C: Seed Locking（同场景同 seed）
     reference_video_base64: Optional[str] = None,  # P1-D: 多模态组合参考
 ) -> str:
@@ -95,7 +95,8 @@ def submit(
     payload = {
         "model": model,
         "content": content,
-        "generate_audio": generate_audio,
+        # generate_audio: Agent Plan 不支持，仅按量计费可用
+        **({"generate_audio": generate_audio} if generate_audio is not None else {}),
         "ratio": ratio,
         "duration": duration,
         "watermark": False,  # MUST be included at top level
