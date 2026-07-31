@@ -472,6 +472,7 @@ def generate_character(
     size: str = "1920x1920",
     model: Optional[str] = None,
     skip_images: bool = False,
+    variants: Optional[list] = None,
 ) -> dict:
     """Generate complete character asset set.
 
@@ -496,6 +497,9 @@ def generate_character(
     print(f"  Character Factory: {name} ({char_id})")
     print(f"  Output: {char_dir}")
     print(f"{'='*60}\n")
+
+    # Initialize client (may be None if skip_images=True)
+    client = None
 
     # Step 1: Generate character sheet (combined 4-view image)
     if not skip_images:
@@ -571,6 +575,56 @@ def generate_character(
         json.dump(angle_map, f, ensure_ascii=False, indent=2)
     print(f"  ✓ {angle_path}")
 
+    # Step 4: Generate variant images (P1-A3: 衍生参考图)
+    variant_paths = {}
+    if variants and not skip_images and client is not None:
+        print(f"\n[Step 4] Generating {len(variants)} variant reference(s)...")
+        for variant in variants:
+            state_name = variant.get("state_name", "unknown")
+            variant_desc = variant.get("description", "")
+            if not variant_desc:
+                print(f"  [variant] Skipping {state_name}: no description")
+                continue
+            
+            variant_filename = f"variant_{state_name}.png"
+            variant_path = os.path.join(char_dir, variant_filename)
+            
+            # Skip if already exists
+            if os.path.exists(variant_path):
+                print(f"  [variant] {variant_filename} already exists, skipping")
+                variant_paths[state_name] = variant_path
+                continue
+            
+            try:
+                # Build variant prompt: base appearance + state change
+                # Emphasize face must remain identical
+                variant_prompt = (
+                    f"Character reference sheet, same person as base reference. "
+                    f"State change: {variant_desc}. "
+                    f"CRITICAL: facial features, bone structure, and identity must remain "
+                    f"100% identical to the base character. Only modify clothing, hair condition, "
+                    f"or add props as described in the state change. "
+                    f"Photorealistic, front view, full body, white background, consistent lighting."
+                )
+                
+                print(f"  [variant] Generating {variant_filename}...")
+                url = client.text_to_image(
+                    prompt=variant_prompt,
+                    output_path=variant_path,
+                    size=size,
+                )
+                print(f"  [variant] ✓ {variant_filename}")
+                variant_paths[state_name] = variant_path
+                
+            except Exception as e:
+                print(f"  [variant] ✗ Failed to generate {variant_filename}: {e}")
+                # Continue with other variants (graceful degradation)
+                continue
+    elif skip_images:
+        print("\n[Step 4] Skipping variant generation (--skip-images)")
+    else:
+        print("\n[Step 4] No variants to generate")
+
     # Summary
     result = {
         "char_id": char_id,
@@ -579,6 +633,7 @@ def generate_character(
         "card": card_path,
         "angle_map": angle_path,
         "views": views,
+        "variants": variant_paths,
     }
     print(f"\n  ✓ Character '{name}' complete!")
     print(f"  Files: {char_dir}/")
@@ -594,7 +649,7 @@ def batch_generate(characters: list, output_dir: str, **kwargs) -> list:
     """Generate multiple characters from a list of dicts.
 
     Each dict must have: id, name, description
-    Optional: style, negative, size, model
+    Optional: style, negative, size, model, variants
     """
     results = []
     for char in characters:
@@ -609,6 +664,7 @@ def batch_generate(characters: list, output_dir: str, **kwargs) -> list:
                 size=char.get("size", "1920x1920"),
                 model=char.get("model"),
                 skip_images=kwargs.get("skip_images", False),
+                variants=char.get("appearance", {}).get("variants", []),
             )
             results.append(result)
         except Exception as e:

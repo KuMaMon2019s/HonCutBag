@@ -25,6 +25,8 @@ def submit(
     first_frame_base64: Optional[str] = None,
     reference_image_base64: Optional[str] = None,
     generate_audio: str = "true",  # P0-D: 默认开启（学 OpenMontage: "sync audio is the moat"）
+    seed: int = None,  # P1-C: Seed Locking（同场景同 seed）
+    reference_video_base64: Optional[str] = None,  # P1-D: 多模态组合参考
 ) -> str:
     """Submit a Seedance generation task. Returns task_id."""
     # Sanitize prompt to remove IP risks
@@ -74,6 +76,21 @@ def submit(
         # txt2vid: content is array with text object
         content = [{"type": "text", "text": sanitized_prompt}]
 
+    # --- P1-D: 多模态组合参考 — 视频参考追加到 content ---
+    if reference_video_base64:
+        video_url = None
+        try:
+            from tos_uploader import base64_to_signed_url
+            video_url = base64_to_signed_url(reference_video_base64)
+        except Exception as e:
+            print(f"  [seedance] Video TOS upload failed: {e}")
+        if video_url:
+            content.append({
+                "type": "video_url",
+                "video_url": {"url": video_url},
+                "role": "reference_video",
+            })
+
     # ALL params at top level — CRITICAL
     payload = {
         "model": model,
@@ -83,6 +100,9 @@ def submit(
         "duration": duration,
         "watermark": False,  # MUST be included at top level
     }
+    # P1-C: Seed Locking（Agent Plan API 参数必须在顶层）
+    if seed is not None:
+        payload["seed"] = seed
 
     resp = requests.post(SUBMIT_ENDPOINT, json=payload, headers=headers, timeout=30)
     if resp.status_code != 200:

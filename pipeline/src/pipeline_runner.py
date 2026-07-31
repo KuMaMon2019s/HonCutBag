@@ -1775,6 +1775,10 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
         print(f"  → 已加载故事板风格参考图")
 
     outputs = []
+    # --- P1-C: Seed Locking（参考 OpenMontage asset_manifest seed）---
+    # 同场景镜头使用相同 seed，确保背景一致性
+    scene_seed_map = {}  # {where: seed}
+    prev_shot_dir = None  # --- P1-D2: 上一镜头视频作为运动参考 ---
     for shot_dir in sorted(shots_dir.iterdir()):
         if not shot_dir.is_dir() or not shot_dir.name.startswith("S"):
             continue
@@ -1811,12 +1815,26 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
         prompt_lower = prompt.lower()
 
         # --- P0-C: 资产ID绑定匹配（学 Toonflow associateAssetsIds）---
+        # --- P1-A4: 衍生参考图匹配（char:id:state → variant_state.png）---
         associate_assets = meta.get("associate_assets", [])
         if associate_assets and first_frame_b64 is None:
             for asset_id in associate_assets:
                 if asset_id.startswith("char:"):
-                    char_id = asset_id[5:]
-                    # 尝试匹配角色参考图
+                    parts = asset_id[5:].split(":")
+                    char_id = parts[0]
+                    variant_state = parts[1] if len(parts) > 1 else None
+
+                    if variant_state:
+                        # 衍生参考图匹配（P1-A4）
+                        variant_png = output_dir / "characters" / char_id / f"variant_{variant_state}.png"
+                        if not variant_png.exists():
+                            variant_png = output_dir / "characters" / "characters" / char_id / f"variant_{variant_state}.png"
+                        if variant_png.exists():
+                            first_frame_b64 = _b64.b64encode(variant_png.read_bytes()).decode()
+                            print(f"    [P1-A] 衍生参考图匹配: {char_id}:{variant_state}")
+                            break
+
+                    # 基准参考图匹配（现有逻辑）
                     front_png = output_dir / "characters" / char_id / "front.png"
                     if not front_png.exists():
                         front_png = output_dir / "characters" / "characters" / char_id / "front.png"
@@ -1866,17 +1884,44 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
         if not prompt.lower().startswith("photorealistic"):
             prompt = style_prefix + prompt
 
+        # --- P1-C2: 同场景同 seed ---
+        shot_where = meta.get("where", "")
+        shot_seed = None
+        if shot_where:
+            if shot_where not in scene_seed_map:
+                import hashlib
+                scene_seed_map[shot_where] = int(hashlib.md5(shot_where.encode()).hexdigest()[:8], 16) % 2147483647
+            shot_seed = scene_seed_map[shot_where]
+
+        # --- P1-D2: 上一镜头视频作为运动参考（可选）---
+        prev_video_ref = None
+        if prev_shot_dir is not None:
+            prev_output = prev_shot_dir / "output.mp4"
+            if prev_output.exists() and prev_output.stat().st_size > 10240:
+                try:
+                    prev_video_ref = _b64.b64encode(prev_output.read_bytes()).decode()
+                    # 视频参考大小限制（>5MB 不传，避免超限）
+                    if len(prev_video_ref) > 5 * 1024 * 1024 * 4 // 3:
+                        prev_video_ref = None
+                except Exception:
+                    pass
+
         max_retries = 3
         for attempt in range(max_retries + 1):
             try:
                 print(f"  → {shot_dir.name}: 提交视频生成...")
                 task_id = submit(prompt=prompt, api_key=api_key, duration=duration, ratio="16:9",
-                                 reference_image_base64=first_frame_b64)
+                                 reference_image_base64=first_frame_b64, seed=shot_seed,
+                                 reference_video_base64=prev_video_ref)
                 video_url = poll(task_id, api_key=api_key)
                 if video_url:
                     out_path = str(shot_dir / "output.mp4")
                     download(video_url, out_path)
                     outputs.append(f"shots/{shot_dir.name}/output.mp4")
+                    # --- P1-C3: 记录 seed 到 SHOT_META ---
+                    if shot_seed is not None:
+                        meta["seed"] = shot_seed
+                        meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False))
                     print(f"    ✓ {shot_dir.name}: 视频已生成")
                     break
                 else:
@@ -1908,6 +1953,9 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
                     continue
                 print(f"    ✗ {shot_dir.name}: 异常 — {e}")
                 break
+
+        # --- P1-D2: 更新上一镜头目录 ---
+        prev_shot_dir = shot_dir
 
     return {
         "status": "done" if outputs else "error",

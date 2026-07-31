@@ -98,6 +98,11 @@ USER_PROMPT_TEMPLATE = (
     "- 角色出现即引用：格式 'char:角色id'（如 'char:lin_xia'）\n"
     "- 场景必选：格式 'scene:场景名'（如 'scene:便利店门口'）\n"
     "- 示例：[\"char:lin_xia\", \"char:shen_yu\", \"scene:便利店门口\"]\n\n"
+    "【空间位置基准（学 Toonflow）】\n"
+    "如果提供了 director_plan 中的 spatial_positions，每个镜头的 visual 必须按基准表标注角色位置：\n"
+    "- 格式：'角色名在画面左前/右前/居中，面朝左/右/镜头'\n"
+    "- 同场景内角色位置不应无故跳变（左前突然变右前）\n"
+    "- 位置变化必须有动作交代（如'林夏从左侧走到右侧'）\n\n"
     "注意：所有 shot 的 suggested_duration 总和应接近 target_duration（允许 ±10% 偏差）。"
 )
 

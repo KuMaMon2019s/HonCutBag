@@ -294,6 +294,73 @@ def execute_edit_decisions(edit_decisions: dict, output_path: str) -> dict:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+# ─── P2-B: Boundary Frame Consistency Check ──────────────────────────────────
+
+def check_boundary_consistency(video_a: Path, video_b: Path) -> dict:
+    """检查两个相邻视频的边界帧一致性（参考 OpenMontage frame_sampler）。
+
+    Returns:
+        {"consistent": bool, "issues": [...], "recommended_transition": str}
+    """
+    issues = []
+
+    def _probe(path):
+        try:
+            cmd = ["ffprobe", "-v", "quiet", "-print_format", "json",
+                   "-show_streams", "-show_format", str(path)]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            return json.loads(result.stdout)
+        except Exception:
+            return None
+
+    info_a = _probe(video_a)
+    info_b = _probe(video_b)
+
+    if not info_a or not info_b:
+        return {"consistent": True, "issues": [], "recommended_transition": "dissolve"}
+
+    # 检查分辨率一致性
+    def _get_resolution(info):
+        for s in info.get("streams", []):
+            if s.get("codec_type") == "video":
+                return s.get("width", 0), s.get("height", 0)
+        return (0, 0)
+
+    res_a = _get_resolution(info_a)
+    res_b = _get_resolution(info_b)
+    if res_a != res_b:
+        issues.append(f"分辨率不一致: {res_a} vs {res_b}")
+
+    # 检查 fps 一致性
+    def _get_fps(info):
+        for s in info.get("streams", []):
+            if s.get("codec_type") == "video":
+                fps_str = s.get("r_frame_rate", "30/1")
+                try:
+                    num, den = fps_str.split("/")
+                    return float(num) / float(den)
+                except Exception:
+                    return 30.0
+        return 30.0
+
+    fps_a = _get_fps(info_a)
+    fps_b = _get_fps(info_b)
+    if abs(fps_a - fps_b) > 1.0:
+        issues.append(f"FPS 不一致: {fps_a:.1f} vs {fps_b:.1f}")
+
+    # 推荐转场
+    if issues:
+        recommended = "dissolve"  # 不一致时用 dissolve 过渡
+    else:
+        recommended = "cut"  # 一致时可以直接 cut
+
+    return {
+        "consistent": len(issues) == 0,
+        "issues": issues,
+        "recommended_transition": recommended,
+    }
+
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _concat_copy(segments: list, output_path: Path,
@@ -327,6 +394,18 @@ def _xfade_chain(segments: list, transitions: list, output_path: Path,
         t = trans_map.get(i, {"type": "cut", "duration": 0.5})
         ttype = t["type"]
         tdur = t.get("duration", 0.5)
+
+        # --- P2-B: 边界帧一致性检查（参考 OpenMontage AI Clip Chaining）---
+        try:
+            boundary = check_boundary_consistency(Path(segments[i]), Path(segments[i + 1]))
+            if not boundary["consistent"]:
+                # 不一致时强制使用 dissolve，不用 cut
+                if ttype == "cut":
+                    ttype = "dissolve"
+                    print(f"    [P2-B] 边界不一致({boundary['issues'][0]})，cut→dissolve")
+        except Exception:
+            pass  # 检查失败不影响现有流程
+
         xname = {"dissolve": "fade", "fade": "fadeblack", "cut": "fade"}.get(ttype, "fade")
         if ttype == "cut":
             tdur = 0.01

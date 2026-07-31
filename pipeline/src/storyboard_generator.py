@@ -253,13 +253,14 @@ def _get_first_frame_for_shot(
     return characters_map.get(first_char)
 
 
-def _build_shot_prompt(shot: Dict[str, Any], characters: Optional[List[Dict[str, Any]]] = None) -> str:
+def _build_shot_prompt(shot: Dict[str, Any], characters: Optional[List[Dict[str, Any]]] = None, scene_style_map: Optional[Dict[str, str]] = None) -> str:
     """
     为单个 shot 构建 LLM user prompt
 
     Args:
         shot: shot 字典
         characters: 角色列表（可选）
+        scene_style_map: 场景级风格后缀映射（可选，P1-B 同场景共享视觉参数）
 
     Returns:
         格式化后的 user prompt
@@ -291,6 +292,12 @@ def _build_shot_prompt(shot: Dict[str, Any], characters: Optional[List[Dict[str,
             visual = identity_prefix.rstrip(" — ") + ". " + visual
     except Exception:
         pass  # 降级：不阻断主流程
+
+    # --- P1-B2: 追加场景级共享视觉参数（同场景镜头共享 Layer 3-5）---
+    if scene_style_map:
+        scene_suffix = scene_style_map.get(shot.get("where", ""), "")
+        if scene_suffix and scene_suffix not in visual:
+            visual = visual + " " + scene_suffix
 
     # Build reference binding for characters in this shot
     ref_parts = []
@@ -349,6 +356,20 @@ def generate_storyboard(
     # 构建角色映射
     characters_map = _build_characters_map(characters)
 
+    # --- P1-B1: 同场景共享视觉参数（参考 OpenMontage shot_prompt_builder 5层构建）---
+    # 同场景镜头共享 Layer 3-5（Subject/Lighting/Style），只有 Layer 1-2（Camera/Movement）随镜头变
+    scene_style_map = {}  # {where: style_suffix}
+    for shot in shots:
+        where = shot.get("where", "")
+        if where and where not in scene_style_map:
+            emotion = shot.get("emotion", "")
+            # 基于场景首个镜头的情绪生成场景级风格后缀
+            try:
+                from emotion_mapping import build_style_suffix
+                scene_style_map[where] = build_style_suffix(emotion=emotion, scene=where)
+            except Exception:
+                scene_style_map[where] = ""
+
     # 计算总时长
     total_duration = sum(shot.get("suggested_duration", 5) for shot in shots)
 
@@ -358,7 +379,7 @@ def generate_storyboard(
         duration = shot.get("suggested_duration", 5)
 
         # 调用 LLM 生成英文 prompt 和中文 caption
-        user_prompt = _build_shot_prompt(shot, characters)
+        user_prompt = _build_shot_prompt(shot, characters, scene_style_map=scene_style_map)
         llm_result = None
 
         for attempt in range(1 + MAX_RETRIES):
