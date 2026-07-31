@@ -85,7 +85,7 @@ USER_PROMPT_TEMPLATE = (
     "【衍生状态检测（学 Toonflow derive_assets）】\n"
     "分析每个角色在故事中是否有明显的状态变化（如淋湿、换装、受伤、变身）。\n"
     "如果有，在角色输出的 appearance 中增加 variants 字段：\n"
-    "- variants: 数组，每项包含 {state_name: '淋湿', description: '头发湿透贴在脸上，衬衫被雨淋湿半透明'}\n"
+    "- variants: 数组，每项包含 {{state_name: '淋湿', description: '头发湿透贴在脸上，衬衫被雨淋湿半透明'}}\n"
     "- 只提取「稳定、可复用、资产级」的状态变化，瞬时表情/局部特写不算\n"
     "- 常见状态：淋湿、换装、受伤、变身、卸妆、戴帽/摘帽\n"
     "- 如果没有明显状态变化，variants 可以为空数组 []\n"
