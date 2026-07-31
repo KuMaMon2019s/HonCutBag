@@ -1,8 +1,8 @@
-# HonCut 使用示例
+# HonCut Usage Examples
 
-## 示例 1: 基础视频生成
+## Example 1: Basic Video Generation
 
-最简单的用法，从剧本生成 60 秒视频。
+Simplest usage, generate 60-second video from script.
 
 ```bash
 python pipeline/src/pipeline_runner.py \
@@ -12,16 +12,16 @@ python pipeline/src/pipeline_runner.py \
   --auto-approve
 ```
 
-**输出**:
-- `data/output/basic_example/polished.mp4` - 最终视频
-- `data/output/basic_example/STORYBOARD.json` - 分镜数据
-- `data/output/basic_example/CHARACTERS.json` - 角色数据
+**Output**:
+- `data/output/basic_example/polished.mp4` - Final video
+- `data/output/basic_example/STORYBOARD.json` - Storyboard data
+- `data/output/basic_example/CHARACTERS.json` - Character data
 
 ---
 
-## 示例 2: Dry Run 测试
+## Example 2: Dry Run Test
 
-仅验证流程，不实际生成视频（快速测试）。
+Validate pipeline only, no actual video generation (fast test).
 
 ```bash
 python pipeline/src/pipeline_runner.py \
@@ -31,13 +31,13 @@ python pipeline/src/pipeline_runner.py \
   --dry-run
 ```
 
-**用途**: 快速检查剧本格式、配置是否正确，不消耗 API 额度。
+**Purpose**: Quickly check script format and configuration without consuming API quota.
 
 ---
 
-## 示例 3: 跳过特定阶段
+## Example 3: Skip Specific Phases
 
-如果某些阶段已经完成，可以跳过。
+Skip phases that are already completed.
 
 ```bash
 python pipeline/src/pipeline_runner.py \
@@ -48,13 +48,13 @@ python pipeline/src/pipeline_runner.py \
   --auto-approve
 ```
 
-**用途**: 重新生成视频（Phase 5+），跳过编剧和角色生成。
+**Purpose**: Regenerate video (Phase 5+), skip screenwriting and character generation.
 
 ---
 
-## 示例 4: 从检查点恢复
+## Example 4: Resume from Checkpoint
 
-如果管线中断，可以从检查点恢复。
+Resume pipeline if it was interrupted.
 
 ```bash
 python pipeline/src/pipeline_runner.py \
@@ -64,13 +64,13 @@ python pipeline/src/pipeline_runner.py \
   --resume
 ```
 
-**用途**: 恢复中断的管线执行，避免重复已完成的工作。
+**Purpose**: Resume interrupted pipeline execution, avoid repeating completed work.
 
 ---
 
-## 示例 5: 自定义转场和编码
+## Example 5: Custom Transition and Encoding
 
-指定转场效果和编码配置。
+Specify transition effect and encoding profile.
 
 ```bash
 python pipeline/src/pipeline_runner.py \
@@ -82,23 +82,23 @@ python pipeline/src/pipeline_runner.py \
   --auto-approve
 ```
 
-**可用转场**:
-- `crossfade` - 交叉淡入淡出（默认）
-- `fade` - 淡入淡出
-- `cut` - 硬切
+**Available Transitions**:
+- `crossfade` - Cross fade (default)
+- `fade` - Fade in/out
+- `cut` - Hard cut
 
-**可用编码配置**:
+**Available Encoding Profiles**:
 - `1080p` - 1920x1080 @ 30fps
 - `480p` - 854x480 @ 30fps
 - `720p` - 1280x720 @ 30fps
 - `cinematic` - 2048x858 @ 24fps
-- `youtube_shorts` - 1080x1920 @ 30fps（竖屏）
+- `youtube_shorts` - 1080x1920 @ 30fps (vertical)
 
 ---
 
-## 示例 6: Python API 调用
+## Example 6: Python API Call
 
-在 Python 代码中调用管线。
+Call pipeline in Python code.
 
 ```python
 from pipeline.src.pipeline_runner import run_pipeline
@@ -113,16 +113,16 @@ result = run_pipeline(
     media_profile="1080p"
 )
 
-print(f"执行状态: {result['status']}")
-print(f"总耗时: {result['total_duration']:.2f}s")
-print(f"输出目录: {result['output_dir']}")
+print(f"Execution status: {result['status']}")
+print(f"Total duration: {result['total_duration']:.2f}s")
+print(f"Output directory: {result['output_dir']}")
 ```
 
 ---
 
-## 示例 7: 批量处理多个剧本
+## Example 7: Batch Process Multiple Scripts
 
-使用脚本批量处理多个剧本。
+Use script to batch process multiple scripts.
 
 ```bash
 #!/bin/bash
@@ -130,7 +130,7 @@ print(f"输出目录: {result['output_dir']}")
 
 for story in scripts/stories/*.txt; do
     output_name=$(basename "$story" .txt)
-    echo "处理: $story"
+    echo "Processing: $story"
     
     python pipeline/src/pipeline_runner.py \
         --input "$story" \
@@ -138,11 +138,11 @@ for story in scripts/stories/*.txt; do
         --output-dir "data/output/batch/$output_name" \
         --auto-approve
     
-    echo "完成: $output_name"
+    echo "Completed: $output_name"
 done
 ```
 
-**用法**:
+**Usage**:
 ```bash
 chmod +x batch_process.sh
 ./batch_process.sh
@@ -150,9 +150,9 @@ chmod +x batch_process.sh
 
 ---
 
-## 示例 8: 检查一致性报告
+## Example 8: Check Consistency Report
 
-生成视频后检查角色一致性。
+Check character consistency after video generation.
 
 ```python
 from pipeline.src.consistency_guard import run_consistency_check
@@ -162,23 +162,23 @@ report = run_consistency_check(
     threshold=70
 )
 
-print(f"整体一致性: {report['overall_score']:.2f}")
-print(f"是否通过: {report['passed']}")
+print(f"Overall consistency: {report['overall_score']:.2f}")
+print(f"Passed: {report['passed']}")
 
 for char_id, details in report['details'].items():
     print(f"  {char_id}: {details['score']:.2f}")
     if details['issues']:
-        print(f"    问题: {details['issues']}")
+        print(f"    Issues: {details['issues']}")
 ```
 
 ---
 
-## 示例 9: 自定义提示词生成
+## Example 9: Custom Prompt Generation
 
-手动修改分镜提示词后重新生成。
+Manually modify storyboard prompts and regenerate.
 
 ```bash
-# 1. 先生成分镜
+# 1. Generate storyboard first
 python pipeline/src/pipeline_runner.py \
   --input scripts/sample_story.txt \
   --duration 60 \
@@ -186,10 +186,10 @@ python pipeline/src/pipeline_runner.py \
   --skip-phase 5 6 7 8 \
   --auto-approve
 
-# 2. 编辑 STORYBOARD.json
-# 修改 prompts 字段，添加自定义描述
+# 2. Edit STORYBOARD.json
+# Modify prompts field, add custom descriptions
 
-# 3. 从 Phase 5 继续
+# 3. Continue from Phase 5
 python pipeline/src/pipeline_runner.py \
   --input scripts/sample_story.txt \
   --duration 60 \
@@ -200,55 +200,55 @@ python pipeline/src/pipeline_runner.py \
 
 ---
 
-## 示例 10: 监控管线进度
+## Example 10: Monitor Pipeline Progress
 
-实时监控管线执行进度。
+Real-time monitor pipeline execution progress.
 
 ```bash
-# 在另一个终端监控
+# Monitor in another terminal
 tail -f data/output/monitor_example/pipeline.log
 
-# 查看当前阶段
+# View current phase
 watch -n 1 'cat data/output/monitor_example/progress.json | jq .current_phase'
 ```
 
 ---
 
-## 示例 11: 使用 Makefile 命令
+## Example 11: Using Makefile Commands
 
-使用预定义的 Makefile 命令简化操作。
+Use predefined Makefile commands to simplify operations.
 
 ```bash
-# 安装依赖
+# Install dependencies
 make install
 
-# 运行测试
+# Run tests
 make test
 
-# 运行管线
+# Run pipeline
 make run INPUT_FILE=scripts/sample_story.txt
 
-# 清理输出
+# Clean output
 make clean
 
-# 启动 Docker 服务
+# Start Docker services
 make docker-up
 
-# 停止 Docker 服务
+# Stop Docker services
 make docker-down
 ```
 
 ---
 
-## 示例 12: 调试模式
+## Example 12: Debug Mode
 
-启用详细日志进行调试。
+Enable verbose logging for debugging.
 
 ```bash
-# 设置日志级别
+# Set log level
 export LOG_LEVEL=DEBUG
 
-# 运行管线
+# Run pipeline
 python pipeline/src/pipeline_runner.py \
   --input scripts/sample_story.txt \
   --duration 60 \
@@ -258,12 +258,12 @@ python pipeline/src/pipeline_runner.py \
 
 ---
 
-## 示例 13: 生成不同风格视频
+## Example 13: Generate Different Style Videos
 
-使用不同的媒体配置生成不同风格的视频。
+Use different media profiles to generate different style videos.
 
 ```bash
-# 电影风格
+# Cinematic style
 python pipeline/src/pipeline_runner.py \
   --input scripts/sample_story.txt \
   --output-dir data/output/cinematic \
@@ -271,7 +271,7 @@ python pipeline/src/pipeline_runner.py \
   --transition fade \
   --auto-approve
 
-# YouTube Shorts（竖屏）
+# YouTube Shorts (vertical)
 python pipeline/src/pipeline_runner.py \
   --input scripts/sample_story.txt \
   --output-dir data/output/shorts \
@@ -282,9 +282,9 @@ python pipeline/src/pipeline_runner.py \
 
 ---
 
-## 示例 14: 检查管线报告
+## Example 14: Check Pipeline Report
 
-查看管线执行报告。
+View pipeline execution report.
 
 ```python
 import json
@@ -292,36 +292,36 @@ import json
 with open("data/output/basic_example/pipeline_report.json") as f:
     report = json.load(f)
 
-print("=== 管线执行报告 ===")
-print(f"状态: {report['status']}")
-print(f"总耗时: {report['total_duration']:.2f}s")
-print(f"阶段数: {len(report['phases'])}")
+print("=== Pipeline Execution Report ===")
+print(f"Status: {report['status']}")
+print(f"Total duration: {report['total_duration']:.2f}s")
+print(f"Number of phases: {len(report['phases'])}")
 
 for phase_name, phase_data in report['phases'].items():
     print(f"\n{phase_name}:")
-    print(f"  状态: {phase_data['status']}")
-    print(f"  耗时: {phase_data['duration']:.2f}s")
+    print(f"  Status: {phase_data['status']}")
+    print(f"  Duration: {phase_data['duration']:.2f}s")
     if phase_data.get('error'):
-        print(f"  错误: {phase_data['error']}")
+        print(f"  Error: {phase_data['error']}")
 ```
 
 ---
 
-## 示例 15: 环境变量配置
+## Example 15: Environment Variable Configuration
 
-使用环境变量配置 API 和其他设置。
+Use environment variables to configure API and other settings.
 
 ```bash
-# 配置 API 密钥
+# Configure API key
 export ARK_AGENT_API_KEY=your_api_key_here
 
-# 配置 API 地址
+# Configure API URL
 export ARK_BASE_URL=https://api.volcengine.com
 
-# 配置日志级别
+# Configure log level
 export LOG_LEVEL=INFO
 
-# 运行管线
+# Run pipeline
 python pipeline/src/pipeline_runner.py \
   --input scripts/sample_story.txt \
   --duration 60 \
@@ -331,35 +331,35 @@ python pipeline/src/pipeline_runner.py \
 
 ---
 
-## 常见问题
+## FAQ
 
-### Q: 如何查看 API 调用详情？
+### Q: How to view API call details?
 
-设置 `LOG_LEVEL=DEBUG` 并查看日志文件。
+Set `LOG_LEVEL=DEBUG` and check log files.
 
-### Q: 如何中断正在运行的管线？
+### Q: How to interrupt a running pipeline?
 
-按 `Ctrl+C`，管线会保存检查点，下次可以用 `--resume` 恢复。
+Press `Ctrl+C`, pipeline will save checkpoint, next time you can use `--resume` to recover.
 
-### Q: 如何重新生成某个镜头？
+### Q: How to regenerate a specific shot?
 
-删除对应的 `shots/SXX/` 目录，然后使用 `--resume` 重新运行。
+Delete corresponding `shots/SXX/` directory, then use `--resume` to rerun.
 
-### Q: 如何修改角色外观？
+### Q: How to modify character appearance?
 
-编辑 `CHARACTERS.json` 中的角色描述，然后使用 `--resume` 重新生成。
+Edit character description in `CHARACTERS.json`, then use `--resume` to regenerate.
 
-### Q: 如何导出中间结果？
+### Q: How to export intermediate results?
 
-所有中间文件都在 `output_dir/` 目录下，包括：
-- `STORYBOARD.json` - 分镜数据
-- `CHARACTERS.json` - 角色数据
-- `shots/` - 各镜头的视频和图片
+All intermediate files are in `output_dir/` directory, including:
+- `STORYBOARD.json` - Storyboard data
+- `CHARACTERS.json` - Character data
+- `shots/` - Videos and images for each shot
 
 ---
 
-## 下一步
+## Next Steps
 
-- 阅读 [QUICKSTART.md](QUICKSTART.md) 了解快速开始
-- 阅读 [API.md](API.md) 了解详细接口
-- 阅读 [PIPELINE.md](PIPELINE.md) 了解管线架构
+- Read [QUICKSTART.md](QUICKSTART.md) for quick start
+- Read [API.md](API.md) for detailed interfaces
+- Read [PIPELINE.md](PIPELINE.md) for pipeline architecture

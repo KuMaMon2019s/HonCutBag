@@ -20,8 +20,6 @@ def test_max_retries_config():
     
     assert MAX_RETRIES == 3, f"期望 MAX_RETRIES=3，实际={MAX_RETRIES}"
     print(f"✓ MAX_RETRIES = {MAX_RETRIES}")
-    
-    return True
 
 
 def test_retry_feedback_injection():
@@ -56,8 +54,6 @@ def test_retry_feedback_injection():
     assert last_error in feedback_prompt, "反馈应包含上次错误信息"
     print("✓ 重试时注入反馈")
     print(f"  反馈内容: {feedback_prompt[-50:]}")
-    
-    return True
 
 
 def test_retry_error_tracking():
@@ -86,8 +82,6 @@ def test_retry_error_tracking():
     
     assert last_error == "第二次错误", f"期望 last_error='第二次错误'，实际='{last_error}'"
     print(f"✓ last_error 正确追踪: {last_error}")
-    
-    return True
 
 
 def test_retry_with_fallback():
@@ -119,8 +113,6 @@ def test_retry_with_fallback():
     assert llm_result is not None, "应该有降级结果"
     assert "fallback" in llm_result["prompt"], "降级 prompt 应包含 fallback"
     print(f"✓ 降级方案: {llm_result}")
-    
-    return True
 
 
 def main():

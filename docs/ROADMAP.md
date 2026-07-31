@@ -1,70 +1,70 @@
-# HonCut 改造路线图（融合 Toonflow + OpenMontage 精华）
+# HonCut Refactoring Roadmap (Integrating Toonflow + OpenMontage Best Practices)
 
-> 生成日期: 2026-07-31
-> 原则: **只增不删，只扩不改** — 在现有 8 Phase 基础上叠加能力，不重构不重写
+> Generated: 2026-07-31  
+> Principle: **Add only, don't delete; extend only, don't rewrite** — layer capabilities on top of existing 8 phases without restructuring or rewriting
 
 ---
 
-## 一、现有架构（不动）
+## I. Existing Architecture (Unchanged)
 
 ```
-Phase 2   编剧引擎     text_parser → event_extractor → character_discoverer → adaptation_engine → storyboard_generator
-Phase 2.5 故事板       seedream_client → storyboard.png
-Phase 3   角色工厂     character_factory → 2×2 grid → crop → front/side/back.png
-Phase 4   编排器       orchestrator → shots/S01-S10/SHOT_META.json
-Phase 5   视频生成     seedance_client (TOS + reference_image + 429退避)
-Phase 6   一致性守卫   consistency_guard + quality_gate
-Phase 7   组装引擎     edit_decisions (trim + normalize + smart_transition + xfade)
-Phase 8   后期处理     audio_pipeline → visual_post → rhythm_editor → final_encode
+Phase 2   Screenwriter Engine     text_parser → event_extractor → character_discoverer → adaptation_engine → storyboard_generator
+Phase 2.5 Storyboard              seedream_client → storyboard.png
+Phase 3   Character Factory       character_factory → 2×2 grid → crop → front/side/back.png
+Phase 4   Orchestrator            orchestrator → shots/S01-S10/SHOT_META.json
+Phase 5   Video Generation        seedance_client (TOS + reference_image + 429 backoff)
+Phase 6   Consistency Guard       consistency_guard + quality_gate
+Phase 7   Assembly Engine         edit_decisions (trim + normalize + smart_transition + xfade)
+Phase 8   Post-Production         audio_pipeline → visual_post → rhythm_editor → final_encode
 ```
 
-**已有模块（25个，~9600行）全部保留，不做任何删改。**
+**All existing modules (25 files, ~9600 lines) are retained without any deletions or modifications.**
 
 ---
 
-## 二、改造总览（6 个增量模块）
+## II. Refactoring Overview (6 Incremental Modules)
 
-| # | 增量模块 | 学谁 | 插入位置 | 方式 |
-|---|---|---|---|---|
-| M1 | 导演规划层 | Toonflow 阶段1 | Phase 2 之前新增 Phase 1 | 新增 `director_planner.py` |
-| M2 | 分镜图序列 | Toonflow 阶段6 | Phase 2.5 扩展 | 扩展 `seedream_client` 调用 |
-| M3 | 片段间过渡桥梁 | Toonflow 分镜表 | Phase 2 adaptation_engine 扩展 | 扩展 LLM prompt |
-| M4 | 模型路由 | Toonflow 视频提示词 | Phase 5 之前新增路由层 | 新增 `prompt_router.py` |
-| M5 | 监督层审核 | Toonflow 监督层 | Phase 6 扩展 | 扩展 `quality_gate.py` |
-| M6 | 产物链 + Checkpoint | OpenMontage | 全流程叠加 | 新增 `artifact_chain.py` |
+| # | Module | Learn From | Insertion Point | Method |
+|---|--------|-----------|-----------------|--------|
+| M1 | Director Planning Layer | Toonflow Stage 1 | New Phase 1 before Phase 2 | Add `director_planner.py` |
+| M2 | Storyboard Image Sequence | Toonflow Stage 6 | Extend Phase 2.5 | Extend `seedream_client` calls |
+| M3 | Inter-Clip Transition Bridges | Toonflow storyboard table | Extend Phase 2 adaptation_engine | Extend LLM prompt |
+| M4 | Model Routing | Toonflow video prompts | New routing layer before Phase 5 | Add `prompt_router.py` |
+| M5 | Supervision Layer Review | Toonflow supervision layer | Extend Phase 6 | Extend `quality_gate.py` |
+| M6 | Artifact Chain + Checkpoint | OpenMontage | Overlay on full pipeline | Add `artifact_chain.py` |
 
 ---
 
-## 三、M1: 导演规划层（学 Toonflow 阶段1）
+## III. M1: Director Planning Layer (Learn from Toonflow Stage 1)
 
-### 目标
-在 Phase 2 之前新增 Phase 1，产出结构化的导演规划，让下游分镜有情绪依据和一致性锚点。
+### Goal
+Add Phase 1 before Phase 2 to produce structured director planning, giving downstream storyboard phases emotional grounding and consistency anchors.
 
-### 新增文件
+### New File
 `pipeline/src/director_planner.py`
 
-### 输入
-- 剧本文本（text_parser 输出的 segments）
-- 角色列表（可选，如果已有）
+### Input
+- Script text (segments from text_parser)
+- Character list (optional, if available)
 
-### 输出
+### Output
 `director_plan.json`:
 ```json
 {
   "scenes": [
     {
       "scene_id": "Sc1",
-      "scene_name": "便利店门口·暴雨傍晚",
+      "scene_name": "Convenience store entrance · heavy rain evening",
       "dialogue_count": 3,
       "dialogue_words": 86,
       "emotion_intensity": 4,
-      "emotion_arc": "烦闷→好奇→心动",
+      "emotion_arc": "boredom → curiosity → attraction",
       "notes": {
-        "emotional_peak": "沈屿举伞出现，四目相对",
-        "consistency_anchors": ["林夏: 白色衬衫+深蓝西装裤+黑色长直发", "沈屿: 黑伞+挽袖+机械表"],
-        "spatial": "林夏左前站位面朝右，沈屿从右侧入画",
-        "ambient_sound": "暴雨打玻璃声、便利店门铃声",
-        "pitfall": "两人同框时注意伞的遮挡关系"
+        "emotional_peak": "Shen Yu appears with umbrella, eyes meet",
+        "consistency_anchors": ["Lin Xia: white shirt + dark blue pants + black straight hair", "Shen Yu: black umbrella + rolled sleeves + mechanical watch"],
+        "spatial": "Lin Xia stands left-front facing right, Shen Yu enters from right",
+        "ambient_sound": "rain hitting glass, convenience store door bell",
+        "pitfall": "Watch umbrella occlusion when both characters in frame"
       }
     }
   ],
@@ -72,134 +72,134 @@ Phase 8   后期处理     audio_pipeline → visual_post → rhythm_editor → 
     {
       "from": "Sc1",
       "to": "Sc2",
-      "type": "动作衔接",
-      "description": "沈屿倾伞 → 两人并肩走入雨中"
+      "type": "action bridge",
+      "description": "Shen Yu tilts umbrella → two walk side-by-side into rain"
     }
   ]
 }
 ```
 
-### 实现方式
-- 调用 LLM（doubao-seed-2.0-lite），prompt 学 Toonflow 导演规划
-- 只做四件事：拆分场、台词统计、情绪分析、过渡设计
-- 不规划光影/色调/配乐
-- 输出纯结构化 JSON，不写创作叙述
+### Implementation
+- Call LLM (doubao-seed-2.0-lite), prompt follows Toonflow director planning
+- Does only 4 things: scene splitting, dialogue counting, emotion analysis, transition design
+- Does not plan lighting/color grading/music
+- Outputs pure structured JSON, no creative prose
 
-### 与现有代码的关系
-- **不改** `pipeline_runner.py` 的 Phase 2 逻辑
-- 在 `run_pipeline()` 的 Phase 2 之前插入 `run_phase1()` 调用
-- `director_plan.json` 作为额外输入传给 Phase 2 的 adaptation_engine
+### Relationship to Existing Code
+- **Does not modify** Phase 2 logic in `pipeline_runner.py`
+- Inserts `run_phase1()` call before Phase 2 in `run_pipeline()`
+- `director_plan.json` passed as additional input to Phase 2 adaptation_engine
 
-### Toonflow 原文精华（直接复用）
+### Toonflow Original Best Practices (Direct Reuse)
 
-**分场原则：**
-- 一个场 = 同一时空下一段连续戏
-- 以地点变更/时间跳变/戏剧单元收束为切点
-- 剧本已有场标 → 原著保真
+**Scene Splitting Rules:**
+- One scene = one continuous dramatic unit in same time-space
+- Cut points: location change / time jump / dramatic unit closure
+- If script has scene markers → preserve original fidelity
 
-**情绪分析：**
-- 逐场给情绪浓度 0~10 + 一句话情绪基调
-- 场内情绪推进标出 X→Y
+**Emotion Analysis:**
+- Assign emotion intensity 0~10 + one-line emotional tone per scene
+- Mark intra-scene emotion progression as X→Y
 
-**场间过渡 4 种桥梁：**
+**4 Types of Inter-Scene Transition Bridges:**
 
-| 桥梁 | 触发条件 | 做法 |
-|---|---|---|
-| 动作桥梁 | 同一组人物连续动作 | 前段结尾=动作起始态，后段首镜=进行时/完成时 |
-| 情绪接力 | 对话/冲突情绪延续 | 前段结尾用反应镜/微表情铺垫，后段承接强化 |
-| 空间视线 | 场景切换/视线转移 | 空镜+视线引导+声音延续 |
-| 台词黏合 | 台词/音效需画面回应 | 前段末尾声音延续到后段首镜 |
+| Bridge | Trigger | Method |
+|--------|---------|--------|
+| Action bridge | Same characters, continuous action | End of previous = action start state; first shot of next = in-progress/completed |
+| Emotion relay | Dialogue/conflict emotion continues | End of previous uses reaction shot / micro-expression; next inherits and amplifies |
+| Spatial / gaze | Scene change / gaze shift | Empty shot + gaze guidance + sound continuation |
+| Dialogue glue | Dialogue/SFX needs visual response | Sound from end of previous carries into first shot of next |
 
 ---
 
-## 四、M2: 分镜图序列（学 Toonflow 阶段6）
+## IV. M2: Storyboard Image Sequence (Learn from Toonflow Stage 6)
 
-### 目标
-Phase 2.5 从生成 1 张 storyboard.png 扩展为每个镜头一张分镜图。
+### Goal
+Extend Phase 2.5 from generating 1 storyboard.png to one storyboard image per shot.
 
-### 改动方式
-**不改** `seedream_client.py`，在 `pipeline_runner.py` 的 `run_phase2_5()` 中扩展调用：
+### Modification Method
+**Does not modify** `seedream_client.py`, extends calls in `pipeline_runner.py` `run_phase2_5()`:
 
 ```python
-# 现在：生成 1 张
+# Current: generate 1 image
 seedream_client.text_to_image(prompt=storyboard_prompt, output_path="storyboard.png")
 
-# 扩展为：每个镜头一张（在现有调用之后追加）
+# Extended: one per shot (appended after existing call)
 for shot in storyboard_data["shots"]:
-    shot_prompt = shot["prompt"]  # 每个镜头已有独立 prompt
+    shot_prompt = shot["prompt"]  # each shot already has independent prompt
     shot_image_path = output_dir / "storyboard_images" / f"{shot['shot_id']}.png"
     seedream_client.text_to_image(prompt=shot_prompt, output_path=str(shot_image_path))
 ```
 
-### 输出
+### Output
 ```
 output/
-  storyboard.png          ← 保留（总览）
+  storyboard.png          ← retained (overview)
   storyboard_images/
-    S01.png               ← 新增（每镜头一张）
+    S01.png               ← new (one per shot)
     S02.png
     ...
     S10.png
 ```
 
-### 与 Phase 5 的联动
-Phase 5 生成视频时，可以把对应镜头的分镜图作为构图参考（reference_image）：
+### Integration with Phase 5
+During Phase 5 video generation, corresponding storyboard image can serve as composition reference (reference_image):
 ```python
-# 在 _run_phase5_fallback 中，现有逻辑之后追加
+# In _run_phase5_fallback, appended after existing logic
 shot_image = output_dir / "storyboard_images" / f"{shot_id}.png"
 if shot_image.exists():
-    # 用分镜图作为构图参考（优先级低于角色参考图）
+    # Use storyboard image as composition reference (lower priority than character reference)
     if first_frame_b64 is None:
         first_frame_b64 = base64.b64encode(shot_image.read_bytes()).decode()
 ```
 
 ---
 
-## 五、M3: 片段间过渡桥梁（学 Toonflow 分镜表）
+## V. M3: Inter-Clip Transition Bridges (Learn from Toonflow Storyboard Table)
 
-### 目标
-在 adaptation_engine 的 LLM prompt 中增加片段间过渡设计规则。
+### Goal
+Add inter-clip transition design rules to adaptation_engine LLM prompt.
 
-### 改动方式
-**不改** `adaptation_engine.py` 的代码逻辑，只扩展 LLM prompt 内容：
+### Modification Method
+**Does not modify** `adaptation_engine.py` code logic, only extends LLM prompt content:
 
-在 `USER_PROMPT_TEMPLATE` 中追加过渡规则（学 Toonflow 原文）：
+Append transition rules to `USER_PROMPT_TEMPLATE` (from Toonflow original):
 
 ```
-【片段间过渡规则】
-相邻片段之间必须设计过渡桥梁，消灭跳跃感：
-1. 动作桥梁：前段结尾=动作起始态，后段首镜=进行时/完成时
-2. 情绪接力：前段结尾用反应镜/微表情铺垫，后段承接强化
-3. 空间视线：场景切换时用空镜+视线引导+声音延续
-4. 台词黏合：前段末尾声音延续到后段首镜
+[Inter-Clip Transition Rules]
+Adjacent clips must design transition bridges to eliminate jump-cut feel:
+1. Action bridge: end of previous = action start state; first shot of next = in-progress/completed
+2. Emotion relay: end of previous uses reaction shot / micro-expression; next inherits and amplifies
+3. Spatial / gaze: use empty shot + gaze guidance + sound continuation during scene changes
+4. Dialogue glue: sound from end of previous carries into first shot of next
 
-每个镜头的 visual 描述开头必须包含「承接上镜」段（第一个镜头除外）。
+Each shot's visual description must begin with "continuation from previous shot" paragraph (except first shot).
 ```
 
-### 与现有代码的关系
-- 现有 `adaptation_engine.py` 已有承接上镜规则（line 70），只需扩展 prompt 内容
-- **不改代码逻辑**，只改 prompt 字符串
+### Relationship to Existing Code
+- Existing `adaptation_engine.py` already has continuation rules (line 70), only need to extend prompt content
+- **Does not modify code logic**, only modifies prompt string
 
 ---
 
-## 六、M4: 模型路由（学 Toonflow 4 种提示词模式）
+## VI. M4: Model Routing (Learn from Toonflow 4 Prompt Modes)
 
-### 目标
-Phase 5 之前新增提示词路由层，按模型名自动匹配提示词格式。
+### Goal
+Add prompt routing layer before Phase 5, auto-match prompt format by model name.
 
-### 新增文件
+### New File
 `pipeline/src/prompt_router.py`
 
-### 4 种模式（学 Toonflow 原文）
+### 4 Modes (from Toonflow original)
 
-| 模式 | 触发条件 | 提示词格式 |
-|---|---|---|
-| Seedance 2.0 多分镜 | 模型=seedance-2-0 + 多分镜 | 中文结构化12维编码 + @图N 引用 + 毫秒时长 |
-| Seedance 2.0 单镜头 | 模型=seedance-2-0 + 单镜头 | reference_image + 英文 prompt |
-| 通用首尾帧 | 其他模型 + 首尾帧 | [Visual][Motion][Camera][Audio][Narrative] 五维度 |
-| Wan 2.6 | 模型=wan2.6 | 叙事式英文（风格→主体→光线→镜头） |
+| Mode | Trigger | Prompt Format |
+|------|---------|---------------|
+| Seedance 2.0 multi-shot | model=seedance-2.0 + multi-shot | Chinese structured 12-dim encoding + @imageN references + ms durations |
+| Seedance 2.0 single-shot | model=seedance-2.0 + single-shot | reference_image + English prompt |
+| Generic first/last-frame | Other models + first/last-frame | [Visual][Motion][Camera][Audio][Narrative] 5 dimensions |
+| Wan 2.6 | model=wan2.6 | Narrative English (style → subject → lighting → camera) |
 
-### 路由逻辑
+### Routing Logic
 ```python
 def route_prompt(model_name: str, mode: str, shot_data: dict, assets: list) -> str:
     model_lower = model_name.lower()
@@ -215,70 +215,70 @@ def route_prompt(model_name: str, mode: str, shot_data: dict, assets: list) -> s
         return _build_generic_first_last_frame(shot_data)
 ```
 
-### Seedance 2.0 多分镜格式（学 Toonflow 原文）
+### Seedance 2.0 Multi-Shot Format (from Toonflow original)
 ```
-画面风格和类型: 真人写实, 电影风格, 都市暖调
+Visual style and type: realistic, cinematic, warm urban tone
 
-图片定义:
-@图1: 林夏，黑色长直发及肩，白色修身衬衫+深蓝西装裤
-@图2: 沈屿，短发干净，休闲商务装，手持黑伞
+Image definitions:
+@Image1: Lin Xia, black straight hair to shoulders, white fitted shirt + dark blue suit pants
+@Image2: Shen Yu, short clean hair, casual business attire, holding black umbrella
 
-生成一个由以下 N 个分镜组成的视频:
+Generate a video composed of the following N shots:
 
-分镜1 6s: 时间：傍晚，场景：便利店门口，镜头：全景，静止，
-  林夏站在便利店门口，望着瓢泼大雨，皱眉...
+Shot 1 6s: Time: evening, Scene: convenience store entrance, Camera: wide shot, static,
+  Lin Xia stands at convenience store entrance, watching heavy rain, frowning...
 
-分镜2 6s: 时间：傍晚，场景：便利店门口，镜头：中景，
-  沈屿举着黑伞出现，"一起？"...
+Shot 2 6s: Time: evening, Scene: convenience store entrance, Camera: medium shot,
+  Shen Yu appears with black umbrella, "Together?"...
 ```
 
-### 与现有代码的关系
-- **不改** `seedance_client.py`
-- 在 `pipeline_runner.py` 的 `_run_phase5_fallback()` 中，在构建 prompt 之前调用 `prompt_router.route_prompt()`
-- 现有的 style_prefix 和 reference_image 注入逻辑保留
+### Relationship to Existing Code
+- **Does not modify** `seedance_client.py`
+- In `pipeline_runner.py` `_run_phase5_fallback()`, call `prompt_router.route_prompt()` before building prompt
+- Existing style_prefix and reference_image injection logic retained
 
 ---
 
-## 七、M5: 监督层审核（学 Toonflow 监督层）
+## VII. M5: Supervision Layer Review (Learn from Toonflow Supervision Layer)
 
-### 目标
-扩展 `quality_gate.py`，增加 Toonflow 的 4 条红线审核和 A/B/C/D 评分。
+### Goal
+Extend `quality_gate.py` to add Toonflow's 4 red-line reviews and A/B/C/D grading.
 
-### 改动方式
-**不改** 现有 `quality_gate.py` 的 `run_quality_check()`，新增函数：
+### Modification Method
+**Does not modify** existing `quality_gate.py` `run_quality_check()`, adds new function:
 
 ```python
-# 新增函数，不改现有代码
+# New function, does not modify existing code
 def run_storyboard_review(storyboard_data: dict, script_text: str, characters: list) -> dict:
-    """学 Toonflow 监督层：审核分镜表质量。
+    """Learn from Toonflow supervision layer: review storyboard quality.
     
-    4 条红线（违反即严重）：
-    R1: 资产引用合法（角色/场景必须在 characters 中存在）
-    R2: 剧本忠实（台词一字不差，不遗漏不新增）
-    R3: 具象可感（禁止抽象笼统词）
-    R4: 父子资产正确（衍生状态用衍生 ID）
+    4 red lines (violation = serious):
+    R1: Asset references valid (characters/scenes must exist in characters)
+    R2: Script fidelity (dialogue verbatim, no omissions or additions)
+    R3: Concreteness (no abstract/vague descriptions)
+    R4: Parent-child assets correct (derived states use derived IDs)
     
-    评分：A(0严重≤2中等) / B(0严重≤5中等) / C(1-2严重) / D(≥3严重)
+    Grading: A(0 critical ≤2 moderate) / B(0 critical ≤5 moderate) / C(1-2 critical) / D(≥3 critical)
     """
 ```
 
-### 与现有代码的关系
-- 现有 `run_quality_check()` 检查文件存在性（Phase 级别）
-- 新增 `run_storyboard_review()` 检查内容质量（分镜级别）
-- 两个函数互补，不冲突
-- 在 `run_phase2()` 末尾调用 `run_storyboard_review()`
+### Relationship to Existing Code
+- Existing `run_quality_check()` checks file existence (phase-level)
+- New `run_storyboard_review()` checks content quality (storyboard-level)
+- Two functions complement, don't conflict
+- Call `run_storyboard_review()` at end of `run_phase2()`
 
 ---
 
-## 八、M6: 产物链 + Checkpoint（学 OpenMontage）
+## VIII. M6: Artifact Chain + Checkpoint (Learn from OpenMontage)
 
-### 目标
-每阶段产出结构化 JSON 产物，支持从任意阶段恢复。
+### Goal
+Each phase produces structured JSON artifacts, supports recovery from any phase.
 
-### 新增文件
+### New File
 `pipeline/src/artifact_chain.py`
 
-### 产物链定义
+### Artifact Chain Definition
 ```python
 ARTIFACT_CHAIN = {
     "phase1":  {"produces": "director_plan.json",     "requires": []},
@@ -293,10 +293,10 @@ ARTIFACT_CHAIN = {
 }
 ```
 
-### Checkpoint 增强
+### Checkpoint Enhancement
 ```python
 def save_checkpoint(phase: str, output_dir: Path, artifacts: dict):
-    """每阶段完成后写 checkpoint。"""
+    """Write checkpoint after each phase."""
     checkpoint = {
         "phase": phase,
         "timestamp": datetime.now().isoformat(),
@@ -307,7 +307,7 @@ def save_checkpoint(phase: str, output_dir: Path, artifacts: dict):
     checkpoint_path.write_text(json.dumps(checkpoint, indent=2, ensure_ascii=False))
 
 def can_resume_from(phase: str, output_dir: Path) -> bool:
-    """检查是否可以从指定阶段恢复。"""
+    """Check if can resume from specified phase."""
     required = ARTIFACT_CHAIN[phase]["requires"]
     for artifact in required:
         if not (output_dir / artifact).exists():
@@ -315,43 +315,43 @@ def can_resume_from(phase: str, output_dir: Path) -> bool:
     return True
 ```
 
-### 与现有代码的关系
-- 现有 LangGraph checkpoint 保留
-- 新增文件级 checkpoint（每阶段一个 JSON）
-- 在 `run_pipeline()` 中每阶段完成后调用 `save_checkpoint()`
-- 支持 `--resume-from phase5` 从任意阶段恢复
+### Relationship to Existing Code
+- Existing LangGraph checkpoint retained
+- New file-level checkpoint (one JSON per phase)
+- Call `save_checkpoint()` after each phase in `run_pipeline()`
+- Support `--resume-from phase5` to recover from any phase
 
 ---
 
-## 九、实施顺序
+## IX. Implementation Sequence
 
-| 批次 | 模块 | 依赖 | 预估 |
-|---|---|---|---|
-| 第1批 | M2 分镜图序列 | 无 | 低（扩展 Phase 2.5 调用） |
-| 第1批 | M3 片段间过渡 | 无 | 低（扩展 prompt 字符串） |
-| 第2批 | M1 导演规划 | 无 | 中（新增 director_planner.py） |
-| 第2批 | M5 监督层审核 | 无 | 中（扩展 quality_gate.py） |
-| 第3批 | M4 模型路由 | M2 | 高（新增 prompt_router.py） |
-| 第3批 | M6 产物链 | M1 | 中（新增 artifact_chain.py） |
+| Batch | Module | Dependencies | Estimate |
+|-------|--------|--------------|----------|
+| Batch 1 | M2 Storyboard Sequence | None | Low (extend Phase 2.5 calls) |
+| Batch 1 | M3 Transition Bridges | None | Low (extend prompt string) |
+| Batch 2 | M1 Director Planning | None | Medium (new director_planner.py) |
+| Batch 2 | M5 Supervision Review | None | Medium (extend quality_gate.py) |
+| Batch 3 | M4 Model Routing | M2 | High (new prompt_router.py) |
+| Batch 3 | M6 Artifact Chain | M1 | Medium (new artifact_chain.py) |
 
-### 铁律
-1. **不删除任何现有代码**
-2. **不重写任何现有函数**
-3. **只新增文件或在现有函数末尾追加逻辑**
-4. **新增模块通过 try/except 优雅降级，失败不影响现有流程**
-5. **每批完成后全量重跑验证，确认不破坏现有功能**
+### Iron Rules
+1. **Do not delete any existing code**
+2. **Do not rewrite any existing functions**
+3. **Only add new files or append logic at end of existing functions**
+4. **New modules degrade gracefully via try/except, failures don't affect existing flow**
+5. **After each batch, full re-run validation to confirm no breakage**
 
 ---
 
-## 十、参考来源
+## X. Reference Sources
 
-| 来源 | 文件 | 学到什么 |
-|---|---|---|
-| Toonflow 导演规划 | `data/skills/production_execution_director_plan.md` | 分场/情绪/过渡/注意事项 |
-| Toonflow 分镜表 | `data/skills/production_execution_storyboard_table.md` | 铁律/拆镜/过渡桥梁 |
-| Toonflow 监督层 | `data/skills/production_agent_supervision.md` | 4条红线/A-D评分/审核维度 |
-| Toonflow 视频提示词 | `src/lib/fixDB.ts` (videoPromptGeneration) | 4种模式路由/Seedance 2.0格式 |
-| Toonflow 分镜图生成 | `src/routes/production/storyboard/batchGenerateImage.ts` | 每镜头一张/并发批量 |
-| OpenMontage cinematic | `pipeline_defs/cinematic.yaml` | 8阶段产物链/checkpoint/审批门 |
-| OpenMontage VideoCompose | `tools/video/video_compose.py` | edit_decisions/帧精确/归一化/多引擎 |
-| OpenMontage pipeline_loader | `lib/pipeline_loader.py` | 阶段排序/子阶段/条件激活 |
+| Source | File | What We Learn |
+|--------|------|---------------|
+| Toonflow director planning | `data/skills/production_execution_director_plan.md` | Scene splitting/emotion/transition/pitfalls |
+| Toonflow storyboard table | `data/skills/production_execution_storyboard_table.md` | Iron rules/shot splitting/transition bridges |
+| Toonflow supervision layer | `data/skills/production_agent_supervision.md` | 4 red lines/A-D grading/review dimensions |
+| Toonflow video prompts | `src/lib/fixDB.ts` (videoPromptGeneration) | 4-mode routing/Seedance 2.0 format |
+| Toonflow storyboard generation | `src/routes/production/storyboard/batchGenerateImage.ts` | One per shot/concurrent batching |
+| OpenMontage cinematic | `pipeline_defs/cinematic.yaml` | 8-phase artifact chain/checkpoint/approval gates |
+| OpenMontage VideoCompose | `tools/video/video_compose.py` | edit_decisions/frame-precise/normalization/multi-engine |
+| OpenMontage pipeline_loader | `lib/pipeline_loader.py` | Phase ordering/sub-phases/conditional activation |

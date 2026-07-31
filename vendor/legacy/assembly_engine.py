@@ -27,7 +27,7 @@ CHROME_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
 # OCC MCP endpoint (Phase 4 context)
 OCC_MCP_URL = "http://localhost:5173/api/external-mcp/mcp"
-OCC_BEARER_TOKEN = "occ-panda-secret"
+OCC_BEARER_TOKEN = os.environ.get("OCC_BEARER_TOKEN", "occ-panda-secret")
 
 
 # ─── 0. preprocess helpers (silence removal + waste trimming) ────────────────

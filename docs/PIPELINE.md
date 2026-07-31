@@ -1,222 +1,248 @@
-# Honcut AI 视频管线 — PIPELINE 总纲
+# HonCut AI Video Pipeline — PIPELINE Master Document
 
-> **版本**: v1.0.0  
-> **更新日期**: 2026-07-28  
-> **状态**: 架构定义阶段
+> **Version**: v1.0.0  
+> **Updated**: 2026-07-28  
+> **Status**: Architecture definition phase
 
 ---
 
-## 1. 数据流总览（ASCII）
+## 1. Data Flow Overview (ASCII)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                        Honcut AI 视频管线 · 9 Phase 架构                      │
+│                     HonCut AI Video Pipeline · 9-Phase Architecture          │
 └─────────────────────────────────────────────────────────────────────────────┘
 
                           ┌──────────────────┐
-                          │   任意文本输入     │
-                          │ (一句话/大纲/长篇) │
+                          │  Arbitrary Text   │
+                          │ (sentence/outline │
+                          │   /long-form)     │
                           └────────┬─────────┘
                                    │
                     ┌──────────────▼──────────────┐
-                    │  Phase 1: 基础设施 (已就绪)   │
-                    │  n8n · KB · ARK · Qdrant     │
+                    │  Phase 1: Director Planning  │
+                    │  (M1 - scene/emotion/trans.) │
                     └──────────────┬──────────────┘
                                    │
                     ┌──────────────▼──────────────┐
-                    │  Phase 2: 事件图谱引擎 (编剧) │
-                    │  text → 结构化叙事            │
+                    │  Phase 2: Screenwriter Engine│
+                    │  text → structured narrative │
                     └──────┬───────────────┬──────┘
                            │               │
               STORYBOARD.json      CHARACTERS.json
                            │               │
                            │    ┌──────────▼──────────┐
-                           │    │  Phase 3: 角色资产    │
-                           │    │  三视图 + 角色卡      │
+                           │    │  Phase 3: Character  │
+                           │    │  Assets (3-views +   │
+                           │    │  character cards)    │
                            │    └──────────┬──────────┘
                            │               │
                            │    characters/*/front|side|back.png
                            │    character_card.json / angle_map.json
                            │               │
                     ┌──────▼───────────────▼──────┐
-                    │  Phase 4: 智能路由            │
-                    │  镜头 → 工具决策              │
+                    │  Phase 4: Smart Routing      │
+                    │  (M4 - model-based routing)  │
                     └──────────────┬──────────────┘
                                    │
                     shots/S*/SHOT_META.json
                                    │
                     ┌──────────────▼──────────────┐
-                    │  Phase 5: 视频生成            │
-                    │  Seedance 异步生成            │
+                    │  Phase 5: Video Generation   │
+                    │  Seedance async generation   │
                     └──────────────┬──────────────┘
                                    │
                     shots/S*/output.mp4 + frames/
                                    │
                     ┌──────────────▼──────────────┐
-                    │  Phase 6: 质量检查            │
-                    │  一致性守卫                   │
+                    │  Phase 6: Quality Gate       │
+                    │  (M5 - supervision + grading)│
                     └──┬─────────────────────┬────┘
                        │                     │
                   ✅ ≥0.7              🔴 <0.7
                        │                     │
                        │              ┌──────▼──────┐
-                       │              │ 回 Phase 5   │
+                       │              │ Back to P5   │
                        │              │ re-gen       │
                        │              └─────────────┘
                        │
                     ┌──▼───────────────────────────┐
-                    │  Phase 7: 粗剪                │
-                    │  拼接毛坯                     │
+                    │  Phase 7: Rough Assembly      │
+                    │  (M3 - transition bridges)    │
                     └──────────────┬───────────────┘
                                    │
                           stitched.mp4
                                    │
                     ┌──────────────▼──────────────┐
-                    │  Phase 8: 后处理 (精剪)       │
-                    │  音频/画质/节奏/转场          │
+                    │  Phase 8: Post-Production    │
+                    │  Audio/quality/rhythm/       │
+                    │  transitions                 │
                     └──────────────┬──────────────┘
                                    │
                           polished.mp4
                                    │
                     ┌──────────────▼──────────────┐
-                    │  Phase 9: 全流程集成          │
-                    │  Go 后端 + n8n 触发 + E2E    │
+                    │  Phase 9: Full Integration   │
+                    │  Go backend + n8n trigger    │
+                    │  + E2E validation            │
                     └─────────────────────────────┘
 ```
 
 ---
 
-## 2. Phase 依赖关系
+## 2. Phase Dependencies
 
 ```
-Phase 1 (基础设施)
-  └── 被所有 Phase 依赖（运行时环境）
+Phase 1 (Director Planning)
+  └── Depended on by all phases (runtime foundation + planning input)
 
-Phase 2 (事件图谱) ──依赖──▶ Phase 1
-  ├── 输出 STORYBOARD.json ──▶ Phase 4
-  └── 输出 CHARACTERS.json ──▶ Phase 3
+Phase 2 (Screenwriter) ──depends──▶ Phase 1
+  ├── outputs STORYBOARD.json ──▶ Phase 4
+  └── outputs CHARACTERS.json ──▶ Phase 3
 
-Phase 3 (角色资产) ──依赖──▶ Phase 2 (CHARACTERS.json)
-  └── 输出角色资产 ──▶ Phase 4
+Phase 3 (Character Assets) ──depends──▶ Phase 2 (CHARACTERS.json)
+  └── outputs character assets ──▶ Phase 4
 
-Phase 4 (智能路由) ──依赖──▶ Phase 2 + Phase 3
-  └── 输出 SHOT_META.json ──▶ Phase 5
+Phase 4 (Smart Routing) ──depends──▶ Phase 2 + Phase 3
+  └── outputs SHOT_META.json ──▶ Phase 5
 
-Phase 5 (视频生成) ──依赖──▶ Phase 4
-  ├── 输出 output.mp4 ──▶ Phase 6, Phase 7
-  └── 输出 frames/ ──▶ Phase 6
+Phase 5 (Video Generation) ──depends──▶ Phase 4
+  ├── outputs output.mp4 ──▶ Phase 6, Phase 7
+  └── outputs frames/ ──▶ Phase 6
 
-Phase 6 (质量检查) ──依赖──▶ Phase 5
-  ├── ✅ 通过 ──▶ Phase 7
-  └── 🔴 不通过 ──▶ Phase 5 (闭环重试)
+Phase 6 (Quality Gate) ──depends──▶ Phase 5
+  ├── ✅ Pass ──▶ Phase 7
+  └── 🔴 Fail ──▶ Phase 5 (closed-loop retry)
 
-Phase 7 (粗剪) ──依赖──▶ Phase 5 (所有 output.mp4)
-  └── 输出 stitched.mp4 ──▶ Phase 8
+Phase 7 (Rough Assembly) ──depends──▶ Phase 5 (all output.mp4)
+  └── outputs stitched.mp4 ──▶ Phase 8
 
-Phase 8 (后处理) ──依赖──▶ Phase 7
-  └── 输出 polished.mp4 ──▶ Phase 9 / 交付
+Phase 8 (Post-Production) ──depends──▶ Phase 7
+  └── outputs polished.mp4 ──▶ Phase 9 / delivery
 
-Phase 9 (全流程集成) ──依赖──▶ Phase 1~8 全部
-  └── 端到端编排
+Phase 9 (Full Integration) ──depends──▶ Phases 1-8
+  └── End-to-end orchestration
 ```
 
 ---
 
-## 3. Phase 详细定义
+## 3. Phase Definitions
 
-### Phase 1: 基础设施 ✅
+### Phase 1: Director Planning ✅
 
-> **一句话**: 搭建运行环境，确保所有外部服务和密钥就绪。
+> **One-liner**: Produce structured director planning — scene breakdown, emotion arcs, and transition design — before storyboarding begins.
 
-| 项目 | 说明 |
-|------|------|
-| **输入** | 环境变量 `ARK_API_KEY`、Docker 镜像、knowledge-base 目录 |
-| **输出** | 可用服务：n8n (localhost:5678)、Qdrant (localhost:6333)、知识库向量索引 |
-| **工具/脚本** | `docker compose up`、`kb_scan`、`kb_search` |
-| **状态** | ✅ 已完成 |
+| Item | Description |
+|------|-------------|
+| **Input** | Script text (segments from text_parser), optional character list |
+| **Output** | `director_plan.json` (scenes, emotion arcs, scene transitions) |
+| **Tool** | `director_planner.py` (LLM call: doubao-seed-2.0-lite) |
+| **Status** | ✅ Implemented (M1 module) |
 
-**组件清单**:
-- n8n Docker（工作流触发器）
-- knowledge-base 目录结构
-- ARK_API_KEY（火山方舟 API）
-- Qdrant 向量数据库
-
----
-
-### Phase 2: 事件图谱引擎（编剧）❌
-
-> **一句话**: 将任意文本解析为结构化事件图谱和角色列表。
-
-| 项目 | 说明 |
-|------|------|
-| **输入** | 任意文本（一句话 / 一段描述 / 大纲 / 长篇均可，不特指小说） |
-| **输出** | `STORYBOARD.json` + `CHARACTERS.json` |
-| **工具链** | `text_parser.py` → `event_extractor.py` → `character_discoverer.py` → `adaptation_engine.py` → `storyboard_generator.py` |
-| **状态** | ❌ 未实现 |
-
-**工具链说明**:
-
-| 工具 | 职责 |
-|------|------|
-| `text_parser.py` | 自动判断输入规模：短文直接提事件，长文按段落/章节拆分 |
-| `event_extractor.py` | 从文本块中提取事件（who/what/where/when/why） |
-| `character_discoverer.py` | 从事件中发现角色并提取属性 |
-| `adaptation_engine.py` | 将原始事件适配为可视觉化的镜头语言 |
-| `storyboard_generator.py` | 生成最终分镜脚本 |
-
-**关键约束**:
-- 输入不限格式，text_parser 负责自适应
-- 输出必须严格符合下方 JSON Schema
+**Key behaviors**:
+- Splits script into scenes by location/time/dramatic unit boundaries
+- Assigns emotion intensity (0–10) and emotion arc (X→Y) per scene
+- Designs inter-scene transitions using 4 bridge types
+- Outputs pure structured JSON, no creative prose
 
 ---
 
-### Phase 3: 角色资产 ✅（需增强）
+### Phase 2: Screenwriter Engine ❌
 
-> **一句话**: 为每个角色生成三视图和角色卡。
+> **One-liner**: Parse arbitrary text into a structured event graph and character list.
 
-| 项目 | 说明 |
-|------|------|
-| **输入** | `CHARACTERS.json`（来自 Phase 2） |
-| **输出** | `characters/{name}/front.png` · `side.png` · `back.png` · `character_card.json` · `angle_map.json` |
-| **工具** | `character_factory.py`（调用 Seedream 5.0-lite `/images/generations`） |
-| **状态** | ✅ 已完成，需增强 |
+| Item | Description |
+|------|-------------|
+| **Input** | Arbitrary text (sentence / paragraph / outline / long-form) |
+| **Output** | `STORYBOARD.json` + `CHARACTERS.json` |
+| **Toolchain** | `text_parser.py` → `event_extractor.py` → `character_discoverer.py` → `adaptation_engine.py` → `storyboard_generator.py` |
+| **Status** | ❌ Not implemented |
 
-**增强方向**:
-- 参考 ComfyUI 三视图工作流的 prompt 模板和负面提示词
-- 将 IPAdapter / ControlNet 思路转为 Seedream API 参数（如 reference_image、control_strength）
-- 统一角色一致性（同一角色不同镜头的外貌锚定）
+**Toolchain details**:
 
-**输出目录结构**:
+| Tool | Responsibility |
+|------|---------------|
+| `text_parser.py` | Auto-detect input scale: short text → direct extraction; long text → split by paragraph/chapter |
+| `event_extractor.py` | Extract events (who/what/where/when/why) from text blocks |
+| `character_discoverer.py` | Discover characters from events and extract attributes |
+| `adaptation_engine.py` | Adapt raw events into visualizable shot language |
+| `storyboard_generator.py` | Generate final storyboard script |
+
+**Key constraints**:
+- Input format is unrestricted; text_parser handles adaptation
+- Output must strictly conform to JSON Schema below
+
+---
+
+### Phase 2.5: Storyboard Sequence (M2)
+
+> **One-liner**: Generate one storyboard image per shot for visual composition reference.
+
+| Item | Description |
+|------|-------------|
+| **Input** | `STORYBOARD.json` shot prompts |
+| **Output** | `storyboard_images/S01.png`, `S02.png`, ... |
+| **Tool** | `seedream_client.py` (extended per-shot calls) |
+| **Status** | ✅ Implemented (M2 module) |
+
+---
+
+### Phase 3: Character Assets ✅ (needs enhancement)
+
+> **One-liner**: Generate three-view images and character cards for each character.
+
+| Item | Description |
+|------|-------------|
+| **Input** | `CHARACTERS.json` (from Phase 2) |
+| **Output** | `characters/{name}/front.png` · `side.png` · `back.png` · `character_card.json` · `angle_map.json` |
+| **Tool** | `character_factory.py` (calls Seedream 5.0-lite `/images/generations`) |
+| **Status** | ✅ Implemented, needs enhancement |
+
+**Enhancement directions**:
+- Reference ComfyUI three-view workflow prompt templates and negative prompts
+- Convert IPAdapter / ControlNet concepts to Seedream API parameters (e.g., reference_image, control_strength)
+- Unify character consistency (appearance anchoring across shots)
+
+**Output directory structure**:
 ```
 characters/
-├── {角色名}/
-│   ├── front.png          # 正面视图
-│   ├── side.png           # 侧面视图
-│   ├── back.png           # 背面视图
-│   ├── character_card.json # 角色属性卡
-│   └── angle_map.json     # 角度映射表
+├── {character_name}/
+│   ├── front.png          # Front view
+│   ├── side.png           # Side view
+│   ├── back.png           # Back view
+│   ├── character_card.json # Character attribute card
+│   └── angle_map.json     # Angle mapping table
 ```
 
 ---
 
-### Phase 4: 智能路由 ✅
+### Phase 4: Smart Routing ✅ (M4)
 
-> **一句话**: 为每个镜头选择最优生成工具和参数。
+> **One-liner**: Select the optimal generation tool and prompt format for each shot.
 
-| 项目 | 说明 |
-|------|------|
-| **输入** | `STORYBOARD.json` + 角色三视图路径 |
-| **输出** | `shots/S{N}/SHOT_META.json`（含路由决策） |
-| **工具** | `orchestrator.py` + `tool_router.py` |
-| **状态** | ✅ 已完成 |
+| Item | Description |
+|------|-------------|
+| **Input** | `STORYBOARD.json` + character three-view paths |
+| **Output** | `shots/S{N}/SHOT_META.json` (with routing decision) |
+| **Tool** | `orchestrator.py` + `tool_router.py` + `prompt_router.py` (M4) |
+| **Status** | ✅ Implemented |
 
-**路由决策维度**:
-- 镜头类型（全景/中景/特写/运动）
-- 角色数量（单人/多人/无人）
-- 动作复杂度（静态/动态/交互）
-- 情绪基调（决定风格参数）
+**Routing dimensions**:
+- Shot type (wide / medium / close-up / motion)
+- Character count (single / multi / none)
+- Action complexity (static / dynamic / interactive)
+- Emotional tone (determines style parameters)
 
-**输出目录结构**:
+**M4 Model Routing** (`prompt_router.py`):
+
+| Mode | Trigger | Prompt Format |
+|------|---------|---------------|
+| Seedance 2.0 multi-shot | model=seedance-2.0 + multi-shot | Chinese structured 12-dim encoding + @image refs + ms durations |
+| Seedance 2.0 single-shot | model=seedance-2.0 + single-shot | reference_image + English prompt |
+| Generic first/last-frame | Other models + first/last-frame | [Visual][Motion][Camera][Audio][Narrative] 5 dimensions |
+| Wan 2.6 | model=wan2.6 | Narrative English (style → subject → lighting → camera) |
+
+**Output directory structure**:
 ```
 shots/
 ├── S1/
@@ -228,110 +254,129 @@ shots/
 
 ---
 
-### Phase 5: 视频生成 ✅
+### Phase 5: Video Generation ✅
 
-> **一句话**: 调用 Seedance 异步生成每个镜头的视频片段。
+> **One-liner**: Call Seedance API to asynchronously generate video clips for each shot.
 
-| 项目 | 说明 |
-|------|------|
-| **输入** | `shots/S{N}/SHOT_META.json` |
-| **输出** | `shots/S{N}/output.mp4` + `shots/S{N}/frames/` |
-| **工具** | `seedance_client.py`（Agent Plan 异步 submit/poll） |
-| **状态** | ✅ 已完成 |
+| Item | Description |
+|------|-------------|
+| **Input** | `shots/S{N}/SHOT_META.json` |
+| **Output** | `shots/S{N}/output.mp4` + `shots/S{N}/frames/` |
+| **Tool** | `seedance_client.py` (Agent Plan async submit/poll) |
+| **Status** | ✅ Implemented |
 
-**API 约束**:
-- Endpoint: `/api/plan/v3/`（Agent Plan）
-- 模型: `doubao-seedance-2.0-fast`
-- 参数全部顶层，`watermark: false`
-- 异步模式：submit → poll → 下载
-
----
-
-### Phase 6: 质量检查 ✅（需增强）
-
-> **一句话**: 检查角色一致性和画面质量，不合格则回退重生成。
-
-| 项目 | 说明 |
-|------|------|
-| **输入** | `shots/S{N}/frames/`（抽帧） |
-| **输出** | `consistency_report.json` |
-| **工具** | `consistency_guard.py`（embedding 比对） |
-| **状态** | ✅ 已完成，需增强 |
-
-**增强方向**:
-- 用 OM `frame_sampler` 替代手写 ffmpeg 抽帧
-- 增加 `composition_validator`（构图检查）
-- 增加 `face_tracker`（人脸追踪一致性）
-
-**闭环机制**:
-- 一致性分数 ≥ 0.7 → ✅ 通过，进入 Phase 7
-- 一致性分数 < 0.7 → 🔴 不通过，回退 Phase 5 re-gen（最多重试 3 次）
+**API constraints**:
+- Endpoint: `/api/plan/v3/` (Agent Plan)
+- Model: `doubao-seedance-2.0-fast`
+- All parameters at top level, `watermark: false`
+- Async mode: submit → poll → download
 
 ---
 
-### Phase 7: 粗剪 ✅（需增强）
+### Phase 6: Quality Gate ✅ (M5)
 
-> **一句话**: 将所有镜头拼接为毛坯视频。
+> **One-liner**: Check character consistency and visual quality; reject and re-generate if below threshold.
 
-| 项目 | 说明 |
-|------|------|
-| **输入** | 所有 `shots/S{N}/output.mp4` |
-| **输出** | `stitched.mp4`（毛坯） |
-| **工具** | `assembly_engine.py`（OM `video_stitch` + `remotion_caption_burn`） |
-| **状态** | ✅ 已完成，需增强 |
+| Item | Description |
+|------|-------------|
+| **Input** | `shots/S{N}/frames/` (sampled frames) |
+| **Output** | `consistency_report.json` |
+| **Tool** | `consistency_guard.py` (embedding comparison) + `quality_gate.py` (`run_storyboard_review` — M5) |
+| **Status** | ✅ Implemented, needs enhancement |
 
-**增强方向**:
-- OM `video_trimmer`：去除每个镜头的废片（开头/结尾黑帧、模糊帧）
-- OM `silence_cutter`：去除静默段落（如有音频轨道）
+**M5 Supervision Layer** (`run_storyboard_review`):
 
----
+4 red-line checks:
+- R1: Asset references valid (characters/scenes must exist)
+- R2: Script fidelity (dialogue verbatim, no omissions or additions)
+- R3: Concreteness (no abstract/vague descriptions)
+- R4: Parent-child assets correct (derived states use derived IDs)
 
-### Phase 8: 后处理（精剪）❌
+Grading: A (0 critical, ≤2 moderate) / B (0 critical, ≤5 moderate) / C (1–2 critical) / D (≥3 critical)
 
-> **一句话**: 对毛坯视频进行音频、画质、节奏、转场的精细加工，输出成品。
+**Enhancement directions**:
+- Replace hand-written ffmpeg frame extraction with OM `frame_sampler`
+- Add `composition_validator` (composition checking)
+- Add `face_tracker` (face tracking consistency)
 
-| 项目 | 说明 |
-|------|------|
-| **输入** | `stitched.mp4` |
-| **输出** | `polished.mp4`（成品） |
-| **工具** | 全部来自 OpenMontage（见下表） |
-| **状态** | ❌ 未实现 |
-
-**工具清单（全部来自 OM）**:
-
-| 类别 | 工具 | 职责 |
-|------|------|------|
-| **音频** | `audio_mixer` | 多轨混音（BGM + 音效 + 对白） |
-| | `music_gen` | AI 生成背景音乐 |
-| | `doubao_tts` | 豆包 TTS 生成旁白/对白 |
-| | `audio_enhance` | 音频降噪/增强 |
-| **画质** | `enhancement/` | 超分辨率 / 降噪 |
-| **画幅** | `auto_reframe` | 自动裁切适配不同比例（16:9 / 9:16 / 1:1） |
-| **图文** | `graphics/` | 片头 / 片尾 / 字幕卡 |
-| **节奏** | 变速 / 卡点 | 根据音乐节奏调整镜头速度 |
-| **转场** | 转场精修 | 按情绪选择转场类型（切/溶解/擦除/缩放） |
+**Closed-loop mechanism**:
+- Consistency score ≥ 0.7 → ✅ Pass, proceed to Phase 7
+- Consistency score < 0.7 → 🔴 Fail, return to Phase 5 re-gen (max 3 retries)
 
 ---
 
-### Phase 9: 全流程集成 ✅
+### Phase 7: Rough Assembly ✅ (M3)
 
-> **一句话**: 用 Go 后端串联所有 Phase，支持 n8n 触发和端到端验证。
+> **One-liner**: Stitch all shot clips into a rough-cut video with transition bridges.
 
-| 项目 | 说明 |
-|------|------|
-| **输入** | 用户请求（文本 + 参数） |
-| **输出** | `polished.mp4`（最终交付物） |
-| **工具** | Go 后端 + n8n webhook 触发 + E2E 测试 |
-| **状态** | ✅ 已完成 |
+| Item | Description |
+|------|-------------|
+| **Input** | All `shots/S{N}/output.mp4` |
+| **Output** | `stitched.mp4` (rough cut) |
+| **Tool** | `assembly_engine.py` (OM `video_stitch` + `remotion_caption_burn`) |
+| **Status** | ✅ Implemented, needs enhancement |
 
-**集成架构**:
+**M3 Transition Bridges** (4 types injected into adaptation prompts):
+
+| Bridge | Trigger | Method |
+|--------|---------|--------|
+| Action bridge | Same characters, continuous action | End of previous = action start state; first shot of next = in-progress/completed |
+| Emotion relay | Dialogue/conflict emotion continues | End of previous uses reaction shot / micro-expression; next inherits and amplifies |
+| Spatial / gaze | Scene change / gaze shift | Empty shot + gaze guidance + sound continuation |
+| Dialogue glue | Dialogue/SFX needs visual response | Sound from end of previous carries into first shot of next |
+
+**Enhancement directions**:
+- OM `video_trimmer`: Remove dead frames (black/blurry frames at start/end of each shot)
+- OM `silence_cutter`: Remove silent segments (if audio track present)
+
+---
+
+### Phase 8: Post-Production ❌
+
+> **One-liner**: Fine-tune rough-cut video with audio, visual quality, rhythm, and transitions to produce final deliverable.
+
+| Item | Description |
+|------|-------------|
+| **Input** | `stitched.mp4` |
+| **Output** | `polished.mp4` (final deliverable) |
+| **Tool** | All from OpenMontage (see table below) |
+| **Status** | ❌ Not implemented |
+
+**Tool list (all from OM)**:
+
+| Category | Tool | Responsibility |
+|----------|------|---------------|
+| **Audio** | `audio_mixer` | Multi-track mixing (BGM + SFX + dialogue) |
+| | `music_gen` | AI-generated background music |
+| | `doubao_tts` | Doubao TTS for narration/dialogue |
+| | `audio_enhance` | Audio noise reduction/enhancement |
+| **Quality** | `enhancement/` | Super-resolution / denoising |
+| **Aspect** | `auto_reframe` | Auto-crop for different ratios (16:9 / 9:16 / 1:1) |
+| **Graphics** | `graphics/` | Title cards / end cards / subtitle cards |
+| **Rhythm** | Speed ramp / beat-sync | Adjust shot speed to music rhythm |
+| **Transitions** | Transition refinement | Select transition type by emotion (cut/dissolve/wipe/zoom) |
+
+---
+
+### Phase 9: Full Integration ✅
+
+> **One-liner**: Orchestrate all phases via Go backend with n8n trigger and end-to-end validation.
+
+| Item | Description |
+|------|-------------|
+| **Input** | User request (text + parameters) |
+| **Output** | `polished.mp4` (final deliverable) |
+| **Tool** | Go backend + n8n webhook trigger + E2E tests |
+| **Status** | ✅ Implemented |
+
+**Integration architecture**:
 ```
-用户请求 → n8n webhook → Go 后端 → Phase 2~8 顺序执行 → 交付 polished.mp4
+User request → n8n webhook → Go backend → Phase 1-8 sequential execution → deliver polished.mp4
 ```
 
 ---
 
-## 4. 关键 JSON 接口规范
+## 4. Key JSON Interface Specifications
 
 ### 4.1 CHARACTERS.json Schema
 
@@ -343,29 +388,29 @@ shots/
   "required": ["version", "characters"],
   "properties": {
     "version": { "type": "string", "const": "1.0" },
-    "source_text_hash": { "type": "string", "description": "输入文本的 SHA-256，用于溯源" },
+    "source_text_hash": { "type": "string", "description": "SHA-256 of input text for traceability" },
     "characters": {
       "type": "array",
       "items": {
         "type": "object",
         "required": ["id", "name", "appearance", "role"],
         "properties": {
-          "id": { "type": "string", "description": "角色唯一标识，如 char_001" },
-          "name": { "type": "string", "description": "角色名称" },
-          "role": { "type": "string", "enum": ["protagonist", "antagonist", "supporting", "extra"], "description": "角色定位" },
+          "id": { "type": "string", "description": "Unique character ID, e.g. char_001" },
+          "name": { "type": "string", "description": "Character name" },
+          "role": { "type": "string", "enum": ["protagonist", "antagonist", "supporting", "extra"], "description": "Character role" },
           "appearance": {
             "type": "object",
             "required": ["gender", "age_range", "summary"],
             "properties": {
               "gender": { "type": "string", "enum": ["male", "female", "nonbinary", "unknown"] },
-              "age_range": { "type": "string", "description": "如 '20-30'" },
-              "height": { "type": "string", "description": "如 '175cm'" },
-              "build": { "type": "string", "description": "体型，如 'slim', 'athletic', 'heavy'" },
-              "hair": { "type": "string", "description": "发型发色，如 '黑色短发'" },
-              "face": { "type": "string", "description": "面部特征，如 '圆脸、戴眼镜'" },
-              "clothing": { "type": "string", "description": "典型穿着，如 '白色衬衫+牛仔裤'" },
-              "distinguishing": { "type": "string", "description": "显著标记，如 '左脸颊疤痕'" },
-              "summary": { "type": "string", "description": "一句话外貌总结，用于 prompt 生成" }
+              "age_range": { "type": "string", "description": "e.g. '20-30'" },
+              "height": { "type": "string", "description": "e.g. '175cm'" },
+              "build": { "type": "string", "description": "Body type, e.g. 'slim', 'athletic', 'heavy'" },
+              "hair": { "type": "string", "description": "Hair style and color" },
+              "face": { "type": "string", "description": "Facial features" },
+              "clothing": { "type": "string", "description": "Typical attire" },
+              "distinguishing": { "type": "string", "description": "Distinguishing marks" },
+              "summary": { "type": "string", "description": "One-line appearance summary for prompt generation" }
             }
           },
           "personality": {
@@ -382,12 +427,12 @@ shots/
               "type": "object",
               "properties": {
                 "target_id": { "type": "string" },
-                "type": { "type": "string", "description": "如 'friend', 'rival', 'mentor'" },
+                "type": { "type": "string", "description": "e.g. 'friend', 'rival', 'mentor'" },
                 "description": { "type": "string" }
               }
             }
           },
-          "asset_path": { "type": "string", "description": "角色资产目录，如 'characters/char_001/'" }
+          "asset_path": { "type": "string", "description": "Character asset directory, e.g. 'characters/char_001/'" }
         }
       }
     }
@@ -407,21 +452,21 @@ shots/
   "required": ["version", "title", "shots"],
   "properties": {
     "version": { "type": "string", "const": "1.0" },
-    "title": { "type": "string", "description": "作品标题" },
-    "genre": { "type": "string", "description": "类型，如 'sci-fi', 'romance', 'thriller'" },
-    "tone": { "type": "string", "description": "整体基调，如 'dark', 'uplifting', 'suspenseful'" },
-    "total_duration_target": { "type": "number", "description": "目标总时长（秒）" },
-    "synopsis": { "type": "string", "description": "故事梗概（3-5 句）" },
+    "title": { "type": "string", "description": "Work title" },
+    "genre": { "type": "string", "description": "Genre, e.g. 'sci-fi', 'romance', 'thriller'" },
+    "tone": { "type": "string", "description": "Overall tone, e.g. 'dark', 'uplifting', 'suspenseful'" },
+    "total_duration_target": { "type": "number", "description": "Target total duration (seconds)" },
+    "synopsis": { "type": "string", "description": "Story synopsis (3-5 sentences)" },
     "shots": {
       "type": "array",
       "items": {
         "type": "object",
         "required": ["shot_id", "sequence", "description", "characters"],
         "properties": {
-          "shot_id": { "type": "string", "description": "镜头 ID，如 'S1', 'S2'" },
-          "sequence": { "type": "integer", "description": "镜头序号（从 1 开始）" },
-          "description": { "type": "string", "description": "镜头内容描述（自然语言）" },
-          "scene": { "type": "string", "description": "场景/地点，如 '咖啡馆内'、'雨夜街道'" },
+          "shot_id": { "type": "string", "description": "Shot ID, e.g. 'S1', 'S2'" },
+          "sequence": { "type": "integer", "description": "Shot sequence number (starting from 1)" },
+          "description": { "type": "string", "description": "Shot content description (natural language)" },
+          "scene": { "type": "string", "description": "Scene/location" },
           "time_of_day": { "type": "string", "enum": ["dawn", "morning", "noon", "afternoon", "dusk", "night"] },
           "camera": {
             "type": "object",
@@ -429,7 +474,7 @@ shots/
               "shot_type": { "type": "string", "enum": ["wide", "medium", "close-up", "extreme-close-up", "over-shoulder", "pov", "aerial"] },
               "angle": { "type": "string", "enum": ["eye-level", "low-angle", "high-angle", "dutch", "birds-eye"] },
               "movement": { "type": "string", "enum": ["static", "pan-left", "pan-right", "tilt-up", "tilt-down", "dolly-in", "dolly-out", "tracking", "crane", "handheld"] },
-              "lens": { "type": "string", "description": "如 '50mm', 'wide-angle', 'telephoto'" }
+              "lens": { "type": "string", "description": "e.g. '50mm', 'wide-angle', 'telephoto'" }
             }
           },
           "characters": {
@@ -438,9 +483,9 @@ shots/
               "type": "object",
               "properties": {
                 "character_id": { "type": "string" },
-                "action": { "type": "string", "description": "该角色在此镜头中的动作" },
-                "emotion": { "type": "string", "description": "情绪状态" },
-                "position": { "type": "string", "description": "画面中的位置，如 'left', 'center', 'right'" }
+                "action": { "type": "string", "description": "Character action in this shot" },
+                "emotion": { "type": "string", "description": "Emotional state" },
+                "position": { "type": "string", "description": "Position in frame, e.g. 'left', 'center', 'right'" }
               }
             }
           },
@@ -451,14 +496,14 @@ shots/
               "properties": {
                 "character_id": { "type": "string" },
                 "line": { "type": "string" },
-                "delivery": { "type": "string", "description": "语气，如 'whisper', 'shout', 'calm'" }
+                "delivery": { "type": "string", "description": "Delivery style, e.g. 'whisper', 'shout', 'calm'" }
               }
             }
           },
-          "mood": { "type": "string", "description": "镜头情绪，如 'tense', 'peaceful', 'joyful'" },
-          "duration_hint": { "type": "number", "description": "建议时长（秒）" },
-          "transition_to_next": { "type": "string", "enum": ["cut", "dissolve", "fade", "wipe", "match-cut"], "description": "到下一镜头的转场" },
-          "notes": { "type": "string", "description": "导演备注/特殊要求" }
+          "mood": { "type": "string", "description": "Shot mood, e.g. 'tense', 'peaceful', 'joyful'" },
+          "duration_hint": { "type": "number", "description": "Suggested duration (seconds)" },
+          "transition_to_next": { "type": "string", "enum": ["cut", "dissolve", "fade", "wipe", "match-cut"], "description": "Transition to next shot" },
+          "notes": { "type": "string", "description": "Director notes / special requirements" }
         }
       }
     }
@@ -477,36 +522,36 @@ shots/
   "type": "object",
   "required": ["shot_id", "route", "prompt", "parameters"],
   "properties": {
-    "shot_id": { "type": "string", "description": "镜头 ID，如 'S1'" },
-    "source_storyboard": { "type": "string", "description": "来源 STORYBOARD.json 的 shot_id" },
+    "shot_id": { "type": "string", "description": "Shot ID, e.g. 'S1'" },
+    "source_storyboard": { "type": "string", "description": "Source shot_id from STORYBOARD.json" },
     "route": {
       "type": "object",
       "required": ["tool", "model"],
       "properties": {
-        "tool": { "type": "string", "description": "使用的工具，如 'seedance_client'" },
-        "model": { "type": "string", "description": "模型名，如 'doubao-seedance-2.0-fast'" },
-        "reason": { "type": "string", "description": "路由决策理由" },
-        "fallback": { "type": "string", "description": "备选工具/模型" }
+        "tool": { "type": "string", "description": "Tool used, e.g. 'seedance_client'" },
+        "model": { "type": "string", "description": "Model name, e.g. 'doubao-seedance-2.0-fast'" },
+        "reason": { "type": "string", "description": "Routing decision reason" },
+        "fallback": { "type": "string", "description": "Fallback tool/model" }
       }
     },
     "prompt": {
       "type": "object",
       "required": ["text"],
       "properties": {
-        "text": { "type": "string", "description": "最终发送给生成模型的 prompt" },
-        "negative_prompt": { "type": "string", "description": "负面提示词" },
-        "style_prefix": { "type": "string", "description": "风格前缀，如 'cinematic, 4K'" }
+        "text": { "type": "string", "description": "Final prompt sent to generation model" },
+        "negative_prompt": { "type": "string", "description": "Negative prompt" },
+        "style_prefix": { "type": "string", "description": "Style prefix, e.g. 'cinematic, 4K'" }
       }
     },
     "parameters": {
       "type": "object",
       "properties": {
-        "duration": { "type": "number", "description": "视频时长（秒）" },
-        "resolution": { "type": "string", "description": "如 '1280x720', '720x1280'" },
-        "fps": { "type": "integer", "description": "帧率" },
+        "duration": { "type": "number", "description": "Video duration (seconds)" },
+        "resolution": { "type": "string", "description": "e.g. '1280x720', '720x1280'" },
+        "fps": { "type": "integer", "description": "Frame rate" },
         "aspect_ratio": { "type": "string", "enum": ["16:9", "9:16", "1:1", "4:3"] },
-        "seed": { "type": "integer", "description": "随机种子（可复现）" },
-        "cfg_scale": { "type": "number", "description": "引导强度" },
+        "seed": { "type": "integer", "description": "Random seed (reproducible)" },
+        "cfg_scale": { "type": "number", "description": "Guidance strength" },
         "watermark": { "type": "boolean", "const": false }
       }
     },
@@ -516,16 +561,16 @@ shots/
         "type": "object",
         "properties": {
           "character_id": { "type": "string" },
-          "image_path": { "type": "string", "description": "参考图路径，如 'characters/char_001/front.png'" },
+          "image_path": { "type": "string", "description": "Reference image path" },
           "role": { "type": "string", "enum": ["face_ref", "pose_ref", "style_ref", "full_body_ref"] },
-          "weight": { "type": "number", "description": "参考权重 0.0-1.0" }
+          "weight": { "type": "number", "description": "Reference weight 0.0-1.0" }
         }
       }
     },
     "status": { "type": "string", "enum": ["pending", "generating", "completed", "failed", "retrying"] },
     "retry_count": { "type": "integer", "default": 0 },
-    "output_path": { "type": "string", "description": "生成结果路径" },
-    "task_id": { "type": "string", "description": "Agent Plan 异步任务 ID" }
+    "output_path": { "type": "string", "description": "Generation result path" },
+    "task_id": { "type": "string", "description": "Agent Plan async task ID" }
   }
 }
 ```
@@ -543,7 +588,7 @@ shots/
   "properties": {
     "shot_id": { "type": "string" },
     "timestamp": { "type": "string", "format": "date-time" },
-    "overall_score": { "type": "number", "minimum": 0, "maximum": 1, "description": "综合一致性分数" },
+    "overall_score": { "type": "number", "minimum": 0, "maximum": 1, "description": "Overall consistency score" },
     "verdict": { "type": "string", "enum": ["pass", "fail"], "description": "pass: ≥0.7, fail: <0.7" },
     "checks": {
       "type": "object",
@@ -552,7 +597,7 @@ shots/
           "type": "object",
           "properties": {
             "score": { "type": "number", "minimum": 0, "maximum": 1 },
-            "method": { "type": "string", "description": "如 'embedding_cosine_similarity'" },
+            "method": { "type": "string", "description": "e.g. 'embedding_cosine_similarity'" },
             "details": {
               "type": "array",
               "items": {
@@ -580,7 +625,7 @@ shots/
           "type": "object",
           "properties": {
             "score": { "type": "number" },
-            "method": { "type": "string", "description": "如 'rule_of_thirds_analysis'" },
+            "method": { "type": "string", "description": "e.g. 'rule_of_thirds_analysis'" },
             "issues": { "type": "array", "items": { "type": "string" } }
           }
         },
@@ -588,7 +633,7 @@ shots/
           "type": "object",
           "properties": {
             "score": { "type": "number" },
-            "method": { "type": "string", "description": "如 'frame_to_frame_embedding_delta'" },
+            "method": { "type": "string", "description": "e.g. 'frame_to_frame_embedding_delta'" },
             "max_delta": { "type": "number" },
             "avg_delta": { "type": "number" }
           }
@@ -610,7 +655,7 @@ shots/
         "retry_reason": { "type": "string" },
         "suggested_parameter_changes": {
           "type": "object",
-          "description": "建议调整的生成参数"
+          "description": "Suggested generation parameter adjustments"
         }
       }
     }
@@ -620,54 +665,57 @@ shots/
 
 ---
 
-## 5. 状态汇总
+## 5. Status Summary
 
-| Phase | 名称 | 状态 | 备注 |
-|-------|------|------|------|
-| 1 | 基础设施 | ✅ 已完成 | — |
-| 2 | 事件图谱引擎 | ❌ 未实现 | 核心编剧模块 |
-| 3 | 角色资产 | ✅ 需增强 | ComfyUI prompt 迁移 |
-| 4 | 智能路由 | ✅ 已完成 | — |
-| 5 | 视频生成 | ✅ 已完成 | — |
-| 6 | 质量检查 | ✅ 需增强 | OM frame_sampler 替代 |
-| 7 | 粗剪 | ✅ 需增强 | OM video_trimmer + silence_cutter |
-| 8 | 后处理 | ❌ 未实现 | OM 全套后处理工具 |
-| 9 | 全流程集成 | ✅ 已完成 | — |
+| Phase | Name | Status | Notes |
+|-------|------|--------|-------|
+| 1 | Director Planning (M1) | ✅ Implemented | — |
+| 2 | Screenwriter Engine | ❌ Not implemented | Core screenwriting module |
+| 2.5 | Storyboard Sequence (M2) | ✅ Implemented | Per-shot storyboard images |
+| 3 | Character Assets | ✅ Needs enhancement | ComfyUI prompt migration |
+| 4 | Smart Routing (M4) | ✅ Implemented | Model-based prompt routing |
+| 5 | Video Generation | ✅ Implemented | — |
+| 6 | Quality Gate (M5) | ✅ Needs enhancement | OM frame_sampler replacement |
+| 7 | Rough Assembly (M3) | ✅ Needs enhancement | OM video_trimmer + silence_cutter |
+| 8 | Post-Production | ❌ Not implemented | Full OM post-production toolkit |
+| 9 | Full Integration | ✅ Implemented | — |
 
-**实现进度**: 7/9 Phase 可用（其中 3 个需增强），2 个未实现（Phase 2, Phase 8）。
+**Implementation progress**: 8/10 phases available (3 need enhancement), 2 not implemented (Phase 2, Phase 8).
 
 ---
 
-## 6. 约束与约定
+## 6. Constraints and Conventions
 
-### 6.1 API 约束
+### 6.1 API Constraints
 - **Agent Plan Endpoint**: `/api/plan/v3/`
-- **Seedream**: `doubao-seedream-5.0-lite`，同步接口 `/images/generations`
-- **Seedance**: `doubao-seedance-2.0-fast`，异步接口 `/contents/generations/tasks`
-- **Seedance 参数**: 全部顶层，`watermark: false`
+- **Seedream**: `doubao-seedream-5.0-lite`, sync interface `/images/generations`
+- **Seedance**: `doubao-seedance-2.0-fast`, async interface `/contents/generations/tasks`
+- **Seedance parameters**: All at top level, `watermark: false`
 
-### 6.2 硬件约束
-- M4 Mac 16GB，不跑本地模型
-- ComfyUI 只参考工作流/prompt，不做本地推理
+### 6.2 Hardware Constraints
+- M4 Mac 16GB, no local model inference
+- ComfyUI referenced for workflow/prompt design only, no local inference
 
-### 6.3 架构约定
-- 输入是"任意文本"，不特指小说/章节
-- OCC（OpenChatCut）已归档，OM（OpenMontage）是核心引擎
-- 所有 Phase 输出写入工作目录，便于回溯和调试
+### 6.3 Architecture Conventions
+- Input is "arbitrary text", not specifically novels/chapters
+- OCC (OpenChatCut) archived; OM (OpenMontage) is the core engine
+- All phase outputs written to working directory for traceability and debugging
 
-### 6.4 目录结构约定
+### 6.4 Directory Structure Convention
 ```
 {project_root}/
-├── characters/          # Phase 3 输出
-├── shots/               # Phase 4/5/6 输出
+├── characters/          # Phase 3 output
+├── shots/               # Phase 4/5/6 output
 │   ├── S1/
 │   │   ├── SHOT_META.json
 │   │   ├── output.mp4
 │   │   └── frames/
 │   └── ...
-├── STORYBOARD.json      # Phase 2 输出
-├── CHARACTERS.json      # Phase 2 输出
-├── consistency_report.json  # Phase 6 输出
-├── stitched.mp4         # Phase 7 输出
-└── polished.mp4         # Phase 8 输出（最终交付）
+├── STORYBOARD.json      # Phase 2 output
+├── CHARACTERS.json      # Phase 2 output
+├── director_plan.json   # Phase 1 output (M1)
+├── storyboard_images/   # Phase 2.5 output (M2)
+├── consistency_report.json  # Phase 6 output
+├── stitched.mp4         # Phase 7 output
+└── polished.mp4         # Phase 8 output (final deliverable)
 ```

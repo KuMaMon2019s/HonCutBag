@@ -1,12 +1,12 @@
-# HonCut API 文档
+# HonCut API Documentation
 
-## 核心模块
+## Core Modules
 
 ### pipeline_runner.py
 
-主管线执行器，串联所有阶段。
+Main pipeline executor that orchestrates all phases.
 
-#### 主要函数
+#### Main Functions
 
 ```python
 def run_pipeline(
@@ -21,25 +21,25 @@ def run_pipeline(
 ) -> dict
 ```
 
-**参数**:
-- `input_file`: 输入剧本文件路径
-- `duration`: 目标视频时长（秒）
-- `output_dir`: 输出目录
-- `dry_run`: 仅验证流程，不生成视频
-- `auto_approve`: 自动批准人工审核节点
-- `skip_phase`: 跳过的阶段列表
-- `transition`: 转场模式（crossfade/fade/cut）
-- `media_profile`: 编码配置
+**Parameters**:
+- `input_file`: Path to input script file
+- `duration`: Target video duration in seconds
+- `output_dir`: Output directory
+- `dry_run`: Validate pipeline only, no video generation
+- `auto_approve`: Auto-approve manual review nodes
+- `skip_phase`: List of phases to skip
+- `transition`: Transition mode (crossfade/fade/cut)
+- `media_profile`: Encoding profile
 
-**返回**: 执行报告字典
+**Returns**: Execution report dictionary
 
 ---
 
 ### character_factory.py
 
-角色工厂，生成角色三视图。
+Character factory that generates three-view character assets.
 
-#### 主要函数
+#### Main Functions
 
 ```python
 def generate_character_views(
@@ -48,19 +48,19 @@ def generate_character_views(
 ) -> dict
 ```
 
-**参数**:
-- `character`: 角色数据（来自 CHARACTERS.json）
-- `output_dir`: 输出目录
+**Parameters**:
+- `character`: Character data (from CHARACTERS.json)
+- `output_dir`: Output directory
 
-**返回**: 包含三视图路径的字典
+**Returns**: Dictionary containing three-view image paths
 
 ---
 
 ### seedance_client.py
 
-Seedance API 客户端，用于视频生成。
+Seedance API client for video generation.
 
-#### 主要函数
+#### Main Functions
 
 ```python
 def submit_video_generation(
@@ -71,13 +71,13 @@ def submit_video_generation(
 ) -> dict
 ```
 
-**参数**:
-- `prompt`: 视频生成提示词
-- `image_url`: 参考图片 URL（可选）
-- `duration`: 视频时长
-- `**kwargs`: 其他参数
+**Parameters**:
+- `prompt`: Video generation prompt
+- `image_url`: Reference image URL (optional)
+- `duration`: Video duration
+- `**kwargs`: Additional parameters
 
-**返回**: 任务提交结果
+**Returns**: Task submission result
 
 ```python
 def poll_video_status(
@@ -86,19 +86,19 @@ def poll_video_status(
 ) -> dict
 ```
 
-**参数**:
-- `task_id`: 任务 ID
-- `timeout`: 超时时间（秒）
+**Parameters**:
+- `task_id`: Task ID
+- `timeout`: Timeout in seconds
 
-**返回**: 视频生成状态和结果
+**Returns**: Video generation status and result
 
 ---
 
 ### seedream_client.py
 
-Seedream API 客户端，用于图片生成。
+Seedream API client for image generation.
 
-#### 主要函数
+#### Main Functions
 
 ```python
 def generate_image(
@@ -109,21 +109,21 @@ def generate_image(
 ) -> dict
 ```
 
-**参数**:
-- `prompt`: 图片生成提示词
-- `width`: 图片宽度
-- `height`: 图片高度
-- `**kwargs`: 其他参数
+**Parameters**:
+- `prompt`: Image generation prompt
+- `width`: Image width
+- `height`: Image height
+- `**kwargs`: Additional parameters
 
-**返回**: 图片生成结果
+**Returns**: Image generation result
 
 ---
 
 ### consistency_guard.py
 
-一致性守卫，检查角色一致性。
+Consistency guard that checks character consistency across shots.
 
-#### 主要函数
+#### Main Functions
 
 ```python
 def run_consistency_check(
@@ -132,19 +132,19 @@ def run_consistency_check(
 ) -> dict
 ```
 
-**参数**:
-- `output_dir`: 输出目录
-- `threshold`: 一致性阈值（0-100）
+**Parameters**:
+- `output_dir`: Output directory
+- `threshold`: Consistency threshold (0-100)
 
-**返回**: 一致性检查报告
+**Returns**: Consistency check report
 
 ---
 
 ### storyboard_generator.py
 
-分镜生成器，生成 STORYBOARD.json。
+Storyboard generator that produces STORYBOARD.json.
 
-#### 主要函数
+#### Main Functions
 
 ```python
 def generate_storyboard(
@@ -153,15 +153,15 @@ def generate_storyboard(
 ) -> dict
 ```
 
-**参数**:
-- `script_text`: 剧本文本
-- `duration`: 目标时长
+**Parameters**:
+- `script_text`: Script text
+- `duration`: Target duration
 
-**返回**: 分镜数据
+**Returns**: Storyboard data
 
 ---
 
-## 数据结构
+## Data Structures
 
 ### CHARACTERS.json
 
@@ -170,14 +170,14 @@ def generate_storyboard(
   "characters": [
     {
       "id": "char_001",
-      "name": "主角",
-      "description": "角色描述",
+      "name": "Protagonist",
+      "description": "Character description",
       "appearance": {
-        "hair": "黑色短发",
-        "clothing": "休闲装",
-        "face": "坚毅面容",
-        "build": "中等身材",
-        "gender": "男",
+        "hair": "Short black hair",
+        "clothing": "Casual wear",
+        "face": "Determined expression",
+        "build": "Medium build",
+        "gender": "male",
         "age_range": "25-35"
       },
       "reference_images": {
@@ -197,11 +197,11 @@ def generate_storyboard(
   "shots": [
     {
       "id": "S01",
-      "prompt": "镜头描述",
+      "prompt": "Shot description",
       "duration": 5,
       "characters": ["char_001"],
-      "scene": "场景描述",
-      "camera": "镜头运动"
+      "scene": "Scene description",
+      "camera": "Camera movement"
     }
   ]
 }
@@ -224,7 +224,7 @@ def generate_storyboard(
 
 ---
 
-## 配置选项
+## Configuration Options
 
 ### config.yaml
 
@@ -249,48 +249,48 @@ generation:
 
 ---
 
-## 错误处理
+## Error Handling
 
-### 常见错误码
+### Common Error Codes
 
-- `API_KEY_MISSING`: API 密钥未配置
-- `API_TIMEOUT`: API 调用超时
-- `GENERATION_FAILED`: 视频/图片生成失败
-- `CONSISTENCY_LOW`: 一致性检查未通过
-- `PHASE_FAILED`: 阶段执行失败
+- `API_KEY_MISSING`: API key not configured
+- `API_TIMEOUT`: API call timeout
+- `GENERATION_FAILED`: Video/image generation failed
+- `CONSISTENCY_LOW`: Consistency check failed
+- `PHASE_FAILED`: Phase execution failed
 
-### 错误处理示例
+### Error Handling Example
 
 ```python
 try:
     result = run_pipeline(...)
 except APIKeyError as e:
-    print(f"API 密钥错误: {e}")
+    print(f"API key error: {e}")
 except TimeoutError as e:
-    print(f"API 调用超时: {e}")
+    print(f"API call timeout: {e}")
 except PipelineError as e:
-    print(f"管线执行错误: {e}")
+    print(f"Pipeline execution error: {e}")
 ```
 
 ---
 
-## 扩展开发
+## Extension Development
 
-### 添加新的阶段
+### Adding a New Phase
 
-1. 在 `pipeline/src/` 创建新模块
-2. 实现 `execute()` 函数
-3. 在 `pipeline_runner.py` 注册阶段
-4. 添加测试到 `pipeline/tests/`
+1. Create new module in `pipeline/src/`
+2. Implement `execute()` function
+3. Register phase in `pipeline_runner.py`
+4. Add tests to `pipeline/tests/`
 
-### 自定义转场效果
+### Custom Transition Effects
 
-1. 修改 `phase7_assembly.py`
-2. 实现新的转场函数
-3. 在配置文件中注册
+1. Modify `phase7_assembly.py`
+2. Implement new transition function
+3. Register in configuration file
 
-### 集成新的 API
+### Integrating New APIs
 
-1. 创建新的 client 模块
-2. 实现标准接口（submit/poll）
-3. 在配置文件中添加 API 配置
+1. Create new client module
+2. Implement standard interface (submit/poll)
+3. Add API configuration to config file
