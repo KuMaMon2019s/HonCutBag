@@ -60,7 +60,11 @@ SYSTEM_PROMPT = (
     "隐忍/克制：神情内敛，唇线收紧 → restrained expression, tight lips\n\n"
     "同时生成一句中文字幕（≤15字）。\n"
     "输出严格 JSON：{\"prompt\": \"英文prompt\", \"caption\": \"中文字幕\"}\n"
-    "不要输出任何解释文字。"
+    "不要输出任何解释文字。\n\n"
+    "【Identity Anchor 规则】\n"
+    "每个镜头的 visual 描述中，角色必须用「角色名 — 视觉特征」格式开头。\n"
+    "禁止使用代词（he/she/该角色/同上/此人），必须每次写出角色名+特征。\n"
+    "示例：'林夏 — 黑色长直发及肩, 白色修身衬衫, 深蓝西装裤 — 站在便利店门口...'\n"
 )
 
 USER_PROMPT_TEMPLATE = (
@@ -265,7 +269,29 @@ def _build_shot_prompt(shot: Dict[str, Any], characters: Optional[List[Dict[str,
     who = ", ".join(who_list) if isinstance(who_list, list) else str(who_list)
     emotion = shot.get("emotion", "")
     where = shot.get("where", "")
-    
+
+    # --- P0-B: Identity Anchor（参考 OpenMontage seedance-prompting.md L47）---
+    # 从 characters 提取角色 3-6 个视觉特征，逐字复述到每个镜头 prompt
+    try:
+        characters_map = {}
+        if characters:
+            for char in characters:
+                char_name = char.get("name", "")
+                if char_name:
+                    characters_map[char_name] = char
+        identity_prefix = ""
+        shot_who = who_list if isinstance(who_list, list) else [who_list]
+        for char_name in shot_who:
+            char_info = characters_map.get(char_name, {})
+            appearance = char_info.get("appearance", {})
+            summary = appearance.get("summary", "")
+            if summary:
+                identity_prefix += f"{char_name} — {summary} — "
+        if identity_prefix:
+            visual = identity_prefix.rstrip(" — ") + ". " + visual
+    except Exception:
+        pass  # 降级：不阻断主流程
+
     # Build reference binding for characters in this shot
     ref_parts = []
     if characters:

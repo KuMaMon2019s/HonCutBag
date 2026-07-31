@@ -1070,6 +1070,36 @@ def run_phase2_5(storyboard_data: dict, characters_data: dict, output_dir: Path,
                 except Exception as e:
                     print(f"  ⚠ [M2] 分镜图序列生成失败（降级跳过）: {e}")
 
+                # --- P0-A: 场景参考图生成（学 Toonflow 场景资产）---
+                try:
+                    scenes_dir = output_dir / "scenes"
+                    scenes_dir.mkdir(exist_ok=True)
+                    # 提取所有唯一场景
+                    unique_wheres = list(set(
+                        shot.get("where", "") for shot in storyboard_data.get("shots", [])
+                        if shot.get("where")
+                    ))
+                    scene_count = 0
+                    for where in unique_wheres:
+                        scene_id = where.replace(" ", "_").replace("/", "_")[:30]
+                        scene_dir = scenes_dir / scene_id
+                        scene_dir.mkdir(exist_ok=True)
+                        ref_path = scene_dir / "reference.png"
+                        if ref_path.exists():
+                            scene_count += 1
+                            continue
+                        try:
+                            scene_prompt = f"Scene: {where}. Photorealistic environment, cinematic quality, no people, establishing shot."
+                            from seedream_client import text_to_image
+                            text_to_image(prompt=scene_prompt, output_path=str(ref_path))
+                            scene_count += 1
+                            print(f"    [P0-A] 场景参考图 {scene_id}/reference.png ✓")
+                        except Exception as e:
+                            print(f"    [P0-A] 场景参考图 {scene_id} 失败（降级跳过）: {e}")
+                    print(f"  → [P0-A] 场景参考图: {scene_count}/{len(unique_wheres)} 个")
+                except Exception as e:
+                    print(f"  ⚠ [P0-A] 场景参考图生成失败（降级跳过）: {e}")
+
                 return {
                     "status": "done",
                     "duration_s": _elapsed(start),
@@ -1779,6 +1809,23 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
         # Strategy: match by name/id in prompt → fallback to protagonist
         first_frame_b64 = None
         prompt_lower = prompt.lower()
+
+        # --- P0-C: 资产ID绑定匹配（学 Toonflow associateAssetsIds）---
+        associate_assets = meta.get("associate_assets", [])
+        if associate_assets and first_frame_b64 is None:
+            for asset_id in associate_assets:
+                if asset_id.startswith("char:"):
+                    char_id = asset_id[5:]
+                    # 尝试匹配角色参考图
+                    front_png = output_dir / "characters" / char_id / "front.png"
+                    if not front_png.exists():
+                        front_png = output_dir / "characters" / "characters" / char_id / "front.png"
+                    if front_png.exists():
+                        first_frame_b64 = _b64.b64encode(front_png.read_bytes()).decode()
+                        print(f"    [P0-C] 资产绑定匹配角色: {char_id}")
+                        break
+
+        # Strategy: match by name/id in prompt → fallback to protagonist
         for char_name, b64 in char_ref_map.items():
             if char_name in prompt_lower:
                 first_frame_b64 = b64
@@ -1796,6 +1843,16 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
         if first_frame_b64 is None and storyboard_b64:
             first_frame_b64 = storyboard_b64
             print(f"    [ref] 注入故事板风格参考")
+
+        # --- P0-A3: 场景参考图（优先级: 角色 > 场景 > 分镜图）---
+        if first_frame_b64 is None:
+            shot_where = meta.get("where", "")
+            if shot_where:
+                scene_id = shot_where.replace(" ", "_").replace("/", "_")[:30]
+                scene_ref = output_dir / "scenes" / scene_id / "reference.png"
+                if scene_ref.exists() and scene_ref.stat().st_size > 1024:
+                    first_frame_b64 = _b64.b64encode(scene_ref.read_bytes()).decode()
+                    print(f"    [P0-A] 注入场景参考图: {scene_id}")
 
         # --- M2: 分镜图构图参考（优先级低于角色参考图）---
         if first_frame_b64 is None:
@@ -2663,82 +2720,103 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
     storyboard_path = output_dir / "STORYBOARD.json"
     sb_path_str = str(storyboard_path) if storyboard_path.exists() else None
 
+    # --- P0-D3: 如果视频已有音轨（Seedance generate_audio），跳过环境音合成 ---
+    has_audio = False
+    try:
+        import subprocess as _sp
+        probe_cmd = ["ffprobe", "-v", "quiet", "-select_streams", "a", "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(raw_video)]
+        probe_result = _sp.run(probe_cmd, capture_output=True, text=True, timeout=10)
+        has_audio = bool(probe_result.stdout.strip())
+    except Exception:
+        pass
+    if has_audio:
+        print("  → [P0-D3] 视频已有音轨（Seedance generate_audio），跳过环境音合成")
+
     try:
         from visual_post import process_visual
         from rhythm_editor import edit_rhythm
 
         # Step 8.1: Audio processing via OM AudioMixer
-        print("  → audio_pipeline: 音频处理 (AudioMixer: loudnorm + ducking)...")
-        audio_out = output_dir / "audio_processed.mp4"
-
-        # Detect background music for ducking
-        bgm_path = _detect_bgm(output_dir, storyboard_path)
-        if bgm_path:
-            print(f"    ✓ BGM detected: {Path(bgm_path).name}")
+        if has_audio:
+            # 视频已有音轨，直接复制作为音频处理输出，跳过环境音合成
+            import shutil
+            audio_out = output_dir / "audio_processed.mp4"
+            shutil.copy2(raw_video, audio_out)
+            outputs.append("audio_processed.mp4")
+            print(f"  ✓ [P0-D3] 跳过环境音合成，直接使用视频自带音轨")
+            audio_success = True
         else:
-            print(f"    ⊘ No BGM detected (skipping ducking)")
+            print("  → audio_pipeline: 音频处理 (AudioMixer: loudnorm + ducking)...")
+            audio_out = output_dir / "audio_processed.mp4"
 
-        audio_success = False
-        try:
-            from tools.audio.audio_mixer import AudioMixer
-            mixer = AudioMixer()
-
-            # Prepare tracks
-            tracks = [{"path": str(raw_video), "role": "speech"}]
+            # Detect background music for ducking
+            bgm_path = _detect_bgm(output_dir, storyboard_path)
             if bgm_path:
-                tracks.append({"path": bgm_path, "role": "music", "volume": 0.2})
-
-            mix_result = mixer.execute({
-                "operation": "full_mix" if bgm_path else "mix",
-                "tracks": tracks,
-                "ducking": {"enabled": True, "music_volume_during_speech": 0.15} if bgm_path else None,
-                "normalize": True,
-                "loudnorm_target": -14,  # YouTube/TikTok standard
-                "output_path": str(audio_out),
-            })
-
-            if mix_result.success:
-                outputs.append("audio_processed.mp4")
-                audio_success = True
-                print(f"  ✓ Audio processing complete")
-
-                # AudioMixer outputs audio-only (-vn); remux processed audio
-                # back into the original video stream so downstream steps
-                # (visual_post, rhythm_editor, final_encode) still have video.
-                remux_tmp = output_dir / "audio_remux_tmp.mp4"
-                remux_cmd = [
-                    "ffmpeg", "-y",
-                    "-i", str(raw_video),       # original video with video stream
-                    "-i", str(audio_out),        # processed audio-only file
-                    "-map", "0:v",              # take video from original
-                    "-map", "1:a",              # take audio from processed
-                    "-c:v", "copy",             # don't re-encode video
-                    "-c:a", "aac",
-                    "-shortest",
-                    str(remux_tmp),
-                ]
-                import subprocess as _sp
-                try:
-                    _sp.run(remux_cmd, capture_output=True, check=True)
-                    import shutil
-                    shutil.move(str(remux_tmp), str(audio_out))
-                    print(f"  ✓ Audio remuxed into video stream")
-                except Exception as remux_err:
-                    print(f"  ⚠ Audio remux failed: {remux_err}, using original video")
-                    import shutil
-                    if remux_tmp.exists():
-                        remux_tmp.unlink()
-                    shutil.copy2(str(raw_video), str(audio_out))
+                print(f"    ✓ BGM detected: {Path(bgm_path).name}")
             else:
-                print(f"  ⚠ AudioMixer failed: {mix_result.error}")
+                print(f"    ⊘ No BGM detected (skipping ducking)")
+
+            audio_success = False
+            try:
+                from tools.audio.audio_mixer import AudioMixer
+                mixer = AudioMixer()
+
+                # Prepare tracks
+                tracks = [{"path": str(raw_video), "role": "speech"}]
+                if bgm_path:
+                    tracks.append({"path": bgm_path, "role": "music", "volume": 0.2})
+
+                mix_result = mixer.execute({
+                    "operation": "full_mix" if bgm_path else "mix",
+                    "tracks": tracks,
+                    "ducking": {"enabled": True, "music_volume_during_speech": 0.15} if bgm_path else None,
+                    "normalize": True,
+                    "loudnorm_target": -14,  # YouTube/TikTok standard
+                    "output_path": str(audio_out),
+                })
+
+                if mix_result.success:
+                    outputs.append("audio_processed.mp4")
+                    audio_success = True
+                    print(f"  ✓ Audio processing complete")
+
+                    # AudioMixer outputs audio-only (-vn); remux processed audio
+                    # back into the original video stream so downstream steps
+                    # (visual_post, rhythm_editor, final_encode) still have video.
+                    remux_tmp = output_dir / "audio_remux_tmp.mp4"
+                    remux_cmd = [
+                        "ffmpeg", "-y",
+                        "-i", str(raw_video),       # original video with video stream
+                        "-i", str(audio_out),        # processed audio-only file
+                        "-map", "0:v",              # take video from original
+                        "-map", "1:a",              # take audio from processed
+                        "-c:v", "copy",             # don't re-encode video
+                        "-c:a", "aac",
+                        "-shortest",
+                        str(remux_tmp),
+                    ]
+                    import subprocess as _sp
+                    try:
+                        _sp.run(remux_cmd, capture_output=True, check=True)
+                        import shutil
+                        shutil.move(str(remux_tmp), str(audio_out))
+                        print(f"  ✓ Audio remuxed into video stream")
+                    except Exception as remux_err:
+                        print(f"  ⚠ Audio remux failed: {remux_err}, using original video")
+                        import shutil
+                        if remux_tmp.exists():
+                            remux_tmp.unlink()
+                        shutil.copy2(str(raw_video), str(audio_out))
+                else:
+                    print(f"  ⚠ AudioMixer failed: {mix_result.error}")
+                    # Fallback: just copy video
+                    import shutil
+                    shutil.copy2(raw_video, audio_out)
+            except ImportError as e:
+                print(f"  ⚠ AudioMixer unavailable: {e}")
                 # Fallback: just copy video
                 import shutil
                 shutil.copy2(raw_video, audio_out)
-        except ImportError as e:
-            print(f"  ⚠ AudioMixer unavailable: {e}")
-            # Fallback: just copy video
-            import shutil
-            shutil.copy2(raw_video, audio_out)
 
         audio_out = str(audio_out)
 

@@ -24,6 +24,7 @@ def submit(
     ratio: str = "16:9",
     first_frame_base64: Optional[str] = None,
     reference_image_base64: Optional[str] = None,
+    generate_audio: str = "true",  # P0-D: 默认开启（学 OpenMontage: "sync audio is the moat"）
 ) -> str:
     """Submit a Seedance generation task. Returns task_id."""
     # Sanitize prompt to remove IP risks
@@ -77,7 +78,7 @@ def submit(
     payload = {
         "model": model,
         "content": content,
-        "generate_audio": False,
+        "generate_audio": generate_audio,
         "ratio": ratio,
         "duration": duration,
         "watermark": False,  # MUST be included at top level

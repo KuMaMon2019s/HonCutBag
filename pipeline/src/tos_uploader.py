@@ -182,7 +182,60 @@ def get_signed_url(object_key: str, expires: int = 7200) -> str:
     return f"https://{host}/{object_key}?{canonical_qs}&X-Tos-Signature={signature}"
 
 
+# ─── Image compression (P0-E, ref: Toonflow zipImage) ────────────────────────
+
+def compress_image_base64(b64_data: str, max_bytes: int = 300 * 1024) -> str:
+    """压缩 base64 图片到目标大小以下（参考 Toonflow zipImage）。
+    
+    策略：先降 quality，再降分辨率，循环直到 < max_bytes。
+    """
+    import io
+    try:
+        from PIL import Image
+    except ImportError:
+        return b64_data  # Pillow 未安装，跳过压缩
+    
+    raw = base64.b64decode(b64_data)
+    if len(raw) <= max_bytes:
+        return b64_data  # 已经够小
+    
+    img = Image.open(io.BytesIO(raw))
+    if img.mode == 'RGBA':
+        img = img.convert('RGB')
+    
+    # 策略1: 降 quality
+    for quality in [85, 70, 55, 40]:
+        buf = io.BytesIO()
+        img.save(buf, format='JPEG', quality=quality, optimize=True)
+        if buf.tell() <= max_bytes:
+            return base64.b64encode(buf.getvalue()).decode()
+    
+    # 策略2: 降分辨率 + 降 quality
+    for scale in [0.75, 0.5, 0.35]:
+        new_size = (int(img.width * scale), int(img.height * scale))
+        resized = img.resize(new_size, Image.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        resized.save(buf, format='JPEG', quality=60, optimize=True)
+        if buf.tell() <= max_bytes:
+            return base64.b64encode(buf.getvalue()).decode()
+    
+    # 兜底：返回最小版本
+    buf = io.BytesIO()
+    img.resize((int(img.width * 0.25), int(img.height * 0.25)), Image.Resampling.LANCZOS).save(
+        buf, format='JPEG', quality=40, optimize=True)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
 # ─── Upload ───────────────────────────────────────────────────────────────────
+
+def compress_image_bytes(image_data: bytes, max_bytes: int = 300 * 1024) -> bytes:
+    """压缩图片字节到目标大小以下。内部复用 compress_image_base64。"""
+    if len(image_data) <= max_bytes:
+        return image_data
+    b64 = base64.b64encode(image_data).decode()
+    compressed_b64 = compress_image_base64(b64, max_bytes=max_bytes)
+    return base64.b64decode(compressed_b64)
+
 
 def upload_image(image_data: bytes, content_type: str = "image/png") -> Optional[str]:
     """Upload image to TOS and return pre-signed URL.
@@ -198,6 +251,9 @@ def upload_image(image_data: bytes, content_type: str = "image/png") -> Optional
     if not all([config["ak"], config["sk"], config["bucket"]]):
         print("  [tos] TOS config incomplete (need TOS_ACCESS_KEY, TOS_SECRET_KEY, TOS_BUCKET), skipping upload")
         return None
+
+    # --- P0-E: 上传前压缩（参考 Toonflow zipImage）---
+    image_data = compress_image_bytes(image_data)
 
     # Object key with content hash for dedup
     content_hash = hashlib.sha256(image_data).hexdigest()
@@ -256,6 +312,9 @@ def base64_to_signed_url(base64_data: str) -> Optional[str]:
     # Strip data URL prefix if present (e.g., "data:image/png;base64,...")
     if "," in base64_data:
         base64_data = base64_data.split(",", 1)[1]
+
+    # --- P0-E: 上传前压缩（参考 Toonflow zipImage）---
+    base64_data = compress_image_base64(base64_data)
 
     try:
         image_bytes = base64.b64decode(base64_data)
