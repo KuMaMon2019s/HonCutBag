@@ -147,32 +147,48 @@ def submit(
 
 def poll(
     task_id: str,
-    max_attempts: int = 360,  # 增加到 1 小时（360 × 10秒）
+    max_attempts: int = 30,  # 语义改为：连续无进度轮询次数上限（默认 30 × 10s = 300s 无进度增长才判定卡死）
     interval: int = 10,
 ) -> dict:
-    """Poll task until done.
-    
+    """Poll task until done, with progress-based timeout.
+
+    只要任务还在 running/queued 且 progress 在增长，就一直等下去（适合 8GB 显存的慢机器，
+    单任务可能 20-60 分钟）。只有当 progress 连续 max_attempts 次轮询都没有任何增长，
+    且 status 仍是 running/queued 时，才判定卡死并 raise TimeoutError。
+
+    Args:
+        task_id: 任务 ID
+        max_attempts: 连续无进度增长的轮询次数上限。默认 30（即 30 × interval 秒无进度增长则超时）。
+                      参数名保留以向后兼容，语义已从"总轮询次数"改为"无进度超时轮数"。
+        interval: 轮询间隔（秒）
+
     Returns:
-        dict with keys: status ("completed"|"failed"|"running"|"queued"), progress (0-100)
-    
+        dict with keys: status ("completed"), progress (100)
+
     Raises:
-        TimeoutError: If polling exceeds max_attempts * interval
-        RuntimeError: If the task fails
+        TimeoutError: 如果 progress 连续 max_attempts * interval 秒没有增长
+        RuntimeError: 如果任务失败或返回 error 字段
     """
     api_url = _get_api_url()
     session = _request_session()
     url = f"{api_url}/status/{task_id}"
-    
-    for attempt in range(1, max_attempts + 1):
+
+    last_progress: float = -1.0
+    stale_count: int = 0          # 连续无进度增长的轮询次数
+    total_polls: int = 0          # 总轮询次数（仅用于日志）
+    last_progress_change_poll: int = 0  # 上次 progress 变化时的 total_polls 序号
+
+    while True:
+        total_polls += 1
         try:
             resp = session.get(url, timeout=15)
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
-            print(f"  [local_poll {attempt}/{max_attempts}] error: {e}")
+            print(f"  [local_poll #{total_polls}] network error: {e}")
             time.sleep(interval)
             continue
-        
+
         # Check for error responses (e.g., {"error": "task not found"})
         if "error" in data and data["error"] is not None:
             error_msg = data["error"]
@@ -180,24 +196,40 @@ def poll(
                 raise RuntimeError(f"Local video task {task_id} not found in Bridge database")
             # Other errors
             raise RuntimeError(f"Local video task {task_id} error: {error_msg}")
-        
+
         status = data.get("status", "unknown")
-        progress = data.get("progress", 0)
-        
+        progress = data.get("progress", 0) or 0  # guard None
+
         if status == "completed":
+            print(f"  [local_poll #{total_polls}] ✓ completed (progress={progress}%)")
             return {"status": "completed", "progress": 100}
         elif status == "failed":
             error_msg = data.get("error", "unknown error")
             raise RuntimeError(f"Local video task {task_id} failed: {error_msg}")
-        elif status == "unknown":
-            # Unknown status is suspicious, log warning but continue
-            print(f"  [local_poll {attempt}/{max_attempts}] WARNING: status=unknown, continuing...")
+
+        # Progress-based stall detection
+        if progress > last_progress:
+            if stale_count > 0:
+                print(f"  [local_poll #{total_polls}] ↗ progress resumed: {last_progress}% → {progress}%")
+            last_progress = progress
+            stale_count = 0
+            last_progress_change_poll = total_polls
         else:
-            print(f"  [local_poll {attempt}/{max_attempts}] status={status} progress={progress}%")
-        
+            stale_count += 1
+
+        stale_seconds = stale_count * interval
+        if status == "unknown":
+            print(f"  [local_poll #{total_polls}] WARNING: status=unknown progress={progress}% (no-progress wait {stale_seconds}s / {max_attempts * interval}s)")
+        else:
+            print(f"  [local_poll #{total_polls}] status={status} progress={progress}% (no-progress wait {stale_seconds}s / {max_attempts * interval}s)")
+
+        if stale_count >= max_attempts and status in ("running", "queued", "unknown"):
+            raise TimeoutError(
+                f"Local video task {task_id} stalled: progress stuck at {last_progress}% "
+                f"for {stale_count} polls ({stale_seconds}s) with status={status}"
+            )
+
         time.sleep(interval)
-    
-    raise TimeoutError(f"Local video task {task_id} timed out after {max_attempts * interval}s")
 
 
 def download(task_id: str, output_path: str, timeout: int = 120) -> str:
