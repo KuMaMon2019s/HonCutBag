@@ -771,7 +771,7 @@ def run_phase2(text: str, output_dir: Path, duration: int, dry_run: bool, report
         print("  → adaptation_engine: 影视化改编...")
         if reporter:
             reporter.step("phase2", "影视化改编", progress_pct=70)
-        adapted = adapt_events(events, characters_list, target_duration=duration)
+        adapted = adapt_events(events, characters_list, target_duration=duration, source_text=text)
         adapted_shots = adapted.get("shots", [])
         print(f"    ✓ 改编完成，{len(adapted_shots)} 个镜头")
         if reporter:
@@ -2018,7 +2018,10 @@ def run_phase5(storyboard_data: dict, output_dir: Path, dry_run: bool) -> dict:
     start = _now()
     
     # Estimate based on shot count
-    _num_shots = len(storyboard_data.get("shots", [])) if storyboard_data else 10
+    _num_shots = len(storyboard_data.get("shots", [])) if storyboard_data else 0
+    if _num_shots == 0:
+        # 如果没有 storyboard_data，使用默认值（但不写死 10）
+        _num_shots = 5  # 合理的默认值，实际会根据剧本长度计算
     _p5_est = estimate_phase_duration("phase5", num_shots=_num_shots)
     print(f"  ⏱ Phase 5 开始 (预估 ~{int(_p5_est)}s, {_num_shots} 镜头)")
 

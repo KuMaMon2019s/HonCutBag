@@ -109,6 +109,62 @@ USER_PROMPT_TEMPLATE = (
 LLM_TIMEOUT = 90  # 秒
 MAX_RETRIES = 1  # 解析失败重试次数
 AVG_SHOT_DURATION = 6  # 默认每镜时长（秒）
+MIN_SHOT_DURATION = 3  # 单镜头最小时长（秒）
+MAX_SHOT_DURATION = 15  # 单镜头最大时长（秒）
+CHARS_PER_SECOND = 4  # 中文剧本预估：约 4 字/秒（范围 3-5）
+DEFAULT_TARGET_DURATION = 60  # 默认目标时长（用户未指定时使用）
+
+
+def estimate_duration_from_text(text: str) -> int:
+    """
+    根据剧本字数预估视频时长（秒）。
+
+    中文阅读/表演节奏约 3-5 字/秒，取中值 4 字/秒。
+    结果限制在 [15, 300] 秒范围内（15秒~5分钟）。
+
+    Args:
+        text: 剧本文本
+
+    Returns:
+        预估时长（秒）
+    """
+    if not text:
+        return DEFAULT_TARGET_DURATION
+
+    # 去除空白后计算有效字符数
+    clean_text = re.sub(r'\s+', '', text)
+    char_count = len(clean_text)
+
+    if char_count == 0:
+        return DEFAULT_TARGET_DURATION
+
+    # 预估时长 = 字数 / 字速
+    estimated = char_count / CHARS_PER_SECOND
+
+    # 限制范围：最短 15 秒，最长 300 秒（5 分钟）
+    estimated = max(15, min(300, estimated))
+
+    return int(estimated)
+
+
+def estimate_shot_count(target_duration: int, shot_duration: int = AVG_SHOT_DURATION) -> int:
+    """
+    根据目标时长和单镜时长计算合理的镜头数量。
+
+    单镜时长限制在 [MIN_SHOT_DURATION, MAX_SHOT_DURATION] 范围内。
+
+    Args:
+        target_duration: 目标总时长（秒）
+        shot_duration: 每镜平均时长（秒）
+
+    Returns:
+        建议的最大镜头数
+    """
+    # 将 shot_duration 限制在合理范围内
+    shot_duration = max(MIN_SHOT_DURATION, min(MAX_SHOT_DURATION, shot_duration))
+
+    max_shots = max(1, target_duration // shot_duration)
+    return max_shots
 
 
 # ─── LLM 客户端 ─────────────────────────────────────────────────────────────
@@ -270,8 +326,9 @@ def _build_events_json(events: List[Dict[str, Any]]) -> str:
 def adapt_events(
     events: List[Dict[str, Any]],
     characters: Optional[List[Dict[str, Any]]] = None,
-    target_duration: int = 60,
+    target_duration: Optional[int] = None,
     shot_duration: int = AVG_SHOT_DURATION,
+    source_text: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     将事件列表改编为 shot 列表
@@ -279,8 +336,9 @@ def adapt_events(
     Args:
         events: 事件列表（event_extractor.py 输出）
         characters: 角色列表（character_discoverer.py 输出，可选）
-        target_duration: 目标总时长（秒），默认 60
+        target_duration: 目标总时长（秒），默认 None（根据剧本长度智能预估）
         shot_duration: 每镜平均时长（秒），默认 6
+        source_text: 原始剧本文本（用于智能预估时长）
 
     Returns:
         包含 target_duration, estimated_shots, strategy, shots 的字典
@@ -293,14 +351,23 @@ def adapt_events(
     if not events:
         raise ValueError("事件列表为空，无法进行改编")
 
+    # ── 智能时长预估 ─────────────────────────────────────────────────────
+    if target_duration is None:
+        if source_text:
+            target_duration = estimate_duration_from_text(source_text)
+            print(f"  ℹ 根据剧本长度智能预估时长: {target_duration}秒")
+        else:
+            target_duration = DEFAULT_TARGET_DURATION
+            print(f"  ℹ 使用默认时长: {target_duration}秒")
+
     if target_duration < 10:
         raise ValueError(f"目标时长不合理：{target_duration}秒（最少 10 秒）")
 
     if shot_duration < 2:
         raise ValueError(f"每镜时长不合理：{shot_duration}秒（最少 2 秒）")
 
-    # ── 计算最大 shot 数 ──────────────────────────────────────────────────
-    max_shots = max(1, target_duration // shot_duration)
+    # ── 计算最大 shot 数（智能分镜）──────────────────────────────────────
+    max_shots = estimate_shot_count(target_duration, shot_duration)
 
     # ── 构建 prompt ───────────────────────────────────────────────────────
     events_json = _build_events_json(events)
