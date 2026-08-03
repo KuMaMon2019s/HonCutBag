@@ -364,6 +364,20 @@ DEFAULT_TEXT_MODEL = Models.ARK_TEXT_LITE
 DEFAULT_IMAGE_MODEL = Models.ARK_IMAGE
 DEFAULT_VIDEO_MODEL = Models.ARK_VIDEO
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 本地视频 API 配置（HonCutBag ComfyUI 后端）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# 本地视频生成 API URL（Windows ComfyUI 机器）
+LOCAL_VIDEO_API_URL = os.environ.get("LOCAL_VIDEO_API_URL", "http://192.168.31.221:9100")
+
+# 是否优先使用本地视频 API（True = 优先本地，False = 仅用 ARK）
+USE_LOCAL_VIDEO_API = os.environ.get("USE_LOCAL_VIDEO_API", "true").lower() in ("true", "1", "yes")
+
+# Seedance 模型 ID（Agent Plan 支持的模型）
+# 可选: doubao-seedance-2.0, doubao-seedance-2.0-fast, doubao-seedance-2.0-mini
+SEEDANCE_MODEL = os.environ.get("SEEDANCE_MODEL", "doubao-seedance-2.0-mini")
+
 # Paths
 OM_TOOLS_DIR = ToolPaths.OM_TOOLS_DIR
 

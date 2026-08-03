@@ -203,7 +203,17 @@ def _check_red_line(rule_id: str, output_dir: Path,
         f = output_dir / "CHARACTERS.json"
         if f.exists():
             data = json.loads(f.read_text())
-            return len(data.get("characters", [])) > 0
+            chars = data.get("characters", [])
+            if len(chars) > 0:
+                return True
+            # Landscape-only scripts: storyboard exists with shots but no
+            # human characters — this is valid (e.g. nature scenery).
+            sb = output_dir / "STORYBOARD.json"
+            if sb.exists():
+                sb_data = json.loads(sb.read_text())
+                if len(sb_data.get("shots", [])) > 0:
+                    return True
+            return False
         return False
 
     if rule_id == "storyboard_exists":

@@ -12,7 +12,8 @@ from typing import Optional
 
 from config import get_api_key
 
-ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
+# Phase 1 LLM 使用 Agent Plan 端点（不是按量计费端点）
+ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/plan/v3"
 
 SYSTEM_PROMPT = (
     "你是资深影视导演。对剧本做导演级规划分析。"

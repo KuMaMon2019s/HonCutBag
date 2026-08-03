@@ -19,7 +19,7 @@ POLL_ENDPOINT = f"{BASE_URL}/contents/generations/tasks/{{task_id}}"
 def submit(
     prompt: str,
     api_key: str,
-    model: str = "doubao-seedance-2.0-mini",
+    model: str = None,
     duration: int = 7,
     ratio: str = "16:9",
     first_frame_base64: Optional[str] = None,
@@ -29,6 +29,14 @@ def submit(
     reference_video_base64: Optional[str] = None,  # P1-D: 多模态组合参考
 ) -> str:
     """Submit a Seedance generation task. Returns task_id."""
+    # 从 config 读取默认模型（如果未传入）
+    if model is None:
+        try:
+            from config import SEEDANCE_MODEL
+            model = SEEDANCE_MODEL
+        except ImportError:
+            model = "doubao-seedance-2.0-mini"
+    
     # Sanitize prompt to remove IP risks
     sanitized_prompt, filtered_terms = sanitize_prompt(prompt)
     if filtered_terms:

@@ -1727,7 +1727,7 @@ def _run_phase5_om_seedance(storyboard_data: dict, output_dir: Path, characters_
 
 
 def _run_phase5_fallback(output_dir: Path) -> dict:
-    """降级：使用手写的 seedance_client"""
+    """降级：使用手写的 seedance_client，优先本地 API，降级到 ARK Agent Plan"""
     output_dir = Path(output_dir)
     from seedance_client import submit, poll, download
 
@@ -1735,11 +1735,25 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
     if not shots_dir.exists():
         return {"status": "skipped", "reason": "no shots directory"}
 
-    api_key = get_api_key("ARK_AGENT_API_KEY") or os.environ.get("ARK_AGENT_API_KEY", "")
-    if not api_key:
-        return {"status": "error", "error": "ARK_AGENT_API_KEY not set"}
+    # --- 本地 API 路由检测 ---
+    use_local = False
+    try:
+        from config import USE_LOCAL_VIDEO_API
+        if USE_LOCAL_VIDEO_API:
+            import local_video_client
+            if local_video_client.is_available(timeout=3.0):
+                use_local = True
+                print("  → 路由: 本地视频 API (192.168.31.221:9100) 可用，优先使用")
+            else:
+                print("  → 路由: 本地视频 API 不可达，降级到 ARK Agent Plan")
+    except ImportError:
+        print("  → 路由: local_video_client 未找到，使用 ARK Agent Plan")
 
-    print("  → 模式: text_to_video (seedance_client fallback)")
+    api_key = get_api_key("ARK_AGENT_API_KEY") or os.environ.get("ARK_AGENT_API_KEY", "")
+    if not api_key and not use_local:
+        return {"status": "error", "error": "ARK_AGENT_API_KEY not set and local API unavailable"}
+
+    print(f"  → 模式: {'local_api' if use_local else 'seedance_client'} (text_to_video)")
 
     # Load character reference images for consistency
     import base64 as _b64
@@ -1791,7 +1805,11 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
         # --- M4: 模型路由（增量，失败用原始 prompt）---
         try:
             from prompt_router import route_prompt
-            model_name = os.environ.get("SEEDANCE_MODEL", "seedance-2-0-mini")
+            try:
+                from config import SEEDANCE_MODEL
+                model_name = SEEDANCE_MODEL
+            except ImportError:
+                model_name = os.environ.get("SEEDANCE_MODEL", "doubao-seedance-2.0-mini")
             routed_prompt = route_prompt(
                 model_name=model_name,
                 mode="single_shot",
@@ -1909,20 +1927,53 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
         max_retries = 3
         for attempt in range(max_retries + 1):
             try:
-                print(f"  → {shot_dir.name}: 提交视频生成...")
+                out_path = str(shot_dir / "output.mp4")
+                
+                # --- 本地 API 路由 ---
+                if use_local:
+                    try:
+                        print(f"  → {shot_dir.name}: 提交本地 API 视频生成...")
+                        import local_video_client
+                        local_video_client.generate_video(
+                            prompt=prompt,
+                            output_path=out_path,
+                            reference_image_base64=first_frame_b64,
+                            seed=shot_seed if shot_seed is not None else -1,
+                            duration=duration,
+                            width=1280,
+                            height=720,
+                            fps=24,
+                        )
+                        outputs.append(f"shots/{shot_dir.name}/output.mp4")
+                        if shot_seed is not None:
+                            meta["seed"] = shot_seed
+                            meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False))
+                        print(f"    ✓ {shot_dir.name}: 视频已生成 (本地 API)")
+                        break
+                    except Exception as local_err:
+                        print(f"    ⚠ {shot_dir.name}: 本地 API 失败 — {local_err}")
+                        # 降级到 ARK
+                        use_local = False
+                        if not api_key:
+                            print(f"    ✗ {shot_dir.name}: ARK API key 不可用，跳过")
+                            break
+                        print(f"    → 降级到 ARK Agent Plan...")
+                        continue
+                
+                # --- ARK Agent Plan 路由 ---
+                print(f"  → {shot_dir.name}: 提交 ARK 视频生成...")
                 task_id = submit(prompt=prompt, api_key=api_key, duration=duration, ratio="16:9",
                                  reference_image_base64=first_frame_b64, seed=shot_seed,
                                  reference_video_base64=prev_video_ref)
                 video_url = poll(task_id, api_key=api_key)
                 if video_url:
-                    out_path = str(shot_dir / "output.mp4")
                     download(video_url, out_path)
                     outputs.append(f"shots/{shot_dir.name}/output.mp4")
                     # --- P1-C3: 记录 seed 到 SHOT_META ---
                     if shot_seed is not None:
                         meta["seed"] = shot_seed
                         meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False))
-                    print(f"    ✓ {shot_dir.name}: 视频已生成")
+                    print(f"    ✓ {shot_dir.name}: 视频已生成 (ARK)")
                     break
                 else:
                     print(f"    ✗ {shot_dir.name}: poll 返回空 URL")
@@ -1957,10 +2008,11 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
         # --- P1-D2: 更新上一镜头目录 ---
         prev_shot_dir = shot_dir
 
+    provider = "local_video_client" if use_local else "seedance_client"
     return {
         "status": "done" if outputs else "error",
         "outputs": outputs,
-        "provider": "seedance_client",
+        "provider": provider,
         "mode": "text_to_video",
     }
 
