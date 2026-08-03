@@ -1951,14 +1951,9 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
                         print(f"    ✓ {shot_dir.name}: 视频已生成 (本地 API)")
                         break
                     except Exception as local_err:
-                        print(f"    ⚠ {shot_dir.name}: 本地 API 失败 — {local_err}")
-                        # 降级到 ARK
-                        use_local = False
-                        if not api_key:
-                            print(f"    ✗ {shot_dir.name}: ARK API key 不可用，跳过")
-                            break
-                        print(f"    → 降级到 ARK Agent Plan...")
-                        continue
+                        print(f"    ✗ {shot_dir.name}: 本地 API 失败 — {local_err}")
+                        print(f"    ⚠ 不降级到 ARK（零成本测试模式），跳过此镜头")
+                        break
                 
                 # --- ARK Agent Plan 路由 ---
                 print(f"  → {shot_dir.name}: 提交 ARK 视频生成...")
