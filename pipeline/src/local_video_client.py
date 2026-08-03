@@ -156,6 +156,10 @@ def poll(
     单任务可能 20-60 分钟）。只有当 progress 连续 max_attempts 次轮询都没有任何增长，
     且 status 仍是 running/queued 时，才判定卡死并 raise TimeoutError。
 
+    Bridge v3.2 quirk: 任务完成后 status 可能永远卡在 "running" + progress=100，
+    但 GET /download/{task_id} 能正常下载。当检测到 progress>=100 且 status=running 时，
+    主动探测 /download 端点：连续 3 轮(30s)探测成功 → 判定完成；连续 10 轮(100s)探测失败 → 判定卡死。
+
     Args:
         task_id: 任务 ID
         max_attempts: 连续无进度增长的轮询次数上限。默认 30（即 30 × interval 秒无进度增长则超时）。
@@ -177,6 +181,11 @@ def poll(
     stale_count: int = 0          # 连续无进度增长的轮询次数
     total_polls: int = 0          # 总轮询次数（仅用于日志）
     last_progress_change_poll: int = 0  # 上次 progress 变化时的 total_polls 序号
+
+    # Bridge running/100 quirk tracking
+    at_100_count: int = 0         # progress>=100 且 status=running 的连续轮数
+    download_probe_success: int = 0  # /download 探测连续成功轮数
+    download_probe_fail: int = 0     # /download 探测连续失败轮数
 
     while True:
         total_polls += 1
@@ -207,7 +216,36 @@ def poll(
             error_msg = data.get("error", "unknown error")
             raise RuntimeError(f"Local video task {task_id} failed: {error_msg}")
 
-        # Progress-based stall detection
+        # --- Bridge v3.2 quirk: running + progress=100 ---
+        if progress >= 100 and status == "running":
+            at_100_count += 1
+            # Probe /download endpoint
+            probe_ok = _probe_download(session, api_url, task_id)
+            if probe_ok:
+                download_probe_success += 1
+                download_probe_fail = 0
+                print(f"  [local_poll #{total_polls}] download-probe OK ({download_probe_success}/3 consecutive)")
+                if download_probe_success >= 3:
+                    print(f"  [local_poll #{total_polls}] ✓ Bridge running/100 quirk: download probe succeeded 3x → treating as completed")
+                    return {"status": "completed", "progress": 100}
+            else:
+                download_probe_fail += 1
+                download_probe_success = 0
+                print(f"  [local_poll #{total_polls}] download-probe FAIL ({download_probe_fail}/10 consecutive)")
+                if download_probe_fail >= 10:
+                    raise TimeoutError(
+                        f"Local video task {task_id} stalled: progress=100% status=running, "
+                        f"download probe failed {download_probe_fail} consecutive times"
+                    )
+            time.sleep(interval)
+            continue
+
+        # Reset quirk counters when not in the 100/running state
+        at_100_count = 0
+        download_probe_success = 0
+        download_probe_fail = 0
+
+        # Progress-based stall detection (unchanged for progress < 100)
         if progress > last_progress:
             if stale_count > 0:
                 print(f"  [local_poll #{total_polls}] ↗ progress resumed: {last_progress}% → {progress}%")
@@ -230,6 +268,32 @@ def poll(
             )
 
         time.sleep(interval)
+
+
+def _probe_download(session, api_url: str, task_id: str) -> bool:
+    """Probe /download/{task_id} to check if video is ready (Bridge running/100 quirk).
+
+    Uses stream=True and reads only headers + first few bytes to avoid downloading
+    the entire file. Returns True if HTTP 200 with reasonable content-type/length.
+    """
+    url = f"{api_url}/download/{task_id}"
+    try:
+        resp = session.get(url, stream=True, timeout=10)
+        if resp.status_code == 200:
+            # Check content-type looks like video
+            ct = resp.headers.get("content-type", "")
+            cl = resp.headers.get("content-length", "0")
+            # Read a small chunk to verify it's real data
+            chunk = next(resp.iter_content(chunk_size=1024), b"")
+            resp.close()
+            if chunk and len(chunk) > 0:
+                return True
+        else:
+            resp.close()
+        return False
+    except Exception as e:
+        print(f"  [download-probe] exception: {e}")
+        return False
 
 
 def download(task_id: str, output_path: str, timeout: int = 120) -> str:

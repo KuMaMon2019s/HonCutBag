@@ -378,6 +378,10 @@ USE_LOCAL_VIDEO_API = os.environ.get("USE_LOCAL_VIDEO_API", "true").lower() in (
 # 可选: doubao-seedance-2.0, doubao-seedance-2.0-fast, doubao-seedance-2.0-mini
 SEEDANCE_MODEL = os.environ.get("SEEDANCE_MODEL", "doubao-seedance-2.0-mini")
 
+# 视频生成并发数（1=串行，>1=ThreadPoolExecutor 并发）
+# 本地 Bridge 单 GPU 串行即可；切在线模型时可调大
+VIDEO_GEN_CONCURRENCY = int(os.environ.get("VIDEO_GEN_CONCURRENCY", "1"))
+
 # Paths
 OM_TOOLS_DIR = ToolPaths.OM_TOOLS_DIR
 

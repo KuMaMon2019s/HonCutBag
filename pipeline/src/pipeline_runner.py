@@ -1745,9 +1745,12 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
                 use_local = True
                 print("  → 路由: 本地视频 API (192.168.31.221:9100) 可用，优先使用")
             else:
-                print("  → 路由: 本地视频 API 不可达，降级到 ARK Agent Plan")
+                # 零降级: 本地 API 不可达 → 直接报错，不降级 ARK（成本控制红线）
+                print("  → 路由: 本地视频 API 不可达，ARK 降级已禁用")
+                return {"status": "error", "error": "local video API unreachable, ARK fallback disabled"}
     except ImportError:
-        print("  → 路由: local_video_client 未找到，使用 ARK Agent Plan")
+        print("  → 路由: local_video_client 未找到，ARK 降级已禁用")
+        return {"status": "error", "error": "local_video_client not found, ARK fallback disabled"}
 
     api_key = get_api_key("ARK_AGENT_API_KEY") or os.environ.get("ARK_AGENT_API_KEY", "")
     if not api_key and not use_local:
@@ -1793,12 +1796,22 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
     # 同场景镜头使用相同 seed，确保背景一致性
     scene_seed_map = {}  # {where: seed}
     prev_shot_dir = None  # --- P1-D2: 上一镜头视频作为运动参考 ---
-    for shot_dir in sorted(shots_dir.iterdir()):
-        if not shot_dir.is_dir() or not shot_dir.name.startswith("S"):
-            continue
+    
+    # --- 并发配置 ---
+    try:
+        from config import VIDEO_GEN_CONCURRENCY
+        concurrency = VIDEO_GEN_CONCURRENCY
+    except ImportError:
+        concurrency = int(os.environ.get("VIDEO_GEN_CONCURRENCY", "1"))
+    print(f"  → 并发模式: VIDEO_GEN_CONCURRENCY={concurrency} ({'串行' if concurrency == 1 else f'并行 workers={concurrency}'})")
+    
+    shot_dirs = [d for d in sorted(shots_dir.iterdir()) if d.is_dir() and d.name.startswith("S")]
+    
+    def _process_shot(shot_dir: Path) -> Optional[str]:
+        """处理单个镜头的视频生成，返回 output.mp4 路径或 None"""
         meta_path = shot_dir / "SHOT_META.json"
         if not meta_path.exists():
-            continue
+            return None
 
         meta = json.loads(meta_path.read_text())
         prompt = meta.get("prompt", "")
@@ -1825,7 +1838,7 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
             pass  # 降级用原始 prompt
         duration = meta.get("duration", 5)  # 从 SHOT_META 读取 duration
         if not prompt:
-            continue
+            return None
 
         # Find character reference for this shot
         # Strategy: match by name/id in prompt → fallback to protagonist
@@ -1911,9 +1924,9 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
                 scene_seed_map[shot_where] = int(hashlib.md5(shot_where.encode()).hexdigest()[:8], 16) % 2147483647
             shot_seed = scene_seed_map[shot_where]
 
-        # --- P1-D2: 上一镜头视频作为运动参考（可选）---
+        # --- P1-D2: 上一镜头视频作为运动参考（可选，仅串行模式）---
         prev_video_ref = None
-        if prev_shot_dir is not None:
+        if concurrency == 1 and prev_shot_dir is not None:
             prev_output = prev_shot_dir / "output.mp4"
             if prev_output.exists() and prev_output.stat().st_size > 10240:
                 try:
@@ -1944,18 +1957,17 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
                             height=720,
                             fps=24,
                         )
-                        outputs.append(f"shots/{shot_dir.name}/output.mp4")
                         if shot_seed is not None:
                             meta["seed"] = shot_seed
                             meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False))
                         print(f"    ✓ {shot_dir.name}: 视频已生成 (本地 API)")
-                        break
+                        return f"shots/{shot_dir.name}/output.mp4"
                     except Exception as local_err:
                         print(f"    ✗ {shot_dir.name}: 本地 API 失败 — {local_err}")
                         print(f"    ⚠ 不降级到 ARK（零成本测试模式），跳过此镜头")
-                        break
+                        return None
                 
-                # --- ARK Agent Plan 路由 ---
+                # --- ARK Agent Plan 路由（use_local=False 时才会走到这里）---
                 print(f"  → {shot_dir.name}: 提交 ARK 视频生成...")
                 task_id = submit(prompt=prompt, api_key=api_key, duration=duration, ratio="16:9",
                                  reference_image_base64=first_frame_b64, seed=shot_seed,
@@ -1963,16 +1975,15 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
                 video_url = poll(task_id, api_key=api_key)
                 if video_url:
                     download(video_url, out_path)
-                    outputs.append(f"shots/{shot_dir.name}/output.mp4")
                     # --- P1-C3: 记录 seed 到 SHOT_META ---
                     if shot_seed is not None:
                         meta["seed"] = shot_seed
                         meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False))
                     print(f"    ✓ {shot_dir.name}: 视频已生成 (ARK)")
-                    break
+                    return f"shots/{shot_dir.name}/output.mp4"
                 else:
                     print(f"    ✗ {shot_dir.name}: poll 返回空 URL")
-                    break
+                    return None
             except Exception as e:
                 err_str = str(e)
                 # 429 QuotaExceeded — exponential backoff retry
@@ -1985,7 +1996,7 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
                         continue
                     else:
                         print(f"    ✗ {shot_dir.name}: 配额超限，已重试 {max_retries} 次，跳过")
-                        break
+                        return None
                 if "PrivacyInformation" in err_str and first_frame_b64 is not None:
                     # Seedance rejects real-person reference images — drop and retry text-only
                     print(f"    ⚠ {shot_dir.name}: 参考图被隐私检测拒绝，降级为纯文本生成")
@@ -1998,10 +2009,31 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
                     first_frame_b64 = None
                     continue
                 print(f"    ✗ {shot_dir.name}: 异常 — {e}")
-                break
+                return None
+        
+        return None
 
-        # --- P1-D2: 更新上一镜头目录 ---
-        prev_shot_dir = shot_dir
+    # --- 执行模式：串行或并发 ---
+    if concurrency == 1:
+        # 串行模式（默认，保持原有逻辑和状态更新）
+        for shot_dir in shot_dirs:
+            result = _process_shot(shot_dir)
+            if result:
+                outputs.append(result)
+            prev_shot_dir = shot_dir
+    else:
+        # 并发模式（VIDEO_GEN_CONCURRENCY > 1）
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = {executor.submit(_process_shot, shot_dir): shot_dir for shot_dir in shot_dirs}
+            for future in as_completed(futures):
+                shot_dir = futures[future]
+                try:
+                    result = future.result()
+                    if result:
+                        outputs.append(result)
+                except Exception as e:
+                    print(f"    ✗ {shot_dir.name}: 并发处理异常 — {e}")
 
     provider = "local_video_client" if use_local else "seedance_client"
     return {
