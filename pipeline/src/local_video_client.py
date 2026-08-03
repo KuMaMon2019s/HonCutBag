@@ -147,7 +147,7 @@ def submit(
 
 def poll(
     task_id: str,
-    max_attempts: int = 60,
+    max_attempts: int = 360,  # 增加到 1 小时（360 × 10秒）
     interval: int = 10,
 ) -> dict:
     """Poll task until done.
