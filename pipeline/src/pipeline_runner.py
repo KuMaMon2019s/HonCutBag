@@ -955,6 +955,25 @@ def fill_storyboard_template(template: str, storyboard_data: dict, characters_da
     return prompt
 
 
+def _normalize_shot_id(shot_item: dict) -> Optional[str]:
+    """Return a zero-padded shot ID, or ``None`` when no usable ID exists."""
+    raw = (
+        shot_item.get("shot_id")
+        or shot_item.get("id")
+        or shot_item.get("shot_order", 0)
+    )
+    if not raw:
+        return None
+    if isinstance(raw, int):
+        return f"S{raw:02d}"
+
+    raw_str = str(raw)
+    # Legacy storyboards already store IDs such as ``S01``.
+    if raw_str.upper().startswith("S"):
+        raw_str = raw_str[1:]
+    return f"S{raw_str.zfill(2)}"
+
+
 def _generate_shot_images(output_dir: Path, storyboard_data: dict) -> int:
     """Generate storyboard images for each shot (M2 task).
     
@@ -996,7 +1015,10 @@ def _generate_shot_images(output_dir: Path, storyboard_data: dict) -> int:
         # --- P2-5d: Concurrent shot image generation (learned from Toonflow concurrentCount) ---
         def _gen_shot_image(shot_item):
             """Single shot image generation logic (for concurrent calls)"""
-            shot_id = shot_item.get("shot_id", f"S{shot_item.get('shot_order', 0):02d}")
+            shot_id = _normalize_shot_id(shot_item)
+            if shot_id is None:
+                print("    ⚠ [M2] 分镜缺少有效 shot_id/id/shot_order，跳过")
+                return None
             shot_prompt = shot_item.get("prompt", shot_item.get("visual", ""))
             if not shot_prompt:
                 return None
@@ -1065,7 +1087,7 @@ def _generate_shot_images(output_dir: Path, storyboard_data: dict) -> int:
                         generated_count += 1
                 except Exception as e:
                     shot = futures[future]
-                    shot_id = shot.get("shot_id", f"S{shot.get('shot_order', 0):02d}")
+                    shot_id = _normalize_shot_id(shot) or "<missing>"
                     print(f"    [M2] 分镜图 {shot_id}.png 并发失败（降级跳过）: {e}")
         print(f"  → [M2] 分镜图序列: {generated_count}/{len(shots)} 张")
         return generated_count
