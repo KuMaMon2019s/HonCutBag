@@ -3176,7 +3176,7 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
                         elif "city" in scene_desc or "城" in scene_desc:
                             scene_hint = "city"
                     ambient_tmp = output_dir / ".ambient_fallback.m4a"
-                    if generate_ambient_audio(ambient_dur, str(ambient_tmp), scene_hint=scene_hint):
+                    if generate_ambient_audio(ambient_dur, str(ambient_tmp), scene_hint=scene_hint, target_db=-10.0):
                         # Mix ambient audio into the video
                         ambient_out = output_dir / ".ambient_remux.mp4"
                         import subprocess as _sp
