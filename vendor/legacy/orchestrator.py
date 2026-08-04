@@ -369,6 +369,10 @@ def main():
     if args.shots_dir:
         SHOTS_DIR = Path(args.shots_dir).resolve()
 
+    # Fix: update STORYBOARD_PATH so route_shot() resolves relative first_frame paths correctly
+    global STORYBOARD_PATH
+    STORYBOARD_PATH = Path(args.storyboard).resolve()
+
     print(f"🎬 Phase 4 Orchestrator — {'DRY RUN' if args.dry_run else 'LIVE'}")
     print(f"   Storyboard: {args.storyboard}")
     print(f"   Project: {PROJECT_ROOT}")

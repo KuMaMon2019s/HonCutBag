@@ -43,6 +43,7 @@ class QualityReport:
     grade: str              # A/B/C/D
     passed: bool            # False if any CRITICAL issue
     issues: List[QualityIssue] = field(default_factory=list)
+    step_summary: Dict[str, str] = field(default_factory=dict)  # step_name → status
 
     def has_critical(self) -> bool:
         return any(i.severity == Severity.CRITICAL for i in self.issues)
@@ -95,6 +96,12 @@ QUALITY_RULES: Dict[str, Dict[str, Any]] = {
              lambda d: True),  # ratio check needs shot count context
         ],
     },
+    "phase6": {
+        "name": "一致性守卫",
+        "red_lines": [],
+        "dimensions": [],
+        "critical_steps": ["consistency_guard", "scene_variation", "slideshow_risk"],
+    },
     "phase7": {
         "name": "组装引擎",
         "red_lines": [
@@ -102,6 +109,7 @@ QUALITY_RULES: Dict[str, Dict[str, Any]] = {
             ("assembly_has_video", "raw_assembly.mp4 包含视频流"),
         ],
         "dimensions": [],
+        "critical_steps": ["transition_render"],
     },
     "phase8": {
         "name": "后期处理",
@@ -111,6 +119,7 @@ QUALITY_RULES: Dict[str, Dict[str, Any]] = {
             ("final_has_audio", "polished.mp4 包含音频流"),
         ],
         "dimensions": [],
+        "critical_steps": ["subtitle_burn", "audio_pipeline", "rhythm_editor", "final_encode"],
     },
 }
 
@@ -123,6 +132,7 @@ def run_quality_check(
     phase: str,
     output_dir,
     artifacts: Optional[dict] = None,
+    step_status: Optional[Dict[str, str]] = None,
 ) -> QualityReport:
     """Run quality check for a specific phase.
 
@@ -130,6 +140,9 @@ def run_quality_check(
         phase: Phase key (e.g. "phase3")
         output_dir: Path to the output directory
         artifacts: Optional dict of phase outputs/results
+        step_status: Optional dict mapping step names to status
+                     ("done", "failed", "skipped"). Failed/skipped
+                     critical steps cap the grade.
 
     Returns:
         QualityReport with grade and issues
@@ -167,6 +180,31 @@ def run_quality_check(
         except Exception:
             pass
 
+    # --- Step status integrity: failed/skipped critical steps cap grade ---
+    step_issues: List[QualityIssue] = []
+    critical_steps = rules.get("critical_steps", [])
+    step_status = step_status or {}
+
+    if step_status:
+        for step_name, status in step_status.items():
+            if status in ("failed", "skipped"):
+                is_critical = step_name in critical_steps
+                if is_critical:
+                    sev = Severity.CRITICAL
+                    msg = f"🔴 关键步骤 {step_name} {status}（必须真实执行才能获得 A）"
+                else:
+                    sev = Severity.WARNING
+                    msg = f"🟡 可选步骤 {step_name} {status}"
+                step_issues.append(QualityIssue(
+                    severity=sev,
+                    phase=phase,
+                    rule=f"step_{step_name}_{status}",
+                    message=msg,
+                    suggestion=f"检查 {step_name} 的执行日志，修复后重新运行",
+                ))
+
+    issues.extend(step_issues)
+
     # --- Grade ---
     n_crit = sum(1 for i in issues if i.severity == Severity.CRITICAL)
     n_warn = sum(1 for i in issues if i.severity == Severity.WARNING)
@@ -182,6 +220,12 @@ def run_quality_check(
 
     passed = n_crit == 0
     report = QualityReport(phase=phase, grade=grade, passed=passed, issues=issues)
+
+    # Attach step_status summary for downstream consumers
+    report.step_summary = {
+        name: status for name, status in step_status.items()
+    } if step_status else {}
+
     _print_report(report, rules["name"])
     return report
 
@@ -331,6 +375,11 @@ def _print_report(report: QualityReport, phase_name: str) -> None:
                 print(f"  │   → 建议: {issue.suggestion}")
     else:
         print(f"  │ 无问题")
+    if report.step_summary:
+        print(f"  │ ── 步骤执行清单 ──")
+        for step, st in report.step_summary.items():
+            icon = "✓" if st == "done" else ("✗" if st == "failed" else "⊘")
+            print(f"  │   {icon} {step}: {st}")
     print(f"  └──────────────────────────────────────────\n")
 
 

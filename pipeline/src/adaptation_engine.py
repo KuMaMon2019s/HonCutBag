@@ -58,14 +58,18 @@ USER_PROMPT_TEMPLATE = (
     "  - source_events: 整数数组，来源事件编号\n"
     "  - action: 字符串，keep/merge/drop/expand\n"
     "  - reason: 字符串，改编理由\n"
-    "  - who: 字符串数组，出场角色\n"
+    "  - who: 字符串数组，出场角色名（空数组 [] 表示纯风景/无角色镜头）\n"
     "  - where: 字符串，地点\n"
     "  - what: 字符串，发生了什么\n"
     "  - emotion: 字符串，情绪/情感\n"
     "  - visual: 字符串，画面描述（用于视频生成）\n"
     "  - suggested_duration: 整数，建议时长（秒）\n"
     "  - transition_to_next: 字符串，转场方式 cut/dissolve/fade\n"
-    "  - associate_assets: 字符串数组，该镜头涉及的资产ID（格式 'char:角色id' 或 'scene:场景名'）\n\n"
+    "  - associate_assets: 字符串数组，该镜头涉及的资产ID（格式 'char:角色id' 或 'scene:场景名'）\n"
+    "  - shot_size: 字符串，景别（extreme_wide/wide/medium_wide/medium/medium_close/close_up/extreme_close_up/over_shoulder/insert/establishing）\n"
+    "  - camera_movement: 字符串，摄影机运动（static/pan_left/pan_right/tilt_up/tilt_down/dolly_in/dolly_out/tracking_left/tracking_right/crane_up/crane_down/handheld/steadicam/orbital/zoom_in/zoom_out）\n"
+    "  - lighting_key: 字符串，光影基调（high_key/low_key/natural/golden_hour/blue_hour/tungsten_warm/neon/silhouette/rim_lit/volumetric/overcast_soft）\n"
+    "  - shot_intent: 字符串，镜头叙事意图（establishing/reveal/reaction/dialogue/action/transition/atmosphere/detail）\n\n"
     "【镜头连贯性规则】\n"
     "每个镜头（除第一个外）必须在 visual 描述开头加入「承接上镜」段：\n"
     "- 格式：'承接上镜：上镜定格于{{角色名}}{{位置/姿态/朝向}}，{{最后动作的终态}}——本镜由此延续'\n"
@@ -263,6 +267,56 @@ def _parse_response(response: str) -> Dict[str, Any]:
         missing = required_fields - set(shot.keys())
         if missing:
             raise ValueError(f"第 {i+1} 个 shot 缺少字段: {missing}")
+
+    # 规范化结构化字段（shot_size/camera_movement/lighting_key/shot_intent）
+    # 如果 LLM 没返回，给默认值而不是缺失
+    _VALID_SHOT_SIZES = {
+        "extreme_wide", "wide", "medium_wide", "medium", "medium_close",
+        "close_up", "extreme_close_up", "over_shoulder", "insert", "establishing",
+    }
+    _VALID_CAMERA_MOVEMENTS = {
+        "static", "pan_left", "pan_right", "tilt_up", "tilt_down",
+        "dolly_in", "dolly_out", "tracking_left", "tracking_right",
+        "crane_up", "crane_down", "handheld", "steadicam", "orbital",
+        "zoom_in", "zoom_out", "rack_focus",
+    }
+    _VALID_LIGHTING_KEYS = {
+        "high_key", "low_key", "natural", "golden_hour", "blue_hour",
+        "tungsten_warm", "neon", "silhouette", "rim_lit", "volumetric", "overcast_soft",
+    }
+    _VALID_SHOT_INTENTS = {
+        "establishing", "reveal", "reaction", "dialogue", "action",
+        "transition", "atmosphere", "detail",
+    }
+    for shot in parsed["shots"]:
+        # shot_size: validate or default
+        ss = shot.get("shot_size", "")
+        if ss not in _VALID_SHOT_SIZES:
+            shot["shot_size"] = "wide"  # sensible default
+        # camera_movement: validate or default
+        cm = shot.get("camera_movement", "")
+        if cm not in _VALID_CAMERA_MOVEMENTS:
+            shot["camera_movement"] = "static"
+        # lighting_key: validate or default
+        lk = shot.get("lighting_key", "")
+        if lk not in _VALID_LIGHTING_KEYS:
+            shot["lighting_key"] = "natural"
+        # shot_intent: validate or default
+        si = shot.get("shot_intent", "")
+        if si not in _VALID_SHOT_INTENTS:
+            shot["shot_intent"] = "atmosphere"
+        # who: ensure it's a list (LLM may return string)
+        who = shot.get("who", [])
+        if isinstance(who, str):
+            shot["who"] = [who] if who else []
+        elif not isinstance(who, list):
+            shot["who"] = []
+        # associate_assets: ensure it's a list
+        aa = shot.get("associate_assets", [])
+        if isinstance(aa, str):
+            shot["associate_assets"] = [aa] if aa else []
+        elif not isinstance(aa, list):
+            shot["associate_assets"] = []
 
     return parsed
 

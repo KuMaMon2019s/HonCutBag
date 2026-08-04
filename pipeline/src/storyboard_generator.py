@@ -444,9 +444,28 @@ def generate_storyboard(
             "caption_frames": caption_frames,
         }
 
-        # 仅在有 first_frame 时添加该字段
+        # 透传结构化字段（who/shot_size/camera_movement/lighting_key/shot_intent/associate_assets）
+        # 这些字段从 adaptation_engine 的 LLM 输出传递到 STORYBOARD.json，供 M2 和 Phase 6 消费
         if first_frame:
             storyboard_shot["first_frame"] = first_frame
+
+        # who: 出场角色列表（空数组 = 纯风景镜头）
+        who_list = shot.get("who", [])
+        if isinstance(who_list, list):
+            storyboard_shot["who"] = who_list
+        else:
+            storyboard_shot["who"] = [str(who_list)] if who_list else []
+
+        # shot_size / camera_movement / lighting_key / shot_intent
+        for field in ("shot_size", "camera_movement", "lighting_key", "shot_intent"):
+            val = shot.get(field)
+            if val:
+                storyboard_shot[field] = val
+
+        # associate_assets: 资产绑定
+        aa = shot.get("associate_assets", [])
+        if aa:
+            storyboard_shot["associate_assets"] = aa if isinstance(aa, list) else [aa]
 
         storyboard_shots.append(storyboard_shot)
 
