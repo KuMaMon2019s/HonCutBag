@@ -15,6 +15,9 @@ Usage:
 
 import os
 import base64
+import threading
+import time
+from contextlib import contextmanager
 import requests
 from typing import Optional
 from ip_blacklist import sanitize_prompt
@@ -26,6 +29,46 @@ IMAGE_ENDPOINT = f"{BASE_URL}/images/generations"
 
 # Agent Plan model (NOT doubao-seedream-3-0 which doesn't exist)
 DEFAULT_MODEL = "doubao-seedream-5.0-lite"
+
+
+class _SeedreamRateLimiter:
+    """Serialize Seedream calls and space request starts across all clients."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._last_request_started = 0.0
+
+    @staticmethod
+    def _min_interval() -> float:
+        raw_value = os.environ.get("SEEDREAM_MIN_INTERVAL", "5")
+        try:
+            return max(0.0, float(raw_value))
+        except ValueError:
+            print(
+                f"  [seedream] invalid SEEDREAM_MIN_INTERVAL={raw_value!r}; using 5s",
+                flush=True,
+            )
+            return 5.0
+
+    @contextmanager
+    def request_slot(self):
+        # Keep the lock for the complete API call. This guarantees a single
+        # in-flight request, not merely spaced request starts.
+        with self._lock:
+            wait_seconds = self._min_interval() - (
+                time.monotonic() - self._last_request_started
+            )
+            if wait_seconds > 0:
+                print(
+                    f"  [seedream] rate limit: waiting {wait_seconds:.1f}s",
+                    flush=True,
+                )
+                time.sleep(wait_seconds)
+            self._last_request_started = time.monotonic()
+            yield
+
+
+_SEEDREAM_RATE_LIMITER = _SeedreamRateLimiter()
 
 
 class SeedreamClient:
@@ -157,10 +200,19 @@ class SeedreamClient:
 
     def _call_and_save(self, payload: dict, output_path: str, timeout: int = 180) -> str:
         """Call Agent Plan API (synchronous), save result. Returns image URL."""
-        print(f"  [seedream] calling Agent Plan API (timeout={timeout}s)...")
-        resp = requests.post(IMAGE_ENDPOINT, json=payload, headers=self.headers, timeout=timeout)
-        resp.raise_for_status()
-        data = resp.json()
+        with _SEEDREAM_RATE_LIMITER.request_slot():
+            print(
+                f"  [seedream] calling Agent Plan API (timeout={timeout}s)...",
+                flush=True,
+            )
+            resp = requests.post(
+                IMAGE_ENDPOINT,
+                json=payload,
+                headers=self.headers,
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()
 
         # Agent Plan returns data[] array with url or b64_json
         if "data" not in data or len(data["data"]) == 0:

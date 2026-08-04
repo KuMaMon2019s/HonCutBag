@@ -12,6 +12,7 @@ Usage:
 import argparse
 import json
 import os
+import random
 import subprocess
 import sys
 import time
@@ -23,6 +24,12 @@ from config import get_api_key
 from progress_reporter import ProgressReporter
 from quality_gate import run_quality_check
 from timing_estimator import estimate_phase_duration, estimate_total, estimate_remaining
+
+# Keep progress visible when invoked through ``conda run | tee``.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(line_buffering=True)
 
 # ---------------------------------------------------------------------------
 # LangGraph Integration (Phase 1: @task + RetryPolicy, Send fan-out, SqliteSaver)
@@ -284,11 +291,22 @@ def _retry_with_policy(func, max_attempts=3, backoff_factor=2.0, *args, **kwargs
         except Exception as e:
             last_error = e
             if attempt < max_attempts:
-                wait_time = backoff_factor ** (attempt - 1)
-                print(f"    ⚠ Attempt {attempt}/{max_attempts} failed: {e}. Retrying in {wait_time}s...")
+                # Agent Plan throttling commonly outlasts short exponential
+                # retries. Keep the legacy argument for caller compatibility,
+                # but use an explicit 30/60/120 cooldown plus small jitter.
+                base_wait = min(30 * (2 ** (attempt - 1)), 120)
+                wait_time = base_wait + random.uniform(0, min(5, base_wait * 0.1))
+                print(
+                    f"    ⚠ Attempt {attempt}/{max_attempts} failed: {e}. "
+                    f"Retrying in {wait_time:.1f}s...",
+                    flush=True,
+                )
                 time.sleep(wait_time)
             else:
-                print(f"    ✗ All {max_attempts} attempts failed. Last error: {e}")
+                print(
+                    f"    ✗ All {max_attempts} attempts failed. Last error: {e}",
+                    flush=True,
+                )
     raise last_error
 
 
@@ -1769,45 +1787,36 @@ def _run_phase5_om_seedance(storyboard_data: dict, output_dir: Path, characters_
 
 
 def _run_phase5_fallback(output_dir: Path) -> dict:
-    """降级：使用手写的 seedance_client，优先本地 API，降级到 ARK Agent Plan"""
+    """Generate Phase 5 video through the local Bridge only."""
     output_dir = Path(output_dir)
-    from seedance_client import submit, poll, download
 
     shots_dir = output_dir / "shots"
     if not shots_dir.exists():
         return {"status": "skipped", "reason": "no shots directory"}
 
-    # --- 本地 API 路由检测 ---
-    use_local = False
+    # Cost-control red line: video generation must never fall back to ARK.
     try:
-        from config import USE_LOCAL_VIDEO_API
-        if USE_LOCAL_VIDEO_API:
-            import local_video_client
-            if local_video_client.is_available(timeout=3.0):
-                use_local = True
-                print("  → 路由: 本地视频 API (192.168.31.221:9100) 可用，优先使用")
-            else:
-                # 零降级: 本地 API 不可达 → 直接报错，不降级 ARK（成本控制红线）
-                print("  → 路由: 本地视频 API 不可达，ARK 降级已禁用")
-                return {"status": "error", "error": "local video API unreachable, ARK fallback disabled"}
+        import local_video_client
     except ImportError:
-        print("  → 路由: local_video_client 未找到，ARK 降级已禁用")
+        print("  ✗ Phase 5 前置检查失败: local_video_client 未找到，ARK 视频降级已禁用", flush=True)
         return {"status": "error", "error": "local_video_client not found, ARK fallback disabled"}
-
-    api_key = get_api_key("ARK_AGENT_API_KEY") or os.environ.get("ARK_AGENT_API_KEY", "")
-    if not api_key and not use_local:
-        return {"status": "error", "error": "ARK_AGENT_API_KEY not set and local API unavailable"}
-
-    print(f"  → 模式: {'local_api' if use_local else 'seedance_client'} (text_to_video)")
+    if not local_video_client.is_available(timeout=3.0):
+        print("  ✗ Phase 5 前置检查失败: 本地视频 API 不可达，ARK 视频降级已禁用", flush=True)
+        return {"status": "error", "error": "local video API unreachable, ARK fallback disabled"}
+    use_local = True
+    print("  → 路由: 仅使用本地视频 API (192.168.31.221:9100)", flush=True)
 
     # Load character reference images for consistency
     import base64 as _b64
     char_ref_map = {}   # {match_key_lower: base64_of_front_png}
     char_list = []      # [(char_id, char_name, b64)] for fallback
     chars_path = output_dir / "CHARACTERS.json"
+    declared_character_ids = set()
+    missing_character_fronts = set()
     if chars_path.exists():
         chars_data = json.loads(chars_path.read_text())
         for char in chars_data.get("characters", []):
+            declared_character_ids.add(char["id"])
             # Try both directory structures: characters/{id}/ and characters/characters/{id}/
             front_png = output_dir / "characters" / char["id"] / "front.png"
             if not front_png.exists():
@@ -1819,8 +1828,16 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
                 char_ref_map[char["id"].lower()] = b64
                 char_ref_map[char["id"].replace("_", "").lower()] = b64
                 char_list.append((char["id"], char["name"], b64))
+            else:
+                missing_character_fronts.add(char["id"])
         if char_ref_map:
             print(f"  → 已加载 {len(char_list)} 个角色参考图")
+        if missing_character_fronts:
+            print(
+                "  ⚠ Phase 5 前置检查: 缺少角色 front.png: "
+                + ", ".join(sorted(missing_character_fronts)),
+                flush=True,
+            )
 
     # Determine protagonist (first character) for default injection
     protagonist_b64 = char_list[0][2] if char_list else None
@@ -1857,6 +1874,20 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
 
         meta = json.loads(meta_path.read_text())
         prompt = meta.get("prompt", "")
+        associated_character_ids = {
+            asset_id[5:].split(":", 1)[0]
+            for asset_id in meta.get("associate_assets", [])
+            if isinstance(asset_id, str) and asset_id.startswith("char:")
+        }
+        missing_for_shot = associated_character_ids & missing_character_fronts
+        if missing_for_shot or (declared_character_ids and not char_list):
+            missing_ids = missing_for_shot or missing_character_fronts
+            print(
+                f"    ✗ {shot_dir.name}: 缺少角色参考图 "
+                f"characters/*/front.png ({', '.join(sorted(missing_ids))})，跳过镜头",
+                flush=True,
+            )
+            return None
         # --- M4: 模型路由（增量，失败用原始 prompt）---
         try:
             from prompt_router import route_prompt
@@ -2035,23 +2066,7 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
                         print(f"    ⚠ 不降级到 ARK（零成本测试模式），跳过此镜头")
                         return None
                 
-                # --- ARK Agent Plan 路由（use_local=False 时才会走到这里）---
-                print(f"  → {shot_dir.name}: 提交 ARK 视频生成...")
-                task_id = submit(prompt=prompt, api_key=api_key, duration=duration, ratio="16:9",
-                                 reference_image_base64=first_frame_b64, seed=shot_seed,
-                                 reference_video_base64=prev_video_ref)
-                video_url = poll(task_id, api_key=api_key)
-                if video_url:
-                    download(video_url, out_path)
-                    # --- P1-C3: 记录 seed 到 SHOT_META ---
-                    if shot_seed is not None:
-                        meta["seed"] = shot_seed
-                        meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False))
-                    print(f"    ✓ {shot_dir.name}: 视频已生成 (ARK)")
-                    return f"shots/{shot_dir.name}/output.mp4"
-                else:
-                    print(f"    ✗ {shot_dir.name}: poll 返回空 URL")
-                    return None
+                raise RuntimeError("internal routing error: local video path was not selected")
             except Exception as e:
                 err_str = str(e)
                 # 429 QuotaExceeded — exponential backoff retry
@@ -2129,7 +2144,7 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
 
 
 def run_phase5(storyboard_data: dict, output_dir: Path, dry_run: bool) -> dict:
-    """Phase 5: 视频生成 — OM SeedanceVideo (reference_to_video) 带降级"""
+    """Phase 5: video generation through the local Bridge only."""
     _banner(5, 8, "视频生成 (Seedance — reference_to_video)", dry_run)
     start = _now()
     
@@ -2145,36 +2160,12 @@ def run_phase5(storyboard_data: dict, output_dir: Path, dry_run: bool) -> dict:
         print("  ⊘ dry-run 模式，跳过视频生成")
         return {"status": "skipped", "reason": "dry-run", "duration_s": _elapsed(start)}
 
-    # 优先尝试 OM SeedanceVideo
-    try:
-        print("  → 尝试 OM SeedanceVideo...")
-        result = _run_phase5_om_seedance(storyboard_data, output_dir, _timing_ctx={"start": start, "estimate": _p5_est})
-        result["duration_s"] = _elapsed(start)
-        if result["status"] == "done":
-            print(f"  ✓ Phase 5 完成: {len(result['outputs'])} 视频 (OM SeedanceVideo)")
-            
-            # Quality gate: Phase 5
-            qg_report = run_quality_check("phase5", output_dir)
-            if not qg_report.passed:
-                return {"status": "error", "error": f"Phase 5 质检未通过: {qg_report.grade}", "quality_report": qg_report, "duration_s": _elapsed(start)}
-            
-        else:
-            print(f"  ⚠ Phase 5 部分完成: {len(result.get('outputs', []))} 视频, {len(result.get('errors', []))} 错误")
-        return result
-
-    except ImportError as e:
-        print(f"  ⚠ OM SeedanceVideo 不可用: {e}")
-        print("  → 降级到 seedance_client...")
-    except Exception as e:
-        print(f"  ⚠ OM SeedanceVideo 异常: {e}")
-        print("  → 降级到 seedance_client...")
-
-    # 降级到手写的 seedance_client
+    print("  → Phase 5 强制本地 Bridge 路由；ARK/OM 视频模型已禁用", flush=True)
     try:
         result = _run_phase5_fallback(output_dir)
         result["duration_s"] = _elapsed(start)
         if result["status"] == "done":
-            print(f"  ✓ Phase 5 完成: {len(result['outputs'])} 视频 (seedance_client fallback)")
+            print(f"  ✓ Phase 5 完成: {len(result['outputs'])} 视频 (local_video_client)")
             
             # Quality gate: Phase 5
             qg_report = run_quality_check("phase5", output_dir)
@@ -2182,7 +2173,7 @@ def run_phase5(storyboard_data: dict, output_dir: Path, dry_run: bool) -> dict:
                 return {"status": "error", "error": f"Phase 5 质检未通过: {qg_report.grade}", "quality_report": qg_report, "duration_s": _elapsed(start)}
             
         else:
-            print(f"  ✗ Phase 5 失败 (seedance_client fallback)")
+            print(f"  ✗ Phase 5 失败 (local_video_client)")
         return result
 
     except ImportError as e:
