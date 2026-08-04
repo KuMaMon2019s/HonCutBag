@@ -290,15 +290,7 @@ def _retry_with_policy(func, max_attempts=3, backoff_factor=2.0, *args, **kwargs
             return func(*args, **kwargs)
         except Exception as e:
             last_error = e
-            # 配额耗尽快速失败：重试无法恢复，立即放弃（区别于瞬时限流）
             error_text = str(e)
-            if "AccountQuotaExceeded" in error_text or "AgentPlanQuotaExceededError" in type(e).__name__:
-                print(
-                    f"    ✗ Agent Plan 月度配额已耗尽，重试无法恢复，立即停止。"
-                    f"请等配额重置或升级套餐。",
-                    flush=True,
-                )
-                raise
             if attempt < max_attempts:
                 is_429 = (
                     "429" in error_text
@@ -1046,10 +1038,6 @@ def _generate_shot_images(output_dir: Path, storyboard_data: dict) -> int:
                     return shot_id
                 except Exception as e:
                     _err_str = str(e)
-                    # 配额耗尽快速失败：重试无法恢复，立即放弃
-                    if "AccountQuotaExceeded" in _err_str or "AgentPlanQuotaExceededError" in type(e).__name__:
-                        print(f"    [M2] {shot_id} ✗ Agent Plan 月度配额已耗尽，立即停止。")
-                        raise
                     _is_429 = (
                         "429" in _err_str
                         or "Too Many Requests" in _err_str

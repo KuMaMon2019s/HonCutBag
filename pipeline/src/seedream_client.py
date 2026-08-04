@@ -72,11 +72,7 @@ _SEEDREAM_RATE_LIMITER = _SeedreamRateLimiter()
 
 
 class AgentPlanQuotaExceededError(RuntimeError):
-    """Agent Plan 月度配额耗尽（AccountQuotaExceeded）。
-
-    与瞬时限流不同：重试/冷却无法恢复，必须等配额重置或升级套餐。
-    所有重试层检测到此异常应立即放弃，避免无谓等待。
-    """
+    """Agent Plan repeatedly returned AccountQuotaExceeded after retries."""
 
 
 class SeedreamClient:
@@ -206,47 +202,56 @@ class SeedreamClient:
 
     def _call_and_save(self, payload: dict, output_path: str, timeout: int = 180) -> str:
         """Call Agent Plan API (synchronous), save result. Returns image URL."""
-        with _SEEDREAM_RATE_LIMITER.request_slot():
-            print(
-                f"  [seedream] calling Agent Plan API (timeout={timeout}s)...",
-                flush=True,
-            )
-            resp = requests.post(
-                IMAGE_ENDPOINT,
-                json=payload,
-                headers=self.headers,
-                timeout=timeout,
-            )
-            status_code = getattr(resp, "status_code", 200)
-            if status_code != 200:
-                diagnostic_headers = {
-                    name: value
-                    for name, value in resp.headers.items()
-                    if name.lower() in {
-                        "retry-after",
-                        "x-request-id",
-                        "x-tt-logid",
-                    }
-                    or any(
-                        marker in name.lower()
-                        for marker in ("rate", "limit", "retry")
-                    )
-                }
+        max_quota_retries = 3
+        for quota_retry in range(max_quota_retries + 1):
+            with _SEEDREAM_RATE_LIMITER.request_slot():
                 print(
-                    f"  [seedream] ✗ HTTP {status_code} "
-                    f"body={resp.text[:1000]!r} headers={diagnostic_headers}",
+                    f"  [seedream] calling Agent Plan API (timeout={timeout}s)...",
                     flush=True,
                 )
-                # 配额耗尽快速失败：AgentPlanQuotaExceededError 不可通过重试恢复，
-                # 立即抛出，让所有重试层放弃（区别于瞬时限流）。
-                if "AccountQuotaExceeded" in resp.text:
-                    raise AgentPlanQuotaExceededError(
-                        f"Agent Plan 月度配额已耗尽（AccountQuotaExceeded）。"
-                        f"重试无法恢复，请等配额重置或升级套餐。"
-                        f"Request id: {diagnostic_headers.get('x-request-id', 'N/A')}"
+                resp = requests.post(
+                    IMAGE_ENDPOINT,
+                    json=payload,
+                    headers=self.headers,
+                    timeout=timeout,
+                )
+                status_code = getattr(resp, "status_code", 200)
+                diagnostic_headers = {}
+                if status_code != 200:
+                    diagnostic_headers = {
+                        name: value
+                        for name, value in resp.headers.items()
+                        if name.lower() in {
+                            "retry-after",
+                            "x-request-id",
+                            "x-tt-logid",
+                        }
+                        or any(
+                            marker in name.lower()
+                            for marker in ("rate", "limit", "retry")
+                        )
+                    }
+                    print(
+                        f"  [seedream] ✗ HTTP {status_code} "
+                        f"body={resp.text[:1000]!r} headers={diagnostic_headers}",
+                        flush=True,
                     )
-            resp.raise_for_status()
-            data = resp.json()
+                    if "AccountQuotaExceeded" in resp.text:
+                        if quota_retry < max_quota_retries:
+                            print(
+                                f"  [seedream] ⚠ AccountQuotaExceeded (intermittent), "
+                                f"retry {quota_retry + 1}/3 in 60s...",
+                                flush=True,
+                            )
+                            time.sleep(60)
+                            continue
+                        raise AgentPlanQuotaExceededError(
+                            "HTTP 429 AccountQuotaExceeded persisted after 3 retries. "
+                            f"Request id: {diagnostic_headers.get('x-request-id', 'N/A')}"
+                        )
+                resp.raise_for_status()
+                data = resp.json()
+                break
 
         # Agent Plan returns data[] array with url or b64_json
         if "data" not in data or len(data["data"]) == 0:

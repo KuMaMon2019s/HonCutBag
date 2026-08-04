@@ -543,11 +543,6 @@ def generate_character(
                 break
             except Exception as e:
                 _err_str = str(e)
-                # 配额耗尽快速失败：重试无法恢复，立即放弃（必须先于 _is_429 检测，
-                # 因为 "QuotaExceeded" 会误匹配 AccountQuotaExceeded）
-                if "AccountQuotaExceeded" in _err_str or "AgentPlanQuotaExceededError" in type(e).__name__:
-                    print(f"  [sheet] ✗ Agent Plan 月度配额已耗尽，重试无法恢复，立即停止。")
-                    raise
                 _is_429 = (
                     "429" in _err_str
                     or "Too Many Requests" in _err_str
