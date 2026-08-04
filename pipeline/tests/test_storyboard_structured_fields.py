@@ -311,9 +311,12 @@ class TestGenerateShotImagesCharacterRef:
                 char_dir.mkdir(parents=True)
                 (char_dir / "front.png").write_bytes(b"fake_png_data")
 
-            # Mock the seedream_client module
+            # Mock SeedreamClient as a class with image_to_image method
+            MockSeedreamClient = MagicMock()
+            MockSeedreamClient.return_value.image_to_image = mock_image_to_image
+
             mock_seedream = MagicMock()
-            mock_seedream.image_to_image = mock_image_to_image
+            mock_seedream.SeedreamClient = MockSeedreamClient
             sys.modules['seedream_client'] = mock_seedream
 
             try:

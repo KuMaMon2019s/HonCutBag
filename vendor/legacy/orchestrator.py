@@ -355,6 +355,8 @@ def print_summary(shots: list):
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def main():
+    global SHOTS_DIR, STORYBOARD_PATH
+
     parser = argparse.ArgumentParser(description="Phase 4 Orchestrator")
     parser.add_argument("--dry-run", action="store_true", help="Parse + route only, no API calls")
     parser.add_argument("--shots", type=str, help="Comma-separated shot IDs (e.g. S01,S03)")
@@ -365,12 +367,10 @@ def main():
     args = parser.parse_args()
 
     # Allow external override of SHOTS_DIR (e.g. when called by pipeline_runner.py)
-    global SHOTS_DIR
     if args.shots_dir:
         SHOTS_DIR = Path(args.shots_dir).resolve()
 
     # Fix: update STORYBOARD_PATH so route_shot() resolves relative first_frame paths correctly
-    global STORYBOARD_PATH
     STORYBOARD_PATH = Path(args.storyboard).resolve()
 
     print(f"🎬 Phase 4 Orchestrator — {'DRY RUN' if args.dry_run else 'LIVE'}")
