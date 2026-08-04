@@ -184,7 +184,7 @@ def _ensure_dir(p: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 # Phase 顺序定义（用于 resume 时判断哪些已完成）
-PHASE_ORDER = ["phase1", "phase2", "phase2_5", "phase3", "phase4", "phase5", "phase6", "phase7", "phase8"]
+PHASE_ORDER = ["phase1", "phase2", "phase2_5", "phase3", "phase4", "phase5", "phase6", "phase7", "phase8", "phase8_5"]
 
 
 def _checkpoint_path(output_dir: Path) -> Path:
@@ -1027,14 +1027,27 @@ def _generate_shot_images(output_dir: Path, storyboard_data: dict) -> int:
                 return shot_id
 
             # --- P0-1c: Match character reference image ---
+            # Support structured who[] from storyboard:
+            # - Empty who [] → pure landscape/no_character → NO reference injection
+            # - Single character → use that character's front.png
+            # - Multiple characters → use first character's front.png (primary ref)
             ref_image_path = None
             shot_who = shot_item.get("who", [])
-            for name in shot_who:
-                if name.lower() in char_ref_map:
-                    ref_image_path = char_ref_map[name.lower()]
-                    break
-            if ref_image_path is None and protagonist_ref:
-                ref_image_path = protagonist_ref
+            if not isinstance(shot_who, list):
+                shot_who = [shot_who] if shot_who else []
+
+            if len(shot_who) == 0:
+                # Pure landscape / no_character shot — do NOT inject any character reference
+                print(f"    [M2] {shot_id}: 纯风景镜头(who=[]), 不注入角色参考")
+            else:
+                # Match first available character reference
+                for name in shot_who:
+                    if name.lower() in char_ref_map:
+                        ref_image_path = char_ref_map[name.lower()]
+                        break
+                # Fallback to protagonist only if who[] is non-empty but no match found
+                if ref_image_path is None and protagonist_ref:
+                    ref_image_path = protagonist_ref
 
             # --- 429 retry with exponential backoff ---
             import time as _time
@@ -3215,14 +3228,19 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
                         outputs.append("subtitled.mp4")
                         outputs.append("subtitles.srt")
                         print(f"    ✓ 字幕烧录完成: {len(segments)} 条字幕")
+                        step_status["subtitle_burn"] = "done"
                     else:
                         print(f"    ⚠ 字幕烧录失败: {burn_result.error}")
+                        step_status["subtitle_burn"] = "failed"
                 else:
                     print(f"    ⊘ No subtitle data available, skipping subtitle burn")
+                    step_status["subtitle_burn"] = "skipped"
             except ImportError as e:
                 print(f"    ⚠ RemotionCaptionBurn unavailable: {e}")
+                step_status["subtitle_burn"] = "failed"
             except Exception as e:
                 print(f"    ⚠ 字幕烧录异常: {e}")
+                step_status["subtitle_burn"] = "failed"
 
         # Step 8.2.5: Color grade (optional, from OM ColorGrade)
         if color_grade:
@@ -3270,12 +3288,21 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
         # Step 8.3: rhythm_editor → polished.mp4
         print("  → rhythm_editor: 节奏编辑...")
         final_out = str(output_dir / "polished.mp4")
-        edit_rhythm(
-            video_path=current_video,
-            storyboard_path=sb_path_str,
-            output_path=final_out,
-        )
-        outputs.append("polished.mp4")
+        try:
+            edit_rhythm(
+                video_path=current_video,
+                storyboard_path=sb_path_str,
+                output_path=final_out,
+            )
+            outputs.append("polished.mp4")
+            step_status["rhythm_editor"] = "done"
+        except Exception as e:
+            print(f"  ⚠ rhythm_editor failed: {e}")
+            step_status["rhythm_editor"] = "failed"
+            # Fallback: just copy video
+            import shutil
+            shutil.copy2(current_video, final_out)
+            outputs.append("polished.mp4")
 
         # Step 8.4: Final encoding with media profile
         print(f"  → final_encode: 使用 {media_profile} 配置重新编码...")
@@ -3304,15 +3331,18 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
                 shutil.move(final_encoded, final_out)
                 outputs.append(f"polished.mp4 (encoded with {media_profile})")
                 print(f"    ✓ 最终编码完成: {profile['width']}x{profile['height']} @ {profile['fps']}fps")
+                step_status["final_encode"] = "done"
             else:
                 print(f"    ⚠ 最终编码失败，使用原始 polished.mp4")
+                step_status["final_encode"] = "failed"
         except Exception as e:
             print(f"    ⚠ 最终编码异常: {e}，使用原始 polished.mp4")
+            step_status["final_encode"] = "failed"
 
         print(f"  ✓ Phase 8 完成: polished.mp4")
         
         # Quality gate: Phase 8
-        qg_report = run_quality_check("phase8", output_dir)
+        qg_report = run_quality_check("phase8", output_dir, step_status=step_status)
         if not qg_report.passed:
             return {"status": "error", "error": f"Phase 8 质检未通过: {qg_report.grade}", "quality_report": qg_report, "duration_s": _elapsed(start)}
         
@@ -3325,6 +3355,7 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             "audio_enhanced": audio_success,
             "bgm_detected": bgm_path is not None,
             "media_profile": media_profile,
+            "step_status": step_status,
         }
 
     except ImportError as e:
@@ -3401,8 +3432,9 @@ if LANGGRAPH_AVAILABLE:
         graph.add_node("phase6", node_phase6)
         graph.add_node("phase7", node_phase7)
         graph.add_node("phase8", node_phase8)
-        
-        # Define edges
+        graph.add_node("phase8_5", node_phase8_5)
+
+        # Edges
         graph.add_edge(START, "phase2")
         graph.add_edge("phase2", "phase2_5")
         
@@ -3441,7 +3473,8 @@ if LANGGRAPH_AVAILABLE:
         )
         
         graph.add_edge("phase7", "phase8")
-        graph.add_edge("phase8", END)
+        graph.add_edge("phase8", "phase8_5")
+        graph.add_edge("phase8_5", END)
         
         # Compile with SQLite checkpointer
         # Note: checkpointer is created per-invocation in run_pipeline()
@@ -3704,6 +3737,55 @@ if LANGGRAPH_AVAILABLE:
             "completed_phases": state.get("completed_phases", []) + ["phase8"],
             "skip_phase": state.get("skip_phase", []),
         }
+
+    def node_phase8_5(state: HonCutState) -> dict:
+        """Phase 8.5 node: Video QA 硬性质检"""
+        output_dir = Path(state["output_dir"])
+        dry_run = state.get("dry_run", False)
+
+        if dry_run:
+            return {
+                "phase_results": {**state.get("phase_results", {}), "phase8_5": {"status": "skipped", "reason": "dry-run"}},
+                "completed_phases": state.get("completed_phases", []) + ["phase8_5"],
+                "skip_phase": state.get("skip_phase", []),
+            }
+
+        try:
+            from video_qa import run_video_qa
+            storyboard_data = state.get("storyboard")
+            qa_report = run_video_qa(output_dir, storyboard_data=storyboard_data)
+
+            result = {
+                "status": "done" if qa_report.verdict == "pass" else "warning",
+                "verdict": qa_report.verdict,
+                "grade": qa_report.grade,
+                "issues_count": len(qa_report.issues),
+            }
+
+            new_status = "completed"
+            if qa_report.verdict == "fail":
+                new_status = "partial"
+
+            return {
+                "final_video": state.get("final_video", ""),
+                "status": new_status,
+                "phase_results": {**state.get("phase_results", {}), "phase8_5": result},
+                "completed_phases": state.get("completed_phases", []) + ["phase8_5"],
+                "quality_report": qa_report.to_dict(),
+                "skip_phase": state.get("skip_phase", []),
+            }
+        except ImportError:
+            return {
+                "phase_results": {**state.get("phase_results", {}), "phase8_5": {"status": "skipped", "reason": "video_qa not available"}},
+                "completed_phases": state.get("completed_phases", []) + ["phase8_5"],
+                "skip_phase": state.get("skip_phase", []),
+            }
+        except Exception as e:
+            return {
+                "phase_results": {**state.get("phase_results", {}), "phase8_5": {"status": "error", "error": str(e)}},
+                "completed_phases": state.get("completed_phases", []) + ["phase8_5"],
+                "skip_phase": state.get("skip_phase", []),
+            }
 
 else:
     # Fallback when LangGraph is not available
@@ -4254,6 +4336,46 @@ def run_pipeline(
             report["status"] = "partial"
         else:
             _write_checkpoint(output_path, "phase8", p8)
+
+    # ---- Phase 8.5: Video QA 硬性质检 ----
+    if 8.5 in skip_phase:
+        report["phases"]["8.5"] = {"status": "skipped", "reason": "user-specified"}
+    elif resume and "phase8_5" in completed_phases:
+        cp = _read_checkpoint(output_path)
+        p8_5 = dict(cp["results"].get("phase8_5", {"status": "done"}))
+        p8_5.setdefault("status", "done")
+        report["phases"]["8.5"] = {**p8_5, "resumed": True}
+        print(f"  🔄 Phase 8.5: 从 checkpoint 恢复 (已跳过)")
+    else:
+        try:
+            from video_qa import run_video_qa
+            qa_report = run_video_qa(
+                output_dir,
+                storyboard_data=storyboard_data,
+                expected_width=None,  # Let QA infer from media profile
+                expected_height=None,
+            )
+            p8_5 = {
+                "status": "done" if qa_report.verdict == "pass" else "warning",
+                "verdict": qa_report.verdict,
+                "grade": qa_report.grade,
+                "issues_count": len(qa_report.issues),
+                "duration_s": 0,
+            }
+            report["phases"]["8.5"] = p8_5
+            if qa_report.verdict == "fail":
+                report["status"] = "partial"
+                report["quality_gate"] = {
+                    "passed": False,
+                    "reason": f"Phase 8.5 QA failed: {qa_report.grade} grade",
+                    "issues": [i.message for i in qa_report.issues if i.severity == "critical"],
+                }
+            else:
+                _write_checkpoint(output_path, "phase8_5", p8_5)
+        except ImportError:
+            report["phases"]["8.5"] = {"status": "skipped", "reason": "video_qa module not available"}
+        except Exception as e:
+            report["phases"]["8.5"] = {"status": "error", "error": str(e)}
 
     report["total_duration_s"] = _elapsed(total_start)
 
