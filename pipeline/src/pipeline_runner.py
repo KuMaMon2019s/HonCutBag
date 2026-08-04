@@ -3253,6 +3253,7 @@ if LANGGRAPH_AVAILABLE:
         quality_report: dict
         final_video: str
         status: str
+        error: str
         # Internal fields (not in original plan but needed for compatibility)
         output_dir: str
         duration: int
@@ -3360,13 +3361,17 @@ if LANGGRAPH_AVAILABLE:
         storyboard_data = result.pop("_storyboard", None)
         characters_data = result.pop("_characters", None)
         
-        return {
+        update = {
             "storyboard": storyboard_data or {},
             "characters": characters_data.get("characters", []) if characters_data else [],
             "phase_results": {**state.get("phase_results", {}), "phase2": result},
-            "completed_phases": state.get("completed_phases", []) + ["phase2"],
+            "completed_phases": state.get("completed_phases", []) + (["phase2"] if result.get("status") != "error" else []),
             "skip_phase": state.get("skip_phase", []),
         }
+        if result.get("status") == "error":
+            update.update(status="failed", error=f"Phase 2 failed: {result.get('error')}")
+            return Command(goto=END, update=update)
+        return update
 
     def node_phase2_5(state: HonCutState) -> dict:
         """Phase 2.5 node: 故事板图片生成"""
@@ -3386,12 +3391,16 @@ if LANGGRAPH_AVAILABLE:
         if result.get("status") == "done" and result.get("outputs"):
             storyboard_image = result["outputs"][0]
         
-        return {
+        update = {
             "storyboard_image": storyboard_image,
             "phase_results": {**state.get("phase_results", {}), "phase2_5": result},
-            "completed_phases": state.get("completed_phases", []) + ["phase2_5"],
+            "completed_phases": state.get("completed_phases", []) + (["phase2_5"] if result.get("status") != "error" else []),
             "skip_phase": state.get("skip_phase", []),
         }
+        if result.get("status") == "error":
+            update.update(status="failed", error=f"Phase 2.5 failed: {result.get('error')}")
+            return Command(goto=END, update=update)
+        return update
 
     def node_review_storyboard(state: HonCutState) -> dict:
         """Interrupt node: pause for human review of storyboard
@@ -3431,11 +3440,15 @@ if LANGGRAPH_AVAILABLE:
             dry_run=state["dry_run"],
         )
         
-        return {
+        update = {
             "phase_results": {**state.get("phase_results", {}), "phase3": result},
-            "completed_phases": state.get("completed_phases", []) + ["phase3"],
+            "completed_phases": state.get("completed_phases", []) + (["phase3"] if result.get("status") != "error" else []),
             "skip_phase": state.get("skip_phase", []),
         }
+        if result.get("status") == "error":
+            update.update(status="failed", error=f"Phase 3 failed: {result.get('error')}")
+            return Command(goto=END, update=update)
+        return update
 
     def node_phase4(state: HonCutState) -> dict:
         """Phase 4 node: 编排器"""
@@ -3446,11 +3459,15 @@ if LANGGRAPH_AVAILABLE:
             dry_run=state["dry_run"],
         )
         
-        return {
+        update = {
             "phase_results": {**state.get("phase_results", {}), "phase4": result},
-            "completed_phases": state.get("completed_phases", []) + ["phase4"],
+            "completed_phases": state.get("completed_phases", []) + (["phase4"] if result.get("status") != "error" else []),
             "skip_phase": state.get("skip_phase", []),
         }
+        if result.get("status") == "error":
+            update.update(status="failed", error=f"Phase 4 failed: {result.get('error')}")
+            return Command(goto=END, update=update)
+        return update
 
     def route_phase5(state: HonCutState) -> str:
         """根据镜头属性路由到不同的 Phase 5 生成器"""
@@ -3968,9 +3985,13 @@ def run_pipeline(
         p2_5 = run_phase2_5(storyboard_data, characters_data, Path(output_dir), dry_run)
         report["phases"]["2.5"] = p2_5
         if p2_5["status"] == "error":
-            # Phase 2.5 失败不阻断管线，仅标记 partial
-            report["status"] = "partial"
             reporter.phase_done("phase2_5", f"故事板图片生成失败: {p2_5.get('error')}", duration_s=p2_5.get("duration_s"))
+            reporter.mark_failed(f"Phase 2.5 failed: {p2_5.get('error')}")
+            report["status"] = "failed"
+            report["error"] = f"Phase 2.5 failed: {p2_5.get('error')}"
+            report["total_duration_s"] = _elapsed(total_start)
+            _write_report(report, output_dir)
+            return report
         else:
             reporter.phase_done("phase2_5", "故事板图片生成完成", duration_s=p2_5.get("duration_s"))
             _write_checkpoint(output_path, "phase2_5", p2_5)
@@ -3991,8 +4012,13 @@ def run_pipeline(
         p3 = run_phase3(output_dir, characters_data, dry_run)
         report["phases"]["3"] = p3
         if p3["status"] == "error":
-            report["status"] = "partial"
             reporter.phase_done("phase3", f"角色工厂失败: {p3.get('error')}", duration_s=p3.get("duration_s"))
+            reporter.mark_failed(f"Phase 3 failed: {p3.get('error')}")
+            report["status"] = "failed"
+            report["error"] = f"Phase 3 failed: {p3.get('error')}"
+            report["total_duration_s"] = _elapsed(total_start)
+            _write_report(report, output_dir)
+            return report
         else:
             reporter.phase_done("phase3", "角色工厂完成", duration_s=p3.get("duration_s"))
             _write_checkpoint(output_path, "phase3", p3)
@@ -4013,8 +4039,13 @@ def run_pipeline(
         p4 = run_phase4(output_dir, dry_run)
         report["phases"]["4"] = p4
         if p4["status"] == "error":
-            report["status"] = "partial"
             reporter.phase_done("phase4", f"编排器失败: {p4.get('error')}", duration_s=p4.get("duration_s"))
+            reporter.mark_failed(f"Phase 4 failed: {p4.get('error')}")
+            report["status"] = "failed"
+            report["error"] = f"Phase 4 failed: {p4.get('error')}"
+            report["total_duration_s"] = _elapsed(total_start)
+            _write_report(report, output_dir)
+            return report
         else:
             reporter.phase_done("phase4", "编排器完成", duration_s=p4.get("duration_s"))
             _write_checkpoint(output_path, "phase4", p4)
