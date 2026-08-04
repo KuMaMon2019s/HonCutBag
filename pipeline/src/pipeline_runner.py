@@ -291,11 +291,18 @@ def _retry_with_policy(func, max_attempts=3, backoff_factor=2.0, *args, **kwargs
         except Exception as e:
             last_error = e
             if attempt < max_attempts:
-                # Agent Plan throttling commonly outlasts short exponential
-                # retries. Keep the legacy argument for caller compatibility,
-                # but use an explicit 30/60/120 cooldown plus small jitter.
-                base_wait = min(30 * (2 ** (attempt - 1)), 120)
-                wait_time = base_wait + random.uniform(0, min(5, base_wait * 0.1))
+                error_text = str(e)
+                is_429 = (
+                    "429" in error_text
+                    or "Too Many Requests" in error_text
+                    or "QuotaExceeded" in error_text
+                    or getattr(getattr(e, "response", None), "status_code", None) == 429
+                )
+                if is_429:
+                    base_wait = [120, 240, 480][attempt - 1]
+                    wait_time = base_wait + random.uniform(0, 30)
+                else:
+                    wait_time = backoff_factor ** (attempt - 1)
                 print(
                     f"    ⚠ Attempt {attempt}/{max_attempts} failed: {e}. "
                     f"Retrying in {wait_time:.1f}s...",
@@ -1010,7 +1017,7 @@ def _generate_shot_images(output_dir: Path, storyboard_data: dict) -> int:
             # --- 429 retry with exponential backoff ---
             import time as _time
             _m2_max_retries = 3
-            _m2_wait_times = [5, 15, 45]
+            _m2_wait_times = [120, 240, 480]
             for _m2_attempt in range(1, _m2_max_retries + 1):
                 try:
                     if ref_image_path and ref_image_path.exists():
@@ -1079,6 +1086,9 @@ def run_phase2_5(storyboard_data: dict, characters_data: dict, output_dir: Path,
     if dry_run:
         print("  ⊘ dry-run 模式，跳过故事板图片生成")
         return {"status": "skipped", "reason": "dry-run", "duration_s": _elapsed(start)}
+
+    print("[cooldown] 等待 120s 让 Agent Plan 限流窗口重置...", flush=True)
+    time.sleep(120)
 
     # 1. 加载模板
     template_path = SCRIPT_DIR.parent / "prompts" / "storyboard_template.md"
@@ -1343,6 +1353,10 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
         _p3_est = estimate_phase_duration("phase3", num_characters=len(char_dicts))
         print(f"  ⏱ Phase 3 开始 (预估 ~{int(_p3_est)}s)")
         print(f"  → batch_generate: {len(char_dicts)} 个角色, skip_images={dry_run}")
+
+        if not dry_run:
+            print("[cooldown] 等待 120s 让 Agent Plan 限流窗口重置...", flush=True)
+            time.sleep(120)
         
         # Use retry policy for each character generation
         results = []

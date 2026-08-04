@@ -40,15 +40,15 @@ class _SeedreamRateLimiter:
 
     @staticmethod
     def _min_interval() -> float:
-        raw_value = os.environ.get("SEEDREAM_MIN_INTERVAL", "5")
+        raw_value = os.environ.get("SEEDREAM_MIN_INTERVAL", "120")
         try:
             return max(0.0, float(raw_value))
         except ValueError:
             print(
-                f"  [seedream] invalid SEEDREAM_MIN_INTERVAL={raw_value!r}; using 5s",
+                f"  [seedream] invalid SEEDREAM_MIN_INTERVAL={raw_value!r}; using 120s",
                 flush=True,
             )
-            return 5.0
+            return 120.0
 
     @contextmanager
     def request_slot(self):

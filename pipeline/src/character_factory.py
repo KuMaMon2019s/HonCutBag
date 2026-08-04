@@ -529,7 +529,7 @@ def generate_character(
         # --- 429 retry with exponential backoff (inner retry before outer _retry_with_policy) ---
         import time as _time
         _sheet_max_retries = 3
-        _sheet_wait_times = [30, 60, 120]  # Agent Plan 429 cooldown window
+        _sheet_wait_times = [120, 240, 480]  # Agent Plan 429 cooldown window
         _sheet_success = False
         for _sheet_attempt in range(1, _sheet_max_retries + 1):
             try:
