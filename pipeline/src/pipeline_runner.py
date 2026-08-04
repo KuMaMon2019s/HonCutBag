@@ -2942,6 +2942,54 @@ def _detect_bgm(output_dir: Path, storyboard_path: Optional[Path] = None) -> Opt
     return None
 
 
+def _probe_shot_duration(shots_dir: Path, shot_id: int) -> float:
+    """Probe the real duration of a shot video via ffprobe.
+
+    Falls back to 2.0s if the file is missing or ffprobe fails.
+    """
+    shot_video = shots_dir / f"S{shot_id:02d}" / "output.mp4"
+    if not shot_video.exists():
+        return 2.0
+    try:
+        import subprocess as _sp
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "csv=p=0",
+            str(shot_video),
+        ]
+        result = _sp.run(cmd, capture_output=True, text=True, timeout=10)
+        return float(result.stdout.strip().split("\n")[0])
+    except Exception:
+        return 2.0
+
+
+def _write_srt(segments: list, srt_path: str) -> None:
+    """Write segments to an SRT subtitle file as fallback."""
+    import os
+    os.makedirs(os.path.dirname(srt_path) or ".", exist_ok=True)
+    lines = []
+    for idx, seg in enumerate(segments, 1):
+        start_s = seg.get("start", 0.0)
+        end_s = seg.get("end", 0.0)
+        text = seg.get("text", "")
+        lines.append(str(idx))
+        lines.append(f"{_fmt_srt_time(start_s)} --> {_fmt_srt_time(end_s)}")
+        lines.append(text)
+        lines.append("")
+    with open(srt_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+def _fmt_srt_time(seconds: float) -> str:
+    """Format seconds as SRT timestamp HH:MM:SS,mmm."""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int((seconds % 1) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
 
 def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = None, upscale: Optional[int] = None, media_profile: str = "1080p") -> dict:
     """Phase 8: audio_pipeline + visual_post + [color_grade] + [upscale] + rhythm_editor → polished.mp4
@@ -2993,6 +3041,9 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
         from visual_post import process_visual
         from rhythm_editor import edit_rhythm
 
+        # Track step statuses for quality gate integrity
+        step_status = {}
+
         # Step 8.1: Audio processing via OM AudioMixer
         bgm_path = None
         if has_audio:
@@ -3003,6 +3054,7 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             outputs.append("audio_processed.mp4")
             print(f"  ✓ [P0-D3] 跳过环境音合成，直接使用视频自带音轨")
             audio_success = True
+            step_status["audio_pipeline"] = "done"
         else:
             print("  → audio_pipeline: 音频处理 (AudioMixer: loudnorm + ducking)...")
             audio_out = output_dir / "audio_processed.mp4"
@@ -3037,6 +3089,7 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
                     outputs.append("audio_processed.mp4")
                     audio_success = True
                     print(f"  ✓ Audio processing complete")
+                    step_status["audio_pipeline"] = "done"
 
                     # AudioMixer outputs audio-only (-vn); remux processed audio
                     # back into the original video stream so downstream steps
@@ -3067,11 +3120,13 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
                         shutil.copy2(str(raw_video), str(audio_out))
                 else:
                     print(f"  ⚠ AudioMixer failed: {mix_result.error}")
+                    step_status["audio_pipeline"] = "failed"
                     # Fallback: just copy video
                     import shutil
                     shutil.copy2(raw_video, audio_out)
             except ImportError as e:
                 print(f"  ⚠ AudioMixer unavailable: {e}")
+                step_status["audio_pipeline"] = "failed"
                 # Fallback: just copy video
                 import shutil
                 shutil.copy2(raw_video, audio_out)
@@ -3102,34 +3157,64 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
                 with open(sb_path_str, 'r', encoding='utf-8') as f:
                     storyboard_data = json.load(f)
 
-                # Extract captions from shots
-                captions = []
-                for shot in storyboard_data.get('shots', []):
-                    if 'caption' in shot and shot['caption']:
-                        captions.append({
-                            "text": shot['caption'],
-                            "start": shot.get('start_time', 0),
-                            "end": shot.get('end_time', 0),
+                # Build segments with real timing from ffprobe.
+                # STORYBOARD.json has no start_time/end_time, so we probe
+                # each shot's actual video duration and accumulate a timeline.
+                shots_dir = output_dir / "shots"
+                sb_shots = storyboard_data.get('shots', [])
+                segments = []
+                cumulative_start = 0.0
+
+                for i, shot in enumerate(sb_shots):
+                    caption_text = shot.get('caption', '')
+                    if not caption_text:
+                        # Still need to advance timeline even if no caption
+                        shot_dur = _probe_shot_duration(shots_dir, i + 1)
+                        cumulative_start += shot_dur
+                        continue
+
+                    shot_dur = _probe_shot_duration(shots_dir, i + 1)
+                    seg_start = cumulative_start
+                    seg_end = cumulative_start + shot_dur
+
+                    # Build word-level entries for Chinese text (char-by-char)
+                    chars = list(caption_text)
+                    per_char = shot_dur / max(len(chars), 1)
+                    words = []
+                    for ci, ch in enumerate(chars):
+                        words.append({
+                            "word": ch,
+                            "start": seg_start + ci * per_char,
+                            "end": seg_start + (ci + 1) * per_char,
                         })
 
-                if captions:
+                    segments.append({
+                        "text": caption_text,
+                        "start": seg_start,
+                        "end": seg_end,
+                        "words": words,
+                    })
+                    cumulative_start = seg_end
+
+                # Also generate SRT as fallback
+                srt_path = str(output_dir / "subtitles.srt")
+                _write_srt(segments, srt_path)
+
+                if segments:
                     burn_result = caption_burner.execute({
                         "input_path": str(current_video),
                         "output_path": str(subtitled_out),
-                        "captions": captions,
-                        "style": {
-                            "font_size": 48,
-                            "font_color": "#FFFFFF",
-                            "background_color": "#000000",
-                            "background_opacity": 0.7,
-                            "position": "bottom",
-                        },
+                        "segments": segments,
+                        "srt_path": srt_path,
+                        "font_size": 48,
+                        "force_ffmpeg": True,
                     })
 
                     if burn_result.success:
                         current_video = subtitled_out
                         outputs.append("subtitled.mp4")
-                        print(f"    ✓ 字幕烧录完成: {len(captions)} 条字幕")
+                        outputs.append("subtitles.srt")
+                        print(f"    ✓ 字幕烧录完成: {len(segments)} 条字幕")
                     else:
                         print(f"    ⚠ 字幕烧录失败: {burn_result.error}")
                 else:
