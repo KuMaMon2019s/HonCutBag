@@ -97,8 +97,6 @@ class SeedreamClient:
         prompt: str,
         output_path: str = "output.png",
         size: str = "1920x1920",
-        n: int = 1,
-        output_format: str = "png",
         timeout: int = 60,
     ) -> str:
         """Generate image from text prompt. Returns image URL.
@@ -114,9 +112,9 @@ class SeedreamClient:
             "model": self.model,
             "prompt": sanitized_prompt,
             "size": size,
-            "n": n,
-            "output_format": output_format,
+            "response_format": "url",
             "watermark": False,
+            "sequential_image_generation": "disabled",
         }
 
         return self._call_and_save(payload, output_path, timeout=timeout)
