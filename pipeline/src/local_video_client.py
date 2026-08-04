@@ -87,6 +87,7 @@ def submit(
     timeout: int = 30,
     asset_zip_path: Optional[str] = None,
     content: Optional[List[dict]] = None,
+    batch_id: Optional[str] = None,
 ) -> Optional[str]:
     """Submit a video generation task to the local API.
     
@@ -104,6 +105,7 @@ def submit(
         timeout: Request timeout in seconds
         asset_zip_path: Optional path to zip file containing assets (priority over image_base64_list)
         content: Optional Bridge content[] list (highest priority, uses new contract)
+        batch_id: Optional identifier shared by all shots in one pipeline run
     
     Returns:
         task_id: Unique task identifier for polling, or None if zip not supported
@@ -117,7 +119,18 @@ def submit(
     # --- New content[] contract (highest priority) ---
     if content:
         try:
-            payload = {"content": content}
+            payload = {
+                "content": content,
+                "steps": steps,
+                "num_frames": num_frames,
+                "cfg": cfg,
+                "seed": seed,
+                "width": width,
+                "height": height,
+                "fps": fps,
+            }
+            if batch_id is not None:
+                payload["batch_id"] = batch_id
             resp = session.post(
                 f"{api_url}/generate",
                 json=payload,
@@ -189,6 +202,8 @@ def submit(
         payload["image_base64_list"] = image_base64_list
     if image_urls:
         payload["image_urls"] = image_urls
+    if batch_id is not None:
+        payload["batch_id"] = batch_id
     
     try:
         resp = session.post(
@@ -219,9 +234,9 @@ def poll(
 ) -> dict:
     """Poll task until done, with progress-based timeout.
 
-    只要任务还在 running/queued 且 progress 在增长，就一直等下去（适合 8GB 显存的慢机器，
-    单任务可能 20-60 分钟）。只有当 progress 连续 max_attempts 次轮询都没有任何增长，
-    且 status 仍是 running/queued 时，才判定卡死并 raise TimeoutError。
+    progress 为 0 或 status=queued 时按排队等待处理，最长等待时间由
+    LOCAL_VIDEO_QUEUE_TIMEOUT 控制（默认 7200 秒）。任务开始产生进度后，只有当
+    progress 连续 max_attempts 次轮询都没有任何增长时才判定卡死。
 
     Bridge v3.2 quirk: 任务完成后 status 可能永远卡在 "running" + progress=100，
     但 GET /download/{task_id} 能正常下载。当检测到 progress>=100 且 status=running 时，
@@ -237,7 +252,8 @@ def poll(
         dict with keys: status ("completed"), progress (100)
 
     Raises:
-        TimeoutError: 如果 progress 连续 max_attempts * interval 秒没有增长
+        TimeoutError: 排队超过 LOCAL_VIDEO_QUEUE_TIMEOUT，或已开始任务的 progress
+            连续 max_attempts * interval 秒没有增长
         RuntimeError: 如果任务失败或返回 error 字段
     """
     api_url = _get_api_url()
@@ -248,6 +264,8 @@ def poll(
     stale_count: int = 0          # 连续无进度增长的轮询次数
     total_polls: int = 0          # 总轮询次数（仅用于日志）
     last_progress_change_poll: int = 0  # 上次 progress 变化时的 total_polls 序号
+    queue_started_at = time.monotonic()
+    queue_timeout = int(os.environ.get("LOCAL_VIDEO_QUEUE_TIMEOUT", "7200"))
 
     # Bridge running/100 quirk tracking
     at_100_count: int = 0         # progress>=100 且 status=running 的连续轮数
@@ -312,7 +330,24 @@ def poll(
         download_probe_success = 0
         download_probe_fail = 0
 
-        # Progress-based stall detection (unchanged for progress < 100)
+        # A task at 0% (or explicitly queued) has not reached the GPU yet. Queue
+        # wait has its own generous wall-clock cap and never consumes the
+        # progress-stall allowance.
+        if status == "queued" or progress <= 0:
+            queue_seconds = time.monotonic() - queue_started_at
+            print(
+                f"  [local_poll #{total_polls}] queue-waiting: status={status} "
+                f"progress={progress}% ({queue_seconds:.0f}s / {queue_timeout}s)"
+            )
+            if queue_seconds >= queue_timeout:
+                raise TimeoutError(
+                    f"Local video task {task_id} queue wait exceeded {queue_timeout}s "
+                    f"with status={status} progress={progress}%"
+                )
+            time.sleep(interval)
+            continue
+
+        # Progress-based stall detection for tasks that have started.
         if progress > last_progress:
             if stale_count > 0:
                 print(f"  [local_poll #{total_polls}] ↗ progress resumed: {last_progress}% → {progress}%")
@@ -324,9 +359,9 @@ def poll(
 
         stale_seconds = stale_count * interval
         if status == "unknown":
-            print(f"  [local_poll #{total_polls}] WARNING: status=unknown progress={progress}% (no-progress wait {stale_seconds}s / {max_attempts * interval}s)")
+            print(f"  [local_poll #{total_polls}] WARNING: stall-waiting status=unknown progress={progress}% (no-progress wait {stale_seconds}s / {max_attempts * interval}s)")
         else:
-            print(f"  [local_poll #{total_polls}] status={status} progress={progress}% (no-progress wait {stale_seconds}s / {max_attempts * interval}s)")
+            print(f"  [local_poll #{total_polls}] stall-waiting: status={status} progress={progress}% (no-progress wait {stale_seconds}s / {max_attempts * interval}s)")
 
         if stale_count >= max_attempts and status in ("running", "queued", "unknown"):
             raise TimeoutError(
@@ -535,6 +570,7 @@ def generate_video(
     asset_zip_path: Optional[str] = None,
     image_base64_list: Optional[List[str]] = None,
     content: Optional[List[dict]] = None,
+    batch_id: Optional[str] = None,
 ) -> str:
     """High-level function: submit + poll + download in one call.
     
@@ -550,6 +586,7 @@ def generate_video(
         asset_zip_path: Optional path to zip file containing assets (priority over base64)
         image_base64_list: Optional list of base64 images for I2V (fallback if zip not supported)
         content: Optional Bridge content[] list (highest priority, uses new contract)
+        batch_id: Optional identifier shared by all shots in one pipeline run
     
     Returns:
         output_path on success
@@ -557,15 +594,21 @@ def generate_video(
     Raises:
         RuntimeError: If any step fails
     """
-    # Calculate num_frames from duration
-    num_frames = int(duration * fps) + 1  # +1 for inclusive frame count
+    # Local Wan2.2 TI2V-5B currently produces 49 frames on the 8GB GPU. Keep
+    # this environment-configurable so future local/online models can switch
+    # frame counts without a code change.
+    num_frames = int(os.environ.get("LOCAL_VIDEO_NUM_FRAMES", "49"))
+    expected_duration = num_frames / fps
     
     # Prepare image list (legacy single image support)
     if reference_image_base64 and not image_base64_list:
         image_base64_list = [reference_image_base64]
     
     # Submit
-    print(f"  [local_video] submitting ({width}x{height}, {duration}s, {num_frames} frames)...")
+    print(
+        f"  [local_video] submitting ({width}x{height}, num_frames={num_frames}, "
+        f"expected_duration={expected_duration:.2f}s)..."
+    )
     task_id = submit(
         prompt=prompt,
         image_base64_list=image_base64_list,
@@ -576,6 +619,7 @@ def generate_video(
         fps=fps,
         asset_zip_path=asset_zip_path,
         content=content,
+        batch_id=batch_id,
     )
     
     # Handle content[] failure - fallback to zip/base64
@@ -590,6 +634,7 @@ def generate_video(
             height=height,
             fps=fps,
             asset_zip_path=asset_zip_path,
+            batch_id=batch_id,
         )
     
     # Handle zip upload failure - fallback to base64
@@ -603,6 +648,7 @@ def generate_video(
             width=width,
             height=height,
             fps=fps,
+            batch_id=batch_id,
         )
     
     if task_id is None:
@@ -618,7 +664,7 @@ def generate_video(
     download(
         task_id,
         output_path,
-        expected_duration=duration,
+        expected_duration=expected_duration,
         expected_width=width,
         expected_height=height,
     )

@@ -1900,6 +1900,14 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
     print(f"  → 并发模式: VIDEO_GEN_CONCURRENCY={concurrency} ({'串行' if concurrency == 1 else f'并行 workers={concurrency}'})")
     
     shot_dirs = [d for d in sorted(shots_dir.iterdir()) if d.is_dir() and d.name.startswith("S")]
+    pending_shot_dirs = []
+    for shot_dir in shot_dirs:
+        existing_output = shot_dir / "output.mp4"
+        if existing_output.exists() and existing_output.stat().st_size > 10 * 1024:
+            print(f"  ⏭ {shot_dir.name}: output.mp4 exists, skipping")
+            outputs.append(f"shots/{shot_dir.name}/output.mp4")
+        else:
+            pending_shot_dirs.append(shot_dir)
     
     def _process_shot(shot_dir: Path) -> Optional[str]:
         """处理单个镜头的视频生成，返回 output.mp4 路径或 None"""
@@ -2089,6 +2097,7 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
                             asset_zip_path=zip_path,
                             image_base64_list=base64_list,
                             content=content_list,
+                            batch_id=output_dir.name,
                         )
                         
                         if shot_seed is not None:
@@ -2134,7 +2143,7 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
     # --- 执行模式：串行或并发 ---
     if concurrency == 1:
         # 串行模式（默认，保持原有逻辑和状态更新）
-        for shot_dir in shot_dirs:
+        for shot_dir in pending_shot_dirs:
             result = _process_shot(shot_dir)
             if result:
                 outputs.append(result)
@@ -2143,7 +2152,7 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
         # 并发模式（VIDEO_GEN_CONCURRENCY > 1）
         from concurrent.futures import ThreadPoolExecutor, as_completed
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            futures = {executor.submit(_process_shot, shot_dir): shot_dir for shot_dir in shot_dirs}
+            futures = {executor.submit(_process_shot, shot_dir): shot_dir for shot_dir in pending_shot_dirs}
             for future in as_completed(futures):
                 shot_dir = futures[future]
                 try:
