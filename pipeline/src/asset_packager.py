@@ -145,6 +145,64 @@ def package_shot_assets(
     return str(zip_path), base64_list
 
 
+def _detect_shot_characters(
+    output_dir: Path,
+    shot_meta: dict,
+) -> List[str]:
+    """
+    Detect which characters appear in a shot.
+
+    Resolution order:
+        1. Explicit char_ids in shot_meta (from pipeline_runner)
+        2. associate_assets in shot_meta (e.g. ["char:lin_xiao", "char:chen_yang"])
+        3. Name matching against CHARACTERS.json + prompt text
+
+    Returns:
+        List of character ids (e.g. ["lin_xiao", "chen_yang"])
+    """
+    # 1. Explicit char_ids
+    explicit = shot_meta.get("_char_ids")
+    if explicit:
+        return list(explicit)
+
+    # 2. associate_assets
+    associate = shot_meta.get("associate_assets", [])
+    if associate:
+        char_ids = [
+            aid[5:].split(":")[0]
+            for aid in associate
+            if isinstance(aid, str) and aid.startswith("char:")
+        ]
+        if char_ids:
+            return char_ids
+
+    # 3. Prompt name matching against CHARACTERS.json
+    prompt_text = shot_meta.get("prompt", "")
+    characters_json = output_dir / "CHARACTERS.json"
+    if not prompt_text or not characters_json.exists():
+        return []
+
+    try:
+        import json as _json
+        chars_data = _json.loads(characters_json.read_text())
+    except Exception:
+        return []
+
+    prompt_lower = prompt_text.lower()
+    matched = []
+    for char in chars_data.get("characters", []):
+        char_id = char.get("id", "")
+        char_name = char.get("name", "")
+        # Match by display name (case-insensitive) or char_id
+        if char_name and char_name.lower() in prompt_lower:
+            matched.append(char_id)
+        elif char_id and char_id.lower().replace("_", " ") in prompt_lower:
+            matched.append(char_id)
+        elif char_id and char_id.lower() in prompt_lower:
+            matched.append(char_id)
+    return matched
+
+
 def build_content_for_shot(
     output_dir: Path,
     shot_id: str,
@@ -152,12 +210,12 @@ def build_content_for_shot(
 ) -> List[dict]:
     """
     Build Bridge content[] list for a shot with TOS-uploaded reference images.
-    
+
     Args:
         output_dir: Project output directory
         shot_id: Shot identifier (e.g., "S01")
         shot_meta: Shot metadata dict with prompt, duration, seed, width, height
-    
+
     Returns:
         List of content items for Bridge /generate API:
         [
@@ -166,26 +224,31 @@ def build_content_for_shot(
             {"type": "image_url", "image_url": {"url": "https://..."}, "role": "reference_image", "priority": "high"},
             ...
         ]
-    
-    Image collection order (max 9 total):
-        1. Shot frame (storyboard_images/{shot_id}.png) → role=first_frame, priority=high
-        2. Character front views (characters/{char_id}/front.png) → role=reference_image, priority=high
-        3. Storyboard.png → role=reference_image, priority=medium
-        4. Character side/back views → role=reference_image, priority=medium
-    
+
+    Smart image selection strategy (max 9 total, Bridge picks ~3):
+        - Single-character shot: front + side + back of that character (all high)
+          → Bridge gets 3 views of the same character for maximum consistency
+        - Multi-character shot: front of each character (all high)
+          → Bridge gets identity reference for each character
+        - Shot frame always high priority
+        - Storyboard.png always medium priority (style reference)
+
     Each image is uploaded to TOS and replaced with a signed URL.
     """
     output_dir = Path(output_dir)
     content = []
-    
+
     # 1. Text prompt (always first)
     prompt_text = shot_meta.get("prompt", "")
     if prompt_text:
         content.append({"type": "text", "text": prompt_text})
-    
+
+    # Detect which characters appear in this shot
+    shot_char_ids = _detect_shot_characters(output_dir, shot_meta)
+
     # Collect image assets with metadata
     image_assets = []
-    
+
     # 2. Shot frame (storyboard_images/{shot_id}.png) — highest priority
     shot_frame_path = output_dir / "storyboard_images" / f"{shot_id}.png"
     if shot_frame_path.exists() and shot_frame_path.stat().st_size > 1024:
@@ -194,33 +257,64 @@ def build_content_for_shot(
             "role": "first_frame",
             "priority": "high",
         })
-    
-    # 3. Character reference images
+
+    # 3. Character reference images — smart selection based on shot characters
     char_bases = [output_dir / "characters", output_dir / "characters" / "characters"]
     seen_char_dirs = set()
-    for char_base in char_bases:
-        if char_base.exists():
-            for char_dir in char_base.iterdir():
-                if char_dir.is_dir() and char_dir.name not in seen_char_dirs:
-                    seen_char_dirs.add(char_dir.name)
-                    # Front view (high priority)
-                    front_path = char_dir / "front.png"
-                    if front_path.exists() and front_path.stat().st_size > 1024:
-                        image_assets.append({
-                            "path": front_path,
-                            "role": "reference_image",
-                            "priority": "high",
-                        })
-                    # Side/back views (medium priority)
-                    for view in ["side.png", "back.png"]:
-                        view_path = char_dir / view
-                        if view_path.exists() and view_path.stat().st_size > 1024:
+
+    # Determine which characters to include and their view priority
+    if shot_char_ids:
+        # We know exactly which characters are in this shot
+        for char_base in char_bases:
+            if char_base.exists():
+                for char_dir in char_base.iterdir():
+                    if char_dir.is_dir() and char_dir.name not in seen_char_dirs:
+                        seen_char_dirs.add(char_dir.name)
+                        if char_dir.name in shot_char_ids:
+                            # This character is IN the shot
+                            is_single_char_shot = len(shot_char_ids) == 1
+                            # Front view always high
+                            front_path = char_dir / "front.png"
+                            if front_path.exists() and front_path.stat().st_size > 1024:
+                                image_assets.append({
+                                    "path": front_path,
+                                    "role": "reference_image",
+                                    "priority": "high",
+                                })
+                            # Side/back: high for single-char shots, medium for multi-char
+                            side_back_priority = "high" if is_single_char_shot else "medium"
+                            for view in ["side.png", "back.png"]:
+                                view_path = char_dir / view
+                                if view_path.exists() and view_path.stat().st_size > 1024:
+                                    image_assets.append({
+                                        "path": view_path,
+                                        "role": "reference_image",
+                                        "priority": side_back_priority,
+                                    })
+                        # Characters NOT in shot: skip entirely (don't waste slots)
+    else:
+        # Fallback: no character detection — include all characters (legacy behavior)
+        for char_base in char_bases:
+            if char_base.exists():
+                for char_dir in char_base.iterdir():
+                    if char_dir.is_dir() and char_dir.name not in seen_char_dirs:
+                        seen_char_dirs.add(char_dir.name)
+                        front_path = char_dir / "front.png"
+                        if front_path.exists() and front_path.stat().st_size > 1024:
                             image_assets.append({
-                                "path": view_path,
+                                "path": front_path,
                                 "role": "reference_image",
-                                "priority": "medium",
+                                "priority": "high",
                             })
-    
+                        for view in ["side.png", "back.png"]:
+                            view_path = char_dir / view
+                            if view_path.exists() and view_path.stat().st_size > 1024:
+                                image_assets.append({
+                                    "path": view_path,
+                                    "role": "reference_image",
+                                    "priority": "medium",
+                                })
+
     # 4. Storyboard.png (medium priority)
     storyboard_path = output_dir / "storyboard.png"
     if storyboard_path.exists() and storyboard_path.stat().st_size > 1024:
@@ -229,10 +323,15 @@ def build_content_for_shot(
             "role": "reference_image",
             "priority": "medium",
         })
-    
+
     # Sort by priority (high first), then upload to TOS
     image_assets.sort(key=lambda a: (0 if a["priority"] == "high" else 1, a["path"].name))
-    
+
+    # Log the smart selection
+    high_count = sum(1 for a in image_assets if a["priority"] == "high")
+    print(f"  [assets] 智能选图: {len(shot_char_ids)} 个出场角色 {shot_char_ids}, "
+          f"{high_count} high + {len(image_assets) - high_count} medium = {len(image_assets)} 张")
+
     # Limit to 9 images max (Bridge limit)
     image_assets = image_assets[:9]
     
