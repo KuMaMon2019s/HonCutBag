@@ -211,6 +211,26 @@ class SeedreamClient:
                 headers=self.headers,
                 timeout=timeout,
             )
+            status_code = getattr(resp, "status_code", 200)
+            if status_code != 200:
+                diagnostic_headers = {
+                    name: value
+                    for name, value in resp.headers.items()
+                    if name.lower() in {
+                        "retry-after",
+                        "x-request-id",
+                        "x-tt-logid",
+                    }
+                    or any(
+                        marker in name.lower()
+                        for marker in ("rate", "limit", "retry")
+                    )
+                }
+                print(
+                    f"  [seedream] ✗ HTTP {status_code} "
+                    f"body={resp.text[:1000]!r} headers={diagnostic_headers}",
+                    flush=True,
+                )
             resp.raise_for_status()
             data = resp.json()
 
