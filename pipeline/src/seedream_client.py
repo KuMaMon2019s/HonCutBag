@@ -71,6 +71,14 @@ class _SeedreamRateLimiter:
 _SEEDREAM_RATE_LIMITER = _SeedreamRateLimiter()
 
 
+class AgentPlanQuotaExceededError(RuntimeError):
+    """Agent Plan 月度配额耗尽（AccountQuotaExceeded）。
+
+    与瞬时限流不同：重试/冷却无法恢复，必须等配额重置或升级套餐。
+    所有重试层检测到此异常应立即放弃，避免无谓等待。
+    """
+
+
 class SeedreamClient:
     """Seedream image generation client for Volcano Ark Agent Plan API."""
 
@@ -231,6 +239,14 @@ class SeedreamClient:
                     f"body={resp.text[:1000]!r} headers={diagnostic_headers}",
                     flush=True,
                 )
+                # 配额耗尽快速失败：AgentPlanQuotaExceededError 不可通过重试恢复，
+                # 立即抛出，让所有重试层放弃（区别于瞬时限流）。
+                if "AccountQuotaExceeded" in resp.text:
+                    raise AgentPlanQuotaExceededError(
+                        f"Agent Plan 月度配额已耗尽（AccountQuotaExceeded）。"
+                        f"重试无法恢复，请等配额重置或升级套餐。"
+                        f"Request id: {diagnostic_headers.get('x-request-id', 'N/A')}"
+                    )
             resp.raise_for_status()
             data = resp.json()
 
