@@ -2805,12 +2805,20 @@ def run_phase7(output_dir: Path, dry_run: bool,
     try:
         from edit_decisions import build_edit_decisions, execute_edit_decisions
         
+        # Convert selected_transitions (list of strings) to the format
+        # build_edit_decisions expects: list of dicts with "decision" key
+        # This ensures transitions are applied even when smart_decisions is None
+        # (e.g. when the embedding API fails with 400 and we fall back to emotion mapping)
+        transition_dicts = None
+        if selected_transitions:
+            transition_dicts = [{"decision": t} for t in selected_transitions]
+        
         print("  → 构建 edit_decisions（帧精确裁切 + 音频归一化）...")
         edit_decisions = build_edit_decisions(
             shots_dir=shots_dir,
             target_width=1920,
             target_height=1080,
-            transition_decisions=smart_decisions,
+            transition_decisions=transition_dicts,
         )
         
         print(f"  → 执行 edit_decisions（{len(edit_decisions['cuts'])} 个片段）...")
