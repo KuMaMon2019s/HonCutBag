@@ -14,6 +14,7 @@ import time
 import json
 import subprocess
 import requests
+from pathlib import Path
 from typing import Optional, List
 
 
@@ -84,7 +85,8 @@ def submit(
     height: int = 720,
     fps: int = 24,
     timeout: int = 30,
-) -> str:
+    asset_zip_path: Optional[str] = None,
+) -> Optional[str]:
     """Submit a video generation task to the local API.
     
     Args:
@@ -99,9 +101,10 @@ def submit(
         height: Output video height
         fps: Output video framerate
         timeout: Request timeout in seconds
+        asset_zip_path: Optional path to zip file containing assets (priority over image_base64_list)
     
     Returns:
-        task_id: Unique task identifier for polling
+        task_id: Unique task identifier for polling, or None if zip not supported
     
     Raises:
         RuntimeError: If the API is unreachable or returns an error
@@ -109,6 +112,37 @@ def submit(
     api_url = _get_api_url()
     session = _request_session()
     
+    # Try zip upload first if provided
+    if asset_zip_path:
+        try:
+            with open(asset_zip_path, "rb") as f:
+                files = {"file": (Path(asset_zip_path).name, f, "application/zip")}
+                data = {"prompt": prompt}
+                resp = session.post(
+                    f"{api_url}/generate_zip",
+                    files=files,
+                    data=data,
+                    timeout=timeout,
+                )
+            if resp.status_code == 200:
+                data = resp.json()
+                task_id = data.get("task_id") or data.get("id")
+                if task_id:
+                    return task_id
+            elif resp.status_code == 404:
+                print(f"  [submit] Bridge does not support /generate_zip (404), falling back to base64")
+                return None
+            else:
+                print(f"  [submit] /generate_zip failed with {resp.status_code}, falling back to base64")
+                return None
+        except requests.exceptions.ConnectionError:
+            print(f"  [submit] Bridge unreachable for zip upload, falling back to base64")
+            return None
+        except Exception as e:
+            print(f"  [submit] zip upload failed: {e}, falling back to base64")
+            return None
+    
+    # Fallback to JSON payload
     payload = {
         "prompt": prompt,
         "steps": steps,
@@ -467,18 +501,22 @@ def generate_video(
     width: int = 1280,
     height: int = 720,
     fps: int = 24,
+    asset_zip_path: Optional[str] = None,
+    image_base64_list: Optional[List[str]] = None,
 ) -> str:
     """High-level function: submit + poll + download in one call.
     
     Args:
         prompt: Video description
         output_path: Where to save the output mp4
-        reference_image_base64: Optional reference image for I2V
+        reference_image_base64: Optional reference image for I2V (single image, legacy)
         seed: Random seed (-1 for random)
         duration: Desired video duration in seconds
         width: Output width
         height: Output height
         fps: Output framerate
+        asset_zip_path: Optional path to zip file containing assets (priority over base64)
+        image_base64_list: Optional list of base64 images for I2V (fallback if zip not supported)
     
     Returns:
         output_path on success
@@ -489,9 +527,8 @@ def generate_video(
     # Calculate num_frames from duration
     num_frames = int(duration * fps) + 1  # +1 for inclusive frame count
     
-    # Prepare image list
-    image_base64_list = None
-    if reference_image_base64:
+    # Prepare image list (legacy single image support)
+    if reference_image_base64 and not image_base64_list:
         image_base64_list = [reference_image_base64]
     
     # Submit
@@ -504,7 +541,25 @@ def generate_video(
         width=width,
         height=height,
         fps=fps,
+        asset_zip_path=asset_zip_path,
     )
+    
+    # Handle zip upload failure - fallback to base64
+    if task_id is None and asset_zip_path is not None:
+        print(f"  [local_video] zip upload failed, falling back to base64 list")
+        task_id = submit(
+            prompt=prompt,
+            image_base64_list=image_base64_list,
+            num_frames=num_frames,
+            seed=seed,
+            width=width,
+            height=height,
+            fps=fps,
+        )
+    
+    if task_id is None:
+        raise RuntimeError("Failed to submit video generation task")
+    
     print(f"  [local_video] task_id={task_id}")
     
     # Poll
