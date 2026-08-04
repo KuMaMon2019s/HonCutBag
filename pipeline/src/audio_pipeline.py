@@ -15,8 +15,120 @@ Usage:
 
 import subprocess
 import json
+import re
 from pathlib import Path
 from typing import Optional
+
+
+# ─── Silent Audio Detection ───────────────────────────────────────────────────
+
+def is_silent_audio(video_path: str, threshold_db: float = -60.0) -> bool:
+    """Detect whether the audio track of a video is effectively silent.
+
+    Uses ffmpeg volumedetect filter.  mean_volume < threshold_db (default -60 dB)
+    is considered silent — this covers both truly empty tracks and the anullsrc
+    silence injected by edit_decisions normalisation.
+
+    Returns True when the track is silent (or when no audio stream exists, or
+    when detection fails — callers should treat failure as "assume silent" so
+    the ambient fallback always produces audible output).
+    """
+    cmd = [
+        "ffmpeg", "-i", str(video_path),
+        "-af", "volumedetect",
+        "-f", "null", "-",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        # volumedetect writes to stderr
+        match = re.search(r"mean_volume:\s*([-\d.]+)\s*dB", result.stderr)
+        if match:
+            mean_vol = float(match.group(1))
+            return mean_vol < threshold_db
+        # No mean_volume line → probably no audio stream → silent
+        return True
+    except Exception:
+        # Detection failure → assume silent so ambient fallback kicks in
+        return True
+
+
+# ─── Ambient Audio Generation (local fallback) ────────────────────────────────
+
+def generate_ambient_audio(
+    duration: float,
+    output_path: str,
+    scene_hint: str = "lake_evening",
+    target_db: float = -20.0,
+) -> bool:
+    """Generate lightweight ambient audio using ffmpeg filters only.
+
+    Produces pink-noise-based ambience filtered to match a scene mood.
+    No external model or API required.
+
+    Scene presets:
+      lake_evening  — low-pass filtered pink noise (warm lake breeze)
+      forest        — band-pass pink noise (rustling leaves)
+      city          — wider band-pass with slight rumble
+      generic       — gentle pink noise (safe default)
+
+    Args:
+        duration:    target duration in seconds
+        output_path: where to write the generated audio (mp4/m4a)
+        scene_hint:  one of the presets above
+        target_db:   target volume in dB (default -20 dB, moderate)
+
+    Returns:
+        True on success.
+    """
+    if duration <= 0:
+        return False
+
+    # Preset filter chains (applied to anullsrc white noise → shaped to pink-ish)
+    presets = {
+        "lake_evening": (
+            "highpass=f=40,"
+            "lowpass=f=800,"
+            "equalizer=f=200:t=q:w=1.5:g=4,"
+            "equalizer=f=500:t=q:w=2:g=-3,"
+            "volume={vol_db}dB"
+        ),
+        "forest": (
+            "highpass=f=200,"
+            "lowpass=f=4000,"
+            "equalizer=f=1000:t=q:w=1:g=3,"
+            "equalizer=f=3000:t=q:w=1.5:g=-2,"
+            "volume={vol_db}dB"
+        ),
+        "city": (
+            "highpass=f=60,"
+            "lowpass=f=3000,"
+            "equalizer=f=120:t=q:w=2:g=5,"
+            "volume={vol_db}dB"
+        ),
+        "generic": (
+            "highpass=f=80,"
+            "lowpass=f=2000,"
+            "volume={vol_db}dB"
+        ),
+    }
+
+    af = presets.get(scene_hint, presets["generic"]).format(vol_db=target_db)
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "lavfi", "-t", str(duration),
+        "-i", "anoisesrc=color=pink:amplitude=1.0:sample_rate=48000",
+        "-af", af,
+        "-c:a", "aac", "-b:a", "128k",
+        "-ar", "48000", "-ac", "2",
+        str(output_path),
+    ]
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=60, check=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"  ⚠ Ambient generation failed: {e.stderr[:200] if e.stderr else e}")
+        return False
 
 
 def get_audio_duration(file_path: str) -> float:

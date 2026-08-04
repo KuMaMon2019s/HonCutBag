@@ -3038,17 +3038,29 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
     storyboard_path = output_dir / "STORYBOARD.json"
     sb_path_str = str(storyboard_path) if storyboard_path.exists() else None
 
-    # --- P0-D3: 如果视频已有音轨（Seedance generate_audio），跳过环境音合成 ---
-    has_audio = False
+    # --- P0-D3: Check whether the audio track is genuinely audible ──────────
+    # Previously this only checked "has audio stream" — but local Wan2.2 videos
+    # have an anullsrc-injected silent track from edit_decisions normalisation.
+    # Now we run volumedetect: mean_volume < -60 dB → treat as silent → run
+    # ambient fallback so the final video is never silent.
+    has_real_audio = False
     try:
+        from audio_pipeline import is_silent_audio
         import subprocess as _sp
-        probe_cmd = ["ffprobe", "-v", "quiet", "-select_streams", "a", "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(raw_video)]
+        # First check: does an audio stream exist at all?
+        probe_cmd = ["ffprobe", "-v", "quiet", "-select_streams", "a",
+                     "-show_entries", "stream=codec_type", "-of", "csv=p=0",
+                     str(raw_video)]
         probe_result = _sp.run(probe_cmd, capture_output=True, text=True, timeout=10)
-        has_audio = bool(probe_result.stdout.strip())
+        has_stream = bool(probe_result.stdout.strip())
+        if has_stream:
+            # Second check: is it actually audible?
+            has_real_audio = not is_silent_audio(str(raw_video))
     except Exception:
         pass
-    if has_audio:
-        print("  → [P0-D3] 视频已有音轨（Seedance generate_audio），跳过环境音合成")
+
+    if has_real_audio:
+        print("  → [P0-D3] 视频已有真实音轨（Seedance generate_audio），跳过环境音合成")
 
     try:
         from visual_post import process_visual
@@ -3060,8 +3072,8 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
 
         # Step 8.1: Audio processing via OM AudioMixer
         bgm_path = None
-        if has_audio:
-            # 视频已有音轨，直接复制作为音频处理输出，跳过环境音合成
+        if has_real_audio:
+            # 视频已有真实音轨，直接复制作为音频处理输出，跳过环境音合成
             import shutil
             audio_out = output_dir / "audio_processed.mp4"
             shutil.copy2(raw_video, audio_out)
@@ -3137,13 +3149,67 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
                     step_status["audio_pipeline"] = "failed"
                     # Fallback: just copy video
                     import shutil
-                    shutil.copy2(raw_video, audio_out)
+                    shutil.copy2(str(raw_video), audio_out)
             except ImportError as e:
                 print(f"  ⚠ AudioMixer unavailable: {e}")
                 step_status["audio_pipeline"] = "failed"
                 # Fallback: just copy video
                 import shutil
-                shutil.copy2(raw_video, audio_out)
+                shutil.copy2(str(raw_video), audio_out)
+
+            # ── Ambient fallback: if AudioMixer path produced a silent track ──
+            # AudioMixer may not be available or may fail, leaving audio_out as
+            # a copy of the silent raw_video.  Detect and inject generated ambience.
+            try:
+                from audio_pipeline import is_silent_audio, generate_ambient_audio
+                if audio_out.exists() and is_silent_audio(str(audio_out)):
+                    print("  → [ambient-fallback] AudioMixer output still silent, generating ambient audio...")
+                    from edit_decisions import probe_video
+                    vid_info = probe_video(str(raw_video))
+                    ambient_dur = vid_info.get("duration", 12.0)
+                    # Pick scene hint from storyboard if available
+                    scene_hint = "lake_evening"
+                    if storyboard_data:
+                        scene_desc = str(storyboard_data.get("metadata", {}).get("scene", "")).lower()
+                        if "forest" in scene_desc or "林" in scene_desc:
+                            scene_hint = "forest"
+                        elif "city" in scene_desc or "城" in scene_desc:
+                            scene_hint = "city"
+                    ambient_tmp = output_dir / ".ambient_fallback.m4a"
+                    if generate_ambient_audio(ambient_dur, str(ambient_tmp), scene_hint=scene_hint):
+                        # Mix ambient audio into the video
+                        ambient_out = output_dir / ".ambient_remux.mp4"
+                        import subprocess as _sp
+                        mix_cmd = [
+                            "ffmpeg", "-y",
+                            "-i", str(audio_out),
+                            "-i", str(ambient_tmp),
+                            "-filter_complex",
+                            "[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=0[aout]",
+                            "-map", "0:v", "-map", "[aout]",
+                            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                            "-shortest",
+                            str(ambient_out),
+                        ]
+                        try:
+                            _sp.run(mix_cmd, capture_output=True, check=True, timeout=60)
+                            import shutil
+                            shutil.move(str(ambient_out), str(audio_out))
+                            print(f"  ✓ [ambient-fallback] Ambient audio mixed in ({scene_hint}, {ambient_dur:.1f}s)")
+                            step_status["audio_pipeline"] = "done"
+                            if "audio_processed.mp4" not in outputs:
+                                outputs.append("audio_processed.mp4")
+                        except Exception as mix_err:
+                            print(f"  ⚠ [ambient-fallback] Mix failed: {mix_err}")
+                        finally:
+                            if ambient_tmp.exists():
+                                ambient_tmp.unlink()
+                            if ambient_out.exists():
+                                ambient_out.unlink()
+                    else:
+                        print("  ⚠ [ambient-fallback] Ambient generation failed")
+            except ImportError:
+                pass  # audio_pipeline not available, skip fallback
 
         audio_out = str(audio_out)
 
