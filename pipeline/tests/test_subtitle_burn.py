@@ -301,3 +301,34 @@ class TestRemotionCaptionBurnInterface:
         burner = RemotionCaptionBurn()
         schema = burner.input_schema
         assert "style" not in schema["properties"]
+
+    def test_caption_pages_preserve_srt_cue_boundaries(self, tmp_path):
+        """Separate SRT cues must not be merged into one timed overlay."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "vendor" / "openmontage"))
+        from tools.video.remotion_caption_burn import RemotionCaptionBurn
+
+        srt_path = tmp_path / "two_cues.srt"
+        srt_path.write_text(
+            "1\n00:00:00,500 --> 00:00:02,500\n第一条\n\n"
+            "2\n00:00:03,000 --> 00:00:05,500\n第二条\n",
+            encoding="utf-8",
+        )
+        burner = RemotionCaptionBurn()
+        captions = burner._srt_to_word_captions(str(srt_path))
+
+        assert burner._caption_pages(captions) == [
+            ("第一条", 0.5, 2.5),
+            ("第二条", 3.0, 5.5),
+        ]
+
+    def test_filter_detection_finds_overlay(self):
+        """The minimal Homebrew FFmpeg path can feature-detect overlay."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "vendor" / "openmontage"))
+        from tools.video.remotion_caption_burn import RemotionCaptionBurn
+
+        filters_output = "Filters:\n TS overlay VV->V Overlay a video source.\n"
+        completed = MagicMock(stdout=filters_output)
+        with patch("tools.video.remotion_caption_burn.subprocess.run", return_value=completed):
+            assert "overlay" in RemotionCaptionBurn._ffmpeg_filters()

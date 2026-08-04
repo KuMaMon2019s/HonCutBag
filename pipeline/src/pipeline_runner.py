@@ -3056,6 +3056,7 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
 
         # Track step statuses for quality gate integrity
         step_status = {}
+        storyboard_data = None
 
         # Step 8.1: Audio processing via OM AudioMixer
         bgm_path = None
@@ -3339,6 +3340,28 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             print(f"    ⚠ 最终编码异常: {e}，使用原始 polished.mp4")
             step_status["final_encode"] = "failed"
 
+        # Step 8.5: hard video QA must also run when run_phase8() is invoked
+        # directly (outside the full pipeline graph/runner).
+        video_qa_result = None
+        try:
+            from video_qa import run_video_qa
+            if storyboard_data is None and storyboard_path.exists():
+                storyboard_data = json.loads(storyboard_path.read_text(encoding="utf-8"))
+            qa_report = run_video_qa(output_dir, storyboard_data=storyboard_data)
+            video_qa_result = {
+                "status": "done" if qa_report.verdict == "pass" else "warning",
+                "verdict": qa_report.verdict,
+                "grade": qa_report.grade,
+                "issues_count": len(qa_report.issues),
+            }
+            outputs.append("video_qa_report.json")
+        except ImportError as e:
+            video_qa_result = {"status": "skipped", "reason": str(e)}
+            print(f"  ⚠ Phase 8.5 Video QA unavailable: {e}")
+        except Exception as e:
+            video_qa_result = {"status": "error", "error": str(e)}
+            print(f"  ⚠ Phase 8.5 Video QA failed: {e}")
+
         print(f"  ✓ Phase 8 完成: polished.mp4")
         
         # Quality gate: Phase 8
@@ -3356,6 +3379,7 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             "bgm_detected": bgm_path is not None,
             "media_profile": media_profile,
             "step_status": step_status,
+            "video_qa": video_qa_result,
         }
 
     except ImportError as e:

@@ -34,6 +34,8 @@ import json
 import math
 import re
 import shutil
+import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -219,7 +221,7 @@ class RemotionCaptionBurn(BaseTool):
         captions: list[dict] = []
         corr = {k.lower(): v for k, v in (corrections or {}).items()}
 
-        for seg in segments:
+        for segment_index, seg in enumerate(segments):
             words = seg.get("words", [])
             if words:
                 for w in words:
@@ -235,6 +237,7 @@ class RemotionCaptionBurn(BaseTool):
                         "word": fixed,
                         "startMs": int(w["start"] * 1000),
                         "endMs": int(w["end"] * 1000),
+                        "cueId": segment_index,
                     })
             elif "text" in seg:
                 text_words = seg["text"].strip().split()
@@ -246,6 +249,7 @@ class RemotionCaptionBurn(BaseTool):
                         "word": fixed,
                         "startMs": int((seg["start"] + i * per_word) * 1000),
                         "endMs": int((seg["start"] + (i + 1) * per_word) * 1000),
+                        "cueId": segment_index,
                     })
         return captions
 
@@ -258,7 +262,7 @@ class RemotionCaptionBurn(BaseTool):
         corr = {k.lower(): v for k, v in (corrections or {}).items()}
         captions: list[dict] = []
 
-        for block in blocks:
+        for cue_index, block in enumerate(blocks):
             lines = block.strip().split("\n")
             if len(lines) < 3:
                 continue
@@ -290,6 +294,7 @@ class RemotionCaptionBurn(BaseTool):
                     "word": fixed,
                     "startMs": int(start_ms + i * per_word),
                     "endMs": int(start_ms + (i + 1) * per_word),
+                    "cueId": cue_index,
                 })
         return captions
 
@@ -423,30 +428,30 @@ class RemotionCaptionBurn(BaseTool):
 
         tmp_srt.write_text("\n".join(srt_lines), encoding="utf-8")
 
-        # Escape path for FFmpeg subtitles filter (Windows colon issue)
-        srt_escaped = str(tmp_srt).replace("\\", "/").replace(":", "\\:")
-
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", input_path,
-            "-vf", (
-                f"subtitles='{srt_escaped}'"
-                ":force_style='FontName=serif,FontSize=52,"
-                "PrimaryColour=&H004242c9,Outline=0,"
-                "Shadow=1,Alignment=2,MarginV=80'"
-            ),
-            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "copy",
-            output_path,
-        ]
-        self.run_command(cmd)
-
-        # Clean up temp SRT
         try:
-            tmp_srt.unlink()
-        except OSError:
-            pass
+            filters = self._ffmpeg_filters()
+            if "subtitles" in filters:
+                self._render_with_subtitles(input_path, output_path, tmp_srt)
+                method = "ffmpeg_subtitles"
+            elif "drawtext" in filters:
+                self._render_with_drawtext(input_path, output_path, captions)
+                method = "ffmpeg_drawtext"
+            elif "overlay" in filters:
+                # Minimal FFmpeg bottles can omit both libass and libfreetype.
+                # Render glyphs with Pillow and let FFmpeg perform only the
+                # timed compositing, which is available in those builds.
+                self._render_with_image_overlays(input_path, output_path, captions)
+                method = "ffmpeg_image_overlay"
+            else:
+                return ToolResult(
+                    success=False,
+                    error="FFmpeg has none of the subtitles, drawtext, or overlay filters",
+                )
+        finally:
+            try:
+                tmp_srt.unlink()
+            except OSError:
+                pass
 
         if not Path(output_path).exists():
             return ToolResult(success=False, error="FFmpeg subtitle burn produced no output")
@@ -454,13 +459,176 @@ class RemotionCaptionBurn(BaseTool):
         return ToolResult(
             success=True,
             data={
-                "method": "ffmpeg_fallback",
+                "method": method,
                 "output": output_path,
                 "caption_count": len(captions),
                 "note": "Used FFmpeg fallback. Install Remotion for animated captions.",
             },
             artifacts=[output_path],
         )
+
+    @staticmethod
+    def _ffmpeg_filters() -> set[str]:
+        """Return filter names supported by the active FFmpeg binary."""
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-filters"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True,
+        )
+        names = set()
+        for line in result.stdout.splitlines():
+            columns = line.split()
+            if (
+                len(columns) >= 2
+                and 2 <= len(columns[0]) <= 3
+                and columns[1] != "="
+                and all(char in ".|" or "A" <= char <= "Z" for char in columns[0])
+            ):
+                names.add(columns[1])
+        return names
+
+    def _render_with_subtitles(
+        self, input_path: str, output_path: str, srt_path: Path,
+    ) -> None:
+        # Quotes here belong to FFmpeg's filtergraph grammar. The command is
+        # passed as argv (without a shell), so shell quoting must not be added.
+        escaped = str(srt_path).replace("\\", "/")
+        escaped = escaped.replace("'", r"\'").replace(":", r"\:")
+        video_filter = (
+            f"subtitles=filename='{escaped}':"
+            "force_style='FontName=serif,FontSize=52,"
+            "PrimaryColour=&H004242c9,Outline=0,"
+            "Shadow=1,Alignment=2,MarginV=80'"
+        )
+        self.run_command(self._ffmpeg_video_command(
+            input_path, output_path, ["-vf", video_filter]
+        ))
+
+    def _render_with_drawtext(
+        self, input_path: str, output_path: str, captions: list[dict],
+    ) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="caption_drawtext_"))
+        try:
+            filters = []
+            for index, (text, start_s, end_s) in enumerate(self._caption_pages(captions)):
+                text_path = temp_dir / f"cue_{index:04d}.txt"
+                text_path.write_text(text, encoding="utf-8")
+                escaped_path = str(text_path).replace("\\", "/")
+                escaped_path = escaped_path.replace("'", r"\'").replace(":", r"\:")
+                filters.append(
+                    "drawtext="
+                    f"textfile='{escaped_path}':fontsize=52:fontcolor=#c94242:"
+                    "borderw=2:bordercolor=black:"
+                    "x=(w-text_w)/2:y=h-text_h-80:"
+                    f"enable='between(t,{start_s:.3f},{end_s:.3f})'"
+                )
+            self.run_command(self._ffmpeg_video_command(
+                input_path, output_path, ["-vf", ",".join(filters)]
+            ))
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def _render_with_image_overlays(
+        self, input_path: str, output_path: str, captions: list[dict],
+    ) -> None:
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+        except ImportError as exc:
+            raise RuntimeError(
+                "Pillow is required when FFmpeg lacks subtitles and drawtext"
+            ) from exc
+
+        temp_dir = Path(tempfile.mkdtemp(prefix="caption_overlay_"))
+        try:
+            font = self._caption_font(ImageFont, 52)
+            pages = self._caption_pages(captions)
+            png_paths = []
+            for index, (caption_text, _, _) in enumerate(pages):
+                scratch = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+                draw = ImageDraw.Draw(scratch)
+                box = draw.textbbox((0, 0), caption_text, font=font, stroke_width=2)
+                width = max(2, box[2] - box[0] + 24)
+                height = max(2, box[3] - box[1] + 20)
+                image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+                draw = ImageDraw.Draw(image)
+                draw.text(
+                    (12 - box[0], 10 - box[1]), caption_text, font=font,
+                    fill=(201, 66, 66, 255), stroke_width=2,
+                    stroke_fill=(0, 0, 0, 255),
+                )
+                png_path = temp_dir / f"cue_{index:04d}.png"
+                image.save(png_path)
+                png_paths.append(png_path)
+
+            cmd = ["ffmpeg", "-y", "-i", input_path]
+            for png_path in png_paths:
+                cmd.extend(["-i", str(png_path)])
+
+            chains = []
+            previous = "[0:v]"
+            for index, (_, start_s, end_s) in enumerate(pages, start=1):
+                output = f"[captioned{index}]"
+                chains.append(
+                    f"{previous}[{index}:v]overlay="
+                    f"x=(W-w)/2:y=H-h-80:enable='between(t,{start_s:.3f},{end_s:.3f})'"
+                    f"{output}"
+                )
+                previous = output
+
+            cmd.extend([
+                "-filter_complex", ";".join(chains),
+                "-map", previous, "-map", "0:a?",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                "-pix_fmt", "yuv420p", "-c:a", "copy", output_path,
+            ])
+            self.run_command(cmd)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    @staticmethod
+    def _caption_font(image_font: Any, size: int) -> Any:
+        candidates = [
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            "/System/Library/Fonts/STHeiti Medium.ttc",
+            "/System/Library/Fonts/HelveticaNeue.ttc",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]
+        for candidate in candidates:
+            if Path(candidate).exists():
+                return image_font.truetype(candidate, size=size)
+        return image_font.load_default()
+
+    @staticmethod
+    def _caption_pages(captions: list[dict]) -> list[tuple[str, float, float]]:
+        pages = []
+        cue_groups: list[list[dict]] = []
+        for caption in captions:
+            if not cue_groups or (
+                caption.get("cueId") != cue_groups[-1][-1].get("cueId")
+            ):
+                cue_groups.append([])
+            cue_groups[-1].append(caption)
+        for cue in cue_groups:
+            for index in range(0, len(cue), 4):
+                page = cue[index:index + 4]
+                pages.append((
+                    " ".join(item["word"] for item in page),
+                    page[0]["startMs"] / 1000.0,
+                    page[-1]["endMs"] / 1000.0,
+                ))
+        return pages
+
+    @staticmethod
+    def _ffmpeg_video_command(
+        input_path: str, output_path: str, filter_args: list[str],
+    ) -> list[str]:
+        return [
+            "ffmpeg", "-y", "-i", input_path, *filter_args,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+            "-pix_fmt", "yuv420p", "-c:a", "copy", output_path,
+        ]
 
     @staticmethod
     def _ms_to_srt(ms: int) -> str:
