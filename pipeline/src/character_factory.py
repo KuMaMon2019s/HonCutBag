@@ -525,24 +525,50 @@ def generate_character(
         # Seedream API requires min 1920x1920; use square for 2x2 grid layout
         sheet_path = os.path.join(char_dir, "character_sheet.png")
         print("  [sheet] generating combined character sheet (2x2 grid)...")
-        try:
-            url = client.text_to_image(
-                prompt=sheet_prompt,
-                output_path=sheet_path,
-                size="1920x1920",  # square for 2x2 grid
-            )
-            print(f"  [sheet] ✓ → {sheet_path}")
-            
-            # Crop into individual views using ffmpeg
-            print("  [crop] splitting character sheet into 4 views...")
-            views = crop_character_sheet(
-                sheet_path=sheet_path,
-                output_dir=char_dir,
-                num_views=4,  # closeup, front, side, back
-            )
-        except Exception as e:
-            print(f"  [sheet] ✗ → {e}")
-            views = {"closeup": None, "front": None, "side": None, "back": None}
+
+        # --- 429 retry with exponential backoff (inner retry before outer _retry_with_policy) ---
+        import time as _time
+        _sheet_max_retries = 3
+        _sheet_wait_times = [5, 15, 45]  # exponential backoff for 429
+        _sheet_success = False
+        for _sheet_attempt in range(1, _sheet_max_retries + 1):
+            try:
+                url = client.text_to_image(
+                    prompt=sheet_prompt,
+                    output_path=sheet_path,
+                    size="1920x1920",  # square for 2x2 grid
+                )
+                print(f"  [sheet] ✓ → {sheet_path}")
+                _sheet_success = True
+                break
+            except Exception as e:
+                _err_str = str(e)
+                _is_429 = (
+                    "429" in _err_str
+                    or "Too Many Requests" in _err_str
+                    or "QuotaExceeded" in _err_str
+                    or (hasattr(e, "response") and getattr(getattr(e, "response", None), "status_code", None) == 429)
+                )
+                if _is_429 and _sheet_attempt < _sheet_max_retries:
+                    _wait = _sheet_wait_times[_sheet_attempt - 1]
+                    print(f"  [sheet] retry {_sheet_attempt}/{_sheet_max_retries} (429, wait {_wait}s)...")
+                    _time.sleep(_wait)
+                    continue
+                else:
+                    # Non-429 or retries exhausted → raise to outer _retry_with_policy
+                    print(f"  [sheet] ✗ → {e}")
+                    raise
+
+        if not _sheet_success:
+            raise RuntimeError(f"[sheet] all {_sheet_max_retries} retries exhausted for {char_id}")
+
+        # Crop into individual views using ffmpeg
+        print("  [crop] splitting character sheet into 4 views...")
+        views = crop_character_sheet(
+            sheet_path=sheet_path,
+            output_dir=char_dir,
+            num_views=4,  # closeup, front, side, back
+        )
     else:
         print("[Step 1/3] Skipping image generation (--skip-images)")
         views = {"closeup": None, "front": None, "side": None, "back": None}

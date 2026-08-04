@@ -145,6 +145,126 @@ def package_shot_assets(
     return str(zip_path), base64_list
 
 
+def build_content_for_shot(
+    output_dir: Path,
+    shot_id: str,
+    shot_meta: dict,
+) -> List[dict]:
+    """
+    Build Bridge content[] list for a shot with TOS-uploaded reference images.
+    
+    Args:
+        output_dir: Project output directory
+        shot_id: Shot identifier (e.g., "S01")
+        shot_meta: Shot metadata dict with prompt, duration, seed, width, height
+    
+    Returns:
+        List of content items for Bridge /generate API:
+        [
+            {"type": "text", "text": "shot prompt"},
+            {"type": "image_url", "image_url": {"url": "https://..."}, "role": "first_frame", "priority": "high"},
+            {"type": "image_url", "image_url": {"url": "https://..."}, "role": "reference_image", "priority": "high"},
+            ...
+        ]
+    
+    Image collection order (max 9 total):
+        1. Shot frame (storyboard_images/{shot_id}.png) → role=first_frame, priority=high
+        2. Character front views (characters/{char_id}/front.png) → role=reference_image, priority=high
+        3. Storyboard.png → role=reference_image, priority=medium
+        4. Character side/back views → role=reference_image, priority=medium
+    
+    Each image is uploaded to TOS and replaced with a signed URL.
+    """
+    output_dir = Path(output_dir)
+    content = []
+    
+    # 1. Text prompt (always first)
+    prompt_text = shot_meta.get("prompt", "")
+    if prompt_text:
+        content.append({"type": "text", "text": prompt_text})
+    
+    # Collect image assets with metadata
+    image_assets = []
+    
+    # 2. Shot frame (storyboard_images/{shot_id}.png) — highest priority
+    shot_frame_path = output_dir / "storyboard_images" / f"{shot_id}.png"
+    if shot_frame_path.exists() and shot_frame_path.stat().st_size > 1024:
+        image_assets.append({
+            "path": shot_frame_path,
+            "role": "first_frame",
+            "priority": "high",
+        })
+    
+    # 3. Character reference images
+    char_bases = [output_dir / "characters", output_dir / "characters" / "characters"]
+    seen_char_dirs = set()
+    for char_base in char_bases:
+        if char_base.exists():
+            for char_dir in char_base.iterdir():
+                if char_dir.is_dir() and char_dir.name not in seen_char_dirs:
+                    seen_char_dirs.add(char_dir.name)
+                    # Front view (high priority)
+                    front_path = char_dir / "front.png"
+                    if front_path.exists() and front_path.stat().st_size > 1024:
+                        image_assets.append({
+                            "path": front_path,
+                            "role": "reference_image",
+                            "priority": "high",
+                        })
+                    # Side/back views (medium priority)
+                    for view in ["side.png", "back.png"]:
+                        view_path = char_dir / view
+                        if view_path.exists() and view_path.stat().st_size > 1024:
+                            image_assets.append({
+                                "path": view_path,
+                                "role": "reference_image",
+                                "priority": "medium",
+                            })
+    
+    # 4. Storyboard.png (medium priority)
+    storyboard_path = output_dir / "storyboard.png"
+    if storyboard_path.exists() and storyboard_path.stat().st_size > 1024:
+        image_assets.append({
+            "path": storyboard_path,
+            "role": "reference_image",
+            "priority": "medium",
+        })
+    
+    # Sort by priority (high first), then upload to TOS
+    image_assets.sort(key=lambda a: (0 if a["priority"] == "high" else 1, a["path"].name))
+    
+    # Limit to 9 images max (Bridge limit)
+    image_assets = image_assets[:9]
+    
+    # Upload each image to TOS and add to content
+    uploaded_count = 0
+    try:
+        import tos_uploader
+    except ImportError:
+        print(f"  [assets] ⚠ tos_uploader not available, skipping image upload")
+        return content
+    
+    for asset in image_assets:
+        try:
+            img_data = asset["path"].read_bytes()
+            tos_url = tos_uploader.upload_image(img_data, "image/png")
+            if tos_url:
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": tos_url},
+                    "role": asset["role"],
+                    "priority": asset["priority"],
+                })
+                uploaded_count += 1
+            else:
+                print(f"  [assets] ⚠ TOS upload failed for {asset['path'].name}, skipping")
+        except Exception as e:
+            print(f"  [assets] ⚠ Failed to upload {asset['path'].name}: {e}")
+    
+    print(f"  [assets] 上传 {uploaded_count} 张参考图到 TOS")
+    return content
+
+
 if __name__ == "__main__":
     # Quick test
     import tempfile
@@ -172,6 +292,7 @@ if __name__ == "__main__":
             "height": 720,
         }
         
+        # Test old package_shot_assets
         zip_path, base64_list = package_shot_assets(output_dir, "S01", shot_meta)
         
         if zip_path is None:
@@ -186,3 +307,13 @@ if __name__ == "__main__":
             print(f"✓ Zip contents: {zf.namelist()}")
             meta = json.loads(zf.read("meta.json"))
             print(f"✓ Meta: {json.dumps(meta, indent=2)}")
+        
+        # Test new build_content_for_shot (will fail TOS upload without credentials, but structure should be correct)
+        print("\n--- Testing build_content_for_shot ---")
+        content = build_content_for_shot(output_dir, "S01", shot_meta)
+        print(f"✓ Content items: {len(content)}")
+        for i, item in enumerate(content):
+            if item["type"] == "text":
+                print(f"  [{i}] text: {item['text'][:50]}...")
+            else:
+                print(f"  [{i}] image_url: role={item.get('role')}, priority={item.get('priority')}")

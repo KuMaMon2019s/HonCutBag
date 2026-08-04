@@ -86,6 +86,7 @@ def submit(
     fps: int = 24,
     timeout: int = 30,
     asset_zip_path: Optional[str] = None,
+    content: Optional[List[dict]] = None,
 ) -> Optional[str]:
     """Submit a video generation task to the local API.
     
@@ -102,6 +103,7 @@ def submit(
         fps: Output video framerate
         timeout: Request timeout in seconds
         asset_zip_path: Optional path to zip file containing assets (priority over image_base64_list)
+        content: Optional Bridge content[] list (highest priority, uses new contract)
     
     Returns:
         task_id: Unique task identifier for polling, or None if zip not supported
@@ -111,6 +113,35 @@ def submit(
     """
     api_url = _get_api_url()
     session = _request_session()
+    
+    # --- New content[] contract (highest priority) ---
+    if content:
+        try:
+            payload = {"content": content}
+            resp = session.post(
+                f"{api_url}/generate",
+                json=payload,
+                timeout=timeout,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                task_id = data.get("task_id") or data.get("id")
+                images_used = data.get("images_used", 0)
+                warnings = data.get("warnings", [])
+                if task_id:
+                    print(f"  [local_submit] ✓ task_id={task_id}, images_used={images_used}")
+                    if warnings:
+                        print(f"  [local_submit] warnings: {warnings}")
+                    return task_id
+            else:
+                print(f"  [local_submit] ✗ /generate with content[] failed: HTTP {resp.status_code} — {resp.text[:200]}")
+                return None
+        except requests.exceptions.ConnectionError as e:
+            print(f"  [local_submit] ✗ Bridge unreachable for content[]: {e}")
+            return None
+        except Exception as e:
+            print(f"  [local_submit] ✗ content[] submission error: {e}")
+            return None
     
     # Try zip upload first if provided
     if asset_zip_path:
@@ -503,6 +534,7 @@ def generate_video(
     fps: int = 24,
     asset_zip_path: Optional[str] = None,
     image_base64_list: Optional[List[str]] = None,
+    content: Optional[List[dict]] = None,
 ) -> str:
     """High-level function: submit + poll + download in one call.
     
@@ -517,6 +549,7 @@ def generate_video(
         fps: Output framerate
         asset_zip_path: Optional path to zip file containing assets (priority over base64)
         image_base64_list: Optional list of base64 images for I2V (fallback if zip not supported)
+        content: Optional Bridge content[] list (highest priority, uses new contract)
     
     Returns:
         output_path on success
@@ -542,7 +575,22 @@ def generate_video(
         height=height,
         fps=fps,
         asset_zip_path=asset_zip_path,
+        content=content,
     )
+    
+    # Handle content[] failure - fallback to zip/base64
+    if task_id is None and content is not None:
+        print(f"  [local_video] content[] failed, falling back to zip/base64")
+        task_id = submit(
+            prompt=prompt,
+            image_base64_list=image_base64_list,
+            num_frames=num_frames,
+            seed=seed,
+            width=width,
+            height=height,
+            fps=fps,
+            asset_zip_path=asset_zip_path,
+        )
     
     # Handle zip upload failure - fallback to base64
     if task_id is None and asset_zip_path is not None:

@@ -989,22 +989,46 @@ def _generate_shot_images(output_dir: Path, storyboard_data: dict) -> int:
             if ref_image_path is None and protagonist_ref:
                 ref_image_path = protagonist_ref
 
-            if ref_image_path and ref_image_path.exists():
-                # P0-1c: Use image_to_image mode (with reference image)
-                from seedream_client import SeedreamClient
-                client = SeedreamClient()
-                client.image_to_image(
-                    prompt=shot_prompt,
-                    ref_image=str(ref_image_path),
-                    output_path=str(shot_image_path),
-                )
-                print(f"    [M2] 分镜图 {shot_id}.png ✓ (ref: {ref_image_path.name})")
-            else:
-                # No reference image, pure text-to-image
-                from seedream_client import text_to_image
-                text_to_image(prompt=shot_prompt, output_path=str(shot_image_path))
-            print(f"    [M2] 分镜图 {shot_id}.png ✓")
-            return shot_id
+            # --- 429 retry with exponential backoff ---
+            import time as _time
+            _m2_max_retries = 3
+            _m2_wait_times = [5, 15, 45]
+            for _m2_attempt in range(1, _m2_max_retries + 1):
+                try:
+                    if ref_image_path and ref_image_path.exists():
+                        # P0-1c: Use image_to_image mode (with reference image)
+                        from seedream_client import SeedreamClient
+                        client = SeedreamClient()
+                        client.image_to_image(
+                            prompt=shot_prompt,
+                            ref_image=str(ref_image_path),
+                            output_path=str(shot_image_path),
+                        )
+                        print(f"    [M2] 分镜图 {shot_id}.png ✓ (ref: {ref_image_path.name})")
+                    else:
+                        # No reference image, pure text-to-image
+                        from seedream_client import text_to_image
+                        text_to_image(prompt=shot_prompt, output_path=str(shot_image_path))
+                    print(f"    [M2] 分镜图 {shot_id}.png ✓")
+                    return shot_id
+                except Exception as e:
+                    _err_str = str(e)
+                    _is_429 = (
+                        "429" in _err_str
+                        or "Too Many Requests" in _err_str
+                        or "QuotaExceeded" in _err_str
+                        or (hasattr(e, "response") and getattr(getattr(e, "response", None), "status_code", None) == 429)
+                    )
+                    if _is_429 and _m2_attempt < _m2_max_retries:
+                        _wait = _m2_wait_times[_m2_attempt - 1]
+                        print(f"    [M2] {shot_id} retry {_m2_attempt}/{_m2_max_retries} (429, wait {_wait}s)...")
+                        _time.sleep(_wait)
+                        continue
+                    else:
+                        # Non-429 or retries exhausted → raise
+                        print(f"    [M2] {shot_id}.png ✗ → {e}")
+                        raise
+            return None
 
         # Concurrent execution (max_workers=3)
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1967,41 +1991,39 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
                         import local_video_client
                         import asset_packager
                         
-                        # Package assets for this shot
+                        # Build content[] with TOS-uploaded reference images (new contract)
                         shot_id = shot_dir.name  # e.g., "S01"
-                        zip_path, base64_list = asset_packager.package_shot_assets(
+                        content_list = asset_packager.build_content_for_shot(
                             output_dir=output_dir,
                             shot_id=shot_id,
                             shot_meta=meta,
                         )
                         
-                        if zip_path:
-                            print(f"  [assets] 打包 {len(base64_list)} 张参考图 (zip)")
-                            local_video_client.generate_video(
-                                prompt=prompt,
-                                output_path=out_path,
-                                reference_image_base64=first_frame_b64,
-                                seed=shot_seed if shot_seed is not None else -1,
-                                duration=duration,
-                                width=1280,
-                                height=720,
-                                fps=24,
-                                asset_zip_path=zip_path,
-                                image_base64_list=base64_list,
+                        # Fallback to legacy zip/base64 if content[] is empty
+                        zip_path = None
+                        base64_list = []
+                        if not content_list or len(content_list) <= 1:
+                            # No images uploaded, fall back to legacy packaging
+                            zip_path, base64_list = asset_packager.package_shot_assets(
+                                output_dir=output_dir,
+                                shot_id=shot_id,
+                                shot_meta=meta,
                             )
-                        else:
-                            print(f"  [assets] 降级 base64 多图")
-                            local_video_client.generate_video(
-                                prompt=prompt,
-                                output_path=out_path,
-                                reference_image_base64=first_frame_b64,
-                                seed=shot_seed if shot_seed is not None else -1,
-                                duration=duration,
-                                width=1280,
-                                height=720,
-                                fps=24,
-                                image_base64_list=base64_list,
-                            )
+                            content_list = None  # signal to use legacy path
+                        
+                        local_video_client.generate_video(
+                            prompt=prompt,
+                            output_path=out_path,
+                            reference_image_base64=first_frame_b64,
+                            seed=shot_seed if shot_seed is not None else -1,
+                            duration=duration,
+                            width=1280,
+                            height=720,
+                            fps=24,
+                            asset_zip_path=zip_path,
+                            image_base64_list=base64_list,
+                            content=content_list,
+                        )
                         
                         if shot_seed is not None:
                             meta["seed"] = shot_seed
