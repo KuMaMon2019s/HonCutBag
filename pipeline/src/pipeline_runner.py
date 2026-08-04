@@ -2036,9 +2036,25 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
                     print(f"    ✗ {shot_dir.name}: 并发处理异常 — {e}")
 
     provider = "local_video_client" if use_local else "seedance_client"
+
+    # --- Bug 3 fix: detect shots with missing/invalid output.mp4 ---
+    errors = []
+    missing_shots = []
+    for sd in shot_dirs:
+        out_mp4 = sd / "output.mp4"
+        if not out_mp4.exists():
+            missing_shots.append(sd.name)
+            errors.append({"shot": sd.name, "error": "output.mp4 missing after Phase 5"})
+        elif out_mp4.stat().st_size < 10 * 1024:
+            missing_shots.append(sd.name)
+            errors.append({"shot": sd.name, "error": f"output.mp4 too small ({out_mp4.stat().st_size} bytes) after Phase 5"})
+    if missing_shots:
+        print(f"  ⚠ Phase 5 部分镜头无产出: {', '.join(missing_shots)}")
+
     return {
         "status": "done" if outputs else "error",
         "outputs": outputs,
+        "errors": errors,
         "provider": provider,
         "mode": "text_to_video",
     }
@@ -2867,6 +2883,7 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
         from rhythm_editor import edit_rhythm
 
         # Step 8.1: Audio processing via OM AudioMixer
+        bgm_path = None
         if has_audio:
             # 视频已有音轨，直接复制作为音频处理输出，跳过环境音合成
             import shutil

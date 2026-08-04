@@ -11,6 +11,8 @@ API Spec (HonCutBag_API_v3.1):
 
 import os
 import time
+import json
+import subprocess
 import requests
 from typing import Optional, List
 
@@ -296,33 +298,163 @@ def _probe_download(session, api_url: str, task_id: str) -> bool:
         return False
 
 
-def download(task_id: str, output_path: str, timeout: int = 120) -> str:
+def _verify_download(
+    file_path: str,
+    expected_duration: Optional[float] = None,
+    expected_width: Optional[int] = None,
+    expected_height: Optional[int] = None,
+) -> dict:
+    """Probe the downloaded mp4 with ffprobe and check against expectations.
+
+    Returns:
+        dict with keys: duration (float), width (int), height (int)
+
+    Raises:
+        RuntimeError: if probe fails or any provided expectation mismatches
+            (duration tolerance ±1.5s; resolution must match exactly).
+    """
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-print_format", "json",
+            "-show_format", "-show_streams",
+            file_path,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if proc.returncode != 0:
+            raise RuntimeError(f"ffprobe failed: {proc.stderr.strip()}")
+        info = json.loads(proc.stdout)
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as e:
+        raise RuntimeError(f"ffprobe failed for {file_path}: {e}")
+
+    # Extract duration
+    actual_duration = None
+    fmt = info.get("format", {})
+    if fmt.get("duration"):
+        try:
+            actual_duration = float(fmt["duration"])
+        except (TypeError, ValueError):
+            pass
+    if actual_duration is None:
+        for s in info.get("streams", []):
+            if s.get("duration"):
+                try:
+                    actual_duration = float(s["duration"])
+                    break
+                except (TypeError, ValueError):
+                    continue
+
+    # Extract video stream resolution
+    actual_width = None
+    actual_height = None
+    for s in info.get("streams", []):
+        if s.get("codec_type") == "video":
+            try:
+                actual_width = int(s.get("width"))
+                actual_height = int(s.get("height"))
+            except (TypeError, ValueError):
+                pass
+            break
+
+    actual = {
+        "duration": actual_duration,
+        "width": actual_width,
+        "height": actual_height,
+    }
+
+    # Validate
+    if expected_duration is not None and actual_duration is not None:
+        if abs(actual_duration - float(expected_duration)) > 1.5:
+            raise RuntimeError(
+                f"Download verification failed: expected duration ~{expected_duration}s, "
+                f"got {actual_duration:.2f}s (tolerance ±1.5s)"
+            )
+    if expected_width is not None and actual_width is not None:
+        if int(actual_width) != int(expected_width):
+            raise RuntimeError(
+                f"Download verification failed: expected width {expected_width}, got {actual_width}"
+            )
+    if expected_height is not None and actual_height is not None:
+        if int(actual_height) != int(expected_height):
+            raise RuntimeError(
+                f"Download verification failed: expected height {expected_height}, got {actual_height}"
+            )
+
+    return actual
+
+
+def download(
+    task_id: str,
+    output_path: str,
+    timeout: int = 120,
+    expected_duration: Optional[float] = None,
+    expected_width: Optional[int] = None,
+    expected_height: Optional[int] = None,
+) -> str:
     """Download the generated video to output_path.
-    
+
+    Args:
+        task_id: Bridge task id.
+        output_path: Where to save the mp4.
+        timeout: HTTP timeout in seconds.
+        expected_duration: If provided, verify downloaded video duration (±1.5s tolerance).
+        expected_width: If provided, verify downloaded video width (exact match).
+        expected_height: If provided, verify downloaded video height (exact match).
+
     Returns:
         The output_path on success.
-    
+
     Raises:
-        RuntimeError: If download fails
+        RuntimeError: If download fails or verification fails. On verification
+            failure the downloaded file is deleted to prevent cross-task leakage.
     """
     api_url = _get_api_url()
     session = _request_session()
     url = f"{api_url}/download/{task_id}"
-    
+
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    
+
     try:
         resp = session.get(url, stream=True, timeout=timeout)
         resp.raise_for_status()
     except requests.exceptions.ConnectionError as e:
         raise RuntimeError(f"Local video API download failed: {e}")
-    
+
     with open(output_path, "wb") as f:
         for chunk in resp.iter_content(chunk_size=8192):
             f.write(chunk)
-    
+
     file_size = os.path.getsize(output_path)
     print(f"  [local_download] saved {output_path} ({file_size} bytes)")
+
+    # --- Cross-task leakage guard ---
+    need_verify = any(v is not None for v in (expected_duration, expected_width, expected_height))
+    if need_verify:
+        actual = None
+        try:
+            actual = _verify_download(
+                output_path,
+                expected_duration=expected_duration,
+                expected_width=expected_width,
+                expected_height=expected_height,
+            )
+            print(
+                f"  [local_download] ✓ verify ok: "
+                f"{actual.get('width')}x{actual.get('height')}, "
+                f"{actual.get('duration'):.2f}s"
+            )
+        except RuntimeError as e:
+            try:
+                os.remove(output_path)
+                print(f"  [local_download] ✗ verification failed, deleted {output_path}")
+            except OSError:
+                pass
+            raise RuntimeError(
+                f"Download verification failed for task {task_id}: "
+                f"expected {expected_width}x{expected_height}/{expected_duration}s, "
+                f"got actual={actual if actual is not None else 'unknown'}"
+            ) from e
+
     return output_path
 
 
@@ -379,6 +511,12 @@ def generate_video(
     result = poll(task_id)
     print(f"  [local_video] completed!")
     
-    # Download
-    download(task_id, output_path)
+    # Download (with cross-task leakage verification)
+    download(
+        task_id,
+        output_path,
+        expected_duration=duration,
+        expected_width=width,
+        expected_height=height,
+    )
     return output_path
