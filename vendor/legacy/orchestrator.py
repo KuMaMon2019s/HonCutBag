@@ -65,6 +65,11 @@ def parse_shots(storyboard: dict) -> list:
             "first_frame": s.get("first_frame"),
             "caption": s.get("caption", ""),
             "caption_frames": s.get("caption_frames", ""),
+            "who": s.get("who", []),
+            "associate_assets": s.get("associate_assets", []),
+            "gen_strategy": s.get("gen_strategy", "i2v"),
+            "visual": s.get("visual", ""),
+            "what": s.get("what", ""),
         }
         shots.append(shot)
     return shots
@@ -224,6 +229,11 @@ def setup_shot_dirs(shots: list) -> list:
             "caption": shot["caption"],          # legacy: original string
             "caption_frames": shot["caption_frames"],  # legacy: original frame range
             "captions": captions,                # structured list for assembly_engine
+            "who": shot.get("who", []),
+            "associate_assets": shot.get("associate_assets", []),
+            "gen_strategy": shot.get("gen_strategy", "i2v"),
+            "visual": shot.get("visual", ""),
+            "what": shot.get("what", ""),
             "status": "pending",
             "task_id": None,
             "video_path": None,

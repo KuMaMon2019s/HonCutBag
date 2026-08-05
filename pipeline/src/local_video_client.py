@@ -88,6 +88,7 @@ def submit(
     asset_zip_path: Optional[str] = None,
     content: Optional[List[dict]] = None,
     batch_id: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> Optional[str]:
     """Submit a video generation task to the local API.
     
@@ -106,6 +107,7 @@ def submit(
         asset_zip_path: Optional path to zip file containing assets (priority over image_base64_list)
         content: Optional Bridge content[] list (highest priority, uses new contract)
         batch_id: Optional identifier shared by all shots in one pipeline run
+        model: Optional Bridge model route (wan22, phantom, or flf2v)
     
     Returns:
         task_id: Unique task identifier for polling, or None if zip not supported
@@ -131,6 +133,8 @@ def submit(
             }
             if batch_id is not None:
                 payload["batch_id"] = batch_id
+            if model is not None:
+                payload["model"] = model
             resp = session.post(
                 f"{api_url}/generate",
                 json=payload,
@@ -204,6 +208,8 @@ def submit(
         payload["image_urls"] = image_urls
     if batch_id is not None:
         payload["batch_id"] = batch_id
+    if model is not None:
+        payload["model"] = model
     
     try:
         resp = session.post(
@@ -594,6 +600,7 @@ def generate_video(
     image_base64_list: Optional[List[str]] = None,
     content: Optional[List[dict]] = None,
     batch_id: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> str:
     """High-level function: submit + poll + download in one call.
     
@@ -610,6 +617,7 @@ def generate_video(
         image_base64_list: Optional list of base64 images for I2V (fallback if zip not supported)
         content: Optional Bridge content[] list (highest priority, uses new contract)
         batch_id: Optional identifier shared by all shots in one pipeline run
+        model: Optional Bridge model route (wan22, phantom, or flf2v)
     
     Returns:
         output_path on success
@@ -648,6 +656,7 @@ def generate_video(
         asset_zip_path=asset_zip_path,
         content=content,
         batch_id=batch_id,
+        model=model,
     )
     
     # Handle content[] failure - fallback to zip/base64
@@ -663,6 +672,7 @@ def generate_video(
             fps=fps,
             asset_zip_path=asset_zip_path,
             batch_id=batch_id,
+            model=model,
         )
     
     # Handle zip upload failure - fallback to base64
@@ -677,6 +687,7 @@ def generate_video(
             height=height,
             fps=fps,
             batch_id=batch_id,
+            model=model,
         )
     
     if task_id is None:

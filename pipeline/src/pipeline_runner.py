@@ -974,6 +974,60 @@ def _normalize_shot_id(shot_item: dict) -> Optional[str]:
     return f"S{raw_str.zfill(2)}"
 
 
+def build_end_frame_prompt(shot: dict) -> str:
+    """Describe the completed action while retaining the M2 visual/style prompt."""
+    prompt = shot.get("prompt", shot.get("visual", ""))
+    action_text = " ".join(
+        str(shot.get(field, "")) for field in ("visual", "what", "description")
+        if shot.get(field)
+    )
+    return (
+        f"{prompt}\n\nEND FRAME: Show the same scene and characters after the action "
+        f"has fully completed. Completed end state: {action_text or prompt}. "
+        "Preserve the exact visual style, lighting, camera angle, composition, "
+        "character identity, clothing, and environment of the first frame."
+    )
+
+
+def _storyboard_image_size(image_path: Path) -> str:
+    """Return Seedream's WxH size string for an existing storyboard frame."""
+    try:
+        from PIL import Image
+        with Image.open(image_path) as image:
+            return f"{image.width}x{image.height}"
+    except Exception:
+        return "1920x1920"
+
+
+def _generate_flf2v_end_frame(
+    shot_item: dict,
+    shot_id: str,
+    first_frame_path: Path,
+    ref_image_path: Optional[Path],
+) -> bool:
+    """Generate one idempotent Seedream end frame for an FLF2V shot."""
+    if shot_item.get("gen_strategy", "i2v") != "flf2v":
+        return False
+    end_path = first_frame_path.with_name(f"{shot_id}_end.png")
+    if end_path.exists() and end_path.stat().st_size > 10 * 1024:
+        print(f"    ⏭ [FLF2V] {end_path.name} exists, skipping")
+        return False
+
+    from seedream_client import SeedreamClient
+    client = SeedreamClient()
+    kwargs = {
+        "prompt": build_end_frame_prompt(shot_item),
+        "output_path": str(end_path),
+        "size": _storyboard_image_size(first_frame_path),
+    }
+    if ref_image_path and ref_image_path.exists():
+        client.image_to_image(ref_image=str(ref_image_path), **kwargs)
+    else:
+        client.text_to_image(**kwargs)
+    print(f"    [FLF2V] 终帧 {end_path.name} ✓")
+    return True
+
+
 def _generate_shot_images(output_dir: Path, storyboard_data: dict) -> int:
     """Generate storyboard images for each shot (M2 task).
     
@@ -1023,8 +1077,6 @@ def _generate_shot_images(output_dir: Path, storyboard_data: dict) -> int:
             if not shot_prompt:
                 return None
             shot_image_path = storyboard_images_dir / f"{shot_id}.png"
-            if shot_image_path.exists():
-                return shot_id
 
             # --- P0-1c: Match character reference image ---
             # Support structured who[] from storyboard:
@@ -1049,6 +1101,12 @@ def _generate_shot_images(output_dir: Path, storyboard_data: dict) -> int:
                 if ref_image_path is None and protagonist_ref:
                     ref_image_path = protagonist_ref
 
+            if shot_image_path.exists():
+                _generate_flf2v_end_frame(
+                    shot_item, shot_id, shot_image_path, ref_image_path
+                )
+                return shot_id
+
             # --- 429 retry with exponential backoff ---
             import time as _time
             _m2_max_retries = 3
@@ -1070,6 +1128,9 @@ def _generate_shot_images(output_dir: Path, storyboard_data: dict) -> int:
                         from seedream_client import text_to_image
                         text_to_image(prompt=shot_prompt, output_path=str(shot_image_path))
                     print(f"    [M2] 分镜图 {shot_id}.png ✓")
+                    _generate_flf2v_end_frame(
+                        shot_item, shot_id, shot_image_path, ref_image_path
+                    )
                     return shot_id
                 except Exception as e:
                     _err_str = str(e)
@@ -1930,6 +1991,16 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
 
         meta = json.loads(meta_path.read_text())
         prompt = meta.get("prompt", "")
+        gen_strategy = meta.get("gen_strategy", "i2v")
+        if gen_strategy not in {"flf2v", "phantom", "i2v"}:
+            gen_strategy = "i2v"
+        route_reason = {
+            "flf2v": "action shot",
+            "phantom": "dialogue/emotion shot",
+            "i2v": "scenery/ambient or default",
+        }[gen_strategy]
+        bridge_model = {"flf2v": "flf2v", "phantom": "phantom", "i2v": "wan22"}[gen_strategy]
+        print(f"    [route] {shot_dir.name} → {gen_strategy} ({route_reason})")
         associated_character_ids = {
             asset_id[5:].split(":", 1)[0]
             for asset_id in meta.get("associate_assets", [])
@@ -2080,10 +2151,14 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
                         
                         # Build content[] with TOS-uploaded reference images (new contract)
                         shot_id = shot_dir.name  # e.g., "S01"
+                        content_meta = dict(meta)
+                        content_meta["prompt"] = prompt
+                        content_meta["gen_strategy"] = gen_strategy
+                        content_meta["_char_ids"] = sorted(associated_character_ids)
                         content_list = asset_packager.build_content_for_shot(
                             output_dir=output_dir,
                             shot_id=shot_id,
-                            shot_meta=meta,
+                            shot_meta=content_meta,
                         )
                         
                         # Fallback to legacy zip/base64 if content[] is empty
@@ -2111,6 +2186,7 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
                             image_base64_list=base64_list,
                             content=content_list,
                             batch_id=output_dir.name,
+                            model=bridge_model,
                         )
                         
                         if shot_seed is not None:

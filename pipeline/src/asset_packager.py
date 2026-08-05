@@ -209,7 +209,7 @@ def build_content_for_shot(
     shot_meta: dict,
 ) -> List[dict]:
     """
-    Build Bridge content[] list for a shot with TOS-uploaded reference images.
+    Build Bridge content[] for the shot's deterministic generation strategy.
 
     Args:
         output_dir: Project output directory
@@ -223,18 +223,8 @@ def build_content_for_shot(
             {"type": "image_url", "image_url": {"url": "https://..."}, "role": "first_frame", "priority": "high"}
         ]
 
-    CRITICAL: Wan2.2 multi-image semantics = opening consecutive frames condition.
-        When multiple images are passed in content[], Wan2.2 treats them as the
-        first N consecutive frames of the video. This causes contamination:
-        three-view drawings (front/side/back) appear as frames 2-5 in the output.
-
-    Single-image strategy (anti-contamination):
-        Only pass the shot's storyboard image (role=first_frame) — 1 image total.
-        Character consistency is handled by M2 storyboard generation, which already
-        injects character front reference during the storyboard creation phase.
-
-        DO NOT add three-view images or storyboard.png to content[] — they will
-        be interpreted as opening frames and contaminate the video output.
+    i2v uses one first frame; Phantom adds the shot characters' three views as
+    identity references; FLF2V uses an explicit first and last frame.
 
     Legacy paths (zip/base64) are preserved for backward compatibility but not
     used in the primary content[] workflow.
@@ -249,11 +239,11 @@ def build_content_for_shot(
     if prompt_text:
         content.append({"type": "text", "text": prompt_text})
 
-    # 2. Shot frame (storyboard_images/{shot_id}.png) — ONLY this image
-    # CRITICAL: Wan2.2 treats content[] images as opening consecutive frames.
-    # Passing three-view drawings or storyboard.png causes contamination.
-    # Character consistency is handled by M2 storyboard generation (which injects
-    # character front reference during storyboard creation), NOT by runtime injection.
+    strategy = shot_meta.get("gen_strategy", "i2v")
+    if strategy not in {"flf2v", "phantom", "i2v"}:
+        strategy = "i2v"
+
+    # Every route starts from the per-shot storyboard image.
     shot_frame_path = output_dir / "storyboard_images" / f"{shot_id}.png"
     image_assets = []
     if shot_frame_path.exists() and shot_frame_path.stat().st_size > 1024:
@@ -263,8 +253,37 @@ def build_content_for_shot(
             "priority": "high",
         })
 
-    # Log the single-image strategy
-    print(f"  [assets] 单图策略: images_used={len(image_assets)} (仅分镜图，无三视图/故事板污染)")
+    if strategy == "flf2v":
+        end_frame_path = output_dir / "storyboard_images" / f"{shot_id}_end.png"
+        if end_frame_path.exists() and end_frame_path.stat().st_size > 1024:
+            image_assets.append({
+                "path": end_frame_path,
+                "role": "last_frame",
+                "priority": "high",
+            })
+        else:
+            raise FileNotFoundError(
+                f"FLF2V end frame missing or too small: {end_frame_path}"
+            )
+    elif strategy == "phantom":
+        for char_id in _detect_shot_characters(output_dir, shot_meta):
+            char_dir = output_dir / "characters" / char_id
+            if not char_dir.exists():
+                char_dir = output_dir / "characters" / "characters" / char_id
+            for view in ("front", "side", "back"):
+                view_path = char_dir / f"{view}.png"
+                if view_path.exists() and view_path.stat().st_size > 1024:
+                    image_assets.append({
+                        "path": view_path,
+                        "role": "reference_image",
+                        "priority": "high",
+                    })
+        if not any(asset["role"] == "reference_image" for asset in image_assets):
+            raise FileNotFoundError(
+                f"Phantom character three-view references missing for shot {shot_id}"
+            )
+
+    print(f"  [assets] {strategy}: images_used={len(image_assets)}")
     
     # Upload each image to TOS and add to content
     uploaded_count = 0

@@ -442,6 +442,9 @@ def generate_storyboard(
             "prompt": llm_result["prompt"],
             "caption": llm_result["caption"],
             "caption_frames": caption_frames,
+            # Retained for deterministic route diagnostics and FLF2V end-state prompts.
+            "visual": shot.get("visual", ""),
+            "what": shot.get("what", ""),
         }
 
         # 透传结构化字段（who/shot_size/camera_movement/lighting_key/shot_intent/associate_assets）
@@ -456,8 +459,8 @@ def generate_storyboard(
         else:
             storyboard_shot["who"] = [str(who_list)] if who_list else []
 
-        # shot_size / camera_movement / lighting_key / shot_intent
-        for field in ("shot_size", "camera_movement", "lighting_key", "shot_intent"):
+        # Structured fields used by review and generation routing.
+        for field in ("shot_size", "camera_movement", "lighting_key", "shot_intent", "gen_strategy"):
             val = shot.get(field)
             if val:
                 storyboard_shot[field] = val

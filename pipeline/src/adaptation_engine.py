@@ -70,6 +70,7 @@ USER_PROMPT_TEMPLATE = (
     "  - camera_movement: 字符串，摄影机运动（static/pan_left/pan_right/tilt_up/tilt_down/dolly_in/dolly_out/tracking_left/tracking_right/crane_up/crane_down/handheld/steadicam/orbital/zoom_in/zoom_out）\n"
     "  - lighting_key: 字符串，光影基调（high_key/low_key/natural/golden_hour/blue_hour/tungsten_warm/neon/silhouette/rim_lit/volumetric/overcast_soft）\n"
     "  - shot_intent: 字符串，镜头叙事意图（establishing/reveal/reaction/dialogue/action/transition/atmosphere/detail）\n\n"
+    "  - gen_strategy: 字符串，视频生成策略（flf2v/phantom/i2v）；最终值会由确定性规则校正\n\n"
     "【镜头连贯性规则】\n"
     "每个镜头（除第一个外）必须在 visual 描述开头加入「承接上镜」段：\n"
     "- 格式：'承接上镜：上镜定格于{{角色名}}{{位置/姿态/朝向}}，{{最后动作的终态}}——本镜由此延续'\n"
@@ -109,6 +110,47 @@ USER_PROMPT_TEMPLATE = (
     "- 位置变化必须有动作交代（如'林夏从左侧走到右侧'）\n\n"
     "注意：所有 shot 的 suggested_duration 总和应接近 target_duration（允许 ±10% 偏差）。"
 )
+
+
+_ACTION_VERBS = (
+    "抬手", "举手", "挥手", "走来", "走向", "走到", "坐下", "站起", "起身",
+    "转身", "拥抱", "抱住", "牵手", "拉手", "奔跑", "跑来", "跳起", "跪下",
+    "推开", "拉开", "打开", "关上", "递给", "接过", "弯腰", "回头",
+    "raises her hand", "raises his hand", "walks over", "walks toward", "sits down",
+    "stands up", "turns around", "embraces", "hugs", "holds hands", "runs toward",
+)
+_DIALOGUE_EMOTION_MARKERS = (
+    "对话", "交谈", "说话", "说道", "询问", "回答", "低语", "耳语", "台词",
+    "凝视", "对视", "注视", "微笑", "落泪", "流泪", "皱眉", "表情", "神情",
+    "情绪", "反应", "沉默", "脸部", "面部", "dialogue", "speaks", "talking",
+    "expression", "emotion", "reaction", "close-up", "close up", "facing each other",
+    "eye contact", "smiles", "tears",
+)
+
+
+def determine_gen_strategy(shot: Dict[str, Any]) -> str:
+    """Choose the local video route with action > interaction > safe I2V precedence.
+
+    Clear body movement uses FLF2V. Explicit dialogue, emotion, or low-motion
+    character interaction uses Phantom. Scenery, ambient shots, and uncertain
+    descriptions use single-image I2V.
+    """
+    searchable = " ".join(
+        str(shot.get(field, ""))
+        for field in ("visual", "what", "prompt", "description")
+    ).lower()
+    if any(verb in searchable for verb in _ACTION_VERBS):
+        return "flf2v"
+
+    intent = str(shot.get("shot_intent", "")).lower()
+    who = shot.get("who", [])
+    has_characters = bool(who)
+    if has_characters and (
+        intent in {"dialogue", "reaction"}
+        or any(marker in searchable for marker in _DIALOGUE_EMOTION_MARKERS)
+    ):
+        return "phantom"
+    return "i2v"
 
 LLM_TIMEOUT = 90  # 秒
 MAX_RETRIES = 1  # 解析失败重试次数
@@ -317,6 +359,9 @@ def _parse_response(response: str) -> Dict[str, Any]:
             shot["associate_assets"] = [aa] if aa else []
         elif not isinstance(aa, list):
             shot["associate_assets"] = []
+        # Generation routing is deliberately deterministic rather than trusted
+        # to the LLM: action > dialogue/emotion interaction > safe I2V default.
+        shot["gen_strategy"] = determine_gen_strategy(shot)
 
     return parsed
 
