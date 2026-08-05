@@ -987,7 +987,7 @@ _ACTION_END_STATES = {
     "回头": "head turned to look back over the shoulder",
     "起身": "standing upright, fully risen from the seated position",
     "挥手": "hand raised in a waving gesture, arm extended",
-    # English
+    # English (base forms)
     "raise hand": "hand raised to its highest point, arm extended",
     "walk over": "has arrived at the destination, standing steadily",
     "sit down": "seated steadily on the chair, posture relaxed",
@@ -997,6 +997,22 @@ _ACTION_END_STATES = {
     "look back": "head turned to look back over the shoulder",
     "stand up": "standing upright, fully risen from the seated position",
     "wave": "hand raised in a waving gesture, arm extended",
+    # English (conjugated variants — S05 "raises her hand to brush away hair")
+    "raises her hand": "hand lowered back to resting position, hair now clear of the face",
+    "raises his hand": "hand lowered back to resting position",
+    "brush away": "hand lowered after brushing, action completed",
+    "brushes away": "hand lowered after brushing, action completed",
+    "walks over": "has arrived at the destination, standing steadily",
+    "walks toward": "has arrived at the destination, standing steadily",
+    "sits down": "seated steadily on the chair, posture relaxed",
+    "stands up": "standing upright, fully risen from the seated position",
+    "turns around": "has completed the turn, now facing the new direction",
+    "embraces": "arms wrapped around each other in a warm embrace",
+    "hugs": "arms wrapped around each other in a warm embrace",
+    "holds hands": "hands clasped together, fingers interlocked",
+    "runs toward": "has arrived at the destination, standing steadily",
+    "looks back": "head turned to look back over the shoulder",
+    "waves": "hand raised in a waving gesture, arm extended",
 }
 
 
@@ -1022,20 +1038,28 @@ def _derive_end_state(shot: dict) -> str:
 
 
 def build_end_frame_prompt(shot: dict) -> str:
-    """Describe the completed action while retaining the M2 visual/style prompt.
-    
-    Now includes explicit end-state derivation from action verbs for clarity.
+    """Build rich t2i prompt for end frame generation.
+
+    M3 fix: switched from i2i (copies reference) to t2i with rich description.
+    Includes: end-state pose, scene context, character appearance, style anchors.
     """
     prompt = shot.get("prompt", shot.get("visual", ""))
     end_state = _derive_end_state(shot)
-    
+
+    # Extract character appearance from prompt (simple heuristic)
+    char_desc = ""
+    if "少女" in prompt or "girl" in prompt.lower():
+        char_desc = "young woman in traditional attire"
+    elif "少年" in prompt or "boy" in prompt.lower():
+        char_desc = "young man"
+
     return (
-        f"Starting from the provided start frame, show the moment after the action "
-        f"has fully completed.\n\n"
-        f"End state: {end_state}\n\n"
-        f"Scene context: {prompt}\n\n"
-        "Preserve background, camera position, character placement, lighting, "
-        "and style exactly. Maintain character identity, clothing, and environment."
+        f"{end_state}.\n\n"
+        f"Scene: {prompt}.\n\n"
+        f"Character: {char_desc if char_desc else 'the character'}.\n\n"
+        f"Style: maintain the same artistic style, lighting, and composition as the start frame.\n\n"
+        f"The action has just completed; the character is in the final resting position.\n\n"
+        f"Background, camera angle, and environment must match the start frame exactly."
     )
 
 
@@ -1221,29 +1245,31 @@ def _generate_flf2v_end_frame(
     ref_image_path: Optional[Path],
 ) -> bool:
     """Generate one idempotent Seedream end frame for an FLF2V shot.
-    
-    M2 fix: primary reference = first frame (not character front.png).
-    The first frame already contains character + scene + costume + composition + lighting.
-    
+
+    M3 fix: prefer text_to_image (NOT image_to_image) to avoid near-identical copies.
+    t2i generates a fresh image from the rich prompt — end-state pose + scene + style.
+    The first frame is still used for VALIDATION (similarity band check) only.
+    Falls back to i2i if t2i fails.
+
     Cache: uses sidecar meta JSON with first_frame_sha + prompt_sha + validation.
     Validation: metric-based checks (resolution, brightness, sharpness, similarity band).
     """
     if shot_item.get("gen_strategy", "i2v") != "flf2v":
         return False
-    
-    # First frame MUST exist — it is the primary reference
+
+    # First frame MUST exist — used for validation and size reference
     if not first_frame_path.exists():
         raise FileNotFoundError(
             f"[FLF2V] {shot_id}: first frame {first_frame_path} not found. "
             "Cannot generate end frame without the start frame as reference."
         )
-    
+
     end_path = first_frame_path.with_name(f"{shot_id}_end.png")
     prompt = build_end_frame_prompt(shot_item)
     first_frame_sha = _file_sha256(first_frame_path)
     import hashlib as _hashlib
     prompt_sha = _hashlib.sha256(prompt.encode()).hexdigest()
-    
+
     # Check cache sidecar
     sidecar = _read_end_frame_sidecar(end_path)
     if (
@@ -1255,19 +1281,30 @@ def _generate_flf2v_end_frame(
     ):
         print(f"    ⏭ [FLF2V] {end_path.name} cached+validated, skipping")
         return False
-    
-    # Generate end frame using FIRST FRAME as primary reference
+
+    # Generate end frame — M3: prefer t2i over i2i
     from seedream_client import SeedreamClient
     client = SeedreamClient()
-    kwargs = {
-        "prompt": prompt,
-        "output_path": str(end_path),
-        "size": _storyboard_image_size(first_frame_path),
-    }
-    
-    # M2 fix: primary reference = first frame (not character front.png)
-    client.image_to_image(ref_image=str(first_frame_path), **kwargs)
-    print(f"    [FLF2V] 终帧 {end_path.name} ✓ (ref: first frame)")
+    size = _storyboard_image_size(first_frame_path)
+
+    # Primary: text_to_image (no reference → no copy problem)
+    try:
+        client.text_to_image(
+            prompt=prompt,
+            output_path=str(end_path),
+            size=size,
+        )
+        print(f"    [FLF2V] 终帧 {end_path.name} ✓ (t2i)")
+    except Exception as e:
+        # Fallback: i2i with first frame as reference
+        print(f"    ⚠ [FLF2V] t2i failed ({e}), falling back to i2i")
+        client.image_to_image(
+            prompt=prompt,
+            ref_image=str(first_frame_path),
+            output_path=str(end_path),
+            size=size,
+        )
+        print(f"    [FLF2V] 终帧 {end_path.name} ✓ (i2i fallback)")
     
     # Validate the generated end frame
     validation = _validate_end_frame(first_frame_path, end_path)
@@ -1276,9 +1313,13 @@ def _generate_flf2v_end_frame(
     if not validation["passed"]:
         reason = validation.get("reason", "unknown")
         print(f"    ⚠ [FLF2V] {end_path.name} validation FAILED: {reason}")
-        # Retry once (rate-limiter permitting)
+        # Retry once with same approach (t2i)
         print(f"    [FLF2V] retrying {end_path.name}...")
-        client.image_to_image(ref_image=str(first_frame_path), **kwargs)
+        client.text_to_image(
+            prompt=prompt,
+            output_path=str(end_path),
+            size=size,
+        )
         validation = _validate_end_frame(first_frame_path, end_path)
         _write_end_frame_sidecar(end_path, first_frame_sha, prompt_sha, validation)
         

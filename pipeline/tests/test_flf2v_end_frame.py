@@ -105,7 +105,7 @@ class TestBuildEndFramePrompt:
     def test_preserve_instructions(self):
         shot = {"prompt": "test scene"}
         prompt = build_end_frame_prompt(shot)
-        assert "preserve" in prompt.lower()
+        assert "match" in prompt.lower()
         assert "background" in prompt.lower()
 
 
@@ -216,8 +216,8 @@ class TestGenerateFlf2vEndFrame:
         assert result is False
 
     @patch("seedream_client.SeedreamClient")
-    def test_uses_first_frame_as_reference(self, mock_client_cls, tmp_dir):
-        """Primary reference must be first frame, not character front.png."""
+    def test_uses_t2i_for_generation(self, mock_client_cls, tmp_dir):
+        """M3: primary generation uses text_to_image (no reference image)."""
         first_frame = _make_image(tmp_dir / "S01.png", color=(100, 150, 200))
         char_front = _make_image(tmp_dir / "char_front.png", color=(50, 50, 50))
         
@@ -225,17 +225,17 @@ class TestGenerateFlf2vEndFrame:
         
         mock_client = MagicMock()
         mock_client_cls.return_value = mock_client
-        mock_client.image_to_image.return_value = "http://example.com/img.png"
+        mock_client.text_to_image.return_value = "http://example.com/img.png"
         
-        # Patch _validate_end_frame to always pass (we're testing reference selection, not validation)
+        # Patch _validate_end_frame to always pass (we're testing generation method, not validation)
         with patch("pipeline_runner._validate_end_frame") as mock_validate:
             mock_validate.return_value = {"passed": True, "similarity": 0.5}
             result = _generate_flf2v_end_frame(shot, "S01", first_frame, char_front)
         
-        # Verify it was called with first frame as ref, NOT char_front
-        mock_client.image_to_image.assert_called()
-        call_kwargs = mock_client.image_to_image.call_args
-        assert call_kwargs[1]["ref_image"] == str(first_frame)
+        # M3: Verify text_to_image was called (NOT image_to_image)
+        mock_client.text_to_image.assert_called()
+        call_kwargs = mock_client.text_to_image.call_args
+        assert "西湖" in call_kwargs[1]["prompt"] or "西湖" in call_kwargs[0][0]
 
     @patch("seedream_client.SeedreamClient")
     def test_cache_hit_skips_generation(self, mock_client_cls, tmp_dir):
@@ -276,12 +276,12 @@ class TestGenerateFlf2vEndFrame:
         
         mock_client = MagicMock()
         mock_client_cls.return_value = mock_client
-        mock_client.image_to_image.return_value = "http://example.com/img.png"
+        mock_client.text_to_image.return_value = "http://example.com/img.png"
         mock_validate.return_value = {"passed": True, "similarity": 0.5}
         
         result = _generate_flf2v_end_frame(shot, "S01", first_frame, None)
         # Should have regenerated (stale cache)
-        mock_client.image_to_image.assert_called()
+        mock_client.text_to_image.assert_called()
 
 
 # ─── File SHA-256 test ───────────────────────────────────────────────────────

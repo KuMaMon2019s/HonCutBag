@@ -56,11 +56,11 @@ def test_end_frame_prompt_describes_completed_action_and_keeps_source_prompt():
         "visual": "林晓抬手拂发",
     })
     assert "Golden-hour medium shot" in prompt
-    assert "after the action has fully completed" in prompt
-    # M2: prompt now uses structured end-state mapping + scene context format
+    assert "action" in prompt.lower() and "completed" in prompt.lower()
+    # M3: prompt now uses t2i format with Scene:/Character:/Style: sections
     assert "hand lowered after brushing hair aside" in prompt
-    assert "Scene context" in prompt
-    assert "Preserve background" in prompt
+    assert "Scene:" in prompt
+    assert "match the start frame" in prompt
 
 
 def test_end_frame_generation_skips_existing_large_file(monkeypatch, tmp_path):
