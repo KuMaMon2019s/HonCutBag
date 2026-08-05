@@ -126,6 +126,90 @@ def test_generate_video_uses_num_frames_override_and_real_duration(monkeypatch, 
     assert downloaded["expected_duration"] == pytest.approx(73 / 24)
 
 
+@pytest.mark.parametrize(
+    ("duration", "expected_frames"),
+    [(2, 49), (3.5, 97), (5, 145), (6, 145)],
+)
+def test_snap_duration_to_verified_wan22_frames(duration, expected_frames):
+    frames, actual_duration, reason = local_video_client.snap_duration_to_frames(
+        duration, 24, [49, 97, 145]
+    )
+
+    assert frames == expected_frames
+    assert actual_duration == pytest.approx(expected_frames / 24)
+    assert "ties prefer larger" in reason
+
+
+def test_snap_duration_tie_breaks_to_larger_frame_count():
+    frames, _, _ = local_video_client.snap_duration_to_frames(3, 24, [49, 97])
+
+    assert frames == 97
+
+
+def test_generate_video_uses_duration_snap_and_snapped_validation_duration(monkeypatch, tmp_path):
+    submitted = {}
+    downloaded = {}
+    monkeypatch.delenv("LOCAL_VIDEO_NUM_FRAMES", raising=False)
+    monkeypatch.setattr(local_video_client, "submit", lambda **kwargs: submitted.update(kwargs) or "task-1")
+    monkeypatch.setattr(local_video_client, "poll", lambda task_id: {"status": "completed"})
+    monkeypatch.setattr(local_video_client, "download", lambda *args, **kwargs: downloaded.update(kwargs))
+
+    local_video_client.generate_video("prompt", str(tmp_path / "S02" / "output.mp4"), duration=5)
+
+    assert submitted["num_frames"] == 145
+    assert downloaded["expected_duration"] == pytest.approx(145 / 24)
+
+
+def test_generate_video_respects_custom_valid_frames(monkeypatch, tmp_path):
+    submitted = {}
+    monkeypatch.delenv("LOCAL_VIDEO_NUM_FRAMES", raising=False)
+    monkeypatch.setenv("LOCAL_VIDEO_VALID_FRAMES", "25,73,121")
+    monkeypatch.setattr(local_video_client, "submit", lambda **kwargs: submitted.update(kwargs) or "task-1")
+    monkeypatch.setattr(local_video_client, "poll", lambda task_id: {"status": "completed"})
+    monkeypatch.setattr(local_video_client, "download", lambda *args, **kwargs: None)
+
+    local_video_client.generate_video("prompt", str(tmp_path / "output.mp4"), duration=3)
+
+    assert submitted["num_frames"] == 73
+
+
+def test_generate_video_missing_duration_uses_middle_valid_frame_count(monkeypatch, tmp_path):
+    submitted = {}
+    monkeypatch.delenv("LOCAL_VIDEO_NUM_FRAMES", raising=False)
+    monkeypatch.delenv("LOCAL_VIDEO_VALID_FRAMES", raising=False)
+    monkeypatch.setattr(local_video_client, "submit", lambda **kwargs: submitted.update(kwargs) or "task-1")
+    monkeypatch.setattr(local_video_client, "poll", lambda task_id: {"status": "completed"})
+    monkeypatch.setattr(local_video_client, "download", lambda *args, **kwargs: None)
+
+    local_video_client.generate_video("prompt", str(tmp_path / "output.mp4"), duration=None)
+
+    assert submitted["num_frames"] == 97
+
+
+def test_generate_video_records_probe_provenance_and_duration_drift(monkeypatch, tmp_path, capsys):
+    shot_dir = tmp_path / "S02"
+    shot_dir.mkdir()
+    meta_path = shot_dir / "SHOT_META.json"
+    meta_path.write_text(json.dumps({"prompt": "test", "duration": 5}))
+    monkeypatch.delenv("LOCAL_VIDEO_NUM_FRAMES", raising=False)
+    monkeypatch.setattr(local_video_client, "submit", lambda **kwargs: "task-1")
+    monkeypatch.setattr(local_video_client, "poll", lambda task_id: {"status": "completed"})
+
+    def fake_download(*args, **kwargs):
+        kwargs["verification_out"].update({"duration": 6.04, "num_frames": 145})
+
+    monkeypatch.setattr(local_video_client, "download", fake_download)
+
+    local_video_client.generate_video("prompt", str(shot_dir / "output.mp4"), duration=5)
+
+    meta = json.loads(meta_path.read_text())
+    assert meta["requested_duration"] == 5
+    assert meta["requested_num_frames"] == 145
+    assert meta["actual_duration"] == pytest.approx(6.04)
+    assert meta["actual_num_frames"] == 145
+    assert "duration drift" in capsys.readouterr().out
+
+
 def test_submit_includes_batch_id_in_payload(monkeypatch):
     session = _Session()
     monkeypatch.setattr(local_video_client, "_request_session", lambda: session)

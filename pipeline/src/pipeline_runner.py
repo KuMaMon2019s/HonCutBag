@@ -2036,7 +2036,7 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
                 print(f"    [M4] 提示词路由: {model_name} → single_shot")
         except Exception as e:
             pass  # 降级用原始 prompt
-        duration = meta.get("duration", 5)  # 从 SHOT_META 读取 duration
+        duration = meta.get("duration")  # 从 SHOT_META 读取；缺失时由模型 profile 选中间档
         if not prompt:
             return None
 

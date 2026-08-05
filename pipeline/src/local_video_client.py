@@ -15,11 +15,20 @@ import json
 import subprocess
 import requests
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Sequence, Tuple
 
 
 # Default local API URL (can be overridden via config or env)
 DEFAULT_API_URL = "http://192.168.31.221:9100"
+
+# Model-specific generation constraints. Additional Bridge routes can use the
+# same ``fps``/``valid_frames`` shape when their safe frame sets are verified.
+MODEL_PROFILES = {
+    "wan22": {
+        "fps": 24,
+        "valid_frames": [49, 97, 145],
+    },
+}
 
 # Bypass proxy for local network requests
 _NO_PROXY_ENV = {
@@ -30,6 +39,50 @@ _NO_PROXY_ENV = {
     "http_proxy": "",
     "https_proxy": "",
 }
+
+
+def _valid_frames_for_model(model: Optional[str]) -> Tuple[int, List[int]]:
+    """Return the model fps and legal frame counts, applying the env override."""
+    model_name = model or "wan22"
+    profile = MODEL_PROFILES.get(model_name, MODEL_PROFILES["wan22"])
+    fps = int(profile["fps"])
+    configured = os.environ.get("LOCAL_VIDEO_VALID_FRAMES")
+    if configured:
+        try:
+            valid_frames = sorted({int(value.strip()) for value in configured.split(",") if value.strip()})
+        except ValueError as exc:
+            raise ValueError("LOCAL_VIDEO_VALID_FRAMES must be a comma-separated list of integers") from exc
+        if not valid_frames or valid_frames[0] <= 0:
+            raise ValueError("LOCAL_VIDEO_VALID_FRAMES must contain positive frame counts")
+    else:
+        valid_frames = list(profile["valid_frames"])
+    return fps, valid_frames
+
+
+def snap_duration_to_frames(
+    duration_s: float,
+    fps: int,
+    valid_frames: Sequence[int],
+) -> Tuple[int, float, str]:
+    """Snap a requested duration to the nearest legal frame count.
+
+    Equidistant choices select the larger count so a tie never silently
+    shortens a shot.
+    """
+    if fps <= 0:
+        raise ValueError("fps must be positive")
+    legal = sorted({int(value) for value in valid_frames})
+    if not legal or legal[0] <= 0:
+        raise ValueError("valid_frames must contain positive frame counts")
+    requested_duration = float(duration_s)
+    if requested_duration <= 0:
+        raise ValueError("duration_s must be positive")
+
+    target = round(requested_duration * fps) + 1
+    frames = min(legal, key=lambda value: (abs(value - target), -value))
+    actual_duration = frames / fps
+    reason = f"target={target}, nearest legal frame count; ties prefer larger"
+    return frames, actual_duration, reason
 
 
 def _get_api_url() -> str:
@@ -476,11 +529,17 @@ def _verify_download(
     # Extract video stream resolution
     actual_width = None
     actual_height = None
+    actual_num_frames = None
     for s in info.get("streams", []):
         if s.get("codec_type") == "video":
             try:
                 actual_width = int(s.get("width"))
                 actual_height = int(s.get("height"))
+            except (TypeError, ValueError):
+                pass
+            try:
+                if s.get("nb_frames") is not None:
+                    actual_num_frames = int(s["nb_frames"])
             except (TypeError, ValueError):
                 pass
             break
@@ -489,6 +548,7 @@ def _verify_download(
         "duration": actual_duration,
         "width": actual_width,
         "height": actual_height,
+        "num_frames": actual_num_frames,
     }
 
     # Validate
@@ -519,6 +579,7 @@ def download(
     expected_duration: Optional[float] = None,
     expected_width: Optional[int] = None,
     expected_height: Optional[int] = None,
+    verification_out: Optional[dict] = None,
 ) -> str:
     """Download the generated video to output_path.
 
@@ -572,6 +633,8 @@ def download(
                 f"{actual.get('width')}x{actual.get('height')}, "
                 f"{actual.get('duration'):.2f}s"
             )
+            if verification_out is not None:
+                verification_out.update(actual)
         except RuntimeError as e:
             try:
                 os.remove(output_path)
@@ -592,7 +655,7 @@ def generate_video(
     output_path: str,
     reference_image_base64: Optional[str] = None,
     seed: int = -1,
-    duration: int = 5,
+    duration: Optional[float] = None,
     width: int = 1280,
     height: int = 720,
     fps: int = 24,
@@ -625,16 +688,30 @@ def generate_video(
     Raises:
         RuntimeError: If any step fails
     """
-    # Local Wan2.2 TI2V-5B on 8GB VRAM.
-    # Frame count exploration (2026-08-05):
-    #   - 49 frames (~2s): STABLE, legacy default
-    #   - 81 frames (~3.4s): STABLE
-    #   - 97 frames (~4s): STABLE, RECOMMENDED for 8GB VRAM
-    #   - 145 frames (~6s): supported but slow (~60 min) with coarse progress updates
-    # Bridge correctly passes through num_frames parameter (nf= field in logs).
-    # Keep environment-configurable for future GPU upgrades.
-    num_frames = int(os.environ.get("LOCAL_VIDEO_NUM_FRAMES", "97"))
-    expected_duration = num_frames / fps
+    profile_fps, valid_frames = _valid_frames_for_model(model)
+    fps = profile_fps
+    frame_override = os.environ.get("LOCAL_VIDEO_NUM_FRAMES")
+    shot_id = Path(output_path).parent.name
+    requested_duration = float(duration) if duration is not None else None
+    if frame_override is not None:
+        num_frames = int(frame_override)
+        expected_duration = num_frames / fps
+        reason = "explicit LOCAL_VIDEO_NUM_FRAMES override"
+        print(f"  [frames] override={num_frames} ({expected_duration:.2f}s)")
+    elif requested_duration is not None:
+        num_frames, expected_duration, reason = snap_duration_to_frames(
+            requested_duration, fps, valid_frames
+        )
+        target = round(requested_duration * fps) + 1
+        print(
+            f"  [frames] {shot_id}: duration={requested_duration:.1f}s → "
+            f"target={target} → snapped {num_frames} ({expected_duration:.2f}s)"
+        )
+    else:
+        num_frames = valid_frames[len(valid_frames) // 2]
+        expected_duration = num_frames / fps
+        reason = "missing shot duration; middle valid frame count fallback"
+        print(f"  [frames] {shot_id}: duration=missing → fallback {num_frames} ({expected_duration:.2f}s)")
     
     # Prepare image list (legacy single image support)
     if reference_image_base64 and not image_base64_list:
@@ -700,11 +777,43 @@ def generate_video(
     print(f"  [local_video] completed!")
     
     # Download (with cross-task leakage verification)
+    verification = {}
     download(
         task_id,
         output_path,
         expected_duration=expected_duration,
         expected_width=width,
         expected_height=height,
+        verification_out=verification,
     )
+
+    actual_duration = verification.get("duration")
+    actual_num_frames = verification.get("num_frames")
+    if actual_num_frames is None and actual_duration is not None:
+        actual_num_frames = round(actual_duration * fps)
+    provenance = {
+        "requested_duration": requested_duration,
+        "requested_num_frames": num_frames,
+        "actual_duration": actual_duration,
+        "actual_num_frames": actual_num_frames,
+    }
+    meta_path = Path(output_path).parent / "SHOT_META.json"
+    if meta_path.exists():
+        try:
+            shot_meta = json.loads(meta_path.read_text())
+            shot_meta.update(provenance)
+            meta_path.write_text(json.dumps(shot_meta, indent=2, ensure_ascii=False))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"  [frames] {shot_id}: unable to update provenance: {exc}")
+    print(
+        f"  [frames] {shot_id}: requested_duration={requested_duration}, "
+        f"requested_num_frames={num_frames}, actual_duration={actual_duration}, "
+        f"actual_num_frames={actual_num_frames}; reason={reason}"
+    )
+    if requested_duration is not None and actual_duration is not None:
+        if abs(actual_duration - requested_duration) > 1.0:
+            print(
+                f"  [frames] WARNING duration drift: {shot_id} requested "
+                f"{requested_duration:.2f}s, actual {actual_duration:.2f}s"
+            )
     return output_path
