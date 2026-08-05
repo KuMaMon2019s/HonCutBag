@@ -138,8 +138,8 @@ class TestValidateEndFrame:
         assert result["passed"] is False
         assert "resolution" in result["reason"].lower()
 
-    def test_drifted_image_too_different(self, temp_images):
-        """Completely different scene → rejected as too different (scene drift)."""
+    def test_drifted_image_rejected(self, temp_images):
+        """Completely different scene → rejected."""
         end_path = temp_images["tmp_path"] / "S01_end.png"
         # Solid white (maximally different from gradient which averages ~100)
         white_arr = np.full((100, 100, 3), 255, dtype=np.uint8)
@@ -150,7 +150,6 @@ class TestValidateEndFrame:
             similarity_low=0.25, similarity_high=0.85
         )
         assert result["passed"] is False
-        # White vs gradient should be quite different
         assert result["reason"] is not None
 
     def test_sane_pair_passes(self, temp_images):
@@ -254,48 +253,43 @@ class TestGenerateFLF2VEndFrame:
         )
         assert result is False
 
-    @patch("seedream_client.SeedreamClient")
     @patch("pipeline_runner._validate_end_frame")
-    def test_first_frame_used_as_reference(self, mock_validate, mock_client_class, tmp_path):
+    @patch("seedream_client.SeedreamClient")
+    def test_first_frame_used_as_reference(self, mock_client_class, mock_validate, tmp_path):
         """First frame (not character front.png) passed as reference."""
-        @patch("pipeline_runner._validate_end_frame")
-        @patch("seedream_client.SeedreamClient")
-        def test_first_frame_used_as_reference(self, mock_client_class, mock_validate, tmp_path):
-            """First frame (not character front.png) passed as reference."""
-            # Create first frame
-            first_arr = np.random.randint(50, 200, (100, 100, 3), dtype=np.uint8)
-            first_path = tmp_path / "S01.png"
-            Image.fromarray(first_arr).save(first_path)
+        # Create first frame
+        first_arr = np.random.randint(50, 200, (100, 100, 3), dtype=np.uint8)
+        first_path = tmp_path / "S01.png"
+        Image.fromarray(first_arr).save(first_path)
 
-            # Mock validation to always pass
-            mock_validate.return_value = {"passed": True, "similarity": 0.65}
+        # Mock validation to always pass
+        mock_validate.return_value = {"passed": True, "similarity": 0.65}
 
-            # Mock SeedreamClient — capture the call, then create a synthetic end frame
-            mock_client = MagicMock()
-            mock_client_class.return_value = mock_client
+        # Mock SeedreamClient
+        mock_client = MagicMock()
+        mock_client_class.return_value = mock_client
 
-            def fake_generate(ref_image, **kwargs):
-                # Simulate generation: create a moderately different end frame
-                end_path = Path(kwargs["output_path"])
-                # Create a random noise pattern (maximally different)
-                np.random.seed(99)
-                random_arr = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
-                Image.fromarray(random_arr).save(end_path)
+        def fake_generate(ref_image, **kwargs):
+            end_path = Path(kwargs["output_path"])
+            # Create a different image
+            np.random.seed(99)
+            random_arr = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
+            Image.fromarray(random_arr).save(end_path)
 
-            mock_client.image_to_image.side_effect = fake_generate
+        mock_client.image_to_image.side_effect = fake_generate
 
-            shot = {"gen_strategy": "flf2v", "visual": "抬手拂发"}
-            char_front = tmp_path / "char_front.png"
-            char_front.touch()
+        shot = {"gen_strategy": "flf2v", "visual": "抬手拂发"}
+        char_front = tmp_path / "char_front.png"
+        char_front.touch()
 
-            pipeline_runner._generate_flf2v_end_frame(
-                shot, "S01", first_path, char_front
-            )
+        pipeline_runner._generate_flf2v_end_frame(
+            shot, "S01", first_path, char_front
+        )
 
-            # Verify image_to_image was called with first frame as ref_image
-            mock_client.image_to_image.assert_called_once()
-            call_kwargs = mock_client.image_to_image.call_args[1]
-            assert call_kwargs["ref_image"] == str(first_path)
+        # Verify image_to_image was called with first frame as ref_image
+        mock_client.image_to_image.assert_called_once()
+        call_kwargs = mock_client.image_to_image.call_args[1]
+        assert call_kwargs["ref_image"] == str(first_path)
 
     @patch("seedream_client.SeedreamClient")
     def test_cache_skip_when_valid(self, mock_client_class, tmp_path):
@@ -329,9 +323,9 @@ class TestGenerateFLF2VEndFrame:
         assert result is False
         mock_client.image_to_image.assert_not_called()
 
-    @patch("seedream_client.SeedreamClient")
     @patch("pipeline_runner._validate_end_frame")
-    def test_stale_cache_regenerates(self, mock_validate, mock_client_class, tmp_path):
+    @patch("seedream_client.SeedreamClient")
+    def test_stale_cache_regenerates(self, mock_client_class, mock_validate, tmp_path):
         """Changed first frame → regenerate (cache miss)."""
         first_arr = np.random.randint(50, 200, (100, 100, 3), dtype=np.uint8)
         first_path = tmp_path / "S01.png"
@@ -359,14 +353,9 @@ class TestGenerateFLF2VEndFrame:
 
         def fake_generate(ref_image, **kwargs):
             end_path = Path(kwargs["output_path"])
-            src = np.array(Image.open(ref_image))
-            # Heavy transformation to ensure similarity < 0.85
-            # Invert + large shift + heavy noise
-            inverted = 255 - src
-            shifted = np.roll(inverted, shift=30, axis=(0, 1))
             np.random.seed(99)
-            noisy = np.clip(shifted.astype(np.int16) + np.random.randint(-80, 80, shifted.shape), 0, 255).astype(np.uint8)
-            Image.fromarray(noisy).save(end_path)
+            random_arr = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
+            Image.fromarray(random_arr).save(end_path)
 
         mock_client.image_to_image.side_effect = fake_generate
 
