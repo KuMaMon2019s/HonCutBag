@@ -229,14 +229,16 @@ def submit(
 
 def poll(
     task_id: str,
-    max_attempts: int = 30,  # 语义改为：连续无进度轮询次数上限（默认 30 × 10s = 300s 无进度增长才判定卡死）
+    max_attempts: Optional[int] = None,
     interval: int = 10,
 ) -> dict:
     """Poll task until done, with progress-based timeout.
 
     progress 为 0 或 status=queued 时按排队等待处理，最长等待时间由
     LOCAL_VIDEO_QUEUE_TIMEOUT 控制（默认 7200 秒）。任务开始产生进度后，只有当
-    progress 连续 max_attempts 次轮询都没有任何增长时才判定卡死。
+    progress 连续 stall_polls 次轮询都没有任何增长时才判定卡死。
+    stall_polls 默认从 LOCAL_VIDEO_STALL_POLLS 读取（默认 60）；显式传入
+    max_attempts 时仍优先使用该参数，以保持向后兼容。
 
     Bridge v3.2 quirk: 任务完成后 status 可能永远卡在 "running" + progress=100，
     但 GET /download/{task_id} 能正常下载。当检测到 progress>=100 且 status=running 时，
@@ -244,8 +246,8 @@ def poll(
 
     Args:
         task_id: 任务 ID
-        max_attempts: 连续无进度增长的轮询次数上限。默认 30（即 30 × interval 秒无进度增长则超时）。
-                      参数名保留以向后兼容，语义已从"总轮询次数"改为"无进度超时轮数"。
+        max_attempts: 显式的连续无进度增长轮询上限。None 时使用
+                      LOCAL_VIDEO_STALL_POLLS（默认 60）。参数名保留以向后兼容。
         interval: 轮询间隔（秒）
 
     Returns:
@@ -266,6 +268,13 @@ def poll(
     last_progress_change_poll: int = 0  # 上次 progress 变化时的 total_polls 序号
     queue_started_at = time.monotonic()
     queue_timeout = int(os.environ.get("LOCAL_VIDEO_QUEUE_TIMEOUT", "7200"))
+    stall_polls = (
+        max_attempts
+        if max_attempts is not None
+        else int(os.environ.get("LOCAL_VIDEO_STALL_POLLS", "60"))
+    )
+    if stall_polls <= 0:
+        raise ValueError("LOCAL_VIDEO_STALL_POLLS/max_attempts must be a positive integer")
 
     # Bridge running/100 quirk tracking
     at_100_count: int = 0         # progress>=100 且 status=running 的连续轮数
@@ -359,11 +368,25 @@ def poll(
 
         stale_seconds = stale_count * interval
         if status == "unknown":
-            print(f"  [local_poll #{total_polls}] WARNING: stall-waiting status=unknown progress={progress}% (no-progress wait {stale_seconds}s / {max_attempts * interval}s)")
+            print(f"  [local_poll #{total_polls}] WARNING: stall-waiting status=unknown progress={progress}% (no-progress wait {stale_seconds}s / {stall_polls * interval}s)")
         else:
-            print(f"  [local_poll #{total_polls}] stall-waiting: status={status} progress={progress}% (no-progress wait {stale_seconds}s / {max_attempts * interval}s)")
+            print(f"  [local_poll #{total_polls}] stall-waiting: status={status} progress={progress}% (no-progress wait {stale_seconds}s / {stall_polls * interval}s)")
 
-        if stale_count >= max_attempts and status in ("running", "queued", "unknown"):
+        if stale_count >= stall_polls and status in ("running", "queued", "unknown"):
+            if progress >= 50:
+                for probe_round in range(1, 4):
+                    print(
+                        f"  [local_poll #{total_polls}] high-progress stall: "
+                        f"probing download ({probe_round}/3)"
+                    )
+                    if _probe_download(session, api_url, task_id):
+                        print(
+                            f"  [local_poll #{total_polls}] ✓ high-progress download "
+                            "probe succeeded → treating as completed"
+                        )
+                        return {"status": "completed", "progress": 100}
+                    if probe_round < 3:
+                        time.sleep(interval)
             raise TimeoutError(
                 f"Local video task {task_id} stalled: progress stuck at {last_progress}% "
                 f"for {stale_count} polls ({stale_seconds}s) with status={status}"
@@ -599,7 +622,7 @@ def generate_video(
     #   - 49 frames (~2s): STABLE, legacy default
     #   - 81 frames (~3.4s): STABLE
     #   - 97 frames (~4s): STABLE, RECOMMENDED for 8GB VRAM
-    #   - 145 frames (~6s): OOM on 8GB VRAM (exceeds memory limit)
+    #   - 145 frames (~6s): supported but slow (~60 min) with coarse progress updates
     # Bridge correctly passes through num_frames parameter (nf= field in logs).
     # Keep environment-configurable for future GPU upgrades.
     num_frames = int(os.environ.get("LOCAL_VIDEO_NUM_FRAMES", "97"))

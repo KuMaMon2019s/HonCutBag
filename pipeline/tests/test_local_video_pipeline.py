@@ -13,17 +13,25 @@ import pipeline_runner
 
 
 class _Response:
-    status_code = 200
     text = ""
 
-    def __init__(self, payload):
+    def __init__(self, payload, status_code=200, content=b"video"):
         self._payload = payload
+        self.status_code = status_code
+        self.headers = {"content-type": "video/mp4", "content-length": str(len(content))}
+        self._content = content
 
     def raise_for_status(self):
         return None
 
     def json(self):
         return self._payload
+
+    def iter_content(self, chunk_size=8192):
+        yield self._content
+
+    def close(self):
+        return None
 
 
 class _Session:
@@ -63,6 +71,45 @@ def test_poll_started_task_still_stalls(monkeypatch):
 
     with pytest.raises(TimeoutError, match="stalled: progress stuck at 10%"):
         local_video_client.poll("started-task", max_attempts=2, interval=0)
+
+
+def test_poll_stall_polls_env_override(monkeypatch):
+    statuses = [{"status": "running", "progress": 10}] * 4
+    monkeypatch.setattr(local_video_client, "_request_session", lambda: _Session(statuses))
+    monkeypatch.setenv("LOCAL_VIDEO_STALL_POLLS", "3")
+
+    with pytest.raises(TimeoutError, match="for 3 polls"):
+        local_video_client.poll("env-stall-task", interval=0)
+
+
+def test_poll_high_progress_stall_download_probe_completes(monkeypatch):
+    class ProbeSession(_Session):
+        def get(self, url, **kwargs):
+            if "/download/" in url:
+                return _Response({}, content=b"ready")
+            return super().get(url, **kwargs)
+
+    statuses = [{"status": "running", "progress": 80}] * 3
+    monkeypatch.setattr(local_video_client, "_request_session", lambda: ProbeSession(statuses))
+
+    assert local_video_client.poll("slow-task", max_attempts=2, interval=0) == {
+        "status": "completed",
+        "progress": 100,
+    }
+
+
+def test_poll_high_progress_genuine_stall_raises(monkeypatch):
+    class FailedProbeSession(_Session):
+        def get(self, url, **kwargs):
+            if "/download/" in url:
+                return _Response({}, status_code=404, content=b"")
+            return super().get(url, **kwargs)
+
+    statuses = [{"status": "running", "progress": 80}] * 3
+    monkeypatch.setattr(local_video_client, "_request_session", lambda: FailedProbeSession(statuses))
+
+    with pytest.raises(TimeoutError, match="stalled: progress stuck at 80%"):
+        local_video_client.poll("genuine-stall", max_attempts=2, interval=0)
 
 
 def test_generate_video_uses_num_frames_override_and_real_duration(monkeypatch, tmp_path):
