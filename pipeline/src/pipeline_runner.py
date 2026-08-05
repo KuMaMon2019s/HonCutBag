@@ -974,18 +974,68 @@ def _normalize_shot_id(shot_item: dict) -> Optional[str]:
     return f"S{raw_str.zfill(2)}"
 
 
-def build_end_frame_prompt(shot: dict) -> str:
-    """Describe the completed action while retaining the M2 visual/style prompt."""
-    prompt = shot.get("prompt", shot.get("visual", ""))
+# Action verb → end-state mapping (for FLF2V end frames)
+_ACTION_END_STATES = {
+    # Chinese
+    "抬手": "hand raised to its highest point, arm extended",
+    "抬手拂发": "hand lowered after brushing hair aside, hair now clear of the face",
+    "走来": "has arrived at the destination, standing steadily",
+    "坐下": "seated steadily on the chair, posture relaxed",
+    "转身": "has completed the turn, now facing the new direction",
+    "拥抱": "arms wrapped around each other in a warm embrace",
+    "牵手": "hands clasped together, fingers interlocked",
+    "回头": "head turned to look back over the shoulder",
+    "起身": "standing upright, fully risen from the seated position",
+    "挥手": "hand raised in a waving gesture, arm extended",
+    # English
+    "raise hand": "hand raised to its highest point, arm extended",
+    "walk over": "has arrived at the destination, standing steadily",
+    "sit down": "seated steadily on the chair, posture relaxed",
+    "turn around": "has completed the turn, now facing the new direction",
+    "embrace": "arms wrapped around each other in a warm embrace",
+    "hold hands": "hands clasped together, fingers interlocked",
+    "look back": "head turned to look back over the shoulder",
+    "stand up": "standing upright, fully risen from the seated position",
+    "wave": "hand raised in a waving gesture, arm extended",
+}
+
+
+def _derive_end_state(shot: dict) -> str:
+    """Derive explicit end-state description from action verbs.
+    
+    Returns a concrete end-state sentence for known action verbs,
+    or a generic fallback for unknown actions.
+    """
     action_text = " ".join(
         str(shot.get(field, "")) for field in ("visual", "what", "description")
         if shot.get(field)
-    )
+    ).lower()
+    
+    # Check for known action verbs (longest match first to avoid partial matches)
+    sorted_verbs = sorted(_ACTION_END_STATES.keys(), key=len, reverse=True)
+    for verb in sorted_verbs:
+        if verb.lower() in action_text:
+            return _ACTION_END_STATES[verb]
+    
+    # Generic fallback
+    return "the action described is fully completed, natural resting pose afterwards"
+
+
+def build_end_frame_prompt(shot: dict) -> str:
+    """Describe the completed action while retaining the M2 visual/style prompt.
+    
+    Now includes explicit end-state derivation from action verbs for clarity.
+    """
+    prompt = shot.get("prompt", shot.get("visual", ""))
+    end_state = _derive_end_state(shot)
+    
     return (
-        f"{prompt}\n\nEND FRAME: Show the same scene and characters after the action "
-        f"has fully completed. Completed end state: {action_text or prompt}. "
-        "Preserve the exact visual style, lighting, camera angle, composition, "
-        "character identity, clothing, and environment of the first frame."
+        f"Starting from the provided start frame, show the moment after the action "
+        f"has fully completed.\n\n"
+        f"End state: {end_state}\n\n"
+        f"Scene context: {prompt}\n\n"
+        "Preserve background, camera position, character placement, lighting, "
+        "and style exactly. Maintain character identity, clothing, and environment."
     )
 
 
@@ -999,32 +1049,248 @@ def _storyboard_image_size(image_path: Path) -> str:
         return "1920x1920"
 
 
+def _validate_end_frame(
+    first_frame_path: Path,
+    end_frame_path: Path,
+    similarity_low: float = 0.25,
+    similarity_high: float = 0.85,
+    sharpness_floor_ratio: float = 0.3,
+    brightness_range: tuple = (15, 240),
+) -> dict:
+    """Validate end frame against first frame using metric-based checks.
+    
+    Returns dict with keys: passed, similarity, sharpness_ok, brightness_ok,
+    resolution_ok, reason (if failed).
+    
+    No VLM required — deterministic metric checks:
+    1. Resolution identical to first frame
+    2. Non-black, non-blank (mean brightness in range)
+    3. Sharpness: Laplacian variance above floor (first_frame_variance × ratio)
+    4. Similarity: perceptual distance must be in band [low, high]
+       - Too similar (< low) → action didn't progress (copy of first frame)
+       - Too different (> high) → scene/camera drifted
+    """
+    from PIL import Image
+    import numpy as np
+    
+    result = {
+        "passed": False,
+        "similarity": None,
+        "sharpness_ok": False,
+        "brightness_ok": False,
+        "resolution_ok": False,
+        "reason": None,
+    }
+    
+    try:
+        first_img = Image.open(first_frame_path).convert("RGB")
+        end_img = Image.open(end_frame_path).convert("RGB")
+    except Exception as e:
+        result["reason"] = f"cannot open images: {e}"
+        return result
+    
+    # 1. Resolution check
+    if first_img.size != end_img.size:
+        result["reason"] = (
+            f"resolution mismatch: first={first_img.size}, end={end_img.size}"
+        )
+        return result
+    result["resolution_ok"] = True
+    
+    # Convert to numpy arrays for metric computation
+    first_arr = np.array(first_img)
+    end_arr = np.array(end_img)
+    
+    # 2. Brightness check (non-black, non-blank)
+    mean_brightness = float(np.mean(end_arr))
+    result["brightness_ok"] = brightness_range[0] <= mean_brightness <= brightness_range[1]
+    if not result["brightness_ok"]:
+        result["reason"] = f"brightness out of range: {mean_brightness:.1f} (expected {brightness_range})"
+        return result
+    
+    # 3. Sharpness check (Laplacian variance)
+    def _laplacian_variance(arr):
+        """Compute Laplacian variance as sharpness proxy."""
+        gray = np.mean(arr, axis=2)  # RGB → grayscale
+        # Simple 3×3 Laplacian kernel via array slicing
+        lap = (
+            gray[:-2, 1:-1] + gray[2:, 1:-1] +
+            gray[1:-1, :-2] + gray[1:-1, 2:] -
+            4 * gray[1:-1, 1:-1]
+        )
+        return float(np.var(lap))
+    
+    first_sharpness = _laplacian_variance(first_arr)
+    end_sharpness = _laplacian_variance(end_arr)
+    sharpness_floor = first_sharpness * sharpness_floor_ratio
+    result["sharpness_ok"] = end_sharpness >= sharpness_floor
+    if not result["sharpness_ok"]:
+        result["reason"] = (
+            f"too blurry: sharpness={end_sharpness:.1f} < floor={sharpness_floor:.1f} "
+            f"(first_frame={first_sharpness:.1f} × {sharpness_floor_ratio})"
+        )
+        return result
+    
+    # 4. Similarity check (downsampled grayscale MSE → normalized similarity)
+    def _downsample_gray(arr, target_size=64):
+        """Downsample to small grayscale image for perceptual comparison."""
+        gray = np.mean(arr, axis=2)
+        # Simple box downsample
+        h, w = gray.shape
+        step_h = max(1, h // target_size)
+        step_w = max(1, w // target_size)
+        small = gray[::step_h, ::step_w][:target_size, :target_size]
+        return small.astype(np.float64)
+    
+    first_small = _downsample_gray(first_arr)
+    end_small = _downsample_gray(end_arr)
+    
+    # Pad to same shape if needed
+    min_h = min(first_small.shape[0], end_small.shape[0])
+    min_w = min(first_small.shape[1], end_small.shape[1])
+    first_small = first_small[:min_h, :min_w]
+    end_small = end_small[:min_h, :min_w]
+    
+    # MSE → similarity (1.0 = identical, 0.0 = maximally different)
+    mse = float(np.mean((first_small - end_small) ** 2))
+    # Normalize: max possible MSE for 8-bit images is 255^2 = 65025
+    similarity = max(0.0, 1.0 - mse / 65025.0)
+    result["similarity"] = round(similarity, 4)
+    
+    if similarity < similarity_low:
+        result["reason"] = (
+            f"too different (scene drift): similarity={similarity:.4f} < {similarity_low}"
+        )
+        return result
+    
+    if similarity > similarity_high:
+        result["reason"] = (
+            f"too similar (no action progress): similarity={similarity:.4f} > {similarity_high}"
+        )
+        return result
+    
+    result["passed"] = True
+    return result
+
+
+def _end_frame_sidecar_path(end_frame_path: Path) -> Path:
+    """Return the sidecar meta JSON path for an end frame."""
+    return end_frame_path.with_name(end_frame_path.stem + "_end.meta.json")
+
+
+def _write_end_frame_sidecar(
+    end_frame_path: Path,
+    first_frame_sha: str,
+    prompt_sha: str,
+    validation: dict,
+):
+    """Write cache sidecar for end frame."""
+    sidecar = _end_frame_sidecar_path(end_frame_path)
+    sidecar.write_text(json.dumps({
+        "first_frame_sha256": first_frame_sha,
+        "prompt_sha256": prompt_sha,
+        "validation": validation,
+    }, indent=2))
+
+
+def _read_end_frame_sidecar(end_frame_path: Path) -> Optional[dict]:
+    """Read cache sidecar, or None if missing/invalid."""
+    sidecar = _end_frame_sidecar_path(end_frame_path)
+    if not sidecar.exists():
+        return None
+    try:
+        return json.loads(sidecar.read_text())
+    except Exception:
+        return None
+
+
+def _file_sha256(path: Path) -> str:
+    """Compute SHA-256 hex digest of a file."""
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def _generate_flf2v_end_frame(
     shot_item: dict,
     shot_id: str,
     first_frame_path: Path,
     ref_image_path: Optional[Path],
 ) -> bool:
-    """Generate one idempotent Seedream end frame for an FLF2V shot."""
+    """Generate one idempotent Seedream end frame for an FLF2V shot.
+    
+    M2 fix: primary reference = first frame (not character front.png).
+    The first frame already contains character + scene + costume + composition + lighting.
+    
+    Cache: uses sidecar meta JSON with first_frame_sha + prompt_sha + validation.
+    Validation: metric-based checks (resolution, brightness, sharpness, similarity band).
+    """
     if shot_item.get("gen_strategy", "i2v") != "flf2v":
         return False
+    
+    # First frame MUST exist — it is the primary reference
+    if not first_frame_path.exists():
+        raise FileNotFoundError(
+            f"[FLF2V] {shot_id}: first frame {first_frame_path} not found. "
+            "Cannot generate end frame without the start frame as reference."
+        )
+    
     end_path = first_frame_path.with_name(f"{shot_id}_end.png")
-    if end_path.exists() and end_path.stat().st_size > 10 * 1024:
-        print(f"    ⏭ [FLF2V] {end_path.name} exists, skipping")
+    prompt = build_end_frame_prompt(shot_item)
+    first_frame_sha = _file_sha256(first_frame_path)
+    import hashlib as _hashlib
+    prompt_sha = _hashlib.sha256(prompt.encode()).hexdigest()
+    
+    # Check cache sidecar
+    sidecar = _read_end_frame_sidecar(end_path)
+    if (
+        sidecar is not None
+        and end_path.exists()
+        and sidecar.get("first_frame_sha256") == first_frame_sha
+        and sidecar.get("prompt_sha256") == prompt_sha
+        and sidecar.get("validation", {}).get("passed")
+    ):
+        print(f"    ⏭ [FLF2V] {end_path.name} cached+validated, skipping")
         return False
-
+    
+    # Generate end frame using FIRST FRAME as primary reference
     from seedream_client import SeedreamClient
     client = SeedreamClient()
     kwargs = {
-        "prompt": build_end_frame_prompt(shot_item),
+        "prompt": prompt,
         "output_path": str(end_path),
         "size": _storyboard_image_size(first_frame_path),
     }
-    if ref_image_path and ref_image_path.exists():
-        client.image_to_image(ref_image=str(ref_image_path), **kwargs)
-    else:
-        client.text_to_image(**kwargs)
-    print(f"    [FLF2V] 终帧 {end_path.name} ✓")
+    
+    # M2 fix: primary reference = first frame (not character front.png)
+    client.image_to_image(ref_image=str(first_frame_path), **kwargs)
+    print(f"    [FLF2V] 终帧 {end_path.name} ✓ (ref: first frame)")
+    
+    # Validate the generated end frame
+    validation = _validate_end_frame(first_frame_path, end_path)
+    _write_end_frame_sidecar(end_path, first_frame_sha, prompt_sha, validation)
+    
+    if not validation["passed"]:
+        reason = validation.get("reason", "unknown")
+        print(f"    ⚠ [FLF2V] {end_path.name} validation FAILED: {reason}")
+        # Retry once (rate-limiter permitting)
+        print(f"    [FLF2V] retrying {end_path.name}...")
+        client.image_to_image(ref_image=str(first_frame_path), **kwargs)
+        validation = _validate_end_frame(first_frame_path, end_path)
+        _write_end_frame_sidecar(end_path, first_frame_sha, prompt_sha, validation)
+        
+        if not validation["passed"]:
+            reason = validation.get("reason", "unknown")
+            print(f"    ✗ [FLF2V] {end_path.name} retry FAILED: {reason}")
+            raise RuntimeError(
+                f"[FLF2V] {shot_id}: end frame validation failed after retry: {reason}"
+            )
+    
+    sim = validation.get("similarity", "N/A")
+    print(f"    ✓ [FLF2V] {end_path.name} validated (similarity={sim})")
     return True
 
 

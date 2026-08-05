@@ -57,24 +57,43 @@ def test_end_frame_prompt_describes_completed_action_and_keeps_source_prompt():
     })
     assert "Golden-hour medium shot" in prompt
     assert "after the action has fully completed" in prompt
-    assert "林晓抬手拂发" in prompt
-    assert "Preserve the exact visual style" in prompt
+    # M2: prompt now uses structured end-state mapping + scene context format
+    assert "hand lowered after brushing hair aside" in prompt
+    assert "Scene context" in prompt
+    assert "Preserve background" in prompt
 
 
 def test_end_frame_generation_skips_existing_large_file(monkeypatch, tmp_path):
+    """M2: cache skip now uses sidecar meta JSON, not just file size."""
     first = tmp_path / "S01.png"
     end = tmp_path / "S01_end.png"
     first.write_bytes(b"x" * 2048)
     end.write_bytes(b"x" * (10 * 1024 + 1))
 
+    # Write valid sidecar to trigger cache skip
+    import hashlib
+    first_sha = hashlib.sha256(b"x" * 2048).hexdigest()
+    sidecar = tmp_path / "S01_end_end.meta.json"
+
+    # Compute prompt hash for the shot
+    shot = {"gen_strategy": "flf2v", "prompt": "shot"}
+    prompt = pipeline_runner.build_end_frame_prompt(shot)
+    prompt_sha = hashlib.sha256(prompt.encode()).hexdigest()
+
+    sidecar.write_text(json.dumps({
+        "first_frame_sha256": first_sha,
+        "prompt_sha256": prompt_sha,
+        "validation": {"passed": True, "similarity": 0.5},
+    }))
+
     class ForbiddenClient:
         def __init__(self):
-            pytest.fail("Seedream must not be constructed for an existing end frame")
+            pytest.fail("Seedream must not be constructed for a cached end frame")
 
     import seedream_client
     monkeypatch.setattr(seedream_client, "SeedreamClient", ForbiddenClient)
     assert pipeline_runner._generate_flf2v_end_frame(
-        {"gen_strategy": "flf2v", "prompt": "shot"}, "S01", first, None
+        shot, "S01", first, None
     ) is False
 
 
