@@ -594,10 +594,15 @@ def generate_video(
     Raises:
         RuntimeError: If any step fails
     """
-    # Local Wan2.2 TI2V-5B currently produces 49 frames on the 8GB GPU. Keep
-    # this environment-configurable so future local/online models can switch
-    # frame counts without a code change.
-    num_frames = int(os.environ.get("LOCAL_VIDEO_NUM_FRAMES", "49"))
+    # Local Wan2.2 TI2V-5B on 8GB VRAM.
+    # Frame count exploration (2026-08-05):
+    #   - 49 frames (~2s): STABLE, legacy default
+    #   - 81 frames (~3.4s): STABLE
+    #   - 97 frames (~4s): STABLE, RECOMMENDED for 8GB VRAM
+    #   - 145 frames (~6s): OOM on 8GB VRAM (exceeds memory limit)
+    # Bridge correctly passes through num_frames parameter (nf= field in logs).
+    # Keep environment-configurable for future GPU upgrades.
+    num_frames = int(os.environ.get("LOCAL_VIDEO_NUM_FRAMES", "97"))
     expected_duration = num_frames / fps
     
     # Prepare image list (legacy single image support)

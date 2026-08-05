@@ -29,7 +29,7 @@ def package_shot_assets(
     Returns:
         Tuple of (zip_path_or_None, base64_list)
         - zip_path: Path to zip file if assets found, None otherwise
-        - base64_list: List of base64-encoded images (sorted by priority, max 3)
+        - base64_list: List of base64-encoded images (sorted by priority, max 9)
     
     Zip structure:
         assets.zip
@@ -129,12 +129,12 @@ def package_shot_assets(
         for asset in assets:
             zf.write(asset["src_path"], asset["zip_path"])
     
-    # Build base64 fallback list (sorted by priority, then by role, max 3)
+    # Build base64 fallback list (sorted by priority, then by role, max 9)
     # Priority order: identity (character) > composition (shot frame) > style (storyboard)
     sorted_assets = sorted(assets, key=lambda a: (a["priority"], a["role"]))
     base64_list = []
     
-    for asset in sorted_assets[:3]:
+    for asset in sorted_assets[:9]:
         try:
             img_data = asset["src_path"].read_bytes()
             b64 = base64.b64encode(img_data).decode('utf-8')
@@ -220,18 +220,24 @@ def build_content_for_shot(
         List of content items for Bridge /generate API:
         [
             {"type": "text", "text": "shot prompt"},
-            {"type": "image_url", "image_url": {"url": "https://..."}, "role": "first_frame", "priority": "high"},
-            {"type": "image_url", "image_url": {"url": "https://..."}, "role": "reference_image", "priority": "high"},
-            ...
+            {"type": "image_url", "image_url": {"url": "https://..."}, "role": "first_frame", "priority": "high"}
         ]
 
-    Smart image selection strategy (max 9 total, Bridge picks ~3):
-        - Single-character shot: front + side + back of that character (all high)
-          → Bridge gets 3 views of the same character for maximum consistency
-        - Multi-character shot: front of each character (all high)
-          → Bridge gets identity reference for each character
-        - Shot frame always high priority
-        - Storyboard.png always medium priority (style reference)
+    CRITICAL: Wan2.2 multi-image semantics = opening consecutive frames condition.
+        When multiple images are passed in content[], Wan2.2 treats them as the
+        first N consecutive frames of the video. This causes contamination:
+        three-view drawings (front/side/back) appear as frames 2-5 in the output.
+
+    Single-image strategy (anti-contamination):
+        Only pass the shot's storyboard image (role=first_frame) — 1 image total.
+        Character consistency is handled by M2 storyboard generation, which already
+        injects character front reference during the storyboard creation phase.
+
+        DO NOT add three-view images or storyboard.png to content[] — they will
+        be interpreted as opening frames and contaminate the video output.
+
+    Legacy paths (zip/base64) are preserved for backward compatibility but not
+    used in the primary content[] workflow.
 
     Each image is uploaded to TOS and replaced with a signed URL.
     """
@@ -243,14 +249,13 @@ def build_content_for_shot(
     if prompt_text:
         content.append({"type": "text", "text": prompt_text})
 
-    # Detect which characters appear in this shot
-    shot_char_ids = _detect_shot_characters(output_dir, shot_meta)
-
-    # Collect image assets with metadata
-    image_assets = []
-
-    # 2. Shot frame (storyboard_images/{shot_id}.png) — highest priority
+    # 2. Shot frame (storyboard_images/{shot_id}.png) — ONLY this image
+    # CRITICAL: Wan2.2 treats content[] images as opening consecutive frames.
+    # Passing three-view drawings or storyboard.png causes contamination.
+    # Character consistency is handled by M2 storyboard generation (which injects
+    # character front reference during storyboard creation), NOT by runtime injection.
     shot_frame_path = output_dir / "storyboard_images" / f"{shot_id}.png"
+    image_assets = []
     if shot_frame_path.exists() and shot_frame_path.stat().st_size > 1024:
         image_assets.append({
             "path": shot_frame_path,
@@ -258,82 +263,8 @@ def build_content_for_shot(
             "priority": "high",
         })
 
-    # 3. Character reference images — smart selection based on shot characters
-    char_bases = [output_dir / "characters", output_dir / "characters" / "characters"]
-    seen_char_dirs = set()
-
-    # Determine which characters to include and their view priority
-    if shot_char_ids:
-        # We know exactly which characters are in this shot
-        for char_base in char_bases:
-            if char_base.exists():
-                for char_dir in char_base.iterdir():
-                    if char_dir.is_dir() and char_dir.name not in seen_char_dirs:
-                        seen_char_dirs.add(char_dir.name)
-                        if char_dir.name in shot_char_ids:
-                            # This character is IN the shot
-                            is_single_char_shot = len(shot_char_ids) == 1
-                            # Front view always high
-                            front_path = char_dir / "front.png"
-                            if front_path.exists() and front_path.stat().st_size > 1024:
-                                image_assets.append({
-                                    "path": front_path,
-                                    "role": "reference_image",
-                                    "priority": "high",
-                                })
-                            # Side/back: high for single-char shots, medium for multi-char
-                            side_back_priority = "high" if is_single_char_shot else "medium"
-                            for view in ["side.png", "back.png"]:
-                                view_path = char_dir / view
-                                if view_path.exists() and view_path.stat().st_size > 1024:
-                                    image_assets.append({
-                                        "path": view_path,
-                                        "role": "reference_image",
-                                        "priority": side_back_priority,
-                                    })
-                        # Characters NOT in shot: skip entirely (don't waste slots)
-    else:
-        # Fallback: no character detection — include all characters (legacy behavior)
-        for char_base in char_bases:
-            if char_base.exists():
-                for char_dir in char_base.iterdir():
-                    if char_dir.is_dir() and char_dir.name not in seen_char_dirs:
-                        seen_char_dirs.add(char_dir.name)
-                        front_path = char_dir / "front.png"
-                        if front_path.exists() and front_path.stat().st_size > 1024:
-                            image_assets.append({
-                                "path": front_path,
-                                "role": "reference_image",
-                                "priority": "high",
-                            })
-                        for view in ["side.png", "back.png"]:
-                            view_path = char_dir / view
-                            if view_path.exists() and view_path.stat().st_size > 1024:
-                                image_assets.append({
-                                    "path": view_path,
-                                    "role": "reference_image",
-                                    "priority": "medium",
-                                })
-
-    # 4. Storyboard.png (medium priority)
-    storyboard_path = output_dir / "storyboard.png"
-    if storyboard_path.exists() and storyboard_path.stat().st_size > 1024:
-        image_assets.append({
-            "path": storyboard_path,
-            "role": "reference_image",
-            "priority": "medium",
-        })
-
-    # Sort by priority (high first), then upload to TOS
-    image_assets.sort(key=lambda a: (0 if a["priority"] == "high" else 1, a["path"].name))
-
-    # Log the smart selection
-    high_count = sum(1 for a in image_assets if a["priority"] == "high")
-    print(f"  [assets] 智能选图: {len(shot_char_ids)} 个出场角色 {shot_char_ids}, "
-          f"{high_count} high + {len(image_assets) - high_count} medium = {len(image_assets)} 张")
-
-    # Limit to 9 images max (Bridge limit)
-    image_assets = image_assets[:9]
+    # Log the single-image strategy
+    print(f"  [assets] 单图策略: images_used={len(image_assets)} (仅分镜图，无三视图/故事板污染)")
     
     # Upload each image to TOS and add to content
     uploaded_count = 0

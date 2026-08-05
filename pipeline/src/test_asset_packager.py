@@ -85,8 +85,8 @@ def test_package_shot_assets_with_all_assets():
             assert "shot_frames/S01.png" in image_paths
             assert "storyboard/storyboard.png" in image_paths
         
-        # Verify base64 list (implementation takes sorted[:3])
-        assert len(base64_list) == 3
+        # Verify base64 list (implementation takes sorted[:9], all 5 fit)
+        assert len(base64_list) == 5
         assert all(isinstance(b64, str) for b64 in base64_list)
         
         print("✓ Test passed: package_shot_assets with all assets")
@@ -277,8 +277,8 @@ def test_detect_shot_characters_no_match():
         assert result == []
 
 
-def test_build_content_single_char_gets_three_views():
-    """Single-character shot: front + side + back all high priority."""
+def test_build_content_single_image_anti_contamination():
+    """Single-image strategy: only storyboard image, no three-view contamination."""
     with tempfile.TemporaryDirectory() as tmpdir:
         od = Path(tmpdir)
         _make_char_images(od, "lin_xiao")
@@ -291,31 +291,25 @@ def test_build_content_single_char_gets_three_views():
             "_char_ids": ["lin_xiao"],
         })
 
-        # Extract image items
+        # Extract image items — should be exactly 1 (storyboard image only)
         images = [c for c in content if c.get("type") == "image_url"]
-        high_images = [c for c in images if c.get("priority") == "high"]
+        assert len(images) == 1, f"Expected 1 image (anti-contamination), got {len(images)}"
+        assert images[0]["role"] == "first_frame"
+        assert images[0]["priority"] == "high"
 
-        # Should have: shot_frame + front + side + back = 4 high
-        assert len(high_images) == 4, f"Expected 4 high, got {len(high_images)}: {high_images}"
-
-        # Verify no medium character images leaked in for non-shot characters
-        medium_images = [c for c in images if c.get("priority") == "medium"]
-        # Only storyboard should be medium
-        assert len(medium_images) == 1  # storyboard.png
+        # No reference_image role should exist
+        ref_items = [c for c in content if c.get("role") == "reference_image"]
+        assert len(ref_items) == 0, "No reference_image (three-view) should exist"
 
 
-def test_build_content_multi_char_gets_fronts_only():
-    """Multi-character shot: each character's front is high, side/back are medium."""
+def test_build_content_multi_char_still_single_image():
+    """Multi-character shot: still only 1 image (storyboard), no three-view injection."""
     with tempfile.TemporaryDirectory() as tmpdir:
         od = Path(tmpdir)
         _make_char_images(od, "lin_xiao")
         _make_char_images(od, "chen_yang")
         _make_shot_frame(od, "S03")
         _make_storyboard(od)
-        _make_characters_json(od, [
-            {"id": "lin_xiao", "name": "林晓"},
-            {"id": "chen_yang", "name": "陈阳"},
-        ])
 
         content = build_content_for_shot(od, "S03", {
             "prompt": "林晓 and 陈阳 sit by the lake.",
@@ -323,66 +317,24 @@ def test_build_content_multi_char_gets_fronts_only():
         })
 
         images = [c for c in content if c.get("type") == "image_url"]
-        high_images = [c for c in images if c.get("priority") == "high"]
-        medium_images = [c for c in images if c.get("priority") == "medium"]
-
-        # High: shot_frame + lin_xiao.front + chen_yang.front = 3
-        assert len(high_images) == 3, f"Expected 3 high, got {len(high_images)}"
-
-        # Medium: lin_xiao.side + lin_xiao.back + chen_yang.side + chen_yang.back + storyboard = 5
-        assert len(medium_images) == 5, f"Expected 5 medium, got {len(medium_images)}"
+        assert len(images) == 1, f"Expected 1 image (anti-contamination), got {len(images)}"
+        assert images[0]["role"] == "first_frame"
 
 
-def test_build_content_skips_non_shot_characters():
-    """Characters not in the shot should NOT be included."""
+def test_build_content_no_storyboard_image():
+    """When storyboard image is missing, only text prompt in content."""
     with tempfile.TemporaryDirectory() as tmpdir:
         od = Path(tmpdir)
-        _make_char_images(od, "lin_xiao")
-        _make_char_images(od, "chen_yang")
-        _make_shot_frame(od, "S02")
-        _make_storyboard(od)
-        _make_characters_json(od, [
-            {"id": "lin_xiao", "name": "林晓"},
-            {"id": "chen_yang", "name": "陈阳"},
-        ])
-
-        content = build_content_for_shot(od, "S02", {
-            "prompt": "林晓 walks alone in the park.",
-            "_char_ids": ["lin_xiao"],
-        })
-
-        images = [c for c in content if c.get("type") == "image_url"]
-
-        # chen_yang should NOT appear at all
-        # We can't check by path (TOS URLs replace them), but we can count:
-        # High: shot_frame + lin_xiao.front + lin_xiao.side + lin_xiao.back = 4
-        # Medium: storyboard = 1
-        # Total = 5 (not 8 which would include chen_yang)
-        assert len(images) == 5, f"Expected 5 total images, got {len(images)}"
-
-
-def test_build_content_fallback_no_detection():
-    """When no character detection available, legacy behavior (all chars)."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        od = Path(tmpdir)
-        _make_char_images(od, "lin_xiao")
-        _make_char_images(od, "chen_yang")
-        _make_shot_frame(od, "S01")
-        _make_storyboard(od)
-        # No CHARACTERS.json, no _char_ids, no associate_assets
+        # No storyboard image created
 
         content = build_content_for_shot(od, "S01", {
             "prompt": "A beautiful sunset.",
         })
 
         images = [c for c in content if c.get("type") == "image_url"]
-        high_images = [c for c in images if c.get("priority") == "high"]
-
-        # Legacy: shot_frame + lin_xiao.front + chen_yang.front = 3 high
-        assert len(high_images) == 3
-        # Medium: lin_xiao.side + lin_xiao.back + chen_yang.side + chen_yang.back + storyboard = 5
-        medium_images = [c for c in images if c.get("priority") == "medium"]
-        assert len(medium_images) == 5
+        assert len(images) == 0, "No images when storyboard image missing"
+        assert len(content) == 1  # text only
+        assert content[0]["type"] == "text"
 
 
 if __name__ == "__main__":
@@ -395,8 +347,7 @@ if __name__ == "__main__":
     test_detect_shot_characters_prompt_matching()
     test_detect_shot_characters_multi_char_prompt()
     test_detect_shot_characters_no_match()
-    test_build_content_single_char_gets_three_views()
-    test_build_content_multi_char_gets_fronts_only()
-    test_build_content_skips_non_shot_characters()
-    test_build_content_fallback_no_detection()
+    test_build_content_single_image_anti_contamination()
+    test_build_content_multi_char_still_single_image()
+    test_build_content_no_storyboard_image()
     print("\n✓ All asset_packager tests passed!")
