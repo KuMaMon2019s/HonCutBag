@@ -136,13 +136,15 @@ class TestValidateEndFrame:
         assert result["passed"] is False
         assert "brightness" in result["reason"]
 
-    def test_resolution_mismatch(self, tmp_dir):
-        """Different resolution → rejected."""
-        first = _make_image(tmp_dir / "first.png", size=(64, 64))
-        end = _make_image(tmp_dir / "end.png", size=(128, 128))
+    def test_resolution_mismatch_normalized(self, tmp_dir):
+        """Different resolution but same aspect → normalized via fit_to_aspect, should pass if content similar."""
+        # 64×64 square first frame, 128×128 square end frame — same aspect, different size
+        first = _make_image(tmp_dir / "first.png", color=(100, 100, 100), size=(64, 64))
+        end = _make_image(tmp_dir / "end.png", color=(181, 181, 181), size=(128, 128))
         result = _validate_end_frame(first, end)
-        assert result["passed"] is False
-        assert "resolution" in result["reason"]
+        # After normalization both should be compared at end frame size (128×128)
+        assert result["resolution_ok"] is True
+        assert result["similarity"] is not None
 
     def test_drifted_scene_too_different(self, tmp_dir):
         """Completely different noise patterns → rejected (scene drift)."""
@@ -208,6 +210,51 @@ class TestValidateEndFrame:
         result = _validate_end_frame(first, end)
         assert result["passed"] is False
         assert "cannot open" in result["reason"]
+
+    def test_m8_square_first_vs_16x9_end_normalized(self, tmp_dir):
+        """M8: Legacy square first frame (1920×1920) vs 16:9 end frame (2560×1440) — should normalize and compare."""
+        # Use smaller sizes for speed but same aspect ratios: square vs 16:9
+        first = _make_image(tmp_dir / "first.png", color=(100, 100, 100), size=(192, 192))
+        end = _make_image(tmp_dir / "end.png", color=(181, 181, 181), size=(256, 144))
+        result = _validate_end_frame(first, end)
+        # After fit_to_aspect normalization, first is cropped/resized to 256×144
+        assert result["resolution_ok"] is True
+        assert result["similarity"] is not None
+        # Solid colors with moderate difference → should be in valid similarity band
+        assert result["brightness_ok"] is True
+
+    def test_m8_same_dimensions_still_works(self, tmp_dir):
+        """M8: Same dimensions → no normalization needed, original path works."""
+        first = _make_image(tmp_dir / "first.png", color=(100, 100, 100), size=(128, 72))
+        end = _make_image(tmp_dir / "end.png", color=(181, 181, 181), size=(128, 72))
+        result = _validate_end_frame(first, end)
+        assert result["resolution_ok"] is True
+        assert result["passed"] is True
+        assert result["similarity"] == pytest.approx(0.8991, abs=0.001)
+
+    def test_m8_normalization_called_only_when_sizes_differ(self, tmp_dir):
+        """M8: fit_to_aspect is only invoked when first.size != end.size."""
+        from unittest.mock import patch as mock_patch
+        first = _make_image(tmp_dir / "first.png", color=(100, 100, 100), size=(64, 64))
+        end = _make_image(tmp_dir / "end.png", color=(181, 181, 181), size=(64, 64))
+        with mock_patch("pipeline_runner.fit_to_aspect") as mock_fit:
+            result = _validate_end_frame(first, end)
+            mock_fit.assert_not_called()
+        assert result["passed"] is True
+
+    def test_m8_normalization_called_when_sizes_differ(self, tmp_dir):
+        """M8: fit_to_aspect IS invoked when first.size != end.size."""
+        from unittest.mock import patch as mock_patch
+        first = _make_image(tmp_dir / "first.png", color=(100, 100, 100), size=(192, 192))
+        end = _make_image(tmp_dir / "end.png", color=(181, 181, 181), size=(256, 144))
+        with mock_patch("pipeline_runner.fit_to_aspect", wraps=pipeline_runner.fit_to_aspect) as mock_fit:
+            result = _validate_end_frame(first, end)
+            mock_fit.assert_called_once()
+            # Verify it was called with end frame dimensions as target
+            call_args = mock_fit.call_args
+            assert call_args[0][1] == 256  # target_w
+            assert call_args[0][2] == 144  # target_h
+        assert result["resolution_ok"] is True
 
 # ─── Cache sidecar tests ─────────────────────────────────────────────────────
 

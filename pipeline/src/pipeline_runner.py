@@ -1217,12 +1217,18 @@ def _validate_end_frame(
         result["reason"] = f"cannot open images: {e}"
         return result
     
-    # 1. Resolution check
+    # 1. Resolution normalization (M8): if sizes differ, normalize first frame
+    #    to end frame dimensions via fit_to_aspect (COVER + center-crop, no stretch).
+    #    This handles legacy square first frames (1920×1920) vs new 16:9 end frames (2560×1440).
+    end_w, end_h = end_img.size
     if first_img.size != end_img.size:
-        result["reason"] = (
-            f"resolution mismatch: first={first_img.size}, end={end_img.size}"
-        )
-        return result
+        import tempfile
+        tmp_first = Path(tempfile.mktemp(suffix=".png"))
+        try:
+            fit_to_aspect(first_frame_path, end_w, end_h, tmp_first)
+            first_img = Image.open(tmp_first).convert("RGB")
+        finally:
+            tmp_first.unlink(missing_ok=True)
     result["resolution_ok"] = True
     
     # Convert to numpy arrays for metric computation
