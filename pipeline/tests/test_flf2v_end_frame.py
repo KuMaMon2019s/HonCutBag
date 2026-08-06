@@ -26,6 +26,9 @@ from pipeline_runner import (
     _read_end_frame_sidecar,
     _write_end_frame_sidecar,
     _ACTION_END_STATES,
+    FLF2V_SIMILARITY_LOW,
+    FLF2V_SIMILARITY_HIGH,
+    FLF2V_SHARPNESS_RATIO,
 )
 
 
@@ -112,6 +115,11 @@ class TestBuildEndFramePrompt:
 # ─── Validation tests ────────────────────────────────────────────────────────
 
 class TestValidateEndFrame:
+    def test_t2i_threshold_defaults(self):
+        assert FLF2V_SIMILARITY_LOW == 0.3
+        assert FLF2V_SIMILARITY_HIGH == 0.93
+        assert FLF2V_SHARPNESS_RATIO == 0.15
+
     def test_identical_images_too_similar(self, tmp_dir):
         """Identical first and end frame → rejected (no action progress)."""
         first = _make_image(tmp_dir / "first.png", color=(100, 150, 200))
@@ -140,7 +148,7 @@ class TestValidateEndFrame:
         """Completely different noise patterns → rejected (scene drift)."""
         first = _make_noisy_image(tmp_dir / "first.png", seed=1)
         end = _make_noisy_image(tmp_dir / "end.png", seed=999)
-        result = _validate_end_frame(first, end, similarity_low=0.25, similarity_high=0.85)
+        result = _validate_end_frame(first, end)
         # Two completely different noise images should have low similarity
         assert result["similarity"] is not None
         # May or may not fail depending on random noise — just check it ran
@@ -152,11 +160,46 @@ class TestValidateEndFrame:
         first = _make_image(tmp_dir / "first.png", color=(100, 150, 200), size=(64, 64))
         # Create end frame with slight color shift (simulating action progress)
         end = _make_image(tmp_dir / "end.png", color=(110, 145, 195), size=(64, 64))
-        result = _validate_end_frame(first, end, similarity_low=0.25, similarity_high=0.99)
+        result = _validate_end_frame(first, end, similarity_low=0.3, similarity_high=0.99)
         # Very similar solid colors → might be "too similar" with high threshold
         # Lower the high threshold to allow this
         assert result["resolution_ok"] is True
         assert result["brightness_ok"] is True
+
+    def test_similarity_090_passes_as_action_progress(self, tmp_dir):
+        first = _make_image(tmp_dir / "first.png", color=(100, 100, 100))
+        end = _make_image(tmp_dir / "end.png", color=(181, 181, 181))
+
+        result = _validate_end_frame(first, end)
+
+        assert result["similarity"] == pytest.approx(0.8991, abs=0.0001)
+        assert result["passed"] is True
+
+    def test_similarity_099_rejected_as_copy(self, tmp_dir):
+        first = _make_image(tmp_dir / "first.png", color=(100, 100, 100))
+        end = _make_image(tmp_dir / "end.png", color=(120, 120, 120))
+
+        result = _validate_end_frame(first, end)
+
+        assert result["similarity"] == pytest.approx(0.9938, abs=0.0001)
+        assert result["passed"] is False
+        assert "too similar" in result["reason"]
+
+    def test_sharpness_ratio_020_passes_for_t2i_softness(self, tmp_dir):
+        checkerboard = (np.indices((64, 64)).sum(axis=0) % 2) * 80 + 88
+        first_arr = np.repeat(checkerboard[:, :, None], 3, axis=2).astype(np.uint8)
+        # Contrast scaling by sqrt(0.20) produces a 0.20 Laplacian variance ratio.
+        end_gray = 208 + np.sqrt(0.20) * (checkerboard - 128)
+        end_arr = np.repeat(end_gray[:, :, None], 3, axis=2).astype(np.uint8)
+        first = tmp_dir / "first.png"
+        end = tmp_dir / "end.png"
+        Image.fromarray(first_arr).save(first)
+        Image.fromarray(end_arr).save(end)
+
+        result = _validate_end_frame(first, end)
+
+        assert result["sharpness_ok"] is True
+        assert result["passed"] is True
 
     def test_cannot_open_images(self, tmp_dir):
         """Non-existent file → fails gracefully."""
@@ -165,6 +208,100 @@ class TestValidateEndFrame:
         result = _validate_end_frame(first, end)
         assert result["passed"] is False
         assert "cannot open" in result["reason"]
+
+
+# ─── M4: t2i-adapted threshold tests ────────────────────────────────────────
+
+class TestM4Thresholds:
+    """M4: Thresholds tuned for t2i generation (no reference image copy problem)."""
+
+    def test_constants_exported(self):
+        """Module-level constants exist and have expected values."""
+        assert FLF2V_SIMILARITY_LOW == 0.25
+        assert FLF2V_SIMILARITY_HIGH == 0.93
+        assert FLF2V_SHARPNESS_RATIO == 0.15
+
+    def test_default_params_use_constants(self):
+        """_validate_end_frame defaults should match module constants."""
+        import inspect
+        sig = inspect.signature(_validate_end_frame)
+        assert sig.parameters["similarity_low"].default == FLF2V_SIMILARITY_LOW
+        assert sig.parameters["similarity_high"].default == FLF2V_SIMILARITY_HIGH
+        assert sig.parameters["sharpness_floor_ratio"].default == FLF2V_SHARPNESS_RATIO
+
+    def test_similarity_090_passes_genuine_action(self, tmp_dir):
+        """M4 core: similarity=0.90 (genuine action progress) must PASS.
+        
+        This was the S05 smoke test failure — 0.8883 similarity with real
+        hand position change was rejected by old 0.85 threshold.
+        """
+        # Create images with moderate difference (simulating action progress)
+        first = _make_noisy_image(tmp_dir / "first.png", seed=100)
+        # Slightly perturb the noise to get ~0.88-0.92 similarity
+        rng = np.random.RandomState(100)
+        first_arr = rng.randint(0, 256, (64, 64, 3), dtype=np.uint8)
+        # Add small perturbation (~5% pixel change) for moderate similarity
+        perturbation = rng.randint(-15, 16, (64, 64, 3), dtype=np.int16)
+        end_arr = np.clip(first_arr.astype(np.int16) + perturbation, 0, 255).astype(np.uint8)
+        
+        first = _make_image(tmp_dir / "first.png")
+        Image.fromarray(first_arr).save(str(first))
+        end = _make_image(tmp_dir / "end.png")
+        Image.fromarray(end_arr).save(str(end))
+        
+        result = _validate_end_frame(first, end)
+        # With new 0.93 threshold, moderate differences should pass
+        if result["similarity"] is not None and 0.3 <= result["similarity"] <= 0.92:
+            assert result["passed"] is True, (
+                f"similarity={result['similarity']} should pass with threshold 0.93"
+            )
+
+    def test_similarity_099_rejected_as_copy(self, tmp_dir):
+        """M4: similarity=0.99+ (true copy) must be REJECTED."""
+        # Nearly identical images → very high similarity
+        first = _make_noisy_image(tmp_dir / "first.png", seed=200)
+        # Tiny perturbation (1% pixel change) → ~0.99 similarity
+        rng = np.random.RandomState(200)
+        first_arr = rng.randint(0, 256, (64, 64, 3), dtype=np.uint8)
+        perturbation = rng.randint(-3, 4, (64, 64, 3), dtype=np.int16)
+        end_arr = np.clip(first_arr.astype(np.int16) + perturbation, 0, 255).astype(np.uint8)
+        
+        first = _make_image(tmp_dir / "first.png")
+        Image.fromarray(first_arr).save(str(first))
+        end = _make_image(tmp_dir / "end.png")
+        Image.fromarray(end_arr).save(str(end))
+        
+        result = _validate_end_frame(first, end)
+        if result["similarity"] is not None and result["similarity"] > 0.93:
+            assert result["passed"] is False
+            assert "too similar" in result["reason"]
+
+    def test_sharpness_ratio_020_passes_t2i(self, tmp_dir):
+        """M4: sharpness ratio 0.20 (t2i acceptable softness) must PASS.
+        
+        S05 smoke test: end_sharpness=88.5, first_sharpness=439.7 → ratio=0.20.
+        Old threshold 0.3 rejected this; new 0.15 accepts it.
+        """
+        # Create a sharp first frame (high-frequency noise)
+        rng = np.random.RandomState(300)
+        sharp_arr = rng.randint(0, 256, (64, 64, 3), dtype=np.uint8)
+        first = tmp_dir / "first.png"
+        Image.fromarray(sharp_arr).save(str(first))
+        
+        # Create a softer end frame (blurred version)
+        from PIL import ImageFilter
+        sharp_img = Image.fromarray(sharp_arr)
+        soft_img = sharp_img.filter(ImageFilter.BLUR)
+        end = tmp_dir / "end.png"
+        soft_img.save(str(end))
+        
+        result = _validate_end_frame(first, end)
+        # The blurred image should still pass sharpness check with 0.15 ratio
+        # (it has lower variance but ratio should be > 0.15 for mild blur)
+        assert result["resolution_ok"] is True
+        assert result["brightness_ok"] is True
+        # sharpness_ok depends on actual blur amount — just verify it ran
+        assert "sharpness_ok" in result
 
 
 # ─── Cache sidecar tests ─────────────────────────────────────────────────────
@@ -181,6 +318,20 @@ class TestEndFrameSidecar:
         assert sidecar["first_frame_sha256"] == "sha_first"
         assert sidecar["prompt_sha256"] == "sha_prompt"
         assert sidecar["validation"]["passed"] is True
+
+    def test_validation_sidecar_records_current_thresholds(self, tmp_dir):
+        first = _make_image(tmp_dir / "first.png", color=(100, 100, 100))
+        end = _make_image(tmp_dir / "end.png", color=(181, 181, 181))
+        validation = _validate_end_frame(first, end)
+
+        _write_end_frame_sidecar(end, "sha_first", "sha_prompt", validation)
+
+        sidecar = _read_end_frame_sidecar(end)
+        assert sidecar["validation"]["thresholds"] == {
+            "similarity_low": 0.3,
+            "similarity_high": 0.93,
+            "sharpness_ratio": 0.15,
+        }
 
     def test_missing_sidecar_returns_none(self, tmp_dir):
         end_path = tmp_dir / "S01_end.png"

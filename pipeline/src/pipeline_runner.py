@@ -1073,12 +1073,27 @@ def _storyboard_image_size(image_path: Path) -> str:
         return "1920x1920"
 
 
+# ── M4: FLF2V end-frame validation thresholds (t2i-adapted) ──────────────
+# Tuned after S05 smoke test: t2i generation (M3) produces genuinely different
+# images from first frame, so i2i-era thresholds were too strict.
+#
+# similarity_high: 0.93 allows genuine action progress (0.88-0.92) while
+#   catching true copies (0.99+). Old value 0.85 rejected good frames.
+# similarity_low: 0.3 unchanged — scene drift detection still needed.
+# sharpness_floor_ratio: 0.15 — t2i without reference injection is inherently
+#   softer than i2i with character refs.实测 88.5/439.7=0.20 > 0.15 passes.
+#   Old value 0.3 rejected visually acceptable t2i output.
+FLF2V_SIMILARITY_LOW: float = 0.3
+FLF2V_SIMILARITY_HIGH: float = 0.93
+FLF2V_SHARPNESS_RATIO: float = 0.15
+
+
 def _validate_end_frame(
     first_frame_path: Path,
     end_frame_path: Path,
-    similarity_low: float = 0.25,
-    similarity_high: float = 0.85,
-    sharpness_floor_ratio: float = 0.3,
+    similarity_low: float = FLF2V_SIMILARITY_LOW,
+    similarity_high: float = FLF2V_SIMILARITY_HIGH,
+    sharpness_floor_ratio: float = FLF2V_SHARPNESS_RATIO,
     brightness_range: tuple = (15, 240),
 ) -> dict:
     """Validate end frame against first frame using metric-based checks.
@@ -1086,13 +1101,18 @@ def _validate_end_frame(
     Returns dict with keys: passed, similarity, sharpness_ok, brightness_ok,
     resolution_ok, reason (if failed).
     
+    Thresholds (M4, t2i-adapted):
+      similarity_low=0.3   — scene drift floor (unchanged from M2)
+      similarity_high=0.93 — catch true copies (0.99+), allow genuine action (0.88-0.92)
+      sharpness_floor_ratio=0.15 — t2i is softer than i2i; 0.20× ratio is acceptable
+    
     No VLM required — deterministic metric checks:
     1. Resolution identical to first frame
     2. Non-black, non-blank (mean brightness in range)
     3. Sharpness: Laplacian variance above floor (first_frame_variance × ratio)
     4. Similarity: perceptual distance must be in band [low, high]
-       - Too similar (< low) → action didn't progress (copy of first frame)
-       - Too different (> high) → scene/camera drifted
+       - Too similar (> high) → copy of first frame (no action progress)
+       - Too different (< low) → scene/camera drifted
     """
     from PIL import Image
     import numpy as np
@@ -1104,6 +1124,11 @@ def _validate_end_frame(
         "brightness_ok": False,
         "resolution_ok": False,
         "reason": None,
+        "thresholds": {
+            "similarity_low": similarity_low,
+            "similarity_high": similarity_high,
+            "sharpness_ratio": sharpness_floor_ratio,
+        },
     }
     
     try:
