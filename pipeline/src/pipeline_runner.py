@@ -1112,24 +1112,44 @@ def fit_to_aspect(image_path: Path, target_w: int, target_h: int, output_path: P
     return output_path
 
 
+# Seedream API minimum pixel requirement (Agent Plan).
+# HTTP 400 if WxH < 3686400. Empirically verified 2026-08-06.
+SEEDREAM_MIN_PIXELS = 3686400
+
+
 def _storyboard_image_size(image_path: Optional[Path] = None, video_width: int = 1280, video_height: int = 720) -> str:
     """Return Seedream's WxH size string for storyboard/end-frame generation.
 
-    M5 fix: derive size from video target aspect ratio (16:9 for 1280x720),
-    not from existing image dimensions (which may be square 1920x1920).
+    M7 fix: ensure returned size meets Seedream's minimum pixel requirement
+    (SEEDREAM_MIN_PIXELS = 3686400). The old 1920x1080 (2,073,600 px) was
+    rejected with HTTP 400 InvalidParameter.
 
-    Preferred size: 1920x1080 (16:9, high quality for Seedream Agent Plan).
+    Formula: for aspect a=w/h, width = ceil(sqrt(min_pixels * a)), then
+    round to even. Height = width / a, also rounded to even.
+
+    For 16:9: 2560x1440 = 3,686,400 px (exactly at minimum).
     """
-    aspect = video_width / video_height
+    import math
 
-    if abs(aspect - 16 / 9) < 0.01:
-        return "1920x1080"
-    else:
-        # Fallback: scale to 1920 width, maintain aspect
-        target_h = int(1920 / aspect)
-        # Ensure even dimensions
-        target_h = target_h if target_h % 2 == 0 else target_h + 1
-        return f"1920x{target_h}"
+    aspect = video_width / video_height  # a = w/h
+
+    # Compute smallest width >= sqrt(min_pixels * aspect) at correct aspect
+    raw_w = math.sqrt(SEEDREAM_MIN_PIXELS * aspect)
+    w = math.ceil(raw_w)
+    # Round to even
+    w = w if w % 2 == 0 else w + 1
+
+    # Compute height from width and aspect, round to even
+    h = math.ceil(w / aspect)
+    h = h if h % 2 == 0 else h + 1
+
+    # Safety check: if rounding pushed us below minimum, bump width
+    if w * h < SEEDREAM_MIN_PIXELS:
+        w += 2  # next even number
+        h = math.ceil(w / aspect)
+        h = h if h % 2 == 0 else h + 1
+
+    return f"{w}x{h}"
 
 
 # ── M4: FLF2V end-frame validation thresholds (t2i-adapted) ──────────────

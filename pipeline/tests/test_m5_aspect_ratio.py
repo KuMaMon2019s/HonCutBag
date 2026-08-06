@@ -76,16 +76,43 @@ def test_fit_to_aspect_portrait_to_16x9():
 
 
 def test_storyboard_image_size_returns_16x9():
-    """_storyboard_image_size should return 16:9 size string."""
-    from pipeline_runner import _storyboard_image_size
+    """_storyboard_image_size should return 16:9 size string meeting Seedream minimum."""
+    from pipeline_runner import _storyboard_image_size, SEEDREAM_MIN_PIXELS
 
-    # Default (1280x720 video) → 1920x1080
+    # Default (1280x720 video) → 2560x1440 (= 3,686,400 px, exactly at minimum)
     size = _storyboard_image_size(video_width=1280, video_height=720)
-    assert size == "1920x1080", f"Expected 1920x1080, got {size}"
+    assert size == "2560x1440", f"Expected 2560x1440, got {size}"
 
-    # 1920x1080 video → 1920x1080
+    # 1920x1080 video → 2560x1440 (same aspect ratio)
     size = _storyboard_image_size(video_width=1920, video_height=1080)
-    assert size == "1920x1080"
+    assert size == "2560x1440"
+
+
+def test_storyboard_image_size_meets_seedream_minimum():
+    """All returned sizes must have pixel count >= SEEDREAM_MIN_PIXELS."""
+    from pipeline_runner import _storyboard_image_size, SEEDREAM_MIN_PIXELS
+
+    test_cases = [
+        (1280, 720),    # 16:9
+        (1920, 1080),   # 16:9 HD
+        (720, 1280),    # 9:16 portrait
+        (1080, 1920),   # 9:16 portrait HD
+        (1280, 1280),   # 1:1 square
+        (1920, 1920),   # 1:1 square HD
+    ]
+
+    for w, h in test_cases:
+        size_str = _storyboard_image_size(video_width=w, video_height=h)
+        parts = size_str.split("x")
+        sw, sh = int(parts[0]), int(parts[1])
+        pixels = sw * sh
+        assert pixels >= SEEDREAM_MIN_PIXELS, (
+            f"Size {size_str} ({pixels} px) for video {w}x{h} "
+            f"is below Seedream minimum {SEEDREAM_MIN_PIXELS}"
+        )
+        # Both dimensions must be even
+        assert sw % 2 == 0, f"Width {sw} is not even"
+        assert sh % 2 == 0, f"Height {sh} is not even"
 
 
 def test_end_frame_generation_uses_16x9_size():
