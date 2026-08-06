@@ -54,9 +54,6 @@ def test_consistency_guard():
     assert result['consistency_score'] == 75, f"期望分数 75，实际 {result['consistency_score']}"
     assert result['passed'] == True, f"期望通过，实际未通过"
     print("\n✓ 测试 1 通过")
-    return True
-
-
 def test_quality_gate():
     """测试质检门逻辑"""
     print("\n" + "=" * 60)
@@ -83,9 +80,6 @@ def test_quality_gate():
         assert result == expected, f"测试失败: {desc}"
     
     print("\n✓ 测试 2 通过")
-    return True
-
-
 def test_file_based_check():
     """测试基于文件的一致性检查"""
     print("\n" + "=" * 60)
@@ -136,9 +130,6 @@ def test_file_based_check():
         assert result['passed'] == True, f"期望通过，实际未通过"
     
     print("\n✓ 测试 3 通过")
-    return True
-
-
 def main():
     """运行所有测试"""
     print("\n" + "=" * 60)
@@ -156,8 +147,8 @@ def main():
     
     for test in tests:
         try:
-            if test():
-                passed += 1
+            test()
+            passed += 1
         except Exception as e:
             failed += 1
             print(f"\n✗ 测试失败: {e}")
@@ -168,10 +159,9 @@ def main():
     print(f"测试完成: {passed} 通过, {failed} 失败")
     print("=" * 60 + "\n")
     
-    return failed == 0
+    if failed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
-    import sys
-    success = main()
-    sys.exit(0 if success else 1)
+    main()

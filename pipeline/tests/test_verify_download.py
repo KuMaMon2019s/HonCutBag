@@ -27,11 +27,9 @@ def test_verify_download_mismatch():
                 expected_width=1280,
                 expected_height=720,
             )
-            print(f"✗ FAIL: Expected RuntimeError but got result: {result}")
-            return False
+            raise AssertionError(f"Expected RuntimeError but got result: {result}")
         except RuntimeError as e:
             print(f"✓ PASS: Got expected RuntimeError: {e}")
-            return True
     finally:
         # Cleanup
         try:
@@ -40,5 +38,4 @@ def test_verify_download_mismatch():
             pass
 
 if __name__ == "__main__":
-    success = test_verify_download_mismatch()
-    sys.exit(0 if success else 1)
+    test_verify_download_mismatch()

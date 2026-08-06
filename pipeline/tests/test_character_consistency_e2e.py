@@ -52,9 +52,6 @@ def test_appearance_dict_propagation():
     print(f"  - 字段数量: {len(char_dict['appearance'])}")
     print(f"  - 包含: hair, clothing, face, build, summary")
     
-    return True
-
-
 def test_character_reference_mapping():
     """测试角色参考图映射逻辑"""
     print("\n" + "=" * 60)
@@ -102,9 +99,6 @@ def test_character_reference_mapping():
         print(f"  - char_001 -> {character_ref_images['char_001']}")
         print(f"  - 主角 -> {character_ref_images['主角']}")
     
-    return True
-
-
 def test_shot_character_matching():
     """测试 shot 与角色的匹配逻辑"""
     print("\n" + "=" * 60)
@@ -158,9 +152,6 @@ def test_shot_character_matching():
     print(f"  - prompt: {shot2['prompt']}")
     print(f"  - 匹配到: {matched_ref}")
     
-    return True
-
-
 def test_reference_priority():
     """测试参考图优先级逻辑"""
     print("\n" + "=" * 60)
@@ -188,9 +179,6 @@ def test_reference_priority():
     assert reference_image is None, "应返回 None"
     print("✓ 场景 3: 两者都无时返回 None")
     
-    return True
-
-
 def main():
     """运行所有测试"""
     print("\n" + "=" * 60)
@@ -209,8 +197,8 @@ def main():
     
     for name, test_func in tests:
         try:
-            if test_func():
-                passed += 1
+            test_func()
+            passed += 1
         except Exception as e:
             failed += 1
             print(f"\n✗ 测试失败: {name}")
@@ -222,10 +210,9 @@ def main():
     print(f"测试完成: {passed} 通过, {failed} 失败")
     print("=" * 60 + "\n")
     
-    return failed == 0
+    if failed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
-    import sys
-    success = main()
-    sys.exit(0 if success else 1)
+    main()

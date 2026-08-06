@@ -28,10 +28,9 @@ def test_config_yaml_loading():
         assert threshold == 70, f"期望默认阈值 70，实际 {threshold}"
         print(f"✓ 默认阈值: {threshold}")
         
-        return True
     except Exception as e:
         print(f"✗ 加载失败: {e}")
-        return False
+        raise
 
 
 def test_config_custom_threshold():
@@ -56,10 +55,9 @@ quality_gate:
             assert threshold == 85, f"期望自定义阈值 85，实际 {threshold}"
             print(f"✓ 自定义阈值: {threshold}")
         
-        return True
     except Exception as e:
         print(f"✗ 测试失败: {e}")
-        return False
+        raise
 
 
 def test_retry_count_increment():
@@ -94,10 +92,9 @@ def test_retry_count_increment():
             assert loaded["retry_count"] == 1, f"期望 retry_count=1，实际 {loaded['retry_count']}"
             print(f"✓ retry_count 递增: {loaded['retry_count']}")
         
-        return True
     except Exception as e:
         print(f"✗ 测试失败: {e}")
-        return False
+        raise
 
 
 def test_config_fallback():
@@ -114,10 +111,9 @@ def test_config_fallback():
         assert threshold == 70, f"期望回退到默认值 70，实际 {threshold}"
         print(f"✓ 回退到默认值: {threshold}")
         
-        return True
     except Exception as e:
         print(f"✗ 测试失败: {e}")
-        return False
+        raise
 
 
 def main():
@@ -138,10 +134,8 @@ def main():
     
     for name, test_func in tests:
         try:
-            if test_func():
-                passed += 1
-            else:
-                failed += 1
+            test_func()
+            passed += 1
         except Exception as e:
             failed += 1
             print(f"\n✗ 测试失败: {name}")
@@ -153,9 +147,9 @@ def main():
     print(f"测试完成: {passed} 通过, {failed} 失败")
     print("=" * 60 + "\n")
     
-    return failed == 0
+    if failed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
-    success = main()
-    sys.exit(0 if success else 1)
+    main()
