@@ -10,12 +10,22 @@ HonCut 配置管理 - 集中管理所有 API keys、tokens 和工具常量
 """
 
 import os
+from enum import Enum
 from pathlib import Path
 from typing import Optional, Dict, Any
 
 
 DEFAULT_BRIDGE_API_URL = "http://192.168.31.221:9100"
 VIDEO_ROUTE_VALUES = {"bridge", "direct", "local"}
+
+
+class VideoModel(str, Enum):
+    """Video model routes supported by the Bridge v3.2 contract."""
+
+    WAN22 = "wan22"
+    PHANTOM = "phantom"
+    FLF2V = "flf2v"
+    SEEDANCE = "seedance"
 
 
 def _load_env_file():
