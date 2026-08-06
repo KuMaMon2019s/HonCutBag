@@ -4209,7 +4209,7 @@ def run_pipeline(
     if resume and completed_phases:
         print(f"  🔄 Resume: 已完成 {len(completed_phases)}/{len(PHASE_ORDER)} Phase")
     if auto_approve:
-        print(f"  ✓ Auto-approve: 跳过人工审核节点")
+        print("  ⏭️ 自动跳过人工审核节点 (--auto-approve)")
     
     # 打印预估总耗时
     if not dry_run:
@@ -4299,10 +4299,37 @@ def run_pipeline(
             # Execute the graph
             try:
                 final_state = app.invoke(initial_state, config=config)
+
+                # LangGraph versions that implement interrupt() as a returned
+                # value do not raise GraphInterrupt.  Treat the marker as a
+                # paused run so a process that has exited never leaves a
+                # misleading "running" pipeline_report.json behind.
+                pending_interrupts = final_state.get("__interrupt__", ())
+                if pending_interrupts:
+                    print(f"\n  ⏸ Pipeline paused for human review")
+                    print(f"  Resume with: python pipeline_runner.py --resume --output-dir {output_dir}")
+                    report = {
+                        "status": "interrupted",
+                        "input_text_length": len(text),
+                        "duration_target_s": duration,
+                        "dry_run": dry_run,
+                        "output_dir": str(output_dir),
+                        "resumed": resume,
+                        "phases": final_state.get("phase_results", {}),
+                        "total_duration_s": _elapsed(total_start),
+                        "interrupt_info": str(pending_interrupts),
+                        "langgraph": True,
+                    }
+                    _write_report(report, output_dir)
+                    return report
+
+                final_status = final_state.get("status", "completed")
+                if final_status == "running":
+                    final_status = "failed"
                 
                 # Build report from final state
                 report = {
-                    "status": final_state.get("status", "completed"),
+                    "status": final_status,
                     "input_text_length": len(text),
                     "duration_target_s": duration,
                     "dry_run": dry_run,
@@ -4314,8 +4341,12 @@ def run_pipeline(
                     "langgraph": True,
                 }
                 
-                # Mark pipeline complete
-                reporter.mark_completed()
+                if report["status"] in ("completed", "partial"):
+                    reporter.mark_completed()
+                else:
+                    reporter.mark_failed(
+                        final_state.get("error") or f"Pipeline ended with status: {report['status']}"
+                    )
                 
                 # Write report
                 _write_report(report, output_dir)
