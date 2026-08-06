@@ -17,19 +17,21 @@ first_frame = OUT / 'storyboard_images' / f'{SHOT}.png'
 end_frame = OUT / 'storyboard_images' / f'{SHOT}_end.png'
 print(f'[smoke] first frame: {first_frame} exists={first_frame.exists()}')
 
-# Step 0: clean stale failed end frame (sidecar passed=false means regenerate)
-from pipeline_runner import _read_end_frame_sidecar, _generate_flf2v_end_frame
+# Step 0: re-validate existing end frame with CURRENT thresholds (don't trust stale sidecar)
+from pipeline_runner import _read_end_frame_sidecar, _generate_flf2v_end_frame, _validate_end_frame, _write_end_frame_sidecar, _file_sha256
+import hashlib as _hashlib
 need_regen = True
 if end_frame.exists() and end_frame.stat().st_size > 1024:
-    sc = _read_end_frame_sidecar(end_frame)
-    if sc and sc.get('validation', {}).get('passed'):
-        print(f'[smoke] end frame cached+VALID ({end_frame.stat().st_size}B), reusing')
+    # Re-run validation with current (M4) thresholds instead of trusting stored passed flag
+    fresh_validation = _validate_end_frame(first_frame, end_frame)
+    if fresh_validation.get("passed"):
+        print(f'[smoke] existing end frame RE-VALIDATED with current thresholds '
+              f'(similarity={fresh_validation.get("similarity")}), reusing — no Seedream quota spent')
         need_regen = False
     else:
-        reason = sc.get('validation', {}).get('reason', 'no sidecar') if sc else 'no sidecar'
-        print(f'[smoke] stale end frame (reason: {reason}), removing for M3 t2i regeneration')
+        reason = fresh_validation.get('reason', 'unknown')
+        print(f'[smoke] existing end frame fails current validation (reason: {reason}), removing for regeneration')
         end_frame.unlink()
-        # also remove orphan sidecars
         for orphan in OUT.glob('storyboard_images/S05_end*.meta.json'):
             orphan.unlink()
             print(f'[smoke] removed orphan sidecar: {orphan.name}')
