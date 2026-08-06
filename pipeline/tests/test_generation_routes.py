@@ -12,7 +12,7 @@ sys.path.insert(0, str(VENDOR_DIR))
 
 import adaptation_engine
 import asset_packager
-import local_video_client
+from clients import local_video_client
 import pipeline_runner
 
 
@@ -90,7 +90,7 @@ def test_end_frame_generation_skips_existing_large_file(monkeypatch, tmp_path):
         def __init__(self):
             pytest.fail("Seedream must not be constructed for a cached end frame")
 
-    import seedream_client
+    from clients import seedream_client
     monkeypatch.setattr(seedream_client, "SeedreamClient", ForbiddenClient)
     assert pipeline_runner._generate_flf2v_end_frame(
         shot, "S01", first, None
@@ -143,7 +143,7 @@ def test_phantom_content_has_first_frame_and_character_three_views(monkeypatch, 
     for view in ("front", "side", "back"):
         (char_dir / f"{view}.png").write_bytes(b"x" * 2048)
 
-    import tos_uploader
+    from clients import tos_uploader
     monkeypatch.setattr(tos_uploader, "upload_image", lambda *_: "https://example.test/image")
     content = asset_packager.build_content_for_shot(
         tmp_path,
@@ -160,7 +160,7 @@ def test_flf2v_content_has_first_and_last_frames(monkeypatch, tmp_path):
     (image_dir / "S03.png").write_bytes(b"x" * 2048)
     (image_dir / "S03_end.png").write_bytes(b"x" * 2048)
 
-    import tos_uploader
+    from clients import tos_uploader
     monkeypatch.setattr(tos_uploader, "upload_image", lambda *_: "https://example.test/image")
     content = asset_packager.build_content_for_shot(
         tmp_path, "S03", {"prompt": "action", "gen_strategy": "flf2v"}

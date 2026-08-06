@@ -2,7 +2,7 @@ import sys
 from pathlib import Path
 import pytest
 sys.path.insert(0,str(Path(__file__).parents[1]/"src"))
-from vendor_adapter import VendorAdapter,VendorModel,merge_models
+from tools.vendor_adapter import VendorAdapter,VendorModel,merge_models
 class Demo(VendorAdapter):
     def text_request(self,config,model): return model.model_name+":"+config["prompt"]
 def test_routes_request_by_model_type(): assert Demo([VendorModel("GPT","gpt","text")]).request("gpt",{"prompt":"hi"}) == "gpt:hi"

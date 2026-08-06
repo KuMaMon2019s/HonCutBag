@@ -1,7 +1,7 @@
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[1]/"src"))
-from base_tool import BaseTool, ToolResult, ToolTier
+from tools.base_tool import BaseTool, ToolResult, ToolTier
 class Echo(BaseTool):
     name="echo"; capabilities=["echo"]
     def execute(self, inputs): return ToolResult(True, inputs)

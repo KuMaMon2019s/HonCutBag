@@ -28,7 +28,7 @@ import pytest
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from video_qa import (
+from quality.video_qa import (
     VideoQAReport,
     QAIssue,
     FrameSample,

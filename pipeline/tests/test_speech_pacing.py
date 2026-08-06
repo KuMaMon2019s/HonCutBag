@@ -1,7 +1,7 @@
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
-from speech_pacing import annotate_shot_pacing, estimate_speech_duration, pacing_tier
+from prompt.speech_pacing import annotate_shot_pacing, estimate_speech_duration, pacing_tier
 
 def test_emotion_tiers_map_to_expected_rates():
     assert [pacing_tier(x) for x in ("愤怒", "正常对话", "悲伤沉思")] == ["angry", "normal", "sad"]

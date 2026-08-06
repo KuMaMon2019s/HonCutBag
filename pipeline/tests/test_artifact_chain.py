@@ -7,7 +7,7 @@ import json
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from artifact_chain import (
+from utils.artifact_chain import (
     ARTIFACT_CHAIN,
     PHASE_SEQUENCE,
     save_checkpoint,

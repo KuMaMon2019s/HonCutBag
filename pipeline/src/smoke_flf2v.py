@@ -61,7 +61,7 @@ for name, src in [('start', first_frame), ('end', end_frame)]:
     resized[name] = tmp
 
 # Step 2: upload to TOS
-import tos_uploader
+from clients import tos_uploader
 url_start = tos_uploader.upload_image(resized['start'].read_bytes(), 'image/png')
 url_end = tos_uploader.upload_image(resized['end'].read_bytes(), 'image/png')
 print(f'[smoke] TOS start: {str(url_start)[:70]}...')
@@ -71,7 +71,7 @@ if not url_start or not url_end:
     sys.exit(1)
 
 # Step 3: submit flf2v
-import local_video_client
+from clients import local_video_client
 task_id = local_video_client.submit(
     prompt=meta.get('prompt', ''),
     content=[

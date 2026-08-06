@@ -8,7 +8,7 @@ import os
 import time
 import requests
 from typing import Optional
-from ip_blacklist import sanitize_prompt
+from utils.ip_blacklist import sanitize_prompt
 
 
 BASE_URL = "https://ark.cn-beijing.volces.com/api/plan/v3"
@@ -52,7 +52,7 @@ def submit(
         # Try TOS upload first (avoids PrivacyInformation detection)
         image_url = None
         try:
-            from tos_uploader import base64_to_signed_url
+            from clients.tos_uploader import base64_to_signed_url
             image_url = base64_to_signed_url(reference_image_base64)
         except Exception as e:
             print(f"  [seedance] TOS upload failed: {e}")
@@ -88,7 +88,7 @@ def submit(
     if reference_video_base64:
         video_url = None
         try:
-            from tos_uploader import base64_to_signed_url
+            from clients.tos_uploader import base64_to_signed_url
             video_url = base64_to_signed_url(reference_video_base64)
         except Exception as e:
             print(f"  [seedance] Video TOS upload failed: {e}")

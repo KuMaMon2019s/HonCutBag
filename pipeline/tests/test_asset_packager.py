@@ -277,7 +277,7 @@ def test_detect_shot_characters_no_match():
         assert result == []
 
 
-def test_build_content_single_image_anti_contamination():
+def test_build_content_single_image_anti_contamination(monkeypatch):
     """Single-image strategy: only storyboard image, no three-view contamination."""
     with tempfile.TemporaryDirectory() as tmpdir:
         od = Path(tmpdir)
@@ -286,6 +286,10 @@ def test_build_content_single_image_anti_contamination():
         _make_storyboard(od)
         _make_characters_json(od, [{"id": "lin_xiao", "name": "林晓"}])
 
+        monkeypatch.setattr(
+            "clients.tos_uploader.upload_image",
+            lambda *_args, **_kwargs: "https://example.invalid/S01.png",
+        )
         content = build_content_for_shot(od, "S01", {
             "prompt": "林晓 sits by the lake.",
             "_char_ids": ["lin_xiao"],
@@ -302,7 +306,7 @@ def test_build_content_single_image_anti_contamination():
         assert len(ref_items) == 0, "No reference_image (three-view) should exist"
 
 
-def test_build_content_multi_char_still_single_image():
+def test_build_content_multi_char_still_single_image(monkeypatch):
     """Multi-character shot: still only 1 image (storyboard), no three-view injection."""
     with tempfile.TemporaryDirectory() as tmpdir:
         od = Path(tmpdir)
@@ -311,6 +315,10 @@ def test_build_content_multi_char_still_single_image():
         _make_shot_frame(od, "S03")
         _make_storyboard(od)
 
+        monkeypatch.setattr(
+            "clients.tos_uploader.upload_image",
+            lambda *_args, **_kwargs: "https://example.invalid/S03.png",
+        )
         content = build_content_for_shot(od, "S03", {
             "prompt": "林晓 and 陈阳 sit by the lake.",
             "_char_ids": ["lin_xiao", "chen_yang"],

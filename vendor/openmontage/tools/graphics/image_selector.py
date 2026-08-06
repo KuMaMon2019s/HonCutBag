@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from tools.base_tool import BaseTool, ToolResult, ToolRuntime, ToolStability, ToolStatus, ToolTier
+from ..base_tool import BaseTool, ToolResult, ToolRuntime, ToolStability, ToolStatus, ToolTier
 
 
 class ImageSelector(BaseTool):

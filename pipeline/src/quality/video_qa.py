@@ -14,7 +14,7 @@ Checks:
 VLM semantic check is optional (uses ARK vision model if available, else leaves interface).
 
 Usage:
-    from video_qa import run_video_qa
+    from quality.video_qa import run_video_qa
     report = run_video_qa(output_dir, storyboard_data=...)
     if report["verdict"] == "fail":
         # Block pipeline

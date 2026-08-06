@@ -288,7 +288,7 @@ def build_content_for_shot(
     # Upload each image to TOS and add to content
     uploaded_count = 0
     try:
-        import tos_uploader
+        from clients import tos_uploader
     except ImportError:
         print(f"  [assets] ⚠ tos_uploader not available, skipping image upload")
         return content

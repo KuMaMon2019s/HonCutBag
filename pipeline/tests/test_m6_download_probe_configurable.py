@@ -8,7 +8,7 @@ import pytest
 SRC_DIR = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC_DIR))
 
-import local_video_client
+from clients import local_video_client
 
 
 # ---------------------------------------------------------------------------

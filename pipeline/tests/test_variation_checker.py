@@ -1,7 +1,7 @@
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
-from variation_checker import check_scene_variation
+from quality.variation_checker import check_scene_variation
 
 def test_empty_plan_fails():
     assert check_scene_variation([])["verdict"] == "fail"

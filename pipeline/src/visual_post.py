@@ -50,7 +50,7 @@ def _try_import_om_upscale():
     if not OM_AVAILABLE:
         return None
     try:
-        from tools.enhancement.upscale import Upscale
+        from vendor.openmontage.tools.enhancement.upscale import Upscale
         return Upscale
     except (ImportError, Exception):
         return None
@@ -61,7 +61,7 @@ def _try_import_om_reframe():
     if not OM_AVAILABLE:
         return None
     try:
-        from tools.video.auto_reframe import AutoReframe
+        from vendor.openmontage.tools.video.auto_reframe import AutoReframe
         return AutoReframe
     except (ImportError, Exception):
         return None

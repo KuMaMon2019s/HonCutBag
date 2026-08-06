@@ -266,12 +266,12 @@ class TestGenerateShotImagesCharacterRef:
             # Mock the seedream_client module
             mock_seedream = MagicMock()
             mock_seedream.text_to_image = mock_text_to_image
-            sys.modules['seedream_client'] = mock_seedream
+            sys.modules['clients.seedream_client'] = mock_seedream
 
             try:
                 _generate_shot_images(output_dir, storyboard_data)
             finally:
-                del sys.modules['seedream_client']
+                del sys.modules['clients.seedream_client']
 
             # For who=[], text_to_image should be called (no ref image)
             assert len(captured_calls) == 1
@@ -317,12 +317,12 @@ class TestGenerateShotImagesCharacterRef:
 
             mock_seedream = MagicMock()
             mock_seedream.SeedreamClient = MockSeedreamClient
-            sys.modules['seedream_client'] = mock_seedream
+            sys.modules['clients.seedream_client'] = mock_seedream
 
             try:
                 _generate_shot_images(output_dir, storyboard_data)
             finally:
-                del sys.modules['seedream_client']
+                del sys.modules['clients.seedream_client']
 
             # Should use 林晓's front.png (first in who list)
             assert len(captured_calls) == 1

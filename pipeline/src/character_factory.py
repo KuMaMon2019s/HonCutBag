@@ -24,7 +24,7 @@ from typing import Optional, Tuple, List
 
 # Import seedream client from same directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from seedream_client import SeedreamClient
+from clients.seedream_client import SeedreamClient
 
 # Import prompt validator from prompts/ directory
 _PROMPTS_DIR = Path(__file__).parent.parent / "prompts"

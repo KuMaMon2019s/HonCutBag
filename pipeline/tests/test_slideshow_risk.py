@@ -2,7 +2,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
-from slideshow_risk import score_slideshow_risk
+from quality.slideshow_risk import score_slideshow_risk
 
 
 def test_empty_plan_fails():

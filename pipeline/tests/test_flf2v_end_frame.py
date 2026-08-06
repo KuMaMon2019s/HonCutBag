@@ -318,7 +318,7 @@ class TestGenerateFlf2vEndFrame:
         result = _generate_flf2v_end_frame(shot, "S01", first_frame, None)
         assert result is False
 
-    @patch("seedream_client.SeedreamClient")
+    @patch("clients.seedream_client.SeedreamClient")
     def test_uses_t2i_for_generation(self, mock_client_cls, tmp_dir):
         """M3: primary generation uses text_to_image (no reference image)."""
         first_frame = _make_image(tmp_dir / "S01.png", color=(100, 150, 200))
@@ -340,7 +340,7 @@ class TestGenerateFlf2vEndFrame:
         call_kwargs = mock_client.text_to_image.call_args
         assert "西湖" in call_kwargs[1]["prompt"] or "西湖" in call_kwargs[0][0]
 
-    @patch("seedream_client.SeedreamClient")
+    @patch("clients.seedream_client.SeedreamClient")
     def test_cache_hit_skips_generation(self, mock_client_cls, tmp_dir):
         """Valid sidecar + matching hashes → skip generation."""
         first_frame = _make_image(tmp_dir / "S01.png", color=(100, 150, 200))
@@ -363,7 +363,7 @@ class TestGenerateFlf2vEndFrame:
         mock_client_cls.assert_not_called()
 
     @patch("pipeline_runner._validate_end_frame")
-    @patch("seedream_client.SeedreamClient")
+    @patch("clients.seedream_client.SeedreamClient")
     def test_stale_sidecar_regenerates(self, mock_client_cls, mock_validate, tmp_dir):
         """Changed first frame → stale sidecar → regenerate."""
         first_frame = _make_image(tmp_dir / "S01.png", color=(100, 150, 200))

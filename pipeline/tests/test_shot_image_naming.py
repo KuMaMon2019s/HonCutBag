@@ -18,7 +18,7 @@ def test_id_only_shots_create_distinct_zero_padded_filenames(tmp_path, monkeypat
 
     monkeypatch.setitem(
         sys.modules,
-        "seedream_client",
+        "clients.seedream_client",
         types.SimpleNamespace(text_to_image=fake_text_to_image),
     )
     storyboard = {

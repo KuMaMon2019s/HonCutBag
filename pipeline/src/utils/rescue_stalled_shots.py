@@ -10,7 +10,7 @@ from pathlib import Path
 
 import requests
 
-from local_video_client import DEFAULT_API_URL, _request_session
+from clients.local_video_client import DEFAULT_API_URL, _request_session
 
 
 SUBMISSION_RE = re.compile(r"→\s*(S\d+):\s*提交")

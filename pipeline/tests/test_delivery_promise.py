@@ -1,7 +1,7 @@
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
-from delivery_promise import DeliveryPromise, PromiseType, classify_from_brief
+from quality.delivery_promise import DeliveryPromise, PromiseType, classify_from_brief
 
 def test_all_eight_promise_types_have_rules():
     assert len(PromiseType) == 8

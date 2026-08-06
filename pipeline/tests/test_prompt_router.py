@@ -6,7 +6,7 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from prompt_router import route_prompt
+from prompt.prompt_router import route_prompt
 
 
 def test_seedance2_multi_shot_returns_chinese_structured():

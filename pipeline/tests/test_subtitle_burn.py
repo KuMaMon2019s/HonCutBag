@@ -264,8 +264,8 @@ class TestRemotionCaptionBurnInterface:
     def test_segments_key_accepted(self):
         """RemotionCaptionBurn.execute() must accept 'segments' key."""
         import sys
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "vendor" / "openmontage"))
-        from tools.video.remotion_caption_burn import RemotionCaptionBurn
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from vendor.openmontage.tools.video.remotion_caption_burn import RemotionCaptionBurn
 
         burner = RemotionCaptionBurn()
         schema = burner.input_schema
@@ -275,8 +275,8 @@ class TestRemotionCaptionBurnInterface:
     def test_srt_path_key_accepted(self):
         """RemotionCaptionBurn.execute() must accept 'srt_path' key."""
         import sys
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "vendor" / "openmontage"))
-        from tools.video.remotion_caption_burn import RemotionCaptionBurn
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from vendor.openmontage.tools.video.remotion_caption_burn import RemotionCaptionBurn
 
         burner = RemotionCaptionBurn()
         schema = burner.input_schema
@@ -285,8 +285,8 @@ class TestRemotionCaptionBurnInterface:
     def test_captions_key_NOT_accepted(self):
         """RemotionCaptionBurn does NOT accept 'captions' key — this was the bug."""
         import sys
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "vendor" / "openmontage"))
-        from tools.video.remotion_caption_burn import RemotionCaptionBurn
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from vendor.openmontage.tools.video.remotion_caption_burn import RemotionCaptionBurn
 
         burner = RemotionCaptionBurn()
         schema = burner.input_schema
@@ -295,8 +295,8 @@ class TestRemotionCaptionBurnInterface:
     def test_style_key_NOT_accepted(self):
         """RemotionCaptionBurn does NOT accept 'style' dict — this was also wrong."""
         import sys
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "vendor" / "openmontage"))
-        from tools.video.remotion_caption_burn import RemotionCaptionBurn
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from vendor.openmontage.tools.video.remotion_caption_burn import RemotionCaptionBurn
 
         burner = RemotionCaptionBurn()
         schema = burner.input_schema
@@ -305,8 +305,8 @@ class TestRemotionCaptionBurnInterface:
     def test_caption_pages_preserve_srt_cue_boundaries(self, tmp_path):
         """Separate SRT cues must not be merged into one timed overlay."""
         import sys
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "vendor" / "openmontage"))
-        from tools.video.remotion_caption_burn import RemotionCaptionBurn
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from vendor.openmontage.tools.video.remotion_caption_burn import RemotionCaptionBurn
 
         srt_path = tmp_path / "two_cues.srt"
         srt_path.write_text(
@@ -325,10 +325,13 @@ class TestRemotionCaptionBurnInterface:
     def test_filter_detection_finds_overlay(self):
         """The minimal Homebrew FFmpeg path can feature-detect overlay."""
         import sys
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "vendor" / "openmontage"))
-        from tools.video.remotion_caption_burn import RemotionCaptionBurn
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from vendor.openmontage.tools.video.remotion_caption_burn import RemotionCaptionBurn
 
         filters_output = "Filters:\n TS overlay VV->V Overlay a video source.\n"
         completed = MagicMock(stdout=filters_output)
-        with patch("tools.video.remotion_caption_burn.subprocess.run", return_value=completed):
+        with patch(
+            "vendor.openmontage.tools.video.remotion_caption_burn.subprocess.run",
+            return_value=completed,
+        ):
             assert "overlay" in RemotionCaptionBurn._ffmpeg_filters()

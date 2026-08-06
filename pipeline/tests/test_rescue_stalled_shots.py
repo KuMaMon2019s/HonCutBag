@@ -5,7 +5,7 @@ from pathlib import Path
 SRC_DIR = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC_DIR))
 
-import rescue_stalled_shots
+from utils import rescue_stalled_shots
 
 
 class Response:

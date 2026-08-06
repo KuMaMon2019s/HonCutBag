@@ -6,9 +6,9 @@ import tempfile
 from pathlib import Path
 
 # Add src to path
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from local_video_client import _verify_download
+from clients.local_video_client import _verify_download
 
 def test_verify_download_mismatch():
     """Test that _verify_download raises RuntimeError on mismatch."""

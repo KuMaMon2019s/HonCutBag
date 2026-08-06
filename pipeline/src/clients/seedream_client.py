@@ -5,7 +5,7 @@ Model: doubao-seedream-5.0-lite
 Response: data[].url or data[].b64_json (no polling needed)
 
 Usage:
-    from seedream_client import SeedreamClient
+    from clients.seedream_client import SeedreamClient
     client = SeedreamClient()
     # text-to-image
     url = client.text_to_image("狐耳少女弹吉他", output_path="output.png")
@@ -20,7 +20,7 @@ import time
 from contextlib import contextmanager
 import requests
 from typing import Optional
-from ip_blacklist import sanitize_prompt
+from utils.ip_blacklist import sanitize_prompt
 
 
 # Agent Plan base URL (NOT /api/v3/ which is pay-as-you-go)
