@@ -249,12 +249,12 @@ class TestGenerateShotImagesCharacterRef:
         # Track what ref_image is passed to image_to_image
         captured_calls = []
 
-        def mock_image_to_image(prompt, ref_image, output_path):
+        def mock_image_to_image(prompt, ref_image, output_path, size=None):
             captured_calls.append({"prompt": prompt, "ref_image": ref_image, "output_path": output_path})
             # Create a fake output file
             Path(output_path).write_bytes(b"fake_png")
 
-        def mock_text_to_image(prompt, output_path):
+        def mock_text_to_image(prompt, output_path, size=None):
             captured_calls.append({"prompt": prompt, "ref_image": None, "output_path": output_path})
             Path(output_path).write_bytes(b"fake_png")
 
@@ -287,7 +287,7 @@ class TestGenerateShotImagesCharacterRef:
 
         captured_calls = []
 
-        def mock_image_to_image(prompt, ref_image, output_path):
+        def mock_image_to_image(prompt, ref_image, output_path, size=None):
             captured_calls.append({"prompt": prompt, "ref_image": ref_image, "output_path": output_path})
             Path(output_path).write_bytes(b"fake_png")
 

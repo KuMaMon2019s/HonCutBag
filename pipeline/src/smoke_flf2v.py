@@ -49,15 +49,15 @@ if not end_frame.exists() or end_frame.stat().st_size < 1024:
     print('[smoke] FATAL: no end frame, aborting')
     sys.exit(1)
 
-# Step 1: resize both frames to video dimensions (1280x720) for FLF2V stability
+# Step 1: fit both frames to video dimensions (1280x720) — no stretching
+from pipeline_runner import fit_to_aspect
+
 resized = {}
 for name, src in [('start', first_frame), ('end', end_frame)]:
-    img = Image.open(src).convert('RGB')
-    if img.size != (TARGET_W, TARGET_H):
-        img = img.resize((TARGET_W, TARGET_H), Image.LANCZOS)
-        print(f'[smoke] {name}: resized {Image.open(src).size} -> {TARGET_W}x{TARGET_H}')
     tmp = Path(f'/tmp/flf2v_smoke_{name}.png')
-    img.save(tmp)
+    fit_to_aspect(src, TARGET_W, TARGET_H, tmp)
+    orig_size = Image.open(src).size
+    print(f'[smoke] {name}: fit_to_aspect {orig_size} -> {TARGET_W}x{TARGET_H}')
     resized[name] = tmp
 
 # Step 2: upload to TOS

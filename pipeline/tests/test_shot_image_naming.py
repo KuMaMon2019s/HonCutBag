@@ -11,7 +11,7 @@ from pipeline_runner import _generate_shot_images, _normalize_shot_id
 def test_id_only_shots_create_distinct_zero_padded_filenames(tmp_path, monkeypatch):
     calls = []
 
-    def fake_text_to_image(*, prompt, output_path):
+    def fake_text_to_image(*, prompt, output_path, size=None):
         calls.append(output_path)
         # Match the real client's successful side effect.
         Path(output_path).write_bytes(b"mock image")

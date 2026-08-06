@@ -1063,14 +1063,73 @@ def build_end_frame_prompt(shot: dict) -> str:
     )
 
 
-def _storyboard_image_size(image_path: Path) -> str:
-    """Return Seedream's WxH size string for an existing storyboard frame."""
-    try:
-        from PIL import Image
-        with Image.open(image_path) as image:
-            return f"{image.width}x{image.height}"
-    except Exception:
-        return "1920x1920"
+def fit_to_aspect(image_path: Path, target_w: int, target_h: int, output_path: Path) -> Path:
+    """Resize image to exact target dimensions WITHOUT stretching.
+
+    M5: If image already matches target aspect ratio (within 1% tolerance):
+    simple high-quality resize. Otherwise: resize to COVER target aspect,
+    then CENTER-CROP to exact dimensions. NEVER stretch/distort.
+
+    Args:
+        image_path: Source image path
+        target_w: Target width in pixels
+        target_h: Target height in pixels
+        output_path: Where to save result (PNG)
+
+    Returns:
+        output_path (for chaining)
+    """
+    from PIL import Image
+
+    with Image.open(image_path) as img:
+        img = img.convert('RGB')
+        src_w, src_h = img.size
+
+        src_aspect = src_w / src_h
+        target_aspect = target_w / target_h
+        aspect_tolerance = 0.01  # 1% tolerance
+
+        if abs(src_aspect - target_aspect) / target_aspect <= aspect_tolerance:
+            # Already matches aspect ratio — simple resize
+            resized = img.resize((target_w, target_h), Image.LANCZOS)
+        else:
+            # Need to cover + center-crop
+            scale_w = target_w / src_w
+            scale_h = target_h / src_h
+            scale = max(scale_w, scale_h)  # COVER = use larger scale
+
+            new_w = int(src_w * scale)
+            new_h = int(src_h * scale)
+            resized_cover = img.resize((new_w, new_h), Image.LANCZOS)
+
+            # Center-crop to exact target dimensions
+            left = (new_w - target_w) // 2
+            top = (new_h - target_h) // 2
+            resized = resized_cover.crop((left, top, left + target_w, top + target_h))
+
+        resized.save(str(output_path), 'PNG')
+
+    return output_path
+
+
+def _storyboard_image_size(image_path: Optional[Path] = None, video_width: int = 1280, video_height: int = 720) -> str:
+    """Return Seedream's WxH size string for storyboard/end-frame generation.
+
+    M5 fix: derive size from video target aspect ratio (16:9 for 1280x720),
+    not from existing image dimensions (which may be square 1920x1920).
+
+    Preferred size: 1920x1080 (16:9, high quality for Seedream Agent Plan).
+    """
+    aspect = video_width / video_height
+
+    if abs(aspect - 16 / 9) < 0.01:
+        return "1920x1080"
+    else:
+        # Fallback: scale to 1920 width, maintain aspect
+        target_h = int(1920 / aspect)
+        # Ensure even dimensions
+        target_h = target_h if target_h % 2 == 0 else target_h + 1
+        return f"1920x{target_h}"
 
 
 # ── M4: FLF2V end-frame validation thresholds (t2i-adapted) ──────────────
@@ -1310,7 +1369,10 @@ def _generate_flf2v_end_frame(
     # Generate end frame — M3: prefer t2i over i2i
     from seedream_client import SeedreamClient
     client = SeedreamClient()
-    size = _storyboard_image_size(first_frame_path)
+    # M5: use video target aspect ratio (16:9), not first frame's dimensions
+    video_w = shot_item.get("width", 1280)
+    video_h = shot_item.get("height", 720)
+    size = _storyboard_image_size(video_width=video_w, video_height=video_h)
 
     # Primary: text_to_image (no reference → no copy problem)
     try:
@@ -1445,6 +1507,8 @@ def _generate_shot_images(output_dir: Path, storyboard_data: dict) -> int:
             _m2_wait_times = [120, 240, 480]
             for _m2_attempt in range(1, _m2_max_retries + 1):
                 try:
+                    # M5: use 16:9 aspect ratio for shot image generation
+                    _m2_size = "1920x1080"
                     if ref_image_path and ref_image_path.exists():
                         # P0-1c: Use image_to_image mode (with reference image)
                         from seedream_client import SeedreamClient
@@ -1453,12 +1517,13 @@ def _generate_shot_images(output_dir: Path, storyboard_data: dict) -> int:
                             prompt=shot_prompt,
                             ref_image=str(ref_image_path),
                             output_path=str(shot_image_path),
+                            size=_m2_size,
                         )
                         print(f"    [M2] 分镜图 {shot_id}.png ✓ (ref: {ref_image_path.name})")
                     else:
                         # No reference image, pure text-to-image
                         from seedream_client import text_to_image
-                        text_to_image(prompt=shot_prompt, output_path=str(shot_image_path))
+                        text_to_image(prompt=shot_prompt, output_path=str(shot_image_path), size=_m2_size)
                     print(f"    [M2] 分镜图 {shot_id}.png ✓")
                     _generate_flf2v_end_frame(
                         shot_item, shot_id, shot_image_path, ref_image_path
@@ -1628,14 +1693,14 @@ def run_phase2_5(storyboard_data: dict, characters_data: dict, output_dir: Path,
     try:
         from seedream_client import SeedreamClient
         client = SeedreamClient()
-        print(f"  → seedream: 生成故事板图片 (1920x1920, timeout=180s, retry=3)...")
+        print(f"  → seedream: 生成故事板图片 (1920x1080, timeout=180s, retry=3)...")
 
         # Use retry policy for API call
         def _call_seedream():
             client.text_to_image(
                 prompt=prompt,
                 output_path=str(storyboard_path),
-                size="1920x1920",
+                size="1920x1080",  # M5: 16:9 aspect ratio
                 timeout=180,
             )
             if not storyboard_path.exists():

@@ -295,7 +295,25 @@ def build_content_for_shot(
     
     for asset in image_assets:
         try:
-            img_data = asset["path"].read_bytes()
+            # M5: fit first_frame/last_frame to video aspect ratio before upload (no stretching)
+            video_w = shot_meta.get("width", 1280)
+            video_h = shot_meta.get("height", 720)
+
+            if asset["role"] in {"first_frame", "last_frame"}:
+                try:
+                    import tempfile
+                    from pipeline_runner import fit_to_aspect
+                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                        tmp_path = Path(tmp.name)
+                    fit_to_aspect(asset["path"], video_w, video_h, tmp_path)
+                    img_data = tmp_path.read_bytes()
+                    tmp_path.unlink()
+                except Exception:
+                    # Fallback: use raw bytes if fit_to_aspect fails (e.g. non-image file)
+                    img_data = asset["path"].read_bytes()
+            else:
+                img_data = asset["path"].read_bytes()
+
             tos_url = tos_uploader.upload_image(img_data, "image/png")
             if tos_url:
                 content.append({
