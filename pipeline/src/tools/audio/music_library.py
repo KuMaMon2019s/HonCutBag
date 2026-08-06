@@ -12,14 +12,19 @@ it shows up in the preflight provider menu alongside ``music_gen`` and the stock
 music sources.
 """
 
+# ruff: noqa: RUF012
+
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import shutil
 import subprocess
 import time
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from tools.base_tool import (
     BaseTool,
@@ -48,6 +53,21 @@ _AUDIO_EXTENSIONS = {
     ".aiff",
     ".aif",
 }
+
+_MOODS = {"happy", "sad", "epic", "calm"}
+
+
+@dataclass(frozen=True)
+class MusicTrack:
+    """A normalized local or remote music-library entry."""
+
+    id: str
+    path: str
+    duration: float
+    format: str
+    mood: str
+    source: str
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class MusicLibrary(BaseTool):
@@ -129,15 +149,22 @@ class MusicLibrary(BaseTool):
         "Confirm the listed tracks are the ones you intend to choose from",
     ]
 
+    def __init__(self, music_dir: str = "~/.honcut/music/") -> None:
+        self.music_dir = Path(music_dir).expanduser()
+        self._tracks: dict[str, MusicTrack] = {}
+
     # ---- Library resolution ----
 
-    def _library_dir(self, inputs: Optional[dict[str, Any]] = None) -> Path:
+    def _library_dir(self, inputs: dict[str, Any] | None = None) -> Path:
         if inputs and inputs.get("library_dir"):
             return Path(inputs["library_dir"]).expanduser()
         env_dir = os.environ.get("MUSIC_LIBRARY_DIR")
         if env_dir:
             return Path(env_dir).expanduser()
-        return _PROJECT_ROOT / "music_library"
+        honcut_dir = os.environ.get("HONCUT_MUSIC_DIR")
+        if honcut_dir:
+            return Path(honcut_dir).expanduser()
+        return self.music_dir
 
     def _list_tracks(self, library_dir: Path) -> list[Path]:
         if not library_dir.is_dir():
@@ -150,10 +177,154 @@ class MusicLibrary(BaseTool):
         return sorted(tracks, key=lambda p: p.as_posix().lower())
 
     @staticmethod
-    def _probe_duration(path: Path) -> Optional[float]:
+    def _probe_duration(path: Path) -> float | None:
         """Best-effort track duration via ffprobe; None if unavailable."""
         if shutil.which("ffprobe") is None:
             return None
+
+    @staticmethod
+    def _probe_metadata(path: Path) -> tuple[float, dict[str, Any]]:
+        """Extract duration, bitrate, tags, and stream information with ffprobe."""
+        if shutil.which("ffprobe") is None:
+            raise RuntimeError("ffprobe is required to scan music metadata")
+        command = [
+            "ffprobe", "-v", "error", "-show_entries",
+            "format=duration,bit_rate,format_name:format_tags=title,artist,album,genre,mood",
+            "-show_entries", "stream=codec_name,sample_rate,channels",
+            "-of", "json", str(path),
+        ]
+        try:
+            completed = subprocess.run(
+                command, capture_output=True, text=True, timeout=15, check=True
+            )
+            probe = json.loads(completed.stdout)
+            format_info = probe.get("format", {})
+            duration = float(format_info.get("duration") or 0.0)
+            bitrate = int(format_info.get("bit_rate") or 0)
+        except (subprocess.SubprocessError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Could not read audio metadata for {path}: {exc}") from exc
+        metadata = {
+            "bitrate": bitrate,
+            "tags": format_info.get("tags", {}),
+            "streams": probe.get("streams", []),
+            "size_bytes": path.stat().st_size,
+        }
+        return duration, metadata
+
+    @staticmethod
+    def _infer_mood(path: Path, metadata: dict[str, Any]) -> str:
+        tags = metadata.get("tags", {})
+        searchable = " ".join(
+            [path.stem, path.parent.name]
+            + [str(value) for value in tags.values()]
+        ).lower()
+        aliases = {
+            "happy": ("happy", "upbeat", "joy", "cheerful", "欢快", "快乐"),
+            "sad": ("sad", "melancholy", "sorrow", "悲伤", "忧郁"),
+            "epic": ("epic", "cinematic", "trailer", "heroic", "史诗"),
+            "calm": ("calm", "ambient", "peaceful", "relax", "宁静", "舒缓"),
+        }
+        for mood, words in aliases.items():
+            if any(word in searchable for word in words):
+                return mood
+        return "calm"
+
+    @staticmethod
+    def _track_id(path: Path) -> str:
+        identity = str(path.resolve()).encode("utf-8")
+        return hashlib.sha256(identity).hexdigest()[:16]
+
+    def scan(self) -> list[MusicTrack]:
+        """Scan the configured directory recursively and cache valid tracks."""
+        tracks: dict[str, MusicTrack] = {}
+        for path in self._list_tracks(self._library_dir()):
+            try:
+                duration, metadata = self._probe_metadata(path)
+            except RuntimeError:
+                continue
+            track = MusicTrack(
+                id=self._track_id(path),
+                path=str(path),
+                duration=duration,
+                format=path.suffix.lower().lstrip("."),
+                mood=self._infer_mood(path, metadata),
+                source="local",
+                metadata=metadata,
+            )
+            tracks[track.id] = track
+        self._tracks = tracks
+        return list(tracks.values())
+
+    def search(
+        self,
+        mood: str | None = None,
+        duration_range: tuple[float | None, float | None] | None = None,
+    ) -> list[MusicTrack]:
+        """Return cached tracks matching mood and inclusive duration bounds."""
+        if mood is not None and mood not in _MOODS:
+            raise ValueError(f"Unsupported mood {mood!r}; expected one of {sorted(_MOODS)}")
+        if duration_range is not None:
+            if len(duration_range) != 2:
+                raise ValueError("duration_range must be a (minimum, maximum) pair")
+            minimum, maximum = duration_range
+            if minimum is not None and maximum is not None and minimum > maximum:
+                raise ValueError("duration_range minimum cannot exceed maximum")
+        else:
+            minimum = maximum = None
+        candidates = self.scan()
+        return [
+            track for track in candidates
+            if (mood is None or track.mood == mood)
+            and (minimum is None or track.duration >= minimum)
+            and (maximum is None or track.duration <= maximum)
+        ]
+
+    def get_track(self, track_id: str) -> MusicTrack:
+        """Return a track by stable id, rescanning once when needed."""
+        if track_id not in self._tracks:
+            self.scan()
+        try:
+            return self._tracks[track_id]
+        except KeyError as exc:
+            raise KeyError(f"Music track not found: {track_id}") from exc
+
+    def search_external(
+        self,
+        query: str,
+        source: str,
+        duration_range: tuple[float, float] = (30.0, 120.0),
+    ) -> list[MusicTrack]:
+        """Search Pixabay or Freesound using the project's provider adapters."""
+        providers = {
+            "pixabay": ("tools.audio.pixabay_music", "PixabayMusic"),
+            "freesound": ("tools.audio.freesound_music", "FreesoundMusic"),
+        }
+        if source not in providers:
+            raise ValueError("source must be 'pixabay' or 'freesound'")
+        module_name, class_name = providers[source]
+        import importlib
+
+        provider = getattr(importlib.import_module(module_name), class_name)()
+        response = provider.execute({
+            "query": query,
+            "min_duration": duration_range[0],
+            "max_duration": duration_range[1],
+        })
+        if not response.success:
+            raise RuntimeError(response.error or f"{source} search failed")
+        payload = response.data or {}
+        path = payload.get("output")
+        if not path:
+            return []
+        duration = float(payload.get("duration_seconds") or 0.0)
+        track = MusicTrack(
+            id=self._track_id(Path(path)), path=str(path), duration=duration,
+            format=str(payload.get("format") or Path(path).suffix.lstrip(".")),
+            mood=self._infer_mood(Path(path), {"tags": payload}), source=source,
+            metadata=payload,
+        )
+        self._tracks[track.id] = track
+        return [track]
         try:
             out = subprocess.run(
                 [
@@ -205,6 +376,8 @@ class MusicLibrary(BaseTool):
                     "path": str(path),
                     "size_bytes": path.stat().st_size,
                     "duration_seconds": duration,
+                    "track": asdict(self._tracks.get(self._track_id(path)))
+                    if self._track_id(path) in self._tracks else None,
                 }
             )
 

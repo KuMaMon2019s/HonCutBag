@@ -2913,6 +2913,8 @@ def run_phase7(output_dir: Path, dry_run: bool,
         import shutil
         output_final = output_dir / "raw_assembly.mp4"
         shutil.copy2(clip_paths[0], str(output_final))
+        from phases.audio_mixer import apply_phase7_audio
+        audio_receipt = apply_phase7_audio(output_dir)
         print(f"  ✓ Phase 7 完成: 仅 1 个片段，直接复制")
         
         # Quality gate: Phase 7
@@ -2921,7 +2923,8 @@ def run_phase7(output_dir: Path, dry_run: bool,
             return {"status": "error", "error": f"Phase 7 质检未通过: {qg_report.grade}", "quality_report": qg_report, "duration_s": _elapsed(start)}
         
         return {"status": "done", "duration_s": _elapsed(start),
-                "outputs": ["raw_assembly.mp4"], "method": "single_clip_copy"}
+                "outputs": ["raw_assembly.mp4"], "method": "single_clip_copy",
+                "audio_layer": audio_receipt}
 
     # Intelligent transition selection based on shot emotions
     print(f"  → 发现 {len(clip_paths)} 个视频片段")
@@ -3024,6 +3027,8 @@ def run_phase7(output_dir: Path, dry_run: bool,
         
         if ed_result.get("success"):
             print(f"  ✓ Phase 7 完成: raw_assembly.mp4 (edit_decisions)")
+            from phases.audio_mixer import apply_phase7_audio
+            audio_receipt = apply_phase7_audio(output_dir)
             
             # Quality gate: Phase 7
             qg_report = run_quality_check("phase7", output_dir)
@@ -3040,6 +3045,7 @@ def run_phase7(output_dir: Path, dry_run: bool,
                 "clip_count": len(clip_paths),
                 "transition_selections": selected_transitions if selected_transitions else None,
                 "edit_decisions_segments": ed_result.get("segments"),
+                "audio_layer": audio_receipt,
             }
         else:
             error_msg = ed_result.get("error", "Unknown error")
@@ -3066,6 +3072,8 @@ def run_phase7(output_dir: Path, dry_run: bool,
 
         if result.success:
             print(f"  ✓ Phase 7 完成: raw_assembly.mp4 (VideoStitch fallback)")
+            from phases.audio_mixer import apply_phase7_audio
+            audio_receipt = apply_phase7_audio(output_dir)
             
             # Quality gate: Phase 7
             qg_report = run_quality_check("phase7", output_dir)
@@ -3082,6 +3090,7 @@ def run_phase7(output_dir: Path, dry_run: bool,
                 "clip_count": len(clip_paths),
                 "transition_selections": selected_transitions if selected_transitions else None,
                 "stitch_offsets": stitch_plan.offsets,
+                "audio_layer": audio_receipt,
             }
         else:
             return {"status": "error", "error": result.error, "duration_s": _elapsed(start)}
