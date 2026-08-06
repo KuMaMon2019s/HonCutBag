@@ -217,7 +217,7 @@ class TestM4Thresholds:
 
     def test_constants_exported(self):
         """Module-level constants exist and have expected values."""
-        assert FLF2V_SIMILARITY_LOW == 0.25
+        assert FLF2V_SIMILARITY_LOW == 0.3
         assert FLF2V_SIMILARITY_HIGH == 0.93
         assert FLF2V_SHARPNESS_RATIO == 0.15
 
