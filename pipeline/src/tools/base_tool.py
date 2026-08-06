@@ -4,15 +4,30 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
 
-class ToolTier(str, Enum): CORE="core"; OPTIONAL="optional"; EXPERIMENTAL="experimental"
+class ToolTier(str, Enum):
+    CORE="core"; OPTIONAL="optional"; EXPERIMENTAL="experimental"
+    VOICE="voice"; ENHANCE="enhance"; GENERATE="generate"; SOURCE="source"; ANALYZE="analyze"; PUBLISH="publish"
+class ToolStability(str, Enum): EXPERIMENTAL="experimental"; BETA="beta"; PRODUCTION="production"
 class ToolStatus(str, Enum): AVAILABLE="available"; UNAVAILABLE="unavailable"; DEGRADED="degraded"
-class ToolRuntime(str, Enum): LOCAL="local"; API="api"; BROWSER="browser"
+class ToolRuntime(str, Enum): LOCAL="local"; LOCAL_GPU="local_gpu"; API="api"; HYBRID="hybrid"; BROWSER="browser"
 class ExecutionMode(str, Enum): SYNC="sync"; ASYNC="async"
-class Determinism(str, Enum): DETERMINISTIC="deterministic"; SEEDED="seeded"; NONDETERMINISTIC="nondeterministic"
+class Determinism(str, Enum): DETERMINISTIC="deterministic"; SEEDED="seeded"; STOCHASTIC="stochastic"; NONDETERMINISTIC="nondeterministic"
+class ResumeSupport(str, Enum): NONE="none"; FROM_START="from_start"; FROM_CHECKPOINT="from_checkpoint"
 @dataclass(frozen=True)
 class ResourceProfile: cpu_cores: int=1; ram_mb: int=256; vram_mb: int=0; disk_mb: int=0; network_required: bool=False
 @dataclass
-class ToolResult: success: bool; data: Any=None; error: str|None=None; duration_seconds: float=0.0; metadata: dict[str, Any]=field(default_factory=dict)
+class RetryPolicy: max_retries: int=0; backoff_seconds: float=1.0; retryable_errors: list[str]=field(default_factory=list)
+@dataclass
+class ToolResult:
+    success: bool
+    data: Any=None
+    error: str|None=None
+    duration_seconds: float=0.0
+    metadata: dict[str, Any]=field(default_factory=dict)
+    artifacts: list[str]=field(default_factory=list)
+    cost_usd: float=0.0
+    seed: int|None=None
+    model: str|None=None
 
 class BaseTool(ABC):
     name="unnamed"; version="0.1.0"; tier=ToolTier.CORE; runtime=ToolRuntime.LOCAL; execution_mode=ExecutionMode.SYNC; determinism=Determinism.DETERMINISTIC
