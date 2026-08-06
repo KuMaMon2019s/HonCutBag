@@ -14,6 +14,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, ClassVar, Dict, Optional
 
+from dotenv import load_dotenv
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -75,51 +76,12 @@ class VideoModel(str, Enum):
     SEEDANCE = "seedance"
 
 
-def _load_env_file():
-    """从项目根目录加载 .env 文件（手动解析，不依赖 python-dotenv）
-    
-    搜索策略（按优先级）：
-    1. 当前工作目录 (cwd)
-    2. config.py 所在包的父目录（pipeline/）
-    3. 再上一级（项目根目录）
-    """
-    candidates = [
-        Path.cwd() / ".env",
-        Path(__file__).parent.parent / ".env",      # pipeline/
-        Path(__file__).parent.parent.parent / ".env", # project root
-    ]
-    env_file = None
-    for candidate in candidates:
-        if candidate.exists():
-            env_file = candidate
-            break
-    if env_file is None:
-        return
-    
-    try:
-        with open(env_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                # 跳过空行和注释
-                if not line or line.startswith("#"):
-                    continue
-                # 解析 KEY=VALUE
-                if "=" in line:
-                    key, value = line.split("=", 1)
-                    key = key.strip()
-                    value = value.strip()
-                    # 移除引号
-                    if value and value[0] in ('"', "'") and value[-1] == value[0]:
-                        value = value[1:-1]
-                    # 只设置未存在的环境变量
-                    if key and key not in os.environ:
-                        os.environ[key] = value
-    except Exception:
-        pass
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+ENV_FILE = PROJECT_ROOT / ".env"
 
-
-# 启动时自动加载 .env
-_load_env_file()
+# Load before pipeline_runner starts child processes so they inherit the same
+# repository-level configuration. Explicitly exported variables keep priority.
+load_dotenv(ENV_FILE, override=False)
 
 
 def get_video_route(provider: str) -> str:
@@ -145,19 +107,6 @@ def get_video_route(provider: str) -> str:
 def get_bridge_api_url() -> str:
     """Return the Bridge base URL without a trailing slash."""
     return os.environ.get("BRIDGE_API_URL", DEFAULT_BRIDGE_API_URL).rstrip("/")
-
-# 自动加载 .env 文件
-try:
-    from dotenv import load_dotenv
-    # 从项目根目录加载 .env
-    _project_root = Path(__file__).parent.parent
-    _env_file = _project_root / ".env"
-    if _env_file.exists():
-        load_dotenv(_env_file)
-except ImportError:
-    # python-dotenv 未安装，跳过
-    pass
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # API Keys 配置
@@ -316,6 +265,7 @@ def get_api_key(service: str, fallback: Optional[str] = None) -> Optional[str]:
     Returns:
         API key 值
     """
+    load_dotenv(ENV_FILE, override=False)
     return APIKeys.get(service, fallback)
 
 

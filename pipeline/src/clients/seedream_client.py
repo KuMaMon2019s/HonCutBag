@@ -29,6 +29,7 @@ IMAGE_ENDPOINT = f"{BASE_URL}/images/generations"
 
 # Agent Plan model (NOT doubao-seedream-3-0 which doesn't exist)
 DEFAULT_MODEL = "doubao-seedream-5.0-lite"
+DEFAULT_IMAGE_SIZE = "1920x1920"
 
 
 class _SeedreamRateLimiter:
@@ -92,7 +93,7 @@ class SeedreamClient:
         self,
         prompt: str,
         output_path: str = "output.png",
-        size: str = "1920x1920",
+        size: str = DEFAULT_IMAGE_SIZE,
         timeout: int = 60,
     ) -> str:
         """Generate image from text prompt. Returns image URL.
@@ -120,7 +121,7 @@ class SeedreamClient:
         prompt: str,
         ref_image: str,
         output_path: str = "output.png",
-        size: str = "1920x1920",
+        size: str = DEFAULT_IMAGE_SIZE,
     ) -> str:
         """Generate image from text + reference image (i2i / reference mode).
 
@@ -156,7 +157,7 @@ class SeedreamClient:
         style: str = "",
         negative: str = "",
         output_dir: str = ".",
-        size: str = "1920x1920",
+        size: str = DEFAULT_IMAGE_SIZE,
     ) -> dict:
         """Generate front/side/back three-view character sheets.
 

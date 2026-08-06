@@ -1575,8 +1575,8 @@ def _generate_shot_images(output_dir: Path, storyboard_data: dict) -> int:
             _m2_wait_times = [120, 240, 480]
             for _m2_attempt in range(1, _m2_max_retries + 1):
                 try:
-                    # M5: use 16:9 aspect ratio for shot image generation
-                    _m2_size = "1920x1080"
+                    # Preserve 16:9 while meeting Seedream's minimum pixel count.
+                    _m2_size = _storyboard_image_size(video_width=1920, video_height=1080)
                     if ref_image_path and ref_image_path.exists():
                         # P0-1c: Use image_to_image mode (with reference image)
                         from clients.seedream_client import SeedreamClient
@@ -1787,14 +1787,15 @@ def run_phase2_5(storyboard_data: dict, characters_data: dict, output_dir: Path,
     try:
         from clients.seedream_client import SeedreamClient
         client = SeedreamClient()
-        print(f"  → seedream: 生成故事板图片 (1920x1080, timeout=180s, retry=3)...")
+        seedream_size = _storyboard_image_size(video_width=1920, video_height=1080)
+        print(f"  → seedream: 生成故事板图片 ({seedream_size}, timeout=180s, retry=3)...")
 
         # Use retry policy for API call
         def _call_seedream():
             client.text_to_image(
                 prompt=prompt,
                 output_path=str(storyboard_path),
-                size="1920x1080",  # M5: 16:9 aspect ratio
+                size=seedream_size,
                 timeout=180,
             )
             if not storyboard_path.exists():

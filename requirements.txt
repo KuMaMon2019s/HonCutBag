@@ -6,6 +6,7 @@
 openai>=2.50.0            # LLM client (ARK-compatible) — adaptation/discovery/storyboard/director
 requests>=2.34.0          # HTTP — seedance_client, seedream_client, tos_uploader, shot_embedder
 PyYAML>=6.0               # pipeline_config.py
+python-dotenv>=1.0.0       # project-root .env loading for pipeline subprocesses
 
 # --- LangGraph (optional but recommended; pipeline falls back to sequential if missing) ---
 langgraph>=1.2.0

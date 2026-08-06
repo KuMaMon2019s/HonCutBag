@@ -115,6 +115,14 @@ def test_storyboard_image_size_meets_seedream_minimum():
         assert sh % 2 == 0, f"Height {sh} is not even"
 
 
+def test_seedream_client_default_size_meets_minimum_pixels():
+    from clients.seedream_client import DEFAULT_IMAGE_SIZE
+    from pipeline_runner import SEEDREAM_MIN_PIXELS
+
+    width, height = map(int, DEFAULT_IMAGE_SIZE.split("x"))
+    assert width * height >= SEEDREAM_MIN_PIXELS
+
+
 def test_end_frame_generation_uses_16x9_size():
     """_generate_flf2v_end_frame should request 16:9 size from Seedream."""
     # This is a mock test — verify size parameter is passed correctly
