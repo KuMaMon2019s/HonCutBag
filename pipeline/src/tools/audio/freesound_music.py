@@ -26,6 +26,7 @@ from tools.base_tool import (
     ToolStatus,
     ToolTier,
 )
+from utils.config import get_external_api_url
 
 
 class FreesoundMusic(BaseTool):
@@ -107,8 +108,6 @@ class FreesoundMusic(BaseTool):
         "Check Creative Commons license terms for your use case",
     ]
 
-    _BASE_URL = "https://freesound.org/apiv2"
-
     def get_status(self) -> ToolStatus:
         if os.environ.get("FREESOUND_API_KEY"):
             return ToolStatus.AVAILABLE
@@ -187,7 +186,7 @@ class FreesoundMusic(BaseTool):
             "page_size": 15,
         })
 
-        url = f"{self._BASE_URL}/search/text/?{params}"
+        url = f"{get_external_api_url('FREESOUND')}/search/text/?{params}"
 
         request = urllib.request.Request(
             url,

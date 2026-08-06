@@ -12,11 +12,58 @@ HonCut 配置管理 - 集中管理所有 API keys、tokens 和工具常量
 import os
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Any, ClassVar, Dict, Optional
 
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_BRIDGE_API_URL = "http://192.168.31.221:9100"
 VIDEO_ROUTE_VALUES = {"bridge", "direct", "local"}
+
+
+class PathConfig(BaseSettings):
+    """Filesystem roots, overridable with ``HONCUT_*`` environment variables."""
+
+    model_config = SettingsConfigDict(env_prefix="HONCUT_")
+
+    projects_dir: Path = Field(default=Path.home() / "projects")
+    repo_root: Path = Field(default=Path.home() / "projects" / "honcut")
+
+
+class ExternalAPIEndpoints:
+    """Default provider endpoints and their environment-variable overrides."""
+
+    DEFAULTS: ClassVar[dict[str, str]] = {
+        "DASHSCOPE_TTS": "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+        "DOUBAO_TTS_SUBMIT": "https://openspeech.bytedance.com/api/v3/tts/submit",
+        "DOUBAO_TTS_QUERY": "https://openspeech.bytedance.com/api/v3/tts/query",
+        "FREESOUND": "https://freesound.org/apiv2",
+        "GOOGLE_TTS": "https://texttospeech.googleapis.com",
+        "PIXABAY_MUSIC": "https://pixabay.com",
+        "SUNO": "https://api.sunoapi.org/api/v1",
+        "GOOGLE_IMAGEN_VERTEX": "https://{location}-aiplatform.googleapis.com/v1",
+        "GOOGLE_IMAGEN_STUDIO": "https://generativelanguage.googleapis.com/v1beta",
+        "FAL_FLUX": "https://fal.run/fal-ai/flux/dev",
+        "PEXELS_IMAGE": "https://api.pexels.com/v1/search",
+        "PIXABAY_IMAGE": "https://pixabay.com/api/",
+        "KLING": "https://api-singapore.klingai.com",
+    }
+    ENV_VARS: ClassVar[dict[str, str]] = {"KLING": "KLING_API_BASE_URL"}
+
+    @classmethod
+    def get(cls, service: str) -> str:
+        """Return a configured endpoint, falling back to the provider default."""
+        try:
+            default = cls.DEFAULTS[service]
+        except KeyError as exc:
+            raise ValueError(f"Unknown external API endpoint: {service}") from exc
+        env_var = cls.ENV_VARS.get(service, f"{service}_API_URL")
+        return os.environ.get(env_var, default).rstrip("/")
+
+
+def get_external_api_url(service: str) -> str:
+    """Return an external provider endpoint from environment-backed config."""
+    return ExternalAPIEndpoints.get(service)
 
 
 class VideoModel(str, Enum):

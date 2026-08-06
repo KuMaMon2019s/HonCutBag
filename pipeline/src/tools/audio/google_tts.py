@@ -24,10 +24,11 @@ from tools.base_tool import (
     ToolStatus,
     ToolTier,
 )
+from utils.config import get_external_api_url
 from utils.google_credentials import (
     get_access_token,
-    service_account_configured,
     has_google_credentials,
+    service_account_configured,
 )
 
 
@@ -263,7 +264,7 @@ class GoogleTTS(BaseTool):
 
         # Chirp 3 HD and Journey voices require the v1beta1 endpoint
         api_version = "v1beta1" if self._needs_beta_api(voice_name) else "v1"
-        url = f"https://texttospeech.googleapis.com/{api_version}/text:synthesize"
+        url = f"{get_external_api_url('GOOGLE_TTS')}/{api_version}/text:synthesize"
 
         headers = {"Content-Type": "application/json"}
         params: dict[str, str] = {}

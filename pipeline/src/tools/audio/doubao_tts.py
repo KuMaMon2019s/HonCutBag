@@ -21,6 +21,7 @@ from tools.base_tool import (
     ToolStatus,
     ToolTier,
 )
+from utils.config import get_external_api_url
 
 
 class DoubaoTTS(BaseTool):
@@ -170,8 +171,6 @@ class DoubaoTTS(BaseTool):
     quality_score = 0.88
     latency_p50_seconds = 8.0
 
-    SUBMIT_URL = "https://openspeech.bytedance.com/api/v3/tts/submit"
-    QUERY_URL = "https://openspeech.bytedance.com/api/v3/tts/query"
     DEFAULT_RESOURCE_ID = "seed-tts-2.0"
     DEFAULT_VOICE_ENV = "DOUBAO_SPEECH_VOICE_TYPE"
 
@@ -233,7 +232,7 @@ class DoubaoTTS(BaseTool):
         )
         body = self._submit_body(inputs, voice_id=voice_id, request_id=req_id)
 
-        submit_response = requests.post(self.SUBMIT_URL, headers=headers, json=body, timeout=(10, 60))
+        submit_response = requests.post(get_external_api_url("DOUBAO_TTS_SUBMIT"), headers=headers, json=body, timeout=(10, 60))
         submit_data = self._json_or_raise(submit_response)
         self._raise_for_doubao_error(submit_response.status_code, submit_data)
 
@@ -350,7 +349,7 @@ class DoubaoTTS(BaseTool):
                 request_id=str(uuid.uuid4()),
                 return_usage=return_usage,
             )
-            response = requests_module.post(self.QUERY_URL, headers=headers, json={"task_id": task_id}, timeout=(10, 60))
+            response = requests_module.post(get_external_api_url("DOUBAO_TTS_QUERY"), headers=headers, json={"task_id": task_id}, timeout=(10, 60))
             query_data = self._json_or_raise(response)
             self._raise_for_doubao_error(response.status_code, query_data)
             status = query_data.get("data", {}).get("task_status")

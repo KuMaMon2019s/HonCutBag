@@ -19,6 +19,7 @@ from tools.base_tool import (
     ToolStatus,
     ToolTier,
 )
+from utils.config import get_external_api_url
 
 
 class PixabayImage(BaseTool):
@@ -145,7 +146,7 @@ class PixabayImage(BaseTool):
 
         try:
             search_response = requests.get(
-                "https://pixabay.com/api/",
+                get_external_api_url("PIXABAY_IMAGE"),
                 params=params,
                 timeout=30,
             )

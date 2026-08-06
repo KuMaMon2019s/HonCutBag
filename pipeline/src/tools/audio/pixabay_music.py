@@ -30,6 +30,7 @@ from tools.base_tool import (
     ToolStatus,
     ToolTier,
 )
+from utils.config import get_external_api_url
 
 
 class PixabayMusic(BaseTool):
@@ -219,7 +220,8 @@ class PixabayMusic(BaseTool):
         query = inputs["query"]
         slug = re.sub(r"\s+", "-", query.strip().lower())
         slug = urllib.parse.quote(slug, safe="-")
-        search_url = f"https://pixabay.com/music/search/{slug}/"
+        base_url = get_external_api_url("PIXABAY_MUSIC")
+        search_url = f"{base_url}/music/search/{slug}/"
 
         opener = self._build_opener()
 
@@ -258,7 +260,7 @@ class PixabayMusic(BaseTool):
         if not bootstrap_path or bootstrap_path == "":
             return []
 
-        bootstrap_url = f"https://pixabay.com{bootstrap_path}"
+        bootstrap_url = f"{base_url}{bootstrap_path}"
 
         req = urllib.request.Request(bootstrap_url)
         req.add_header("User-Agent", self._USER_AGENT)
@@ -330,7 +332,7 @@ class PixabayMusic(BaseTool):
         if audio_url.startswith("//"):
             audio_url = "https:" + audio_url
         elif audio_url.startswith("/"):
-            audio_url = "https://pixabay.com" + audio_url
+            audio_url = get_external_api_url("PIXABAY_MUSIC") + audio_url
 
         # Build output path
         track_title = track.get("title", "pixabay_music")
@@ -345,7 +347,7 @@ class PixabayMusic(BaseTool):
             audio_url,
             headers={
                 "User-Agent": self._USER_AGENT,
-                "Referer": "https://pixabay.com/music/",
+                "Referer": f"{get_external_api_url('PIXABAY_MUSIC')}/music/",
             },
         )
 

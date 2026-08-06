@@ -6,8 +6,9 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from utils.config import get_external_api_url
 
-DEFAULT_API_BASE_URL = "https://api-singapore.klingai.com"
+DEFAULT_API_BASE_URL = get_external_api_url("KLING")
 
 
 class KlingProtocol(str, Enum):

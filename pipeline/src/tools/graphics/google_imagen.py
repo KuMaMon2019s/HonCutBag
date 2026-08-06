@@ -20,11 +20,12 @@ from tools.base_tool import (
     ToolStatus,
     ToolTier,
 )
+from utils.config import get_external_api_url
 from utils.google_credentials import (
     get_access_token,
+    has_google_credentials,
     resolve_project_id,
     service_account_configured,
-    has_google_credentials,
 )
 
 # Aspect ratio to approximate pixel dimensions (for cost/reporting only)
@@ -243,7 +244,7 @@ class GoogleImagen(BaseTool):
         if bearer_token:
             location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
             url = (
-                f"https://{location}-aiplatform.googleapis.com/v1/projects/"
+                f"{get_external_api_url('GOOGLE_IMAGEN_VERTEX').format(location=location)}/projects/"
                 f"{project_id}/locations/{location}/publishers/google/models/"
                 f"{model}:predict"
             )
@@ -253,7 +254,7 @@ class GoogleImagen(BaseTool):
             }
         else:
             url = (
-                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{get_external_api_url('GOOGLE_IMAGEN_STUDIO')}/models/"
                 f"{model}:predict"
             )
             headers = {

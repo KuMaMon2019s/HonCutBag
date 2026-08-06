@@ -19,6 +19,7 @@ from tools.base_tool import (
     ToolStatus,
     ToolTier,
 )
+from utils.config import get_external_api_url
 
 
 class PexelsImage(BaseTool):
@@ -130,7 +131,7 @@ class PexelsImage(BaseTool):
 
         try:
             search_response = requests.get(
-                "https://api.pexels.com/v1/search",
+                get_external_api_url("PEXELS_IMAGE"),
                 headers={"Authorization": api_key},
                 params=params,
                 timeout=30,

@@ -24,6 +24,7 @@ from tools.base_tool import (
     ToolStatus,
     ToolTier,
 )
+from utils.config import get_external_api_url
 
 
 class SunoMusic(BaseTool):
@@ -127,7 +128,6 @@ class SunoMusic(BaseTool):
         "Listen to generated music for mood, genre accuracy, and quality",
     ]
 
-    _BASE_URL = "https://api.sunoapi.org/api/v1"
     _POLL_INTERVAL = 30  # seconds between status checks
     _MAX_WAIT = 300  # 5 minutes max wait
 
@@ -222,7 +222,7 @@ class SunoMusic(BaseTool):
             payload["prompt"] = inputs["prompt"][:500]  # description, max 500 chars
 
         response = requests.post(
-            f"{self._BASE_URL}/generate",
+            f"{get_external_api_url('SUNO')}/generate",
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
@@ -249,7 +249,7 @@ class SunoMusic(BaseTool):
             elapsed += self._POLL_INTERVAL
 
             response = requests.get(
-                f"{self._BASE_URL}/generate/record-info",
+                f"{get_external_api_url('SUNO')}/generate/record-info",
                 params={"taskId": task_id},
                 headers={"Authorization": f"Bearer {api_key}"},
                 timeout=30,

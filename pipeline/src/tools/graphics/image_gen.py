@@ -32,6 +32,7 @@ from tools.base_tool import (
     ToolStatus,
     ToolTier,
 )
+from utils.config import get_external_api_url
 
 
 class ImageGen(BaseTool):
@@ -153,8 +154,9 @@ class ImageGen(BaseTool):
         return result
 
     def _generate_openai(self, inputs: dict[str, Any]) -> ToolResult:
-        from openai import OpenAI
         import base64
+
+        from openai import OpenAI
 
         client = OpenAI()
         prompt = inputs["prompt"]
@@ -203,7 +205,7 @@ class ImageGen(BaseTool):
             payload["seed"] = seed
 
         response = requests.post(
-            "https://fal.run/fal-ai/flux/dev",
+            get_external_api_url("FAL_FLUX"),
             headers={"Authorization": f"Key {api_key}", "Content-Type": "application/json"},
             json=payload,
             timeout=120,
