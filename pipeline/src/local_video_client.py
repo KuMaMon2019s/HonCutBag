@@ -293,15 +293,24 @@ def poll(
 ) -> dict:
     """Poll task until done, with progress-based timeout.
 
-    progress 为 0 或 status=queued 时按排队等待处理，最长等待时间由
-    LOCAL_VIDEO_QUEUE_TIMEOUT 控制（默认 7200 秒）。任务开始产生进度后，只有当
-    progress 连续 stall_polls 次轮询都没有任何增长时才判定卡死。
-    stall_polls 默认从 LOCAL_VIDEO_STALL_POLLS 读取（默认 60）；显式传入
-    max_attempts 时仍优先使用该参数，以保持向后兼容。
+    Two independent timeout windows govern this loop:
+
+    1. **Stall window** (progress < 100%): when progress fails to grow for
+       ``stall_polls`` consecutive polls the task is declared stalled.
+       ``stall_polls`` defaults to LOCAL_VIDEO_STALL_POLLS (env, default 60);
+       an explicit *max_attempts* argument takes precedence for back-compat.
+
+    2. **Download-probe window** (progress >= 100%, status=running): Bridge
+       archives the rendered video asynchronously so /download returns 404
+       for ~2-6 min after progress hits 100%.  We probe /download on every
+       poll iteration and tolerate up to *probe_attempts* consecutive failures
+       before declaring the task stalled.  ``probe_attempts`` defaults to
+       LOCAL_VIDEO_DOWNLOAD_PROBE_ATTEMPTS (env, default 40 → 40×10s ≈ 6.7 min).
 
     Bridge v3.2 quirk: 任务完成后 status 可能永远卡在 "running" + progress=100，
     但 GET /download/{task_id} 能正常下载。当检测到 progress>=100 且 status=running 时，
-    主动探测 /download 端点：连续 3 轮(30s)探测成功 → 判定完成；连续 10 轮(100s)探测失败 → 判定卡死。
+    主动探测 /download 端点：连续 3 轮探测成功 → 判定完成；连续 probe_attempts 轮
+    探测失败 → 判定卡死。
 
     Args:
         task_id: 任务 ID
@@ -314,7 +323,8 @@ def poll(
 
     Raises:
         TimeoutError: 排队超过 LOCAL_VIDEO_QUEUE_TIMEOUT，或已开始任务的 progress
-            连续 max_attempts * interval 秒没有增长
+            连续 max_attempts * interval 秒没有增长，或 progress=100 但
+            /download 连续 probe_attempts 次探测失败
         RuntimeError: 如果任务失败或返回 error 字段
     """
     api_url = _get_api_url()
@@ -335,10 +345,18 @@ def poll(
     if stall_polls <= 0:
         raise ValueError("LOCAL_VIDEO_STALL_POLLS/max_attempts must be a positive integer")
 
+    # Download-probe window: how many consecutive /download failures at
+    # progress=100% before we declare the task stalled.  Env-configurable so
+    # operators can tune for slower Bridge archival without code changes.
+    probe_attempts: int = int(os.environ.get("LOCAL_VIDEO_DOWNLOAD_PROBE_ATTEMPTS", "40"))
+    if probe_attempts <= 0:
+        raise ValueError("LOCAL_VIDEO_DOWNLOAD_PROBE_ATTEMPTS must be a positive integer")
+
     # Bridge running/100 quirk tracking
     at_100_count: int = 0         # progress>=100 且 status=running 的连续轮数
     download_probe_success: int = 0  # /download 探测连续成功轮数
     download_probe_fail: int = 0     # /download 探测连续失败轮数
+    probe_started_at: Optional[float] = None  # monotonic time of first probe fail in current run
 
     while True:
         total_polls += 1
@@ -377,6 +395,7 @@ def poll(
             if probe_ok:
                 download_probe_success += 1
                 download_probe_fail = 0
+                probe_started_at = None
                 print(f"  [local_poll #{total_polls}] download-probe OK ({download_probe_success}/3 consecutive)")
                 if download_probe_success >= 3:
                     print(f"  [local_poll #{total_polls}] ✓ Bridge running/100 quirk: download probe succeeded 3x → treating as completed")
@@ -384,11 +403,19 @@ def poll(
             else:
                 download_probe_fail += 1
                 download_probe_success = 0
-                print(f"  [local_poll #{total_polls}] download-probe FAIL ({download_probe_fail}/10 consecutive)")
-                if download_probe_fail >= 10:
+                if probe_started_at is None:
+                    probe_started_at = time.monotonic()
+                waited_s = time.monotonic() - probe_started_at
+                print(
+                    f"  [local_poll #{total_polls}] download-probe FAIL "
+                    f"({download_probe_fail}/{probe_attempts}) "
+                    f"[{waited_s:.0f}s elapsed]"
+                )
+                if download_probe_fail >= probe_attempts:
                     raise TimeoutError(
                         f"Local video task {task_id} stalled: progress=100% status=running, "
-                        f"download probe failed {download_probe_fail} consecutive times"
+                        f"download probe failed {download_probe_fail}/{probe_attempts} times "
+                        f"over {waited_s:.0f}s (interval={interval}s)"
                     )
             time.sleep(interval)
             continue
