@@ -88,7 +88,7 @@ def snap_duration_to_frames(
 def _get_api_url() -> str:
     """Get the local video API URL from config or env."""
     try:
-        from config import LOCAL_VIDEO_API_URL
+        from utils.config import LOCAL_VIDEO_API_URL
         return LOCAL_VIDEO_API_URL
     except ImportError:
         return os.environ.get("LOCAL_VIDEO_API_URL", DEFAULT_API_URL)

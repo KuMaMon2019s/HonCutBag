@@ -245,7 +245,7 @@ def extract_events_from_text(text: str) -> Dict[str, Any]:
     """
     # 导入 text_parser
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from text_parser import parse_text
+    from prompt.text_parser import parse_text
 
     parsed = parse_text(text)
     segments = parsed.get("segments", [])

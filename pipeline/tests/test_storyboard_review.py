@@ -6,7 +6,7 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from quality_gate import run_storyboard_review
+from quality.quality_gate import run_storyboard_review
 
 
 CHARACTERS = [
@@ -220,4 +220,3 @@ def test_same_camera():
 
     assert result["moderate"] >= 1, f"同景别应触发中等问题，实际 moderate={result['moderate']}"
     assert any("景别" in issue and "特写" in issue for issue in result["issues"])
-

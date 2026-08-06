@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from src.audio_pipeline import is_silent_audio, generate_ambient_audio
+from tools.audio_pipeline import is_silent_audio, generate_ambient_audio
 
 
 @pytest.fixture

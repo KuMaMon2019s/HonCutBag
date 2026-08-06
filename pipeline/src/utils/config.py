@@ -3,7 +3,7 @@
 HonCut 配置管理 - 集中管理所有 API keys、tokens 和工具常量
 
 使用方式：
-    from config import get_api_key, ARK_BASE_URL
+    from utils.config import get_api_key, ARK_BASE_URL
     
     api_key = get_api_key("ARK_AGENT")
     base_url = ARK_BASE_URL

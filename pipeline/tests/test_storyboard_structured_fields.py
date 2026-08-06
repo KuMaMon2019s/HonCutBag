@@ -48,7 +48,7 @@ class TestParseResponseNormalization:
 
     def test_valid_structured_fields_preserved(self):
         """When LLM returns valid shot_size etc., they are preserved."""
-        from adaptation_engine import _parse_response
+        from phases.adaptation_engine import _parse_response
         resp = self._make_response([{
             "shot_order": 1,
             "source_events": [1],
@@ -72,7 +72,7 @@ class TestParseResponseNormalization:
 
     def test_missing_structured_fields_get_defaults(self):
         """When LLM omits structured fields, sensible defaults are filled."""
-        from adaptation_engine import _parse_response
+        from phases.adaptation_engine import _parse_response
         resp = self._make_response()  # no shot_size etc.
         parsed = _parse_response(resp)
         shot = parsed["shots"][0]
@@ -83,7 +83,7 @@ class TestParseResponseNormalization:
 
     def test_invalid_structured_fields_get_defaults(self):
         """When LLM returns garbage values, defaults are used."""
-        from adaptation_engine import _parse_response
+        from phases.adaptation_engine import _parse_response
         resp = self._make_response([{
             "shot_order": 1,
             "source_events": [1],
@@ -107,7 +107,7 @@ class TestParseResponseNormalization:
 
     def test_who_string_converted_to_list(self):
         """When LLM returns who as a string instead of list, it's normalized."""
-        from adaptation_engine import _parse_response
+        from phases.adaptation_engine import _parse_response
         resp = self._make_response([{
             "shot_order": 1,
             "source_events": [1],
@@ -124,7 +124,7 @@ class TestParseResponseNormalization:
 
     def test_empty_who_preserved_as_empty_list(self):
         """Pure landscape shots: who=[] stays as empty list."""
-        from adaptation_engine import _parse_response
+        from phases.adaptation_engine import _parse_response
         resp = self._make_response([{
             "shot_order": 1,
             "source_events": [1],
@@ -141,7 +141,7 @@ class TestParseResponseNormalization:
 
     def test_associate_assets_normalized(self):
         """associate_assets is ensured to be a list."""
-        from adaptation_engine import _parse_response
+        from phases.adaptation_engine import _parse_response
         resp = self._make_response([{
             "shot_order": 1,
             "source_events": [1],
@@ -163,10 +163,10 @@ class TestParseResponseNormalization:
 class TestStoryboardGeneratorPassthrough:
     """Test that generate_storyboard passes structured fields to STORYBOARD.json."""
 
-    @patch("storyboard_generator._call_llm")
+    @patch("phases.storyboard_generator._call_llm")
     def test_structured_fields_passed_through(self, mock_llm):
         """who/shot_size/camera_movement/lighting_key/shot_intent/associate_assets appear in output."""
-        from storyboard_generator import generate_storyboard
+        from phases.storyboard_generator import generate_storyboard
 
         mock_llm.return_value = json.dumps({
             "prompt": "Cinematic test shot",
@@ -199,10 +199,10 @@ class TestStoryboardGeneratorPassthrough:
         assert sb_shot["shot_intent"] == "atmosphere"
         assert sb_shot["associate_assets"] == ["char:lin_xiao", "char:chen_yang"]
 
-    @patch("storyboard_generator._call_llm")
+    @patch("phases.storyboard_generator._call_llm")
     def test_empty_who_no_first_frame(self, mock_llm):
         """Pure landscape shot (who=[]) → no first_frame set."""
-        from storyboard_generator import generate_storyboard
+        from phases.storyboard_generator import generate_storyboard
 
         mock_llm.return_value = json.dumps({
             "prompt": "Sunset over lake",

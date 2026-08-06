@@ -6,7 +6,7 @@
 import json
 import tempfile
 from pathlib import Path
-from consistency_guard import check_character_consistency, run_consistency_check
+from quality.consistency_guard import check_character_consistency, run_consistency_check
 
 def test_consistency_guard():
     """测试角色一致性检查"""

@@ -29,7 +29,7 @@ from clients.seedream_client import SeedreamClient
 # Import prompt validator from prompts/ directory
 _PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 sys.path.insert(0, str(_PROMPTS_DIR))
-from prompt_validator import validate_prompt
+from prompt.prompt_validator import validate_prompt
 
 
 # =============================================================================

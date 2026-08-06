@@ -21,7 +21,7 @@ def test_config_yaml_loading():
     print("=" * 60)
     
     try:
-        from pipeline_config import get_quality_gate_threshold
+        from utils.pipeline_config import get_quality_gate_threshold
         
         # 测试默认值
         threshold = get_quality_gate_threshold()
@@ -41,7 +41,7 @@ def test_config_custom_threshold():
     print("=" * 60)
     
     try:
-        from pipeline_config import get_quality_gate_threshold
+        from utils.pipeline_config import get_quality_gate_threshold
         
         # 创建临时 config.yaml
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -107,7 +107,7 @@ def test_config_fallback():
     print("=" * 60)
     
     try:
-        from pipeline_config import get_quality_gate_threshold
+        from utils.pipeline_config import get_quality_gate_threshold
         
         # 测试不存在的配置文件
         threshold = get_quality_gate_threshold("/nonexistent/config.yaml")

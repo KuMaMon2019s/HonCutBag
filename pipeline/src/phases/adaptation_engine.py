@@ -36,7 +36,7 @@ import time
 from typing import List, Dict, Any, Optional
 
 from openai import OpenAI
-from config import get_api_key, ARK_BASE_URL
+from utils.config import get_api_key, ARK_BASE_URL
 
 
 # ─── LLM 配置 ───────────────────────────────────────────────────────────────

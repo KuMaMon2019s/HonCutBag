@@ -7,7 +7,7 @@ import zipfile
 from pathlib import Path
 import pytest
 
-from asset_packager import package_shot_assets
+from tools.asset_packager import package_shot_assets
 
 
 def test_package_shot_assets_with_all_assets():
@@ -189,7 +189,7 @@ def test_package_shot_assets_multiple_characters():
 
 # ─── Tests for build_content_for_shot smart selection ───
 
-from asset_packager import build_content_for_shot, _detect_shot_characters
+from tools.asset_packager import build_content_for_shot, _detect_shot_characters
 
 
 def _make_char_images(output_dir: Path, char_id: str, views=("front", "side", "back")):

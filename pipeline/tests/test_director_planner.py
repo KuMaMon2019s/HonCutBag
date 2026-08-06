@@ -9,7 +9,7 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from director_planner import plan_director, SYSTEM_PROMPT, USER_PROMPT_TEMPLATE
+from phases.director_planner import plan_director, SYSTEM_PROMPT, USER_PROMPT_TEMPLATE
 
 
 def test_plan_director_dry_run_returns_skipped(tmp_path):

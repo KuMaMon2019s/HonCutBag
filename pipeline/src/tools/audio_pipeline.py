@@ -9,7 +9,7 @@ Integrates FFmpeg-based audio processing inspired by OpenMontage AudioMixer:
 - Audio track mixing (amix)
 
 Usage:
-    from audio_pipeline import process_audio
+    from tools.audio_pipeline import process_audio
     process_audio(video_path, storyboard_path, output_path, bgm_path=None)
 """
 

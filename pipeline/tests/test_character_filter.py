@@ -7,7 +7,7 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../src'))
 
-from character_discoverer import _is_human_character, _filter_non_human_characters
+from phases.character_discoverer import _is_human_character, _filter_non_human_characters
 
 
 def test_is_human_character_filtered():

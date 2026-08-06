@@ -32,7 +32,7 @@ def submit(
     # 从 config 读取默认模型（如果未传入）
     if model is None:
         try:
-            from config import SEEDANCE_MODEL
+            from utils.config import SEEDANCE_MODEL
             model = SEEDANCE_MODEL
         except ImportError:
             model = "doubao-seedance-2.0-mini"

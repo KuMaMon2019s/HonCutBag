@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from config import get_api_key
+from utils.config import get_api_key
 
 # Phase 1 LLM 使用 Agent Plan 端点（不是按量计费端点）
 ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/plan/v3"

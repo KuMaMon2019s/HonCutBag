@@ -20,9 +20,9 @@ import traceback
 from pathlib import Path
 from typing import Optional, TypedDict, Any
 
-from config import get_api_key
+from utils.config import get_api_key
 from utils.progress_reporter import ProgressReporter
-from quality_gate import run_quality_check
+from quality.quality_gate import run_quality_check
 from utils.timing_estimator import estimate_phase_duration, estimate_total, estimate_remaining
 from quality.slideshow_risk import score_slideshow_risk
 from quality.variation_checker import check_scene_variation
@@ -335,7 +335,7 @@ if LANGGRAPH_AVAILABLE:
     def task_generate_character(char_dict: dict, chars_dir: str, skip_images: bool = False) -> dict:
         """⚠️ 此函数为 LangGraph @task 包装，仅在 StateGraph 执行上下文中有效，不可直接调用。
         Task-wrapped character generation with retry (for StateGraph)."""
-        from character_factory import generate_single
+        from phases.character_factory import generate_single
         result = generate_single(char_dict, chars_dir, skip_images=skip_images)
         return {"status": "done", "result": result}
 
@@ -534,7 +534,7 @@ def run_phase1(text: str, output_dir: Path, dry_run: bool) -> dict:
     _banner("1", 9, "导演规划 (Director Planner)", dry_run)
     start = _now()
     try:
-        from director_planner import plan_director
+        from phases.director_planner import plan_director
         result = plan_director(text, output_dir, dry_run)
         # Lock the intended production medium before providers can downgrade it.
         delivery_promise = classify_from_brief("cinematic", {}).to_dict()
@@ -601,7 +601,7 @@ def run_phase2(text: str, output_dir: Path, duration: int, dry_run: bool, report
     output_dir = Path(output_dir)
 
     try:
-        from text_parser import parse_text
+        from prompt.text_parser import parse_text
     except ImportError as e:
         return {"status": "error", "error": f"Phase 2 import failed: {e}", "duration_s": _elapsed(start)}
 
@@ -790,10 +790,10 @@ def run_phase2(text: str, output_dir: Path, duration: int, dry_run: bool, report
         
         # 正常模式：调用 API
         try:
-            from event_extractor import extract_events
-            from character_discoverer import discover_characters
-            from adaptation_engine import adapt_events
-            from storyboard_generator import generate_storyboard
+            from prompt.event_extractor import extract_events
+            from phases.character_discoverer import discover_characters
+            from phases.adaptation_engine import adapt_events
+            from phases.storyboard_generator import generate_storyboard
         except ImportError as e:
             return {"status": "error", "error": f"Phase 2 import failed: {e}", "duration_s": _elapsed(start)}
 
@@ -855,7 +855,7 @@ def run_phase2(text: str, output_dir: Path, duration: int, dry_run: bool, report
 
         # --- M5: 监督层审核（增量，失败不影响后续）---
         try:
-            from quality_gate import run_storyboard_review
+            from quality.quality_gate import run_storyboard_review
             review = run_storyboard_review(
                 storyboard_data=storyboard,
                 script_text=text,
@@ -1910,7 +1910,7 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
     output_dir = Path(output_dir)
 
     try:
-        from character_factory import batch_generate
+        from phases.character_factory import batch_generate
 
         chars_dir = _ensure_dir(output_dir / "characters")
         characters_list = characters_data.get("characters", [])
@@ -2353,7 +2353,7 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
     
     # --- 并发配置 ---
     try:
-        from config import VIDEO_GEN_CONCURRENCY
+        from utils.config import VIDEO_GEN_CONCURRENCY
         concurrency = VIDEO_GEN_CONCURRENCY
     except ImportError:
         concurrency = int(os.environ.get("VIDEO_GEN_CONCURRENCY", "1"))
@@ -2405,7 +2405,7 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
         try:
             from prompt.prompt_router import route_prompt
             try:
-                from config import SEEDANCE_MODEL
+                from utils.config import SEEDANCE_MODEL
                 model_name = SEEDANCE_MODEL
             except ImportError:
                 model_name = os.environ.get("SEEDANCE_MODEL", "doubao-seedance-2.0-mini")
@@ -2533,7 +2533,7 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
                     try:
                         print(f"  → {shot_dir.name}: 提交本地 API 视频生成...")
                         from clients import local_video_client
-                        import asset_packager
+                        from tools import asset_packager
                         
                         # Build content[] with TOS-uploaded reference images (new contract)
                         shot_id = shot_dir.name  # e.g., "S01"
@@ -2753,7 +2753,7 @@ def run_phase6(output_dir: Path, dry_run: bool, storyboard_data: dict = None) ->
 
     # --- 1. consistency_guard (原有逻辑) ---
     try:
-        from consistency_guard import run_consistency_check
+        from quality.consistency_guard import run_consistency_check
 
         print("  → run_consistency_check: 检查角色一致性...")
         result = run_consistency_check(output_dir=output_dir)
@@ -2930,7 +2930,7 @@ def run_phase7(output_dir: Path, dry_run: bool,
     smart_decisions = None
     try:
         from utils.shot_embedder import embed_all_shots, compute_transition_similarity
-        from smart_transition import decide_all_transitions
+        from tools.smart_transition import decide_all_transitions
         
         print("  → 智能转场: 抽帧 + 向量化 + 三层决策...")
         embeddings = embed_all_shots(str(shots_dir), run_id=str(output_dir.name))
@@ -2998,7 +2998,7 @@ def run_phase7(output_dir: Path, dry_run: bool,
 
     # 调用 edit_decisions 架构（从 OpenMontage VideoCompose 学习）
     try:
-        from edit_decisions import build_edit_decisions, execute_edit_decisions
+        from phases.edit_decisions import build_edit_decisions, execute_edit_decisions
         
         # Convert selected_transitions (list of strings) to the format
         # build_edit_decisions expects: list of dicts with "decision" key
@@ -3228,7 +3228,7 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
     # ambient fallback so the final video is never silent.
     has_real_audio = False
     try:
-        from audio_pipeline import is_silent_audio
+        from tools.audio_pipeline import is_silent_audio
         import subprocess as _sp
         # First check: does an audio stream exist at all?
         probe_cmd = ["ffprobe", "-v", "quiet", "-select_streams", "a",
@@ -3246,8 +3246,8 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
         print("  → [P0-D3] 视频已有真实音轨（Seedance generate_audio），跳过环境音合成")
 
     try:
-        from visual_post import process_visual
-        from rhythm_editor import edit_rhythm
+        from phases.visual_post import process_visual
+        from phases.rhythm_editor import edit_rhythm
 
         # Track step statuses for quality gate integrity
         step_status = {}
@@ -3344,10 +3344,10 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             # AudioMixer may not be available or may fail, leaving audio_out as
             # a copy of the silent raw_video.  Detect and inject generated ambience.
             try:
-                from audio_pipeline import is_silent_audio, generate_ambient_audio
+                from tools.audio_pipeline import is_silent_audio, generate_ambient_audio
                 if audio_out.exists() and is_silent_audio(str(audio_out)):
                     print("  → [ambient-fallback] AudioMixer output still silent, generating ambient audio...")
-                    from edit_decisions import probe_video
+                    from phases.edit_decisions import probe_video
                     vid_info = probe_video(str(raw_video))
                     ambient_dur = vid_info.get("duration", 12.0)
                     # Pick scene hint from storyboard if available

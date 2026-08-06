@@ -313,7 +313,7 @@ def _build_shot_prompt(shot: Dict[str, Any], characters: Optional[List[Dict[str,
     
     # Add emotion and style enrichment
     try:
-        from emotion_mapping import build_style_suffix
+        from prompt.emotion_mapping import build_style_suffix
         style_suffix = build_style_suffix(emotion=emotion, scene=where)
     except ImportError:
         style_suffix = ""
@@ -365,7 +365,7 @@ def generate_storyboard(
             emotion = shot.get("emotion", "")
             # 基于场景首个镜头的情绪生成场景级风格后缀
             try:
-                from emotion_mapping import build_style_suffix
+                from prompt.emotion_mapping import build_style_suffix
                 scene_style_map[where] = build_style_suffix(emotion=emotion, scene=where)
             except Exception:
                 scene_style_map[where] = ""

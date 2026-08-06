@@ -16,7 +16,7 @@ def test_max_retries_config():
     print("测试 1: MAX_RETRIES 配置")
     print("=" * 60)
     
-    from storyboard_generator import MAX_RETRIES
+    from phases.storyboard_generator import MAX_RETRIES
     
     assert MAX_RETRIES == 3, f"期望 MAX_RETRIES=3，实际={MAX_RETRIES}"
     print(f"✓ MAX_RETRIES = {MAX_RETRIES}")

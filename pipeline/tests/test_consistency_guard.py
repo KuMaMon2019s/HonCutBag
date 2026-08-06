@@ -3,7 +3,7 @@ test_consistency_guard.py — consistency_guard 模块的单元测试
 """
 
 import pytest
-from consistency_guard import (
+from quality.consistency_guard import (
     check_character_consistency,
     DEFAULT_THRESHOLD,
 )

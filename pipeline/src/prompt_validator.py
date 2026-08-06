@@ -1,1 +1,0 @@
-../prompts/prompt_validator.py

@@ -7,7 +7,7 @@ Architecture learned from Toonflow's supervision layer:
 - Structured report: 总评 → 问题清单 → 建议
 
 Usage:
-    from quality_gate import run_quality_check
+    from quality.quality_gate import run_quality_check
     report = run_quality_check("phase3", output_dir)
     if not report.passed:
         # Block pipeline — critical artifact missing

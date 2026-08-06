@@ -10,8 +10,8 @@ VENDOR_DIR = Path(__file__).resolve().parents[2] / "vendor" / "legacy"
 sys.path.insert(0, str(SRC_DIR))
 sys.path.insert(0, str(VENDOR_DIR))
 
-import adaptation_engine
-import asset_packager
+from phases import adaptation_engine
+from tools import asset_packager
 from clients import local_video_client
 import pipeline_runner
 

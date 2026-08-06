@@ -16,7 +16,7 @@
 import tempfile
 import subprocess
 from pathlib import Path
-from quality_gate import run_quality_check
+from quality.quality_gate import run_quality_check
 
 
 def _create_test_video(path: Path, has_audio: bool = False):

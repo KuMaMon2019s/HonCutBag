@@ -13,7 +13,7 @@ print("Testing quality_gate import in pipeline context...")
 
 try:
     # Test the import as it appears in pipeline_runner.py
-    from quality_gate import run_quality_check
+    from quality.quality_gate import run_quality_check
     
     print("✅ Import successful")
     
