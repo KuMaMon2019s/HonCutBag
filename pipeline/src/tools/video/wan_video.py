@@ -5,6 +5,8 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from clients.video_client import VideoClient
+
 from tools.base_tool import (
     BaseTool,
     Determinism,
@@ -86,6 +88,32 @@ class WanVideo(BaseTool):
         return estimate_local_runtime(variant["speed"])
 
     def execute(self, inputs: dict[str, Any]) -> ToolResult:
+        output_path = inputs.get("output_path", "wan_output.mp4")
+        client = VideoClient(provider="wan", direct_generator=self._generate_local)
+        if client.mode != "bridge":
+            return client.generate(inputs["prompt"], inputs=inputs).value
+        start = time.time()
+        try:
+            routed = client.generate(
+                inputs["prompt"],
+                output_path=output_path,
+                reference_image_base64=inputs.get("reference_image_base64"),
+                seed=inputs.get("seed", -1),
+                width=inputs.get("width", 1280),
+                height=inputs.get("height", 720),
+                duration=inputs.get("duration"),
+            )
+        except Exception as exc:
+            return ToolResult(success=False, error=f"Wan Bridge video generation failed: {exc}")
+        return ToolResult(
+            success=True,
+            data={"provider": "wan", "route": "bridge", "output": routed.output_path, "output_path": routed.output_path},
+            artifacts=[routed.output_path] if routed.output_path else [],
+            duration_seconds=round(time.time() - start, 2),
+            model="wan22",
+        )
+
+    def _generate_local(self, prompt: str, inputs: dict[str, Any]) -> ToolResult:
         if self.get_status() != ToolStatus.AVAILABLE:
             return ToolResult(success=False, error="Wan local video generation is unavailable. " + self.install_instructions)
         start = time.time()

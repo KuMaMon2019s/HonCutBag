@@ -10,6 +10,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from clients.video_client import VideoClient
+
 from tools.base_tool import (
     BaseTool,
     Determinism,
@@ -100,7 +102,7 @@ class KlingVideo(BaseTool):
         return os.environ.get("FAL_KEY") or os.environ.get("FAL_AI_API_KEY")
 
     def get_status(self) -> ToolStatus:
-        if self._get_api_key():
+        if VideoClient(provider="kling").mode == "bridge" or self._get_api_key():
             return ToolStatus.AVAILABLE
         return ToolStatus.UNAVAILABLE
 
@@ -117,6 +119,29 @@ class KlingVideo(BaseTool):
         return 60.0  # ~1 minute typical
 
     def execute(self, inputs: dict[str, Any]) -> ToolResult:
+        client = VideoClient(provider="kling", direct_generator=self._generate_direct)
+        if client.mode != "bridge":
+            return client.generate(inputs["prompt"], inputs=inputs).value
+        start = time.time()
+        output_path = str(inputs.get("output_path", "kling_output.mp4"))
+        try:
+            routed = client.generate(
+                inputs["prompt"],
+                output_path=output_path,
+                duration=float(inputs.get("duration", "5")),
+            )
+        except Exception as exc:
+            return ToolResult(success=False, error=f"Kling Bridge video generation failed: {exc}")
+        return ToolResult(
+            success=True,
+            data={"provider": "kling", "route": "bridge", "output": routed.output_path, "output_path": routed.output_path},
+            artifacts=[routed.output_path] if routed.output_path else [],
+            cost_usd=self.estimate_cost(inputs),
+            duration_seconds=round(time.time() - start, 2),
+            model="kling",
+        )
+
+    def _generate_direct(self, prompt: str, inputs: dict[str, Any]) -> ToolResult:
         api_key = self._get_api_key()
         if not api_key:
             return ToolResult(

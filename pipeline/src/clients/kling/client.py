@@ -37,6 +37,13 @@ class KlingClient:
         self.session = session or requests.Session()
         self.max_retries = max_retries
 
+    def generate_video(self, prompt: str, **kwargs: Any):
+        """Generate video through Bridge by default; direct callable is the fallback."""
+        from clients.video_client import VideoClient
+
+        direct_generator = kwargs.pop("direct_generator", None)
+        return VideoClient("kling", direct_generator=direct_generator).generate(prompt, **kwargs)
+
     @property
     def headers(self) -> dict[str, str]:
         if not self.api_key:

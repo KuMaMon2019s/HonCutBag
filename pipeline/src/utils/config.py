@@ -14,6 +14,10 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 
 
+DEFAULT_BRIDGE_API_URL = "http://192.168.31.221:9100"
+VIDEO_ROUTE_VALUES = {"bridge", "direct", "local"}
+
+
 def _load_env_file():
     """从项目根目录加载 .env 文件（手动解析，不依赖 python-dotenv）
     
@@ -59,6 +63,31 @@ def _load_env_file():
 
 # 启动时自动加载 .env
 _load_env_file()
+
+
+def get_video_route(provider: str) -> str:
+    """Return the configured video route for *provider*.
+
+    Provider-specific configuration wins over the global setting.  ``bridge``
+    is deliberately the default so video work stays on the Windows backend.
+    """
+    provider_name = provider.strip().upper()
+    if not provider_name:
+        raise ValueError("video provider must not be empty")
+    route = os.environ.get(f"VIDEO_PROVIDER_{provider_name}") or os.environ.get(
+        "VIDEO_GENERATION_MODE", "bridge"
+    )
+    route = route.strip().lower()
+    if route not in VIDEO_ROUTE_VALUES:
+        raise ValueError(
+            f"Invalid video route {route!r} for {provider}; expected bridge, direct, or local"
+        )
+    return route
+
+
+def get_bridge_api_url() -> str:
+    """Return the Bridge base URL without a trailing slash."""
+    return os.environ.get("BRIDGE_API_URL", DEFAULT_BRIDGE_API_URL).rstrip("/")
 
 # 自动加载 .env 文件
 try:

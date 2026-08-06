@@ -9,6 +9,7 @@ import time
 import requests
 from typing import Optional
 from utils.ip_blacklist import sanitize_prompt
+from clients.video_client import VideoClient
 
 
 BASE_URL = "https://ark.cn-beijing.volces.com/api/plan/v3"
@@ -16,7 +17,7 @@ SUBMIT_ENDPOINT = f"{BASE_URL}/contents/generations/tasks"
 POLL_ENDPOINT = f"{BASE_URL}/contents/generations/tasks/{{task_id}}"
 
 
-def submit(
+def _submit_direct(
     prompt: str,
     api_key: str,
     model: str = None,
@@ -121,6 +122,35 @@ def submit(
     if not task_id:
         raise RuntimeError(f"No task_id in response: {data}")
     return task_id
+
+
+def submit(
+    prompt: str,
+    api_key: str,
+    model: str = None,
+    duration: int = 7,
+    ratio: str = "16:9",
+    first_frame_base64: Optional[str] = None,
+    reference_image_base64: Optional[str] = None,
+    generate_audio: Optional[str] = None,
+    seed: int = None,
+    reference_video_base64: Optional[str] = None,
+) -> str:
+    """Submit through Bridge by default, retaining Ark as direct fallback."""
+    client = VideoClient(provider="seedance", direct_generator=_submit_direct)
+    result = client.generate(
+        prompt,
+        api_key=api_key,
+        model=model,
+        duration=duration,
+        ratio=ratio,
+        first_frame_base64=first_frame_base64,
+        reference_image_base64=reference_image_base64,
+        generate_audio=generate_audio,
+        seed=seed,
+        reference_video_base64=reference_video_base64,
+    )
+    return str(result.value)
 
 
 def poll(
