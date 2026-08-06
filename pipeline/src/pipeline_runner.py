@@ -13,6 +13,10 @@ SRC_DIR = Path(__file__).resolve().parent
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from utils.deps import check_dependencies
+
+check_dependencies()
+
 from phases import pipeline_core as _core
 
 # Preserve the historical ``import pipeline_runner`` module identity. This is
