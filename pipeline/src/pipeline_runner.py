@@ -24,6 +24,21 @@ from config import get_api_key
 from progress_reporter import ProgressReporter
 from quality_gate import run_quality_check
 from timing_estimator import estimate_phase_duration, estimate_total, estimate_remaining
+from slideshow_risk import score_slideshow_risk
+from variation_checker import check_scene_variation
+from delivery_promise import classify_from_brief
+from speech_pacing import annotate_shot_pacing
+from base_tool import BaseTool
+from checkpoint import write_checkpoint as write_stage_checkpoint
+from provider_scoring import rank_providers
+from video_composer import lock_runtime
+from shot_prompt_builder import build_batch_prompts
+from video_stitcher import build_stitch_plan
+from asset_binder import bind_assets
+from prompt_sanitizer import sanitize_quality_prompt
+from three_part_prompt import build_three_part_prompt
+from composition_validator import validate_composition
+from vendor_adapter import VendorAdapter
 
 # Keep progress visible when invoked through ``conda run | tee``.
 if hasattr(sys.stdout, "reconfigure"):
@@ -557,6 +572,8 @@ def run_phase1(text: str, output_dir: Path, dry_run: bool) -> dict:
     try:
         from director_planner import plan_director
         result = plan_director(text, output_dir, dry_run)
+        # Lock the intended production medium before providers can downgrade it.
+        result.setdefault("delivery_promise", classify_from_brief("cinematic", {}).to_dict())
         result["duration_s"] = _elapsed(start)
         return result
     except Exception as e:
@@ -807,6 +824,7 @@ def run_phase2(text: str, output_dir: Path, duration: int, dry_run: bool, report
         if reporter:
             reporter.step("phase2", "生成分镜", progress_pct=90)
         storyboard = generate_storyboard(adapted_shots, characters_list)
+        annotate_shot_pacing(storyboard.get("shots", []))
 
         # 写出文件
         storyboard_path = output_dir / "STORYBOARD.json"
@@ -3104,7 +3122,7 @@ def run_phase6(output_dir: Path, dry_run: bool, storyboard_data: dict = None) ->
         print("  → scene_variation_check: 检查场景变化...")
         scenes = storyboard_data.get("shots", [])
         if scenes:
-            variation_result = _check_scene_variation(scenes)
+            variation_result = check_scene_variation(scenes)
             variation_report_path = output_dir / "variation_report.json"
             variation_report_path.write_text(json.dumps(variation_result, ensure_ascii=False, indent=2))
             outputs.append("variation_report.json")
@@ -3126,7 +3144,7 @@ def run_phase6(output_dir: Path, dry_run: bool, storyboard_data: dict = None) ->
         print("  → slideshow_risk_score: 评估幻灯片风险...")
         scenes = storyboard_data.get("shots", [])
         if scenes:
-            slideshow_result = _score_slideshow_risk(scenes)
+            slideshow_result = score_slideshow_risk(scenes)
             slideshow_report_path = output_dir / "slideshow_risk_report.json"
             slideshow_report_path.write_text(json.dumps(slideshow_result, ensure_ascii=False, indent=2))
             outputs.append("slideshow_risk_report.json")
