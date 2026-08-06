@@ -1,4 +1,4 @@
-"""Seven-dimension provider ranking adapted from OpenMontage scoring."""
+"""HonCut seven-dimension provider ranking."""
 from dataclasses import asdict, dataclass
 from typing import Any
 @dataclass

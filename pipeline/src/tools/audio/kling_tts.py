@@ -41,7 +41,7 @@ class KlingTTS(BaseTool):
     dependencies = ["env:KLING_API_KEY"]
     install_instructions = (
         "Set KLING_API_KEY in .env for the official Kling API. "
-        "Pass voice_id explicitly; OpenMontage does not guess Kling voice IDs."
+        "Pass voice_id explicitly; HonCut does not guess Kling voice IDs."
     )
     agent_skills = ["kling-official", "text-to-speech"]
 
@@ -130,7 +130,7 @@ class KlingTTS(BaseTool):
             {
                 "paid_api": True,
                 "cost_estimate_confidence": "low",
-                "cost_estimate_basis": "Conservative character-based OpenMontage estimate pending official account-usage reconciliation.",
+                "cost_estimate_basis": "Conservative character-based HonCut estimate pending official account-usage reconciliation.",
             }
         )
         return result

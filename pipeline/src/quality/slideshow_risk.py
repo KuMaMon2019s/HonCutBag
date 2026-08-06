@@ -1,6 +1,6 @@
 """Score six structural signals that make a video feel like a slideshow.
 
-Adapted from OpenMontage ``lib/slideshow_risk.py`` for HonCut's shot lists.
+Scores slideshow risk for HonCut shot lists.
 Lower scores are better.
 """
 

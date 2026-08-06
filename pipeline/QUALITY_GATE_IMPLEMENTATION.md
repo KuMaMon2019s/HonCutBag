@@ -1,7 +1,7 @@
 # Quality Gate System - Implementation Summary
 
 ## Overview
-Successfully implemented a unified quality gate system for the HonCut pipeline, inspired by Toonflow's supervision layer. The system prevents pipeline progression when critical artifacts are missing, addressing the issue where Phase 5 video generation wasted 25 minutes of Seedance API calls despite Phase 3 character image generation failures.
+Successfully implemented a unified quality gate system for the HonCut pipeline, inspired by HonCut's supervision layer. The system prevents pipeline progression when critical artifacts are missing, addressing the issue where Phase 5 video generation wasted 25 minutes of Seedance API calls despite Phase 3 character image generation failures.
 
 ## Files Created/Modified
 
@@ -16,7 +16,7 @@ Successfully implemented a unified quality gate system for the HonCut pipeline, 
   - `run_quality_check()`: Main entry point for quality validation
   - `_check_red_line()`: Validates individual red line rules
   - `_get_suggestion()`: Provides actionable suggestions for failures
-  - `_print_report()`: Displays Toonflow-style quality reports
+  - `_print_report()`: Displays HonCut-style quality reports
 
 ### 2. `/Users/soda/projects/honcut/pipeline/src/pipeline_runner.py` (MODIFIED)
 - **Changes**: Added quality gate checks at 6 phase boundaries
@@ -96,7 +96,7 @@ Successfully implemented a unified quality gate system for the HonCut pipeline, 
 2. **Red Line System**: Critical checks that block pipeline progression
 3. **Dimension System**: Quality metrics that generate warnings but don't block
 4. **Actionable Suggestions**: Each failure includes specific troubleshooting guidance
-5. **Toonflow-Style Reports**: Visual quality reports with grades and issue lists
+5. **HonCut-Style Reports**: Visual quality reports with grades and issue lists
 6. **Flexible File Detection**: Handles both flat and nested directory structures
 7. **FFprobe Integration**: Validates video/audio streams using ffprobe
 

@@ -1,4 +1,4 @@
-"""Pre-render composition checks adapted from OpenMontage."""
+"""Pre-render composition checks for HonCut."""
 from pathlib import Path
 from typing import Any,Callable
 def validate_composition(composition:dict[str,Any],assets_root:str|Path,probe_duration:Callable[[Path],float|None]|None=None)->dict[str,Any]:

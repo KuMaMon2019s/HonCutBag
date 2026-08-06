@@ -1,4 +1,4 @@
-"""Toonflow three-part prompt: visual content, lighting, then concise style."""
+"""HonCut three-part prompt: visual content, lighting, then concise style."""
 from dataclasses import dataclass
 @dataclass(frozen=True)
 class ThreePartPrompt:

@@ -1,4 +1,4 @@
-"""Emotion-aware Chinese dialogue timing adapted from Toonflow's storyboard rules."""
+"""Emotion-aware Chinese dialogue timing for HonCut storyboard rules."""
 import math
 import re
 from typing import Any
@@ -19,7 +19,7 @@ def count_spoken_characters(dialogue: str) -> int:
     return len(re.findall(r"[\w\u3400-\u9fff]", dialogue, flags=re.UNICODE))
 
 def estimate_speech_duration(dialogue: str, emotion: str | None = None, pause_seconds: float = .4, safety_seconds: float = 1.0) -> int:
-    """Return Toonflow's ceil(chars/rate + punctuation pauses + safety)."""
+    """Return HonCut's ceil(chars/rate + punctuation pauses + safety)."""
     if not dialogue or dialogue.strip() in {"无台词", "none", "No dialogue"}: return 0
     rate = SPEECH_RATES[pacing_tier(emotion)]
     pauses = len(re.findall(r"[，。！？、；：,.!?;:…—]", dialogue)) * pause_seconds

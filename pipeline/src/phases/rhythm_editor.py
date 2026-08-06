@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Optional
 
 # ---------------------------------------------------------------------------
-# OpenMontage 工具可选导入（graceful fallback 到 ffmpeg）
+# 第三方兼容工具可选导入（graceful fallback 到 ffmpeg）
 # ---------------------------------------------------------------------------
 OM_TOOLS_DIR = str(Path(__file__).resolve().parent.parent.parent / "vendor" / "openmontage" / "tools")
 OM_AVAILABLE = False

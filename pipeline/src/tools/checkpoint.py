@@ -1,4 +1,4 @@
-"""Atomic stage checkpoint persistence adapted from OpenMontage."""
+"""Atomic HonCut stage checkpoint persistence."""
 import json, os
 from datetime import datetime, timezone
 from pathlib import Path

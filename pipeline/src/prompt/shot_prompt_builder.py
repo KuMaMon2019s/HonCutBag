@@ -1,4 +1,4 @@
-"""Five-layer cinematography prompt builder adapted from OpenMontage."""
+"""HonCut five-layer cinematography prompt builder."""
 from typing import Any
 SHOT={"wide":"wide shot capturing full scene","medium":"medium shot from waist up","close_up":"close-up focusing on face or detail","establishing":"establishing shot setting the location"}
 MOVE={"dolly_in":"slow dolly in toward subject","tracking_left":"tracking shot moving left alongside subject","handheld":"handheld camera with natural movement","orbital":"orbital camera circling subject"}

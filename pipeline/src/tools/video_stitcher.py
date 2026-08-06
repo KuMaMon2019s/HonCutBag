@@ -1,4 +1,4 @@
-"""Transition planning adapted from OpenMontage's FFmpeg stitch tool."""
+"""HonCut transition planning for FFmpeg stitching."""
 from dataclasses import dataclass
 from typing import Any
 TRANSITIONS={"cut","crossfade","fade_through_black"}

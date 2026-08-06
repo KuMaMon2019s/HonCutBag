@@ -7,7 +7,7 @@
   3. 片头（标题卡，2-3 秒，淡入）
   4. 片尾（演员表/制作信息，3-5 秒，淡出）
 
-优先使用 OpenMontage 工具，不可用时 graceful fallback 到 ffmpeg。
+优先使用 HonCut 工具，不可用时 graceful fallback 到 ffmpeg。
 
 Usage:
     python visual_post.py --input audio_mixed.mp4 --title "雪狼传说" --output visual_final.mp4
@@ -27,13 +27,13 @@ from pathlib import Path
 from typing import Optional
 
 # ---------------------------------------------------------------------------
-# OpenMontage 工具路径
+# 第三方兼容工具路径
 # ---------------------------------------------------------------------------
 OM_TOOLS_DIR = Path(__file__).resolve().parent.parent.parent / "vendor" / "openmontage" / "tools"
 OM_AVAILABLE = OM_TOOLS_DIR.exists()
 
 if OM_AVAILABLE:
-    _om_parent = OM_TOOLS_DIR.parent  # .../OpenMontage/
+    _om_parent = OM_TOOLS_DIR.parent  # vendor package root
     if str(_om_parent) not in sys.path:
         sys.path.insert(0, str(_om_parent))
 
@@ -413,7 +413,7 @@ def add_intro(
 
 def add_outro(
     video_path: str,
-    credits_text: str = "Made with AI\nPowered by OpenMontage",
+    credits_text: str = "Made with AI\nPowered by HonCut",
     duration: float = 4.0,
     output_path: str = "with_outro.mp4",
 ) -> str:
@@ -570,7 +570,7 @@ def process_visual(
         # Step 4: 片尾
         if enable_outro:
             print("─" * 40)
-            credits = f"{title or 'Project'}\n\nMade with AI\nPowered by OpenMontage"
+            credits = f"{title or 'Project'}\n\nMade with AI\nPowered by HonCut"
             with_outro = os.path.join(tmpdir, "with_outro.mp4")
             current = add_outro(current, credits, output_path=with_outro)
             print()

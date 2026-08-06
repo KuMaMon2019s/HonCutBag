@@ -1,6 +1,6 @@
 # 分镜提示词技巧（精简版）
 
-> 来源: ToonFlow storyboard_prompt_techniques.md — 仅保留核心技巧供 Phase 2.5 使用
+> 来源: HonCut 内部规范 storyboard_prompt_techniques.md — 仅保留核心技巧供 Phase 2.5 使用
 
 ## 核心原则
 

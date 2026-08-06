@@ -157,7 +157,7 @@ class KlingAvatar(BaseTool):
             {
                 "paid_api": True,
                 "cost_estimate_confidence": "low",
-                "cost_estimate_basis": "Conservative OpenMontage avatar estimate pending official account-usage reconciliation.",
+                "cost_estimate_basis": "Conservative HonCut avatar estimate pending official account-usage reconciliation.",
             }
         )
         return result

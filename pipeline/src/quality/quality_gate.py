@@ -1,6 +1,6 @@
 """Unified quality gate with per-phase rule routing.
 
-Architecture learned from Toonflow's supervision layer:
+HonCut supervision architecture:
 - ONE quality gate module, multiple rule sets routed by phase key
 - Red lines (CRITICAL): violate → block pipeline
 - Dimensions (WARNING): graded A/B/C/D
@@ -364,7 +364,7 @@ def _get_suggestion(rule_id: str) -> str:
 
 
 def _print_report(report: QualityReport, phase_name: str) -> None:
-    """Print quality report in Toonflow supervision style."""
+    """Print a HonCut quality supervision report."""
     status = "✅ 通过" if report.passed else "❌ 未通过（红线违反）"
     print(f"\n  ┌─ 质检报告: {phase_name} ─────────────────")
     print(f"  │ 评分: {report.grade}  {status}")
@@ -384,11 +384,11 @@ def _print_report(report: QualityReport, phase_name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# M5: 监督层审核（学 Toonflow 监督层）
+# M5: HonCut 监督层审核
 # ---------------------------------------------------------------------------
 
 def run_storyboard_review(storyboard_data: dict, script_text: str, characters: list) -> dict:
-    """学 Toonflow 监督层：审核分镜表质量。
+    """按 HonCut 监督规范审核分镜表质量。
     
     4 条红线（违反即严重）：
     R1: 资产引用合法（角色/场景必须在 characters 中存在）
@@ -448,25 +448,25 @@ def run_storyboard_review(storyboard_data: dict, script_text: str, characters: l
                 if q not in script_text:
                     severe_issues.append(f"[R2] {shot_id}: 台词 '{q[:20]}...' 不在原文中")
         
-        # P0-2b: 片段时长检查（Toonflow 铁律: ≤15秒）
+        # P0-2b: 片段时长检查（HonCut 铁律: ≤15秒）
         duration = shot.get("suggested_duration", shot.get("duration", 0))
         if duration and duration > 15:
             severe_issues.append(f"[时长] {shot_id}: {duration}s 超过15秒上限")
         
-        # P0-2c: 长台词拆镜检查（Toonflow 铁律: >20字强制拆镜）
+        # P0-2c: 长台词拆镜检查（HonCut 铁律: >20字强制拆镜）
         dialogue = shot.get("dialogue", shot.get("what", ""))
         dialogue_text = re.findall(r'["「](.+?)["」]', dialogue)
         for d in dialogue_text:
             if len(d) > 20:
                 moderate_issues.append(f"[拆镜] {shot_id}: 台词'{d[:15]}...'({len(d)}字) 建议拆镜")
         
-        # P0-2f: 禁光影色调词（Toonflow: 分镜不规划光影/色调/配乐）
+        # P0-2f: 禁光影色调词（HonCut: 分镜不规划光影/色调/配乐）
         banned_visual_words = ["色调", "光影", "配乐", "BGM", "背景音乐", "色温", "饱和度", "对比度"]
         for bw in banned_visual_words:
             if bw in visual:
                 moderate_issues.append(f"[禁词] {shot_id}: visual 含 '{bw}'（应由后期处理）")
     
-    # P0-2d: 在场人物不消失检查（Toonflow 铁律）
+    # P0-2d: 在场人物不消失检查（HonCut 铁律）
     for i in range(1, len(shots)):
         prev_who = set(shots[i-1].get("who", []))
         curr_who = set(shots[i].get("who", []))
@@ -477,7 +477,7 @@ def run_storyboard_review(storyboard_data: dict, script_text: str, characters: l
                 moderate_issues.append(
                     f"[消失] S{i+1:02d}: {', '.join(disappeared)} 在同场景中消失")
     
-    # P0-2g: 景别视角错开检查（Toonflow: 相邻镜头不应同景别同角度）
+    # P0-2g: 景别视角错开检查（HonCut: 相邻镜头不应同景别同角度）
     for i in range(1, len(shots)):
         prev_cam = shots[i-1].get("camera", "")
         curr_cam = shots[i].get("camera", "")

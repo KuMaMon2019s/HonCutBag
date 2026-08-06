@@ -271,7 +271,7 @@ def _build_shot_prompt(shot: Dict[str, Any], characters: Optional[List[Dict[str,
     emotion = shot.get("emotion", "")
     where = shot.get("where", "")
 
-    # --- P0-B: Identity Anchor（参考 OpenMontage seedance-prompting.md L47）---
+    # --- P0-B: Identity Anchor（参考 HonCut 内部提示词规范）---
     # 从 characters 提取角色 3-6 个视觉特征，逐字复述到每个镜头 prompt
     try:
         characters_map = {}
@@ -356,7 +356,7 @@ def generate_storyboard(
     # 构建角色映射
     characters_map = _build_characters_map(characters)
 
-    # --- P1-B1: 同场景共享视觉参数（参考 OpenMontage shot_prompt_builder 5层构建）---
+    # --- P1-B1: 同场景共享视觉参数（参考 HonCut 五层镜头构建）---
     # 同场景镜头共享 Layer 3-5（Subject/Lighting/Style），只有 Layer 1-2（Camera/Movement）随镜头变
     scene_style_map = {}  # {where: style_suffix}
     for shot in shots:

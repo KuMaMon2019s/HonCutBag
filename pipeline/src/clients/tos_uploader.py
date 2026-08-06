@@ -1,6 +1,6 @@
 """Volcano TOS (Object Storage) uploader for Seedance reference images.
 
-Ported from Toonflow's volcengineSd2.ts — TOS4-HMAC-SHA256 signing.
+Ported for HonCut's volcengineSd2.ts — TOS4-HMAC-SHA256 signing.
 Uploads images to TOS and returns pre-signed URLs for Seedance API.
 """
 
@@ -182,10 +182,10 @@ def get_signed_url(object_key: str, expires: int = 7200) -> str:
     return f"https://{host}/{object_key}?{canonical_qs}&X-Tos-Signature={signature}"
 
 
-# ─── Image compression (P0-E, ref: Toonflow zipImage) ────────────────────────
+# ─── Image compression (P0-E, ref: HonCut spec zipImage) ────────────────────────
 
 def compress_image_base64(b64_data: str, max_bytes: int = 300 * 1024) -> str:
-    """压缩 base64 图片到目标大小以下（参考 Toonflow zipImage）。
+    """压缩 base64 图片到目标大小以下（参考 HonCut 规范 zipImage）。
     
     策略：先降 quality，再降分辨率，循环直到 < max_bytes。
     """
@@ -252,7 +252,7 @@ def upload_image(image_data: bytes, content_type: str = "image/png") -> Optional
         print("  [tos] TOS config incomplete (need TOS_ACCESS_KEY, TOS_SECRET_KEY, TOS_BUCKET), skipping upload")
         return None
 
-    # --- P0-E: 上传前压缩（参考 Toonflow zipImage）---
+    # --- P0-E: 上传前压缩（参考 HonCut 规范 zipImage）---
     image_data = compress_image_bytes(image_data)
 
     # Object key with content hash for dedup
@@ -313,7 +313,7 @@ def base64_to_signed_url(base64_data: str) -> Optional[str]:
     if "," in base64_data:
         base64_data = base64_data.split(",", 1)[1]
 
-    # --- P0-E: 上传前压缩（参考 Toonflow zipImage）---
+    # --- P0-E: 上传前压缩（参考 HonCut 规范 zipImage）---
     base64_data = compress_image_base64(base64_data)
 
     try:

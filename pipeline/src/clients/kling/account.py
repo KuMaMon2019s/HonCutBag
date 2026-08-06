@@ -1,6 +1,6 @@
 """Account usage diagnostics for Kling official API.
 
-This module is a low-frequency helper, not an OpenMontage registry tool.
+This module is a low-frequency helper, not an HonCut registry tool.
 """
 
 from __future__ import annotations

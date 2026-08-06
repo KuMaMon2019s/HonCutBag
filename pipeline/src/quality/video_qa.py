@@ -1,6 +1,6 @@
 """Phase 8.5: Video QA — 抽帧分析硬性质检
 
-Inspired by OpenMontage FrameSampler / VisualQA / VideoUnderstand / final_review.
+Combines HonCut frame sampling, visual QA, video understanding, and final review.
 Runs after Phase 8 (polished.mp4) to verify final output quality.
 
 Checks:

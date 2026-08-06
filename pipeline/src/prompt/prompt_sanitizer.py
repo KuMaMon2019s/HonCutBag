@@ -1,4 +1,4 @@
-"""Remove Toonflow's universal image-quality downgrade phrases."""
+"""Remove universal image-quality downgrade phrases from HonCut prompts."""
 import re
 REPLACEMENTS={"film grain":"subtle cinematic texture","胶片颗粒":"轻微电影质感","imperfect focus":"","失焦":"","edges not perfectly sharp":"","slight natural deviation":"","not completely stable":"","blurry background":"background bokeh, subject in sharp focus","柔焦":"","朦胧感":""}
 def sanitize_quality_prompt(prompt:str)->str:

@@ -197,7 +197,7 @@ class Models:
 class ToolPaths:
     """外部工具路径配置"""
     
-    # OpenMontage 工具目录
+    # 第三方兼容工具目录
     OM_TOOLS_DIR: Path = Path(__file__).resolve().parent.parent.parent / "vendor" / "openmontage"
     
     # HonCut 项目目录

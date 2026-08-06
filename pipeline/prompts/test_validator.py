@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """测试提示词验证脚本"""
 
-from prompt_validator import validate_prompt
+from prompt.prompt_validator import validate_prompt
 
 # v1 简化版提示词（应该失败）
 v1_prompt = """

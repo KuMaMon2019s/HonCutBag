@@ -1,4 +1,4 @@
-"""Toonflow-compatible @图N asset binding."""
+"""HonCut-compatible @图N asset binding."""
 import re
 from typing import Any
 def build_asset_bindings(assets:list[dict[str,Any]],shots:list[dict[str,Any]]|None=None)->dict[str,str]:

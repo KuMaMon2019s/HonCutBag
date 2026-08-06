@@ -1,4 +1,4 @@
-"""Lock and validate one of eight delivery promises, adapted from OpenMontage."""
+"""Lock and validate one of eight HonCut delivery promises."""
 from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Any

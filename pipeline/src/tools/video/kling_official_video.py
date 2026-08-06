@@ -208,7 +208,7 @@ class KlingOfficialVideo(BaseTool):
             {
                 "paid_api": True,
                 "cost_estimate_confidence": "low",
-                "cost_estimate_basis": "Conservative OpenMontage estimate; official account usage reconciliation is planned for Phase 2.",
+                "cost_estimate_basis": "Conservative HonCut estimate; official account usage reconciliation is planned for Phase 2.",
             }
         )
         return result

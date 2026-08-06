@@ -1,6 +1,6 @@
 # 衍生资产提取规则（精简版）
 
-> 来源: ToonFlow production_execution_derive_assets.md — 仅保留核心规则供 Phase 3 使用
+> 来源: HonCut 内部规范 production_execution_derive_assets.md — 仅保留核心规则供 Phase 3 使用
 
 ## 核心原则
 

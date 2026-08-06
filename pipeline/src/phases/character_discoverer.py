@@ -82,7 +82,7 @@ USER_PROMPT_TEMPLATE = (
     "- first_appearance: 首次出场的事件 ID（整数）\n"
     "- appearance_count: 出场次数（整数）\n"
     "- relationships: 与其他角色的关系数组（可选），每项含 target_id, type, description\n\n"
-    "【衍生状态检测（学 Toonflow derive_assets）】\n"
+    "【衍生状态检测（HonCut derive_assets 规范）】\n"
     "分析每个角色在故事中是否有明显的状态变化（如淋湿、换装、受伤、变身）。\n"
     "如果有，在角色输出的 appearance 中增加 variants 字段：\n"
     "- variants: 数组，每项包含 {{state_name: '淋湿', description: '头发湿透贴在脸上，衬衫被雨淋湿半透明'}}\n"

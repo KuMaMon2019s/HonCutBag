@@ -94,7 +94,7 @@ for d in (PHASE28_DIR, PHASE47_DIR, str(OM_TOOLS_DIR)):
 
 
 # ---------------------------------------------------------------------------
-# Media Profiles — delegate to OpenMontage lib.media_profiles
+# Media Profiles — delegate to the bundled compatibility module
 # ---------------------------------------------------------------------------
 import dataclasses as _dc
 
@@ -189,7 +189,7 @@ def _ensure_dir(p: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Checkpoint — 断点续跑（灵感来自 OpenMontage/lib/checkpoint.py）
+# Checkpoint — HonCut 断点续跑
 # ---------------------------------------------------------------------------
 # 格式: {
 #   "completed": ["phase2", "phase2_5", ...],
@@ -893,7 +893,7 @@ def run_phase2(text: str, output_dir: Path, duration: int, dry_run: bool, report
 # ---------------------------------------------------------------------------
 
 def load_storyboard_prompt_techniques() -> str:
-    """加载分镜提示词技巧（来源: ToonFlow storyboard_prompt_techniques.md）
+    """加载 HonCut 分镜提示词技巧。
 
     返回精简版提示词技巧文本，追加到分镜生成 prompt 中，
     增强镜头语言、构图规则和画质控制。
@@ -912,7 +912,7 @@ def fill_storyboard_template(template: str, storyboard_data: dict, characters_da
 
     从 STORYBOARD.json 提取镜头描述，从 CHARACTERS.json 提取角色描述，
     替换模板中的占位符。
-    集成 ToonFlow 分镜提示词技巧（镜头语言、构图规则、画质控制）。
+    集成 HonCut 分镜提示词技巧（镜头语言、构图规则、画质控制）。
 
     注意：只提取代码块内的提示词部分，忽略文档说明。
     """
@@ -963,7 +963,7 @@ def fill_storyboard_template(template: str, storyboard_data: dict, characters_da
     prompt = prompt.replace("{{PANEL_COUNT}}", str(panel_count))
     prompt = prompt.replace("{{STYLE}}", style)
 
-    # 追加 ToonFlow 分镜提示词技巧参考
+    # 追加 HonCut 分镜提示词技巧参考
     techniques = load_storyboard_prompt_techniques()
     if techniques:
         prompt += "\n\n---\n# 分镜提示词技巧参考\n\n"
@@ -1528,7 +1528,7 @@ def _generate_shot_images(output_dir: Path, storyboard_data: dict) -> int:
 
         generated_count = 0
         
-        # --- P2-5d: Concurrent shot image generation (learned from Toonflow concurrentCount) ---
+        # --- P2-5d: HonCut concurrent shot image generation ---
         def _gen_shot_image(shot_item):
             """Single shot image generation logic (for concurrent calls)"""
             shot_id = _normalize_shot_id(shot_item)
@@ -1723,7 +1723,7 @@ def run_phase2_5(storyboard_data: dict, characters_data: dict, output_dir: Path,
                 if not composition_report["valid"]:
                     return {"status": "error", "error": "Storyboard composition validation failed", "composition_report": composition_report, "duration_s": _elapsed(start)}
 
-                # --- P0-A: 场景参考图生成（学 Toonflow 场景资产）---
+                # --- P0-A: HonCut 场景参考图生成 ---
                 try:
                     scenes_dir = output_dir / "scenes"
                     scenes_dir.mkdir(exist_ok=True)
@@ -1840,7 +1840,7 @@ def run_phase2_5(storyboard_data: dict, characters_data: dict, output_dir: Path,
 # ---------------------------------------------------------------------------
 
 def detect_derive_assets(characters_data: dict) -> list:
-    """检测衍生资产（来源: ToonFlow derive_assets 方法论）
+    """按 HonCut 规范检测衍生资产。
 
     读取 CHARACTERS.json，检测角色是否有变身/换装描述，
     返回衍生资产列表。
@@ -1919,7 +1919,7 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
             print("  ⊘ 无角色数据，跳过")
             return {"status": "skipped", "reason": "no characters", "duration_s": _elapsed(start)}
 
-        # Step 3.1: 衍生资产检测（ToonFlow 方法论）
+        # Step 3.1: HonCut 衍生资产检测
         print("  → 检测衍生资产（变身/换装状态）...")
         derive_assets = detect_derive_assets(characters_data)
         if derive_assets:
@@ -2346,7 +2346,7 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
         print(f"  → 已加载故事板风格参考图")
 
     outputs = []
-    # --- P1-C: Seed Locking（参考 OpenMontage asset_manifest seed）---
+    # --- P1-C: Seed Locking（参考 HonCut asset_manifest seed）---
     # 同场景镜头使用相同 seed，确保背景一致性
     scene_seed_map = {}  # {where: seed}
     prev_shot_dir = None  # --- P1-D2: 上一镜头视频作为运动参考 ---
@@ -2431,7 +2431,7 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
         first_frame_b64 = None
         prompt_lower = prompt.lower()
 
-        # --- P0-C: 资产ID绑定匹配（学 Toonflow associateAssetsIds）---
+        # --- P0-C: HonCut 资产ID绑定匹配（associateAssetsIds）---
         # --- P1-A4: 衍生参考图匹配（char:id:state → variant_state.png）---
         associate_assets = meta.get("associate_assets", [])
         if associate_assets and first_frame_b64 is None:
@@ -2996,7 +2996,7 @@ def run_phase7(output_dir: Path, dry_run: bool,
     )
     clip_paths = stitch_plan.clips
 
-    # 调用 edit_decisions 架构（从 OpenMontage VideoCompose 学习）
+    # 调用 HonCut edit_decisions 架构
     try:
         from phases.edit_decisions import build_edit_decisions, execute_edit_decisions
         
@@ -4404,7 +4404,7 @@ def run_pipeline(
         # 写入 checkpoint
         _record_stage_checkpoint(output_path, "phase2", p2)
 
-    # --- P2-5b: 质检阻断（学 Toonflow 监督层）---
+    # --- P2-5b: HonCut 质检阻断 ---
     try:
         p2_result = report["phases"].get("2") or report["phases"].get("phase2", {})
         review = p2_result.get("storyboard_review", {})

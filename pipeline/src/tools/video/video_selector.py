@@ -169,7 +169,7 @@ class VideoSelector(BaseTool):
             },
             "callback_url": {
                 "type": "string",
-                "description": "Provider-specific callback URL. Current OpenMontage providers still poll by default.",
+                "description": "Provider-specific callback URL. Current HonCut providers still poll by default.",
             },
             "external_task_id": {
                 "type": "string",

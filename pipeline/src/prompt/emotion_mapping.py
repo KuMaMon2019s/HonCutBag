@@ -1,6 +1,6 @@
 """Emotion → facial expression / eye / lighting mapping for video prompts.
 
-Learned from Toonflow's director_storyboard.md (realpeople_urban_modern style).
+Supports HonCut's realpeople_urban_modern storyboard style.
 Used by storyboard_generator.py to enrich prompts with emotion-specific details.
 """
 

@@ -1,4 +1,4 @@
-"""Eight structural scene-variation checks adapted from OpenMontage."""
+"""Eight structural scene-variation checks for HonCut."""
 
 from collections import Counter
 from typing import Any

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-prompt_router.py — M4: 模型路由（学 Toonflow 4 种提示词模式）
+prompt_router.py — M4: HonCut 模型路由（4 种提示词模式）
 按模型名自动匹配提示词格式。
 """
 
@@ -68,7 +68,7 @@ def _build_seedance2_multi(shot_data: dict, assets: list) -> str:
         parts.append(f"分镜{i} {dur}s: 时间：{time_desc}，场景：{where}，"
                      f"镜头：{camera}，{who}，{visual}")
         
-        # 12维编码补充（学 Toonflow）
+        # HonCut 12维编码补充
         dims = []
         if shot.get("action"): dims.append(f"动作：{shot['action']}")
         if shot.get("expression"): dims.append(f"表情：{shot['expression']}")
@@ -145,7 +145,7 @@ def _build_generic_first_last_frame(shot_data: dict) -> str:
 
 
 def _build_generic_multi_ref(shot_data: dict, assets: list) -> str:
-    """通用多参模式：[References] + [Instruction]（学 Toonflow）"""
+    """HonCut 通用多参模式：[References] + [Instruction]。"""
     parts = []
     # References 段
     if assets:

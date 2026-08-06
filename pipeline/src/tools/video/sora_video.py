@@ -62,7 +62,7 @@ class SoraVideo(BaseTool):
     best_for = [
         "OpenAI Sora 2 / Sora 2 Pro clips from the project .env credentials",
         "short cinematic product-ad inserts with native ambience or dialogue",
-        "4, 8, or 12 second social-video clips that OpenMontage can stitch and compose",
+        "4, 8, or 12 second social-video clips that HonCut can stitch and compose",
     ]
     not_good_for = ["offline generation", "long continuous scenes", "projects without Sora API access"]
     fallback_tools = ["veo_video", "gemini_omni_video", "seedance_video", "kling_video", "minimax_video"]

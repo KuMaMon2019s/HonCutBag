@@ -1,4 +1,4 @@
-"""Unified Toonflow-style vendor/model adapter contract."""
+"""Unified HonCut vendor/model adapter contract."""
 from abc import ABC
 from dataclasses import dataclass,field
 from typing import Any

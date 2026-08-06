@@ -146,7 +146,7 @@ Phase 7 attempts to assemble video clips into a final video, but:
 ```
 
 ### Root Cause Analysis
-The OpenMontage (OM) tools require `lib.scoring` module, which is not available in the current environment. The pipeline correctly falls back to the Seedream API.
+The HonCut tools require `lib.scoring` module, which is not available in the current environment. The pipeline correctly falls back to the Seedream API.
 
 ### Impact
 - Phase 2.5 still succeeded using Seedream API

@@ -2,7 +2,7 @@
 """
 audio_pipeline.py — Enhanced audio post-processing with OM AudioMixer capabilities
 
-Integrates FFmpeg-based audio processing inspired by OpenMontage AudioMixer:
+Integrates HonCut FFmpeg-based audio processing:
 - Loudness normalization (loudnorm filter, target -14 LUFS)
 - Audio fade in/out (afade filter)
 - Background music ducking (sidechaincompress)

@@ -1,9 +1,9 @@
-"""Edit decisions builder and executor — learned from OpenMontage VideoCompose.
+"""HonCut edit decisions builder and executor.
 
 Builds structured edit_decisions from shot videos, then executes
 frame-accurate assembly with normalization, transitions, and audio handling.
 
-Key capabilities (from OpenMontage):
+Key capabilities:
 1. Frame-accurate trimming (blackdetect + static frame removal)
 2. Segment normalization (resolution/fps/codec/pix_fmt/sar)
 3. Silent audio track injection (anullsrc for clips without audio)
@@ -297,7 +297,7 @@ def execute_edit_decisions(edit_decisions: dict, output_path: str) -> dict:
 # ─── P2-B: Boundary Frame Consistency Check ──────────────────────────────────
 
 def check_boundary_consistency(video_a: Path, video_b: Path) -> dict:
-    """检查两个相邻视频的边界帧一致性（参考 OpenMontage frame_sampler）。
+    """检查两个相邻视频的边界帧一致性（参考 HonCut frame sampler）。
 
     Returns:
         {"consistent": bool, "issues": [...], "recommended_transition": str}
@@ -395,7 +395,7 @@ def _xfade_chain(segments: list, transitions: list, output_path: Path,
         ttype = t["type"]
         tdur = t.get("duration", 0.5)
 
-        # --- P2-B: 边界帧一致性检查（参考 OpenMontage AI Clip Chaining）---
+        # --- P2-B: 边界帧一致性检查（参考 HonCut AI Clip Chaining）---
         try:
             boundary = check_boundary_consistency(Path(segments[i]), Path(segments[i + 1]))
             if not boundary["consistent"]:

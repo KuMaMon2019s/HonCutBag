@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-artifact_chain.py — M6: 产物链 + Checkpoint（学 OpenMontage）
+artifact_chain.py — M6: HonCut 产物链 + Checkpoint
 每阶段产出结构化 JSON 产物，支持从任意阶段恢复。
 """
 
@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 
-# 产物链定义（学 OpenMontage cinematic.yaml）
+# HonCut 产物链定义
 ARTIFACT_CHAIN = {
     "phase1":   {"produces": "director_plan.json",                    "requires": []},
     "phase2":   {"produces": "events.json + characters.json + storyboard.json", "requires": ["director_plan.json"]},
@@ -51,7 +51,7 @@ def save_checkpoint(phase: str, output_dir: Path, artifacts: dict = None) -> Pat
     
     checkpoint_path = output_dir / f"checkpoint_{phase}.json"
 
-    # --- P2-5a: 历史归档（学 OpenMontage）---
+    # --- P2-5a: HonCut 历史归档 ---
     try:
         if checkpoint_path.exists():
             history_dir = output_dir / "history"
