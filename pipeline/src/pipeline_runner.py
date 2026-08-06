@@ -28,7 +28,7 @@ from slideshow_risk import score_slideshow_risk
 from variation_checker import check_scene_variation
 from delivery_promise import classify_from_brief
 from speech_pacing import annotate_shot_pacing
-from base_tool import BaseTool
+from base_tool import BaseTool, ToolResult, ToolRuntime
 from checkpoint import write_checkpoint as write_stage_checkpoint
 from provider_scoring import rank_providers
 from video_composer import lock_runtime
@@ -38,7 +38,7 @@ from asset_binder import bind_assets
 from prompt_sanitizer import sanitize_quality_prompt
 from three_part_prompt import build_three_part_prompt
 from composition_validator import validate_composition
-from vendor_adapter import VendorAdapter
+from vendor_adapter import VendorAdapter, VendorModel
 
 # Keep progress visible when invoked through ``conda run | tee``.
 if hasattr(sys.stdout, "reconfigure"):
@@ -207,60 +207,23 @@ def _checkpoint_path(output_dir: Path) -> Path:
     return Path(output_dir) / "checkpoint.json"
 
 
-def _write_checkpoint(output_dir: Path, phase_name: str, result: dict) -> Path:
-    """每个 Phase 完成后写入检查点。
-
-    更新 output_dir/checkpoint.json：
-    - 将 phase_name 加入 completed 列表（去重）
-    - 将 result 存入 results[phase_name]
-    - 更新 timestamp
-
-    使用原子写入（tmp + rename）防止写坏。
-    
-    如果 LangGraph 可用，同时写入 SQLite checkpoint。
-    """
+def _record_stage_checkpoint(output_dir: Path, phase_name: str, result: dict) -> Path:
+    """Persist a successful phase through the shared checkpoint module."""
     cp_path = _checkpoint_path(output_dir)
-    cp_path = Path(cp_path)
-
-    # 读取已有 checkpoint（如果有）
-    checkpoint = {"completed": [], "results": {}, "timestamp": ""}
-    if cp_path.exists():
-        try:
-            with open(cp_path, encoding="utf-8") as f:
-                checkpoint = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            checkpoint = {"completed": [], "results": {}, "timestamp": ""}
-
-    # 更新（只保存成功的 Phase）
     status = result.get("status", "")
     if status not in ("done", "skipped"):
-        # 失败的 Phase 不写入 checkpoint，避免 resume 时跳过
         return cp_path
-    
-    if phase_name not in checkpoint["completed"]:
-        checkpoint["completed"].append(phase_name)
-    # 只存可序列化的 result 摘要（去掉内部大对象）
     safe_result = {}
     for k, v in result.items():
         if k.startswith("_"):
-            continue  # 跳过内部数据（如 _storyboard, _characters）
+            continue
         try:
             json.dumps(v, default=str)
             safe_result[k] = v
         except (TypeError, ValueError):
             safe_result[k] = str(v)
-    checkpoint["results"][phase_name] = safe_result
-    checkpoint["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+    checkpoint = write_stage_checkpoint(cp_path, phase_name, safe_result)
 
-    # 原子写入 JSON checkpoint
-    tmp_path = cp_path.with_suffix(".json.tmp")
-    tmp_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(checkpoint, f, ensure_ascii=False, indent=2)
-    import os
-    os.replace(tmp_path, cp_path)
-
-    # 如果 LangGraph 可用，同时写入 SQLite checkpoint
     if LANGGRAPH_AVAILABLE:
         try:
             save_state_to_sqlite(checkpoint, output_dir, thread_id="pipeline_run")
@@ -389,7 +352,8 @@ if LANGGRAPH_AVAILABLE:
             shot_id_str = f"S{shot_id:02d}"
         else:
             shot_id_str = f"S{str(shot_id).zfill(2)}"
-        prompt = _build_shot_prompt(shot, style_context) or shot.get("prompt", "")
+        prompt_items = build_batch_prompts([shot], style_context)
+        prompt = (prompt_items[0]["prompt"] if prompt_items else "") or shot.get("prompt", "")
         duration = str(shot.get("duration", 5))
         aspect_ratio = shot.get("aspect_ratio", "16:9")
         
@@ -573,7 +537,29 @@ def run_phase1(text: str, output_dir: Path, dry_run: bool) -> dict:
         from director_planner import plan_director
         result = plan_director(text, output_dir, dry_run)
         # Lock the intended production medium before providers can downgrade it.
-        result.setdefault("delivery_promise", classify_from_brief("cinematic", {}).to_dict())
+        delivery_promise = classify_from_brief("cinematic", {}).to_dict()
+        result.setdefault("delivery_promise", delivery_promise)
+        plan = result.get("plan")
+        if isinstance(plan, dict):
+            plan.setdefault("delivery_promise", delivery_promise)
+            scenes = plan.get("scenes", [])
+            pacing_inputs = []
+            for scene in scenes:
+                dialogue = scene.get("dialogue") or scene.get("lines")
+                if not dialogue and scene.get("dialogue_words"):
+                    dialogue = "字" * int(scene["dialogue_words"])
+                pacing_inputs.append({
+                    "dialogue": dialogue or "",
+                    "emotion": scene.get("emotion_arc", ""),
+                })
+            pacing = annotate_shot_pacing(pacing_inputs)
+            for scene, annotation in zip(scenes, pacing):
+                scene["speech_pacing"] = {
+                    "duration_s": annotation["speech_duration_s"],
+                    "emotion": annotation["emotion"],
+                }
+            plan_path = Path(result.get("output", output_dir / "director_plan.json"))
+            plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
         result["duration_s"] = _elapsed(start)
         return result
     except Exception as e:
@@ -584,6 +570,27 @@ def run_phase1(text: str, output_dir: Path, dry_run: bool) -> dict:
 # ---------------------------------------------------------------------------
 # Phase 2: 编剧引擎 (text → STORYBOARD.json + CHARACTERS.json)
 # ---------------------------------------------------------------------------
+
+def _integrate_storyboard_prompts(storyboard: dict, characters: list[dict]) -> dict:
+    """Normalize generated prompts through the shared Phase 2 contracts."""
+    assets = [
+        {"id": character.get("id", index), "name": character.get("name", ""), "type": "角色"}
+        for index, character in enumerate(characters, 1)
+        if character.get("name")
+    ]
+    for shot in storyboard.get("shots", []):
+        visual = shot.get("prompt") or shot.get("visual") or shot.get("what") or "scene"
+        lighting = shot.get("lighting_key") or "natural cinematic lighting"
+        style = storyboard.get("style") or "cinematic"
+        prompt = build_three_part_prompt(str(visual), str(lighting), str(style))
+        referenced = shot.get("associate_assets") or shot.get("who") or []
+        referenced_names = {str(value) for value in referenced}
+        shot_assets = [
+            asset for asset in assets
+            if str(asset["id"]) in referenced_names or asset["name"] in referenced_names
+        ]
+        shot["prompt"] = sanitize_quality_prompt(bind_assets(prompt, shot_assets))
+    return storyboard
 
 def run_phase2(text: str, output_dir: Path, duration: int, dry_run: bool, reporter: Optional[ProgressReporter] = None) -> dict:
     """Phase 2: text_parser → event_extractor → character_discoverer → adaptation_engine → storyboard_generator"""
@@ -756,6 +763,7 @@ def run_phase2(text: str, output_dir: Path, duration: int, dry_run: bool, report
                 "total_duration": 15,
                 "style": "写实电影风格"
             }
+            _integrate_storyboard_prompts(mock_storyboard, mock_characters["characters"])
             
             if reporter:
                 reporter.step("phase2", f"dry-run: 生成 {len(mock_storyboard['shots'])} 个分镜", progress_pct=80)
@@ -824,6 +832,7 @@ def run_phase2(text: str, output_dir: Path, duration: int, dry_run: bool, report
         if reporter:
             reporter.step("phase2", "生成分镜", progress_pct=90)
         storyboard = generate_storyboard(adapted_shots, characters_list)
+        _integrate_storyboard_prompts(storyboard, characters_list)
         annotate_shot_pacing(storyboard.get("shots", []))
 
         # 写出文件
@@ -866,7 +875,7 @@ def run_phase2(text: str, output_dir: Path, duration: int, dry_run: bool, report
         except Exception as e:
             print(f"  ⚠ [M5] 分镜审核跳过: {e}")
 
-        return {
+        phase8_result = {
             "status": "done",
             "duration_s": _elapsed(start),
             "outputs": outputs,
@@ -1480,6 +1489,21 @@ def _generate_shot_images(output_dir: Path, storyboard_data: dict) -> int:
         storyboard_images_dir = output_dir / "storyboard_images"
         storyboard_images_dir.mkdir(exist_ok=True)
         shots = storyboard_data.get("shots", [])
+        prompt_scenes = []
+        for shot in shots:
+            prompt_scene = dict(shot)
+            prompt_scene.setdefault("description", shot.get("visual") or shot.get("prompt", ""))
+            prompt_scene.setdefault("shot_language", {
+                "shot_size": shot.get("shot_size"),
+                "camera_movement": shot.get("camera_movement"),
+                "lighting_key": shot.get("lighting_key"),
+            })
+            prompt_scenes.append(prompt_scene)
+        batch_prompts = build_batch_prompts(
+            prompt_scenes,
+            {"mood": storyboard_data.get("style", "cinematic")},
+        )
+        prompt_by_id = {str(item["scene_id"]): item["prompt"] for item in batch_prompts}
 
         # --- P0-1a: Load character reference images (for shot image consistency) ---
         char_ref_map = {}  # {char_name_lower: front_png_path}
@@ -1511,7 +1535,7 @@ def _generate_shot_images(output_dir: Path, storyboard_data: dict) -> int:
             if shot_id is None:
                 print("    ⚠ [M2] 分镜缺少有效 shot_id/id/shot_order，跳过")
                 return None
-            shot_prompt = shot_item.get("prompt", shot_item.get("visual", ""))
+            shot_prompt = prompt_by_id.get(str(shot_item.get("id", ""))) or shot_item.get("prompt", shot_item.get("visual", ""))
             if not shot_prompt:
                 return None
             shot_image_path = storyboard_images_dir / f"{shot_id}.png"
@@ -1611,6 +1635,29 @@ def _generate_shot_images(output_dir: Path, storyboard_data: dict) -> int:
         return 0
 
 
+def _validate_storyboard_image_composition(output_dir: Path, storyboard_data: dict) -> dict:
+    """Validate that every generated storyboard cut has its required image asset."""
+    cuts = []
+    cursor = 0.0
+    for shot in storyboard_data.get("shots", []):
+        shot_id = _normalize_shot_id(shot)
+        if shot_id is None:
+            continue
+        duration = float(shot.get("duration", 5))
+        cuts.append({
+            "id": shot_id,
+            "source": f"storyboard_images/{shot_id}.png",
+            "in_seconds": cursor,
+            "out_seconds": cursor + duration,
+        })
+        cursor += duration
+    report = validate_composition({"cuts": cuts}, output_dir)
+    (output_dir / "storyboard_composition_report.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return report
+
+
 def run_phase2_5(storyboard_data: dict, characters_data: dict, output_dir: Path, dry_run: bool) -> dict:
     """Phase 2.5: 使用 OM image_selector 生成故事板图片，不可用时降级到 Seedream API"""
     _banner("2.5", 8, "故事板图片生成 (ImageSelector / Seedream)", dry_run)
@@ -1672,6 +1719,9 @@ def run_phase2_5(storyboard_data: dict, characters_data: dict, output_dir: Path,
                 
                 # --- M2: 分镜图序列（每镜头一张）---
                 _generate_shot_images(output_dir, storyboard_data)
+                composition_report = _validate_storyboard_image_composition(output_dir, storyboard_data)
+                if not composition_report["valid"]:
+                    return {"status": "error", "error": "Storyboard composition validation failed", "composition_report": composition_report, "duration_s": _elapsed(start)}
 
                 # --- P0-A: 场景参考图生成（学 Toonflow 场景资产）---
                 try:
@@ -1762,6 +1812,9 @@ def run_phase2_5(storyboard_data: dict, characters_data: dict, output_dir: Path,
             
             # --- M2: 分镜图序列（每镜头一张）---
             _generate_shot_images(output_dir, storyboard_data)
+            composition_report = _validate_storyboard_image_composition(output_dir, storyboard_data)
+            if not composition_report["valid"]:
+                return {"status": "error", "error": "Storyboard composition validation failed", "composition_report": composition_report, "duration_s": _elapsed(start)}
             
             return {
                 "status": "done",
@@ -2007,157 +2060,48 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
                 if d.is_dir() and d.name.startswith("S"):
                     outputs.append(f"shots/{d.name}/")
 
+        storyboard = json.loads(storyboard_path.read_text(encoding="utf-8"))
+        provider_candidates = [
+            {"name": "local_video", "provider": "local", "capabilities": ["i2v", "flf2v"], "quality": .8, "control": .9, "reliability": .8, "cost": 0, "latency_score": .7},
+            {"name": "seedance", "provider": "volcengine", "capabilities": ["i2v", "t2v", "reference_image"], "quality": .9, "control": .7, "reliability": .75, "cost": .4, "latency_score": .6},
+        ]
+        required_capabilities = sorted({
+            shot.get("gen_strategy", "i2v") for shot in storyboard.get("shots", [])
+        })
+        rankings = rank_providers(provider_candidates, {"capabilities": required_capabilities})
+        selected_provider = rankings[0].tool_name if rankings else "local_video"
+        composition = {
+            "cuts": [{"id": shot.get("id"), "type": shot.get("type", "video")} for shot in storyboard.get("shots", [])],
+            "provider": selected_provider,
+            "provider_rankings": [score.to_dict() for score in rankings],
+        }
+        locked_composition = lock_runtime(composition, available={"ffmpeg", "remotion"})
+
+        director_scenes = []
+        director_plan_path = output_dir / "director_plan.json"
+        if director_plan_path.exists():
+            director_scenes = json.loads(director_plan_path.read_text(encoding="utf-8")).get("scenes", [])
+        for index, shot_dir in enumerate(sorted(shots_dir.glob("S*")) if shots_dir.exists() else []):
+            meta_path = shot_dir / "SHOT_META.json"
+            if not meta_path.exists():
+                continue
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta["provider"] = selected_provider
+            meta["provider_rankings"] = locked_composition["provider_rankings"]
+            meta["render_runtime"] = locked_composition["render_runtime"]
+            if index < len(director_scenes) and director_scenes[index].get("speech_pacing"):
+                meta["speech_pacing"] = director_scenes[index]["speech_pacing"]
+            meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
         print(f"  ✓ Phase 4 完成: {len(outputs)} 镜头目录")
         status = "done" if outputs or dry_run else "error"
-        return {"status": status, "duration_s": _elapsed(start), "outputs": outputs or ["shots/"]}
+        return {"status": status, "duration_s": _elapsed(start), "outputs": outputs or ["shots/"], "provider": selected_provider, "render_runtime": locked_composition["render_runtime"]}
 
     except subprocess.TimeoutExpired:
         return {"status": "error", "error": "orchestrator timed out", "duration_s": _elapsed(start)}
     except Exception as e:
         traceback.print_exc()
         return {"status": "error", "error": str(e), "duration_s": _elapsed(start)}
-
-
-# ---------------------------------------------------------------------------
-# OM build_shot_prompt — 标准化提示词构建（抄自 OpenMontage/lib/shot_prompt_builder.py）
-# ---------------------------------------------------------------------------
-
-_SHOT_SIZE_PHRASES = {
-    "extreme_wide": "extreme wide shot showing vast environment",
-    "wide": "wide shot capturing full scene",
-    "medium_wide": "medium-wide shot framing subject with surroundings",
-    "medium": "medium shot from waist up",
-    "medium_close": "medium close-up from chest up",
-    "close_up": "close-up focusing on face or detail",
-    "extreme_close_up": "extreme close-up on fine detail",
-    "over_shoulder": "over-the-shoulder perspective",
-    "insert": "insert shot of specific detail",
-    "establishing": "establishing shot setting the location",
-}
-
-_MOVEMENT_PHRASES = {
-    "static": "locked-off static camera",
-    "pan_left": "smooth pan to the left",
-    "pan_right": "smooth pan to the right",
-    "tilt_up": "gentle tilt upward",
-    "tilt_down": "gentle tilt downward",
-    "dolly_in": "slow dolly in toward subject",
-    "dolly_out": "slow dolly out from subject",
-    "tracking_left": "tracking shot moving left alongside subject",
-    "tracking_right": "tracking shot moving right alongside subject",
-    "crane_up": "crane shot rising upward",
-    "crane_down": "crane shot descending",
-    "handheld": "handheld camera with natural movement",
-    "steadicam": "smooth steadicam following movement",
-    "whip_pan": "fast whip pan",
-    "orbital": "orbital camera circling subject",
-    "zoom_in": "slow zoom in",
-    "zoom_out": "slow zoom out",
-    "rack_focus": "rack focus shift between foreground and background",
-}
-
-_LIGHTING_PHRASES = {
-    "high_key": "bright high-key lighting, minimal shadows",
-    "low_key": "dramatic low-key lighting with deep shadows",
-    "natural": "natural ambient lighting",
-    "golden_hour": "warm golden hour sunlight",
-    "blue_hour": "cool blue hour twilight",
-    "tungsten_warm": "warm tungsten interior lighting",
-    "neon": "neon-lit with vibrant color spill",
-    "silhouette": "backlit silhouette",
-    "rim_lit": "rim lighting highlighting edges",
-    "volumetric": "volumetric light with visible rays",
-    "overcast_soft": "soft overcast diffused light",
-}
-
-_DOF_PHRASES = {
-    "shallow": "shallow depth of field with bokeh",
-    "medium": "medium depth of field",
-    "deep": "deep focus with everything sharp",
-}
-
-_COLOR_TEMP_PHRASES = {
-    "cool": "cool blue-toned color palette",
-    "neutral": "neutral balanced colors",
-    "warm": "warm amber-toned color palette",
-    "mixed": "mixed color temperatures for contrast",
-}
-
-
-def _build_shot_prompt(shot: dict, style_context: Optional[dict] = None) -> str:
-    """Build standardized prompt from shot metadata (OM 5-layer framework).
-
-    Layers:
-      1. Camera (lens, depth of field)
-      2. Movement (shot size, camera movement)
-      3. Subject (description + texture keywords)
-      4. Lighting (lighting key, color temperature)
-      5. Style (from style_context)
-    """
-    sl = shot.get("shot_language", {}) or {}
-    layers: list[str] = []
-
-    # Layer 1: Camera
-    camera_parts = []
-    if sl.get("lens_mm"):
-        camera_parts.append(f"{sl['lens_mm']}mm lens")
-    if sl.get("depth_of_field"):
-        camera_parts.append(_DOF_PHRASES.get(sl["depth_of_field"], ""))
-    if camera_parts:
-        layers.append(", ".join(filter(None, camera_parts)))
-
-    # Layer 2: Movement
-    movement_parts = []
-    if sl.get("shot_size"):
-        movement_parts.append(_SHOT_SIZE_PHRASES.get(sl["shot_size"], sl["shot_size"]))
-    if sl.get("camera_movement") and sl["camera_movement"] != "static":
-        movement_parts.append(_MOVEMENT_PHRASES.get(sl["camera_movement"], sl["camera_movement"]))
-    if movement_parts:
-        layers.append(", ".join(movement_parts))
-
-    # Layer 3: Subject
-    description = shot.get("description", "") or shot.get("scene", "") or shot.get("prompt", "")
-    texture = shot.get("texture_keywords", []) or []
-    subject_parts = [description]
-    if texture:
-        subject_parts.append(", ".join(texture) if isinstance(texture, list) else str(texture))
-    action = shot.get("action", "")
-    if action:
-        subject_parts.append(f"action: {action}")
-    layers.append(". ".join(filter(None, subject_parts)))
-
-    # Layer 4: Lighting
-    lighting_parts = []
-    if sl.get("lighting_key"):
-        lighting_parts.append(_LIGHTING_PHRASES.get(sl["lighting_key"], sl["lighting_key"]))
-    if sl.get("color_temperature"):
-        lighting_parts.append(_COLOR_TEMP_PHRASES.get(sl["color_temperature"], ""))
-    # Fallback: use shot-level emotion as lighting hint
-    if not lighting_parts and shot.get("emotion"):
-        emotion = shot["emotion"]
-        emotion_map = {
-            "紧张": "tense dramatic lighting",
-            "激动": "energetic vibrant lighting",
-            "坚定": "determined strong lighting",
-            "悲伤": "melancholic muted lighting",
-            "快乐": "bright cheerful lighting",
-        }
-        lighting_parts.append(emotion_map.get(emotion, f"{emotion} mood"))
-    if lighting_parts:
-        layers.append(", ".join(filter(None, lighting_parts)))
-
-    # Layer 5: Style
-    if style_context:
-        mood = style_context.get("mood", "")
-        visual_lang = style_context.get("visual_language", {}) or {}
-        style_hint = visual_lang.get("aesthetic", "") or mood
-        if style_hint:
-            layers.append(f"Style: {style_hint}")
-    # Fallback: use storyboard-level style
-    elif shot.get("style"):
-        layers.append(f"Style: {shot['style']}")
-
-    return ". ".join(filter(None, layers))
 
 
 # ---------------------------------------------------------------------------
@@ -2225,7 +2169,8 @@ def _run_phase5_om_seedance(storyboard_data: dict, output_dir: Path, characters_
 
         # Use OM build_shot_prompt for standardized prompt construction
         # Falls back to raw prompt if no shot_language metadata present
-        prompt = _build_shot_prompt(shot, style_context)
+        prompt_items = build_batch_prompts([shot], style_context)
+        prompt = prompt_items[0]["prompt"] if prompt_items else ""
         if not prompt or len(prompt) < 5:
             prompt = raw_prompt  # fallback to original prompt
         elif raw_prompt and len(raw_prompt) > len(prompt):
@@ -2717,6 +2662,30 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
     }
 
 
+class _PipelineVideoTool(BaseTool):
+    """BaseTool-conforming wrapper around the pipeline's video generator."""
+    name = "pipeline_video_generation"
+    runtime = ToolRuntime.API
+    capabilities = ["i2v", "flf2v"]
+    input_schema = {"output_dir": "path"}
+
+    def execute(self, inputs: dict[str, Any]) -> ToolResult:
+        started = _now()
+        try:
+            data = _run_phase5_fallback(Path(inputs["output_dir"]))
+            return ToolResult(data.get("status") == "done", data=data, error=data.get("error"), duration_seconds=_elapsed(started))
+        except Exception as exc:
+            return ToolResult(False, error=str(exc), duration_seconds=_elapsed(started))
+
+
+class _LocalVideoVendorAdapter(VendorAdapter):
+    id = "honcut-local-video"
+    name = "HonCut Local Video"
+
+    def video_request(self, config: dict[str, Any], model: VendorModel) -> Any:
+        return _PipelineVideoTool().execute(config)
+
+
 def run_phase5(storyboard_data: dict, output_dir: Path, dry_run: bool) -> dict:
     """Phase 5: video generation through the local Bridge only."""
     _banner(5, 8, "视频生成 (Seedance — reference_to_video)", dry_run)
@@ -2736,7 +2705,11 @@ def run_phase5(storyboard_data: dict, output_dir: Path, dry_run: bool) -> dict:
 
     print("  → Phase 5 强制本地 Bridge 路由；ARK/OM 视频模型已禁用", flush=True)
     try:
-        result = _run_phase5_fallback(output_dir)
+        adapter = _LocalVideoVendorAdapter([
+            VendorModel("Local Bridge", "local-video-bridge", "video", ("i2v", "flf2v"))
+        ])
+        tool_result = adapter.request("local-video-bridge", {"output_dir": str(output_dir)})
+        result = tool_result.data or {"status": "error", "error": tool_result.error}
         result["duration_s"] = _elapsed(start)
         if result["status"] == "done":
             print(f"  ✓ Phase 5 完成: {len(result['outputs'])} 视频 (local_video_client)")
@@ -2759,330 +2732,6 @@ def run_phase5(storyboard_data: dict, output_dir: Path, dry_run: bool) -> dict:
 
 # ---------------------------------------------------------------------------
 # Phase 6: 一致性守卫 + 场景变化检测 + 幻灯片风险评分
-# ---------------------------------------------------------------------------
-
-# --- 抄自 OpenMontage/lib/variation_checker.py ---
-_GENERIC_PHRASES = {
-    "a person", "a beautiful", "modern", "futuristic", "cutting-edge",
-    "in today's world", "sleek design", "innovative", "state-of-the-art",
-    "next-generation", "revolutionary", "a professional", "dynamic",
-    "vibrant", "stunning", "breathtaking", "amazing", "incredible",
-    "powerful", "seamless", "elegant solution",
-}
-
-def _check_scene_variation(scenes: list) -> dict:
-    """检查场景计划的重复模式（抄自 OM variation_checker.check_scene_variation）
-    
-    Returns:
-        {
-            "score": float (0-5, lower is better),
-            "verdict": "strong" | "acceptable" | "revise" | "fail",
-            "violations": list of specific issues,
-            "suggestions": list of improvement suggestions,
-        }
-    """
-    if not scenes:
-        return {"score": 5.0, "verdict": "fail", "violations": ["No scenes to check"], "suggestions": []}
-
-    violations = []
-    suggestions = []
-
-    # Check 1: Shot size variety
-    shot_sizes = [
-        s.get("shot_language", {}).get("shot_size", "unspecified")
-        for s in scenes
-    ]
-    from collections import Counter
-    size_counts = Counter(shot_sizes)
-    if len(scenes) >= 4:
-        most_common_size, most_common_count = size_counts.most_common(1)[0]
-        if most_common_count / len(scenes) > 0.5:
-            violations.append(
-                f"Shot size '{most_common_size}' used in {most_common_count}/{len(scenes)} scenes "
-                f"({most_common_count/len(scenes):.0%}). Vary shot sizes for visual interest."
-            )
-            suggestions.append("Mix wide establishing shots with close-ups for visual rhythm.")
-
-    # Check 2: Consecutive same-size shots
-    longest_run = 1 if shot_sizes else 0
-    current_run = 1
-    for i in range(1, len(shot_sizes)):
-        if shot_sizes[i] == shot_sizes[i-1] and shot_sizes[i] != "unspecified":
-            current_run += 1
-            longest_run = max(longest_run, current_run)
-        else:
-            current_run = 1
-    if longest_run >= 3:
-        violations.append(
-            f"{longest_run} consecutive same-size shots. "
-            f"Vary shot sizes between scenes for editorial rhythm."
-        )
-
-    # Check 3: Static shot overuse
-    movements = [
-        s.get("shot_language", {}).get("camera_movement", "unspecified")
-        for s in scenes
-    ]
-    static_count = sum(1 for m in movements if m in ("static", "unspecified"))
-    if len(scenes) >= 4 and static_count / len(scenes) > 0.6:
-        violations.append(
-            f"{static_count}/{len(scenes)} scenes are static or unspecified movement. "
-            f"Add intentional camera movement to at least 40% of scenes."
-        )
-        suggestions.append("Consider dolly_in for emphasis, tracking for energy, or crane for scale.")
-
-    # Check 4: Lighting variety
-    lightings = {
-        s.get("shot_language", {}).get("lighting_key")
-        for s in scenes
-        if s.get("shot_language", {}).get("lighting_key")
-    }
-    if len(scenes) >= 4 and len(lightings) <= 1:
-        violations.append(
-            f"Only {len(lightings)} unique lighting setup(s) across {len(scenes)} scenes. "
-            f"Vary lighting to create mood shifts."
-        )
-
-    # Check 5: Hero moment exists and is visually distinct
-    hero_scenes = [s for s in scenes if s.get("hero_moment")]
-    if len(scenes) >= 4 and not hero_scenes:
-        violations.append(
-            "No hero_moment flagged. Every video should have at least one visual peak."
-        )
-        suggestions.append("Mark the most impactful scene as hero_moment=true.")
-
-    if hero_scenes:
-        for hero in hero_scenes:
-            hero_idx = scenes.index(hero)
-            hero_size = hero.get("shot_language", {}).get("shot_size")
-            for offset in (-1, 1):
-                neighbor_idx = hero_idx + offset
-                if 0 <= neighbor_idx < len(scenes):
-                    neighbor_size = scenes[neighbor_idx].get("shot_language", {}).get("shot_size")
-                    if hero_size and neighbor_size and hero_size == neighbor_size:
-                        violations.append(
-                            f"Hero scene '{hero.get('id')}' has same shot size as neighbor. "
-                            f"Hero moments should be visually distinct from surrounding scenes."
-                        )
-
-    # Check 6: Description specificity
-    generic_count = 0
-    for scene in scenes:
-        desc = scene.get("description", "").lower()
-        for phrase in _GENERIC_PHRASES:
-            if phrase in desc:
-                generic_count += 1
-                break
-    if generic_count >= len(scenes) * 0.3:
-        violations.append(
-            f"{generic_count}/{len(scenes)} scenes use generic language. "
-            f"Replace vague descriptions with specific visual details."
-        )
-        suggestions.append(
-            "Instead of 'a beautiful cityscape', try 'rain-slicked Tokyo intersection "
-            "at night, neon reflections in puddles, pedestrians with translucent umbrellas'."
-        )
-
-    # Check 7: Texture keywords presence
-    textured = sum(1 for s in scenes if s.get("texture_keywords"))
-    if len(scenes) >= 4 and textured < len(scenes) * 0.3:
-        violations.append(
-            f"Only {textured}/{len(scenes)} scenes have texture_keywords. "
-            f"Add texture descriptors to visual scenes for richer generation prompts."
-        )
-
-    # Check 8: Shot intent completeness
-    intented = sum(1 for s in scenes if s.get("shot_intent"))
-    if len(scenes) >= 4 and intented < len(scenes) * 0.5:
-        violations.append(
-            f"Only {intented}/{len(scenes)} scenes have shot_intent. "
-            f"Every scene should explain WHY it exists in the video."
-        )
-
-    # Score
-    score = min(5.0, len(violations) * 0.6)
-    if score < 2.0:
-        verdict = "strong"
-    elif score < 3.0:
-        verdict = "acceptable"
-    elif score < 4.0:
-        verdict = "revise"
-    else:
-        verdict = "fail"
-
-    return {
-        "score": round(score, 1),
-        "verdict": verdict,
-        "violations": violations,
-        "suggestions": suggestions,
-    }
-
-
-# --- 抄自 OpenMontage/lib/slideshow_risk.py ---
-def _score_slideshow_risk(scenes: list) -> dict:
-    """评估幻灯片风险（抄自 OM slideshow_risk.score_slideshow_risk）
-    
-    Returns:
-        {
-            "average": float,
-            "verdict": str,
-            "dimensions": {dimension_name: {"score": float, "reason": str}},
-        }
-    """
-    if not scenes:
-        return {"average": 5.0, "verdict": "fail", "dimensions": {}}
-
-    dimensions = {
-        "repetition": _score_repetition(scenes),
-        "decorative_visuals": _score_decorative(scenes),
-        "weak_motion": _score_weak_motion(scenes),
-        "weak_shot_intent": _score_weak_intent(scenes),
-        "typography_overreliance": _score_typography(scenes),
-    }
-
-    scores = [d["score"] for d in dimensions.values()]
-    average = sum(scores) / len(scores)
-
-    if average < 2.0:
-        verdict = "strong"
-    elif average < 3.0:
-        verdict = "acceptable"
-    elif average < 4.0:
-        verdict = "revise"
-    else:
-        verdict = "fail"
-
-    return {
-        "average": round(average, 2),
-        "verdict": verdict,
-        "dimensions": dimensions,
-    }
-
-
-def _score_repetition(scenes: list) -> dict:
-    """评估视觉重复度"""
-    if len(scenes) < 3:
-        return {"score": 0.0, "reason": "Too few scenes to assess repetition"}
-
-    from collections import Counter
-    types = Counter(s.get("type", "unknown") for s in scenes)
-    most_common_type, most_common_count = types.most_common(1)[0]
-    type_ratio = most_common_count / len(scenes)
-
-    descriptions = [s.get("description", "").lower()[:50] for s in scenes]
-    unique_desc_ratio = len(set(descriptions)) / len(descriptions)
-
-    sizes = [s.get("shot_language", {}).get("shot_size", "none") for s in scenes]
-    size_ratio = Counter(sizes).most_common(1)[0][1] / len(scenes)
-
-    score = 0.0
-    reasons = []
-
-    if type_ratio > 0.7:
-        score += 2.0
-        reasons.append(f"Scene type '{most_common_type}' dominates at {type_ratio:.0%}")
-    if unique_desc_ratio < 0.6:
-        score += 1.5
-        reasons.append(f"Only {unique_desc_ratio:.0%} unique descriptions")
-    if size_ratio > 0.6:
-        score += 1.5
-        reasons.append(f"Same shot size in {size_ratio:.0%} of scenes")
-
-    return {"score": min(5.0, score), "reason": "; ".join(reasons) or "Good variety"}
-
-
-def _score_decorative(scenes: list) -> dict:
-    """评估场景是否装饰性而非传达信息"""
-    decorative_count = 0
-    for scene in scenes:
-        has_info_role = bool(scene.get("information_role"))
-        has_narrative_role = bool(scene.get("narrative_role"))
-        has_intent = bool(scene.get("shot_intent"))
-
-        if not has_info_role and not has_narrative_role and not has_intent:
-            decorative_count += 1
-
-    ratio = decorative_count / len(scenes)
-    score = min(5.0, ratio * 5.0)
-
-    if ratio > 0.5:
-        reason = f"{decorative_count}/{len(scenes)} scenes have no stated purpose"
-    elif ratio > 0.2:
-        reason = f"{decorative_count}/{len(scenes)} scenes lack stated purpose"
-    else:
-        reason = "Most scenes have clear communicative purpose"
-
-    return {"score": round(score, 1), "reason": reason}
-
-
-def _score_weak_motion(scenes: list) -> dict:
-    """评估摄像机运动是否有目的"""
-    total_moving = 0
-    purposeless_moving = 0
-
-    for scene in scenes:
-        sl = scene.get("shot_language", {})
-        movement = sl.get("camera_movement", "static")
-        if movement not in ("static", "unspecified", None):
-            total_moving += 1
-            if not scene.get("shot_intent"):
-                purposeless_moving += 1
-
-    if total_moving == 0:
-        return {"score": 1.5, "reason": "No camera movement defined"}
-
-    ratio = purposeless_moving / total_moving
-    score = min(5.0, ratio * 4.0)
-
-    if ratio > 0.5:
-        reason = f"{purposeless_moving}/{total_moving} moving shots lack shot_intent"
-    else:
-        reason = "Camera movement appears purposeful"
-
-    return {"score": round(score, 1), "reason": reason}
-
-
-def _score_weak_intent(scenes: list) -> dict:
-    """评估 shot_intent 完整性"""
-    with_intent = sum(1 for s in scenes if s.get("shot_intent"))
-    ratio = with_intent / len(scenes)
-
-    score = min(5.0, (1.0 - ratio) * 5.0)
-
-    if ratio < 0.3:
-        reason = f"Only {with_intent}/{len(scenes)} scenes have shot_intent"
-    elif ratio < 0.6:
-        reason = f"{with_intent}/{len(scenes)} scenes have shot_intent"
-    else:
-        reason = "Strong shot intent coverage"
-
-    return {"score": round(score, 1), "reason": reason}
-
-
-def _score_typography(scenes: list) -> dict:
-    """评估文字主导过度"""
-    text_scenes = sum(
-        1 for s in scenes
-        if s.get("type") in ("text_card", "stat_card", "kpi_grid")
-    )
-    ratio = text_scenes / len(scenes)
-
-    if ratio > 0.6:
-        score = 4.0
-        reason = f"{text_scenes}/{len(scenes)} scenes are text/stat cards"
-    elif ratio > 0.4:
-        score = 2.5
-        reason = f"{text_scenes}/{len(scenes)} scenes are text-based"
-    elif ratio > 0.2:
-        score = 1.0
-        reason = "Balanced text and visual content"
-    else:
-        score = 0.0
-        reason = "Visual-first approach"
-
-    return {"score": score, "reason": reason}
-
-
 def run_phase6(output_dir: Path, dry_run: bool, storyboard_data: dict = None) -> dict:
     """Phase 6: consistency_guard + scene_variation_check + slideshow_risk_score
     
@@ -3331,6 +2980,22 @@ def run_phase7(output_dir: Path, dry_run: bool,
         batch_transition = transition
         print(f"  → 拼接模式: {batch_transition} (duration={transition_duration}s)")
 
+    stitch_transition = {
+        "dissolve": "crossfade",
+        "fade": "fade_through_black",
+    }.get(batch_transition, batch_transition)
+    if stitch_transition not in {"cut", "crossfade", "fade_through_black"}:
+        stitch_transition = "crossfade"
+    stitch_plan = build_stitch_plan(
+        [
+            {"path": path, "duration": shot_metas[index].get("duration", 0) if index < len(shot_metas) else 0}
+            for index, path in enumerate(clip_paths)
+        ],
+        stitch_transition,
+        transition_duration,
+    )
+    clip_paths = stitch_plan.clips
+
     # 调用 edit_decisions 架构（从 OpenMontage VideoCompose 学习）
     try:
         from edit_decisions import build_edit_decisions, execute_edit_decisions
@@ -3393,8 +3058,8 @@ def run_phase7(output_dir: Path, dry_run: bool,
             "operation": "stitch",
             "clips": clip_paths,
             "output_path": str(output_dir / "raw_assembly.mp4"),
-            "transition": batch_transition,
-            "transition_duration": transition_duration,
+            "transition": stitch_plan.transition,
+            "transition_duration": stitch_plan.duration,
             "auto_normalize": True,
             "profile": media_profile,
         })
@@ -3412,10 +3077,11 @@ def run_phase7(output_dir: Path, dry_run: bool,
                 "duration_s": _elapsed(start),
                 "outputs": ["raw_assembly.mp4"],
                 "method": f"VideoStitch_{batch_transition}_fallback",
-                "transition": batch_transition,
-                "transition_duration": transition_duration,
+                "transition": stitch_plan.transition,
+                "transition_duration": stitch_plan.duration,
                 "clip_count": len(clip_paths),
                 "transition_selections": selected_transitions if selected_transitions else None,
+                "stitch_offsets": stitch_plan.offsets,
             }
         else:
             return {"status": "error", "error": result.error, "duration_s": _elapsed(start)}
@@ -3964,6 +3630,8 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             "step_status": step_status,
             "video_qa": video_qa_result,
         }
+        write_stage_checkpoint(_checkpoint_path(output_dir), "phase8", phase8_result)
+        return phase8_result
 
     except ImportError as e:
         return {"status": "error", "error": str(e), "duration_s": _elapsed(start)}
@@ -4482,7 +4150,7 @@ def run_pipeline(
                     phase_results = sqlite_state.get("phase_results", {})
                     for phase_name in completed_phases:
                         phase_result = phase_results.get(phase_name, {"status": "done"})
-                        _write_checkpoint(output_path, phase_name, phase_result)
+                        _record_stage_checkpoint(output_path, phase_name, phase_result)
                 else:
                     print(f"\n  🔄 Resume 模式: 无检查点，从头开始")
             else:
@@ -4692,7 +4360,7 @@ def run_pipeline(
         try:
             p1_result = run_phase1(text, output_path, dry_run)
             report["phases"]["phase1"] = p1_result
-            _write_checkpoint(output_path, "phase1", p1_result)
+            _record_stage_checkpoint(output_path, "phase1", p1_result)
         except Exception as e:
             print(f"  ⚠ Phase 1 降级跳过: {e}")
             report["phases"]["phase1"] = {"status": "skipped", "reason": str(e)}
@@ -4734,7 +4402,7 @@ def run_pipeline(
             return report
         reporter.phase_done("phase2", "编剧引擎完成", duration_s=p2.get("duration_s"))
         # 写入 checkpoint
-        _write_checkpoint(output_path, "phase2", p2)
+        _record_stage_checkpoint(output_path, "phase2", p2)
 
     # --- P2-5b: 质检阻断（学 Toonflow 监督层）---
     try:
@@ -4785,7 +4453,7 @@ def run_pipeline(
             return report
         else:
             reporter.phase_done("phase2_5", "故事板图片生成完成", duration_s=p2_5.get("duration_s"))
-            _write_checkpoint(output_path, "phase2_5", p2_5)
+            _record_stage_checkpoint(output_path, "phase2_5", p2_5)
 
     # ---- Phase 3: 角色工厂 ----
     if 3 in skip_phase:
@@ -4812,7 +4480,7 @@ def run_pipeline(
             return report
         else:
             reporter.phase_done("phase3", "角色工厂完成", duration_s=p3.get("duration_s"))
-            _write_checkpoint(output_path, "phase3", p3)
+            _record_stage_checkpoint(output_path, "phase3", p3)
 
     # ---- Phase 4: 编排器 ----
     if 4 in skip_phase:
@@ -4839,7 +4507,7 @@ def run_pipeline(
             return report
         else:
             reporter.phase_done("phase4", "编排器完成", duration_s=p4.get("duration_s"))
-            _write_checkpoint(output_path, "phase4", p4)
+            _record_stage_checkpoint(output_path, "phase4", p4)
 
     # ---- Phase 5: 视频生成 ----
     if 5 in skip_phase:
@@ -4858,7 +4526,7 @@ def run_pipeline(
         if p5["status"] == "error":
             report["status"] = "partial"
         else:
-            _write_checkpoint(output_path, "phase5", p5)
+            _record_stage_checkpoint(output_path, "phase5", p5)
 
     # ---- Phase 6: 一致性守卫 + 场景变化检测 + 幻灯片风险评分 ----
     if 6 in skip_phase:
@@ -4881,7 +4549,7 @@ def run_pipeline(
         if p6["status"] == "error":
             report["status"] = "partial"
         else:
-            _write_checkpoint(output_path, "phase6", p6)
+            _record_stage_checkpoint(output_path, "phase6", p6)
 
         # ---- 质检门：检查 Phase 6 结果，决定是否回退到 Phase 5 ----
         quality_gate_passed = True
@@ -4925,7 +4593,7 @@ def run_pipeline(
         if p7["status"] == "error":
             report["status"] = "partial"
         else:
-            _write_checkpoint(output_path, "phase7", p7)
+            _record_stage_checkpoint(output_path, "phase7", p7)
 
     # ---- Phase 8: 后期处理 ----
     if 8 in skip_phase:
@@ -4942,7 +4610,7 @@ def run_pipeline(
         if p8["status"] == "error":
             report["status"] = "partial"
         else:
-            _write_checkpoint(output_path, "phase8", p8)
+            _record_stage_checkpoint(output_path, "phase8", p8)
 
     # ---- Phase 8.5: Video QA 硬性质检 ----
     if 8.5 in skip_phase:
@@ -4978,7 +4646,7 @@ def run_pipeline(
                     "issues": [i.message for i in qa_report.issues if i.severity == "critical"],
                 }
             else:
-                _write_checkpoint(output_path, "phase8_5", p8_5)
+                _record_stage_checkpoint(output_path, "phase8_5", p8_5)
         except ImportError:
             report["phases"]["8.5"] = {"status": "skipped", "reason": "video_qa module not available"}
         except Exception as e:
