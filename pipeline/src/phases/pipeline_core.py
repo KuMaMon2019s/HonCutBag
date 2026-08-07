@@ -2405,7 +2405,11 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
             "phantom": "dialogue/emotion shot",
             "i2v": "scenery/ambient or default",
         }[gen_strategy]
-        bridge_model = {"flf2v": "flf2v", "phantom": "phantom", "i2v": "wan22"}[gen_strategy]
+        video_provider = os.environ.get("VIDEO_PROVIDER", "local").lower()
+        if video_provider == "seedance":
+            bridge_model = "seedance"
+        else:
+            bridge_model = {"flf2v": "flf2v", "phantom": "phantom", "i2v": "wan22"}[gen_strategy]
         print(f"    [route] {shot_dir.name} → {gen_strategy} ({route_reason})")
         associated_character_ids = {
             asset_id[5:].split(":", 1)[0]

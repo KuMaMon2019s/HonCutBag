@@ -44,6 +44,8 @@ _NO_PROXY_ENV = {
 def _valid_frames_for_model(model: Optional[str]) -> Tuple[int, List[int]]:
     """Return the model fps and legal frame counts, applying the env override."""
     model_name = model or "wan22"
+    if model_name == "seedance":
+        return 24, [120, 144, 168, 192, 216, 240, 264, 288, 312, 336, 360]
     profile = MODEL_PROFILES.get(model_name, MODEL_PROFILES["wan22"])
     fps = int(profile["fps"])
     configured = os.environ.get("LOCAL_VIDEO_VALID_FRAMES")
