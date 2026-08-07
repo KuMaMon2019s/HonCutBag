@@ -78,7 +78,7 @@ QUALITY_RULES: Dict[str, Dict[str, Any]] = {
     "phase3": {
         "name": "角色工厂",
         "red_lines": [
-            ("character_images_exist", "每个角色至少有 front.png 且 > 10KB"),
+            ("character_images_exist", "每个角色至少有一张参考图（face_closeup/full_body/front）且 > 10KB"),
             ("character_card_exists", "每个角色有 character_card.json"),
         ],
         "dimensions": [
@@ -275,8 +275,14 @@ def _check_red_line(rule_id: str, output_dir: Path,
         for cd in chars_dir.iterdir():
             if not cd.is_dir():
                 continue
-            front = cd / "front.png"
-            if not front.exists() or front.stat().st_size < 10_240:
+            # 八层框架改造后角色参考图为"大头照+全身照"分离模式
+            # （官方文档不建议三视图），兼容旧版 front.png
+            candidates = [
+                cd / "face_closeup.png",
+                cd / "full_body.png",
+                cd / "front.png",
+            ]
+            if not any(f.exists() and f.stat().st_size > 10_240 for f in candidates):
                 return False
         return True
 
