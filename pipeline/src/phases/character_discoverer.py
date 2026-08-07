@@ -336,15 +336,24 @@ def _is_human_character(name: str) -> bool:
     - 抽象指代（说话者、观察者、记录者等以"者"、"员"结尾）
     - 复数群体（以"们"结尾）
     - 物品、概念
+    
+    保留：
+    - 无人机、机器人等智能设备（可作为主角）
+    - 工程师、运维员等职业角色
     """
     # 排除复数群体
     if name.endswith("们"):
         return False
     
+    # 白名单：无人机、机器人等智能设备可作为主角
+    robot_whitelist = ["无人机", "机器人", "机械臂", "传感器"]
+    if any(keyword in name for keyword in robot_whitelist):
+        return True
+    
     # 排除抽象指代（以"者"、"员"结尾的抽象名词）
     if name.endswith("者") or name.endswith("员"):
         # 但保留一些可能是人物的（如"记者"、"演员"等职业）
-        human_suffixes = ["记者", "演员", "医生", "教师", "工人", "农民", "士兵", "保安"]
+        human_suffixes = ["记者", "演员", "医生", "教师", "工人", "农民", "士兵", "保安", "工程师", "运维员"]
         if not any(name.endswith(suffix) for suffix in human_suffixes):
             return False
     
