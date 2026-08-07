@@ -84,7 +84,7 @@ except ImportError as e:
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
 PHASE28_DIR = SCRIPT_DIR  # Phase 2,3,8 模块所在
 PHASE47_DIR = SCRIPT_DIR.parent.parent / "vendor" / "legacy"
-OM_TOOLS_DIR = SCRIPT_DIR.parent.parent / "vendor" / "openmontage"
+OM_TOOLS_DIR = SCRIPT_DIR.parent.parent / "vendor" / "video_tools"
 
 # 优先加载当前目录（2026-07-28_01/scripts），然后是旧目录
 for d in (PHASE28_DIR, PHASE47_DIR, str(OM_TOOLS_DIR)):
@@ -343,7 +343,7 @@ if LANGGRAPH_AVAILABLE:
     def task_generate_video(shot: dict, storyboard_image: Optional[str], output_dir: str, style_context: Optional[dict] = None) -> dict:
         """⚠️ 此函数为 LangGraph @task 包装，仅在 StateGraph 执行上下文中有效，不可直接调用。
         Task-wrapped video generation with retry (for StateGraph)."""
-        from vendor.openmontage.tools.video.seedance_video import SeedanceVideo
+        from vendor.video_tools.tools.video.seedance_video import SeedanceVideo
         sv = SeedanceVideo()
         
         shot_id = shot.get("id", "?")
@@ -1689,7 +1689,7 @@ def run_phase2_5(storyboard_data: dict, characters_data: dict, output_dir: Path,
 
     # 3. 尝试调用 OM image_selector
     try:
-        from vendor.openmontage.tools.graphics.image_selector import ImageSelector
+        from vendor.video_tools.tools.graphics.image_selector import ImageSelector
         selector = ImageSelector()
 
         print(f"  → image_selector: 生成故事板图片...")
@@ -2127,7 +2127,7 @@ def _run_phase5_om_seedance(storyboard_data: dict, output_dir: Path, characters_
         characters_data: CHARACTERS.json 的内容（可选，用于注入角色参考图）
         _timing_ctx: 可选计时上下文 {start, estimate}，用于打印子节点进度
     """
-    from vendor.openmontage.tools.video.seedance_video import SeedanceVideo
+    from vendor.video_tools.tools.video.seedance_video import SeedanceVideo
 
     sv = SeedanceVideo()
 
@@ -3076,7 +3076,7 @@ def run_phase7(output_dir: Path, dry_run: bool,
     
     # Fallback: OM VideoStitch（如果 edit_decisions 失败）
     try:
-        from vendor.openmontage.tools.video.video_stitch import VideoStitch
+        from vendor.video_tools.tools.video.video_stitch import VideoStitch
         stitcher = VideoStitch()
         result = stitcher.execute({
             "operation": "stitch",
@@ -3304,7 +3304,7 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
 
             audio_success = False
             try:
-                from vendor.openmontage.tools.audio.audio_mixer import AudioMixer
+                from vendor.video_tools.tools.audio.audio_mixer import AudioMixer
                 mixer = AudioMixer()
 
                 # Prepare tracks
@@ -3439,7 +3439,7 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             print("  → subtitle_burn: 字幕烧录 (RemotionCaptionBurn)...")
             subtitled_out = str(output_dir / "subtitled.mp4")
             try:
-                from vendor.openmontage.tools.video.remotion_caption_burn import RemotionCaptionBurn
+                from vendor.video_tools.tools.video.remotion_caption_burn import RemotionCaptionBurn
                 caption_burner = RemotionCaptionBurn()
 
                 # Read captions from storyboard
@@ -3524,7 +3524,7 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             print(f"  → color_grade: 应用调色 ({color_grade})...")
             graded_out = str(output_dir / "color_graded.mp4")
             try:
-                from vendor.openmontage.tools.enhancement.color_grade import ColorGrade
+                from vendor.video_tools.tools.enhancement.color_grade import ColorGrade
                 grader = ColorGrade()
                 grade_result = grader.execute({
                     "input_path": str(current_video),
@@ -3546,7 +3546,7 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             print(f"  → upscale: 超分到 {upscale}p (lanczos)...")
             upscaled_out = str(output_dir / "upscaled.mp4")
             try:
-                from vendor.openmontage.tools.enhancement.upscale import Upscale
+                from vendor.video_tools.tools.enhancement.upscale import Upscale
                 upscaler = Upscale()
                 upscale_result = upscaler.execute({
                     "input_path": str(current_video),

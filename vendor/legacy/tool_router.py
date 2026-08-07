@@ -46,7 +46,7 @@ class ToolRouter:
                 'capabilities': ['stitch', 'crossfade', 'concat'],
                 'use_when': ['multiple clips to combine', 'need crossfade', 'assembly'],
                 'api': 'Python import',
-                'endpoint': str(Path(__file__).resolve().parent.parent / "openmontage" / "tools" / "video" / "video_stitch.py")
+                'endpoint': str(Path(__file__).resolve().parent.parent / "video_tools" / "tools" / "video" / "video_stitch.py")
             },
             'om_caption_burn': {
                 'name': 'OM remotion_caption_burn',
@@ -54,7 +54,7 @@ class ToolRouter:
                 'capabilities': ['caption', 'subtitle', 'text_overlay'],
                 'use_when': ['need captions', 'subtitle overlay'],
                 'api': 'Python import',
-                'endpoint': str(Path(__file__).resolve().parent.parent / "openmontage" / "tools" / "video" / "remotion_caption_burn.py")
+                'endpoint': str(Path(__file__).resolve().parent.parent / "video_tools" / "tools" / "video" / "remotion_caption_burn.py")
             }
         }
     

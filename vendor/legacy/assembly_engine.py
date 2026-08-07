@@ -22,7 +22,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 # ─── OM tool paths ────────────────────────────────────────────────────────────
-OM_VIDEO_DIR = Path(__file__).resolve().parent.parent / "openmontage" / "tools" / "video"
+OM_VIDEO_DIR = Path(__file__).resolve().parent.parent / "video_tools" / "tools" / "video"
 CHROME_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
 # OCC MCP endpoint (Phase 4 context)
@@ -270,7 +270,7 @@ def stitch_clips(
     except ImportError as e:
         raise ImportError(
             f"Cannot import VideoStitch from {OM_VIDEO_DIR}. "
-            "Ensure OpenMontage is available."
+            "Ensure the vendored video tools are available."
         ) from e
 
     # Build operation payload
@@ -340,7 +340,7 @@ def burn_subtitles(
     except ImportError as e:
         raise ImportError(
             f"Cannot import RemotionCaptionBurn from {OM_VIDEO_DIR}. "
-            "Ensure OpenMontage is available."
+            "Ensure the vendored video tools are available."
         ) from e
 
     params = {

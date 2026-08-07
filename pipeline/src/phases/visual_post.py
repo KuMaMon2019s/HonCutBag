@@ -29,7 +29,7 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 # 第三方兼容工具路径
 # ---------------------------------------------------------------------------
-OM_TOOLS_DIR = Path(__file__).resolve().parent.parent.parent / "vendor" / "openmontage" / "tools"
+OM_TOOLS_DIR = Path(__file__).resolve().parent.parent.parent / "vendor" / "video_tools" / "tools"
 OM_AVAILABLE = OM_TOOLS_DIR.exists()
 
 if OM_AVAILABLE:
@@ -50,7 +50,7 @@ def _try_import_om_upscale():
     if not OM_AVAILABLE:
         return None
     try:
-        from vendor.openmontage.tools.enhancement.upscale import Upscale
+        from vendor.video_tools.tools.enhancement.upscale import Upscale
         return Upscale
     except (ImportError, Exception):
         return None
@@ -61,7 +61,7 @@ def _try_import_om_reframe():
     if not OM_AVAILABLE:
         return None
     try:
-        from vendor.openmontage.tools.video.auto_reframe import AutoReframe
+        from vendor.video_tools.tools.video.auto_reframe import AutoReframe
         return AutoReframe
     except (ImportError, Exception):
         return None

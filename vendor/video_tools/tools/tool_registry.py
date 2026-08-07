@@ -1,7 +1,7 @@
 """Tool registry with status, stability, and support-envelope reporting.
 
-Vendored from OpenMontage's ``tools.tool_registry`` and adjusted so discovery
-uses HonCut's ``vendor.openmontage.tools`` package layout.
+Vendored tool registry adjusted so discovery
+uses HonCut's ``vendor.video_tools.tools`` package layout.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ def _scrub_unicode_dashes(value: Any) -> Any:
 
 
 class ToolRegistry:
-    """Central registry of all vendored OpenMontage tools."""
+    """Central registry of all vendored video tools."""
 
     def __init__(self) -> None:
         self._tools: dict[str, BaseTool] = {}
@@ -91,7 +91,7 @@ class ToolRegistry:
                 if key and key not in os.environ:
                     os.environ[key] = value
 
-    def discover(self, package_name: str = "vendor.openmontage.tools") -> list[str]:
+    def discover(self, package_name: str = "vendor.video_tools.tools") -> list[str]:
         self._load_dotenv()
         package = importlib.import_module(package_name)
         package_paths = getattr(package, "__path__", None)
@@ -106,7 +106,7 @@ class ToolRegistry:
         self._discovered_packages.add(package_name)
         return discovered
 
-    def ensure_discovered(self, package_name: str = "vendor.openmontage.tools") -> None:
+    def ensure_discovered(self, package_name: str = "vendor.video_tools.tools") -> None:
         if package_name not in self._discovered_packages:
             self.discover(package_name)
 
