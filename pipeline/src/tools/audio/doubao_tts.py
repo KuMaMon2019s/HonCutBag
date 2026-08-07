@@ -37,9 +37,9 @@ class DoubaoTTS(BaseTool):
 
     dependencies = []
     install_instructions = (
-        "Set DOUBAO_SPEECH_API_KEY to a Volcengine Doubao Speech API Key.\n"
+        "Set ARK_AGENT_API_KEY to a Volcengine Ark Agent Plan API Key.\n"
         "Optional: set DOUBAO_SPEECH_VOICE_TYPE to the default speaker voice.\n"
-        "Use the new console API key flow; do not pass app id/access token as the API key."
+        "Agent Plan includes TTS 2.0 (seed-tts-2.0). DOUBAO_SPEECH_API_KEY is deprecated fallback."
     )
     fallback = "google_tts"
     fallback_tools = ["google_tts", "elevenlabs_tts", "openai_tts", "piper_tts"]
@@ -175,7 +175,8 @@ class DoubaoTTS(BaseTool):
     DEFAULT_VOICE_ENV = "DOUBAO_SPEECH_VOICE_TYPE"
 
     def get_status(self) -> ToolStatus:
-        if os.environ.get("DOUBAO_SPEECH_API_KEY"):
+        # Prefer ARK_AGENT_API_KEY (Agent Plan includes TTS 2.0)
+        if os.environ.get("ARK_AGENT_API_KEY") or os.environ.get("DOUBAO_SPEECH_API_KEY"):
             return ToolStatus.AVAILABLE
         return ToolStatus.UNAVAILABLE
 
@@ -185,9 +186,10 @@ class DoubaoTTS(BaseTool):
         return round(len(inputs.get("text", "")) * 0.000015, 4)
 
     def execute(self, inputs: dict[str, Any]) -> ToolResult:
-        api_key = os.environ.get("DOUBAO_SPEECH_API_KEY")
+        # Prefer ARK_AGENT_API_KEY (Agent Plan), fallback to legacy DOUBAO_SPEECH_API_KEY
+        api_key = os.environ.get("ARK_AGENT_API_KEY") or os.environ.get("DOUBAO_SPEECH_API_KEY")
         if not api_key:
-            return ToolResult(success=False, error="No Doubao Speech API key. " + self.install_instructions)
+            return ToolResult(success=False, error="No API key. " + self.install_instructions)
 
         voice_id = inputs.get("voice_id") or os.environ.get(self.DEFAULT_VOICE_ENV)
         if not voice_id:
@@ -232,7 +234,7 @@ class DoubaoTTS(BaseTool):
         )
         body = self._submit_body(inputs, voice_id=voice_id, request_id=req_id)
 
-        submit_response = requests.post(get_external_api_url("DOUBAO_TTS_SUBMIT"), headers=headers, json=body, timeout=(10, 60))
+        submit_response = requests.post(get_external_api_url("DOUBAO_TTS"), headers=headers, json=body, timeout=(10, 60))
         submit_data = self._json_or_raise(submit_response)
         self._raise_for_doubao_error(submit_response.status_code, submit_data)
 
@@ -349,7 +351,7 @@ class DoubaoTTS(BaseTool):
                 request_id=str(uuid.uuid4()),
                 return_usage=return_usage,
             )
-            response = requests_module.post(get_external_api_url("DOUBAO_TTS_QUERY"), headers=headers, json={"task_id": task_id}, timeout=(10, 60))
+            response = requests_module.post(get_external_api_url("DOUBAO_TTS"), headers=headers, json={"task_id": task_id}, timeout=(10, 60))
             query_data = self._json_or_raise(response)
             self._raise_for_doubao_error(response.status_code, query_data)
             status = query_data.get("data", {}).get("task_status")
@@ -378,7 +380,7 @@ class DoubaoTTS(BaseTool):
     def _diagnostic_hint(message: str) -> str:
         lowered = message.lower()
         if "load grant" in lowered or "requested grant not found" in lowered:
-            return " (check DOUBAO_SPEECH_API_KEY and use the new-console X-Api-Key flow)"
+            return " (check ARK_AGENT_API_KEY or DOUBAO_SPEECH_API_KEY and use the new-console X-Api-Key flow)"
         if "speaker permission denied" in lowered or "access denied" in lowered:
             return " (check voice_id/DOUBAO_SPEECH_VOICE_TYPE and voice authorization)"
         if "quota exceeded" in lowered:
@@ -390,7 +392,8 @@ class DoubaoTTS(BaseTool):
     @staticmethod
     def _safe_error(exc: Exception) -> str:
         # Avoid ever echoing request headers or secrets in user-visible errors.
-        return str(exc).replace(os.environ.get("DOUBAO_SPEECH_API_KEY", ""), "[redacted]")
+        api_key = os.environ.get("ARK_AGENT_API_KEY") or os.environ.get("DOUBAO_SPEECH_API_KEY", "")
+        return str(exc).replace(api_key, "[redacted]")
 
     @staticmethod
     def _extension_for_format(fmt: str) -> str:

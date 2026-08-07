@@ -36,8 +36,7 @@ class ExternalAPIEndpoints:
 
     DEFAULTS: ClassVar[dict[str, str]] = {
         "DASHSCOPE_TTS": "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
-        "DOUBAO_TTS_SUBMIT": "https://openspeech.bytedance.com/api/v3/tts/submit",
-        "DOUBAO_TTS_QUERY": "https://openspeech.bytedance.com/api/v3/tts/query",
+        "DOUBAO_TTS": "https://openspeech.bytedance.com/api/v3/plan/tts/unidirectional",
         "FREESOUND": "https://freesound.org/apiv2",
         "GOOGLE_TTS": "https://texttospeech.googleapis.com",
         "PIXABAY_MUSIC": "https://pixabay.com",
@@ -216,6 +215,12 @@ class Models:
     
     # 火山方舟 - 视频生成
     ARK_VIDEO: str = "doubao-seedance-2.0-mini"
+    
+    # 火山方舟 - 语音合成 (TTS 2.0)
+    ARK_TTS: str = "seed-tts-2.0"
+    
+    # 火山方舟 - 语音识别 (ASR 2.0)
+    ARK_ASR: str = "volc.seedasr.sauc.duration"
     
     # 火山方舟 - Embedding
     ARK_EMBEDDING: str = "doubao-embedding-vision",

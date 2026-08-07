@@ -81,3 +81,13 @@ workspaces
 2026-07-27_05/
 .ruff_cache/
 atris/
+
+# Internal task documents (do not publish)
+CODEX_*.md
+.atris/
+.codex-delivery/
+*.bundle
+
+# Tests (local only, not for public repo)
+pipeline/tests/
+pipeline/prompts/test_validator.py
