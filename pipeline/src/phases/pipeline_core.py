@@ -2025,6 +2025,37 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
         return {"status": "error", "error": "STORYBOARD.json not found", "duration_s": _elapsed(start)}
 
     try:
+        # V6.3 scene contract is additive. Failure must never block the legacy
+        # orchestrator path.
+        try:
+            from phases.scene_consistency import write_scene_consistency
+
+            storyboard_for_consistency = json.loads(storyboard_path.read_text(encoding="utf-8"))
+            characters_path = output_dir / "CHARACTERS.json"
+            characters_for_consistency = (
+                json.loads(characters_path.read_text(encoding="utf-8"))
+                if characters_path.exists() else {"characters": []}
+            )
+            visual_style_path = next(
+                (
+                    candidate for candidate in (
+                        output_dir / "visual-style.md",
+                        output_dir / "visual_style_spec.md",
+                    ) if candidate.exists()
+                ),
+                None,
+            )
+            write_scene_consistency(
+                output_dir / "SCENE_CONSISTENCY.json",
+                storyboard_for_consistency,
+                characters_for_consistency,
+                visual_style_path,
+            )
+            outputs.append("SCENE_CONSISTENCY.json")
+            print("  ✓ 场景一致性契约: SCENE_CONSISTENCY.json")
+        except Exception as exc:
+            print(f"  ⚠ 场景一致性生成失败，继续旧 Phase 4: {exc}")
+
         orchestrator_script = PHASE47_DIR / "orchestrator.py"
         if not orchestrator_script.exists():
             return {"status": "error", "error": f"orchestrator.py not found at {orchestrator_script}", "duration_s": _elapsed(start)}
@@ -2103,8 +2134,9 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
                 meta["speech_pacing"] = director_scenes[index]["speech_pacing"]
             meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        print(f"  ✓ Phase 4 完成: {len(outputs)} 镜头目录")
-        status = "done" if outputs or dry_run else "error"
+        shot_output_count = sum(item.startswith("shots/") for item in outputs)
+        print(f"  ✓ Phase 4 完成: {shot_output_count} 镜头目录")
+        status = "done" if shot_output_count or dry_run else "error"
         return {"status": status, "duration_s": _elapsed(start), "outputs": outputs or ["shots/"], "provider": selected_provider, "render_runtime": locked_composition["render_runtime"]}
 
     except subprocess.TimeoutExpired:
@@ -2320,6 +2352,7 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
     char_ref_map = {}   # {match_key_lower: base64_of_front_png}
     char_list = []      # [(char_id, char_name, b64)] for fallback
     chars_path = output_dir / "CHARACTERS.json"
+    chars_data = {"characters": []}
     declared_character_ids = set()
     missing_character_fronts = set()
     if chars_path.exists():
@@ -2327,7 +2360,11 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
         for char in chars_data.get("characters", []):
             declared_character_ids.add(char["id"])
             # Try both directory structures: characters/{id}/ and characters/characters/{id}/
-            front_png = output_dir / "characters" / char["id"] / "front.png"
+            front_png = output_dir / "characters" / char["id"] / "face_closeup.png"
+            if not front_png.exists():
+                front_png = output_dir / "characters" / char["id"] / "full_body.png"
+            if not front_png.exists():
+                front_png = output_dir / "characters" / char["id"] / "front.png"
             if not front_png.exists():
                 front_png = output_dir / "characters" / "characters" / char["id"] / "front.png"
             if front_png.exists():
@@ -2364,6 +2401,11 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
     # 同场景镜头使用相同 seed，确保背景一致性
     scene_seed_map = {}  # {where: seed}
     prev_shot_dir = None  # --- P1-D2: 上一镜头视频作为运动参考 ---
+    scene_consistency_path = output_dir / "SCENE_CONSISTENCY.json"
+    scene_consistency_data = (
+        json.loads(scene_consistency_path.read_text(encoding="utf-8"))
+        if scene_consistency_path.exists() else {}
+    )
     
     # --- 并发配置 ---
     try:
@@ -2391,6 +2433,25 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
 
         meta = json.loads(meta_path.read_text())
         prompt = meta.get("prompt", "")
+        try:
+            if scene_consistency_data:
+                from phases.video_generator import build_video_prompt
+
+                routed_prompt = build_video_prompt(
+                    meta,
+                    chars_data,
+                    scene_consistency_data,
+                    os.environ.get("VIDEO_MODEL", "seedance"),
+                )
+                if isinstance(routed_prompt, dict):
+                    prompt = routed_prompt["prompt"]
+                    meta["negative_prompt"] = routed_prompt["negative_prompt"]
+                else:
+                    prompt = routed_prompt
+                meta["prompt"] = prompt
+                meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            print(f"    ⚠ {shot_dir.name}: 八层提示词组装失败，使用旧 prompt: {exc}")
         gen_strategy = meta.get("gen_strategy", "i2v")
         if gen_strategy not in {"flf2v", "phantom", "i2v"}:
             gen_strategy = "i2v"

@@ -468,6 +468,29 @@ def _post_filter_characters(characters: List[Dict[str, Any]]) -> List[Dict[str, 
     return filtered
 
 
+def _add_reference_contract(character: Dict[str, Any]) -> None:
+    """Add the V6.3 reference contract without removing legacy character fields."""
+    appearance = character.get("appearance")
+    appearance = appearance if isinstance(appearance, dict) else {}
+    traits = [
+        str(appearance.get(key, "")).strip()
+        for key in ("clothing", "face", "hair", "distinguishing")
+        if appearance.get(key)
+    ][:3]
+    subject_traits = "、".join(traits) or str(appearance.get("summary") or character.get("name", "角色"))
+    character.setdefault("face_reference", "face_closeup.png")
+    character.setdefault("body_reference", "full_body.png")
+    character.setdefault(
+        "prompt_definition",
+        f"将图片1中的[{subject_traits}]定义为<主体1>",
+    )
+    base_guardrails = "去龄化, 特征变形, 更换服装, 颜色偏移, 多余肢体, 关节扭曲"
+    character.setdefault(
+        "negative_guardrails",
+        ", ".join(filter(None, (base_guardrails, str(character.get("negative", "")).strip()))),
+    )
+
+
 def discover_characters(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     核心函数：从事件列表中发现所有角色并生成 CHARACTERS.json
@@ -582,6 +605,10 @@ def discover_characters(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     for char in characters:
         char_id = char.get("id", "unknown")
         char["asset_path"] = f"characters/{char_id}/"
+        try:
+            _add_reference_contract(char)
+        except Exception as exc:
+            print(f"警告：角色参考契约补充失败，保留旧结构: {exc}", file=sys.stderr)
 
     # 7. 构建最终输出
     result = {

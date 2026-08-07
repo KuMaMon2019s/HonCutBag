@@ -263,6 +263,33 @@ REFERENCE_WEIGHT_NOTE = (
     "outfit details, and color palette as the reference image"
 )
 
+SOURCE_IMAGE_RULES = (
+    "avoid strong shadows, front-facing or three-quarter view, "
+    "solid-color or simple fabric background, face occupies at least 60 percent"
+)
+
+
+def build_model_reference_prompts(
+    character_desc: str, style: str = "", target_model: str = "seedance"
+) -> dict:
+    """Build separated reference prompts for Seedance or Kling."""
+    suffix = f", {style}" if style else ""
+    base = f"{character_desc}{suffix}. {SOURCE_IMAGE_RULES}. Photorealistic, neutral expression"
+    if "kling" in target_model.lower():
+        return {
+            "front": f"{base}, front portrait, identity reference",
+            "side": f"{base}, strict side profile, identity reference",
+            "three_quarter": f"{base}, three-quarter portrait, identity reference",
+            "detail": f"{base}, facial detail close-up, face occupies 70 percent",
+        }
+    return {
+        "face_closeup": f"{base}, head-and-shoulders close-up, face occupies 70 percent",
+        "full_body": (
+            f"{base}, separate full-body standing photograph, complete outfit and footwear visible, "
+            "same identity and clothing as the face reference"
+        ),
+    }
+
 
 def build_combined_sheet_prompt(
     character_desc: str,
@@ -501,76 +528,47 @@ def generate_character(
     # Initialize client (may be None if skip_images=True)
     client = None
 
-    # Step 1: Generate character sheet (combined 4-view image)
+    # Step 1: Generate separated references. The legacy combined sheet remains
+    # available as a graceful fallback for providers that reject this route.
+    target_model = "kling" if model and "kling" in model.lower() else "seedance"
+    seedream_model = (
+        model if model and "seedream" in model.lower()
+        else "doubao-seedream-5.0-lite"
+    )
     if not skip_images:
-        print("[Step 1/3] Generating combined character sheet (4 views in one image)...")
-        client = SeedreamClient(model=model or "doubao-seedream-5.0-lite")
-
-        # Build combined sheet prompt (all views in one image)
-        sheet_prompt = build_combined_sheet_prompt(
-            character_desc=description,
-            style=style,
-        )
-
-        # Validate prompt before calling API
-        print("  [validation] Checking prompt completeness...")
+        print(f"[Step 1/3] Generating separated {target_model} references...")
+        client = SeedreamClient(model=seedream_model)
+        reference_prompts = build_model_reference_prompts(description, style, target_model)
+        views = {}
         try:
-            validate_and_build_prompt(sheet_prompt, "three_view")
-            print("  [validation] ✓ Prompt passed validation")
-        except ValueError as e:
-            print(f"  [validation] ✗ {e}")
-            print("  [validation] Proceeding with combined prompt (may have quality issues)")
-
-        # Generate combined character sheet (square 2x2 grid)
-        # Seedream API requires min 1920x1920; use square for 2x2 grid layout
-        sheet_path = os.path.join(char_dir, "character_sheet.png")
-        print("  [sheet] generating combined character sheet (2x2 grid)...")
-
-        # --- 429 retry with exponential backoff (inner retry before outer _retry_with_policy) ---
-        import time as _time
-        _sheet_max_retries = 3
-        _sheet_wait_times = [120, 240, 480]  # Agent Plan 429 cooldown window
-        _sheet_success = False
-        for _sheet_attempt in range(1, _sheet_max_retries + 1):
-            try:
-                url = client.text_to_image(
-                    prompt=sheet_prompt,
-                    output_path=sheet_path,
-                    size="1920x1920",  # square for 2x2 grid
-                )
-                print(f"  [sheet] ✓ → {sheet_path}")
-                _sheet_success = True
-                break
-            except Exception as e:
-                _err_str = str(e)
-                _is_429 = (
-                    "429" in _err_str
-                    or "Too Many Requests" in _err_str
-                    or getattr(getattr(e, "response", None), "status_code", None) == 429
-                )
-                if _is_429 and _sheet_attempt < _sheet_max_retries:
-                    _wait = _sheet_wait_times[_sheet_attempt - 1]
-                    print(f"  [sheet] retry {_sheet_attempt}/{_sheet_max_retries} (429, wait {_wait}s)...")
-                    _time.sleep(_wait)
-                    continue
+            first_path = None
+            for index, (view_name, reference_prompt) in enumerate(reference_prompts.items()):
+                view_path = os.path.join(char_dir, f"{view_name}.png")
+                if index and first_path and hasattr(client, "image_to_image"):
+                    client.image_to_image(
+                        prompt=f"{REFERENCE_WEIGHT_NOTE}. {reference_prompt}",
+                        ref_image=first_path,
+                        output_path=view_path,
+                        size=size,
+                    )
                 else:
-                    # Non-429 or retries exhausted → raise to outer _retry_with_policy
-                    print(f"  [sheet] ✗ → {e}")
-                    raise
-
-        if not _sheet_success:
-            raise RuntimeError(f"[sheet] all {_sheet_max_retries} retries exhausted for {char_id}")
-
-        # Crop into individual views using ffmpeg
-        print("  [crop] splitting character sheet into 4 views...")
-        views = crop_character_sheet(
-            sheet_path=sheet_path,
-            output_dir=char_dir,
-            num_views=4,  # closeup, front, side, back
-        )
+                    client.text_to_image(prompt=reference_prompt, output_path=view_path, size=size)
+                first_path = first_path or view_path
+                views[view_name] = view_path
+                print(f"  [{view_name}] ✓ → {view_path}")
+        except Exception as exc:
+            print(f"  ⚠ separated references failed ({exc}); using legacy combined sheet fallback")
+            sheet_path = os.path.join(char_dir, "character_sheet.png")
+            client.text_to_image(
+                prompt=build_combined_sheet_prompt(description, style),
+                output_path=sheet_path,
+                size="1920x1920",
+            )
+            legacy_views = crop_character_sheet(sheet_path, char_dir, num_views=4)
+            views = legacy_views
     else:
         print("[Step 1/3] Skipping image generation (--skip-images)")
-        views = {"closeup": None, "front": None, "side": None, "back": None}
+        views = {name: None for name in build_model_reference_prompts(description, style, target_model)}
 
     # Step 2: Create character_card.json
     print("[Step 2/3] Creating character_card.json...")
@@ -580,13 +578,13 @@ def generate_character(
         description=description,
         style=style,
         negative=negative,
-        seedream_model=model or "doubao-seedream-5.0-lite",
-        reference_images={
-            "front": f"characters/{char_id}/front.png",
-            "side": f"characters/{char_id}/side.png",
-            "back": f"characters/{char_id}/back.png",
-        },
+        seedream_model=seedream_model,
+        reference_images={name: f"characters/{char_id}/{name}.png" for name in views},
     )
+    card["face_reference"] = f"characters/{char_id}/face_closeup.png"
+    card["body_reference"] = f"characters/{char_id}/full_body.png"
+    card["reference_strategy"] = "kling_four_views" if "kling" in target_model.lower() else "seedance_face_and_body"
+    card["source_image_rules"] = SOURCE_IMAGE_RULES
     card_path = os.path.join(char_dir, "character_card.json")
     with open(card_path, "w", encoding="utf-8") as f:
         json.dump(card, f, ensure_ascii=False, indent=2)

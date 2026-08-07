@@ -121,7 +121,7 @@ IDENTITY_LOCK_PHRASES = [
 CAMERA_OPENERS = {
     "establishing": "Wide establishing shot, slow cinematic push-in, cinematic lighting, photorealistic, 35mm film quality.",
     "close_up": "Medium close-up, subtle handheld motion, shallow depth of field, photorealistic, 35mm film.",
-    "action": "Dynamic tracking shot, cinematic lighting, photorealistic, 35mm film quality, motion blur on fast actions.",
+    "action": "Dynamic tracking shot, cinematic lighting, photorealistic, 35mm film quality, crisp subject detail.",
     "reaction": "One continuous shot, natural head movement, photorealistic, 35mm film grain, no cuts, no zoom.",
     "transition": "Slow pan across scene, cinematic lighting, photorealistic, volumetric haze, 35mm film.",
     "atmosphere": "Wide aerial shot, slow drift, golden hour lighting, photorealistic, 35mm film quality.",
@@ -154,6 +154,38 @@ SHOT_SIZE_MAP = {
     "close_up": "Close-up",
     "extreme_close_up": "Extreme close-up",
 }
+
+CAMERA_TERMS = {
+    "dolly_in": "推进(dolly in)",
+    "dolly_out": "拉出(dolly out)",
+    "pan_left": "左摇(pan left)",
+    "pan_right": "右摇(pan right)",
+    "slow_pan": "左摇(pan left)",
+    "tracking": "跟拍(tracking shot)",
+    "tracking_shot": "跟拍(tracking shot)",
+    "orbit": "环绕(orbit)",
+    "handheld": "手持(handheld)",
+    "static": "固定(fixed/locked)",
+    "fixed": "固定(fixed/locked)",
+    "crane_up": "上升(crane up)",
+    "crane_down": "下降(crane down)",
+    "push_in": "推入(push in)",
+    "whip_pan": "甩镜(whip-pan)",
+    "rack_focus": "焦点转移(rack focus)",
+}
+
+EMOTION_ACTIONS = {
+    "悲伤": "低头，肩膀微颤，眼眶泛红，手指攥紧衣角",
+    "喜悦": "嘴角上扬，眉眼舒展，脚步轻快",
+    "紧张": "频繁看手表，手指敲击桌面，呼吸急促，眼神闪躲",
+    "愤怒": "双拳紧握，下颌紧绷，胸口起伏",
+}
+
+QUALITY_GUARDRAILS = (
+    "变形扭曲(warping)，形态渐变(morphing)，面部扭曲(distorted faces)，"
+    "多余手指(extra fingers)，模糊纹理(blurry textures)，"
+    "抖动运动(jittery motion)，伪影(artifacts)"
+)
 
 
 # ─── LLM 客户端 ─────────────────────────────────────────────────────────────
@@ -327,7 +359,7 @@ def _get_first_frame_for_shot(
     return characters_map.get(first_char)
 
 
-def _build_shot_prompt(
+def _build_shot_prompt_legacy(
     shot: Dict[str, Any],
     characters: Optional[List[Dict[str, Any]]] = None,
     scene_style_map: Optional[Dict[str, str]] = None,
@@ -461,6 +493,135 @@ def _build_shot_prompt(
         prompt = f"{prompt}\n\nVisual style: {visual_style.style_prompt_full}"
     shot.setdefault("speech_duration_s", estimate_shot_duration(len(prompt.split())))
     return prompt
+
+
+def _concrete_subject_description(
+    shot: Dict[str, Any], characters: Optional[List[Dict[str, Any]]]
+) -> str:
+    """Return names plus at most three stable, drawable appearance traits."""
+    requested = shot.get("who", [])
+    requested = requested if isinstance(requested, list) else [requested]
+    descriptions = []
+    for requested_name in filter(None, requested):
+        match = next(
+            (
+                char for char in characters or []
+                if requested_name == char.get("name")
+                or requested_name in char.get("aliases", [])
+            ),
+            None,
+        )
+        appearance = (match or {}).get("appearance", {})
+        traits = [
+            str(appearance.get(key, "")).strip()
+            for key in ("hair", "face", "clothing", "distinguishing")
+            if appearance.get(key)
+        ][:3]
+        descriptions.append(f"{requested_name}—{'，'.join(traits)}" if traits else str(requested_name))
+    return "；".join(descriptions) or str(shot.get("subject_description") or "场景主体")
+
+
+def _specific_lighting(shot: Dict[str, Any], where: str) -> str:
+    lighting = str(shot.get("lighting_description") or shot.get("lighting_key") or "").strip()
+    if lighting and any(token in lighting for token in ("左", "右", "上", "下", "逆光", "侧光")):
+        if any(token in lighting.upper() for token in ("K", "暖", "冷")):
+            return lighting
+    if any(token in where for token in ("夜", "月", "室外")):
+        return "冷蓝月光从镜头右上方射入，色温5600K，暖橙环境光轻微补亮轮廓，气氛克制"
+    if any(token in where for token in ("室内", "房", "店", "办公室")):
+        return "暖白LED主光从镜头左上方照射，色温4200K，右侧冷色窗光勾勒轮廓，气氛沉静"
+    return "黄金时段主光从镜头左上方侧逆光照射，色温4800K，空气颗粒可见，气氛真实"
+
+
+def _build_eight_layer_prompt(
+    shot: Dict[str, Any],
+    characters: Optional[List[Dict[str, Any]]] = None,
+    scene_style_map: Optional[Dict[str, str]] = None,
+    prev_shot: Optional[Dict[str, Any]] = None,
+    visual_style_path: Optional[str] = None,
+) -> str:
+    """Build the deterministic eight-layer blueprint consumed by the LLM."""
+    shot_number = shot.get("shot_number") or shot.get("shot_order") or shot.get("id") or 1
+    try:
+        shot_number = int(str(shot_number).lstrip("Ss"))
+    except (TypeError, ValueError):
+        shot_number = 1
+
+    requested = shot.get("who", [])
+    requested = requested if isinstance(requested, list) else [requested]
+    references = []
+    for char in characters or []:
+        if char.get("name") not in requested and not set(char.get("aliases", [])).intersection(requested):
+            continue
+        char_id = char.get("id") or char.get("name")
+        ref = char.get("face_reference") or f"characters/{char_id}/face_closeup.png"
+        references.append(f"参考图{ref}中的{char.get('name')}作为主体，保持身份与服装一致")
+
+    intent = str(shot.get("shot_intent") or "establishing").lower()
+    camera_key = str(shot.get("camera_movement") or INTENT_TO_CAMERA.get(intent, "slow_pan")).lower()
+    if prev_shot and prev_shot.get("camera_movement") == camera_key:
+        camera_key = "fixed"
+    shot["camera_movement"] = camera_key
+    camera = CAMERA_TERMS.get(camera_key, "固定(fixed/locked)")
+    framing = SHOT_SIZE_MAP.get(str(shot.get("shot_size") or "medium").lower(), "Medium shot")
+    subject = _concrete_subject_description(shot, characters)
+    emotion = str(shot.get("emotion") or "")
+    action = str(shot.get("action_description") or shot.get("what") or shot.get("visual") or "保持自然姿态")
+    externalized = next((value for key, value in EMOTION_ACTIONS.items() if key in emotion), "")
+    if externalized and externalized not in action:
+        action = f"{action}，{externalized}"
+    where = str(shot.get("where") or "当前场景")
+    scene_suffix = (scene_style_map or {}).get(where, "")
+    lighting = _specific_lighting(shot, where)
+    audio = str(shot.get("audio") or shot.get("sound") or "环境底噪与动作同期声")
+    visual_style = _load_default_visual_style(visual_style_path)
+    style_anchor = visual_style.style_prompt_short or visual_style.style_prompt_full or "电影叙事风格，35mm胶片质感"
+    duration = shot.get("duration", 5)
+
+    layers = []
+    if references:
+        layers.append("元素参考声明：" + "；".join(references))
+    layers.extend([
+        f"镜头{shot_number}：",
+        f"{framing}，{subject}",
+        f"动作：{action}",
+        f"运镜：{camera}",
+        f"场景与光影：{where}，{scene_suffix}，{lighting}".replace("，，", "，"),
+        f"音效：{audio}",
+        f"全局收尾：{style_anchor}；约束词：{QUALITY_GUARDRAILS}；4K，16:9，{duration}秒",
+    ])
+    blueprint = "\n".join(layers)
+    if "fast" in blueprint.lower() or "快速" in blueprint:
+        blueprint = re.sub(r"(?i)fast", "平稳", blueprint).replace("快速", "平稳")
+    shot["eight_layer_prompt"] = blueprint
+    shot.setdefault("speech_duration_s", estimate_shot_duration(len(blueprint.split())))
+    return USER_PROMPT_TEMPLATE.format(
+        visual=blueprint,
+        who=", ".join(map(str, requested)),
+        emotion=emotion,
+        where=where,
+        ref_binding="；".join(references) if references else "No character reference.",
+        style_suffix=style_anchor,
+    )
+
+
+def _build_shot_prompt(
+    shot: Dict[str, Any],
+    characters: Optional[List[Dict[str, Any]]] = None,
+    scene_style_map: Optional[Dict[str, str]] = None,
+    prev_shot: Optional[Dict[str, Any]] = None,
+    visual_style_path: Optional[str] = None,
+) -> str:
+    """Prefer the eight-layer framework and retain the V6.2 builder as fallback."""
+    try:
+        return _build_eight_layer_prompt(
+            shot, characters, scene_style_map, prev_shot, visual_style_path
+        )
+    except Exception as exc:
+        print(f"警告：八层分镜提示词构建失败，回退旧逻辑: {exc}", file=sys.stderr)
+        return _build_shot_prompt_legacy(
+            shot, characters, scene_style_map, prev_shot, visual_style_path
+        )
 
 
 # ─── 核心函数 ────────────────────────────────────────────────────────────────
