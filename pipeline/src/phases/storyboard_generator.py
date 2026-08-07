@@ -86,6 +86,51 @@ LLM_TIMEOUT = 60  # 秒
 MAX_RETRIES = 3  # 解析失败重试次数（从 1 提高到 3）
 FPS = 30  # 帧率
 
+IDENTITY_LOCK_PHRASES = [
+    "the same character",
+    "consistent across all shots",
+    "maintain exact appearance from reference image",
+    "no deformation, no drift, no face morph",
+    "Do not alter clothing category or primary color",
+]
+
+CAMERA_OPENERS = {
+    "establishing": "Wide establishing shot, slow cinematic push-in, cinematic lighting, photorealistic, 35mm film quality.",
+    "close_up": "Medium close-up, subtle handheld motion, shallow depth of field, photorealistic, 35mm film.",
+    "action": "Dynamic tracking shot, cinematic lighting, photorealistic, 35mm film quality, motion blur on fast actions.",
+    "reaction": "One continuous shot, natural head movement, photorealistic, 35mm film grain, no cuts, no zoom.",
+    "transition": "Slow pan across scene, cinematic lighting, photorealistic, volumetric haze, 35mm film.",
+    "atmosphere": "Wide aerial shot, slow drift, golden hour lighting, photorealistic, 35mm film quality.",
+}
+
+CAMERA_NEGATIONS = {
+    "static": "no camera movement, locked tripod, no pan, no tilt, no zoom",
+    "slow_pan": "no zoom, no cuts, smooth slow pan only",
+    "tracking": "no zoom, no cuts, smooth tracking only",
+    "handheld": "no zoom, no cuts, natural handheld movement",
+}
+
+INTENT_TO_CAMERA = {
+    "establishing": "slow_pan",
+    "transition": "slow_pan",
+    "reveal": "tracking",
+    "emotional": "static",
+    "action": "tracking",
+    "atmosphere": "slow_pan",
+    "reaction": "handheld",
+}
+
+SHOT_SIZE_MAP = {
+    "extreme_wide": "Extreme wide shot",
+    "wide": "Wide shot",
+    "full": "Full shot",
+    "medium_wide": "Medium wide shot",
+    "medium": "Medium shot",
+    "medium_close_up": "Medium close-up",
+    "close_up": "Close-up",
+    "extreme_close_up": "Extreme close-up",
+}
+
 
 # ─── LLM 客户端 ─────────────────────────────────────────────────────────────
 
@@ -253,7 +298,12 @@ def _get_first_frame_for_shot(
     return characters_map.get(first_char)
 
 
-def _build_shot_prompt(shot: Dict[str, Any], characters: Optional[List[Dict[str, Any]]] = None, scene_style_map: Optional[Dict[str, str]] = None) -> str:
+def _build_shot_prompt(
+    shot: Dict[str, Any],
+    characters: Optional[List[Dict[str, Any]]] = None,
+    scene_style_map: Optional[Dict[str, str]] = None,
+    prev_shot: Optional[Dict[str, Any]] = None,
+) -> str:
     """
     为单个 shot 构建 LLM user prompt
 
@@ -271,27 +321,63 @@ def _build_shot_prompt(shot: Dict[str, Any], characters: Optional[List[Dict[str,
     emotion = shot.get("emotion", "")
     where = shot.get("where", "")
 
-    # --- P0-B: Identity Anchor（参考 HonCut 内部提示词规范）---
-    # 从 characters 提取角色 3-6 个视觉特征，逐字复述到每个镜头 prompt
-    try:
-        characters_map = {}
-        if characters:
-            for char in characters:
-                char_name = char.get("name", "")
-                if char_name:
-                    characters_map[char_name] = char
-        identity_prefix = ""
-        shot_who = who_list if isinstance(who_list, list) else [who_list]
-        for char_name in shot_who:
-            char_info = characters_map.get(char_name, {})
-            appearance = char_info.get("appearance", {})
-            summary = appearance.get("summary", "")
-            if summary:
-                identity_prefix += f"{char_name} — {summary} — "
-        if identity_prefix:
-            visual = identity_prefix.rstrip(" — ") + ". " + visual
-    except Exception:
-        pass  # 降级：不阻断主流程
+    # Select deterministic camera language and persist it for STORYBOARD.json.
+    intent = str(shot.get("shot_intent") or "establishing").lower()
+    camera = INTENT_TO_CAMERA.get(intent, "slow_pan")
+    previous_camera = prev_shot.get("camera_movement") if prev_shot else None
+    if previous_camera == camera:
+        camera = next(
+            alternative
+            for alternative in ("slow_pan", "tracking", "static")
+            if alternative != camera
+        )
+    shot["camera_movement"] = camera
+
+    shot_size = str(shot.get("shot_size") or "medium").lower()
+    framing = SHOT_SIZE_MAP.get(shot_size, "Medium shot")
+    opener_key = intent if intent in CAMERA_OPENERS else "establishing"
+    if shot_size in {"medium_close_up", "close_up", "extreme_close_up"} and intent not in {
+        "action", "reaction"
+    }:
+        opener_key = "close_up"
+    camera_desc = CAMERA_OPENERS[opener_key]
+    camera_negation = CAMERA_NEGATIONS[camera]
+
+    # Build one verbatim identity-lock block per on-screen character. Aliases
+    # resolve to the canonical character record, but never use appearance.summary.
+    characters_map: Dict[str, Dict[str, Any]] = {}
+    for character in characters or []:
+        name = character.get("name", "")
+        if name:
+            characters_map[name] = character
+            for alias in character.get("aliases", []):
+                characters_map[alias] = character
+
+    identity_blocks = []
+    shot_who = who_list if isinstance(who_list, list) else [who_list]
+    for requested_name in filter(None, shot_who):
+        character = characters_map.get(requested_name)
+        if not character:
+            continue
+        appearance = character.get("appearance") or {}
+        features = [
+            str(appearance.get(field, "")).strip()
+            for field in ("hair", "face", "clothing", "distinguishing")
+            if appearance.get(field)
+        ]
+        if not features:
+            continue
+        canonical_name = character.get("name") or requested_name
+        char_id = character.get("id")
+        reference_path = f"characters/{char_id}/front.png" if char_id else f"{canonical_name}_ref.png"
+        identity_blocks.append(
+            f"[reference_image: {reference_path}]\n"
+            "[identity_lock]\n"
+            f"{canonical_name}: {IDENTITY_LOCK_PHRASES[0]} — {', '.join(features)} — "
+            f"{IDENTITY_LOCK_PHRASES[1]}; {IDENTITY_LOCK_PHRASES[2]}; "
+            f"{IDENTITY_LOCK_PHRASES[3]}. {IDENTITY_LOCK_PHRASES[4]}."
+        )
+    identity_block = "\n".join(identity_blocks)
 
     # --- P1-B2: 追加场景级共享视觉参数（同场景镜头共享 Layer 3-5）---
     if scene_style_map:
@@ -318,8 +404,20 @@ def _build_shot_prompt(shot: Dict[str, Any], characters: Optional[List[Dict[str,
     except ImportError:
         style_suffix = ""
     
+    scene_suffix = scene_style_map.get(where, "") if scene_style_map else ""
+    lighting = shot.get("lighting_key") or "natural"
+    action = shot.get("what") or visual
+    style = "Photorealistic, cinematic, 35mm film quality, no 3D, no cartoon, no VFX aesthetic."
+    audio = "Ambient natural sound, no music."
+    eight_part_prompt = (
+        f"{framing}. {camera_desc} Camera movement: {camera}; {camera_negation}.\n"
+        f"{identity_block + chr(10) if identity_block else ''}"
+        f"Action: {action}.\nSetting: {where}. {scene_suffix}\n"
+        f"Lighting: {lighting} lighting.\nStyle: {style}\nAudio: {audio}"
+    )
+
     return USER_PROMPT_TEMPLATE.format(
-        visual=visual,
+        visual=eight_part_prompt,
         who=who,
         emotion=emotion,
         where=where,
@@ -379,7 +477,13 @@ def generate_storyboard(
         duration = shot.get("suggested_duration", 5)
 
         # 调用 LLM 生成英文 prompt 和中文 caption
-        user_prompt = _build_shot_prompt(shot, characters, scene_style_map=scene_style_map)
+        previous_shot = shots[i - 2] if i > 1 else None
+        user_prompt = _build_shot_prompt(
+            shot,
+            characters,
+            scene_style_map=scene_style_map,
+            prev_shot=previous_shot,
+        )
         llm_result = None
 
         for attempt in range(1 + MAX_RETRIES):
@@ -422,6 +526,13 @@ def generate_storyboard(
                 "prompt": f"Cinematic shot, {shot.get('visual', 'scene')}, natural lighting, film grain",
                 "caption": shot.get("what", ""),
             }
+
+        # Identity and camera constraints are deterministic safety rails. Keep
+        # them in the final Seedance prompt even if the translation model omits
+        # or paraphrases part of the requested structure.
+        prompt_blueprint = user_prompt.partition("场景：")[2].partition("\n角色：")[0].strip()
+        if prompt_blueprint:
+            llm_result["prompt"] = f"{prompt_blueprint}\n{llm_result['prompt']}".strip()
 
         # 确定 first_frame
         first_frame = _get_first_frame_for_shot(shot, characters_map)
