@@ -180,7 +180,7 @@ class ImageSelector(BaseTool):
 
     def _providers(self) -> list[BaseTool]:
         """Auto-discover image generation providers from the registry."""
-        from tools.tool_registry import registry
+        from vendor.openmontage.tools.tool_registry import registry
         registry.ensure_discovered()
         return [t for t in registry.get_by_capability("image_generation")
                 if t.name != self.name]
@@ -213,7 +213,7 @@ class ImageSelector(BaseTool):
 
     def execute(self, inputs: dict[str, Any]) -> ToolResult:
         import logging
-        from lib.scoring import rank_providers
+        from vendor.openmontage.lib.scoring import rank_providers
 
         logger = logging.getLogger(__name__)
         task_context = self._prepare_task_context(inputs)
@@ -312,7 +312,7 @@ class ImageSelector(BaseTool):
         task_context: dict[str, Any],
     ) -> tuple[BaseTool | None, object]:
         """Select the best provider using scored ranking."""
-        from lib.scoring import rank_providers
+        from vendor.openmontage.lib.scoring import rank_providers
 
         preferred = inputs.get("preferred_provider", "auto")
         allowed = set(inputs.get("allowed_providers") or [])
@@ -339,7 +339,7 @@ class ImageSelector(BaseTool):
         return None, None
 
     def _prepare_task_context(self, inputs: dict[str, Any]) -> dict[str, Any]:
-        from lib.scoring import normalize_task_context
+        from vendor.openmontage.lib.scoring import normalize_task_context
 
         return normalize_task_context(
             inputs.get("task_context", {}),

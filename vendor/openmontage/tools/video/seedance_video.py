@@ -1,4 +1,4 @@
-"""Seedance 2.0 (ByteDance) video generation via fal.ai API.
+"""Seedance 2.0 video generation through HonCut Bridge or fal.ai.
 
 Best for cinematic clips with native audio, director-level camera control,
 and lip-sync from quoted dialogue in prompts.
@@ -38,8 +38,8 @@ class SeedanceVideo(BaseTool):
 
     dependencies = []
     install_instructions = (
-        "Set FAL_KEY to your fal.ai API key.\n"
-        "  Get one at https://fal.ai/dashboard/keys"
+        "Set VIDEO_PROVIDER=seedance to use HonCut Bridge, or set FAL_KEY "
+        "to retain the legacy fal.ai route."
     )
     agent_skills = ["seedance-2-0", "ai-video-gen"]
 
@@ -59,7 +59,7 @@ class SeedanceVideo(BaseTool):
         "seed": True,
     }
     best_for = [
-        "preferred premium video gen when FAL_KEY is available",
+        "preferred premium video gen through the HonCut Bridge Seedance route",
         "cinematic trailers, teasers, and high-fidelity clips with native synchronized audio",
         "director-level camera control and multi-shot editing in a single generation",
         "lip-sync from quoted dialogue in prompts",
@@ -154,7 +154,7 @@ class SeedanceVideo(BaseTool):
     )
     retry_policy = RetryPolicy(max_retries=2, retryable_errors=["rate_limit", "timeout"])
     idempotency_key_fields = ["prompt", "model_variant", "operation", "duration", "seed"]
-    side_effects = ["writes video file to output_path", "calls fal.ai API"]
+    side_effects = ["writes video file to output_path", "calls HonCut Bridge or fal.ai API"]
     user_visible_verification = [
         "Watch generated clip for motion coherence, audio sync, and visual quality"
     ]
@@ -162,8 +162,12 @@ class SeedanceVideo(BaseTool):
     def _get_api_key(self) -> str | None:
         return os.environ.get("FAL_KEY") or os.environ.get("FAL_AI_API_KEY")
 
+    @staticmethod
+    def _uses_bridge() -> bool:
+        return os.environ.get("VIDEO_PROVIDER", "").strip().lower() == "seedance"
+
     def get_status(self) -> ToolStatus:
-        if self._get_api_key():
+        if self._uses_bridge() or self._get_api_key():
             return ToolStatus.AVAILABLE
         return ToolStatus.UNAVAILABLE
 
@@ -179,6 +183,12 @@ class SeedanceVideo(BaseTool):
         return 60.0 if variant == "fast" else 120.0
 
     def execute(self, inputs: dict[str, Any]) -> ToolResult:
+        if self._uses_bridge():
+            return self._execute_bridge(inputs)
+
+        return self._execute_fal(inputs)
+
+    def _execute_fal(self, inputs: dict[str, Any]) -> ToolResult:
         api_key = self._get_api_key()
         if not api_key:
             return ToolResult(
@@ -215,7 +225,7 @@ class SeedanceVideo(BaseTool):
             if inputs.get("image_url"):
                 payload["image_url"] = inputs["image_url"]
             elif inputs.get("image_path"):
-                from tools.video._shared import upload_image_fal
+                from pipeline.src.tools.video._shared import upload_image_fal
                 payload["image_url"] = upload_image_fal(inputs["image_path"])
             if inputs.get("end_image_url"):
                 payload["end_image_url"] = inputs["end_image_url"]
@@ -223,7 +233,7 @@ class SeedanceVideo(BaseTool):
         if operation == "reference_to_video":
             ref_image_urls = list(inputs.get("reference_image_urls") or [])
             for local_path in inputs.get("reference_image_paths") or []:
-                from tools.video._shared import upload_image_fal
+                from pipeline.src.tools.video._shared import upload_image_fal
                 ref_image_urls.append(upload_image_fal(local_path))
             # Seedance 2.0 reference-to-video ceilings: 9 images + 3 video + 3 audio.
             if len(ref_image_urls) > 9:
@@ -298,7 +308,7 @@ class SeedanceVideo(BaseTool):
                 error=f"Seedance 2.0 video generation failed: {e}",
             )
 
-        from tools.video._shared import probe_output
+        from pipeline.src.tools.video._shared import probe_output
 
         probed = probe_output(output_path)
         return ToolResult(
@@ -322,4 +332,77 @@ class SeedanceVideo(BaseTool):
             cost_usd=self.estimate_cost(inputs),
             duration_seconds=round(time.time() - start, 2),
             model=model_path,
+        )
+
+    def _execute_bridge(self, inputs: dict[str, Any]) -> ToolResult:
+        """Generate through HonCut Bridge, explicitly selecting Seedance."""
+        import base64
+
+        from pipeline.src.clients import local_video_client
+
+        start = time.time()
+        output_path = Path(inputs.get("output_path", "seedance_output.mp4"))
+        operation = inputs.get("operation", "text_to_video")
+        image_urls: list[str] = []
+        image_paths: list[str] = []
+
+        if operation == "image_to_video":
+            if inputs.get("image_url"):
+                image_urls.append(inputs["image_url"])
+            if inputs.get("image_path"):
+                image_paths.append(inputs["image_path"])
+            if inputs.get("end_image_url"):
+                image_urls.append(inputs["end_image_url"])
+        elif operation == "reference_to_video":
+            image_urls.extend(inputs.get("reference_image_urls") or [])
+            image_paths.extend(inputs.get("reference_image_paths") or [])
+
+        try:
+            image_base64_list = [
+                base64.b64encode(Path(path).read_bytes()).decode("ascii")
+                for path in image_paths
+            ]
+            duration_value = inputs.get("duration", "5")
+            duration = None if duration_value == "auto" else float(duration_value)
+            aspect_ratio = inputs.get("aspect_ratio", "16:9")
+            resolution = inputs.get("resolution", "720p")
+            height = 720 if resolution == "720p" else 480
+            ratio_width, ratio_height = (
+                (int(value) for value in aspect_ratio.split(":"))
+                if aspect_ratio != "auto" else (16, 9)
+            )
+            width = round(height * ratio_width / ratio_height)
+
+            local_video_client.generate_video(
+                prompt=inputs["prompt"],
+                output_path=str(output_path),
+                image_base64_list=image_base64_list or None,
+                seed=inputs.get("seed", -1),
+                duration=duration,
+                width=width,
+                height=height,
+                model="seedance",
+                content=(
+                    [{"type": "text", "text": inputs["prompt"]}]
+                    + [{"type": "image_url", "image_url": url} for url in image_urls]
+                    if image_urls else None
+                ),
+            )
+        except Exception as exc:
+            return ToolResult(
+                success=False,
+                error=f"Seedance Bridge video generation failed: {exc}",
+            )
+
+        return ToolResult(
+            success=True,
+            data={
+                "provider": "seedance", "route": "honcut_bridge", "model": "seedance",
+                "prompt": inputs["prompt"], "operation": operation,
+                "output": str(output_path), "output_path": str(output_path), "format": "mp4",
+            },
+            artifacts=[str(output_path)],
+            duration_seconds=round(time.time() - start, 2),
+            seed=inputs.get("seed"),
+            model="seedance",
         )
