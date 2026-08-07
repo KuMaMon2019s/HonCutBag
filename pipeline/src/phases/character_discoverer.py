@@ -605,10 +605,7 @@ def discover_characters(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     for char in characters:
         char_id = char.get("id", "unknown")
         char["asset_path"] = f"characters/{char_id}/"
-        try:
-            _add_reference_contract(char)
-        except Exception as exc:
-            print(f"警告：角色参考契约补充失败，保留旧结构: {exc}", file=sys.stderr)
+        _add_reference_contract(char)
 
     # 7. 构建最终输出
     result = {

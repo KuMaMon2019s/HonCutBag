@@ -2025,36 +2025,31 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
         return {"status": "error", "error": "STORYBOARD.json not found", "duration_s": _elapsed(start)}
 
     try:
-        # V6.3 scene contract is additive. Failure must never block the legacy
-        # orchestrator path.
-        try:
-            from phases.scene_consistency import write_scene_consistency
+        from phases.scene_consistency import write_scene_consistency
 
-            storyboard_for_consistency = json.loads(storyboard_path.read_text(encoding="utf-8"))
-            characters_path = output_dir / "CHARACTERS.json"
-            characters_for_consistency = (
-                json.loads(characters_path.read_text(encoding="utf-8"))
-                if characters_path.exists() else {"characters": []}
-            )
-            visual_style_path = next(
-                (
-                    candidate for candidate in (
-                        output_dir / "visual-style.md",
-                        output_dir / "visual_style_spec.md",
-                    ) if candidate.exists()
-                ),
-                None,
-            )
-            write_scene_consistency(
-                output_dir / "SCENE_CONSISTENCY.json",
-                storyboard_for_consistency,
-                characters_for_consistency,
-                visual_style_path,
-            )
-            outputs.append("SCENE_CONSISTENCY.json")
-            print("  ✓ 场景一致性契约: SCENE_CONSISTENCY.json")
-        except Exception as exc:
-            print(f"  ⚠ 场景一致性生成失败，继续旧 Phase 4: {exc}")
+        storyboard_for_consistency = json.loads(storyboard_path.read_text(encoding="utf-8"))
+        characters_path = output_dir / "CHARACTERS.json"
+        characters_for_consistency = (
+            json.loads(characters_path.read_text(encoding="utf-8"))
+            if characters_path.exists() else {"characters": []}
+        )
+        visual_style_path = next(
+            (
+                candidate for candidate in (
+                    output_dir / "visual-style.md",
+                    output_dir / "visual_style_spec.md",
+                ) if candidate.exists()
+            ),
+            None,
+        )
+        write_scene_consistency(
+            output_dir / "SCENE_CONSISTENCY.json",
+            storyboard_for_consistency,
+            characters_for_consistency,
+            visual_style_path,
+        )
+        outputs.append("SCENE_CONSISTENCY.json")
+        print("  ✓ 场景一致性契约: SCENE_CONSISTENCY.json")
 
         orchestrator_script = PHASE47_DIR / "orchestrator.py"
         if not orchestrator_script.exists():
@@ -2433,25 +2428,22 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
 
         meta = json.loads(meta_path.read_text())
         prompt = meta.get("prompt", "")
-        try:
-            if scene_consistency_data:
-                from phases.video_generator import build_video_prompt
+        if scene_consistency_data:
+            from phases.video_generator import build_video_prompt
 
-                routed_prompt = build_video_prompt(
-                    meta,
-                    chars_data,
-                    scene_consistency_data,
-                    os.environ.get("VIDEO_MODEL", "seedance"),
-                )
-                if isinstance(routed_prompt, dict):
-                    prompt = routed_prompt["prompt"]
-                    meta["negative_prompt"] = routed_prompt["negative_prompt"]
-                else:
-                    prompt = routed_prompt
-                meta["prompt"] = prompt
-                meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception as exc:
-            print(f"    ⚠ {shot_dir.name}: 八层提示词组装失败，使用旧 prompt: {exc}")
+            routed_prompt = build_video_prompt(
+                meta,
+                chars_data,
+                scene_consistency_data,
+                os.environ.get("VIDEO_MODEL", "seedance"),
+            )
+            if isinstance(routed_prompt, dict):
+                prompt = routed_prompt["prompt"]
+                meta["negative_prompt"] = routed_prompt["negative_prompt"]
+            else:
+                prompt = routed_prompt
+            meta["prompt"] = prompt
+            meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
         gen_strategy = meta.get("gen_strategy", "i2v")
         if gen_strategy not in {"flf2v", "phantom", "i2v"}:
             gen_strategy = "i2v"

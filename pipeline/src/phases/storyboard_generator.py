@@ -612,16 +612,10 @@ def _build_shot_prompt(
     prev_shot: Optional[Dict[str, Any]] = None,
     visual_style_path: Optional[str] = None,
 ) -> str:
-    """Prefer the eight-layer framework and retain the V6.2 builder as fallback."""
-    try:
-        return _build_eight_layer_prompt(
-            shot, characters, scene_style_map, prev_shot, visual_style_path
-        )
-    except Exception as exc:
-        print(f"警告：八层分镜提示词构建失败，回退旧逻辑: {exc}", file=sys.stderr)
-        return _build_shot_prompt_legacy(
-            shot, characters, scene_style_map, prev_shot, visual_style_path
-        )
+    """Build shot prompt using the eight-layer framework."""
+    return _build_eight_layer_prompt(
+        shot, characters, scene_style_map, prev_shot, visual_style_path
+    )
 
 
 # ─── 核心函数 ────────────────────────────────────────────────────────────────

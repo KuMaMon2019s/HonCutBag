@@ -132,22 +132,19 @@ class VideoGenerator:
         asset_id = _read_state(state, "character_asset_id") or _read_state(state, "asset_id")
         prompt = _read_state(state, "prompt", "")
         negative_prompt = None
-        try:
-            output_dir = Path(_read_state(state, "output_dir", "."))
-            shot_meta = _read_state(state, "shot_meta") or _read_state(state, "shot")
-            characters = _read_state(state, "characters") or _load_json(output_dir / "CHARACTERS.json", {})
-            scene_contract = _read_state(state, "scene_consistency") or _load_json(output_dir / "SCENE_CONSISTENCY.json", {})
-            model = str(_read_state(state, "model") or "seedance")
-            if shot_meta and scene_contract:
-                routed = build_video_prompt(shot_meta, characters, scene_contract, model)
-                if isinstance(routed, dict):
-                    prompt = routed["prompt"]
-                    negative_prompt = routed["negative_prompt"]
-                else:
-                    prompt = routed
-                _write_state(state, "assembled_prompt", routed)
-        except Exception as exc:
-            _write_state(state, "prompt_fallback_reason", str(exc))
+        output_dir = Path(_read_state(state, "output_dir", "."))
+        shot_meta = _read_state(state, "shot_meta") or _read_state(state, "shot")
+        characters = _read_state(state, "characters") or _load_json(output_dir / "CHARACTERS.json", {})
+        scene_contract = _read_state(state, "scene_consistency") or _load_json(output_dir / "SCENE_CONSISTENCY.json", {})
+        model = str(_read_state(state, "model") or "seedance")
+        if shot_meta and scene_contract:
+            routed = build_video_prompt(shot_meta, characters, scene_contract, model)
+            if isinstance(routed, dict):
+                prompt = routed["prompt"]
+                negative_prompt = routed["negative_prompt"]
+            else:
+                prompt = routed
+            _write_state(state, "assembled_prompt", routed)
         if asset_id:
             result = await self.video_client.generate_with_assets(
                 asset_id=asset_id,
