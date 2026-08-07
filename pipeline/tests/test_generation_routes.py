@@ -35,6 +35,33 @@ def test_orchestrator_writes_gen_strategy_to_shot_meta(monkeypatch, tmp_path):
     assert meta["gen_strategy"] == "flf2v"
 
 
+def test_orchestrator_imports_seedance_client_from_clients_package(monkeypatch, tmp_path):
+    import orchestrator
+    from clients import seedance_client
+
+    monkeypatch.setattr(orchestrator, "SHOTS_DIR", tmp_path / "shots")
+    shot = {
+        "shot_id": "S01",
+        "name": "test",
+        "duration": 5,
+        "prompt": "test prompt",
+        "route": "txt2vid",
+        "route_reason": "test",
+        "caption": "",
+        "caption_frames": "",
+    }
+    orchestrator.setup_shot_dirs([shot])
+    monkeypatch.setattr(seedance_client, "submit", lambda **kwargs: "task-1")
+    monkeypatch.setattr(seedance_client, "poll", lambda task_id, api_key: "https://example.test/video.mp4")
+    monkeypatch.setattr(seedance_client, "download", lambda url, path: Path(path).write_bytes(b"video"))
+    monkeypatch.setattr(orchestrator, "extract_frames", lambda *args: None)
+
+    result = orchestrator.generate_shot(shot, "test-key")
+
+    assert result["status"] == "done"
+    assert result["task_id"] == "task-1"
+
+
 @pytest.mark.parametrize(
     ("shot", "expected"),
     [
@@ -136,40 +163,34 @@ def test_phase5_routes_model_and_defaults_old_metadata(
 
 
 def test_phase5_routes_to_seedance_when_requested(monkeypatch, tmp_path):
-    (tmp_path / "shots").mkdir()
-    storyboard = {"shots": [{"id": 1, "prompt": "test prompt"}]}
-    characters = {"characters": [{"id": "lead", "name": "Lead"}]}
-    (tmp_path / "STORYBOARD.json").write_text(json.dumps(storyboard))
-    (tmp_path / "CHARACTERS.json").write_text(json.dumps(characters))
+    shot_dir = tmp_path / "shots" / "S01"
+    shot_dir.mkdir(parents=True)
+    (shot_dir / "SHOT_META.json").write_text(
+        json.dumps({"prompt": "test prompt", "duration": 5})
+    )
     monkeypatch.setenv("VIDEO_PROVIDER", "seedance")
 
     captured = {}
-
-    def fake_seedance(storyboard_data, output_dir, characters_data, timing_ctx):
-        captured.update(
-            storyboard=storyboard_data,
-            output_dir=output_dir,
-            characters=characters_data,
-            timing_ctx=timing_ctx,
-        )
-        return {"status": "done", "provider": "seedance", "outputs": []}
-
-    monkeypatch.setattr(pipeline_runner, "_run_phase5_om_seedance", fake_seedance)
+    monkeypatch.setattr(local_video_client, "is_available", lambda timeout: True)
     monkeypatch.setattr(
-        local_video_client,
-        "is_available",
-        lambda timeout: pytest.fail("local Bridge must not be checked"),
+        asset_packager,
+        "build_content_for_shot",
+        lambda **kwargs: [
+            {"type": "text", "text": "test prompt"},
+            {"type": "image_url", "role": "first_frame"},
+        ],
     )
+    def fake_generate_video(**kwargs):
+        captured.update(kwargs)
+        Path(kwargs["output_path"]).write_bytes(b"x" * (10 * 1024 + 1))
+
+    monkeypatch.setattr(local_video_client, "generate_video", fake_generate_video)
 
     result = pipeline_runner._run_phase5_fallback(tmp_path)
 
-    assert result["provider"] == "seedance"
-    assert captured == {
-        "storyboard": storyboard,
-        "output_dir": tmp_path,
-        "characters": characters,
-        "timing_ctx": None,
-    }
+    assert result["status"] == "done"
+    assert result["provider"] == "local_video_client"
+    assert captured["model"] == "seedance"
 
 
 def test_phantom_content_has_first_frame_and_character_three_views(monkeypatch, tmp_path):

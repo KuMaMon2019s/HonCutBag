@@ -269,7 +269,7 @@ def generate_shot(shot: dict, api_key: str, dry_run: bool = False) -> dict:
         return meta
 
     # Real generation
-    import seedance_client
+    from clients import seedance_client
 
     print(f"  [gen] {shot['shot_id']} — submitting via {shot['route']}...")
     meta["status"] = "generating"
