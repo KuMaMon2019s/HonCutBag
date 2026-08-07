@@ -28,9 +28,32 @@ import os
 import argparse
 import re
 import time
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 from openai import OpenAI
+
+from utils.config import ToolPaths
+from utils.visual_style_spec import VisualStyle, parse_visual_style
+
+
+def _load_default_visual_style(
+    visual_style_path: Optional[str] = None,
+) -> VisualStyle:
+    """Load an override or the default HonCut visual style."""
+    default_path = ToolPaths.PROMPTS_DIR / "default_visual_style.md"
+    # ToolPaths historically points at pipeline/src/prompts; the portable
+    # prompt assets live in pipeline/prompts.
+    bundled_path = Path(__file__).resolve().parents[2] / "prompts" / "default_visual_style.md"
+    style_path = Path(visual_style_path) if visual_style_path else default_path
+    if not visual_style_path and not style_path.exists():
+        style_path = bundled_path
+    if style_path.exists():
+        return parse_visual_style(style_path.read_text(encoding="utf-8"))
+    return VisualStyle(
+        name="fallback",
+        style_prompt_full="cinematic, warm tones, 16:9",
+    )
 
 
 # ─── LLM 配置 ───────────────────────────────────────────────────────────────
@@ -303,6 +326,7 @@ def _build_shot_prompt(
     characters: Optional[List[Dict[str, Any]]] = None,
     scene_style_map: Optional[Dict[str, str]] = None,
     prev_shot: Optional[Dict[str, Any]] = None,
+    visual_style_path: Optional[str] = None,
 ) -> str:
     """
     为单个 shot 构建 LLM user prompt
@@ -416,7 +440,7 @@ def _build_shot_prompt(
         f"Lighting: {lighting} lighting.\nStyle: {style}\nAudio: {audio}"
     )
 
-    return USER_PROMPT_TEMPLATE.format(
+    prompt = USER_PROMPT_TEMPLATE.format(
         visual=eight_part_prompt,
         who=who,
         emotion=emotion,
@@ -425,6 +449,12 @@ def _build_shot_prompt(
         style_suffix=style_suffix,
     )
 
+    # Append the portable design system after identity-lock and camera rules.
+    visual_style = _load_default_visual_style(visual_style_path)
+    if visual_style.style_prompt_full:
+        prompt = f"{prompt}\n\nVisual style: {visual_style.style_prompt_full}"
+    return prompt
+
 
 # ─── 核心函数 ────────────────────────────────────────────────────────────────
 
@@ -432,6 +462,7 @@ def generate_storyboard(
     shots: List[Dict[str, Any]],
     characters: Optional[List[Dict[str, Any]]] = None,
     title: str = "未命名项目",
+    visual_style_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     将 shot 列表转化为 STORYBOARD.json 格式
@@ -483,6 +514,7 @@ def generate_storyboard(
             characters,
             scene_style_map=scene_style_map,
             prev_shot=previous_shot,
+            visual_style_path=visual_style_path,
         )
         llm_result = None
 
@@ -533,6 +565,18 @@ def generate_storyboard(
         prompt_blueprint = user_prompt.partition("场景：")[2].partition("\n角色：")[0].strip()
         if prompt_blueprint:
             llm_result["prompt"] = f"{prompt_blueprint}\n{llm_result['prompt']}".strip()
+
+        # Preserve the king field verbatim in the final Seedance prompt even
+        # when the translation model paraphrases or omits style instructions.
+        visual_style = _load_default_visual_style(visual_style_path)
+        if (
+            visual_style.style_prompt_full
+            and visual_style.style_prompt_full not in llm_result["prompt"]
+        ):
+            llm_result["prompt"] = (
+                f"{llm_result['prompt']}\n\nVisual style: "
+                f"{visual_style.style_prompt_full}"
+            )
 
         # 确定 first_frame
         first_frame = _get_first_frame_for_shot(shot, characters_map)
@@ -682,6 +726,12 @@ def main():
         help="输出 JSON 文件路径（可选，默认打印到 stdout）",
     )
 
+    parser.add_argument(
+        "--visual-style",
+        type=str,
+        help="visual-style.md 覆盖路径（可选）",
+    )
+
     args = parser.parse_args()
 
     # ── 读取 shots ────────────────────────────────────────────────────────
@@ -757,6 +807,7 @@ def main():
             shots=shots_data,
             characters=characters,
             title=args.title,
+            visual_style_path=args.visual_style,
         )
     except (ValueError, RuntimeError) as e:
         print(f"错误：{e}", file=sys.stderr)

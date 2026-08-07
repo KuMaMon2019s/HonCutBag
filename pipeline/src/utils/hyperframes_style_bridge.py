@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from utils.visual_style_spec import VisualStyle
+
 
 _FALLBACK_CSS_VARS = {
     "--color-bg": "#0B0F1A",
@@ -36,6 +38,26 @@ _FALLBACK_CSS_VARS = {
     "--duration-entrance": "0.6s",
     "--duration-transition": "0.5s",
 }
+
+
+def build_from_visual_style(vs: VisualStyle) -> dict[str, str]:
+    """Map a VisualStyle to a CSS custom-properties dictionary."""
+    css_vars = dict(_FALLBACK_CSS_VARS)
+
+    if vs.colors_primary:
+        css_vars["--color-bg"] = vs.colors_primary[0].hex
+        if len(vs.colors_primary) > 1:
+            css_vars["--color-fg"] = vs.colors_primary[1].hex
+    if vs.colors_accent:
+        css_vars["--color-accent"] = vs.colors_accent[0].hex
+    if vs.colors_neutral:
+        css_vars["--color-muted"] = vs.colors_neutral[0].hex
+    if vs.typography_display:
+        css_vars["--font-heading"] = vs.typography_display.family
+    if vs.typography_body:
+        css_vars["--font-body"] = vs.typography_body.family
+
+    return css_vars
 
 
 def _first(raw: Any, default: str) -> str:
