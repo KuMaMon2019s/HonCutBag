@@ -387,7 +387,7 @@ def _filter_descriptive_phrases(stats: Dict[str, Dict[str, Any]]) -> Dict[str, D
     移除：
     - 包含描述性形容词/修饰语的名称（如"年轻的"、"没带伞的"、"都市"）
     - 通用角色描述（如"路人"、"女性"、"男性"、"店员"）
-    - 超过 4 个中文字符的名称（真实中文姓名通常为 2-3 字）
+    - 过长且不像实体名称的描述性短语
     
     Args:
         stats: 角色统计字典
@@ -426,9 +426,14 @@ def _filter_descriptive_phrases(stats: Dict[str, Dict[str, Any]]) -> Dict[str, D
             print(f"  过滤通用角色描述: {name}", file=sys.stderr)
             continue
         
-        # 检查长度：统计中文字符数（排除标点）
+        # 实体后缀允许较长的复合名称，如“白色金属AI巡检机器人”。
         chinese_chars = [c for c in name if '\u4e00' <= c <= '\u9fff']
-        if len(chinese_chars) > 4:
+        entity_suffixes = [
+            "机器人", "号", "型", "级", "者", "员", "师", "家", "王", "后",
+            "公主", "王子", "先生", "小姐",
+        ]
+        is_entity = any(name.endswith(suffix) for suffix in entity_suffixes)
+        if not is_entity and len(chinese_chars) > 6:
             print(f"  过滤过长名称: {name} ({len(chinese_chars)} 字)", file=sys.stderr)
             continue
         

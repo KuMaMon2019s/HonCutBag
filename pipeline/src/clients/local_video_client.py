@@ -10,6 +10,7 @@ API Spec (HonCutBag_API_v3.1):
 """
 
 import os
+import sys
 import time
 import json
 import subprocess
@@ -540,10 +541,17 @@ def _verify_download(
     Returns:
         dict with keys: duration (float), width (int), height (int)
 
-    Raises:
-        RuntimeError: if probe fails or any provided expectation mismatches
-            (duration tolerance ±1.5s; resolution must match exactly).
+    Unreadable metadata is reported with ``None`` values so a successful
+    download is not discarded solely because ffprobe could not inspect it.
+    A RuntimeError is raised only when parsed metadata mismatches an expected
+    value (duration tolerance ±1.5s; resolution must match exactly).
     """
+    unavailable = {
+        "duration": None,
+        "width": None,
+        "height": None,
+        "num_frames": None,
+    }
     try:
         cmd = [
             "ffprobe", "-v", "error",
@@ -553,10 +561,29 @@ def _verify_download(
         ]
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if proc.returncode != 0:
-            raise RuntimeError(f"ffprobe failed: {proc.stderr.strip()}")
+            detail = proc.stderr.strip() or f"exit code {proc.returncode}"
+            print(
+                f"  [local_download] WARNING: ffprobe could not read metadata "
+                f"for {file_path}: {detail}",
+                file=sys.stderr,
+            )
+            return unavailable
         info = json.loads(proc.stdout)
     except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as e:
-        raise RuntimeError(f"ffprobe failed for {file_path}: {e}")
+        print(
+            f"  [local_download] WARNING: ffprobe could not read metadata "
+            f"for {file_path}: {e}",
+            file=sys.stderr,
+        )
+        return unavailable
+
+    streams = info.get("streams") or []
+    if not any(stream.get("codec_type") == "video" for stream in streams):
+        print(
+            f"  [local_download] WARNING: ffprobe found no video stream in {file_path}",
+            file=sys.stderr,
+        )
+        return unavailable
 
     # Extract duration
     actual_duration = None
@@ -567,7 +594,7 @@ def _verify_download(
         except (TypeError, ValueError):
             pass
     if actual_duration is None:
-        for s in info.get("streams", []):
+        for s in streams:
             if s.get("duration"):
                 try:
                     actual_duration = float(s["duration"])
@@ -579,7 +606,7 @@ def _verify_download(
     actual_width = None
     actual_height = None
     actual_num_frames = None
-    for s in info.get("streams", []):
+    for s in streams:
         if s.get("codec_type") == "video":
             try:
                 actual_width = int(s.get("width"))
@@ -677,11 +704,19 @@ def download(
                 expected_width=expected_width,
                 expected_height=expected_height,
             )
-            print(
-                f"  [local_download] ✓ verify ok: "
-                f"{actual.get('width')}x{actual.get('height')}, "
-                f"{actual.get('duration'):.2f}s"
-            )
+            if all(value is None for value in actual.values()):
+                print(
+                    "  [local_download] WARNING: metadata unavailable; "
+                    "keeping successfully downloaded file",
+                    file=sys.stderr,
+                )
+            else:
+                duration = actual.get("duration")
+                duration_text = f"{duration:.2f}s" if duration is not None else "unknown"
+                print(
+                    f"  [local_download] ✓ verify ok: "
+                    f"{actual.get('width')}x{actual.get('height')}, {duration_text}"
+                )
             if verification_out is not None:
                 verification_out.update(actual)
         except RuntimeError as e:
