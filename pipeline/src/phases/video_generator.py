@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
 from collections.abc import MutableMapping
 from pathlib import Path
 from typing import Any
@@ -95,7 +96,7 @@ def build_video_prompt(
     negatives.extend(str(char.get("negative_guardrails", "")).strip() for char in selected)
     negative_prompt = ", ".join(dict.fromkeys(item for item in negatives if item))
     prompt = "。".join(parts)
-    prompt = prompt.replace("快速", "平稳").replace("fast", "smooth").replace("Fast", "Smooth")
+    prompt = re.sub(r"(?i)\bfast\b", "smooth", prompt).replace("快速", "平稳")
     if "kling" in model.lower():
         return {"prompt": prompt, "negative_prompt": negative_prompt}
     identity_lock = "identity-lock：保持参考图中的面部骨骼、发型、服装类别与主色不变"

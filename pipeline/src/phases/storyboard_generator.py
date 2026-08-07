@@ -188,6 +188,11 @@ QUALITY_GUARDRAILS = (
 )
 
 
+def _remove_fast_motion_words(text: str) -> str:
+    """Remove blur-prone speed words without corrupting words like breakfast."""
+    return re.sub(r"(?i)\bfast\b", "smooth", str(text)).replace("快速", "平稳")
+
+
 # ─── LLM 客户端 ─────────────────────────────────────────────────────────────
 
 def estimate_shot_duration(word_count: int) -> float:
@@ -591,8 +596,7 @@ def _build_eight_layer_prompt(
         f"全局收尾：{style_anchor}；约束词：{QUALITY_GUARDRAILS}；4K，16:9，{duration}秒",
     ])
     blueprint = "\n".join(layers)
-    if "fast" in blueprint.lower() or "快速" in blueprint:
-        blueprint = re.sub(r"(?i)fast", "平稳", blueprint).replace("快速", "平稳")
+    blueprint = _remove_fast_motion_words(blueprint)
     shot["eight_layer_prompt"] = blueprint
     shot.setdefault("speech_duration_s", estimate_shot_duration(len(blueprint.split())))
     return USER_PROMPT_TEMPLATE.format(
@@ -739,6 +743,7 @@ def generate_storyboard(
                 f"{llm_result['prompt']}\n\nVisual style: "
                 f"{visual_style.style_prompt_full}"
             )
+        llm_result["prompt"] = _remove_fast_motion_words(llm_result["prompt"])
 
         # 确定 first_frame
         first_frame = _get_first_frame_for_shot(shot, characters_map)
@@ -777,7 +782,17 @@ def generate_storyboard(
             storyboard_shot["who"] = [str(who_list)] if who_list else []
 
         # Structured fields used by review and generation routing.
-        for field in ("shot_size", "camera_movement", "lighting_key", "shot_intent", "gen_strategy"):
+        structured_defaults = {
+            "shot_type": shot.get("shot_type") or shot.get("shot_size"),
+            "subject_description": _concrete_subject_description(shot, characters),
+            "action_description": shot.get("action_description") or shot.get("what") or shot.get("visual"),
+            "camera_movement_en": str(shot.get("camera_movement") or "fixed").replace("_", " "),
+            "lighting_description": _specific_lighting(shot, str(shot.get("where") or "")),
+        }
+        for field, value in structured_defaults.items():
+            if value:
+                storyboard_shot[field] = value
+        for field in ("shot_size", "camera_movement", "lighting_key", "shot_intent", "gen_strategy", "where", "audio", "sound"):
             val = shot.get(field)
             if val:
                 storyboard_shot[field] = val

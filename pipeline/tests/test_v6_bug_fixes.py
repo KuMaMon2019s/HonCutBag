@@ -9,6 +9,7 @@ from phases.character_discoverer import _filter_descriptive_phrases
 from phases.character_discoverer import _add_reference_contract
 from phases.character_factory import build_model_reference_prompts
 from phases.scene_consistency import generate_scene_consistency
+from phases import storyboard_generator
 from phases.storyboard_generator import _build_shot_prompt
 from phases.video_generator import BASE_NEGATIVE_PROMPT, build_video_prompt
 
@@ -107,6 +108,7 @@ def test_scene_contract_and_video_prompt_model_routing():
     scene = contract["shots"]["S01"]
     assert "5600K" in scene["lighting_description"]
     assert scene["spatial_layout"]["subject"]
+    assert len(scene["negative_prompt"].split(", ")) == 7
 
     seedance = build_video_prompt(storyboard["shots"][0], characters, contract, "seedance")
     kling = build_video_prompt(storyboard["shots"][0], characters, contract, "kling")

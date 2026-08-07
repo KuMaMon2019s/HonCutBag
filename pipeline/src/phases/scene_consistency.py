@@ -23,6 +23,9 @@ BASE_NEGATIVE_PROMPTS = [
 def _load_style(path: Optional[Path]) -> VisualStyle:
     if path and path.exists():
         return parse_visual_style(path.read_text(encoding="utf-8"))
+    bundled = Path(__file__).resolve().parents[2] / "prompts" / "default_visual_style.md"
+    if bundled.exists():
+        return parse_visual_style(bundled.read_text(encoding="utf-8"))
     return VisualStyle(
         name="cinematic-fallback",
         style_prompt_short="电影叙事风格，35mm胶片质感，高清细节",
@@ -85,6 +88,12 @@ def generate_scene_consistency(
         place = str(shot.get("where") or shot.get("scene_description") or "").strip()
         if place and place not in fixed_elements:
             fixed_elements.append(place)
+        props = shot.get("props", [])
+        prop_names = list(props) if isinstance(props, Mapping) else props
+        for prop in prop_names if isinstance(prop_names, (list, tuple, set)) else []:
+            prop = str(prop).strip()
+            if prop and prop not in fixed_elements:
+                fixed_elements.append(prop)
     if not fixed_elements:
         fixed_elements = ["场景建筑结构", "主要家具", "门窗位置"]
 
