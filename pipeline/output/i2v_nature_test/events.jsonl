@@ -1,7 +1,0 @@
-{"ts": "2026-08-03T16:32:30", "phase": "phase2_5", "event": "start", "msg": "故事板图片生成"}
-{"ts": "2026-08-03T16:33:30", "phase": "phase2_5", "event": "done", "msg": "故事板图片生成完成", "duration_s": 60.58}
-{"ts": "2026-08-03T16:33:30", "phase": "phase3", "event": "start", "msg": "角色工厂"}
-{"ts": "2026-08-03T16:33:30", "phase": "phase3", "event": "done", "msg": "角色工厂完成", "duration_s": 0.0}
-{"ts": "2026-08-03T16:33:30", "phase": "phase4", "event": "start", "msg": "编排器"}
-{"ts": "2026-08-03T16:33:30", "phase": "phase4", "event": "done", "msg": "编排器完成", "duration_s": 0.07}
-{"ts": "2026-08-03T17:19:59", "phase": "pipeline", "event": "completed", "msg": "Pipeline 全部完成"}
