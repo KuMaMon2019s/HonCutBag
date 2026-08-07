@@ -108,6 +108,14 @@ def _request_session() -> requests.Session:
     return session
 
 
+def _get_ark_api_key() -> str:
+    """Return the ARK credential used by Bridge-backed Seedance routes."""
+    api_key = os.environ.get("ARK_AGENT_API_KEY") or os.environ.get("ARK_API_KEY")
+    if not api_key:
+        raise ValueError("ARK_AGENT_API_KEY or ARK_API_KEY not set")
+    return api_key
+
+
 def is_available(timeout: float = 3.0) -> bool:
     """Check if the local video API is reachable.
     
@@ -170,6 +178,9 @@ def submit(
     Raises:
         RuntimeError: If the API is unreachable or returns an error
     """
+    if model == "seedance":
+        _get_ark_api_key()
+
     api_url = _get_api_url()
     session = _request_session()
     
