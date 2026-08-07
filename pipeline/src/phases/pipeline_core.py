@@ -2283,12 +2283,31 @@ def _run_phase5_om_seedance(storyboard_data: dict, output_dir: Path, characters_
 
 
 def _run_phase5_fallback(output_dir: Path) -> dict:
-    """Generate Phase 5 video through the local Bridge only."""
+    """Generate Phase 5 video through the local Bridge or Seedance API."""
     output_dir = Path(output_dir)
 
     shots_dir = output_dir / "shots"
     if not shots_dir.exists():
         return {"status": "skipped", "reason": "no shots directory"}
+
+    use_seedance = os.environ.get("VIDEO_PROVIDER", "local").lower() == "seedance"
+    if use_seedance:
+        print("  → 路由: 使用 Seedance 在线模型 (火山方舟)", flush=True)
+        storyboard_path = output_dir / "STORYBOARD.json"
+        characters_path = output_dir / "CHARACTERS.json"
+        storyboard_data = (
+            json.loads(storyboard_path.read_text(encoding="utf-8"))
+            if storyboard_path.exists()
+            else {"shots": []}
+        )
+        characters_data = (
+            json.loads(characters_path.read_text(encoding="utf-8"))
+            if characters_path.exists()
+            else None
+        )
+        return _run_phase5_om_seedance(
+            storyboard_data, output_dir, characters_data, None
+        )
 
     # Cost-control red line: video generation must never fall back to ARK.
     try:

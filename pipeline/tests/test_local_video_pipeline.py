@@ -229,6 +229,7 @@ def test_submit_includes_batch_id_in_payload(monkeypatch):
 
 
 def test_phase5_skips_existing_valid_output(monkeypatch, tmp_path):
+    monkeypatch.delenv("VIDEO_PROVIDER", raising=False)
     shot_dir = tmp_path / "shots" / "S01"
     shot_dir.mkdir(parents=True)
     (shot_dir / "SHOT_META.json").write_text(json.dumps({"prompt": "test", "duration": 6}))

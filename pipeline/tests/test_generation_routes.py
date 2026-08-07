@@ -109,6 +109,7 @@ def test_end_frame_generation_skips_existing_large_file(monkeypatch, tmp_path):
 def test_phase5_routes_model_and_defaults_old_metadata(
     monkeypatch, tmp_path, meta, expected_model
 ):
+    monkeypatch.delenv("VIDEO_PROVIDER", raising=False)
     shot_dir = tmp_path / "shots" / "S01"
     shot_dir.mkdir(parents=True)
     shot_meta = {"prompt": "test prompt", "duration": 5, **meta}
@@ -132,6 +133,43 @@ def test_phase5_routes_model_and_defaults_old_metadata(
 
     assert result["status"] == "done"
     assert captured["model"] == expected_model
+
+
+def test_phase5_routes_to_seedance_when_requested(monkeypatch, tmp_path):
+    (tmp_path / "shots").mkdir()
+    storyboard = {"shots": [{"id": 1, "prompt": "test prompt"}]}
+    characters = {"characters": [{"id": "lead", "name": "Lead"}]}
+    (tmp_path / "STORYBOARD.json").write_text(json.dumps(storyboard))
+    (tmp_path / "CHARACTERS.json").write_text(json.dumps(characters))
+    monkeypatch.setenv("VIDEO_PROVIDER", "seedance")
+
+    captured = {}
+
+    def fake_seedance(storyboard_data, output_dir, characters_data, timing_ctx):
+        captured.update(
+            storyboard=storyboard_data,
+            output_dir=output_dir,
+            characters=characters_data,
+            timing_ctx=timing_ctx,
+        )
+        return {"status": "done", "provider": "seedance", "outputs": []}
+
+    monkeypatch.setattr(pipeline_runner, "_run_phase5_om_seedance", fake_seedance)
+    monkeypatch.setattr(
+        local_video_client,
+        "is_available",
+        lambda timeout: pytest.fail("local Bridge must not be checked"),
+    )
+
+    result = pipeline_runner._run_phase5_fallback(tmp_path)
+
+    assert result["provider"] == "seedance"
+    assert captured == {
+        "storyboard": storyboard,
+        "output_dir": tmp_path,
+        "characters": characters,
+        "timing_ctx": None,
+    }
 
 
 def test_phantom_content_has_first_frame_and_character_three_views(monkeypatch, tmp_path):
