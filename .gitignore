@@ -41,6 +41,8 @@ ENV/
 # Data and Outputs
 data/output/
 data/input/
+pipeline/output/
+pipeline/input/*.txt
 *.mp4
 *.mov
 *.avi
