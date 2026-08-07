@@ -424,10 +424,18 @@ def run_storyboard_review(storyboard_data: dict, script_text: str, characters: l
         visual = shot.get("visual", "")
         what = shot.get("what", "")
         
-        # R1: 资产引用合法
+        # R1: 资产引用合法（子串模糊匹配：LLM 分镜常用描述性长名，
+        # 角色列表存的是过滤后的短名，精确匹配会误杀，如
+        # "三十岁左右普通上班族男人" vs 角色表中的 "男人"）
         if char_names:
             for name in who:
-                if name.lower() not in char_names and name.lower() not in char_ids:
+                lowered = name.lower()
+                matched = (
+                    lowered in char_names
+                    or lowered in char_ids
+                    or any(cn and (cn in lowered or lowered in cn) for cn in char_names)
+                )
+                if not matched:
                     severe_issues.append(f"[R1] {shot_id}: 角色 '{name}' 不在角色列表中")
         
         # R3: 具象可感
