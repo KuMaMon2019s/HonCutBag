@@ -1,4 +1,4 @@
-"""M6: download-probe window configurable via LOCAL_VIDEO_DOWNLOAD_PROBE_ATTEMPTS."""
+"""Bridge download-probe timeout and compatibility-attempt coverage."""
 
 import sys
 from pathlib import Path
@@ -61,17 +61,20 @@ class _Session:
 # Tests
 # ---------------------------------------------------------------------------
 
-def test_default_probe_attempts_is_40(monkeypatch):
-    """Default LOCAL_VIDEO_DOWNLOAD_PROBE_ATTEMPTS must be 40."""
+def test_default_probe_timeout_is_60_seconds(monkeypatch):
+    monkeypatch.delenv("VIDEO_DOWNLOAD_PROBE_TIMEOUT", raising=False)
     monkeypatch.delenv("LOCAL_VIDEO_DOWNLOAD_PROBE_ATTEMPTS", raising=False)
-    # 40 consecutive failures → TimeoutError.  We feed 40 running/100 statuses
-    # with download always failing.
-    statuses = [{"status": "running", "progress": 100}] * 40
+    clock = {"now": 0.0}
+    monkeypatch.setattr(local_video_client.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(local_video_client.time, "sleep", lambda seconds: clock.update(now=clock["now"] + seconds))
+    statuses = [{"status": "running", "progress": 100}] * 20
     sess = _Session(statuses, download_ok=False)
     monkeypatch.setattr(local_video_client, "_request_session", lambda: sess)
 
-    with pytest.raises(TimeoutError, match=r"download probe failed 40/40"):
-        local_video_client.poll("probe-task", interval=0)
+    with pytest.raises(TimeoutError, match=r"timeout=60s"):
+        local_video_client.poll("probe-task", interval=10)
+    assert clock["now"] == 60
+    assert sess.download_calls == 12
 
 
 def test_env_override_respected(monkeypatch):
@@ -86,8 +89,8 @@ def test_env_override_respected(monkeypatch):
     assert sess.download_calls == 5
 
 
-def test_probe_success_after_many_failures_completes(monkeypatch):
-    """28 fails then 3 consecutive successes → task completes (need 3 OK in a row)."""
+def test_probe_success_after_failures_completes_immediately(monkeypatch):
+    """A ready download is sufficient even while Bridge still reports running/100."""
     monkeypatch.setenv("LOCAL_VIDEO_DOWNLOAD_PROBE_ATTEMPTS", "40")
 
     call_count = {"n": 0}
@@ -99,7 +102,7 @@ def test_probe_success_after_many_failures_completes(monkeypatch):
             if "/download/" in url:
                 self.download_calls += 1
                 call_count["n"] += 1
-                # First 28 calls fail, then 3 consecutive OK → completed
+                # First 28 calls fail, then the first OK completes immediately.
                 if call_count["n"] > 28:
                     return _Response({}, content=b"ready")
                 return _Response({}, status_code=404, content=b"")
@@ -113,8 +116,7 @@ def test_probe_success_after_many_failures_completes(monkeypatch):
 
     result = local_video_client.poll("probe-task", interval=0)
     assert result == {"status": "completed", "progress": 100}
-    # 28 fails + 3 consecutive OK = 31 download calls
-    assert call_count["n"] == 31
+    assert call_count["n"] == 29
 
 
 def test_timeout_error_includes_wait_duration(monkeypatch):
@@ -140,4 +142,28 @@ def test_invalid_env_value_raises(monkeypatch):
     monkeypatch.setattr(local_video_client, "_request_session", lambda: sess)
 
     with pytest.raises(ValueError, match="must be a positive integer"):
+        local_video_client.poll("probe-task", interval=0)
+
+
+def test_probe_timeout_env_and_diagnostic_status(monkeypatch, capsys):
+    monkeypatch.setenv("VIDEO_DOWNLOAD_PROBE_TIMEOUT", "10")
+    monkeypatch.delenv("LOCAL_VIDEO_DOWNLOAD_PROBE_ATTEMPTS", raising=False)
+    clock = {"now": 0.0}
+    monkeypatch.setattr(local_video_client.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(local_video_client.time, "sleep", lambda seconds: clock.update(now=clock["now"] + seconds))
+    sess = _Session([{"status": "running", "progress": 100, "bridge_detail": "archiving"}] * 4)
+    monkeypatch.setattr(local_video_client, "_request_session", lambda: sess)
+
+    with pytest.raises(TimeoutError, match=r"timeout=10s"):
+        local_video_client.poll("probe-task", interval=10)
+
+    assert clock["now"] == 10
+    output = capsys.readouterr().out
+    assert "Bridge status:" in output
+    assert "bridge_detail" in output
+
+
+def test_invalid_probe_timeout_raises(monkeypatch):
+    monkeypatch.setenv("VIDEO_DOWNLOAD_PROBE_TIMEOUT", "0")
+    with pytest.raises(ValueError, match="VIDEO_DOWNLOAD_PROBE_TIMEOUT must be a positive integer"):
         local_video_client.poll("probe-task", interval=0)

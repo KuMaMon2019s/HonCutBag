@@ -302,15 +302,14 @@ def poll(
 
     2. **Download-probe window** (progress >= 100%, status=running): Bridge
        archives the rendered video asynchronously so /download returns 404
-       for ~2-6 min after progress hits 100%.  We probe /download on every
-       poll iteration and tolerate up to *probe_attempts* consecutive failures
-       before declaring the task stalled.  ``probe_attempts`` defaults to
-       LOCAL_VIDEO_DOWNLOAD_PROBE_ATTEMPTS (env, default 40 → 40×10s ≈ 6.7 min).
+       briefly after progress hits 100%. We probe /download aggressively (at
+       most five seconds between attempts) until VIDEO_DOWNLOAD_PROBE_TIMEOUT
+       expires (default 60 seconds). LOCAL_VIDEO_DOWNLOAD_PROBE_ATTEMPTS remains
+       supported as a secondary cap for backwards compatibility.
 
     Bridge v3.2 quirk: 任务完成后 status 可能永远卡在 "running" + progress=100，
     但 GET /download/{task_id} 能正常下载。当检测到 progress>=100 且 status=running 时，
-    主动探测 /download 端点：连续 3 轮探测成功 → 判定完成；连续 probe_attempts 轮
-    探测失败 → 判定卡死。
+    主动探测 /download 端点：首次探测成功即判定完成；超时后判定卡死。
 
     Args:
         task_id: 任务 ID
@@ -324,7 +323,7 @@ def poll(
     Raises:
         TimeoutError: 排队超过 LOCAL_VIDEO_QUEUE_TIMEOUT，或已开始任务的 progress
             连续 max_attempts * interval 秒没有增长，或 progress=100 但
-            /download 连续 probe_attempts 次探测失败
+            /download 探测超过 VIDEO_DOWNLOAD_PROBE_TIMEOUT
         RuntimeError: 如果任务失败或返回 error 字段
     """
     api_url = _get_api_url()
@@ -351,12 +350,15 @@ def poll(
     probe_attempts: int = int(os.environ.get("LOCAL_VIDEO_DOWNLOAD_PROBE_ATTEMPTS", "40"))
     if probe_attempts <= 0:
         raise ValueError("LOCAL_VIDEO_DOWNLOAD_PROBE_ATTEMPTS must be a positive integer")
+    probe_timeout: int = int(os.environ.get("VIDEO_DOWNLOAD_PROBE_TIMEOUT", "60"))
+    if probe_timeout <= 0:
+        raise ValueError("VIDEO_DOWNLOAD_PROBE_TIMEOUT must be a positive integer")
+    probe_interval = min(interval, 5)
 
     # Bridge running/100 quirk tracking
     at_100_count: int = 0         # progress>=100 且 status=running 的连续轮数
-    download_probe_success: int = 0  # /download 探测连续成功轮数
     download_probe_fail: int = 0     # /download 探测连续失败轮数
-    probe_started_at: Optional[float] = None  # monotonic time of first probe fail in current run
+    probe_started_at: Optional[float] = None  # monotonic time of first probe in current run
 
     while True:
         total_polls += 1
@@ -390,40 +392,45 @@ def poll(
         # --- Bridge v3.2 quirk: running + progress=100 ---
         if progress >= 100 and status == "running":
             at_100_count += 1
+            if probe_started_at is None:
+                probe_started_at = time.monotonic()
+            waited_s = time.monotonic() - probe_started_at
+            if download_probe_fail and waited_s >= probe_timeout:
+                raise TimeoutError(
+                    f"Local video task {task_id} stalled: progress=100% status=running, "
+                    f"download probe failed {download_probe_fail}/{probe_attempts} times "
+                    f"over {waited_s:.0f}s (timeout={probe_timeout}s)"
+                )
             # Probe /download endpoint
-            probe_ok = _probe_download(session, api_url, task_id)
+            probe_request_timeout = min(10, max(0.1, probe_timeout - waited_s))
+            probe_ok = _probe_download(
+                session, api_url, task_id, timeout=probe_request_timeout
+            )
             if probe_ok:
-                download_probe_success += 1
-                download_probe_fail = 0
-                probe_started_at = None
-                print(f"  [local_poll #{total_polls}] download-probe OK ({download_probe_success}/3 consecutive)")
-                if download_probe_success >= 3:
-                    print(f"  [local_poll #{total_polls}] ✓ Bridge running/100 quirk: download probe succeeded 3x → treating as completed")
-                    return {"status": "completed", "progress": 100}
+                print(f"  [local_poll #{total_polls}] ✓ download-probe OK → treating as completed")
+                return {"status": "completed", "progress": 100}
             else:
                 download_probe_fail += 1
-                download_probe_success = 0
-                if probe_started_at is None:
-                    probe_started_at = time.monotonic()
                 waited_s = time.monotonic() - probe_started_at
                 print(
                     f"  [local_poll #{total_polls}] download-probe FAIL "
                     f"({download_probe_fail}/{probe_attempts}) "
-                    f"[{waited_s:.0f}s elapsed]"
+                    f"[{waited_s:.0f}s/{probe_timeout}s elapsed]; "
+                    f"Bridge status: {data!r}"
                 )
-                if download_probe_fail >= probe_attempts:
+                if waited_s >= probe_timeout or download_probe_fail >= probe_attempts:
                     raise TimeoutError(
                         f"Local video task {task_id} stalled: progress=100% status=running, "
                         f"download probe failed {download_probe_fail}/{probe_attempts} times "
-                        f"over {waited_s:.0f}s (interval={interval}s)"
+                        f"over {waited_s:.0f}s (timeout={probe_timeout}s)"
                     )
-            time.sleep(interval)
+            time.sleep(min(probe_interval, max(0, probe_timeout - waited_s)))
             continue
 
         # Reset quirk counters when not in the 100/running state
         at_100_count = 0
-        download_probe_success = 0
         download_probe_fail = 0
+        probe_started_at = None
 
         # A task at 0% (or explicitly queued) has not reached the GPU yet. Queue
         # wait has its own generous wall-clock cap and never consumes the
@@ -481,7 +488,9 @@ def poll(
         time.sleep(interval)
 
 
-def _probe_download(session, api_url: str, task_id: str) -> bool:
+def _probe_download(
+    session, api_url: str, task_id: str, timeout: float = 10
+) -> bool:
     """Probe /download/{task_id} to check if video is ready (Bridge running/100 quirk).
 
     Uses stream=True and reads only headers + first few bytes to avoid downloading
@@ -489,7 +498,7 @@ def _probe_download(session, api_url: str, task_id: str) -> bool:
     """
     url = f"{api_url}/download/{task_id}"
     try:
-        resp = session.get(url, stream=True, timeout=10)
+        resp = session.get(url, stream=True, timeout=timeout)
         if resp.status_code == 200:
             # Check content-type looks like video
             ct = resp.headers.get("content-type", "")
