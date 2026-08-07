@@ -26,6 +26,7 @@ import json
 import sys
 import os
 import argparse
+import math
 import re
 import time
 from pathlib import Path
@@ -156,6 +157,11 @@ SHOT_SIZE_MAP = {
 
 
 # ─── LLM 客户端 ─────────────────────────────────────────────────────────────
+
+def estimate_shot_duration(word_count: int) -> float:
+    """Estimate shot duration from word count using video-toolkit formula."""
+    return math.ceil(word_count / 2.5) + 2
+
 
 def _get_client() -> OpenAI:
     """
@@ -453,6 +459,7 @@ def _build_shot_prompt(
     visual_style = _load_default_visual_style(visual_style_path)
     if visual_style.style_prompt_full:
         prompt = f"{prompt}\n\nVisual style: {visual_style.style_prompt_full}"
+    shot.setdefault("speech_duration_s", estimate_shot_duration(len(prompt.split())))
     return prompt
 
 
