@@ -3017,6 +3017,97 @@ def run_phase7(output_dir: Path, dry_run: bool,
     )
     clip_paths = stitch_plan.clips
 
+    # Prefer the unified VideoEdit tool.  Keep the existing edit_decisions and
+    # VideoStitch paths below as progressively more permissive fallbacks.
+    try:
+        from tools.video.video_edit import VideoEdit
+
+        editor = VideoEdit()
+        concat_output = output_dir / ".video_edit_concat.mp4"
+        final_output = output_dir / "raw_assembly.mp4"
+        video_edit_transition = "cut" if stitch_plan.transition == "cut" else "crossfade"
+        call_started = time.time()
+        print(
+            f"  → [{time.strftime('%Y-%m-%d %H:%M:%S')}] VideoEdit.concat: "
+            f"{len(clip_paths)} clips, transition={video_edit_transition}, "
+            f"crossfade={stitch_plan.duration}s"
+        )
+        concat_result = editor.execute({
+            "operation": "concat",
+            "input_paths": clip_paths,
+            "output_path": str(concat_output),
+            "transition": video_edit_transition,
+            "crossfade_duration": stitch_plan.duration,
+        })
+        print(
+            f"    VideoEdit.concat result: success={concat_result.success}, "
+            f"elapsed={time.time() - call_started:.1f}s, "
+            f"output={concat_output if concat_result.success else None}, "
+            f"error={concat_result.error}"
+        )
+        if not concat_result.success:
+            raise RuntimeError(concat_result.error or "VideoEdit.concat failed")
+
+        # Trim the assembled container to its exact computed timeline.  Using
+        # actual probed clip durations avoids stale SHOT_META duration values.
+        clip_durations = []
+        for clip_path in clip_paths:
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", clip_path],
+                capture_output=True, text=True, timeout=30, check=True,
+            )
+            clip_durations.append(float(probe.stdout.strip().splitlines()[0]))
+        trim_end = sum(clip_durations)
+        if video_edit_transition == "crossfade":
+            trim_end -= stitch_plan.duration * (len(clip_paths) - 1)
+
+        trim_started = time.time()
+        print(
+            f"  → [{time.strftime('%Y-%m-%d %H:%M:%S')}] VideoEdit.trim: "
+            f"start=0.0s, end={trim_end:.3f}s"
+        )
+        trim_result = editor.execute({
+            "operation": "trim",
+            "input_path": str(concat_output),
+            "output_path": str(final_output),
+            "start_time": 0.0,
+            "end_time": trim_end,
+        })
+        print(
+            f"    VideoEdit.trim result: success={trim_result.success}, "
+            f"elapsed={time.time() - trim_started:.1f}s, output={final_output}, "
+            f"error={trim_result.error}"
+        )
+        if not trim_result.success:
+            raise RuntimeError(trim_result.error or "VideoEdit.trim failed")
+        concat_output.unlink(missing_ok=True)
+
+        print(f"  ✓ Phase 7 完成: raw_assembly.mp4 (VideoEdit)")
+        from phases.audio_mixer import apply_phase7_audio
+        audio_receipt = apply_phase7_audio(output_dir)
+        qg_report = run_quality_check("phase7", output_dir)
+        if not qg_report.passed:
+            return {"status": "error", "error": f"Phase 7 质检未通过: {qg_report.grade}", "quality_report": qg_report, "duration_s": _elapsed(start)}
+        return {
+            "status": "done",
+            "duration_s": _elapsed(start),
+            "outputs": ["raw_assembly.mp4"],
+            "method": "VideoEdit",
+            "transition": video_edit_transition,
+            "transition_duration": stitch_plan.duration,
+            "clip_count": len(clip_paths),
+            "transition_selections": selected_transitions if selected_transitions else None,
+            "trim_end_s": round(trim_end, 3),
+            "audio_layer": audio_receipt,
+        }
+    except Exception as e:
+        try:
+            (output_dir / ".video_edit_concat.mp4").unlink(missing_ok=True)
+        except OSError:
+            pass
+        print(f"  ⚠ VideoEdit 失败: {e}，降级为 edit_decisions / VideoStitch")
+
     # 调用 HonCut edit_decisions 架构
     try:
         from phases.edit_decisions import build_edit_decisions, execute_edit_decisions
@@ -3638,6 +3729,59 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             video_qa_result = {"status": "error", "error": str(e)}
             print(f"  ⚠ Phase 8.5 Video QA failed: {e}")
 
+        # Final character-animation QA runs against the delivered video and
+        # persists its complete structured result for later inspection.
+        character_qa_result = None
+        try:
+            from quality.character_qa import CharacterAnimationQA
+
+            character_video = output_dir / "polished.mp4"
+            characters_json = output_dir / "CHARACTERS.json"
+            qa_started = time.time()
+            print(
+                f"  → [{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                f"CharacterAnimationQA.check: video={character_video}, "
+                f"characters={characters_json}"
+            )
+            character_tool_result = CharacterAnimationQA().execute({
+                "operation": "full_qa",
+                "video_path": str(character_video),
+                "characters_json_path": str(characters_json),
+                "output_dir": str(output_dir / "character_qa_samples"),
+            })
+            if character_tool_result.success:
+                qa_data = character_tool_result.data or {}
+                verdict = qa_data.get("verdict", "unknown")
+                grade = {"pass": "A", "revise": "C", "fail": "D"}.get(verdict, "N/A")
+                character_qa_result = {
+                    "status": "success",
+                    "grade": grade,
+                    "duration_seconds": character_tool_result.duration_seconds,
+                    **qa_data,
+                }
+                (output_dir / "character_qa_report.json").write_text(
+                    json.dumps(character_qa_result, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                outputs.append("character_qa_report.json")
+                step_status["character_qa"] = "done"
+                print(
+                    f"  ✓ Character QA 完成: elapsed={time.time() - qa_started:.1f}s, "
+                    f"grade={grade}, verdict={verdict}, issues={len(qa_data.get('issues', []))}"
+                )
+                print(f"    CharacterAnimationQA result: {json.dumps(qa_data, ensure_ascii=False, default=str)}")
+            else:
+                character_qa_result = {"status": "failed", "error": character_tool_result.error}
+                step_status["character_qa"] = "failed"
+                print(
+                    f"  ⚠ Character QA 失败: elapsed={time.time() - qa_started:.1f}s, "
+                    f"error={character_tool_result.error}"
+                )
+        except Exception as e:
+            character_qa_result = {"status": "skipped", "reason": str(e)}
+            step_status["character_qa"] = "skipped"
+            print(f"  ⚠ Character QA 不可用: {e}")
+
         print(f"  ✓ Phase 8 完成: polished.mp4")
         
         # Quality gate: Phase 8
@@ -3656,6 +3800,7 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             "media_profile": media_profile,
             "step_status": step_status,
             "video_qa": video_qa_result,
+            "character_qa": character_qa_result,
         }
         write_stage_checkpoint(_checkpoint_path(output_dir), "phase8", phase8_result)
         return phase8_result

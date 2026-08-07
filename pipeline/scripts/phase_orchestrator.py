@@ -18,6 +18,16 @@ PHASES = [
     "phase7",
     "phase8",
 ]
+PHASE_NUMBERS = {
+    "phase2": "2",
+    "phase2_5": "2.5",
+    "phase3": "3",
+    "phase4": "4",
+    "phase5": "5",
+    "phase6": "6",
+    "phase7": "7",
+    "phase8": "8",
+}
 PIPELINE_DIR = Path(__file__).resolve().parents[1]
 RUNNER = PIPELINE_DIR / "src" / "pipeline_runner.py"
 
@@ -30,8 +40,50 @@ def _write_progress(progress_file: Path, payload: dict) -> None:
     temporary.replace(progress_file)
 
 
+def _read_json(path: Path, default: dict) -> dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else default
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def _merge_phase_report(report_path: Path, existing_report: dict, phase: str) -> None:
+    """Keep prior phase results when the single-phase runner rewrites its report."""
+    generated_report = _read_json(report_path, {})
+    phase_number = PHASE_NUMBERS[phase]
+    generated_phases = generated_report.get("phases", {})
+    current_result = generated_phases.get(phase_number, generated_phases.get(phase, {}))
+
+    merged = {**existing_report, **generated_report}
+    merged_phases = dict(existing_report.get("phases", {}))
+    is_synthetic_skip = (
+        current_result.get("status") == "skipped"
+        and current_result.get("reason") == "user-specified"
+    )
+    if current_result and not is_synthetic_skip:
+        # Canonicalize orchestrator reports to phase names and do not import the
+        # runner's synthetic "skipped user-specified" entries.
+        merged_phases[phase] = current_result
+    merged["phases"] = merged_phases
+    merged["status"] = "running"
+    temporary = report_path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(report_path)
+
+
+def _set_report_status(report_path: Path, status: str) -> None:
+    report = _read_json(report_path, {"phases": {}})
+    report["status"] = status
+    temporary = report_path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(report_path)
+
+
 def run_phase(phase: str, config: dict) -> dict:
     """Run a single phase and return its process status."""
+    report_path = Path(config["output_dir"]) / "pipeline_report.json"
+    existing_report = _read_json(report_path, {"phases": {}, "status": "running"})
     cmd = [
         sys.executable,
         str(RUNNER),
@@ -54,6 +106,7 @@ def run_phase(phase: str, config: dict) -> dict:
         cmd.append("--dry-run")
 
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=RUNNER.parent)
+    _merge_phase_report(report_path, existing_report, phase)
     return {
         "phase": phase,
         "exit_code": result.returncode,
@@ -122,6 +175,7 @@ def main() -> None:
         )
 
         if result["exit_code"] != 0:
+            _set_report_status(Path(config["output_dir"]) / "pipeline_report.json", "failed")
             print(f"\n❌ {phase} FAILED!", flush=True)
             print(f"Exit code: {result['exit_code']}", flush=True)
             print(f"Error: {result['stderr'][:500]}", flush=True)
@@ -133,6 +187,7 @@ def main() -> None:
         progress_file,
         {"results": results, "current_phase": None, "status": "completed", "phases": PHASES},
     )
+    _set_report_status(Path(config["output_dir"]) / "pipeline_report.json", "completed")
     print(f"\n{'=' * 60}\n  All phases completed successfully!\n{'=' * 60}", flush=True)
 
 
