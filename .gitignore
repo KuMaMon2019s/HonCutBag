@@ -52,6 +52,10 @@ pipeline/input/*.txt
 *.jpeg
 *.gif
 
+# Demo assets are tracked (README images)
+!assets/demo/
+!assets/demo/**
+
 # Docker
 docker/data/
 *.log
