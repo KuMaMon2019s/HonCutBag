@@ -5,49 +5,48 @@ HonCut is an end-to-end AI video generation pipeline that transforms arbitrary t
 ## Architecture
 
 ```
-Text Input → Director Planning → Screenwriter Engine → Character Factory → Orchestrator → Video Generation → Assembly Engine → Post-Production → Video Output
+Text Input → Director Planning → Screenwriter Engine → Character Factory → Scene Consistency → Video Generation → Quality Gate → Assembly Engine → Post-Production → Video Output
 ```
 
-### 9-Phase Pipeline
+### Pipeline Phases
 
 | Phase | Name | Description |
 |-------|------|-------------|
-| Phase 1 | Director Planning | Scene breakdown, emotion analysis, and transition design before storyboarding (M1) |
-| Phase 2 | Screenwriter Engine | Text parsing → event extraction → character discovery → adaptation → storyboard generation |
-| Phase 2.5 | Storyboard Sequence | Per-shot storyboard images for visual reference (M2) |
-| Phase 3 | Character Factory | Three-view generation (front/side/back) + character cards |
-| Phase 4 | Orchestrator | Shot scheduling, timeline planning, and model routing (M4) |
-| Phase 5 | Video Generation | Async video clip generation via Seedance/Wan APIs |
-| Phase 6 | Quality Gate | Consistency checks, red-line supervision, and A/B/C/D grading (M5) |
-| Phase 7 | Assembly Engine | Clip stitching with transition bridges (M3) |
-| Phase 8 | Post-Production | Audio mixing, visual enhancement, rhythm editing, final encode |
+| Phase 1 | Director Planning | Scene breakdown, emotion analysis, and transition design before storyboarding |
+| Phase 2 | Screenwriter Engine | Text parsing → event extraction → character discovery → adaptation → storyboard generation with eight-layer prompt framework |
+| Phase 2.5 | Storyboard Sequence | Per-shot storyboard images for visual reference |
+| Phase 3 | Character Factory | Character reference assets (face close-up + full-body + variants) + character cards |
+| Phase 4 | Orchestrator | Shot scheduling, timeline planning, scene consistency contracts, and model routing |
+| Phase 5 | Video Generation | Video clip generation via Seedance (online) with Wan2.2 local fallback |
+| Phase 6 | Quality Gate | Consistency checks, red-line supervision, and A/B/C/D grading |
+| Phase 7 | Assembly Engine | Clip stitching with smart transition analysis |
+| Phase 8 | Post-Production | Audio mixing, color grading, rhythm editing, final encode |
 
-### Incremental Modules (M1–M6)
+## Key Capabilities
 
-| Module | Component | Purpose |
-|--------|-----------|---------|
-| M1 | `director_planner.py` | Scene breakdown, emotion analysis, transition design — runs before storyboarding to give downstream phases emotional grounding and consistency anchors |
-| M2 | Storyboard Sequence | Generates one storyboard image per shot in Phase 2.5, used as composition reference during video generation |
-| M3 | Transition Bridges | Four bridge types (action / emotion / spatial / dialogue) injected into adaptation prompts to eliminate jump-cut feel between shots |
-| M4 | `prompt_router.py` | Auto-routes prompt format by target model — Seedance 2.0 multi-shot, Seedance 2.0 single-shot, Wan 2.6 narrative, or generic first/last-frame |
-| M5 | `quality_gate.py` (`run_storyboard_review`) | Supervision layer with 4 red-line checks (asset validity, script fidelity, concreteness, parent-child assets) + A/B/C/D grading |
-| M6 | `artifact_chain.py` | Per-phase checkpoint files + `--resume-from` recovery to restart from any phase without re-running completed work |
+- **Eight-layer prompt framework** — every shot prompt is assembled from eight structured layers (element reference, shot summary, audio, style anchor, quality suffix, negative guardrails), balancing concise shot descriptions with full constraint coverage.
+- **Seedance-first with graceful fallback** — shots are generated via Seedance online API by default; on timeout or stall the pipeline falls back to local Wan2.2 generation with explicit duration-loss logging.
+- **Chain mode (last-frame relay)** — optional serial generation where each shot's last frame becomes the next shot's first frame, physically inheriting character appearance, lighting, and scene continuity across shots.
+- **Segmentation-aware shot duration** — shot length follows video-model segmentation best practice (medium-form video: fewer, longer shots, one clear plot beat per shot) instead of many short fragments.
+- **Fictional-character declaration** — reference-image and video prompts declare AI-generated fictional characters to reduce real-person content moderation friction.
+- **Checkpoint & resume** — per-phase checkpoint files with `--resume-from` recovery restart from any phase without re-running completed work.
+- **Quality supervision** — four red-line checks (asset validity, script fidelity, concreteness, parent-child assets) with A/B/C/D grading gate before assembly.
 
 ## Project Structure
 
 ```
 honcut/
 ├── pipeline/           # Python video pipeline
-│   ├── src/           # Source modules
-│   ├── tests/         # Test suite
+│   ├── src/            # Source modules (phases, clients, tools, quality)
+│   ├── scripts/        # Orchestrator entry points
+│   ├── prompts/        # Prompt templates
 │   └── requirements.txt
-├── docker/            # Docker Compose (Qdrant, MinIO, n8n)
-├── data/              # Input/output data
-├── docs/              # Documentation
-├── scripts/           # Utility scripts
-├── Makefile           # Common commands
-├── pyproject.toml     # Python project config
-└── environment.yml    # Conda environment
+├── docker/             # Docker Compose (Qdrant, MinIO, n8n)
+├── data/               # Input/output data
+├── scripts/            # Utility scripts
+├── Makefile            # Common commands
+├── pyproject.toml      # Python project config
+└── environment.yml     # Conda environment
 ```
 
 ## Development
@@ -60,14 +59,6 @@ The project uses **Black** for formatting and **Ruff** for linting:
 pip install -e ".[dev]"
 black pipeline/src/ pipeline/tests/
 ruff check pipeline/src/ pipeline/tests/
-```
-
-### Pre-commit Hooks
-
-```bash
-pip install pre-commit
-pre-commit install
-pre-commit run --all-files
 ```
 
 ### Testing
