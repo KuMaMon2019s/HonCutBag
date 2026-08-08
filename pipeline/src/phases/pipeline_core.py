@@ -1506,21 +1506,34 @@ def _generate_shot_images(output_dir: Path, storyboard_data: dict) -> int:
         prompt_by_id = {str(item["scene_id"]): item["prompt"] for item in batch_prompts}
 
         # --- P0-1a: Load character reference images (for shot image consistency) ---
-        char_ref_map = {}  # {char_name_lower: front_png_path}
+        char_ref_map = {}  # {char_name_lower: preferred_reference_path}
         protagonist_ref = None
         chars_path = output_dir / "CHARACTERS.json"
         if chars_path.exists():
             try:
                 chars_data = json.loads(chars_path.read_text())
                 for char in chars_data.get("characters", []):
-                    front_png = output_dir / "characters" / char["id"] / "front.png"
-                    if not front_png.exists():
-                        front_png = output_dir / "characters" / "characters" / char["id"] / "front.png"
-                    if front_png.exists():
-                        char_ref_map[char["name"].lower()] = front_png
-                        char_ref_map[char["id"].lower()] = front_png
+                    reference_path = None
+                    for char_dir in (
+                        output_dir / "characters" / char["id"],
+                        output_dir / "characters" / "characters" / char["id"],
+                    ):
+                        candidates = [
+                            char_dir / "face_closeup.png",
+                            char_dir / "full_body.png",
+                            *sorted(char_dir.glob("variant_*.png")),
+                            char_dir / "front.png",  # legacy fallback
+                        ]
+                        reference_path = next(
+                            (path for path in candidates if path.exists()), None
+                        )
+                        if reference_path is not None:
+                            break
+                    if reference_path is not None:
+                        char_ref_map[char["name"].lower()] = reference_path
+                        char_ref_map[char["id"].lower()] = reference_path
                         if protagonist_ref is None:
-                            protagonist_ref = front_png
+                            protagonist_ref = reference_path
                 if char_ref_map:
                     print(f"  → [P0-1] 已加载 {len(char_ref_map)//2} 个角色参考图")
             except Exception as e:
@@ -1543,8 +1556,8 @@ def _generate_shot_images(output_dir: Path, storyboard_data: dict) -> int:
             # --- P0-1c: Match character reference image ---
             # Support structured who[] from storyboard:
             # - Empty who [] → pure landscape/no_character → NO reference injection
-            # - Single character → use that character's front.png
-            # - Multiple characters → use first character's front.png (primary ref)
+            # - Single character → use that character's preferred reference
+            # - Multiple characters → use first character's preferred reference
             ref_image_path = None
             shot_who = shot_item.get("who", [])
             if not isinstance(shot_who, list):

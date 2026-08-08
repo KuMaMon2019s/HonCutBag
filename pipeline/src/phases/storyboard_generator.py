@@ -316,7 +316,7 @@ def _build_characters_map(characters: Optional[List[Dict[str, Any]]]) -> Dict[st
         characters: 角色列表（character_discoverer.py 输出）
 
     Returns:
-        字典：角色名 → "characters/{id}/front.png"
+        字典：角色名 → 角色卡声明的人脸参考图路径
     """
     if not characters:
         return {}
@@ -325,16 +325,18 @@ def _build_characters_map(characters: Optional[List[Dict[str, Any]]]) -> Dict[st
     for char in characters:
         char_id = char.get("id", "")
         name = char.get("name", "")
+        face_reference = char.get("face_reference") or "face_closeup.png"
         # 优先使用 id，其次使用 name
         if char_id:
-            char_map[name] = f"characters/{char_id}/front.png"
+            reference_path = f"characters/{char_id}/{face_reference}"
+            char_map[name] = reference_path
             # 也把别名映射上
             for alias in char.get("aliases", []):
-                char_map[alias] = f"characters/{char_id}/front.png"
+                char_map[alias] = reference_path
         elif name:
             # 没有 id 时用 name 做路径
             safe_name = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fff]', '_', name.lower())
-            char_map[name] = f"characters/{safe_name}/front.png"
+            char_map[name] = f"characters/{safe_name}/{face_reference}"
 
     return char_map
 
@@ -346,7 +348,7 @@ def _get_first_frame_for_shot(
     """
     为 shot 确定 first_frame 路径
 
-    如果 shot 中有 who 字段（角色列表），取第一个角色的 front.png。
+    如果 shot 中有 who 字段（角色列表），取第一个角色的人脸参考图。
 
     Args:
         shot: shot 字典（含 who 字段）
@@ -436,7 +438,12 @@ def _build_shot_prompt_legacy(
             continue
         canonical_name = character.get("name") or requested_name
         char_id = character.get("id")
-        reference_path = f"characters/{char_id}/front.png" if char_id else f"{canonical_name}_ref.png"
+        face_reference = character.get("face_reference") or "face_closeup.png"
+        reference_path = (
+            f"characters/{char_id}/{face_reference}"
+            if char_id
+            else f"{canonical_name}_ref.png"
+        )
         identity_blocks.append(
             f"[reference_image: {reference_path}]\n"
             "[identity_lock]\n"

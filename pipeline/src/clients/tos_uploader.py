@@ -255,9 +255,17 @@ def upload_image(image_data: bytes, content_type: str = "image/png") -> Optional
     # --- P0-E: 上传前压缩（参考 HonCut 规范 zipImage）---
     image_data = compress_image_bytes(image_data)
 
+    # Compression may transcode a large PNG to JPEG.  Keep the object suffix and
+    # HTTP Content-Type consistent with the bytes so downstream decoders do not
+    # have to guess (large full_body.png files routinely take this path).
+    if image_data.startswith(b"\xff\xd8\xff"):
+        content_type = "image/jpeg"
+    elif image_data.startswith(b"\x89PNG\r\n\x1a\n"):
+        content_type = "image/png"
+
     # Object key with content hash for dedup
     content_hash = hashlib.sha256(image_data).hexdigest()
-    ext = "png" if "png" in content_type else "jpg"
+    ext = "png" if content_type == "image/png" else "jpg"
     object_key = f"volcengine/image/{content_hash}.{ext}"
 
     host = f"{config['bucket']}.{config['endpoint']}"

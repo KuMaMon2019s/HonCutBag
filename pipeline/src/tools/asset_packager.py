@@ -286,7 +286,6 @@ def build_content_for_shot(
                         "role": "reference_image",
                         "priority": "high",
                     })
-                    break
         if not any(asset["role"] == "reference_image" for asset in image_assets):
             raise FileNotFoundError(
                 "Phantom character references missing for shot "
