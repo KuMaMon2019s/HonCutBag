@@ -2357,7 +2357,7 @@ def _run_phase5_om_seedance(storyboard_data: dict, output_dir: Path, characters_
     }
 
 
-def _run_phase5_fallback(output_dir: Path) -> dict:
+def _run_phase5_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
     """Generate Phase 5 video through the local Bridge."""
     output_dir = Path(output_dir)
 
@@ -2380,6 +2380,9 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
         print("  → 路由: 通过 Bridge 使用 Seedance 在线模型", flush=True)
     else:
         print("  → 路由: 仅使用本地视频 API (192.168.31.221:9100)", flush=True)
+        if chain_mode:
+            print("  [chain] 当前 provider 不是 seedance，Wan2.2 本地不支持接力；按普通模式执行", flush=True)
+            chain_mode = False
 
     # Load character reference images for consistency
     import base64 as _b64
@@ -2455,6 +2458,9 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
         concurrency = VIDEO_GEN_CONCURRENCY
     except ImportError:
         concurrency = int(os.environ.get("VIDEO_GEN_CONCURRENCY", "1"))
+    if chain_mode:
+        concurrency = 1
+        print("  [chain] Seedance 尾帧接力已启用，强制按 shot_id 串行生成", flush=True)
     print(f"  → 并发模式: VIDEO_GEN_CONCURRENCY={concurrency} ({'串行' if concurrency == 1 else f'并行 workers={concurrency}'})")
     
     shot_dirs = [d for d in sorted(shots_dir.iterdir()) if d.is_dir() and d.name.startswith("S")]
@@ -2467,13 +2473,21 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
         else:
             pending_shot_dirs.append(shot_dir)
     
-    def _process_shot(shot_dir: Path) -> Optional[str]:
+    def _process_shot(
+        shot_dir: Path,
+        chain_source: Optional[tuple[str, Path]] = None,
+        chain_allowed: bool = True,
+    ) -> Optional[dict]:
         """处理单个镜头的视频生成，返回 output.mp4 路径或 None"""
         meta_path = shot_dir / "SHOT_META.json"
         if not meta_path.exists():
             return None
 
         meta = json.loads(meta_path.read_text())
+        active_source = chain_source if chain_mode and chain_allowed else None
+        meta["chain_source"] = active_source[0] if active_source else None
+        meta["chain_active"] = bool(active_source)
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
         prompt = meta.get("prompt", "")
         if scene_consistency_data:
             from phases.video_generator import build_video_prompt
@@ -2628,6 +2642,17 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
                 first_frame_b64 = _b64.b64encode(shot_image.read_bytes()).decode()
                 print(f"    [M2] 注入分镜图构图参考: {shot_dir.name}.png")
 
+        if active_source:
+            try:
+                first_frame_b64 = _b64.b64encode(active_source[1].read_bytes()).decode()
+                print(f"    [chain] {shot_dir.name}: 首帧接力自 {active_source[0]}", flush=True)
+            except Exception as error:
+                print(f"    [chain] {shot_dir.name}: 无法读取 {active_source[0]} 尾帧，回退独立首帧 — {error}", flush=True)
+                active_source = None
+                meta["chain_source"] = None
+                meta["chain_active"] = False
+                meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
         # Add style prefix to every prompt
         style_prefix = "Photorealistic, urban, Jiangnan aesthetic, lifelike skin texture, natural lighting, "
         if not prompt.lower().startswith("photorealistic"):
@@ -2681,6 +2706,17 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
                             shot_id=shot_id,
                             shot_meta=content_meta,
                         )
+                        if active_source and first_frame_b64:
+                            content_list = [
+                                item for item in (content_list or [])
+                                if item.get("role") != "first_frame"
+                            ]
+                            content_list.insert(1 if content_list else 0, {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/jpeg;base64,{first_frame_b64}"},
+                                "role": "first_frame",
+                                "priority": "high",
+                            })
                         
                         # Fallback to legacy zip/base64 if content[] is empty
                         zip_path = None
@@ -2699,7 +2735,7 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
                             if bridge_model == "seedance"
                             else local_video_client.generate_video
                         )
-                        generate(
+                        generation_result = generate(
                             prompt=prompt,
                             output_path=out_path,
                             reference_image_base64=first_frame_b64,
@@ -2713,13 +2749,21 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
                             content=content_list,
                             batch_id=output_dir.name,
                             model=bridge_model,
+                            return_last_frame=chain_mode and chain_allowed,
                         )
                         
                         if shot_seed is not None:
                             meta["seed"] = shot_seed
                             meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False))
                         print(f"    ✓ {shot_dir.name}: 视频已生成 (本地 API)")
-                        return f"shots/{shot_dir.name}/output.mp4"
+                        if isinstance(generation_result, str):
+                            generation_result = {
+                                "output_path": generation_result,
+                                "last_frame_path": None,
+                                "actual_model": bridge_model,
+                            }
+                        generation_result["relative_output"] = f"shots/{shot_dir.name}/output.mp4"
+                        return generation_result
                     except Exception as local_err:
                         print(f"    ✗ {shot_dir.name}: 本地 API 失败 — {local_err}")
                         print(f"    ⚠ 不降级到 ARK（零成本测试模式），跳过此镜头")
@@ -2758,10 +2802,25 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
     # --- 执行模式：串行或并发 ---
     if concurrency == 1:
         # 串行模式（默认，保持原有逻辑和状态更新）
+        chain_source = None
+        chain_allowed = True
         for shot_dir in pending_shot_dirs:
-            result = _process_shot(shot_dir)
+            result = _process_shot(shot_dir, chain_source, chain_allowed)
             if result:
-                outputs.append(result)
+                outputs.append(result["relative_output"])
+            if chain_mode:
+                actual_model = result.get("actual_model") if result else None
+                if actual_model == "wan22":
+                    print(f"    [chain] {shot_dir.name}: 降级 Wan2.2，接力链中断，后续镜头回退独立首帧", flush=True)
+                    chain_allowed = False
+                    chain_source = None
+                else:
+                    last_frame_path = result.get("last_frame_path") if result else None
+                    chain_source = (
+                        (shot_dir.name, Path(last_frame_path))
+                        if last_frame_path and Path(last_frame_path).exists()
+                        else None
+                    )
             prev_shot_dir = shot_dir
     else:
         # 并发模式（VIDEO_GEN_CONCURRENCY > 1）
@@ -2773,7 +2832,7 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
                 try:
                     result = future.result()
                     if result:
-                        outputs.append(result)
+                        outputs.append(result["relative_output"])
                 except Exception as e:
                     print(f"    ✗ {shot_dir.name}: 并发处理异常 — {e}")
 
@@ -2812,7 +2871,10 @@ class _PipelineVideoTool(BaseTool):
     def execute(self, inputs: dict[str, Any]) -> ToolResult:
         started = _now()
         try:
-            data = _run_phase5_fallback(Path(inputs["output_dir"]))
+            data = _run_phase5_fallback(
+                Path(inputs["output_dir"]),
+                chain_mode=bool(inputs.get("chain_mode", False)),
+            )
             return ToolResult(data.get("status") == "done", data=data, error=data.get("error"), duration_seconds=_elapsed(started))
         except Exception as exc:
             return ToolResult(False, error=str(exc), duration_seconds=_elapsed(started))
@@ -2826,7 +2888,7 @@ class _LocalVideoVendorAdapter(VendorAdapter):
         return _PipelineVideoTool().execute(config)
 
 
-def run_phase5(storyboard_data: dict, output_dir: Path, dry_run: bool) -> dict:
+def run_phase5(storyboard_data: dict, output_dir: Path, dry_run: bool, chain_mode: bool = False) -> dict:
     """Phase 5: video generation through the local Bridge only."""
     _banner(5, 8, "视频生成 (Seedance — reference_to_video)", dry_run)
     start = _now()
@@ -2848,7 +2910,10 @@ def run_phase5(storyboard_data: dict, output_dir: Path, dry_run: bool) -> dict:
         adapter = _LocalVideoVendorAdapter([
             VendorModel("Local Bridge", "local-video-bridge", "video", ("i2v", "flf2v"))
         ])
-        tool_result = adapter.request("local-video-bridge", {"output_dir": str(output_dir)})
+        tool_result = adapter.request(
+            "local-video-bridge",
+            {"output_dir": str(output_dir), "chain_mode": chain_mode},
+        )
         result = tool_result.data or {"status": "error", "error": tool_result.error}
         result["duration_s"] = _elapsed(start)
         if result["status"] == "done":
@@ -3959,6 +4024,8 @@ if LANGGRAPH_AVAILABLE:
         # Internal fields (not in original plan but needed for compatibility)
         output_dir: str
         duration: int
+        shot_duration: int
+        chain_mode: bool
         dry_run: bool
         transition: str
         transition_duration: float
@@ -4199,6 +4266,7 @@ if LANGGRAPH_AVAILABLE:
             storyboard_data=storyboard_data,
             output_dir=output_dir,
             dry_run=state["dry_run"],
+            chain_mode=state.get("chain_mode", False),
         )
         
         # P0-2 fix: increment retry_count so quality_gate_router can terminate
@@ -4372,6 +4440,7 @@ def run_pipeline(
     input_file: str = None,
     duration: int = 60,
     shot_duration: int = AVG_SHOT_DURATION,
+    chain_mode: bool = False,
     dry_run: bool = False,
     skip_phase: list = None,
     output_dir: str = ".",
@@ -4390,6 +4459,7 @@ def run_pipeline(
         input_file: 故事文本文件路径（与 text 二选一）
         duration: 目标视频时长（秒）
         shot_duration: 每镜平均时长（秒）
+        chain_mode: Seedance 尾帧接力模式
         dry_run: dry-run 模式（Phase 2 实际调 LLM，Phase 3 skip-images，Phase 4 dry-run，Phase 5-8 跳过）
         skip_phase: 跳过指定 phase 列表，如 [3, 8]
         output_dir: 输出目录
@@ -4553,6 +4623,7 @@ def run_pipeline(
                 "output_dir": str(output_path),
                 "duration": duration,
                 "shot_duration": shot_duration,
+                "chain_mode": chain_mode,
                 "dry_run": dry_run,
                 "transition": transition,
                 "transition_duration": transition_duration,
@@ -4850,7 +4921,7 @@ def run_pipeline(
     elif storyboard_data is None:
         report["phases"]["5"] = {"status": "skipped", "reason": "no storyboard data"}
     else:
-        p5 = run_phase5(storyboard_data, output_dir, dry_run)
+        p5 = run_phase5(storyboard_data, output_dir, dry_run, chain_mode=chain_mode)
         report["phases"]["5"] = p5
         if p5["status"] == "error":
             report["status"] = "partial"

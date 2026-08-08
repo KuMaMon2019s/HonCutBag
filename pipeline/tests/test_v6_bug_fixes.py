@@ -15,6 +15,7 @@ from phases.character_discoverer import _add_reference_contract
 from phases.character_factory import build_combined_sheet_prompt, build_model_reference_prompts
 from phases.scene_consistency import generate_scene_consistency
 from phases import storyboard_generator
+from phases import pipeline_core
 from phases.adaptation_engine import estimate_shot_count
 from phases.storyboard_generator import _build_characters_map, _build_shot_prompt
 from phases.video_generator import BASE_NEGATIVE_PROMPT, build_video_prompt
@@ -56,6 +57,146 @@ def test_orchestrator_clamps_shot_duration_with_warning(capsys):
     assert phase_orchestrator._normalize_shot_duration(config) == 15
     assert config["shot_duration"] == 15
     assert "clamped to 15s" in capsys.readouterr().err
+
+
+def test_orchestrator_passes_chain_mode(monkeypatch, tmp_path):
+    config = {
+        "input": "story.txt",
+        "duration": 45,
+        "shot_duration": 12,
+        "chain_mode": True,
+        "output_dir": str(tmp_path),
+    }
+    commands = []
+    monkeypatch.setattr(
+        phase_orchestrator.subprocess,
+        "run",
+        lambda command, **kwargs: (
+            commands.append(command)
+            or SimpleNamespace(returncode=0, stdout="", stderr="")
+        ),
+    )
+
+    phase_orchestrator.run_phase("phase5", config)
+
+    assert "--chain-mode" in commands[0]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_seedance_submit_last_frame_flag_is_opt_in(monkeypatch, enabled):
+    posted = []
+
+    class Response:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"task_id": "seedance-1"}
+
+    session = SimpleNamespace(
+        post=lambda *args, **kwargs: posted.append(kwargs["json"]) or Response()
+    )
+    monkeypatch.setenv("ARK_API_KEY", "test-key")
+    monkeypatch.setattr(local_video_client, "_request_session", lambda: session)
+
+    local_video_client.submit(
+        prompt="shot",
+        content=[{"type": "text", "text": "shot"}],
+        model="seedance",
+        return_last_frame=enabled,
+    )
+
+    if enabled:
+        assert posted[0]["return_last_frame"] is True
+    else:
+        assert "return_last_frame" not in posted[0]
+
+
+def test_generate_saves_base64_last_frame_and_missing_value_warns(
+    tmp_path, monkeypatch, capsys
+):
+    poll_results = iter([
+        {"status": "completed", "progress": 100, "last_frame_url": "ZnJhbWU="},
+        {"status": "completed", "progress": 100, "last_frame_url": None},
+    ])
+    monkeypatch.setattr(local_video_client, "submit", lambda **kwargs: "task-1")
+    monkeypatch.setattr(local_video_client, "poll", lambda task_id: next(poll_results))
+
+    def fake_download(task_id, output_path, verification_out, **kwargs):
+        Path(output_path).write_bytes(b"v" * 2048)
+
+    monkeypatch.setattr(local_video_client, "download", fake_download)
+    (tmp_path / "S01").mkdir()
+    (tmp_path / "S02").mkdir()
+
+    first = local_video_client.generate_video(
+        prompt="one",
+        output_path=str(tmp_path / "S01" / "output.mp4"),
+        model="seedance",
+        return_last_frame=True,
+    )
+    second = local_video_client.generate_video(
+        prompt="two",
+        output_path=str(tmp_path / "S02" / "output.mp4"),
+        model="seedance",
+        return_last_frame=True,
+    )
+
+    assert Path(first["last_frame_path"]).read_bytes() == b"frame"
+    assert second["last_frame_path"] is None
+    assert "[chain] S02: Bridge 未返回尾帧" in capsys.readouterr().out
+
+
+def test_phase5_chain_is_serial_and_injects_previous_last_frame(
+    tmp_path, monkeypatch
+):
+    shots = tmp_path / "shots"
+    for shot_id in ("S01", "S02", "S03"):
+        shot_dir = shots / shot_id
+        shot_dir.mkdir(parents=True)
+        (shot_dir / "SHOT_META.json").write_text(
+            json.dumps({"prompt": f"prompt-{shot_id}", "gen_strategy": "i2v"})
+        )
+
+    calls = []
+
+    def fake_generate(**kwargs):
+        shot_dir = Path(kwargs["output_path"]).parent
+        calls.append((shot_dir.name, kwargs.get("content")))
+        Path(kwargs["output_path"]).write_bytes(b"v" * 11000)
+        last_frame = shot_dir / "last_frame.jpg"
+        last_frame.write_bytes(f"frame-{shot_dir.name}".encode())
+        return {
+            "output_path": kwargs["output_path"],
+            "last_frame_path": str(last_frame),
+            "actual_model": "seedance",
+        }
+
+    monkeypatch.setenv("VIDEO_PROVIDER", "seedance")
+    monkeypatch.setattr(local_video_client, "is_available", lambda timeout: True)
+    monkeypatch.setattr(local_video_client, "generate_video_with_fallback", fake_generate)
+    monkeypatch.setattr(
+        asset_packager,
+        "build_content_for_shot",
+        lambda **kwargs: [{"type": "text", "text": kwargs["shot_id"]}],
+    )
+    monkeypatch.setattr(asset_packager, "package_shot_assets", lambda **kwargs: (None, []))
+    monkeypatch.setattr("utils.config.VIDEO_GEN_CONCURRENCY", 3)
+
+    result = pipeline_core._run_phase5_fallback(tmp_path, chain_mode=True)
+
+    assert result["status"] == "done"
+    assert [shot_id for shot_id, _ in calls] == ["S01", "S02", "S03"]
+    for index, expected in ((1, b"frame-S01"), (2, b"frame-S02")):
+        image_items = [item for item in calls[index][1] if item.get("role") == "first_frame"]
+        encoded = image_items[0]["image_url"]["url"].split(",", 1)[1]
+        import base64
+        assert base64.b64decode(encoded) == expected
+    first_meta = json.loads((shots / "S01" / "SHOT_META.json").read_text())
+    second_meta = json.loads((shots / "S02" / "SHOT_META.json").read_text())
+    assert first_meta["chain_active"] is False
+    assert second_meta["chain_active"] is True
+    assert second_meta["chain_source"] == "S01"
 
 
 class _DownloadResponse:

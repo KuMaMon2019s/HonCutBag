@@ -13,10 +13,11 @@ import os
 import sys
 import time
 import json
+import base64
 import subprocess
 import requests
 from pathlib import Path
-from typing import Optional, List, Sequence, Tuple
+from typing import Optional, List, Sequence, Tuple, Union
 
 
 # Default local API URL (can be overridden via config or env)
@@ -153,6 +154,7 @@ def submit(
     content: Optional[List[dict]] = None,
     batch_id: Optional[str] = None,
     model: Optional[str] = None,
+    return_last_frame: bool = False,
 ) -> Optional[str]:
     """Submit a video generation task to the local API.
     
@@ -202,6 +204,8 @@ def submit(
                 payload["batch_id"] = batch_id
             if model is not None:
                 payload["model"] = model
+            if return_last_frame and model == "seedance":
+                payload["return_last_frame"] = True
             resp = session.post(
                 f"{api_url}/generate",
                 json=payload,
@@ -281,6 +285,8 @@ def submit(
         payload["batch_id"] = batch_id
     if model is not None:
         payload["model"] = model
+    if return_last_frame and model == "seedance":
+        payload["return_last_frame"] = True
     
     try:
         resp = session.post(
@@ -404,7 +410,12 @@ def poll(
 
         if status == "completed":
             print(f"  [local_poll #{total_polls}] ✓ completed (progress={progress}%)")
-            return {"status": "completed", "progress": 100}
+            content = data.get("content") if isinstance(data.get("content"), dict) else {}
+            return {
+                "status": "completed",
+                "progress": 100,
+                "last_frame_url": data.get("last_frame_url") or content.get("last_frame_url"),
+            }
         elif status == "failed":
             error_msg = data.get("error", "unknown error")
             raise RuntimeError(f"Local video task {task_id} failed: {error_msg}")
@@ -428,7 +439,12 @@ def poll(
             )
             if probe_ok:
                 print(f"  [local_poll #{total_polls}] ✓ download-probe OK → treating as completed")
-                return {"status": "completed", "progress": 100}
+                content = data.get("content") if isinstance(data.get("content"), dict) else {}
+                return {
+                    "status": "completed",
+                    "progress": 100,
+                    "last_frame_url": data.get("last_frame_url") or content.get("last_frame_url"),
+                }
             else:
                 download_probe_fail += 1
                 waited_s = time.monotonic() - probe_started_at
@@ -497,7 +513,12 @@ def poll(
                             f"  [local_poll #{total_polls}] ✓ high-progress download "
                             "probe succeeded → treating as completed"
                         )
-                        return {"status": "completed", "progress": 100}
+                        content = data.get("content") if isinstance(data.get("content"), dict) else {}
+                        return {
+                            "status": "completed",
+                            "progress": 100,
+                            "last_frame_url": data.get("last_frame_url") or content.get("last_frame_url"),
+                        }
                     if probe_round < 3:
                         time.sleep(interval)
             raise TimeoutError(
@@ -760,6 +781,29 @@ def download(
     return output_path
 
 
+def _save_last_frame(last_frame_value: str, output_path: str, timeout: int = 120) -> str:
+    """Save a Bridge last-frame URL or base64 value next to the shot video."""
+    destination = Path(output_path).parent / "last_frame.jpg"
+    value = last_frame_value.strip()
+    try:
+        if value.startswith(("http://", "https://")):
+            response = _request_session().get(value, stream=True, timeout=timeout)
+            response.raise_for_status()
+            with destination.open("wb") as frame_file:
+                for chunk in response.iter_content(chunk_size=8192):
+                    frame_file.write(chunk)
+        else:
+            encoded = value.split(",", 1)[1] if value.startswith("data:") else value
+            destination.write_bytes(base64.b64decode(encoded, validate=True))
+        if destination.stat().st_size == 0:
+            raise RuntimeError("decoded last frame is empty")
+    except Exception as exc:
+        destination.unlink(missing_ok=True)
+        raise RuntimeError(f"unable to save Bridge last frame: {exc}") from exc
+    print(f"  [chain] saved {destination} ({destination.stat().st_size} bytes)")
+    return str(destination)
+
+
 def generate_video(
     prompt: str,
     output_path: str,
@@ -775,7 +819,8 @@ def generate_video(
     batch_id: Optional[str] = None,
     model: Optional[str] = None,
     submit_timeout: Optional[int] = None,
-) -> str:
+    return_last_frame: bool = False,
+) -> Union[str, dict]:
     """High-level function: submit + poll + download in one call.
     
     Args:
@@ -845,6 +890,7 @@ def generate_video(
         content=content,
         batch_id=batch_id,
         model=model,
+        return_last_frame=return_last_frame,
         timeout=submit_timeout or (60 if model == "seedance" else 30),
     )
     
@@ -862,6 +908,7 @@ def generate_video(
             asset_zip_path=asset_zip_path,
             batch_id=batch_id,
             model=model,
+            return_last_frame=return_last_frame,
             timeout=submit_timeout or (60 if model == "seedance" else 30),
         )
     
@@ -878,6 +925,7 @@ def generate_video(
             fps=fps,
             batch_id=batch_id,
             model=model,
+            return_last_frame=return_last_frame,
             timeout=submit_timeout or (60 if model == "seedance" else 30),
         )
     
@@ -901,6 +949,20 @@ def generate_video(
         verification_out=verification,
         model=model,
     )
+
+    last_frame_path = None
+    if return_last_frame and model == "seedance":
+        last_frame_value = result.get("last_frame_url")
+        if last_frame_value:
+            try:
+                last_frame_path = _save_last_frame(last_frame_value, output_path)
+            except RuntimeError as exc:
+                print(f"    [chain] {shot_id}: 尾帧保存失败，降级为独立生成 — {exc}", flush=True)
+        else:
+            print(
+                f"    [chain] {shot_id}: Bridge 未返回尾帧（Bridge 需升级到 v3.5+ 契约），降级为独立生成",
+                flush=True,
+            )
 
     actual_duration = verification.get("duration")
     actual_num_frames = verification.get("num_frames")
@@ -932,10 +994,16 @@ def generate_video(
                 f"  [frames] WARNING duration drift: {shot_id} requested "
                 f"{requested_duration:.2f}s, actual {actual_duration:.2f}s"
             )
-    return output_path
+    if not return_last_frame:
+        return output_path
+    return {
+        "output_path": output_path,
+        "last_frame_path": last_frame_path,
+        "actual_model": model or "wan22",
+    }
 
 
-def generate_video_with_fallback(**kwargs) -> str:
+def generate_video_with_fallback(**kwargs) -> Union[str, dict]:
     """Generate with Seedance, falling back to Wan2.2 only on a timeout.
 
     The same prompt and reference payload are retained because Wan2.2 accepts

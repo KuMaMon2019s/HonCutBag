@@ -59,6 +59,15 @@ def _normalize_shot_duration(config: dict) -> int:
     return clamped
 
 
+def _normalize_chain_mode(config: dict) -> bool:
+    """Validate the optional Seedance chain-mode switch."""
+    chain_mode = config.get("chain_mode", False)
+    if not isinstance(chain_mode, bool):
+        raise ValueError("config chain_mode must be a boolean")
+    config["chain_mode"] = chain_mode
+    return chain_mode
+
+
 def _write_progress(progress_file: Path, payload: dict) -> None:
     """Atomically replace the progress file so cron never reads partial JSON."""
     progress_file.parent.mkdir(parents=True, exist_ok=True)
@@ -187,6 +196,8 @@ def run_phase(phase: str, config: dict) -> dict:
         cmd.append("--auto-approve")
     if config.get("dry_run"):
         cmd.append("--dry-run")
+    if config.get("chain_mode"):
+        cmd.append("--chain-mode")
 
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=RUNNER.parent)
     _merge_phase_report(report_path, existing_report, phase)
@@ -214,6 +225,7 @@ def main() -> None:
         parser.error(f"config is missing required keys: {', '.join(missing)}")
     try:
         _normalize_shot_duration(config)
+        _normalize_chain_mode(config)
     except ValueError as error:
         parser.error(str(error))
 
