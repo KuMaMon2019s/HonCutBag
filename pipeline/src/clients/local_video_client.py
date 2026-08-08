@@ -220,6 +220,10 @@ def submit(
             else:
                 print(f"  [local_submit] ✗ /generate with content[] failed: HTTP {resp.status_code} — {resp.text[:200]}")
                 return None
+        except requests.exceptions.Timeout as e:
+            if model == "seedance":
+                raise TimeoutError(f"Seedance submission timed out after {timeout}s") from e
+            return None
         except requests.exceptions.ConnectionError as e:
             print(f"  [local_submit] ✗ Bridge unreachable for content[]: {e}")
             return None
@@ -287,6 +291,8 @@ def submit(
     except requests.exceptions.ConnectionError as e:
         raise RuntimeError(f"Local video API unreachable at {api_url}: {e}")
     except requests.exceptions.Timeout as e:
+        if model == "seedance":
+            raise TimeoutError(f"Seedance submission timed out after {timeout}s") from e
         raise RuntimeError(f"Local video API timeout: {e}")
     
     if resp.status_code != 200:
@@ -768,6 +774,7 @@ def generate_video(
     content: Optional[List[dict]] = None,
     batch_id: Optional[str] = None,
     model: Optional[str] = None,
+    submit_timeout: Optional[int] = None,
 ) -> str:
     """High-level function: submit + poll + download in one call.
     
@@ -838,6 +845,7 @@ def generate_video(
         content=content,
         batch_id=batch_id,
         model=model,
+        timeout=submit_timeout or (60 if model == "seedance" else 30),
     )
     
     # Handle content[] failure - fallback to zip/base64
@@ -854,6 +862,7 @@ def generate_video(
             asset_zip_path=asset_zip_path,
             batch_id=batch_id,
             model=model,
+            timeout=submit_timeout or (60 if model == "seedance" else 30),
         )
     
     # Handle zip upload failure - fallback to base64
@@ -869,6 +878,7 @@ def generate_video(
             fps=fps,
             batch_id=batch_id,
             model=model,
+            timeout=submit_timeout or (60 if model == "seedance" else 30),
         )
     
     if task_id is None:
@@ -897,6 +907,7 @@ def generate_video(
     if actual_num_frames is None and actual_duration is not None:
         actual_num_frames = round(actual_duration * fps)
     provenance = {
+        "actual_model": model or "wan22",
         "requested_duration": requested_duration,
         "requested_num_frames": num_frames,
         "actual_duration": actual_duration,
@@ -922,3 +933,24 @@ def generate_video(
                 f"{requested_duration:.2f}s, actual {actual_duration:.2f}s"
             )
     return output_path
+
+
+def generate_video_with_fallback(**kwargs) -> str:
+    """Generate with Seedance, falling back to Wan2.2 only on a timeout.
+
+    The same prompt and reference payload are retained because Wan2.2 accepts
+    the positive identity/negative guardrails used by Seedance. Calling
+    ``generate_video`` again with ``model=wan22`` deliberately re-snaps the
+    requested duration to Wan2.2's legal 49/97/145 frame profile and enables
+    strict duration/dimension verification.
+    """
+    output_path = str(kwargs["output_path"])
+    shot_id = Path(output_path).parent.name
+    seedance_kwargs = dict(kwargs, model="seedance", submit_timeout=60)
+    try:
+        return generate_video(**seedance_kwargs)
+    except TimeoutError:
+        print(f"    [fallback] {shot_id}: Seedance timeout → Wan2.2", flush=True)
+        wan_kwargs = dict(kwargs, model="wan22")
+        wan_kwargs.pop("submit_timeout", None)
+        return generate_video(**wan_kwargs)

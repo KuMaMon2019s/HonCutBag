@@ -2361,7 +2361,7 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
         print("  ✗ Phase 5 前置检查失败: 本地视频 API 不可达，ARK 视频降级已禁用", flush=True)
         return {"status": "error", "error": "local video API unreachable, ARK fallback disabled"}
     use_local = True
-    video_provider = os.environ.get("VIDEO_PROVIDER", "local").lower()
+    video_provider = os.environ.get("VIDEO_PROVIDER", "seedance").lower()
     if video_provider == "seedance":
         print("  → 路由: 通过 Bridge 使用 Seedance 在线模型", flush=True)
     else:
@@ -2485,7 +2485,7 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
             "phantom": "dialogue/emotion shot",
             "i2v": "scenery/ambient or default",
         }[gen_strategy]
-        video_provider = os.environ.get("VIDEO_PROVIDER", "local").lower()
+        video_provider = os.environ.get("VIDEO_PROVIDER", "seedance").lower()
         if video_provider == "seedance":
             bridge_model = "seedance"
         else:
@@ -2677,7 +2677,12 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
                             )
                             content_list = None  # signal to use legacy path
                         
-                        local_video_client.generate_video(
+                        generate = (
+                            local_video_client.generate_video_with_fallback
+                            if bridge_model == "seedance"
+                            else local_video_client.generate_video
+                        )
+                        generate(
                             prompt=prompt,
                             output_path=out_path,
                             reference_image_base64=first_frame_b64,
