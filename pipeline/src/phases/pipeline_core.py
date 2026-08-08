@@ -2167,20 +2167,32 @@ def _run_phase5_om_seedance(storyboard_data: dict, output_dir: Path, characters_
     storyboard_image = output_dir / "storyboard.png"
     has_storyboard_image = storyboard_image.exists()
 
-    # 构建角色参考图映射：character_id -> front.png 路径
+    # 构建角色参考图映射：character_id -> preferred reference path
     character_ref_images = {}
     if characters_data:
         characters = characters_data.get("characters", [])
         for char in characters:
             char_id = char.get("id", "")
             char_name = char.get("name", "")
-            # 查找角色目录中的 front.png
-            char_dir = output_dir / "characters" / char_id
-            front_png = char_dir / "front.png"
-            if front_png.exists():
-                character_ref_images[char_id] = str(front_png)
-                character_ref_images[char_name] = str(front_png)  # 也支持按名称匹配
-                print(f"  ✓ 角色参考图: {char_name} -> {front_png.name}")
+            char_dirs = [
+                output_dir / "characters" / char_id,
+                output_dir / "characters" / "characters" / char_id,
+            ]
+            reference_path = None
+            for char_dir in char_dirs:
+                candidates = [
+                    char_dir / "face_closeup.png",
+                    char_dir / "full_body.png",
+                    *sorted(char_dir.glob("variant_*.png")),
+                    char_dir / "front.png",  # legacy fallback
+                ]
+                reference_path = next((path for path in candidates if path.exists()), None)
+                if reference_path is not None:
+                    break
+            if reference_path is not None:
+                character_ref_images[char_id] = str(reference_path)
+                character_ref_images[char_name] = str(reference_path)  # 也支持按名称匹配
+                print(f"  ✓ 角色参考图: {char_name} -> {reference_path.name}")
 
     if has_storyboard_image:
         print(f"  → 模式: reference_to_video (storyboard.png 存在)")
@@ -2355,15 +2367,22 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
         for char in chars_data.get("characters", []):
             declared_character_ids.add(char["id"])
             # Try both directory structures: characters/{id}/ and characters/characters/{id}/
-            front_png = output_dir / "characters" / char["id"] / "face_closeup.png"
-            if not front_png.exists():
-                front_png = output_dir / "characters" / char["id"] / "full_body.png"
-            if not front_png.exists():
-                front_png = output_dir / "characters" / char["id"] / "front.png"
-            if not front_png.exists():
-                front_png = output_dir / "characters" / "characters" / char["id"] / "front.png"
-            if front_png.exists():
-                b64 = _b64.b64encode(front_png.read_bytes()).decode()
+            reference_path = None
+            for char_dir in (
+                output_dir / "characters" / char["id"],
+                output_dir / "characters" / "characters" / char["id"],
+            ):
+                candidates = [
+                    char_dir / "face_closeup.png",
+                    char_dir / "full_body.png",
+                    *sorted(char_dir.glob("variant_*.png")),
+                    char_dir / "front.png",  # legacy fallback
+                ]
+                reference_path = next((path for path in candidates if path.exists()), None)
+                if reference_path is not None:
+                    break
+            if reference_path is not None:
+                b64 = _b64.b64encode(reference_path.read_bytes()).decode()
                 # Map multiple keys for matching: Chinese name, pinyin id, id without underscores
                 char_ref_map[char["name"].lower()] = b64
                 char_ref_map[char["id"].lower()] = b64
@@ -2375,7 +2394,8 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
             print(f"  → 已加载 {len(char_list)} 个角色参考图")
         if missing_character_fronts:
             print(
-                "  ⚠ Phase 5 前置检查: 缺少角色 front.png: "
+                "  ⚠ Phase 5 前置检查: 缺少角色参考图 "
+                "(face_closeup.png/full_body.png/variant_*.png): "
                 + ", ".join(sorted(missing_character_fronts)),
                 flush=True,
             )
@@ -2468,7 +2488,8 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
             missing_ids = missing_for_shot or missing_character_fronts
             print(
                 f"    ✗ {shot_dir.name}: 缺少角色参考图 "
-                f"characters/*/front.png ({', '.join(sorted(missing_ids))})，跳过镜头",
+                "characters/*/{face_closeup.png,full_body.png,variant_*.png} "
+                f"({', '.join(sorted(missing_ids))})，跳过镜头",
                 flush=True,
             )
             return None
@@ -2522,12 +2543,25 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
                             print(f"    [P1-A] 衍生参考图匹配: {char_id}:{variant_state}")
                             break
 
-                    # 基准参考图匹配（现有逻辑）
-                    front_png = output_dir / "characters" / char_id / "front.png"
-                    if not front_png.exists():
-                        front_png = output_dir / "characters" / "characters" / char_id / "front.png"
-                    if front_png.exists():
-                        first_frame_b64 = _b64.b64encode(front_png.read_bytes()).decode()
+                    # 基准参考图匹配（新资产优先，旧 front.png 仅兼容）
+                    reference_path = None
+                    for char_dir in (
+                        output_dir / "characters" / char_id,
+                        output_dir / "characters" / "characters" / char_id,
+                    ):
+                        candidates = [
+                            char_dir / "face_closeup.png",
+                            char_dir / "full_body.png",
+                            *sorted(char_dir.glob("variant_*.png")),
+                            char_dir / "front.png",
+                        ]
+                        reference_path = next(
+                            (path for path in candidates if path.exists()), None
+                        )
+                        if reference_path is not None:
+                            break
+                    if reference_path is not None:
+                        first_frame_b64 = _b64.b64encode(reference_path.read_bytes()).decode()
                         print(f"    [P0-C] 资产绑定匹配角色: {char_id}")
                         break
 

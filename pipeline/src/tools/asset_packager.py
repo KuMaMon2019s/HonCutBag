@@ -34,7 +34,7 @@ def package_shot_assets(
     Zip structure:
         assets.zip
         ├─ meta.json
-        ├─ three_view/          (character front/side/back.png)
+        ├─ character_refs/      (face_closeup/full_body/variant_*.png)
         ├─ shot_frames/         (storyboard_images/{shot_id}.png)
         └─ storyboard/          (storyboard.png)
     
@@ -47,7 +47,7 @@ def package_shot_assets(
             "width": 1280,
             "height": 720,
             "images": [
-                {"path": "three_view/front.png", "role": "identity", "priority": 1},
+                {"path": "character_refs/char_id_face_closeup.png", "role": "identity", "priority": 1},
                 ...
             ]
         }
@@ -66,12 +66,16 @@ def package_shot_assets(
             for char_dir in char_base.iterdir():
                 if char_dir.is_dir() and char_dir.name not in seen_char_dirs:
                     seen_char_dirs.add(char_dir.name)
-                    for view in ["front.png", "side.png", "back.png"]:
-                        view_path = char_dir / view
-                        if view_path.exists():
+                    reference_paths = [
+                        char_dir / "face_closeup.png",
+                        char_dir / "full_body.png",
+                        *sorted(char_dir.glob("variant_*.png")),
+                    ]
+                    for reference_path in reference_paths:
+                        if reference_path.exists():
                             assets.append({
-                                "src_path": view_path,
-                                "zip_path": f"three_view/{char_dir.name}_{view}",
+                                "src_path": reference_path,
+                                "zip_path": f"character_refs/{char_dir.name}_{reference_path.name}",
                                 "role": "identity",
                                 "priority": 1,
                             })
@@ -223,8 +227,8 @@ def build_content_for_shot(
             {"type": "image_url", "image_url": {"url": "https://..."}, "role": "first_frame", "priority": "high"}
         ]
 
-    i2v uses one first frame; Phantom adds the shot characters' three views as
-    identity references; FLF2V uses an explicit first and last frame.
+    i2v uses one first frame; Phantom adds the shot characters' face, body, and
+    optional variant references; FLF2V uses an explicit first and last frame.
 
     Legacy paths (zip/base64) are preserved for backward compatibility but not
     used in the primary content[] workflow.
@@ -270,17 +274,23 @@ def build_content_for_shot(
             char_dir = output_dir / "characters" / char_id
             if not char_dir.exists():
                 char_dir = output_dir / "characters" / "characters" / char_id
-            for view in ("front", "side", "back"):
-                view_path = char_dir / f"{view}.png"
-                if view_path.exists() and view_path.stat().st_size > 1024:
+            reference_paths = [
+                char_dir / "face_closeup.png",
+                char_dir / "full_body.png",
+                *sorted(char_dir.glob("variant_*.png")),
+            ]
+            for reference_path in reference_paths:
+                if reference_path.exists() and reference_path.stat().st_size > 1024:
                     image_assets.append({
-                        "path": view_path,
+                        "path": reference_path,
                         "role": "reference_image",
                         "priority": "high",
                     })
+                    break
         if not any(asset["role"] == "reference_image" for asset in image_assets):
             raise FileNotFoundError(
-                f"Phantom character three-view references missing for shot {shot_id}"
+                "Phantom character references missing for shot "
+                f"{shot_id}; expected face_closeup.png, full_body.png, or variant_*.png"
             )
 
     print(f"  [assets] {strategy}: images_used={len(image_assets)}")

@@ -535,6 +535,7 @@ def _verify_download(
     expected_duration: Optional[float] = None,
     expected_width: Optional[int] = None,
     expected_height: Optional[int] = None,
+    require_video_stream: bool = False,
 ) -> dict:
     """Probe the downloaded mp4 with ffprobe and check against expectations.
 
@@ -562,6 +563,10 @@ def _verify_download(
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if proc.returncode != 0:
             detail = proc.stderr.strip() or f"exit code {proc.returncode}"
+            if require_video_stream:
+                raise RuntimeError(
+                    f"Download verification failed: ffprobe could not read video: {detail}"
+                )
             print(
                 f"  [local_download] WARNING: ffprobe could not read metadata "
                 f"for {file_path}: {detail}",
@@ -570,6 +575,10 @@ def _verify_download(
             return unavailable
         info = json.loads(proc.stdout)
     except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as e:
+        if require_video_stream:
+            raise RuntimeError(
+                f"Download verification failed: ffprobe could not read video: {e}"
+            ) from e
         print(
             f"  [local_download] WARNING: ffprobe could not read metadata "
             f"for {file_path}: {e}",
@@ -579,6 +588,8 @@ def _verify_download(
 
     streams = info.get("streams") or []
     if not any(stream.get("codec_type") == "video" for stream in streams):
+        if require_video_stream:
+            raise RuntimeError("Download verification failed: ffprobe found no video stream")
         print(
             f"  [local_download] WARNING: ffprobe found no video stream in {file_path}",
             file=sys.stderr,
@@ -656,6 +667,7 @@ def download(
     expected_width: Optional[int] = None,
     expected_height: Optional[int] = None,
     verification_out: Optional[dict] = None,
+    model: Optional[str] = None,
 ) -> str:
     """Download the generated video to output_path.
 
@@ -694,15 +706,23 @@ def download(
     print(f"  [local_download] saved {output_path} ({file_size} bytes)")
 
     # --- Cross-task leakage guard ---
-    need_verify = any(v is not None for v in (expected_duration, expected_width, expected_height))
+    is_online_route = (model or "").lower() == "seedance"
+    need_verify = is_online_route or any(
+        v is not None for v in (expected_duration, expected_width, expected_height)
+    )
     if need_verify:
         actual = None
         try:
+            if is_online_route and file_size <= 1024:
+                raise RuntimeError(
+                    f"Download verification failed: downloaded file is too small ({file_size} bytes)"
+                )
             actual = _verify_download(
                 output_path,
-                expected_duration=expected_duration,
-                expected_width=expected_width,
-                expected_height=expected_height,
+                expected_duration=None if is_online_route else expected_duration,
+                expected_width=None if is_online_route else expected_width,
+                expected_height=None if is_online_route else expected_height,
+                require_video_stream=is_online_route,
             )
             if all(value is None for value in actual.values()):
                 print(
@@ -869,6 +889,7 @@ def generate_video(
         expected_width=width,
         expected_height=height,
         verification_out=verification,
+        model=model,
     )
 
     actual_duration = verification.get("duration")

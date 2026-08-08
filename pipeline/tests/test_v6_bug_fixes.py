@@ -2,9 +2,12 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from clients import local_video_client
+from clients import tos_uploader
 from phases.character_discoverer import _filter_descriptive_phrases
 from phases.character_discoverer import _add_reference_contract
 from phases.character_factory import build_model_reference_prompts
@@ -12,6 +15,7 @@ from phases.scene_consistency import generate_scene_consistency
 from phases import storyboard_generator
 from phases.storyboard_generator import _build_shot_prompt
 from phases.video_generator import BASE_NEGATIVE_PROMPT, build_video_prompt
+from tools import asset_packager
 
 
 class _DownloadResponse:
@@ -46,6 +50,104 @@ def test_download_keeps_file_when_ffprobe_metadata_is_unreadable(
 
     assert output_path.read_bytes() == b"downloaded-video"
     assert "WARNING: metadata unavailable" in capsys.readouterr().err
+
+
+def test_seedance_download_keeps_valid_video_when_dimensions_differ(
+    tmp_path, monkeypatch
+):
+    output_path = tmp_path / "output.mp4"
+    session = SimpleNamespace(get=lambda *args, **kwargs: _DownloadResponse())
+    monkeypatch.setattr(
+        _DownloadResponse,
+        "iter_content",
+        lambda self, chunk_size: iter([b"v" * 2048]),
+    )
+    monkeypatch.setattr(local_video_client, "_request_session", lambda: session)
+    monkeypatch.setattr(
+        local_video_client.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout='{"format":{"duration":"5.1"},"streams":['
+                   '{"codec_type":"video","width":1920,"height":1080}]}',
+            stderr="",
+        ),
+    )
+
+    local_video_client.download(
+        "seedance-task",
+        str(output_path),
+        expected_duration=7.0,
+        expected_width=1280,
+        expected_height=720,
+        model="seedance",
+    )
+
+    assert output_path.exists()
+    assert output_path.stat().st_size == 2048
+
+
+def test_seedance_download_deletes_file_without_video_stream(tmp_path, monkeypatch):
+    output_path = tmp_path / "output.mp4"
+    session = SimpleNamespace(get=lambda *args, **kwargs: _DownloadResponse())
+    monkeypatch.setattr(
+        _DownloadResponse,
+        "iter_content",
+        lambda self, chunk_size: iter([b"x" * 2048]),
+    )
+    monkeypatch.setattr(local_video_client, "_request_session", lambda: session)
+    monkeypatch.setattr(
+        local_video_client.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout='{"format":{},"streams":[{"codec_type":"audio"}]}',
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="Download verification failed"):
+        local_video_client.download(
+            "seedance-task",
+            str(output_path),
+            expected_duration=7.0,
+            expected_width=1280,
+            expected_height=720,
+            model="seedance",
+        )
+
+    assert not output_path.exists()
+
+
+def test_phantom_uses_new_character_reference_assets(tmp_path, monkeypatch):
+    char_dir = tmp_path / "characters" / "hero"
+    char_dir.mkdir(parents=True)
+    (char_dir / "face_closeup.png").write_bytes(b"f" * 2048)
+    (char_dir / "full_body.png").write_bytes(b"b" * 2048)
+    monkeypatch.setattr(
+        tos_uploader,
+        "upload_image",
+        lambda data, content_type: f"https://assets.test/{data[:1].decode()}.png",
+    )
+
+    content = asset_packager.build_content_for_shot(
+        tmp_path,
+        "S04",
+        {"prompt": "hero speaks", "gen_strategy": "phantom", "_char_ids": ["hero"]},
+    )
+
+    references = [item for item in content if item.get("role") == "reference_image"]
+    assert len(references) == 1
+    assert references[0]["image_url"]["url"] == "https://assets.test/f.png"
+
+    (char_dir / "face_closeup.png").unlink()
+    content = asset_packager.build_content_for_shot(
+        tmp_path,
+        "S04",
+        {"prompt": "hero speaks", "gen_strategy": "phantom", "_char_ids": ["hero"]},
+    )
+    references = [item for item in content if item.get("role") == "reference_image"]
+    assert references[0]["image_url"]["url"] == "https://assets.test/b.png"
 
 
 def test_compound_robot_name_passes_character_filter():
