@@ -54,6 +54,8 @@ def _build_parser() -> argparse.ArgumentParser:
     input_group.add_argument("--text", type=str, help="故事文本")
     input_group.add_argument("--input", type=str, help="故事文本文件路径")
     parser.add_argument("--duration", type=int, default=60, help="目标视频时长（秒），默认 60")
+    parser.add_argument("--shot-duration", type=int, default=_core.AVG_SHOT_DURATION,
+                        help=f"每镜平均时长（秒），默认 {_core.AVG_SHOT_DURATION}")
     parser.add_argument("--dry-run", action="store_true", help="dry-run 模式")
     parser.add_argument("--output-dir", type=str, default=".", help="输出目录，默认当前目录")
     parser.add_argument("--skip-phase", type=float, nargs="+", default=[], help="跳过指定 Phase")
@@ -114,6 +116,7 @@ def main() -> None:
         text=args.text,
         input_file=args.input,
         duration=args.duration,
+        shot_duration=args.shot_duration,
         dry_run=args.dry_run,
         skip_phase=_phase_skip_list(args, parser),
         output_dir=args.output_dir,

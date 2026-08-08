@@ -950,7 +950,17 @@ def generate_video_with_fallback(**kwargs) -> str:
     try:
         return generate_video(**seedance_kwargs)
     except TimeoutError:
-        print(f"    [fallback] {shot_id}: Seedance timeout → Wan2.2", flush=True)
+        requested_duration = kwargs.get("duration")
+        duration_loss = ""
+        if requested_duration is not None and float(requested_duration) > 6:
+            requested_label = f"{float(requested_duration):g}"
+            duration_loss = (
+                f" (duration {requested_label}s → 6s, Wan2.2 max ~6s)"
+            )
+        print(
+            f"    [fallback] {shot_id}: Seedance timeout → Wan2.2{duration_loss}",
+            flush=True,
+        )
         wan_kwargs = dict(kwargs, model="wan22")
         wan_kwargs.pop("submit_timeout", None)
         return generate_video(**wan_kwargs)

@@ -9,7 +9,7 @@
 - events JSON（event_extractor.py 输出）
 - characters JSON（character_discoverer.py 输出，可选）
 - 目标时长（默认 60 秒）
-- 每镜时长（默认 5-7 秒）
+- 每镜时长（默认 12 秒）
 
 输出：
 - shots JSON（包含 shot_order, source_events, action, reason, who, where,
@@ -48,7 +48,8 @@ SYSTEM_PROMPT = (
 )
 
 USER_PROMPT_TEMPLATE = (
-    "目标时长：{target_duration}秒，每镜约{shot_duration}秒，最多{max_shots}个镜头。\n\n"
+    "目标时长：{target_duration}秒，每镜约{shot_duration}秒，最多{max_shots}个镜头。"
+    "每镜只完成一个明确情节。\n\n"
     "事件列表：\n{events_json}\n\n"
     "角色列表：\n{characters_summary}\n\n"
     "请输出一个 JSON 对象，包含：\n"
@@ -154,8 +155,8 @@ def determine_gen_strategy(shot: Dict[str, Any]) -> str:
 
 LLM_TIMEOUT = 90  # 秒
 MAX_RETRIES = 1  # 解析失败重试次数
-AVG_SHOT_DURATION = 6  # 默认每镜时长（秒）
-MIN_SHOT_DURATION = 3  # 单镜头最小时长（秒）
+AVG_SHOT_DURATION = 12  # 默认每镜时长（秒）
+MIN_SHOT_DURATION = 4  # 单镜头最小时长（秒）
 MAX_SHOT_DURATION = 15  # 单镜头最大时长（秒）
 CHARS_PER_SECOND = 4  # 中文剧本预估：约 4 字/秒（范围 3-5）
 DEFAULT_TARGET_DURATION = 60  # 默认目标时长（用户未指定时使用）
@@ -209,7 +210,7 @@ def estimate_shot_count(target_duration: int, shot_duration: int = AVG_SHOT_DURA
     # 将 shot_duration 限制在合理范围内
     shot_duration = max(MIN_SHOT_DURATION, min(MAX_SHOT_DURATION, shot_duration))
 
-    max_shots = max(1, target_duration // shot_duration)
+    max_shots = max(1, (target_duration + shot_duration - 1) // shot_duration)
     return max_shots
 
 
@@ -436,7 +437,7 @@ def adapt_events(
         events: 事件列表（event_extractor.py 输出）
         characters: 角色列表（character_discoverer.py 输出，可选）
         target_duration: 目标总时长（秒），默认 None（根据剧本长度智能预估）
-        shot_duration: 每镜平均时长（秒），默认 6
+        shot_duration: 每镜平均时长（秒），默认 12
         source_text: 原始剧本文本（用于智能预估时长）
 
     Returns:
@@ -462,8 +463,11 @@ def adapt_events(
     if target_duration < 10:
         raise ValueError(f"目标时长不合理：{target_duration}秒（最少 10 秒）")
 
-    if shot_duration < 2:
-        raise ValueError(f"每镜时长不合理：{shot_duration}秒（最少 2 秒）")
+    if not MIN_SHOT_DURATION <= shot_duration <= MAX_SHOT_DURATION:
+        raise ValueError(
+            f"每镜时长不合理：{shot_duration}秒"
+            f"（应在 {MIN_SHOT_DURATION}-{MAX_SHOT_DURATION} 秒）"
+        )
 
     # ── 计算最大 shot 数（智能分镜）──────────────────────────────────────
     max_shots = estimate_shot_count(target_duration, shot_duration)

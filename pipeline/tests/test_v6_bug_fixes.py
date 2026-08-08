@@ -15,12 +15,47 @@ from phases.character_discoverer import _add_reference_contract
 from phases.character_factory import build_combined_sheet_prompt, build_model_reference_prompts
 from phases.scene_consistency import generate_scene_consistency
 from phases import storyboard_generator
+from phases.adaptation_engine import estimate_shot_count
 from phases.storyboard_generator import _build_characters_map, _build_shot_prompt
 from phases.video_generator import BASE_NEGATIVE_PROMPT, build_video_prompt
 from prompt.eight_layer_summary import build_subject_summary
 from tools import asset_packager
 import cron_monitor
 import phase_orchestrator
+
+
+def test_default_shot_count_uses_twelve_second_target():
+    assert estimate_shot_count(45) == 4
+
+
+def test_orchestrator_passes_configured_shot_duration(monkeypatch, tmp_path):
+    config = {
+        "input": "story.txt",
+        "duration": 45,
+        "shot_duration": 10,
+        "output_dir": str(tmp_path),
+    }
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(phase_orchestrator.subprocess, "run", fake_run)
+
+    assert phase_orchestrator._normalize_shot_duration(config) == 10
+    phase_orchestrator.run_phase("phase2", config)
+
+    command = commands[0]
+    assert command[command.index("--shot-duration") + 1] == "10"
+
+
+def test_orchestrator_clamps_shot_duration_with_warning(capsys):
+    config = {"shot_duration": 20}
+
+    assert phase_orchestrator._normalize_shot_duration(config) == 15
+    assert config["shot_duration"] == 15
+    assert "clamped to 15s" in capsys.readouterr().err
 
 
 class _DownloadResponse:
@@ -131,7 +166,7 @@ def test_seedance_timeout_falls_back_to_wan22_and_records_actual_model(
     shot_dir.mkdir()
     output_path = shot_dir / "output.mp4"
     meta_path = shot_dir / "SHOT_META.json"
-    meta_path.write_text(json.dumps({"duration": 6, "prompt": "identity-lock"}))
+    meta_path.write_text(json.dumps({"duration": 12, "prompt": "identity-lock"}))
 
     submissions = []
     polls = iter([TimeoutError("stalled"), {"status": "completed", "progress": 100}])
@@ -157,7 +192,7 @@ def test_seedance_timeout_falls_back_to_wan22_and_records_actual_model(
     local_video_client.generate_video_with_fallback(
         prompt="identity-lock and positive negative-guardrails",
         output_path=str(output_path),
-        duration=6,
+        duration=12,
         content=[{"type": "text", "text": "same assets"}],
     )
 
@@ -167,7 +202,13 @@ def test_seedance_timeout_falls_back_to_wan22_and_records_actual_model(
     assert submissions[0]["content"] == submissions[1]["content"]
     assert submissions[1]["num_frames"] == 145
     assert json.loads(meta_path.read_text())["actual_model"] == "wan22"
-    assert "[fallback] S03: Seedance timeout → Wan2.2" in capsys.readouterr().out
+    metadata = json.loads(meta_path.read_text())
+    assert metadata["requested_duration"] == 12
+    assert metadata["actual_duration"] == pytest.approx(97 / 24)
+    assert (
+        "[fallback] S03: Seedance timeout → Wan2.2 "
+        "(duration 12s → 6s, Wan2.2 max ~6s)"
+    ) in capsys.readouterr().out
 
 
 def test_phantom_uses_new_character_reference_assets(tmp_path, monkeypatch):

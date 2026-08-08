@@ -32,6 +32,31 @@ PHASE_NUMBERS = {
 }
 PIPELINE_DIR = Path(__file__).resolve().parents[1]
 RUNNER = PIPELINE_DIR / "src" / "pipeline_runner.py"
+if str(RUNNER.parent) not in sys.path:
+    sys.path.insert(0, str(RUNNER.parent))
+
+from phases.adaptation_engine import (  # noqa: E402
+    AVG_SHOT_DURATION,
+    MAX_SHOT_DURATION,
+    MIN_SHOT_DURATION,
+)
+
+
+def _normalize_shot_duration(config: dict) -> int:
+    """Validate and clamp the optional per-shot duration from config."""
+    shot_duration = config.get("shot_duration", AVG_SHOT_DURATION)
+    if isinstance(shot_duration, bool) or not isinstance(shot_duration, int):
+        raise ValueError("config shot_duration must be an integer number of seconds")
+    clamped = max(MIN_SHOT_DURATION, min(MAX_SHOT_DURATION, shot_duration))
+    if clamped != shot_duration:
+        print(
+            f"Warning: shot_duration {shot_duration}s is outside "
+            f"[{MIN_SHOT_DURATION}, {MAX_SHOT_DURATION}]; clamped to {clamped}s",
+            file=sys.stderr,
+            flush=True,
+        )
+    config["shot_duration"] = clamped
+    return clamped
 
 
 def _write_progress(progress_file: Path, payload: dict) -> None:
@@ -147,6 +172,8 @@ def run_phase(phase: str, config: dict) -> dict:
         str(config["input"]),
         "--duration",
         str(config["duration"]),
+        "--shot-duration",
+        str(config["shot_duration"]),
         "--output-dir",
         str(config["output_dir"]),
         "--phase",
@@ -185,6 +212,10 @@ def main() -> None:
     missing = sorted(required.difference(config))
     if missing:
         parser.error(f"config is missing required keys: {', '.join(missing)}")
+    try:
+        _normalize_shot_duration(config)
+    except ValueError as error:
+        parser.error(str(error))
 
     # Match direct runner usage from pipeline/src: relative input/output paths
     # are interpreted from that directory for both execution and monitoring.

@@ -37,6 +37,7 @@ from tools.video_stitcher import build_stitch_plan
 from tools.asset_binder import bind_assets
 from prompt.prompt_sanitizer import sanitize_quality_prompt
 from prompt.three_part_prompt import build_three_part_prompt
+from phases.adaptation_engine import AVG_SHOT_DURATION
 from quality.composition_validator import validate_composition
 from tools.vendor_adapter import VendorAdapter, VendorModel
 
@@ -592,7 +593,14 @@ def _integrate_storyboard_prompts(storyboard: dict, characters: list[dict]) -> d
         shot["prompt"] = sanitize_quality_prompt(bind_assets(prompt, shot_assets))
     return storyboard
 
-def run_phase2(text: str, output_dir: Path, duration: int, dry_run: bool, reporter: Optional[ProgressReporter] = None) -> dict:
+def run_phase2(
+    text: str,
+    output_dir: Path,
+    duration: int,
+    dry_run: bool,
+    reporter: Optional[ProgressReporter] = None,
+    shot_duration: int = AVG_SHOT_DURATION,
+) -> dict:
     """Phase 2: text_parser → event_extractor → character_discoverer → adaptation_engine → storyboard_generator"""
     _banner(2, 8, "编剧引擎 (Screenwriter)", dry_run)
     start = _now()
@@ -821,7 +829,13 @@ def run_phase2(text: str, output_dir: Path, duration: int, dry_run: bool, report
         print("  → adaptation_engine: 影视化改编...")
         if reporter:
             reporter.step("phase2", "影视化改编", progress_pct=70)
-        adapted = adapt_events(events, characters_list, target_duration=duration, source_text=text)
+        adapted = adapt_events(
+            events,
+            characters_list,
+            target_duration=duration,
+            shot_duration=shot_duration,
+            source_text=text,
+        )
         adapted_shots = adapted.get("shots", [])
         print(f"    ✓ 改编完成，{len(adapted_shots)} 个镜头")
         if reporter:
@@ -4045,6 +4059,7 @@ if LANGGRAPH_AVAILABLE:
             output_dir=output_dir,
             duration=state["duration"],
             dry_run=state["dry_run"],
+            shot_duration=state.get("shot_duration", AVG_SHOT_DURATION),
         )
         
         # Extract internal data
@@ -4356,6 +4371,7 @@ def run_pipeline(
     text: str = None,
     input_file: str = None,
     duration: int = 60,
+    shot_duration: int = AVG_SHOT_DURATION,
     dry_run: bool = False,
     skip_phase: list = None,
     output_dir: str = ".",
@@ -4373,6 +4389,7 @@ def run_pipeline(
         text: 故事文本（直接传入）
         input_file: 故事文本文件路径（与 text 二选一）
         duration: 目标视频时长（秒）
+        shot_duration: 每镜平均时长（秒）
         dry_run: dry-run 模式（Phase 2 实际调 LLM，Phase 3 skip-images，Phase 4 dry-run，Phase 5-8 跳过）
         skip_phase: 跳过指定 phase 列表，如 [3, 8]
         output_dir: 输出目录
@@ -4535,6 +4552,7 @@ def run_pipeline(
                 "status": "running",
                 "output_dir": str(output_path),
                 "duration": duration,
+                "shot_duration": shot_duration,
                 "dry_run": dry_run,
                 "transition": transition,
                 "transition_duration": transition_duration,
@@ -4698,7 +4716,7 @@ def run_pipeline(
         print(f"  🔄 Phase 2: 从 checkpoint 恢复 (已跳过)")
     else:
         reporter.phase_start("phase2", "编剧引擎")
-        p2 = run_phase2(text, output_dir, duration, dry_run)
+        p2 = run_phase2(text, output_dir, duration, dry_run, shot_duration=shot_duration)
         # 提取内部数据（不写入 report）
         storyboard_data = p2.pop("_storyboard", None)
         characters_data = p2.pop("_characters", None)
