@@ -8,6 +8,7 @@ for upload to Bridge API. Falls back to base64 list if zip upload fails.
 
 import base64
 import json
+import re
 import zipfile
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -270,7 +271,17 @@ def build_content_for_shot(
                 f"FLF2V end frame missing or too small: {end_frame_path}"
             )
     elif strategy == "phantom":
+        character_names = {}
+        characters_json = output_dir / "CHARACTERS.json"
+        if characters_json.exists():
+            characters_data = json.loads(characters_json.read_text())
+            character_names = {
+                character.get("id"): character.get("name") or character.get("id")
+                for character in characters_data.get("characters", [])
+                if character.get("id")
+            }
         for char_id in _detect_shot_characters(output_dir, shot_meta):
+            character_name = character_names.get(char_id, char_id)
             char_dir = output_dir / "characters" / char_id
             if not char_dir.exists():
                 char_dir = output_dir / "characters" / "characters" / char_id
@@ -285,6 +296,13 @@ def build_content_for_shot(
                         "path": reference_path,
                         "role": "reference_image",
                         "priority": "high",
+                        "reference_description": (
+                            f"{character_name}的面部特写"
+                            if reference_path.name == "face_closeup.png"
+                            else f"{character_name}的全身照"
+                            if reference_path.name == "full_body.png"
+                            else f"{character_name}的变体图（{reference_path.stem}）"
+                        ),
                     })
         if not any(asset["role"] == "reference_image" for asset in image_assets):
             raise FileNotFoundError(
@@ -296,6 +314,7 @@ def build_content_for_shot(
     
     # Upload each image to TOS and add to content
     uploaded_count = 0
+    uploaded_reference_descriptions = []
     try:
         from clients import tos_uploader
     except ImportError:
@@ -332,11 +351,42 @@ def build_content_for_shot(
                     "priority": asset["priority"],
                 })
                 uploaded_count += 1
+                if asset["role"] == "reference_image":
+                    uploaded_reference_descriptions.append(
+                        asset["reference_description"]
+                    )
             else:
                 print(f"  [assets] ⚠ TOS upload failed for {asset['path'].name}, skipping")
         except Exception as e:
             print(f"  [assets] ⚠ Failed to upload {asset['path'].name}: {e}")
     
+    if strategy == "phantom" and uploaded_reference_descriptions and content:
+        references = "，".join(
+            f"图片{index}为{description}"
+            for index, description in enumerate(
+                uploaded_reference_descriptions, start=1
+            )
+        )
+        reference_instruction = (
+            f"{references}。生成时严格保持参考图中角色的外观一致。"
+        )
+        text_item = next(
+            (item for item in content if item.get("type") == "text"), None
+        )
+        if text_item is not None:
+            existing_prompt = text_item["text"]
+            if "元素参考" in existing_prompt:
+                text_item["text"] = re.sub(
+                    r"元素参考(?:声明)?\s*[：:]?\s*",
+                    f"元素参考：{reference_instruction}",
+                    existing_prompt,
+                    count=1,
+                )
+            else:
+                text_item["text"] = (
+                    f"元素参考：{reference_instruction}{existing_prompt}"
+                )
+
     print(f"  [assets] 上传 {uploaded_count} 张参考图到 TOS")
     return content
 

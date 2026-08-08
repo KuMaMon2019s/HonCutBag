@@ -132,11 +132,11 @@ _DIALOGUE_EMOTION_MARKERS = (
 
 
 def determine_gen_strategy(shot: Dict[str, Any]) -> str:
-    """Choose the local video route with action > interaction > safe I2V precedence.
+    """Choose the local video route with action > character > safe I2V precedence.
 
-    Clear body movement uses FLF2V. Explicit dialogue, emotion, or low-motion
-    character interaction uses Phantom. Scenery, ambient shots, and uncertain
-    descriptions use single-image I2V.
+    Clear body movement uses FLF2V. Every other character shot uses Phantom so
+    character reference images constrain appearance consistently. Scenery and
+    ambient shots without characters use single-image I2V.
     """
     searchable = " ".join(
         str(shot.get(field, ""))
@@ -145,13 +145,9 @@ def determine_gen_strategy(shot: Dict[str, Any]) -> str:
     if any(verb in searchable for verb in _ACTION_VERBS):
         return "flf2v"
 
-    intent = str(shot.get("shot_intent", "")).lower()
     who = shot.get("who", [])
     has_characters = bool(who)
-    if has_characters and (
-        intent in {"dialogue", "reaction"}
-        or any(marker in searchable for marker in _DIALOGUE_EMOTION_MARKERS)
-    ):
+    if has_characters:
         return "phantom"
     return "i2v"
 
