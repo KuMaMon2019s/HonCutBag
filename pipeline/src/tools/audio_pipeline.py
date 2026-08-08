@@ -20,6 +20,21 @@ from pathlib import Path
 from typing import Optional
 
 
+def extract_audio_track(video_path: str, wav_path: str) -> None:
+    """Extract a video's audio as a 16 kHz mono PCM WAV for ASR."""
+    output = Path(wav_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg", "-y", "-i", str(video_path), "-vn",
+        "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(output),
+    ]
+    try:
+        subprocess.run(cmd, capture_output=True, check=True, timeout=120)
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.decode("utf-8", errors="replace") if exc.stderr else str(exc)
+        raise RuntimeError(f"failed to extract ASR audio from {video_path}: {detail}") from exc
+
+
 # ─── Silent Audio Detection ───────────────────────────────────────────────────
 
 def is_silent_audio(video_path: str, threshold_db: float = -60.0) -> bool:

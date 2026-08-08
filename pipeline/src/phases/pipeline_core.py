@@ -3491,6 +3491,71 @@ def _fmt_srt_time(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+def _merge_shot_transcripts(sb_shots: list, durations_ms: list[int], shot_transcripts: list[dict]) -> dict:
+    """Offset per-shot ASR words and create caption-burn segments."""
+    merged_words = []
+    caption_segments = []
+    cumulative_ms = 0
+    shot_entries = []
+    for index, (shot, duration_ms, transcription) in enumerate(
+        zip(sb_shots, durations_ms, shot_transcripts), 1
+    ):
+        local_words = transcription.get("segments") or []
+        if local_words:
+            words = [{
+                "word": item.get("word") or item.get("text") or "",
+                "start_ms": cumulative_ms + int(item["start_ms"]),
+                "end_ms": cumulative_ms + int(item["end_ms"]),
+                "source": "asr",
+            } for item in local_words]
+            text = transcription.get("text") or "".join(item["word"] for item in words)
+            source = "asr"
+        else:
+            text = shot.get("caption", "")
+            words = []
+            source = "script_fallback"
+            if text:
+                characters = list(text)
+                per_character_ms = duration_ms / max(len(characters), 1)
+                words = [{
+                    "word": character,
+                    "start_ms": round(cumulative_ms + offset * per_character_ms),
+                    "end_ms": round(cumulative_ms + (offset + 1) * per_character_ms),
+                    "source": source,
+                } for offset, character in enumerate(characters)]
+
+        merged_words.extend(words)
+        shot_entries.append({
+            "shot_id": shot.get("shot_id") or f"S{index:02d}",
+            "text": text,
+            "source": source,
+            "start_ms": cumulative_ms,
+            "end_ms": cumulative_ms + duration_ms,
+            "segments": words,
+        })
+        if words:
+            caption_segments.append({
+                "text": text,
+                "start": words[0]["start_ms"] / 1000,
+                "end": words[-1]["end_ms"] / 1000,
+                "source": source,
+                "words": [{
+                    "word": item["word"],
+                    "start": item["start_ms"] / 1000,
+                    "end": item["end_ms"] / 1000,
+                    "source": item["source"],
+                } for item in words],
+            })
+        cumulative_ms += duration_ms
+    return {
+        "text": "".join(entry["text"] for entry in shot_entries if entry["text"]),
+        "duration_ms": cumulative_ms,
+        "segments": merged_words,
+        "shots": shot_entries,
+        "caption_segments": caption_segments,
+    }
+
+
 
 def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = None, upscale: Optional[int] = None, media_profile: str = "1080p") -> dict:
     """Phase 8: audio_pipeline + visual_post + [color_grade] + [upscale] + rhythm_editor → polished.mp4
@@ -3550,13 +3615,44 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
     if has_real_audio:
         print("  → [P0-D3] 视频已有真实音轨（Seedance generate_audio），跳过环境音合成")
 
+    # Step 8.1: transcribe every source shot before subtitle rendering. Keep
+    # this outside Phase 8's broad post-processing guard so extraction/API
+    # failures propagate instead of being reported as an ordinary soft failure.
+    transcript_data = None
+    if sb_path_str:
+        from clients.asr_client import transcribe_audio
+        from tools.audio_pipeline import extract_audio_track
+
+        storyboard_data = json.loads(storyboard_path.read_text(encoding="utf-8"))
+        sb_shots = storyboard_data.get("shots", [])
+        shots_dir = output_dir / "shots"
+        durations_ms = []
+        shot_transcripts = []
+        print("  → asr_transcription: 逐镜提取音轨并转写...")
+        for index, _shot in enumerate(sb_shots, 1):
+            shot_dir = shots_dir / f"S{index:02d}"
+            shot_video = shot_dir / "output.mp4"
+            wav_path = shot_dir / "audio.wav"
+            extract_audio_track(str(shot_video), str(wav_path))
+            durations_ms.append(round(_probe_shot_duration(shots_dir, index) * 1000))
+            shot_transcripts.append(transcribe_audio(str(wav_path)))
+        transcript_data = _merge_shot_transcripts(sb_shots, durations_ms, shot_transcripts)
+        transcript_path = output_dir / "transcript.json"
+        transcript_path.write_text(
+            json.dumps(transcript_data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        outputs.append("transcript.json")
+        print(f"    ✓ ASR 完成: {len(transcript_data['segments'])} 个词")
+
     try:
         from phases.visual_post import process_visual
         from phases.rhythm_editor import edit_rhythm
 
         # Track step statuses for quality gate integrity
         step_status = {}
-        storyboard_data = None
+        storyboard_data = storyboard_data if sb_path_str else None
+        if transcript_data is not None:
+            step_status["asr_transcription"] = "done"
 
         # Step 8.1: Audio processing via OM AudioMixer
         bgm_path = None
@@ -3720,49 +3816,7 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
                 from vendor.video_tools.tools.video.remotion_caption_burn import RemotionCaptionBurn
                 caption_burner = RemotionCaptionBurn()
 
-                # Read captions from storyboard
-                import json
-                with open(sb_path_str, 'r', encoding='utf-8') as f:
-                    storyboard_data = json.load(f)
-
-                # Build segments with real timing from ffprobe.
-                # STORYBOARD.json has no start_time/end_time, so we probe
-                # each shot's actual video duration and accumulate a timeline.
-                shots_dir = output_dir / "shots"
-                sb_shots = storyboard_data.get('shots', [])
-                segments = []
-                cumulative_start = 0.0
-
-                for i, shot in enumerate(sb_shots):
-                    caption_text = shot.get('caption', '')
-                    if not caption_text:
-                        # Still need to advance timeline even if no caption
-                        shot_dur = _probe_shot_duration(shots_dir, i + 1)
-                        cumulative_start += shot_dur
-                        continue
-
-                    shot_dur = _probe_shot_duration(shots_dir, i + 1)
-                    seg_start = cumulative_start
-                    seg_end = cumulative_start + shot_dur
-
-                    # Build word-level entries for Chinese text (char-by-char)
-                    chars = list(caption_text)
-                    per_char = shot_dur / max(len(chars), 1)
-                    words = []
-                    for ci, ch in enumerate(chars):
-                        words.append({
-                            "word": ch,
-                            "start": seg_start + ci * per_char,
-                            "end": seg_start + (ci + 1) * per_char,
-                        })
-
-                    segments.append({
-                        "text": caption_text,
-                        "start": seg_start,
-                        "end": seg_end,
-                        "words": words,
-                    })
-                    cumulative_start = seg_end
+                segments = transcript_data["caption_segments"] if transcript_data else []
 
                 # Also generate SRT as fallback
                 srt_path = str(output_dir / "subtitles.srt")
