@@ -537,6 +537,8 @@ def _specific_lighting(shot: Dict[str, Any], where: str) -> str:
     lighting = str(shot.get("lighting_description") or shot.get("lighting_key") or "").strip()
     if lighting and any(token in lighting for token in ("左", "右", "上", "下", "逆光", "侧光")):
         if any(token in lighting.upper() for token in ("K", "暖", "冷")):
+            if not any(token in lighting for token in ("气氛", "氛围", "雾", "雨", "尘", "颗粒", "潮湿")):
+                lighting += "，空气颗粒轻微可见，气氛与剧情情绪一致"
             return lighting
     if any(token in where for token in ("夜", "月", "室外")):
         return "冷蓝月光从镜头右上方射入，色温5600K，暖橙环境光轻微补亮轮廓，气氛克制"

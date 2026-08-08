@@ -46,7 +46,10 @@ def _shot_key(shot: Mapping[str, Any], index: int) -> str:
 def _lighting_for(shot: Mapping[str, Any]) -> str:
     explicit = str(shot.get("lighting_description") or shot.get("lighting_key") or "").strip()
     if explicit and any(token in explicit for token in ("左", "右", "上", "下", "逆光", "侧光")):
-        return explicit if any(token in explicit.upper() for token in ("K", "暖", "冷")) else f"{explicit}，色温4800K"
+        lighting = explicit if any(token in explicit.upper() for token in ("K", "暖", "冷")) else f"{explicit}，色温4800K"
+        if not any(token in lighting for token in ("气氛", "氛围", "雾", "雨", "尘", "颗粒", "潮湿")):
+            lighting += "，空气颗粒轻微可见，气氛与剧情情绪一致"
+        return lighting
     place = str(shot.get("where") or shot.get("scene_description") or shot.get("visual") or "")
     if any(token in place for token in ("夜", "月", "暗", "工厂")):
         return "冷蓝月光从镜头右上方射入，色温5600K，左侧暖橙实景灯补亮人物轮廓，空气颗粒清晰"

@@ -12,9 +12,17 @@ PHASES = ["phase2", "phase2_5", "phase3", "phase4", "phase5", "phase6", "phase7"
 def check_process(process_id: str) -> dict:
     """Check whether a background process is still running."""
     try:
-        pid = str(int(process_id))
-        result = subprocess.run(["ps", "-p", pid], capture_output=True, text=True)
-        return {"running": result.returncode == 0}
+        pid_number = int(process_id)
+        if pid_number <= 0:
+            raise ValueError("process ID must be a positive integer")
+        result = subprocess.run(
+            ["ps", "-p", str(pid_number), "-o", "stat="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        state = result.stdout.strip()
+        return {"running": result.returncode == 0 and bool(state) and not state.startswith("Z")}
     except (ValueError, OSError) as error:
         return {"running": False, "error": str(error)}
 
@@ -40,13 +48,15 @@ def get_phase_status(output_dir: str) -> dict:
         "current_phase": data.get("current_phase"),
         "completed_phases": [],
         "failed_phases": [],
-        "total_phases": len(data.get("results", [])),
+        "total_phases": len(data.get("phases") or PHASES),
     }
     for result in data.get("results", []):
+        if not isinstance(result, dict) or result.get("phase") not in PHASES:
+            continue
         phase_info = {
             "phase": result["phase"],
-            "exit_code": result["exit_code"],
-            "timestamp": result["timestamp"],
+            "exit_code": result.get("exit_code", 1),
+            "timestamp": result.get("timestamp", "unknown"),
         }
         target = "completed_phases" if result["exit_code"] == 0 else "failed_phases"
         summary[target].append(phase_info)

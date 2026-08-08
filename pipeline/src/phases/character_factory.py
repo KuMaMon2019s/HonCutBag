@@ -461,9 +461,8 @@ def create_character_card(
         "seedream_model": seedream_model,
         "seedance_model": seedance_model,
         "reference_images": reference_images or {
-            "front": f"characters/{char_id}/front.png",
-            "side": f"characters/{char_id}/side.png",
-            "back": f"characters/{char_id}/back.png",
+            "face_closeup": f"characters/{char_id}/face_closeup.png",
+            "full_body": f"characters/{char_id}/full_body.png",
         },
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "generator": seedream_model,
@@ -472,14 +471,14 @@ def create_character_card(
 
 def create_angle_map(
     char_id: str,
-    default_view: str = "front",
+    default_view: str = "face_closeup",
     custom_mappings: Optional[dict] = None,
 ) -> dict:
     """Create angle_map.json — maps camera angles to best reference images."""
     mappings = custom_mappings or {
-        "正面/特写/对话": "front.png",
-        "侧面/行走/奔跑": "side.png",
-        "背面/远去/离开": "back.png",
+        "正面/特写/对话": "face_closeup.png",
+        "侧面/行走/奔跑": "full_body.png",
+        "背面/远去/离开": "full_body.png",
         "面部/情绪/泪水": "face_closeup.png",
     }
     return {

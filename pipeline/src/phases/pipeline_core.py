@@ -2638,8 +2638,11 @@ def _run_phase5_fallback(output_dir: Path) -> dict:
                     # 视频参考大小限制（>5MB 不传，避免超限）
                     if len(prev_video_ref) > 5 * 1024 * 1024 * 4 // 3:
                         prev_video_ref = None
-                except Exception:
-                    pass
+                except Exception as error:
+                    print(
+                        f"  ⚠ {shot_dir.name}: 无法读取上一镜头运动参考 — {error}",
+                        flush=True,
+                    )
 
         max_retries = 3
         for attempt in range(max_retries + 1):

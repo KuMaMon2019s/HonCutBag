@@ -3,8 +3,10 @@
 
 import argparse
 import json
+import os
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -35,9 +37,63 @@ RUNNER = PIPELINE_DIR / "src" / "pipeline_runner.py"
 def _write_progress(progress_file: Path, payload: dict) -> None:
     """Atomically replace the progress file so cron never reads partial JSON."""
     progress_file.parent.mkdir(parents=True, exist_ok=True)
-    temporary = progress_file.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(progress_file)
+    serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+    temporary_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=progress_file.parent,
+            prefix=f".{progress_file.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_name = temporary.name
+            temporary.write(serialized)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_name, progress_file)
+    finally:
+        if temporary_name:
+            try:
+                Path(temporary_name).unlink(missing_ok=True)
+            except OSError as error:
+                print(f"Warning: unable to remove progress temp file: {error}", file=sys.stderr)
+
+
+def _resume_results(output_dir: Path, progress_file: Path, resume_from: str) -> list[dict]:
+    """Merge successful pre-resume phases from progress and pipeline reports."""
+    resume_index = PHASES.index(resume_from)
+    prior_phases = set(PHASES[:resume_index])
+    merged: dict[str, dict] = {}
+
+    if progress_file.exists():
+        previous = _read_json(progress_file, {})
+        for result in previous.get("results", []):
+            phase = result.get("phase")
+            if phase in prior_phases and result.get("exit_code") == 0:
+                merged[phase] = result
+
+    report_path = output_dir / "pipeline_report.json"
+    if report_path.exists():
+        report = _read_json(report_path, {})
+        report_phases = report.get("phases", {})
+        for phase in PHASES[:resume_index]:
+            phase_number = PHASE_NUMBERS[phase]
+            phase_report = report_phases.get(phase, report_phases.get(phase_number, {}))
+            if phase_report.get("status") in {"success", "completed", "done"}:
+                merged.setdefault(
+                    phase,
+                    {
+                        "phase": phase,
+                        "exit_code": 0,
+                        "stdout": "",
+                        "stderr": "",
+                        "timestamp": phase_report.get("timestamp", report.get("generated_at", "historical")),
+                    },
+                )
+
+    return [merged[phase] for phase in PHASES[:resume_index] if phase in merged]
 
 
 def _read_json(path: Path, default: dict) -> dict:
@@ -140,19 +196,7 @@ def main() -> None:
 
     progress_file = Path(config["output_dir"]) / "phase_progress.json"
     phases = PHASES[PHASES.index(args.resume_from) :] if args.resume_from else PHASES
-    results = []
-    if args.resume_from and progress_file.exists():
-        try:
-            previous = json.loads(progress_file.read_text(encoding="utf-8"))
-            resume_index = PHASES.index(args.resume_from)
-            results = [
-                result
-                for result in previous.get("results", [])
-                if result.get("exit_code") == 0
-                and result.get("phase") in PHASES[:resume_index]
-            ]
-        except (OSError, json.JSONDecodeError):
-            results = []
+    results = _resume_results(Path(config["output_dir"]), progress_file, args.resume_from) if args.resume_from else []
     _write_progress(
         progress_file,
         {"results": results, "current_phase": None, "status": "pending", "phases": PHASES},
