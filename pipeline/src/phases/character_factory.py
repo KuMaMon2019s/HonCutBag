@@ -274,7 +274,11 @@ def build_model_reference_prompts(
 ) -> dict:
     """Build separated reference prompts for Seedance or Kling."""
     suffix = f", {style}" if style else ""
-    base = f"{character_desc}{suffix}. {SOURCE_IMAGE_RULES}. Photorealistic, neutral expression"
+    fictional_decl = (
+        "This is a fully fictional AI-generated character (virtual avatar), "
+        "not a real person; the face is a synthetic digital creation"
+    )
+    base = f"{fictional_decl}. {character_desc}{suffix}. {SOURCE_IMAGE_RULES}. Photorealistic, neutral expression"
     if "kling" in target_model.lower():
         return {
             "front": f"{base}, front portrait, identity reference",
@@ -311,7 +315,8 @@ def build_combined_sheet_prompt(
     full_desc = f"{character_desc}{style_suffix}"
     
     prompt = (
-        "【宏观描述】画面风格：真人写实风格，照片级渲染，细节超高清。"
+        "【宏观描述】所有角色均为 AI 生成的虚拟形象，非真实人物。"
+        "画面风格：真人写实风格，照片级渲染，细节超高清。"
         "根据以下角色描述，生成一张纯白背景的角色四视图设定表。"
         "要求服装、发型、配饰等所有细节在四个视角中完全一致。\n"
         "【微观描述】\n"

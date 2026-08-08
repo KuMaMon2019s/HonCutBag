@@ -104,10 +104,11 @@ def build_video_prompt(
     negative_prompt = ", ".join(dict.fromkeys(item for item in negatives if item))
     prompt = "。".join(parts)
     prompt = re.sub(r"(?i)\bfast\b", "smooth", prompt).replace("快速", "平稳")
+    fictional_decl = "虚拟形象声明：片中角色均为 AI 生成的虚构角色，非真实人物"
     if "kling" in model.lower():
-        return {"prompt": prompt, "negative_prompt": negative_prompt}
+        return {"prompt": f"{fictional_decl}。{prompt}", "negative_prompt": negative_prompt}
     identity_lock = "identity-lock：保持参考图中的面部骨骼、发型、服装类别与主色不变"
-    return f"{prompt}。{identity_lock}。约束条件：{negative_prompt}"
+    return f"{prompt}。{fictional_decl}。{identity_lock}。约束条件：{negative_prompt}"
 
 
 def _load_json(path: Path, fallback: Any) -> Any:

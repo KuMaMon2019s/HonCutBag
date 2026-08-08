@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -5,17 +6,21 @@ from types import SimpleNamespace
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from clients import local_video_client
 from clients import tos_uploader
 from phases.character_discoverer import _filter_descriptive_phrases
 from phases.character_discoverer import _add_reference_contract
-from phases.character_factory import build_model_reference_prompts
+from phases.character_factory import build_combined_sheet_prompt, build_model_reference_prompts
 from phases.scene_consistency import generate_scene_consistency
 from phases import storyboard_generator
-from phases.storyboard_generator import _build_shot_prompt
+from phases.storyboard_generator import _build_characters_map, _build_shot_prompt
 from phases.video_generator import BASE_NEGATIVE_PROMPT, build_video_prompt
+from prompt.eight_layer_summary import build_subject_summary
 from tools import asset_packager
+import cron_monitor
+import phase_orchestrator
 
 
 class _DownloadResponse:
@@ -119,6 +124,52 @@ def test_seedance_download_deletes_file_without_video_stream(tmp_path, monkeypat
     assert not output_path.exists()
 
 
+def test_seedance_timeout_falls_back_to_wan22_and_records_actual_model(
+    tmp_path, monkeypatch, capsys
+):
+    shot_dir = tmp_path / "S03"
+    shot_dir.mkdir()
+    output_path = shot_dir / "output.mp4"
+    meta_path = shot_dir / "SHOT_META.json"
+    meta_path.write_text(json.dumps({"duration": 6, "prompt": "identity-lock"}))
+
+    submissions = []
+    polls = iter([TimeoutError("stalled"), {"status": "completed", "progress": 100}])
+
+    def fake_submit(**kwargs):
+        submissions.append(kwargs)
+        return f"task-{kwargs['model']}"
+
+    def fake_poll(task_id):
+        result = next(polls)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def fake_download(task_id, path, verification_out, **kwargs):
+        Path(path).write_bytes(b"video")
+        verification_out.update(duration=97 / 24, num_frames=97)
+
+    monkeypatch.setattr(local_video_client, "submit", fake_submit)
+    monkeypatch.setattr(local_video_client, "poll", fake_poll)
+    monkeypatch.setattr(local_video_client, "download", fake_download)
+
+    local_video_client.generate_video_with_fallback(
+        prompt="identity-lock and positive negative-guardrails",
+        output_path=str(output_path),
+        duration=6,
+        content=[{"type": "text", "text": "same assets"}],
+    )
+
+    assert [call["model"] for call in submissions] == ["seedance", "wan22"]
+    assert submissions[0]["timeout"] == 60
+    assert submissions[0]["prompt"] == submissions[1]["prompt"]
+    assert submissions[0]["content"] == submissions[1]["content"]
+    assert submissions[1]["num_frames"] == 145
+    assert json.loads(meta_path.read_text())["actual_model"] == "wan22"
+    assert "[fallback] S03: Seedance timeout → Wan2.2" in capsys.readouterr().out
+
+
 def test_phantom_uses_new_character_reference_assets(tmp_path, monkeypatch):
     char_dir = tmp_path / "characters" / "hero"
     char_dir.mkdir(parents=True)
@@ -137,8 +188,11 @@ def test_phantom_uses_new_character_reference_assets(tmp_path, monkeypatch):
     )
 
     references = [item for item in content if item.get("role") == "reference_image"]
-    assert len(references) == 1
-    assert references[0]["image_url"]["url"] == "https://assets.test/f.png"
+    assert len(references) == 2
+    assert [item["image_url"]["url"] for item in references] == [
+        "https://assets.test/f.png",
+        "https://assets.test/b.png",
+    ]
 
     (char_dir / "face_closeup.png").unlink()
     content = asset_packager.build_content_for_shot(
@@ -149,6 +203,48 @@ def test_phantom_uses_new_character_reference_assets(tmp_path, monkeypatch):
     references = [item for item in content if item.get("role") == "reference_image"]
     assert references[0]["image_url"]["url"] == "https://assets.test/b.png"
 
+    (char_dir / "full_body.png").unlink()
+    (char_dir / "variant_中文造型.png").write_bytes(b"v" * 2048)
+    content = asset_packager.build_content_for_shot(
+        tmp_path,
+        "S04",
+        {"prompt": "hero speaks", "gen_strategy": "phantom", "_char_ids": ["hero"]},
+    )
+    references = [item for item in content if item.get("role") == "reference_image"]
+    assert references[0]["image_url"]["url"] == "https://assets.test/v.png"
+
+
+def test_tos_upload_uses_jpeg_metadata_after_large_png_compression(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        tos_uploader,
+        "_get_tos_config",
+        lambda: {
+            "ak": "ak",
+            "sk": "sk",
+            "bucket": "bucket",
+            "endpoint": "tos.example.test",
+            "region": "cn-test",
+        },
+    )
+    monkeypatch.setattr(
+        tos_uploader,
+        "compress_image_bytes",
+        lambda data: b"\xff\xd8\xff" + b"j" * 2048,
+    )
+
+    def fake_put(url, data, headers, timeout):
+        captured.update(url=url, data=data, headers=headers, timeout=timeout)
+        return SimpleNamespace(status_code=200, text="")
+
+    monkeypatch.setattr(tos_uploader.requests, "put", fake_put)
+
+    url = tos_uploader.upload_image(b"p" * (5_400_000), "image/png")
+
+    assert url is not None
+    assert ".jpg?" in url
+    assert captured["headers"]["Content-Type"] == "image/jpeg"
+
 
 def test_compound_robot_name_passes_character_filter():
     name = "白色金属AI巡检机器人"
@@ -157,6 +253,15 @@ def test_compound_robot_name_passes_character_filter():
     filtered = _filter_descriptive_phrases(stats)
 
     assert name in filtered
+
+
+def test_storyboard_character_map_uses_new_face_reference_contract():
+    mapping = _build_characters_map(
+        [{"id": "hero", "name": "主角", "aliases": ["英雄"]}]
+    )
+
+    assert mapping["主角"] == "characters/hero/face_closeup.png"
+    assert mapping["英雄"] == "characters/hero/face_closeup.png"
 
 
 def test_storyboard_prompt_uses_eight_layers_without_fast_motion():
@@ -191,8 +296,15 @@ def test_character_reference_contract_and_model_routes():
     assert character["face_reference"] == "face_closeup.png"
     assert character["body_reference"] == "full_body.png"
     assert "<主体1>" in character["prompt_definition"]
-    assert set(build_model_reference_prompts("角色", target_model="seedance")) == {"face_closeup", "full_body"}
+    seedance_prompts = build_model_reference_prompts("角色", target_model="seedance")
+    assert set(seedance_prompts) == {"face_closeup", "full_body"}
+    for prompt in seedance_prompts.values():
+        assert "fictional" in prompt.lower()
+        assert "virtual avatar" in prompt.lower()
     assert set(build_model_reference_prompts("角色", target_model="kling")) == {"front", "side", "three_quarter", "detail"}
+    assert build_combined_sheet_prompt("角色").startswith(
+        "【宏观描述】所有角色均为 AI 生成的虚拟形象，非真实人物。"
+    )
 
 
 def test_scene_contract_and_video_prompt_model_routing():
@@ -215,5 +327,94 @@ def test_scene_contract_and_video_prompt_model_routing():
     seedance = build_video_prompt(storyboard["shots"][0], characters, contract, "seedance")
     kling = build_video_prompt(storyboard["shots"][0], characters, contract, "kling")
     assert isinstance(seedance, str) and "identity-lock" in seedance and BASE_NEGATIVE_PROMPT in seedance
+    assert "虚拟形象声明：片中角色均为 AI 生成的虚构角色，非真实人物" in seedance
     assert isinstance(kling, dict) and BASE_NEGATIVE_PROMPT in kling["negative_prompt"]
+    assert kling["prompt"].startswith("虚拟形象声明：片中角色均为 AI 生成的虚构角色，非真实人物。")
     assert "推入(push in)" in kling["prompt"]
+
+
+def test_subject_summary_limit_never_truncates_layer_eight_guardrails():
+    long_text = "人物与环境细节" * 40
+    summary = build_subject_summary([
+        ("景别与主体：", long_text),
+        ("动作：", long_text),
+        ("运镜：", "缓慢推进(dolly in)"),
+        ("场景与光影：", long_text),
+    ])
+    assert 40 <= len(summary) <= 100
+    for label in ("景别与主体：", "动作：", "运镜：", "场景与光影："):
+        assert label in summary
+
+    storyboard = {"shots": [{
+        "id": 1, "who": ["林夏"], "where": long_text,
+        "subject_description": long_text, "what": long_text,
+        "camera_movement": "push_in", "duration": 8,
+    }]}
+    contract = generate_scene_consistency(storyboard)
+    complete_prompt = build_video_prompt(
+        storyboard["shots"][0], {"characters": []}, contract, "seedance"
+    )
+    bounded = complete_prompt.split("主体总结：", 1)[1].split("。", 1)[0]
+    assert 40 <= len(bounded) <= 100
+    assert "虚拟形象声明：片中角色均为 AI 生成的虚构角色，非真实人物" in complete_prompt
+    assert complete_prompt.endswith(f"约束条件：{BASE_NEGATIVE_PROMPT}")
+    for guardrail in BASE_NEGATIVE_PROMPT.split(", "):
+        assert guardrail in complete_prompt
+
+    storyboard_shot = dict(storyboard["shots"][0])
+    _build_shot_prompt(storyboard_shot)
+    blueprint = storyboard_shot["eight_layer_prompt"]
+    storyboard_summary = blueprint.split("主体总结：", 1)[1].split("\n", 1)[0]
+    assert 40 <= len(storyboard_summary) <= 100
+    assert f"约束词：{storyboard_generator.QUALITY_GUARDRAILS}" in blueprint
+    assert blueprint.index("主体总结：") < blueprint.index("约束词：")
+
+
+def _phase_result(phase, exit_code=0):
+    return {"phase": phase, "exit_code": exit_code, "timestamp": "2026-08-08T08:00:00"}
+
+
+def test_resume_merges_progress_and_pipeline_report(tmp_path):
+    progress = tmp_path / "phase_progress.json"
+    progress.write_text(json.dumps({"results": [_phase_result("phase2")]}), encoding="utf-8")
+    (tmp_path / "pipeline_report.json").write_text(
+        json.dumps({"phases": {"2.5": {"status": "completed"}, "phase3": {"status": "success"}}}),
+        encoding="utf-8",
+    )
+    results = phase_orchestrator._resume_results(tmp_path, progress, "phase4")
+    assert [result["phase"] for result in results] == ["phase2", "phase2_5", "phase3"]
+
+
+def test_monitor_total_and_report_use_canonical_phase_list(tmp_path):
+    (tmp_path / "phase_progress.json").write_text(
+        json.dumps({
+            "status": "running",
+            "current_phase": "phase4",
+            "phases": phase_orchestrator.PHASES,
+            "results": [_phase_result("phase2"), _phase_result("phase2_5"), _phase_result("phase3")],
+        }),
+        encoding="utf-8",
+    )
+    status = cron_monitor.get_phase_status(str(tmp_path))
+    report = cron_monitor.format_report(status)
+    assert status["total_phases"] == 8
+    assert "**Progress**: 3/8 phases" in report
+    assert "✅ phase2" in report
+    assert "⏳ phase4 (running)" in report
+
+
+def test_check_process_rejects_invalid_pid():
+    assert cron_monitor.check_process("0")["running"] is False
+    assert cron_monitor.check_process("not-a-pid")["running"] is False
+
+
+def test_explicit_lighting_adds_missing_atmosphere_dimension():
+    contract = generate_scene_consistency({"shots": [{
+        "id": 1,
+        "where": "办公室",
+        "lighting_description": "主光从左上方照射，色温4200K",
+    }]})
+    lighting = contract["shots"]["S01"]["lighting_description"]
+    assert "左上方" in lighting
+    assert "4200K" in lighting
+    assert "气氛" in lighting
