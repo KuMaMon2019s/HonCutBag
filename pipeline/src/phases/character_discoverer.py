@@ -44,6 +44,8 @@ SYSTEM_PROMPT = (
     "必须排除以下类型：天气现象（如'冷空气'、'风'）、动物（如'鸡'、'狗'）、"
     "抽象指代（如'说话者'、'观察者'、'记录者'、'思考者'、'行走者'、'试验者'、'打探人员'）、"
     "复数群体（如'保安们'应合并为'保安'）、物品、概念。"
+    "同一角色的编号、职业称呼和通用指代必须合并为一个对象："
+    "保留最具体的主名，其余写入 aliases；禁止将'主角'、'他'、'她'单独输出为角色。"
     "最多保留5个主要人物角色。"
     "\n\n外貌描述具体化要求：\n"
     "- hair 必须写明发色+发长+发型（如'黑色长直发及肩'），不能只写'长发'\n"
@@ -56,7 +58,9 @@ USER_PROMPT_TEMPLATE = (
     "以下是故事中的角色列表和出现的事件：\n\n"
     "{character_context}\n\n"
     "注意：只提取有具体外貌、动作、对话的人物角色。排除：天气现象、动物、"
-    "抽象指代（如'说话者'、'观察者'）、复数群体。最多保留5个主要角色。\n\n"
+    "抽象指代（如'说话者'、'观察者'）、复数群体。"
+    "同一实体的编号/职业/主角指代只输出一个对象，其余称呼放入 aliases；"
+    "'主角'、'他'、'她'不得独立成条。最多保留5个主要角色。\n\n"
     "为每个角色输出 JSON 对象，组成数组。每个对象包含：\n"
     "- id: 英文标识（拼音或英文缩写，用于目录名，如 amy, wolf, old_man）\n"
     "- name: 角色名称（中文）\n"
@@ -93,6 +97,14 @@ USER_PROMPT_TEMPLATE = (
 
 LLM_TIMEOUT = 60  # 秒
 MAX_RETRIES = 3  # 解析失败重试次数
+
+ENTITY_SUFFIXES = (
+    "机器人", "号", "型", "级", "者", "员", "师", "家", "王", "后",
+    "公主", "王子", "先生", "小姐", "佣兵", "机械体", "合成人", "复制体",
+    "复制品", "生命体", "机甲", "战士", "卫兵", "执法体",
+)
+MAX_ENTITY_NAME_CHINESE_CHARS = 12
+GENERIC_CHARACTER_NAMES = {"主角", "主人公", "男主", "女主", "人物", "他", "她", "它"}
 
 
 def _get_client() -> OpenAI:
@@ -437,11 +449,10 @@ def _filter_descriptive_phrases(stats: Dict[str, Dict[str, Any]]) -> Dict[str, D
         
         # 实体后缀允许较长的复合名称，如“白色金属AI巡检机器人”。
         chinese_chars = [c for c in name if '\u4e00' <= c <= '\u9fff']
-        entity_suffixes = [
-            "机器人", "号", "型", "级", "者", "员", "师", "家", "王", "后",
-            "公主", "王子", "先生", "小姐",
-        ]
-        is_entity = any(name.endswith(suffix) for suffix in entity_suffixes)
+        is_entity = any(name.endswith(suffix) for suffix in ENTITY_SUFFIXES)
+        if len(chinese_chars) > MAX_ENTITY_NAME_CHINESE_CHARS:
+            print(f"  过滤超长实体名称: {name} ({len(chinese_chars)} 字)", file=sys.stderr)
+            continue
         if not is_entity and len(chinese_chars) > 6:
             print(f"  过滤过长名称: {name} ({len(chinese_chars)} 字)", file=sys.stderr)
             continue
@@ -469,6 +480,59 @@ def _post_filter_characters(characters: List[Dict[str, Any]]) -> List[Dict[str, 
         else:
             print(f"  后处理过滤非人物角色: {name}", file=sys.stderr)
     
+    # LLM 有时会把同一角色的主名、职业和通用指代分成多条。
+    # 优先使用显式 aliases 合并；“银白色机械技师/机械技师”这类同定位修饰名也合并。
+    merged: List[Dict[str, Any]] = []
+    for char in filtered:
+        name = str(char.get("name", "")).strip()
+        aliases = {str(alias).strip() for alias in char.get("aliases", []) if str(alias).strip()}
+        target = None
+        for existing in merged:
+            existing_name = str(existing.get("name", "")).strip()
+            existing_aliases = {
+                str(alias).strip() for alias in existing.get("aliases", []) if str(alias).strip()
+            }
+            explicit_alias_match = (
+                name in existing_aliases
+                or existing_name in aliases
+                or bool(aliases & existing_aliases)
+            )
+            qualified_name_match = (
+                char.get("role") == existing.get("role")
+                and min(len(name), len(existing_name)) >= 2
+                and (name.endswith(existing_name) or existing_name.endswith(name))
+            )
+            generic_role_match = (
+                char.get("role") == existing.get("role")
+                and (name in GENERIC_CHARACTER_NAMES or existing_name in GENERIC_CHARACTER_NAMES)
+            )
+            if explicit_alias_match or qualified_name_match or generic_role_match:
+                target = existing
+                break
+
+        if target is None:
+            merged.append(char)
+            continue
+
+        target_name = str(target.get("name", "")).strip()
+        # Prefer a concrete, more specific canonical name over a generic or shortened name.
+        if target_name in GENERIC_CHARACTER_NAMES or (
+            name not in GENERIC_CHARACTER_NAMES and name.endswith(target_name)
+        ):
+            char, target = target, char
+            merged[merged.index(char)] = target
+            name, target_name = target_name, name
+
+        combined_aliases = list(dict.fromkeys(
+            [*target.get("aliases", []), target_name, name, *char.get("aliases", [])]
+        ))
+        target["aliases"] = [
+            alias for alias in combined_aliases if alias and alias != target.get("name")
+        ]
+
+    # 无法归并的通用指代不能单独成为角色资产。
+    filtered = [char for char in merged if char.get("name") not in GENERIC_CHARACTER_NAMES]
+
     # 限制最多 5 个角色
     if len(filtered) > 5:
         print(f"  角色数量超限 ({len(filtered)} > 5)，只保留前 5 个", file=sys.stderr)

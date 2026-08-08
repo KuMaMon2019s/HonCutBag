@@ -10,11 +10,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from clients import local_video_client
 from clients import tos_uploader
-from phases.character_discoverer import _filter_descriptive_phrases
+from phases.character_discoverer import (
+    ENTITY_SUFFIXES,
+    _filter_descriptive_phrases,
+    _post_filter_characters,
+)
 from phases.character_discoverer import _add_reference_contract
 from phases.character_factory import build_combined_sheet_prompt, build_model_reference_prompts
 from phases.scene_consistency import generate_scene_consistency
-from phases import storyboard_generator
+from phases import adaptation_engine, storyboard_generator
 from phases import pipeline_core
 from phases.adaptation_engine import estimate_shot_count
 from phases.storyboard_generator import _build_characters_map, _build_shot_prompt
@@ -435,6 +439,40 @@ def test_compound_robot_name_passes_character_filter():
     filtered = _filter_descriptive_phrases(stats)
 
     assert name in filtered
+
+
+def test_scifi_entity_suffixes_and_compound_mercenary_survive_filter():
+    for suffix in ("佣兵", "机械体", "合成人", "复制体"):
+        assert suffix in ENTITY_SUFFIXES
+
+    name = "黑色重型机械合成人佣兵"
+    assert name in _filter_descriptive_phrases({name: {"count": 1, "events": [1]}})
+
+
+def test_overlong_entity_description_is_filtered_even_with_known_suffix():
+    name = "与零七号外观完全相同胸部能源核心呈红色的机械复制体"
+    assert name not in _filter_descriptive_phrases({name: {"count": 1, "events": [1]}})
+
+
+def test_post_filter_merges_aliases_and_removes_generic_protagonist():
+    characters = [
+        {"id": "zero_seven", "name": "07号", "aliases": ["佣兵"], "role": "protagonist"},
+        {"id": "mercenary", "name": "佣兵", "aliases": [], "role": "protagonist"},
+        {"id": "generic", "name": "主角", "aliases": [], "role": "protagonist"},
+        {"id": "technician", "name": "机械技师", "aliases": [], "role": "supporting"},
+        {"id": "silver_technician", "name": "银白色机械技师", "aliases": [], "role": "supporting"},
+    ]
+
+    filtered = _post_filter_characters(characters)
+
+    assert [char["name"] for char in filtered] == ["07号", "银白色机械技师"]
+    assert {"佣兵", "主角"} <= set(filtered[0]["aliases"])
+    assert "机械技师" in filtered[1]["aliases"]
+
+
+def test_adaptation_prompt_restricts_who_to_canonical_character_names():
+    assert "who 只能逐字引用上方角色列表中的主名" in adaptation_engine.USER_PROMPT_TEMPLATE
+    assert "群体/群众/背景元素" in adaptation_engine.USER_PROMPT_TEMPLATE
 
 
 def test_storyboard_character_map_uses_new_face_reference_contract():
