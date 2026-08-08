@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from clients.video_client import VideoClient
+from prompt.eight_layer_summary import build_subject_summary
 
 
 BASE_NEGATIVE_PROMPT = (
@@ -76,20 +77,26 @@ def build_video_prompt(
             stable = [str(appearance.get(key, "")).strip() for key in ("hair", "face", "clothing") if appearance.get(key)][:3]
             traits.append(f"{character.get('name')}—{'，'.join(stable)}")
         subject = "；".join(traits) or shot_meta.get("visual") or "场景主体"
-    parts.append(f"{shot_type}，{subject}")
-    parts.append("动作：" + str(shot_meta.get("action_description") or shot_meta.get("what") or "保持自然姿态"))
+    action = str(shot_meta.get("action_description") or shot_meta.get("what") or "保持自然姿态")
     camera_key = str(shot_meta.get("camera_movement") or "fixed").lower()
     camera = CAMERA_MOVEMENTS.get(camera_key, str(shot_meta.get("camera_movement") or "固定(fixed/locked)"))
-    parts.append(f"运镜：{camera}")
     layout = scene.get("spatial_layout", {})
     setting = scene.get("scene_description") or shot_meta.get("where") or "当前场景"
     lighting = scene.get("lighting_description") or scene.get("lighting_note") or "主光从镜头左上方照射，色温4800K"
-    parts.append(f"场景与光影：{setting}，{layout.get('subject', '')}，{lighting}".replace("，，", "，"))
+    scene_and_lighting = f"{setting}，{layout.get('subject', '')}，{lighting}".replace("，，", "，")
+    subject_summary = build_subject_summary([
+        ("景别与主体：", f"{shot_type}，{subject}"),
+        ("动作：", action),
+        ("运镜：", camera),
+        ("场景与光影：", scene_and_lighting),
+    ])
+    parts.append(f"主体总结：{subject_summary}")
     audio = shot_meta.get("audio") or shot_meta.get("sound")
     if audio:
         parts.append(f"音效：{audio}")
     style = scene.get("style_anchor") or scene.get("style_suffix") or scene_consistency.get("global_style_lock") or "电影叙事风格"
     quality = scene.get("quality_suffix") or f"4K, 16:9, {shot_meta.get('duration', 5)}秒"
+    # Layer 8 is appended after the bounded summary and is never truncated.
     parts.append(f"全局收尾：{style}；{quality}")
 
     negatives = [BASE_NEGATIVE_PROMPT, str(scene.get("negative_prompt", "")).strip()]

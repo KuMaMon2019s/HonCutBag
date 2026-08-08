@@ -34,6 +34,7 @@ from typing import List, Dict, Any, Optional
 
 from openai import OpenAI
 
+from prompt.eight_layer_summary import build_subject_summary
 from utils.config import ToolPaths
 from utils.visual_style_spec import VisualStyle, parse_visual_style
 
@@ -595,12 +596,15 @@ def _build_eight_layer_prompt(
     layers = []
     if references:
         layers.append("元素参考声明：" + "；".join(references))
+    subject_summary = build_subject_summary([
+        ("景别与主体：", f"{framing}，{subject}"),
+        ("动作：", action),
+        ("运镜：", camera),
+        ("场景与光影：", f"{where}，{scene_suffix}，{lighting}".replace("，，", "，")),
+    ])
     layers.extend([
         f"镜头{shot_number}：",
-        f"{framing}，{subject}",
-        f"动作：{action}",
-        f"运镜：{camera}",
-        f"场景与光影：{where}，{scene_suffix}，{lighting}".replace("，，", "，"),
+        f"主体总结：{subject_summary}",
         f"音效：{audio}",
         f"全局收尾：{style_anchor}；约束词：{QUALITY_GUARDRAILS}；4K，16:9，{duration}秒",
     ])
