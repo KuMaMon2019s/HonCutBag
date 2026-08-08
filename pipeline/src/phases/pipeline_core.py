@@ -3077,16 +3077,120 @@ def _select_transition(shot_meta: dict, default_transition: str = "dissolve") ->
 # Phase 7: 组装引擎 (Assembly) — delegates to OM VideoStitch
 # ---------------------------------------------------------------------------
 
+def _finish_phase7(
+    phase_result: dict,
+    output_dir: Path,
+    target_duration: Optional[float],
+    enable_reshoot: bool,
+    transition: str,
+    transition_duration: float,
+    media_profile: str,
+    reshoot_round: int,
+    reshoot_history: list[dict],
+) -> dict:
+    """Apply the non-blocking duration gate after any successful assembler."""
+    from phases.duration_gate import evaluate_duration_gate
+
+    outputs = list(phase_result.get("outputs", []))
+    for artifact in (
+        "storyboard_order_review.json",
+        "frame_analysis.json",
+        "duration_gate.json",
+    ):
+        if artifact not in outputs:
+            outputs.append(artifact)
+    phase_result["outputs"] = outputs
+
+    try:
+        gate, reshoot_plan = evaluate_duration_gate(
+            output_dir,
+            target_duration,
+            round_number=reshoot_round,
+            reshoots=reshoot_history,
+        )
+    except Exception as exc:
+        print(f"  ⚠ [7.3] 时长闸门执行失败: {exc}；不阻塞后续 Phase", flush=True)
+        phase_result["duration_gate_error"] = str(exc)
+        return phase_result
+
+    phase_result["duration_gate"] = gate
+    if target_duration is None:
+        print("  ⊘ [7.3] target_duration=None，跳过时长闸门", flush=True)
+        return phase_result
+    if gate["passed"]:
+        print(
+            f"  ✓ [7.3] 时长闸门通过: {gate['actual_s']:.2f}s / {gate['target_s']:.2f}s",
+            flush=True,
+        )
+        return phase_result
+
+    print(
+        f"  ⚠⚠ [7.3] 时长不足: 实际 {gate['actual_s']:.2f}s，"
+        f"目标 {gate['target_s']:.2f}s，缺口 {gate['gap_s']:.2f}s",
+        flush=True,
+    )
+    if not enable_reshoot:
+        print("  ⊘ [7.3] enable_reshoot=false，仅报告缺口，不触发视频重发", flush=True)
+        return phase_result
+    if reshoot_round >= 2:
+        print("  ⚠⚠ [7.3] 已达补录上限 2 轮；标记未通过但继续后续 Phase", flush=True)
+        return phase_result
+    selected = (reshoot_plan or {}).get("shots", [])
+    if not selected:
+        print("  ⚠⚠ [7.3] 未找到 requested > actual 的短板镜头，无法自动补录", flush=True)
+        return phase_result
+
+    deleted: list[str] = []
+    for shot in selected:
+        video_path = output_dir / "shots" / shot["shot_id"] / "output.mp4"
+        if video_path.is_file():
+            video_path.unlink()
+            deleted.append(shot["shot_id"])
+    print(
+        f"  🔄 [7.3] 补录第 {reshoot_round + 1}/2 轮: {', '.join(deleted)}；"
+        "其余镜头由 Phase 5 自动跳过",
+        flush=True,
+    )
+    storyboard_path = output_dir / "STORYBOARD.json"
+    try:
+        storyboard = json.loads(storyboard_path.read_text(encoding="utf-8"))
+        generation = run_phase5(storyboard, output_dir, dry_run=False)
+    except Exception as exc:
+        print(f"  ⚠⚠ [7.3] 补录调用 Phase 5 失败: {exc}；继续后续 Phase", flush=True)
+        return phase_result
+    if generation.get("status") == "error":
+        print(f"  ⚠⚠ [7.3] Phase 5 补录失败: {generation.get('error') or generation.get('errors')}", flush=True)
+        return phase_result
+
+    history = reshoot_history + [{**reshoot_plan, "phase5_status": generation.get("status")}]
+    return run_phase7(
+        output_dir,
+        dry_run=False,
+        transition=transition,
+        transition_duration=transition_duration,
+        media_profile=media_profile,
+        target_duration=target_duration,
+        enable_reshoot=enable_reshoot,
+        _reshoot_round=reshoot_round + 1,
+        _reshoot_history=history,
+    )
+
+
 def run_phase7(output_dir: Path, dry_run: bool,
                transition: str = "crossfade",
                transition_duration: float = 0.5,
-               media_profile: str = "1080p") -> dict:
+               media_profile: str = "1080p",
+               target_duration: Optional[float] = None,
+               enable_reshoot: bool = False,
+               _reshoot_round: int = 0,
+               _reshoot_history: Optional[list[dict]] = None) -> dict:
     """Phase 7: 组装引擎 — 直接调用 OM VideoStitch"""
     _banner(7, 8, f"组装引擎 (Assembly) — {transition}", dry_run)
     start = _now()
     _p7_est = estimate_phase_duration("phase7")
     print(f"  ⏱ Phase 7 开始 (预估 ~{int(_p7_est)}s)")
     output_dir = Path(output_dir)
+    reshoot_history = list(_reshoot_history or [])
 
     if dry_run:
         print("  ⊘ dry-run 模式，跳过视频组装")
@@ -3114,6 +3218,29 @@ def run_phase7(output_dir: Path, dry_run: bool,
     if not clip_paths:
         return {"status": "error", "error": "No video clips found", "duration_s": _elapsed(start)}
 
+    # Step 7.1: compare storyboard narrative order with the current clip order.
+    from phases.story_order_reviewer import reorder_shots, review_story_order
+
+    current_order = [Path(path).parent.name for path in clip_paths]
+    order_review = review_story_order(output_dir, current_order)
+    if not order_review["matches_current_order"]:
+        clip_paths, shot_metas, changed = reorder_shots(
+            clip_paths, shot_metas, order_review["suggested_order"]
+        )
+        if changed:
+            print(
+                "  🔀 [7.1] 按剧情审稿建议重排镜头: "
+                + " → ".join(Path(path).parent.name for path in clip_paths),
+                flush=True,
+            )
+    if not order_review["narrative_consistent"]:
+        print(f"  ⚠ [7.1] 剧情连贯性问题: {order_review['issues']}", flush=True)
+
+    # Step 7.2: local first/middle/last-frame inspection, warning only.
+    from phases.frame_analysis import analyze_shot_frames
+
+    analyze_shot_frames(shots_dir, output_dir / "frame_analysis.json")
+
     if len(clip_paths) < 2:
         import shutil
         output_final = output_dir / "raw_assembly.mp4"
@@ -3127,9 +3254,13 @@ def run_phase7(output_dir: Path, dry_run: bool,
         if not qg_report.passed:
             return {"status": "error", "error": f"Phase 7 质检未通过: {qg_report.grade}", "quality_report": qg_report, "duration_s": _elapsed(start)}
         
-        return {"status": "done", "duration_s": _elapsed(start),
-                "outputs": ["raw_assembly.mp4"], "method": "single_clip_copy",
-                "audio_layer": audio_receipt}
+        return _finish_phase7(
+            {"status": "done", "duration_s": _elapsed(start),
+             "outputs": ["raw_assembly.mp4"], "method": "single_clip_copy",
+             "audio_layer": audio_receipt},
+            output_dir, target_duration, enable_reshoot, transition,
+            transition_duration, media_profile, _reshoot_round, reshoot_history,
+        )
 
     # Intelligent transition selection based on shot emotions
     print(f"  → 发现 {len(clip_paths)} 个视频片段")
@@ -3276,7 +3407,7 @@ def run_phase7(output_dir: Path, dry_run: bool,
         qg_report = run_quality_check("phase7", output_dir)
         if not qg_report.passed:
             return {"status": "error", "error": f"Phase 7 质检未通过: {qg_report.grade}", "quality_report": qg_report, "duration_s": _elapsed(start)}
-        return {
+        return _finish_phase7({
             "status": "done",
             "duration_s": _elapsed(start),
             "outputs": ["raw_assembly.mp4"],
@@ -3287,7 +3418,8 @@ def run_phase7(output_dir: Path, dry_run: bool,
             "transition_selections": selected_transitions if selected_transitions else None,
             "trim_end_s": round(trim_end, 3),
             "audio_layer": audio_receipt,
-        }
+        }, output_dir, target_duration, enable_reshoot, transition,
+           transition_duration, media_profile, _reshoot_round, reshoot_history)
     except Exception as e:
         try:
             (output_dir / ".video_edit_concat.mp4").unlink(missing_ok=True)
@@ -3331,7 +3463,7 @@ def run_phase7(output_dir: Path, dry_run: bool,
             if not qg_report.passed:
                 return {"status": "error", "error": f"Phase 7 质检未通过: {qg_report.grade}", "quality_report": qg_report, "duration_s": _elapsed(start)}
             
-            return {
+            return _finish_phase7({
                 "status": "done",
                 "duration_s": _elapsed(start),
                 "outputs": ["raw_assembly.mp4"],
@@ -3342,7 +3474,8 @@ def run_phase7(output_dir: Path, dry_run: bool,
                 "transition_selections": selected_transitions if selected_transitions else None,
                 "edit_decisions_segments": ed_result.get("segments"),
                 "audio_layer": audio_receipt,
-            }
+            }, output_dir, target_duration, enable_reshoot, transition,
+               transition_duration, media_profile, _reshoot_round, reshoot_history)
         else:
             error_msg = ed_result.get("error", "Unknown error")
             print(f"  ⚠ edit_decisions 失败: {error_msg}，降级为 VideoStitch")
@@ -3376,7 +3509,7 @@ def run_phase7(output_dir: Path, dry_run: bool,
             if not qg_report.passed:
                 return {"status": "error", "error": f"Phase 7 质检未通过: {qg_report.grade}", "quality_report": qg_report, "duration_s": _elapsed(start)}
             
-            return {
+            return _finish_phase7({
                 "status": "done",
                 "duration_s": _elapsed(start),
                 "outputs": ["raw_assembly.mp4"],
@@ -3387,7 +3520,8 @@ def run_phase7(output_dir: Path, dry_run: bool,
                 "transition_selections": selected_transitions if selected_transitions else None,
                 "stitch_offsets": stitch_plan.offsets,
                 "audio_layer": audio_receipt,
-            }
+            }, output_dir, target_duration, enable_reshoot, transition,
+               transition_duration, media_profile, _reshoot_round, reshoot_history)
         else:
             return {"status": "error", "error": result.error, "duration_s": _elapsed(start)}
 
@@ -4083,6 +4217,7 @@ if LANGGRAPH_AVAILABLE:
         dry_run: bool
         transition: str
         transition_duration: float
+        enable_reshoot: bool
         media_profile: str
         skip_phase: list
         resume: bool
@@ -4400,6 +4535,8 @@ if LANGGRAPH_AVAILABLE:
             transition=state.get("transition", "crossfade"),
             transition_duration=state.get("transition_duration", 0.5),
             media_profile=state.get("media_profile", "1080p"),
+            target_duration=state.get("duration"),
+            enable_reshoot=state.get("enable_reshoot", False),
         )
         
         return {
@@ -4501,6 +4638,7 @@ def run_pipeline(
     transition: str = "crossfade",
     transition_duration: float = 0.5,
     media_profile: str = "1080p",
+    enable_reshoot: bool = False,
     resume: bool = False,
     auto_approve: bool = False,
     resume_from: str = None,
@@ -4520,6 +4658,7 @@ def run_pipeline(
         transition: Phase 7 转场模式 ("crossfade" | "fade" | "cut")
         transition_duration: Phase 7 转场时长（秒），默认 0.5
         media_profile: 编码配置名称，从 MEDIA_PROFILES 中选择（默认 "1080p"）
+        enable_reshoot: 时长不足时是否允许真实调用 Phase 5 补录（默认 False）
         resume: 从检查点恢复，跳过已完成的 Phase
 
     Returns:
@@ -4682,6 +4821,7 @@ def run_pipeline(
                 "transition": transition,
                 "transition_duration": transition_duration,
                 "media_profile": media_profile,
+                "enable_reshoot": enable_reshoot,
                 "skip_phase": skip_phase or [],
                 "resume": resume,
                 "auto_approve": auto_approve,
@@ -5042,7 +5182,11 @@ def run_pipeline(
         report["phases"]["7"] = {**p7, "resumed": True}
         print(f"  🔄 Phase 7: 从 checkpoint 恢复 (已跳过)")
     else:
-        p7 = run_phase7(output_dir, dry_run, transition=transition, transition_duration=transition_duration, media_profile=media_profile)
+        p7 = run_phase7(
+            output_dir, dry_run, transition=transition,
+            transition_duration=transition_duration, media_profile=media_profile,
+            target_duration=duration, enable_reshoot=enable_reshoot,
+        )
         report["phases"]["7"] = p7
         if p7["status"] == "error":
             report["status"] = "partial"
@@ -5182,6 +5326,8 @@ def main():
                         help="Phase 7 转场模式: crossfade (默认), fade (fade-through-black), cut (硬切)")
     parser.add_argument("--transition-duration", type=float, default=0.5,
                         help="Phase 7 转场时长（秒），默认 0.5")
+    parser.add_argument("--enable-reshoot", action="store_true",
+                        help="允许 Phase 7 时长不足时真实补录（默认关闭）")
     parser.add_argument("--media-profile", type=str, default="1080p",
                         choices=AVAILABLE_PROFILES,
                         help="编码配置（默认 1080p）")
@@ -5204,6 +5350,7 @@ def main():
         transition=args.transition,
         transition_duration=args.transition_duration,
         media_profile=args.media_profile,
+        enable_reshoot=args.enable_reshoot,
         resume=args.resume,
         auto_approve=args.auto_approve,
         resume_from=args.resume_from,

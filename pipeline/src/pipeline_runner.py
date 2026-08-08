@@ -65,6 +65,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--transition", choices=["crossfade", "fade", "cut"], default="crossfade", help="Phase 7 转场模式"
     )
     parser.add_argument("--transition-duration", type=float, default=0.5, help="Phase 7 转场时长（秒）")
+    parser.add_argument("--enable-reshoot", action="store_true",
+                        help="允许 Phase 7 时长不足时真实补录（默认关闭）")
     parser.add_argument(
         "--media-profile", choices=_core.AVAILABLE_PROFILES, default="1080p", help="编码配置（默认 1080p）"
     )
@@ -126,6 +128,7 @@ def main() -> None:
         transition=args.transition,
         transition_duration=args.transition_duration,
         media_profile=args.media_profile,
+        enable_reshoot=args.enable_reshoot,
         resume=args.resume,
         auto_approve=args.auto_approve,
         resume_from=args.resume_from,

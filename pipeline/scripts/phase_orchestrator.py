@@ -68,6 +68,15 @@ def _normalize_chain_mode(config: dict) -> bool:
     return chain_mode
 
 
+def _normalize_enable_reshoot(config: dict) -> bool:
+    """Validate the opt-in switch that may consume video generation quota."""
+    enable_reshoot = config.get("enable_reshoot", False)
+    if not isinstance(enable_reshoot, bool):
+        raise ValueError("config enable_reshoot must be a boolean")
+    config["enable_reshoot"] = enable_reshoot
+    return enable_reshoot
+
+
 def _write_progress(progress_file: Path, payload: dict) -> None:
     """Atomically replace the progress file so cron never reads partial JSON."""
     progress_file.parent.mkdir(parents=True, exist_ok=True)
@@ -198,6 +207,8 @@ def run_phase(phase: str, config: dict) -> dict:
         cmd.append("--dry-run")
     if config.get("chain_mode"):
         cmd.append("--chain-mode")
+    if config.get("enable_reshoot"):
+        cmd.append("--enable-reshoot")
 
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=RUNNER.parent)
     _merge_phase_report(report_path, existing_report, phase)
@@ -226,6 +237,7 @@ def main() -> None:
     try:
         _normalize_shot_duration(config)
         _normalize_chain_mode(config)
+        _normalize_enable_reshoot(config)
     except ValueError as error:
         parser.error(str(error))
 
