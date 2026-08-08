@@ -3634,6 +3634,17 @@ def _merge_shot_transcripts(sb_shots: list, durations_ms: list[int], shot_transc
     for index, (shot, duration_ms, transcription) in enumerate(
         zip(sb_shots, durations_ms, shot_transcripts), 1
     ):
+        if duration_ms <= 0 or transcription.get("skipped"):
+            # Shot missing output.mp4 — skip caption generation entirely
+            shot_entries.append({
+                "shot_id": shot.get("shot_id") or f"S{index:02d}",
+                "text": "",
+                "source": "skipped",
+                "start_ms": cumulative_ms,
+                "end_ms": cumulative_ms,
+                "segments": [],
+            })
+            continue
         local_words = transcription.get("segments") or []
         if local_words:
             words = [{
@@ -3767,6 +3778,11 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             shot_dir = shots_dir / f"S{index:02d}"
             shot_video = shot_dir / "output.mp4"
             wav_path = shot_dir / "audio.wav"
+            if not shot_video.is_file():
+                print(f"    ⚠ S{index:02d}: output.mp4 缺失，跳过 ASR（该镜未进入成片）")
+                durations_ms.append(0)
+                shot_transcripts.append({"text": "", "segments": [], "skipped": True})
+                continue
             extract_audio_track(str(shot_video), str(wav_path))
             durations_ms.append(round(_probe_shot_duration(shots_dir, index) * 1000))
             shot_transcripts.append(transcribe_audio(str(wav_path)))
