@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 import traceback
+import re
 from pathlib import Path
 from typing import Optional, TypedDict, Any
 
@@ -593,6 +594,59 @@ def _integrate_storyboard_prompts(storyboard: dict, characters: list[dict]) -> d
         shot["prompt"] = sanitize_quality_prompt(bind_assets(prompt, shot_assets))
     return storyboard
 
+
+def _extract_visual_style_text(script_text: str) -> Optional[str]:
+    """Extract a declared art-style paragraph without interpreting the script."""
+    match = re.search(
+        r"(?im)^\s*(?:美术风格|Art\s+style)\s*[：:]\s*(.+(?:\n(?!\s*(?:角色设定|剧情|人物设定|Characters?|Plot|Story)\s*[：:]).+)*)",
+        script_text,
+    )
+    if not match:
+        return None
+    lines = [line.strip() for line in match.group(1).splitlines() if line.strip()]
+    return " ".join(lines).strip() or None
+
+
+def _summarize_visual_style_with_llm(script_text: str) -> Optional[str]:
+    """Best-effort style summary; deliberately isolated so tests can mock it."""
+    api_key = os.environ.get("ARK_AGENT_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    try:
+        from openai import OpenAI
+        client = OpenAI(
+            api_key=api_key,
+            base_url="https://ark.cn-beijing.volces.com/api/plan/v3",
+        )
+        response = client.chat.completions.create(
+            model="doubao-seed-2.0-lite",
+            messages=[{
+                "role": "user",
+                "content": "用一句话总结以下剧本的美术风格，只输出风格描述：\n" + script_text,
+            }],
+            timeout=30,
+        )
+        return str(response.choices[0].message.content or "").strip() or None
+    except Exception:
+        return None
+
+
+def _write_project_visual_style(output_dir: Path, style_text: str) -> Path:
+    """Write the minimal frontmatter accepted by parse_visual_style."""
+    import yaml
+    payload = {
+        "name": "Script-derived project style",
+        "version": "1.0",
+        "style_prompt_short": style_text,
+        "style_prompt_full": style_text,
+    }
+    style_path = Path(output_dir) / "visual-style.md"
+    style_path.write_text(
+        "---\n" + yaml.safe_dump(payload, allow_unicode=True, sort_keys=False, width=1000) + "---\n",
+        encoding="utf-8",
+    )
+    return style_path
+
 def run_phase2(
     text: str,
     output_dir: Path,
@@ -842,10 +896,24 @@ def run_phase2(
             reporter.step("phase2", f"改编完成，{len(adapted_shots)} 个镜头", progress_pct=80)
 
         # Step 2.5: storyboard_generator → storyboard dict
+        style_source = "剧本提取"
+        visual_style_text = _extract_visual_style_text(text)
+        if not visual_style_text:
+            style_source = "LLM 总结"
+            visual_style_text = _summarize_visual_style_with_llm(text)
+        visual_style_path = None
+        if visual_style_text:
+            visual_style_path = _write_project_visual_style(output_dir, visual_style_text)
+            print(f"  ✓ 项目风格: visual-style.md（{style_source}）")
         print("  → storyboard_generator: 生成分镜...")
         if reporter:
             reporter.step("phase2", "生成分镜", progress_pct=90)
-        storyboard = generate_storyboard(adapted_shots, characters_list)
+        storyboard = generate_storyboard(
+            adapted_shots,
+            characters_list,
+            visual_style_path=str(visual_style_path) if visual_style_path else None,
+            visual_style_text=visual_style_text,
+        )
         _integrate_storyboard_prompts(storyboard, characters_list)
         annotate_shot_pacing(storyboard.get("shots", []))
 
