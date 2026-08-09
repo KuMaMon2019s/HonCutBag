@@ -9,6 +9,7 @@ import hashlib
 import hmac
 import base64
 import requests
+from urllib.parse import quote
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -300,6 +301,57 @@ def upload_image(image_data: bytes, content_type: str = "image/png") -> Optional
         return None
 
     # Generate pre-signed GET URL (7200s = 2 hours)
+    return get_signed_url(object_key, expires=7200)
+
+
+def upload_file(
+    image_data: bytes,
+    object_key: str,
+    content_type: str = "image/png",
+) -> Optional[str]:
+    """Upload bytes to an explicit TOS object key, preserving its directories."""
+    config = _get_tos_config()
+    if not all([config["ak"], config["sk"], config["bucket"]]):
+        print("  [tos] TOS config incomplete (need TOS_ACCESS_KEY, TOS_SECRET_KEY, TOS_BUCKET), skipping upload")
+        return None
+
+    if content_type.startswith("image/"):
+        image_data = compress_image_bytes(image_data)
+        if image_data.startswith(b"\xff\xd8\xff"):
+            content_type = "image/jpeg"
+            object_key = str(Path(object_key).with_suffix(".jpg"))
+        elif image_data.startswith(b"\x89PNG\r\n\x1a\n"):
+            content_type = "image/png"
+            object_key = str(Path(object_key).with_suffix(".png"))
+
+    host = f"{config['bucket']}.{config['endpoint']}"
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    payload_hash = hashlib.sha256(image_data).hexdigest()
+    headers = {
+        "Content-Type": content_type,
+        "Host": host,
+        "x-tos-content-sha256": payload_hash,
+        "x-tos-date": timestamp,
+    }
+    headers["Authorization"] = _sign(
+        "PUT", object_key, headers, payload_hash, timestamp, config
+    )
+
+    try:
+        encoded_key = quote(object_key, safe="/")
+        resp = requests.put(
+            f"https://{host}/{encoded_key}",
+            data=image_data,
+            headers=headers,
+            timeout=30,
+        )
+        if resp.status_code not in (200, 201):
+            print(f"  [tos] Upload failed: HTTP {resp.status_code} — {resp.text[:200]}")
+            return None
+        print(f"  [tos] Uploaded: {object_key} ({len(image_data)} bytes)")
+    except Exception as exc:
+        print(f"  [tos] Upload error for {object_key}: {exc}")
+        return None
     return get_signed_url(object_key, expires=7200)
 
 

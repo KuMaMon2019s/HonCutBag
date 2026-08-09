@@ -2472,6 +2472,35 @@ def _run_phase5_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
             outputs.append(f"shots/{shot_dir.name}/output.mp4")
         else:
             pending_shot_dirs.append(shot_dir)
+
+    task_dir_id = None
+    if use_local and os.environ.get("HONCUT_TASK_DIR_MODE") == "1" and pending_shot_dirs:
+        from tools import task_dir_exporter
+
+        export_shots = {}
+        for pending_dir in pending_shot_dirs:
+            pending_meta_path = pending_dir / "SHOT_META.json"
+            if not pending_meta_path.exists():
+                raise FileNotFoundError(f"Missing shot metadata for task export: {pending_meta_path}")
+            pending_meta = json.loads(pending_meta_path.read_text(encoding="utf-8"))
+            pending_meta["_char_ids"] = sorted({
+                asset_id[5:].split(":", 1)[0]
+                for asset_id in pending_meta.get("associate_assets", [])
+                if isinstance(asset_id, str) and asset_id.startswith("char:")
+            })
+            export_shots[pending_dir.name] = pending_meta
+        local_task_dir = task_dir_exporter.build_task_dir(
+            output_dir,
+            [directory.name for directory in pending_shot_dirs],
+            {
+                "shots": export_shots,
+                "chain_mode": chain_mode,
+                "model": os.environ.get("SEEDANCE_MODEL", "doubao-seedance-2-0-mini"),
+                "resolution": "720p",
+            },
+        )
+        task_dir_id = task_dir_exporter.upload_task_dir(local_task_dir, "tasks")
+        print(f"  [task_dir] uploaded tasks/{task_dir_id}", flush=True)
     
     def _process_shot(
         shot_dir: Path,
@@ -2695,40 +2724,41 @@ def _run_phase5_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                         from clients import local_video_client
                         from tools import asset_packager
                         
-                        # Build content[] with TOS-uploaded reference images (new contract)
+                        # [LEGACY-KEEP v2.0] Build content[] for Windows Bridges not yet on task_dir.
                         shot_id = shot_dir.name  # e.g., "S01"
                         content_meta = dict(meta)
                         content_meta["prompt"] = prompt
                         content_meta["gen_strategy"] = gen_strategy
                         content_meta["_char_ids"] = sorted(associated_character_ids)
-                        content_list = asset_packager.build_content_for_shot(
-                            output_dir=output_dir,
-                            shot_id=shot_id,
-                            shot_meta=content_meta,
-                        )
-                        if active_source and first_frame_b64:
-                            content_list = [
-                                item for item in (content_list or [])
-                                if item.get("role") != "first_frame"
-                            ]
-                            content_list.insert(1 if content_list else 0, {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/jpeg;base64,{first_frame_b64}"},
-                                "role": "first_frame",
-                                "priority": "high",
-                            })
-                        
-                        # Fallback to legacy zip/base64 if content[] is empty
                         zip_path = None
                         base64_list = []
-                        if not content_list or len(content_list) <= 1:
-                            # No images uploaded, fall back to legacy packaging
-                            zip_path, base64_list = asset_packager.package_shot_assets(
+                        content_list = None
+                        if task_dir_id is None:
+                            content_list = asset_packager.build_content_for_shot(
                                 output_dir=output_dir,
                                 shot_id=shot_id,
-                                shot_meta=meta,
+                                shot_meta=content_meta,
                             )
-                            content_list = None  # signal to use legacy path
+                            if active_source and first_frame_b64:
+                                content_list = [
+                                    item for item in (content_list or [])
+                                    if item.get("role") != "first_frame"
+                                ]
+                                content_list.insert(1 if content_list else 0, {
+                                    "type": "image_url",
+                                    "image_url": {"url": f"data:image/jpeg;base64,{first_frame_b64}"},
+                                    "role": "first_frame",
+                                    "priority": "high",
+                                })
+
+                            # [LEGACY-KEEP v2.0] zip/base64 fallback for old Bridges.
+                            if not content_list or len(content_list) <= 1:
+                                zip_path, base64_list = asset_packager.package_shot_assets(
+                                    output_dir=output_dir,
+                                    shot_id=shot_id,
+                                    shot_meta=meta,
+                                )
+                                content_list = None
                         
                         generate = (
                             local_video_client.generate_video_with_fallback
@@ -2750,6 +2780,7 @@ def _run_phase5_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                             batch_id=output_dir.name,
                             model=bridge_model,
                             return_last_frame=chain_mode and chain_allowed,
+                            task_dir=task_dir_id,
                         )
                         
                         if shot_seed is not None:

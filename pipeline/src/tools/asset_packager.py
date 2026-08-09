@@ -208,6 +208,70 @@ def _detect_shot_characters(
     return matched
 
 
+def collect_character_reference_assets(
+    output_dir: Path,
+    shot_meta: dict,
+) -> List[dict]:
+    """Return Phantom references in the exact order used for 图片N numbering."""
+    output_dir = Path(output_dir)
+    character_names = {}
+    characters_json = output_dir / "CHARACTERS.json"
+    if characters_json.exists():
+        characters_data = json.loads(characters_json.read_text(encoding="utf-8"))
+        character_names = {
+            character.get("id"): character.get("name") or character.get("id")
+            for character in characters_data.get("characters", [])
+            if character.get("id")
+        }
+
+    references = []
+    for char_id in _detect_shot_characters(output_dir, shot_meta):
+        character_name = character_names.get(char_id, char_id)
+        char_dir = output_dir / "characters" / char_id
+        if not char_dir.exists():
+            char_dir = output_dir / "characters" / "characters" / char_id
+        reference_paths = [
+            char_dir / "face_closeup.png",
+            char_dir / "full_body.png",
+            *sorted(char_dir.glob("variant_*.png")),
+        ]
+        for reference_path in reference_paths:
+            if reference_path.exists() and reference_path.stat().st_size > 1024:
+                references.append({
+                    "path": reference_path,
+                    "char_id": char_id,
+                    "role": "reference_image",
+                    "priority": "high",
+                    "reference_description": (
+                        f"{character_name}的面部特写"
+                        if reference_path.name == "face_closeup.png"
+                        else f"{character_name}的全身照"
+                        if reference_path.name == "full_body.png"
+                        else f"{character_name}的变体图（{reference_path.stem}）"
+                    ),
+                })
+    return references
+
+
+def inject_reference_instruction(prompt_text: str, descriptions: List[str]) -> str:
+    """Inject 图片N descriptions using the shared manifest/content order."""
+    if not descriptions:
+        return prompt_text
+    references = "，".join(
+        f"图片{index}为{description}"
+        for index, description in enumerate(descriptions, start=1)
+    )
+    instruction = f"{references}。生成时严格保持参考图中角色的外观一致。"
+    if "元素参考" in prompt_text:
+        return re.sub(
+            r"元素参考(?:声明)?\s*[：:]?\s*",
+            f"元素参考：{instruction}",
+            prompt_text,
+            count=1,
+        )
+    return f"元素参考：{instruction}{prompt_text}"
+
+
 def build_content_for_shot(
     output_dir: Path,
     shot_id: str,
@@ -271,39 +335,7 @@ def build_content_for_shot(
                 f"FLF2V end frame missing or too small: {end_frame_path}"
             )
     elif strategy == "phantom":
-        character_names = {}
-        characters_json = output_dir / "CHARACTERS.json"
-        if characters_json.exists():
-            characters_data = json.loads(characters_json.read_text())
-            character_names = {
-                character.get("id"): character.get("name") or character.get("id")
-                for character in characters_data.get("characters", [])
-                if character.get("id")
-            }
-        for char_id in _detect_shot_characters(output_dir, shot_meta):
-            character_name = character_names.get(char_id, char_id)
-            char_dir = output_dir / "characters" / char_id
-            if not char_dir.exists():
-                char_dir = output_dir / "characters" / "characters" / char_id
-            reference_paths = [
-                char_dir / "face_closeup.png",
-                char_dir / "full_body.png",
-                *sorted(char_dir.glob("variant_*.png")),
-            ]
-            for reference_path in reference_paths:
-                if reference_path.exists() and reference_path.stat().st_size > 1024:
-                    image_assets.append({
-                        "path": reference_path,
-                        "role": "reference_image",
-                        "priority": "high",
-                        "reference_description": (
-                            f"{character_name}的面部特写"
-                            if reference_path.name == "face_closeup.png"
-                            else f"{character_name}的全身照"
-                            if reference_path.name == "full_body.png"
-                            else f"{character_name}的变体图（{reference_path.stem}）"
-                        ),
-                    })
+        image_assets.extend(collect_character_reference_assets(output_dir, shot_meta))
         if not any(asset["role"] == "reference_image" for asset in image_assets):
             raise FileNotFoundError(
                 "Phantom character references missing for shot "
@@ -361,31 +393,13 @@ def build_content_for_shot(
             print(f"  [assets] ⚠ Failed to upload {asset['path'].name}: {e}")
     
     if strategy == "phantom" and uploaded_reference_descriptions and content:
-        references = "，".join(
-            f"图片{index}为{description}"
-            for index, description in enumerate(
-                uploaded_reference_descriptions, start=1
-            )
-        )
-        reference_instruction = (
-            f"{references}。生成时严格保持参考图中角色的外观一致。"
-        )
         text_item = next(
             (item for item in content if item.get("type") == "text"), None
         )
         if text_item is not None:
-            existing_prompt = text_item["text"]
-            if "元素参考" in existing_prompt:
-                text_item["text"] = re.sub(
-                    r"元素参考(?:声明)?\s*[：:]?\s*",
-                    f"元素参考：{reference_instruction}",
-                    existing_prompt,
-                    count=1,
-                )
-            else:
-                text_item["text"] = (
-                    f"元素参考：{reference_instruction}{existing_prompt}"
-                )
+            text_item["text"] = inject_reference_instruction(
+                text_item["text"], uploaded_reference_descriptions
+            )
 
     print(f"  [assets] 上传 {uploaded_count} 张参考图到 TOS")
     return content

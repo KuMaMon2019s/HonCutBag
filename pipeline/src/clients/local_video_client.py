@@ -155,6 +155,7 @@ def submit(
     batch_id: Optional[str] = None,
     model: Optional[str] = None,
     return_last_frame: bool = False,
+    task_dir: Optional[str] = None,
 ) -> Optional[str]:
     """Submit a video generation task to the local API.
     
@@ -187,7 +188,29 @@ def submit(
     api_url = _get_api_url()
     session = _request_session()
     
-    # --- New content[] contract (highest priority) ---
+    # --- Task-directory contract v2.0 (feature-gated by the caller) ---
+    if task_dir:
+        payload = {"task_dir": task_dir}
+        if model is not None:
+            payload["model"] = model
+        if batch_id is not None:
+            payload["batch_id"] = batch_id
+        try:
+            resp = session.post(f"{api_url}/generate", json=payload, timeout=timeout)
+            if resp.status_code == 200:
+                response_data = resp.json()
+                task_id = response_data.get("task_id") or response_data.get("id")
+                if task_id:
+                    return task_id
+            raise RuntimeError(
+                f"Bridge task_dir submission failed: HTTP {resp.status_code} — {resp.text[:200]}"
+            )
+        except requests.exceptions.Timeout as exc:
+            raise TimeoutError(f"task_dir submission timed out after {timeout}s") from exc
+        except requests.exceptions.ConnectionError as exc:
+            raise RuntimeError(f"Bridge unreachable for task_dir submission: {exc}") from exc
+
+    # [LEGACY-KEEP v2.0] content[] remains the compatibility contract.
     if content:
         try:
             payload = {
@@ -820,6 +843,7 @@ def generate_video(
     model: Optional[str] = None,
     submit_timeout: Optional[int] = None,
     return_last_frame: bool = False,
+    task_dir: Optional[str] = None,
 ) -> Union[str, dict]:
     """High-level function: submit + poll + download in one call.
     
@@ -891,11 +915,12 @@ def generate_video(
         batch_id=batch_id,
         model=model,
         return_last_frame=return_last_frame,
+        task_dir=task_dir,
         timeout=submit_timeout or (60 if model == "seedance" else 30),
     )
     
     # Handle content[] failure - fallback to zip/base64
-    if task_id is None and content is not None:
+    if task_id is None and content is not None and task_dir is None:
         print(f"  [local_video] content[] failed, falling back to zip/base64")
         task_id = submit(
             prompt=prompt,
