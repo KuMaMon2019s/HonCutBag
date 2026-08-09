@@ -186,7 +186,7 @@ def _detect_shot_characters(
     # 1. Explicit char_ids
     explicit = shot_meta.get("_char_ids")
     if explicit:
-        return list(explicit)
+        return _resolve_char_ids(output_dir, list(explicit))
 
     # 2. associate_assets
     associate = shot_meta.get("associate_assets", [])
