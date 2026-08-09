@@ -35,7 +35,7 @@ import re
 import time
 from typing import List, Dict, Any, Optional
 
-from openai import OpenAI
+from openai import OpenAI, APITimeoutError
 from utils.config import get_api_key, ARK_BASE_URL
 
 
@@ -157,6 +157,7 @@ def determine_gen_strategy(shot: Dict[str, Any]) -> str:
 
 LLM_TIMEOUT = 240  # 秒（2026-08-09: turbo 推理模型需要更长推理时间）
 MAX_RETRIES = 1  # 解析失败重试次数
+NETWORK_RETRIES = 2  # 网络超时自动重试次数（2026-08-09 R7: 70事件大prompt一次超时即死太脆）
 AVG_SHOT_DURATION = 12  # 默认每镜时长（秒）
 MIN_SHOT_DURATION = 4  # 单镜头最小时长（秒）
 MAX_SHOT_DURATION = 15  # 单镜头最大时长（秒）
@@ -263,6 +264,36 @@ def _call_llm(user_prompt: str) -> str:
     if content is None:
         raise ValueError("LLM 返回空内容")
     return content
+
+
+def _call_llm_with_timeout_retry(user_prompt: str) -> str:
+    """
+    网络超时自动重试包装（2026-08-09 R7 教训：70 事件大 prompt 一次 ReadTimeout 即死）
+
+    只对 APITimeoutError 重试，其他异常原样上抛由调用方处理。
+
+    Args:
+        user_prompt: 用户 prompt
+
+    Returns:
+        LLM 原始响应字符串
+
+    Raises:
+        RuntimeError: 连续超时超过 NETWORK_RETRIES 次
+    """
+    for net_attempt in range(NETWORK_RETRIES + 1):
+        try:
+            return _call_llm(user_prompt)
+        except APITimeoutError as e:
+            if net_attempt < NETWORK_RETRIES:
+                wait = 15 * (net_attempt + 1)
+                print(f"  ⚠ LLM 网络超时，{wait}s 后重试 ({net_attempt + 1}/{NETWORK_RETRIES})...", file=sys.stderr)
+                time.sleep(wait)
+            else:
+                raise RuntimeError(
+                    f"LLM 调用失败: 连续 {NETWORK_RETRIES} 次网络超时: {e}"
+                ) from e
+    raise RuntimeError("LLM 调用失败: 意外退出重试循环")  # 不可达，满足类型检查
 
 
 def _parse_response(response: str) -> Dict[str, Any]:
@@ -500,7 +531,7 @@ def adapt_events(
     parsed = None
     for attempt in range(1 + MAX_RETRIES):
         try:
-            response = _call_llm(user_prompt)
+            response = _call_llm_with_timeout_retry(user_prompt)
             parsed = _parse_response(response)
             break
         except (json.JSONDecodeError, ValueError) as e:

@@ -82,6 +82,19 @@ ENV_FILE = PROJECT_ROOT / ".env"
 # repository-level configuration. Explicitly exported variables keep priority.
 load_dotenv(ENV_FILE, override=False)
 
+# 火山系服务（ARK/TOS/TTS/ASR）是国内服务，走本地代理会多一跳且不稳：
+# 2026-08-09 R5/R7 实测 http_proxy=127.0.0.1:7897 时事件提取 8/19 段超时、
+# adaptation_engine 240s ReadTimeout（traceback 里 http_proxy.py 实锤）。
+# 追加 NO_PROXY 保证直连；已有值则合并，不覆盖用户显式配置。
+_NO_PROXY_VOLC_DOMAINS = ".volces.com,.bytedance.com"
+for _np_key in ("NO_PROXY", "no_proxy"):
+    _existing = os.environ.get(_np_key, "")
+    if _existing:
+        if "volces.com" not in _existing:
+            os.environ[_np_key] = _existing + "," + _NO_PROXY_VOLC_DOMAINS
+    else:
+        os.environ[_np_key] = _NO_PROXY_VOLC_DOMAINS.lstrip(".")
+
 
 def get_video_route(provider: str) -> str:
     """Return the configured video route for *provider*.

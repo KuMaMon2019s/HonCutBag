@@ -19,7 +19,10 @@ from phases.storyboard_generator import (
 from tools.asset_packager import build_content_for_shot, inject_reference_instruction
 
 
-V10_SCRIPT = Path("/Users/soda/knowledge-base/2026-08-09_01/input/source_text.txt")
+V10_SCRIPT = Path("/Users/soda/knowledge-base/2026-08-09_01/input/source_text.with_style_header.bak.txt")
+# 2026-08-09: 部长下令换成纯剧情版（无美术风格段）后，F1 正则提取测试
+# 固定指向带风格段的备份版；纯剧情版在下方 fallback 测试覆盖。
+V10_SCRIPT_PLOT_ONLY = Path("/Users/soda/knowledge-base/2026-08-09_01/input/source_text.txt")
 
 
 def test_f1_extracts_and_parses_v10_project_style(tmp_path):
@@ -31,6 +34,13 @@ def test_f1_extracts_and_parses_v10_project_style(tmp_path):
     parsed = _load_default_visual_style(str(style_path))
     assert "赛璐璐" in style_path.read_text(encoding="utf-8")
     assert parsed.style_prompt_short
+
+
+def test_f1_plot_only_script_falls_back_without_crash():
+    """纯剧情剧本（无美术风格段）正则提取应返回空值而非崩溃，交给 LLM 兜底。"""
+    script_text = V10_SCRIPT_PLOT_ONLY.read_text(encoding="utf-8")
+    style_text = _extract_visual_style_text(script_text)
+    assert style_text is None or style_text == ""
 
 
 def test_f2_system_prompt_uses_project_style_or_legacy_default():
