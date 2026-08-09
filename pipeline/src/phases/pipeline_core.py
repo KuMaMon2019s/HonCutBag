@@ -3625,6 +3625,23 @@ def _fmt_srt_time(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+def clean_subtitle_text(text: str) -> str:
+    """去除中英文标点并规范空白。
+
+    中文分词由 ASR word segment 边界提供；本函数不猜测中文词界，
+    因此没有 word 级数据时只去标点，不强行切字。
+    """
+    import unicodedata
+
+    if not isinstance(text, str):
+        return ""
+    without_punctuation = "".join(
+        character for character in text
+        if not unicodedata.category(character).startswith("P")
+    )
+    return " ".join(without_punctuation.split())
+
+
 def _merge_shot_transcripts(sb_shots: list, durations_ms: list[int], shot_transcripts: list[dict]) -> dict:
     """Offset per-shot ASR words and create caption-burn segments."""
     merged_words = []
@@ -3646,28 +3663,67 @@ def _merge_shot_transcripts(sb_shots: list, durations_ms: list[int], shot_transc
             })
             continue
         local_words = transcription.get("segments") or []
-        if local_words:
-            words = [{
-                "word": item.get("word") or item.get("text") or "",
-                "start_ms": cumulative_ms + int(item["start_ms"]),
-                "end_ms": cumulative_ms + int(item["end_ms"]),
-                "source": "asr",
-            } for item in local_words]
-            text = transcription.get("text") or "".join(item["word"] for item in words)
+        asr_text = clean_subtitle_text(transcription.get("text") or "")
+        # [DEPRECATED 2026-08-09] 旧逻辑：ASR 文本未去标点、未按 word 边界加空格
+        # 被新的字幕清洗逻辑取代，保留备查
+        # if local_words:
+        #     words = [{
+        #         "word": item.get("word") or item.get("text") or "",
+        #         "start_ms": cumulative_ms + int(item["start_ms"]),
+        #         "end_ms": cumulative_ms + int(item["end_ms"]),
+        #         "source": "asr",
+        #     } for item in local_words]
+        #     text = transcription.get("text") or "".join(item["word"] for item in words)
+        #     source = "asr"
+        if local_words or asr_text:
+            words = []
+            for item in local_words:
+                cleaned_word = clean_subtitle_text(item.get("word") or item.get("text") or "")
+                if not cleaned_word:
+                    continue
+                words.append({
+                    "word": cleaned_word,
+                    "start_ms": cumulative_ms + int(item["start_ms"]),
+                    "end_ms": cumulative_ms + int(item["end_ms"]),
+                    "source": "asr",
+                })
+            text = " ".join(item["word"] for item in words) if words else asr_text
+            if not words and text:
+                words = [{
+                    "word": text,
+                    "start_ms": cumulative_ms,
+                    "end_ms": cumulative_ms + duration_ms,
+                    "source": "asr",
+                }]
             source = "asr"
         else:
-            text = shot.get("caption", "")
             words = []
-            source = "script_fallback"
+            dialogue = shot.get("dialogue")
+            dialogue_line = dialogue.get("line", "") if isinstance(dialogue, dict) else ""
+            text = clean_subtitle_text(dialogue_line)
+            source = "dialogue_script" if text else "none"
             if text:
-                characters = list(text)
-                per_character_ms = duration_ms / max(len(characters), 1)
                 words = [{
-                    "word": character,
-                    "start_ms": round(cumulative_ms + offset * per_character_ms),
-                    "end_ms": round(cumulative_ms + (offset + 1) * per_character_ms),
+                    "word": text,
+                    "start_ms": round(cumulative_ms + duration_ms * 0.2),
+                    "end_ms": round(cumulative_ms + duration_ms * 0.8),
                     "source": source,
-                } for offset, character in enumerate(characters)]
+                }]
+
+            # [DEPRECATED 2026-08-09] 旧逻辑：逐字符 fallback 字幕（用户反馈：像随便贴的文字）
+            # 被新的"仅对白字幕"逻辑取代，保留备查
+            # text = shot.get("caption", "")
+            # words = []
+            # source = "script_fallback"
+            # if text:
+            #     characters = list(text)
+            #     per_character_ms = duration_ms / max(len(characters), 1)
+            #     words = [{
+            #         "word": character,
+            #         "start_ms": round(cumulative_ms + offset * per_character_ms),
+            #         "end_ms": round(cumulative_ms + (offset + 1) * per_character_ms),
+            #         "source": source,
+            #     } for offset, character in enumerate(characters)]
 
         merged_words.extend(words)
         shot_entries.append({

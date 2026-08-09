@@ -778,6 +778,9 @@ def generate_storyboard(
             "prompt": llm_result["prompt"],
             "caption": llm_result["caption"],
             "caption_frames": caption_frames,
+            # Dialogue is script truth from Phase 2. Caption remains the visual
+            # scene description and must never be substituted for dialogue.
+            "dialogue": shot.get("dialogue") if isinstance(shot.get("dialogue"), dict) else None,
             # Retained for deterministic route diagnostics and FLF2V end-state prompts.
             "visual": shot.get("visual", ""),
             "what": shot.get("what", ""),

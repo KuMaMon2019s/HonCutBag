@@ -71,7 +71,11 @@ USER_PROMPT_TEMPLATE = (
     "  - camera_movement: 字符串，摄影机运动（static/pan_left/pan_right/tilt_up/tilt_down/dolly_in/dolly_out/tracking_left/tracking_right/crane_up/crane_down/handheld/steadicam/orbital/zoom_in/zoom_out）\n"
     "  - lighting_key: 字符串，光影基调（high_key/low_key/natural/golden_hour/blue_hour/tungsten_warm/neon/silhouette/rim_lit/volumetric/overcast_soft）\n"
     "  - shot_intent: 字符串，镜头叙事意图（establishing/reveal/reaction/dialogue/action/transition/atmosphere/detail）\n\n"
+    "  - dialogue: 对象或 null；有角色在本镜头说话时为 {\"speaker\": \"角色名\", \"line\": \"剧本台词原文\"}，无对白时必须为 null\n"
     "  - gen_strategy: 字符串，视频生成策略（flf2v/phantom/i2v）；最终值会由确定性规则校正\n\n"
+    "【对白铁律】\n"
+    "dialogue.line 必须逐字来自上方事件列表中的剧本原文，禁止改写、摘要或编造台词。\n"
+    "本镜头无人真正说话时 dialogue 必须输出 null，不得把 visual、what 或旁白当作角色对白。\n\n"
     "【镜头连贯性规则】\n"
     "每个镜头（除第一个外）必须在 visual 描述开头加入「承接上镜」段：\n"
     "- 格式：'承接上镜：上镜定格于{{角色名}}{{位置/姿态/朝向}}，{{最后动作的终态}}——本镜由此延续'\n"
@@ -358,6 +362,16 @@ def _parse_response(response: str) -> Dict[str, Any]:
             shot["associate_assets"] = [aa] if aa else []
         elif not isinstance(aa, list):
             shot["associate_assets"] = []
+        # Backward compatibility: old adaptation/storyboard data has no
+        # dialogue field. Invalid shapes are treated as no dialogue.
+        dialogue = shot.get("dialogue")
+        if not (
+            isinstance(dialogue, dict)
+            and isinstance(dialogue.get("speaker"), str)
+            and isinstance(dialogue.get("line"), str)
+            and dialogue.get("line", "").strip()
+        ):
+            shot["dialogue"] = None
         # Generation routing is deliberately deterministic rather than trusted
         # to the LLM: action > dialogue/emotion interaction > safe I2V default.
         shot["gen_strategy"] = determine_gen_strategy(shot)

@@ -496,11 +496,14 @@ class RemotionCaptionBurn(BaseTool):
         # passed as argv (without a shell), so shell quoting must not be added.
         escaped = str(srt_path).replace("\\", "/")
         escaped = escaped.replace("'", r"\'").replace(":", r"\:")
+        # [DEPRECATED 2026-08-09] 旧逻辑：字幕底边距固定 80px，不随画面高度接近 5%
+        # 被新的底部居中约 5% 边距逻辑取代，保留备查
+        # video_filter = (... "Shadow=1,Alignment=2,MarginV=80'")
         video_filter = (
             f"subtitles=filename='{escaped}':"
             "force_style='FontName=serif,FontSize=52,"
             "PrimaryColour=&H004242c9,Outline=0,"
-            "Shadow=1,Alignment=2,MarginV=80'"
+            "Shadow=1,Alignment=2,MarginV=54'"
         )
         self.run_command(self._ffmpeg_video_command(
             input_path, output_path, ["-vf", video_filter]
@@ -517,11 +520,14 @@ class RemotionCaptionBurn(BaseTool):
                 text_path.write_text(text, encoding="utf-8")
                 escaped_path = str(text_path).replace("\\", "/")
                 escaped_path = escaped_path.replace("'", r"\'").replace(":", r"\:")
+                # [DEPRECATED 2026-08-09] 旧逻辑：y=h-text_h-80 固定底边距
+                # 被新的底部居中约 5% 边距逻辑取代，保留备查
+                # "x=(w-text_w)/2:y=h-text_h-80:"
                 filters.append(
                     "drawtext="
                     f"textfile='{escaped_path}':fontsize=52:fontcolor=#c94242:"
                     "borderw=2:bordercolor=black:"
-                    "x=(w-text_w)/2:y=h-text_h-80:"
+                    "x=(w-text_w)/2:y=h-text_h-h*0.05:"
                     f"enable='between(t,{start_s:.3f},{end_s:.3f})'"
                 )
             self.run_command(self._ffmpeg_video_command(
@@ -570,9 +576,12 @@ class RemotionCaptionBurn(BaseTool):
             previous = "[0:v]"
             for index, (_, start_s, end_s) in enumerate(pages, start=1):
                 output = f"[captioned{index}]"
+                # [DEPRECATED 2026-08-09] 旧逻辑：y=H-h-80 固定底边距
+                # 被新的底部居中约 5% 边距逻辑取代，保留备查
+                # f"x=(W-w)/2:y=H-h-80:enable='between(t,{start_s:.3f},{end_s:.3f})'"
                 chains.append(
                     f"{previous}[{index}:v]overlay="
-                    f"x=(W-w)/2:y=H-h-80:enable='between(t,{start_s:.3f},{end_s:.3f})'"
+                    f"x=(W-w)/2:y=H-h-H*0.05:enable='between(t,{start_s:.3f},{end_s:.3f})'"
                     f"{output}"
                 )
                 previous = output
