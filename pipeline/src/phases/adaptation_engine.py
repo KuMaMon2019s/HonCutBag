@@ -236,7 +236,7 @@ def _get_client() -> OpenAI:
     )
 
 
-def _call_llm(user_prompt: str) -> str:
+def _call_llm(user_prompt: str, max_tokens: int = 32000) -> str:
     """
     调用 LLM 并返回原始响应文本
 
@@ -265,7 +265,7 @@ def _call_llm(user_prompt: str) -> str:
             {"role": "user", "content": user_prompt},
         ],
         stream=True,
-        max_tokens=32000,
+        max_tokens=max_tokens,
         timeout=LLM_TIMEOUT,
     )
 
@@ -279,7 +279,7 @@ def _call_llm(user_prompt: str) -> str:
     return content
 
 
-def _call_llm_with_timeout_retry(user_prompt: str) -> str:
+def _call_llm_with_timeout_retry(user_prompt: str, max_tokens: int = 32000) -> str:
     """
     网络超时自动重试包装（2026-08-09 R7 教训：70 事件大 prompt 一次 ReadTimeout 即死）
 
@@ -296,7 +296,7 @@ def _call_llm_with_timeout_retry(user_prompt: str) -> str:
     """
     for net_attempt in range(NETWORK_RETRIES + 1):
         try:
-            return _call_llm(user_prompt)
+            return _call_llm(user_prompt, max_tokens=max_tokens)
         except APITimeoutError as e:
             if net_attempt < NETWORK_RETRIES:
                 wait = 15 * (net_attempt + 1)
@@ -307,6 +307,74 @@ def _call_llm_with_timeout_retry(user_prompt: str) -> str:
                     f"LLM 调用失败: 连续 {NETWORK_RETRIES} 次网络超时: {e}"
                 ) from e
     raise RuntimeError("LLM 调用失败: 意外退出重试循环")  # 不可达，满足类型检查
+
+
+def _validate_shots(shots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Validate and normalize a shot list shared by both adaptation modes."""
+    if not isinstance(shots, list):
+        raise ValueError(f"'shots' 应为数组，得到 {type(shots).__name__}")
+
+    required_fields = {"shot_order", "source_events", "action", "who", "where", "what", "visual", "suggested_duration"}
+    for i, shot in enumerate(shots):
+        if not isinstance(shot, dict):
+            raise ValueError(f"第 {i+1} 个 shot 不是字典")
+        missing = required_fields - set(shot.keys())
+        if missing:
+            raise ValueError(f"第 {i+1} 个 shot 缺少字段: {missing}")
+
+    # 规范化结构化字段（shot_size/camera_movement/lighting_key/shot_intent）
+    # 如果 LLM 没返回，给默认值而不是缺失
+    _VALID_SHOT_SIZES = {
+        "extreme_wide", "wide", "medium_wide", "medium", "medium_close",
+        "close_up", "extreme_close_up", "over_shoulder", "insert", "establishing",
+    }
+    _VALID_CAMERA_MOVEMENTS = {
+        "static", "pan_left", "pan_right", "tilt_up", "tilt_down",
+        "dolly_in", "dolly_out", "tracking_left", "tracking_right",
+        "crane_up", "crane_down", "handheld", "steadicam", "orbital",
+        "zoom_in", "zoom_out", "rack_focus",
+    }
+    _VALID_LIGHTING_KEYS = {
+        "high_key", "low_key", "natural", "golden_hour", "blue_hour",
+        "tungsten_warm", "neon", "silhouette", "rim_lit", "volumetric", "overcast_soft",
+    }
+    _VALID_SHOT_INTENTS = {
+        "establishing", "reveal", "reaction", "dialogue", "action",
+        "transition", "atmosphere", "detail",
+    }
+    for shot in shots:
+        ss = shot.get("shot_size", "")
+        if ss not in _VALID_SHOT_SIZES:
+            shot["shot_size"] = "wide"
+        cm = shot.get("camera_movement", "")
+        if cm not in _VALID_CAMERA_MOVEMENTS:
+            shot["camera_movement"] = "static"
+        lk = shot.get("lighting_key", "")
+        if lk not in _VALID_LIGHTING_KEYS:
+            shot["lighting_key"] = "natural"
+        si = shot.get("shot_intent", "")
+        if si not in _VALID_SHOT_INTENTS:
+            shot["shot_intent"] = "atmosphere"
+        who = shot.get("who", [])
+        if isinstance(who, str):
+            shot["who"] = [who] if who else []
+        elif not isinstance(who, list):
+            shot["who"] = []
+        aa = shot.get("associate_assets", [])
+        if isinstance(aa, str):
+            shot["associate_assets"] = [aa] if aa else []
+        elif not isinstance(aa, list):
+            shot["associate_assets"] = []
+        dialogue = shot.get("dialogue")
+        if not (
+            isinstance(dialogue, dict)
+            and isinstance(dialogue.get("speaker"), str)
+            and isinstance(dialogue.get("line"), str)
+            and dialogue.get("line", "").strip()
+        ):
+            shot["dialogue"] = None
+        shot["gen_strategy"] = determine_gen_strategy(shot)
+    return shots
 
 
 def _parse_response(response: str) -> Dict[str, Any]:
@@ -344,81 +412,7 @@ def _parse_response(response: str) -> Dict[str, Any]:
     if "strategy" not in parsed:
         parsed["strategy"] = ""
 
-    # 验证 shots 是数组
-    if not isinstance(parsed["shots"], list):
-        raise ValueError(f"'shots' 应为数组，得到 {type(parsed['shots']).__name__}")
-
-    # 验证每个 shot 的基本结构
-    required_fields = {"shot_order", "source_events", "action", "who", "where", "what", "visual", "suggested_duration"}
-    for i, shot in enumerate(parsed["shots"]):
-        if not isinstance(shot, dict):
-            raise ValueError(f"第 {i+1} 个 shot 不是字典")
-        missing = required_fields - set(shot.keys())
-        if missing:
-            raise ValueError(f"第 {i+1} 个 shot 缺少字段: {missing}")
-
-    # 规范化结构化字段（shot_size/camera_movement/lighting_key/shot_intent）
-    # 如果 LLM 没返回，给默认值而不是缺失
-    _VALID_SHOT_SIZES = {
-        "extreme_wide", "wide", "medium_wide", "medium", "medium_close",
-        "close_up", "extreme_close_up", "over_shoulder", "insert", "establishing",
-    }
-    _VALID_CAMERA_MOVEMENTS = {
-        "static", "pan_left", "pan_right", "tilt_up", "tilt_down",
-        "dolly_in", "dolly_out", "tracking_left", "tracking_right",
-        "crane_up", "crane_down", "handheld", "steadicam", "orbital",
-        "zoom_in", "zoom_out", "rack_focus",
-    }
-    _VALID_LIGHTING_KEYS = {
-        "high_key", "low_key", "natural", "golden_hour", "blue_hour",
-        "tungsten_warm", "neon", "silhouette", "rim_lit", "volumetric", "overcast_soft",
-    }
-    _VALID_SHOT_INTENTS = {
-        "establishing", "reveal", "reaction", "dialogue", "action",
-        "transition", "atmosphere", "detail",
-    }
-    for shot in parsed["shots"]:
-        # shot_size: validate or default
-        ss = shot.get("shot_size", "")
-        if ss not in _VALID_SHOT_SIZES:
-            shot["shot_size"] = "wide"  # sensible default
-        # camera_movement: validate or default
-        cm = shot.get("camera_movement", "")
-        if cm not in _VALID_CAMERA_MOVEMENTS:
-            shot["camera_movement"] = "static"
-        # lighting_key: validate or default
-        lk = shot.get("lighting_key", "")
-        if lk not in _VALID_LIGHTING_KEYS:
-            shot["lighting_key"] = "natural"
-        # shot_intent: validate or default
-        si = shot.get("shot_intent", "")
-        if si not in _VALID_SHOT_INTENTS:
-            shot["shot_intent"] = "atmosphere"
-        # who: ensure it's a list (LLM may return string)
-        who = shot.get("who", [])
-        if isinstance(who, str):
-            shot["who"] = [who] if who else []
-        elif not isinstance(who, list):
-            shot["who"] = []
-        # associate_assets: ensure it's a list
-        aa = shot.get("associate_assets", [])
-        if isinstance(aa, str):
-            shot["associate_assets"] = [aa] if aa else []
-        elif not isinstance(aa, list):
-            shot["associate_assets"] = []
-        # Backward compatibility: old adaptation/storyboard data has no
-        # dialogue field. Invalid shapes are treated as no dialogue.
-        dialogue = shot.get("dialogue")
-        if not (
-            isinstance(dialogue, dict)
-            and isinstance(dialogue.get("speaker"), str)
-            and isinstance(dialogue.get("line"), str)
-            and dialogue.get("line", "").strip()
-        ):
-            shot["dialogue"] = None
-        # Generation routing is deliberately deterministic rather than trusted
-        # to the LLM: action > dialogue/emotion interaction > safe I2V default.
-        shot["gen_strategy"] = determine_gen_strategy(shot)
+    parsed["shots"] = _validate_shots(parsed["shots"])
 
     return parsed
 
@@ -477,6 +471,181 @@ def _build_events_json(events: List[Dict[str, Any]]) -> str:
     return json.dumps(numbered_events, ensure_ascii=False, indent=2)
 
 
+BEAT_SKELETON_PROMPT = (
+    "目标时长：{target_duration}秒，每镜约{shot_duration}秒。请把全部事件压缩为恰好{beat_count}个 beat。\n\n"
+    "事件列表：\n{events_json}\n\n角色列表：\n{characters_summary}\n\n"
+    "只做全局改编决策，不要输出 visual、镜头语言、景别或摄影细节。输出严格 JSON 对象："
+    '{{"strategy":"一句话改编策略","beats":[{{"beat_order":1,"source_events":[1],'
+    '"action":"keep/merge/drop","reason":"一句话理由","who":["角色主名"],'
+    '"where":"地点","what":"一句话事件","suggested_duration":12}}]}}。\n'
+    "【全局铁律】\n"
+    "1. beats 数量必须恰好等于 {beat_count}，总建议时长应接近 {target_duration} 秒（±10%）。\n"
+    "2. 每个输入事件编号必须且至少被某个 beat 的 source_events 引用；删减事件也必须放入 action=drop 的 beat 显式声明。\n"
+    "3. keep 保留关键因果/情感节点，merge 合并连续或重复事件，drop 只删不影响因果链的内容。\n"
+    "4. 台词归属必须忠于原事件；who 只能使用角色列表主名，别名改为主名，群众不得写入 who。\n"
+    "5. 只输出骨架决策，禁止展开对白、visual、Identity Anchor 或任何镜头生成细节。"
+)
+
+
+def _parse_beat_skeleton(response: str, expected_count: int, event_count: int) -> Dict[str, Any]:
+    """Parse and validate the bounded Stage 1 beat table."""
+    text = response.strip()
+    if "```" in text:
+        match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', text, re.DOTALL)
+        if match:
+            text = match.group(1).strip()
+    parsed = json.loads(text)
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("beats"), list):
+        raise ValueError("骨架响应必须是包含 beats 数组的 JSON 对象")
+    beats = parsed["beats"]
+    if len(beats) != expected_count:
+        raise ValueError(f"beat 数量应为 {expected_count}，实际为 {len(beats)}")
+    required = {"beat_order", "source_events", "action", "reason", "who", "where", "what", "suggested_duration"}
+    covered = set()
+    for i, beat in enumerate(beats, 1):
+        if not isinstance(beat, dict):
+            raise ValueError(f"第 {i} 个 beat 不是字典")
+        missing = required - set(beat)
+        if missing:
+            raise ValueError(f"第 {i} 个 beat 缺少字段: {missing}")
+        if beat["action"] not in {"keep", "merge", "drop"}:
+            raise ValueError(f"第 {i} 个 beat action 无效: {beat['action']}")
+        if not isinstance(beat["source_events"], list):
+            raise ValueError(f"第 {i} 个 beat source_events 必须是数组")
+        for event_id in beat["source_events"]:
+            if not isinstance(event_id, int) or event_id < 1 or event_id > event_count:
+                raise ValueError(f"第 {i} 个 beat 引用了无效事件编号: {event_id}")
+            covered.add(event_id)
+    missing_events = set(range(1, event_count + 1)) - covered
+    if missing_events:
+        raise ValueError(f"beat 未覆盖事件编号: {sorted(missing_events)}")
+    parsed.setdefault("strategy", "")
+    return parsed
+
+
+def _build_beat_skeleton(
+    events: List[Dict[str, Any]],
+    characters_summary: str,
+    target_duration: int,
+    shot_duration: int,
+) -> Dict[str, Any]:
+    """Build a globally informed, bounded beat table (Stage 1)."""
+    beat_count = estimate_shot_count(target_duration, shot_duration)
+    prompt = BEAT_SKELETON_PROMPT.format(
+        target_duration=target_duration,
+        shot_duration=shot_duration,
+        beat_count=beat_count,
+        events_json=_build_events_json(events),
+        characters_summary=characters_summary,
+    )
+    for attempt in range(1 + MAX_RETRIES):
+        try:
+            response = _call_llm(prompt, max_tokens=8000)
+            skeleton = _parse_beat_skeleton(response, beat_count, len(events))
+            event_by_id = {i: dict(event, event_id=i) for i, event in enumerate(events, 1)}
+            for beat in skeleton["beats"]:
+                beat["_source_event_details"] = [event_by_id[event_id] for event_id in beat["source_events"]]
+            return skeleton
+        except (json.JSONDecodeError, ValueError) as e:
+            if attempt < MAX_RETRIES:
+                print(f"骨架解析失败，重试中（{attempt + 1}/{MAX_RETRIES}）: {e}", file=sys.stderr)
+                time.sleep(1)
+            else:
+                raise RuntimeError(f"骨架响应解析失败（已重试 {MAX_RETRIES} 次）: {e}") from e
+        except Exception as e:
+            raise RuntimeError(f"骨架 LLM 调用失败: {e}") from e
+    raise RuntimeError("骨架 LLM 调用失败：未获得有效响应")
+
+
+def _batch_prompt(
+    batch: List[Dict[str, Any]],
+    characters_summary: str,
+    target_duration: int,
+    offset: int,
+    relay: Optional[Dict[str, str]],
+) -> str:
+    public_beats = [{k: v for k, v in beat.items() if not k.startswith("_")} for beat in batch]
+    event_details = [detail for beat in batch for detail in beat.get("_source_event_details", [])]
+    base = USER_PROMPT_TEMPLATE.format(
+        target_duration=target_duration,
+        shot_duration=AVG_SHOT_DURATION,
+        max_shots=len(batch),
+        events_json=json.dumps(event_details, ensure_ascii=False, indent=2),
+        characters_summary=characters_summary,
+    )
+    if relay is None:
+        relay_text = "这是第一镜，无需承接上镜。"
+    else:
+        relay_text = (
+            "上一批最后一镜接力上下文（只据此保持连续）："
+            f"who={json.dumps(relay['who'], ensure_ascii=False)}；where={relay['where']}；"
+            f"visual末尾={relay['visual']}"
+        )
+    return (
+        f"{base}\n\n【本批展开任务】\n本批 beat：\n"
+        f"{json.dumps(public_beats, ensure_ascii=False, indent=2)}\n"
+        f"{relay_text}\n本批只输出 {len(batch)} 个完整 shot；第一个 shot_order 必须为 {offset + 1}，"
+        "随后连续递增。每个 beat 恰好展开为一个 shot，source_events/action 必须忠于 beat。"
+    )
+
+
+def _expand_beats_to_shots(
+    beats: List[Dict[str, Any]],
+    characters_summary: str,
+    target_duration: int,
+) -> List[Dict[str, Any]]:
+    """Expand three beats at a time, relaying only the previous final shot."""
+    shots: List[Dict[str, Any]] = []
+    relay: Optional[Dict[str, str]] = None
+    for start in range(0, len(beats), 3):
+        batch = beats[start:start + 3]
+        prompt = _batch_prompt(batch, characters_summary, target_duration, len(shots), relay)
+        parsed = None
+        for attempt in range(1 + MAX_RETRIES):
+            try:
+                response = _call_llm_with_timeout_retry(prompt, max_tokens=16000)
+                parsed = _parse_response(response)
+                if len(parsed["shots"]) != len(batch):
+                    raise ValueError(f"本批应输出 {len(batch)} 镜，实际为 {len(parsed['shots'])} 镜")
+                expanded_fields = {
+                    "shot_order", "source_events", "action", "reason", "who", "where",
+                    "what", "emotion", "visual", "suggested_duration", "transition_to_next",
+                    "associate_assets", "shot_size", "camera_movement", "lighting_key",
+                    "shot_intent", "dialogue", "gen_strategy",
+                }
+                for index, shot in enumerate(parsed["shots"], 1):
+                    missing = expanded_fields - set(shot)
+                    if missing:
+                        raise ValueError(f"本批第 {index} 镜缺少完整字段: {missing}")
+                break
+            except (json.JSONDecodeError, ValueError) as e:
+                if attempt < MAX_RETRIES:
+                    print(f"第 {start // 3 + 1} 批解析失败，重试中（{attempt + 1}/{MAX_RETRIES}）: {e}", file=sys.stderr)
+                    time.sleep(1)
+                else:
+                    raise RuntimeError(
+                        f"第 {start // 3 + 1} 批响应解析失败（已重试 {MAX_RETRIES} 次）: {e}"
+                    ) from e
+            except Exception as e:
+                raise RuntimeError(f"第 {start // 3 + 1} 批 LLM 调用失败: {e}") from e
+        if parsed is None:
+            raise RuntimeError(f"第 {start // 3 + 1} 批未获得有效响应")
+        for shot, beat in zip(parsed["shots"], batch):
+            # One beat maps to one shot; keep coverage/drop decisions deterministic
+            # even when the expansion model drifts from its input skeleton.
+            shot["source_events"] = list(beat["source_events"])
+            shot["action"] = beat["action"]
+            shot["shot_order"] = len(shots) + 1
+            shots.append(shot)
+        last = shots[-1]
+        relay = {
+            "who": last.get("who", []),
+            "where": str(last.get("where", "")),
+            "visual": str(last.get("visual", ""))[-100:],
+        }
+    return shots
+
+
 # ─── 核心函数 ────────────────────────────────────────────────────────────────
 
 def adapt_events(
@@ -532,6 +701,51 @@ def adapt_events(
     events_json = _build_events_json(events)
     characters_summary = _build_characters_summary(characters)
 
+    requested_mode = os.getenv("HONCUT_ADAPT_MODE", "layered").strip().lower()
+    use_layered = requested_mode != "single" and len(events) > 10
+    if use_layered:
+        skeleton = _build_beat_skeleton(
+            events, characters_summary, target_duration, shot_duration
+        )
+        shots = _expand_beats_to_shots(
+            skeleton["beats"], characters_summary, target_duration
+        )
+        _validate_shots(shots)
+
+        # Defensive assembly: batch responses may ignore their requested offset.
+        for i, shot in enumerate(shots, 1):
+            shot["shot_order"] = i
+
+        for i, shot in enumerate(shots):
+            if i > 0:
+                prev = shots[i - 1]
+                prev_visual = prev.get("visual", "")
+                if shot.get("where") == prev.get("where"):
+                    shot["prev_shot_context"] = (
+                        f"承接上镜：{prev_visual[-80:]}"
+                        if len(prev_visual) > 80
+                        else f"承接上镜：{prev_visual}"
+                    )
+                else:
+                    shot["prev_shot_context"] = ""
+            else:
+                shot["prev_shot_context"] = ""
+
+        total_duration = sum(shot.get("suggested_duration", 0) for shot in shots)
+        if abs(total_duration - target_duration) > target_duration * 0.10:
+            print(
+                f"  ⚠ 分镜建议总时长 {total_duration}秒与目标 {target_duration}秒偏差超过 10%",
+                file=sys.stderr,
+            )
+        return {
+            "target_duration": target_duration,
+            "estimated_shots": len(shots),
+            "total_duration": total_duration,
+            "strategy": skeleton.get("strategy", ""),
+            "shots": shots,
+        }
+
+    # [LEGACY-KEEP layered-adapt] 原单次调用路径；显式 single 或事件数 <= 10 时使用。
     user_prompt = USER_PROMPT_TEMPLATE.format(
         target_duration=target_duration,
         shot_duration=shot_duration,
