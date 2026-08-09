@@ -150,6 +150,24 @@ def package_shot_assets(
     return str(zip_path), base64_list
 
 
+def _resolve_char_ids(output_dir: Path, raw_ids: List[str]) -> List[str]:
+    """Resolve character display names to ids, preserving unknown values."""
+    characters_json = Path(output_dir) / "CHARACTERS.json"
+    try:
+        chars_data = json.loads(characters_json.read_text(encoding="utf-8"))
+    except Exception:
+        return list(raw_ids)
+
+    characters = chars_data.get("characters", [])
+    valid_ids = {char.get("id") for char in characters if char.get("id")}
+    name_to_id = {
+        char.get("name"): char.get("id")
+        for char in characters
+        if char.get("name") and char.get("id")
+    }
+    return [raw_id if raw_id in valid_ids else name_to_id.get(raw_id, raw_id) for raw_id in raw_ids]
+
+
 def _detect_shot_characters(
     output_dir: Path,
     shot_meta: dict,
@@ -179,6 +197,7 @@ def _detect_shot_characters(
             if isinstance(aid, str) and aid.startswith("char:")
         ]
         if char_ids:
+            char_ids = _resolve_char_ids(output_dir, char_ids)
             return char_ids
 
     # 3. Prompt name matching against CHARACTERS.json
@@ -358,7 +377,13 @@ def build_content_for_shot(
         strategy = "i2v"
 
     # Every route starts from the per-shot storyboard image.
-    shot_frame_path = output_dir / "storyboard_images" / f"{shot_id}.png"
+    storyboard_images_dir = output_dir / "storyboard_images"
+    if not storyboard_images_dir.exists():
+        print(
+            f"  [assets] ⚠ storyboard_images directory missing: {storyboard_images_dir}; "
+            "run Phase 2.5 to generate per-shot first frames"
+        )
+    shot_frame_path = storyboard_images_dir / f"{shot_id}.png"
     image_assets = []
     if shot_frame_path.exists() and shot_frame_path.stat().st_size > 1024:
         image_assets.append({
@@ -368,7 +393,7 @@ def build_content_for_shot(
         })
 
     if strategy == "flf2v":
-        end_frame_path = output_dir / "storyboard_images" / f"{shot_id}_end.png"
+        end_frame_path = storyboard_images_dir / f"{shot_id}_end.png"
         if end_frame_path.exists() and end_frame_path.stat().st_size > 1024:
             image_assets.append({
                 "path": end_frame_path,

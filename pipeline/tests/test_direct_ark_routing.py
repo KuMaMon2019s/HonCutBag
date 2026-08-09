@@ -26,6 +26,26 @@ pipeline_runner_cli = importlib.util.module_from_spec(_runner_spec)
 _runner_spec.loader.exec_module(pipeline_runner_cli)
 
 
+def test_detect_shot_characters_resolves_display_names(tmp_path):
+    (tmp_path / "CHARACTERS.json").write_text(
+        json.dumps({"characters": [{"id": "lin", "name": "凛"}]}),
+        encoding="utf-8",
+    )
+    shot_meta = {"associate_assets": ["char:凛"]}
+
+    assert asset_packager._detect_shot_characters(tmp_path, shot_meta) == ["lin"]
+
+
+def test_detect_shot_characters_passthrough_valid_ids(tmp_path):
+    (tmp_path / "CHARACTERS.json").write_text(
+        json.dumps({"characters": [{"id": "lin", "name": "凛"}]}),
+        encoding="utf-8",
+    )
+    shot_meta = {"associate_assets": ["char:lin"]}
+
+    assert asset_packager._detect_shot_characters(tmp_path, shot_meta) == ["lin"]
+
+
 def test_phase_orchestrator_failure_prints_stdout_and_stderr_tails(
     monkeypatch, tmp_path, capsys
 ):
