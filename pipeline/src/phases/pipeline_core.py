@@ -2359,31 +2359,33 @@ def _run_phase5_om_seedance(storyboard_data: dict, output_dir: Path, characters_
 
 
 def _run_phase5_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
-    """Generate Phase 5 video through the local Bridge."""
+    """Generate Phase 5 video through direct ARK or the explicit local Bridge."""
     output_dir = Path(output_dir)
 
     shots_dir = output_dir / "shots"
     if not shots_dir.exists():
         return {"status": "skipped", "reason": "no shots directory"}
 
-    # Cost-control red line: video generation must never fall back to ARK.
-    try:
-        from clients import local_video_client
-    except ImportError:
-        print("  ✗ Phase 5 前置检查失败: local_video_client 未找到，ARK 视频降级已禁用", flush=True)
-        return {"status": "error", "error": "local_video_client not found, ARK fallback disabled"}
-    if not local_video_client.is_available(timeout=3.0):
-        print("  ✗ Phase 5 前置检查失败: 本地视频 API 不可达，ARK 视频降级已禁用", flush=True)
-        return {"status": "error", "error": "local video API unreachable, ARK fallback disabled"}
-    use_local = True
     video_provider = os.environ.get("VIDEO_PROVIDER", "seedance").lower()
-    if video_provider == "seedance":
-        print("  → 路由: 通过 Bridge 使用 Seedance 在线模型", flush=True)
-    else:
-        print("  → 路由: 仅使用本地视频 API (192.168.31.221:9100)", flush=True)
-        if chain_mode:
+    use_local = video_provider in {"local", "wan", "bridge"}
+    if use_local:
+        try:
+            from clients import local_video_client
+        except ImportError:
+            print("  ✗ Phase 5 前置检查失败: local_video_client 未找到", flush=True)
+            return {"status": "error", "error": "local_video_client not found"}
+        if not local_video_client.is_available(timeout=3.0):
+            print("  ✗ Phase 5 前置检查失败: 本地视频 API 不可达", flush=True)
+            return {"status": "error", "error": "local video API unreachable"}
+        if video_provider == "bridge":
+            print("  → 路由: 通过 Bridge 使用 Seedance 在线模型", flush=True)
+        else:
+            print("  → 路由: 仅使用本地视频 API (192.168.31.221:9100)", flush=True)
+        if chain_mode and video_provider != "bridge":
             print("  [chain] 当前 provider 不是 seedance，Wan2.2 本地不支持接力；按普通模式执行", flush=True)
             chain_mode = False
+    else:
+        print("  → 路由: 直连 ARK Agent Plan", flush=True)
 
     # Load character reference images for consistency
     import base64 as _b64
@@ -2544,7 +2546,7 @@ def _run_phase5_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
             "i2v": "scenery/ambient or default",
         }[gen_strategy]
         video_provider = os.environ.get("VIDEO_PROVIDER", "seedance").lower()
-        if video_provider == "seedance":
+        if video_provider == "bridge":
             bridge_model = "seedance"
         else:
             bridge_model = {"flf2v": "flf2v", "phantom": "phantom", "i2v": "wan22"}[gen_strategy]
@@ -2801,9 +2803,114 @@ def _run_phase5_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                         print(f"    ⚠ 不降级到 ARK（零成本测试模式），跳过此镜头")
                         return None
                 
-                raise RuntimeError("internal routing error: local video path was not selected")
+                print(f"  → {shot_dir.name}: 提交 ARK Agent Plan 视频生成...")
+                from clients import seedance_client
+                from tools import asset_packager
+
+                shot_id = shot_dir.name
+                content_meta = dict(meta)
+                content_meta["prompt"] = prompt
+                content_meta["gen_strategy"] = gen_strategy
+                content_meta["_char_ids"] = sorted(associated_character_ids)
+                content_list = asset_packager.build_content_for_shot(
+                    output_dir=output_dir,
+                    shot_id=shot_id,
+                    shot_meta=content_meta,
+                )
+                if active_source and first_frame_b64:
+                    content_list = [
+                        item for item in (content_list or [])
+                        if item.get("role") != "first_frame"
+                    ]
+                    content_list.insert(1 if content_list else 0, {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{first_frame_b64}"},
+                        "role": "first_frame",
+                        "priority": "high",
+                    })
+
+                api_key = get_api_key("ARK_AGENT")
+                if not api_key:
+                    raise RuntimeError("缺少 ARK_AGENT_API_KEY；检查 ARK_AGENT_API_KEY 或 Agent Plan 权限")
+                try:
+                    from utils.config import SEEDANCE_MODEL
+                    direct_model = SEEDANCE_MODEL
+                except ImportError:
+                    direct_model = os.environ.get(
+                        "SEEDANCE_MODEL", "doubao-seedance-2.0-mini"
+                    )
+                task_id = seedance_client.submit_content(
+                    content_list,
+                    api_key=api_key,
+                    model=direct_model,
+                    duration=duration or 12,
+                    ratio="16:9",
+                    seed=shot_seed,
+                )
+                video_url = seedance_client.poll(task_id, api_key)
+                seedance_client.download(video_url, out_path)
+
+                last_frame_path = shot_dir / "last_frame.jpg"
+                if chain_mode and chain_allowed:
+                    try:
+                        subprocess.run(
+                            [
+                                "ffmpeg", "-sseof", "-0.1", "-i", out_path,
+                                "-frames:v", "1", "-q:v", "2",
+                                str(last_frame_path), "-y",
+                            ],
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                        )
+                    except Exception as frame_error:
+                        print(
+                            f"    ⚠ {shot_dir.name}: 尾帧提取失败 — {frame_error}",
+                            flush=True,
+                        )
+
+                actual_duration = None
+                try:
+                    probe = subprocess.run(
+                        [
+                            "ffprobe", "-v", "error", "-show_entries",
+                            "format=duration", "-of",
+                            "default=noprint_wrappers=1:nokey=1", out_path,
+                        ],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                    actual_duration = float(probe.stdout.strip())
+                except Exception:
+                    pass
+
+                meta.update({
+                    "task_id": task_id,
+                    "status": "completed",
+                    "video_path": out_path,
+                    "actual_model": direct_model,
+                    "actual_duration": actual_duration,
+                })
+                if shot_seed is not None:
+                    meta["seed"] = shot_seed
+                meta_path.write_text(
+                    json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8"
+                )
+                return {
+                    "output_path": out_path,
+                    "last_frame_path": (
+                        str(last_frame_path) if last_frame_path.exists() else None
+                    ),
+                    "actual_model": direct_model,
+                    "relative_output": f"shots/{shot_dir.name}/output.mp4",
+                }
             except Exception as e:
                 err_str = str(e)
+                if "401" in err_str or "403" in err_str:
+                    raise RuntimeError(
+                        f"{err_str}；检查 ARK_AGENT_API_KEY 或 Agent Plan 权限"
+                    ) from e
                 # 429 QuotaExceeded — exponential backoff retry
                 if "QuotaExceeded" in err_str or "429" in err_str:
                     wait_sec = min(30 * (2 ** attempt), 120)

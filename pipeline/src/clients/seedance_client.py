@@ -124,6 +124,41 @@ def _submit_direct(
     return task_id
 
 
+def submit_content(
+    content: list,
+    api_key: str,
+    model: str,
+    duration: int,
+    ratio: str = "16:9",
+    seed: int = None,
+    generate_audio: Optional[str] = None,
+) -> str:
+    """Submit a preassembled ARK Agent Plan content array. Returns task_id."""
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "content": content,
+        **({"generate_audio": generate_audio} if generate_audio is not None else {}),
+        "ratio": ratio,
+        "duration": duration,
+        "watermark": False,
+    }
+    if seed is not None:
+        payload["seed"] = seed
+
+    resp = requests.post(SUBMIT_ENDPOINT, json=payload, headers=headers, timeout=30)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Seedance API {resp.status_code}: {resp.text[:500]}")
+    data = resp.json()
+    task_id = data.get("id")
+    if not task_id:
+        raise RuntimeError(f"No task_id in response: {data}")
+    return task_id
+
+
 def submit(
     prompt: str,
     api_key: str,
