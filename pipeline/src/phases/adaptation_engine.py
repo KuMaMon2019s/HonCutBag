@@ -251,17 +251,25 @@ def _call_llm(user_prompt: str) -> str:
     """
     client = _get_client()
 
-    response = client.chat.completions.create(
+    # 2026-08-09 R8 教训：70事件→15镜大JSON非流式调用，turbo生成完整响应
+    # 远超 240s timeout（R7/R8 共 6 次超时实锤）。改流式后 timeout 语义变为
+    # "等下一个数据块"，turbo 推理模型先吐 reasoning 再吐 content，数据流不断即不断连。
+    stream = client.chat.completions.create(
         model="doubao-seed-2.1-turbo",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
+        stream=True,
         timeout=LLM_TIMEOUT,
     )
 
-    content = response.choices[0].message.content
-    if content is None:
+    chunks: List[str] = []
+    for chunk in stream:
+        if chunk.choices and chunk.choices[0].delta.content:
+            chunks.append(chunk.choices[0].delta.content)
+    content = "".join(chunks)
+    if not content.strip():
         raise ValueError("LLM 返回空内容")
     return content
 
