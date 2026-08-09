@@ -106,7 +106,7 @@ def plan_director(script_text: str, output_dir: Path, dry_run: bool = False) -> 
         user_prompt = USER_PROMPT_TEMPLATE.format(script_text=script_text[:8000])
         
         response = client.chat.completions.create(
-            model="doubao-seed-2.0-lite",
+            model="doubao-seed-2.1-turbo",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},

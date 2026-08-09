@@ -619,7 +619,7 @@ def _summarize_visual_style_with_llm(script_text: str) -> Optional[str]:
             base_url="https://ark.cn-beijing.volces.com/api/plan/v3",
         )
         response = client.chat.completions.create(
-            model="doubao-seed-2.0-lite",
+            model="doubao-seed-2.1-turbo",
             messages=[{
                 "role": "user",
                 "content": "用一句话总结以下剧本的美术风格，只输出风格描述：\n" + script_text,
@@ -2566,7 +2566,7 @@ def _run_phase5_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
             {
                 "shots": export_shots,
                 "chain_mode": chain_mode,
-                "model": os.environ.get("SEEDANCE_MODEL", "doubao-seedance-2-0-mini"),
+                "model": os.environ.get("SEEDANCE_MODEL", "doubao-seedance-2.0-mini"),
                 "resolution": "720p",
             },
         )

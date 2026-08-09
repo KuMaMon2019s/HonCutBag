@@ -255,7 +255,7 @@ def _call_llm(user_prompt: str, visual_style_text: Optional[str] = None) -> str:
     client = _get_client()
 
     response = client.chat.completions.create(
-        model="doubao-seed-2.0-lite",
+        model="doubao-seed-2.1-turbo",
         messages=[
             {"role": "system", "content": _render_system_prompt(visual_style_text)},
             {"role": "user", "content": user_prompt},
