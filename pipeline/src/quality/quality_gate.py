@@ -469,6 +469,10 @@ def run_storyboard_review(storyboard_data: dict, script_text: str, characters: l
         
         # P0-2c: 长台词拆镜检查（HonCut 铁律: >20字强制拆镜）
         dialogue = shot.get("dialogue") or shot.get("what") or ""
+        if isinstance(dialogue, dict):
+            dialogue = dialogue.get("line") or ""
+        elif not isinstance(dialogue, str):
+            dialogue = str(dialogue) if dialogue is not None else ""
         dialogue_text = re.findall(r'["「](.+?)["」]', dialogue)
         for d in dialogue_text:
             if len(d) > 20:

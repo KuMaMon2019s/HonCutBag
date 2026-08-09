@@ -32,6 +32,7 @@ def _beat(i):
 
 def _shot(order, visual=None):
     return {
+        "beat_order": order,
         "shot_order": order,
         "source_events": [order],
         "action": "keep",
@@ -53,8 +54,12 @@ def _shot(order, visual=None):
     }
 
 
-def _batch_response(first, count=3, final_visual=None):
+def _batch_response(first, count=3, final_visual=None, beat_first=None):
     shots = [_shot(first + i) for i in range(count)]
+    if beat_first is not None:
+        for i, shot in enumerate(shots):
+            shot["beat_order"] = beat_first + i
+            shot["source_events"] = [beat_first + i]
     if final_visual:
         shots[-1]["visual"] = final_visual
     return json.dumps({"strategy": "批次", "shots": shots}, ensure_ascii=False)
@@ -72,7 +77,8 @@ def test_beat_skeleton_parsing_and_coverage(monkeypatch):
     for beat in payload["beats"]:
         beat.pop("_source_event_details", None)
     monkeypatch.setattr(engine, "estimate_shot_count", lambda *_: 2)
-    monkeypatch.setattr(engine, "_call_llm", lambda prompt, max_tokens=0: json.dumps(payload, ensure_ascii=False))
+    call = lambda prompt, max_tokens=0: json.dumps(payload, ensure_ascii=False)
+    monkeypatch.setattr(engine, "_call_llm_with_timeout_retry", call)
 
     result = engine._build_beat_skeleton(events, "- 凛", 24, 12)
 
@@ -82,12 +88,17 @@ def test_beat_skeleton_parsing_and_coverage(monkeypatch):
 
 
 def test_expand_three_batches_has_global_contiguous_order(monkeypatch):
-    responses = iter([_batch_response(91), _batch_response(41), _batch_response(7)])
+    responses = iter([
+        _batch_response(91, beat_first=1),
+        _batch_response(41, beat_first=4),
+        _batch_response(7, beat_first=7),
+    ])
     monkeypatch.setattr(engine, "_call_llm_with_timeout_retry", lambda *args, **kwargs: next(responses))
 
-    shots = engine._expand_beats_to_shots([_beat(i) for i in range(1, 10)], "- 凛", 108)
+    shots = engine._expand_beats_to_shots([_beat(i) for i in range(1, 10)], "- 凛", 108, 12)
 
     assert [shot["shot_order"] for shot in shots] == list(range(1, 10))
+    assert all("beat_order" not in shot for shot in shots)
 
 
 def test_second_batch_prompt_contains_last_shot_relay(monkeypatch):
@@ -99,7 +110,7 @@ def test_second_batch_prompt_contains_last_shot_relay(monkeypatch):
         return _batch_response(1 if len(prompts) == 1 else 4, final_visual=tail if len(prompts) == 1 else None)
 
     monkeypatch.setattr(engine, "_call_llm_with_timeout_retry", fake_call)
-    engine._expand_beats_to_shots([_beat(i) for i in range(1, 7)], "- 凛", 72)
+    engine._expand_beats_to_shots([_beat(i) for i in range(1, 7)], "- 凛", 72, 12)
 
     assert "上一批最后一镜接力上下文" in prompts[1]
     assert "who=[\"凛\"]" in prompts[1]
@@ -147,7 +158,7 @@ def test_batch_parse_retry_only_retries_failing_batch(monkeypatch):
     monkeypatch.setattr(engine, "_call_llm_with_timeout_retry", fake_call)
     monkeypatch.setattr(engine.time, "sleep", lambda *_: None)
 
-    shots = engine._expand_beats_to_shots([_beat(i) for i in range(1, 10)], "- 凛", 108)
+    shots = engine._expand_beats_to_shots([_beat(i) for i in range(1, 10)], "- 凛", 108, 12)
 
     assert len(shots) == 9
     assert len(prompts) == 4
@@ -161,3 +172,64 @@ def test_small_script_automatically_uses_single(monkeypatch):
     monkeypatch.setattr(engine, "_build_beat_skeleton", lambda *args: pytest.fail("small script used layered mode"))
 
     assert engine.adapt_events(_events(10), target_duration=12)["estimated_shots"] == 1
+
+
+def test_beat_order_mismatch_retries_batch(monkeypatch):
+    wrong = json.loads(_batch_response(1))
+    wrong["shots"][0]["beat_order"] = 2
+    responses = iter([json.dumps(wrong, ensure_ascii=False), _batch_response(1)])
+    calls = []
+
+    def fake_call(prompt, **kwargs):
+        calls.append(prompt)
+        return next(responses)
+
+    monkeypatch.setattr(engine, "_call_llm_with_timeout_retry", fake_call)
+    monkeypatch.setattr(engine.time, "sleep", lambda *_: None)
+
+    shots = engine._expand_beats_to_shots([_beat(i) for i in range(1, 4)], "- 凛", 36, 12)
+
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+    assert all("beat_order" not in shot for shot in shots)
+
+
+def test_batch_prompt_uses_local_duration_budget_and_formats_safely():
+    beats = [dict(_beat(1), suggested_duration=7), dict(_beat(2), suggested_duration=9)]
+
+    prompt = engine._batch_prompt(beats, "- 凛", 999, 8, 0, None)
+
+    assert "每镜约8秒" in prompt
+    assert "本批目标时长：16秒" in prompt
+    assert "接近 16 秒" in prompt
+    assert "接近 target_duration" not in prompt
+    assert "接近 999 秒" not in prompt
+    assert '"beat_order":1' in prompt
+
+
+@pytest.mark.parametrize("visual", ["", None, 123])
+def test_batch_prompt_empty_relay_visual_uses_fallback(visual):
+    prompt = engine._batch_prompt(
+        [_beat(1)], "- 凛", 12, 12, 0,
+        {"who": ["凛"], "where": "庭院", "visual": visual},
+    )
+
+    assert "上一镜无可用 visual，仅按 who/where 承接" in prompt
+    assert "visual末尾=" not in prompt
+
+
+def test_stage1_uses_timeout_retry_wrapper(monkeypatch):
+    payload = {"strategy": "骨架", "beats": [{k: v for k, v in _beat(1).items() if not k.startswith("_")}]}
+    calls = []
+    monkeypatch.setattr(engine, "estimate_shot_count", lambda *_: 1)
+
+    def fake_call(prompt, max_tokens):
+        calls.append(max_tokens)
+        return json.dumps(payload, ensure_ascii=False)
+
+    monkeypatch.setattr(engine, "_call_llm_with_timeout_retry", fake_call)
+    monkeypatch.setattr(engine, "_call_llm", lambda *args, **kwargs: pytest.fail("Stage 1 bypassed retry wrapper"))
+
+    engine._build_beat_skeleton(_events(1), "- 凛", 12, 12)
+
+    assert calls == [8000]

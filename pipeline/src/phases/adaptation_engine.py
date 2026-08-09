@@ -119,6 +119,47 @@ USER_PROMPT_TEMPLATE = (
 )
 
 
+# Stage 2 only: its duration budget is local to one beat batch.  Keep this
+# independent from USER_PROMPT_TEMPLATE, whose global contract is still used by
+# the LEGACY single-call path.
+BATCH_EXPAND_PROMPT = (
+    "本批目标时长：{batch_target}秒，每镜约{shot_duration}秒，恰好输出{max_shots}个镜头。"
+    "每镜只完成一个明确情节。\n\n"
+    "本批来源事件：\n{events_json}\n\n角色列表：\n{characters_summary}\n\n"
+    "输出严格 JSON 对象，包含 strategy 和 shots。每个 shot 必须包含以下字段：\n"
+    "beat_order（整数，必须等于该镜展开自哪个 beat 的 beat_order）、shot_order、"
+    "source_events、action、reason、who、where、what、emotion、visual、"
+    "suggested_duration、transition_to_next、associate_assets、shot_size、"
+    "camera_movement、lighting_key、shot_intent、dialogue、gen_strategy。\n"
+    "JSON 示例：{{\"strategy\":\"本批策略\",\"shots\":[{{\"beat_order\":1,"
+    "\"shot_order\":1,\"source_events\":[1],\"action\":\"keep\","
+    "\"reason\":\"理由\",\"who\":[\"角色主名\"],\"where\":\"地点\","
+    "\"what\":\"事件\",\"emotion\":\"情绪\",\"visual\":\"画面\","
+    "\"suggested_duration\":12,\"transition_to_next\":\"cut\","
+    "\"associate_assets\":[\"char:id\",\"scene:地点\"],\"shot_size\":\"medium\","
+    "\"camera_movement\":\"static\",\"lighting_key\":\"natural\","
+    "\"shot_intent\":\"action\",\"dialogue\":null,\"gen_strategy\":\"phantom\"}}]}}\n\n"
+    "【对白铁律】dialogue 有对白时为 {{\"speaker\":\"角色名\",\"line\":\"剧本台词原文\"}}，"
+    "line 必须逐字来自来源事件，禁止改写、摘要或编造；无人真正说话时必须为 null，"
+    "不得把 visual、what 或旁白当对白。\n\n"
+    "【镜头连贯性规则】除第一镜和跨场景硬切外，visual 开头必须写"
+    "「承接上镜：上镜定格于{{角色名}}{{位置/姿态/朝向}}，{{最后动作的终态}}——本镜由此延续」。\n"
+    "【片段间过渡规则】相邻片段用动作桥梁、情绪接力、空间视线或台词黏合消灭跳跃感。\n"
+    "【铁律优先级】台词零删改 > 出场人物完整 > 只描述动作状态 > 长台词拆镜。\n\n"
+    "【HonCut 分镜铁律】who 只能逐字引用角色主名，别名改主名，群众只进 visual；"
+    "每片段≤15秒；单镜台词>20字必须拆镜（按4字/秒）；同场景人物不得无故消失；"
+    "人物外观不进提示词；声音只写环境音和音效，禁止配乐/BGM/背景音乐；"
+    "群演只做背景动作；相邻镜头景别和角度必须错开。\n\n"
+    "【HonCut Identity Anchor】每镜 visual 必须以「角色名 — 3-6个视觉特征」开头，"
+    "特征逐字取自 appearance.summary，不用代词。\n\n"
+    "【HonCut 资产绑定（associateAssetsIds）】每镜 associate_assets 必须列出可见角色"
+    "（char:角色id）和必选场景（scene:场景名）。\n\n"
+    "【HonCut 空间位置基准】若 director_plan 提供 spatial_positions，visual 必须标注角色"
+    "在画面左前/右前/居中及朝向；同场景位置不得无故跳变，变化必须有动作交代。\n\n"
+    "本批所有 shot 的 suggested_duration 总和应接近 {batch_target} 秒（允许 ±10% 偏差）。"
+)
+
+
 _ACTION_VERBS = (
     "抬手", "举手", "挥手", "走来", "走向", "走到", "坐下", "站起", "起身",
     "转身", "拥抱", "抱住", "牵手", "拉手", "奔跑", "跑来", "跳起", "跪下",
@@ -540,7 +581,7 @@ def _build_beat_skeleton(
     )
     for attempt in range(1 + MAX_RETRIES):
         try:
-            response = _call_llm(prompt, max_tokens=8000)
+            response = _call_llm_with_timeout_retry(prompt, max_tokens=8000)
             skeleton = _parse_beat_skeleton(response, beat_count, len(events))
             event_by_id = {i: dict(event, event_id=i) for i, event in enumerate(events, 1)}
             for beat in skeleton["beats"]:
@@ -561,14 +602,16 @@ def _batch_prompt(
     batch: List[Dict[str, Any]],
     characters_summary: str,
     target_duration: int,
+    shot_duration: int,
     offset: int,
     relay: Optional[Dict[str, str]],
 ) -> str:
     public_beats = [{k: v for k, v in beat.items() if not k.startswith("_")} for beat in batch]
     event_details = [detail for beat in batch for detail in beat.get("_source_event_details", [])]
-    base = USER_PROMPT_TEMPLATE.format(
-        target_duration=target_duration,
-        shot_duration=AVG_SHOT_DURATION,
+    batch_target = sum(beat.get("suggested_duration", 0) for beat in batch)
+    base = BATCH_EXPAND_PROMPT.format(
+        batch_target=batch_target,
+        shot_duration=shot_duration,
         max_shots=len(batch),
         events_json=json.dumps(event_details, ensure_ascii=False, indent=2),
         characters_summary=characters_summary,
@@ -579,8 +622,12 @@ def _batch_prompt(
         relay_text = (
             "上一批最后一镜接力上下文（只据此保持连续）："
             f"who={json.dumps(relay['who'], ensure_ascii=False)}；where={relay['where']}；"
-            f"visual末尾={relay['visual']}"
         )
+        visual = relay.get("visual")
+        if isinstance(visual, str) and visual:
+            relay_text += f"visual末尾={visual[-100:]}"
+        else:
+            relay_text += "上一镜无可用 visual，仅按 who/where 承接"
     return (
         f"{base}\n\n【本批展开任务】\n本批 beat：\n"
         f"{json.dumps(public_beats, ensure_ascii=False, indent=2)}\n"
@@ -593,13 +640,14 @@ def _expand_beats_to_shots(
     beats: List[Dict[str, Any]],
     characters_summary: str,
     target_duration: int,
+    shot_duration: int,
 ) -> List[Dict[str, Any]]:
     """Expand three beats at a time, relaying only the previous final shot."""
     shots: List[Dict[str, Any]] = []
     relay: Optional[Dict[str, str]] = None
     for start in range(0, len(beats), 3):
         batch = beats[start:start + 3]
-        prompt = _batch_prompt(batch, characters_summary, target_duration, len(shots), relay)
+        prompt = _batch_prompt(batch, characters_summary, target_duration, shot_duration, len(shots), relay)
         parsed = None
         for attempt in range(1 + MAX_RETRIES):
             try:
@@ -617,6 +665,15 @@ def _expand_beats_to_shots(
                     missing = expanded_fields - set(shot)
                     if missing:
                         raise ValueError(f"本批第 {index} 镜缺少完整字段: {missing}")
+                    beat = batch[index - 1]
+                    if shot.get("beat_order") != beat["beat_order"]:
+                        raise ValueError(
+                            f"本批第 {index} 镜 beat_order 错配: "
+                            f"应为 {beat['beat_order']}，实际为 {shot.get('beat_order')}"
+                        )
+                    returned_sources = shot.get("source_events")
+                    if not isinstance(returned_sources, list) or set(returned_sources) != set(beat["source_events"]):
+                        raise ValueError(f"本批第 {index} 镜 source_events 与 beat 不一致")
                 break
             except (json.JSONDecodeError, ValueError) as e:
                 if attempt < MAX_RETRIES:
@@ -636,12 +693,13 @@ def _expand_beats_to_shots(
             shot["source_events"] = list(beat["source_events"])
             shot["action"] = beat["action"]
             shot["shot_order"] = len(shots) + 1
+            shot.pop("beat_order", None)
             shots.append(shot)
         last = shots[-1]
         relay = {
             "who": last.get("who", []),
             "where": str(last.get("where", "")),
-            "visual": str(last.get("visual", ""))[-100:],
+            "visual": last.get("visual"),
         }
     return shots
 
@@ -708,7 +766,7 @@ def adapt_events(
             events, characters_summary, target_duration, shot_duration
         )
         shots = _expand_beats_to_shots(
-            skeleton["beats"], characters_summary, target_duration
+            skeleton["beats"], characters_summary, target_duration, shot_duration
         )
         _validate_shots(shots)
 
