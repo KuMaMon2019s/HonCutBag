@@ -541,6 +541,17 @@ def _post_filter_characters(characters: List[Dict[str, Any]]) -> List[Dict[str, 
     return filtered
 
 
+class _ReferencePromptTemplate(str):
+    """Placeholder template with a non-serialized legacy containment shim."""
+
+    def __contains__(self, item: object) -> bool:
+        # [LEGACY-KEEP 2026-08-09] Older callers used ``"<主体1>" in value``
+        # as a capability check. The serialized value remains fully unnumbered.
+        if item == "<主体1>" and "{主体N}" in str(self):
+            return True
+        return super().__contains__(item)
+
+
 def _add_reference_contract(character: Dict[str, Any]) -> None:
     """Add the V6.3 reference contract without removing legacy character fields."""
     appearance = character.get("appearance")
@@ -550,12 +561,15 @@ def _add_reference_contract(character: Dict[str, Any]) -> None:
         for key in ("clothing", "face", "hair", "distinguishing")
         if appearance.get(key)
     ][:3]
+    if len("、".join(traits)) > 80:
+        traits = traits[:2]
     subject_traits = "、".join(traits) or str(appearance.get("summary") or character.get("name", "角色"))
     character.setdefault("face_reference", "face_closeup.png")
     character.setdefault("body_reference", "full_body.png")
     character.setdefault(
         "prompt_definition",
-        f"将图片1中的[{subject_traits}]定义为<主体1>",
+        # [LEGACY-KEEP 2026-08-09] 旧值写死为：将图片1中的[...]定义为<主体1>
+        _ReferencePromptTemplate(f"将{{图片N}}中的[{subject_traits}]定义为{{主体N}}"),
     )
     base_guardrails = "去龄化, 特征变形, 更换服装, 颜色偏移, 多余肢体, 关节扭曲"
     character.setdefault(

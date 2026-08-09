@@ -61,7 +61,7 @@ def _load_default_visual_style(
 # ─── LLM 配置 ───────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = (
-    "你是 AI 视频生成 prompt 专家，专精真人写实摄影风格。\n"
+    "你是 AI 视频生成 prompt 专家。{style_directive}\n"
     "将中文场景描述转化为英文 Seedance 视频生成 prompt。\n\n"
     "【输出结构】三段式，严格按以下顺序：\n"
     "1. 【画面】（主干，最长）：完整保留场景描述中的所有视觉元素——主体、动作、空间关系、物件细节。\n"
@@ -72,9 +72,7 @@ SYSTEM_PROMPT = (
     "   傍晚：暖调侧逆光，斜射余晖，长影拉伸。\n"
     "   夜间：窗光冷蓝，室内暖点光源，冷暖对比。\n"
     "3. 【风格】（最短）：固定锚定词 + 画质锁定。\n"
-    "   必加：Photorealistic cinematography, cinematic quality, ultra-fine detail, "
-    "strong contrast, delicate skin texture, detailed facial rendering, "
-    "strand-by-strand hair detail, modern urban aesthetic, oriental temperament.\n"
+    "   {quality_anchor}\n"
     "   画质：Ultra-sharp 4K, high detail, natural sharpness, no subtitles, no watermark.\n\n"
     "【情绪→面容映射】\n"
     "心动/欣喜：嘴角微扬，眼底笑意，眼神明亮 → subtle smile, bright eyes\n"
@@ -91,6 +89,24 @@ SYSTEM_PROMPT = (
     "禁止使用代词（he/she/该角色/同上/此人），必须每次写出角色名+特征。\n"
     "示例：'林夏 — 黑色长直发及肩, 白色修身衬衫, 深蓝西装裤 — 站在便利店门口...'\n"
 )
+
+
+def _render_system_prompt(visual_style_text: Optional[str] = None) -> str:
+    """Render the style branch while preserving the original output contract."""
+    if visual_style_text:
+        style_directive = f"严格遵循项目美术风格：{visual_style_text}，禁止替换为真人写实摄影风格。"
+        quality_anchor = f"必加：{visual_style_text}；cinematic quality, ultra-fine detail, strong contrast."
+    else:
+        # [LEGACY-KEEP 2026-08-09] 无项目风格时保留原真人写实默认行为。
+        style_directive = "专精真人写实摄影风格。"
+        quality_anchor = (
+            "必加：Photorealistic cinematography, cinematic quality, ultra-fine detail, "
+            "strong contrast, delicate skin texture, detailed facial rendering, "
+            "strand-by-strand hair detail, modern urban aesthetic, oriental temperament."
+        )
+    return SYSTEM_PROMPT.replace("{style_directive}", style_directive).replace(
+        "{quality_anchor}", quality_anchor
+    )
 
 USER_PROMPT_TEMPLATE = (
     "场景：{visual}\n"
@@ -223,7 +239,7 @@ def _get_client() -> OpenAI:
     )
 
 
-def _call_llm(user_prompt: str) -> str:
+def _call_llm(user_prompt: str, visual_style_text: Optional[str] = None) -> str:
     """
     调用 LLM 并返回原始响应文本
 
@@ -241,7 +257,7 @@ def _call_llm(user_prompt: str) -> str:
     response = client.chat.completions.create(
         model="doubao-seed-2.0-lite",
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": _render_system_prompt(visual_style_text)},
             {"role": "user", "content": user_prompt},
         ],
         timeout=LLM_TIMEOUT,
@@ -571,7 +587,9 @@ def _build_eight_layer_prompt(
             continue
         char_id = char.get("id") or char.get("name")
         ref = char.get("face_reference") or f"characters/{char_id}/face_closeup.png"
-        references.append(f"参考图{ref}中的{char.get('name')}作为主体，保持身份与服装一致")
+        # 文件名只保留在注释中供 Phase 2.5 人工排查，不进入 LLM 提示词。
+        shot.setdefault("reference_debug_files", []).append(str(ref))
+        references.append(f"参考{{图片N}}中的{char.get('name')}作为主体，保持身份与服装一致")
 
     intent = str(shot.get("shot_intent") or "establishing").lower()
     camera_key = str(shot.get("camera_movement") or INTENT_TO_CAMERA.get(intent, "slow_pan")).lower()
@@ -582,7 +600,18 @@ def _build_eight_layer_prompt(
     framing = SHOT_SIZE_MAP.get(str(shot.get("shot_size") or "medium").lower(), "Medium shot")
     subject = _concrete_subject_description(shot, characters)
     emotion = str(shot.get("emotion") or "")
-    action = str(shot.get("action_description") or shot.get("what") or shot.get("visual") or "保持自然姿态")
+    source_action = (
+        shot.get("script_excerpt")
+        or shot.get("action_description")
+        or shot.get("source_excerpt")
+    )
+    if source_action and len(str(source_action)) > 20:
+        action = str(source_action)[:120]
+        supplemental = str(shot.get("what") or "").strip()
+        if supplemental and supplemental not in action:
+            action = f"{action}；补充：{supplemental}"
+    else:
+        action = str(source_action or shot.get("what") or shot.get("visual") or "保持自然姿态")
     externalized = next((value for key, value in EMOTION_ACTIONS.items() if key in emotion), "")
     if externalized and externalized not in action:
         action = f"{action}，{externalized}"
@@ -643,6 +672,7 @@ def generate_storyboard(
     characters: Optional[List[Dict[str, Any]]] = None,
     title: str = "未命名项目",
     visual_style_path: Optional[str] = None,
+    visual_style_text: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     将 shot 列表转化为 STORYBOARD.json 格式
@@ -685,6 +715,8 @@ def generate_storyboard(
     # 处理每个 shot
     storyboard_shots = []
     for i, shot in enumerate(shots, 1):
+        if shot.get("source_excerpt") and not shot.get("action_description"):
+            shot["action_description"] = shot["source_excerpt"]
         duration = shot.get("suggested_duration", 5)
 
         # 调用 LLM 生成英文 prompt 和中文 caption
@@ -703,9 +735,9 @@ def generate_storyboard(
                 # 如果是重试，注入质量反馈到 prompt
                 if attempt > 0:
                     feedback_prompt = user_prompt + f"\n\n[重试反馈] 上次失败原因: {last_error}。请确保输出有效的 JSON 格式。"
-                    response = _call_llm(feedback_prompt)
+                    response = _call_llm(feedback_prompt, visual_style_text)
                 else:
-                    response = _call_llm(user_prompt)
+                    response = _call_llm(user_prompt, visual_style_text)
                 
                 llm_result = _parse_llm_response(response)
                 break

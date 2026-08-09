@@ -11,7 +11,7 @@ import json
 import re
 import zipfile
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 
 def package_shot_assets(
@@ -223,6 +223,13 @@ def collect_character_reference_assets(
             for character in characters_data.get("characters", [])
             if character.get("id")
         }
+        character_definitions = {
+            character.get("id"): character.get("prompt_definition", "")
+            for character in characters_data.get("characters", [])
+            if character.get("id")
+        }
+    else:
+        character_definitions = {}
 
     references = []
     for char_id in _detect_shot_characters(output_dir, shot_meta):
@@ -240,6 +247,8 @@ def collect_character_reference_assets(
                 references.append({
                     "path": reference_path,
                     "char_id": char_id,
+                    "character_name": character_name,
+                    "prompt_definition": character_definitions.get(char_id, ""),
                     "role": "reference_image",
                     "priority": "high",
                     "reference_description": (
@@ -253,15 +262,51 @@ def collect_character_reference_assets(
     return references
 
 
-def inject_reference_instruction(prompt_text: str, descriptions: List[str]) -> str:
+def inject_reference_instruction(prompt_text: str, descriptions: List[Any]) -> str:
     """Inject 图片N descriptions using the shared manifest/content order."""
     if not descriptions:
         return prompt_text
+    normalized = [
+        item if isinstance(item, dict) else {"reference_description": str(item), "char_id": str(index)}
+        for index, item in enumerate(descriptions, start=1)
+    ]
     references = "，".join(
-        f"图片{index}为{description}"
-        for index, description in enumerate(descriptions, start=1)
+        f"图片{index}为{item['reference_description']}"
+        for index, item in enumerate(normalized, start=1)
     )
-    instruction = f"{references}。生成时严格保持参考图中角色的外观一致。"
+    subject_bindings = []
+    subject_numbers = {}
+    for image_number, item in enumerate(normalized, start=1):
+        char_id = item.get("char_id") or str(image_number)
+        if char_id in subject_numbers:
+            continue
+        subject_number = len(subject_numbers) + 1
+        subject_numbers[char_id] = (image_number, subject_number)
+        definition = item.get("prompt_definition") or (
+            f"将{{图片N}}中的[{item.get('reference_description', char_id)}]定义为{{主体N}}"
+        )
+        subject_bindings.append(
+            definition.replace("{图片N}", f"图片{image_number}").replace("{主体N}", f"<主体{subject_number}>")
+        )
+
+    image_replacements = iter(subject_numbers.values())
+    def replace_image_placeholder(match: re.Match) -> str:
+        try:
+            image_number, _ = next(image_replacements)
+        except StopIteration:
+            return match.group(0)
+        return f"图片{image_number}"
+
+    prompt_text = re.sub(r"\{图片N\}", replace_image_placeholder, prompt_text)
+    subject_replacements = iter(subject_numbers.values())
+    def replace_subject_placeholder(match: re.Match) -> str:
+        try:
+            _, subject_number = next(subject_replacements)
+        except StopIteration:
+            return match.group(0)
+        return f"<主体{subject_number}>"
+    prompt_text = re.sub(r"\{主体N\}", replace_subject_placeholder, prompt_text)
+    instruction = f"{references}。{'；'.join(subject_bindings)}。生成时严格保持参考图中角色的外观一致。"
     if "元素参考" in prompt_text:
         return re.sub(
             r"元素参考(?:声明)?\s*[：:]?\s*",
@@ -384,9 +429,7 @@ def build_content_for_shot(
                 })
                 uploaded_count += 1
                 if asset["role"] == "reference_image":
-                    uploaded_reference_descriptions.append(
-                        asset["reference_description"]
-                    )
+                    uploaded_reference_descriptions.append(asset)
             else:
                 print(f"  [assets] ⚠ TOS upload failed for {asset['path'].name}, skipping")
         except Exception as e:
