@@ -124,7 +124,7 @@ USER_PROMPT_TEMPLATE = (
     '输出 JSON：{{"prompt": "英文视频生成prompt", "caption": "中文字幕"}}'
 )
 
-LLM_TIMEOUT = 60  # 秒
+LLM_TIMEOUT = 180  # 秒（2026-08-09: turbo 推理模型需要更长推理时间）
 MAX_RETRIES = 3  # 解析失败重试次数（从 1 提高到 3）
 FPS = 30  # 帧率
 

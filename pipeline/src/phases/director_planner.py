@@ -111,7 +111,7 @@ def plan_director(script_text: str, output_dir: Path, dry_run: bool = False) -> 
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
-            timeout=90,
+            timeout=240,  # 2026-08-09: turbo 推理模型需要更长推理时间
         )
         
         content = response.choices[0].message.content

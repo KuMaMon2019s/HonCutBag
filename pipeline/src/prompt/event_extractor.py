@@ -48,7 +48,7 @@ USER_PROMPT_TEMPLATE = (
     "- action_type: 字符串，事件类型（discovery/conflict/resolution/transition 等）"
 )
 
-LLM_TIMEOUT = 60  # 秒
+LLM_TIMEOUT = 180  # 秒（2026-08-09: turbo 推理模型比 lite 慢，60s 实测 8/19 段超时）
 MAX_RETRIES = 1  # 解析失败重试次数
 
 

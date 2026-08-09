@@ -624,7 +624,7 @@ def _summarize_visual_style_with_llm(script_text: str) -> Optional[str]:
                 "role": "user",
                 "content": "用一句话总结以下剧本的美术风格，只输出风格描述：\n" + script_text,
             }],
-            timeout=30,
+            timeout=120,  # 2026-08-09: turbo 推理模型 30s 必超时，F1 风格提取依赖此调用
         )
         return str(response.choices[0].message.content or "").strip() or None
     except Exception:

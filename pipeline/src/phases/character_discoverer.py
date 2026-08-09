@@ -95,7 +95,7 @@ USER_PROMPT_TEMPLATE = (
     "- 如果没有明显状态变化，variants 可以为空数组 []\n"
 )
 
-LLM_TIMEOUT = 60  # 秒
+LLM_TIMEOUT = 180  # 秒（2026-08-09: turbo 推理模型比 lite 慢，60s 实测角色描述超时）
 MAX_RETRIES = 3  # 解析失败重试次数
 
 ENTITY_SUFFIXES = (
@@ -374,6 +374,7 @@ def _is_human_character(name: str) -> bool:
         "冷空气", "风", "雨", "雪", "雷", "电",  # 天气
         "鸡", "鸭", "狗", "猫", "鸟", "鱼",  # 动物
         "桌子", "椅子", "车", "书",  # 物品
+        "刀", "剑", "枪", "刃", "武器", "护甲", "铠甲", "弓", "箭",  # 武器/装备（2026-08-09: "两把金属刀具"混入角色列表实锤）
     ]
     if any(keyword in name for keyword in non_human_keywords):
         return False

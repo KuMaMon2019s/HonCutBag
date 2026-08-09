@@ -155,7 +155,7 @@ def determine_gen_strategy(shot: Dict[str, Any]) -> str:
         return "phantom"
     return "i2v"
 
-LLM_TIMEOUT = 90  # 秒
+LLM_TIMEOUT = 240  # 秒（2026-08-09: turbo 推理模型需要更长推理时间）
 MAX_RETRIES = 1  # 解析失败重试次数
 AVG_SHOT_DURATION = 12  # 默认每镜时长（秒）
 MIN_SHOT_DURATION = 4  # 单镜头最小时长（秒）
