@@ -896,6 +896,7 @@ def run_phase2(
             "_storyboard": storyboard,
             "_characters": characters_result,
         }
+        return phase8_result
 
     except Exception as e:
         traceback.print_exc()

@@ -427,8 +427,8 @@ def run_storyboard_review(storyboard_data: dict, script_text: str, characters: l
     for i, shot in enumerate(shots):
         shot_id = shot.get("shot_id", f"S{i+1:02d}")
         who = shot.get("who", [])
-        visual = shot.get("visual", "")
-        what = shot.get("what", "")
+        visual = shot.get("visual") or ""
+        what = shot.get("what") or ""
         
         # R1: 资产引用合法（子串模糊匹配：LLM 分镜常用描述性长名，
         # 角色列表存的是过滤后的短名，精确匹配会误杀，如
@@ -454,7 +454,7 @@ def run_storyboard_review(storyboard_data: dict, script_text: str, characters: l
             moderate_issues.append(f"[R2] {shot_id}: visual 描述过短或为空")
         
         # P0-2a: R2 台词忠实度（检查 shot 中引用的台词是否在原文中存在）
-        what = shot.get("what", "")
+        what = shot.get("what") or ""
         if what and script_text:
             # 提取引号内的台词
             quoted = re.findall(r'["「](.+?)["」]', what)
@@ -468,7 +468,7 @@ def run_storyboard_review(storyboard_data: dict, script_text: str, characters: l
             severe_issues.append(f"[时长] {shot_id}: {duration}s 超过15秒上限")
         
         # P0-2c: 长台词拆镜检查（HonCut 铁律: >20字强制拆镜）
-        dialogue = shot.get("dialogue", shot.get("what", ""))
+        dialogue = shot.get("dialogue") or shot.get("what") or ""
         dialogue_text = re.findall(r'["「](.+?)["」]', dialogue)
         for d in dialogue_text:
             if len(d) > 20:
