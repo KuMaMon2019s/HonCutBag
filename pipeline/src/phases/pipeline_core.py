@@ -2179,7 +2179,11 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
             },
         )
 
+        print(f"  → orchestrator return code: {result.returncode}")
+
         if result.returncode != 0:
+            print(f"  ⚠ orchestrator stdout tail: {result.stdout[-1500:]}")
+            print(f"  ⚠ orchestrator stderr tail: {result.stderr[-1000:]}")
             print(f"  ⚠ orchestrator stderr: {result.stderr[-500:]}")
             # 非致命：可能只是没有视频文件
             if "shots" in str(result.stdout) or dry_run:
@@ -2228,9 +2232,18 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
         shot_output_count = sum(item.startswith("shots/") for item in outputs)
         print(f"  ✓ Phase 4 完成: {shot_output_count} 镜头目录")
         status = "done" if shot_output_count or dry_run else "error"
-        return {"status": status, "duration_s": _elapsed(start), "outputs": outputs or ["shots/"], "provider": selected_provider, "render_runtime": locked_composition["render_runtime"]}
+        return {"status": status, "duration_s": _elapsed(start), "outputs": outputs or ["shots/"], "provider": selected_provider, "render_runtime": locked_composition["render_runtime"], **({"error": "orchestrator produced no shot directories"} if status == "error" else {})}
 
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as e:
+        timeout_stdout = e.stdout or ""
+        timeout_stderr = e.stderr or ""
+        if isinstance(timeout_stdout, bytes):
+            timeout_stdout = timeout_stdout.decode(errors="replace")
+        if isinstance(timeout_stderr, bytes):
+            timeout_stderr = timeout_stderr.decode(errors="replace")
+        print("  ⚠ orchestrator timed out after 120s")
+        print(f"  ⚠ orchestrator stdout tail: {timeout_stdout[-1500:]}")
+        print(f"  ⚠ orchestrator stderr tail: {timeout_stderr[-1000:]}")
         return {"status": "error", "error": "orchestrator timed out", "duration_s": _elapsed(start)}
     except Exception as e:
         traceback.print_exc()

@@ -138,6 +138,8 @@ def main() -> None:
         report_key = "phase1" if args.phase == "phase1" else PHASE_NUMBERS[args.phase]
         selected_result = report.get("phases", {}).get(report_key)
     phase_failed = selected_result and selected_result.get("status") == "error"
+    if phase_failed:
+        print(f"Phase {args.phase} failed: {selected_result.get('error', 'unknown error')}", flush=True)
     success = report["status"] in ("completed", "partial") and not phase_failed
     raise SystemExit(0 if success else 1)
 

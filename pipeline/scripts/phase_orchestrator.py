@@ -277,6 +277,8 @@ def main() -> None:
             _set_report_status(Path(config["output_dir"]) / "pipeline_report.json", "failed")
             print(f"\n❌ {phase} FAILED!", flush=True)
             print(f"Exit code: {result['exit_code']}", flush=True)
+            print(f"Stdout tail: {result['stdout'][-1500:]}", flush=True)
+            print(f"Stderr tail: {result['stderr'][-500:]}", flush=True)
             print(f"Error: {result['stderr'][:500]}", flush=True)
             raise SystemExit(1)
 

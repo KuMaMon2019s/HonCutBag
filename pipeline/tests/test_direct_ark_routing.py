@@ -1,4 +1,5 @@
 import json
+import importlib.util
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,12 +8,93 @@ import pytest
 
 
 SRC = Path(__file__).resolve().parents[1] / "src"
+SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
 
 from clients import local_video_client, seedance_client
 from phases import pipeline_core
 from tools import asset_packager
+import phase_orchestrator
+
+_runner_spec = importlib.util.spec_from_file_location(
+    "pipeline_runner_cli", SRC / "pipeline_runner.py"
+)
+pipeline_runner_cli = importlib.util.module_from_spec(_runner_spec)
+_runner_spec.loader.exec_module(pipeline_runner_cli)
+
+
+def test_phase_orchestrator_failure_prints_stdout_and_stderr_tails(
+    monkeypatch, tmp_path, capsys
+):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "input": str(tmp_path / "story.txt"),
+        "duration": 45,
+        "output_dir": str(tmp_path),
+    }))
+    (tmp_path / "pipeline_report.json").write_text(json.dumps({"phases": {}}))
+    monkeypatch.setattr(
+        phase_orchestrator,
+        "run_phase",
+        lambda phase, config: {
+            "phase": phase,
+            "exit_code": 1,
+            "stdout": "A" * 500 + "stdout-cause",
+            "stderr": "B" * 500 + "stderr-cause",
+            "timestamp": "2026-08-10T00:00:00",
+        },
+    )
+    monkeypatch.setattr(
+        sys, "argv", ["phase_orchestrator.py", "--config", str(config_path), "--resume-from", "phase4"]
+    )
+
+    with pytest.raises(SystemExit, match="1"):
+        phase_orchestrator.main()
+
+    output = capsys.readouterr().out
+    assert "Stdout tail:" in output and "stdout-cause" in output
+    assert "Stderr tail:" in output and "stderr-cause" in output
+
+
+def test_pipeline_runner_prints_selected_phase_error(monkeypatch, capsys):
+    monkeypatch.setattr(
+        pipeline_runner_cli._core,
+        "run_pipeline",
+        lambda **kwargs: {
+            "status": "partial",
+            "phases": {"4": {"status": "error", "error": "orchestrator timed out"}},
+        },
+    )
+    monkeypatch.setattr(sys, "argv", ["pipeline_runner.py", "--input", "story.txt", "--phase", "phase4"])
+
+    with pytest.raises(SystemExit, match="1"):
+        pipeline_runner_cli.main()
+
+    assert "Phase phase4 failed: orchestrator timed out" in capsys.readouterr().out
+
+
+def test_phase4_timeout_prints_subprocess_output_tails(monkeypatch, tmp_path, capsys):
+    (tmp_path / "STORYBOARD.json").write_text(json.dumps({"shots": []}))
+    monkeypatch.setattr(
+        pipeline_core.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            pipeline_core.subprocess.TimeoutExpired(
+                args[0], 120, output=b"inner stdout cause", stderr=b"inner stderr cause"
+            )
+        ),
+    )
+
+    result = pipeline_core.run_phase4(tmp_path, dry_run=False)
+
+    output = capsys.readouterr().out
+    assert result["status"] == "error"
+    assert result["error"] == "orchestrator timed out"
+    assert "inner stdout cause" in output
+    assert "inner stderr cause" in output
 
 
 def test_submit_content_sends_top_level_agent_plan_payload(monkeypatch):
