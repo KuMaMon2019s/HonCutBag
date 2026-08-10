@@ -17,6 +17,7 @@ from phases.storyboard_generator import (
     _specific_lighting,
     generate_storyboard,
 )
+from phases.video_generator import build_video_prompt
 from tools.asset_packager import build_content_for_shot, inject_reference_instruction
 from utils.visual_style_spec import VisualStyle
 
@@ -163,3 +164,43 @@ def test_specific_lighting_uses_neutral_fallback_without_time_of_day():
 
     assert "与全片美术风格一致的自然光照" in lighting
     assert "黄金时段" not in lighting
+
+
+def test_video_prompt_preserves_scene_lighting_description():
+    lighting = "环境光从开口处自然进入，保留柔和阴影"
+    prompt = build_video_prompt(
+        {"id": 1, "where": "室内", "visual": "场景主体"},
+        {"characters": []},
+        {
+            "global_lighting": "跨镜头光照保持连续",
+            "shots": {"S01": {"lighting_description": lighting}},
+        },
+        "seedance",
+    )
+
+    assert lighting in prompt
+
+
+def test_video_prompt_uses_global_lighting_without_fixed_color_temperature():
+    global_lighting = "跨镜头光照方向与明暗关系保持连续"
+    prompt = build_video_prompt(
+        {"id": 1, "where": "室内", "visual": "场景主体"},
+        {"characters": []},
+        {"global_lighting": global_lighting, "shots": {"S01": {}}},
+        "seedance",
+    )
+
+    assert global_lighting in prompt
+    assert "色温4800K" not in prompt
+
+
+def test_video_prompt_uses_neutral_lighting_for_empty_scene_consistency():
+    prompt = build_video_prompt(
+        {"id": 1, "where": "室内", "visual": "场景主体"},
+        {"characters": []},
+        {},
+        "seedance",
+    )
+
+    assert "与全片美术风格一致的自然光照，明暗关系真实克制" in prompt
+    assert "色温4800K" not in prompt

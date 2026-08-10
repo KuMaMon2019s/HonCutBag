@@ -82,7 +82,7 @@ def build_video_prompt(
     camera = CAMERA_MOVEMENTS.get(camera_key, str(shot_meta.get("camera_movement") or "固定(fixed/locked)"))
     layout = scene.get("spatial_layout", {})
     setting = scene.get("scene_description") or shot_meta.get("where") or "当前场景"
-    lighting = scene.get("lighting_description") or scene.get("lighting_note") or "主光从镜头左上方照射，色温4800K"
+    lighting = scene.get("lighting_description") or scene.get("lighting_note") or scene_consistency.get("global_lighting") or "与全片美术风格一致的自然光照，明暗关系真实克制"
     scene_and_lighting = f"{setting}，{layout.get('subject', '')}，{lighting}".replace("，，", "，")
     subject_summary = build_subject_summary([
         ("景别与主体：", f"{shot_type}，{subject}"),
