@@ -7,6 +7,7 @@ continue to share a single module namespace.
 """
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -23,6 +24,8 @@ from utils.deps import check_dependencies
 check_dependencies()
 
 from phases import pipeline_core as _core
+from utils.pipeline_config import DEFAULT_CONFIG, load_config
+from utils.run_memory import RunMemory
 
 # Phase IDs renumbered to contiguous integers on 2026-08-10.
 PHASES = (
@@ -58,6 +61,58 @@ def _record_report_checkpoints(report: dict, output_dir: str | Path) -> None:
         phase_name = report_key if report_key in PHASES else phase_names.get(str(report_key))
         if phase_name:
             _core._record_stage_checkpoint(Path(output_dir), phase_name, result)
+
+
+def _compact_phase_record(phase_id: str, result: dict) -> str:
+    """Build generic phase metadata without copying large result payloads."""
+    metrics = {
+        key: value
+        for key, value in result.items()
+        if key not in {"status", "outputs", "artifacts"}
+        and isinstance(value, (int, float, bool))
+    }
+    artifact_values = result.get("outputs") or result.get("artifacts") or []
+    if isinstance(artifact_values, str):
+        artifact_values = [artifact_values]
+    artifacts = [Path(value).name for value in artifact_values if isinstance(value, str)]
+    record = {
+        "phase": phase_id,
+        "status": result.get("status", "unknown"),
+        "metrics": metrics,
+        "artifacts": artifacts,
+    }
+    if result.get("error"):
+        record["error"] = str(result["error"])[:160]
+    return json.dumps(record, ensure_ascii=False, sort_keys=True)[:499]
+
+
+def _record_run_memory(
+    report: dict,
+    output_dir: str | Path,
+    config: dict | None = None,
+    *,
+    memory_factory=RunMemory,
+) -> None:
+    """Record every reported phase status in run-scoped memory."""
+    config = load_config() if config is None else config
+    if not config.get("memory_enabled", DEFAULT_CONFIG["memory_enabled"]):
+        return
+    memory = memory_factory(
+        Path(output_dir),
+        messages_per_summary=int(
+            config.get(
+                "memory_messages_per_summary",
+                DEFAULT_CONFIG["memory_messages_per_summary"],
+            )
+        ),
+    )
+    phase_names = {value: key for key, value in PHASE_NUMBERS.items()}
+    for report_key, result in report.get("phases", {}).items():
+        if not isinstance(result, dict):
+            continue
+        phase_name = report_key if report_key in PHASES else phase_names.get(str(report_key))
+        if phase_name:
+            memory.add("phase", _compact_phase_record(phase_name, result))
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -146,6 +201,7 @@ def main() -> None:
         resume_from=args.resume_from,
     )
     _record_report_checkpoints(report, args.output_dir)
+    _record_run_memory(report, args.output_dir)
     selected_result = None
     if args.phase:
         report_key = "phase1" if args.phase == "phase1" else PHASE_NUMBERS[args.phase]

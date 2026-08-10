@@ -70,6 +70,8 @@ class HonCutConfig(BaseModel):
     checkpoint: CheckpointConfig = Field(default_factory=CheckpointConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
     paths: PathsConfig = Field(default_factory=PathsConfig)
+    memory_enabled: bool = True
+    memory_messages_per_summary: int = Field(default=3, ge=1)
 
     @classmethod
     def load(cls, config_path: Optional[Path] = None) -> "HonCutConfig":

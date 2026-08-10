@@ -14,6 +14,8 @@ from typing import Any, Optional
 
 # 默认配置
 DEFAULT_CONFIG = {
+    "memory_enabled": True,
+    "memory_messages_per_summary": 3,
     "quality_gate": {
         "consistency_threshold": 70,
         "min_shot_quality": 60,
