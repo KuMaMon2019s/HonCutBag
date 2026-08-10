@@ -17,6 +17,7 @@ if str(SCRIPTS) not in sys.path:
 from clients import local_video_client, seedance_client
 from phases import pipeline_core
 from tools import asset_packager
+from utils import shot_embedder
 import phase_orchestrator
 
 _runner_spec = importlib.util.spec_from_file_location(
@@ -24,6 +25,56 @@ _runner_spec = importlib.util.spec_from_file_location(
 )
 pipeline_runner_cli = importlib.util.module_from_spec(_runner_spec)
 _runner_spec.loader.exec_module(pipeline_runner_cli)
+
+
+def test_embed_image_sends_tos_url_as_string_input(monkeypatch, tmp_path):
+    image_path = tmp_path / "arbitrary-frame.png"
+    image_bytes = b"\x89PNG\r\n\x1a\nproject-specific-image-data"
+    image_path.write_bytes(image_bytes)
+    signed_url = "https://example-bucket.tos.example/arbitrary/object.png?signature=test"
+    request = {}
+
+    monkeypatch.setenv("ARK_AGENT_API_KEY", "test-api-key")
+
+    def fake_upload(data, content_type):
+        assert data == image_bytes
+        assert content_type == "image/png"
+        return signed_url
+
+    def fake_post(url, **kwargs):
+        request["url"] = url
+        request.update(kwargs)
+        return SimpleNamespace(
+            status_code=200,
+            text="",
+            json=lambda: {"data": [{"embedding": [0.25, 0.75]}]},
+        )
+
+    monkeypatch.setattr(shot_embedder.tos_uploader, "upload_image", fake_upload)
+    monkeypatch.setattr(shot_embedder.requests, "post", fake_post)
+
+    assert shot_embedder.embed_image(str(image_path)) == [0.25, 0.75]
+    assert request["url"] == f"{shot_embedder.ARK_BASE_URL}/embeddings"
+    assert request["json"] == {
+        "model": shot_embedder.EMBEDDING_MODEL,
+        "input": [signed_url],
+    }
+    assert isinstance(request["json"]["input"][0], str)
+
+
+def test_embed_image_does_not_call_api_when_tos_upload_fails(monkeypatch, tmp_path):
+    image_path = tmp_path / "frame.jpg"
+    image_path.write_bytes(b"jpeg-data")
+
+    monkeypatch.setenv("ARK_AGENT_API_KEY", "test-api-key")
+    monkeypatch.setattr(shot_embedder.tos_uploader, "upload_image", lambda *_: None)
+
+    def unexpected_post(*args, **kwargs):
+        raise AssertionError("embedding API must not receive an invalid local image reference")
+
+    monkeypatch.setattr(shot_embedder.requests, "post", unexpected_post)
+
+    assert shot_embedder.embed_image(str(image_path)) is None
 
 
 def test_detect_shot_characters_resolves_display_names(tmp_path):

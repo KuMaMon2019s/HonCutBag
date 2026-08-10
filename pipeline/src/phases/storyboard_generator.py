@@ -36,6 +36,7 @@ from openai import OpenAI
 
 from prompt.eight_layer_summary import build_subject_summary
 from utils.config import ToolPaths
+from utils.pipeline_config import load_config
 from utils.visual_style_spec import VisualStyle, parse_visual_style
 
 
@@ -694,6 +695,9 @@ def generate_storyboard(
     title: str = "未命名项目",
     visual_style_path: Optional[str] = None,
     visual_style_text: Optional[str] = None,
+    config: Optional[Dict[str, Any]] = None,
+    config_path: Optional[str] = None,
+    audio_enabled: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     将 shot 列表转化为 STORYBOARD.json 格式
@@ -702,6 +706,9 @@ def generate_storyboard(
         shots: shot 列表（adaptation_engine.py 输出）
         characters: 角色列表（character_discoverer.py 输出，可选）
         title: 项目标题
+        config: 管线配置；支持 audio_enabled 或 audio.enabled
+        config_path: 可选 YAML/JSON 管线配置路径
+        audio_enabled: 显式音频开关，优先于配置
 
     Returns:
         STORYBOARD.json 格式的字典
@@ -831,13 +838,16 @@ def generate_storyboard(
             "prompt": llm_result["prompt"],
             "caption": llm_result["caption"],
             "caption_frames": caption_frames,
-            # Dialogue is script truth from Phase 2. Caption remains the visual
+            # Speech is script truth from Phase 2. Caption remains the visual
             # scene description and must never be substituted for dialogue.
             "dialogue": shot.get("dialogue"),
             # Retained for deterministic route diagnostics and FLF2V end-state prompts.
             "visual": shot.get("visual", ""),
             "what": shot.get("what", ""),
         }
+        for speech_field in ("narration", "voiceover"):
+            if speech_field in shot:
+                storyboard_shot[speech_field] = shot[speech_field]
 
         # 透传结构化字段（who/shot_size/camera_movement/lighting_key/shot_intent/associate_assets）
         # 这些字段从 adaptation_engine 的 LLM 输出传递到 STORYBOARD.json，供 M2 和 Phase 6 消费
@@ -877,11 +887,31 @@ def generate_storyboard(
         storyboard_shots.append(storyboard_shot)
 
     # 组装完整 STORYBOARD
+    pipeline_config = config if config is not None else load_config(config_path)
+    if not isinstance(pipeline_config, dict):
+        pipeline_config = {}
+    audio_config = pipeline_config.get("audio", {})
+    if not isinstance(audio_config, dict):
+        audio_config = {}
+    configured_enabled = audio_config.get(
+        "enabled", pipeline_config.get("audio_enabled", True)
+    )
+    enabled = audio_enabled if audio_enabled is not None else configured_enabled
+    if not isinstance(enabled, bool):
+        enabled = True
+    tts_enabled = audio_config.get("tts", True)
+    if not isinstance(tts_enabled, bool):
+        tts_enabled = True
+
     storyboard = {
         "title": title,
         "total_shots": len(storyboard_shots),
         "target_duration": total_duration,
         "static_reference_images": {},
+        "audio": {
+            "enabled": bool(enabled),
+            "tts": tts_enabled,
+        },
         "shots": storyboard_shots,
     }
 
@@ -981,6 +1011,18 @@ def main():
         help="visual-style.md 覆盖路径（可选）",
     )
 
+    parser.add_argument(
+        "--config",
+        type=str,
+        help="管线 YAML/JSON 配置路径（可选）",
+    )
+
+    parser.add_argument(
+        "--no-audio",
+        action="store_true",
+        help="禁用 Phase 7 音频处理",
+    )
+
     args = parser.parse_args()
 
     # ── 读取 shots ────────────────────────────────────────────────────────
@@ -1057,6 +1099,8 @@ def main():
             characters=characters,
             title=args.title,
             visual_style_path=args.visual_style,
+            config_path=args.config,
+            audio_enabled=False if args.no_audio else None,
         )
     except (ValueError, RuntimeError) as e:
         print(f"错误：{e}", file=sys.stderr)

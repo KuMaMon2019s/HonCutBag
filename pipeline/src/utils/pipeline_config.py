@@ -6,6 +6,7 @@ pipeline_config.py — 管线配置管理模块
 """
 
 import os
+import json
 import yaml
 from pathlib import Path
 from typing import Any, Optional
@@ -29,24 +30,27 @@ DEFAULT_CONFIG = {
 
 
 def _find_config_file() -> Optional[Path]:
-    """查找 config.yaml 文件"""
+    """查找 config.yaml 或 config.json 文件。"""
     # 优先查找当前目录
     current_dir = Path.cwd()
-    config_path = current_dir / "config.yaml"
-    if config_path.exists():
-        return config_path
+    for filename in ("config.yaml", "config.json"):
+        config_path = current_dir / filename
+        if config_path.exists():
+            return config_path
     
     # 查找 scripts 目录
     scripts_dir = Path(__file__).parent
-    config_path = scripts_dir / "config.yaml"
-    if config_path.exists():
-        return config_path
+    for filename in ("config.yaml", "config.json"):
+        config_path = scripts_dir / filename
+        if config_path.exists():
+            return config_path
     
     # 查找项目根目录
     project_root = scripts_dir.parent
-    config_path = project_root / "config.yaml"
-    if config_path.exists():
-        return config_path
+    for filename in ("config.yaml", "config.json"):
+        config_path = project_root / filename
+        if config_path.exists():
+            return config_path
     
     return None
 
@@ -65,13 +69,13 @@ def load_config(config_path: Optional[str] = None) -> dict:
         path = Path(config_path)
         if path.exists():
             with open(path, "r", encoding="utf-8") as f:
-                return yaml.safe_load(f) or {}
+                return json.load(f) if path.suffix.lower() == ".json" else (yaml.safe_load(f) or {})
     
     # 自动查找配置文件
     path = _find_config_file()
     if path and path.exists():
         with open(path, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
+            return json.load(f) if path.suffix.lower() == ".json" else (yaml.safe_load(f) or {})
     
     return {}
 
