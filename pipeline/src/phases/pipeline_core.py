@@ -166,6 +166,37 @@ def _get_profile_dict(profile_name: str = "1080p") -> dict:
             "codec": "libx264", "audio_codec": "aac", "crf": 23, "pixel_format": "yuv420p"}
 
 
+def _probe_av_durations(path: Path) -> dict[str, float | None]:
+    """Return independent video/audio stream durations; probing failures block delivery."""
+    completed = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,duration",
+         "-of", "json", str(path)],
+        capture_output=True, text=True, timeout=30, check=True,
+    )
+    streams = json.loads(completed.stdout).get("streams", [])
+    durations: dict[str, float | None] = {"video": None, "audio": None}
+    for stream in streams:
+        kind = stream.get("codec_type")
+        if kind in durations and durations[kind] is None and stream.get("duration") not in (None, "N/A"):
+            durations[kind] = float(stream["duration"])
+    if durations["video"] is None:
+        raise RuntimeError(f"No measurable video stream duration: {path}")
+    return durations
+
+
+def _assert_duration_conserved(before: dict[str, float | None], after: dict[str, float | None], tolerance_s: float = 1.0) -> None:
+    """Assert final encoding conserved video and audio durations independently."""
+    for kind in ("video", "audio"):
+        expected, actual = before.get(kind), after.get(kind)
+        if expected is None:
+            continue
+        if actual is None or abs(actual - expected) > tolerance_s:
+            raise RuntimeError(
+                f"Final {kind} duration changed from {expected:.3f}s to "
+                f"{actual if actual is not None else 'missing'} (tolerance ±{tolerance_s:.1f}s)"
+            )
+
+
 # ---------------------------------------------------------------------------
 # 工具函数
 # ---------------------------------------------------------------------------
@@ -4350,12 +4381,17 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
         print(f"  → final_encode: 使用 {media_profile} 配置重新编码...")
         final_encoded = str(output_dir / "polished_final.mp4")
         profile = _get_profile_dict(media_profile)
-        
+        encode_input_durations = _probe_av_durations(Path(final_out))
+
         cmd = [
             "ffmpeg", "-y",
             "-i", final_out,
-            "-vf", f"scale={profile['width']}:{profile['height']}",
-            "-r", str(profile["fps"]),
+            "-vf", (
+                "setpts=PTS-STARTPTS,"
+                f"scale={profile['width']}:{profile['height']},"
+                f"fps={profile['fps']}"
+            ),
+            "-af", "asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0",
             "-c:v", profile["codec"],
             "-crf", str(profile["crf"]),
             "-preset", "medium",
@@ -4364,22 +4400,50 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             "-pix_fmt", profile["pixel_format"],
             final_encoded,
         ]
-        
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-            if result.returncode == 0:
-                # Replace polished.mp4 with final encoded version
-                import shutil
-                shutil.move(final_encoded, final_out)
-                outputs.append(f"polished.mp4 (encoded with {media_profile})")
-                print(f"    ✓ 最终编码完成: {profile['width']}x{profile['height']} @ {profile['fps']}fps")
-                step_status["final_encode"] = "done"
-            else:
-                print(f"    ⚠ 最终编码失败，使用原始 polished.mp4")
-                step_status["final_encode"] = "failed"
-        except Exception as e:
-            print(f"    ⚠ 最终编码异常: {e}，使用原始 polished.mp4")
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
             step_status["final_encode"] = "failed"
+            raise RuntimeError(f"Final encoding failed: {result.stderr[-1000:]}")
+
+        encoded_durations = _probe_av_durations(Path(final_encoded))
+        _assert_duration_conserved(encode_input_durations, encoded_durations, tolerance_s=1.0)
+
+        # Only promote the encoded artifact after its independent A/V duration
+        # assertions pass.  The delivery gate deliberately probes polished.mp4.
+        import shutil
+        shutil.move(final_encoded, final_out)
+        polished_durations = _probe_av_durations(Path(final_out))
+        duration_deltas = {
+            kind: (None if encode_input_durations[kind] is None or polished_durations[kind] is None
+                   else round(abs(polished_durations[kind] - encode_input_durations[kind]), 6))
+            for kind in ("video", "audio")
+        }
+        duration_gate_passed = all(
+            encode_input_durations[kind] is None
+            or (polished_durations[kind] is not None and duration_deltas[kind] <= 1.0)
+            for kind in ("video", "audio")
+        )
+        final_duration_gate = {
+            "passed": duration_gate_passed,
+            "artifact": "polished.mp4",
+            "expected": encode_input_durations,
+            "actual": polished_durations,
+            "absolute_delta_s": duration_deltas,
+            "tolerance_s": 1.0,
+            "basis": "Phase 8 pre-delivery encode input (includes intentional intro/outro/rhythm adjustments)",
+        }
+        (output_dir / "final_duration_gate.json").write_text(
+            json.dumps(final_duration_gate, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        _assert_duration_conserved(encode_input_durations, polished_durations, tolerance_s=1.0)
+        outputs.extend([
+            f"polished.mp4 (encoded with {media_profile})",
+            "final_duration_gate.json",
+        ])
+        print(f"    ✓ 最终编码完成: {profile['width']}x{profile['height']} @ {profile['fps']}fps")
+        step_status["final_encode"] = "done"
+        step_status["final_duration_gate"] = "done"
 
         # Step 8.5: hard video QA must also run when run_phase8() is invoked
         # directly (outside the full pipeline graph/runner).
@@ -4390,7 +4454,9 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
                 storyboard_data = json.loads(storyboard_path.read_text(encoding="utf-8"))
             qa_report = run_video_qa(output_dir, storyboard_data=storyboard_data)
             video_qa_result = {
-                "status": "done" if qa_report.verdict == "pass" else "warning",
+                "status": "error" if qa_report.verdict == "fail" else (
+                    "done" if qa_report.verdict == "pass" else "warning"
+                ),
                 "verdict": qa_report.verdict,
                 "grade": qa_report.grade,
                 "issues_count": len(qa_report.issues),
@@ -4402,6 +4468,14 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
         except Exception as e:
             video_qa_result = {"status": "error", "error": str(e)}
             print(f"  ⚠ Phase 8.5 Video QA failed: {e}")
+
+        if video_qa_result.get("verdict") == "fail":
+            return {
+                "status": "error",
+                "error": f"Phase 8.5 QA blocking failure: {video_qa_result['grade']} grade",
+                "video_qa": video_qa_result,
+                "duration_s": _elapsed(start),
+            }
 
         # Final character-animation QA runs against the delivered video and
         # persists its complete structured result for later inspection.

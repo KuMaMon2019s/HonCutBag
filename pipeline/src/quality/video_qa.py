@@ -606,12 +606,13 @@ def _crossref_storyboard(
         "duration_diff": round(abs(actual_duration - storyboard_total), 2),
     }
 
-    # Check duration mismatch (> 20% difference is a warning)
+    # A gross duration mismatch is blocking: it indicates dropped segments or
+    # timestamp inflation, not merely a cosmetic QA concern.
     if storyboard_total > 0:
         diff_ratio = abs(actual_duration - storyboard_total) / storyboard_total
-        if diff_ratio > 0.3:
+        if diff_ratio > 0.2:
             report.issues.append(QAIssue(
-                severity="warning",
+                severity="critical",
                 check="storyboard_duration",
                 message=f"Video duration ({actual_duration:.1f}s) differs from storyboard total ({storyboard_total:.1f}s) by {diff_ratio*100:.0f}%",
                 suggestion="Phase 7 assembly may have dropped or added segments",
@@ -723,7 +724,10 @@ def _compute_verdict(report: VideoQAReport) -> None:
     warning_count = sum(1 for i in report.issues if i.severity == "warning")
 
     # Verdict
-    if critical_count >= 2:
+    if any(i.check == "storyboard_duration" and i.severity == "critical"
+           for i in report.issues):
+        report.verdict = "fail"
+    elif critical_count >= 2:
         report.verdict = "fail"
     elif critical_count >= 1:
         report.verdict = "revise"

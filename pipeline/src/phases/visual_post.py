@@ -89,10 +89,11 @@ def _probe_video(path: str) -> dict:
                     "height": int(s.get("height", 0)),
                     "duration": float(data.get("format", {}).get("duration", 0)),
                     "codec": s.get("codec_name", "unknown"),
+                    "fps": s.get("avg_frame_rate") or s.get("r_frame_rate") or "24",
                 }
     except Exception:
         pass
-    return {"width": 0, "height": 0, "duration": 0, "codec": "unknown"}
+    return {"width": 0, "height": 0, "duration": 0, "codec": "unknown", "fps": "24"}
 
 
 def _run_cmd(cmd: list[str], desc: str = "") -> bool:
@@ -469,17 +470,48 @@ def add_outro(
             shutil.copy2(video_path, output_path)
             return output_path
 
-        # 拼接：原视频 + outro
-        concat_file = os.path.join(tmpdir, "concat.txt")
-        with open(concat_file, "w") as f:
-            f.write(f"file '{video_path}'\n")
-            f.write(f"file '{outro_path}'\n")
-
+        # Normalize both inputs before concatenation.  The concat demuxer with
+        # stream-copy preserves incompatible/non-zero timestamps and can make
+        # the delivery encode duplicate frames.  A generated silent track also
+        # guarantees that the outro participates in an A/V concat.
+        source_duration = max(float(info.get("duration") or 0), 0.001)
+        source_fps = str(info.get("fps") or "24")
+        probe_audio = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=index", "-of", "csv=p=0", video_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        has_source_audio = probe_audio.returncode == 0 and bool(probe_audio.stdout.strip())
+        source_audio_index = 0 if has_source_audio else 3
+        audio_inputs = [
+            "-f", "lavfi", "-t", str(duration),
+            "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+        ]
+        if not has_source_audio:
+            audio_inputs += [
+                "-f", "lavfi", "-t", str(source_duration),
+                "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+            ]
+        filter_graph = (
+            f"[0:v]scale={w}:{h},fps={source_fps},format=yuv420p,settb=AVTB,"
+            "setpts=PTS-STARTPTS[v0];"
+            f"[1:v]scale={w}:{h},fps={source_fps},format=yuv420p,settb=AVTB,"
+            "setpts=PTS-STARTPTS[v1];"
+            f"[{source_audio_index}:a]aformat=sample_rates=48000:channel_layouts=stereo,"
+            "aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS[a0];"
+            "[2:a]aformat=sample_rates=48000:channel_layouts=stereo,"
+            "asetpts=PTS-STARTPTS[a1];"
+            "[v0][a0][v1][a1]concat=n=2:v=1:a=1[outv][outa]"
+        )
         cmd_concat = [
             "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0",
-            "-i", concat_file,
-            "-c", "copy",
+            "-i", video_path,
+            "-i", outro_path,
+            *audio_inputs,
+            "-filter_complex", filter_graph,
+            "-map", "[outv]", "-map", "[outa]",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+            "-c:a", "aac", "-b:a", "192k", "-pix_fmt", "yuv420p",
             output_path,
         ]
         if _run_cmd(cmd_concat, "拼接片尾"):
