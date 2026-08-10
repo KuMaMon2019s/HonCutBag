@@ -43,6 +43,21 @@ from quality.composition_validator import validate_composition
 from tools.vendor_adapter import VendorAdapter, VendorModel
 from utils.style_slices import get_slice
 
+
+def _run_storyboard_supervision(storyboard: dict, output_dir: Path) -> dict:
+    """Run the optional independent review at the Phase 5/6 boundary."""
+    from quality.supervision_agent import run_supervision
+    from utils.pipeline_config import load_config
+
+    config = load_config()
+    style_path = output_dir / "visual-style.md"
+    visual_style = (
+        style_path.read_text(encoding="utf-8")
+        if style_path.is_file()
+        else str(storyboard.get("style", ""))
+    )
+    return run_supervision(storyboard, visual_style, output_dir, config)
+
 # Keep progress visible when invoked through ``conda run | tee``.
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
@@ -4942,6 +4957,7 @@ if LANGGRAPH_AVAILABLE:
     def node_phase5_quality(state: HonCutState) -> dict:
         """Phase 5 node: storyboard QA gate before paid generation."""
         from phases.storyboard_qa_gate import run_storyboard_qa_gate
+        from quality.supervision_agent import SupervisionBlockedError
 
         result = run_storyboard_qa_gate(Path(state["output_dir"]))
         update = {
@@ -4951,6 +4967,17 @@ if LANGGRAPH_AVAILABLE:
         }
         if result.get("status") == "error":
             update.update(status="failed", error=result.get("error", "Phase 5 blocked Phase 6"))
+            return Command(goto=END, update=update)
+        try:
+            supervision = _run_storyboard_supervision(
+                state.get("storyboard", {}), Path(state["output_dir"])
+            )
+            update["phase_results"]["phase5"] = {
+                **result,
+                "supervision": supervision,
+            }
+        except SupervisionBlockedError as exc:
+            update.update(status="failed", error=str(exc))
             return Command(goto=END, update=update)
         return update
 
@@ -5629,6 +5656,17 @@ def run_pipeline(
             reporter.mark_failed(p4_5.get("error", "Phase 5 blocked Phase 6"))
             report["status"] = "failed"
             report["error"] = p4_5.get("error", "Phase 5 blocked Phase 6")
+            report["total_duration_s"] = _elapsed(total_start)
+            _write_report(report, output_dir)
+            return report
+        from quality.supervision_agent import SupervisionBlockedError
+        try:
+            supervision = _run_storyboard_supervision(storyboard_data, output_path)
+            report["phases"]["5"]["supervision"] = supervision
+        except SupervisionBlockedError as exc:
+            reporter.mark_failed(str(exc))
+            report["status"] = "failed"
+            report["error"] = str(exc)
             report["total_duration_s"] = _elapsed(total_start)
             _write_report(report, output_dir)
             return report
