@@ -2439,6 +2439,27 @@ def _run_phase5_om_seedance(storyboard_data: dict, output_dir: Path, characters_
     }
 
 
+def _apply_chain_relay(content_list, first_frame_b64, shot_id):
+    """Replace the first frame with a relay frame unless content is reference-only."""
+    if any(item.get("role") == "reference_image" for item in (content_list or [])):
+        print(
+            f"    [chain] {shot_id}: reference-only shot, skipping tail-frame relay",
+            flush=True,
+        )
+        return content_list
+    content_list = [
+        item for item in (content_list or [])
+        if item.get("role") != "first_frame"
+    ]
+    content_list.insert(1 if content_list else 0, {
+        "type": "image_url",
+        "image_url": {"url": f"data:image/jpeg;base64,{first_frame_b64}"},
+        "role": "first_frame",
+        "priority": "high",
+    })
+    return content_list
+
+
 def _run_phase5_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
     """Generate Phase 5 video through direct ARK or the explicit local Bridge."""
     output_dir = Path(output_dir)
@@ -2824,16 +2845,9 @@ def _run_phase5_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                                 shot_meta=content_meta,
                             )
                             if active_source and first_frame_b64:
-                                content_list = [
-                                    item for item in (content_list or [])
-                                    if item.get("role") != "first_frame"
-                                ]
-                                content_list.insert(1 if content_list else 0, {
-                                    "type": "image_url",
-                                    "image_url": {"url": f"data:image/jpeg;base64,{first_frame_b64}"},
-                                    "role": "first_frame",
-                                    "priority": "high",
-                                })
+                                content_list = _apply_chain_relay(
+                                    content_list, first_frame_b64, shot_id
+                                )
 
                             # [LEGACY-KEEP v2.0] zip/base64 fallback for old Bridges.
                             if not content_list or len(content_list) <= 1:
@@ -2899,16 +2913,9 @@ def _run_phase5_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                     shot_meta=content_meta,
                 )
                 if active_source and first_frame_b64:
-                    content_list = [
-                        item for item in (content_list or [])
-                        if item.get("role") != "first_frame"
-                    ]
-                    content_list.insert(1 if content_list else 0, {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{first_frame_b64}"},
-                        "role": "first_frame",
-                        "priority": "high",
-                    })
+                    content_list = _apply_chain_relay(
+                        content_list, first_frame_b64, shot_id
+                    )
 
                 api_key = get_api_key("ARK_AGENT")
                 if not api_key:

@@ -210,13 +210,24 @@ def run_phase(phase: str, config: dict) -> dict:
     if config.get("enable_reshoot"):
         cmd.append("--enable-reshoot")
 
+    log_dir = Path(config["output_dir"]) / "phase_logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{phase}_run.log"
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=RUNNER.parent)
+    log_path.write_text(
+        f"=== {phase} phase run log ===\n"
+        f"{result.stdout}"
+        "\n=== STDERR ===\n"
+        f"{result.stderr}",
+        encoding="utf-8",
+    )
     _merge_phase_report(report_path, existing_report, phase)
     return {
         "phase": phase,
         "exit_code": result.returncode,
         "stdout": result.stdout[-2000:],
         "stderr": result.stderr[-1000:],
+        "log_path": str(log_path),
         "timestamp": datetime.now().isoformat(),
     }
 

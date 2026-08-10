@@ -406,6 +406,20 @@ def build_content_for_shot(
             )
     elif strategy == "phantom":
         image_assets.extend(collect_character_reference_assets(output_dir, shot_meta))
+        frame_asset_count = sum(
+            asset["role"] in {"first_frame", "last_frame"}
+            for asset in image_assets
+        )
+        if frame_asset_count:
+            image_assets = [
+                asset
+                for asset in image_assets
+                if asset["role"] not in {"first_frame", "last_frame"}
+            ]
+            print(
+                "  [assets] phantom: discarded frame-role image(s), "
+                "reference-only mode"
+            )
         if not any(asset["role"] == "reference_image" for asset in image_assets):
             raise FileNotFoundError(
                 "Phantom character references missing for shot "
