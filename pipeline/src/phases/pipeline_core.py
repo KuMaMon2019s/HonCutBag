@@ -232,7 +232,7 @@ def _ensure_dir(p: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 # Phase 顺序定义（用于 resume 时判断哪些已完成）
-PHASE_ORDER = ["phase1", "phase2", "phase2_5", "phase3", "phase4", "phase5", "phase6", "phase7", "phase8", "phase8_5"]
+PHASE_ORDER = ["phase1", "phase2", "phase2_5", "phase3", "phase4", "phase4_5", "phase5", "phase6", "phase7", "phase8", "phase8_5"]
 
 
 def _checkpoint_path(output_dir: Path) -> Path:
@@ -4632,6 +4632,7 @@ if LANGGRAPH_AVAILABLE:
         
         graph.add_node("phase3", node_phase3)
         graph.add_node("phase4", node_phase4)
+        graph.add_node("phase4_5", node_phase4_5)
         
         # Conditional routing for Phase 4 → Phase 5 (different generators)
         graph.add_node("phase5_txt2vid", node_phase5_txt2vid)
@@ -4655,9 +4656,11 @@ if LANGGRAPH_AVAILABLE:
         
         graph.add_edge("phase3", "phase4")
         
-        # Conditional routing: Phase 4 routes to different Phase 5 variants
+        graph.add_edge("phase4", "phase4_5")
+
+        # Conditional routing: the passed Phase 4.5 gate selects a Phase 5 variant
         graph.add_conditional_edges(
-            "phase4",
+            "phase4_5",
             route_phase5,
             {
                 "txt2vid": "phase5_txt2vid",
@@ -4829,6 +4832,21 @@ if LANGGRAPH_AVAILABLE:
             return "img2vid"
         else:
             return "txt2vid"
+
+    def node_phase4_5(state: HonCutState) -> dict:
+        """Phase 4.5 node: storyboard QA gate before paid generation."""
+        from phases.storyboard_qa_gate import run_storyboard_qa_gate
+
+        result = run_storyboard_qa_gate(Path(state["output_dir"]))
+        update = {
+            "phase_results": {**state.get("phase_results", {}), "phase4_5": result},
+            "completed_phases": state.get("completed_phases", []) + (["phase4_5"] if result.get("status") != "error" else []),
+            "skip_phase": state.get("skip_phase", []),
+        }
+        if result.get("status") == "error":
+            update.update(status="failed", error=result.get("error", "Phase 4.5 blocked Phase 5"))
+            return Command(goto=END, update=update)
+        return update
 
     def node_phase5_txt2vid(state: HonCutState) -> dict:
         """Phase 5 variant: text-to-video generation"""
@@ -5486,6 +5504,29 @@ def run_pipeline(
         else:
             reporter.phase_done("phase4", "编排器完成", duration_s=p4.get("duration_s"))
             _record_stage_checkpoint(output_path, "phase4", p4)
+
+    # ---- Phase 4.5: 分镜质检闸门 ----
+    # This is deliberately immediately before Phase 5: a resumed or partially
+    # selected run must not bypass the last zero/video-cost checkpoint.
+    if 4.5 in skip_phase:
+        report["phases"]["4.5"] = {"status": "skipped", "reason": "user-specified"}
+    elif storyboard_data is None:
+        report["phases"]["4.5"] = {"status": "skipped", "reason": "no storyboard data"}
+    else:
+        from phases.storyboard_qa_gate import run_storyboard_qa_gate
+
+        reporter.phase_start("phase4_5", "分镜质检闸门")
+        p4_5 = run_storyboard_qa_gate(output_path)
+        report["phases"]["4.5"] = p4_5
+        reporter.phase_done("phase4_5", f"分镜质检 {p4_5.get('grade', '?')} 级", duration_s=p4_5.get("duration_s"))
+        if p4_5["status"] == "error":
+            reporter.mark_failed(p4_5.get("error", "Phase 4.5 blocked Phase 5"))
+            report["status"] = "failed"
+            report["error"] = p4_5.get("error", "Phase 4.5 blocked Phase 5")
+            report["total_duration_s"] = _elapsed(total_start)
+            _write_report(report, output_dir)
+            return report
+        _record_stage_checkpoint(output_path, "phase4_5", p4_5)
 
     # ---- Phase 5: 视频生成 ----
     if 5 in skip_phase:

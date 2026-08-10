@@ -17,14 +17,15 @@ ARTIFACT_CHAIN = {
     "phase2_5": {"produces": "storyboard_images/",                    "requires": ["storyboard.json"]},
     "phase3":   {"produces": "characters/",                           "requires": ["characters.json"]},
     "phase4":   {"produces": "shots/",                                "requires": ["storyboard.json"]},
-    "phase5":   {"produces": "shots/*/output.mp4",                    "requires": ["shots/"]},
+    "phase4_5": {"produces": "storyboard_qa_report.json",            "requires": ["STORYBOARD.json", "shots/"]},
+    "phase5":   {"produces": "shots/*/output.mp4",                   "requires": ["shots/", "storyboard_qa_report.json"]},
     "phase6":   {"produces": "quality_report.json",                   "requires": ["shots/"]},
     "phase7":   {"produces": "edit_decisions.json + raw_assembly.mp4", "requires": ["shots/"]},
     "phase8":   {"produces": "polished.mp4 + render_report.json",     "requires": ["raw_assembly.mp4"]},
 }
 
 # Phase 执行顺序
-PHASE_SEQUENCE = ["phase1", "phase2", "phase2_5", "phase3", "phase4", "phase5", "phase6", "phase7", "phase8"]
+PHASE_SEQUENCE = ["phase1", "phase2", "phase2_5", "phase3", "phase4", "phase4_5", "phase5", "phase6", "phase7", "phase8"]
 
 
 def save_checkpoint(phase: str, output_dir: Path, artifacts: dict = None) -> Path:

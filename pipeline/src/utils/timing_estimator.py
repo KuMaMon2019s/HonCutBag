@@ -6,6 +6,7 @@ HISTORICAL_DATA = {
     "phase2_5": {"avg": 63, "min": 58, "max": 68, "runs": 3},
     "phase3": {"avg": 460, "min": 180, "max": 706, "runs": 3},  # varies by char count
     "phase4": {"avg": 1, "min": 1, "max": 1, "runs": 3},
+    "phase4_5": {"avg": 10, "min": 1, "max": 30, "runs": 0},
     "phase5": {"avg": 1400, "min": 1349, "max": 1482, "runs": 2},  # varies by shot count
     "phase6": {"avg": 0.5, "min": 0, "max": 1, "runs": 3},
     "phase7": {"avg": 14, "min": 13, "max": 14, "runs": 3},
@@ -30,7 +31,7 @@ def estimate_phase_duration(phase: str, num_characters: int = 3, num_shots: int 
 
 def estimate_total(num_characters: int = 3, num_shots: int = 10) -> dict:
     """Estimate total pipeline duration with per-phase breakdown."""
-    phases = ["phase2", "phase2_5", "phase3", "phase4", "phase5", "phase6", "phase7", "phase8"]
+    phases = ["phase2", "phase2_5", "phase3", "phase4", "phase4_5", "phase5", "phase6", "phase7", "phase8"]
     estimates = {}
     total = 0
     for p in phases:
@@ -43,7 +44,7 @@ def estimate_total(num_characters: int = 3, num_shots: int = 10) -> dict:
 def estimate_remaining(current_phase: str, elapsed_in_phase: float,
                        num_characters: int = 3, num_shots: int = 10) -> dict:
     """Estimate remaining time from current position."""
-    phases = ["phase2", "phase2_5", "phase3", "phase4", "phase5", "phase6", "phase7", "phase8"]
+    phases = ["phase2", "phase2_5", "phase3", "phase4", "phase4_5", "phase5", "phase6", "phase7", "phase8"]
     try:
         idx = phases.index(current_phase)
     except ValueError:
