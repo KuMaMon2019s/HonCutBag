@@ -45,7 +45,11 @@ USER_PROMPT_TEMPLATE = (
     "- emotion: 字符串，情绪氛围\n"
     "- visual: 字符串，描述画面（用于生成视频镜头）\n"
     "- time: 字符串，时间/季节\n"
-    "- action_type: 字符串，事件类型（discovery/conflict/resolution/transition 等）"
+    "- action_type: 字符串，事件类型（discovery/conflict/resolution/transition 等）\n"
+    "- lines: 数组，本事件中角色说出的台词原文，每条为 "
+    "{{\"speaker\": \"角色名\", \"line\": \"逐字台词\"}}；无台词时为空数组 []\n"
+    "line 必须逐字保留剧本原文，禁止改写、摘要或翻译。\n"
+    "剧本对白可能写作 角色名：\"台词\" 或 角色名:\"台词\"，全角/半角冒号与引号均可能出现。"
 )
 
 LLM_TIMEOUT = 180  # 秒（2026-08-09: turbo 推理模型比 lite 慢，60s 实测 8/19 段超时）
@@ -153,6 +157,7 @@ def _parse_events(response: str) -> List[Dict[str, Any]]:
         missing = required_fields - set(event.keys())
         if missing:
             raise ValueError(f"第 {i+1} 个事件缺少字段: {missing}")
+        event.setdefault("lines", [])
 
     return parsed
 
