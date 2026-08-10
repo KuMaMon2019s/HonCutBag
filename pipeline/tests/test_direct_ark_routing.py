@@ -46,6 +46,198 @@ def test_detect_shot_characters_passthrough_valid_ids(tmp_path):
     assert asset_packager._detect_shot_characters(tmp_path, shot_meta) == ["lin"]
 
 
+def test_detect_shot_characters_resolves_explicit_display_names(tmp_path):
+    (tmp_path / "CHARACTERS.json").write_text(
+        json.dumps({
+            "characters": [
+                {"id": "lin", "name": "凛"},
+                {"id": "jin", "name": "烬"},
+            ]
+        }),
+        encoding="utf-8",
+    )
+    shot_meta = {"_char_ids": ["凛", "烬"]}
+
+    assert sorted(asset_packager._detect_shot_characters(tmp_path, shot_meta)) == [
+        "jin",
+        "lin",
+    ]
+
+
+def test_detect_shot_characters_passes_through_explicit_valid_id(tmp_path):
+    (tmp_path / "CHARACTERS.json").write_text(
+        json.dumps({"characters": [{"id": "lin", "name": "凛"}]}),
+        encoding="utf-8",
+    )
+    shot_meta = {"_char_ids": ["lin"]}
+
+    assert asset_packager._detect_shot_characters(tmp_path, shot_meta) == ["lin"]
+
+
+def test_detect_shot_characters_passes_through_unknown_explicit_name(tmp_path):
+    (tmp_path / "CHARACTERS.json").write_text(
+        json.dumps({"characters": [{"id": "lin", "name": "凛"}]}),
+        encoding="utf-8",
+    )
+    shot_meta = {"_char_ids": ["幽灵"]}
+
+    assert asset_packager._detect_shot_characters(tmp_path, shot_meta) == ["幽灵"]
+
+
+def test_collect_character_references_resolves_explicit_display_names(tmp_path):
+    (tmp_path / "CHARACTERS.json").write_text(
+        json.dumps({
+            "characters": [
+                {"id": "lin", "name": "凛"},
+                {"id": "jin", "name": "烬"},
+            ]
+        }),
+        encoding="utf-8",
+    )
+    for char_id in ("lin", "jin"):
+        char_dir = tmp_path / "characters" / char_id
+        char_dir.mkdir(parents=True)
+        (char_dir / "face_closeup.png").write_bytes(b"f" * 1025)
+        (char_dir / "full_body.png").write_bytes(b"b" * 1025)
+
+    references = asset_packager.collect_character_reference_assets(
+        tmp_path, {"_char_ids": ["凛", "烬"]}
+    )
+
+    assert len(references) >= 2
+    assert {reference["char_id"] for reference in references} == {"lin", "jin"}
+
+
+def _stub_tos_upload(monkeypatch):
+    monkeypatch.setattr(
+        "clients.tos_uploader.upload_image",
+        lambda image_data, content_type: f"https://tos.test/{len(image_data)}.png",
+    )
+
+
+def test_phantom_content_uses_reference_images_only(tmp_path, monkeypatch):
+    _stub_tos_upload(monkeypatch)
+    storyboard_dir = tmp_path / "storyboard_images"
+    storyboard_dir.mkdir()
+    (storyboard_dir / "S01.png").write_bytes(b"s" * 1025)
+    char_dir = tmp_path / "characters" / "lin"
+    char_dir.mkdir(parents=True)
+    (char_dir / "face_closeup.png").write_bytes(b"f" * 1025)
+    (char_dir / "full_body.png").write_bytes(b"b" * 1025)
+
+    content = asset_packager.build_content_for_shot(
+        tmp_path,
+        "S01",
+        {"prompt": "phantom shot", "gen_strategy": "phantom", "_char_ids": ["lin"]},
+    )
+
+    roles = [item.get("role", item["type"]) for item in content]
+    assert "first_frame" not in roles
+    assert "last_frame" not in roles
+    assert roles.count("reference_image") >= 2
+    assert roles[0] == "text"
+
+
+def test_flf2v_content_keeps_first_and_last_frames(tmp_path, monkeypatch):
+    _stub_tos_upload(monkeypatch)
+    storyboard_dir = tmp_path / "storyboard_images"
+    storyboard_dir.mkdir()
+    (storyboard_dir / "S01.png").write_bytes(b"s" * 1025)
+    (storyboard_dir / "S01_end.png").write_bytes(b"e" * 1025)
+
+    content = asset_packager.build_content_for_shot(
+        tmp_path,
+        "S01",
+        {"prompt": "frame shot", "gen_strategy": "flf2v"},
+    )
+
+    assert [item.get("role", item["type"]) for item in content] == [
+        "text",
+        "first_frame",
+        "last_frame",
+    ]
+
+
+def test_flf2v_injects_text_identity_lock_and_rejects_drifted_relay(tmp_path, monkeypatch):
+    _stub_tos_upload(monkeypatch)
+    storyboard_dir = tmp_path / "storyboard_images"
+    storyboard_dir.mkdir()
+    (storyboard_dir / "S03.png").write_bytes(b"s" * 1025)
+    (storyboard_dir / "S03_end.png").write_bytes(b"e" * 1025)
+    (tmp_path / "CHARACTERS.json").write_text(
+        json.dumps({"characters": [{
+            "id": "rin",
+            "name": "凛",
+            "appearance": {
+                "hair": "银灰色短发",
+                "face": "小巧鹅蛋脸",
+                "clothing": "黑色短外套",
+                "build": "纤细少女体型",
+            },
+        }]}),
+        encoding="utf-8",
+    )
+
+    content = asset_packager.build_content_for_shot(
+        tmp_path,
+        "S03",
+        {"prompt": "凛转身看向镜头。", "gen_strategy": "flf2v", "_char_ids": ["rin"]},
+    )
+
+    prompt = next(item["text"] for item in content if item["type"] == "text")
+    roles = [item.get("role") for item in content if item["type"] == "image_url"]
+    assert "[identity-lock: text-only; no reference media]" in prompt
+    assert "hair: 银灰色短发" in prompt
+    assert "face: 小巧鹅蛋脸" in prompt
+    assert "clothing: 黑色短外套" in prompt
+    assert "body build: 纤细少女体型" in prompt
+    assert roles == ["first_frame", "last_frame"]
+    assert "reference_image" not in roles
+
+    relayed = pipeline_core._apply_chain_relay(content, "drifted-tail", "S03")
+    assert relayed is content
+    assert relayed[1]["role"] == "first_frame"
+
+
+def test_chain_relay_skips_reference_only_content():
+    content = [
+        {"type": "text", "text": "phantom shot"},
+        {
+            "type": "image_url",
+            "image_url": {"url": "https://tos.test/reference.png"},
+            "role": "reference_image",
+        },
+    ]
+
+    relayed = pipeline_core._apply_chain_relay(content, "relay-data", "S01")
+
+    assert relayed is content
+    assert not any(item.get("role") == "first_frame" for item in relayed)
+
+
+def test_phase_orchestrator_writes_full_streamed_log(monkeypatch, tmp_path):
+    full_output = "x" * 2500 + "\n"
+    monkeypatch.setattr(
+        phase_orchestrator.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0, stdout=full_output, stderr=""
+        ),
+    )
+    result = phase_orchestrator.run_phase("phase5", {
+        "input": str(tmp_path / "story.txt"),
+        "duration": 45,
+        "shot_duration": 12,
+        "output_dir": str(tmp_path),
+    })
+
+    log_path = Path(result["log_path"])
+    assert log_path.exists()
+    assert full_output in log_path.read_text(encoding="utf-8")
+    assert log_path.stat().st_size > 2000
+    assert result["stdout"] == full_output[-2000:]
+
+
 def test_phase_orchestrator_failure_prints_stdout_and_stderr_tails(
     monkeypatch, tmp_path, capsys
 ):

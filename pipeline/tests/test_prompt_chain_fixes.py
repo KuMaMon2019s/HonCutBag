@@ -14,9 +14,11 @@ from phases.storyboard_generator import (
     _build_shot_prompt,
     _load_default_visual_style,
     _render_system_prompt,
+    _specific_lighting,
     generate_storyboard,
 )
 from tools.asset_packager import build_content_for_shot, inject_reference_instruction
+from utils.visual_style_spec import VisualStyle
 
 
 V10_SCRIPT = Path("/Users/soda/knowledge-base/2026-08-09_01/input/source_text.with_style_header.bak.txt")
@@ -133,3 +135,31 @@ def test_f5_placeholder_rendering_ignores_first_frame_numbering():
     assert "参考图片1中的凛" in rendered
     assert "参考图片3中的烬" in rendered
     assert "{图片N}" not in rendered
+
+
+def test_specific_lighting_inherits_film_wide_rainy_night_style():
+    style = VisualStyle(
+        name="rainy-night",
+        style_prompt_full="暗黑冷峻硬核赛博朋克，暴雨夜高空废弃磁悬浮轨道，湿冷压抑",
+    )
+
+    lighting = _specific_lighting({}, "废弃高空磁悬浮轨道", style)
+
+    assert "冷蓝雨夜光" in lighting
+    assert "黄金时段" not in lighting
+
+
+def test_specific_lighting_preserves_valid_shot_lighting():
+    original = "冷色主光从镜头右上方侧光照入，色温5600K，雨雾氛围压抑"
+    style = VisualStyle(name="unrelated", style_prompt_full="golden hour")
+
+    assert _specific_lighting({"lighting_description": original}, "轨道", style) == original
+
+
+def test_specific_lighting_uses_neutral_fallback_without_time_of_day():
+    style = VisualStyle(name="neutral", style_prompt_full="粗粝金属质感，低饱和度")
+
+    lighting = _specific_lighting({}, "废弃轨道", style)
+
+    assert "与全片美术风格一致的自然光照" in lighting
+    assert "黄金时段" not in lighting
