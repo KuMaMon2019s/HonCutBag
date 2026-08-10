@@ -551,7 +551,9 @@ def _concrete_subject_description(
     return "；".join(descriptions) or str(shot.get("subject_description") or "场景主体")
 
 
-def _specific_lighting(shot: Dict[str, Any], where: str) -> str:
+def _specific_lighting(
+    shot: Dict[str, Any], where: str, visual_style: VisualStyle
+) -> str:
     lighting = str(shot.get("lighting_description") or shot.get("lighting_key") or "").strip()
     if lighting and any(token in lighting for token in ("左", "右", "上", "下", "逆光", "侧光")):
         if any(token in lighting.upper() for token in ("K", "暖", "冷")):
@@ -562,7 +564,26 @@ def _specific_lighting(shot: Dict[str, Any], where: str) -> str:
         return "冷蓝月光从镜头右上方射入，色温5600K，暖橙环境光轻微补亮轮廓，气氛克制"
     if any(token in where for token in ("室内", "房", "店", "办公室")):
         return "暖白LED主光从镜头左上方照射，色温4200K，右侧冷色窗光勾勒轮廓，气氛沉静"
-    return "黄金时段主光从镜头左上方侧逆光照射，色温4800K，空气颗粒可见，气氛真实"
+
+    style_text = " ".join(filter(None, (
+        visual_style.style_prompt_short,
+        visual_style.style_prompt_full,
+        " ".join(visual_style.mood_keywords),
+        " ".join(visual_style.tags),
+    ))).lower()
+    has_rain = any(token in style_text for token in ("雨", "rain", "storm", "暴风"))
+    has_night = any(token in style_text for token in ("夜", "night", "moon", "月"))
+    if has_rain and has_night:
+        return "冷蓝雨夜光从镜头右上方漫射照入，湿润表面反射微光，低饱和度，气氛湿冷压抑"
+    if has_night:
+        return "冷蓝夜间主光从镜头右上方照入，微弱环境光勾勒轮廓，气氛与全片美术风格一致"
+    if has_rain or any(token in style_text for token in ("阴", "overcast", "cloudy")):
+        return "阴雨天漫射冷光从上方均匀落下，低饱和度，空气潮湿，气氛与全片美术风格一致"
+    if any(token in style_text for token in ("黄金时段", "golden hour", "日落", "sunset", "黄昏", "dusk")):
+        return "黄金时段暖调主光从镜头左上方侧逆光照射，斜射余晖拉出长影，气氛与全片美术风格一致"
+    if any(token in style_text for token in ("黎明", "清晨", "dawn", "sunrise")):
+        return "清晨柔和自然光从镜头左上方斜射，薄雾中轮廓清晰，气氛与全片美术风格一致"
+    return "与全片美术风格一致的自然光照，主光从镜头左上方照射，明暗关系真实克制"
 
 
 def _build_eight_layer_prompt(
@@ -617,9 +638,9 @@ def _build_eight_layer_prompt(
         action = f"{action}，{externalized}"
     where = str(shot.get("where") or "当前场景")
     scene_suffix = (scene_style_map or {}).get(where, "")
-    lighting = _specific_lighting(shot, where)
-    audio = str(shot.get("audio") or shot.get("sound") or "环境底噪与动作同期声")
     visual_style = _load_default_visual_style(visual_style_path)
+    lighting = _specific_lighting(shot, where, visual_style)
+    audio = str(shot.get("audio") or shot.get("sound") or "环境底噪与动作同期声")
     style_anchor = visual_style.style_prompt_short or visual_style.style_prompt_full or "电影叙事风格，35mm胶片质感"
     duration = shot.get("duration", 5)
 
@@ -836,7 +857,9 @@ def generate_storyboard(
             "subject_description": _concrete_subject_description(shot, characters),
             "action_description": shot.get("action_description") or shot.get("what") or shot.get("visual"),
             "camera_movement_en": str(shot.get("camera_movement") or "fixed").replace("_", " "),
-            "lighting_description": _specific_lighting(shot, str(shot.get("where") or "")),
+            "lighting_description": _specific_lighting(
+                shot, str(shot.get("where") or ""), visual_style
+            ),
         }
         for field, value in structured_defaults.items():
             if value:
