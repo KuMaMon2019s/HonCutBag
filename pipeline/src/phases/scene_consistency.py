@@ -43,7 +43,7 @@ def _shot_key(shot: Mapping[str, Any], index: int) -> str:
     return f"S{number:02d}"
 
 
-def _lighting_for(shot: Mapping[str, Any]) -> str:
+def _lighting_for(shot: Mapping[str, Any], visual_style: VisualStyle) -> str:
     explicit = str(shot.get("lighting_description") or shot.get("lighting_key") or "").strip()
     if explicit and any(token in explicit for token in ("左", "右", "上", "下", "逆光", "侧光")):
         lighting = explicit if any(token in explicit.upper() for token in ("K", "暖", "冷")) else f"{explicit}，色温4800K"
@@ -55,7 +55,26 @@ def _lighting_for(shot: Mapping[str, Any]) -> str:
         return "冷蓝月光从镜头右上方射入，色温5600K，左侧暖橙实景灯补亮人物轮廓，空气颗粒清晰"
     if any(token in place for token in ("室内", "房", "店", "办公室")):
         return "暖白LED面板从镜头左上方照射，色温4200K，右后方冷色窗光勾勒轮廓，明暗层次稳定"
-    return "黄金时段阳光从镜头左上方形成侧逆光，色温4800K，暖色反射补光照亮面部，尘埃颗粒可见"
+
+    style_text = " ".join(filter(None, (
+        visual_style.style_prompt_short,
+        visual_style.style_prompt_full,
+        " ".join(visual_style.mood_keywords),
+        " ".join(visual_style.tags),
+    ))).lower()
+    has_rain = any(token in style_text for token in ("雨", "rain", "storm", "暴风"))
+    has_night = any(token in style_text for token in ("夜", "night", "moon", "月"))
+    if has_rain and has_night:
+        return "冷蓝雨夜光从镜头右上方漫射照入，湿润表面反射微光，低饱和度，气氛湿冷压抑"
+    if has_night:
+        return "冷蓝夜间主光从镜头右上方照入，微弱环境光勾勒轮廓，气氛与全片美术风格一致"
+    if has_rain or any(token in style_text for token in ("阴", "overcast", "cloudy")):
+        return "阴雨天漫射冷光从上方均匀落下，低饱和度，空气潮湿，气氛与全片美术风格一致"
+    if any(token in style_text for token in ("黄金时段", "golden hour", "日落", "sunset", "黄昏", "dusk")):
+        return "黄金时段暖调主光从镜头左上方侧逆光照射，斜射余晖拉出长影，气氛与全片美术风格一致"
+    if any(token in style_text for token in ("黎明", "清晨", "dawn", "sunrise")):
+        return "清晨柔和自然光从镜头左上方斜射，薄雾中轮廓清晰，气氛与全片美术风格一致"
+    return "与全片美术风格一致的自然光照，主光从镜头左上方照射，明暗关系真实克制"
 
 
 def _appearance_constraints(characters: list[Mapping[str, Any]], shot: Mapping[str, Any]) -> list[str]:
@@ -113,7 +132,7 @@ def generate_scene_consistency(
     for index, shot in enumerate(shots, 1):
         key = _shot_key(shot, index)
         duration = shot.get("duration", 5)
-        lighting = _lighting_for(shot)
+        lighting = _lighting_for(shot, style)
         style_anchor = style.style_prompt_short or global_style
         constraints = _appearance_constraints(characters, shot)
         constraints.extend([
