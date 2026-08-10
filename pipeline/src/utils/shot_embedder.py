@@ -6,12 +6,13 @@ for visual similarity-based transition decisions.
 """
 
 import os
-import base64
 import subprocess
 from pathlib import Path
 from typing import Optional
 
 import requests
+
+from clients import tos_uploader
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -90,11 +91,14 @@ def embed_image(image_path: str) -> Optional[list]:
     if not image_path.exists():
         return None
 
-    with open(image_path, "rb") as f:
-        image_b64 = base64.b64encode(f.read()).decode()
-
     suffix = image_path.suffix.lower().lstrip(".")
     mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg"}.get(suffix, "image/png")
+
+    with open(image_path, "rb") as f:
+        image_url = tos_uploader.upload_image(f.read(), mime)
+    if not image_url:
+        print(f"  [embed] TOS upload failed: {image_path}")
+        return None
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -102,7 +106,10 @@ def embed_image(image_path: str) -> Optional[list]:
     }
     payload = {
         "model": EMBEDDING_MODEL,
-        "input": [{"type": "image_url", "image_url": {"url": f"data:{mime};base64,{image_b64}"}}],
+        # Agent/Coding Plan's OpenAI-compatible embeddings endpoint expects
+        # each input item to be a string.  For vision embeddings that string
+        # is a remotely accessible image URL, not a chat-style image_url map.
+        "input": [image_url],
     }
 
     try:
