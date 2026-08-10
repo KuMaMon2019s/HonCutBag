@@ -408,10 +408,9 @@ def _validate_shots(shots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             shot["associate_assets"] = []
         dialogue = shot.get("dialogue")
         if not (
-            isinstance(dialogue, dict)
-            and isinstance(dialogue.get("speaker"), str)
-            and isinstance(dialogue.get("line"), str)
-            and dialogue.get("line", "").strip()
+            (isinstance(dialogue, str) and dialogue.strip())
+            or (isinstance(dialogue, list) and dialogue)
+            or (isinstance(dialogue, dict) and dialogue)
         ):
             shot["dialogue"] = None
         shot["gen_strategy"] = determine_gen_strategy(shot)

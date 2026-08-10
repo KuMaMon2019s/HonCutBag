@@ -58,12 +58,28 @@ class AudioMixer:
         directory = Path(output_dir)
         outputs: list[str] = []
         for index, segment in enumerate(segments, 1):
-            text = str(segment.get("narration") or segment.get("voiceover") or "").strip()
+            raw_text = (
+                segment.get("narration")
+                or segment.get("voiceover")
+                or segment.get("dialogue")
+            )
+            text = self._spoken_text(raw_text)
             if text:
                 outputs.append(narrator.generate(
                     text, str(directory / f"narration_{index:03d}.mp3"), speed, pitch
                 ))
         return outputs
+
+    @classmethod
+    def _spoken_text(cls, value: Any) -> str:
+        """Return speakable text from supported storyboard dialogue shapes."""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, dict):
+            return cls._spoken_text(value.get("line") or value.get("text"))
+        if isinstance(value, list):
+            return "\n".join(filter(None, (cls._spoken_text(item) for item in value)))
+        return ""
 
     @staticmethod
     def mix_tracks(tracks: list[str], output_path: str, volumes: list[float] | None = None) -> str:
