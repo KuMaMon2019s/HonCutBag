@@ -11,6 +11,7 @@ from typing import Any
 
 from clients.video_client import VideoClient
 from prompt.eight_layer_summary import build_subject_summary
+from utils.style_slices import get_slice
 
 
 BASE_NEGATIVE_PROMPT = (
@@ -95,6 +96,7 @@ def build_video_prompt(
     if audio:
         parts.append(f"音效：{audio}")
     style = scene.get("style_anchor") or scene.get("style_suffix") or scene_consistency.get("global_style_lock") or "电影叙事风格"
+    style = get_slice(str(style), "video")
     quality = scene.get("quality_suffix") or f"4K, 16:9, {shot_meta.get('duration', 5)}秒"
     # Layer 8 is appended after the bounded summary and is never truncated.
     parts.append(f"全局收尾：{style}；{quality}")

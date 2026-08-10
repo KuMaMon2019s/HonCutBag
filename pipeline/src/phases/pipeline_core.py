@@ -41,6 +41,7 @@ from prompt.three_part_prompt import build_three_part_prompt
 from phases.adaptation_engine import AVG_SHOT_DURATION
 from quality.composition_validator import validate_composition
 from tools.vendor_adapter import VendorAdapter, VendorModel
+from utils.style_slices import get_slice
 
 # Keep progress visible when invoked through ``conda run | tee``.
 if hasattr(sys.stdout, "reconfigure"):
@@ -1618,9 +1619,14 @@ def _generate_shot_images(output_dir: Path, storyboard_data: dict) -> int:
                 "lighting_key": shot.get("lighting_key"),
             })
             prompt_scenes.append(prompt_scene)
+        visual_style_path = output_dir / "visual-style.md"
+        visual_style_text = (
+            visual_style_path.read_text(encoding="utf-8")
+            if visual_style_path.is_file() else storyboard_data.get("style", "cinematic")
+        )
         batch_prompts = build_batch_prompts(
             prompt_scenes,
-            {"mood": storyboard_data.get("style", "cinematic")},
+            {"mood": get_slice(visual_style_text, "storyboard")},
         )
         prompt_by_id = {str(item["scene_id"]): item["prompt"] for item in batch_prompts}
 
@@ -2061,6 +2067,12 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
                 print(f"      - {da['parent_name']}·{da['name']}: {da['desc']}")
 
         # Step 3.2: 生成基础角色三视图
+        visual_style_path = output_dir / "visual-style.md"
+        character_style = ""
+        if visual_style_path.is_file():
+            character_style = get_slice(
+                visual_style_path.read_text(encoding="utf-8"), "character"
+            )
         # 为每个角色准备 id/name/description
         char_dicts = []
         for i, c in enumerate(characters_list):
@@ -2069,7 +2081,9 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
                 "name": c.get("name", f"角色{i}"),
                 "description": c.get("appearance", {}).get("summary", c.get("description", "")),
                 "appearance": c.get("appearance", {}),  # 传递完整 appearance dict
-                "style": c.get("style", ""),
+                "style": "\n\n".join(
+                    part for part in (c.get("style", ""), character_style) if part
+                ),
             })
 
         _p3_est = estimate_phase_duration("phase3", num_characters=len(char_dicts))
