@@ -339,6 +339,26 @@ def test_pipeline_runner_prints_selected_phase_error(monkeypatch, capsys):
     assert "Phase phase4 failed: orchestrator timed out" in capsys.readouterr().out
 
 
+def test_pipeline_runner_reconnects_successful_report_checkpoints(monkeypatch, tmp_path):
+    pipeline_runner_cli._record_report_checkpoints(
+        {
+            "phases": {
+                "2": {"status": "done", "outputs": ["artifact.json"]},
+                "3": {"status": "error", "error": "ignored"},
+                "4": {"status": "skipped", "reason": "selected range"},
+            }
+        },
+        tmp_path,
+    )
+
+    checkpoint = json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))
+    assert checkpoint["completed"] == ["phase2", "phase4"]
+    assert checkpoint["results"]["phase2"]["status"] == "done"
+    assert (tmp_path / "checkpoint.db").exists()
+    sqlite_state = pipeline_core.load_state_from_sqlite(tmp_path, thread_id="pipeline_run")
+    assert sqlite_state["completed"] == ["phase2", "phase4"]
+
+
 def test_phase4_timeout_prints_subprocess_output_tails(monkeypatch, tmp_path, capsys):
     (tmp_path / "STORYBOARD.json").write_text(json.dumps({"shots": []}))
     monkeypatch.setattr(

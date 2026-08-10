@@ -55,6 +55,7 @@ try:
     from langgraph.func import task
     from langgraph.types import RetryPolicy, Send, Command, interrupt
     from langgraph.checkpoint.sqlite import SqliteSaver
+    from langgraph.checkpoint.base import empty_checkpoint
     from langgraph.graph import StateGraph, START, END
     from langgraph.errors import GraphInterrupt
     LANGGRAPH_AVAILABLE = True
@@ -491,30 +492,33 @@ if LANGGRAPH_AVAILABLE:
             return None
 
     def save_state_to_sqlite(state: dict, output_dir: Path, thread_id: str = "default") -> bool:
-        """Save pipeline state to JSON file.
-        
-        P0-4 fix: SQLite checkpoint management is now handled automatically by
-        StateGraph.compile(checkpointer=...) during graph execution. This function
-        only writes state to JSON for external inspection/debugging.
-        """
+        """Save the stage checkpoint as LangGraph channel values in SQLite."""
         try:
-            # Write state to JSON for inspection (not for graph checkpoint)
-            state_file = output_dir / "state.json"
-            with open(state_file, "w", encoding="utf-8") as f:
-                json.dump(state, f, indent=2, ensure_ascii=False)
+            db_path = Path(output_dir) / "checkpoint.db"
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint = empty_checkpoint()
+            checkpoint["channel_values"] = state
+            config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+            with SqliteSaver.from_conn_string(str(db_path)) as checkpointer:
+                checkpointer.put(
+                    config,
+                    checkpoint,
+                    {"source": "update", "step": len(state.get("completed", [])), "writes": state},
+                    {},
+                )
             return True
         except Exception as e:
-            print(f"⚠ Failed to save state to JSON: {e}")
+            print(f"⚠ Failed to save state to SQLite: {e}")
             return False
 
     def load_state_from_sqlite(output_dir: Path, thread_id: str = "default") -> Optional[dict]:
         """Load pipeline state from SQLite checkpoint."""
         try:
-            saver = get_sqlite_checkpointer(output_dir)
-            if not saver:
+            db_path = Path(output_dir) / "checkpoint.db"
+            if not db_path.exists():
                 return None
-            with saver as checkpointer:  # type: ignore[attr-defined]
-                config = {"configurable": {"thread_id": thread_id}}
+            with SqliteSaver.from_conn_string(str(db_path)) as checkpointer:
+                config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
                 checkpoint = checkpointer.get_tuple(config)
             
                 if checkpoint and checkpoint.checkpoint:
@@ -920,6 +924,7 @@ def run_phase2(
             target_duration=duration,
             shot_duration=shot_duration,
             source_text=text,
+            output_dir=output_dir,
         )
         adapted_shots = adapted.get("shots", [])
         print(f"    ✓ 改编完成，{len(adapted_shots)} 个镜头")

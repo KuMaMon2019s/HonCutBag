@@ -233,3 +233,75 @@ def test_stage1_uses_timeout_retry_wrapper(monkeypatch):
     engine._build_beat_skeleton(_events(1), "- 凛", 12, 12)
 
     assert calls == [8000]
+
+
+def test_layered_mode_persists_skeleton_and_each_batch(monkeypatch, tmp_path):
+    events = _events(11)
+    beats = [_beat(i) for i in range(1, 4)]
+    skeleton = {"strategy": "preserve causal spine", "beats": beats}
+    writes = []
+
+    monkeypatch.setattr(engine, "estimate_shot_count", lambda *_: 3)
+    monkeypatch.setattr(engine, "_build_beat_skeleton", lambda *args: skeleton)
+    monkeypatch.setattr(
+        engine,
+        "_call_llm_with_timeout_retry",
+        lambda *args, **kwargs: _batch_response(1),
+    )
+    original_write = engine._atomic_write_json
+
+    def recording_write(path, value):
+        original_write(path, value)
+        writes.append((path.name, json.loads(path.read_text(encoding="utf-8"))))
+
+    monkeypatch.setattr(engine, "_atomic_write_json", recording_write)
+    result = engine.adapt_events(events, target_duration=36, output_dir=tmp_path)
+
+    persisted_skeleton = json.loads((tmp_path / "beat_skeleton.json").read_text(encoding="utf-8"))
+    partial = json.loads((tmp_path / "shots_partial.json").read_text(encoding="utf-8"))
+    assert persisted_skeleton["strategy"] == "preserve causal spine"
+    assert len(persisted_skeleton["beats"]) == 3
+    assert partial["completed_batches"] == [1]
+    assert [shot["shot_order"] for shot in partial["shots"]] == [1, 2, 3]
+    assert [shot["shot_order"] for shot in result["shots"]] == [1, 2, 3]
+    assert [name for name, _ in writes] == ["beat_skeleton.json", "shots_partial.json"]
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_layered_resume_skips_cached_skeleton_and_batches(monkeypatch, tmp_path):
+    events = _events(11)
+    public_beats = []
+    for i in range(1, 7):
+        beat = _beat(i)
+        beat.pop("_source_event_details")
+        public_beats.append(beat)
+    public_beats[-1]["source_events"] = list(range(6, 12))
+    (tmp_path / "beat_skeleton.json").write_text(
+        json.dumps({"strategy": "cached strategy", "beats": public_beats}), encoding="utf-8"
+    )
+    cached_shots = [_shot(i) for i in range(1, 4)]
+    for shot in cached_shots:
+        shot.pop("beat_order")
+    (tmp_path / "shots_partial.json").write_text(
+        json.dumps({"completed_batches": [1], "shots": cached_shots}), encoding="utf-8"
+    )
+    calls = []
+    monkeypatch.setattr(engine, "estimate_shot_count", lambda *_: 6)
+    monkeypatch.setattr(
+        engine, "_build_beat_skeleton", lambda *args: pytest.fail("cached skeleton was rebuilt")
+    )
+
+    def expand_only_missing(prompt, **kwargs):
+        calls.append(prompt)
+        response = json.loads(_batch_response(4, beat_first=4))
+        response["shots"][-1]["source_events"] = list(range(6, 12))
+        return json.dumps(response)
+
+    monkeypatch.setattr(engine, "_call_llm_with_timeout_retry", expand_only_missing)
+    result = engine.adapt_events(events, target_duration=72, output_dir=tmp_path)
+
+    assert len(calls) == 1
+    assert "第一个 shot_order 必须为 4" in calls[0]
+    assert result["strategy"] == "cached strategy"
+    assert [shot["shot_order"] for shot in result["shots"]] == list(range(1, 7))
+    assert json.loads((tmp_path / "shots_partial.json").read_text())["completed_batches"] == [1, 2]

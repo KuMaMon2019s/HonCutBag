@@ -33,6 +33,7 @@ import os
 import argparse
 import re
 import time
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 from openai import OpenAI, APITimeoutError
@@ -640,11 +641,21 @@ def _expand_beats_to_shots(
     characters_summary: str,
     target_duration: int,
     shot_duration: int,
+    output_dir: Optional[Path] = None,
+    resumed_shots: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Expand three beats at a time, relaying only the previous final shot."""
-    shots: List[Dict[str, Any]] = []
+    shots: List[Dict[str, Any]] = list(resumed_shots or [])
     relay: Optional[Dict[str, str]] = None
-    for start in range(0, len(beats), 3):
+    if shots:
+        last = shots[-1]
+        relay = {
+            "who": last.get("who", []),
+            "where": str(last.get("where", "")),
+            "visual": last.get("visual"),
+        }
+    first_missing = len(shots)
+    for start in range(first_missing, len(beats), 3):
         batch = beats[start:start + 3]
         prompt = _batch_prompt(batch, characters_summary, target_duration, shot_duration, len(shots), relay)
         parsed = None
@@ -694,6 +705,14 @@ def _expand_beats_to_shots(
             shot["shot_order"] = len(shots) + 1
             shot.pop("beat_order", None)
             shots.append(shot)
+        if output_dir is not None:
+            _atomic_write_json(
+                output_dir / "shots_partial.json",
+                {
+                    "completed_batches": list(range(1, (len(shots) + 2) // 3 + 1)),
+                    "shots": shots,
+                },
+            )
         last = shots[-1]
         relay = {
             "who": last.get("who", []),
@@ -701,6 +720,55 @@ def _expand_beats_to_shots(
             "visual": last.get("visual"),
         }
     return shots
+
+
+def _atomic_write_json(path: Path, value: Any) -> None:
+    """Write JSON without ever exposing a partially written checkpoint."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _load_layered_checkpoints(
+    output_dir: Path,
+    events: List[Dict[str, Any]],
+    expected_beats: int,
+) -> tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Load only valid, contiguous layered checkpoints."""
+    skeleton = None
+    skeleton_path = output_dir / "beat_skeleton.json"
+    if skeleton_path.exists():
+        try:
+            candidate = json.loads(skeleton_path.read_text(encoding="utf-8"))
+            _parse_beat_skeleton(json.dumps(candidate, ensure_ascii=False), expected_beats, len(events))
+            event_by_id = {i: dict(event, event_id=i) for i, event in enumerate(events, 1)}
+            for beat in candidate["beats"]:
+                beat["_source_event_details"] = [event_by_id[event_id] for event_id in beat["source_events"]]
+            skeleton = candidate
+            print(f"  ↺ Reusing layered checkpoint: {skeleton_path}")
+        except (OSError, json.JSONDecodeError, ValueError, TypeError):
+            skeleton = None
+
+    shots: List[Dict[str, Any]] = []
+    partial_path = output_dir / "shots_partial.json"
+    if skeleton is not None and partial_path.exists():
+        try:
+            partial = json.loads(partial_path.read_text(encoding="utf-8"))
+            candidate_shots = partial.get("shots", [])
+            completed = partial.get("completed_batches", [])
+            if not isinstance(candidate_shots, list) or not isinstance(completed, list):
+                raise ValueError("invalid partial checkpoint structure")
+            contiguous = list(range(1, len(completed) + 1))
+            expected_count = min(len(skeleton["beats"]), len(completed) * 3)
+            if completed != contiguous or len(candidate_shots) != expected_count:
+                raise ValueError("partial checkpoint is not batch-contiguous")
+            _validate_shots(candidate_shots)
+            shots = candidate_shots
+            print(f"  ↺ Reusing {len(completed)} completed layered batch(es): {partial_path}")
+        except (OSError, json.JSONDecodeError, ValueError, TypeError):
+            shots = []
+    return skeleton, shots
 
 
 # ─── 核心函数 ────────────────────────────────────────────────────────────────
@@ -711,6 +779,7 @@ def adapt_events(
     target_duration: Optional[int] = None,
     shot_duration: int = AVG_SHOT_DURATION,
     source_text: Optional[str] = None,
+    output_dir: Optional[str | Path] = None,
 ) -> Dict[str, Any]:
     """
     将事件列表改编为 shot 列表
@@ -761,11 +830,20 @@ def adapt_events(
     requested_mode = os.getenv("HONCUT_ADAPT_MODE", "layered").strip().lower()
     use_layered = requested_mode != "single" and len(events) > 10
     if use_layered:
-        skeleton = _build_beat_skeleton(
-            events, characters_summary, target_duration, shot_duration
-        )
+        checkpoint_dir = Path(output_dir) if output_dir is not None else None
+        skeleton = None
+        resumed_shots: List[Dict[str, Any]] = []
+        if checkpoint_dir is not None:
+            skeleton, resumed_shots = _load_layered_checkpoints(checkpoint_dir, events, max_shots)
+        if skeleton is None:
+            skeleton = _build_beat_skeleton(
+                events, characters_summary, target_duration, shot_duration
+            )
+            if checkpoint_dir is not None:
+                _atomic_write_json(checkpoint_dir / "beat_skeleton.json", skeleton)
         shots = _expand_beats_to_shots(
-            skeleton["beats"], characters_summary, target_duration, shot_duration
+            skeleton["beats"], characters_summary, target_duration, shot_duration,
+            output_dir=checkpoint_dir, resumed_shots=resumed_shots,
         )
         _validate_shots(shots)
 
@@ -985,6 +1063,7 @@ def main():
             characters=characters,
             target_duration=args.duration,
             shot_duration=args.shot_duration,
+            output_dir=Path(args.output).parent if args.output else None,
         )
     except (ValueError, RuntimeError) as e:
         print(f"错误：{e}", file=sys.stderr)

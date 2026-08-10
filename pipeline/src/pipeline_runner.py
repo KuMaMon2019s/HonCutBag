@@ -50,6 +50,17 @@ PHASE_NUMBERS = {
 }
 
 
+def _record_report_checkpoints(report: dict, output_dir: str | Path) -> None:
+    """Persist every successful phase returned by the live runner path."""
+    phase_names = {value: key for key, value in PHASE_NUMBERS.items()}
+    for report_key, result in report.get("phases", {}).items():
+        if not isinstance(result, dict) or result.get("status") not in ("done", "skipped"):
+            continue
+        phase_name = report_key if report_key in PHASES else phase_names.get(str(report_key))
+        if phase_name:
+            _core._record_stage_checkpoint(Path(output_dir), phase_name, result)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Honcut AI Video Pipeline — 端到端管线")
     input_group = parser.add_mutually_exclusive_group(required=True)
@@ -135,6 +146,7 @@ def main() -> None:
         auto_approve=args.auto_approve,
         resume_from=args.resume_from,
     )
+    _record_report_checkpoints(report, args.output_dir)
     selected_result = None
     if args.phase:
         report_key = "phase1" if args.phase == "phase1" else PHASE_NUMBERS[args.phase]
