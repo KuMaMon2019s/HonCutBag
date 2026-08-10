@@ -4026,6 +4026,66 @@ def _merge_shot_transcripts(sb_shots: list, durations_ms: list[int], shot_transc
     }
 
 
+def _phase8_real_audio_tracks(
+    output_dir: Path,
+    storyboard_data: Optional[dict],
+    transcript_data: Optional[dict],
+    raw_video: Path,
+) -> tuple[list[dict], int]:
+    """Build the real-audio base + Phase 7 narration tracks for Phase 8."""
+    tracks = [{"path": str(raw_video), "role": "music"}]
+    audio_options = storyboard_data.get("audio", {}) if storyboard_data else {}
+    if not storyboard_data or not audio_options.get("enabled", False) or not audio_options.get("tts", True):
+        return tracks, 0
+
+    from phases.audio_mixer import AudioMixer as Phase7AudioMixer
+
+    transcript_shots = (transcript_data or {}).get("shots", [])
+    skipped = 0
+    for index, shot in enumerate(storyboard_data.get("shots", []), 1):
+        narration_path = output_dir / "audio_layer" / f"narration_{index:03d}.mp3"
+        spoken_text = Phase7AudioMixer._spoken_text(
+            shot.get("narration") or shot.get("voiceover") or shot.get("dialogue")
+        )
+        if not spoken_text or not narration_path.is_file():
+            continue
+
+        transcript_shot = transcript_shots[index - 1] if index <= len(transcript_shots) else {}
+        # Only ASR text proves the line exists in source audio. Script fallback
+        # text is not evidence and must never suppress an overlay.
+        asr_text = transcript_shot.get("text", "") if transcript_shot.get("source") == "asr" else ""
+        normalized_line = "".join(clean_subtitle_text(spoken_text).casefold().split())
+        normalized_asr = "".join(clean_subtitle_text(asr_text).casefold().split())
+        if normalized_line and normalized_asr and normalized_line in normalized_asr:
+            skipped += 1
+            shot_id = shot.get("shot_id") or f"S{index:02d}"
+            print(f"    ⊘ [P0-D3] {shot_id}: TTS skipped (dialogue already in source audio)")
+            continue
+
+        tracks.append({
+            "path": str(narration_path),
+            "role": "speech",
+            "start_seconds": float(transcript_shot.get("start_ms", 0)) / 1000,
+        })
+    return tracks, skipped
+
+
+def _phase8_real_audio_mix_request(tracks: list[dict], audio_out: Path) -> dict:
+    """Return the AudioMixer request for a preserved real-audio base track."""
+    has_tts = len(tracks) > 1
+    return {
+        "operation": "full_mix" if has_tts else "mix",
+        "tracks": tracks,
+        "ducking": {
+            "enabled": True,
+            "music_volume_during_speech": 0.15,
+        } if has_tts else None,
+        "normalize": True,
+        "loudnorm_target": -14,
+        "output_path": str(audio_out),
+    }
+
+
 
 def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = None, upscale: Optional[int] = None, media_profile: str = "1080p") -> dict:
     """Phase 8: audio_pipeline + visual_post + [color_grade] + [upscale] + rhythm_editor → polished.mp4
@@ -4132,14 +4192,41 @@ def run_phase8(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
         # Step 8.1: Audio processing via OM AudioMixer
         bgm_path = None
         if has_real_audio:
-            # 视频已有真实音轨，直接复制作为音频处理输出，跳过环境音合成
-            import shutil
             audio_out = output_dir / "audio_processed.mp4"
-            shutil.copy2(raw_video, audio_out)
-            outputs.append("audio_processed.mp4")
-            print(f"  ✓ [P0-D3] 跳过环境音合成，直接使用视频自带音轨")
-            audio_success = True
-            step_status["audio_pipeline"] = "done"
+            from vendor.video_tools.tools.audio.audio_mixer import AudioMixer
+
+            tracks, skipped_tts = _phase8_real_audio_tracks(
+                output_dir, storyboard_data, transcript_data, raw_video
+            )
+            overlay_count = len(tracks) - 1
+            mixer = AudioMixer()
+            mix_result = mixer.execute(_phase8_real_audio_mix_request(tracks, audio_out))
+            audio_success = bool(mix_result.success)
+            if audio_success:
+                remux_tmp = output_dir / "audio_remux_tmp.mp4"
+                remux_cmd = [
+                    "ffmpeg", "-y", "-i", str(raw_video), "-i", str(audio_out),
+                    "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac",
+                    "-shortest", str(remux_tmp),
+                ]
+                import subprocess as _sp
+                _sp.run(remux_cmd, capture_output=True, check=True)
+                import shutil
+                shutil.move(str(remux_tmp), str(audio_out))
+                outputs.append("audio_processed.mp4")
+                step_status["audio_pipeline"] = "done"
+                if overlay_count:
+                    print(
+                        f"  ✓ [P0-D3] base track preserved + {overlay_count} TTS overlays "
+                        f"({skipped_tts} skipped: dialogue already in source audio)"
+                    )
+                else:
+                    print("  ✓ [P0-D3] base track only, loudnorm applied")
+            else:
+                print(f"  ⚠ [P0-D3] real-audio processing failed: {mix_result.error}")
+                step_status["audio_pipeline"] = "failed"
+                import shutil
+                shutil.copy2(str(raw_video), audio_out)
         else:
             print("  → audio_pipeline: 音频处理 (AudioMixer: loudnorm + ducking)...")
             audio_out = output_dir / "audio_processed.mp4"
