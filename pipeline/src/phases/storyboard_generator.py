@@ -609,7 +609,7 @@ def _build_eight_layer_prompt(
             continue
         char_id = char.get("id") or char.get("name")
         ref = char.get("face_reference") or f"characters/{char_id}/face_closeup.png"
-        # 文件名只保留在注释中供 Phase 2.5 人工排查，不进入 LLM 提示词。
+        # 文件名只保留在注释中供 Phase 2 人工排查，不进入 LLM 提示词。
         shot.setdefault("reference_debug_files", []).append(str(ref))
         references.append(f"参考{{图片N}}中的{char.get('name')}作为主体，保持身份与服装一致")
 

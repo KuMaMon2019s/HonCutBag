@@ -54,7 +54,7 @@ class QualityReport:
 # ---------------------------------------------------------------------------
 
 QUALITY_RULES: Dict[str, Dict[str, Any]] = {
-    "phase2": {
+    "phase1": {
         "name": "编剧引擎",
         "red_lines": [
             ("events_exist", "事件列表不为空"),
@@ -68,7 +68,7 @@ QUALITY_RULES: Dict[str, Dict[str, Any]] = {
              lambda d: len(d.get("shots", [])) >= 5),
         ],
     },
-    "phase2_5": {
+    "phase2": {
         "name": "故事板图片",
         "red_lines": [
             ("storyboard_image_exists", "storyboard.png 存在且 > 10KB"),
@@ -86,7 +86,7 @@ QUALITY_RULES: Dict[str, Dict[str, Any]] = {
              lambda d: True),  # checked via file system in red lines
         ],
     },
-    "phase5": {
+    "phase6": {
         "name": "视频生成",
         "red_lines": [
             ("videos_exist", "至少 1 个镜头视频 > 100KB"),
@@ -96,13 +96,13 @@ QUALITY_RULES: Dict[str, Dict[str, Any]] = {
              lambda d: True),  # ratio check needs shot count context
         ],
     },
-    "phase6": {
+    "phase7": {
         "name": "一致性守卫",
         "red_lines": [],
         "dimensions": [],
         "critical_steps": ["consistency_guard", "scene_variation", "slideshow_risk"],
     },
-    "phase7": {
+    "phase8": {
         "name": "组装引擎",
         "red_lines": [
             ("assembly_exists", "raw_assembly.mp4 存在且 > 500KB"),
@@ -111,7 +111,7 @@ QUALITY_RULES: Dict[str, Dict[str, Any]] = {
         "dimensions": [],
         "critical_steps": ["transition_render"],
     },
-    "phase8": {
+    "phase9": {
         "name": "后期处理",
         "red_lines": [
             ("final_exists", "polished.mp4 存在且 > 500KB"),
@@ -361,9 +361,9 @@ def _get_suggestion(rule_id: str) -> str:
         "videos_exist":
             "检查 Seedance API key 和 prompt，确认视频生成成功",
         "assembly_has_video":
-            "Phase 7 拼接可能丢失视频流，检查 VideoStitch 逻辑",
+            "Phase 8 拼接可能丢失视频流，检查 VideoStitch 逻辑",
         "final_has_video":
-            "Phase 8 音频处理可能丢失视频流，检查 remux 逻辑",
+            "Phase 9 音频处理可能丢失视频流，检查 remux 逻辑",
         "final_has_audio":
             "检查音频处理管线是否正常",
     }.get(rule_id, "")

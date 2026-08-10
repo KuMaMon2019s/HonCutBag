@@ -8,9 +8,9 @@ progress_reporter.py — 管线进度报告系统
 
 Usage:
     reporter = ProgressReporter("./output", total_phases=8)
-    reporter.phase_start("phase2", "编剧引擎")
-    reporter.step("phase2", "提取 47 个事件", progress_pct=20)
-    reporter.phase_done("phase2", "完成", duration_s=61.3)
+    reporter.phase_start("phase1", "编剧引擎")
+    reporter.step("phase1", "提取 47 个事件", progress_pct=20)
+    reporter.phase_done("phase1", "完成", duration_s=61.3)
 """
 
 import json
@@ -129,7 +129,7 @@ class ProgressReporter:
 
     def _phase_index(self, phase_id: str) -> int:
         """返回 phase 在 PHASE_ORDER 中的索引，找不到返回 -1"""
-        order = ["phase2", "phase2_5", "phase3", "phase4", "phase5", "phase6", "phase7", "phase8"]
+        order = ["phase1", "phase2", "phase3", "phase4", "phase6", "phase7", "phase8", "phase9"]
         try:
             return order.index(phase_id)
         except ValueError:

@@ -10,27 +10,28 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
+# Phase IDs renumbered to contiguous integers on 2026-08-10.
 PHASES = [
+    "phase1",
     "phase2",
-    "phase2_5",
     "phase3",
     "phase4",
-    "phase4_5",
     "phase5",
     "phase6",
     "phase7",
     "phase8",
+    "phase9",
 ]
 PHASE_NUMBERS = {
+    "phase1": "1",
     "phase2": "2",
-    "phase2_5": "2.5",
     "phase3": "3",
     "phase4": "4",
-    "phase4_5": "4.5",
     "phase5": "5",
     "phase6": "6",
     "phase7": "7",
     "phase8": "8",
+    "phase9": "9",
 }
 PIPELINE_DIR = Path(__file__).resolve().parents[1]
 RUNNER = PIPELINE_DIR / "src" / "pipeline_runner.py"

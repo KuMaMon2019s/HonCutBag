@@ -440,7 +440,7 @@ def build_content_for_shot(
     if not storyboard_images_dir.exists():
         print(
             f"  [assets] ⚠ storyboard_images directory missing: {storyboard_images_dir}; "
-            "run Phase 2.5 to generate per-shot first frames"
+            "run Phase 2 to generate per-shot first frames"
         )
     shot_frame_path = storyboard_images_dir / f"{shot_id}.png"
     image_assets = []

@@ -1,4 +1,4 @@
-"""Phase 4.5: pre-generation storyboard quality gate.
+"""Phase 5: pre-generation storyboard quality gate.
 
 Every judgment is derived from project artifacts.  The gate never repairs a
 storyboard; it reports the shots that need to be redrawn before Phase 5.

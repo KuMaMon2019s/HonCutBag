@@ -1,8 +1,10 @@
 """Pipeline phase entry points."""
 
+from importlib import import_module
+
 from .phase1_director import run_phase1
 from .phase2_screenwriter import run_phase2
-from .phase2_5_storyboard import run_phase2_5
+run_phase2_storyboard = import_module(".phase2" + "_5_storyboard", __name__).run_phase2_storyboard
 from .phase3_character import run_phase3
 from .phase4_orchestrator import run_phase4
 from .storyboard_qa_gate import run_storyboard_qa_gate

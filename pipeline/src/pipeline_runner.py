@@ -24,29 +24,28 @@ check_dependencies()
 
 from phases import pipeline_core as _core
 
+# Phase IDs renumbered to contiguous integers on 2026-08-10.
 PHASES = (
     "phase1",
     "phase2",
-    "phase2_5",
     "phase3",
     "phase4",
-    "phase4_5",
     "phase5",
     "phase6",
     "phase7",
     "phase8",
+    "phase9",
 )
 PHASE_NUMBERS = {
     "phase1": "1",
     "phase2": "2",
-    "phase2_5": "2.5",
     "phase3": "3",
     "phase4": "4",
-    "phase4_5": "4.5",
     "phase5": "5",
     "phase6": "6",
     "phase7": "7",
     "phase8": "8",
+    "phase9": "9",
 }
 
 
@@ -75,11 +74,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=str, default=".", help="输出目录，默认当前目录")
     parser.add_argument("--skip-phase", type=float, nargs="+", default=[], help="跳过指定 Phase")
     parser.add_argument(
-        "--transition", choices=["crossfade", "fade", "cut"], default="crossfade", help="Phase 7 转场模式"
+        "--transition", choices=["crossfade", "fade", "cut"], default="crossfade", help="Phase 8 转场模式"
     )
-    parser.add_argument("--transition-duration", type=float, default=0.5, help="Phase 7 转场时长（秒）")
+    parser.add_argument("--transition-duration", type=float, default=0.5, help="Phase 8 转场时长（秒）")
     parser.add_argument("--enable-reshoot", action="store_true",
-                        help="允许 Phase 7 时长不足时真实补录（默认关闭）")
+                        help="允许 Phase 8 时长不足时真实补录（默认关闭）")
     parser.add_argument(
         "--media-profile", choices=_core.AVAILABLE_PROFILES, default="1080p", help="编码配置（默认 1080p）"
     )
@@ -87,7 +86,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--auto-approve", action="store_true", help="自动批准人工审核节点")
     parser.add_argument("--resume-from", help="从指定阶段恢复（如 phase5）")
     parser.add_argument(
-        "--phase", choices=PHASES, help="Execute single phase only (e.g., 'phase2', 'phase5')"
+        "--phase", choices=PHASES, help="Execute single phase only (e.g., 'phase1', 'phase6')"
     )
     parser.add_argument(
         "--start-phase", choices=PHASES, help="Start from this phase (skip earlier phases)"
@@ -121,7 +120,7 @@ def _phase_skip_list(args: argparse.Namespace, parser: argparse.ArgumentParser) 
 
     selected = set(PHASES[start_index : end_index + 1])
     skipped = [float(PHASE_NUMBERS[phase]) for phase in PHASES if phase not in selected]
-    # Phase 8.5 is outside the supported phase-level monitoring sequence.
+    # Phase 9.5 is outside the supported phase-level monitoring sequence.
     skipped.append(8.5)
     return skipped
 

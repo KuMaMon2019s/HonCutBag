@@ -27,6 +27,31 @@ pipeline_runner_cli = importlib.util.module_from_spec(_runner_spec)
 _runner_spec.loader.exec_module(pipeline_runner_cli)
 
 
+def test_phase_ids_are_contiguous_in_execution_order():
+    expected = [f"phase{number}" for number in range(1, 10)]
+    assert phase_orchestrator.PHASES == expected
+    assert list(pipeline_runner_cli.PHASES) == expected
+    assert phase_orchestrator.PHASE_NUMBERS == {
+        phase: str(index) for index, phase in enumerate(expected, start=1)
+    }
+
+
+def test_progress_file_is_written_with_new_phase_ids(tmp_path):
+    progress = tmp_path / "phase_progress.json"
+    phase_orchestrator._write_progress(
+        progress,
+        {
+            "results": [{"phase": "phase1", "exit_code": 0}],
+            "current_phase": "phase2",
+            "status": "running",
+            "phases": phase_orchestrator.PHASES,
+        },
+    )
+    written = json.loads(progress.read_text(encoding="utf-8"))
+    assert written["phases"] == [f"phase{number}" for number in range(1, 10)]
+    assert written["current_phase"] == "phase2"
+
+
 def test_embed_image_sends_tos_url_as_string_input(monkeypatch, tmp_path):
     image_path = tmp_path / "arbitrary-frame.png"
     image_bytes = b"\x89PNG\r\n\x1a\nproject-specific-image-data"
@@ -292,6 +317,7 @@ def test_phase_orchestrator_writes_full_streamed_log(monkeypatch, tmp_path):
 def test_phase_orchestrator_failure_prints_stdout_and_stderr_tails(
     monkeypatch, tmp_path, capsys
 ):
+    attempted_phases = []
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({
         "input": str(tmp_path / "story.txt"),
@@ -299,17 +325,17 @@ def test_phase_orchestrator_failure_prints_stdout_and_stderr_tails(
         "output_dir": str(tmp_path),
     }))
     (tmp_path / "pipeline_report.json").write_text(json.dumps({"phases": {}}))
-    monkeypatch.setattr(
-        phase_orchestrator,
-        "run_phase",
-        lambda phase, config: {
+    def fail_phase(phase, config):
+        attempted_phases.append(phase)
+        return {
             "phase": phase,
             "exit_code": 1,
             "stdout": "A" * 500 + "stdout-cause",
             "stderr": "B" * 500 + "stderr-cause",
             "timestamp": "2026-08-10T00:00:00",
-        },
-    )
+        }
+
+    monkeypatch.setattr(phase_orchestrator, "run_phase", fail_phase)
     monkeypatch.setattr(
         sys, "argv", ["phase_orchestrator.py", "--config", str(config_path), "--resume-from", "phase4"]
     )
@@ -318,6 +344,7 @@ def test_phase_orchestrator_failure_prints_stdout_and_stderr_tails(
         phase_orchestrator.main()
 
     output = capsys.readouterr().out
+    assert attempted_phases == ["phase4"]
     assert "Stdout tail:" in output and "stdout-cause" in output
     assert "Stderr tail:" in output and "stderr-cause" in output
 
