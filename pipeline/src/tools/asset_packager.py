@@ -336,6 +336,64 @@ def inject_reference_instruction(prompt_text: str, descriptions: List[Any]) -> s
     return f"元素参考：{instruction}{prompt_text}"
 
 
+def inject_flf2v_identity_lock(
+    output_dir: Path,
+    shot_meta: dict,
+    prompt_text: str,
+) -> str:
+    """Add canonical character traits to FLF2V prompts without reference media."""
+    char_ids = _detect_shot_characters(output_dir, shot_meta)
+    if not char_ids:
+        return prompt_text
+
+    characters_json = Path(output_dir) / "CHARACTERS.json"
+    try:
+        characters_data = json.loads(characters_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"  [assets] ⚠ cannot load FLF2V identity traits: {error}")
+        return prompt_text
+
+    characters_by_id = {
+        character.get("id"): character
+        for character in characters_data.get("characters", [])
+        if character.get("id")
+    }
+    identity_lines = []
+    trait_labels = (
+        ("hair", "hair"),
+        ("face", "face"),
+        ("clothing", "clothing"),
+        ("build", "body build"),
+        ("distinguishing", "distinguishing features"),
+    )
+    for char_id in char_ids:
+        character = characters_by_id.get(char_id)
+        if not character:
+            continue
+        appearance = character.get("appearance") or {}
+        if not isinstance(appearance, dict):
+            continue
+        traits = [
+            f"{label}: {str(appearance[field]).strip()}"
+            for field, label in trait_labels
+            if appearance.get(field)
+        ]
+        if traits:
+            name = character.get("name") or char_id
+            identity_lines.append(f"{name} — " + "; ".join(traits))
+
+    if not identity_lines:
+        return prompt_text
+    lock = (
+        "[identity-lock: text-only; no reference media]\n"
+        + "\n".join(identity_lines)
+        + "\nKeep each named character's sex, age, facial structure, hairstyle, "
+        "clothing, body proportions, and distinguishing features unchanged in every frame; "
+        "do not masculinize, feminize, age-shift, body-swap, or change build."
+    )
+    return f"{lock}\n{prompt_text}" if prompt_text else lock
+
+
 def build_content_for_shot(
     output_dir: Path,
     shot_id: str,
@@ -369,12 +427,13 @@ def build_content_for_shot(
 
     # 1. Text prompt (always first)
     prompt_text = shot_meta.get("prompt", "")
-    if prompt_text:
-        content.append({"type": "text", "text": prompt_text})
-
     strategy = shot_meta.get("gen_strategy", "i2v")
     if strategy not in {"flf2v", "phantom", "i2v"}:
         strategy = "i2v"
+    if strategy == "flf2v":
+        prompt_text = inject_flf2v_identity_lock(output_dir, shot_meta, prompt_text)
+    if prompt_text:
+        content.append({"type": "text", "text": prompt_text})
 
     # Every route starts from the per-shot storyboard image.
     storyboard_images_dir = output_dir / "storyboard_images"

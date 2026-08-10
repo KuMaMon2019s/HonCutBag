@@ -2478,6 +2478,17 @@ def _apply_chain_relay(content_list, first_frame_b64, shot_id):
             flush=True,
         )
         return content_list
+    if any(
+        item.get("type") == "text"
+        and "[identity-lock: text-only; no reference media]" in item.get("text", "")
+        for item in (content_list or [])
+    ):
+        print(
+            f"    [chain] {shot_id}: identity-locked FLF2V shot, "
+            "keeping its storyboard first frame",
+            flush=True,
+        )
+        return content_list
     content_list = [
         item for item in (content_list or [])
         if item.get("role") != "first_frame"
