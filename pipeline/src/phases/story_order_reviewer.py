@@ -4,8 +4,25 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
+
+from clients.ark_multimodal_client import ArkMultimodalClient
+
+
+REVIEW_PROMPT = """You are a film storyboard continuity reviewer. Review all supplied
+images together, in their supplied order, against the complete storyboard JSON below.
+Return one JSON object only with these fields:
+- suggested_order: array containing every shot ID exactly once
+- narrative_consistent: boolean
+- issues: array of concise strings
+Judge narrative chronology, character/action continuity, and whether the visual order
+matches the written story. Do not invent or omit shot IDs.
+
+STORYBOARD JSON:
+{storyboard_json}
+"""
 
 
 def _shot_id(value: Any) -> str | None:
@@ -41,26 +58,43 @@ def reorder_shots(
     return new_paths, [meta for _, meta in ordered], new_paths != clip_paths
 
 
-def review_with_multimodal_llm(storyboard: dict, image_paths: list[Path]) -> dict:
-    """Production interface for a future multi-image narrative reviewer.
+def review_with_multimodal_llm(
+    storyboard: dict,
+    image_paths: list[Path],
+    client: ArkMultimodalClient | None = None,
+) -> dict:
+    """Review a complete storyboard with all images in one ARK request."""
+    reviewer = client or ArkMultimodalClient()
+    prompt = REVIEW_PROMPT.format(
+        storyboard_json=json.dumps(storyboard, ensure_ascii=False, indent=2)
+    )
+    raw = reviewer.review(image_paths, prompt)
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.IGNORECASE)
+    try:
+        result = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"ARK multimodal review returned invalid JSON: {exc}") from exc
+    if not isinstance(result, dict):
+        raise RuntimeError("ARK multimodal review must return a JSON object")
 
-    The repository currently has single-asset vision/embedding helpers only;
-    none accepts all storyboard images plus the complete script. Keeping this
-    interface explicit prevents an image generator or transition embedder from
-    being mistaken for a narrative reviewer.
-    """
-    # TODO: send storyboard + every image to the approved multimodal LLM and
-    # return suggested_order, narrative_consistent, and issues.
-    raise NotImplementedError("full-story multi-image LLM client is not configured")
+    expected = storyboard_shot_ids(storyboard)
+    suggested = [_shot_id(item) for item in result.get("suggested_order", [])]
+    if (
+        any(item is None for item in suggested)
+        or len(suggested) != len(expected)
+        or set(suggested) != set(expected)
+    ):
+        raise RuntimeError("ARK multimodal review returned an invalid or incomplete shot order")
+    result["suggested_order"] = suggested
+    if not isinstance(result.get("narrative_consistent"), bool):
+        raise RuntimeError("ARK multimodal review omitted boolean narrative_consistent")
+    if not isinstance(result.get("issues"), list):
+        raise RuntimeError("ARK multimodal review omitted issues array")
+    return result
 
 
 def review_story_order(output_dir: Path, current_order: list[str]) -> dict:
-    """Review storyboard order, with an explicit deterministic mock/skip path.
-
-    TODO: wire a production multi-image LLM client once the pipeline has a
-    supported narrative-review endpoint. Existing vision helpers analyze one
-    image/video at a time and cannot reliably order a complete storyboard.
-    """
+    """Review storyboard order in explicit ``real`` or ``mock`` mode."""
     output_dir = Path(output_dir)
     review_path = output_dir / "storyboard_order_review.json"
     storyboard_path = output_dir / "STORYBOARD.json"
@@ -86,13 +120,18 @@ def review_story_order(output_dir: Path, current_order: list[str]) -> dict:
     if absent_images:
         missing.append("storyboard images missing: " + ", ".join(absent_images))
 
-    mock_enabled = os.environ.get("HONCUT_ORDER_REVIEW_MOCK") == "1"
+    mode = os.environ.get("HONCUT_STORYBOARD_REVIEW", "real").strip().lower()
+    # Preserve the old test-only switch while callers migrate to the named mode.
+    if os.environ.get("HONCUT_ORDER_REVIEW_MOCK") == "1":
+        mode = "mock"
+    if mode not in {"mock", "real"}:
+        raise ValueError("HONCUT_STORYBOARD_REVIEW must be 'mock' or 'real'")
+    mock_enabled = mode == "mock"
     llm_review: dict | None = None
     if not mock_enabled and not missing:
-        try:
-            llm_review = review_with_multimodal_llm(storyboard, images)
-        except Exception as exc:
-            missing.append(f"multimodal LLM unavailable: {exc}")
+        # Real mode is deliberately fail-fast: an API/configuration failure must
+        # not be mislabeled as a successful mock review.
+        llm_review = review_with_multimodal_llm(storyboard, images)
 
     if llm_review is not None:
         suggested = llm_review.get("suggested_order") or llm_review.get("ordered_shot_ids") or current
@@ -102,7 +141,7 @@ def review_story_order(output_dir: Path, current_order: list[str]) -> dict:
         skipped_reason = None
         source = "llm"
     elif mock_enabled and not missing:
-        print("  [7.1] HONCUT_ORDER_REVIEW_MOCK=1，使用确定性剧情顺序审稿", flush=True)
+        print("  [7.1] HONCUT_STORYBOARD_REVIEW=mock，使用确定性剧情顺序审稿", flush=True)
         suggested = expected
         issues: list[str] = []
         consistent = True
@@ -116,14 +155,14 @@ def review_story_order(output_dir: Path, current_order: list[str]) -> dict:
         else:
             reason = (
                 "未配置可用的全剧本多图 LLM 客户端；设置 "
-                "HONCUT_ORDER_REVIEW_MOCK=1 可启用确定性测试路径"
+                "HONCUT_STORYBOARD_REVIEW=mock 可启用确定性测试路径"
             )
         print(f"  ⚠ [7.1] 剧情顺序校验跳过: {reason}；保持原顺序", flush=True)
         suggested = current
         issues = [reason]
         consistent = True
         skipped_reason = reason
-        source = "mock"
+        source = "skipped"
 
     review = {
         "suggested_order": suggested,
