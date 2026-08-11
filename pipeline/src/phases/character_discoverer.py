@@ -32,6 +32,7 @@ from typing import List, Dict, Any, Optional
 from collections import defaultdict
 
 from openai import OpenAI
+from utils.ark_llm import call_llm_stream, create_ark_client
 
 
 # ─── LLM 配置 ───────────────────────────────────────────────────────────────
@@ -113,38 +114,22 @@ def _get_client() -> OpenAI:
 
     API Key: ARK_AGENT_API_KEY (火山方舟 Agent Plan)
     """
-    api_key = (
-        os.environ.get("ARK_AGENT_API_KEY")
-        
-        or os.environ.get("OPENAI_API_KEY")
-    )
-    if not api_key:
-        print("错误：环境变量 ARK_AGENT_API_KEY 未设置（火山方舟 Agent Plan）", file=sys.stderr)
-        sys.exit(1)
-
-    return OpenAI(
-        api_key=api_key,
-        base_url="https://ark.cn-beijing.volces.com/api/plan/v3",
-    )
+    return create_ark_client()
 
 
 def _call_llm(prompt: str) -> str:
     """调用 LLM 并返回原始响应文本"""
     client = _get_client()
 
-    response = client.chat.completions.create(
-        model="doubao-seed-2.1-turbo",
+    return call_llm_stream(
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
-        timeout=LLM_TIMEOUT,
+        max_tokens=16000,
+        wall_timeout=LLM_TIMEOUT,
+        _client=client,
     )
-
-    content = response.choices[0].message.content
-    if content is None:
-        raise ValueError("LLM 返回空内容")
-    return content
 
 
 def _fix_json(text: str) -> str:

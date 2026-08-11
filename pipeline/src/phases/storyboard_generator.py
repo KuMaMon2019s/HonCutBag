@@ -29,6 +29,7 @@ import argparse
 import math
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -38,6 +39,7 @@ from prompt.eight_layer_summary import build_subject_summary
 from utils.config import ToolPaths
 from utils.pipeline_config import load_config
 from utils.visual_style_spec import VisualStyle, parse_visual_style
+from utils.ark_llm import call_llm_stream, create_ark_client
 
 
 def _load_default_visual_style(
@@ -226,19 +228,7 @@ def _get_client() -> OpenAI:
 
     API Key: ARK_AGENT_API_KEY (火山方舟 Agent Plan)
     """
-    api_key = (
-        os.environ.get("ARK_AGENT_API_KEY")
-        
-        or os.environ.get("OPENAI_API_KEY")
-    )
-    if not api_key:
-        print("错误：环境变量 ARK_AGENT_API_KEY 未设置（火山方舟 Agent Plan）", file=sys.stderr)
-        sys.exit(1)
-
-    return OpenAI(
-        api_key=api_key,
-        base_url="https://ark.cn-beijing.volces.com/api/plan/v3",
-    )
+    return create_ark_client()
 
 
 def _call_llm(user_prompt: str, visual_style_text: Optional[str] = None) -> str:
@@ -256,25 +246,15 @@ def _call_llm(user_prompt: str, visual_style_text: Optional[str] = None) -> str:
     """
     client = _get_client()
 
-    stream = client.chat.completions.create(
-        model="doubao-seed-2.1-turbo",
+    return call_llm_stream(
         messages=[
             {"role": "system", "content": _render_system_prompt(visual_style_text)},
             {"role": "user", "content": user_prompt},
         ],
-        stream=True,
         max_tokens=16000,
-        timeout=LLM_TIMEOUT,
+        wall_timeout=LLM_TIMEOUT,
+        _client=client,
     )
-
-    chunks: List[str] = []
-    for chunk in stream:
-        if chunk.choices and chunk.choices[0].delta.content:
-            chunks.append(chunk.choices[0].delta.content)
-    content = "".join(chunks)
-    if not content.strip():
-        raise ValueError("LLM 返回空内容")
-    return content
 
 
 def _parse_llm_response(response: str) -> Dict[str, str]:
@@ -862,14 +842,15 @@ def generate_storyboard(
             payloads, run_tag=run_tag, partial_path=output_dir / "shots_partial.json"
         )
     else:
-        # Default remains Mission 19's serial streaming/watchdog path.
-        storyboard_shots = [
-            _generate_single_shot(
+        def generate_one(item):
+            i, shot = item
+            return _generate_single_shot(
                 shot, i, total, characters, visual_style_text, scene_style_map,
                 shots[i - 2] if i > 1 else None, visual_style_path,
             )
-            for i, shot in enumerate(shots, 1)
-        ]
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            storyboard_shots = list(executor.map(generate_one, enumerate(shots, 1)))
 
     # 组装完整 STORYBOARD
     pipeline_config = config if config is not None else load_config(config_path)

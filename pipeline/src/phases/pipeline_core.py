@@ -42,6 +42,7 @@ from phases.adaptation_engine import AVG_SHOT_DURATION
 from quality.composition_validator import validate_composition
 from tools.vendor_adapter import VendorAdapter, VendorModel
 from utils.style_slices import get_slice
+from utils.ark_llm import call_llm_stream, configure_heartbeat_callback
 
 
 def _run_storyboard_supervision(storyboard: dict, output_dir: Path) -> dict:
@@ -662,24 +663,37 @@ def _summarize_visual_style_with_llm(script_text: str) -> Optional[str]:
     """Best-effort style summary; deliberately isolated so tests can mock it."""
     api_key = os.environ.get("ARK_AGENT_API_KEY") or os.environ.get("OPENAI_API_KEY")
     if not api_key:
+        print("  ⚠ 风格总结不可用，降级使用 default_visual_style")
         return None
     try:
-        from openai import OpenAI
-        client = OpenAI(
-            api_key=api_key,
-            base_url="https://ark.cn-beijing.volces.com/api/plan/v3",
-        )
-        response = client.chat.completions.create(
-            model="doubao-seed-2.1-turbo",
+        return call_llm_stream(
             messages=[{
                 "role": "user",
                 "content": "用一句话总结以下剧本的美术风格，只输出风格描述：\n" + script_text,
             }],
-            timeout=120,  # 2026-08-09: turbo 推理模型 30s 必超时，F1 风格提取依赖此调用
-        )
-        return str(response.choices[0].message.content or "").strip() or None
-    except Exception:
+            max_tokens=1024,
+            wall_timeout=60.0,
+        ).strip() or None
+    except Exception as exc:
+        print(f"  ⚠ 风格总结失败，降级使用 default_visual_style: {exc}")
         return None
+
+
+def _atomic_write_phase1_json(path: Path, payload: dict) -> None:
+    """Persist a completed Phase 1 substage without exposing partial JSON."""
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
+def _load_phase1_checkpoint(path: Path, collection_key: str) -> Optional[dict]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get(collection_key), list):
+        return None
+    return payload
 
 
 def _write_project_visual_style(output_dir: Path, style_text: str) -> Path:
@@ -719,6 +733,13 @@ def run_phase2(
         return {"status": "error", "error": f"Phase 1 import failed: {e}", "duration_s": _elapsed(start)}
 
     outputs = []
+    if reporter:
+        reporter.start_heartbeat("phase1")
+        configure_heartbeat_callback(
+            lambda: reporter.step(
+                "phase1", "LLM 流式响应", progress_pct=reporter._progress_pct
+            )
+        )
     try:
         # Step 2.1: text_parser → segments list
         print("  → text_parser: 解析文本结构...")
@@ -914,7 +935,13 @@ def run_phase2(
         print("  → event_extractor: 提取事件...")
         if reporter:
             reporter.step("phase1", "提取事件", progress_pct=30)
-        events_result = extract_events(segments)
+        events_checkpoint = output_dir / "phase1_events.json"
+        events_result = _load_phase1_checkpoint(events_checkpoint, "events")
+        if events_result is not None:
+            print("    ↻ 复用 phase1_events.json，跳过事件提取")
+        else:
+            events_result = extract_events(segments)
+            _atomic_write_phase1_json(events_checkpoint, events_result)
         events = events_result.get("events", [])
         print(f"    ✓ 提取 {len(events)} 个事件")
         if reporter:
@@ -924,7 +951,13 @@ def run_phase2(
         print("  → character_discoverer: 发现角色...")
         if reporter:
             reporter.step("phase1", "发现角色", progress_pct=50)
-        characters_result = discover_characters(events)
+        characters_checkpoint = output_dir / "phase1_characters.json"
+        characters_result = _load_phase1_checkpoint(characters_checkpoint, "characters")
+        if characters_result is not None:
+            print("    ↻ 复用 phase1_characters.json，跳过角色发现")
+        else:
+            characters_result = discover_characters(events)
+            _atomic_write_phase1_json(characters_checkpoint, characters_result)
         characters_list = characters_result.get("characters", [])
         print(f"    ✓ 发现 {len(characters_list)} 个角色")
         if reporter:
@@ -1021,6 +1054,10 @@ def run_phase2(
     except Exception as e:
         traceback.print_exc()
         return {"status": "error", "error": str(e), "duration_s": _elapsed(start), "outputs": outputs}
+    finally:
+        configure_heartbeat_callback(None)
+        if reporter:
+            reporter.stop_heartbeat()
 
 
 # ---------------------------------------------------------------------------
@@ -4732,7 +4769,7 @@ if LANGGRAPH_AVAILABLE:
         retry_count: int
         completed_phases: list
 
-    def build_pipeline_graph(auto_approve: bool = False):
+    def build_pipeline_graph(auto_approve: bool = False, reporter: Optional[ProgressReporter] = None):
         """Build the LangGraph StateGraph for the pipeline.
         
         Args:
@@ -4744,7 +4781,7 @@ if LANGGRAPH_AVAILABLE:
         graph = StateGraph(HonCutState)
         
         # Add nodes (each phase is a node)
-        graph.add_node("phase1", node_phase2)
+        graph.add_node("phase1", lambda state: node_phase2(state, reporter=reporter))
         graph.add_node("phase2", node_phase2_storyboard)
         
         # Interrupt node for human review (Phase 2 → Phase 3)
@@ -4815,7 +4852,7 @@ if LANGGRAPH_AVAILABLE:
 
     # --- Node functions (wrappers around existing run_phase* functions) ---
     
-    def node_phase2(state: HonCutState) -> dict:
+    def node_phase2(state: HonCutState, reporter: Optional[ProgressReporter] = None) -> dict:
         """Phase 1 node: 编剧引擎"""
         output_dir = Path(state["output_dir"])
         result = run_phase2(
@@ -4823,6 +4860,7 @@ if LANGGRAPH_AVAILABLE:
             output_dir=output_dir,
             duration=state["duration"],
             dry_run=state["dry_run"],
+            reporter=reporter,
             shot_duration=state.get("shot_duration", AVG_SHOT_DURATION),
         )
         
@@ -5153,7 +5191,7 @@ if LANGGRAPH_AVAILABLE:
 
 else:
     # Fallback when LangGraph is not available
-    def build_pipeline_graph(auto_approve: bool = False):
+    def build_pipeline_graph(auto_approve: bool = False, reporter: Optional[ProgressReporter] = None):
         return None
 
 
@@ -5308,7 +5346,7 @@ def run_pipeline(
         print(f"\n  🚀 Using LangGraph StateGraph for pipeline execution")
         try:
             # Build the graph
-            graph = build_pipeline_graph(auto_approve=auto_approve)
+            graph = build_pipeline_graph(auto_approve=auto_approve, reporter=reporter)
             
             if graph is None:
                 raise RuntimeError("Failed to build pipeline graph")
@@ -5331,7 +5369,7 @@ def run_pipeline(
                 if not auto_approve:
                     print("  ⚠ interrupt nodes require checkpointer but SQLite unavailable; falling back to --auto-approve mode")
                     # Rebuild graph without interrupt nodes
-                    graph = build_pipeline_graph(auto_approve=True)
+                    graph = build_pipeline_graph(auto_approve=True, reporter=reporter)
                     if graph is None:
                         raise RuntimeError("Failed to rebuild pipeline graph (auto_approve fallback)")
                 app = graph.compile()
@@ -5516,7 +5554,7 @@ def run_pipeline(
         print(f"  🔄 Phase 1: 从 checkpoint 恢复 (已跳过)")
     else:
         reporter.phase_start("phase1", "编剧引擎")
-        p2 = run_phase2(text, output_dir, duration, dry_run, shot_duration=shot_duration)
+        p2 = run_phase2(text, output_dir, duration, dry_run, reporter=reporter, shot_duration=shot_duration)
         # 提取内部数据（不写入 report）
         storyboard_data = p2.pop("_storyboard", None)
         characters_data = p2.pop("_characters", None)

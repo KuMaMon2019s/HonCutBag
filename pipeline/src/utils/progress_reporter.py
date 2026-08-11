@@ -16,6 +16,7 @@ Usage:
 import json
 import os
 import time
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -38,6 +39,8 @@ class ProgressReporter:
         self._current_step: Optional[str] = None
         self._progress_pct: int = 0
         self._status: str = "running"
+        self._heartbeat_stop: Optional[threading.Event] = None
+        self._heartbeat_thread: Optional[threading.Thread] = None
 
         # 清空旧的 events 文件（新管线运行 = 新日志）
         self.events_file.write_text("")
@@ -77,6 +80,34 @@ class ProgressReporter:
             "msg": msg,
         })
         self._flush_progress()
+
+    def start_heartbeat(self, phase_id: str, interval_s: float = 15.0):
+        """Write periodic liveness events until ``stop_heartbeat`` is called."""
+        self.stop_heartbeat()
+        stop = threading.Event()
+        self._heartbeat_stop = stop
+        started = time.monotonic()
+
+        def emit() -> None:
+            while not stop.wait(interval_s):
+                self._write_event({
+                    "phase": phase_id,
+                    "event": "heartbeat",
+                    "elapsed_s": round(time.monotonic() - started),
+                    "ts": self._now_iso(),
+                })
+
+        self._heartbeat_thread = threading.Thread(target=emit, daemon=True)
+        self._heartbeat_thread.start()
+
+    def stop_heartbeat(self):
+        """Stop and join the active heartbeat thread, if any."""
+        if self._heartbeat_stop is not None:
+            self._heartbeat_stop.set()
+        if self._heartbeat_thread is not None:
+            self._heartbeat_thread.join(timeout=1.0)
+        self._heartbeat_stop = None
+        self._heartbeat_thread = None
 
     def phase_done(self, phase_id: str, msg: str, duration_s: Optional[float] = None):
         """Phase 完成时调用"""

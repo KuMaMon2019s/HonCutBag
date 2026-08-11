@@ -38,6 +38,7 @@ from typing import List, Dict, Any, Optional
 
 from openai import OpenAI, APITimeoutError
 from utils.config import get_api_key, ARK_BASE_URL
+from utils.ark_llm import LLMReadTimeout, call_llm_stream, create_ark_client
 
 
 # ─── LLM 配置 ───────────────────────────────────────────────────────────────
@@ -267,15 +268,7 @@ def _get_client() -> OpenAI:
 
     API Key: ARK_AGENT_API_KEY (火山方舟 Agent Plan)
     """
-    api_key = get_api_key("ARK_AGENT_API_KEY")
-    if not api_key:
-        print("错误：环境变量 ARK_AGENT_API_KEY 未设置（火山方舟 Agent Plan）", file=sys.stderr)
-        sys.exit(1)
-
-    return OpenAI(
-        api_key=api_key,
-        base_url=ARK_BASE_URL,
-    )
+    return create_ark_client()
 
 
 def _call_llm(user_prompt: str, max_tokens: int = 32000) -> str:
@@ -300,25 +293,15 @@ def _call_llm(user_prompt: str, max_tokens: int = 32000) -> str:
     # 在 char 8354/9433 被截断（JSONDecodeError: Unterminated string）。
     # 探针实锤 max_tokens=16000/32000 均被 Agent Plan 端点接受（HTTP 200），
     # 取 32000 留足 reasoning + 15 镜 JSON 余量。
-    stream = client.chat.completions.create(
-        model="doubao-seed-2.1-turbo",
+    return call_llm_stream(
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
-        stream=True,
         max_tokens=max_tokens,
-        timeout=LLM_TIMEOUT,
+        wall_timeout=LLM_TIMEOUT,
+        _client=client,
     )
-
-    chunks: List[str] = []
-    for chunk in stream:
-        if chunk.choices and chunk.choices[0].delta.content:
-            chunks.append(chunk.choices[0].delta.content)
-    content = "".join(chunks)
-    if not content.strip():
-        raise ValueError("LLM 返回空内容")
-    return content
 
 
 def _call_llm_with_timeout_retry(user_prompt: str, max_tokens: int = 32000) -> str:
@@ -339,7 +322,7 @@ def _call_llm_with_timeout_retry(user_prompt: str, max_tokens: int = 32000) -> s
     for net_attempt in range(NETWORK_RETRIES + 1):
         try:
             return _call_llm(user_prompt, max_tokens=max_tokens)
-        except APITimeoutError as e:
+        except (APITimeoutError, LLMReadTimeout) as e:
             if net_attempt < NETWORK_RETRIES:
                 wait = 15 * (net_attempt + 1)
                 print(f"  ⚠ LLM 网络超时，{wait}s 后重试 ({net_attempt + 1}/{NETWORK_RETRIES})...", file=sys.stderr)

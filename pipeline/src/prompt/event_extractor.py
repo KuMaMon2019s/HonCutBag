@@ -22,9 +22,11 @@ import sys
 import os
 import argparse
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, Optional
 
 from openai import OpenAI
+from utils.ark_llm import call_llm_stream, create_ark_client
 
 
 # ─── LLM 配置 ───────────────────────────────────────────────────────────────
@@ -68,20 +70,7 @@ def _get_client() -> OpenAI:
     Raises:
         SystemExit: 如果所有 API key 环境变量均未设置
     """
-    # 尝试多个环境变量名
-    api_key = (
-        os.environ.get("ARK_AGENT_API_KEY")
-        
-        or os.environ.get("OPENAI_API_KEY")
-    )
-    if not api_key:
-        print("错误：环境变量 ARK_AGENT_API_KEY 未设置（火山方舟 Agent Plan）", file=sys.stderr)
-        sys.exit(1)
-
-    return OpenAI(
-        api_key=api_key,
-        base_url="https://ark.cn-beijing.volces.com/api/plan/v3",
-    )
+    return create_ark_client()
 
 
 def _call_llm(prompt: str) -> str:
@@ -99,19 +88,15 @@ def _call_llm(prompt: str) -> str:
     """
     client = _get_client()
 
-    response = client.chat.completions.create(
-        model="doubao-seed-2.1-turbo",
+    return call_llm_stream(
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
-        timeout=LLM_TIMEOUT,
+        max_tokens=16000,
+        wall_timeout=LLM_TIMEOUT,
+        _client=client,
     )
-
-    content = response.choices[0].message.content
-    if content is None:
-        raise ValueError("LLM 返回空内容")
-    return content
 
 
 def _parse_events(response: str) -> List[Dict[str, Any]]:
@@ -220,11 +205,15 @@ def extract_events(segments: List[Dict[str, Any]]) -> Dict[str, Any]:
     all_events = []
     event_id = 1
 
-    for segment in segments:
+    def extract_one(segment):
         segment_id = segment.get("id", 0)
         print(f"处理 segment {segment_id}...", file=sys.stderr)
+        return segment_id, _extract_events_from_segment(segment)
 
-        events = _extract_events_from_segment(segment)
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        ordered_results = list(executor.map(extract_one, segments))
+
+    for segment_id, events in ordered_results:
 
         for event in events:
             event["id"] = event_id
