@@ -696,6 +696,102 @@ def _build_shot_prompt(
 
 # ─── 核心函数 ────────────────────────────────────────────────────────────────
 
+def _generate_single_shot(
+    shot: Dict[str, Any],
+    index: int,
+    total: int,
+    characters: Optional[List[Dict[str, Any]]] = None,
+    visual_style_text: Optional[str] = None,
+    scene_style_map: Optional[Dict[str, str]] = None,
+    previous_shot: Optional[Dict[str, Any]] = None,
+    visual_style_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Generate and assemble one shot; shared by serial and arq paths."""
+    print(f"Shot {index}/{total} 开始生成...")
+    shot_deadline = time.monotonic() + SHOT_WALL_CLOCK_S
+    if shot.get("source_excerpt") and not shot.get("action_description"):
+        shot["action_description"] = shot["source_excerpt"]
+    duration = shot.get("suggested_duration", 5)
+    user_prompt = _build_shot_prompt(
+        shot, characters, scene_style_map=scene_style_map,
+        prev_shot=previous_shot, visual_style_path=visual_style_path,
+    )
+    llm_result = None
+    last_error = "unknown error"
+    for attempt in range(1 + MAX_RETRIES):
+        if time.monotonic() + LLM_TIMEOUT > shot_deadline:
+            print(f"Shot {index} 总时限 {SHOT_WALL_CLOCK_S}s 到，使用降级方案", file=sys.stderr)
+            llm_result = {"prompt": f"Cinematic shot, {shot.get('visual', 'scene')}, natural lighting, film grain", "caption": shot.get("what", "")}
+            break
+        try:
+            prompt = user_prompt if attempt == 0 else user_prompt + f"\n\n[重试反馈] 上次失败原因: {last_error}。请确保输出有效的 JSON 格式。"
+            llm_result = _parse_llm_response(_call_llm(prompt, visual_style_text))
+            break
+        except (json.JSONDecodeError, ValueError) as exc:
+            last_error = str(exc)
+            if attempt < MAX_RETRIES:
+                print(f"Shot {index} LLM 解析失败，重试中（{attempt + 1}/{MAX_RETRIES}）: {exc}", file=sys.stderr)
+                time.sleep(1)
+            else:
+                print(f"Shot {index} LLM 解析失败，使用降级方案: {exc}", file=sys.stderr)
+        except Exception as exc:
+            last_error = str(exc)
+            if attempt < MAX_RETRIES:
+                print(f"Shot {index} LLM 调用失败，重试中（{attempt + 1}/{MAX_RETRIES}）: {exc}", file=sys.stderr)
+                time.sleep(min(15 * (attempt + 1), 60) if isinstance(exc, (APIConnectionError, TimeoutError, ConnectionError)) else 1)
+            else:
+                print(f"Shot {index} LLM 调用失败，使用降级方案: {exc}", file=sys.stderr)
+        if attempt == MAX_RETRIES:
+            llm_result = {"prompt": f"Cinematic shot, {shot.get('visual', 'scene')}, natural lighting, film grain", "caption": shot.get("what", "")}
+
+    if llm_result is None:
+        llm_result = {"prompt": f"Cinematic shot, {shot.get('visual', 'scene')}, natural lighting, film grain", "caption": shot.get("what", "")}
+    prompt_blueprint = user_prompt.partition("场景：")[2].partition("\n角色：")[0].strip()
+    if prompt_blueprint:
+        llm_result["prompt"] = f"{prompt_blueprint}\n{llm_result['prompt']}".strip()
+    visual_style = _load_default_visual_style(visual_style_path)
+    if visual_style.style_prompt_full and visual_style.style_prompt_full not in llm_result["prompt"]:
+        llm_result["prompt"] = f"{llm_result['prompt']}\n\nVisual style: {visual_style.style_prompt_full}"
+    llm_result["prompt"] = _remove_fast_motion_words(llm_result["prompt"])
+    print(f"Shot {index}/{total} ✅ 完成")
+
+    characters_map = _build_characters_map(characters)
+    first_frame = _get_first_frame_for_shot(shot, characters_map)
+    shot_name = shot.get("what", f"镜头 {index}")
+    if len(shot_name) > 30:
+        shot_name = shot_name[:30] + "..."
+    result = {
+        "id": index, "name": shot_name, "duration": duration,
+        "prompt": llm_result["prompt"], "caption": llm_result["caption"],
+        "caption_frames": _calculate_caption_frames(duration),
+        "dialogue": shot.get("dialogue"), "visual": shot.get("visual", ""),
+        "what": shot.get("what", ""),
+    }
+    for field in ("narration", "voiceover"):
+        if field in shot:
+            result[field] = shot[field]
+    if first_frame:
+        result["first_frame"] = first_frame
+    who = shot.get("who", [])
+    result["who"] = who if isinstance(who, list) else ([str(who)] if who else [])
+    defaults = {
+        "shot_type": shot.get("shot_type") or shot.get("shot_size"),
+        "subject_description": _concrete_subject_description(shot, characters),
+        "action_description": shot.get("action_description") or shot.get("what") or shot.get("visual"),
+        "camera_movement_en": str(shot.get("camera_movement") or "fixed").replace("_", " "),
+        "lighting_description": _specific_lighting(shot, str(shot.get("where") or ""), visual_style),
+    }
+    for field, value in defaults.items():
+        if value:
+            result[field] = value
+    for field in ("shot_size", "camera_movement", "lighting_key", "shot_intent", "gen_strategy", "where", "audio", "sound"):
+        if shot.get(field):
+            result[field] = shot[field]
+    assets = shot.get("associate_assets", [])
+    if assets:
+        result["associate_assets"] = assets if isinstance(assets, list) else [assets]
+    return result
+
 def generate_storyboard(
     shots: List[Dict[str, Any]],
     characters: Optional[List[Dict[str, Any]]] = None,
@@ -727,9 +823,6 @@ def generate_storyboard(
     if not shots:
         raise ValueError("shot 列表为空，无法生成分镜")
 
-    # 构建角色映射
-    characters_map = _build_characters_map(characters)
-
     # --- P1-B1: 同场景共享视觉参数（参考 HonCut 五层镜头构建）---
     # 同场景镜头共享 Layer 3-5（Subject/Lighting/Style），只有 Layer 1-2（Camera/Movement）随镜头变
     scene_style_map = {}  # {where: style_suffix}
@@ -747,169 +840,36 @@ def generate_storyboard(
     # 计算总时长
     total_duration = sum(shot.get("suggested_duration", 5) for shot in shots)
 
-    # 处理每个 shot
-    storyboard_shots = []
     total = len(shots)
-    for i, shot in enumerate(shots, 1):
-        print(f"Shot {i}/{total} 开始生成...")
-        shot_deadline = time.monotonic() + SHOT_WALL_CLOCK_S
-        if shot.get("source_excerpt") and not shot.get("action_description"):
-            shot["action_description"] = shot["source_excerpt"]
-        duration = shot.get("suggested_duration", 5)
+    if os.environ.get("HONCUT_SHOT_QUEUE") == "1":
+        from utils.shot_queue import make_payload, run_shot_queue
 
-        # 调用 LLM 生成英文 prompt 和中文 caption
-        previous_shot = shots[i - 2] if i > 1 else None
-        user_prompt = _build_shot_prompt(
-            shot,
-            characters,
-            scene_style_map=scene_style_map,
-            prev_shot=previous_shot,
-            visual_style_path=visual_style_path,
-        )
-        llm_result = None
-
-        for attempt in range(1 + MAX_RETRIES):
-            # Do not start a request that can outlive this shot's wall-clock budget.
-            if time.monotonic() + LLM_TIMEOUT > shot_deadline:
-                print(
-                    f"Shot {i} 总时限 {SHOT_WALL_CLOCK_S}s 到，使用降级方案",
-                    file=sys.stderr,
-                )
-                llm_result = {
-                    "prompt": f"Cinematic shot, {shot.get('visual', 'scene')}, natural lighting, film grain",
-                    "caption": shot.get("what", ""),
-                }
-                break
-            try:
-                # 如果是重试，注入质量反馈到 prompt
-                if attempt > 0:
-                    feedback_prompt = user_prompt + f"\n\n[重试反馈] 上次失败原因: {last_error}。请确保输出有效的 JSON 格式。"
-                    response = _call_llm(feedback_prompt, visual_style_text)
-                else:
-                    response = _call_llm(user_prompt, visual_style_text)
-                
-                llm_result = _parse_llm_response(response)
-                break
-            except (json.JSONDecodeError, ValueError) as e:
-                last_error = str(e)
-                if attempt < MAX_RETRIES:
-                    print(f"Shot {i} LLM 解析失败，重试中（{attempt + 1}/{MAX_RETRIES}）: {e}", file=sys.stderr)
-                    time.sleep(1)
-                else:
-                    print(f"Shot {i} LLM 解析失败，使用降级方案: {e}", file=sys.stderr)
-                    # 降级：直接用 visual 作为 prompt，空 caption
-                    llm_result = {
-                        "prompt": f"Cinematic shot, {shot.get('visual', 'scene')}, natural lighting, film grain",
-                        "caption": shot.get("what", ""),
-                    }
-            except Exception as e:
-                last_error = str(e)
-                if attempt < MAX_RETRIES:
-                    print(f"Shot {i} LLM 调用失败，重试中（{attempt + 1}/{MAX_RETRIES}）: {e}", file=sys.stderr)
-                    if isinstance(e, (APIConnectionError, TimeoutError, ConnectionError)):
-                        time.sleep(min(15 * (attempt + 1), 60))
-                    else:
-                        time.sleep(1)
-                else:
-                    print(f"Shot {i} LLM 调用失败，使用降级方案: {e}", file=sys.stderr)
-                    llm_result = {
-                        "prompt": f"Cinematic shot, {shot.get('visual', 'scene')}, natural lighting, film grain",
-                        "caption": shot.get("what", ""),
-                    }
-
-        if llm_result is None:
-            llm_result = {
-                "prompt": f"Cinematic shot, {shot.get('visual', 'scene')}, natural lighting, film grain",
-                "caption": shot.get("what", ""),
-            }
-
-        # Identity and camera constraints are deterministic safety rails. Keep
-        # them in the final Seedance prompt even if the translation model omits
-        # or paraphrases part of the requested structure.
-        prompt_blueprint = user_prompt.partition("场景：")[2].partition("\n角色：")[0].strip()
-        if prompt_blueprint:
-            llm_result["prompt"] = f"{prompt_blueprint}\n{llm_result['prompt']}".strip()
-
-        # Preserve the king field verbatim in the final Seedance prompt even
-        # when the translation model paraphrases or omits style instructions.
-        visual_style = _load_default_visual_style(visual_style_path)
-        if (
-            visual_style.style_prompt_full
-            and visual_style.style_prompt_full not in llm_result["prompt"]
-        ):
-            llm_result["prompt"] = (
-                f"{llm_result['prompt']}\n\nVisual style: "
-                f"{visual_style.style_prompt_full}"
+        pipeline_config = config if isinstance(config, dict) else load_config(config_path)
+        pipeline_config = pipeline_config if isinstance(pipeline_config, dict) else {}
+        inferred_dir = Path(visual_style_path).parent if visual_style_path else (Path(config_path).parent if config_path else Path.cwd())
+        output_dir = Path(pipeline_config.get("output_dir", inferred_dir))
+        run_tag = str(pipeline_config.get("run_tag") or output_dir.name)
+        payloads = [
+            make_payload(
+                shot, i, total, characters=characters,
+                visual_style_text=visual_style_text, scene_style_map=scene_style_map,
+                previous_shot=shots[i - 2] if i > 1 else None,
+                visual_style_path=visual_style_path,
             )
-        llm_result["prompt"] = _remove_fast_motion_words(llm_result["prompt"])
-        print(f"Shot {i}/{total} ✅ 完成")
-
-        # 确定 first_frame
-        first_frame = _get_first_frame_for_shot(shot, characters_map)
-
-        # 计算 caption_frames
-        caption_frames = _calculate_caption_frames(duration)
-
-        # 构建 shot 名称
-        shot_name = shot.get("what", f"镜头 {i}")
-        if len(shot_name) > 30:
-            shot_name = shot_name[:30] + "..."
-
-        # 组装 storyboard shot
-        storyboard_shot = {
-            "id": i,
-            "name": shot_name,
-            "duration": duration,
-            "prompt": llm_result["prompt"],
-            "caption": llm_result["caption"],
-            "caption_frames": caption_frames,
-            # Speech is script truth from Phase 2. Caption remains the visual
-            # scene description and must never be substituted for dialogue.
-            "dialogue": shot.get("dialogue"),
-            # Retained for deterministic route diagnostics and FLF2V end-state prompts.
-            "visual": shot.get("visual", ""),
-            "what": shot.get("what", ""),
-        }
-        for speech_field in ("narration", "voiceover"):
-            if speech_field in shot:
-                storyboard_shot[speech_field] = shot[speech_field]
-
-        # 透传结构化字段（who/shot_size/camera_movement/lighting_key/shot_intent/associate_assets）
-        # 这些字段从 adaptation_engine 的 LLM 输出传递到 STORYBOARD.json，供 M2 和 Phase 6 消费
-        if first_frame:
-            storyboard_shot["first_frame"] = first_frame
-
-        # who: 出场角色列表（空数组 = 纯风景镜头）
-        who_list = shot.get("who", [])
-        if isinstance(who_list, list):
-            storyboard_shot["who"] = who_list
-        else:
-            storyboard_shot["who"] = [str(who_list)] if who_list else []
-
-        # Structured fields used by review and generation routing.
-        structured_defaults = {
-            "shot_type": shot.get("shot_type") or shot.get("shot_size"),
-            "subject_description": _concrete_subject_description(shot, characters),
-            "action_description": shot.get("action_description") or shot.get("what") or shot.get("visual"),
-            "camera_movement_en": str(shot.get("camera_movement") or "fixed").replace("_", " "),
-            "lighting_description": _specific_lighting(
-                shot, str(shot.get("where") or ""), visual_style
-            ),
-        }
-        for field, value in structured_defaults.items():
-            if value:
-                storyboard_shot[field] = value
-        for field in ("shot_size", "camera_movement", "lighting_key", "shot_intent", "gen_strategy", "where", "audio", "sound"):
-            val = shot.get(field)
-            if val:
-                storyboard_shot[field] = val
-
-        # associate_assets: 资产绑定
-        aa = shot.get("associate_assets", [])
-        if aa:
-            storyboard_shot["associate_assets"] = aa if isinstance(aa, list) else [aa]
-
-        storyboard_shots.append(storyboard_shot)
+            for i, shot in enumerate(shots, 1)
+        ]
+        storyboard_shots = run_shot_queue(
+            payloads, run_tag=run_tag, partial_path=output_dir / "shots_partial.json"
+        )
+    else:
+        # Default remains Mission 19's serial streaming/watchdog path.
+        storyboard_shots = [
+            _generate_single_shot(
+                shot, i, total, characters, visual_style_text, scene_style_map,
+                shots[i - 2] if i > 1 else None, visual_style_path,
+            )
+            for i, shot in enumerate(shots, 1)
+        ]
 
     # 组装完整 STORYBOARD
     pipeline_config = config if config is not None else load_config(config_path)

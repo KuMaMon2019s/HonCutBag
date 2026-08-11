@@ -1,4 +1,5 @@
 import json
+import asyncio
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from phases import storyboard_generator
+from utils import shot_queue
 
 
 def _shot():
@@ -18,6 +20,53 @@ def _shot():
         "where": "测试地点",
         "suggested_duration": 3,
     }
+
+
+def _queue_payload(index):
+    return shot_queue.make_payload(
+        {"what": f"shot-{index}", "who": []}, index, 3, characters=[],
+        visual_style_text="style", scene_style_map={}, previous_shot=None,
+        visual_style_path=None,
+    )
+
+
+def test_shot_queue_payload_recovery_and_sorting(tmp_path):
+    payload = _queue_payload(2)
+    assert shot_queue.deserialize_payload(shot_queue.serialize_payload(payload)) == payload
+    checkpoint = tmp_path / "shots_partial.json"
+    shot_queue.write_completed(checkpoint, "run-a", {2: {"id": 2}})
+    completed = shot_queue.load_completed(checkpoint, "run-a")
+    assert [item["index"] for item in shot_queue.missing_payloads(
+        [_queue_payload(1), _queue_payload(2), _queue_payload(3)], completed
+    )] == [1, 3]
+    assert shot_queue.sorted_results({2: {"id": 2}, 1: {"id": 1}}) == [
+        {"id": 1}, {"id": 2}
+    ]
+
+
+def test_shot_queue_enqueue_worker_collect_without_redis(tmp_path, monkeypatch):
+    import pipeline.src.phases.storyboard_generator as canonical_generator
+
+    monkeypatch.setattr(canonical_generator, "_generate_single_shot", lambda **payload: {
+        "id": payload["index"], "name": payload["shot"]["what"]
+    })
+
+    class FakeJob:
+        def __init__(self, payload): self.payload = payload
+        async def result(self, timeout=None):
+            return await shot_queue.generate_shot_job({"job_try": 1}, self.payload)
+
+    class FakeRedis:
+        async def enqueue_job(self, _function, payload, **kwargs): return FakeJob(payload)
+        async def aclose(self): pass
+
+    async def pool_factory(_settings): return FakeRedis()
+    result = asyncio.run(shot_queue.enqueue_and_collect(
+        [_queue_payload(3), _queue_payload(1), _queue_payload(2)],
+        run_tag="integration", partial_path=tmp_path / "shots_partial.json",
+        pool_factory=pool_factory,
+    ))
+    assert [item["id"] for item in result] == [1, 2, 3]
 
 
 def test_call_llm_uses_streaming_and_joins_chunks(monkeypatch):

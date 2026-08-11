@@ -1,2 +1,3 @@
 # Dependencies are managed in the project root requirements.txt
 # Install: pip install -r ../requirements.txt
+arq==0.28.0
