@@ -73,7 +73,6 @@ try:
     from langgraph.types import RetryPolicy, Send, Command, interrupt
     from langgraph.checkpoint.sqlite import SqliteSaver
     from langgraph.checkpoint.base import empty_checkpoint
-    from langgraph.graph import StateGraph, START, END
     from langgraph.errors import GraphInterrupt
     LANGGRAPH_AVAILABLE = True
 except ImportError as e:
@@ -4873,102 +4872,34 @@ if LANGGRAPH_AVAILABLE:
         completed_phases: list
 
     def build_pipeline_graph(auto_approve: bool = False, reporter: Optional[ProgressReporter] = None):
-        """Build the LangGraph StateGraph for the pipeline.
-        
-        Args:
-            auto_approve: If True, skip interrupt nodes (for CI/testing)
-        
-        Returns:
-            CompiledStateGraph instance
-        """
+        """Compatibility facade for the migrated uncompiled workflow builder."""
         from graph.nodes.phase8 import route_after_phase8
         from graph.nodes.phase9 import route_after_phase9
+        from graph.workflow import build_workflow
 
-        graph = StateGraph(HonCutState)
-        
-        # Add nodes (each phase is a node)
-        graph.add_node("phase1", lambda state: node_phase1(state, reporter=reporter))
-        graph.add_node("phase2", node_phase2)
-        
-        # Interrupt node for human review (Phase 2 → Phase 3)
-        if not auto_approve:
-            graph.add_node("review_storyboard", node_review_storyboard)
-        
-        graph.add_node("phase3", node_phase3)
-        graph.add_node("phase4", node_phase4)
-        graph.add_node("phase5", node_phase5_quality)
-        
-        # Conditional routing for Phase 4 → Phase 6 (different generators)
-        graph.add_node("phase6_txt2vid", node_phase6_txt2vid)
-        graph.add_node("phase6_img2vid", node_phase6_img2vid)
-        graph.add_node("phase6_reference", node_phase6_reference)
-        
-        graph.add_node("phase7", node_phase7)
-        graph.add_node("phase8", node_phase8)
-        graph.add_node("phase9", node_phase9)
-        graph.add_node("phase9_5", node_phase9_5)
-
-        # Edges
-        graph.add_edge(START, "phase1")
-        graph.add_edge("phase1", "phase2")
-        
-        if not auto_approve:
-            graph.add_edge("phase2", "review_storyboard")
-            graph.add_edge("review_storyboard", "phase3")
-        else:
-            graph.add_edge("phase2", "phase3")
-        
-        graph.add_edge("phase3", "phase4")
-        
-        graph.add_edge("phase4", "phase5")
-
-        # Conditional routing: the passed Phase 5 gate selects a Phase 6 variant
-        graph.add_conditional_edges(
-            "phase5",
-            route_phase5,
-            {
-                "txt2vid": "phase6_txt2vid",
-                "img2vid": "phase6_img2vid",
-                "reference": "phase6_reference",
-            }
-        )
-        
-        # All Phase 6 variants converge to Phase 7
-        graph.add_edge("phase6_txt2vid", "phase7")
-        graph.add_edge("phase6_img2vid", "phase7")
-        graph.add_edge("phase6_reference", "phase7")
-        
-        # Quality gate: Phase 7 can rollback to Phase 6 via Command
-        graph.add_conditional_edges(
-            "phase7",
-            quality_gate_router,
-            {
-                "pass": "phase8",
-                "retry": "phase6_txt2vid",  # Default retry path
-            }
-        )
-        
-        graph.add_conditional_edges(
-            "phase8",
-            route_after_phase8,
-            {
-                "continue": "phase9",
-                "end": END,
+        return build_workflow(
+            state_schema=HonCutState,
+            nodes={
+                "phase1": lambda state: node_phase1(state, reporter=reporter),
+                "phase2": node_phase2,
+                "phase3": node_phase3,
+                "phase4": node_phase4,
+                "phase5": node_phase5_quality,
+                "phase6_txt2vid": node_phase6_txt2vid,
+                "phase6_img2vid": node_phase6_img2vid,
+                "phase6_reference": node_phase6_reference,
+                "phase7": node_phase7,
+                "phase8": node_phase8,
+                "phase9": node_phase9,
+                "phase9_5": node_phase9_5,
             },
+            review_storyboard_node=node_review_storyboard,
+            route_phase5=route_phase5,
+            quality_gate_router=quality_gate_router,
+            route_after_phase8=route_after_phase8,
+            route_after_phase9=route_after_phase9,
+            auto_approve=auto_approve,
         )
-        graph.add_conditional_edges(
-            "phase9",
-            route_after_phase9,
-            {
-                "continue": "phase9_5",
-                "end": END,
-            },
-        )
-        graph.add_edge("phase9_5", END)
-        
-        # Compile with SQLite checkpointer
-        # Note: checkpointer is created per-invocation in run_pipeline()
-        return graph
 
     # --- Node functions (wrappers around existing run_phase* functions) ---
     
