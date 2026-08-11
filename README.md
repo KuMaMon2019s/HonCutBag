@@ -21,6 +21,8 @@ A 44-second cyberpunk short film generated fully automatically from a text scrip
 
 HonCut runs on a split-role deployment: a Mac orchestration layer drives a nine-phase pipeline, a Windows GPU machine hosts the ComfyUI Bridge for local synthesis fallback, and Volcano Ark provides online LLM scripting, Seedance video, Seedream image, Seed-TTS, and SeedASR services. All LLM scripting calls flow through a unified streaming client (`ark_llm`) with hard wall-clock timeouts, per-phase heartbeats, and sub-phase checkpoints so no phase can hang silently.
 
+The pipeline core is a **LangGraph state graph** (`graph/workflow.py`): phases are graph nodes wired with conditional routing — the QA gate selects one of three video-generation strategies (text-to-video / image-to-video / reference-driven), the consistency guard can loop failed shots back for regeneration, and the assembly engine can trigger a bounded reshoot cycle. Graph state persists through a SQLite checkpointer, so a run can be interrupted and resumed mid-pipeline. Video generation itself runs on a dedicated **runtime layer** (`runtime/`): a SQLite task store persists provider job IDs across process crashes, cross-process capacity leases limit concurrent provider calls, and crash-safe executors resume in-flight tasks instead of resubmitting them.
+
 ```mermaid
 flowchart TB
     subgraph MAC["🖥 Mac Orchestration Layer"]
@@ -28,11 +30,17 @@ flowchart TB
         P2 --> P3[Phase 3<br/>Character Factory]
         P3 --> P4[Phase 4<br/>Scene Consistency & Routing]
         P4 --> P5[Phase 5<br/>QA Gate + Supervision]
-        P5 --> P6[Phase 6<br/>Video Generation]
-        P6 --> P7[Phase 7<br/>Consistency Guard]
+        P5 -- txt2vid --> P6A[Phase 6<br/>Text-to-Video]
+        P5 -- img2vid --> P6B[Phase 6<br/>Image-to-Video]
+        P5 -- reference --> P6C[Phase 6<br/>Reference-Driven]
+        P6A --> P7[Phase 7<br/>Consistency Guard]
+        P6B --> P7
+        P6C --> P7
+        P7 -- retry --> P6A
         P7 --> P8[Phase 8<br/>Assembly + Narrative Review]
         P8 --> P9[Phase 9<br/>Post-Production]
-        P9 --> OUT[🎬 polished.mp4]
+        P9 --> P95[Phase 9.5<br/>Final QA]
+        P95 --> OUT[🎬 polished.mp4]
     end
 
     subgraph WIN["🖥 Windows GPU Machine"]
@@ -47,20 +55,27 @@ flowchart TB
         ASR[SeedASR<br/>speech recognition]
     end
 
-    subgraph QUEUE["⚙️ Shot Queue"]
+    subgraph RUNTIME["⚙️ Generation Runtime"]
+        TASKS[(SQLite<br/>task store)]
+        CAP[(Capacity<br/>leases)]
         REDIS[(Redis<br/>arq workers)]
     end
 
     P1 -- "scripting calls" --> LLM
-    P6 -- "video tasks" --> SD
-    P6 -- "concurrent shots" --> REDIS
-    P6 -. "local fallback" .-> BRIDGE
-    P2 -- "storyboard images" --> SR
+    P5 -- "storyboard images" --> SR
     P3 -- "reference assets" --> SR
+    P6B -- "video tasks" --> SD
+    P6C -- "video tasks" --> SD
+    P6A -. "concurrent shots" .-> REDIS
+    P6B -- "persist / resume" --> TASKS
+    P6C -- "persist / resume" --> TASKS
+    P6B -. "slot accounting" .-> CAP
+    P6C -. "slot accounting" .-> CAP
+    P6A -. "local fallback" .-> BRIDGE
     P9 -- "dialogue voice" --> TTS
     P9 -- "subtitle transcription" --> ASR
 
-    P8 -. "duration gap → reshoot" .-> P6
+    P8 -. "duration gap → reshoot" .-> P6A
 ```
 
 ### Pipeline Phases
@@ -73,11 +88,12 @@ Phases use contiguous integer IDs (`phase1`–`phase9`); every phase writes a ch
 | Phase 2 | Storyboard Images | Per-shot storyboard images (Seedream) as visual reference for video generation |
 | Phase 3 | Character Factory | Character reference assets (face close-up + full-body + variants) + character cards, with skip-if-exists reuse |
 | Phase 4 | Scene Consistency | Shot directory layout, timeline planning, scene consistency contracts, and three-route model routing (first-last-frame / phantom reference / single-image) |
-| Phase 5 | QA Gate + Supervision | L1/L2/L3 structural quality gate plus an LLM supervision agent (continuity / character / style / pacing / dialogue); A/B/C/D grading, C/D blocks video generation |
-| Phase 6 | Video Generation | Shot video synthesis via Seedance with optional arq/Redis concurrent shot queue, wall-clock watchdog, and Wan2.2 local fallback through the Windows Bridge |
-| Phase 7 | Consistency Guard | Cross-shot consistency checks, scene-change detection, and slideshow-risk scoring |
+| Phase 5 | QA Gate + Supervision | L1/L2/L3 structural quality gate plus an LLM supervision agent (continuity / character / style / pacing / dialogue); A/B/C/D grading, C/D blocks video generation. On pass, a graph router picks the Phase 6 strategy (txt2vid / img2vid / reference) |
+| Phase 6 | Video Generation | Shot video synthesis via Seedance on the crash-safe generation runtime (SQLite task store + cross-process capacity leases + resumable provider jobs), with an optional arq/Redis concurrent shot queue, wall-clock watchdog, and Wan2.2 local fallback through the Windows Bridge |
+| Phase 7 | Consistency Guard | Cross-shot consistency checks, scene-change detection, and slideshow-risk scoring; failed shots are routed back to Phase 6 for bounded regeneration |
 | Phase 8 | Assembly Engine | Clip stitching with smart transitions, multimodal narrative-order review, frame analysis (black/still frame detection), and duration gate with optional reshoot loop |
 | Phase 9 | Post-Production | Real SeedASR transcription → subtitle burn-in, three-track audio mixing (original bed + TTS dialogue + ducking), color grading, rhythm editing, final encode |
+| Phase 9.5 | Final QA | Delivery gate that validates the finished film before hand-off |
 
 ## Key Capabilities
 
@@ -92,7 +108,8 @@ Phases use contiguous integer IDs (`phase1`–`phase9`); every phase writes a ch
 - **Three-tier run memory** — a per-run SQLite memory (short-term events, rolling summaries, semantic retrieval) lets later phases and re-runs recall what happened earlier without re-deriving it.
 - **LLM supervision agent** — a streaming LLM reviewer (continuity / character / style / pacing / dialogue) grades the storyboard before video generation; advisory by default, optionally blocking.
 - **Fictional-character declaration** — reference-image and video prompts declare AI-generated fictional characters to reduce real-person content moderation friction.
-- **Checkpoint & resume** — per-phase checkpoint files with `--resume-from` recovery restart from any phase without re-running completed work.
+- **Checkpoint & resume** — per-phase checkpoint files with `--resume-from` recovery restart from any phase without re-running completed work; the LangGraph state persists through a SQLite checkpointer so an interrupted run resumes mid-pipeline.
+- **Crash-safe generation runtime** — video tasks persist their provider job IDs in a SQLite task store; cross-process capacity leases limit concurrent provider calls, and after a crash the pipeline resumes polling in-flight jobs instead of resubmitting and double-paying.
 - **Quality supervision** — four red-line checks (asset validity, script fidelity, concreteness, parent-child assets) with A/B/C/D grading gate before assembly.
 
 ## Project Structure
@@ -100,8 +117,17 @@ Phases use contiguous integer IDs (`phase1`–`phase9`); every phase writes a ch
 ```
 honcut/
 ├── pipeline/           # Python video pipeline
-│   ├── src/            # Source modules (phases, clients, tools, quality)
-│   ├── scripts/        # Orchestrator entry points
+│   ├── src/
+│   │   ├── graph/      # LangGraph workflow (state, nodes, routing)
+│   │   ├── runtime/    # Generation runtime (task store, capacity leases, executors)
+│   │   ├── phases/     # Phase modules (phase1/ … phase9/) + pipeline_core
+│   │   ├── prompt/     # Prompt engineering modules
+│   │   ├── schemas/    # Typed schemas (story, quality, workflow, …)
+│   │   ├── clients/    # Provider clients (Seedance, Seedream, ASR, InvokeAI, TOS, …)
+│   │   ├── tools/      # Media tools (audio, character, enhancement, …)
+│   │   ├── quality/    # QA gates, supervision agent, consistency guard
+│   │   └── utils/      # ark_llm streaming client, run memory, config
+│   ├── scripts/        # Orchestrator + shot queue worker entry points
 │   ├── prompts/        # Prompt templates
 │   └── requirements.txt
 ├── assets/demo/        # Demo frames (see Releases for full videos)
@@ -152,9 +178,11 @@ pytest pipeline/tests/ -v --cov=pipeline/src
 ## Dependencies
 
 - Python 3.11+
+- LangGraph + langgraph-checkpoint-sqlite (workflow graph & state checkpointing)
 - Docker & Docker Compose
 - FFmpeg
 - Volcano Ark API (Seedance, Seedream, SeedASR, Seed-TTS)
+- Optional Redis (arq shot queue)
 - Windows Bridge (ComfyUI + Wan2.2) for local video fallback
 
 ## License
