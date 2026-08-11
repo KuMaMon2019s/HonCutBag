@@ -32,7 +32,7 @@ import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
-from openai import OpenAI
+from openai import APIConnectionError, OpenAI
 
 from prompt.eight_layer_summary import build_subject_summary
 from utils.config import ToolPaths
@@ -127,6 +127,7 @@ USER_PROMPT_TEMPLATE = (
 
 LLM_TIMEOUT = 180  # 秒（2026-08-09: turbo 推理模型需要更长推理时间）
 MAX_RETRIES = 3  # 解析失败重试次数（从 1 提高到 3）
+SHOT_WALL_CLOCK_S = 480  # 单镜生成（含重试）的墙钟上限
 FPS = 30  # 帧率
 
 IDENTITY_LOCK_PHRASES = [
@@ -255,17 +256,23 @@ def _call_llm(user_prompt: str, visual_style_text: Optional[str] = None) -> str:
     """
     client = _get_client()
 
-    response = client.chat.completions.create(
+    stream = client.chat.completions.create(
         model="doubao-seed-2.1-turbo",
         messages=[
             {"role": "system", "content": _render_system_prompt(visual_style_text)},
             {"role": "user", "content": user_prompt},
         ],
+        stream=True,
+        max_tokens=16000,
         timeout=LLM_TIMEOUT,
     )
 
-    content = response.choices[0].message.content
-    if content is None:
+    chunks: List[str] = []
+    for chunk in stream:
+        if chunk.choices and chunk.choices[0].delta.content:
+            chunks.append(chunk.choices[0].delta.content)
+    content = "".join(chunks)
+    if not content.strip():
         raise ValueError("LLM 返回空内容")
     return content
 
@@ -742,7 +749,10 @@ def generate_storyboard(
 
     # 处理每个 shot
     storyboard_shots = []
+    total = len(shots)
     for i, shot in enumerate(shots, 1):
+        print(f"Shot {i}/{total} 开始生成...")
+        shot_deadline = time.monotonic() + SHOT_WALL_CLOCK_S
         if shot.get("source_excerpt") and not shot.get("action_description"):
             shot["action_description"] = shot["source_excerpt"]
         duration = shot.get("suggested_duration", 5)
@@ -759,6 +769,17 @@ def generate_storyboard(
         llm_result = None
 
         for attempt in range(1 + MAX_RETRIES):
+            # Do not start a request that can outlive this shot's wall-clock budget.
+            if time.monotonic() + LLM_TIMEOUT > shot_deadline:
+                print(
+                    f"Shot {i} 总时限 {SHOT_WALL_CLOCK_S}s 到，使用降级方案",
+                    file=sys.stderr,
+                )
+                llm_result = {
+                    "prompt": f"Cinematic shot, {shot.get('visual', 'scene')}, natural lighting, film grain",
+                    "caption": shot.get("what", ""),
+                }
+                break
             try:
                 # 如果是重试，注入质量反馈到 prompt
                 if attempt > 0:
@@ -785,7 +806,10 @@ def generate_storyboard(
                 last_error = str(e)
                 if attempt < MAX_RETRIES:
                     print(f"Shot {i} LLM 调用失败，重试中（{attempt + 1}/{MAX_RETRIES}）: {e}", file=sys.stderr)
-                    time.sleep(1)
+                    if isinstance(e, (APIConnectionError, TimeoutError, ConnectionError)):
+                        time.sleep(min(15 * (attempt + 1), 60))
+                    else:
+                        time.sleep(1)
                 else:
                     print(f"Shot {i} LLM 调用失败，使用降级方案: {e}", file=sys.stderr)
                     llm_result = {
@@ -818,6 +842,7 @@ def generate_storyboard(
                 f"{visual_style.style_prompt_full}"
             )
         llm_result["prompt"] = _remove_fast_motion_words(llm_result["prompt"])
+        print(f"Shot {i}/{total} ✅ 完成")
 
         # 确定 first_frame
         first_frame = _get_first_frame_for_shot(shot, characters_map)
