@@ -2,12 +2,14 @@
 
 import importlib.util
 import json
+import multiprocessing
 import sqlite3
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from queue import Empty
 from types import SimpleNamespace
 
 import pytest
@@ -23,7 +25,12 @@ import phase_orchestrator
 
 from clients import local_video_client, seedance_client
 from phases import pipeline_core
-from runtime.capacity import CapacityTable, SlotTable
+from runtime.capacity import (
+    CapacityTable,
+    CapacityWaitTimeoutError,
+    CrossProcessSlotTable,
+    SlotTable,
+)
 from runtime.generation_tasks import GenerationTaskStore
 from runtime.seedance_execution import (
     ProviderEndpointChangedError,
@@ -38,6 +45,11 @@ _runner_spec = importlib.util.spec_from_file_location(
 )
 pipeline_runner_cli = importlib.util.module_from_spec(_runner_spec)
 _runner_spec.loader.exec_module(pipeline_runner_cli)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_provider_capacity_database(tmp_path, monkeypatch):
+    monkeypatch.setenv("HONCUT_CAPACITY_DB", str(tmp_path / "provider-capacity.db"))
 
 
 def test_phase_ids_are_contiguous_in_execution_order():
@@ -820,6 +832,139 @@ def test_slot_table_caps_concurrency_and_releases_after_failure():
     assert failures == ["provider execution failed"]
     assert peak == 2
     assert slots.occupied("seedance", "video") == 0
+
+
+def _hold_shared_slot(
+    database_path: str,
+    task_id: str,
+    attempting,
+    acquired,
+    release,
+) -> None:
+    slots = CrossProcessSlotTable(
+        Path(database_path),
+        lease_ttl=2,
+        heartbeat_interval=0.1,
+        poll_interval=0.01,
+    )
+    attempting.put(task_id)
+    with slots.reserve(
+        "seedance",
+        "video",
+        task_id,
+        capacity=1,
+        wait_timeout=4,
+    ):
+        acquired.put(task_id)
+        if not release.wait(4):
+            raise TimeoutError(f"test release signal not received for {task_id}")
+
+
+def test_cross_process_slot_blocks_until_other_process_releases(tmp_path):
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("cross-process capacity proof requires a POSIX fork runtime")
+    context = multiprocessing.get_context("fork")
+    database_path = str(tmp_path / "capacity.db")
+    attempting = context.Queue()
+    acquired = context.Queue()
+    release_first = context.Event()
+    release_second = context.Event()
+    first = context.Process(
+        target=_hold_shared_slot,
+        args=(database_path, "first", attempting, acquired, release_first),
+    )
+    second = context.Process(
+        target=_hold_shared_slot,
+        args=(database_path, "second", attempting, acquired, release_second),
+    )
+
+    first.start()
+    try:
+        assert attempting.get(timeout=5) == "first"
+        assert acquired.get(timeout=5) == "first"
+        second.start()
+        assert attempting.get(timeout=5) == "second"
+        with pytest.raises(Empty):
+            acquired.get(timeout=0.25)
+
+        release_first.set()
+        assert acquired.get(timeout=5) == "second"
+        release_second.set()
+    finally:
+        release_first.set()
+        release_second.set()
+        first.join(timeout=5)
+        if second.pid is not None:
+            second.join(timeout=5)
+        if first.is_alive():
+            first.terminate()
+            first.join(timeout=2)
+        if second.pid is not None and second.is_alive():
+            second.terminate()
+            second.join(timeout=2)
+
+    assert first.exitcode == 0
+    assert second.exitcode == 0
+
+
+def test_expired_capacity_lease_can_be_reclaimed(tmp_path):
+    database_path = tmp_path / "capacity.db"
+    first = CrossProcessSlotTable(
+        database_path,
+        lease_ttl=0.05,
+        heartbeat_interval=0.01,
+        poll_interval=0.005,
+    )
+    abandoned = first.acquire("seedance", "video", "abandoned", capacity=1)
+
+    time.sleep(0.08)
+    second = CrossProcessSlotTable(
+        database_path,
+        lease_ttl=0.2,
+        heartbeat_interval=0.05,
+        poll_interval=0.005,
+    )
+    reclaimed = second.acquire(
+        "seedance",
+        "video",
+        "replacement",
+        capacity=1,
+        wait_timeout=0.2,
+    )
+
+    assert reclaimed.lease_id != abandoned.lease_id
+    assert reclaimed.slot_index == 0
+    second.release(reclaimed)
+    assert second.occupied("seedance", "video") == 0
+
+
+def test_heartbeat_keeps_a_long_running_capacity_lease_alive(tmp_path):
+    database_path = tmp_path / "capacity.db"
+    first = CrossProcessSlotTable(
+        database_path,
+        lease_ttl=0.08,
+        heartbeat_interval=0.02,
+        poll_interval=0.005,
+    )
+    second = CrossProcessSlotTable(
+        database_path,
+        lease_ttl=0.08,
+        heartbeat_interval=0.02,
+        poll_interval=0.005,
+    )
+
+    with first.reserve("seedance", "video", "long-running", capacity=1):
+        time.sleep(0.14)
+        with pytest.raises(CapacityWaitTimeoutError):
+            second.acquire(
+                "seedance",
+                "video",
+                "blocked",
+                capacity=1,
+                wait_timeout=0.05,
+            )
+
+    assert first.occupied("seedance", "video") == 0
 
 
 def test_phase6_honors_seedance_provider_capacity(tmp_path, monkeypatch):

@@ -2705,10 +2705,17 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
         concurrency = int(os.environ.get("VIDEO_GEN_CONCURRENCY", "1"))
     provider_capacity = max(1, concurrency)
     provider_slots = None
+    provider_leases = None
     if not use_local:
-        from runtime.capacity import CapacityTable, SlotTable
+        from runtime.capacity import (
+            CapacityTable,
+            CrossProcessSlotTable,
+            SlotTable,
+            default_capacity_lease_path,
+        )
 
         provider_slots = SlotTable()
+        provider_leases = CrossProcessSlotTable(default_capacity_lease_path())
         if not chain_mode:
             capacities = CapacityTable.for_seedance_video(provider_capacity)
             provider_capacity = capacities.get("seedance", "video")
@@ -3211,7 +3218,7 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
         chain_source: tuple[str, Path] | None = None,
         chain_allowed: bool = True,
     ) -> dict | None:
-        if provider_slots is None:
+        if provider_slots is None or provider_leases is None:
             return _process_shot(shot_dir, chain_source, chain_allowed)
         with provider_slots.reserve(
             "seedance",
@@ -3219,7 +3226,14 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
             shot_dir.name,
             capacity=provider_capacity,
         ):
-            return _process_shot(shot_dir, chain_source, chain_allowed)
+            lease_task_id = f"{output_dir.resolve()}:{shot_dir.name}"
+            with provider_leases.reserve(
+                "seedance",
+                "video",
+                lease_task_id,
+                capacity=provider_capacity,
+            ):
+                return _process_shot(shot_dir, chain_source, chain_allowed)
 
     # --- 执行模式：串行或并发 ---
     if concurrency == 1:
