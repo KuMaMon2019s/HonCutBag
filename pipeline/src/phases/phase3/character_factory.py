@@ -700,33 +700,6 @@ def batch_generate(characters: list, output_dir: str, **kwargs) -> list:
     return results
 
 
-# --- Predefined characters (佣兵天下) ---
-
-MERCENARY_CHARACTERS = [
-    {
-        "id": "amy",
-        "name": "艾米",
-        "description": "7岁中国男孩，深色发髻，坚定黑眸，穿灰色交领汉服，布鞋，身形瘦小但眼神坚毅",
-        "style": "张艺谋式写实, 35mm film, 自然光, 古装",
-        "negative": "卡通, 3D渲染, 过度饱和, 变形, 多余手指, 现代服装",
-    },
-    {
-        "id": "grandpa",
-        "name": "爷爷",
-        "description": "65岁中国老者，花白长发束髯，长白胡须，穿灰色麻布长袍，布鞋，面容沧桑但目光慈祥",
-        "style": "张艺谋式写实, 35mm film, 自然光, 古装",
-        "negative": "卡通, 3D渲染, 过度饱和, 变形, 多余手指, 现代服装",
-    },
-    {
-        "id": "wolf",
-        "name": "雪狼",
-        "description": "成年白色雪狼，厚密白色皮毛，黄色锐利眼睛，体型壮硕，凶猛但忠诚",
-        "style": "张艺谋式写实, 35mm film, 自然光, 野生动物摄影",
-        "negative": "卡通, 3D渲染, 过度饱和, 变形, 可爱化",
-    },
-]
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Character Asset Factory")
     parser.add_argument("--name", help="Character display name")
@@ -738,21 +711,11 @@ if __name__ == "__main__":
     parser.add_argument("--size", default="1920x1920", help="Image size WxH")
     parser.add_argument("--model", default=None, help="Override Seedream model")
     parser.add_argument("--batch", help="Path to batch JSON file")
-    parser.add_argument("--preset", choices=["mercenary"], help="Use preset character list")
     parser.add_argument("--skip-images", action="store_true", help="Only create JSON, skip image gen")
 
     args = parser.parse_args()
 
-    if args.preset == "mercenary":
-        print("Using preset: 佣兵天下 characters")
-        results = batch_generate(MERCENARY_CHARACTERS, args.output_dir, skip_images=args.skip_images)
-        print(f"\n{'='*60}")
-        print(f"  Batch complete: {len(results)} characters")
-        for r in results:
-            status = "✓" if "error" not in r else "✗"
-            print(f"  {status} {r.get('name', r.get('char_id', '?'))}")
-
-    elif args.batch:
+    if args.batch:
         with open(args.batch, "r", encoding="utf-8") as f:
             characters = json.load(f)
         results = batch_generate(characters, args.output_dir, skip_images=args.skip_images)
@@ -773,5 +736,5 @@ if __name__ == "__main__":
         parser.print_help()
         print("\nExamples:")
         print('  python character_factory.py --id amy --name "艾米" --desc "7岁男孩..." --output-dir .')
-        print("  python character_factory.py --preset mercenary --output-dir .")
-        print("  python character_factory.py --preset mercenary --skip-images --output-dir .")
+        print("  python character_factory.py --batch characters.json --output-dir .")
+        print("  python character_factory.py --batch characters.json --skip-images --output-dir .")
