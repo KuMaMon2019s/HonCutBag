@@ -1,11 +1,16 @@
-import json
+# ruff: noqa: E402
+
 import importlib.util
+import json
+import sqlite3
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
@@ -14,11 +19,19 @@ if str(SRC) not in sys.path:
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+import phase_orchestrator
+
 from clients import local_video_client, seedance_client
 from phases import pipeline_core
+from runtime.capacity import CapacityTable, SlotTable
+from runtime.generation_tasks import GenerationTaskStore
+from runtime.seedance_execution import (
+    ProviderEndpointChangedError,
+    SubmissionUncertainError,
+    execute_seedance_video_task,
+)
 from tools import asset_packager
 from utils import shot_embedder
-import phase_orchestrator
 
 _runner_spec = importlib.util.spec_from_file_location(
     "pipeline_runner_cli", SRC / "pipeline_runner.py"
@@ -571,3 +584,308 @@ def test_direct_ark_quota_error_uses_existing_retry_loop(tmp_path, monkeypatch):
 
     assert result["status"] == "done"
     assert len(attempts) == 2
+
+
+def _enqueue_runtime_video(store, resource_id="S01"):
+    return store.enqueue(
+        run_id="run-1",
+        task_type="video.generate",
+        media_type="video",
+        resource_id=resource_id,
+        payload={"shot_id": resource_id},
+        provider_id="seedance",
+    )
+
+
+def test_generation_runtime_active_dedupe_and_atomic_claim(tmp_path):
+    store = GenerationTaskStore(tmp_path / "runtime.db")
+
+    first = _enqueue_runtime_video(store)
+    duplicate = _enqueue_runtime_video(store)
+
+    assert duplicate.deduped is True
+    assert duplicate.task.task_id == first.task.task_id
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        claims = list(executor.map(lambda _: store.claim(first.task.task_id), range(2)))
+
+    winners = [task for task in claims if task is not None]
+    assert len(winners) == 1
+    assert winners[0].status == "running"
+    assert winners[0].attempt_count == 1
+
+
+def test_seedance_poll_failure_resumes_without_resubmitting(tmp_path):
+    store = GenerationTaskStore(tmp_path / "runtime.db")
+    output_path = tmp_path / "shots" / "S01" / "output.mp4"
+    output_path.parent.mkdir(parents=True)
+    submissions = []
+
+    def submit():
+        submissions.append("submitted")
+        return "provider-job-1"
+
+    with pytest.raises(TimeoutError, match="poll interrupted"):
+        execute_seedance_video_task(
+            store,
+            run_id="run-1",
+            resource_id="S01",
+            payload={"shot_id": "S01"},
+            provider_endpoint="https://seedance.test",
+            output_path=output_path,
+            submit=submit,
+            poll=lambda provider_job_id: (_ for _ in ()).throw(
+                TimeoutError("poll interrupted")
+            ),
+            download=lambda url, path: path,
+        )
+
+    active = _enqueue_runtime_video(store).task
+    assert active.status == "running"
+    assert active.provider_job_id == "provider-job-1"
+
+    def download(url, path):
+        Path(path).write_bytes(b"video")
+        return path
+
+    execution = execute_seedance_video_task(
+        store,
+        run_id="run-1",
+        resource_id="S01",
+        payload={"shot_id": "S01"},
+        provider_endpoint="https://seedance.test",
+        output_path=output_path,
+        submit=lambda: pytest.fail("resume must not submit a second paid task"),
+        poll=lambda provider_job_id: "https://video.test/output.mp4",
+        download=download,
+    )
+
+    assert execution.resumed is True
+    assert execution.provider_job_id == "provider-job-1"
+    assert submissions == ["submitted"]
+    assert store.get(execution.task_id).status == "succeeded"
+
+
+def test_uncertain_seedance_submission_blocks_automatic_resubmit(tmp_path):
+    store = GenerationTaskStore(tmp_path / "runtime.db")
+    calls = []
+
+    def uncertain_submit():
+        calls.append("submit")
+        raise TimeoutError("request timed out before a job id was returned")
+
+    arguments = {
+        "run_id": "run-1",
+        "resource_id": "S01",
+        "payload": {"shot_id": "S01"},
+        "provider_endpoint": "https://seedance.test",
+        "output_path": tmp_path / "output.mp4",
+        "poll": lambda provider_job_id: "unused",
+        "download": lambda url, path: path,
+    }
+    with pytest.raises(TimeoutError):
+        execute_seedance_video_task(store, submit=uncertain_submit, **arguments)
+
+    with pytest.raises(SubmissionUncertainError, match="refusing to resubmit"):
+        execute_seedance_video_task(store, submit=uncertain_submit, **arguments)
+
+    assert calls == ["submit"]
+    assert _enqueue_runtime_video(store).task.status == "submission_uncertain"
+
+
+def test_seedance_resume_refuses_a_changed_provider_endpoint(tmp_path):
+    store = GenerationTaskStore(tmp_path / "runtime.db")
+
+    with pytest.raises(TimeoutError):
+        execute_seedance_video_task(
+            store,
+            run_id="run-1",
+            resource_id="S01",
+            payload={"shot_id": "S01"},
+            provider_endpoint="https://seedance-a.test",
+            output_path=tmp_path / "output.mp4",
+            submit=lambda: "provider-job-1",
+            poll=lambda provider_job_id: (_ for _ in ()).throw(TimeoutError()),
+            download=lambda url, path: path,
+        )
+
+    with pytest.raises(ProviderEndpointChangedError, match="endpoint changed"):
+        execute_seedance_video_task(
+            store,
+            run_id="run-1",
+            resource_id="S01",
+            payload={"shot_id": "S01"},
+            provider_endpoint="https://seedance-b.test",
+            output_path=tmp_path / "output.mp4",
+            submit=lambda: pytest.fail("resume must not submit"),
+            poll=lambda provider_job_id: pytest.fail("wrong endpoint must not poll"),
+            download=lambda url, path: path,
+        )
+
+
+def test_phase6_resumes_persisted_seedance_job_after_poll_interruption(
+    tmp_path, monkeypatch
+):
+    shot_dir = _write_shot(tmp_path)
+    monkeypatch.delenv("VIDEO_PROVIDER", raising=False)
+    monkeypatch.setattr("utils.config.VIDEO_GEN_CONCURRENCY", 1)
+    monkeypatch.setattr(pipeline_core, "get_api_key", lambda service: "test-key")
+    monkeypatch.setattr(
+        asset_packager,
+        "build_content_for_shot",
+        lambda **kwargs: [{"type": "text", "text": kwargs["shot_meta"]["prompt"]}],
+    )
+    submissions = []
+    poll_calls = []
+
+    def submit(content, **kwargs):
+        submissions.append(kwargs)
+        return "provider-job-1"
+
+    def poll(provider_job_id, api_key):
+        poll_calls.append(provider_job_id)
+        if len(poll_calls) == 1:
+            raise TimeoutError("worker stopped while polling")
+        return "https://video.test/output.mp4"
+
+    def download(url, output_path):
+        Path(output_path).write_bytes(b"v" * 11000)
+        return output_path
+
+    monkeypatch.setattr(seedance_client, "submit_content", submit)
+    monkeypatch.setattr(seedance_client, "poll", poll)
+    monkeypatch.setattr(seedance_client, "download", download)
+    monkeypatch.setattr(
+        pipeline_core.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(stdout="12.0\n", returncode=0),
+    )
+
+    first = pipeline_core._run_phase6_fallback(tmp_path)
+    second = pipeline_core._run_phase6_fallback(tmp_path)
+
+    assert first["status"] == "error"
+    assert second["status"] == "done"
+    assert len(submissions) == 1
+    assert poll_calls == ["provider-job-1", "provider-job-1"]
+    assert json.loads((shot_dir / "SHOT_META.json").read_text())["task_id"] == (
+        "provider-job-1"
+    )
+
+    with sqlite3.connect(tmp_path / "runtime.db") as connection:
+        persisted = connection.execute(
+            "SELECT status, provider_job_id FROM generation_tasks"
+        ).fetchone()
+    assert persisted == ("succeeded", "provider-job-1")
+
+
+def test_capacity_table_uses_provider_lane_and_media_default(monkeypatch):
+    monkeypatch.setenv("HONCUT_SEEDANCE_VIDEO_CONCURRENCY", "3")
+    capacities = CapacityTable.for_seedance_video(fallback=1)
+
+    assert capacities.get("seedance", "video") == 3
+    assert capacities.get("seedance", "image") == 0
+    assert capacities.get("unknown-provider", "video") == 1
+
+
+def test_slot_table_caps_concurrency_and_releases_after_failure():
+    slots = SlotTable()
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+
+    def occupy(index):
+        nonlocal active, peak
+        with slots.reserve("seedance", "video", f"task-{index}", capacity=2):
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            try:
+                time.sleep(0.02)
+                if index == 2:
+                    raise RuntimeError("provider execution failed")
+            finally:
+                with lock:
+                    active -= 1
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(occupy, index) for index in range(5)]
+        failures = []
+        for future in futures:
+            try:
+                future.result()
+            except RuntimeError as error:
+                failures.append(str(error))
+
+    assert failures == ["provider execution failed"]
+    assert peak == 2
+    assert slots.occupied("seedance", "video") == 0
+
+
+def test_phase6_honors_seedance_provider_capacity(tmp_path, monkeypatch):
+    for index in range(1, 5):
+        shot_dir = tmp_path / "shots" / f"S{index:02d}"
+        shot_dir.mkdir(parents=True)
+        (shot_dir / "SHOT_META.json").write_text(
+            json.dumps(
+                {"prompt": f"quiet landscape {index}", "gen_strategy": "i2v"}
+            ),
+            encoding="utf-8",
+        )
+
+    monkeypatch.delenv("VIDEO_PROVIDER", raising=False)
+    monkeypatch.setenv("HONCUT_SEEDANCE_VIDEO_CONCURRENCY", "2")
+    monkeypatch.setattr("utils.config.VIDEO_GEN_CONCURRENCY", 5)
+    monkeypatch.setattr(pipeline_core, "get_api_key", lambda service: "test-key")
+    monkeypatch.setattr(
+        asset_packager,
+        "build_content_for_shot",
+        lambda **kwargs: [{"type": "text", "text": kwargs["shot_meta"]["prompt"]}],
+    )
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+    submission_count = 0
+
+    def submit(content, **kwargs):
+        nonlocal active, peak, submission_count
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            submission_count += 1
+            provider_job_id = f"provider-job-{submission_count}"
+        try:
+            time.sleep(0.03)
+            return provider_job_id
+        finally:
+            with lock:
+                active -= 1
+
+    def download(url, output_path):
+        Path(output_path).write_bytes(b"v" * 11000)
+        return output_path
+
+    monkeypatch.setattr(seedance_client, "submit_content", submit)
+    monkeypatch.setattr(
+        seedance_client,
+        "poll",
+        lambda provider_job_id, api_key: f"https://video.test/{provider_job_id}.mp4",
+    )
+    monkeypatch.setattr(seedance_client, "download", download)
+    monkeypatch.setattr(
+        pipeline_core.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(stdout="12.0\n", returncode=0),
+    )
+
+    phase_outcome = pipeline_core._run_phase6_fallback(tmp_path)
+
+    assert phase_outcome["status"] == "done"
+    assert len(phase_outcome["outputs"]) == 4
+    assert submission_count == 4
+    assert peak == 2
+    with sqlite3.connect(tmp_path / "runtime.db") as connection:
+        succeeded = connection.execute(
+            "SELECT COUNT(*) FROM generation_tasks WHERE status = 'succeeded'"
+        ).fetchone()[0]
+    assert succeeded == 4

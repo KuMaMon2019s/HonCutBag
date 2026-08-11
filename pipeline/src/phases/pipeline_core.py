@@ -2625,6 +2625,9 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
             chain_mode = False
     else:
         print("  → 路由: 直连 ARK Agent Plan", flush=True)
+        from runtime.generation_tasks import GenerationTaskStore
+
+        generation_tasks = GenerationTaskStore(output_dir / "runtime.db")
 
     # Load character reference images for consistency
     import base64 as _b64
@@ -2693,18 +2696,38 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
         json.loads(scene_consistency_path.read_text(encoding="utf-8"))
         if scene_consistency_path.exists() else {}
     )
-    
+
     # --- 并发配置 ---
     try:
         from utils.config import VIDEO_GEN_CONCURRENCY
         concurrency = VIDEO_GEN_CONCURRENCY
     except ImportError:
         concurrency = int(os.environ.get("VIDEO_GEN_CONCURRENCY", "1"))
+    provider_capacity = max(1, concurrency)
+    provider_slots = None
+    if not use_local:
+        from runtime.capacity import CapacityTable, SlotTable
+
+        provider_slots = SlotTable()
+        if not chain_mode:
+            capacities = CapacityTable.for_seedance_video(provider_capacity)
+            provider_capacity = capacities.get("seedance", "video")
     if chain_mode:
         concurrency = 1
+        provider_capacity = 1
         print("  [chain] Seedance 尾帧接力已启用，强制按 shot_id 串行生成", flush=True)
-    print(f"  → 并发模式: VIDEO_GEN_CONCURRENCY={concurrency} ({'串行' if concurrency == 1 else f'并行 workers={concurrency}'})")
-    
+    elif not use_local:
+        concurrency = provider_capacity
+    else:
+        concurrency = max(1, concurrency)
+    capacity_source = (
+        "seedance video capacity" if not use_local else "VIDEO_GEN_CONCURRENCY"
+    )
+    print(
+        f"  → 并发模式: {capacity_source}={concurrency} "
+        f"({'串行' if concurrency == 1 else f'并行 workers={concurrency}'})"
+    )
+
     shot_dirs = [d for d in sorted(shots_dir.iterdir()) if d.is_dir() and d.name.startswith("S")]
     pending_shot_dirs = []
     for shot_dir in shot_dirs:
@@ -3064,16 +3087,36 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                     direct_model = os.environ.get(
                         "SEEDANCE_MODEL", "doubao-seedance-2.0-mini"
                     )
-                task_id = seedance_client.submit_content(
-                    content_list,
-                    api_key=api_key,
-                    model=direct_model,
-                    duration=duration or 12,
-                    ratio="16:9",
-                    seed=shot_seed,
+                from functools import partial
+
+                from runtime.seedance_execution import execute_seedance_video_task
+
+                execution = execute_seedance_video_task(
+                    generation_tasks,
+                    run_id=str(output_dir.resolve()),
+                    resource_id=shot_id,
+                    payload={
+                        "shot_id": shot_id,
+                        "output_path": f"shots/{shot_id}/output.mp4",
+                        "model": direct_model,
+                        "duration": duration or 12,
+                        "seed": shot_seed,
+                    },
+                    provider_endpoint=seedance_client.BASE_URL,
+                    output_path=out_path,
+                    submit=partial(
+                        seedance_client.submit_content,
+                        content_list,
+                        api_key=api_key,
+                        model=direct_model,
+                        duration=duration or 12,
+                        ratio="16:9",
+                        seed=shot_seed,
+                    ),
+                    poll=partial(seedance_client.poll, api_key=api_key),
+                    download=seedance_client.download,
                 )
-                video_url = seedance_client.poll(task_id, api_key)
-                seedance_client.download(video_url, out_path)
+                task_id = execution.provider_job_id
 
                 last_frame_path = shot_dir / "last_frame.jpg"
                 if chain_mode and chain_allowed:
@@ -3160,8 +3203,23 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                     continue
                 print(f"    ✗ {shot_dir.name}: 异常 — {e}")
                 return None
-        
+
         return None
+
+    def _process_shot_with_capacity(
+        shot_dir: Path,
+        chain_source: tuple[str, Path] | None = None,
+        chain_allowed: bool = True,
+    ) -> dict | None:
+        if provider_slots is None:
+            return _process_shot(shot_dir, chain_source, chain_allowed)
+        with provider_slots.reserve(
+            "seedance",
+            "video",
+            shot_dir.name,
+            capacity=provider_capacity,
+        ):
+            return _process_shot(shot_dir, chain_source, chain_allowed)
 
     # --- 执行模式：串行或并发 ---
     if concurrency == 1:
@@ -3169,7 +3227,9 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
         chain_source = None
         chain_allowed = True
         for shot_dir in pending_shot_dirs:
-            result = _process_shot(shot_dir, chain_source, chain_allowed)
+            result = _process_shot_with_capacity(
+                shot_dir, chain_source, chain_allowed
+            )
             if result:
                 outputs.append(result["relative_output"])
             if chain_mode:
@@ -3189,8 +3249,12 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
     else:
         # 并发模式（VIDEO_GEN_CONCURRENCY > 1）
         from concurrent.futures import ThreadPoolExecutor, as_completed
+
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            futures = {executor.submit(_process_shot, shot_dir): shot_dir for shot_dir in pending_shot_dirs}
+            futures = {
+                executor.submit(_process_shot_with_capacity, shot_dir): shot_dir
+                for shot_dir in pending_shot_dirs
+            }
             for future in as_completed(futures):
                 shot_dir = futures[future]
                 try:
