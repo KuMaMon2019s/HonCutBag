@@ -355,9 +355,10 @@ def test_pipeline_runner_prints_selected_phase_error(monkeypatch, capsys):
         "run_pipeline",
         lambda **kwargs: {
             "status": "partial",
-            "phases": {"4": {"status": "error", "error": "orchestrator timed out"}},
+            "phases": {"phase4": {"status": "error", "error": "orchestrator timed out"}},
         },
     )
+    monkeypatch.setattr(pipeline_runner_cli, "_record_run_memory", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(sys, "argv", ["pipeline_runner.py", "--input", "story.txt", "--phase", "phase4"])
 
     with pytest.raises(SystemExit, match="1"):
@@ -507,7 +508,7 @@ def test_direct_providers_bypass_bridge(tmp_path, monkeypatch, provider):
         lambda timeout: pytest.fail("Bridge availability must not be checked"),
     )
 
-    result = pipeline_core._run_phase5_fallback(tmp_path)
+    result = pipeline_core._run_phase6_fallback(tmp_path)
 
     assert result["status"] == "done"
     assert len(direct_calls) == 1
@@ -545,7 +546,7 @@ def test_explicit_bridge_providers_use_local_client(tmp_path, monkeypatch, provi
         lambda **kwargs: [{"type": "text", "text": "shot"}],
     )
 
-    result = pipeline_core._run_phase5_fallback(tmp_path)
+    result = pipeline_core._run_phase6_fallback(tmp_path)
 
     assert result["status"] == "done"
     assert len(bridge_calls) == 1
@@ -566,7 +567,7 @@ def test_direct_ark_quota_error_uses_existing_retry_loop(tmp_path, monkeypatch):
     monkeypatch.setattr(seedance_client, "submit_content", flaky_submit)
     monkeypatch.setattr(pipeline_core.time, "sleep", lambda seconds: None)
 
-    result = pipeline_core._run_phase5_fallback(tmp_path)
+    result = pipeline_core._run_phase6_fallback(tmp_path)
 
     assert result["status"] == "done"
     assert len(attempts) == 2

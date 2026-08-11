@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-分镜生成器 - Phase 2 事件图谱引擎的最后一个模块
+分镜生成器 - Phase 1 编剧引擎的最后一个模块
 
 将 adaptation_engine.py 输出的 shot 列表转化为 orchestrator.py 可消费的 STORYBOARD.json。
-这是 Phase 2 → Phase 4 的桥梁。
+这是 Phase 1 → Phase 4 的结构化分镜桥梁。
 
 输入：
 - shots JSON（adaptation_engine.py 输出）
@@ -49,7 +49,7 @@ def _load_default_visual_style(
     default_path = ToolPaths.PROMPTS_DIR / "default_visual_style.md"
     # ToolPaths historically points at pipeline/src/prompts; the portable
     # prompt assets live in pipeline/prompts.
-    bundled_path = Path(__file__).resolve().parents[2] / "prompts" / "default_visual_style.md"
+    bundled_path = Path(__file__).resolve().parents[3] / "prompts" / "default_visual_style.md"
     style_path = Path(visual_style_path) if visual_style_path else default_path
     if not visual_style_path and not style_path.exists():
         style_path = bundled_path
@@ -596,7 +596,7 @@ def _build_eight_layer_prompt(
             continue
         char_id = char.get("id") or char.get("name")
         ref = char.get("face_reference") or f"characters/{char_id}/face_closeup.png"
-        # 文件名只保留在注释中供 Phase 2 人工排查，不进入 LLM 提示词。
+        # 文件名只保留在注释中供 Phase 1 人工排查，不进入 LLM 提示词。
         shot.setdefault("reference_debug_files", []).append(str(ref))
         references.append(f"参考{{图片N}}中的{char.get('name')}作为主体，保持身份与服装一致")
 
@@ -986,7 +986,7 @@ def main():
     parser.add_argument(
         "--no-audio",
         action="store_true",
-        help="禁用 Phase 7 音频处理",
+        help="禁用 Phase 9 音频处理",
     )
 
     args = parser.parse_args()

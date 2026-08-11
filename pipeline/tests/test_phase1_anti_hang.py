@@ -12,7 +12,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from phases import pipeline_core
-import phases.phase2.storyboard_generator as storyboard_generator
+import phases.phase1.storyboard_generator as storyboard_generator
 from prompt import event_extractor
 from utils import ark_llm
 from utils.progress_reporter import ProgressReporter
@@ -135,8 +135,8 @@ def test_phase1_checkpoints_are_written_and_reused(monkeypatch, tmp_path):
     monkeypatch.setattr(pipeline_core, "run_quality_check", lambda *_args: SimpleNamespace(passed=True, grade="A"))
     monkeypatch.setattr("quality.quality_gate.run_storyboard_review", lambda **_kwargs: {"grade": "A"})
 
-    first = pipeline_core.run_phase2("synthetic input", tmp_path, 10, False)
-    second = pipeline_core.run_phase2("synthetic input", tmp_path, 10, False)
+    first = pipeline_core.run_phase1_screenwriter("synthetic input", tmp_path, 10, False)
+    second = pipeline_core.run_phase1_screenwriter("synthetic input", tmp_path, 10, False)
 
     assert first["status"] == second["status"] == "done"
     assert calls == {"events": 1, "characters": 1}
@@ -157,7 +157,9 @@ def test_phase1_reporter_receives_steps_and_stops_heartbeat(monkeypatch, tmp_pat
         def stop_heartbeat(self):
             steps.append(("stop", None))
 
-    result = pipeline_core.run_phase2("synthetic input", tmp_path, 10, True, reporter=Reporter())
+    result = pipeline_core.run_phase1_screenwriter(
+        "synthetic input", tmp_path, 10, True, reporter=Reporter()
+    )
 
     assert result["status"] == "done"
     assert any(item[0] == "phase1" for item in steps)

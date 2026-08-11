@@ -251,10 +251,10 @@ class ToolPaths:
     """外部工具路径配置"""
     
     # 第三方兼容工具目录
-    OM_TOOLS_DIR: Path = Path(__file__).resolve().parent.parent.parent / "vendor" / "video_tools"
+    OM_TOOLS_DIR: Path = Path(__file__).resolve().parents[3] / "vendor" / "video_tools"
     
     # HonCut 项目目录
-    HONCUT_DIR: Path = Path(__file__).parent.parent
+    HONCUT_DIR: Path = Path(__file__).resolve().parents[2]
     
     # 提示词模板目录
     PROMPTS_DIR: Path = HONCUT_DIR / "prompts"
@@ -428,7 +428,7 @@ LOCAL_VIDEO_API_URL = os.environ.get("LOCAL_VIDEO_API_URL", "http://192.168.31.2
 # 是否优先使用本地视频 API（True = 优先本地，False = 仅用 ARK）
 USE_LOCAL_VIDEO_API = os.environ.get("USE_LOCAL_VIDEO_API", "true").lower() in ("true", "1", "yes")
 
-# Phase 7 audio-material layer. Values remain environment-overridable so CI and
+# Phase 9 audio-material layer. Values remain environment-overridable so CI and
 # local projects can use isolated music libraries and provider credentials.
 AUDIO_CONFIG = {
     "music_dir": os.environ.get("HONCUT_MUSIC_DIR", "~/.honcut/music/"),

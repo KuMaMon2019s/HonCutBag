@@ -54,16 +54,16 @@ def test_storyboard_review_accepts_structured_dialogue():
     assert "grade" in result
 
 
-def test_run_phase2_m5_fallback_returns_result():
-    tree = ast.parse(inspect.getsource(pipeline_core.run_phase2))
+def test_phase1_screenwriter_m5_fallback_returns_result():
+    tree = ast.parse(inspect.getsource(pipeline_core.run_phase1_screenwriter))
 
     fallback_has_return = any(
         isinstance(node, ast.Assign)
-        and any(isinstance(target, ast.Name) and target.id == "phase8_result" for target in node.targets)
+        and any(isinstance(target, ast.Name) and target.id == "phase1_result" for target in node.targets)
         and index + 1 < len(parent.body)
         and isinstance(parent.body[index + 1], ast.Return)
         and isinstance(parent.body[index + 1].value, ast.Name)
-        and parent.body[index + 1].value.id == "phase8_result"
+        and parent.body[index + 1].value.id == "phase1_result"
         for parent in ast.walk(tree)
         if hasattr(parent, "body") and isinstance(parent.body, list)
         for index, node in enumerate(parent.body)

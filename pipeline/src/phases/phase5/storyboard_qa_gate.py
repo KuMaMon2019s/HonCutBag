@@ -1,7 +1,7 @@
 """Phase 5: pre-generation storyboard quality gate.
 
 Every judgment is derived from project artifacts.  The gate never repairs a
-storyboard; it reports the shots that need to be redrawn before Phase 5.
+storyboard; it reports the shots that need to be redrawn before Phase 6.
 """
 
 from __future__ import annotations
@@ -283,7 +283,7 @@ def run_storyboard_qa_gate(output_dir: Path, similarity_threshold: float | None 
     failed_shots = sorted({sid for issue in issues if issue.get("severity") == "severe" for sid in issue.get("shot_ids", [])})
     report = {"status": "done" if grade in {"A", "B"} else "error", "grade": grade, "gate_passed": grade in {"A", "B"}, "issues": issues, "issue_counts": {severity: sum(item.get("severity") == severity for item in issues) for severity in ("severe", "moderate", "minor")}, "failed_shot_ids": failed_shots, "shots": per_shot, "layers": {"L1": {"status": "completed"}, "L2": l2, "L3": l3}, "outputs": ["storyboard_qa_report.json", *( ["storyboard_qa_grid.jpg"] if grid_path_exists(output_dir) else [])]}
     if not report["gate_passed"]:
-        report["error"] = f"Storyboard QA grade {grade} blocks Phase 5; redraw only failed_shot_ids"
+        report["error"] = f"Storyboard QA grade {grade} blocks Phase 6; redraw only failed_shot_ids"
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return report
 

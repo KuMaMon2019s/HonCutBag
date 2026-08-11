@@ -23,7 +23,7 @@ BASE_NEGATIVE_PROMPTS = [
 def _load_style(path: Optional[Path]) -> VisualStyle:
     if path and path.exists():
         return parse_visual_style(path.read_text(encoding="utf-8"))
-    bundled = Path(__file__).resolve().parents[2] / "prompts" / "default_visual_style.md"
+    bundled = Path(__file__).resolve().parents[3] / "prompts" / "default_visual_style.md"
     if bundled.exists():
         return parse_visual_style(bundled.read_text(encoding="utf-8"))
     return VisualStyle(

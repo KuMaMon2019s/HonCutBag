@@ -1,4 +1,4 @@
-"""Phase 7.3 duration measurement and reshoot planning."""
+"""Phase 8 duration measurement and reshoot planning."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ def build_reshoot_list(shots_dir: Path, required_gap_s: float, round_number: int
             requested = float(meta.get("duration") or meta.get("requested_duration") or 0)
             actual = probe_duration(video)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
-            print(f"  ⚠ [7.3] 无法评估 {shot_dir.name} 时长短板: {exc}", flush=True)
+            print(f"  ⚠ [8.3] 无法评估 {shot_dir.name} 时长短板: {exc}", flush=True)
             continue
         gap = max(0.0, requested - actual)
         if gap > 0:

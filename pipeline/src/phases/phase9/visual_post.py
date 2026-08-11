@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""visual_post.py — Phase 8 视觉后处理模块
+"""visual_post.py — Phase 9 视觉后处理模块
 
 对 audio_mixed.mp4 做视觉后处理：
   1. 画质增强（降噪 + 锐化 + 可选超分）
@@ -29,7 +29,7 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 # 第三方兼容工具路径
 # ---------------------------------------------------------------------------
-OM_TOOLS_DIR = Path(__file__).resolve().parent.parent.parent / "vendor" / "video_tools" / "tools"
+OM_TOOLS_DIR = Path(__file__).resolve().parents[4] / "vendor" / "video_tools" / "tools"
 OM_AVAILABLE = OM_TOOLS_DIR.exists()
 
 if OM_AVAILABLE:
@@ -562,7 +562,7 @@ def process_visual(
         raise FileNotFoundError(f"输入视频不存在: {video_path}")
 
     print("=" * 60)
-    print("🎬 Phase 8: 视觉后处理")
+    print("🎬 Phase 9: 视觉后处理")
     print("=" * 60)
     print(f"  输入: {video_path}")
     print(f"  输出: {output_path}")
@@ -627,7 +627,7 @@ def process_visual(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Phase 8 视觉后处理：画质增强 + 画幅适配 + 片头片尾",
+        description="Phase 9 视觉后处理：画质增强 + 画幅适配 + 片头片尾",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:

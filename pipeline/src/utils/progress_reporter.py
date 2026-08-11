@@ -7,7 +7,7 @@ progress_reporter.py — 管线进度报告系统
   - progress.json  当前进度快照（原子覆盖写入）
 
 Usage:
-    reporter = ProgressReporter("./output", total_phases=8)
+    reporter = ProgressReporter("./output", total_phases=10)
     reporter.phase_start("phase1", "编剧引擎")
     reporter.step("phase1", "提取 47 个事件", progress_pct=20)
     reporter.phase_done("phase1", "完成", duration_s=61.3)
@@ -25,7 +25,7 @@ from typing import Optional
 class ProgressReporter:
     """管线进度报告器 — events.jsonl + progress.json"""
 
-    def __init__(self, output_dir: str, total_phases: int = 8):
+    def __init__(self, output_dir: str, total_phases: int = 10):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.events_file = self.output_dir / "events.jsonl"
@@ -160,7 +160,10 @@ class ProgressReporter:
 
     def _phase_index(self, phase_id: str) -> int:
         """返回 phase 在 PHASE_ORDER 中的索引，找不到返回 -1"""
-        order = ["phase1", "phase2", "phase3", "phase4", "phase6", "phase7", "phase8", "phase9"]
+        order = [
+            "phase1", "phase2", "phase3", "phase4", "phase5",
+            "phase6", "phase7", "phase8", "phase9", "phase9_5",
+        ]
         try:
             return order.index(phase_id)
         except ValueError:

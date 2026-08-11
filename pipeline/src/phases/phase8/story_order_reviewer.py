@@ -1,4 +1,4 @@
-"""Phase 7.1 storyboard narrative-order review."""
+"""Phase 8 storyboard narrative-order review."""
 
 from __future__ import annotations
 
@@ -141,7 +141,7 @@ def review_story_order(output_dir: Path, current_order: list[str]) -> dict:
         skipped_reason = None
         source = "llm"
     elif mock_enabled and not missing:
-        print("  [7.1] HONCUT_STORYBOARD_REVIEW=mock，使用确定性剧情顺序审稿", flush=True)
+        print("  [8.1] HONCUT_STORYBOARD_REVIEW=mock，使用确定性剧情顺序审稿", flush=True)
         suggested = expected
         issues: list[str] = []
         consistent = True
@@ -157,7 +157,7 @@ def review_story_order(output_dir: Path, current_order: list[str]) -> dict:
                 "未配置可用的全剧本多图 LLM 客户端；设置 "
                 "HONCUT_STORYBOARD_REVIEW=mock 可启用确定性测试路径"
             )
-        print(f"  ⚠ [7.1] 剧情顺序校验跳过: {reason}；保持原顺序", flush=True)
+        print(f"  ⚠ [8.1] 剧情顺序校验跳过: {reason}；保持原顺序", flush=True)
         suggested = current
         issues = [reason]
         consistent = True

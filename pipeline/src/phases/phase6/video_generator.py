@@ -1,4 +1,4 @@
-"""Asset-aware Phase 5 video generation routing."""
+"""Asset-aware Phase 6 video generation routing."""
 
 from __future__ import annotations
 
@@ -134,7 +134,7 @@ def _write_state(state: Any, name: str, value: Any) -> None:
 
 
 class VideoGenerator:
-    """Generate Phase 5 video, preferring Bridge assets when available."""
+    """Generate Phase 6 video, preferring Bridge assets when available."""
 
     def __init__(self, video_client: VideoClient | None = None) -> None:
         self.video_client = video_client or VideoClient()

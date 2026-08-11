@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-事件提取器 - Phase 2 事件图谱引擎的第二个模块
+事件提取器 - Phase 1 编剧引擎的事件提取模块
 
 从 text_parser.py 输出的 segments 中提取结构化事件。
 每个事件包含：谁(who)、在哪(where)、做什么(what)、情绪(emotion)、视觉描述(visual)。

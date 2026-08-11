@@ -1,4 +1,4 @@
-"""Phase 5: video generation."""
+"""Phase 6: video generation."""
 
 from ..pipeline_core import run_phase6
 

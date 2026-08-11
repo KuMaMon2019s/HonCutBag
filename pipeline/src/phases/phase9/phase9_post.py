@@ -1,4 +1,4 @@
-"""Phase 8: post-production."""
+"""Phase 9: post-production."""
 
 from ..pipeline_core import run_phase9
 

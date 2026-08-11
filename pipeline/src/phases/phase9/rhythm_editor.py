@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-rhythm_editor.py — Phase 8 后处理节奏模块
+rhythm_editor.py — Phase 9 后处理节奏模块
 
 对视频做节奏调整：
   - 变速（高潮加速 / 抒情减速）
@@ -25,7 +25,7 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 # 第三方兼容工具可选导入（graceful fallback 到 ffmpeg）
 # ---------------------------------------------------------------------------
-OM_TOOLS_DIR = str(Path(__file__).resolve().parent.parent.parent / "vendor" / "video_tools" / "tools")
+OM_TOOLS_DIR = str(Path(__file__).resolve().parents[4] / "vendor" / "video_tools" / "tools")
 OM_AVAILABLE = False
 
 if os.path.isdir(OM_TOOLS_DIR):
@@ -432,7 +432,7 @@ def edit_rhythm(
       4. 输出 polished.mp4
     """
     print(f"\n{'='*60}")
-    print(f"Phase 8 — Rhythm Editor")
+    print(f"Phase 9 — Rhythm Editor")
     print(f"{'='*60}")
     print(f"  input:    {video_path}")
     print(f"  output:   {output_path}")
@@ -556,7 +556,7 @@ def edit_rhythm(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Phase 8 Rhythm Editor — 视频节奏调整（变速/卡点/转场精修）",
+        description="Phase 9 Rhythm Editor — 视频节奏调整（变速/卡点/转场精修）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:

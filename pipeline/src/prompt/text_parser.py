@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-文本解析器 - Phase 2 事件图谱引擎的第一个模块
+文本解析器 - Phase 1 编剧引擎的文本解析模块
 
 将任意文本输入解析为结构化段落列表，供后续 event_extractor.py 消费。
 

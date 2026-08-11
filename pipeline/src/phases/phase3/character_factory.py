@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from clients.seedream_client import SeedreamClient
 
 # Import prompt validator from prompts/ directory
-_PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
+_PROMPTS_DIR = Path(__file__).resolve().parents[3] / "prompts"
 sys.path.insert(0, str(_PROMPTS_DIR))
 from prompt.prompt_validator import validate_prompt
 
@@ -52,10 +52,10 @@ def load_template(template_path: Optional[str] = None) -> str:
     if template_path is None:
         template_path = str(_PROMPTS_DIR / "three_view_template.md")
     else:
-        # If relative path, resolve relative to project root (parent of scripts/)
+        # If relative path, resolve relative to the pipeline prompt directory.
         p = Path(template_path)
         if not p.is_absolute():
-            p = Path(__file__).parent.parent / template_path
+            p = _PROMPTS_DIR / template_path
         template_path = str(p)
 
     with open(template_path, 'r', encoding='utf-8') as f:

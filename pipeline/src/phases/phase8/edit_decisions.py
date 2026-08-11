@@ -112,14 +112,26 @@ def build_edit_decisions(
     target_width: int = 1920,
     target_height: int = 1080,
     transition_decisions: Optional[list] = None,
+    quality_report: Optional[dict] = None,
+    shot_order: Optional[list[str]] = None,
 ) -> dict:
-    """Build edit_decisions from shot videos.
+    """Build reviewed edit decisions from shot videos.
 
-    For each shot: probe → detect black frames → build cut entry.
+    For each shot: probe → merge automatic boundary trims → build cut entry.
+    Shots still marked ``reshoot`` are rejected instead of silently assembled.
     """
     shots_dir = Path(shots_dir)
-    shot_dirs = sorted(d for d in shots_dir.iterdir()
-                       if d.is_dir() and d.name.startswith("S"))
+    available = {
+        directory.name: directory
+        for directory in shots_dir.iterdir()
+        if directory.is_dir() and directory.name.startswith("S")
+    }
+    shot_dirs = (
+        [available[name] for name in shot_order or [] if name in available]
+        if shot_order
+        else [available[name] for name in sorted(available)]
+    )
+    quality_shots = (quality_report or {}).get("shots", {})
 
     cuts = []
     for shot_dir in shot_dirs:
@@ -131,11 +143,21 @@ def build_edit_decisions(
         if info["duration"] <= 0:
             continue
 
+        quality = quality_shots.get(shot_dir.name, {})
+        if quality.get("action") == "reshoot":
+            raise ValueError(
+                f"{shot_dir.name} still requires reshoot: "
+                f"{'; '.join(quality.get('reasons', []))}"
+            )
         trims = detect_black_frames(str(video_path))
-        in_s = trims["trim_start"]
-        out_s = info["duration"] - trims["trim_end"]
+        in_s = max(float(trims["trim_start"]), float(quality.get("trim_start_s", 0.0)))
+        quality_end = float(quality.get("trim_end_s", info["duration"]) or info["duration"])
+        out_s = min(info["duration"] - float(trims["trim_end"]), quality_end)
         if out_s <= in_s:
-            in_s, out_s = 0, info["duration"]
+            raise ValueError(
+                f"{shot_dir.name} quality trims are invalid: {in_s:.3f}s-{out_s:.3f}s "
+                f"for {info['duration']:.3f}s clip"
+            )
 
         cut = {
             "source": str(video_path),
@@ -145,7 +167,9 @@ def build_edit_decisions(
             "speed": 1.0,
             "has_audio": info["has_audio"],
             "original_duration": info["duration"],
-            "trimmed": trims["trim_start"] > 0.15 or trims["trim_end"] > 0.15,
+            "trimmed": in_s > 0.15 or out_s < info["duration"] - 0.15,
+            "quality_action": quality.get("action", "keep"),
+            "quality_reasons": quality.get("reasons", []),
         }
         cuts.append(cut)
 
@@ -170,6 +194,7 @@ def build_edit_decisions(
         "metadata": {
             "compose_target": {"width": target_width, "height": target_height, "fit": "pad"},
             "target_fps": 30,
+            "quality_reviewed": bool(quality_report),
         },
     }
 

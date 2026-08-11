@@ -1,4 +1,4 @@
-"""Phase 7: video assembly."""
+"""Phase 8: video assembly."""
 
 from ..pipeline_core import run_phase8
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-角色发现器 - Phase 2 事件图谱引擎的第三个模块
+角色发现器 - Phase 1 编剧引擎的角色发现模块
 
 从 event_extractor.py 输出的 events 中发现所有角色，生成 CHARACTERS.json。
 

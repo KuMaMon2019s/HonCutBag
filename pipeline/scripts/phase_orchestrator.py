@@ -72,8 +72,8 @@ def _normalize_chain_mode(config: dict) -> bool:
 
 
 def _normalize_enable_reshoot(config: dict) -> bool:
-    """Validate the opt-in switch that may consume video generation quota."""
-    enable_reshoot = config.get("enable_reshoot", False)
+    """Validate bounded automatic visual/duration reshoots (enabled by default)."""
+    enable_reshoot = config.get("enable_reshoot", True)
     if not isinstance(enable_reshoot, bool):
         raise ValueError("config enable_reshoot must be a boolean")
     config["enable_reshoot"] = enable_reshoot

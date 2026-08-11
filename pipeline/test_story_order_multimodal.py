@@ -12,7 +12,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from clients.ark_multimodal_client import ArkMultimodalClient
-import phases.phase7.story_order_reviewer as story_order_reviewer
+import phases.phase8.story_order_reviewer as story_order_reviewer
 
 
 class FakeCompletions:

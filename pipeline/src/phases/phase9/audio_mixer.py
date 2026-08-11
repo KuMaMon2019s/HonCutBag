@@ -1,4 +1,4 @@
-"""Phase 7 audio-material orchestration and multi-track mixing."""
+"""Phase 9 audio-material orchestration and multi-track mixing."""
 
 from __future__ import annotations
 
@@ -134,7 +134,7 @@ class AudioMixer:
         sound_effects: list[str] | None = None,
         duration: float | None = None,
     ) -> dict[str, Any]:
-        """Run the full Phase 7 audio-material workflow."""
+        """Run the full Phase 9 audio-material workflow."""
         work_dir = Path(output_path).parent / "audio_layer"
         work_dir.mkdir(parents=True, exist_ok=True)
         audio_options = storyboard.get("audio", {})
@@ -172,7 +172,7 @@ class AudioMixer:
         }
 
 
-def apply_phase7_audio(output_dir: str | Path) -> dict[str, Any] | None:
+def apply_phase9_audio(output_dir: str | Path) -> dict[str, Any] | None:
     """Apply configured audio to ``raw_assembly.mp4`` and replace it safely."""
     directory = Path(output_dir)
     storyboard_path = directory / "STORYBOARD.json"
@@ -187,3 +187,7 @@ def apply_phase7_audio(output_dir: str | Path) -> dict[str, Any] | None:
     temporary.replace(raw_video)
     receipt["output"] = str(raw_video)
     return receipt
+
+
+# Backward-compatible alias for integrations created before Phase renumbering.
+apply_phase7_audio = apply_phase9_audio

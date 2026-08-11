@@ -132,8 +132,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--transition", choices=["crossfade", "fade", "cut"], default="crossfade", help="Phase 8 转场模式"
     )
     parser.add_argument("--transition-duration", type=float, default=0.5, help="Phase 8 转场时长（秒）")
-    parser.add_argument("--enable-reshoot", action="store_true",
-                        help="允许 Phase 8 时长不足时真实补录（默认关闭）")
+    reshoot_group = parser.add_mutually_exclusive_group()
+    reshoot_group.add_argument(
+        "--enable-reshoot", dest="enable_reshoot", action="store_true",
+        help="允许 Phase 8 对视觉缺陷/时长不足镜头补录（默认开启，最多两轮）",
+    )
+    reshoot_group.add_argument(
+        "--disable-reshoot", dest="enable_reshoot", action="store_false",
+        help="禁止付费补录；检测到必须补录的坏镜头时阻断组装",
+    )
+    parser.set_defaults(enable_reshoot=True)
     parser.add_argument(
         "--media-profile", choices=_core.AVAILABLE_PROFILES, default="1080p", help="编码配置（默认 1080p）"
     )
@@ -176,7 +184,7 @@ def _phase_skip_list(args: argparse.Namespace, parser: argparse.ArgumentParser) 
     selected = set(PHASES[start_index : end_index + 1])
     skipped = [float(PHASE_NUMBERS[phase]) for phase in PHASES if phase not in selected]
     # Phase 9.5 is outside the supported phase-level monitoring sequence.
-    skipped.append(8.5)
+    skipped.append(9.5)
     return skipped
 
 
@@ -201,11 +209,15 @@ def main() -> None:
         resume_from=args.resume_from,
     )
     _record_report_checkpoints(report, args.output_dir)
-    _record_run_memory(report, args.output_dir)
+    try:
+        _record_run_memory(report, args.output_dir)
+    except Exception as exc:
+        # Durable run memory is auxiliary and must never turn a completed
+        # render/report into a failed CLI invocation.
+        print(f"Warning: run memory recording skipped: {exc}", flush=True)
     selected_result = None
     if args.phase:
-        report_key = "phase1" if args.phase == "phase1" else PHASE_NUMBERS[args.phase]
-        selected_result = report.get("phases", {}).get(report_key)
+        selected_result = report.get("phases", {}).get(args.phase)
     phase_failed = selected_result and selected_result.get("status") == "error"
     if phase_failed:
         print(f"Phase {args.phase} failed: {selected_result.get('error', 'unknown error')}", flush=True)

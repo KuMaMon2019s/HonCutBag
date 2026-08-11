@@ -12,20 +12,33 @@ from typing import Optional
 
 # HonCut 产物链定义
 ARTIFACT_CHAIN = {
-    "phase1":   {"produces": "director_plan.json",                    "requires": []},
-    "phase1":   {"produces": "events.json + characters.json + storyboard.json", "requires": ["director_plan.json"]},
-    "phase2": {"produces": "storyboard_images/",                    "requires": ["storyboard.json"]},
-    "phase3":   {"produces": "characters/",                           "requires": ["characters.json"]},
-    "phase4":   {"produces": "shots/",                                "requires": ["storyboard.json"]},
-    "phase5": {"produces": "storyboard_qa_report.json",            "requires": ["STORYBOARD.json", "shots/"]},
+    "phase1":   {"produces": "director_plan.json + events.json + CHARACTERS.json + STORYBOARD.json", "requires": []},
+    "phase2":   {"produces": "storyboard_images/",                    "requires": ["STORYBOARD.json"]},
+    "phase3":   {"produces": "characters/",                           "requires": ["CHARACTERS.json"]},
+    "phase4":   {"produces": "shots/",                                "requires": ["STORYBOARD.json"]},
+    "phase5":   {"produces": "storyboard_qa_report.json",             "requires": ["STORYBOARD.json", "shots/"]},
     "phase6":   {"produces": "shots/*/output.mp4",                   "requires": ["shots/", "storyboard_qa_report.json"]},
     "phase7":   {"produces": "quality_report.json",                   "requires": ["shots/"]},
     "phase8":   {"produces": "edit_decisions.json + raw_assembly.mp4", "requires": ["shots/"]},
     "phase9":   {"produces": "polished.mp4 + render_report.json",     "requires": ["raw_assembly.mp4"]},
+    "phase9_5": {"produces": "video_qa_report.json",                  "requires": ["polished.mp4"]},
 }
 
 # Phase 执行顺序
-PHASE_SEQUENCE = ["phase1", "phase1", "phase2", "phase3", "phase4", "phase5", "phase6", "phase7", "phase8", "phase9"]
+PHASE_SEQUENCE = [
+    "phase1", "phase2", "phase3", "phase4", "phase5",
+    "phase6", "phase7", "phase8", "phase9", "phase9_5",
+]
+
+
+def phase_numbers_before(phase: str) -> list[float]:
+    """Return CLI phase numbers that precede ``phase`` in canonical order."""
+    if phase not in PHASE_SEQUENCE:
+        raise ValueError(f"unknown phase: {phase}")
+    numbers: list[float] = []
+    for name in PHASE_SEQUENCE[:PHASE_SEQUENCE.index(phase)]:
+        numbers.append(9.5 if name == "phase9_5" else float(name.removeprefix("phase")))
+    return numbers
 
 
 def save_checkpoint(phase: str, output_dir: Path, artifacts: dict = None) -> Path:

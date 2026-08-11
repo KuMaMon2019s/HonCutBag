@@ -1,7 +1,7 @@
-"""Phase 8.5: Video QA — 抽帧分析硬性质检
+"""Phase 9.5: Video QA — 抽帧分析硬性质检
 
 Combines HonCut frame sampling, visual QA, video understanding, and final review.
-Runs after Phase 8 (polished.mp4) to verify final output quality.
+Runs after Phase 9 (polished.mp4) to verify final output quality.
 
 Checks:
   1. ffprobe validation — resolution, duration, codec, pixel format, file size
@@ -54,7 +54,7 @@ class QAIssue:
 
 @dataclass
 class VideoQAReport:
-    """Full QA report for Phase 8.5."""
+    """Full QA report for Phase 9.5."""
     verdict: str  # "pass", "revise", "fail"
     grade: str    # A/B/C/D
     issues: List[QAIssue] = field(default_factory=list)
@@ -103,7 +103,7 @@ def run_video_qa(
     expected_max_duration: Optional[float] = None,
     vlm_client: Optional[Any] = None,
 ) -> VideoQAReport:
-    """Run Phase 8.5 Video QA on polished.mp4.
+    """Run Phase 9.5 Video QA on polished.mp4.
 
     Args:
         output_dir: Project output directory (contains polished.mp4)
@@ -126,7 +126,7 @@ def run_video_qa(
         report.issues.append(QAIssue(
             severity="critical", check="file_exists",
             message="polished.mp4 not found",
-            suggestion="Phase 8 may have failed; check pipeline logs",
+            suggestion="Phase 9 may have failed; check pipeline logs",
         ))
         report.verdict = "fail"
         report.grade = "D"
@@ -173,7 +173,7 @@ def run_video_qa(
     # Write report to disk
     report_path = output_dir / "video_qa_report.json"
     report_path.write_text(json.dumps(report.to_dict(), indent=2, ensure_ascii=False))
-    print(f"\n  📋 [Phase 8.5] Video QA Report: {report.verdict} ({report.grade})")
+    print(f"\n  📋 [Phase 9.5] Video QA Report: {report.verdict} ({report.grade})")
     for issue in report.issues:
         icon = {"critical": "🔴", "warning": "🟡", "info": "🔵"}.get(issue.severity, "⚪")
         print(f"    {icon} [{issue.check}] {issue.message}")
@@ -276,7 +276,7 @@ def _ffprobe_validate(
         report.issues.append(QAIssue(
             severity="critical", check="video_stream",
             message="No video stream found in polished.mp4",
-            suggestion="Phase 8 may have stripped the video track",
+            suggestion="Phase 9 may have stripped the video track",
         ))
 
     return probe_data

@@ -9,7 +9,7 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-import phases.phase2.storyboard_generator as storyboard_generator
+import phases.phase1.storyboard_generator as storyboard_generator
 from utils import shot_queue
 
 
@@ -45,7 +45,7 @@ def test_shot_queue_payload_recovery_and_sorting(tmp_path):
 
 
 def test_shot_queue_enqueue_worker_collect_without_redis(tmp_path, monkeypatch):
-    import pipeline.src.phases.phase2.storyboard_generator as canonical_generator
+    import pipeline.src.phases.phase1.storyboard_generator as canonical_generator
 
     monkeypatch.setattr(canonical_generator, "_generate_single_shot", lambda **payload: {
         "id": payload["index"], "name": payload["shot"]["what"]

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-pipeline_runner.py — Phase 9: 端到端集成脚本
-串联 Phase 1-8 所有模块，一键运行完整管线：任意文本 → polished.mp4
+pipeline_runner.py — Phase 1-9 端到端集成脚本
+串联 Phase 1-9 所有模块，一键运行完整管线：任意文本 → polished.mp4
 
 Usage:
     python pipeline_runner.py --text "故事文本" --duration 30 --dry-run
@@ -66,7 +66,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(line_buffering=True)
 
 # ---------------------------------------------------------------------------
-# LangGraph Integration (Phase 1: @task + RetryPolicy, Send fan-out, SqliteSaver)
+# LangGraph integration: @task + RetryPolicy, Send fan-out, SqliteSaver
 # ---------------------------------------------------------------------------
 try:
     from langgraph.func import task
@@ -102,12 +102,12 @@ except ImportError as e:
 # Path setup — 让本脚本能 import 同目录及 2026-07-27_05/scripts 下的模块
 # ---------------------------------------------------------------------------
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
-PHASE28_DIR = SCRIPT_DIR  # Phase 1,3,8 模块所在
-PHASE47_DIR = SCRIPT_DIR.parent.parent / "vendor" / "legacy"
+PIPELINE_SRC_DIR = SCRIPT_DIR
+LEGACY_TOOLS_DIR = SCRIPT_DIR.parent.parent / "vendor" / "legacy"
 OM_TOOLS_DIR = SCRIPT_DIR.parent.parent / "vendor" / "video_tools"
 
-# 优先加载当前目录（2026-07-28_01/scripts），然后是旧目录
-for d in (PHASE28_DIR, PHASE47_DIR, str(OM_TOOLS_DIR)):
+# 优先加载当前源码目录，然后是兼容工具目录
+for d in (PIPELINE_SRC_DIR, LEGACY_TOOLS_DIR, str(OM_TOOLS_DIR)):
     s = str(d)
     if s not in sys.path:
         sys.path.insert(0, s)
@@ -250,7 +250,7 @@ def _ensure_dir(p: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 # Phase 顺序定义（用于 resume 时判断哪些已完成）
-PHASE_ORDER = ["phase1", "phase2", "phase3", "phase4", "phase5", "phase6", "phase7", "phase8", "phase9", "phase8_5"]
+PHASE_ORDER = ["phase1", "phase2", "phase3", "phase4", "phase5", "phase6", "phase7", "phase8", "phase9", "phase9_5"]
 
 
 def _checkpoint_path(output_dir: Path) -> Path:
@@ -583,7 +583,7 @@ def _get_next_stage(output_dir: Path, all_phases: list = None) -> Optional[str]:
 # Phase 1: 导演规划 (M1 增量模块)
 # ---------------------------------------------------------------------------
 
-def run_phase1(text: str, output_dir: Path, dry_run: bool) -> dict:
+def run_phase1_director(text: str, output_dir: Path, dry_run: bool) -> dict:
     """Phase 1: 导演规划（M1 增量模块）"""
     _banner("1", 9, "导演规划 (Director Planner)", dry_run)
     start = _now()
@@ -712,7 +712,7 @@ def _write_project_visual_style(output_dir: Path, style_text: str) -> Path:
     )
     return style_path
 
-def run_phase2(
+def run_phase1_screenwriter(
     text: str,
     output_dir: Path,
     duration: int,
@@ -721,7 +721,7 @@ def run_phase2(
     shot_duration: int = AVG_SHOT_DURATION,
 ) -> dict:
     """Phase 1: text_parser → event_extractor → character_discoverer → adaptation_engine → storyboard_generator"""
-    _banner(2, 8, "编剧引擎 (Screenwriter)", dry_run)
+    _banner(1, 9, "编剧引擎 (Screenwriter)", dry_run)
     start = _now()
     _p2_est = estimate_phase_duration("phase1")
     print(f"  ⏱ Phase 1 开始 (预估 ~{int(_p2_est)}s)")
@@ -927,7 +927,7 @@ def run_phase2(
             from prompt.event_extractor import extract_events
             from phases.phase1.character_discoverer import discover_characters
             from phases.phase1.adaptation_engine import adapt_events
-            from phases.phase2.storyboard_generator import generate_storyboard
+            from phases.phase1.storyboard_generator import generate_storyboard
         except ImportError as e:
             return {"status": "error", "error": f"Phase 1 import failed: {e}", "duration_s": _elapsed(start)}
 
@@ -1042,14 +1042,14 @@ def run_phase2(
         except Exception as e:
             print(f"  ⚠ [M5] 分镜审核跳过: {e}")
 
-        phase8_result = {
+        phase1_result = {
             "status": "done",
             "duration_s": _elapsed(start),
             "outputs": outputs,
             "_storyboard": storyboard,
             "_characters": characters_result,
         }
-        return phase8_result
+        return phase1_result
 
     except Exception as e:
         traceback.print_exc()
@@ -1058,6 +1058,31 @@ def run_phase2(
         configure_heartbeat_callback(None)
         if reporter:
             reporter.stop_heartbeat()
+
+
+def run_phase1(
+    text: str,
+    output_dir: Path,
+    duration: int,
+    dry_run: bool,
+    reporter: Optional[ProgressReporter] = None,
+    shot_duration: int = AVG_SHOT_DURATION,
+) -> dict:
+    """Phase 1: director planning followed by the screenwriter engine."""
+    started = _now()
+    director = run_phase1_director(text, Path(output_dir), dry_run)
+    screenwriter = run_phase1_screenwriter(
+        text,
+        output_dir,
+        duration,
+        dry_run,
+        reporter=reporter,
+        shot_duration=shot_duration,
+    )
+    combined = dict(screenwriter)
+    combined["director"] = director
+    combined["duration_s"] = _elapsed(started)
+    return combined
 
 
 # ---------------------------------------------------------------------------
@@ -1848,9 +1873,9 @@ def _validate_storyboard_image_composition(output_dir: Path, storyboard_data: di
     return report
 
 
-def run_phase2_storyboard(storyboard_data: dict, characters_data: dict, output_dir: Path, dry_run: bool) -> dict:
+def run_phase2(storyboard_data: dict, characters_data: dict, output_dir: Path, dry_run: bool) -> dict:
     """Phase 2: 使用 OM image_selector 生成故事板图片，不可用时降级到 Seedream API"""
-    _banner("2", 8, "故事板图片生成 (ImageSelector / Seedream)", dry_run)
+    _banner("2", 9, "故事板图片生成 (ImageSelector / Seedream)", dry_run)
     start = _now()
     _p25_est = estimate_phase_duration("phase2")
     print(f"  ⏱ Phase 2 开始 (预估 ~{int(_p25_est)}s)")
@@ -2095,7 +2120,7 @@ def detect_derive_assets(characters_data: dict) -> list:
 
 def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
     """Phase 3: character_factory — 生成角色三视图 + 衍生资产检测"""
-    _banner(3, 8, "角色工厂 (Character Factory + Derive Assets)", dry_run)
+    _banner(3, 9, "角色工厂 (Character Factory + Derive Assets)", dry_run)
     start = _now()
     outputs = []
     output_dir = Path(output_dir)
@@ -2211,7 +2236,7 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
 
 def run_phase4(output_dir: Path, dry_run: bool) -> dict:
     """Phase 4: orchestrator — 镜头编排（通过 CLI 调用）"""
-    _banner(4, 8, "编排器 (Orchestrator)", dry_run)
+    _banner(4, 9, "编排器 (Orchestrator)", dry_run)
     start = _now()
     _p4_est = estimate_phase_duration("phase4")
     print(f"  ⏱ Phase 4 开始 (预估 ~{int(_p4_est)}s)")
@@ -2249,7 +2274,7 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
         outputs.append("SCENE_CONSISTENCY.json")
         print("  ✓ 场景一致性契约: SCENE_CONSISTENCY.json")
 
-        orchestrator_script = PHASE47_DIR / "orchestrator.py"
+        orchestrator_script = LEGACY_TOOLS_DIR / "orchestrator.py"
         if not orchestrator_script.exists():
             return {"status": "error", "error": f"orchestrator.py not found at {orchestrator_script}", "duration_s": _elapsed(start)}
 
@@ -2269,13 +2294,13 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
             capture_output=True,
             text=True,
             timeout=120,
-            cwd=str(PHASE47_DIR),
+            cwd=str(LEGACY_TOOLS_DIR),
             env={
                 **os.environ,
                 "PYTHONPATH": os.pathsep.join(
                     filter(
                         None,
-                        (str(PHASE28_DIR), os.environ.get("PYTHONPATH", "")),
+                        (str(PIPELINE_SRC_DIR), os.environ.get("PYTHONPATH", "")),
                     )
                 ),
             },
@@ -2356,7 +2381,7 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
 # Phase 6: 视频生成 (OM SeedanceVideo — reference_to_video)
 # ---------------------------------------------------------------------------
 
-def _run_phase5_om_seedance(storyboard_data: dict, output_dir: Path, characters_data: Optional[dict] = None, _timing_ctx: Optional[dict] = None) -> dict:
+def _run_phase6_om_seedance(storyboard_data: dict, output_dir: Path, characters_data: Optional[dict] = None, _timing_ctx: Optional[dict] = None) -> dict:
     """使用 OM SeedanceVideo 生成视频（支持 reference_to_video）
     
     Args:
@@ -2573,7 +2598,7 @@ def _apply_chain_relay(content_list, first_frame_b64, shot_id):
     return content_list
 
 
-def _run_phase5_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
+def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
     """Generate Phase 6 video through direct ARK or the explicit local Bridge."""
     output_dir = Path(output_dir)
 
@@ -3211,7 +3236,7 @@ class _PipelineVideoTool(BaseTool):
     def execute(self, inputs: dict[str, Any]) -> ToolResult:
         started = _now()
         try:
-            data = _run_phase5_fallback(
+            data = _run_phase6_fallback(
                 Path(inputs["output_dir"]),
                 chain_mode=bool(inputs.get("chain_mode", False)),
             )
@@ -3230,7 +3255,7 @@ class _LocalVideoVendorAdapter(VendorAdapter):
 
 def run_phase6(storyboard_data: dict, output_dir: Path, dry_run: bool, chain_mode: bool = False) -> dict:
     """Phase 6: video generation through the local Bridge only."""
-    _banner(5, 8, "视频生成 (Seedance — reference_to_video)", dry_run)
+    _banner(6, 9, "视频生成 (Seedance — reference_to_video)", dry_run)
     start = _now()
     
     # Estimate based on shot count
@@ -3285,7 +3310,7 @@ def run_phase7(output_dir: Path, dry_run: bool, storyboard_data: dict = None) ->
     2. scene_variation_check — 场景变化检测（抄自 OM variation_checker）
     3. slideshow_risk_score — 幻灯片风险评分（抄自 OM slideshow_risk）
     """
-    _banner(6, 8, "一致性守卫 + 场景变化检测 + 幻灯片风险评分", dry_run)
+    _banner(7, 9, "一致性守卫 + 场景变化检测 + 幻灯片风险评分", dry_run)
     start = _now()
     _p6_est = estimate_phase_duration("phase7")
     print(f"  ⏱ Phase 7 开始 (预估 ~{int(_p6_est)}s)")
@@ -3417,7 +3442,7 @@ def _select_transition(shot_meta: dict, default_transition: str = "dissolve") ->
 # Phase 8: 组装引擎 (Assembly) — delegates to OM VideoStitch
 # ---------------------------------------------------------------------------
 
-def _finish_phase7(
+def _finish_phase8(
     phase_result: dict,
     output_dir: Path,
     target_duration: Optional[float],
@@ -3427,9 +3452,10 @@ def _finish_phase7(
     media_profile: str,
     reshoot_round: int,
     reshoot_history: list[dict],
+    chain_mode: bool,
 ) -> dict:
-    """Apply the non-blocking duration gate after any successful assembler."""
-    from phases.phase7.duration_gate import evaluate_duration_gate
+    """Apply the duration gate and fail closed when required footage is missing."""
+    from phases.phase8.duration_gate import evaluate_duration_gate
 
     outputs = list(phase_result.get("outputs", []))
     for artifact in (
@@ -3449,35 +3475,49 @@ def _finish_phase7(
             reshoots=reshoot_history,
         )
     except Exception as exc:
-        print(f"  ⚠ [7.3] 时长闸门执行失败: {exc}；不阻塞后续 Phase", flush=True)
+        print(f"  ⚠⚠ [8.3] 时长闸门执行失败: {exc}；阻止交付", flush=True)
         phase_result["duration_gate_error"] = str(exc)
+        phase_result["status"] = "error"
+        phase_result["error"] = f"Phase 8 duration gate failed: {exc}"
         return phase_result
 
     phase_result["duration_gate"] = gate
     if target_duration is None:
-        print("  ⊘ [7.3] target_duration=None，跳过时长闸门", flush=True)
+        print("  ⊘ [8.3] target_duration=None，跳过时长闸门", flush=True)
         return phase_result
     if gate["passed"]:
         print(
-            f"  ✓ [7.3] 时长闸门通过: {gate['actual_s']:.2f}s / {gate['target_s']:.2f}s",
+            f"  ✓ [8.3] 时长闸门通过: {gate['actual_s']:.2f}s / {gate['target_s']:.2f}s",
             flush=True,
         )
         return phase_result
 
     print(
-        f"  ⚠⚠ [7.3] 时长不足: 实际 {gate['actual_s']:.2f}s，"
+        f"  ⚠⚠ [8.3] 时长不足: 实际 {gate['actual_s']:.2f}s，"
         f"目标 {gate['target_s']:.2f}s，缺口 {gate['gap_s']:.2f}s",
         flush=True,
     )
     if not enable_reshoot:
-        print("  ⊘ [7.3] enable_reshoot=false，仅报告缺口，不触发视频重发", flush=True)
+        print("  ⊘ [8.3] enable_reshoot=false，时长缺口未修复，阻止交付", flush=True)
+        phase_result["status"] = "error"
+        phase_result["error"] = (
+            "Phase 8 duration gate requires reshoot but enable_reshoot=false: "
+            f"missing {gate['gap_s']:.2f}s"
+        )
         return phase_result
     if reshoot_round >= 2:
-        print("  ⚠⚠ [7.3] 已达补录上限 2 轮；标记未通过但继续后续 Phase", flush=True)
+        print("  ⚠⚠ [8.3] 已达补录上限 2 轮；阻止交付", flush=True)
+        phase_result["status"] = "error"
+        phase_result["error"] = (
+            "Phase 8 duration still fails after 2 reshoot rounds: "
+            f"missing {gate['gap_s']:.2f}s"
+        )
         return phase_result
     selected = (reshoot_plan or {}).get("shots", [])
     if not selected:
-        print("  ⚠⚠ [7.3] 未找到 requested > actual 的短板镜头，无法自动补录", flush=True)
+        print("  ⚠⚠ [8.3] 未找到 requested > actual 的短板镜头，无法自动补录", flush=True)
+        phase_result["status"] = "error"
+        phase_result["error"] = "Phase 8 duration gate failed and no reshoot candidates were found"
         return phase_result
 
     deleted: list[str] = []
@@ -3487,22 +3527,29 @@ def _finish_phase7(
             video_path.unlink()
             deleted.append(shot["shot_id"])
     print(
-        f"  🔄 [7.3] 补录第 {reshoot_round + 1}/2 轮: {', '.join(deleted)}；"
+        f"  🔄 [8.3] 补录第 {reshoot_round + 1}/2 轮: {', '.join(deleted)}；"
         "其余镜头由 Phase 6 自动跳过",
         flush=True,
     )
     storyboard_path = output_dir / "STORYBOARD.json"
     try:
         storyboard = json.loads(storyboard_path.read_text(encoding="utf-8"))
-        generation = run_phase6(storyboard, output_dir, dry_run=False)
+        generation = run_phase6(storyboard, output_dir, dry_run=False, chain_mode=chain_mode)
     except Exception as exc:
-        print(f"  ⚠⚠ [7.3] 补录调用 Phase 6 失败: {exc}；继续后续 Phase", flush=True)
+        print(f"  ⚠⚠ [8.3] 补录调用 Phase 6 失败: {exc}；阻止交付", flush=True)
+        phase_result["status"] = "error"
+        phase_result["error"] = f"Phase 8 duration reshoot could not run Phase 6: {exc}"
         return phase_result
     if generation.get("status") == "error":
-        print(f"  ⚠⚠ [7.3] Phase 6 补录失败: {generation.get('error') or generation.get('errors')}", flush=True)
+        print(f"  ⚠⚠ [8.3] Phase 6 补录失败: {generation.get('error') or generation.get('errors')}", flush=True)
+        phase_result["status"] = "error"
+        phase_result["error"] = (
+            "Phase 8 duration reshoot failed in Phase 6: "
+            f"{generation.get('error') or generation.get('errors')}"
+        )
         return phase_result
 
-    history = reshoot_history + [{**reshoot_plan, "phase5_status": generation.get("status")}]
+    history = reshoot_history + [{**reshoot_plan, "phase6_status": generation.get("status")}]
     return run_phase8(
         output_dir,
         dry_run=False,
@@ -3513,6 +3560,7 @@ def _finish_phase7(
         enable_reshoot=enable_reshoot,
         _reshoot_round=reshoot_round + 1,
         _reshoot_history=history,
+        chain_mode=chain_mode,
     )
 
 
@@ -3521,14 +3569,15 @@ def run_phase8(output_dir: Path, dry_run: bool,
                transition_duration: float = 0.5,
                media_profile: str = "1080p",
                target_duration: Optional[float] = None,
-               enable_reshoot: bool = False,
+               enable_reshoot: bool = True,
+               chain_mode: bool = False,
                _reshoot_round: int = 0,
                _reshoot_history: Optional[list[dict]] = None) -> dict:
-    """Phase 8: 组装引擎 — 直接调用 OM VideoStitch"""
-    _banner(7, 8, f"组装引擎 (Assembly) — {transition}", dry_run)
+    """Phase 8: 逐镜质检、裁切/补录闭环与受审组装。"""
+    _banner(8, 9, f"组装引擎 (Assembly) — {transition}", dry_run)
     start = _now()
-    _p7_est = estimate_phase_duration("phase8")
-    print(f"  ⏱ Phase 8 开始 (预估 ~{int(_p7_est)}s)")
+    phase8_estimate = estimate_phase_duration("phase8")
+    print(f"  ⏱ Phase 8 开始 (预估 ~{int(phase8_estimate)}s)")
     output_dir = Path(output_dir)
     reshoot_history = list(_reshoot_history or [])
 
@@ -3549,7 +3598,6 @@ def run_phase8(output_dir: Path, dry_run: bool,
                     # Load SHOT_META.json for this shot
                     meta_path = shot_d / "SHOT_META.json"
                     if meta_path.exists():
-                        import json
                         with open(meta_path, 'r', encoding='utf-8') as f:
                             shot_metas.append(json.load(f))
                     else:
@@ -3558,8 +3606,8 @@ def run_phase8(output_dir: Path, dry_run: bool,
     if not clip_paths:
         return {"status": "error", "error": "No video clips found", "duration_s": _elapsed(start)}
 
-    # Step 7.1: compare storyboard narrative order with the current clip order.
-    from phases.phase7.story_order_reviewer import reorder_shots, review_story_order
+    # Step 8.1: compare storyboard narrative order with the current clip order.
+    from phases.phase8.story_order_reviewer import reorder_shots, review_story_order
 
     current_order = [Path(path).parent.name for path in clip_paths]
     order_review = review_story_order(output_dir, current_order)
@@ -3569,38 +3617,107 @@ def run_phase8(output_dir: Path, dry_run: bool,
         )
         if changed:
             print(
-                "  🔀 [7.1] 按剧情审稿建议重排镜头: "
+                "  🔀 [8.1] 按剧情审稿建议重排镜头: "
                 + " → ".join(Path(path).parent.name for path in clip_paths),
                 flush=True,
             )
     if not order_review["narrative_consistent"]:
-        print(f"  ⚠ [7.1] 剧情连贯性问题: {order_review['issues']}", flush=True)
+        print(f"  ⚠ [8.1] 剧情连贯性问题: {order_review['issues']}", flush=True)
 
-    # Step 7.2: local first/middle/last-frame inspection, warning only.
-    from phases.phase7.frame_analysis import analyze_shot_frames
+    # Step 8.2: dense per-shot review with actionable keep/trim/reshoot decisions.
+    from phases.phase8.frame_analysis import analyze_shot_frames
 
-    analyze_shot_frames(shots_dir, output_dir / "frame_analysis.json")
+    frame_report = analyze_shot_frames(shots_dir, output_dir / "frame_analysis.json")
+    reshoot_shots = list(frame_report.get("summary", {}).get("reshoot", []))
+    if reshoot_shots:
+        if not enable_reshoot:
+            return {
+                "status": "error",
+                "error": (
+                    "Phase 8 visual QA requires reshoot but enable_reshoot=false: "
+                    + ", ".join(reshoot_shots)
+                ),
+                "duration_s": _elapsed(start),
+                "frame_analysis": frame_report.get("summary", {}),
+            }
+        if _reshoot_round >= 2:
+            return {
+                "status": "error",
+                "error": f"Phase 8 visual QA still fails after 2 reshoot rounds: {', '.join(reshoot_shots)}",
+                "duration_s": _elapsed(start),
+                "frame_analysis": frame_report.get("summary", {}),
+                "reshoot_history": reshoot_history,
+            }
 
-    if len(clip_paths) < 2:
-        import shutil
-        output_final = output_dir / "raw_assembly.mp4"
-        shutil.copy2(clip_paths[0], str(output_final))
-        from phases.phase9.audio_mixer import apply_phase7_audio
-        audio_receipt = apply_phase7_audio(output_dir)
-        print(f"  ✓ Phase 8 完成: 仅 1 个片段，直接复制")
-        
-        # Quality gate: Phase 8
-        qg_report = run_quality_check("phase8", output_dir)
-        if not qg_report.passed:
-            return {"status": "error", "error": f"Phase 8 质检未通过: {qg_report.grade}", "quality_report": qg_report, "duration_s": _elapsed(start)}
-        
-        return _finish_phase7(
-            {"status": "done", "duration_s": _elapsed(start),
-             "outputs": ["raw_assembly.mp4"], "method": "single_clip_copy",
-             "audio_layer": audio_receipt},
-            output_dir, target_duration, enable_reshoot, transition,
-            transition_duration, media_profile, _reshoot_round, reshoot_history,
+        deleted: list[str] = []
+        for shot_id in reshoot_shots:
+            video_path = shots_dir / shot_id / "output.mp4"
+            if video_path.is_file():
+                video_path.unlink()
+                deleted.append(shot_id)
+        if deleted != reshoot_shots:
+            missing = sorted(set(reshoot_shots).difference(deleted))
+            return {
+                "status": "error",
+                "error": f"Phase 8 cannot reshoot missing source clips: {', '.join(missing)}",
+                "duration_s": _elapsed(start),
+            }
+
+        print(
+            f"  🔄 [8.2] 视觉质检补录第 {_reshoot_round + 1}/2 轮: {', '.join(deleted)}",
+            flush=True,
         )
+        storyboard_path = output_dir / "STORYBOARD.json"
+        try:
+            storyboard = json.loads(storyboard_path.read_text(encoding="utf-8"))
+            generation = run_phase6(
+                storyboard, output_dir, dry_run=False, chain_mode=chain_mode
+            )
+        except Exception as exc:
+            return {
+                "status": "error",
+                "error": f"Phase 8 visual reshoot could not run Phase 6: {exc}",
+                "duration_s": _elapsed(start),
+            }
+        if generation.get("status") == "error":
+            return {
+                "status": "error",
+                "error": (
+                    "Phase 8 visual reshoot failed in Phase 6: "
+                    f"{generation.get('error') or generation.get('errors')}"
+                ),
+                "duration_s": _elapsed(start),
+            }
+        missing_outputs = [
+            shot_id for shot_id in reshoot_shots
+            if not (shots_dir / shot_id / "output.mp4").is_file()
+        ]
+        if missing_outputs:
+            return {
+                "status": "error",
+                "error": f"Phase 6 reported success without regenerated clips: {', '.join(missing_outputs)}",
+                "duration_s": _elapsed(start),
+            }
+        history = reshoot_history + [{
+            "kind": "visual_quality",
+            "round": _reshoot_round + 1,
+            "shots": reshoot_shots,
+            "phase6_status": generation.get("status"),
+        }]
+        return run_phase8(
+            output_dir,
+            dry_run=False,
+            transition=transition,
+            transition_duration=transition_duration,
+            media_profile=media_profile,
+            target_duration=target_duration,
+            enable_reshoot=enable_reshoot,
+            chain_mode=chain_mode,
+            _reshoot_round=_reshoot_round + 1,
+            _reshoot_history=history,
+        )
+
+    reviewed_order = [Path(path).parent.name for path in clip_paths]
 
     # Intelligent transition selection based on shot emotions
     print(f"  → 发现 {len(clip_paths)} 个视频片段")
@@ -3675,8 +3792,82 @@ def run_phase8(output_dir: Path, dry_run: bool,
     )
     clip_paths = stitch_plan.clips
 
-    # Prefer the unified VideoEdit tool.  Keep the existing edit_decisions and
-    # VideoStitch paths below as progressively more permissive fallbacks.
+    # The reviewed edit-decision path is primary: this is where per-shot trim
+    # decisions become real frame-accurate cuts. Generic concat is fallback.
+    transition_dicts = (
+        [{"decision": value} for value in selected_transitions]
+        if selected_transitions else None
+    )
+    reviewed_edit_error = "reviewed edit path did not complete"
+    try:
+        from phases.phase8.edit_decisions import build_edit_decisions, execute_edit_decisions
+
+        print("  → 构建 reviewed edit_decisions（质检裁切 + 音频归一化）...")
+        edit_decisions = build_edit_decisions(
+            shots_dir=shots_dir,
+            target_width=1920,
+            target_height=1080,
+            transition_decisions=transition_dicts,
+            quality_report=frame_report,
+            shot_order=reviewed_order,
+        )
+        print(f"  → 执行 reviewed edit_decisions（{len(edit_decisions['cuts'])} 个片段）...")
+        reviewed_edit = execute_edit_decisions(
+            edit_decisions,
+            output_path=str(output_dir / "raw_assembly.mp4"),
+        )
+        if reviewed_edit.get("success"):
+            print("  ✓ Phase 8 完成: raw_assembly.mp4 (reviewed_edit_decisions)")
+            from phases.phase9.audio_mixer import apply_phase9_audio
+
+            audio_receipt = apply_phase9_audio(output_dir)
+            qg_report = run_quality_check("phase8", output_dir)
+            if not qg_report.passed:
+                return {
+                    "status": "error",
+                    "error": f"Phase 8 质检未通过: {qg_report.grade}",
+                    "quality_report": qg_report,
+                    "duration_s": _elapsed(start),
+                }
+            return _finish_phase8({
+                "status": "done",
+                "duration_s": _elapsed(start),
+                "outputs": ["raw_assembly.mp4"],
+                "method": "reviewed_edit_decisions",
+                "transition": batch_transition,
+                "transition_duration": transition_duration,
+                "clip_count": len(edit_decisions["cuts"]),
+                "transition_selections": selected_transitions or None,
+                "edit_decisions_segments": reviewed_edit.get("segments"),
+                "frame_analysis": frame_report.get("summary", {}),
+                "reshoot_history": reshoot_history,
+                "audio_layer": audio_receipt,
+            }, output_dir, target_duration, enable_reshoot, transition,
+               transition_duration, media_profile, _reshoot_round, reshoot_history,
+               chain_mode)
+        print(
+            f"  ⚠ reviewed edit_decisions 失败: {reviewed_edit.get('error', 'unknown error')}；"
+            "降级为 VideoEdit",
+            flush=True,
+        )
+        reviewed_edit_error = str(reviewed_edit.get("error", "unknown error"))
+    except Exception as exc:
+        print(f"  ⚠ reviewed edit_decisions 异常: {exc}；降级为 VideoEdit", flush=True)
+        reviewed_edit_error = str(exc)
+
+    if frame_report.get("summary", {}).get("trim"):
+        return {
+            "status": "error",
+            "error": (
+                "Phase 8 cannot safely fall back to raw concat because reviewed trims are required: "
+                f"{reviewed_edit_error}"
+            ),
+            "duration_s": _elapsed(start),
+            "frame_analysis": frame_report.get("summary", {}),
+        }
+
+    # Generic concat cannot apply per-shot decisions, so it is only reached
+    # when the reviewed editor itself is unavailable or fails technically.
     try:
         from tools.video.video_edit import VideoEdit
 
@@ -3742,12 +3933,12 @@ def run_phase8(output_dir: Path, dry_run: bool,
         concat_output.unlink(missing_ok=True)
 
         print(f"  ✓ Phase 8 完成: raw_assembly.mp4 (VideoEdit)")
-        from phases.phase9.audio_mixer import apply_phase7_audio
-        audio_receipt = apply_phase7_audio(output_dir)
+        from phases.phase9.audio_mixer import apply_phase9_audio
+        audio_receipt = apply_phase9_audio(output_dir)
         qg_report = run_quality_check("phase8", output_dir)
         if not qg_report.passed:
             return {"status": "error", "error": f"Phase 8 质检未通过: {qg_report.grade}", "quality_report": qg_report, "duration_s": _elapsed(start)}
-        return _finish_phase7({
+        return _finish_phase8({
             "status": "done",
             "duration_s": _elapsed(start),
             "outputs": ["raw_assembly.mp4"],
@@ -3757,75 +3948,20 @@ def run_phase8(output_dir: Path, dry_run: bool,
             "clip_count": len(clip_paths),
             "transition_selections": selected_transitions if selected_transitions else None,
             "trim_end_s": round(trim_end, 3),
+            "frame_analysis": frame_report.get("summary", {}),
+            "reshoot_history": reshoot_history,
             "audio_layer": audio_receipt,
         }, output_dir, target_duration, enable_reshoot, transition,
-           transition_duration, media_profile, _reshoot_round, reshoot_history)
+           transition_duration, media_profile, _reshoot_round, reshoot_history,
+           chain_mode)
     except Exception as e:
         try:
             (output_dir / ".video_edit_concat.mp4").unlink(missing_ok=True)
         except OSError:
             pass
-        print(f"  ⚠ VideoEdit 失败: {e}，降级为 edit_decisions / VideoStitch")
+        print(f"  ⚠ VideoEdit 失败: {e}，降级为 VideoStitch")
 
-    # 调用 HonCut edit_decisions 架构
-    try:
-        from phases.phase8.edit_decisions import build_edit_decisions, execute_edit_decisions
-        
-        # Convert selected_transitions (list of strings) to the format
-        # build_edit_decisions expects: list of dicts with "decision" key
-        # This ensures transitions are applied even when smart_decisions is None
-        # (e.g. when the embedding API fails with 400 and we fall back to emotion mapping)
-        transition_dicts = None
-        if selected_transitions:
-            transition_dicts = [{"decision": t} for t in selected_transitions]
-        
-        print("  → 构建 edit_decisions（帧精确裁切 + 音频归一化）...")
-        edit_decisions = build_edit_decisions(
-            shots_dir=shots_dir,
-            target_width=1920,
-            target_height=1080,
-            transition_decisions=transition_dicts,
-        )
-        
-        print(f"  → 执行 edit_decisions（{len(edit_decisions['cuts'])} 个片段）...")
-        ed_result = execute_edit_decisions(
-            edit_decisions,
-            output_path=str(output_dir / "raw_assembly.mp4")
-        )
-        
-        if ed_result.get("success"):
-            print(f"  ✓ Phase 8 完成: raw_assembly.mp4 (edit_decisions)")
-            from phases.phase9.audio_mixer import apply_phase7_audio
-            audio_receipt = apply_phase7_audio(output_dir)
-            
-            # Quality gate: Phase 8
-            qg_report = run_quality_check("phase8", output_dir)
-            if not qg_report.passed:
-                return {"status": "error", "error": f"Phase 8 质检未通过: {qg_report.grade}", "quality_report": qg_report, "duration_s": _elapsed(start)}
-            
-            return _finish_phase7({
-                "status": "done",
-                "duration_s": _elapsed(start),
-                "outputs": ["raw_assembly.mp4"],
-                "method": "edit_decisions",
-                "transition": batch_transition,
-                "transition_duration": transition_duration,
-                "clip_count": len(clip_paths),
-                "transition_selections": selected_transitions if selected_transitions else None,
-                "edit_decisions_segments": ed_result.get("segments"),
-                "audio_layer": audio_receipt,
-            }, output_dir, target_duration, enable_reshoot, transition,
-               transition_duration, media_profile, _reshoot_round, reshoot_history)
-        else:
-            error_msg = ed_result.get("error", "Unknown error")
-            print(f"  ⚠ edit_decisions 失败: {error_msg}，降级为 VideoStitch")
-            # Fall through to VideoStitch fallback
-            
-    except Exception as e:
-        print(f"  ⚠ edit_decisions 异常: {e}，降级为 VideoStitch")
-        # Fall through to VideoStitch fallback
-    
-    # Fallback: OM VideoStitch（如果 edit_decisions 失败）
+    # Final fallback: OM VideoStitch for keep-only projects.
     try:
         from vendor.video_tools.tools.video.video_stitch import VideoStitch
         stitcher = VideoStitch()
@@ -3841,15 +3977,15 @@ def run_phase8(output_dir: Path, dry_run: bool,
 
         if result.success:
             print(f"  ✓ Phase 8 完成: raw_assembly.mp4 (VideoStitch fallback)")
-            from phases.phase9.audio_mixer import apply_phase7_audio
-            audio_receipt = apply_phase7_audio(output_dir)
+            from phases.phase9.audio_mixer import apply_phase9_audio
+            audio_receipt = apply_phase9_audio(output_dir)
             
             # Quality gate: Phase 8
             qg_report = run_quality_check("phase8", output_dir)
             if not qg_report.passed:
                 return {"status": "error", "error": f"Phase 8 质检未通过: {qg_report.grade}", "quality_report": qg_report, "duration_s": _elapsed(start)}
             
-            return _finish_phase7({
+            return _finish_phase8({
                 "status": "done",
                 "duration_s": _elapsed(start),
                 "outputs": ["raw_assembly.mp4"],
@@ -3859,9 +3995,12 @@ def run_phase8(output_dir: Path, dry_run: bool,
                 "clip_count": len(clip_paths),
                 "transition_selections": selected_transitions if selected_transitions else None,
                 "stitch_offsets": stitch_plan.offsets,
+                "frame_analysis": frame_report.get("summary", {}),
+                "reshoot_history": reshoot_history,
                 "audio_layer": audio_receipt,
             }, output_dir, target_duration, enable_reshoot, transition,
-               transition_duration, media_profile, _reshoot_round, reshoot_history)
+               transition_duration, media_profile, _reshoot_round, reshoot_history,
+               chain_mode)
         else:
             return {"status": "error", "error": result.error, "duration_s": _elapsed(start)}
 
@@ -4097,13 +4236,13 @@ def _merge_shot_transcripts(sb_shots: list, durations_ms: list[int], shot_transc
     }
 
 
-def _phase8_real_audio_tracks(
+def _phase9_real_audio_tracks(
     output_dir: Path,
     storyboard_data: Optional[dict],
     transcript_data: Optional[dict],
     raw_video: Path,
 ) -> tuple[list[dict], int]:
-    """Build the real-audio base + Phase 8 narration tracks for Phase 9."""
+    """Build the real-audio base and narration tracks for Phase 9."""
     tracks = [{"path": str(raw_video), "role": "music"}]
     audio_options = storyboard_data.get("audio", {}) if storyboard_data else {}
     if not storyboard_data or not audio_options.get("enabled", False) or not audio_options.get("tts", True):
@@ -4141,7 +4280,7 @@ def _phase8_real_audio_tracks(
     return tracks, skipped
 
 
-def _phase8_real_audio_mix_request(tracks: list[dict], audio_out: Path) -> dict:
+def _phase9_real_audio_mix_request(tracks: list[dict], audio_out: Path) -> dict:
     """Return the AudioMixer request for a preserved real-audio base track."""
     has_tts = len(tracks) > 1
     return {
@@ -4174,7 +4313,7 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
         upscale: Optional target height in pixels (e.g. 720 for 720p output)
         media_profile: encoding profile name (default: "1080p")
     """
-    _banner(8, 8, "后期处理 (Post-Production)", dry_run)
+    _banner(9, 9, "后期处理 (Post-Production)", dry_run)
     start = _now()
     _p8_est = estimate_phase_duration("phase9")
     print(f"  ⏱ Phase 9 开始 (预估 ~{int(_p8_est)}s)")
@@ -4216,7 +4355,7 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
     if has_real_audio:
         print("  → [P0-D3] 视频已有真实音轨（Seedance generate_audio），跳过环境音合成")
 
-    # Step 8.1: transcribe every source shot before subtitle rendering. Keep
+    # Step 9.1: transcribe every source shot before subtitle rendering. Keep
     # this outside Phase 9's broad post-processing guard so extraction/API
     # failures propagate instead of being reported as an ordinary soft failure.
     transcript_data = None
@@ -4252,7 +4391,7 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
 
     try:
         from phases.phase9.visual_post import process_visual
-        from phases.phase8.rhythm_editor import edit_rhythm
+        from phases.phase9.rhythm_editor import edit_rhythm
 
         # Track step statuses for quality gate integrity
         step_status = {}
@@ -4260,18 +4399,18 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
         if transcript_data is not None:
             step_status["asr_transcription"] = "done"
 
-        # Step 8.1: Audio processing via OM AudioMixer
+        # Step 9.1: Audio processing via OM AudioMixer
         bgm_path = None
         if has_real_audio:
             audio_out = output_dir / "audio_processed.mp4"
             from vendor.video_tools.tools.audio.audio_mixer import AudioMixer
 
-            tracks, skipped_tts = _phase8_real_audio_tracks(
+            tracks, skipped_tts = _phase9_real_audio_tracks(
                 output_dir, storyboard_data, transcript_data, raw_video
             )
             overlay_count = len(tracks) - 1
             mixer = AudioMixer()
-            mix_result = mixer.execute(_phase8_real_audio_mix_request(tracks, audio_out))
+            mix_result = mixer.execute(_phase9_real_audio_mix_request(tracks, audio_out))
             audio_success = bool(mix_result.success)
             if audio_success:
                 remux_tmp = output_dir / "audio_remux_tmp.mp4"
@@ -4430,7 +4569,7 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
 
         audio_out = str(audio_out)
 
-        # Step 8.2: visual_post
+        # Step 9.2: visual_post
         print("  → visual_post: 视觉后期...")
         visual_out = str(output_dir / "visual_processed.mp4")
         process_visual(
@@ -4441,7 +4580,7 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
 
         current_video = visual_out
 
-        # Step 8.2.1: Subtitle burn (optional, from OM RemotionCaptionBurn)
+        # Step 9.2.1: Subtitle burn (optional, from OM RemotionCaptionBurn)
         if sb_path_str:
             print("  → subtitle_burn: 字幕烧录 (RemotionCaptionBurn)...")
             subtitled_out = str(output_dir / "subtitled.mp4")
@@ -4484,7 +4623,7 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
                 print(f"    ⚠ 字幕烧录异常: {e}")
                 step_status["subtitle_burn"] = "failed"
 
-        # Step 8.2.5: Color grade (optional, from OM ColorGrade)
+        # Step 9.2.5: Color grade (optional, from OM ColorGrade)
         if color_grade:
             print(f"  → color_grade: 应用调色 ({color_grade})...")
             graded_out = str(output_dir / "color_graded.mp4")
@@ -4506,7 +4645,7 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             except ImportError as e:
                 print(f"    ⚠ ColorGrade unavailable: {e}")
 
-        # Step 8.2.6: Upscale (optional, from OM Upscale — lanczos)
+        # Step 9.2.6: Upscale (optional, from OM Upscale — lanczos)
         if upscale:
             print(f"  → upscale: 超分到 {upscale}p (lanczos)...")
             upscaled_out = str(output_dir / "upscaled.mp4")
@@ -4527,7 +4666,7 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             except ImportError as e:
                 print(f"    ⚠ Upscale unavailable: {e}")
 
-        # Step 8.3: rhythm_editor → polished.mp4
+        # Step 9.3: rhythm_editor → polished.mp4
         print("  → rhythm_editor: 节奏编辑...")
         final_out = str(output_dir / "polished.mp4")
         try:
@@ -4546,7 +4685,7 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             shutil.copy2(current_video, final_out)
             outputs.append("polished.mp4")
 
-        # Step 8.4: Final encoding with media profile
+        # Step 9.4: Final encoding with media profile
         print(f"  → final_encode: 使用 {media_profile} 配置重新编码...")
         final_encoded = str(output_dir / "polished_final.mp4")
         profile = _get_profile_dict(media_profile)
@@ -4613,38 +4752,6 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
         print(f"    ✓ 最终编码完成: {profile['width']}x{profile['height']} @ {profile['fps']}fps")
         step_status["final_encode"] = "done"
         step_status["final_duration_gate"] = "done"
-
-        # Step 8.5: hard video QA must also run when run_phase9() is invoked
-        # directly (outside the full pipeline graph/runner).
-        video_qa_result = None
-        try:
-            from quality.video_qa import run_video_qa
-            if storyboard_data is None and storyboard_path.exists():
-                storyboard_data = json.loads(storyboard_path.read_text(encoding="utf-8"))
-            qa_report = run_video_qa(output_dir, storyboard_data=storyboard_data)
-            video_qa_result = {
-                "status": "error" if qa_report.verdict == "fail" else (
-                    "done" if qa_report.verdict == "pass" else "warning"
-                ),
-                "verdict": qa_report.verdict,
-                "grade": qa_report.grade,
-                "issues_count": len(qa_report.issues),
-            }
-            outputs.append("video_qa_report.json")
-        except ImportError as e:
-            video_qa_result = {"status": "skipped", "reason": str(e)}
-            print(f"  ⚠ Phase 9.5 Video QA unavailable: {e}")
-        except Exception as e:
-            video_qa_result = {"status": "error", "error": str(e)}
-            print(f"  ⚠ Phase 9.5 Video QA failed: {e}")
-
-        if video_qa_result.get("verdict") == "fail":
-            return {
-                "status": "error",
-                "error": f"Phase 9.5 QA blocking failure: {video_qa_result['grade']} grade",
-                "video_qa": video_qa_result,
-                "duration_s": _elapsed(start),
-            }
 
         # Final character-animation QA runs against the delivered video and
         # persists its complete structured result for later inspection.
@@ -4716,12 +4823,8 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             "bgm_detected": bgm_path is not None,
             "media_profile": media_profile,
             "step_status": step_status,
-            "video_qa": video_qa_result,
             "character_qa": character_qa_result,
         }
-        write_stage_checkpoint(_checkpoint_path(output_dir), "phase9", phase8_result)
-        return phase8_result
-
     except ImportError as e:
         return {"status": "error", "error": str(e), "duration_s": _elapsed(start)}
     except Exception as e:
@@ -4781,8 +4884,8 @@ if LANGGRAPH_AVAILABLE:
         graph = StateGraph(HonCutState)
         
         # Add nodes (each phase is a node)
-        graph.add_node("phase1", lambda state: node_phase2(state, reporter=reporter))
-        graph.add_node("phase2", node_phase2_storyboard)
+        graph.add_node("phase1", lambda state: node_phase1(state, reporter=reporter))
+        graph.add_node("phase2", node_phase2)
         
         # Interrupt node for human review (Phase 2 → Phase 3)
         if not auto_approve:
@@ -4793,14 +4896,14 @@ if LANGGRAPH_AVAILABLE:
         graph.add_node("phase5", node_phase5_quality)
         
         # Conditional routing for Phase 4 → Phase 6 (different generators)
-        graph.add_node("phase5_txt2vid", node_phase5_txt2vid)
-        graph.add_node("phase5_img2vid", node_phase5_img2vid)
-        graph.add_node("phase5_reference", node_phase5_reference)
+        graph.add_node("phase6_txt2vid", node_phase6_txt2vid)
+        graph.add_node("phase6_img2vid", node_phase6_img2vid)
+        graph.add_node("phase6_reference", node_phase6_reference)
         
-        graph.add_node("phase7", node_phase6)
-        graph.add_node("phase8", node_phase7)
-        graph.add_node("phase9", node_phase8)
-        graph.add_node("phase8_5", node_phase8_5)
+        graph.add_node("phase7", node_phase7)
+        graph.add_node("phase8", node_phase8)
+        graph.add_node("phase9", node_phase9)
+        graph.add_node("phase9_5", node_phase9_5)
 
         # Edges
         graph.add_edge(START, "phase1")
@@ -4821,16 +4924,16 @@ if LANGGRAPH_AVAILABLE:
             "phase5",
             route_phase5,
             {
-                "txt2vid": "phase5_txt2vid",
-                "img2vid": "phase5_img2vid",
-                "reference": "phase5_reference",
+                "txt2vid": "phase6_txt2vid",
+                "img2vid": "phase6_img2vid",
+                "reference": "phase6_reference",
             }
         )
         
         # All Phase 6 variants converge to Phase 7
-        graph.add_edge("phase5_txt2vid", "phase7")
-        graph.add_edge("phase5_img2vid", "phase7")
-        graph.add_edge("phase5_reference", "phase7")
+        graph.add_edge("phase6_txt2vid", "phase7")
+        graph.add_edge("phase6_img2vid", "phase7")
+        graph.add_edge("phase6_reference", "phase7")
         
         # Quality gate: Phase 7 can rollback to Phase 6 via Command
         graph.add_conditional_edges(
@@ -4838,13 +4941,13 @@ if LANGGRAPH_AVAILABLE:
             quality_gate_router,
             {
                 "pass": "phase8",
-                "retry": "phase5_txt2vid",  # Default retry path
+                "retry": "phase6_txt2vid",  # Default retry path
             }
         )
         
         graph.add_edge("phase8", "phase9")
-        graph.add_edge("phase9", "phase8_5")
-        graph.add_edge("phase8_5", END)
+        graph.add_edge("phase9", "phase9_5")
+        graph.add_edge("phase9_5", END)
         
         # Compile with SQLite checkpointer
         # Note: checkpointer is created per-invocation in run_pipeline()
@@ -4852,62 +4955,26 @@ if LANGGRAPH_AVAILABLE:
 
     # --- Node functions (wrappers around existing run_phase* functions) ---
     
-    def node_phase2(state: HonCutState, reporter: Optional[ProgressReporter] = None) -> dict:
-        """Phase 1 node: 编剧引擎"""
-        output_dir = Path(state["output_dir"])
-        result = run_phase2(
-            text=state["text"],
-            output_dir=output_dir,
-            duration=state["duration"],
-            dry_run=state["dry_run"],
-            reporter=reporter,
-            shot_duration=state.get("shot_duration", AVG_SHOT_DURATION),
-        )
-        
-        # Extract internal data
-        storyboard_data = result.pop("_storyboard", None)
-        characters_data = result.pop("_characters", None)
-        
-        update = {
-            "storyboard": storyboard_data or {},
-            "characters": characters_data.get("characters", []) if characters_data else [],
-            "phase_results": {**state.get("phase_results", {}), "phase1": result},
-            "completed_phases": state.get("completed_phases", []) + (["phase1"] if result.get("status") != "error" else []),
-            "skip_phase": state.get("skip_phase", []),
-        }
-        if result.get("status") == "error":
-            update.update(status="failed", error=f"Phase 1 failed: {result.get('error')}")
-            return Command(goto=END, update=update)
-        return update
+    def node_phase1(state: HonCutState, reporter: Optional[ProgressReporter] = None) -> dict:
+        """Compatibility facade for the migrated Phase 1 graph node."""
+        from graph.nodes.phase1 import phase1_node
 
-    def node_phase2_storyboard(state: HonCutState) -> dict:
-        """Phase 2 node: 故事板图片生成"""
-        output_dir = Path(state["output_dir"])
-        storyboard_data = state.get("storyboard")
-        characters_data = {"characters": state.get("characters", [])}
-        
-        result = run_phase2_storyboard(
-            storyboard_data=storyboard_data,
-            characters_data=characters_data,
-            output_dir=output_dir,
-            dry_run=state["dry_run"],
+        # Resolve the module global at call time so existing monkeypatches of
+        # pipeline_core.run_phase1 keep working during the migration.
+        return phase1_node(
+            state,
+            runner=run_phase1,
+            reporter=reporter,
+            default_shot_duration=AVG_SHOT_DURATION,
         )
-        
-        # Extract storyboard image path
-        storyboard_image = ""
-        if result.get("status") == "done" and result.get("outputs"):
-            storyboard_image = result["outputs"][0]
-        
-        update = {
-            "storyboard_image": storyboard_image,
-            "phase_results": {**state.get("phase_results", {}), "phase2": result},
-            "completed_phases": state.get("completed_phases", []) + (["phase2"] if result.get("status") != "error" else []),
-            "skip_phase": state.get("skip_phase", []),
-        }
-        if result.get("status") == "error":
-            update.update(status="failed", error=f"Phase 2 failed: {result.get('error')}")
-            return Command(goto=END, update=update)
-        return update
+
+    def node_phase2(state: HonCutState) -> dict:
+        """Compatibility facade for the migrated Phase 2 graph node."""
+        from graph.nodes.phase2 import phase2_node
+
+        # Resolve the module global at call time so existing monkeypatches of
+        # pipeline_core.run_phase2 keep working during the migration.
+        return phase2_node(state, runner=run_phase2)
 
     def node_review_storyboard(state: HonCutState) -> dict:
         """Interrupt node: pause for human review of storyboard
@@ -4937,25 +5004,12 @@ if LANGGRAPH_AVAILABLE:
         return {}
 
     def node_phase3(state: HonCutState) -> dict:
-        """Phase 3 node: 角色工厂"""
-        output_dir = Path(state["output_dir"])
-        characters_data = {"characters": state.get("characters", [])}
-        
-        result = run_phase3(
-            output_dir=output_dir,
-            characters_data=characters_data,
-            dry_run=state["dry_run"],
-        )
-        
-        update = {
-            "phase_results": {**state.get("phase_results", {}), "phase3": result},
-            "completed_phases": state.get("completed_phases", []) + (["phase3"] if result.get("status") != "error" else []),
-            "skip_phase": state.get("skip_phase", []),
-        }
-        if result.get("status") == "error":
-            update.update(status="failed", error=f"Phase 3 failed: {result.get('error')}")
-            return Command(goto=END, update=update)
-        return update
+        """Compatibility facade for the migrated Phase 3 graph node."""
+        from graph.nodes.phase3 import phase3_node
+
+        # Resolve the module global at call time so existing monkeypatches of
+        # pipeline_core.run_phase3 keep working during the migration.
+        return phase3_node(state, runner=run_phase3)
 
     def node_phase4(state: HonCutState) -> dict:
         """Phase 4 node: 编排器"""
@@ -5019,7 +5073,7 @@ if LANGGRAPH_AVAILABLE:
             return Command(goto=END, update=update)
         return update
 
-    def node_phase5_txt2vid(state: HonCutState) -> dict:
+    def node_phase6_txt2vid(state: HonCutState) -> dict:
         """Phase 6 variant: text-to-video generation"""
         output_dir = Path(state["output_dir"])
         storyboard_data = state.get("storyboard")
@@ -5040,19 +5094,19 @@ if LANGGRAPH_AVAILABLE:
             "skip_phase": state.get("skip_phase", []),
         }
 
-    def node_phase5_img2vid(state: HonCutState) -> dict:
+    def node_phase6_img2vid(state: HonCutState) -> dict:
         """Phase 6 variant: image-to-video generation (uses storyboard image).
-        当前委托给 node_phase5_txt2vid，待实现差异化逻辑。"""
+        当前委托给 node_phase6_txt2vid，待实现差异化逻辑。"""
         # Same as txt2vid for now, but could use different logic
-        return node_phase5_txt2vid(state)
+        return node_phase6_txt2vid(state)
 
-    def node_phase5_reference(state: HonCutState) -> dict:
+    def node_phase6_reference(state: HonCutState) -> dict:
         """Phase 6 variant: reference-to-video generation.
-        当前委托给 node_phase5_txt2vid，待实现差异化逻辑。"""
+        当前委托给 node_phase6_txt2vid，待实现差异化逻辑。"""
         # Same as txt2vid for now, but could use different logic
-        return node_phase5_txt2vid(state)
+        return node_phase6_txt2vid(state)
 
-    def node_phase6(state: HonCutState) -> dict:
+    def node_phase7(state: HonCutState) -> dict:
         """Phase 7 node: 一致性守卫 + 质检"""
         output_dir = Path(state["output_dir"])
         storyboard_data = state.get("storyboard")
@@ -5098,7 +5152,7 @@ if LANGGRAPH_AVAILABLE:
         # Quality passed or max retries reached
         return "pass"
 
-    def node_phase7(state: HonCutState) -> dict:
+    def node_phase8(state: HonCutState) -> dict:
         """Phase 8 node: 组装引擎"""
         output_dir = Path(state["output_dir"])
         
@@ -5109,16 +5163,21 @@ if LANGGRAPH_AVAILABLE:
             transition_duration=state.get("transition_duration", 0.5),
             media_profile=state.get("media_profile", "1080p"),
             target_duration=state.get("duration"),
-            enable_reshoot=state.get("enable_reshoot", False),
+            enable_reshoot=state.get("enable_reshoot", True),
+            chain_mode=state.get("chain_mode", False),
         )
-        
-        return {
+
+        update = {
             "phase_results": {**state.get("phase_results", {}), "phase8": result},
-            "completed_phases": state.get("completed_phases", []) + ["phase8"],
+            "completed_phases": state.get("completed_phases", []) + (["phase8"] if result.get("status") != "error" else []),
             "skip_phase": state.get("skip_phase", []),
         }
+        if result.get("status") == "error":
+            update.update(status="failed", error=f"Phase 8 failed: {result.get('error')}")
+            return Command(goto=END, update=update)
+        return update
 
-    def node_phase8(state: HonCutState) -> dict:
+    def node_phase9(state: HonCutState) -> dict:
         """Phase 9 node: 后期处理"""
         output_dir = Path(state["output_dir"])
         
@@ -5132,23 +5191,27 @@ if LANGGRAPH_AVAILABLE:
         if result.get("status") == "done" and result.get("outputs"):
             final_video = result["outputs"][0]
         
-        return {
+        update = {
             "final_video": final_video,
-            "status": "completed",
             "phase_results": {**state.get("phase_results", {}), "phase9": result},
-            "completed_phases": state.get("completed_phases", []) + ["phase9"],
+            "completed_phases": state.get("completed_phases", []) + (["phase9"] if result.get("status") != "error" else []),
             "skip_phase": state.get("skip_phase", []),
         }
+        if result.get("status") == "error":
+            update.update(status="failed", error=f"Phase 9 failed: {result.get('error')}")
+            return Command(goto=END, update=update)
+        return update
 
-    def node_phase8_5(state: HonCutState) -> dict:
+    def node_phase9_5(state: HonCutState) -> dict:
         """Phase 9.5 node: Video QA 硬性质检"""
         output_dir = Path(state["output_dir"])
         dry_run = state.get("dry_run", False)
 
         if dry_run:
             return {
-                "phase_results": {**state.get("phase_results", {}), "phase8_5": {"status": "skipped", "reason": "dry-run"}},
-                "completed_phases": state.get("completed_phases", []) + ["phase8_5"],
+                "status": "completed",
+                "phase_results": {**state.get("phase_results", {}), "phase9_5": {"status": "skipped", "reason": "dry-run"}},
+                "completed_phases": state.get("completed_phases", []) + ["phase9_5"],
                 "skip_phase": state.get("skip_phase", []),
             }
 
@@ -5157,35 +5220,44 @@ if LANGGRAPH_AVAILABLE:
             storyboard_data = state.get("storyboard")
             qa_report = run_video_qa(output_dir, storyboard_data=storyboard_data)
 
+            qa_passed = qa_report.verdict == "pass"
             result = {
-                "status": "done" if qa_report.verdict == "pass" else "warning",
+                "status": "done" if qa_passed else "error",
                 "verdict": qa_report.verdict,
                 "grade": qa_report.grade,
                 "issues_count": len(qa_report.issues),
             }
 
-            new_status = "completed"
-            if qa_report.verdict == "fail":
-                new_status = "partial"
+            new_status = "completed" if qa_passed else "failed"
 
-            return {
+            update = {
                 "final_video": state.get("final_video", ""),
                 "status": new_status,
-                "phase_results": {**state.get("phase_results", {}), "phase8_5": result},
-                "completed_phases": state.get("completed_phases", []) + ["phase8_5"],
+                "phase_results": {**state.get("phase_results", {}), "phase9_5": result},
+                "completed_phases": state.get("completed_phases", []) + (["phase9_5"] if qa_passed else []),
                 "quality_report": qa_report.to_dict(),
                 "skip_phase": state.get("skip_phase", []),
             }
+            if not qa_passed:
+                update["error"] = (
+                    f"Phase 9.5 delivery QA requires revision: {qa_report.grade} grade "
+                    f"({len(qa_report.issues)} issues)"
+                )
+            return update
         except ImportError:
             return {
-                "phase_results": {**state.get("phase_results", {}), "phase8_5": {"status": "skipped", "reason": "video_qa not available"}},
-                "completed_phases": state.get("completed_phases", []) + ["phase8_5"],
+                "status": "failed",
+                "error": "Phase 9.5 delivery QA is unavailable",
+                "phase_results": {**state.get("phase_results", {}), "phase9_5": {"status": "error", "reason": "video_qa not available"}},
+                "completed_phases": state.get("completed_phases", []),
                 "skip_phase": state.get("skip_phase", []),
             }
         except Exception as e:
             return {
-                "phase_results": {**state.get("phase_results", {}), "phase8_5": {"status": "error", "error": str(e)}},
-                "completed_phases": state.get("completed_phases", []) + ["phase8_5"],
+                "status": "failed",
+                "error": f"Phase 9.5 delivery QA failed to run: {e}",
+                "phase_results": {**state.get("phase_results", {}), "phase9_5": {"status": "error", "error": str(e)}},
+                "completed_phases": state.get("completed_phases", []),
                 "skip_phase": state.get("skip_phase", []),
             }
 
@@ -5211,7 +5283,7 @@ def run_pipeline(
     transition: str = "crossfade",
     transition_duration: float = 0.5,
     media_profile: str = "1080p",
-    enable_reshoot: bool = False,
+    enable_reshoot: bool = True,
     resume: bool = False,
     auto_approve: bool = False,
     resume_from: str = None,
@@ -5231,25 +5303,25 @@ def run_pipeline(
         transition: Phase 8 转场模式 ("crossfade" | "fade" | "cut")
         transition_duration: Phase 8 转场时长（秒），默认 0.5
         media_profile: 编码配置名称，从 MEDIA_PROFILES 中选择（默认 "1080p"）
-        enable_reshoot: 时长不足时是否允许真实调用 Phase 6 补录（默认 False）
+        enable_reshoot: 视觉缺陷或时长不足时是否允许调用 Phase 6 补录（默认 True，最多两轮）
         resume: 从检查点恢复，跳过已完成的 Phase
 
     Returns:
         pipeline_report dict
     """
-    skip_phase = skip_phase or []
-    skip_phases = set(skip_phase)
+    skip_phase = list(skip_phase or [])
     output_path = Path(output_dir).resolve()
     _ensure_dir(output_path)
 
     # --- M6: --resume-from 支持 ---
     if resume_from:
         try:
-            from utils.artifact_chain import PHASE_SEQUENCE, can_resume_from
+            from utils.artifact_chain import PHASE_SEQUENCE, can_resume_from, phase_numbers_before
+            if resume_from not in PHASE_SEQUENCE:
+                raise ValueError(f"未知 Phase: {resume_from}")
             if can_resume_from(resume_from, output_path):
-                idx = PHASE_SEQUENCE.index(resume_from) if resume_from in PHASE_SEQUENCE else 0
-                skip_phases = set(PHASE_SEQUENCE[:idx])
-                print(f"  🔄 [M6] Resume-from {resume_from}: 跳过 {sorted(skip_phases)}")
+                skip_phase = phase_numbers_before(resume_from)
+                print(f"  🔄 [M6] Resume-from {resume_from}: 跳过 {skip_phase}")
             else:
                 print(f"  ⚠ [M6] Resume-from {resume_from}: 前置依赖不满足，从头开始")
         except Exception as e:
@@ -5522,21 +5594,11 @@ def run_pipeline(
     else:
         print(f"\n  📋 Using sequential execution mode")
 
-    # --- M1: Phase 1 导演规划（增量，失败不影响后续）---
-    if 1 not in skip_phase:
-        try:
-            p1_result = run_phase1(text, output_path, dry_run)
-            report["phases"]["phase1"] = p1_result
-            _record_stage_checkpoint(output_path, "phase1", p1_result)
-        except Exception as e:
-            print(f"  ⚠ Phase 1 降级跳过: {e}")
-            report["phases"]["phase1"] = {"status": "skipped", "reason": str(e)}
-
-    # ---- Phase 1: 编剧引擎 (必须成功) ----
+    # ---- Phase 1: 导演拆解 + 编剧引擎 (必须成功) ----
     storyboard_data = None
     characters_data = None
     if 1 in skip_phase:
-        report["phases"]["1"] = {"status": "skipped", "reason": "user-specified"}
+        report["phases"]["phase1"] = {"status": "skipped", "reason": "user-specified"}
     elif resume and "phase1" in completed_phases:
         # Resume: 从 checkpoint 加载 Phase 1 结果
         cp = _read_checkpoint(output_path)
@@ -5550,15 +5612,22 @@ def run_pipeline(
             storyboard_data = json.loads(sb_path.read_text())
         if ch_path.exists():
             characters_data = json.loads(ch_path.read_text())
-        report["phases"]["1"] = {**p2, "resumed": True}
+        report["phases"]["phase1"] = {**p2, "resumed": True}
         print(f"  🔄 Phase 1: 从 checkpoint 恢复 (已跳过)")
     else:
-        reporter.phase_start("phase1", "编剧引擎")
-        p2 = run_phase2(text, output_dir, duration, dry_run, reporter=reporter, shot_duration=shot_duration)
+        reporter.phase_start("phase1", "导演拆解 + 编剧引擎")
+        p2 = run_phase1(
+            text,
+            output_path,
+            duration,
+            dry_run,
+            reporter=reporter,
+            shot_duration=shot_duration,
+        )
         # 提取内部数据（不写入 report）
         storyboard_data = p2.pop("_storyboard", None)
         characters_data = p2.pop("_characters", None)
-        report["phases"]["1"] = p2
+        report["phases"]["phase1"] = p2
 
         if p2["status"] == "error":
             reporter.mark_failed(f"Phase 1 failed: {p2.get('error')}")
@@ -5567,13 +5636,13 @@ def run_pipeline(
             report["total_duration_s"] = _elapsed(total_start)
             _write_report(report, output_dir)
             return report
-        reporter.phase_done("phase1", "编剧引擎完成", duration_s=p2.get("duration_s"))
+        reporter.phase_done("phase1", "导演拆解 + 编剧引擎完成", duration_s=p2.get("duration_s"))
         # 写入 checkpoint
         _record_stage_checkpoint(output_path, "phase1", p2)
 
     # --- P2-5b: HonCut 质检阻断 ---
     try:
-        p2_result = report["phases"].get("1") or report["phases"].get("phase1", {})
+        p2_result = report["phases"].get("phase1", {})
         review = p2_result.get("storyboard_review", {})
         if review.get("grade") == "D":
             print(f"  🚫 [P2-5b] 分镜审核 D 级，管线中止（节省后续 token）")
@@ -5597,19 +5666,19 @@ def run_pipeline(
 
     # ---- Phase 2: 故事板图片生成 (OM image_selector) ----
     if 2 in skip_phase:
-        report["phases"]["2"] = {"status": "skipped", "reason": "user-specified"}
+        report["phases"]["phase2"] = {"status": "skipped", "reason": "user-specified"}
     elif resume and "phase2" in completed_phases:
         cp = _read_checkpoint(output_path)
         p2_5 = dict(cp["results"].get("phase2", {"status": "done"}))
         p2_5.setdefault("status", "done")
-        report["phases"]["2"] = {**p2_5, "resumed": True}
+        report["phases"]["phase2"] = {**p2_5, "resumed": True}
         print(f"  🔄 Phase 2: 从 checkpoint 恢复 (已跳过)")
     elif storyboard_data is None or characters_data is None:
-        report["phases"]["2"] = {"status": "skipped", "reason": "no storyboard/characters data"}
+        report["phases"]["phase2"] = {"status": "skipped", "reason": "no storyboard/characters data"}
     else:
         reporter.phase_start("phase2", "故事板图片生成")
-        p2_5 = run_phase2_storyboard(storyboard_data, characters_data, Path(output_dir), dry_run)
-        report["phases"]["2"] = p2_5
+        p2_5 = run_phase2(storyboard_data, characters_data, Path(output_dir), dry_run)
+        report["phases"]["phase2"] = p2_5
         if p2_5["status"] == "error":
             reporter.phase_done("phase2", f"故事板图片生成失败: {p2_5.get('error')}", duration_s=p2_5.get("duration_s"))
             reporter.mark_failed(f"Phase 2 failed: {p2_5.get('error')}")
@@ -5624,19 +5693,19 @@ def run_pipeline(
 
     # ---- Phase 3: 角色工厂 ----
     if 3 in skip_phase:
-        report["phases"]["3"] = {"status": "skipped", "reason": "user-specified"}
+        report["phases"]["phase3"] = {"status": "skipped", "reason": "user-specified"}
     elif resume and "phase3" in completed_phases:
         cp = _read_checkpoint(output_path)
         p3 = dict(cp["results"].get("phase3", {"status": "done"}))
         p3.setdefault("status", "done")
-        report["phases"]["3"] = {**p3, "resumed": True}
+        report["phases"]["phase3"] = {**p3, "resumed": True}
         print(f"  🔄 Phase 3: 从 checkpoint 恢复 (已跳过)")
     elif characters_data is None:
-        report["phases"]["3"] = {"status": "skipped", "reason": "no characters data"}
+        report["phases"]["phase3"] = {"status": "skipped", "reason": "no characters data"}
     else:
         reporter.phase_start("phase3", "角色工厂")
         p3 = run_phase3(output_dir, characters_data, dry_run)
-        report["phases"]["3"] = p3
+        report["phases"]["phase3"] = p3
         if p3["status"] == "error":
             reporter.phase_done("phase3", f"角色工厂失败: {p3.get('error')}", duration_s=p3.get("duration_s"))
             reporter.mark_failed(f"Phase 3 failed: {p3.get('error')}")
@@ -5651,19 +5720,19 @@ def run_pipeline(
 
     # ---- Phase 4: 编排器 ----
     if 4 in skip_phase:
-        report["phases"]["4"] = {"status": "skipped", "reason": "user-specified"}
+        report["phases"]["phase4"] = {"status": "skipped", "reason": "user-specified"}
     elif resume and "phase4" in completed_phases:
         cp = _read_checkpoint(output_path)
         p4 = dict(cp["results"].get("phase4", {"status": "done"}))
         p4.setdefault("status", "done")
-        report["phases"]["4"] = {**p4, "resumed": True}
+        report["phases"]["phase4"] = {**p4, "resumed": True}
         print(f"  🔄 Phase 4: 从 checkpoint 恢复 (已跳过)")
     elif storyboard_data is None:
-        report["phases"]["4"] = {"status": "skipped", "reason": "no storyboard data"}
+        report["phases"]["phase4"] = {"status": "skipped", "reason": "no storyboard data"}
     else:
         reporter.phase_start("phase4", "编排器")
         p4 = run_phase4(output_dir, dry_run)
-        report["phases"]["4"] = p4
+        report["phases"]["phase4"] = p4
         if p4["status"] == "error":
             reporter.phase_done("phase4", f"编排器失败: {p4.get('error')}", duration_s=p4.get("duration_s"))
             reporter.mark_failed(f"Phase 4 failed: {p4.get('error')}")
@@ -5680,15 +5749,15 @@ def run_pipeline(
     # This is deliberately immediately before Phase 6: a resumed or partially
     # selected run must not bypass the last zero/video-cost checkpoint.
     if 5 in skip_phase:
-        report["phases"]["5"] = {"status": "skipped", "reason": "user-specified"}
+        report["phases"]["phase5"] = {"status": "skipped", "reason": "user-specified"}
     elif storyboard_data is None:
-        report["phases"]["5"] = {"status": "skipped", "reason": "no storyboard data"}
+        report["phases"]["phase5"] = {"status": "skipped", "reason": "no storyboard data"}
     else:
         from phases.phase5.storyboard_qa_gate import run_storyboard_qa_gate
 
         reporter.phase_start("phase5", "分镜质检闸门")
         p4_5 = run_storyboard_qa_gate(output_path)
-        report["phases"]["5"] = p4_5
+        report["phases"]["phase5"] = p4_5
         reporter.phase_done("phase5", f"分镜质检 {p4_5.get('grade', '?')} 级", duration_s=p4_5.get("duration_s"))
         if p4_5["status"] == "error":
             reporter.mark_failed(p4_5.get("error", "Phase 5 blocked Phase 6"))
@@ -5700,7 +5769,7 @@ def run_pipeline(
         from quality.supervision_agent import SupervisionBlockedError
         try:
             supervision = _run_storyboard_supervision(storyboard_data, output_path)
-            report["phases"]["5"]["supervision"] = supervision
+            report["phases"]["phase5"]["supervision"] = supervision
         except SupervisionBlockedError as exc:
             reporter.mark_failed(str(exc))
             report["status"] = "failed"
@@ -5712,18 +5781,18 @@ def run_pipeline(
 
     # ---- Phase 6: 视频生成 ----
     if 6 in skip_phase:
-        report["phases"]["6"] = {"status": "skipped", "reason": "user-specified"}
+        report["phases"]["phase6"] = {"status": "skipped", "reason": "user-specified"}
     elif resume and "phase6" in completed_phases:
         cp = _read_checkpoint(output_path)
         p5 = dict(cp["results"].get("phase6", {"status": "done"}))
         p5.setdefault("status", "done")
-        report["phases"]["6"] = {**p5, "resumed": True}
+        report["phases"]["phase6"] = {**p5, "resumed": True}
         print(f"  🔄 Phase 6: 从 checkpoint 恢复 (已跳过)")
     elif storyboard_data is None:
-        report["phases"]["6"] = {"status": "skipped", "reason": "no storyboard data"}
+        report["phases"]["phase6"] = {"status": "skipped", "reason": "no storyboard data"}
     else:
         p5 = run_phase6(storyboard_data, output_dir, dry_run, chain_mode=chain_mode)
-        report["phases"]["6"] = p5
+        report["phases"]["phase6"] = p5
         if p5["status"] == "error":
             report["status"] = "partial"
         else:
@@ -5731,12 +5800,12 @@ def run_pipeline(
 
     # ---- Phase 7: 一致性守卫 + 场景变化检测 + 幻灯片风险评分 ----
     if 7 in skip_phase:
-        report["phases"]["7"] = {"status": "skipped", "reason": "user-specified"}
+        report["phases"]["phase7"] = {"status": "skipped", "reason": "user-specified"}
     elif resume and "phase7" in completed_phases:
         cp = _read_checkpoint(output_path)
         p6 = dict(cp["results"].get("phase7", {"status": "done"}))
         p6.setdefault("status", "done")
-        report["phases"]["7"] = {**p6, "resumed": True}
+        report["phases"]["phase7"] = {**p6, "resumed": True}
         print(f"  🔄 Phase 7: 从 checkpoint 恢复 (已跳过)")
     else:
         # Ensure storyboard_data is available (may be None if Phase 1 was skipped)
@@ -5746,7 +5815,7 @@ def run_pipeline(
                 storyboard_data = json.loads(sb_path.read_text())
         
         p6 = run_phase7(Path(output_dir), dry_run, storyboard_data=storyboard_data)
-        report["phases"]["7"] = p6
+        report["phases"]["phase7"] = p6
         if p6["status"] == "error":
             report["status"] = "partial"
         else:
@@ -5781,50 +5850,61 @@ def run_pipeline(
 
     # ---- Phase 8: 组装引擎 ----
     if 8 in skip_phase:
-        report["phases"]["8"] = {"status": "skipped", "reason": "user-specified"}
+        report["phases"]["phase8"] = {"status": "skipped", "reason": "user-specified"}
     elif resume and "phase8" in completed_phases:
         cp = _read_checkpoint(output_path)
         p7 = dict(cp["results"].get("phase8", {"status": "done"}))
         p7.setdefault("status", "done")
-        report["phases"]["8"] = {**p7, "resumed": True}
+        report["phases"]["phase8"] = {**p7, "resumed": True}
         print(f"  🔄 Phase 8: 从 checkpoint 恢复 (已跳过)")
     else:
         p7 = run_phase8(
             output_dir, dry_run, transition=transition,
             transition_duration=transition_duration, media_profile=media_profile,
             target_duration=duration, enable_reshoot=enable_reshoot,
+            chain_mode=chain_mode,
         )
-        report["phases"]["8"] = p7
+        report["phases"]["phase8"] = p7
         if p7["status"] == "error":
-            report["status"] = "partial"
+            report["status"] = "failed"
+            report["error"] = f"Phase 8 failed: {p7.get('error', 'unknown assembly error')}"
+            report["total_duration_s"] = _elapsed(total_start)
+            reporter.mark_failed(report["error"])
+            _write_report(report, output_dir)
+            return report
         else:
             _record_stage_checkpoint(output_path, "phase8", p7)
 
     # ---- Phase 9: 后期处理 ----
     if 9 in skip_phase:
-        report["phases"]["9"] = {"status": "skipped", "reason": "user-specified"}
+        report["phases"]["phase9"] = {"status": "skipped", "reason": "user-specified"}
     elif resume and "phase9" in completed_phases:
         cp = _read_checkpoint(output_path)
         p8 = dict(cp["results"].get("phase9", {"status": "done"}))
         p8.setdefault("status", "done")
-        report["phases"]["9"] = {**p8, "resumed": True}
+        report["phases"]["phase9"] = {**p8, "resumed": True}
         print(f"  🔄 Phase 9: 从 checkpoint 恢复 (已跳过)")
     else:
         p8 = run_phase9(output_dir, dry_run, media_profile=media_profile)
-        report["phases"]["9"] = p8
+        report["phases"]["phase9"] = p8
         if p8["status"] == "error":
-            report["status"] = "partial"
+            report["status"] = "failed"
+            report["error"] = f"Phase 9 failed: {p8.get('error', 'unknown post-processing error')}"
+            report["total_duration_s"] = _elapsed(total_start)
+            reporter.mark_failed(report["error"])
+            _write_report(report, output_dir)
+            return report
         else:
             _record_stage_checkpoint(output_path, "phase9", p8)
 
     # ---- Phase 9.5: Video QA 硬性质检 ----
-    if 8.5 in skip_phase:
-        report["phases"]["8.5"] = {"status": "skipped", "reason": "user-specified"}
-    elif resume and "phase8_5" in completed_phases:
+    if 9.5 in skip_phase:
+        report["phases"]["phase9_5"] = {"status": "skipped", "reason": "user-specified"}
+    elif resume and "phase9_5" in completed_phases:
         cp = _read_checkpoint(output_path)
-        p8_5 = dict(cp["results"].get("phase8_5", {"status": "done"}))
-        p8_5.setdefault("status", "done")
-        report["phases"]["8.5"] = {**p8_5, "resumed": True}
+        p9_5 = dict(cp["results"].get("phase9_5", {"status": "done"}))
+        p9_5.setdefault("status", "done")
+        report["phases"]["phase9_5"] = {**p9_5, "resumed": True}
         print(f"  🔄 Phase 9.5: 从 checkpoint 恢复 (已跳过)")
     else:
         try:
@@ -5835,32 +5915,43 @@ def run_pipeline(
                 expected_width=None,  # Let QA infer from media profile
                 expected_height=None,
             )
-            p8_5 = {
-                "status": "done" if qa_report.verdict == "pass" else "warning",
+            qa_passed = qa_report.verdict == "pass"
+            p9_5 = {
+                "status": "done" if qa_passed else "error",
                 "verdict": qa_report.verdict,
                 "grade": qa_report.grade,
                 "issues_count": len(qa_report.issues),
                 "duration_s": 0,
             }
-            report["phases"]["8.5"] = p8_5
-            if qa_report.verdict == "fail":
-                report["status"] = "partial"
+            report["phases"]["phase9_5"] = p9_5
+            if not qa_passed:
+                report["status"] = "failed"
                 report["quality_gate"] = {
                     "passed": False,
-                    "reason": f"Phase 9.5 QA failed: {qa_report.grade} grade",
-                    "issues": [i.message for i in qa_report.issues if i.severity == "critical"],
+                    "reason": f"Phase 9.5 delivery QA requires revision: {qa_report.grade} grade",
+                    "issues": [i.message for i in qa_report.issues],
                 }
             else:
-                _record_stage_checkpoint(output_path, "phase8_5", p8_5)
+                _record_stage_checkpoint(output_path, "phase9_5", p9_5)
         except ImportError:
-            report["phases"]["8.5"] = {"status": "skipped", "reason": "video_qa module not available"}
+            report["phases"]["phase9_5"] = {"status": "error", "reason": "video_qa module not available"}
+            report["status"] = "failed"
+            report["quality_gate"] = {"passed": False, "reason": "Phase 9.5 delivery QA is unavailable"}
         except Exception as e:
-            report["phases"]["8.5"] = {"status": "error", "error": str(e)}
+            report["phases"]["phase9_5"] = {"status": "error", "error": str(e)}
+            report["status"] = "failed"
+            report["quality_gate"] = {"passed": False, "reason": f"Phase 9.5 delivery QA failed to run: {e}"}
 
     report["total_duration_s"] = _elapsed(total_start)
 
-    # 标记管线完成
-    reporter.mark_completed()
+    if report["status"] == "completed":
+        reporter.mark_completed()
+    else:
+        reporter.mark_failed(
+            report.get("quality_gate", {}).get("reason")
+            or report.get("error")
+            or f"Pipeline ended with status: {report['status']}"
+        )
 
     # --- M6: 产物链验证 ---
     if M6_AVAILABLE:
@@ -5928,13 +6019,21 @@ def main():
     parser.add_argument("--duration", type=int, default=60, help="目标视频时长（秒），默认 60")
     parser.add_argument("--dry-run", action="store_true", help="dry-run 模式")
     parser.add_argument("--output-dir", type=str, default=".", help="输出目录，默认当前目录")
-    parser.add_argument("--skip-phase", type=int, nargs="+", default=[], help="跳过指定 Phase")
+    parser.add_argument("--skip-phase", type=float, nargs="+", default=[], help="跳过指定 Phase（支持 9.5）")
     parser.add_argument("--transition", type=str, default="crossfade", choices=["crossfade", "fade", "cut"],
                         help="Phase 8 转场模式: crossfade (默认), fade (fade-through-black), cut (硬切)")
     parser.add_argument("--transition-duration", type=float, default=0.5,
                         help="Phase 8 转场时长（秒），默认 0.5")
-    parser.add_argument("--enable-reshoot", action="store_true",
-                        help="允许 Phase 8 时长不足时真实补录（默认关闭）")
+    reshoot_group = parser.add_mutually_exclusive_group()
+    reshoot_group.add_argument(
+        "--enable-reshoot", dest="enable_reshoot", action="store_true",
+        help="允许 Phase 8 对视觉缺陷/时长不足镜头补录（默认开启，最多两轮）",
+    )
+    reshoot_group.add_argument(
+        "--disable-reshoot", dest="enable_reshoot", action="store_false",
+        help="禁止补录；检测到必须补录的坏镜头时阻断组装",
+    )
+    parser.set_defaults(enable_reshoot=True)
     parser.add_argument("--media-profile", type=str, default="1080p",
                         choices=AVAILABLE_PROFILES,
                         help="编码配置（默认 1080p）")

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 director_planner.py — M1: HonCut 导演规划层
-在 Phase 2 之前新增 Phase 1，产出结构化的导演规划。
+作为 Phase 1 的导演子步骤，产出结构化的导演规划。
 只做四件事：拆分场、台词统计、情绪分析、过渡设计。
 """
 
