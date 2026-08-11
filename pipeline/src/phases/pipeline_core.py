@@ -4881,6 +4881,9 @@ if LANGGRAPH_AVAILABLE:
         Returns:
             CompiledStateGraph instance
         """
+        from graph.nodes.phase8 import route_after_phase8
+        from graph.nodes.phase9 import route_after_phase9
+
         graph = StateGraph(HonCutState)
         
         # Add nodes (each phase is a node)
@@ -4945,8 +4948,22 @@ if LANGGRAPH_AVAILABLE:
             }
         )
         
-        graph.add_edge("phase8", "phase9")
-        graph.add_edge("phase9", "phase9_5")
+        graph.add_conditional_edges(
+            "phase8",
+            route_after_phase8,
+            {
+                "continue": "phase9",
+                "end": END,
+            },
+        )
+        graph.add_conditional_edges(
+            "phase9",
+            route_after_phase9,
+            {
+                "continue": "phase9_5",
+                "end": END,
+            },
+        )
         graph.add_edge("phase9_5", END)
         
         # Compile with SQLite checkpointer
@@ -5012,23 +5029,12 @@ if LANGGRAPH_AVAILABLE:
         return phase3_node(state, runner=run_phase3)
 
     def node_phase4(state: HonCutState) -> dict:
-        """Phase 4 node: 编排器"""
-        output_dir = Path(state["output_dir"])
-        
-        result = run_phase4(
-            output_dir=output_dir,
-            dry_run=state["dry_run"],
-        )
-        
-        update = {
-            "phase_results": {**state.get("phase_results", {}), "phase4": result},
-            "completed_phases": state.get("completed_phases", []) + (["phase4"] if result.get("status") != "error" else []),
-            "skip_phase": state.get("skip_phase", []),
-        }
-        if result.get("status") == "error":
-            update.update(status="failed", error=f"Phase 4 failed: {result.get('error')}")
-            return Command(goto=END, update=update)
-        return update
+        """Compatibility facade for the migrated Phase 4 graph node."""
+        from graph.nodes.phase4 import phase4_node
+
+        # Resolve the module global at call time so existing monkeypatches of
+        # pipeline_core.run_phase4 keep working during the migration.
+        return phase4_node(state, runner=run_phase4)
 
     def route_phase5(state: HonCutState) -> str:
         """根据镜头属性路由到不同的 Phase 6 生成器"""
@@ -5047,88 +5053,43 @@ if LANGGRAPH_AVAILABLE:
             return "txt2vid"
 
     def node_phase5_quality(state: HonCutState) -> dict:
-        """Phase 5 node: storyboard QA gate before paid generation."""
+        """Compatibility facade for the migrated Phase 5 graph node."""
+        from graph.nodes.phase5 import phase5_node
         from phases.phase5.storyboard_qa_gate import run_storyboard_qa_gate
         from quality.supervision_agent import SupervisionBlockedError
 
-        result = run_storyboard_qa_gate(Path(state["output_dir"]))
-        update = {
-            "phase_results": {**state.get("phase_results", {}), "phase5": result},
-            "completed_phases": state.get("completed_phases", []) + (["phase5"] if result.get("status") != "error" else []),
-            "skip_phase": state.get("skip_phase", []),
-        }
-        if result.get("status") == "error":
-            update.update(status="failed", error=result.get("error", "Phase 5 blocked Phase 6"))
-            return Command(goto=END, update=update)
-        try:
-            supervision = _run_storyboard_supervision(
-                state.get("storyboard", {}), Path(state["output_dir"])
-            )
-            update["phase_results"]["phase5"] = {
-                **result,
-                "supervision": supervision,
-            }
-        except SupervisionBlockedError as exc:
-            update.update(status="failed", error=str(exc))
-            return Command(goto=END, update=update)
-        return update
+        # Resolve all existing callables at invocation time so monkeypatches
+        # remain effective even when the graph was built earlier.
+        return phase5_node(
+            state,
+            qa_runner=run_storyboard_qa_gate,
+            supervision_runner=_run_storyboard_supervision,
+            supervision_blocked_error=SupervisionBlockedError,
+        )
 
     def node_phase6_txt2vid(state: HonCutState) -> dict:
-        """Phase 6 variant: text-to-video generation"""
-        output_dir = Path(state["output_dir"])
-        storyboard_data = state.get("storyboard")
-        
-        result = run_phase6(
-            storyboard_data=storyboard_data,
-            output_dir=output_dir,
-            dry_run=state["dry_run"],
-            chain_mode=state.get("chain_mode", False),
-        )
-        
-        # P0-2 fix: increment retry_count so quality_gate_router can terminate
-        return {
-            "videos": result.get("outputs", []),
-            "phase_results": {**state.get("phase_results", {}), "phase6": result},
-            "completed_phases": state.get("completed_phases", []) + ["phase6"],
-            "retry_count": state.get("retry_count", 0) + 1,
-            "skip_phase": state.get("skip_phase", []),
-        }
+        """Compatibility facade for the migrated txt2vid node."""
+        from graph.nodes.phase6 import phase6_txt2vid_node
+
+        return phase6_txt2vid_node(state, runner=run_phase6)
 
     def node_phase6_img2vid(state: HonCutState) -> dict:
-        """Phase 6 variant: image-to-video generation (uses storyboard image).
-        当前委托给 node_phase6_txt2vid，待实现差异化逻辑。"""
-        # Same as txt2vid for now, but could use different logic
-        return node_phase6_txt2vid(state)
+        """Compatibility facade preserving delegation to txt2vid."""
+        from graph.nodes.phase6 import phase6_img2vid_node
+
+        return phase6_img2vid_node(state, txt2vid_node=node_phase6_txt2vid)
 
     def node_phase6_reference(state: HonCutState) -> dict:
-        """Phase 6 variant: reference-to-video generation.
-        当前委托给 node_phase6_txt2vid，待实现差异化逻辑。"""
-        # Same as txt2vid for now, but could use different logic
-        return node_phase6_txt2vid(state)
+        """Compatibility facade preserving delegation to txt2vid."""
+        from graph.nodes.phase6 import phase6_reference_node
+
+        return phase6_reference_node(state, txt2vid_node=node_phase6_txt2vid)
 
     def node_phase7(state: HonCutState) -> dict:
-        """Phase 7 node: 一致性守卫 + 质检"""
-        output_dir = Path(state["output_dir"])
-        storyboard_data = state.get("storyboard")
-        
-        result = run_phase7(
-            output_dir=output_dir,
-            dry_run=state["dry_run"],
-            storyboard_data=storyboard_data,
-        )
-        
-        # Extract quality metrics for gating
-        quality_report = {
-            "slideshow_risk": result.get("slideshow_risk", 0.0),
-            "variation_score": result.get("variation_score", 5.0),
-        }
-        
-        return {
-            "quality_report": quality_report,
-            "phase_results": {**state.get("phase_results", {}), "phase7": result},
-            "completed_phases": state.get("completed_phases", []) + ["phase7"],
-            "skip_phase": state.get("skip_phase", []),
-        }
+        """Compatibility facade for the migrated Phase 7 graph node."""
+        from graph.nodes.phase7 import phase7_node
+
+        return phase7_node(state, runner=run_phase7)
 
     def quality_gate_router(state: HonCutState) -> str:
         """Quality gate: decide whether to pass or retry Phase 6"""
@@ -5153,113 +5114,26 @@ if LANGGRAPH_AVAILABLE:
         return "pass"
 
     def node_phase8(state: HonCutState) -> dict:
-        """Phase 8 node: 组装引擎"""
-        output_dir = Path(state["output_dir"])
-        
-        result = run_phase8(
-            output_dir=output_dir,
-            dry_run=state["dry_run"],
-            transition=state.get("transition", "crossfade"),
-            transition_duration=state.get("transition_duration", 0.5),
-            media_profile=state.get("media_profile", "1080p"),
-            target_duration=state.get("duration"),
-            enable_reshoot=state.get("enable_reshoot", True),
-            chain_mode=state.get("chain_mode", False),
-        )
+        """Compatibility facade for the migrated Phase 8 graph node."""
+        from graph.nodes.phase8 import phase8_node
 
-        update = {
-            "phase_results": {**state.get("phase_results", {}), "phase8": result},
-            "completed_phases": state.get("completed_phases", []) + (["phase8"] if result.get("status") != "error" else []),
-            "skip_phase": state.get("skip_phase", []),
-        }
-        if result.get("status") == "error":
-            update.update(status="failed", error=f"Phase 8 failed: {result.get('error')}")
-            return Command(goto=END, update=update)
-        return update
+        return phase8_node(state, runner=run_phase8)
 
     def node_phase9(state: HonCutState) -> dict:
-        """Phase 9 node: 后期处理"""
-        output_dir = Path(state["output_dir"])
-        
-        result = run_phase9(
-            output_dir=output_dir,
-            dry_run=state["dry_run"],
-            media_profile=state.get("media_profile", "1080p"),
-        )
-        
-        final_video = ""
-        if result.get("status") == "done" and result.get("outputs"):
-            final_video = result["outputs"][0]
-        
-        update = {
-            "final_video": final_video,
-            "phase_results": {**state.get("phase_results", {}), "phase9": result},
-            "completed_phases": state.get("completed_phases", []) + (["phase9"] if result.get("status") != "error" else []),
-            "skip_phase": state.get("skip_phase", []),
-        }
-        if result.get("status") == "error":
-            update.update(status="failed", error=f"Phase 9 failed: {result.get('error')}")
-            return Command(goto=END, update=update)
-        return update
+        """Compatibility facade for the migrated Phase 9 graph node."""
+        from graph.nodes.phase9 import phase9_node
+
+        return phase9_node(state, runner=run_phase9)
 
     def node_phase9_5(state: HonCutState) -> dict:
-        """Phase 9.5 node: Video QA 硬性质检"""
-        output_dir = Path(state["output_dir"])
-        dry_run = state.get("dry_run", False)
-
-        if dry_run:
-            return {
-                "status": "completed",
-                "phase_results": {**state.get("phase_results", {}), "phase9_5": {"status": "skipped", "reason": "dry-run"}},
-                "completed_phases": state.get("completed_phases", []) + ["phase9_5"],
-                "skip_phase": state.get("skip_phase", []),
-            }
-
+        """Compatibility facade for the migrated Phase 9.5 graph node."""
+        from graph.nodes.final_qa import final_qa_node
         try:
             from quality.video_qa import run_video_qa
-            storyboard_data = state.get("storyboard")
-            qa_report = run_video_qa(output_dir, storyboard_data=storyboard_data)
-
-            qa_passed = qa_report.verdict == "pass"
-            result = {
-                "status": "done" if qa_passed else "error",
-                "verdict": qa_report.verdict,
-                "grade": qa_report.grade,
-                "issues_count": len(qa_report.issues),
-            }
-
-            new_status = "completed" if qa_passed else "failed"
-
-            update = {
-                "final_video": state.get("final_video", ""),
-                "status": new_status,
-                "phase_results": {**state.get("phase_results", {}), "phase9_5": result},
-                "completed_phases": state.get("completed_phases", []) + (["phase9_5"] if qa_passed else []),
-                "quality_report": qa_report.to_dict(),
-                "skip_phase": state.get("skip_phase", []),
-            }
-            if not qa_passed:
-                update["error"] = (
-                    f"Phase 9.5 delivery QA requires revision: {qa_report.grade} grade "
-                    f"({len(qa_report.issues)} issues)"
-                )
-            return update
         except ImportError:
-            return {
-                "status": "failed",
-                "error": "Phase 9.5 delivery QA is unavailable",
-                "phase_results": {**state.get("phase_results", {}), "phase9_5": {"status": "error", "reason": "video_qa not available"}},
-                "completed_phases": state.get("completed_phases", []),
-                "skip_phase": state.get("skip_phase", []),
-            }
-        except Exception as e:
-            return {
-                "status": "failed",
-                "error": f"Phase 9.5 delivery QA failed to run: {e}",
-                "phase_results": {**state.get("phase_results", {}), "phase9_5": {"status": "error", "error": str(e)}},
-                "completed_phases": state.get("completed_phases", []),
-                "skip_phase": state.get("skip_phase", []),
-            }
+            run_video_qa = None
+
+        return final_qa_node(state, runner=run_video_qa)
 
 else:
     # Fallback when LangGraph is not available
