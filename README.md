@@ -19,54 +19,65 @@ A 44-second cyberpunk short film generated fully automatically from a text scrip
 
 ## Architecture
 
-HonCut runs on a split-role deployment: a Mac orchestration layer drives the pipeline, a Windows GPU machine hosts the ComfyUI Bridge for local synthesis, and Volcano Ark provides online Seedance video + Seedream image + SeedASR/Seed-TTS services.
+HonCut runs on a split-role deployment: a Mac orchestration layer drives a nine-phase pipeline, a Windows GPU machine hosts the ComfyUI Bridge for local synthesis fallback, and Volcano Ark provides online LLM scripting, Seedance video, Seedream image, Seed-TTS, and SeedASR services. All LLM scripting calls flow through a unified streaming client (`ark_llm`) with hard wall-clock timeouts, per-phase heartbeats, and sub-phase checkpoints so no phase can hang silently.
 
 ```mermaid
 flowchart TB
     subgraph MAC["🖥 Mac Orchestration Layer"]
-        P1[Phase 1<br/>Director Planning] --> P2[Phase 2<br/>Screenwriter Engine]
-        P2 --> P25[Phase 2.5<br/>Storyboard Sequence]
-        P25 --> P3[Phase 3<br/>Character Factory]
+        P1[Phase 1<br/>Director + Screenwriter] --> P2[Phase 2<br/>Storyboard Images]
+        P2 --> P3[Phase 3<br/>Character Factory]
         P3 --> P4[Phase 4<br/>Scene Consistency & Routing]
-        P4 --> P5[Phase 5<br/>Video Generation]
-        P5 --> P6[Phase 6<br/>Quality Gate]
-        P6 --> P7[Phase 7<br/>Assembly + Narrative Review]
-        P7 --> P8[Phase 8<br/>Post-Production]
-        P8 --> OUT[🎬 polished.mp4]
+        P4 --> P5[Phase 5<br/>QA Gate + Supervision]
+        P5 --> P6[Phase 6<br/>Video Generation]
+        P6 --> P7[Phase 7<br/>Consistency Guard]
+        P7 --> P8[Phase 8<br/>Assembly + Narrative Review]
+        P8 --> P9[Phase 9<br/>Post-Production]
+        P9 --> OUT[🎬 polished.mp4]
     end
 
     subgraph WIN["🖥 Windows GPU Machine"]
-        BRIDGE[ComfyUI Bridge :9100<br/>Wan2.2 TI2V-5B local]
+        BRIDGE[ComfyUI Bridge<br/>Wan2.2 local fallback]
     end
 
     subgraph ARK["☁️ Volcano Ark"]
-        SD[Seedance 2.0<br/>text/image-to-video]
+        LLM[Seed LLM<br/>scripting / storyboard]
+        SD[Seedance 2.0<br/>video generation]
         SR[Seedream<br/>image generation]
+        TTS[Seed-TTS<br/>voice synthesis]
         ASR[SeedASR<br/>speech recognition]
     end
 
-    P5 -- "video tasks" --> BRIDGE
-    P5 -- "online generation" --> SD
-    P25 -- "storyboard images" --> SR
-    P3 -- "reference assets" --> SR
-    P8 -- "subtitle transcription" --> ASR
+    subgraph QUEUE["⚙️ Shot Queue"]
+        REDIS[(Redis<br/>arq workers)]
+    end
 
-    P7 -. "duration gap → reshoot" .-> P5
+    P1 -- "scripting calls" --> LLM
+    P6 -- "video tasks" --> SD
+    P6 -- "concurrent shots" --> REDIS
+    P6 -. "local fallback" .-> BRIDGE
+    P2 -- "storyboard images" --> SR
+    P3 -- "reference assets" --> SR
+    P9 -- "dialogue voice" --> TTS
+    P9 -- "subtitle transcription" --> ASR
+
+    P8 -. "duration gap → reshoot" .-> P6
 ```
 
 ### Pipeline Phases
 
+Phases use contiguous integer IDs (`phase1`–`phase9`); every phase writes a checkpoint and can be resumed with `--resume-from`.
+
 | Phase | Name | Description |
 |-------|------|-------------|
-| Phase 1 | Director Planning | Scene breakdown, emotion analysis, and transition design before storyboarding |
-| Phase 2 | Screenwriter Engine | Text parsing → event extraction → character discovery → adaptation → storyboard generation with eight-layer prompt framework |
-| Phase 2.5 | Storyboard Sequence | Per-shot storyboard images for visual reference |
-| Phase 3 | Character Factory | Character reference assets (face close-up + full-body + variants) + character cards |
-| Phase 4 | Scene Consistency | Shot scheduling, timeline planning, scene consistency contracts, and model routing |
-| Phase 5 | Video Generation | Video clip generation via Seedance online API with Wan2.2 local fallback through the Windows Bridge |
-| Phase 6 | Quality Gate | Consistency checks, red-line supervision, and A/B/C/D grading |
-| Phase 7 | Assembly Engine | Clip stitching with smart transitions, multimodal narrative-order review, frame analysis (black/still frame detection), and duration gate with optional reshoot loop |
-| Phase 8 | Post-Production | Real SeedASR transcription → subtitle burn-in, ambient audio, color grading, rhythm editing, final encode |
+| Phase 1 | Screenwriter Engine | Director planning (scene/emotion/transition design), then text parsing → event extraction (concurrent) → character discovery → layered cinematic adaptation (beat skeleton + batch shot expansion) → per-shot storyboard JSON with eight-layer prompts. Sub-phase checkpoints and a 15s heartbeat keep it observable |
+| Phase 2 | Storyboard Images | Per-shot storyboard images (Seedream) as visual reference for video generation |
+| Phase 3 | Character Factory | Character reference assets (face close-up + full-body + variants) + character cards, with skip-if-exists reuse |
+| Phase 4 | Scene Consistency | Shot directory layout, timeline planning, scene consistency contracts, and three-route model routing (first-last-frame / phantom reference / single-image) |
+| Phase 5 | QA Gate + Supervision | L1/L2/L3 structural quality gate plus an LLM supervision agent (continuity / character / style / pacing / dialogue); A/B/C/D grading, C/D blocks video generation |
+| Phase 6 | Video Generation | Shot video synthesis via Seedance with optional arq/Redis concurrent shot queue, wall-clock watchdog, and Wan2.2 local fallback through the Windows Bridge |
+| Phase 7 | Consistency Guard | Cross-shot consistency checks, scene-change detection, and slideshow-risk scoring |
+| Phase 8 | Assembly Engine | Clip stitching with smart transitions, multimodal narrative-order review, frame analysis (black/still frame detection), and duration gate with optional reshoot loop |
+| Phase 9 | Post-Production | Real SeedASR transcription → subtitle burn-in, three-track audio mixing (original bed + TTS dialogue + ducking), color grading, rhythm editing, final encode |
 
 ## Key Capabilities
 
@@ -74,8 +85,12 @@ flowchart TB
 - **Seedance-first with graceful fallback** — shots are generated via Seedance online API by default; on timeout or stall the pipeline falls back to local Wan2.2 generation through the Windows Bridge with explicit duration-loss logging.
 - **Chain mode (last-frame relay)** — optional serial generation where each shot's last frame becomes the next shot's first frame, physically inheriting character appearance, lighting, and scene continuity across shots.
 - **Segmentation-aware shot duration** — shot length follows video-model segmentation best practice (medium-form video: fewer, longer shots, one clear plot beat per shot) instead of many short fragments. Duration is computed as `max(4, min(15, num_frames // fps))` and passed through to Seedance.
-- **Narrative-order verification (Phase 7)** — before assembly, storyboard images are reviewed against the full script with a multimodal LLM; extracted frames are scanned for black/still frames; a duration gate compares actual vs. target runtime and can trigger a bounded reshoot loop.
-- **Real ASR subtitles (Phase 8)** — the final audio track is transcribed via SeedASR WebSocket (`volc.seedasr.sauc.duration`), merged across shots with cumulative time offsets, and burned into the film. Shots without speech fall back to script captions, explicitly marked `script_fallback` — no fabricated timelines.
+- **Narrative-order verification (Phase 8)** — before assembly, storyboard images are reviewed against the full script with a multimodal LLM; extracted frames are scanned for black/still frames; a duration gate compares actual vs. target runtime and can trigger a bounded reshoot loop.
+- **Real ASR subtitles (Phase 9)** — the final audio track is transcribed via SeedASR WebSocket (`volc.seedasr.sauc.duration`), merged across shots with cumulative time offsets, and burned into the film. Shots without speech fall back to script captions, explicitly marked `script_fallback` — no fabricated timelines.
+- **Unified streaming LLM client** — every Phase 1 scripting call flows through a single streaming client with hard wall-clock timeouts (forced stream termination, not just a pre-request budget check), a 15-second heartbeat, and sub-phase checkpoints, so a hung LLM call can never block the pipeline silently for hours.
+- **Concurrent shot queue** — storyboard and shot generation can run through an optional arq/Redis queue with multiple workers, per-shot wall-clock deadlines, exponential backoff, and crash recovery that resumes from the last persisted shot instead of restarting.
+- **Three-tier run memory** — a per-run SQLite memory (short-term events, rolling summaries, semantic retrieval) lets later phases and re-runs recall what happened earlier without re-deriving it.
+- **LLM supervision agent** — a streaming LLM reviewer (continuity / character / style / pacing / dialogue) grades the storyboard before video generation; advisory by default, optionally blocking.
 - **Fictional-character declaration** — reference-image and video prompts declare AI-generated fictional characters to reduce real-person content moderation friction.
 - **Checkpoint & resume** — per-phase checkpoint files with `--resume-from` recovery restart from any phase without re-running completed work.
 - **Quality supervision** — four red-line checks (asset validity, script fidelity, concreteness, parent-child assets) with A/B/C/D grading gate before assembly.
