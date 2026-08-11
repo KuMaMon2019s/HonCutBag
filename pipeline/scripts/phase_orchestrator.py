@@ -38,7 +38,7 @@ RUNNER = PIPELINE_DIR / "src" / "pipeline_runner.py"
 if str(RUNNER.parent) not in sys.path:
     sys.path.insert(0, str(RUNNER.parent))
 
-from phases.adaptation_engine import (  # noqa: E402
+from phases.phase1.adaptation_engine import (  # noqa: E402
     AVG_SHOT_DURATION,
     MAX_SHOT_DURATION,
     MIN_SHOT_DURATION,

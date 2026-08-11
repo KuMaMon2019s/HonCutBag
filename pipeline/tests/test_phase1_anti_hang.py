@@ -11,7 +11,8 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from phases import pipeline_core, storyboard_generator
+from phases import pipeline_core
+import phases.phase2.storyboard_generator as storyboard_generator
 from prompt import event_extractor
 from utils import ark_llm
 from utils.progress_reporter import ProgressReporter
@@ -115,8 +116,8 @@ def test_storyboard_default_path_runs_three_shots_concurrently(monkeypatch):
 
 
 def test_phase1_checkpoints_are_written_and_reused(monkeypatch, tmp_path):
-    import phases.character_discoverer as character_discoverer
-    import phases.adaptation_engine as adaptation_engine
+    import phases.phase1.character_discoverer as character_discoverer
+    import phases.phase1.adaptation_engine as adaptation_engine
     import prompt.text_parser as text_parser
 
     calls = {"events": 0, "characters": 0}

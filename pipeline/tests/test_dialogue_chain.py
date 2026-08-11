@@ -7,8 +7,8 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from phases import adaptation_engine
-from phases.audio_mixer import AudioMixer
+import phases.phase1.adaptation_engine as adaptation_engine
+from phases.phase9.audio_mixer import AudioMixer
 from prompt import event_extractor
 
 

@@ -9,7 +9,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from phases import pipeline_core
-from phases.video_generator import build_video_prompt
+from phases.phase6.video_generator import build_video_prompt
 from utils.style_slices import get_slice, split_visual_style
 
 
@@ -62,7 +62,7 @@ def test_phase3_character_builder_receives_sliced_style(tmp_path, monkeypatch):
         captured.append(characters[0]["style"])
         return ["characters/lead/"]
 
-    monkeypatch.setattr("phases.character_factory.batch_generate", fake_batch)
+    monkeypatch.setattr("phases.phase3.character_factory.batch_generate", fake_batch)
     monkeypatch.setattr(
         pipeline_core,
         "run_quality_check",

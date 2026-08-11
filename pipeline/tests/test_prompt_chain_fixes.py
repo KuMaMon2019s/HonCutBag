@@ -8,16 +8,16 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from clients import tos_uploader
-from phases.character_discoverer import _add_reference_contract
+from phases.phase1.character_discoverer import _add_reference_contract
 from phases.pipeline_core import _extract_visual_style_text, _write_project_visual_style
-from phases.storyboard_generator import (
+from phases.phase2.storyboard_generator import (
     _build_shot_prompt,
     _load_default_visual_style,
     _render_system_prompt,
     _specific_lighting,
     generate_storyboard,
 )
-from phases.video_generator import build_video_prompt
+from phases.phase6.video_generator import build_video_prompt
 from tools.asset_packager import build_content_for_shot, inject_reference_instruction
 from utils.visual_style_spec import VisualStyle
 
@@ -114,7 +114,7 @@ def test_f4_source_excerpt_survives_blueprint_and_storyboard(monkeypatch):
     assert "刀锋从鼻尖掠过削断几缕银发" in prompt
 
     monkeypatch.setattr(
-        "phases.storyboard_generator._call_llm",
+        "phases.phase2.storyboard_generator._call_llm",
         lambda user_prompt, visual_style_text=None: '{"prompt":"mock", "caption":"交锋"}',
     )
     storyboard = generate_storyboard([shot], [], visual_style_text="赛璐璐")

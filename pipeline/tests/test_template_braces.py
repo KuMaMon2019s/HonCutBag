@@ -8,8 +8,8 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from phases import adaptation_engine
-from phases.adaptation_engine import USER_PROMPT_TEMPLATE
+import phases.phase1.adaptation_engine as adaptation_engine
+from phases.phase1.adaptation_engine import USER_PROMPT_TEMPLATE
 
 
 def test_user_prompt_template_formats_literal_dialogue_json():

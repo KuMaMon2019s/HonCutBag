@@ -9,7 +9,7 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from phases import adaptation_engine as engine
+import phases.phase1.adaptation_engine as engine
 
 
 def _events(count):

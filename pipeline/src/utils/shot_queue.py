@@ -78,7 +78,7 @@ def make_payload(
 async def generate_shot_job(ctx: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
     """Generate one storyboard shot, retrying failures with exponential deferral."""
     try:
-        from pipeline.src.phases.storyboard_generator import _generate_single_shot
+        from pipeline.src.phases.phase2.storyboard_generator import _generate_single_shot
 
         return await asyncio.to_thread(_generate_single_shot, **payload)
     except Exception as exc:
