@@ -25,6 +25,7 @@ import phase_orchestrator
 
 from clients import local_video_client, seedance_client
 from phases import pipeline_core
+from runtime.bridge_execution import execute_bridge_video_task
 from runtime.capacity import (
     CapacityTable,
     CapacityWaitTimeoutError,
@@ -550,6 +551,8 @@ def test_explicit_bridge_providers_use_local_client(tmp_path, monkeypatch, provi
     bridge_calls = []
 
     def fake_generate(**kwargs):
+        kwargs["on_submit_start"]()
+        kwargs["on_submitted"]("bridge-job-1")
         Path(kwargs["output_path"]).write_bytes(b"v" * 11000)
         bridge_calls.append(kwargs)
         return {
@@ -575,6 +578,201 @@ def test_explicit_bridge_providers_use_local_client(tmp_path, monkeypatch, provi
 
     assert result["status"] == "done"
     assert len(bridge_calls) == 1
+
+
+def test_local_client_resume_skips_submission(tmp_path, monkeypatch):
+    output_path = tmp_path / "shots" / "S01" / "output.mp4"
+    output_path.parent.mkdir(parents=True)
+    submissions = []
+    polled = []
+    submission_starts = []
+    callbacks = []
+
+    monkeypatch.setattr(
+        local_video_client,
+        "submit",
+        lambda **kwargs: submissions.append(kwargs) or "unexpected-job",
+    )
+    monkeypatch.setattr(
+        local_video_client,
+        "poll",
+        lambda task_id: polled.append(task_id) or {"status": "completed"},
+    )
+
+    def download(task_id, destination, **kwargs):
+        Path(destination).write_bytes(b"v" * 11000)
+        return destination
+
+    monkeypatch.setattr(local_video_client, "download", download)
+
+    generated = local_video_client.generate_video(
+        prompt="quiet landscape",
+        output_path=str(output_path),
+        duration=4,
+        model="wan22",
+        resume_task_id="bridge-job-1",
+        on_submit_start=lambda: submission_starts.append("started"),
+        on_submitted=callbacks.append,
+    )
+
+    assert generated == str(output_path)
+    assert submissions == []
+    assert submission_starts == []
+    assert callbacks == []
+    assert polled == ["bridge-job-1"]
+
+
+def test_local_client_reports_job_id_before_polling(tmp_path, monkeypatch):
+    output_path = tmp_path / "shots" / "S01" / "output.mp4"
+    output_path.parent.mkdir(parents=True)
+    events = []
+
+    def submit(**kwargs):
+        events.append("submitted")
+        return "bridge-job-1"
+
+    def remember(task_id):
+        events.append(f"persisted:{task_id}")
+
+    def poll(task_id):
+        assert events == ["starting", "submitted", "persisted:bridge-job-1"]
+        raise TimeoutError("stop after persistence proof")
+
+    monkeypatch.setattr(local_video_client, "submit", submit)
+    monkeypatch.setattr(local_video_client, "poll", poll)
+
+    with pytest.raises(TimeoutError, match="persistence proof"):
+        local_video_client.generate_video(
+            prompt="quiet landscape",
+            output_path=str(output_path),
+            duration=4,
+            model="wan22",
+            on_submit_start=lambda: events.append("starting"),
+            on_submitted=remember,
+        )
+
+    assert events == ["starting", "submitted", "persisted:bridge-job-1"]
+
+
+def test_bridge_runtime_resumes_persisted_job_without_resubmitting(tmp_path):
+    store = GenerationTaskStore(tmp_path / "runtime.db")
+    output_path = tmp_path / "shots" / "S01" / "output.mp4"
+    output_path.parent.mkdir(parents=True)
+    resume_ids = []
+
+    def interrupted_generate(*, resume_task_id, on_submit_start, on_submitted):
+        resume_ids.append(resume_task_id)
+        on_submit_start()
+        on_submitted("bridge-job-1")
+        raise TimeoutError("Bridge polling interrupted")
+
+    with pytest.raises(TimeoutError, match="polling interrupted"):
+        execute_bridge_video_task(
+            store,
+            run_id="run-1",
+            resource_id="S01",
+            payload={"shot_id": "S01", "model": "wan22"},
+            provider_endpoint="http://bridge.test",
+            output_path=output_path,
+            generate=interrupted_generate,
+        )
+
+    def resumed_generate(*, resume_task_id, on_submit_start, on_submitted):
+        resume_ids.append(resume_task_id)
+        Path(output_path).write_bytes(b"v" * 11000)
+        return {
+            "output_path": str(output_path),
+            "last_frame_path": None,
+            "actual_model": "wan22",
+        }
+
+    execution = execute_bridge_video_task(
+        store,
+        run_id="run-1",
+        resource_id="S01",
+        payload={"shot_id": "S01", "model": "wan22"},
+        provider_endpoint="http://bridge.test",
+        output_path=output_path,
+        generate=resumed_generate,
+    )
+
+    assert execution.resumed is True
+    assert execution.provider_job_id == "bridge-job-1"
+    assert resume_ids == [None, "bridge-job-1"]
+    assert store.get(execution.task_id).status == "succeeded"
+
+
+def test_bridge_fallback_submit_timeout_becomes_uncertain(tmp_path):
+    store = GenerationTaskStore(tmp_path / "runtime.db")
+    output_path = tmp_path / "output.mp4"
+
+    def first_attempt(*, resume_task_id, on_submit_start, on_submitted):
+        on_submit_start()
+        on_submitted("bridge-seedance-job")
+        raise TimeoutError("Seedance polling timed out")
+
+    arguments = {
+        "run_id": "run-1",
+        "resource_id": "S01",
+        "payload": {"shot_id": "S01", "model": "seedance"},
+        "provider_endpoint": "http://bridge.test",
+        "output_path": output_path,
+    }
+    with pytest.raises(TimeoutError, match="polling timed out"):
+        execute_bridge_video_task(store, generate=first_attempt, **arguments)
+
+    def uncertain_fallback(*, resume_task_id, on_submit_start, on_submitted):
+        assert resume_task_id == "bridge-seedance-job"
+        on_submit_start()
+        raise TimeoutError("Wan fallback submit timed out")
+
+    with pytest.raises(TimeoutError, match="fallback submit timed out"):
+        execute_bridge_video_task(store, generate=uncertain_fallback, **arguments)
+
+    active = _enqueue_runtime_video(store).task
+    assert active.status == "submission_uncertain"
+    assert active.provider_job_id == "bridge-seedance-job"
+
+
+def test_phase6_bridge_resume_reuses_persisted_job(tmp_path, monkeypatch):
+    _write_shot(tmp_path)
+    monkeypatch.setenv("VIDEO_PROVIDER", "local")
+    monkeypatch.setattr("utils.config.VIDEO_GEN_CONCURRENCY", 1)
+    monkeypatch.setattr(local_video_client, "is_available", lambda timeout: True)
+    monkeypatch.setattr(local_video_client, "get_api_url", lambda: "http://bridge.test")
+    monkeypatch.setattr(
+        asset_packager,
+        "build_content_for_shot",
+        lambda **kwargs: [{"type": "text", "text": "shot"}],
+    )
+    resume_ids = []
+
+    def generate(**kwargs):
+        resume_ids.append(kwargs["resume_task_id"])
+        if kwargs["resume_task_id"] is None:
+            kwargs["on_submit_start"]()
+            kwargs["on_submitted"]("bridge-job-1")
+            raise TimeoutError("worker stopped while Bridge was polling")
+        Path(kwargs["output_path"]).write_bytes(b"v" * 11000)
+        return {
+            "output_path": kwargs["output_path"],
+            "last_frame_path": None,
+            "actual_model": "wan22",
+        }
+
+    monkeypatch.setattr(local_video_client, "generate_video", generate)
+
+    first = pipeline_core._run_phase6_fallback(tmp_path)
+    second = pipeline_core._run_phase6_fallback(tmp_path)
+
+    assert first["status"] == "error"
+    assert second["status"] == "done"
+    assert resume_ids == [None, "bridge-job-1"]
+    with sqlite3.connect(tmp_path / "runtime.db") as connection:
+        persisted = connection.execute(
+            "SELECT status, provider_id, provider_job_id FROM generation_tasks"
+        ).fetchone()
+    assert persisted == ("succeeded", "bridge", "bridge-job-1")
 
 
 def test_direct_ark_quota_error_uses_existing_retry_loop(tmp_path, monkeypatch):

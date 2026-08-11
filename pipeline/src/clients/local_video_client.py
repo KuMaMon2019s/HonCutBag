@@ -9,16 +9,16 @@ API Spec (HonCutBag_API_v3.1):
 - GET /download/{task_id}: returns mp4 file
 """
 
+import base64
+import json
 import os
+import subprocess
 import sys
 import time
-import json
-import base64
-import subprocess
-import requests
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Optional, List, Sequence, Tuple, Union
 
+import requests
 
 # Default local API URL (can be overridden via config or env)
 DEFAULT_API_URL = "http://192.168.31.221:9100"
@@ -43,7 +43,7 @@ _NO_PROXY_ENV = {
 }
 
 
-def _valid_frames_for_model(model: Optional[str]) -> Tuple[int, List[int]]:
+def _valid_frames_for_model(model: str | None) -> tuple[int, list[int]]:
     """Return the model fps and legal frame counts, applying the env override."""
     model_name = model or "wan22"
     if model_name == "seedance":
@@ -67,7 +67,7 @@ def snap_duration_to_frames(
     duration_s: float,
     fps: int,
     valid_frames: Sequence[int],
-) -> Tuple[int, float, str]:
+) -> tuple[int, float, str]:
     """Snap a requested duration to the nearest legal frame count.
 
     Equidistant choices select the larger count so a tie never silently
@@ -96,6 +96,12 @@ def _get_api_url() -> str:
         return os.environ.get("LOCAL_VIDEO_API_URL", get_bridge_api_url())
     except ImportError:
         return os.environ.get("LOCAL_VIDEO_API_URL", os.environ.get("BRIDGE_API_URL", DEFAULT_API_URL))
+
+
+def get_api_url() -> str:
+    """Return the active Bridge endpoint for durable task resume checks."""
+
+    return _get_api_url()
 
 
 def _request_session() -> requests.Session:
@@ -140,8 +146,8 @@ def is_available(timeout: float = 3.0) -> bool:
 
 def submit(
     prompt: str,
-    image_base64_list: Optional[List[str]] = None,
-    image_urls: Optional[List[str]] = None,
+    image_base64_list: list[str] | None = None,
+    image_urls: list[str] | None = None,
     steps: int = 20,
     num_frames: int = 73,  # ~3 seconds at 24fps
     cfg: float = 7.0,
@@ -150,13 +156,13 @@ def submit(
     height: int = 720,
     fps: int = 24,
     timeout: int = 30,
-    asset_zip_path: Optional[str] = None,
-    content: Optional[List[dict]] = None,
-    batch_id: Optional[str] = None,
-    model: Optional[str] = None,
+    asset_zip_path: str | None = None,
+    content: list[dict] | None = None,
+    batch_id: str | None = None,
+    model: str | None = None,
     return_last_frame: bool = False,
-    task_dir: Optional[str] = None,
-) -> Optional[str]:
+    task_dir: str | None = None,
+) -> str | None:
     """Submit a video generation task to the local API.
     
     Args:
@@ -337,7 +343,7 @@ def submit(
 
 def poll(
     task_id: str,
-    max_attempts: Optional[int] = None,
+    max_attempts: int | None = None,
     interval: int = 10,
 ) -> dict:
     """Poll task until done, with progress-based timeout.
@@ -407,7 +413,7 @@ def poll(
     # Bridge running/100 quirk tracking
     at_100_count: int = 0         # progress>=100 且 status=running 的连续轮数
     download_probe_fail: int = 0     # /download 探测连续失败轮数
-    probe_started_at: Optional[float] = None  # monotonic time of first probe in current run
+    probe_started_at: float | None = None  # monotonic time of first probe in current run
 
     while True:
         total_polls += 1
@@ -582,9 +588,9 @@ def _probe_download(
 
 def _verify_download(
     file_path: str,
-    expected_duration: Optional[float] = None,
-    expected_width: Optional[int] = None,
-    expected_height: Optional[int] = None,
+    expected_duration: float | None = None,
+    expected_width: int | None = None,
+    expected_height: int | None = None,
     require_video_stream: bool = False,
 ) -> dict:
     """Probe the downloaded mp4 with ffprobe and check against expectations.
@@ -713,11 +719,11 @@ def download(
     task_id: str,
     output_path: str,
     timeout: int = 120,
-    expected_duration: Optional[float] = None,
-    expected_width: Optional[int] = None,
-    expected_height: Optional[int] = None,
-    verification_out: Optional[dict] = None,
-    model: Optional[str] = None,
+    expected_duration: float | None = None,
+    expected_width: int | None = None,
+    expected_height: int | None = None,
+    verification_out: dict | None = None,
+    model: str | None = None,
 ) -> str:
     """Download the generated video to output_path.
 
@@ -830,23 +836,26 @@ def _save_last_frame(last_frame_value: str, output_path: str, timeout: int = 120
 def generate_video(
     prompt: str,
     output_path: str,
-    reference_image_base64: Optional[str] = None,
+    reference_image_base64: str | None = None,
     seed: int = -1,
-    duration: Optional[float] = None,
+    duration: float | None = None,
     width: int = 1280,
     height: int = 720,
     fps: int = 24,
-    asset_zip_path: Optional[str] = None,
-    image_base64_list: Optional[List[str]] = None,
-    content: Optional[List[dict]] = None,
-    batch_id: Optional[str] = None,
-    model: Optional[str] = None,
-    submit_timeout: Optional[int] = None,
+    asset_zip_path: str | None = None,
+    image_base64_list: list[str] | None = None,
+    content: list[dict] | None = None,
+    batch_id: str | None = None,
+    model: str | None = None,
+    submit_timeout: int | None = None,
     return_last_frame: bool = False,
-    task_dir: Optional[str] = None,
-) -> Union[str, dict]:
+    task_dir: str | None = None,
+    resume_task_id: str | None = None,
+    on_submit_start: Callable[[], None] | None = None,
+    on_submitted: Callable[[str], None] | None = None,
+) -> str | dict:
     """High-level function: submit + poll + download in one call.
-    
+
     Args:
         prompt: Video description
         output_path: Where to save the output mp4
@@ -861,10 +870,10 @@ def generate_video(
         content: Optional Bridge content[] list (highest priority, uses new contract)
         batch_id: Optional identifier shared by all shots in one pipeline run
         model: Optional Bridge model route (wan22, phantom, or flf2v)
-    
+
     Returns:
         output_path on success
-    
+
     Raises:
         RuntimeError: If any step fails
     """
@@ -892,36 +901,21 @@ def generate_video(
         expected_duration = num_frames / fps
         reason = "missing shot duration; middle valid frame count fallback"
         print(f"  [frames] {shot_id}: duration=missing → fallback {num_frames} ({expected_duration:.2f}s)")
-    
+
     # Prepare image list (legacy single image support)
     if reference_image_base64 and not image_base64_list:
         image_base64_list = [reference_image_base64]
-    
-    # Submit
-    print(
-        f"  [local_video] submitting ({width}x{height}, num_frames={num_frames}, "
-        f"expected_duration={expected_duration:.2f}s)..."
-    )
-    task_id = submit(
-        prompt=prompt,
-        image_base64_list=image_base64_list,
-        num_frames=num_frames,
-        seed=seed,
-        width=width,
-        height=height,
-        fps=fps,
-        asset_zip_path=asset_zip_path,
-        content=content,
-        batch_id=batch_id,
-        model=model,
-        return_last_frame=return_last_frame,
-        task_dir=task_dir,
-        timeout=submit_timeout or (60 if model == "seedance" else 30),
-    )
-    
-    # Handle content[] failure - fallback to zip/base64
-    if task_id is None and content is not None and task_dir is None:
-        print(f"  [local_video] content[] failed, falling back to zip/base64")
+
+    task_id = resume_task_id
+    if task_id:
+        print(f"  [local_video] resuming task_id={task_id}")
+    else:
+        print(
+            f"  [local_video] submitting ({width}x{height}, num_frames={num_frames}, "
+            f"expected_duration={expected_duration:.2f}s)..."
+        )
+        if on_submit_start is not None:
+            on_submit_start()
         task_id = submit(
             prompt=prompt,
             image_base64_list=image_base64_list,
@@ -931,38 +925,64 @@ def generate_video(
             height=height,
             fps=fps,
             asset_zip_path=asset_zip_path,
+            content=content,
             batch_id=batch_id,
             model=model,
             return_last_frame=return_last_frame,
+            task_dir=task_dir,
             timeout=submit_timeout or (60 if model == "seedance" else 30),
         )
-    
-    # Handle zip upload failure - fallback to base64
-    if task_id is None and asset_zip_path is not None:
-        print(f"  [local_video] zip upload failed, falling back to base64 list")
-        task_id = submit(
-            prompt=prompt,
-            image_base64_list=image_base64_list,
-            num_frames=num_frames,
-            seed=seed,
-            width=width,
-            height=height,
-            fps=fps,
-            batch_id=batch_id,
-            model=model,
-            return_last_frame=return_last_frame,
-            timeout=submit_timeout or (60 if model == "seedance" else 30),
-        )
-    
-    if task_id is None:
-        raise RuntimeError("Failed to submit video generation task")
-    
+
+        # Handle content[] failure - fallback to zip/base64
+        if task_id is None and content is not None and task_dir is None:
+            print("  [local_video] content[] failed, falling back to zip/base64")
+            if on_submit_start is not None:
+                on_submit_start()
+            task_id = submit(
+                prompt=prompt,
+                image_base64_list=image_base64_list,
+                num_frames=num_frames,
+                seed=seed,
+                width=width,
+                height=height,
+                fps=fps,
+                asset_zip_path=asset_zip_path,
+                batch_id=batch_id,
+                model=model,
+                return_last_frame=return_last_frame,
+                timeout=submit_timeout or (60 if model == "seedance" else 30),
+            )
+
+        # Handle zip upload failure - fallback to base64
+        if task_id is None and asset_zip_path is not None:
+            print("  [local_video] zip upload failed, falling back to base64 list")
+            if on_submit_start is not None:
+                on_submit_start()
+            task_id = submit(
+                prompt=prompt,
+                image_base64_list=image_base64_list,
+                num_frames=num_frames,
+                seed=seed,
+                width=width,
+                height=height,
+                fps=fps,
+                batch_id=batch_id,
+                model=model,
+                return_last_frame=return_last_frame,
+                timeout=submit_timeout or (60 if model == "seedance" else 30),
+            )
+
+        if task_id is None:
+            raise RuntimeError("Failed to submit video generation task")
+        if on_submitted is not None:
+            on_submitted(task_id)
+
     print(f"  [local_video] task_id={task_id}")
-    
+
     # Poll
     result = poll(task_id)
-    print(f"  [local_video] completed!")
-    
+    print("  [local_video] completed!")
+
     # Download (with cross-task leakage verification)
     verification = {}
     download(
@@ -1028,7 +1048,7 @@ def generate_video(
     }
 
 
-def generate_video_with_fallback(**kwargs) -> Union[str, dict]:
+def generate_video_with_fallback(**kwargs) -> str | dict:
     """Generate with Seedance, falling back to Wan2.2 only on a timeout.
 
     The same prompt and reference payload are retained because Wan2.2 accepts
@@ -1056,4 +1076,5 @@ def generate_video_with_fallback(**kwargs) -> Union[str, dict]:
         )
         wan_kwargs = dict(kwargs, model="wan22")
         wan_kwargs.pop("submit_timeout", None)
+        wan_kwargs.pop("resume_task_id", None)
         return generate_video(**wan_kwargs)

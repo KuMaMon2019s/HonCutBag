@@ -2625,9 +2625,10 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
             chain_mode = False
     else:
         print("  → 路由: 直连 ARK Agent Plan", flush=True)
-        from runtime.generation_tasks import GenerationTaskStore
 
-        generation_tasks = GenerationTaskStore(output_dir / "runtime.db")
+    from runtime.generation_tasks import GenerationTaskStore
+
+    generation_tasks = GenerationTaskStore(output_dir / "runtime.db")
 
     # Load character reference images for consistency
     import base64 as _b64
@@ -3024,13 +3025,18 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                                     shot_meta=meta,
                                 )
                                 content_list = None
-                        
+
                         generate = (
                             local_video_client.generate_video_with_fallback
                             if bridge_model == "seedance"
                             else local_video_client.generate_video
                         )
-                        generation_result = generate(
+                        from functools import partial
+
+                        from runtime.bridge_execution import execute_bridge_video_task
+
+                        bridge_generate = partial(
+                            generate,
                             prompt=prompt,
                             output_path=out_path,
                             reference_image_base64=first_frame_b64,
@@ -3047,7 +3053,24 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                             return_last_frame=chain_mode and chain_allowed,
                             task_dir=task_dir_id,
                         )
-                        
+                        execution = execute_bridge_video_task(
+                            generation_tasks,
+                            run_id=str(output_dir.resolve()),
+                            resource_id=shot_id,
+                            payload={
+                                "shot_id": shot_id,
+                                "output_path": f"shots/{shot_id}/output.mp4",
+                                "model": bridge_model,
+                                "duration": duration,
+                                "seed": shot_seed if shot_seed is not None else -1,
+                                "task_dir": task_dir_id,
+                            },
+                            provider_endpoint=local_video_client.get_api_url(),
+                            output_path=out_path,
+                            generate=bridge_generate,
+                        )
+                        generation_result = execution.generation_result
+
                         if shot_seed is not None:
                             meta["seed"] = shot_seed
                             meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False))
@@ -3062,9 +3085,9 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                         return generation_result
                     except Exception as local_err:
                         print(f"    ✗ {shot_dir.name}: 本地 API 失败 — {local_err}")
-                        print(f"    ⚠ 不降级到 ARK（零成本测试模式），跳过此镜头")
+                        print("    ⚠ 不降级到 ARK（零成本测试模式），跳过此镜头")
                         return None
-                
+
                 print(f"  → {shot_dir.name}: 提交 ARK Agent Plan 视频生成...")
                 from clients import seedance_client
                 from tools import asset_packager

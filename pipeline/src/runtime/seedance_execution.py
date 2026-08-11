@@ -7,15 +7,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from runtime.execution_errors import (
+    ProviderEndpointChangedError,
+    SubmissionUncertainError,
+)
 from runtime.generation_tasks import GenerationTaskStore
-
-
-class SubmissionUncertainError(RuntimeError):
-    """The provider may have accepted a request whose job id is unavailable."""
-
-
-class ProviderEndpointChangedError(RuntimeError):
-    """A persisted job cannot be polled through a different provider endpoint."""
 
 
 @dataclass(frozen=True)
