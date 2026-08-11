@@ -23,16 +23,22 @@
 
 import json
 import sys
-import os
 import argparse
 import re
 import time
 import hashlib
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from collections import defaultdict
 
 from openai import OpenAI
-from utils.ark_llm import call_llm_stream, create_ark_client
+from utils.ark_llm import (
+    LLMConnectTimeout,
+    LLMIdleTimeout,
+    LLMReadTimeout,
+    LLMStreamError,
+    call_llm_stream,
+    create_ark_client,
+)
 
 
 # ─── LLM 配置 ───────────────────────────────────────────────────────────────
@@ -96,7 +102,8 @@ USER_PROMPT_TEMPLATE = (
     "- 如果没有明显状态变化，variants 可以为空数组 []\n"
 )
 
-LLM_TIMEOUT = 180  # 秒（2026-08-09: turbo 推理模型比 lite 慢，60s 实测角色描述超时）
+LLM_TIMEOUT = 600
+LLM_IDLE_TIMEOUT = 75
 MAX_RETRIES = 3  # 解析失败重试次数
 
 ENTITY_SUFFIXES = (
@@ -114,7 +121,7 @@ def _get_client() -> OpenAI:
 
     API Key: ARK_AGENT_API_KEY (火山方舟 Agent Plan)
     """
-    return create_ark_client()
+    return create_ark_client(read_timeout=LLM_IDLE_TIMEOUT)
 
 
 def _call_llm(prompt: str) -> str:
@@ -128,6 +135,7 @@ def _call_llm(prompt: str) -> str:
         ],
         max_tokens=16000,
         wall_timeout=LLM_TIMEOUT,
+        idle_timeout=LLM_IDLE_TIMEOUT,
         _client=client,
     )
 
@@ -225,7 +233,7 @@ def _parse_characters(response: str) -> List[Dict[str, Any]]:
         try:
             fixed_text = _fix_json(text)
             parsed = json.loads(fixed_text, strict=False)
-            print(f"  JSON 修复成功", file=sys.stderr)
+            print("  JSON 修复成功", file=sys.stderr)
         except json.JSONDecodeError as e:
             # 第三次尝试：更激进的修复 - 找到最后一个完整的对象
             try:
@@ -237,7 +245,7 @@ def _parse_characters(response: str) -> List[Dict[str, Any]]:
                     if not truncated.rstrip().endswith(']'):
                         truncated = truncated.rstrip() + ']'
                     parsed = json.loads(truncated, strict=False)
-                    print(f"  JSON 激进修复成功（截断到最后一个完整对象）", file=sys.stderr)
+                    print("  JSON 激进修复成功（截断到最后一个完整对象）", file=sys.stderr)
                 else:
                     raise e
             except json.JSONDecodeError:
@@ -270,7 +278,7 @@ def _collect_character_stats(events: List[Dict[str, Any]]) -> Dict[str, Dict[str
     Returns:
         dict: {角色名: {"events": [event_ids], "contexts": [event_summary]}}
     """
-    stats = defaultdict(lambda: {"events": [], "contexts": []})
+    stats = defaultdict(lambda: {"events": [], "contexts": [], "dialogue_count": 0})
 
     for event in events:
         event_id = event.get("id", 0)
@@ -278,6 +286,11 @@ def _collect_character_stats(events: List[Dict[str, Any]]) -> Dict[str, Dict[str
         what = event.get("what", "")
         where = event.get("where", "")
         emotion = event.get("emotion", "")
+        speakers = {
+            str(line.get("speaker", "")).strip()
+            for line in event.get("lines", [])
+            if isinstance(line, dict) and str(line.get("speaker", "")).strip()
+        }
 
         # 构建事件摘要
         summary_parts = []
@@ -294,6 +307,8 @@ def _collect_character_stats(events: List[Dict[str, Any]]) -> Dict[str, Dict[str
                 name = character_name.strip()
                 stats[name]["events"].append(event_id)
                 stats[name]["contexts"].append(f"事件{event_id}: {event_summary}")
+                if name in speakers:
+                    stats[name]["dialogue_count"] += 1
 
     return dict(stats)
 
@@ -360,6 +375,9 @@ def _is_human_character(name: str) -> bool:
         "鸡", "鸭", "狗", "猫", "鸟", "鱼",  # 动物
         "桌子", "椅子", "车", "书",  # 物品
         "刀", "剑", "枪", "刃", "武器", "护甲", "铠甲", "弓", "箭",  # 武器/装备（2026-08-09: "两把金属刀具"混入角色列表实锤）
+        "霓虹牌", "电缆", "积水", "路面", "钢梁", "混凝土", "高楼",
+        "塑料布", "纸屑", "玻璃", "水浪", "灰尘", "碎石", "残骸",
+        "护臂", "手掌", "手指", "车门",
     ]
     if any(keyword in name for keyword in non_human_keywords):
         return False
@@ -638,6 +656,13 @@ def discover_characters(events: List[Dict[str, Any]]) -> Dict[str, Any]:
                 print(f"  JSON 解析失败，重试 ({attempt+1}/{MAX_RETRIES}): {e}", file=sys.stderr)
                 time.sleep(1)
             continue
+        except (LLMConnectTimeout, LLMReadTimeout, LLMIdleTimeout, LLMStreamError) as e:
+            last_error = e
+            if attempt < 1:
+                print(f"  LLM 流中断，重试 (1/1): {e}", file=sys.stderr)
+                time.sleep(1)
+                continue
+            break
         except Exception as e:
             last_error = e
             print(f"  LLM 调用失败: {e}", file=sys.stderr)
@@ -696,7 +721,13 @@ def _fallback_characters(stats: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any
     LLM 失败时的回退：为每个角色名生成最简描述
     """
     characters = []
-    for i, (name, info) in enumerate(stats.items()):
+    trusted = [
+        (name, info)
+        for name, info in stats.items()
+        if len(info.get("events", [])) >= 2 or info.get("dialogue_count", 0) > 0
+    ]
+    trusted.sort(key=lambda item: (-len(item[1].get("events", [])), item[0]))
+    for i, (name, info) in enumerate(trusted[:5]):
         # 简单生成 id（拼音首字母或 index）
         char_id = f"char_{i+1:03d}"
 

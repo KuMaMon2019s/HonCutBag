@@ -37,8 +37,14 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 from openai import OpenAI, APITimeoutError
-from utils.config import get_api_key, ARK_BASE_URL
-from utils.ark_llm import LLMReadTimeout, call_llm_stream, create_ark_client
+from utils.ark_llm import (
+    LLMConnectTimeout,
+    LLMIdleTimeout,
+    LLMReadTimeout,
+    LLMStreamError,
+    call_llm_stream,
+    create_ark_client,
+)
 
 
 # ─── LLM 配置 ───────────────────────────────────────────────────────────────
@@ -198,7 +204,8 @@ def determine_gen_strategy(shot: Dict[str, Any]) -> str:
         return "phantom"
     return "i2v"
 
-LLM_TIMEOUT = 240  # 秒（2026-08-09: turbo 推理模型需要更长推理时间）
+LLM_TIMEOUT = 900  # 135 个事件的健康流实测超过 240 秒；保留 15 分钟绝对安全上限
+LLM_IDLE_TIMEOUT = 75  # 只在流连续 75 秒没有任何 chunk 时判定停滞
 MAX_RETRIES = 1  # 解析失败重试次数
 NETWORK_RETRIES = 2  # 网络超时自动重试次数（2026-08-09 R7: 70事件大prompt一次超时即死太脆）
 AVG_SHOT_DURATION = 12  # 默认每镜时长（秒）
@@ -268,7 +275,7 @@ def _get_client() -> OpenAI:
 
     API Key: ARK_AGENT_API_KEY (火山方舟 Agent Plan)
     """
-    return create_ark_client()
+    return create_ark_client(read_timeout=LLM_IDLE_TIMEOUT)
 
 
 def _call_llm(user_prompt: str, max_tokens: int = 32000) -> str:
@@ -300,6 +307,7 @@ def _call_llm(user_prompt: str, max_tokens: int = 32000) -> str:
         ],
         max_tokens=max_tokens,
         wall_timeout=LLM_TIMEOUT,
+        idle_timeout=LLM_IDLE_TIMEOUT,
         _client=client,
     )
 
@@ -322,7 +330,13 @@ def _call_llm_with_timeout_retry(user_prompt: str, max_tokens: int = 32000) -> s
     for net_attempt in range(NETWORK_RETRIES + 1):
         try:
             return _call_llm(user_prompt, max_tokens=max_tokens)
-        except (APITimeoutError, LLMReadTimeout) as e:
+        except (
+            APITimeoutError,
+            LLMConnectTimeout,
+            LLMReadTimeout,
+            LLMIdleTimeout,
+            LLMStreamError,
+        ) as e:
             if net_attempt < NETWORK_RETRIES:
                 wait = 15 * (net_attempt + 1)
                 print(f"  ⚠ LLM 网络超时，{wait}s 后重试 ({net_attempt + 1}/{NETWORK_RETRIES})...", file=sys.stderr)

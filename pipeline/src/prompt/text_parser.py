@@ -22,6 +22,10 @@ import argparse
 from typing import List, Dict, Any
 
 
+SEGMENT_TARGET_CHARS = 400
+SEGMENT_MAX_CHARS = 800
+
+
 def detect_input_type(text: str) -> str:
     """
     判断输入规模类型
@@ -143,6 +147,32 @@ def split_by_chapters(text: str) -> List[Dict[str, str]]:
     return [ch for ch in chapters if ch["content"]]
 
 
+def _coalesce_short_lines(lines: List[str]) -> List[str]:
+    """Group screenplay-style short lines into bounded semantic chunks."""
+    chunks: List[str] = []
+    current: List[str] = []
+    current_chars = 0
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        added_chars = len(line) + (1 if current else 0)
+        if current and current_chars + added_chars > SEGMENT_MAX_CHARS:
+            chunks.append("\n".join(current))
+            current = []
+            current_chars = 0
+            added_chars = len(line)
+        current.append(line)
+        current_chars += added_chars
+        if current_chars >= SEGMENT_TARGET_CHARS:
+            chunks.append("\n".join(current))
+            current = []
+            current_chars = 0
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
 def split_by_paragraphs(text: str) -> List[str]:
     """
     按段落拆分文本
@@ -158,11 +188,17 @@ def split_by_paragraphs(text: str) -> List[str]:
     # 尝试双换行分割
     paragraphs = text.split('\n\n')
     paragraphs = [p.strip() for p in paragraphs if p.strip()]
-    
-    # 如果只有一个段落且有单换行，尝试单换行分割
+
+    # Some generated screenplays put a blank line between every action/dialogue
+    # line. Treat that as line-oriented input when most pieces are tiny.
+    short_paragraphs = sum(len(paragraph) <= 80 for paragraph in paragraphs)
+    if len(paragraphs) >= 20 and short_paragraphs / len(paragraphs) >= 0.7:
+        paragraphs = _coalesce_short_lines(paragraphs)
+
+    # 剧本通常每个动作或对白占一行。逐行调用一次 LLM 会把几千字输入
+    # 放大成上百个请求，因此把短行合并为有界分段，同时保留原始换行。
     if len(paragraphs) == 1 and '\n' in text:
-        paragraphs = text.split('\n')
-        paragraphs = [p.strip() for p in paragraphs if p.strip()]
+        paragraphs = _coalesce_short_lines(text.split('\n'))
     
     return paragraphs
 

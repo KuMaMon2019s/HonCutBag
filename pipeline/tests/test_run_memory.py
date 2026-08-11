@@ -1,8 +1,9 @@
-import json
 import importlib.util
+import json
 import sqlite3
 import sys
 from pathlib import Path
+from types import ModuleType
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -101,7 +102,7 @@ def test_disabled_config_writes_nothing(tmp_path):
     assert not (tmp_path / "run_memory.db").exists()
 
 
-def test_runner_records_every_status_compactly(tmp_path):
+def test_runner_records_executed_statuses_compactly(tmp_path):
     created = []
 
     class FakeMemory:
@@ -127,6 +128,33 @@ def test_runner_records_every_status_compactly(tmp_path):
 
     assert created[0][1] == 7
     records = created[0][2]
-    assert [record[1]["status"] for record in records] == ["done", "error", "skipped"]
+    assert [record[1]["status"] for record in records] == ["done", "error"]
     assert records[0][1]["artifacts"] == ["b.json"]
     assert all(len(_compact_phase_record(record[1]["phase"], record[1])) < 500 for record in records)
+
+
+def test_runner_summarizes_locally_without_post_run_llm(monkeypatch, tmp_path):
+    def unexpected_llm_call(*_args, **_kwargs):
+        raise AssertionError("run-memory finalization must not call an external LLM")
+
+    blocked_supervision = ModuleType("quality.supervision_agent")
+    blocked_supervision._call_llm = unexpected_llm_call
+    monkeypatch.setitem(sys.modules, "quality.supervision_agent", blocked_supervision)
+    _record_run_memory(
+        {
+            "phases": {
+                "1": {"status": "done", "duration_s": 1.0},
+                "2": {"status": "done", "duration_s": 2.0},
+                "3": {"status": "done", "duration_s": 3.0},
+                "4": {"status": "skipped", "reason": "selected range"},
+            }
+        },
+        tmp_path,
+        {"memory_enabled": True, "memory_messages_per_summary": 3},
+    )
+
+    tiers = RunMemory(tmp_path).get("")
+    assert len(tiers["summaries"]) == 1
+    assert '"phase": "phase1"' in tiers["summaries"][0]["content"]
+    assert '"phase": "phase3"' in tiers["summaries"][0]["content"]
+    assert "phase4" not in tiers["summaries"][0]["content"]

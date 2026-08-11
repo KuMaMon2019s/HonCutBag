@@ -27,8 +27,16 @@ class LLMReadTimeout(LLMTimeoutError):
     pass
 
 
+class LLMIdleTimeout(LLMTimeoutError):
+    """The stream produced no chunks within the configured idle window."""
+
+
 class LLMWallTimeout(LLMTimeoutError):
     pass
+
+
+class LLMStreamError(ConnectionError):
+    """A retryable transport failure interrupted an in-progress stream."""
 
 
 class LLMEmptyResponse(ValueError):
@@ -64,20 +72,35 @@ def call_llm_stream(
     wall_timeout: float = 180.0,
     read_timeout: float = 60.0,
     connect_timeout: float = 10.0,
+    idle_timeout: Optional[float] = None,
     heartbeat_callback: Optional[Callable[[], None]] = None,
+    heartbeat_interval: float = 5.0,
     _client=None,
 ) -> str:
-    """Stream a completion with classified read/connect and hard wall timeouts."""
+    """Stream a completion with idle and hard wall-clock safety limits.
+
+    ``idle_timeout`` is refreshed for every received chunk, so a healthy long
+    response is not mistaken for a stalled request. ``wall_timeout`` remains a
+    separate absolute ceiling for genuinely unbounded requests.
+    """
     if wall_timeout <= 0:
         raise ValueError("wall_timeout must be positive")
+    idle_timeout = read_timeout if idle_timeout is None else idle_timeout
+    if idle_timeout <= 0:
+        raise ValueError("idle_timeout must be positive")
+    if heartbeat_interval < 0:
+        raise ValueError("heartbeat_interval must be non-negative")
     client = _client or create_ark_client(connect_timeout, read_timeout)
     heartbeat_callback = heartbeat_callback or _default_heartbeat_callback
     deadline = time.monotonic() + wall_timeout
     stream = None
     wall_expired = threading.Event()
+    idle_expired = threading.Event()
+    stop_idle_monitor = threading.Event()
+    activity_lock = threading.Lock()
+    last_activity_at = time.monotonic()
 
-    def force_close() -> None:
-        wall_expired.set()
+    def close_stream() -> None:
         current = stream
         if current is not None:
             try:
@@ -85,10 +108,27 @@ def call_llm_stream(
             except Exception:
                 pass
 
-    timer = threading.Timer(wall_timeout, force_close)
-    timer.daemon = True
-    timer.start()
+    def expire_wall() -> None:
+        wall_expired.set()
+        close_stream()
+
+    def monitor_idle() -> None:
+        check_interval = min(max(idle_timeout / 4, 0.005), 1.0)
+        while not stop_idle_monitor.wait(check_interval):
+            with activity_lock:
+                inactive_for = time.monotonic() - last_activity_at
+            if inactive_for >= idle_timeout:
+                idle_expired.set()
+                close_stream()
+                return
+
+    wall_timer = threading.Timer(wall_timeout, expire_wall)
+    wall_timer.daemon = True
+    wall_timer.start()
+    idle_monitor = threading.Thread(target=monitor_idle, daemon=True)
+    idle_monitor.start()
     chunks: list[str] = []
+    last_heartbeat_at: Optional[float] = None
     try:
         stream = client.chat.completions.create(
             model=model,
@@ -97,17 +137,32 @@ def call_llm_stream(
             max_tokens=max_tokens,
         )
         for chunk in stream:
-            if wall_expired.is_set() or time.monotonic() > deadline:
+            now = time.monotonic()
+            if wall_expired.is_set() or now > deadline:
                 try:
                     stream.close()
                 finally:
                     raise LLMWallTimeout(f"LLM wall timeout after {wall_timeout}s")
-            if heartbeat_callback is not None:
+            if idle_expired.is_set():
+                raise LLMIdleTimeout(f"LLM stream idle timeout after {idle_timeout}s")
+            with activity_lock:
+                last_activity_at = now
+            if (
+                heartbeat_callback is not None
+                and (
+                    last_heartbeat_at is None
+                    or heartbeat_interval == 0
+                    or now - last_heartbeat_at >= heartbeat_interval
+                )
+            ):
                 heartbeat_callback()
+                last_heartbeat_at = now
             if chunk.choices and chunk.choices[0].delta.content:
                 chunks.append(chunk.choices[0].delta.content)
         if wall_expired.is_set():
             raise LLMWallTimeout(f"LLM wall timeout after {wall_timeout}s")
+        if idle_expired.is_set():
+            raise LLMIdleTimeout(f"LLM stream idle timeout after {idle_timeout}s")
     except LLMTimeoutError:
         raise
     except (httpx.ConnectTimeout,) as exc:
@@ -115,7 +170,15 @@ def call_llm_stream(
     except (httpx.ReadTimeout, APITimeoutError) as exc:
         if wall_expired.is_set():
             raise LLMWallTimeout(f"LLM wall timeout after {wall_timeout}s") from exc
+        if idle_expired.is_set():
+            raise LLMIdleTimeout(f"LLM stream idle timeout after {idle_timeout}s") from exc
         raise LLMReadTimeout(str(exc)) from exc
+    except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
+        if wall_expired.is_set():
+            raise LLMWallTimeout(f"LLM wall timeout after {wall_timeout}s") from exc
+        if idle_expired.is_set():
+            raise LLMIdleTimeout(f"LLM stream idle timeout after {idle_timeout}s") from exc
+        raise LLMStreamError(str(exc)) from exc
     except APIConnectionError as exc:
         cause = exc.__cause__
         if isinstance(cause, httpx.ConnectTimeout):
@@ -124,13 +187,19 @@ def call_llm_stream(
             raise LLMReadTimeout(str(exc)) from exc
         if wall_expired.is_set():
             raise LLMWallTimeout(f"LLM wall timeout after {wall_timeout}s") from exc
-        raise
+        if idle_expired.is_set():
+            raise LLMIdleTimeout(f"LLM stream idle timeout after {idle_timeout}s") from exc
+        raise LLMStreamError(str(exc)) from exc
     except Exception as exc:
         if wall_expired.is_set():
             raise LLMWallTimeout(f"LLM wall timeout after {wall_timeout}s") from exc
+        if idle_expired.is_set():
+            raise LLMIdleTimeout(f"LLM stream idle timeout after {idle_timeout}s") from exc
         raise
     finally:
-        timer.cancel()
+        wall_timer.cancel()
+        stop_idle_monitor.set()
+        idle_monitor.join(timeout=1.0)
         if stream is not None:
             try:
                 stream.close()

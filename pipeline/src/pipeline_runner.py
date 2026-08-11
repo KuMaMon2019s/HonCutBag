@@ -110,6 +110,11 @@ def _record_run_memory(
     for report_key, result in report.get("phases", {}).items():
         if not isinstance(result, dict):
             continue
+        # A selected-phase run reports every other phase as skipped. Persisting
+        # those no-op records creates noise and used to trigger paid LLM
+        # summaries after the pipeline had already printed COMPLETED.
+        if result.get("status") == "skipped":
+            continue
         phase_name = report_key if report_key in PHASES else phase_names.get(str(report_key))
         if phase_name:
             memory.add("phase", _compact_phase_record(phase_name, result))

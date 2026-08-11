@@ -10,6 +10,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -678,19 +679,56 @@ def _summarize_visual_style_with_llm(script_text: str) -> Optional[str]:
         return None
 
 
-def _atomic_write_phase1_json(path: Path, payload: dict) -> None:
+PHASE1_CHECKPOINT_SCHEMA_VERSION = 2
+
+
+def _phase1_input_hash(items: list) -> str:
+    serialized = json.dumps(items, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _atomic_write_phase1_json(
+    path: Path,
+    payload: dict,
+    *,
+    collection_key: str,
+    input_hash: str,
+) -> None:
     """Persist a completed Phase 1 substage without exposing partial JSON."""
+    stored = dict(payload)
+    stored["_checkpoint"] = {
+        "schema_version": PHASE1_CHECKPOINT_SCHEMA_VERSION,
+        "collection_key": collection_key,
+        "input_hash": input_hash,
+        "item_count": len(stored.get(collection_key, [])),
+    }
     tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.write_text(json.dumps(stored, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp_path, path)
 
 
-def _load_phase1_checkpoint(path: Path, collection_key: str) -> Optional[dict]:
+def _load_phase1_checkpoint(
+    path: Path,
+    collection_key: str,
+    *,
+    input_hash: str,
+) -> Optional[dict]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict) or not isinstance(payload.get(collection_key), list):
+        return None
+    metadata = payload.get("_checkpoint")
+    if not isinstance(metadata, dict):
+        return None
+    if metadata.get("schema_version") != PHASE1_CHECKPOINT_SCHEMA_VERSION:
+        return None
+    if metadata.get("collection_key") != collection_key:
+        return None
+    if metadata.get("input_hash") != input_hash:
+        return None
+    if metadata.get("item_count") != len(payload[collection_key]):
         return None
     return payload
 
@@ -924,7 +962,7 @@ def run_phase1_screenwriter(
         # 正常模式：调用 API
         try:
             from prompt.event_extractor import extract_events
-            from phases.phase1.character_discoverer import discover_characters
+            from phases.phase1.character_discoverer import discover_characters, _is_human_character
             from phases.phase1.adaptation_engine import adapt_events
             from phases.phase1.storyboard_generator import generate_storyboard
         except ImportError as e:
@@ -935,12 +973,40 @@ def run_phase1_screenwriter(
         if reporter:
             reporter.step("phase1", "提取事件", progress_pct=30)
         events_checkpoint = output_dir / "phase1_events.json"
-        events_result = _load_phase1_checkpoint(events_checkpoint, "events")
+        nonempty_segments = [
+            segment for segment in segments if str(segment.get("content", "")).strip()
+        ]
+        events_input_hash = _phase1_input_hash(nonempty_segments)
+        expected_segment_ids = [segment.get("id", 0) for segment in nonempty_segments]
+        events_result = _load_phase1_checkpoint(
+            events_checkpoint,
+            "events",
+            input_hash=events_input_hash,
+        )
+        if events_result is not None:
+            complete_coverage = (
+                events_result.get("source_segments_hash") == events_input_hash
+                and events_result.get("source_segment_count") == len(nonempty_segments)
+                and events_result.get("covered_segment_ids") == expected_segment_ids
+                and events_result.get("total_events") == len(events_result["events"])
+            )
+            if not complete_coverage:
+                events_result = None
         if events_result is not None:
             print("    ↻ 复用 phase1_events.json，跳过事件提取")
         else:
-            events_result = extract_events(segments)
-            _atomic_write_phase1_json(events_checkpoint, events_result)
+            events_result = dict(extract_events(segments))
+            events_result.setdefault("schema_version", "2.0")
+            events_result.setdefault("source_segments_hash", events_input_hash)
+            events_result.setdefault("source_segment_count", len(nonempty_segments))
+            events_result.setdefault("covered_segment_ids", expected_segment_ids)
+            events_result.setdefault("total_events", len(events_result.get("events", [])))
+            _atomic_write_phase1_json(
+                events_checkpoint,
+                events_result,
+                collection_key="events",
+                input_hash=events_input_hash,
+            )
         events = events_result.get("events", [])
         print(f"    ✓ 提取 {len(events)} 个事件")
         if reporter:
@@ -951,12 +1017,40 @@ def run_phase1_screenwriter(
         if reporter:
             reporter.step("phase1", "发现角色", progress_pct=50)
         characters_checkpoint = output_dir / "phase1_characters.json"
-        characters_result = _load_phase1_checkpoint(characters_checkpoint, "characters")
+        characters_input_hash = _phase1_input_hash(events)
+        characters_result = _load_phase1_checkpoint(
+            characters_checkpoint,
+            "characters",
+            input_hash=characters_input_hash,
+        )
+        if characters_result is not None:
+            characters = characters_result["characters"]
+            valid_characters = (
+                characters_result.get("source_text_hash") == characters_input_hash
+                and characters_result.get("total_characters") == len(characters)
+                and all(
+                    isinstance(character, dict)
+                    and bool(str(character.get("name", "")).strip())
+                    and _is_human_character(str(character.get("name", "")).strip())
+                    for character in characters
+                )
+            )
+            if not valid_characters:
+                characters_result = None
         if characters_result is not None:
             print("    ↻ 复用 phase1_characters.json，跳过角色发现")
         else:
-            characters_result = discover_characters(events)
-            _atomic_write_phase1_json(characters_checkpoint, characters_result)
+            characters_result = dict(discover_characters(events))
+            characters_result.setdefault("source_text_hash", characters_input_hash)
+            characters_result.setdefault(
+                "total_characters", len(characters_result.get("characters", []))
+            )
+            _atomic_write_phase1_json(
+                characters_checkpoint,
+                characters_result,
+                collection_key="characters",
+                input_hash=characters_input_hash,
+            )
         characters_list = characters_result.get("characters", [])
         print(f"    ✓ 发现 {len(characters_list)} 个角色")
         if reporter:

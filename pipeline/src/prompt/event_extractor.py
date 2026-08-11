@@ -12,7 +12,7 @@
 1. 接收 segments（从 text_parser 输出或直接文本）
 2. 对每个 segment，调用 LLM 提取事件
 3. 一个 segment 可能产生多个事件
-4. 解析失败则重试 1 次，仍失败则标记 error 跳过
+4. 解析或瞬时流错误重试 1 次，仍失败则终止，禁止静默丢事件
 5. 合并所有 segment 的事件，重新编号
 6. 输出 JSON
 """
@@ -21,12 +21,20 @@ import json
 import sys
 import os
 import argparse
+import hashlib
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 from openai import OpenAI
-from utils.ark_llm import call_llm_stream, create_ark_client
+from utils.ark_llm import (
+    LLMConnectTimeout,
+    LLMIdleTimeout,
+    LLMReadTimeout,
+    LLMStreamError,
+    call_llm_stream,
+    create_ark_client,
+)
 
 
 # ─── LLM 配置 ───────────────────────────────────────────────────────────────
@@ -54,8 +62,13 @@ USER_PROMPT_TEMPLATE = (
     "剧本对白可能写作 角色名：\"台词\" 或 角色名:\"台词\"，全角/半角冒号与引号均可能出现。"
 )
 
-LLM_TIMEOUT = 180  # 秒（2026-08-09: turbo 推理模型比 lite 慢，60s 实测 8/19 段超时）
+LLM_TIMEOUT = 300
+LLM_IDLE_TIMEOUT = 75
 MAX_RETRIES = 1  # 解析失败重试次数
+
+
+class EventExtractionError(RuntimeError):
+    """A non-empty source segment could not be extracted completely."""
 
 
 def _get_client() -> OpenAI:
@@ -70,7 +83,7 @@ def _get_client() -> OpenAI:
     Raises:
         SystemExit: 如果所有 API key 环境变量均未设置
     """
-    return create_ark_client()
+    return create_ark_client(read_timeout=LLM_IDLE_TIMEOUT)
 
 
 def _call_llm(prompt: str) -> str:
@@ -95,6 +108,7 @@ def _call_llm(prompt: str) -> str:
         ],
         max_tokens=16000,
         wall_timeout=LLM_TIMEOUT,
+        idle_timeout=LLM_IDLE_TIMEOUT,
         _client=client,
     )
 
@@ -157,7 +171,10 @@ def _extract_events_from_segment(segment: Dict[str, Any]) -> List[Dict[str, Any]
         segment: text_parser 输出的单个 segment 字典
 
     Returns:
-        事件列表（可能为空）
+        事件列表（有效响应可以为空）
+
+    Raises:
+        EventExtractionError: 非空 segment 在重试后仍无法完整提取
     """
     content = segment.get("content", "")
     if not content.strip():
@@ -177,14 +194,21 @@ def _extract_events_from_segment(segment: Dict[str, Any]) -> List[Dict[str, Any]
                 print(f"  JSON 解析失败，重试 ({attempt+1}/{MAX_RETRIES}): {e}", file=sys.stderr)
                 time.sleep(1)
             continue
-        except Exception as e:
+        except (LLMConnectTimeout, LLMReadTimeout, LLMIdleTimeout, LLMStreamError) as e:
             last_error = e
-            print(f"  LLM 调用失败: {e}", file=sys.stderr)
+            if attempt < MAX_RETRIES:
+                print(f"  LLM 流中断，重试 ({attempt+1}/{MAX_RETRIES}): {e}", file=sys.stderr)
+                time.sleep(1)
+                continue
             break
+        except Exception as e:
+            raise EventExtractionError(
+                f"segment {segment.get('id', '?')} LLM 调用失败: {e}"
+            ) from e
 
-    # 所有重试都失败
-    print(f"  事件提取失败 (segment {segment.get('id', '?')}): {last_error}", file=sys.stderr)
-    return []
+    raise EventExtractionError(
+        f"segment {segment.get('id', '?')} 事件提取失败（已重试 {MAX_RETRIES} 次）: {last_error}"
+    ) from last_error
 
 
 def extract_events(segments: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -210,8 +234,9 @@ def extract_events(segments: List[Dict[str, Any]]) -> Dict[str, Any]:
         print(f"处理 segment {segment_id}...", file=sys.stderr)
         return segment_id, _extract_events_from_segment(segment)
 
+    source_segments = [segment for segment in segments if str(segment.get("content", "")).strip()]
     with ThreadPoolExecutor(max_workers=3) as executor:
-        ordered_results = list(executor.map(extract_one, segments))
+        ordered_results = list(executor.map(extract_one, source_segments))
 
     for segment_id, events in ordered_results:
 
@@ -221,7 +246,14 @@ def extract_events(segments: List[Dict[str, Any]]) -> Dict[str, Any]:
             all_events.append(event)
             event_id += 1
 
+    source_hash = hashlib.sha256(
+        json.dumps(source_segments, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
     return {
+        "schema_version": "2.0",
+        "source_segments_hash": source_hash,
+        "source_segment_count": len(source_segments),
+        "covered_segment_ids": [segment_id for segment_id, _events in ordered_results],
         "total_events": len(all_events),
         "events": all_events,
     }

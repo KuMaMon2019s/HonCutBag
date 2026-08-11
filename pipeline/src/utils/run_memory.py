@@ -15,6 +15,7 @@ Embedder = Callable[[str], Sequence[float]]
 Summarizer = Callable[[list[dict[str, Any]]], str]
 _TOKEN_RE = re.compile(r"[\w]+", re.UNICODE)
 _VECTOR_SIZE = 256
+_SUMMARY_CHAR_LIMIT = 4000
 
 
 def hashed_bag_of_words(text: str) -> list[float]:
@@ -38,16 +39,16 @@ def cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
 
 
 def _default_summarizer(entries: list[dict[str, Any]]) -> str:
-    """Compress entries with the existing streaming LLM client."""
-    from quality.supervision_agent import _call_llm
-
-    payload = "\n".join(f"{entry['role']}: {entry['content']}" for entry in entries)
-    prompt = (
-        "Compress these run-memory entries into a concise factual summary. "
-        "Preserve decisions, failures, metrics, and artifact names. Do not add facts.\n\n"
-        f"{payload}"
-    )
-    return _call_llm(prompt, {"max_tokens": 512})
+    """Build a bounded local summary without a hidden post-run API call."""
+    facts = []
+    for entry in entries:
+        role = str(entry.get("role", "unknown")).strip() or "unknown"
+        content = " ".join(str(entry.get("content", "")).split())
+        facts.append(f"{role}: {content}")
+    summary = " | ".join(facts)
+    if len(summary) <= _SUMMARY_CHAR_LIMIT:
+        return summary
+    return summary[: _SUMMARY_CHAR_LIMIT - 1].rstrip() + "…"
 
 
 class RunMemory:
@@ -222,4 +223,3 @@ class RunMemory:
 def get_run_memory(output_dir: Path, query: str, **kwargs: Any) -> dict[str, Any]:
     """Module-level retrieval helper for future phase and quality consumers."""
     return RunMemory(output_dir).get(query, **kwargs)
-
