@@ -89,6 +89,7 @@ atris/
 # Internal task documents (do not publish)
 CODEX_*.md
 .atris/
+.archive/
 .codex-delivery/
 *.bundle
 
