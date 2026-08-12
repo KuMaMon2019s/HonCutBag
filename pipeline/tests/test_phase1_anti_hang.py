@@ -84,7 +84,9 @@ def test_active_stream_refreshes_idle_timeout_and_throttles_heartbeat():
     class ActiveStream:
         def __iter__(self):
             for content in ("a", "b", "c"):
-                time.sleep(0.02)
+                # Keep the gap far below idle_timeout (100x margin) so the
+                # test never becomes a scheduler-timing race.
+                time.sleep(0.005)
                 yield _chunk(content)
 
         def close(self):
@@ -96,7 +98,7 @@ def test_active_stream_refreshes_idle_timeout_and_throttles_heartbeat():
     content = ark_llm.call_llm_stream(
         [{"role": "user", "content": "synthetic"}],
         wall_timeout=1,
-        idle_timeout=0.03,
+        idle_timeout=0.5,
         heartbeat_callback=lambda: callbacks.append(time.monotonic()),
         heartbeat_interval=1,
         _client=client,

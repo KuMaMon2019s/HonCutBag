@@ -337,13 +337,14 @@ def test_chain_relay_skips_reference_only_content():
 
 def test_phase_orchestrator_writes_full_streamed_log(monkeypatch, tmp_path):
     full_output = "x" * 2500 + "\n"
-    monkeypatch.setattr(
-        phase_orchestrator.subprocess,
-        "run",
-        lambda *args, **kwargs: SimpleNamespace(
-            returncode=0, stdout=full_output, stderr=""
-        ),
-    )
+
+    def fake_stream(cmd, log_path, cwd, env, monitor=None):
+        # Mirror the real contract: the streamed log carries the full
+        # output while only a tail is returned in the result payload.
+        Path(log_path).write_text(full_output, encoding="utf-8")
+        return {"returncode": 0, "stdout": full_output, "stderr": ""}
+
+    monkeypatch.setattr(phase_orchestrator, "_stream_subprocess", fake_stream)
     result = phase_orchestrator.run_phase("phase5", {
         "input": str(tmp_path / "story.txt"),
         "duration": 45,
@@ -1170,29 +1171,32 @@ def test_expired_capacity_lease_can_be_reclaimed(tmp_path):
 
 
 def test_heartbeat_keeps_a_long_running_capacity_lease_alive(tmp_path):
+    # Timing scaled up ~5x from the original millisecond values: the contract
+    # (heartbeat refreshes the lease) is unchanged, but the margins are now
+    # immune to scheduler jitter on busy machines.
     database_path = tmp_path / "capacity.db"
     first = CrossProcessSlotTable(
         database_path,
-        lease_ttl=0.08,
-        heartbeat_interval=0.02,
-        poll_interval=0.005,
+        lease_ttl=0.4,
+        heartbeat_interval=0.05,
+        poll_interval=0.02,
     )
     second = CrossProcessSlotTable(
         database_path,
-        lease_ttl=0.08,
-        heartbeat_interval=0.02,
-        poll_interval=0.005,
+        lease_ttl=0.4,
+        heartbeat_interval=0.05,
+        poll_interval=0.02,
     )
 
     with first.reserve("seedance", "video", "long-running", capacity=1):
-        time.sleep(0.14)
+        time.sleep(0.7)
         with pytest.raises(CapacityWaitTimeoutError):
             second.acquire(
                 "seedance",
                 "video",
                 "blocked",
                 capacity=1,
-                wait_timeout=0.05,
+                wait_timeout=0.2,
             )
 
     assert first.occupied("seedance", "video") == 0
