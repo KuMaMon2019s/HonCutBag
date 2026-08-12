@@ -94,6 +94,28 @@ def _appearance_constraints(characters: list[Mapping[str, Any]], shot: Mapping[s
     return constraints
 
 
+def build_scene_reference_prompt(
+    where: str,
+    shots: list[Mapping[str, Any]],
+    visual_style: VisualStyle,
+) -> str:
+    """Build an empty-scene reference prompt with the same time/light contract."""
+    related = [shot for shot in shots if str(shot.get("where") or "").strip() == where]
+    evidence = " ".join(
+        str(shot.get(key) or "")
+        for shot in related
+        for key in ("time_of_day", "time", "visual", "lighting_description", "lighting_key")
+    )
+    style = visual_style.style_prompt_full or visual_style.style_prompt_short or "电影叙事风格"
+    lighting = _lighting_for(related[0] if related else {"where": where}, visual_style)
+    is_night = any(token in f"{evidence} {style}".lower() for token in ("夜", "night", "moon"))
+    time_lock = "深夜雨天，不得出现白天、日光、晴空或灰白日间天空。" if is_night else ""
+    return (
+        f"Scene: {where}. {time_lock}Lighting: {lighting}. Style: {style}. "
+        "Photorealistic environment, cinematic quality, no people, establishing shot."
+    )
+
+
 def generate_scene_consistency(
     storyboard: Mapping[str, Any],
     characters_data: Optional[Mapping[str, Any]] = None,

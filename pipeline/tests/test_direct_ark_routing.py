@@ -1410,3 +1410,103 @@ def test_ass_subtitles_keep_dialogue_cues_separate_and_fade():
     assert "{\\fad(180,220)}第二条" in dialogue_lines[1]
     assert "PlayResX: 1920" in content
     assert "PlayResY: 1080" in content
+
+
+def test_ffmpeg_fallback_keeps_all_words_in_one_dialogue_cue():
+    pages = RemotionCaptionBurn._caption_pages([
+        {"word": word, "startMs": index * 100, "endMs": (index + 1) * 100, "cueId": 0}
+        for index, word in enumerate("我从来没想伤你")
+    ])
+
+    assert pages == [("我从来没想伤你", 0.0, 0.7)]
+
+
+def test_asr_speech_is_kept_on_unmarked_shots_in_scripted_scene():
+    merged = pipeline_core._merge_shot_transcripts(
+        [
+            {"shot_id": "S01", "dialogue": {"line": "留下"}},
+            {"shot_id": "S02"},
+        ],
+        [1000, 1000],
+        [
+            {"text": "留下", "segments": []},
+            {"text": "你骗了我", "segments": [
+                {"word": "你骗了我", "start_ms": 100, "end_ms": 700},
+            ]},
+        ],
+    )
+
+    assert merged["shots"][1]["source"] == "asr"
+    assert merged["shots"][1]["text"] == "你骗了我"
+    assert merged["caption_segments"][1]["text"] == "你骗了我"
+
+
+def test_asr_speech_takes_priority_over_mismatched_script_line():
+    merged = pipeline_core._merge_shot_transcripts(
+        [{"shot_id": "S01", "dialogue": {"line": "剧本台词"}}],
+        [1000],
+        [{"text": "实际说出的话", "segments": [
+            {"word": "实际说出的话", "start_ms": 100, "end_ms": 800},
+        ]}],
+    )
+
+    assert merged["shots"][0]["source"] == "asr"
+    assert merged["shots"][0]["text"] == "实际说出的话"
+
+
+def test_final_mix_asr_uses_utterance_boundaries_for_caption_cues():
+    captions = pipeline_core._caption_segments_from_final_asr({
+        "utterances": [
+            {
+                "text": "第一句。",
+                "start_ms": 1000,
+                "end_ms": 1800,
+                "words": [{"word": "第一句", "start_ms": 1000, "end_ms": 1800}],
+            },
+            {
+                "text": "第二句！",
+                "start_ms": 2500,
+                "end_ms": 3300,
+                "words": [{"word": "第二句", "start_ms": 2500, "end_ms": 3300}],
+            },
+        ],
+    })
+
+    assert [item["text"] for item in captions] == ["第一句", "第二句"]
+    assert [(item["start"], item["end"]) for item in captions] == [
+        (1.0, 1.8),
+        (2.5, 3.3),
+    ]
+
+
+def test_final_mix_asr_splits_one_utterance_at_audible_pause():
+    captions = pipeline_core._caption_segments_from_final_asr({
+        "utterances": [{
+            "text": "第一句第二句",
+            "words": [
+                {"word": "第一句", "start_ms": 1000, "end_ms": 1800},
+                {"word": "第二句", "start_ms": 2100, "end_ms": 2800},
+            ],
+        }],
+    })
+
+    assert [item["text"] for item in captions] == ["第一句", "第二句"]
+
+
+def test_final_mix_asr_rejects_transient_noise_as_ultrashort_syllables():
+    captions = pipeline_core._caption_segments_from_final_asr({
+        "utterances": [{
+            "text": "还不够K五少令",
+            "words": [
+                {"word": "还", "start_ms": 1000, "end_ms": 1320},
+                {"word": "不", "start_ms": 1320, "end_ms": 1520},
+                {"word": "够", "start_ms": 1520, "end_ms": 1720},
+                {"word": "K", "start_ms": 2000, "end_ms": 2040},
+                {"word": "五", "start_ms": 2160, "end_ms": 2200},
+                {"word": "少", "start_ms": 2320, "end_ms": 2400},
+                {"word": "令", "start_ms": 2560, "end_ms": 2600},
+            ],
+        }],
+    })
+
+    assert [item["text"] for item in captions] == ["还不够"]

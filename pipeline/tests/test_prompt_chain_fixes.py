@@ -18,6 +18,8 @@ from phases.phase1.storyboard_generator import (
     generate_storyboard,
 )
 from phases.phase6.video_generator import build_video_prompt
+from phases.phase4.scene_consistency import build_scene_reference_prompt
+from prompt.prompt_router import route_prompt
 from tools.asset_packager import build_content_for_shot, inject_reference_instruction
 from utils.visual_style_spec import VisualStyle
 
@@ -205,3 +207,51 @@ def test_video_prompt_uses_neutral_lighting_for_empty_scene_consistency():
 
     assert "与全片美术风格一致的自然光照，明暗关系真实克制" in prompt
     assert "色温4800K" not in prompt
+
+
+def test_seedance_single_route_preserves_complete_rainy_night_prompt():
+    assembled = "镜头6。场景与光影：废弃高架桥，冷蓝雨夜。全局收尾：冷暗雨夜赛博霓虹。"
+
+    prompt = route_prompt(
+        "doubao-seedance-2.0-mini",
+        "single_shot",
+        {
+            "prompt": assembled,
+            "visual": "两人对话",
+            "where": "废弃高架桥",
+            "lighting_description": "冷蓝雨夜光，整镜头保持深夜",
+            "time_of_day": "夜间，雨天",
+        },
+    )
+
+    assert assembled in prompt
+    assert "Time and weather: 夜间，雨天" in prompt
+    assert "Lighting continuity: 冷蓝雨夜光" in prompt
+
+
+def test_video_prompt_adds_hard_night_lock_and_daylight_negative():
+    prompt = build_video_prompt(
+        {"id": 6, "where": "废弃高架桥", "visual": "两人在雨中对话"},
+        {"characters": []},
+        {
+            "global_style_lock": "冷暗雨夜赛博霓虹",
+            "shots": {"S06": {"lighting_description": "冷蓝雨夜光"}},
+        },
+        "seedance",
+    )
+
+    assert "从第一帧到最后一帧始终保持深夜" in prompt
+    assert "白天(daytime)" in prompt
+    assert "灰白日间天空(overcast daylight)" in prompt
+
+
+def test_scene_reference_prompt_inherits_night_weather_and_excludes_daylight():
+    prompt = build_scene_reference_prompt(
+        "废弃高架桥",
+        [{"where": "废弃高架桥", "time": "夜间，雨天", "visual": "霓虹在湿地反光"}],
+        VisualStyle(name="rainy-night", style_prompt_full="冷暗雨夜赛博霓虹"),
+    )
+
+    assert "深夜雨天" in prompt
+    assert "不得出现白天、日光" in prompt
+    assert "冷蓝雨夜光" in prompt

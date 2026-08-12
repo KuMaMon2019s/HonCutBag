@@ -72,6 +72,9 @@ def test_manifest_reference_order_matches_asset_packager_numbering(tmp_path, mon
         numbered = f"{reference['label']}为{reference['desc']}"
         assert numbered in prompt
         assert numbered in content_prompt
+    assert "分镜/分镜图.png是S02分镜首帧" in prompt
+    assert "构图、角色站位、场景结构、时间天气和光影" in prompt
+    assert "图片7为S02分镜首帧" in content_prompt
 
 
 def test_task_directory_matches_contract_structure(tmp_path):

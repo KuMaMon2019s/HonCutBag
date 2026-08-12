@@ -282,7 +282,7 @@ def collect_character_reference_assets(
 
 
 def inject_reference_instruction(prompt_text: str, descriptions: List[Any]) -> str:
-    """Inject 图片N descriptions using the shared manifest/content order."""
+    """Explain every reference image and bind only identity images as subjects."""
     if not descriptions:
         return prompt_text
     normalized = [
@@ -296,6 +296,8 @@ def inject_reference_instruction(prompt_text: str, descriptions: List[Any]) -> s
     subject_bindings = []
     subject_numbers = {}
     for image_number, item in enumerate(normalized, start=1):
+        if item.get("bind_subject", True) is False:
+            continue
         char_id = item.get("char_id") or str(image_number)
         if char_id in subject_numbers:
             continue
@@ -325,7 +327,10 @@ def inject_reference_instruction(prompt_text: str, descriptions: List[Any]) -> s
             return match.group(0)
         return f"<主体{subject_number}>"
     prompt_text = re.sub(r"\{主体N\}", replace_subject_placeholder, prompt_text)
-    instruction = f"{references}。{'；'.join(subject_bindings)}。生成时严格保持参考图中角色的外观一致。"
+    binding_text = "；".join(subject_bindings)
+    instruction = references + "。"
+    if binding_text:
+        instruction += f"{binding_text}。生成时严格保持参考图中角色的外观一致。"
     if "元素参考" in prompt_text:
         return re.sub(
             r"元素参考(?:声明)?\s*[：:]?\s*",
@@ -435,7 +440,9 @@ def build_content_for_shot(
     if prompt_text:
         content.append({"type": "text", "text": prompt_text})
 
-    # Every route starts from the per-shot storyboard image.
+    # Every route uses the per-shot storyboard image. Frame-based routes use it
+    # as a strict frame; Phantom uses it as a composition/environment reference
+    # alongside character identity references.
     storyboard_images_dir = output_dir / "storyboard_images"
     if not storyboard_images_dir.exists():
         print(
@@ -449,6 +456,11 @@ def build_content_for_shot(
             "path": shot_frame_path,
             "role": "first_frame",
             "priority": "high",
+            "bind_subject": False,
+            "reference_description": (
+                f"{shot_id}分镜首帧，用于锁定构图、角色站位、场景结构、"
+                "时间天气和光影"
+            ),
         })
 
     if strategy == "flf2v":
@@ -458,31 +470,37 @@ def build_content_for_shot(
                 "path": end_frame_path,
                 "role": "last_frame",
                 "priority": "high",
+                "bind_subject": False,
+                "reference_description": (
+                    f"{shot_id}分镜尾帧，用于锁定镜头结束时的动作、构图和光影"
+                ),
             })
         else:
             raise FileNotFoundError(
                 f"FLF2V end frame missing or too small: {end_frame_path}"
             )
     elif strategy == "phantom":
-        image_assets.extend(collect_character_reference_assets(output_dir, shot_meta))
-        frame_asset_count = sum(
-            asset["role"] in {"first_frame", "last_frame"}
+        storyboard_assets = [
+            {
+                **asset,
+                "role": "reference_image",
+                "reference_kind": "storyboard_composition",
+            }
             for asset in image_assets
-        )
-        if frame_asset_count:
-            image_assets = [
-                asset
-                for asset in image_assets
-                if asset["role"] not in {"first_frame", "last_frame"}
-            ]
-            print(
-                "  [assets] phantom: discarded frame-role image(s), "
-                "reference-only mode"
-            )
-        if not any(asset["role"] == "reference_image" for asset in image_assets):
+            if asset["role"] == "first_frame"
+        ]
+        character_assets = collect_character_reference_assets(output_dir, shot_meta)
+        if not character_assets:
             raise FileNotFoundError(
                 "Phantom character references missing for shot "
                 f"{shot_id}; expected face_closeup.png, full_body.png, or variant_*.png"
+            )
+        image_assets = character_assets
+        image_assets.extend(storyboard_assets)
+        if storyboard_assets:
+            print(
+                "  [assets] phantom: storyboard frame retained as a "
+                "composition/environment reference"
             )
 
     print(f"  [assets] {strategy}: images_used={len(image_assets)}")
@@ -541,6 +559,21 @@ def build_content_for_shot(
             text_item["text"] = inject_reference_instruction(
                 text_item["text"], uploaded_reference_descriptions
             )
+
+    if strategy in {"i2v", "flf2v"} and content:
+        frame_descriptions = [
+            asset for asset in image_assets
+            if asset.get("role") in {"first_frame", "last_frame"}
+        ]
+        text_item = next(
+            (item for item in content if item.get("type") == "text"), None
+        )
+        if text_item is not None and frame_descriptions:
+            frame_contract = "；".join(
+                f"图片{index}为{asset['reference_description']}"
+                for index, asset in enumerate(frame_descriptions, start=1)
+            )
+            text_item["text"] = f"分镜参考说明：{frame_contract}。{text_item['text']}"
 
     print(f"  [assets] 上传 {uploaded_count} 张参考图到 TOS")
     return content

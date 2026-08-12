@@ -83,20 +83,41 @@ def _build_seedance2_multi(shot_data: dict, assets: list) -> str:
 
 
 def _build_seedance2_single(shot_data: dict, assets: list) -> str:
-    """Seedance 2.0 单镜头模式：reference_image + 英文 prompt"""
-    visual = shot_data.get("visual", shot_data.get("prompt", ""))
+    """Seedance 2.0 单镜头模式：保留上游完整的镜头契约。
+
+    Phase 4/6 已经把角色、动作、场景、光照和全局风格组装进
+    ``prompt``。模型路由只能增强这份契约，不能退回只使用 ``visual``，
+    否则会丢失雨夜等跨镜头约束。
+    """
+    source_prompt = str(
+        shot_data.get("prompt") or shot_data.get("visual") or ""
+    ).strip()
     emotion = shot_data.get("emotion", "")
     where = shot_data.get("where", "")
     camera = shot_data.get("camera", "medium shot")
+    time_desc = shot_data.get("time_of_day") or shot_data.get("time") or ""
+    lighting = (
+        shot_data.get("lighting_description")
+        or shot_data.get("lighting")
+        or shot_data.get("lighting_key")
+        or ""
+    )
+    style = shot_data.get("style_anchor") or shot_data.get("style") or ""
     
     # 构建英文 prompt
     parts = []
     if where:
         parts.append(f"Scene: {where}.")
     parts.append(f"Shot: {camera}.")
+    if time_desc:
+        parts.append(f"Time and weather: {time_desc}.")
+    if lighting:
+        parts.append(f"Lighting continuity: {lighting}.")
     if emotion:
         parts.append(f"Mood: {emotion}.")
-    parts.append(visual)
+    if style:
+        parts.append(f"Style continuity: {style}.")
+    parts.append(source_prompt)
     
     # 角色参考绑定
     if assets:

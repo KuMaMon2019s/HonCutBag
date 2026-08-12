@@ -292,14 +292,19 @@ def _automatic_semantic_reviewer() -> SemanticReviewer | None:
     def review(frame_paths: list[Path], shot_meta: dict[str, Any]) -> dict[str, Any]:
         expected = {
             key: shot_meta.get(key)
-            for key in ("shot_id", "visual", "action", "who", "where", "characters")
+            for key in (
+                "shot_id", "visual", "action", "action_description", "who", "where",
+                "characters", "time", "time_of_day", "lighting", "lighting_key",
+                "lighting_description", "style_anchor",
+            )
             if shot_meta.get(key) not in (None, "", [])
         }
         prompt = (
             "Review these ordered frames from one generated video shot. Compare them with the expected "
             f"shot metadata: {json.dumps(expected, ensure_ascii=False)}. Detect character identity drift, "
             "extra or missing limbs/objects, broken anatomy, impossible geometry, continuity jumps, text or "
-            "watermark artifacts, and content that contradicts the shot. Return JSON only: "
+            "watermark artifacts, wrong time of day, daylight/night drift, weather drift, and lighting that "
+            "contradicts the shot or changes materially between the first and last supplied frame. Return JSON only: "
             '{"verdict":"pass|reshoot","issues":["..."],"confidence":0.0}.'
         )
         raw = client.review(frame_paths, prompt).strip()

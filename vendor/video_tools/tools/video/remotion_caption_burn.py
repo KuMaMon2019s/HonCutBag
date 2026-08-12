@@ -674,13 +674,11 @@ class RemotionCaptionBurn(BaseTool):
                 cue_groups.append([])
             cue_groups[-1].append(caption)
         for cue in cue_groups:
-            for index in range(0, len(cue), 4):
-                page = cue[index:index + 4]
-                pages.append((
-                    " ".join(item["word"] for item in page),
-                    page[0]["startMs"] / 1000.0,
-                    page[-1]["endMs"] / 1000.0,
-                ))
+            pages.append((
+                "".join(item["word"] for item in cue),
+                cue[0]["startMs"] / 1000.0,
+                cue[-1]["endMs"] / 1000.0,
+            ))
         return pages
 
     @classmethod

@@ -112,9 +112,22 @@ def build_task_dir(output_dir, shot_ids: Sequence[str], meta: Mapping) -> Path:
         prompt_dir.mkdir(parents=True, exist_ok=True)
         prompt = current.get("prompt", "")
         if references:
-            prompt = inject_reference_instruction(
-                prompt, [reference["desc"] for reference in references]
+            # Preserve character ids so face/full-body/variant images of one
+            # person bind to one subject, matching the ordinary content[] path.
+            prompt = inject_reference_instruction(prompt, assets)
+        frame_instructions = []
+        if first_frame:
+            frame_instructions.append(
+                f"{first_frame}是{shot_id}分镜首帧，用于锁定构图、角色站位、"
+                "场景结构、时间天气和光影"
             )
+        if last_frame:
+            frame_instructions.append(
+                f"{last_frame}是{shot_id}分镜尾帧，用于锁定镜头结束时的"
+                "动作、构图和光影"
+            )
+        if frame_instructions:
+            prompt = f"分镜参考说明：{'；'.join(frame_instructions)}。{prompt}"
         (prompt_dir / "提示词.txt").write_text(prompt, encoding="utf-8")
         manifest = {
             "shot_id": shot_id,

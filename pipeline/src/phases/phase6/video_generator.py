@@ -20,6 +20,26 @@ BASE_NEGATIVE_PROMPT = (
     "抖动运动(jittery motion), 伪影(artifacts)"
 )
 
+
+def _time_continuity_contract(*values: object) -> tuple[str, str]:
+    """Return a positive continuity lock and its contradictory visual guardrails."""
+    text = " ".join(str(value) for value in values if value).lower()
+    is_night = any(token in text for token in ("夜", "night", "moon", "月光"))
+    is_day = any(token in text for token in ("白天", "daytime", "daylight", "midday", "正午"))
+    if is_night and not is_day:
+        return (
+            "整个镜头从第一帧到最后一帧始终保持深夜，不得渐变为白天或黎明，"
+            "天空和环境不得出现日光",
+            "白天(daytime), 日光(daylight), 晴空(clear sky), 明亮天空(bright sky), "
+            "灰白日间天空(overcast daylight), 清晨(dawn), 日出(sunrise)",
+        )
+    if is_day and not is_night:
+        return (
+            "整个镜头从第一帧到最后一帧始终保持日间光照，不得渐变为夜景",
+            "深夜(deep night), 月光(moonlight), 纯夜景(night scene)",
+        )
+    return "", ""
+
 CAMERA_MOVEMENTS = {
     "dolly_in": "推进(dolly in)", "dolly_out": "拉出(dolly out)",
     "pan_left": "左摇(pan left)", "pan_right": "右摇(pan right)",
@@ -106,10 +126,22 @@ def build_video_prompt(
     style = scene.get("style_anchor") or scene.get("style_suffix") or scene_consistency.get("global_style_lock") or "电影叙事风格"
     style = get_slice(str(style), "video")
     quality = scene.get("quality_suffix") or f"4K, 16:9, {shot_meta.get('duration', 5)}秒"
+    time_lock, time_negative = _time_continuity_contract(
+        shot_meta.get("time_of_day"),
+        shot_meta.get("time"),
+        lighting,
+        style,
+        scene_consistency.get("global_style_lock"),
+    )
+    if time_lock:
+        # This is intentionally outside build_subject_summary's character budget.
+        parts.append(f"时空连续性硬约束：{time_lock}")
     # Layer 8 is appended after the bounded summary and is never truncated.
     parts.append(f"全局收尾：{style}；{quality}")
 
     negatives = [BASE_NEGATIVE_PROMPT, str(scene.get("negative_prompt", "")).strip()]
+    if time_negative:
+        negatives.append(time_negative)
     negatives.extend(str(char.get("negative_guardrails", "")).strip() for char in selected)
     negative_prompt = ", ".join(dict.fromkeys(item for item in negatives if item))
     prompt = "。".join(parts)

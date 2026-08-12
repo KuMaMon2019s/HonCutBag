@@ -122,20 +122,37 @@ def _normalise_transcription(payload: dict, fallback_duration_ms: int) -> dict:
     result = payload.get("result") or {}
     utterances = result.get("utterances") or []
     segments = []
+    normalized_utterances = []
     for utterance in utterances:
+        utterance_words = []
         for word in utterance.get("words") or []:
             text = word.get("text") or word.get("word") or ""
             if text:
-                segments.append({
+                normalized_word = {
                     "word": text,
                     "start_ms": int(word.get("start_time", word.get("start_ms", 0))),
                     "end_ms": int(word.get("end_time", word.get("end_ms", 0))),
-                })
+                }
+                segments.append(normalized_word)
+                utterance_words.append(normalized_word)
+        utterance_text = utterance.get("text") or "".join(
+            item["word"] for item in utterance_words
+        )
+        if utterance_text or utterance_words:
+            starts = [item["start_ms"] for item in utterance_words if item["start_ms"] >= 0]
+            ends = [item["end_ms"] for item in utterance_words if item["end_ms"] >= 0]
+            normalized_utterances.append({
+                "text": utterance_text,
+                "start_ms": int(utterance.get("start_time", min(starts) if starts else 0)),
+                "end_ms": int(utterance.get("end_time", max(ends) if ends else 0)),
+                "words": utterance_words,
+            })
     audio_info = payload.get("audio_info") or result.get("audio_info") or {}
     duration_ms = int(audio_info.get("duration") or fallback_duration_ms)
     return {
         "text": result.get("text") or "".join(item["word"] for item in segments),
         "segments": segments,
+        "utterances": normalized_utterances,
         "duration_ms": duration_ms,
     }
 

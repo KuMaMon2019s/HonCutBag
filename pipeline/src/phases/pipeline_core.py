@@ -2101,6 +2101,13 @@ def run_phase2(storyboard_data: dict, characters_data: dict, output_dir: Path, d
                 try:
                     scenes_dir = output_dir / "scenes"
                     scenes_dir.mkdir(exist_ok=True)
+                    from phases.phase4.scene_consistency import (
+                        _load_style as _load_scene_visual_style,
+                        build_scene_reference_prompt,
+                    )
+                    scene_visual_style = _load_scene_visual_style(
+                        output_dir / "visual-style.md"
+                    )
                     # 提取所有唯一场景
                     unique_wheres = list(set(
                         shot.get("where", "") for shot in storyboard_data.get("shots", [])
@@ -2116,7 +2123,11 @@ def run_phase2(storyboard_data: dict, characters_data: dict, output_dir: Path, d
                             scene_count += 1
                             continue
                         try:
-                            scene_prompt = f"Scene: {where}. Photorealistic environment, cinematic quality, no people, establishing shot."
+                            scene_prompt = build_scene_reference_prompt(
+                                where,
+                                list(storyboard_data.get("shots", [])),
+                                scene_visual_style,
+                            )
                             from clients.seedream_client import text_to_image
                             text_to_image(prompt=scene_prompt, output_path=str(ref_path))
                             scene_count += 1
@@ -2984,6 +2995,22 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
         if scene_consistency_data:
             from phases.phase6.video_generator import build_video_prompt
 
+            scene_contract = scene_consistency_data.get("shots", {}).get(
+                shot_dir.name, {}
+            )
+            if scene_contract:
+                meta["lighting_description"] = (
+                    scene_contract.get("lighting_description")
+                    or scene_contract.get("lighting_note")
+                    or meta.get("lighting_description")
+                )
+                meta["style_anchor"] = (
+                    scene_contract.get("style_anchor")
+                    or scene_contract.get("style_suffix")
+                    or scene_consistency_data.get("global_style_lock")
+                    or meta.get("style_anchor")
+                )
+
             routed_prompt = build_video_prompt(
                 meta,
                 chars_data,
@@ -3144,11 +3171,6 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                 meta["chain_source"] = None
                 meta["chain_active"] = False
                 meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-
-        # Add style prefix to every prompt
-        style_prefix = "Photorealistic, urban, Jiangnan aesthetic, lifelike skin texture, natural lighting, "
-        if not prompt.lower().startswith("photorealistic"):
-            prompt = style_prefix + prompt
 
         # --- P1-C2: 同场景同 seed ---
         shot_where = meta.get("where", "")
@@ -4431,21 +4453,16 @@ def clean_subtitle_text(text: str) -> str:
 
 
 def _merge_shot_transcripts(sb_shots: list, durations_ms: list[int], shot_transcripts: list[dict]) -> dict:
-    """Offset per-shot ASR words and create caption-burn segments."""
+    """Offset per-shot ASR words and create caption-burn segments.
+
+    Audible speech is the source of truth. Script dialogue is used only when
+    ASR found no speech for that shot; it must not suppress or replace words
+    that are actually present in generated source audio.
+    """
     merged_words = []
     caption_segments = []
     cumulative_ms = 0
     shot_entries = []
-    scripted_dialogue_present = any(
-        bool(
-            clean_subtitle_text(
-                shot.get("dialogue", {}).get("line", "")
-                if isinstance(shot.get("dialogue"), dict)
-                else str(shot.get("dialogue") or "")
-            )
-        )
-        for shot in sb_shots
-    )
     for index, (shot, duration_ms, transcription) in enumerate(
         zip(sb_shots, durations_ms, shot_transcripts), 1
     ):
@@ -4467,40 +4484,7 @@ def _merge_shot_transcripts(sb_shots: list, durations_ms: list[int], shot_transc
             dialogue.get("line", "") if isinstance(dialogue, dict) else str(dialogue or "")
         )
         scripted_text = clean_subtitle_text(dialogue_line)
-        normalized_script = "".join(scripted_text.casefold().split())
-        normalized_asr = "".join(asr_text.casefold().split())
-        asr_matches_script = bool(
-            normalized_script
-            and normalized_asr
-            and normalized_script in normalized_asr
-        )
-        # [DEPRECATED 2026-08-09] 旧逻辑：ASR 文本未去标点、未按 word 边界加空格
-        # 被新的字幕清洗逻辑取代，保留备查
-        # if local_words:
-        #     words = [{
-        #         "word": item.get("word") or item.get("text") or "",
-        #         "start_ms": cumulative_ms + int(item["start_ms"]),
-        #         "end_ms": cumulative_ms + int(item["end_ms"]),
-        #         "source": "asr",
-        #     } for item in local_words]
-        #     text = transcription.get("text") or "".join(item["word"] for item in words)
-        #     source = "asr"
-        if scripted_text and not asr_matches_script:
-            text = scripted_text
-            source = "dialogue_script"
-            words = [{
-                "word": text,
-                "start_ms": round(cumulative_ms + duration_ms * 0.2),
-                "end_ms": round(cumulative_ms + duration_ms * 0.8),
-                "source": source,
-            }]
-        elif scripted_dialogue_present and not scripted_text:
-            # In a scripted scene, unplanned ASR from action/noise must not
-            # create invented subtitles on shots that have no dialogue.
-            text = ""
-            source = "none"
-            words = []
-        elif local_words or asr_text:
+        if local_words or asr_text:
             words = []
             for item in local_words:
                 cleaned_word = clean_subtitle_text(item.get("word") or item.get("text") or "")
@@ -4521,32 +4505,19 @@ def _merge_shot_transcripts(sb_shots: list, durations_ms: list[int], shot_transc
                     "source": "asr",
                 }]
             source = "asr"
+        elif scripted_text:
+            text = scripted_text
+            source = "dialogue_script"
+            words = [{
+                "word": text,
+                "start_ms": round(cumulative_ms + duration_ms * 0.2),
+                "end_ms": round(cumulative_ms + duration_ms * 0.8),
+                "source": source,
+            }]
         else:
             words = []
-            text = clean_subtitle_text(dialogue_line)
-            source = "dialogue_script" if text else "none"
-            if text:
-                words = [{
-                    "word": text,
-                    "start_ms": round(cumulative_ms + duration_ms * 0.2),
-                    "end_ms": round(cumulative_ms + duration_ms * 0.8),
-                    "source": source,
-                }]
-
-            # [DEPRECATED 2026-08-09] 旧逻辑：逐字符 fallback 字幕（用户反馈：像随便贴的文字）
-            # 被新的"仅对白字幕"逻辑取代，保留备查
-            # text = shot.get("caption", "")
-            # words = []
-            # source = "script_fallback"
-            # if text:
-            #     characters = list(text)
-            #     per_character_ms = duration_ms / max(len(characters), 1)
-            #     words = [{
-            #         "word": character,
-            #         "start_ms": round(cumulative_ms + offset * per_character_ms),
-            #         "end_ms": round(cumulative_ms + (offset + 1) * per_character_ms),
-            #         "source": source,
-            #     } for offset, character in enumerate(characters)]
+            text = ""
+            source = "none"
 
         merged_words.extend(words)
         shot_entries.append({
@@ -4578,6 +4549,68 @@ def _merge_shot_transcripts(sb_shots: list, durations_ms: list[int], shot_transc
         "shots": shot_entries,
         "caption_segments": caption_segments,
     }
+
+
+def _caption_segments_from_final_asr(transcription: dict) -> list[dict]:
+    """Build cue-preserving captions from the audible final mix."""
+    captions = []
+    utterances = transcription.get("utterances") or []
+    if not utterances and (transcription.get("segments") or transcription.get("text")):
+        utterances = [{
+            "text": transcription.get("text", ""),
+            "words": transcription.get("segments") or [],
+        }]
+    for utterance in utterances:
+        cleaned_words = []
+        for item in utterance.get("words") or []:
+            cleaned = clean_subtitle_text(item.get("word") or item.get("text") or "")
+            start_ms = int(item.get("start_ms", item.get("start_time", -1)))
+            end_ms = int(item.get("end_ms", item.get("end_time", -1)))
+            if not cleaned or start_ms < 0 or end_ms <= start_ms:
+                continue
+            cleaned_words.append({
+                "word": cleaned,
+                "start": start_ms / 1000,
+                "end": end_ms / 1000,
+                "source": "final_mix_asr",
+            })
+        word_groups = []
+        for word in cleaned_words:
+            if word_groups and word["start"] - word_groups[-1][-1]["end"] >= 0.25:
+                word_groups.append([])
+            if not word_groups:
+                word_groups.append([])
+            word_groups[-1].append(word)
+        if not word_groups:
+            text = clean_subtitle_text(utterance.get("text") or "")
+            start_ms = int(utterance.get("start_ms", utterance.get("start_time", -1)))
+            end_ms = int(utterance.get("end_ms", utterance.get("end_time", -1)))
+            if not text or start_ms < 0 or end_ms <= start_ms:
+                continue
+            word_groups = [[{
+                "word": text,
+                "start": start_ms / 1000,
+                "end": end_ms / 1000,
+                "source": "final_mix_asr",
+            }]]
+        for group in word_groups:
+            # Generated impacts and metallic transients can be decoded as a
+            # run of implausibly short syllables. Without confidence scores,
+            # reject only the narrow high-speed pattern that repeatedly caused
+            # unstable text across ASR passes; normal short interjections stay.
+            mean_word_duration = sum(
+                item["end"] - item["start"] for item in group
+            ) / len(group)
+            if len(group) >= 2 and mean_word_duration < 0.1:
+                continue
+            captions.append({
+                "text": "".join(item["word"] for item in group),
+                "start": group[0]["start"],
+                "end": group[-1]["end"],
+                "source": "final_mix_asr",
+                "words": group,
+            })
+    return captions
 
 
 def _phase9_real_audio_tracks(
@@ -4712,6 +4745,8 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
         storyboard_data = json.loads(storyboard_path.read_text(encoding="utf-8"))
         sb_shots = storyboard_data.get("shots", [])
         shots_dir = output_dir / "shots"
+        asr_receipts_dir = output_dir / "asr_transcripts"
+        asr_receipts_dir.mkdir(parents=True, exist_ok=True)
         durations_ms = []
         shot_transcripts = []
         print("  → asr_transcription: 逐镜提取音轨并转写...")
@@ -4726,14 +4761,41 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
                 continue
             extract_audio_track(str(shot_video), str(wav_path))
             durations_ms.append(round(_probe_shot_duration(shots_dir, index) * 1000))
-            shot_transcripts.append(transcribe_audio(str(wav_path)))
+            transcription = transcribe_audio(str(wav_path))
+            shot_transcripts.append(transcription)
+            shot_id = _shot.get("shot_id") or _shot.get("id") or f"S{index:02d}"
+            receipt = {
+                "shot_id": str(shot_id),
+                "audio_path": str(wav_path),
+                "duration_ms": durations_ms[-1],
+                "transcription": transcription,
+            }
+            (asr_receipts_dir / f"S{index:02d}.json").write_text(
+                json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
         transcript_data = _merge_shot_transcripts(sb_shots, durations_ms, shot_transcripts)
+        transcript_data["asr_summary"] = {
+            "shots_submitted": len(shot_transcripts),
+            "shots_with_text": sum(bool(item.get("text") or item.get("segments"))
+                                   for item in shot_transcripts),
+            "raw_word_segments": sum(len(item.get("segments") or [])
+                                     for item in shot_transcripts),
+            "caption_segments": len(transcript_data["caption_segments"]),
+            "receipts_dir": "asr_transcripts",
+        }
         transcript_path = output_dir / "transcript.json"
         transcript_path.write_text(
             json.dumps(transcript_data, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         outputs.append("transcript.json")
-        print(f"    ✓ ASR 完成: {len(transcript_data['segments'])} 个词")
+        outputs.append("asr_transcripts/")
+        summary = transcript_data["asr_summary"]
+        print(
+            "    ✓ ASR 完成: "
+            f"{summary['shots_with_text']}/{summary['shots_submitted']} 镜有语音, "
+            f"{summary['raw_word_segments']} 个原始词段; "
+            f"生成 {summary['caption_segments']} 条字幕"
+        )
 
     try:
         from phases.phase9.visual_post import process_visual
@@ -4924,6 +4986,34 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
                 pass  # audio_pipeline not available, skip fallback
 
         audio_out = str(audio_out)
+
+        # Subtitle timing must reflect the audible final mix, including TTS
+        # overlays and generated speech that was absent from storyboard fields.
+        if sb_path_str:
+            final_mix_wav = output_dir / "asr_transcripts" / "final_mix.wav"
+            final_mix_wav.parent.mkdir(parents=True, exist_ok=True)
+            extract_audio_track(str(audio_out), str(final_mix_wav))
+            final_mix_transcription = transcribe_audio(str(final_mix_wav))
+            final_mix_receipt = {
+                "audio_path": str(final_mix_wav),
+                "transcription": final_mix_transcription,
+            }
+            (final_mix_wav.parent / "final_mix.json").write_text(
+                json.dumps(final_mix_receipt, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            final_mix_captions = _caption_segments_from_final_asr(final_mix_transcription)
+            transcript_data["shot_caption_segments"] = transcript_data["caption_segments"]
+            transcript_data["caption_segments"] = final_mix_captions
+            transcript_data["final_mix_transcription"] = final_mix_transcription
+            transcript_data["asr_summary"]["final_mix_caption_segments"] = len(
+                final_mix_captions
+            )
+            (output_dir / "transcript.json").write_text(
+                json.dumps(transcript_data, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            print(
+                f"  ✓ final_mix_asr: 最终混音识别出 {len(final_mix_captions)} 条对白字幕"
+            )
 
         # Step 9.2: visual_post
         print("  → visual_post: 视觉后期...")
