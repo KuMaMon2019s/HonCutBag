@@ -4,9 +4,11 @@
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -40,11 +42,29 @@ RUNNER = PIPELINE_DIR / "src" / "pipeline_runner.py"
 if str(RUNNER.parent) not in sys.path:
     sys.path.insert(0, str(RUNNER.parent))
 
+#: Phase subprocesses currently running, so a SIGINT/SIGTERM on the
+#: orchestrator terminates them too instead of leaving orphaned paid work.
+_ACTIVE_SUBPROCESSES: set = set()
+
+
+def _terminate_children(signum, frame):  # noqa: ARG001 - signal signature
+    for process in list(_ACTIVE_SUBPROCESSES):
+        try:
+            process.terminate()
+        except OSError:
+            pass
+    raise SystemExit(128 + int(signum))
+
+
+signal.signal(signal.SIGINT, _terminate_children)
+signal.signal(signal.SIGTERM, _terminate_children)
+
 from phases.phase1.adaptation_engine import (  # noqa: E402
     AVG_SHOT_DURATION,
     MAX_SHOT_DURATION,
     MIN_SHOT_DURATION,
 )
+from utils.phase_policy import get_policy  # noqa: E402
 
 
 def _normalize_shot_duration(config: dict) -> int:
@@ -186,6 +206,177 @@ def _set_report_status(report_path: Path, status: str) -> None:
     temporary.replace(report_path)
 
 
+def _stream_subprocess(cmd: list, log_path: Path, cwd: Path, env: dict, monitor=None) -> dict:
+    """Run ``cmd`` with live, line-buffered log capture.
+
+    Output is tee'd to ``log_path`` as it arrives (so external monitors can
+    watch a phase in real time) while a bounded in-memory tail is kept to
+    preserve the historical result contract (stdout tail / stderr tail).
+
+    ``monitor`` is an optional :class:`PhaseMonitor` whose watchdog thread
+    lives exactly as long as this subprocess (created when the phase starts,
+    joined when it ends) — one sentinel per phase, never a global one.
+    """
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+
+    with log_path.open("w", encoding="utf-8", buffering=1) as log_file:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=cwd,
+            env=env,
+            bufsize=1,
+        )
+        _ACTIVE_SUBPROCESSES.add(process)
+        monitor_stop = threading.Event()
+        monitor_thread = None
+        if monitor is not None:
+            monitor_thread = threading.Thread(
+                target=monitor.run, args=(process, monitor_stop), daemon=True
+            )
+            monitor_thread.start()
+        try:
+            def _drain(stream, sink: list[str]) -> None:
+                for line in iter(stream.readline, ""):
+                    sink.append(line)
+                    if len(sink) > 4000:
+                        del sink[:2000]
+                    log_file.write(line)
+
+            stdout_thread = threading.Thread(
+                target=_drain, args=(process.stdout, stdout_chunks), daemon=True
+            )
+            stderr_thread = threading.Thread(
+                target=_drain, args=(process.stderr, stderr_chunks), daemon=True
+            )
+            stdout_thread.start()
+            stderr_thread.start()
+            stdout_thread.join()
+            stderr_thread.join()
+            returncode = process.wait()
+        finally:
+            monitor_stop.set()
+            if monitor_thread is not None:
+                monitor_thread.join(timeout=5.0)
+            _ACTIVE_SUBPROCESSES.discard(process)
+
+    stdout_text = "".join(stdout_chunks)
+    stderr_text = "".join(stderr_chunks)
+    return {"returncode": returncode, "stdout": stdout_text, "stderr": stderr_text}
+
+
+class PhaseMonitor:
+    """Per-phase stall sentinel.
+
+    Lifecycle is bound to one phase subprocess: the orchestrator creates it
+    when the phase starts and joins it when the phase ends (the "create a
+    sentinel per stage, retire it on stage exit" contract).
+
+    Healthy heartbeat = the newest mtime among events.jsonl, progress.json,
+    the live phase log, and any artifact matching the phase policy. Past
+    ``soft_stall_s`` an alert file is written (observation only, never a
+    kill); past ``hard_stall_s`` the subprocess receives SIGTERM so the
+    pipeline fails closed at a resumable checkpoint. A grace window covers
+    cold starts where no artifact exists yet.
+    """
+
+    def __init__(
+        self,
+        output_dir: Path,
+        phase: str,
+        policy,
+        log_path: Path,
+        grace_s: int = 60,
+        interval_s: float = 15.0,
+    ):
+        self.output_dir = Path(output_dir)
+        self.phase = phase
+        self.policy = policy
+        self.log_path = Path(log_path)
+        self.grace_s = grace_s
+        self.interval_s = interval_s
+        self.alert_file = self.output_dir / "monitor_alert.json"
+        self.stall_killed = False
+        self.kill_reason = ""
+
+    def heartbeat_paths(self) -> list:
+        candidates = [
+            self.output_dir / "events.jsonl",
+            self.output_dir / "progress.json",
+            self.log_path,
+        ]
+        for pattern in self.policy.artifacts:
+            candidates.extend(self.output_dir.glob(pattern))
+        return [p for p in candidates if p.exists()]
+
+    def newest_heartbeat_age(self, now=None) -> float:
+        import time as _time
+
+        now = now if now is not None else _time.time()
+        newest = 0.0
+        for path in self.heartbeat_paths():
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            newest = max(newest, mtime)
+        if newest == 0.0:
+            # Nothing to observe yet — treat as "no heartbeat recorded" and
+            # let the caller's grace window decide.
+            return float("inf")
+        return max(0.0, now - newest)
+
+    def _write_alert(self, age: float) -> None:
+        payload = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "phase": self.phase,
+            "kind": "soft_stall",
+            "heartbeat_age_s": round(age, 1),
+            "soft_stall_s": self.policy.soft_stall_s,
+            "hard_stall_s": self.policy.hard_stall_s,
+            "note": "observation only; pipeline not killed",
+        }
+        _write_progress(self.alert_file, payload)
+
+    def _clear_alert(self) -> None:
+        try:
+            self.alert_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def run(self, process, stop_event) -> None:
+        import time as _time
+
+        started = _time.monotonic()
+        while not stop_event.wait(self.interval_s):
+            if process.poll() is not None:
+                break
+            elapsed = _time.monotonic() - started
+            if elapsed < self.grace_s:
+                continue
+            age = self.newest_heartbeat_age()
+            if age > self.policy.hard_stall_s:
+                self.stall_killed = True
+                self.kill_reason = (
+                    f"hard stall: no heartbeat for {age:.0f}s "
+                    f"(threshold {self.policy.hard_stall_s}s)"
+                )
+                self._write_alert(age)
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
+                break
+            if age > self.policy.soft_stall_s:
+                self._write_alert(age)
+            else:
+                self._clear_alert()
+        self._clear_alert()
+
+
 def run_phase(phase: str, config: dict) -> dict:
     """Run a single phase and return its process status."""
     report_path = Path(config["output_dir"]) / "pipeline_report.json"
@@ -220,23 +411,34 @@ def run_phase(phase: str, config: dict) -> dict:
     log_dir = Path(config["output_dir"]) / "phase_logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{phase}_run.log"
-    result = subprocess.run(cmd, capture_output=True, text=True, cwd=RUNNER.parent)
-    log_path.write_text(
-        f"=== {phase} phase run log ===\n"
-        f"{result.stdout}"
-        "\n=== STDERR ===\n"
-        f"{result.stderr}",
-        encoding="utf-8",
+
+    # Per-phase sentinel: created here, retired when the subprocess exits.
+    policy = get_policy(phase, config.get("monitor_overrides"))
+    monitor = PhaseMonitor(
+        output_dir=Path(config["output_dir"]),
+        phase=phase,
+        policy=policy,
+        log_path=log_path,
     )
+
+    # Child reporters append to the shared events.jsonl instead of clearing
+    # it, preserving cross-phase history for monitors and post-mortems.
+    child_env = {**os.environ, "HONCUT_APPEND_EVENTS": "1"}
+    result = _stream_subprocess(cmd, log_path, RUNNER.parent, child_env, monitor=monitor)
     _merge_phase_report(report_path, existing_report, phase)
-    return {
+    phase_result = {
         "phase": phase,
-        "exit_code": result.returncode,
-        "stdout": result.stdout[-2000:],
-        "stderr": result.stderr[-1000:],
+        "exit_code": result["returncode"],
+        "stdout": result["stdout"][-2000:],
+        "stderr": result["stderr"][-1000:],
         "log_path": str(log_path),
         "timestamp": datetime.now().isoformat(),
     }
+    if monitor.stall_killed:
+        phase_result["stall_killed"] = True
+        phase_result["stall_reason"] = monitor.kill_reason
+        print(f"🚨 {phase} monitor: {monitor.kill_reason}", flush=True)
+    return phase_result
 
 
 def main() -> None:

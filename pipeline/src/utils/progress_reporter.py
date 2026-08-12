@@ -25,7 +25,7 @@ from typing import Optional
 class ProgressReporter:
     """管线进度报告器 — events.jsonl + progress.json"""
 
-    def __init__(self, output_dir: str, total_phases: int = 10):
+    def __init__(self, output_dir: str, total_phases: int = 10, clear_events: bool = True):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.events_file = self.output_dir / "events.jsonl"
@@ -42,8 +42,11 @@ class ProgressReporter:
         self._heartbeat_stop: Optional[threading.Event] = None
         self._heartbeat_thread: Optional[threading.Thread] = None
 
-        # 清空旧的 events 文件（新管线运行 = 新日志）
-        self.events_file.write_text("")
+        # 默认清空旧的 events 文件（新管线运行 = 新日志）；
+        # 当编排器以 HONCUT_APPEND_EVENTS 启动各 Phase 子进程时传
+        # clear_events=False，跨阶段历史得以保留给监控与事后复盘。
+        if clear_events:
+            self.events_file.write_text("")
 
     # ------------------------------------------------------------------
     # Public API

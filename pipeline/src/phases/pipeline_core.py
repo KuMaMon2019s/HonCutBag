@@ -5411,7 +5411,12 @@ def run_pipeline(
             print(f"  ⚠ [M6] resume-from 解析失败: {e}")
 
     # ---- 进度报告系统初始化 ----
-    reporter = ProgressReporter(str(output_path), total_phases=len(PHASE_ORDER))
+    # 编排器为每个 Phase 子进程设置 HONCUT_APPEND_EVENTS=1，跨阶段 events 历史保留。
+    reporter = ProgressReporter(
+        str(output_path),
+        total_phases=len(PHASE_ORDER),
+        clear_events=not os.environ.get("HONCUT_APPEND_EVENTS"),
+    )
 
     # --- M6: 产物链（增量）---
     try:
