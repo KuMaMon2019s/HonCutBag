@@ -11,8 +11,9 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from phases import pipeline_core
+import phases.phase1.director_planner as director_planner
 import phases.phase1.storyboard_generator as storyboard_generator
+from phases import pipeline_core
 from prompt import event_extractor, text_parser
 from utils import ark_llm
 from utils.progress_reporter import ProgressReporter
@@ -226,6 +227,77 @@ def test_progress_reporter_emits_heartbeat(tmp_path):
     assert heartbeats
     assert heartbeats[0]["phase"] == "phase1"
     assert "elapsed_s" in heartbeats[0]
+
+
+def test_director_planner_uses_shared_streaming_client(monkeypatch, tmp_path):
+    client = object()
+    observed = {}
+
+    monkeypatch.setattr(director_planner, "get_api_key", lambda _name: "test-key")
+
+    def fake_client(**kwargs):
+        observed["client_args"] = kwargs
+        return client
+
+    monkeypatch.setattr(director_planner, "create_ark_client", fake_client)
+
+    def fake_stream(*, messages, **kwargs):
+        observed["messages"] = messages
+        observed["stream_args"] = kwargs
+        return json.dumps({"scenes": [], "scene_transitions": []})
+
+    monkeypatch.setattr(director_planner, "call_llm_stream", fake_stream)
+
+    result = director_planner.plan_director("云海中的仙宫", tmp_path)
+
+    assert result["status"] == "done"
+    assert observed["client_args"] == {"read_timeout": director_planner.LLM_IDLE_TIMEOUT}
+    assert observed["stream_args"]["_client"] is client
+    assert observed["stream_args"]["wall_timeout"] == director_planner.LLM_WALL_TIMEOUT
+    assert observed["stream_args"]["idle_timeout"] == director_planner.LLM_IDLE_TIMEOUT
+    assert observed["messages"][0]["role"] == "system"
+    assert json.loads((tmp_path / "director_plan.json").read_text())["scenes"] == []
+
+
+def test_combined_phase1_starts_progress_before_director(monkeypatch, tmp_path):
+    calls = []
+
+    class Reporter:
+        _current_phase = None
+        _progress_pct = 0
+
+        def phase_start(self, phase, name):
+            self._current_phase = phase
+            calls.append(("phase_start", phase, name))
+
+        def step(self, phase, message, progress_pct=None):
+            self._progress_pct = progress_pct or self._progress_pct
+            calls.append(("step", phase, message))
+
+        def start_heartbeat(self, phase):
+            calls.append(("heartbeat_start", phase))
+
+        def stop_heartbeat(self):
+            calls.append(("heartbeat_stop",))
+
+    def fake_director(*_args, **_kwargs):
+        calls.append(("director",))
+        return {"status": "done"}
+
+    monkeypatch.setattr(pipeline_core, "run_phase1_director", fake_director)
+    monkeypatch.setattr(
+        pipeline_core,
+        "run_phase1_screenwriter",
+        lambda *_args, **_kwargs: {"status": "done"},
+    )
+
+    result = pipeline_core.run_phase1(
+        "synthetic", tmp_path, 30, False, reporter=Reporter()
+    )
+
+    assert result["status"] == "done"
+    assert calls.index(("heartbeat_start", "phase1")) < calls.index(("director",))
+    assert calls[-1] == ("heartbeat_stop",)
 
 
 def test_storyboard_default_path_runs_three_shots_concurrently(monkeypatch):

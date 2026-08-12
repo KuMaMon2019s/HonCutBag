@@ -1163,15 +1163,38 @@ def run_phase1(
 ) -> dict:
     """Phase 1: director planning followed by the screenwriter engine."""
     started = _now()
-    director = run_phase1_director(text, Path(output_dir), dry_run)
-    screenwriter = run_phase1_screenwriter(
-        text,
-        output_dir,
-        duration,
-        dry_run,
-        reporter=reporter,
-        shot_duration=shot_duration,
-    )
+    if reporter:
+        # LangGraph enters the combined runner directly, so establish visible
+        # progress before the director's first network request.  Sequential
+        # execution may already have called phase_start; avoid a duplicate.
+        if (
+            getattr(reporter, "_current_phase", None) != "phase1"
+            and hasattr(reporter, "phase_start")
+        ):
+            reporter.phase_start("phase1", "导演拆解 + 编剧引擎")
+        reporter.step("phase1", "导演规划", progress_pct=1)
+        reporter.start_heartbeat("phase1")
+        configure_heartbeat_callback(
+            lambda: reporter.step(
+                "phase1",
+                "导演规划 LLM 流式响应",
+                progress_pct=getattr(reporter, "_progress_pct", 1),
+            )
+        )
+    try:
+        director = run_phase1_director(text, Path(output_dir), dry_run)
+        screenwriter = run_phase1_screenwriter(
+            text,
+            output_dir,
+            duration,
+            dry_run,
+            reporter=reporter,
+            shot_duration=shot_duration,
+        )
+    finally:
+        configure_heartbeat_callback(None)
+        if reporter:
+            reporter.stop_heartbeat()
     combined = dict(screenwriter)
     combined["director"] = director
     combined["duration_s"] = _elapsed(started)

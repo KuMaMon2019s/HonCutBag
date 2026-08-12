@@ -6,14 +6,13 @@ director_planner.py — M1: HonCut 导演规划层
 """
 
 import json
-import sys
 from pathlib import Path
-from typing import Optional
 
+from utils.ark_llm import call_llm_stream, create_ark_client
 from utils.config import get_api_key
 
-# Phase 1 LLM 使用 Agent Plan 端点（不是按量计费端点）
-ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/plan/v3"
+LLM_WALL_TIMEOUT = 240
+LLM_IDLE_TIMEOUT = 75
 
 SYSTEM_PROMPT = (
     "你是资深影视导演。对剧本做导演级规划分析。"
@@ -77,67 +76,68 @@ USER_PROMPT_TEMPLATE = (
 def plan_director(script_text: str, output_dir: Path, dry_run: bool = False) -> dict:
     """
     Phase 1: 导演规划
-    
+
     Args:
         script_text: 剧本文本
         output_dir: 输出目录
         dry_run: dry-run 模式
-    
+
     Returns:
         director_plan dict
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     plan_path = output_dir / "director_plan.json"
-    
+
     if dry_run:
         print("  ⊘ dry-run 模式，跳过导演规划")
         return {"status": "skipped", "reason": "dry-run"}
-    
+
     # 调用 LLM
     try:
-        from openai import OpenAI
         api_key = get_api_key("ARK_AGENT_API_KEY")
         if not api_key:
             print("  ⚠ [M1] ARK_AGENT_API_KEY 未设置，降级跳过导演规划")
             return {"status": "skipped", "reason": "no_api_key"}
-        
-        client = OpenAI(api_key=api_key, base_url=ARK_BASE_URL)
+
+        client = create_ark_client(read_timeout=LLM_IDLE_TIMEOUT)
         user_prompt = USER_PROMPT_TEMPLATE.format(script_text=script_text[:8000])
-        
-        response = client.chat.completions.create(
-            model="doubao-seed-2.1-turbo",
+
+        content = call_llm_stream(
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
-            timeout=240,  # 2026-08-09: turbo 推理模型需要更长推理时间
+            model="doubao-seed-2.1-turbo",
+            max_tokens=8000,
+            wall_timeout=LLM_WALL_TIMEOUT,
+            idle_timeout=LLM_IDLE_TIMEOUT,
+            _client=client,
         )
-        
-        content = response.choices[0].message.content
+
         if not content:
             raise ValueError("LLM 返回空内容")
-        
+
         # 解析 JSON（兼容 markdown 代码块包裹）
         text = content.strip()
         if text.startswith("```"):
             lines = text.split("\n")
             text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
-        
+
         plan = json.loads(text)
-        
+
         # 写入文件
         plan_path.write_text(json.dumps(plan, indent=2, ensure_ascii=False), encoding="utf-8")
-        
+
         scenes = plan.get("scenes", [])
         transitions = plan.get("scene_transitions", [])
         print(f"  ✓ [M1] 导演规划完成: {len(scenes)} 场, {len(transitions)} 个过渡")
         for s in scenes:
             print(f"    {s.get('scene_id', '?')}: {s.get('scene_name', '?')} "
                   f"(情绪{s.get('emotion_intensity', '?')}/10, {s.get('emotion_arc', '?')})")
-        
+
         return {"status": "done", "plan": plan, "output": str(plan_path)}
-    
+
     except Exception as e:
         print(f"  ⚠ [M1] 导演规划失败（降级跳过）: {e}")
         return {"status": "error", "error": str(e)}
