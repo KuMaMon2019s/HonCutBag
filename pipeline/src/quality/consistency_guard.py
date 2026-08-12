@@ -82,6 +82,47 @@ def _fuzzy_match(feature: str, prompt: str) -> bool:
     return False
 
 
+def _shot_id(shot: dict) -> str:
+    """Return a stable display id for both numeric and prefixed shot ids."""
+    raw_id = shot.get("id", "?")
+    if isinstance(raw_id, int):
+        return f"S{raw_id:02d}"
+    text = str(raw_id)
+    return text if text.upper().startswith("S") else f"S{text.zfill(2)}"
+
+
+def _character_is_in_shot(character_name: str, shot: dict) -> bool:
+    """Use explicit cast metadata when present; otherwise keep legacy behavior."""
+    who = shot.get("who")
+    if isinstance(who, list) and who:
+        return character_name in {str(item) for item in who}
+    if isinstance(who, str) and who.strip():
+        return character_name in who
+
+    assets = shot.get("associate_assets")
+    if isinstance(assets, list) and assets:
+        character_assets = {
+            str(item).split(":", 1)[1]
+            for item in assets
+            if str(item).startswith("char:")
+        }
+        if character_assets:
+            return character_name in character_assets
+    return True
+
+
+def _shot_character_contract(shot: dict) -> str:
+    """Collect all prompt-contract fields that describe on-screen identity."""
+    fields = (
+        "prompt",
+        "subject_description",
+        "visual",
+        "action_description",
+        "what",
+    )
+    return "\n".join(str(shot.get(field, "")) for field in fields)
+
+
 def check_character_consistency(
     characters_data: dict,
     shots_data: dict,
@@ -133,11 +174,14 @@ def check_character_consistency(
         if not expected_features:
             continue
         
-        # 检查每个 shot 是否包含角色特征
+        # 只检查角色实际出场的镜头，并覆盖新旧两套分镜字段契约。
         missing_in_shots = []
+        relevant_shots = []
         for shot in shots:
-            shot_id = shot.get("id")
-            prompt = shot.get("prompt", "")
+            if not _character_is_in_shot(name, shot):
+                continue
+            relevant_shots.append(shot)
+            prompt = _shot_character_contract(shot)
             
             # 检查是否有任何特征在 prompt 中缺失
             feature_found = False
@@ -148,14 +192,14 @@ def check_character_consistency(
                     break
             
             if not feature_found:
-                missing_in_shots.append(f"S{shot_id:02d}")
+                missing_in_shots.append(_shot_id(shot))
             
             total_checks += 1
             if feature_found:
                 passed_checks += 1
         
         # 如果角色在超过 30% 的 shots 中缺失特征，标记为不一致
-        if len(missing_in_shots) > len(shots) * 0.3:
+        if relevant_shots and len(missing_in_shots) > len(relevant_shots) * 0.3:
             inconsistent_characters.append({
                 "name": name,
                 "expected_features": expected_features,

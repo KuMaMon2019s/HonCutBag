@@ -8,6 +8,14 @@ from collections import Counter
 from typing import Any
 
 
+def _shot_language_value(scene: dict[str, Any], key: str, default: Any = None) -> Any:
+    """Accept nested quality input and the pipeline's flat STORYBOARD schema."""
+    nested = scene.get("shot_language")
+    if isinstance(nested, dict) and nested.get(key) not in (None, ""):
+        return nested[key]
+    return scene.get(key, default)
+
+
 def score_slideshow_risk(
     scenes: list[dict[str, Any]],
     edit_decisions: dict[str, Any] | None = None,
@@ -32,10 +40,13 @@ def score_slideshow_risk(
 def _score_repetition(scenes: list[dict[str, Any]]) -> dict[str, Any]:
     if len(scenes) < 3:
         return {"score": 0.0, "reason": "Too few scenes to assess repetition"}
-    types = Counter(s.get("type", "unknown") for s in scenes)
+    types = Counter(s.get("type") or s.get("shot_type") or "unknown" for s in scenes)
     common_type, common_count = types.most_common(1)[0]
-    descriptions = [s.get("description", "").lower()[:50] for s in scenes]
-    sizes = [s.get("shot_language", {}).get("shot_size", "none") for s in scenes]
+    descriptions = [
+        str(s.get("description") or s.get("visual") or s.get("what") or "").lower()[:50]
+        for s in scenes
+    ]
+    sizes = [_shot_language_value(s, "shot_size", "none") for s in scenes]
     score, reasons = 0.0, []
     if common_count / len(scenes) > 0.7:
         score += 2.0; reasons.append(f"Scene type '{common_type}' dominates at {common_count / len(scenes):.0%}")
@@ -55,7 +66,12 @@ def _score_decorative(scenes: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _score_weak_motion(scenes: list[dict[str, Any]]) -> dict[str, Any]:
-    moving = [s for s in scenes if s.get("shot_language", {}).get("camera_movement", "static") not in ("static", "unspecified", None)]
+    moving = [
+        s
+        for s in scenes
+        if _shot_language_value(s, "camera_movement", "static")
+        not in ("static", "fixed", "unspecified", None)
+    ]
     if not moving:
         return {"score": 1.5, "reason": "No camera movement defined (may be intentional for static style)"}
     purposeless = sum(not s.get("shot_intent") for s in moving)
@@ -84,8 +100,12 @@ def _score_cinematic_claims(scenes: list[dict[str, Any]], renderer_family: str |
         return {"score": 0.0, "reason": "Not claiming cinematic treatment"}
     issues = []
     if not any(s.get("hero_moment") for s in scenes): issues.append("Claims cinematic but has no hero_moment defined")
-    moving = sum(s.get("shot_language", {}).get("camera_movement", "static") != "static" for s in scenes)
+    moving = sum(
+        _shot_language_value(s, "camera_movement", "static")
+        not in ("static", "fixed", "unspecified", None)
+        for s in scenes
+    )
     if moving < len(scenes) * .3: issues.append(f"Claims cinematic but only {moving}/{len(scenes)} scenes have camera movement")
-    lit = sum(bool(s.get("shot_language", {}).get("lighting_key")) for s in scenes)
+    lit = sum(bool(_shot_language_value(s, "lighting_key")) for s in scenes)
     if lit < len(scenes) * .3: issues.append(f"Claims cinematic but only {lit}/{len(scenes)} scenes define lighting")
     return {"score": round(min(5.0, len(issues) * 1.8), 1), "reason": "; ".join(issues) or "Cinematic claims supported by structure"}

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import mimetypes
 import os
 import queue
@@ -53,7 +54,24 @@ class ArkMultimodalClient:
         if not path.is_file():
             raise FileNotFoundError(f"storyboard image not found: {path}")
         mime_type = mimetypes.guess_type(path.name)[0] or "image/png"
-        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        payload = path.read_bytes()
+        try:
+            from PIL import Image
+
+            max_edge = int(os.environ.get("HONCUT_MULTIMODAL_MAX_IMAGE_EDGE", "1280"))
+            if max_edge <= 0:
+                raise ValueError("HONCUT_MULTIMODAL_MAX_IMAGE_EDGE must be positive")
+            with Image.open(path) as source:
+                image = source.convert("RGB")
+                image.thumbnail((max_edge, max_edge))
+                buffer = io.BytesIO()
+                image.save(buffer, format="JPEG", quality=82, optimize=True)
+                payload = buffer.getvalue()
+                mime_type = "image/jpeg"
+        except (ImportError, OSError):
+            # Keep compatibility with environments or fixtures without Pillow.
+            pass
+        encoded = base64.b64encode(payload).decode("ascii")
         return f"data:{mime_type};base64,{encoded}"
 
     def review(self, image_paths: list[Path], prompt: str) -> str:

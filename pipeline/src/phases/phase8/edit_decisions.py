@@ -114,6 +114,8 @@ def build_edit_decisions(
     transition_decisions: Optional[list] = None,
     quality_report: Optional[dict] = None,
     shot_order: Optional[list[str]] = None,
+    target_duration: Optional[float] = None,
+    transition_duration: float = 0.5,
 ) -> dict:
     """Build reviewed edit decisions from shot videos.
 
@@ -185,8 +187,23 @@ def build_edit_decisions(
                 transitions.append({
                     "index": i,
                     "type": td["decision"],
-                    "duration": 0.5,
+                    "duration": transition_duration,
                 })
+
+    # Crossfades overlap neighboring clips. Compensate with one bounded speed
+    # factor so the assembled timeline stays close to the requested duration.
+    if target_duration and cuts:
+        source_duration = sum(cut["out_seconds"] - cut["in_seconds"] for cut in cuts)
+        overlap = sum(
+            0.01 if item["type"] == "cut" else float(item["duration"])
+            for item in transitions
+        )
+        projected = source_duration - overlap
+        if projected < float(target_duration):
+            speed = source_duration / (float(target_duration) + overlap)
+            if 0.85 <= speed < 1.0:
+                for cut in cuts:
+                    cut["speed"] = round(speed, 6)
 
     return {
         "cuts": cuts,
@@ -194,6 +211,7 @@ def build_edit_decisions(
         "metadata": {
             "compose_target": {"width": target_width, "height": target_height, "fit": "pad"},
             "target_fps": 30,
+            "target_duration": target_duration,
             "quality_reviewed": bool(quality_report),
         },
     }
@@ -403,58 +421,66 @@ def _concat_copy(segments: list, output_path: Path,
 
 def _xfade_chain(segments: list, transitions: list, output_path: Path,
                  temp_dir: Path, temp_files: list):
-    """Apply xfade transitions between segments."""
-    n = len(segments)
-    durations = [probe_video(s)["duration"] for s in segments]
+    """Apply xfade transitions as bounded pairwise renders.
+
+    FFmpeg 9 can truncate a long, nested xfade filter graph even when every
+    input has normalized timestamps. Rendering one transition at a time keeps
+    each graph simple and makes every intermediate duration independently
+    probeable.
+    """
     trans_map = {t["index"]: t for t in transitions}
-
-    input_args = []
-    for seg in segments:
-        input_args += ["-i", seg]
-
-    vf, af = [], []
-    cum_offset = 0.0
-
-    for i in range(n - 1):
-        t = trans_map.get(i, {"type": "cut", "duration": 0.5})
-        ttype = t["type"]
-        tdur = t.get("duration", 0.5)
-
-        # --- P2-B: 边界帧一致性检查（参考 HonCut AI Clip Chaining）---
-        try:
-            boundary = check_boundary_consistency(Path(segments[i]), Path(segments[i + 1]))
-            if not boundary["consistent"]:
-                # 不一致时强制使用 dissolve，不用 cut
-                if ttype == "cut":
-                    ttype = "dissolve"
-                    print(f"    [P2-B] 边界不一致({boundary['issues'][0]})，cut→dissolve")
-        except Exception:
-            pass  # 检查失败不影响现有流程
-
-        xname = {"dissolve": "fade", "fade": "fadeblack", "cut": "fade"}.get(ttype, "fade")
-        if ttype == "cut":
-            tdur = 0.01
-
-        offset = round(max(0, cum_offset + durations[i] - tdur), 3)
-
-        if i == 0:
-            vf.append(f"[0:v][1:v]xfade=transition={xname}:duration={tdur}:offset={offset}[v{i}]")
-            af.append(f"[0:a][1:a]acrossfade=d={tdur}[a{i}]")
-        else:
-            vf.append(f"[v{i-1}][{i+1}:v]xfade=transition={xname}:duration={tdur}:offset={offset}[v{i}]")
-            af.append(f"[a{i-1}][{i+1}:a]acrossfade=d={tdur}[a{i}]")
-        cum_offset = offset
-
-    last = n - 2
-    fc = ";".join(vf + af)
-    cmd = ["ffmpeg", "-y", *input_args,
-           "-filter_complex", fc,
-           "-map", f"[v{last}]", "-map", f"[a{last}]",
-           "-c:v", "libx264", "-crf", "23", "-preset", "medium",
-           "-c:a", "aac", "-b:a", "192k",
-           str(output_path)]
+    current = Path(segments[0])
     try:
-        subprocess.run(cmd, capture_output=True, timeout=300, check=True)
-    except subprocess.CalledProcessError as e:
-        print(f"  ⚠ xfade failed, fallback concat: {str(e.stderr)[:200] if e.stderr else e}")
+        for i, next_segment in enumerate(segments[1:]):
+            following = Path(next_segment)
+            current_duration = probe_video(str(current))["duration"]
+            if current_duration <= 0:
+                raise RuntimeError(f"invalid xfade intermediate duration: {current}")
+
+            t = trans_map.get(i, {"type": "cut", "duration": 0.5})
+            ttype = t["type"]
+            tdur = t.get("duration", 0.5)
+
+            # --- P2-B: 边界帧一致性检查（参考 HonCut AI Clip Chaining）---
+            try:
+                boundary = check_boundary_consistency(current, following)
+                if not boundary["consistent"]:
+                    # 不一致时强制使用 dissolve，不用 cut
+                    if ttype == "cut":
+                        ttype = "dissolve"
+                        print(f"    [P2-B] 边界不一致({boundary['issues'][0]})，cut→dissolve")
+            except Exception:
+                pass  # 检查失败不影响现有流程
+
+            xname = {
+                "dissolve": "fade", "fade": "fadeblack", "cut": "fade"
+            }.get(ttype, "fade")
+            if ttype == "cut":
+                tdur = 0.01
+            offset = round(max(0, current_duration - tdur), 3)
+            intermediate = temp_dir / f"xfade_{i:04d}.mp4"
+            filter_complex = (
+                "[0:v]settb=AVTB,setpts=PTS-STARTPTS[v0];"
+                "[1:v]settb=AVTB,setpts=PTS-STARTPTS[v1];"
+                f"[v0][v1]xfade=transition={xname}:duration={tdur}:offset={offset}[v];"
+                "[0:a]aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS[a0];"
+                "[1:a]aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS[a1];"
+                f"[a0][a1]acrossfade=d={tdur}[a]"
+            )
+            cmd = [
+                "ffmpeg", "-y", "-i", str(current), "-i", str(following),
+                "-filter_complex", filter_complex,
+                "-map", "[v]", "-map", "[a]",
+                "-c:v", "libx264", "-crf", "23", "-preset", "medium",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k",
+                str(intermediate),
+            ]
+            subprocess.run(cmd, capture_output=True, timeout=300, check=True)
+            temp_files.append(intermediate)
+            current = intermediate
+        shutil.copy2(current, output_path)
+    except (subprocess.CalledProcessError, RuntimeError) as e:
+        stderr = getattr(e, "stderr", None)
+        print(f"  ⚠ xfade failed, fallback concat: {str(stderr)[:200] if stderr else e}")
         _concat_copy(segments, output_path, temp_dir, temp_files)

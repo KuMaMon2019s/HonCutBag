@@ -120,7 +120,7 @@ class AudioMixer:
         command = [
             "ffmpeg", "-y", "-i", video_path, "-i", audio_path,
             "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
-            "-shortest", str(destination),
+            "-af", "apad", "-shortest", str(destination),
         ]
         subprocess.run(command, capture_output=True, check=True, timeout=600)
         return str(destination)
@@ -170,6 +170,29 @@ class AudioMixer:
             "output": output_path, "bgm": bgm_path, "bgm_track_id": selected.id if selected else None,
             "narration": narration, "effects": list(effects),
         }
+
+
+def prepare_phase9_audio_assets(output_dir: str | Path) -> dict[str, Any] | None:
+    """Synthesize configured narration without mutating the Phase 8 video.
+
+    Phase 9 owns timeline-aware mixing. Phase 8 only prepares reusable speech
+    assets so a short narration file can never truncate ``raw_assembly.mp4``.
+    """
+    directory = Path(output_dir)
+    storyboard_path = directory / "STORYBOARD.json"
+    if not storyboard_path.is_file():
+        return None
+    storyboard = json.loads(storyboard_path.read_text(encoding="utf-8"))
+    audio = storyboard.get("audio", {})
+    if not audio.get("enabled", False) or not audio.get("tts", True):
+        return None
+    narration = AudioMixer().generate_narration(
+        storyboard.get("shots", []),
+        directory / "audio_layer",
+        speed=float(audio.get("speed", 1.0)),
+        pitch=float(audio.get("pitch", 1.0)),
+    )
+    return {"deferred_to": "phase9", "narration": narration}
 
 
 def apply_phase9_audio(output_dir: str | Path) -> dict[str, Any] | None:

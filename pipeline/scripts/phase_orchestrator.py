@@ -179,6 +179,8 @@ def _merge_phase_report(report_path: Path, existing_report: dict, phase: str) ->
 def _set_report_status(report_path: Path, status: str) -> None:
     report = _read_json(report_path, {"phases": {}})
     report["status"] = status
+    if status == "completed":
+        report.pop("error", None)
     temporary = report_path.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(report_path)

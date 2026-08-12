@@ -71,6 +71,7 @@ def test_f3_two_characters_bind_distinct_actual_reference_numbers(tmp_path, monk
     ]
     for character in characters:
         _add_reference_contract(character)
+        assert character["distinguishing_features"]
     (tmp_path / "CHARACTERS.json").write_text(
         json.dumps({"characters": characters}, ensure_ascii=False), encoding="utf-8"
     )

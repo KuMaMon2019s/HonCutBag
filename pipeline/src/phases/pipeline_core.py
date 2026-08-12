@@ -3512,6 +3512,7 @@ def run_phase7(output_dir: Path, dry_run: bool, storyboard_data: dict = None) ->
     print(f"  ⏱ Phase 7 开始 (预估 ~{int(_p6_est)}s)")
     output_dir = Path(output_dir)
     outputs = []
+    consistency_result = None
 
     if dry_run:
         print("  ⊘ dry-run 模式，跳过一致性检查")
@@ -3523,14 +3524,17 @@ def run_phase7(output_dir: Path, dry_run: bool, storyboard_data: dict = None) ->
 
         print("  → run_consistency_check: 检查角色一致性...")
         result = run_consistency_check(output_dir=output_dir)
+        consistency_result = result
         outputs.append("consistency_report.json")
         print(f"  ✓ 角色一致性检查完成")
 
     except ImportError as e:
         print(f"  ⚠ consistency_guard 不可用: {e}")
+        consistency_result = {"passed": False, "error": str(e)}
     except Exception as e:
         traceback.print_exc()
         print(f"  ⚠ 角色一致性检查失败: {e}")
+        consistency_result = {"passed": False, "error": str(e)}
 
     # --- 2. scene_variation_check (新增，抄自 OM variation_checker) ---
     if storyboard_data:
@@ -3572,6 +3576,19 @@ def run_phase7(output_dir: Path, dry_run: bool, storyboard_data: dict = None) ->
             print(f"  ⊘ 无场景数据，跳过幻灯片风险评分")
     else:
         print(f"  ⊘ 无 storyboard_data，跳过幻灯片风险评分")
+
+    if not consistency_result or not consistency_result.get("passed", False):
+        score = (consistency_result or {}).get("consistency_score", 0)
+        error = (consistency_result or {}).get("error")
+        reason = error or f"角色一致性分数 {score} < 70"
+        print(f"  ✗ Phase 7 质检未通过: {reason}")
+        return {
+            "status": "error",
+            "error": reason,
+            "duration_s": _elapsed(start),
+            "outputs": outputs,
+            "consistency_score": score,
+        }
 
     print(f"  ✓ Phase 7 完成")
     
@@ -4006,6 +4023,8 @@ def run_phase8(output_dir: Path, dry_run: bool,
             transition_decisions=transition_dicts,
             quality_report=frame_report,
             shot_order=reviewed_order,
+            target_duration=target_duration,
+            transition_duration=transition_duration,
         )
         print(f"  → 执行 reviewed edit_decisions（{len(edit_decisions['cuts'])} 个片段）...")
         reviewed_edit = execute_edit_decisions(
@@ -4014,9 +4033,9 @@ def run_phase8(output_dir: Path, dry_run: bool,
         )
         if reviewed_edit.get("success"):
             print("  ✓ Phase 8 完成: raw_assembly.mp4 (reviewed_edit_decisions)")
-            from phases.phase9.audio_mixer import apply_phase9_audio
+            from phases.phase9.audio_mixer import prepare_phase9_audio_assets
 
-            audio_receipt = apply_phase9_audio(output_dir)
+            audio_receipt = prepare_phase9_audio_assets(output_dir)
             qg_report = run_quality_check("phase8", output_dir)
             if not qg_report.passed:
                 return {
@@ -4129,8 +4148,8 @@ def run_phase8(output_dir: Path, dry_run: bool,
         concat_output.unlink(missing_ok=True)
 
         print(f"  ✓ Phase 8 完成: raw_assembly.mp4 (VideoEdit)")
-        from phases.phase9.audio_mixer import apply_phase9_audio
-        audio_receipt = apply_phase9_audio(output_dir)
+        from phases.phase9.audio_mixer import prepare_phase9_audio_assets
+        audio_receipt = prepare_phase9_audio_assets(output_dir)
         qg_report = run_quality_check("phase8", output_dir)
         if not qg_report.passed:
             return {"status": "error", "error": f"Phase 8 质检未通过: {qg_report.grade}", "quality_report": qg_report, "duration_s": _elapsed(start)}
@@ -4173,8 +4192,8 @@ def run_phase8(output_dir: Path, dry_run: bool,
 
         if result.success:
             print(f"  ✓ Phase 8 完成: raw_assembly.mp4 (VideoStitch fallback)")
-            from phases.phase9.audio_mixer import apply_phase9_audio
-            audio_receipt = apply_phase9_audio(output_dir)
+            from phases.phase9.audio_mixer import prepare_phase9_audio_assets
+            audio_receipt = prepare_phase9_audio_assets(output_dir)
             
             # Quality gate: Phase 8
             qg_report = run_quality_check("phase8", output_dir)
@@ -4323,6 +4342,16 @@ def _merge_shot_transcripts(sb_shots: list, durations_ms: list[int], shot_transc
     caption_segments = []
     cumulative_ms = 0
     shot_entries = []
+    scripted_dialogue_present = any(
+        bool(
+            clean_subtitle_text(
+                shot.get("dialogue", {}).get("line", "")
+                if isinstance(shot.get("dialogue"), dict)
+                else str(shot.get("dialogue") or "")
+            )
+        )
+        for shot in sb_shots
+    )
     for index, (shot, duration_ms, transcription) in enumerate(
         zip(sb_shots, durations_ms, shot_transcripts), 1
     ):
@@ -4339,6 +4368,18 @@ def _merge_shot_transcripts(sb_shots: list, durations_ms: list[int], shot_transc
             continue
         local_words = transcription.get("segments") or []
         asr_text = clean_subtitle_text(transcription.get("text") or "")
+        dialogue = shot.get("dialogue")
+        dialogue_line = (
+            dialogue.get("line", "") if isinstance(dialogue, dict) else str(dialogue or "")
+        )
+        scripted_text = clean_subtitle_text(dialogue_line)
+        normalized_script = "".join(scripted_text.casefold().split())
+        normalized_asr = "".join(asr_text.casefold().split())
+        asr_matches_script = bool(
+            normalized_script
+            and normalized_asr
+            and normalized_script in normalized_asr
+        )
         # [DEPRECATED 2026-08-09] 旧逻辑：ASR 文本未去标点、未按 word 边界加空格
         # 被新的字幕清洗逻辑取代，保留备查
         # if local_words:
@@ -4350,7 +4391,22 @@ def _merge_shot_transcripts(sb_shots: list, durations_ms: list[int], shot_transc
         #     } for item in local_words]
         #     text = transcription.get("text") or "".join(item["word"] for item in words)
         #     source = "asr"
-        if local_words or asr_text:
+        if scripted_text and not asr_matches_script:
+            text = scripted_text
+            source = "dialogue_script"
+            words = [{
+                "word": text,
+                "start_ms": round(cumulative_ms + duration_ms * 0.2),
+                "end_ms": round(cumulative_ms + duration_ms * 0.8),
+                "source": source,
+            }]
+        elif scripted_dialogue_present and not scripted_text:
+            # In a scripted scene, unplanned ASR from action/noise must not
+            # create invented subtitles on shots that have no dialogue.
+            text = ""
+            source = "none"
+            words = []
+        elif local_words or asr_text:
             words = []
             for item in local_words:
                 cleaned_word = clean_subtitle_text(item.get("word") or item.get("text") or "")
@@ -4373,8 +4429,6 @@ def _merge_shot_transcripts(sb_shots: list, durations_ms: list[int], shot_transc
             source = "asr"
         else:
             words = []
-            dialogue = shot.get("dialogue")
-            dialogue_line = dialogue.get("line", "") if isinstance(dialogue, dict) else ""
             text = clean_subtitle_text(dialogue_line)
             source = "dialogue_script" if text else "none"
             if text:
@@ -4493,7 +4547,9 @@ def _phase9_real_audio_mix_request(tracks: list[dict], audio_out: Path) -> dict:
 
 
 
-def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = None, upscale: Optional[int] = None, media_profile: str = "1080p") -> dict:
+def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = None,
+               upscale: Optional[int] = None, media_profile: str = "1080p",
+               target_duration: Optional[float] = None) -> dict:
     """Phase 9: audio_pipeline + visual_post + [color_grade] + [upscale] + rhythm_editor → polished.mp4
 
     Audio processing (enhanced with OM AudioMixer capabilities):
@@ -4601,8 +4657,18 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             audio_out = output_dir / "audio_processed.mp4"
             from vendor.video_tools.tools.audio.audio_mixer import AudioMixer
 
+            base_audio = output_dir / "audio_layer" / "source_audio.m4a"
+            base_audio.parent.mkdir(parents=True, exist_ok=True)
+            extract_base = [
+                "ffmpeg", "-y", "-i", str(raw_video), "-vn",
+                "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+                str(base_audio),
+            ]
+            import subprocess as _sp
+            extracted = _sp.run(extract_base, capture_output=True, text=True)
+            base_track = base_audio if extracted.returncode == 0 and base_audio.is_file() else raw_video
             tracks, skipped_tts = _phase9_real_audio_tracks(
-                output_dir, storyboard_data, transcript_data, raw_video
+                output_dir, storyboard_data, transcript_data, base_track
             )
             overlay_count = len(tracks) - 1
             mixer = AudioMixer()
@@ -4613,7 +4679,7 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
                 remux_cmd = [
                     "ffmpeg", "-y", "-i", str(raw_video), "-i", str(audio_out),
                     "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac",
-                    "-shortest", str(remux_tmp),
+                    "-af", "apad", "-shortest", str(remux_tmp),
                 ]
                 import subprocess as _sp
                 _sp.run(remux_cmd, capture_output=True, check=True)
@@ -4681,7 +4747,7 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
                         "-map", "1:a",              # take audio from processed
                         "-c:v", "copy",             # don't re-encode video
                         "-c:a", "aac",
-                        "-shortest",
+                        "-af", "apad", "-shortest",
                         str(remux_tmp),
                     ]
                     import subprocess as _sp
@@ -4771,6 +4837,7 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
         process_visual(
             video_path=audio_out,
             output_path=visual_out,
+            enable_outro=False,
         )
         outputs.append("visual_processed.mp4")
 
@@ -4901,6 +4968,8 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             "-preset", "medium",
             "-c:a", profile["audio_codec"],
             "-b:a", "192k",
+            "-ar", "48000",
+            "-ac", "2",
             "-pix_fmt", profile["pixel_format"],
             final_encoded,
         ]
@@ -4928,19 +4997,31 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             or (polished_durations[kind] is not None and duration_deltas[kind] <= 1.0)
             for kind in ("video", "audio")
         )
+        requested_duration_delta = (
+            None if target_duration is None or polished_durations["video"] is None
+            else round(abs(polished_durations["video"] - float(target_duration)), 6)
+        )
+        if requested_duration_delta is not None:
+            duration_gate_passed = duration_gate_passed and requested_duration_delta <= 1.0
         final_duration_gate = {
             "passed": duration_gate_passed,
             "artifact": "polished.mp4",
             "expected": encode_input_durations,
             "actual": polished_durations,
             "absolute_delta_s": duration_deltas,
+            "requested_duration_s": target_duration,
+            "requested_duration_delta_s": requested_duration_delta,
             "tolerance_s": 1.0,
-            "basis": "Phase 9 pre-delivery encode input (includes intentional intro/outro/rhythm adjustments)",
+            "basis": "Phase 9 encode input plus the requested delivery duration",
         }
         (output_dir / "final_duration_gate.json").write_text(
             json.dumps(final_duration_gate, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         _assert_duration_conserved(encode_input_durations, polished_durations, tolerance_s=1.0)
+        if not duration_gate_passed:
+            raise RuntimeError(
+                f"Final duration gate failed: target={target_duration}, actual={polished_durations}"
+            )
         outputs.extend([
             f"polished.mp4 (encoded with {media_profile})",
             "final_duration_gate.json",
@@ -4984,7 +5065,7 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
                     encoding="utf-8",
                 )
                 outputs.append("character_qa_report.json")
-                step_status["character_qa"] = "done"
+                step_status["character_qa"] = "done" if verdict == "pass" else "failed"
                 print(
                     f"  ✓ Character QA 完成: elapsed={time.time() - qa_started:.1f}s, "
                     f"grade={grade}, verdict={verdict}, issues={len(qa_data.get('issues', []))}"
@@ -5819,7 +5900,12 @@ def run_pipeline(
         p6 = run_phase7(Path(output_dir), dry_run, storyboard_data=storyboard_data)
         report["phases"]["phase7"] = p6
         if p6["status"] == "error":
-            report["status"] = "partial"
+            report["status"] = "failed"
+            report["error"] = f"Phase 7 failed: {p6.get('error')}"
+            report["total_duration_s"] = _elapsed(total_start)
+            reporter.mark_failed(report["error"])
+            _write_report(report, output_dir)
+            return report
         else:
             _record_stage_checkpoint(output_path, "phase7", p6)
 
@@ -5840,7 +5926,7 @@ def run_pipeline(
                 except (json.JSONDecodeError, KeyError):
                     pass
 
-        # 如果质检门未通过，记录到报告但不阻断管线（当前版本仅警告）
+        # 兼容旧报告的二次门禁；run_phase7 已经对新执行失败关闭。
         if not quality_gate_passed:
             report["quality_gate"] = {
                 "passed": False,
@@ -5887,7 +5973,10 @@ def run_pipeline(
         report["phases"]["phase9"] = {**p8, "resumed": True}
         print(f"  🔄 Phase 9: 从 checkpoint 恢复 (已跳过)")
     else:
-        p8 = run_phase9(output_dir, dry_run, media_profile=media_profile)
+        p8 = run_phase9(
+            output_dir, dry_run, media_profile=media_profile,
+            target_duration=duration,
+        )
         report["phases"]["phase9"] = p8
         if p8["status"] == "error":
             report["status"] = "failed"
@@ -5947,6 +6036,7 @@ def run_pipeline(
     report["total_duration_s"] = _elapsed(total_start)
 
     if report["status"] == "completed":
+        report.pop("error", None)
         reporter.mark_completed()
     else:
         reporter.mark_failed(
@@ -5988,6 +6078,8 @@ def _write_report(report: dict, output_dir: Path):
     report_path = output_dir / "pipeline_report.json"
     # 深拷贝，确保可序列化
     clean = json.loads(json.dumps(report, default=str))
+    if clean.get("status") == "completed":
+        clean.pop("error", None)
     report_path.write_text(json.dumps(clean, ensure_ascii=False, indent=2))
     print(f"\n  📄 报告已写入: {report_path}")
 

@@ -547,7 +547,11 @@ class AudioMixer(BaseTool):
                 )
             else:
                 filter_parts.append(f"[a{speech_indices[0]}]acopy[speech_all]")
-            filter_parts.append("[speech_all]asplit=2[speech_key][speech_out]")
+            filter_parts.append("[speech_all]asplit=2[speech_key_raw][speech_out]")
+            # sidechaincompress otherwise ends its main (music) output when a
+            # shorter speech key ends. Pad only the detector branch so the
+            # music/base track survives after narration finishes.
+            filter_parts.append("[speech_key_raw]apad[speech_key]")
 
             # Mix music tracks together
             music_start = len(speech_tracks)

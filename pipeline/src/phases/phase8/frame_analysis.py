@@ -16,6 +16,18 @@ import numpy as np
 SemanticReviewer = Callable[[list[Path], dict[str, Any]], dict[str, Any]]
 
 
+def _multimodal_circuit_is_open(output_path: Path) -> bool:
+    """Avoid repeated per-shot calls after the same run's order review failed."""
+    receipt = Path(output_path).parent / "storyboard_order_review.json"
+    if not receipt.is_file():
+        return False
+    try:
+        review = json.loads(receipt.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return review.get("source") == "deterministic_fallback"
+
+
 def _read_pixels(path: Path) -> np.ndarray:
     try:
         import cv2
@@ -307,7 +319,14 @@ def analyze_shot_frames(
     interval_s: float = 1.0,
 ) -> dict[str, Any]:
     """Analyze every generated shot and persist actionable assembly decisions."""
-    if semantic_reviewer is None or semantic_reviewer is True:
+    circuit_open = semantic_reviewer is None and _multimodal_circuit_is_open(output_path)
+    if circuit_open:
+        reviewer = None
+        print(
+            "  ⚠ [8.2] 多模态审稿熔断已打开；跳过逐镜头远端语义请求，继续本地逐帧检查",
+            flush=True,
+        )
+    elif semantic_reviewer is None or semantic_reviewer is True:
         reviewer = _automatic_semantic_reviewer()
     elif semantic_reviewer is False:
         reviewer = None
@@ -318,7 +337,9 @@ def analyze_shot_frames(
         "shots": {},
         "has_issues": False,
         "summary": {"keep": [], "trim": [], "reshoot": []},
-        "semantic_review": "enabled" if reviewer else "unavailable",
+        "semantic_review": (
+            "circuit_open" if circuit_open else "enabled" if reviewer else "unavailable"
+        ),
     }
     for shot_dir in sorted(Path(shots_dir).iterdir()) if Path(shots_dir).is_dir() else []:
         video = shot_dir / "output.mp4"

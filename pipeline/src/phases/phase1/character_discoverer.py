@@ -568,6 +568,7 @@ def _add_reference_contract(character: Dict[str, Any]) -> None:
     if len("、".join(traits)) > 80:
         traits = traits[:2]
     subject_traits = "、".join(traits) or str(appearance.get("summary") or character.get("name", "角色"))
+    character.setdefault("distinguishing_features", traits or [subject_traits])
     character.setdefault("face_reference", "face_closeup.png")
     character.setdefault("body_reference", "full_body.png")
     character.setdefault(
