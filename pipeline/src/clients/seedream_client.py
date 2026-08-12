@@ -119,7 +119,7 @@ class SeedreamClient:
     def image_to_image(
         self,
         prompt: str,
-        ref_image: str,
+        ref_image: str | list[str],
         output_path: str = "output.png",
         size: str = DEFAULT_IMAGE_SIZE,
     ) -> str:
@@ -127,22 +127,35 @@ class SeedreamClient:
 
         Args:
             prompt: Text description for generation
-            ref_image: Path to reference image file (png/jpg)
+            ref_image: One reference path or multiple character reference paths
             output_path: Where to save result
             size: Output dimensions WxH
         """
-        # Encode reference image to base64
-        with open(ref_image, "rb") as f:
-            img_b64 = base64.b64encode(f.read()).decode()
-
-        ext = os.path.splitext(ref_image)[1].lower().lstrip(".")
-        mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp"}.get(ext, "image/png")
+        reference_paths = [ref_image] if isinstance(ref_image, str) else list(ref_image)
+        if not reference_paths:
+            raise ValueError("image_to_image requires at least one reference image")
+        encoded_references = []
+        for reference_path in reference_paths:
+            with open(reference_path, "rb") as f:
+                img_b64 = base64.b64encode(f.read()).decode()
+            ext = os.path.splitext(reference_path)[1].lower().lstrip(".")
+            mime = {
+                "png": "image/png",
+                "jpg": "image/jpeg",
+                "jpeg": "image/jpeg",
+                "webp": "image/webp",
+            }.get(ext, "image/png")
+            encoded_references.append(f"data:{mime};base64,{img_b64}")
 
         # Agent Plan i2i: use image_url in content array
         payload = {
             "model": self.model,
             "prompt": prompt,
-            "image": f"data:{mime};base64,{img_b64}",
+            "image": (
+                encoded_references[0]
+                if len(encoded_references) == 1
+                else encoded_references
+            ),
             "size": size,
             "n": 1,
             "output_format": "png",
@@ -188,7 +201,7 @@ class SeedreamClient:
             out_path = os.path.join(output_dir, f"{view_name}.png")
             print(f"  [three-view] generating {view_name}...")
             try:
-                url = self.text_to_image(
+                self.text_to_image(
                     prompt=prompt,
                     output_path=out_path,
                     size=size,

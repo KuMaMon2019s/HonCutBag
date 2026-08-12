@@ -222,6 +222,9 @@ class Models:
     ARK_TEXT_LITE: str = "doubao-seed-2.1-turbo"     # 标准级(2026-08-09升级自2.0-lite)
     ARK_TEXT_PRO: str = "doubao-seed-2.0-pro"        # 进阶级
     ARK_TEXT_TURBO: str = "doubao-seed-2.1-turbo"    # 快速
+
+    # 火山方舟 - 多模态理解。不要复用文本默认模型；Phase 5/8 会传图片。
+    ARK_MULTIMODAL: str = "doubao-seed-2.0-lite"
     
     # 火山方舟 - 图像生成
     ARK_IMAGE: str = "doubao-seedream-5.0-lite"
@@ -415,6 +418,7 @@ ARK_CODING_BASE_URL = BaseURLs.ARK_CODING_PLAN
 
 # Models
 DEFAULT_TEXT_MODEL = Models.ARK_TEXT_LITE
+DEFAULT_MULTIMODAL_MODEL = Models.ARK_MULTIMODAL
 DEFAULT_IMAGE_MODEL = Models.ARK_IMAGE
 DEFAULT_VIDEO_MODEL = Models.ARK_VIDEO
 

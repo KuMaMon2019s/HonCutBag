@@ -13,7 +13,7 @@ from typing import Any
 
 from openai import OpenAI
 
-from utils.config import ARK_BASE_URL, DEFAULT_TEXT_MODEL, get_api_key
+from utils.config import ARK_BASE_URL, DEFAULT_MULTIMODAL_MODEL, get_api_key
 
 
 class ArkMultimodalClient:
@@ -31,8 +31,20 @@ class ArkMultimodalClient:
         if client is None and not key:
             raise RuntimeError("ARK_AGENT_API_KEY is required for real storyboard review")
         self.model = model or os.environ.get(
-            "HONCUT_STORYBOARD_REVIEW_MODEL", DEFAULT_TEXT_MODEL
+            "HONCUT_STORYBOARD_REVIEW_MODEL", DEFAULT_MULTIMODAL_MODEL
         )
+        self.max_tokens = int(
+            os.environ.get("HONCUT_STORYBOARD_REVIEW_MAX_TOKENS", "4096")
+        )
+        if self.max_tokens <= 0:
+            raise ValueError("HONCUT_STORYBOARD_REVIEW_MAX_TOKENS must be positive")
+        self.thinking_type = os.environ.get(
+            "HONCUT_STORYBOARD_REVIEW_THINKING", "disabled"
+        ).strip().lower()
+        if self.thinking_type not in {"disabled", "enabled", "auto"}:
+            raise ValueError(
+                "HONCUT_STORYBOARD_REVIEW_THINKING must be disabled, enabled, or auto"
+            )
         timeout_s = float(os.environ.get("HONCUT_STORYBOARD_REVIEW_TIMEOUT_S", "120"))
         if timeout_s <= 0:
             raise ValueError("HONCUT_STORYBOARD_REVIEW_TIMEOUT_S must be positive")
@@ -102,6 +114,8 @@ class ArkMultimodalClient:
                     model=self.model,
                     messages=[{"role": "user", "content": content}],
                     response_format={"type": "json_object"},
+                    max_tokens=self.max_tokens,
+                    extra_body={"thinking": {"type": self.thinking_type}},
                 )
                 result_queue.put((True, response))
             except BaseException as exc:

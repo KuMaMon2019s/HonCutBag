@@ -13,6 +13,10 @@ from clients.ark_multimodal_client import ArkMultimodalClient
 
 REVIEW_PROMPT = """You are a film storyboard continuity reviewer. Review all supplied
 images together, in their supplied order, against the complete storyboard JSON below.
+This phase decides chronological shot ordering only. If the supplied order tells the
+story coherently, set narrative_consistent=true even when an individual still has a
+pose, prop, costume-material, or action-fidelity issue; list such visual issues in
+issues without turning an otherwise correct chronology into false.
 Return one JSON object only with these fields:
 - suggested_order: array containing every shot ID exactly once
 - narrative_consistent: boolean
@@ -54,12 +58,14 @@ def _review_payload(storyboard: dict) -> dict:
 
 
 def _shot_id(value: Any) -> str | None:
-    if not isinstance(value, str):
+    if isinstance(value, bool):
         return None
-    value = value.strip().upper()
-    if not value.startswith("S") or not value[1:].isdigit():
+    value = str(value).strip().upper()
+    if value.startswith("S"):
+        value = value[1:]
+    if not value.isdigit():
         return None
-    return f"S{int(value[1:]):02d}"
+    return f"S{int(value):02d}"
 
 
 def storyboard_shot_ids(storyboard: dict) -> list[str]:

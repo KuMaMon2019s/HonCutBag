@@ -1765,7 +1765,37 @@ def _generate_flf2v_end_frame(
     return True
 
 
-def _generate_shot_images(output_dir: Path, storyboard_data: dict) -> int:
+def _storyboard_keyframe_description(shot: dict) -> str:
+    """Build an identity-locked, single-moment prompt for one storyboard frame."""
+    identity = str(shot.get("subject_description") or "").strip()
+    action = str(
+        shot.get("action_description") or shot.get("what") or ""
+    ).strip()
+    staging = str(shot.get("visual") or "").strip()
+    parts = [
+        "Single decisive storyboard keyframe, not a generic fight pose.",
+        (
+            "Character identity lock (gender, hair, face, fully covered clothing, "
+            f"and weapons must remain exact): {identity}."
+            if identity
+            else ""
+        ),
+        f"Exact action contract: {action}." if action else "",
+        (
+            "Show the decisive final pose of that action contract in one frame; "
+            "do not substitute an earlier action or a generic blade clash."
+        ),
+        f"Visual staging: {staging}." if staging else "",
+        "No exposed midriff, no swapped weapons, no reversed attacker and defender.",
+    ]
+    return " ".join(part for part in parts if part)
+
+
+def _generate_shot_images(
+    output_dir: Path,
+    storyboard_data: dict,
+    regenerate_shot_ids: set[str] | None = None,
+) -> int:
     """Generate storyboard images for each shot (M2 task).
     
     Args:
@@ -1782,7 +1812,7 @@ def _generate_shot_images(output_dir: Path, storyboard_data: dict) -> int:
         prompt_scenes = []
         for shot in shots:
             prompt_scene = dict(shot)
-            prompt_scene.setdefault("description", shot.get("visual") or shot.get("prompt", ""))
+            prompt_scene["description"] = _storyboard_keyframe_description(shot)
             prompt_scene.setdefault("shot_language", {
                 "shot_size": shot.get("shot_size"),
                 "camera_movement": shot.get("camera_movement"),
@@ -1835,6 +1865,16 @@ def _generate_shot_images(output_dir: Path, storyboard_data: dict) -> int:
                 print(f"  ⚠ [P0-1] 角色参考图加载失败: {e}")
 
         generated_count = 0
+
+        # Phase 2 runs before the character factory. Character shots must wait
+        # until Phase 3 has produced references instead of silently using t2i.
+        has_character_shots = any(shot.get("who") for shot in shots)
+        if has_character_shots and not char_ref_map:
+            print(
+                "  → [M2] 角色参考图尚未生成；逐镜分镜图延后到 Phase 3",
+                flush=True,
+            )
+            return 0
         
         # --- P2-5d: HonCut concurrent shot image generation ---
         def _gen_shot_image(shot_item):
@@ -1853,7 +1893,7 @@ def _generate_shot_images(output_dir: Path, storyboard_data: dict) -> int:
             # - Empty who [] → pure landscape/no_character → NO reference injection
             # - Single character → use that character's preferred reference
             # - Multiple characters → use first character's preferred reference
-            ref_image_path = None
+            ref_image_paths = []
             shot_who = shot_item.get("who", [])
             if not isinstance(shot_who, list):
                 shot_who = [shot_who] if shot_who else []
@@ -1864,18 +1904,42 @@ def _generate_shot_images(output_dir: Path, storyboard_data: dict) -> int:
             else:
                 # Match first available character reference
                 for name in shot_who:
-                    if name.lower() in char_ref_map:
-                        ref_image_path = char_ref_map[name.lower()]
-                        break
+                    reference = char_ref_map.get(str(name).lower())
+                    if reference is not None and reference not in ref_image_paths:
+                        ref_image_paths.append(reference)
                 # Fallback to protagonist only if who[] is non-empty but no match found
-                if ref_image_path is None and protagonist_ref:
-                    ref_image_path = protagonist_ref
+                if not ref_image_paths and protagonist_ref:
+                    ref_image_paths.append(protagonist_ref)
 
-            if shot_image_path.exists():
+            ref_image_path = ref_image_paths[0] if ref_image_paths else None
+
+            stale_for_references = bool(
+                shot_image_path.exists()
+                and ref_image_paths
+                and any(
+                    reference.stat().st_mtime > shot_image_path.stat().st_mtime
+                    for reference in ref_image_paths
+                )
+            )
+            force_regenerate = bool(
+                regenerate_shot_ids and shot_id in regenerate_shot_ids
+            )
+            if (
+                shot_image_path.exists()
+                and not stale_for_references
+                and not force_regenerate
+            ):
                 _generate_flf2v_end_frame(
                     shot_item, shot_id, shot_image_path, ref_image_path
                 )
                 return shot_id
+            if stale_for_references:
+                print(
+                    f"    [M2] {shot_id}: 角色参考图较新，刷新旧分镜图",
+                    flush=True,
+                )
+            elif force_regenerate:
+                print(f"    [M2] {shot_id}: 按质检清单定向重绘", flush=True)
 
             # --- 429 retry with exponential backoff ---
             import time as _time
@@ -1885,17 +1949,18 @@ def _generate_shot_images(output_dir: Path, storyboard_data: dict) -> int:
                 try:
                     # Preserve 16:9 while meeting Seedream's minimum pixel count.
                     _m2_size = _storyboard_image_size(video_width=1920, video_height=1080)
-                    if ref_image_path and ref_image_path.exists():
+                    if ref_image_paths and all(path.exists() for path in ref_image_paths):
                         # P0-1c: Use image_to_image mode (with reference image)
                         from clients.seedream_client import SeedreamClient
                         client = SeedreamClient()
                         client.image_to_image(
                             prompt=shot_prompt,
-                            ref_image=str(ref_image_path),
+                            ref_image=[str(path) for path in ref_image_paths],
                             output_path=str(shot_image_path),
                             size=_m2_size,
                         )
-                        print(f"    [M2] 分镜图 {shot_id}.png ✓ (ref: {ref_image_path.name})")
+                        refs = ", ".join(path.name for path in ref_image_paths)
+                        print(f"    [M2] 分镜图 {shot_id}.png ✓ (refs: {refs})")
                     else:
                         # No reference image, pure text-to-image
                         from clients.seedream_client import text_to_image
@@ -2026,10 +2091,11 @@ def run_phase2(storyboard_data: dict, characters_data: dict, output_dir: Path, d
                     return {"status": "error", "error": f"Phase 2 质检未通过: {qg_report.grade}", "quality_report": qg_report, "duration_s": _elapsed(start)}
                 
                 # --- M2: 分镜图序列（每镜头一张）---
-                _generate_shot_images(output_dir, storyboard_data)
-                composition_report = _validate_storyboard_image_composition(output_dir, storyboard_data)
-                if not composition_report["valid"]:
-                    return {"status": "error", "error": "Storyboard composition validation failed", "composition_report": composition_report, "duration_s": _elapsed(start)}
+                generated = _generate_shot_images(output_dir, storyboard_data)
+                if generated:
+                    composition_report = _validate_storyboard_image_composition(output_dir, storyboard_data)
+                    if not composition_report["valid"]:
+                        return {"status": "error", "error": "Storyboard composition validation failed", "composition_report": composition_report, "duration_s": _elapsed(start)}
 
                 # --- P0-A: HonCut 场景参考图生成 ---
                 try:
@@ -2120,10 +2186,11 @@ def run_phase2(storyboard_data: dict, characters_data: dict, output_dir: Path, d
                 return {"status": "error", "error": f"Phase 2 质检未通过: {qg_report.grade}", "quality_report": qg_report, "duration_s": _elapsed(start)}
             
             # --- M2: 分镜图序列（每镜头一张）---
-            _generate_shot_images(output_dir, storyboard_data)
-            composition_report = _validate_storyboard_image_composition(output_dir, storyboard_data)
-            if not composition_report["valid"]:
-                return {"status": "error", "error": "Storyboard composition validation failed", "composition_report": composition_report, "duration_s": _elapsed(start)}
+            generated = _generate_shot_images(output_dir, storyboard_data)
+            if generated:
+                composition_report = _validate_storyboard_image_composition(output_dir, storyboard_data)
+                if not composition_report["valid"]:
+                    return {"status": "error", "error": "Storyboard composition validation failed", "composition_report": composition_report, "duration_s": _elapsed(start)}
             
             return {
                 "status": "done",
@@ -2306,6 +2373,33 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
         qg_report = run_quality_check("phase3", output_dir)
         if not qg_report.passed:
             return {"status": "error", "error": f"Phase 3 质检未通过: {qg_report.grade} — 角色图片缺失，不能继续", "quality_report": qg_report, "duration_s": _elapsed(start)}
+
+        # Phase 2 deliberately defers character-bearing shot images until the
+        # reference packs exist. Refresh older t2i artifacts from legacy runs.
+        storyboard_path = output_dir / "STORYBOARD.json"
+        if storyboard_path.is_file():
+            storyboard = json.loads(storyboard_path.read_text(encoding="utf-8"))
+            expected_shots = len(storyboard.get("shots", []))
+            generated_shots = _generate_shot_images(output_dir, storyboard)
+            if generated_shots != expected_shots:
+                return {
+                    "status": "error",
+                    "error": (
+                        "Phase 3 could not produce all character-locked storyboard "
+                        f"images: {generated_shots}/{expected_shots}"
+                    ),
+                    "duration_s": _elapsed(start),
+                }
+            composition_report = _validate_storyboard_image_composition(
+                output_dir, storyboard
+            )
+            if not composition_report["valid"]:
+                return {
+                    "status": "error",
+                    "error": "Storyboard composition validation failed after Phase 3",
+                    "composition_report": composition_report,
+                    "duration_s": _elapsed(start),
+                }
         
         return {
             "status": "done",
@@ -4864,6 +4958,12 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
                         "segments": segments,
                         "srt_path": srt_path,
                         "font_size": 48,
+                        "font_color": "#FFFFFF",
+                        "outline_color": "#000000",
+                        "outline_width": 3,
+                        "margin_bottom": 60,
+                        "fade_in_ms": 180,
+                        "fade_out_ms": 220,
                         "force_ffmpeg": True,
                     })
 

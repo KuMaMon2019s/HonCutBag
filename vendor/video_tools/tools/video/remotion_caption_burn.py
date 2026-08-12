@@ -109,6 +109,36 @@ class RemotionCaptionBurn(BaseTool):
                 "default": 52,
                 "description": "Font size for captions.",
             },
+            "font_color": {
+                "type": "string",
+                "default": "#FFFFFF",
+                "description": "FFmpeg fallback caption color (hex).",
+            },
+            "outline_color": {
+                "type": "string",
+                "default": "#000000",
+                "description": "FFmpeg fallback outline color (hex).",
+            },
+            "outline_width": {
+                "type": "integer",
+                "default": 3,
+                "description": "FFmpeg fallback outline width in pixels.",
+            },
+            "margin_bottom": {
+                "type": "integer",
+                "default": 48,
+                "description": "FFmpeg fallback bottom safe margin in pixels.",
+            },
+            "fade_in_ms": {
+                "type": "integer",
+                "default": 180,
+                "description": "FFmpeg subtitle fade-in duration in milliseconds.",
+            },
+            "fade_out_ms": {
+                "type": "integer",
+                "default": 220,
+                "description": "FFmpeg subtitle fade-out duration in milliseconds.",
+            },
             "highlight_color": {
                 "type": "string",
                 "default": "#22D3EE",
@@ -403,44 +433,51 @@ class RemotionCaptionBurn(BaseTool):
         input_path: str,
         output_path: str,
         captions: list[dict],
+        font_size: int,
+        font_color: str,
+        outline_color: str,
+        outline_width: int,
+        margin_bottom: int,
+        fade_in_ms: int,
+        fade_out_ms: int,
     ) -> ToolResult:
         """Fall back to FFmpeg subtitle burning at bottom of frame."""
-        # Generate temporary SRT from word captions
-        tmp_srt = Path(output_path).parent / f"_tmp_captions_{int(time.time())}.srt"
-        tmp_srt.parent.mkdir(parents=True, exist_ok=True)
-
-        srt_lines = []
-        idx = 1
-        # Group into pages of ~4 words
-        page_size = 4
-        for i in range(0, len(captions), page_size):
-            page = captions[i : i + page_size]
-            text = " ".join(c["word"] for c in page)
-            start = page[0]["startMs"]
-            end = page[-1]["endMs"]
-            srt_lines.append(str(idx))
-            srt_lines.append(
-                f"{self._ms_to_srt(start)} --> {self._ms_to_srt(end)}"
-            )
-            srt_lines.append(text)
-            srt_lines.append("")
-            idx += 1
-
-        tmp_srt.write_text("\n".join(srt_lines), encoding="utf-8")
+        # ASS preserves cue boundaries and supports per-cue fade animation.
+        tmp_subtitle = Path(output_path).parent / f"_tmp_captions_{int(time.time())}.ass"
+        tmp_subtitle.parent.mkdir(parents=True, exist_ok=True)
+        video_width, video_height = self._video_dimensions(input_path)
+        tmp_subtitle.write_text(
+            self._ass_subtitle_content(
+                captions, fade_in_ms, fade_out_ms, video_width, video_height,
+            ),
+            encoding="utf-8",
+        )
 
         try:
             filters = self._ffmpeg_filters()
             if "subtitles" in filters:
-                self._render_with_subtitles(input_path, output_path, tmp_srt)
+                self._render_with_subtitles(
+                    input_path, output_path, tmp_subtitle,
+                    font_size, font_color, outline_color,
+                    outline_width, margin_bottom,
+                )
                 method = "ffmpeg_subtitles"
             elif "drawtext" in filters:
-                self._render_with_drawtext(input_path, output_path, captions)
+                self._render_with_drawtext(
+                    input_path, output_path, captions,
+                    font_size, font_color, outline_color,
+                    outline_width, margin_bottom,
+                )
                 method = "ffmpeg_drawtext"
             elif "overlay" in filters:
                 # Minimal FFmpeg bottles can omit both libass and libfreetype.
                 # Render glyphs with Pillow and let FFmpeg perform only the
                 # timed compositing, which is available in those builds.
-                self._render_with_image_overlays(input_path, output_path, captions)
+                self._render_with_image_overlays(
+                    input_path, output_path, captions,
+                    font_size, font_color, outline_color,
+                    outline_width, margin_bottom,
+                )
                 method = "ffmpeg_image_overlay"
             else:
                 return ToolResult(
@@ -449,7 +486,7 @@ class RemotionCaptionBurn(BaseTool):
                 )
         finally:
             try:
-                tmp_srt.unlink()
+                tmp_subtitle.unlink()
             except OSError:
                 pass
 
@@ -490,20 +527,22 @@ class RemotionCaptionBurn(BaseTool):
         return names
 
     def _render_with_subtitles(
-        self, input_path: str, output_path: str, srt_path: Path,
+        self, input_path: str, output_path: str, subtitle_path: Path,
+        font_size: int, font_color: str, outline_color: str,
+        outline_width: int, margin_bottom: int,
     ) -> None:
         # Quotes here belong to FFmpeg's filtergraph grammar. The command is
         # passed as argv (without a shell), so shell quoting must not be added.
-        escaped = str(srt_path).replace("\\", "/")
+        escaped = str(subtitle_path).replace("\\", "/")
         escaped = escaped.replace("'", r"\'").replace(":", r"\:")
-        # [DEPRECATED 2026-08-09] 旧逻辑：字幕底边距固定 80px，不随画面高度接近 5%
-        # 被新的底部居中约 5% 边距逻辑取代，保留备查
-        # video_filter = (... "Shadow=1,Alignment=2,MarginV=80'")
+        primary = self._hex_to_ass_color(font_color)
+        outline = self._hex_to_ass_color(outline_color)
         video_filter = (
             f"subtitles=filename='{escaped}':"
-            "force_style='FontName=serif,FontSize=52,"
-            "PrimaryColour=&H004242c9,Outline=0,"
-            "Shadow=1,Alignment=2,MarginV=54'"
+            f"force_style='FontName=PingFang SC,FontSize={font_size},Bold=-1,"
+            f"PrimaryColour={primary},OutlineColour={outline},"
+            f"BorderStyle=1,Outline={outline_width},Shadow=1,"
+            f"Alignment=2,MarginV={margin_bottom}'"
         )
         self.run_command(self._ffmpeg_video_command(
             input_path, output_path, ["-vf", video_filter]
@@ -511,6 +550,8 @@ class RemotionCaptionBurn(BaseTool):
 
     def _render_with_drawtext(
         self, input_path: str, output_path: str, captions: list[dict],
+        font_size: int, font_color: str, outline_color: str,
+        outline_width: int, margin_bottom: int,
     ) -> None:
         temp_dir = Path(tempfile.mkdtemp(prefix="caption_drawtext_"))
         try:
@@ -520,14 +561,11 @@ class RemotionCaptionBurn(BaseTool):
                 text_path.write_text(text, encoding="utf-8")
                 escaped_path = str(text_path).replace("\\", "/")
                 escaped_path = escaped_path.replace("'", r"\'").replace(":", r"\:")
-                # [DEPRECATED 2026-08-09] 旧逻辑：y=h-text_h-80 固定底边距
-                # 被新的底部居中约 5% 边距逻辑取代，保留备查
-                # "x=(w-text_w)/2:y=h-text_h-80:"
                 filters.append(
                     "drawtext="
-                    f"textfile='{escaped_path}':fontsize=52:fontcolor=#c94242:"
-                    "borderw=2:bordercolor=black:"
-                    "x=(w-text_w)/2:y=h-text_h-h*0.05:"
+                    f"textfile='{escaped_path}':fontsize={font_size}:fontcolor={font_color}:"
+                    f"borderw={outline_width}:bordercolor={outline_color}:"
+                    f"x=(w-text_w)/2:y=h-text_h-{margin_bottom}:"
                     f"enable='between(t,{start_s:.3f},{end_s:.3f})'"
                 )
             self.run_command(self._ffmpeg_video_command(
@@ -538,6 +576,8 @@ class RemotionCaptionBurn(BaseTool):
 
     def _render_with_image_overlays(
         self, input_path: str, output_path: str, captions: list[dict],
+        font_size: int, font_color: str, outline_color: str,
+        outline_width: int, margin_bottom: int,
     ) -> None:
         try:
             from PIL import Image, ImageDraw, ImageFont
@@ -548,21 +588,25 @@ class RemotionCaptionBurn(BaseTool):
 
         temp_dir = Path(tempfile.mkdtemp(prefix="caption_overlay_"))
         try:
-            font = self._caption_font(ImageFont, 52)
+            font = self._caption_font(ImageFont, font_size)
+            fill = self._hex_to_rgb(font_color)
+            stroke_fill = self._hex_to_rgb(outline_color)
             pages = self._caption_pages(captions)
             png_paths = []
             for index, (caption_text, _, _) in enumerate(pages):
                 scratch = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
                 draw = ImageDraw.Draw(scratch)
-                box = draw.textbbox((0, 0), caption_text, font=font, stroke_width=2)
+                box = draw.textbbox(
+                    (0, 0), caption_text, font=font, stroke_width=outline_width,
+                )
                 width = max(2, box[2] - box[0] + 24)
                 height = max(2, box[3] - box[1] + 20)
                 image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
                 draw = ImageDraw.Draw(image)
                 draw.text(
                     (12 - box[0], 10 - box[1]), caption_text, font=font,
-                    fill=(201, 66, 66, 255), stroke_width=2,
-                    stroke_fill=(0, 0, 0, 255),
+                    fill=(*fill, 255), stroke_width=outline_width,
+                    stroke_fill=(*stroke_fill, 255),
                 )
                 png_path = temp_dir / f"cue_{index:04d}.png"
                 image.save(png_path)
@@ -576,12 +620,10 @@ class RemotionCaptionBurn(BaseTool):
             previous = "[0:v]"
             for index, (_, start_s, end_s) in enumerate(pages, start=1):
                 output = f"[captioned{index}]"
-                # [DEPRECATED 2026-08-09] 旧逻辑：y=H-h-80 固定底边距
-                # 被新的底部居中约 5% 边距逻辑取代，保留备查
-                # f"x=(W-w)/2:y=H-h-80:enable='between(t,{start_s:.3f},{end_s:.3f})'"
                 chains.append(
                     f"{previous}[{index}:v]overlay="
-                    f"x=(W-w)/2:y=H-h-H*0.05:enable='between(t,{start_s:.3f},{end_s:.3f})'"
+                    f"x=(W-w)/2:y=H-h-{margin_bottom}:"
+                    f"enable='between(t,{start_s:.3f},{end_s:.3f})'"
                     f"{output}"
                 )
                 previous = output
@@ -610,6 +652,18 @@ class RemotionCaptionBurn(BaseTool):
         return image_font.load_default()
 
     @staticmethod
+    def _hex_to_rgb(color: str) -> tuple[int, int, int]:
+        normalized = color.strip().lstrip("#")
+        if not re.fullmatch(r"[0-9a-fA-F]{6}", normalized):
+            raise ValueError(f"Caption color must be #RRGGBB, got {color!r}")
+        return tuple(int(normalized[index:index + 2], 16) for index in (0, 2, 4))
+
+    @classmethod
+    def _hex_to_ass_color(cls, color: str) -> str:
+        red, green, blue = cls._hex_to_rgb(color)
+        return f"&H00{blue:02X}{green:02X}{red:02X}"
+
+    @staticmethod
     def _caption_pages(captions: list[dict]) -> list[tuple[str, float, float]]:
         pages = []
         cue_groups: list[list[dict]] = []
@@ -628,6 +682,72 @@ class RemotionCaptionBurn(BaseTool):
                     page[-1]["endMs"] / 1000.0,
                 ))
         return pages
+
+    @classmethod
+    def _ass_subtitle_content(
+        cls,
+        captions: list[dict],
+        fade_in_ms: int,
+        fade_out_ms: int,
+        video_width: int = 1920,
+        video_height: int = 1080,
+    ) -> str:
+        """Build cue-aware ASS subtitles with a short fade at both edges."""
+        header = [
+            "[Script Info]",
+            "ScriptType: v4.00+",
+            f"PlayResX: {video_width}",
+            f"PlayResY: {video_height}",
+            "Collisions: Normal",
+            "WrapStyle: 0",
+            "ScaledBorderAndShadow: yes",
+            "",
+            "[V4+ Styles]",
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+            "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+            "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+            "Alignment, MarginL, MarginR, MarginV, Encoding",
+            "Style: Default,PingFang SC,36,&H00FFFFFF,&H00FFFFFF,&H00000000,"
+            "&H80000000,-1,0,0,0,100,100,0,0,1,3,1,2,24,24,48,1",
+            "",
+            "[Events]",
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, "
+            "Effect, Text",
+        ]
+        fade_in = max(0, int(fade_in_ms))
+        fade_out = max(0, int(fade_out_ms))
+        for text, start_s, end_s in cls._caption_pages(captions):
+            safe_text = text.replace("\\", r"\\").replace("{", r"\{").replace("}", r"\}")
+            header.append(
+                f"Dialogue: 0,{cls._seconds_to_ass(start_s)},"
+                f"{cls._seconds_to_ass(end_s)},Default,,0,0,0,,"
+                f"{{\\fad({fade_in},{fade_out})}}{safe_text}"
+            )
+        return "\n".join(header) + "\n"
+
+    @staticmethod
+    def _video_dimensions(input_path: str) -> tuple[int, int]:
+        completed = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x",
+                input_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True,
+        )
+        width, height = completed.stdout.strip().split("x", maxsplit=1)
+        return int(width), int(height)
+
+    @staticmethod
+    def _seconds_to_ass(seconds: float) -> str:
+        centiseconds = max(0, round(seconds * 100))
+        hours, remainder = divmod(centiseconds, 360000)
+        minutes, remainder = divmod(remainder, 6000)
+        whole_seconds, fraction = divmod(remainder, 100)
+        return f"{hours}:{minutes:02d}:{whole_seconds:02d}.{fraction:02d}"
 
     @staticmethod
     def _ffmpeg_video_command(
@@ -658,6 +778,12 @@ class RemotionCaptionBurn(BaseTool):
         force_ffmpeg = inputs.get("force_ffmpeg", False)
         words_per_page = inputs.get("words_per_page", 4)
         font_size = inputs.get("font_size", 52)
+        font_color = inputs.get("font_color", "#FFFFFF")
+        outline_color = inputs.get("outline_color", "#000000")
+        outline_width = inputs.get("outline_width", 3)
+        margin_bottom = inputs.get("margin_bottom", 48)
+        fade_in_ms = inputs.get("fade_in_ms", 180)
+        fade_out_ms = inputs.get("fade_out_ms", 220)
         highlight_color = inputs.get("highlight_color", "#22D3EE")
 
         if not Path(input_path).exists():
@@ -693,7 +819,11 @@ class RemotionCaptionBurn(BaseTool):
                 overlays=overlays,
             )
         else:
-            result = self._render_ffmpeg(input_path, output_path, captions)
+            result = self._render_ffmpeg(
+                input_path, output_path, captions,
+                font_size, font_color, outline_color,
+                outline_width, margin_bottom, fade_in_ms, fade_out_ms,
+            )
 
         result.duration_seconds = round(time.time() - start, 2)
         return result

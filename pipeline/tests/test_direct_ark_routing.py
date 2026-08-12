@@ -23,8 +23,11 @@ if str(SCRIPTS) not in sys.path:
 
 import phase_orchestrator
 
-from clients import local_video_client, seedance_client
+from clients import ark_multimodal_client, local_video_client, seedance_client
+from clients.seedream_client import SeedreamClient
 from phases import pipeline_core
+from phases.phase5.storyboard_qa_gate import _calibrate_l3_severity
+from phases.phase8.story_order_reviewer import _shot_id, storyboard_shot_ids
 from runtime.bridge_execution import execute_bridge_video_task
 from runtime.capacity import (
     CapacityTable,
@@ -40,6 +43,7 @@ from runtime.seedance_execution import (
 )
 from tools import asset_packager
 from utils import shot_embedder
+from vendor.video_tools.tools.video.remotion_caption_burn import RemotionCaptionBurn
 
 _runner_spec = importlib.util.spec_from_file_location(
     "pipeline_runner_cli", SRC / "pipeline_runner.py"
@@ -1269,3 +1273,140 @@ def test_phase6_honors_seedance_provider_capacity(tmp_path, monkeypatch):
             "SELECT COUNT(*) FROM generation_tasks WHERE status = 'succeeded'"
         ).fetchone()[0]
     assert succeeded == 4
+
+
+def test_multimodal_review_uses_vision_model_and_bounded_output(tmp_path):
+    observed = {}
+
+    class FakeCompletions:
+        @staticmethod
+        def create(**kwargs):
+            observed.update(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"ok": true}'))]
+            )
+
+    class FakeClient:
+        class chat:
+            completions = FakeCompletions()
+
+    image = tmp_path / "grid.jpg"
+    image.write_bytes(b"image-bytes")
+    client = ark_multimodal_client.ArkMultimodalClient(client=FakeClient())
+
+    assert client.review([image], "review") == '{"ok": true}'
+    assert observed["model"] == "doubao-seed-2.0-lite"
+    assert observed["max_tokens"] == 4096
+    assert observed["extra_body"] == {"thinking": {"type": "disabled"}}
+
+
+def test_seedream_accepts_multiple_character_references(tmp_path, monkeypatch):
+    first = tmp_path / "lin.png"
+    second = tmp_path / "jin.jpg"
+    first.write_bytes(b"lin")
+    second.write_bytes(b"jin")
+    observed = {}
+    client = SeedreamClient(api_key="test")
+
+    def fake_call(payload, output_path, timeout=180):
+        observed.update(payload)
+        return "ok"
+
+    monkeypatch.setattr(client, "_call_and_save", fake_call)
+
+    assert client.image_to_image(
+        "two locked characters",
+        [str(first), str(second)],
+        output_path=str(tmp_path / "out.png"),
+    ) == "ok"
+    assert isinstance(observed["image"], list)
+    assert observed["image"][0].startswith("data:image/png;base64,")
+    assert observed["image"][1].startswith("data:image/jpeg;base64,")
+
+
+def test_storyboard_keyframe_prompt_prioritizes_identity_and_action():
+    prompt = pipeline_core._storyboard_keyframe_description(
+        {
+            "subject_description": "凛—银白长发女性；烬—黑色短发男性",
+            "action_description": "烬抓住凛的手腕，将她甩向汽车残骸",
+            "visual": "雨夜高架桥，二人近身缠斗",
+        }
+    )
+
+    assert "银白长发女性" in prompt
+    assert "Exact action contract" in prompt
+    assert "将她甩向汽车残骸" in prompt
+    assert "decisive final pose" in prompt
+    assert "No exposed midriff" in prompt
+
+
+def test_l3_severity_blocks_identity_but_not_static_pose_nuance():
+    assert _calibrate_l3_severity(
+        "R1", "severe", "wrong character identity and gender"
+    ) == "severe"
+    assert _calibrate_l3_severity(
+        "R1", "severe", "black jacket instead of distressed black denim"
+    ) == "moderate"
+    assert _calibrate_l3_severity(
+        "R4", "severe", "blade angle is diagonal rather than horizontal"
+    ) == "moderate"
+    assert _calibrate_l3_severity(
+        "R4", "severe", "reversed attacker and defender"
+    ) == "severe"
+
+
+def test_story_order_accepts_phase1_numeric_ids():
+    assert _shot_id(1) == "S01"
+    assert _shot_id("2") == "S02"
+    assert _shot_id("s03") == "S03"
+    assert _shot_id(True) is None
+    assert storyboard_shot_ids({"shots": [{"id": 1}, {"id": 2}]}) == [
+        "S01",
+        "S02",
+    ]
+
+
+def test_ffmpeg_subtitle_fallback_honors_readable_style(tmp_path, monkeypatch):
+    burner = RemotionCaptionBurn()
+    observed = {}
+
+    def capture(command, **kwargs):
+        observed["command"] = command
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(burner, "run_command", capture)
+    burner._render_with_subtitles(
+        "input.mp4",
+        "output.mp4",
+        tmp_path / "captions.srt",
+        48,
+        "#FFFFFF",
+        "#000000",
+        3,
+        60,
+    )
+
+    video_filter = observed["command"][observed["command"].index("-vf") + 1]
+    assert "FontSize=48" in video_filter
+    assert "PrimaryColour=&H00FFFFFF" in video_filter
+    assert "OutlineColour=&H00000000" in video_filter
+    assert "Outline=3" in video_filter
+    assert "MarginV=60" in video_filter
+
+
+def test_ass_subtitles_keep_dialogue_cues_separate_and_fade():
+    content = RemotionCaptionBurn._ass_subtitle_content(
+        [
+            {"word": "第一条", "startMs": 1000, "endMs": 2000, "cueId": 0},
+            {"word": "第二条", "startMs": 3000, "endMs": 4000, "cueId": 1},
+        ],
+        fade_in_ms=180,
+        fade_out_ms=220,
+    )
+
+    dialogue_lines = [line for line in content.splitlines() if line.startswith("Dialogue:")]
+    assert len(dialogue_lines) == 2
+    assert "{\\fad(180,220)}第一条" in dialogue_lines[0]
+    assert "{\\fad(180,220)}第二条" in dialogue_lines[1]
+    assert "PlayResX: 1920" in content
+    assert "PlayResY: 1080" in content

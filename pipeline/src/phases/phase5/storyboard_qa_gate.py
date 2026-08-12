@@ -207,6 +207,39 @@ def create_storyboard_grid(image_paths: list[Path], output_path: Path, columns: 
     return output_path
 
 
+def _calibrate_l3_severity(red_line: str, severity: str, message: str) -> str:
+    """Keep L3 blocking for production-breaking mismatches, not pose minutiae."""
+    if severity != "severe":
+        return severity
+    normalized_line = red_line.upper()
+    text = message.casefold()
+    hard_blockers = (
+        "identity",
+        "gender",
+        "male",
+        "female",
+        "missing character",
+        "wrong character",
+        "reversed attacker",
+        "wrong location",
+        "身份",
+        "性别",
+        "男性",
+        "女性",
+        "角色缺失",
+        "人物错误",
+        "攻守颠倒",
+        "场景错误",
+    )
+    if normalized_line == "R1" and not any(term in text for term in hard_blockers):
+        return "moderate"
+    if normalized_line in {"R3", "R4"} and not any(
+        term in text for term in hard_blockers
+    ):
+        return "moderate"
+    return severity
+
+
 def run_l3_review(storyboard: dict, characters_data: dict, visual_style: str, images: dict[str, Path], grid_path: Path, client: ArkMultimodalClient | None = None) -> tuple[list[dict], dict]:
     if not images:
         return [], {"status": "skipped", "skipped_reason": "no storyboard images available"}
@@ -214,7 +247,7 @@ def run_l3_review(storyboard: dict, characters_data: dict, visual_style: str, im
     create_storyboard_grid(ordered, grid_path)
     if client is None and not (os.environ.get("ARK_AGENT_API_KEY") or os.environ.get("ARK_API_KEY")):
         return [], {"status": "skipped", "grid_path": str(grid_path), "skipped_reason": "ARK multimodal API key missing"}
-    prompt = f"""Review this storyboard grid against the supplied project artifacts. Apply red lines R1-R4: R1 character identity/gender/build continuity; R2 time-of-day and lighting continuity; R3 scene/action continuity; R4 storyboard-to-image semantic fidelity. Only identify problems; do not propose or perform edits. Return JSON: {{"issues":[{{"red_line":"R1","severity":"severe|moderate|minor","shot_ids":["S01"],"message":"..."}}]}}. Do not invent shot IDs.
+    prompt = f"""Review this storyboard grid against the supplied project artifacts. Apply red lines R1-R4: R1 character identity/gender/build continuity; R2 time-of-day and lighting continuity; R3 scene/action continuity; R4 storyboard-to-image semantic fidelity. Each storyboard image is one decisive still from a multi-step shot, so it need not show every earlier and later action simultaneously. Reserve severe for production-breaking mismatches: wrong/missing character identity or gender, wrong location/time-of-day, reversed attacker/defender, or a wholly unrelated core action. Use moderate for same-color costume material nuances, exact blade angle, blocking position offsets, or omitted intermediate motion that a single still cannot contain. Only identify problems; do not propose or perform edits. Return JSON: {{"issues":[{{"red_line":"R1","severity":"severe|moderate|minor","shot_ids":["S01"],"message":"..."}}]}}. Do not invent shot IDs.
 STORYBOARD:
 {json.dumps(storyboard, ensure_ascii=False)}
 CHARACTERS:
@@ -232,9 +265,14 @@ VISUAL STYLE:
         for value in parsed["issues"]:
             if not isinstance(value, dict):
                 continue
-            severity = value.get("severity") if value.get("severity") in {"severe", "moderate", "minor"} else "moderate"
+            red_line = str(value.get("red_line", "semantic_review"))
+            message = str(value.get("message", "Multimodal review issue"))
+            requested_severity = value.get("severity") if value.get("severity") in {"severe", "moderate", "minor"} else "moderate"
+            severity = _calibrate_l3_severity(
+                red_line, requested_severity, message
+            )
             shot_ids = [sid for sid in value.get("shot_ids", []) if sid in valid_ids]
-            issues.append(_issue("L3", severity, str(value.get("red_line", "semantic_review")), str(value.get("message", "Multimodal review issue")), shot_ids))
+            issues.append(_issue("L3", severity, red_line, message, shot_ids))
         return issues, {"status": "completed", "grid_path": str(grid_path), "raw_issue_count": len(parsed["issues"])}
     except Exception as exc:
         return [], {"status": "skipped", "grid_path": str(grid_path), "skipped_reason": f"multimodal review unavailable: {exc}"}
