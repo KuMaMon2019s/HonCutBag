@@ -83,12 +83,21 @@ def build_video_prompt(
     """Assemble the eight layers and apply Seedance/Kling guardrail routing."""
     number = _shot_number(shot_meta)
     scene = scene_consistency.get("shots", {}).get(f"S{number:02d}", {})
+    requested_declared = "who" in shot_meta or "characters" in shot_meta
     requested = shot_meta.get("who") or shot_meta.get("characters") or []
     requested = requested if isinstance(requested, list) else [requested]
+    explicit_scenery = requested_declared and not requested
     selected = []
     for character in _characters_list(characters):
-        if not requested or character.get("name") in requested or character.get("id") in requested \
-                or set(character.get("aliases", [])).intersection(requested):
+        matches_requested = (
+            character.get("name") in requested
+            or character.get("id") in requested
+            or bool(set(character.get("aliases", [])).intersection(requested))
+        )
+        # An explicit who=[] is a hard scenery contract, not shorthand for
+        # "select every known character". Legacy metadata with no character
+        # field at all retains the historical all-character fallback.
+        if matches_requested or (not requested_declared and not requested):
             selected.append(character)
 
     parts = []
@@ -123,8 +132,16 @@ def build_video_prompt(
     audio = shot_meta.get("audio") or shot_meta.get("sound")
     if audio:
         parts.append(f"音效：{audio}")
-    style = scene.get("style_anchor") or scene.get("style_suffix") or scene_consistency.get("global_style_lock") or "电影叙事风格"
-    style = get_slice(str(style), "video")
+    # The per-shot storyboard frame already carries the project's visual style.
+    # Project-level summaries often contain plot nouns (characters, palaces,
+    # props, future locations). Repeating that prose in every prompt caused a
+    # cloud-only opening shot to invent a fairy and a palace.
+    style = (
+        "仅继承该镜头参考分镜帧的渲染方式、色彩科学、光影质感、材质真实度、"
+        "镜头语言与氛围；不得从项目级风格描述引入本镜头动作与视觉契约未明确列出的"
+        "人物、建筑、地点、道具或剧情元素"
+    )
+    style = get_slice(style, "video")
     quality = scene.get("quality_suffix") or f"4K, 16:9, {shot_meta.get('duration', 5)}秒"
     time_lock, time_negative = _time_continuity_contract(
         shot_meta.get("time_of_day"),
@@ -140,12 +157,23 @@ def build_video_prompt(
     parts.append(f"全局收尾：{style}；{quality}")
 
     negatives = [BASE_NEGATIVE_PROMPT, str(scene.get("negative_prompt", "")).strip()]
+    if explicit_scenery:
+        negatives.append(
+            "人物(people), 人形主体(humanoid figures), 角色(characters), "
+            "服装(costumes), 未明确列出的建筑或道具(unlisted architecture or props)"
+        )
     if time_negative:
         negatives.append(time_negative)
     negatives.extend(str(char.get("negative_guardrails", "")).strip() for char in selected)
     negative_prompt = ", ".join(dict.fromkeys(item for item in negatives if item))
     prompt = "。".join(parts)
     prompt = re.sub(r"(?i)\bfast\b", "smooth", prompt).replace("快速", "平稳")
+    if explicit_scenery:
+        scenery_lock = (
+            "纯环境镜头硬约束：画面中保持零人物、零人形主体、零服装与零角色道具，"
+            "只呈现本镜头主体总结和动作中明确列出的环境元素"
+        )
+        return f"{prompt}。{scenery_lock}。约束条件：{negative_prompt}"
     fictional_decl = "虚拟形象声明：片中角色均为 AI 生成的虚构角色，非真实人物"
     if "kling" in model.lower():
         return {"prompt": f"{fictional_decl}。{prompt}", "negative_prompt": negative_prompt}

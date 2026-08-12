@@ -93,11 +93,17 @@ def _shot_id(shot: dict) -> str:
 
 def _character_is_in_shot(character_name: str, shot: dict) -> bool:
     """Use explicit cast metadata when present; otherwise keep legacy behavior."""
-    who = shot.get("who")
-    if isinstance(who, list) and who:
-        return character_name in {str(item) for item in who}
-    if isinstance(who, str) and who.strip():
-        return character_name in who
+    # Presence of ``who`` is authoritative, including an explicitly empty list.
+    # Treating ``who: []`` as missing metadata makes every scenery-only shot a
+    # character shot and unfairly lowers the consistency score.
+    if "who" in shot:
+        who = shot.get("who")
+        if isinstance(who, list):
+            return character_name in {str(item) for item in who}
+        if isinstance(who, str):
+            return bool(who.strip()) and character_name in who
+        if who is None:
+            return False
 
     assets = shot.get("associate_assets")
     if isinstance(assets, list) and assets:

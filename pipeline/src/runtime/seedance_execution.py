@@ -26,6 +26,8 @@ class SeedanceExecution:
 def _provider_rejected_submission(error: Exception) -> bool:
     message = str(error)
     rejection_markers = (
+        "Seedance API 400",
+        "InvalidParameter",
         "401",
         "403",
         "429",

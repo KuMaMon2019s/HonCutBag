@@ -3,9 +3,64 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 from .frame_analysis import probe_duration
+
+
+def trim_excess_to_target(output_dir: Path, target_duration: float | None) -> dict | None:
+    """Losslessly trim a slightly long assembly to the delivery duration.
+
+    Phase 9 requires the delivered video to be within one second of the user
+    target. Phase 8 historically accepted any overlong output, so accumulated
+    transition rounding could pass here and fail later. Stream-copy trimming is
+    sufficient because the assembly starts at timestamp zero and is already a
+    normalized 30 fps H.264/AAC file.
+    """
+    if target_duration is None:
+        return None
+    video = Path(output_dir) / "raw_assembly.mp4"
+    actual = probe_duration(video)
+    target = float(target_duration)
+    if actual <= target:
+        return None
+    temporary = video.with_name("raw_assembly.duration_trim.mp4")
+    completed = subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", str(video), "-t", f"{target:.6f}",
+            "-map", "0:v:0", "-map", "0:a?", "-c", "copy",
+            "-avoid_negative_ts", "make_zero", str(temporary),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    if completed.returncode != 0 or not temporary.is_file():
+        temporary.unlink(missing_ok=True)
+        detail = completed.stderr.strip().splitlines()
+        raise RuntimeError(
+            "failed to trim overlong Phase 8 assembly: "
+            f"{detail[-1] if detail else 'unknown ffmpeg error'}"
+        )
+    trimmed = probe_duration(temporary)
+    if trimmed > target + 0.1 or trimmed < target - 1.0:
+        temporary.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"trimmed assembly duration invalid: target={target:.3f}s actual={trimmed:.3f}s"
+        )
+    temporary.replace(video)
+    receipt = {
+        "original_s": round(actual, 3),
+        "target_s": round(target, 3),
+        "trimmed_s": round(trimmed, 3),
+        "method": "stream_copy",
+    }
+    (Path(output_dir) / "duration_trim.json").write_text(
+        json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return receipt
 
 
 def build_reshoot_list(shots_dir: Path, required_gap_s: float, round_number: int) -> dict:

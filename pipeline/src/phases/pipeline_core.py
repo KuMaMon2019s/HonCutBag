@@ -46,6 +46,10 @@ from utils.style_slices import get_slice
 from utils.ark_llm import call_llm_stream, configure_heartbeat_callback
 
 
+STYLE_SUMMARY_WALL_TIMEOUT = 180.0
+STYLE_SUMMARY_IDLE_TIMEOUT = 75.0
+
+
 def _run_storyboard_supervision(storyboard: dict, output_dir: Path) -> dict:
     """Run the optional independent review at the Phase 5/6 boundary."""
     from quality.supervision_agent import run_supervision
@@ -464,7 +468,6 @@ if LANGGRAPH_AVAILABLE:
         Generate Send objects for parallel video generation."""
         shots = state.get("shots", [])
         output_dir = state["output_dir"]
-        storyboard_image = str(Path(output_dir) / "storyboard.png")
         style_context = None
         
         if state.get("storyboard_data", {}).get("style"):
@@ -472,9 +475,10 @@ if LANGGRAPH_AVAILABLE:
         
         sends = []
         for shot in shots:
+            shot_reference = _shot_storyboard_reference(Path(output_dir), shot.get("id"))
             sends.append(Send("generate_video", {
                 "shot": shot,
-                "storyboard_image": storyboard_image,
+                "storyboard_image": str(shot_reference) if shot_reference else None,
                 "output_dir": output_dir,
                 "style_context": style_context,
             }))
@@ -672,7 +676,9 @@ def _summarize_visual_style_with_llm(script_text: str) -> Optional[str]:
                 "content": "用一句话总结以下剧本的美术风格，只输出风格描述：\n" + script_text,
             }],
             max_tokens=1024,
-            wall_timeout=60.0,
+            wall_timeout=STYLE_SUMMARY_WALL_TIMEOUT,
+            read_timeout=STYLE_SUMMARY_IDLE_TIMEOUT,
+            idle_timeout=STYLE_SUMMARY_IDLE_TIMEOUT,
         ).strip() or None
     except Exception as exc:
         print(f"  ⚠ 风格总结失败，降级使用 default_visual_style: {exc}")
@@ -962,7 +968,11 @@ def run_phase1_screenwriter(
         # 正常模式：调用 API
         try:
             from prompt.event_extractor import extract_events
-            from phases.phase1.character_discoverer import discover_characters, _is_human_character
+            from phases.phase1.character_discoverer import (
+                CHARACTER_CONTEXT_SCHEMA_VERSION,
+                _is_human_character,
+                discover_characters,
+            )
             from phases.phase1.adaptation_engine import adapt_events
             from phases.phase1.storyboard_generator import generate_storyboard
         except ImportError as e:
@@ -1017,7 +1027,12 @@ def run_phase1_screenwriter(
         if reporter:
             reporter.step("phase1", "发现角色", progress_pct=50)
         characters_checkpoint = output_dir / "phase1_characters.json"
-        characters_input_hash = _phase1_input_hash(events)
+        characters_input_hash = _phase1_input_hash([
+            {
+                "character_context_schema": CHARACTER_CONTEXT_SCHEMA_VERSION,
+                "events": events,
+            }
+        ])
         characters_result = _load_phase1_checkpoint(
             characters_checkpoint,
             "characters",
@@ -1041,7 +1056,7 @@ def run_phase1_screenwriter(
             print("    ↻ 复用 phase1_characters.json，跳过角色发现")
         else:
             characters_result = dict(discover_characters(events))
-            characters_result.setdefault("source_text_hash", characters_input_hash)
+            characters_result["source_text_hash"] = characters_input_hash
             characters_result.setdefault(
                 "total_characters", len(characters_result.get("characters", []))
             )
@@ -1242,10 +1257,27 @@ def fill_storyboard_template(template: str, storyboard_data: dict, characters_da
     shots = storyboard_data.get("shots", [])
     storyboard_lines = []
     for i, shot in enumerate(shots, 1):
-        scene = shot.get("scene", shot.get("description", ""))
-        action = shot.get("action", "")
-        camera = shot.get("camera", "")
-        line = f"面板 {i}: {scene}"
+        scene = (
+            shot.get("visual")
+            or shot.get("scene")
+            or shot.get("description")
+            or shot.get("prompt")
+            or ""
+        )
+        action = shot.get("action_description") or shot.get("action") or shot.get("what") or ""
+        camera = (
+            shot.get("camera_movement")
+            or shot.get("camera_movement_en")
+            or shot.get("camera")
+            or shot.get("shot_type")
+            or ""
+        )
+        scene = str(scene).strip()
+        action = str(action).strip()
+        camera = str(camera).strip()
+        if not scene and not action:
+            raise ValueError(f"storyboard shot {i} has no visual content")
+        line = f"面板 {i}: {scene or action}"
         if action:
             line += f" — 动作: {action}"
         if camera:
@@ -1312,6 +1344,17 @@ def _normalize_shot_id(shot_item: dict) -> Optional[str]:
     if raw_str.upper().startswith("S"):
         raw_str = raw_str[1:]
     return f"S{raw_str.zfill(2)}"
+
+
+def _shot_storyboard_reference(output_dir: Path, shot_id: Any) -> Optional[Path]:
+    """Return a single-shot reference; never return the overview contact sheet."""
+    normalized = _normalize_shot_id({"id": shot_id})
+    if normalized is None:
+        return None
+    path = Path(output_dir) / "storyboard_images" / f"{normalized}.png"
+    if path.is_file() and path.stat().st_size > 1024:
+        return path
+    return None
 
 
 # Action verb → end-state mapping (for FLF2V end frames)
@@ -1496,14 +1539,16 @@ def _storyboard_image_size(image_path: Optional[Path] = None, video_width: int =
 # Tuned after S05 smoke test: t2i generation (M3) produces genuinely different
 # images from first frame, so i2i-era thresholds were too strict.
 #
-# similarity_high: 0.93 allows genuine action progress (0.88-0.92) while
-#   catching true copies (0.99+). Old value 0.85 rejected good frames.
+# similarity_high: 0.97 allows genuine action progress whose broad grayscale
+#   composition remains similar (observed at 0.9324 in the 240s xianxia run),
+#   while still catching true copies (0.99+). The old 0.93 threshold rejected
+#   visibly different camera staging and hand positions.
 # similarity_low: 0.3 unchanged — scene drift detection still needed.
 # sharpness_floor_ratio: 0.15 — t2i without reference injection is inherently
 #   softer than i2i with character refs.实测 88.5/439.7=0.20 > 0.15 passes.
 #   Old value 0.3 rejected visually acceptable t2i output.
 FLF2V_SIMILARITY_LOW: float = 0.3
-FLF2V_SIMILARITY_HIGH: float = 0.93
+FLF2V_SIMILARITY_HIGH: float = 0.97
 FLF2V_SHARPNESS_RATIO: float = 0.15
 
 
@@ -1522,7 +1567,8 @@ def _validate_end_frame(
     
     Thresholds (M4, t2i-adapted):
       similarity_low=0.3   — scene drift floor (unchanged from M2)
-      similarity_high=0.93 — catch true copies (0.99+), allow genuine action (0.88-0.92)
+      similarity_high=0.97 — catch true copies (0.99+), allow changed staging that
+                             retains the same subject and luminous background
       sharpness_floor_ratio=0.15 — t2i is softer than i2i; 0.20× ratio is acceptable
     
     No VLM required — deterministic metric checks:
@@ -1790,27 +1836,39 @@ def _generate_flf2v_end_frame(
 
 def _storyboard_keyframe_description(shot: dict) -> str:
     """Build an identity-locked, single-moment prompt for one storyboard frame."""
+    who_declared = "who" in shot
+    who = shot.get("who") or []
     identity = str(shot.get("subject_description") or "").strip()
     action = str(
         shot.get("action_description") or shot.get("what") or ""
     ).strip()
     staging = str(shot.get("visual") or "").strip()
-    parts = [
-        "Single decisive storyboard keyframe, not a generic fight pose.",
-        (
-            "Character identity lock (gender, hair, face, fully covered clothing, "
-            f"and weapons must remain exact): {identity}."
-            if identity
-            else ""
-        ),
-        f"Exact action contract: {action}." if action else "",
-        (
-            "Show the decisive final pose of that action contract in one frame; "
-            "do not substitute an earlier action or a generic blade clash."
-        ),
-        f"Visual staging: {staging}." if staging else "",
-        "No exposed midriff, no swapped weapons, no reversed attacker and defender.",
-    ]
+    # Only explicit who=[] is an environment contract. Legacy storyboards may
+    # omit ``who`` while carrying character identity and action in the older
+    # subject/action fields.
+    if who_declared and not who:
+        parts = [
+            "Environment-only cinematic keyframe.",
+            "Depict exclusively the described clouds, landscape, architecture, light, and atmosphere.",
+            f"Exact environment contract: {action}." if action else "",
+            f"Visual staging: {staging}." if staging else "",
+            "The frame is uninhabited: zero people, zero humanoid figures, and zero unrelated objects.",
+        ]
+    else:
+        parts = [
+            "Single decisive cinematic keyframe.",
+            (
+                "Character identity lock (gender, hair, face, clothing, and body proportions "
+                f"must remain exact): {identity}."
+                if identity
+                else ""
+            ),
+            f"Exact action contract: {action}." if action else "",
+            "Show one decisive final pose of that exact action contract.",
+            f"Visual staging: {staging}." if staging else "",
+            "Depict only subjects, props, and actions explicitly named in the contract.",
+            "No exposed midriff unless the identity contract explicitly requires it.",
+        ]
     return " ".join(part for part in parts if part)
 
 
@@ -1842,14 +1900,12 @@ def _generate_shot_images(
                 "lighting_key": shot.get("lighting_key"),
             })
             prompt_scenes.append(prompt_scene)
-        visual_style_path = output_dir / "visual-style.md"
-        visual_style_text = (
-            visual_style_path.read_text(encoding="utf-8")
-            if visual_style_path.is_file() else storyboard_data.get("style", "cinematic")
-        )
+        # Each shot's visual/action contract already contains its intended style.
+        # A project-level LLM style summary may mention plot objects (palace,
+        # character, props); injecting it into every shot leaks future content.
         batch_prompts = build_batch_prompts(
             prompt_scenes,
-            {"mood": get_slice(visual_style_text, "storyboard")},
+            None,
         )
         prompt_by_id = {str(item["scene_id"]): item["prompt"] for item in batch_prompts}
 
@@ -2078,6 +2134,7 @@ def run_phase2(storyboard_data: dict, characters_data: dict, output_dir: Path, d
 
     # 2. 填充模板
     prompt = fill_storyboard_template(template, storyboard_data, characters_data)
+    (output_dir / "storyboard_prompt.txt").write_text(prompt, encoding="utf-8")
     print(f"  → 提示词已生成 ({len(prompt)} 字符)")
 
     storyboard_path = output_dir / "storyboard.png"
@@ -2623,8 +2680,10 @@ def _run_phase6_om_seedance(storyboard_data: dict, output_dir: Path, characters_
         raise ImportError(f"SeedanceVideo not available (status={status})")
 
     shots = storyboard_data.get("shots", [])
-    storyboard_image = output_dir / "storyboard.png"
-    has_storyboard_image = storyboard_image.exists()
+    has_shot_references = any(
+        _shot_storyboard_reference(output_dir, shot.get("id")) is not None
+        for shot in shots
+    )
 
     # 构建角色参考图映射：character_id -> preferred reference path
     character_ref_images = {}
@@ -2653,10 +2712,10 @@ def _run_phase6_om_seedance(storyboard_data: dict, output_dir: Path, characters_
                 character_ref_images[char_name] = str(reference_path)  # 也支持按名称匹配
                 print(f"  ✓ 角色参考图: {char_name} -> {reference_path.name}")
 
-    if has_storyboard_image:
-        print(f"  → 模式: reference_to_video (storyboard.png 存在)")
+    if has_shot_references:
+        print("  → 模式: reference_to_video (逐镜分镜图存在)")
     else:
-        print(f"  → 模式: text_to_video (storyboard.png 不存在)")
+        print("  → 模式: 角色参考图或 text_to_video")
 
     outputs = []
     errors = []
@@ -2714,8 +2773,10 @@ def _run_phase6_om_seedance(storyboard_data: dict, output_dir: Path, characters_
                             print(f"    ✓ 使用角色参考图: {char_id}")
                             break
             
-            # 确定参考图：角色参考图 > storyboard.png
-            reference_image = character_ref if character_ref else (str(storyboard_image) if has_storyboard_image else None)
+            # 单镜构图图已经通过角色参考生成，因此优先级最高。总览网格
+            # storyboard.png 绝不能作为单镜视频参考，否则会传播分格构图。
+            shot_reference = _shot_storyboard_reference(output_dir, shot_id)
+            reference_image = str(shot_reference) if shot_reference else character_ref
             
             if reference_image:
                 # 优先使用 reference_to_video
@@ -2785,7 +2846,7 @@ def _run_phase6_om_seedance(storyboard_data: dict, output_dir: Path, characters_
         "outputs": outputs,
         "errors": errors,
         "provider": "seedance",
-        "mode": "reference_to_video" if has_storyboard_image else "text_to_video",
+        "mode": "reference_to_video" if has_shot_references else "text_to_video",
     }
 
 
@@ -2819,6 +2880,84 @@ def _apply_chain_relay(content_list, first_frame_b64, shot_id):
         "priority": "high",
     })
     return content_list
+
+
+def _prompt_assets_for_shot(shot_meta: dict, characters_data: dict) -> list[dict]:
+    """Return only character prompt assets explicitly bound to this shot."""
+    requested = shot_meta.get("who") or shot_meta.get("characters") or []
+    if not isinstance(requested, list):
+        requested = [requested] if requested else []
+    requested_keys = {str(value).casefold() for value in requested if value}
+    for asset_id in shot_meta.get("associate_assets", []):
+        if isinstance(asset_id, str) and asset_id.startswith("char:"):
+            requested_keys.add(asset_id[5:].split(":", 1)[0].casefold())
+
+    selected = []
+    for character in characters_data.get("characters", []):
+        keys = {
+            str(character.get("id", "")).casefold(),
+            str(character.get("name", "")).casefold(),
+            *{
+                str(alias).casefold()
+                for alias in character.get("aliases", [])
+                if alias
+            },
+        }
+        if requested_keys.intersection(keys):
+            selected.append({
+                "name": character.get("name", ""),
+                "description": character.get("appearance", {}).get("summary", ""),
+            })
+    return selected
+
+
+def _rejected_privacy_image_url(content: list[dict] | None, error: object) -> str | None:
+    """Return the stable URL key for the provider-rejected content[N] image."""
+    import re
+    from urllib.parse import urlsplit
+
+    match = re.search(r"content\[(\d+)\]", str(error))
+    if not match or not content:
+        return None
+    index = int(match.group(1))
+    if not 0 <= index < len(content):
+        return None
+    item = content[index]
+    if item.get("type") != "image_url":
+        return None
+    url = item.get("image_url", {}).get("url")
+    if not url:
+        return None
+    parsed = urlsplit(str(url))
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+
+def _without_rejected_privacy_images(
+    content: list[dict], rejected_urls: set[str]
+) -> list[dict]:
+    """Remove only previously rejected images while retaining safe references."""
+    if not rejected_urls:
+        return content
+    from urllib.parse import urlsplit
+
+    filtered = []
+    for item in content:
+        url = item.get("image_url", {}).get("url") if item.get("type") == "image_url" else None
+        if url:
+            parsed = urlsplit(str(url))
+            stable_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+            if stable_url in rejected_urls:
+                continue
+        filtered.append(item)
+    return filtered
+
+
+def _privacy_fallback_strategy(gen_strategy: str) -> str:
+    """Return a structurally valid route after an endpoint-frame rejection."""
+    # FLF2V requires first_frame + last_frame as an inseparable pair. Removing
+    # only one endpoint creates an invalid request, so fall back to Phantom's
+    # identity references instead. Phantom/i2v can drop one rejected image.
+    return "phantom" if gen_strategy == "flf2v" else gen_strategy
 
 
 def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
@@ -2903,13 +3042,6 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
     # Determine protagonist (first character) for default injection
     protagonist_b64 = char_list[0][2] if char_list else None
     protagonist_name = char_list[0][1] if char_list else None
-
-    # Load storyboard image as style reference
-    storyboard_b64 = None
-    storyboard_path = output_dir / "storyboard.png"
-    if storyboard_path.exists() and storyboard_path.stat().st_size > 10240:
-        storyboard_b64 = _b64.b64encode(storyboard_path.read_bytes()).decode()
-        print(f"  → 已加载故事板风格参考图")
 
     outputs = []
     # --- P1-C: Seed Locking（参考 HonCut asset_manifest seed）---
@@ -3088,9 +3220,7 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                 model_name=model_name,
                 mode="single_shot",
                 shot_data=meta,
-                assets=[{"name": c.get("name", ""), "description": c.get("appearance", {}).get("summary", "")} 
-                        for c in (json.loads((output_dir / "CHARACTERS.json").read_text()).get("characters", [])
-                                  if (output_dir / "CHARACTERS.json").exists() else [])]
+                assets=_prompt_assets_for_shot(meta, chars_data),
             )
             if routed_prompt:
                 prompt = routed_prompt
@@ -3105,6 +3235,13 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
         # Strategy: match by name/id in prompt → fallback to protagonist
         first_frame_b64 = None
         prompt_lower = prompt.lower()
+
+        # Canonical visual reference is the one-image-per-shot artifact.
+        # Never inject storyboard.png: it is a multi-panel overview sheet.
+        shot_image = _shot_storyboard_reference(output_dir, shot_dir.name)
+        if shot_image is not None:
+            first_frame_b64 = _b64.b64encode(shot_image.read_bytes()).decode()
+            print(f"    [M2] 注入逐镜分镜图: {shot_image.name}")
 
         # --- P0-C: HonCut 资产ID绑定匹配（associateAssetsIds）---
         # --- P1-A4: 衍生参考图匹配（char:id:state → variant_state.png）---
@@ -3148,26 +3285,25 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                         print(f"    [P0-C] 资产绑定匹配角色: {char_id}")
                         break
 
-        # Strategy: match by name/id in prompt → fallback to protagonist
-        for char_name, b64 in char_ref_map.items():
-            if char_name in prompt_lower:
-                first_frame_b64 = b64
-                print(f"    [ref] 注入角色参考: {char_name}")
-                break
+        # Strategy: match by name/id in prompt only when no canonical shot
+        # frame was found. Global style text may mention a protagonist even for
+        # explicit who=[] scenery shots; it must never replace Sxx.png.
+        if first_frame_b64 is None:
+            for char_name, b64 in char_ref_map.items():
+                if char_name in prompt_lower:
+                    first_frame_b64 = b64
+                    print(f"    [ref] 注入角色参考: {char_name}")
+                    break
         # Fallback: inject protagonist for shots with human activity keywords
-        if first_frame_b64 is None and protagonist_b64:
+        shot_who = meta.get("who") or meta.get("characters") or []
+        if first_frame_b64 is None and protagonist_b64 and shot_who:
             human_keywords = ["woman", "man", "girl", "boy", "person", "she", "he",
                               "her", "his", "lin xia", "shen yu", "xia", "yu"]
             if any(kw in prompt_lower for kw in human_keywords):
                 first_frame_b64 = protagonist_b64
                 print(f"    [ref] 注入主角参考 (fallback): {protagonist_name}")
 
-        # If still no reference, use storyboard as style reference
-        if first_frame_b64 is None and storyboard_b64:
-            first_frame_b64 = storyboard_b64
-            print(f"    [ref] 注入故事板风格参考")
-
-        # --- P0-A3: 场景参考图（优先级: 角色 > 场景 > 分镜图）---
+        # --- P0-A3: 场景参考图（逐镜图/角色参考缺失时使用）---
         if first_frame_b64 is None:
             shot_where = meta.get("where", "")
             if shot_where:
@@ -3176,13 +3312,6 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                 if scene_ref.exists() and scene_ref.stat().st_size > 1024:
                     first_frame_b64 = _b64.b64encode(scene_ref.read_bytes()).decode()
                     print(f"    [P0-A] 注入场景参考图: {scene_id}")
-
-        # --- M2: 分镜图构图参考（优先级低于角色参考图）---
-        if first_frame_b64 is None:
-            shot_image = output_dir / "storyboard_images" / f"{shot_dir.name}.png"
-            if shot_image.exists() and shot_image.stat().st_size > 1024:
-                first_frame_b64 = _b64.b64encode(shot_image.read_bytes()).decode()
-                print(f"    [M2] 注入分镜图构图参考: {shot_dir.name}.png")
 
         if active_source:
             try:
@@ -3221,7 +3350,17 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                     )
 
         max_retries = 3
-        for attempt in range(max_retries + 1):
+        quota_retries = 0
+        privacy_retries = 0
+        policy_retries = 0
+        privacy_rejected_urls: set[str] = set()
+        privacy_retry_strategy = gen_strategy
+        content_list = None
+        # Retry budgets are failure-class specific. A temporary quota burst
+        # must not consume the later privacy-fallback opportunity (or vice
+        # versa), otherwise the first different error after backoff becomes a
+        # false terminal failure.
+        while True:
             try:
                 out_path = str(shot_dir / "output.mp4")
                 
@@ -3330,12 +3469,15 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                 shot_id = shot_dir.name
                 content_meta = dict(meta)
                 content_meta["prompt"] = prompt
-                content_meta["gen_strategy"] = gen_strategy
+                content_meta["gen_strategy"] = privacy_retry_strategy
                 content_meta["_char_ids"] = sorted(associated_character_ids)
                 content_list = asset_packager.build_content_for_shot(
                     output_dir=output_dir,
                     shot_id=shot_id,
                     shot_meta=content_meta,
+                )
+                content_list = _without_rejected_privacy_images(
+                    content_list, privacy_rejected_urls
                 )
                 if active_source and first_frame_b64:
                     content_list = _apply_chain_relay(
@@ -3440,28 +3582,53 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                 }
             except Exception as e:
                 err_str = str(e)
-                if "401" in err_str or "403" in err_str:
-                    raise RuntimeError(
-                        f"{err_str}；检查 ARK_AGENT_API_KEY 或 Agent Plan 权限"
-                    ) from e
                 # 429 QuotaExceeded — exponential backoff retry
                 if "QuotaExceeded" in err_str or "429" in err_str:
-                    wait_sec = min(30 * (2 ** attempt), 120)
-                    if attempt < max_retries:
-                        print(f"    ⚠ {shot_dir.name}: 配额超限(429)，等待 {wait_sec}s 后重试 ({attempt+1}/{max_retries})...")
+                    wait_sec = min(30 * (2 ** quota_retries), 120)
+                    if quota_retries < max_retries:
+                        quota_retries += 1
+                        print(f"    ⚠ {shot_dir.name}: 配额超限(429)，等待 {wait_sec}s 后重试 ({quota_retries}/{max_retries})...")
                         import time as _time
                         _time.sleep(wait_sec)
                         continue
                     else:
                         print(f"    ✗ {shot_dir.name}: 配额超限，已重试 {max_retries} 次，跳过")
                         return None
-                if "PrivacyInformation" in err_str and first_frame_b64 is not None:
-                    # Seedance rejects real-person reference images — drop and retry text-only
-                    print(f"    ⚠ {shot_dir.name}: 参考图被隐私检测拒绝，降级为纯文本生成")
-                    first_frame_b64 = None
-                    continue
-                if "PolicyViolation" in err_str and attempt < max_retries:
-                    print(f"    ⚠ {shot_dir.name}: 版权误报，重试 ({attempt+1}/{max_retries})...")
+                # Check auth only after classifying quota errors. Provider
+                # request ids are arbitrary hexadecimal-ish strings and can
+                # contain the substring "401" or "403" inside a genuine 429.
+                if "401" in err_str or "403" in err_str:
+                    raise RuntimeError(
+                        f"{err_str}；检查 ARK_AGENT_API_KEY 或 Agent Plan 权限"
+                    ) from e
+                if "PrivacyInformation" in err_str and privacy_retries < max_retries:
+                    privacy_retries += 1
+                    fallback_strategy = _privacy_fallback_strategy(
+                        privacy_retry_strategy
+                    )
+                    if fallback_strategy != privacy_retry_strategy:
+                        privacy_retry_strategy = fallback_strategy
+                        privacy_rejected_urls.clear()
+                        print(
+                            f"    ⚠ {shot_dir.name}: FLF2V 首尾帧有图片被隐私检测拒绝，"
+                            "整组切换为 Phantom 身份参考模式后重试"
+                        )
+                        continue
+                    rejected_url = _rejected_privacy_image_url(content_list, e)
+                    if rejected_url:
+                        privacy_rejected_urls.add(rejected_url)
+                        print(
+                            f"    ⚠ {shot_dir.name}: 参考图被隐私检测拒绝，"
+                            "仅剔除被拒图片并保留其余安全参考后重试"
+                        )
+                        continue
+                    print(
+                        f"    ⚠ {shot_dir.name}: 无法定位被拒参考图，"
+                        "停止自动重提以避免重复无效请求"
+                    )
+                if "PolicyViolation" in err_str and policy_retries < max_retries:
+                    policy_retries += 1
+                    print(f"    ⚠ {shot_dir.name}: 版权误报，重试 ({policy_retries}/{max_retries})...")
                     prompt = prompt.replace("Cinematic", "Original fictional")
                     prompt += ", original character design, non-copyrighted"
                     first_frame_b64 = None
@@ -3553,9 +3720,17 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
         print(f"  ⚠ Phase 6 部分镜头无产出: {', '.join(missing_shots)}")
 
     return {
-        "status": "done" if outputs else "error",
+        "status": "error" if missing_shots or not outputs else "done",
         "outputs": outputs,
         "errors": errors,
+        "missing_shots": missing_shots,
+        "error": (
+            "Phase 6 missing required shot outputs: " + ", ".join(missing_shots)
+            if missing_shots
+            else "Phase 6 produced no videos"
+            if not outputs
+            else None
+        ),
         "provider": provider,
         "mode": "text_to_video",
     }
@@ -3589,7 +3764,7 @@ class _LocalVideoVendorAdapter(VendorAdapter):
 
 
 def run_phase6(storyboard_data: dict, output_dir: Path, dry_run: bool, chain_mode: bool = False) -> dict:
-    """Phase 6: video generation through the local Bridge only."""
+    """Phase 6: video generation through the configured provider route."""
     _banner(6, 9, "视频生成 (Seedance — reference_to_video)", dry_run)
     start = _now()
     
@@ -3605,7 +3780,7 @@ def run_phase6(storyboard_data: dict, output_dir: Path, dry_run: bool, chain_mod
         print("  ⊘ dry-run 模式，跳过视频生成")
         return {"status": "skipped", "reason": "dry-run", "duration_s": _elapsed(start)}
 
-    print("  → Phase 6 强制本地 Bridge 路由；ARK/OM 视频模型已禁用", flush=True)
+    print("  → Phase 6 使用当前配置的视频提供方路由", flush=True)
     try:
         adapter = _LocalVideoVendorAdapter([
             VendorModel("Local Bridge", "local-video-bridge", "video", ("i2v", "flf2v"))
@@ -3616,8 +3791,9 @@ def run_phase6(storyboard_data: dict, output_dir: Path, dry_run: bool, chain_mod
         )
         result = tool_result.data or {"status": "error", "error": tool_result.error}
         result["duration_s"] = _elapsed(start)
+        provider = result.get("provider", "unknown_provider")
         if result["status"] == "done":
-            print(f"  ✓ Phase 6 完成: {len(result['outputs'])} 视频 (local_video_client)")
+            print(f"  ✓ Phase 6 完成: {len(result['outputs'])} 视频 ({provider})")
             
             # Quality gate: Phase 6
             qg_report = run_quality_check("phase6", output_dir)
@@ -3625,7 +3801,7 @@ def run_phase6(storyboard_data: dict, output_dir: Path, dry_run: bool, chain_mod
                 return {"status": "error", "error": f"Phase 6 质检未通过: {qg_report.grade}", "quality_report": qg_report, "duration_s": _elapsed(start)}
             
         else:
-            print(f"  ✗ Phase 6 失败 (local_video_client)")
+            print(f"  ✗ Phase 6 失败 ({provider})")
         return result
 
     except ImportError as e:
@@ -3807,7 +3983,7 @@ def _finish_phase8(
     chain_mode: bool,
 ) -> dict:
     """Apply the duration gate and fail closed when required footage is missing."""
-    from phases.phase8.duration_gate import evaluate_duration_gate
+    from phases.phase8.duration_gate import evaluate_duration_gate, trim_excess_to_target
 
     outputs = list(phase_result.get("outputs", []))
     for artifact in (
@@ -3820,6 +3996,16 @@ def _finish_phase8(
     phase_result["outputs"] = outputs
 
     try:
+        duration_trim = trim_excess_to_target(output_dir, target_duration)
+        if duration_trim:
+            phase_result["duration_trim"] = duration_trim
+            if "duration_trim.json" not in phase_result["outputs"]:
+                phase_result["outputs"].append("duration_trim.json")
+            print(
+                "  ✂ [8.3] 组装时长归一化: "
+                f"{duration_trim['original_s']:.2f}s → {duration_trim['trimmed_s']:.2f}s",
+                flush=True,
+            )
         gate, reshoot_plan = evaluate_duration_gate(
             output_dir,
             target_duration,
@@ -4005,6 +4191,29 @@ def run_phase8(output_dir: Path, dry_run: bool,
         for shot_id in reshoot_shots:
             video_path = shots_dir / shot_id / "output.mp4"
             if video_path.is_file():
+                # A rejected FLF2V result can be caused by an inconsistent
+                # generated endpoint (identity/framing drift). Repeating the
+                # exact first/last-frame route reproduces the same defect, so
+                # use the character-reference route for the reshoot.
+                meta_path = shots_dir / shot_id / "SHOT_META.json"
+                try:
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    meta = {}
+                if meta.get("gen_strategy") == "flf2v":
+                    meta["gen_strategy"] = "phantom"
+                    meta["phase8_reshoot_route_reason"] = (
+                        "FLF2V visual QA failure; avoid reusing a possibly "
+                        "inconsistent generated endpoint"
+                    )
+                    meta_path.write_text(
+                        json.dumps(meta, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                    print(
+                        f"  ↪ [8.2] {shot_id}: FLF2V 补录改用 Phantom 角色参考路由",
+                        flush=True,
+                    )
                 video_path.unlink()
                 deleted.append(shot_id)
         if deleted != reshoot_shots:
@@ -4478,14 +4687,23 @@ def clean_subtitle_text(text: str) -> str:
 def _merge_shot_transcripts(sb_shots: list, durations_ms: list[int], shot_transcripts: list[dict]) -> dict:
     """Offset per-shot ASR words and create caption-burn segments.
 
-    Audible speech is the source of truth. Script dialogue is used only when
-    ASR found no speech for that shot; it must not suppress or replace words
-    that are actually present in generated source audio.
+    In a scripted-dialogue scene, the authored dialogue contract is the source
+    of truth: ASR may validate audible speech but cannot replace the line or
+    invent dialogue on a shot explicitly authored without one. In a fully
+    unscripted scene, ASR remains authoritative.
     """
     merged_words = []
     caption_segments = []
     cumulative_ms = 0
     shot_entries = []
+    scripted_scene = any(
+        clean_subtitle_text(
+            (shot.get("dialogue") or {}).get("line", "")
+            if isinstance(shot.get("dialogue"), dict)
+            else str(shot.get("dialogue") or "")
+        )
+        for shot in sb_shots
+    )
     for index, (shot, duration_ms, transcription) in enumerate(
         zip(sb_shots, durations_ms, shot_transcripts), 1
     ):
@@ -4507,7 +4725,22 @@ def _merge_shot_transcripts(sb_shots: list, durations_ms: list[int], shot_transc
             dialogue.get("line", "") if isinstance(dialogue, dict) else str(dialogue or "")
         )
         scripted_text = clean_subtitle_text(dialogue_line)
-        if local_words or asr_text:
+        if scripted_text:
+            text = scripted_text
+            source = "dialogue_script"
+            words = [{
+                "word": text,
+                "start_ms": round(cumulative_ms + duration_ms * 0.2),
+                "end_ms": round(cumulative_ms + duration_ms * 0.8),
+                "source": source,
+            }]
+        elif scripted_scene:
+            # Do not let ASR hallucinations introduce dialogue into a shot that
+            # the authored scripted scene explicitly leaves silent.
+            words = []
+            text = ""
+            source = "none"
+        elif local_words or asr_text:
             words = []
             for item in local_words:
                 cleaned_word = clean_subtitle_text(item.get("word") or item.get("text") or "")
@@ -4528,15 +4761,6 @@ def _merge_shot_transcripts(sb_shots: list, durations_ms: list[int], shot_transc
                     "source": "asr",
                 }]
             source = "asr"
-        elif scripted_text:
-            text = scripted_text
-            source = "dialogue_script"
-            words = [{
-                "word": text,
-                "start_ms": round(cumulative_ms + duration_ms * 0.2),
-                "end_ms": round(cumulative_ms + duration_ms * 0.8),
-                "source": source,
-            }]
         else:
             words = []
             text = ""
@@ -5091,7 +5315,7 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
                         step_status["subtitle_burn"] = "failed"
                 else:
                     print(f"    ⊘ No subtitle data available, skipping subtitle burn")
-                    step_status["subtitle_burn"] = "skipped"
+                    step_status["subtitle_burn"] = "not_required"
             except ImportError as e:
                 print(f"    ⚠ RemotionCaptionBurn unavailable: {e}")
                 step_status["subtitle_burn"] = "failed"

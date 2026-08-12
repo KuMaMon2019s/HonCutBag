@@ -39,6 +39,7 @@ from runtime.generation_tasks import GenerationTaskStore
 from runtime.seedance_execution import (
     ProviderEndpointChangedError,
     SubmissionUncertainError,
+    _provider_rejected_submission,
     execute_seedance_video_task,
 )
 from tools import asset_packager
@@ -206,6 +207,36 @@ def test_detect_shot_characters_passes_through_unknown_explicit_name(tmp_path):
     shot_meta = {"_char_ids": ["幽灵"]}
 
     assert asset_packager._detect_shot_characters(tmp_path, shot_meta) == ["幽灵"]
+
+
+def test_structured_who_overrides_stale_associate_character_alias(tmp_path):
+    (tmp_path / "CHARACTERS.json").write_text(
+        json.dumps({"characters": [{
+            "id": "xian_nv",
+            "name": "年轻东方古装仙女",
+            "aliases": ["仙女"],
+        }]}),
+        encoding="utf-8",
+    )
+    shot_meta = {
+        "who": ["年轻东方古装仙女"],
+        "_char_ids": ["young_eastern_fairy"],
+        "associate_assets": ["char:young_eastern_fairy"],
+    }
+
+    assert asset_packager._detect_shot_characters(tmp_path, shot_meta) == ["xian_nv"]
+
+
+def test_explicit_empty_who_blocks_stale_character_assets(tmp_path):
+    (tmp_path / "CHARACTERS.json").write_text(
+        json.dumps({"characters": [{"id": "lin", "name": "凛"}]}),
+        encoding="utf-8",
+    )
+
+    assert asset_packager._detect_shot_characters(
+        tmp_path,
+        {"who": [], "_char_ids": ["lin"], "associate_assets": ["char:lin"]},
+    ) == []
 
 
 def test_collect_character_references_resolves_explicit_display_names(tmp_path):
@@ -772,6 +803,35 @@ def test_bridge_fallback_submit_timeout_becomes_uncertain(tmp_path):
     assert active.provider_job_id == "bridge-seedance-job"
 
 
+def test_seedance_http_400_is_definite_rejection_not_uncertain_submission():
+    assert _provider_rejected_submission(
+        RuntimeError("Seedance API 400: InvalidParameter content is not valid")
+    ) is True
+    assert _provider_rejected_submission(
+        TimeoutError("connection closed before submission response")
+    ) is False
+
+
+def test_task_store_releases_only_uncertain_task_without_provider_job(tmp_path):
+    store = GenerationTaskStore(tmp_path / "runtime.db")
+    task = store.enqueue(
+        run_id="run-1",
+        task_type="video.generate",
+        media_type="video",
+        resource_id="S14",
+        payload={"shot_id": "S14"},
+    ).task
+    store.claim(task.task_id)
+    store.mark_submission_uncertain(task.task_id, "legacy misclassification")
+
+    resolved = store.resolve_unsubmitted_uncertain_as_failed(
+        task.task_id, "confirmed HTTP 400 rejection"
+    )
+
+    assert resolved.status == "failed"
+    assert resolved.provider_job_id is None
+
+
 def test_phase6_bridge_resume_reuses_persisted_job(tmp_path, monkeypatch):
     _write_shot(tmp_path)
     monkeypatch.setenv("VIDEO_PROVIDER", "local")
@@ -822,7 +882,9 @@ def test_direct_ark_quota_error_uses_existing_retry_loop(tmp_path, monkeypatch):
     def flaky_submit(content, **kwargs):
         attempts.append(kwargs)
         if len(attempts) == 1:
-            raise RuntimeError("429 QuotaExceeded")
+            raise RuntimeError(
+                "Seedance API 429 QuotaExceeded; request id contains 4017c4cb"
+            )
         return "task-after-retry"
 
     monkeypatch.setattr(seedance_client, "submit_content", flaky_submit)
@@ -832,6 +894,53 @@ def test_direct_ark_quota_error_uses_existing_retry_loop(tmp_path, monkeypatch):
 
     assert result["status"] == "done"
     assert len(attempts) == 2
+
+
+def test_direct_ark_quota_retries_do_not_consume_privacy_retry_budget(
+    tmp_path, monkeypatch
+):
+    shot_dir = _write_shot(tmp_path)
+    _mock_common_direct(monkeypatch, shot_dir)
+    monkeypatch.delenv("VIDEO_PROVIDER", raising=False)
+    attempts = []
+    content = [
+        {"type": "text", "text": "shot"},
+        {
+            "type": "image_url",
+            "image_url": {"url": "https://example.test/rejected.png?sig=1"},
+            "role": "reference_image",
+        },
+        {
+            "type": "image_url",
+            "image_url": {"url": "https://example.test/safe.png?sig=1"},
+            "role": "reference_image",
+        },
+    ]
+    monkeypatch.setattr(
+        asset_packager,
+        "build_content_for_shot",
+        lambda **_kwargs: [dict(item) for item in content],
+    )
+
+    def mixed_failures(submitted_content, **_kwargs):
+        attempts.append(submitted_content)
+        if len(attempts) <= 3:
+            raise RuntimeError("429 QuotaExceeded")
+        if len(attempts) == 4:
+            raise RuntimeError("PrivacyInformation content[1]")
+        return "task-after-independent-retries"
+
+    monkeypatch.setattr(seedance_client, "submit_content", mixed_failures)
+    monkeypatch.setattr(pipeline_core.time, "sleep", lambda _seconds: None)
+
+    result = pipeline_core._run_phase6_fallback(tmp_path)
+
+    assert result["status"] == "done"
+    assert len(attempts) == 5
+    assert [item.get("image_url", {}).get("url") for item in attempts[-1]] == [
+        None,
+        "https://example.test/safe.png?sig=1",
+    ]
 
 
 def _enqueue_runtime_video(store, resource_id="S01"):
@@ -1340,6 +1449,15 @@ def test_storyboard_keyframe_prompt_prioritizes_identity_and_action():
     assert "No exposed midriff" in prompt
 
 
+def test_storyboard_keyframe_explicit_empty_cast_is_environment_only():
+    prompt = pipeline_core._storyboard_keyframe_description(
+        {"who": [], "action_description": "云层翻涌", "visual": "金色云海"}
+    )
+
+    assert "Environment-only cinematic keyframe" in prompt
+    assert "zero people" in prompt
+
+
 def test_l3_severity_blocks_identity_but_not_static_pose_nuance():
     assert _calibrate_l3_severity(
         "R1", "severe", "wrong character identity and gender"
@@ -1352,6 +1470,12 @@ def test_l3_severity_blocks_identity_but_not_static_pose_nuance():
     ) == "moderate"
     assert _calibrate_l3_severity(
         "R4", "severe", "reversed attacker and defender"
+    ) == "severe"
+    assert _calibrate_l3_severity(
+        "R1", "severe", "the female character resembles a celebrity"
+    ) == "moderate"
+    assert _calibrate_l3_severity(
+        "R1", "severe", "gender mismatch: female instead of male"
     ) == "severe"
 
 
@@ -1421,7 +1545,7 @@ def test_ffmpeg_fallback_keeps_all_words_in_one_dialogue_cue():
     assert pages == [("我从来没想伤你", 0.0, 0.7)]
 
 
-def test_asr_speech_is_kept_on_unmarked_shots_in_scripted_scene():
+def test_asr_speech_is_suppressed_on_unmarked_shots_in_scripted_scene():
     merged = pipeline_core._merge_shot_transcripts(
         [
             {"shot_id": "S01", "dialogue": {"line": "留下"}},
@@ -1436,12 +1560,12 @@ def test_asr_speech_is_kept_on_unmarked_shots_in_scripted_scene():
         ],
     )
 
-    assert merged["shots"][1]["source"] == "asr"
-    assert merged["shots"][1]["text"] == "你骗了我"
-    assert merged["caption_segments"][1]["text"] == "你骗了我"
+    assert merged["shots"][1]["source"] == "none"
+    assert merged["shots"][1]["text"] == ""
+    assert [item["text"] for item in merged["caption_segments"]] == ["留下"]
 
 
-def test_asr_speech_takes_priority_over_mismatched_script_line():
+def test_explicit_script_line_takes_priority_over_mismatched_asr():
     merged = pipeline_core._merge_shot_transcripts(
         [{"shot_id": "S01", "dialogue": {"line": "剧本台词"}}],
         [1000],
@@ -1450,8 +1574,8 @@ def test_asr_speech_takes_priority_over_mismatched_script_line():
         ]}],
     )
 
-    assert merged["shots"][0]["source"] == "asr"
-    assert merged["shots"][0]["text"] == "实际说出的话"
+    assert merged["shots"][0]["source"] == "dialogue_script"
+    assert merged["shots"][0]["text"] == "剧本台词"
 
 
 def test_final_mix_asr_uses_utterance_boundaries_for_caption_cues():

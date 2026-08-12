@@ -292,6 +292,43 @@ class GenerationTaskStore:
             (message, now, now),
         )
 
+    def resolve_unsubmitted_uncertain_as_failed(
+        self, task_id: str, message: str
+    ) -> GenerationTask:
+        """Release an uncertain task only when no provider job was persisted.
+
+        This is for a later-confirmed HTTP rejection that an older classifier
+        mislabeled as submission uncertainty. A task with any provider job ID
+        remains protected from resubmission.
+        """
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE generation_tasks
+                SET status = 'failed', error_message = ?, updated_at = ?,
+                    finished_at = ?
+                WHERE task_id = ? AND status = 'submission_uncertain'
+                  AND provider_job_id IS NULL
+                """,
+                (message, now, now, task_id),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                current = self.get(task_id)
+                current_status = current.status if current is not None else "missing"
+                provider_job = current.provider_job_id if current is not None else None
+                raise RuntimeError(
+                    f"cannot release uncertain task {task_id}: "
+                    f"status={current_status}, provider_job_id={provider_job!r}"
+                )
+            row = connection.execute(
+                "SELECT * FROM generation_tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            connection.commit()
+        return GenerationTask.from_row(row)
+
     def _update_running(
         self,
         task_id: str,

@@ -151,7 +151,7 @@ def package_shot_assets(
 
 
 def _resolve_char_ids(output_dir: Path, raw_ids: List[str]) -> List[str]:
-    """Resolve character display names to ids, preserving unknown values."""
+    """Resolve character display names and aliases to ids, preserving unknown values."""
     characters_json = Path(output_dir) / "CHARACTERS.json"
     try:
         chars_data = json.loads(characters_json.read_text(encoding="utf-8"))
@@ -160,12 +160,20 @@ def _resolve_char_ids(output_dir: Path, raw_ids: List[str]) -> List[str]:
 
     characters = chars_data.get("characters", [])
     valid_ids = {char.get("id") for char in characters if char.get("id")}
-    name_to_id = {
-        char.get("name"): char.get("id")
-        for char in characters
-        if char.get("name") and char.get("id")
-    }
-    return [raw_id if raw_id in valid_ids else name_to_id.get(raw_id, raw_id) for raw_id in raw_ids]
+    name_to_id = {}
+    for char in characters:
+        char_id = char.get("id")
+        if not char_id:
+            continue
+        for value in (char.get("name"), *char.get("aliases", [])):
+            if value:
+                name_to_id[str(value).casefold()] = char_id
+    return [
+        raw_id
+        if raw_id in valid_ids
+        else name_to_id.get(str(raw_id).casefold(), raw_id)
+        for raw_id in raw_ids
+    ]
 
 
 def _detect_shot_characters(
@@ -176,19 +184,33 @@ def _detect_shot_characters(
     Detect which characters appear in a shot.
 
     Resolution order:
-        1. Explicit char_ids in shot_meta (from pipeline_runner)
-        2. associate_assets in shot_meta (e.g. ["char:lin_xiao", "char:chen_yang"])
-        3. Name matching against CHARACTERS.json + prompt text
+        1. Structured who/characters names from the storyboard
+        2. Explicit char_ids in shot_meta (from pipeline_runner)
+        3. associate_assets in shot_meta (e.g. ["char:lin_xiao", "char:chen_yang"])
+        4. Name matching against CHARACTERS.json + prompt text
 
     Returns:
         List of character ids (e.g. ["lin_xiao", "chen_yang"])
     """
-    # 1. Explicit char_ids
+    # 1. Structured storyboard identity is authoritative. In particular, an
+    # explicit who=[] must not fall through to stale inferred char assets, and
+    # a canonical display name must beat an obsolete associate_assets alias.
+    if "who" in shot_meta or "characters" in shot_meta:
+        structured = shot_meta.get("who") or shot_meta.get("characters") or []
+        if not isinstance(structured, list):
+            structured = [structured] if structured else []
+        if not structured:
+            return []
+        resolved = _resolve_char_ids(output_dir, list(structured))
+        if resolved:
+            return resolved
+
+    # 2. Explicit char_ids
     explicit = shot_meta.get("_char_ids")
     if explicit:
         return _resolve_char_ids(output_dir, list(explicit))
 
-    # 2. associate_assets
+    # 3. associate_assets
     associate = shot_meta.get("associate_assets", [])
     if associate:
         char_ids = [
@@ -200,7 +222,7 @@ def _detect_shot_characters(
             char_ids = _resolve_char_ids(output_dir, char_ids)
             return char_ids
 
-    # 3. Prompt name matching against CHARACTERS.json
+    # 4. Prompt name matching against CHARACTERS.json
     prompt_text = shot_meta.get("prompt", "")
     characters_json = output_dir / "CHARACTERS.json"
     if not prompt_text or not characters_json.exists():

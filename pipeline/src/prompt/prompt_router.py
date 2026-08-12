@@ -94,7 +94,7 @@ def _build_seedance2_single(shot_data: dict, assets: list) -> str:
     ).strip()
     emotion = shot_data.get("emotion", "")
     where = shot_data.get("where", "")
-    camera = shot_data.get("camera", "medium shot")
+    camera = shot_data.get("camera") or shot_data.get("shot_size") or "medium shot"
     time_desc = shot_data.get("time_of_day") or shot_data.get("time") or ""
     lighting = (
         shot_data.get("lighting_description")
@@ -102,7 +102,6 @@ def _build_seedance2_single(shot_data: dict, assets: list) -> str:
         or shot_data.get("lighting_key")
         or ""
     )
-    style = shot_data.get("style_anchor") or shot_data.get("style") or ""
     
     # 构建英文 prompt
     parts = []
@@ -115,8 +114,10 @@ def _build_seedance2_single(shot_data: dict, assets: list) -> str:
         parts.append(f"Lighting continuity: {lighting}.")
     if emotion:
         parts.append(f"Mood: {emotion}.")
-    if style:
-        parts.append(f"Style continuity: {style}.")
+    # ``source_prompt`` is the complete Phase 6 contract and already carries a
+    # reference-frame style lock. Re-appending ``style_anchor`` here can leak
+    # project-level plot nouns (future characters, architecture, props) into a
+    # scenery-only shot after the safe prompt has already been assembled.
     parts.append(source_prompt)
     
     # 角色参考绑定
@@ -125,10 +126,19 @@ def _build_seedance2_single(shot_data: dict, assets: list) -> str:
         parts.append(f"Based on the reference image of {', '.join(names)}, "
                      "maintain consistent: face features, hairstyle, costume details.")
     
-    # 风格锚定
-    parts.append("Photorealistic cinematography, cinematic quality, ultra-fine detail, "
-                 "delicate skin texture, strand-by-strand hair detail. "
-                 "Ultra-sharp 4K, no subtitles, no watermark.")
+    # 风格锚定：纯环境镜不得携带 skin/hair 等人物诱导词。
+    character_requested = bool(
+        assets or shot_data.get("who") or shot_data.get("characters")
+    )
+    detail_contract = (
+        "delicate skin texture, strand-by-strand hair detail"
+        if character_requested
+        else "realistic volumetric atmosphere, fine environmental material detail"
+    )
+    parts.append(
+        "Photorealistic cinematography, cinematic quality, ultra-fine detail, "
+        f"{detail_contract}. Ultra-sharp 4K, no subtitles, no watermark."
+    )
     
     return " ".join(parts)
 

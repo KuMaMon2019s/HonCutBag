@@ -141,7 +141,7 @@ def run_quality_check(
         output_dir: Path to the output directory
         artifacts: Optional dict of phase outputs/results
         step_status: Optional dict mapping step names to status
-                     ("done", "failed", "skipped"). Failed/skipped
+                     ("done", "failed", "skipped", "not_required"). Failed/skipped
                      critical steps cap the grade.
 
     Returns:
@@ -187,6 +187,9 @@ def run_quality_check(
 
     if step_status:
         for step_name, status in step_status.items():
+            # ``not_required`` is a successfully resolved condition (for
+            # example, no speech means there is intentionally no subtitle burn)
+            # and must not be graded like a skipped required operation.
             if status in ("failed", "skipped"):
                 is_critical = step_name in critical_steps
                 if is_critical:

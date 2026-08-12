@@ -268,6 +268,16 @@ SOURCE_IMAGE_RULES = (
     "solid-color or simple fabric background, face occupies at least 60 percent"
 )
 
+FULL_BODY_IMAGE_RULES = (
+    "vertical 9:16 character reference, camera pulled far back, straight-on standing pose, "
+    "entire body visible from the top of the hair to the soles of both shoes, both feet fully "
+    "inside the frame, generous empty margin above the hair and below the shoes, character "
+    "occupies no more than 75 percent of canvas height, plain neutral background, no scenery, "
+    "no props, no crop, no close-up, no medium shot, no knees or feet outside frame"
+)
+
+FULL_BODY_REFERENCE_SIZE = "1440x2560"
+
 
 def build_model_reference_prompts(
     character_desc: str, style: str = "", target_model: str = "seedance"
@@ -278,18 +288,18 @@ def build_model_reference_prompts(
         "This is a fully fictional AI-generated character (virtual avatar), "
         "not a real person; the face is a synthetic digital creation"
     )
-    base = f"{fictional_decl}. {character_desc}{suffix}. {SOURCE_IMAGE_RULES}. Photorealistic, neutral expression"
+    identity = f"{fictional_decl}. {character_desc}{suffix}. Photorealistic, neutral expression"
     if "kling" in target_model.lower():
         return {
-            "front": f"{base}, front portrait, identity reference",
-            "side": f"{base}, strict side profile, identity reference",
-            "three_quarter": f"{base}, three-quarter portrait, identity reference",
-            "detail": f"{base}, facial detail close-up, face occupies 70 percent",
+            "front": f"{identity}, {SOURCE_IMAGE_RULES}, front portrait, identity reference",
+            "side": f"{identity}, {SOURCE_IMAGE_RULES}, strict side profile, identity reference",
+            "three_quarter": f"{identity}, {SOURCE_IMAGE_RULES}, three-quarter portrait, identity reference",
+            "detail": f"{identity}, {SOURCE_IMAGE_RULES}, facial detail close-up, face occupies 70 percent",
         }
     return {
-        "face_closeup": f"{base}, head-and-shoulders close-up, face occupies 70 percent",
+        "face_closeup": f"{identity}, {SOURCE_IMAGE_RULES}, head-and-shoulders close-up, face occupies 70 percent",
         "full_body": (
-            f"{base}, separate full-body standing photograph, complete outfit and footwear visible, "
+            f"{identity}, {FULL_BODY_IMAGE_RULES}, separate full-body standing reference, complete outfit and footwear visible, "
             "same identity and clothing as the face reference"
         ),
     }
@@ -548,15 +558,16 @@ def generate_character(
             first_path = None
             for index, (view_name, reference_prompt) in enumerate(reference_prompts.items()):
                 view_path = os.path.join(char_dir, f"{view_name}.png")
+                view_size = FULL_BODY_REFERENCE_SIZE if view_name == "full_body" else size
                 if index and first_path and hasattr(client, "image_to_image"):
                     client.image_to_image(
                         prompt=f"{REFERENCE_WEIGHT_NOTE}. {reference_prompt}",
                         ref_image=first_path,
                         output_path=view_path,
-                        size=size,
+                        size=view_size,
                     )
                 else:
-                    client.text_to_image(prompt=reference_prompt, output_path=view_path, size=size)
+                    client.text_to_image(prompt=reference_prompt, output_path=view_path, size=view_size)
                 first_path = first_path or view_path
                 views[view_name] = view_path
                 print(f"  [{view_name}] ✓ → {view_path}")

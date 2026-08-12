@@ -58,6 +58,7 @@ SYSTEM_PROMPT = (
     "- hair 必须写明发色+发长+发型（如'黑色长直发及肩'），不能只写'长发'\n"
     "- clothing 必须具体到单品（上装+下装+鞋+配饰），不能只写'通勤装'、'休闲服'\n"
     "- summary 必须包含发型+服装+体态三要素，让 AI 图片生成器能画出一致的角色\n"
+    "- 事件原文已明确的服装颜色、层次、材质、发型和配饰属于硬约束，必须原样保留，禁止改色、换装或替换材质\n"
     "- 根据角色的身份/职业/场景推导合理的具体服装（白领→衬衫+西装裤，学生→校服，店主→围裙）"
 )
 
@@ -68,6 +69,8 @@ USER_PROMPT_TEMPLATE = (
     "抽象指代（如'说话者'、'观察者'）、复数群体。"
     "同一实体的编号/职业/主角指代只输出一个对象，其余称呼放入 aliases；"
     "'主角'、'他'、'她'不得独立成条。最多保留5个主要角色。\n\n"
+    "忠实度要求：事件上下文中明确出现的服装颜色、层次、材质、发型和配饰必须逐项保留；"
+    "只能补全未指定的细节，不能把淡粉改成月白、把轻纱改成其他面料或擅自换装。\n\n"
     "为每个角色输出 JSON 对象，组成数组。每个对象包含：\n"
     "- id: 英文标识（拼音或英文缩写，用于目录名，如 amy, wolf, old_man）\n"
     "- name: 角色名称（中文）\n"
@@ -110,9 +113,12 @@ ENTITY_SUFFIXES = (
     "机器人", "号", "型", "级", "者", "员", "师", "家", "王", "后",
     "公主", "王子", "先生", "小姐", "佣兵", "机械体", "合成人", "复制体",
     "复制品", "生命体", "机甲", "战士", "卫兵", "执法体",
+    "仙女", "女子", "少女", "女人", "男子", "男人", "女孩", "男孩",
+    "姑娘", "妇人", "夫人", "老者",
 )
 MAX_ENTITY_NAME_CHINESE_CHARS = 12
 GENERIC_CHARACTER_NAMES = {"主角", "主人公", "男主", "女主", "人物", "他", "她", "它"}
+CHARACTER_CONTEXT_SCHEMA_VERSION = 2
 
 
 def _get_client() -> OpenAI:
@@ -284,6 +290,7 @@ def _collect_character_stats(events: List[Dict[str, Any]]) -> Dict[str, Dict[str
         event_id = event.get("id", 0)
         who = event.get("who", [])
         what = event.get("what", "")
+        visual = event.get("visual", "")
         where = event.get("where", "")
         emotion = event.get("emotion", "")
         speakers = {
@@ -298,6 +305,8 @@ def _collect_character_stats(events: List[Dict[str, Any]]) -> Dict[str, Dict[str
             summary_parts.append(f"在{where}")
         if what:
             summary_parts.append(what)
+        if visual and visual not in what:
+            summary_parts.append(f"视觉硬约束：{visual}")
         if emotion:
             summary_parts.append(f"（{emotion}）")
         event_summary = "，".join(summary_parts) if summary_parts else "参与事件"

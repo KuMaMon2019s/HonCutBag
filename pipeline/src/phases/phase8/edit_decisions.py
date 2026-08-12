@@ -31,13 +31,19 @@ def probe_video(video_path: str) -> dict:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         data = json.loads(result.stdout)
 
-        duration = float(data.get("format", {}).get("duration", 0))
+        format_duration = float(data.get("format", {}).get("duration", 0))
+        duration = format_duration
+        video_duration = audio_duration = None
         width, height, fps = 1920, 1080, 30.0
         has_audio = has_video = False
 
         for stream in data.get("streams", []):
             if stream.get("codec_type") == "video":
                 has_video = True
+                try:
+                    video_duration = float(stream.get("duration"))
+                except (TypeError, ValueError):
+                    pass
                 width = int(stream.get("width", 1920))
                 height = int(stream.get("height", 1080))
                 fps_str = stream.get("r_frame_rate", "30/1")
@@ -48,9 +54,22 @@ def probe_video(video_path: str) -> dict:
                     fps = float(fps_str)
             elif stream.get("codec_type") == "audio":
                 has_audio = True
+                try:
+                    audio_duration = float(stream.get("duration"))
+                except (TypeError, ValueError):
+                    pass
+
+        # The visual timeline is authoritative for video artifacts. Using the
+        # container's longest-stream duration lets padded audio conceal a
+        # truncated video stream from both assembly offsets and duration gates.
+        if has_video and video_duration is not None:
+            duration = video_duration
 
         return {
             "duration": round(duration, 3),
+            "video_duration": None if video_duration is None else round(video_duration, 3),
+            "audio_duration": None if audio_duration is None else round(audio_duration, 3),
+            "format_duration": round(format_duration, 3),
             "width": width, "height": height,
             "fps": round(fps, 2),
             "has_audio": has_audio, "has_video": has_video,
@@ -452,21 +471,30 @@ def _xfade_chain(segments: list, transitions: list, output_path: Path,
             except Exception:
                 pass  # 检查失败不影响现有流程
 
-            xname = {
-                "dissolve": "fade", "fade": "fadeblack", "cut": "fade"
-            }.get(ttype, "fade")
             if ttype == "cut":
-                tdur = 0.01
-            offset = round(max(0, current_duration - tdur), 3)
+                tdur = 0.0
+                filter_complex = (
+                    "[0:v]settb=AVTB,setpts=PTS-STARTPTS[v0];"
+                    "[1:v]settb=AVTB,setpts=PTS-STARTPTS[v1];"
+                    "[v0][v1]concat=n=2:v=1:a=0[v];"
+                    "[0:a]aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS[a0];"
+                    "[1:a]aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS[a1];"
+                    "[a0][a1]concat=n=2:v=0:a=1[a]"
+                )
+            else:
+                xname = {
+                "dissolve": "fade", "fade": "fadeblack", "cut": "fade"
+                }.get(ttype, "fade")
+                offset = round(max(0, current_duration - tdur), 3)
+                filter_complex = (
+                    "[0:v]settb=AVTB,setpts=PTS-STARTPTS[v0];"
+                    "[1:v]settb=AVTB,setpts=PTS-STARTPTS[v1];"
+                    f"[v0][v1]xfade=transition={xname}:duration={tdur}:offset={offset}[v];"
+                    "[0:a]aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS[a0];"
+                    "[1:a]aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS[a1];"
+                    f"[a0][a1]acrossfade=d={tdur}[a]"
+                )
             intermediate = temp_dir / f"xfade_{i:04d}.mp4"
-            filter_complex = (
-                "[0:v]settb=AVTB,setpts=PTS-STARTPTS[v0];"
-                "[1:v]settb=AVTB,setpts=PTS-STARTPTS[v1];"
-                f"[v0][v1]xfade=transition={xname}:duration={tdur}:offset={offset}[v];"
-                "[0:a]aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS[a0];"
-                "[1:a]aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS[a1];"
-                f"[a0][a1]acrossfade=d={tdur}[a]"
-            )
             cmd = [
                 "ffmpeg", "-y", "-i", str(current), "-i", str(following),
                 "-filter_complex", filter_complex,
@@ -477,6 +505,15 @@ def _xfade_chain(segments: list, transitions: list, output_path: Path,
                 str(intermediate),
             ]
             subprocess.run(cmd, capture_output=True, timeout=300, check=True)
+            following_duration = probe_video(str(following))["duration"]
+            rendered_duration = probe_video(str(intermediate))["duration"]
+            expected_duration = current_duration + following_duration - tdur
+            if abs(rendered_duration - expected_duration) > 0.25:
+                raise RuntimeError(
+                    "xfade intermediate video duration mismatch: "
+                    f"expected={expected_duration:.3f}s actual={rendered_duration:.3f}s "
+                    f"at transition {i}"
+                )
             temp_files.append(intermediate)
             current = intermediate
         shutil.copy2(current, output_path)

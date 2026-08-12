@@ -188,20 +188,52 @@ def create_storyboard_grid(image_paths: list[Path], output_path: Path, columns: 
     """Create a labelled, artifact-derived contact sheet using Pillow."""
     if not image_paths:
         raise ValueError("at least one storyboard image is required")
-    from PIL import Image, ImageDraw
+    from PIL import Image, ImageDraw, ImageFont
     opened = [Image.open(path).convert("RGB") for path in image_paths]
     width = min(480, max(image.width for image in opened))
     height = max(1, int(max(image.height / image.width for image in opened) * width))
-    label_height = 28
     rows = math.ceil(len(opened) / columns)
-    grid = Image.new("RGB", (columns * width, rows * (height + label_height)), "white")
+    grid = Image.new("RGB", (columns * width, rows * height), "white")
     draw = ImageDraw.Draw(grid)
+    font_size = max(28, width // 10)
+    try:
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", font_size)
+    except OSError:
+        try:
+            font = ImageFont.load_default(size=font_size)
+        except TypeError:  # Pillow < 10
+            font = ImageFont.load_default()
     for index, (path, source) in enumerate(zip(image_paths, opened, strict=True)):
         source.thumbnail((width, height))
         x = (index % columns) * width + (width - source.width) // 2
-        y = (index // columns) * (height + label_height)
+        y = (index // columns) * height
         grid.paste(source, (x, y))
-        draw.text(((index % columns) * width + 6, y + height + 6), path.stem, fill="black")
+        # Put a large high-contrast ID inside each frame. Small captions below
+        # a dense contact sheet caused the VLM to associate S15 with S11 and
+        # neighbouring final shots with S24 in a real 24-shot run.
+        label = path.stem.upper()
+        label_x = (index % columns) * width + 10
+        label_y = y + 10
+        bbox = draw.textbbox((label_x, label_y), label, font=font, stroke_width=1)
+        padding = 8
+        draw.rounded_rectangle(
+            (
+                bbox[0] - padding,
+                bbox[1] - padding,
+                bbox[2] + padding,
+                bbox[3] + padding,
+            ),
+            radius=6,
+            fill="black",
+        )
+        draw.text(
+            (label_x, label_y),
+            label,
+            fill="white",
+            font=font,
+            stroke_width=1,
+            stroke_fill="black",
+        )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     grid.save(output_path)
     return output_path
@@ -213,19 +245,30 @@ def _calibrate_l3_severity(red_line: str, severity: str, message: str) -> str:
         return severity
     normalized_line = red_line.upper()
     text = message.casefold()
+    # Match explicit mismatch assertions, not isolated descriptor words. The
+    # former terms "male" and "female" made any sentence beginning with
+    # "the female character..." a hard blocker even when no gender mismatch
+    # was alleged. Likewise, a VLM's unsupported celebrity resemblance claim
+    # is not evidence of a wrong character identity.
     hard_blockers = (
-        "identity",
-        "gender",
-        "male",
-        "female",
+        "wrong identity",
+        "different identity",
+        "identity mismatch",
+        "wrong gender",
+        "different gender",
+        "gender mismatch",
+        "male instead of",
+        "female instead of",
         "missing character",
         "wrong character",
         "reversed attacker",
         "wrong location",
-        "身份",
-        "性别",
-        "男性",
-        "女性",
+        "身份错误",
+        "身份不一致",
+        "性别错误",
+        "性别不一致",
+        "男性而非",
+        "女性而非",
         "角色缺失",
         "人物错误",
         "攻守颠倒",
@@ -247,7 +290,7 @@ def run_l3_review(storyboard: dict, characters_data: dict, visual_style: str, im
     create_storyboard_grid(ordered, grid_path)
     if client is None and not (os.environ.get("ARK_AGENT_API_KEY") or os.environ.get("ARK_API_KEY")):
         return [], {"status": "skipped", "grid_path": str(grid_path), "skipped_reason": "ARK multimodal API key missing"}
-    prompt = f"""Review this storyboard grid against the supplied project artifacts. Apply red lines R1-R4: R1 character identity/gender/build continuity; R2 time-of-day and lighting continuity; R3 scene/action continuity; R4 storyboard-to-image semantic fidelity. Each storyboard image is one decisive still from a multi-step shot, so it need not show every earlier and later action simultaneously. Reserve severe for production-breaking mismatches: wrong/missing character identity or gender, wrong location/time-of-day, reversed attacker/defender, or a wholly unrelated core action. Use moderate for same-color costume material nuances, exact blade angle, blocking position offsets, or omitted intermediate motion that a single still cannot contain. Only identify problems; do not propose or perform edits. Return JSON: {{"issues":[{{"red_line":"R1","severity":"severe|moderate|minor","shot_ids":["S01"],"message":"..."}}]}}. Do not invent shot IDs.
+    prompt = f"""Review this storyboard grid against the supplied project artifacts. The grid has exactly 5 columns in row-major order, and every frame has its shot ID in a large black badge at the top-left. Associate observations only with that in-frame badge; never infer an ID from a neighbouring cell or row position. Apply red lines R1-R4: R1 character identity/gender/build continuity; R2 time-of-day and lighting continuity; R3 scene/action continuity; R4 storyboard-to-image semantic fidelity. Compare character continuity only against the supplied fictional character artifacts. Do not perform face recognition, name a public figure, or claim that a fictional face resembles a celebrity; appearance alone is not evidence of real-person identity. Each storyboard image is one decisive still from a multi-step shot, so it need not show every earlier and later action simultaneously. Reserve severe for production-breaking mismatches: wrong/missing character identity or gender, wrong location/time-of-day, reversed attacker/defender, or a wholly unrelated core action. Use moderate for same-color costume material nuances, exact blade angle, blocking position offsets, or omitted intermediate motion that a single still cannot contain. Only identify problems; do not propose or perform edits. Return JSON: {{"issues":[{{"red_line":"R1","severity":"severe|moderate|minor","shot_ids":["S01"],"message":"..."}}]}}. Do not invent shot IDs.
 STORYBOARD:
 {json.dumps(storyboard, ensure_ascii=False)}
 CHARACTERS:

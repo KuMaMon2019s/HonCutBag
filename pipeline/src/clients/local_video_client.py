@@ -497,10 +497,11 @@ def poll(
         download_probe_fail = 0
         probe_started_at = None
 
-        # A task at 0% (or explicitly queued) has not reached the GPU yet. Queue
-        # wait has its own generous wall-clock cap and never consumes the
-        # progress-stall allowance.
-        if status == "queued" or progress <= 0:
+        # Only an explicitly queued task receives the generous queue timeout.
+        # A task reported as running at 0% has reached the execution state and
+        # must be covered by normal no-progress stall detection; otherwise a
+        # wedged backend can be mislabeled "queue-waiting" for two hours.
+        if status == "queued":
             queue_seconds = time.monotonic() - queue_started_at
             print(
                 f"  [local_poll #{total_polls}] queue-waiting: status={status} "

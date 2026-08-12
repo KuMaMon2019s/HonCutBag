@@ -216,6 +216,37 @@ def test_environment_objects_do_not_become_character_assets():
         assert not _is_human_character(name)
 
 
+def test_named_human_role_phrase_is_not_dropped_only_for_length():
+    from phases.phase1.character_discoverer import _filter_descriptive_phrases
+
+    stats = {
+        "年轻东方古装仙女": {"events": [1, 2], "contexts": []},
+        "金色夕阳下的无边云海": {"events": [1], "contexts": []},
+    }
+
+    filtered = _filter_descriptive_phrases(stats)
+
+    assert "年轻东方古装仙女" in filtered
+    assert "金色夕阳下的无边云海" not in filtered
+
+
+def test_character_context_includes_visual_appearance_constraints():
+    from phases.phase1.character_discoverer import _collect_character_stats
+
+    stats = _collect_character_stats([{
+        "id": 2,
+        "who": ["年轻东方古装仙女"],
+        "where": "白玉栏杆旁",
+        "what": "仙女俯瞰云海",
+        "visual": "她身穿淡粉白色多层轻纱仙裙，玉簪点缀银色流苏",
+        "emotion": "清冷温柔",
+    }])
+
+    context = stats["年轻东方古装仙女"]["contexts"][0]
+    assert "视觉硬约束" in context
+    assert "淡粉白色多层轻纱仙裙" in context
+
+
 def test_progress_reporter_emits_heartbeat(tmp_path):
     reporter = ProgressReporter(str(tmp_path))
     reporter.start_heartbeat("phase1", interval_s=0.01)
@@ -257,6 +288,183 @@ def test_director_planner_uses_shared_streaming_client(monkeypatch, tmp_path):
     assert observed["stream_args"]["idle_timeout"] == director_planner.LLM_IDLE_TIMEOUT
     assert observed["messages"][0]["role"] == "system"
     assert json.loads((tmp_path / "director_plan.json").read_text())["scenes"] == []
+
+
+def test_storyboard_long_stream_timeout_budget_is_consistent(monkeypatch):
+    client = object()
+    observed = {}
+
+    def fake_client(**kwargs):
+        observed["client_args"] = kwargs
+        return client
+
+    def fake_stream(*, messages, **kwargs):
+        observed["messages"] = messages
+        observed["stream_args"] = kwargs
+        return json.dumps({"prompt": "cinematic cloud sea", "caption": "云海"})
+
+    monkeypatch.setattr(storyboard_generator, "create_ark_client", fake_client)
+    monkeypatch.setattr(storyboard_generator, "call_llm_stream", fake_stream)
+
+    result = storyboard_generator._call_llm("synthetic storyboard prompt")
+
+    assert json.loads(result)["caption"] == "云海"
+    assert observed["client_args"] == {
+        "read_timeout": storyboard_generator.LLM_IDLE_TIMEOUT
+    }
+    assert observed["stream_args"]["_client"] is client
+    assert (
+        observed["stream_args"]["wall_timeout"]
+        == storyboard_generator.LLM_TIMEOUT
+    )
+    assert (
+        observed["stream_args"]["idle_timeout"]
+        == storyboard_generator.LLM_IDLE_TIMEOUT
+    )
+    assert storyboard_generator.LLM_TIMEOUT >= 360
+    assert (
+        storyboard_generator.SHOT_WALL_CLOCK_S
+        >= storyboard_generator.LLM_TIMEOUT * 2 + 30
+    )
+
+
+def test_style_summary_uses_long_stream_and_idle_timeouts(monkeypatch):
+    observed = {}
+
+    def fake_stream(*, messages, **kwargs):
+        observed["messages"] = messages
+        observed["stream_args"] = kwargs
+        return "东方仙侠电影写实风格"
+
+    monkeypatch.setattr(pipeline_core, "call_llm_stream", fake_stream)
+    monkeypatch.setenv("ARK_AGENT_API_KEY", "test-key")
+
+    result = pipeline_core._summarize_visual_style_with_llm("云海仙宫")
+
+    assert result == "东方仙侠电影写实风格"
+    assert (
+        observed["stream_args"]["wall_timeout"]
+        == pipeline_core.STYLE_SUMMARY_WALL_TIMEOUT
+    )
+    assert (
+        observed["stream_args"]["read_timeout"]
+        == pipeline_core.STYLE_SUMMARY_IDLE_TIMEOUT
+    )
+    assert (
+        observed["stream_args"]["idle_timeout"]
+        == pipeline_core.STYLE_SUMMARY_IDLE_TIMEOUT
+    )
+
+
+def test_storyboard_template_supports_current_shot_schema():
+    template = "```\n角色：{{CHARACTER_REFERENCE}}\n共{{PANEL_COUNT}}格\n{{STORYBOARD_CONTENT}}\n```"
+    storyboard = {"shots": [{
+        "visual": "巨大蓝色星球从云层后显现",
+        "what": "仙女抬头望向天空",
+        "camera_movement": "orbit",
+    }]}
+    characters = {"characters": [{
+        "name": "年轻东方古装仙女",
+        "appearance": {"summary": "身穿淡粉白色多层轻纱仙裙"},
+    }]}
+
+    prompt = pipeline_core.fill_storyboard_template(template, storyboard, characters)
+
+    assert "面板 1: 巨大蓝色星球从云层后显现" in prompt
+    assert "动作: 仙女抬头望向天空" in prompt
+    assert "镜头: orbit" in prompt
+    assert "淡粉白色多层轻纱仙裙" in prompt
+
+
+def test_storyboard_template_rejects_empty_panels():
+    template = "```\n{{STORYBOARD_CONTENT}}\n```"
+
+    with pytest.raises(ValueError, match="shot 1 has no visual content"):
+        pipeline_core.fill_storyboard_template(template, {"shots": [{}]}, {})
+
+
+def test_video_reference_selects_single_shot_image_not_overview(tmp_path):
+    overview = tmp_path / "storyboard.png"
+    overview.write_bytes(b"x" * 4096)
+
+    assert pipeline_core._shot_storyboard_reference(tmp_path, 6) is None
+
+    shot_dir = tmp_path / "storyboard_images"
+    shot_dir.mkdir()
+    shot_image = shot_dir / "S06.png"
+    shot_image.write_bytes(b"y" * 4096)
+
+    assert pipeline_core._shot_storyboard_reference(tmp_path, 6) == shot_image
+    assert pipeline_core._shot_storyboard_reference(tmp_path, "S06") == shot_image
+
+
+def test_scenery_keyframe_prompt_does_not_inject_action_movie_concepts():
+    prompt = pipeline_core._storyboard_keyframe_description({
+        "who": [],
+        "what": "镜头穿透厚重云墙",
+        "visual": "金色云海与悬浮天宫逐渐显现",
+    })
+
+    assert "Environment-only" in prompt
+    assert "zero people" in prompt
+    for forbidden in ("fight", "weapon", "attacker", "defender", "blade"):
+        assert forbidden not in prompt.lower()
+
+
+def test_character_keyframe_prompt_has_no_unrequested_weapon_vocabulary():
+    prompt = pipeline_core._storyboard_keyframe_description({
+        "who": ["仙女"],
+        "subject_description": "淡粉白色轻纱仙裙",
+        "what": "仙女抚琴",
+        "visual": "仙女端坐古琴前",
+    })
+
+    assert "Character identity lock" in prompt
+    for forbidden in ("fight", "weapon", "attacker", "defender", "blade"):
+        assert forbidden not in prompt.lower()
+
+
+def test_scenery_keyframe_does_not_absorb_project_plot_objects():
+    shot = {
+        "id": 1,
+        "who": [],
+        "what": "镜头掠过云层表面",
+        "visual": "金色夕阳下无边云海剧烈翻涌",
+    }
+    prompt = pipeline_core._storyboard_keyframe_description(shot)
+    project_style = "东方神话风格，悬浮天宫，仙女与古琴"
+
+    assert "天宫" not in prompt
+    assert "仙女" not in prompt
+    assert "古琴" not in prompt
+    assert project_style not in prompt
+
+
+def test_shot_image_batch_does_not_append_global_style_summary(monkeypatch, tmp_path):
+    observed = {}
+
+    def fake_batch(scenes, style_context):
+        observed["scenes"] = scenes
+        observed["style_context"] = style_context
+        return [{"scene_id": 1, "prompt": scenes[0]["description"]}]
+
+    monkeypatch.setattr(pipeline_core, "build_batch_prompts", fake_batch)
+    result = pipeline_core._generate_shot_images(tmp_path, {"shots": [{
+        "id": 1,
+        "who": ["仙女"],
+        "what": "仙女抚琴",
+        "visual": "仙女端坐古琴前",
+    }]})
+
+    assert result == 0
+    assert observed["style_context"] is None
+
+
+def test_character_prompt_locks_explicit_costume_facts():
+    import phases.phase1.character_discoverer as character_discoverer
+
+    assert "必须原样保留" in character_discoverer.SYSTEM_PROMPT
+    assert "不能把淡粉改成月白" in character_discoverer.USER_PROMPT_TEMPLATE
 
 
 def test_combined_phase1_starts_progress_before_director(monkeypatch, tmp_path):
@@ -417,3 +625,24 @@ def test_phase1_reporter_receives_steps_and_stops_heartbeat(monkeypatch, tmp_pat
     assert result["status"] == "done"
     assert any(item[0] == "phase1" for item in steps)
     assert steps[-1] == ("stop", None)
+
+
+def test_flf2v_similarity_gate_allows_changed_staging_but_rejects_copy(tmp_path):
+    from PIL import Image
+
+    first = tmp_path / "first.png"
+    changed = tmp_path / "changed.png"
+    copied = tmp_path / "copied.png"
+    Image.new("RGB", (128, 72), (100, 100, 100)).save(first)
+    # The grayscale-MSE similarity is about 0.933: visibly changed luminance,
+    # but above the former 0.93 cutoff observed to reject real action progress.
+    Image.new("RGB", (128, 72), (166, 166, 166)).save(changed)
+    Image.new("RGB", (128, 72), (100, 100, 100)).save(copied)
+
+    changed_report = pipeline_core._validate_end_frame(first, changed)
+    copied_report = pipeline_core._validate_end_frame(first, copied)
+
+    assert changed_report["passed"] is True
+    assert 0.93 < changed_report["similarity"] < 0.97
+    assert copied_report["passed"] is False
+    assert "too similar" in copied_report["reason"]

@@ -93,6 +93,7 @@ def test_call_llm_uses_streaming_and_joins_chunks(monkeypatch):
 
 
 def test_shot_wall_clock_timeout_uses_fallback(monkeypatch, capsys):
+    monkeypatch.setattr(storyboard_generator, "SHOT_WALL_CLOCK_S", 480)
     clock = iter([0, 0, 200, 200, 400, 400])
     monkeypatch.setattr(storyboard_generator.time, "monotonic", lambda: next(clock))
     monkeypatch.setattr(storyboard_generator.time, "sleep", lambda _seconds: None)

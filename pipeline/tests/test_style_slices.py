@@ -82,7 +82,7 @@ def test_phase3_character_builder_receives_sliced_style(tmp_path, monkeypatch):
     assert len(captured[0]) < len(STYLE)
 
 
-def test_storyboard_prompt_builder_receives_sliced_style(tmp_path, monkeypatch):
+def test_storyboard_prompt_builder_does_not_receive_plot_bearing_global_style(tmp_path, monkeypatch):
     (tmp_path / "visual-style.md").write_text(STYLE, encoding="utf-8")
     captured = {}
 
@@ -93,13 +93,10 @@ def test_storyboard_prompt_builder_receives_sliced_style(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline_core, "build_batch_prompts", fake_build_batch_prompts)
 
     assert pipeline_core._generate_shot_images(tmp_path, {"shots": []}) == 0
-    assert "Camera composition" in captured["mood"]
-    assert "blue palette" in captured["mood"]
-    assert "red outfit" not in captured["mood"]
-    assert len(captured["mood"]) < len(STYLE)
+    assert captured == {}
 
 
-def test_video_prompt_builder_receives_sliced_style():
+def test_video_prompt_builder_uses_plot_neutral_rendering_continuity():
     prompt = build_video_prompt(
         {"id": 1, "duration": 5},
         [],
@@ -107,7 +104,8 @@ def test_video_prompt_builder_receives_sliced_style():
         "seedance",
     )
 
-    assert "believable physics" in prompt
-    assert "blue palette" in prompt
+    assert "believable physics" not in prompt
+    assert "blue palette" not in prompt
     assert "red outfit" not in prompt
+    assert "不得从项目级风格描述引入" in prompt
     assert STYLE not in prompt

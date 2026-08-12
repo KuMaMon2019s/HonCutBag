@@ -55,7 +55,24 @@ def is_static_frame(first: Path, last: Path, threshold: float = 3.0) -> bool:
 
 
 def probe_duration(video_path: Path) -> float:
+    # Prefer the actual video-stream duration. Container duration is often the
+    # longest stream and can hide a truncated picture behind a correctly sized
+    # (or padded) audio track.
     completed = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=duration",
+            "-of", "csv=p=0", str(video_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+    value = completed.stdout.strip().splitlines()
+    if value and value[0] not in {"N/A", ""}:
+        return float(value[0])
+    fallback = subprocess.run(
         [
             "ffprobe", "-v", "error", "-show_entries", "format=duration",
             "-of", "csv=p=0", str(video_path),
@@ -65,7 +82,7 @@ def probe_duration(video_path: Path) -> float:
         timeout=30,
         check=True,
     )
-    return float(completed.stdout.strip().splitlines()[0])
+    return float(fallback.stdout.strip().splitlines()[0])
 
 
 def _sample_timestamps(duration: float, max_frames: int, interval_s: float) -> list[float]:
@@ -304,7 +321,12 @@ def _automatic_semantic_reviewer() -> SemanticReviewer | None:
             f"shot metadata: {json.dumps(expected, ensure_ascii=False)}. Detect character identity drift, "
             "extra or missing limbs/objects, broken anatomy, impossible geometry, continuity jumps, text or "
             "watermark artifacts, wrong time of day, daylight/night drift, weather drift, and lighting that "
-            "contradicts the shot or changes materially between the first and last supplied frame. Return JSON only: "
+            "contradicts the shot or changes materially between the first and last supplied frame. Natural acting "
+            "micro-movements (small gaze/head/hand changes) are allowed unless they reverse the narrative action or "
+            "create a true continuity jump. Do not call a hand or limb anatomically broken merely because it is "
+            "partly hidden by a sleeve, prop, railing, crop, or camera angle; require visible positive evidence of "
+            "malformation. Judge shot-size drift only against explicit camera movement: a dolly-in must not become "
+            "a sustained pull-back, while a fixed shot may contain minor stabilization drift. Return JSON only: "
             '{"verdict":"pass|reshoot","issues":["..."],"confidence":0.0}.'
         )
         raw = client.review(frame_paths, prompt).strip()

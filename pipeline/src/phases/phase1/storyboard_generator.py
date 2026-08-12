@@ -127,9 +127,10 @@ USER_PROMPT_TEMPLATE = (
     '输出 JSON：{{"prompt": "英文视频生成prompt", "caption": "中文字幕"}}'
 )
 
-LLM_TIMEOUT = 180  # 秒（2026-08-09: turbo 推理模型需要更长推理时间）
+LLM_TIMEOUT = 360  # 健康长流可能超过 180s；空闲停滞由独立阈值处理
+LLM_IDLE_TIMEOUT = 75
 MAX_RETRIES = 3  # 解析失败重试次数（从 1 提高到 3）
-SHOT_WALL_CLOCK_S = 480  # 单镜生成（含重试）的墙钟上限
+SHOT_WALL_CLOCK_S = 900  # 可容纳两次完整长流调用、退避及解析开销
 FPS = 30  # 帧率
 
 IDENTITY_LOCK_PHRASES = [
@@ -232,7 +233,7 @@ def _get_client() -> OpenAI:
 
     API Key: ARK_AGENT_API_KEY (火山方舟 Agent Plan)
     """
-    return create_ark_client()
+    return create_ark_client(read_timeout=LLM_IDLE_TIMEOUT)
 
 
 def _call_llm(user_prompt: str, visual_style_text: Optional[str] = None) -> str:
@@ -257,6 +258,7 @@ def _call_llm(user_prompt: str, visual_style_text: Optional[str] = None) -> str:
         ],
         max_tokens=16000,
         wall_timeout=LLM_TIMEOUT,
+        idle_timeout=LLM_IDLE_TIMEOUT,
         _client=client,
     )
 
