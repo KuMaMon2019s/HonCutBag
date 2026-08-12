@@ -11,6 +11,7 @@ from typing import Any
 from openai import OpenAI
 
 from utils.config import ARK_BASE_URL, DEFAULT_TEXT_MODEL, get_api_key
+from utils.ark_llm import call_llm_stream
 
 
 MAX_TOKENS = 4096
@@ -37,25 +38,33 @@ def _get_llm_client(config: dict[str, Any]) -> OpenAI:
     return OpenAI(
         api_key=api_key,
         base_url=config.get("base_url") or ARK_BASE_URL,
+        timeout=float(
+            config.get("request_timeout")
+            or os.environ.get("HONCUT_SUPERVISION_REQUEST_TIMEOUT_S", "60")
+        ),
+        max_retries=0,
     )
 
 
 def _call_llm(prompt: str, config: dict[str, Any]) -> str:
     client = _get_llm_client(config)
-    stream = client.chat.completions.create(
-        model=config.get("model") or DEFAULT_TEXT_MODEL,
-        messages=[
+    return call_llm_stream(
+        [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
-        stream=True,
+        model=config.get("model") or DEFAULT_TEXT_MODEL,
         max_tokens=int(config.get("max_tokens", MAX_TOKENS)),
+        wall_timeout=float(
+            config.get("supervision_wall_timeout")
+            or os.environ.get("HONCUT_SUPERVISION_WALL_TIMEOUT_S", "180")
+        ),
+        idle_timeout=float(
+            config.get("supervision_idle_timeout")
+            or os.environ.get("HONCUT_SUPERVISION_IDLE_TIMEOUT_S", "60")
+        ),
+        _client=client,
     )
-    chunks: list[str] = []
-    for chunk in stream:
-        if chunk.choices and chunk.choices[0].delta.content:
-            chunks.append(chunk.choices[0].delta.content)
-    return "".join(chunks)
 
 
 def _review_prompt(storyboard: dict, visual_style: str) -> str:

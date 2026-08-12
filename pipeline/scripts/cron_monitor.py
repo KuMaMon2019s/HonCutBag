@@ -6,7 +6,18 @@ import json
 import subprocess
 from pathlib import Path
 
-PHASES = ["phase1", "phase2", "phase3", "phase4", "phase5", "phase6", "phase7", "phase8", "phase9"]
+PHASES = [
+    "phase1",
+    "phase2",
+    "phase3",
+    "phase4",
+    "phase5",
+    "phase6",
+    "phase7",
+    "phase8",
+    "phase9",
+    "phase9_5",
+]
 
 
 def check_process(process_id: str) -> dict:

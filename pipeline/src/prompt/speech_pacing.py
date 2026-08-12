@@ -28,5 +28,12 @@ def estimate_speech_duration(dialogue: str, emotion: str | None = None, pause_se
 def annotate_shot_pacing(shots: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for shot in shots:
         dialogue = shot.get("dialogue") or shot.get("lines") or ""
+        if isinstance(dialogue, dict):
+            dialogue = (
+                dialogue.get("line")
+                or dialogue.get("text")
+                or dialogue.get("content")
+                or ""
+            )
         shot["speech_duration_s"] = estimate_speech_duration(str(dialogue), shot.get("emotion"))
     return shots

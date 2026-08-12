@@ -25,6 +25,8 @@ CAMERA_MOVEMENTS = {
     "pan_left": "左摇(pan left)", "pan_right": "右摇(pan right)",
     "slow_pan": "左摇(pan left)", "tracking": "跟拍(tracking shot)",
     "tracking_shot": "跟拍(tracking shot)", "orbit": "环绕(orbit)",
+    "tracking_left": "向左跟拍(tracking left)",
+    "tracking_right": "向右跟拍(tracking right)",
     "handheld": "手持(handheld)", "static": "固定(fixed/locked)",
     "fixed": "固定(fixed/locked)", "crane_up": "上升(crane up)",
     "crane_down": "下降(crane down)", "push_in": "推入(push in)",
@@ -39,7 +41,13 @@ def _characters_list(characters: Any) -> list[dict[str, Any]]:
 
 
 def _shot_number(shot_meta: dict[str, Any]) -> int:
-    raw = shot_meta.get("shot_number") or shot_meta.get("shot_order") or shot_meta.get("id") or 1
+    raw = (
+        shot_meta.get("shot_number")
+        or shot_meta.get("shot_order")
+        or shot_meta.get("id")
+        or shot_meta.get("shot_id")
+        or 1
+    )
     try:
         return int(str(raw).lstrip("Ss"))
     except (TypeError, ValueError):

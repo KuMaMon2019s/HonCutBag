@@ -53,6 +53,28 @@ def test_parse_failure_degrades_to_warn(tmp_path, monkeypatch):
     assert (tmp_path / "supervision_report.json").is_file()
 
 
+def test_llm_call_uses_idle_and_wall_timeouts(monkeypatch):
+    observed = {}
+    fake_client = object()
+    monkeypatch.setattr(supervision_agent, "_get_llm_client", lambda _config: fake_client)
+
+    def fake_stream(messages, **kwargs):
+        observed.update(messages=messages, **kwargs)
+        return "review"
+
+    monkeypatch.setattr(supervision_agent, "call_llm_stream", fake_stream)
+
+    result = supervision_agent._call_llm(
+        "storyboard",
+        {"supervision_wall_timeout": 90, "supervision_idle_timeout": 30},
+    )
+
+    assert result == "review"
+    assert observed["wall_timeout"] == 90.0
+    assert observed["idle_timeout"] == 30.0
+    assert observed["_client"] is fake_client
+
+
 def test_blocking_mode_aborts_and_lists_issues(tmp_path, monkeypatch):
     response = {
         "grade": "D",

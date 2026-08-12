@@ -18,7 +18,6 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +69,15 @@ def parse_shots(storyboard: dict) -> list:
             "gen_strategy": s.get("gen_strategy", "i2v"),
             "visual": s.get("visual", ""),
             "what": s.get("what", ""),
+            "action_description": s.get("action_description", s.get("what", "")),
+            "shot_type": s.get("shot_type"),
+            "shot_size": s.get("shot_size"),
+            "camera_movement": s.get("camera_movement"),
+            "where": s.get("where", ""),
+            "emotion": s.get("emotion", ""),
+            "dialogue": s.get("dialogue"),
+            "speech_duration_s": s.get("speech_duration_s", 0),
+            "audio": s.get("audio", s.get("sound")),
         }
         shots.append(shot)
     return shots
@@ -234,6 +242,15 @@ def setup_shot_dirs(shots: list) -> list:
             "gen_strategy": shot.get("gen_strategy", "i2v"),
             "visual": shot.get("visual", ""),
             "what": shot.get("what", ""),
+            "action_description": shot.get("action_description", shot.get("what", "")),
+            "shot_type": shot.get("shot_type"),
+            "shot_size": shot.get("shot_size"),
+            "camera_movement": shot.get("camera_movement"),
+            "where": shot.get("where", ""),
+            "emotion": shot.get("emotion", ""),
+            "dialogue": shot.get("dialogue"),
+            "speech_duration_s": shot.get("speech_duration_s", 0),
+            "audio": shot.get("audio"),
             "status": "pending",
             "task_id": None,
             "video_path": None,
@@ -430,7 +447,7 @@ def main():
     if args.dry_run:
         print("\n✅ Dry run complete. No API calls made.")
         print(f"   Shot directories created in: {SHOTS_DIR}")
-        print(f"   Review SHOT_META.json files for routing decisions.")
+        print("   Review SHOT_META.json files for routing decisions.")
         return
 
     # Skip assembly if requested
@@ -456,7 +473,7 @@ def main():
         return
 
     # 6. Run consistency guard + re-gen loop (P1-2 fix)
-    print(f"\n[5/6] Running consistency guard...")
+    print("\n[5/6] Running consistency guard...")
     guard_script = PROJECT_ROOT / "scripts" / "consistency_guard.py"
     report_path = SHOTS_DIR / "consistency_report.json"
     if guard_script.exists():
@@ -503,7 +520,7 @@ def main():
         print(f"   ⚠️  consistency_guard.py not found at {guard_script}, skipping.")
 
     # 7. Run assembly engine
-    print(f"\n[6/6] Assembling final video...")
+    print("\n[6/6] Assembling final video...")
     try:
         import assembly_engine
         shot_dir_path = str(SHOTS_DIR)

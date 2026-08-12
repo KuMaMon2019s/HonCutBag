@@ -2377,9 +2377,11 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
             "--storyboard", str(storyboard_path.resolve()),
             "--skip-assembly",
             "--shots-dir", str(shots_dir.resolve()),
+            # Phase 4 owns routing and SHOT_META creation only.  The legacy
+            # orchestrator's live mode also submits video jobs, which belongs
+            # exclusively to Phase 6 and can otherwise double-submit work.
+            "--dry-run",
         ]
-        if dry_run:
-            cmd.append("--dry-run")
 
         print(f"  → orchestrator: {' '.join(cmd[-4:])}")
         result = subprocess.run(

@@ -38,6 +38,7 @@ PHASES = (
     "phase7",
     "phase8",
     "phase9",
+    "phase9_5",
 )
 PHASE_NUMBERS = {
     "phase1": "1",
@@ -49,6 +50,7 @@ PHASE_NUMBERS = {
     "phase7": "7",
     "phase8": "8",
     "phase9": "9",
+    "phase9_5": "9.5",
 }
 
 
@@ -188,8 +190,6 @@ def _phase_skip_list(args: argparse.Namespace, parser: argparse.ArgumentParser) 
 
     selected = set(PHASES[start_index : end_index + 1])
     skipped = [float(PHASE_NUMBERS[phase]) for phase in PHASES if phase not in selected]
-    # Phase 9.5 is outside the supported phase-level monitoring sequence.
-    skipped.append(9.5)
     return skipped
 
 

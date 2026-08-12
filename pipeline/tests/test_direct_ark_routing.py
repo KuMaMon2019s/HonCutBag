@@ -54,11 +54,12 @@ def _isolate_provider_capacity_database(tmp_path, monkeypatch):
 
 
 def test_phase_ids_are_contiguous_in_execution_order():
-    expected = [f"phase{number}" for number in range(1, 10)]
+    expected = [f"phase{number}" for number in range(1, 10)] + ["phase9_5"]
     assert phase_orchestrator.PHASES == expected
     assert list(pipeline_runner_cli.PHASES) == expected
     assert phase_orchestrator.PHASE_NUMBERS == {
-        phase: str(index) for index, phase in enumerate(expected, start=1)
+        **{f"phase{number}": str(number) for number in range(1, 10)},
+        "phase9_5": "9.5",
     }
 
 
@@ -74,8 +75,25 @@ def test_progress_file_is_written_with_new_phase_ids(tmp_path):
         },
     )
     written = json.loads(progress.read_text(encoding="utf-8"))
-    assert written["phases"] == [f"phase{number}" for number in range(1, 10)]
+    assert written["phases"] == [f"phase{number}" for number in range(1, 10)] + ["phase9_5"]
     assert written["current_phase"] == "phase2"
+
+
+def test_pipeline_runner_can_select_phase9_5_independently():
+    parser = pipeline_runner_cli._build_parser()
+    args = parser.parse_args(["--text", "story", "--phase", "phase9_5"])
+
+    assert pipeline_runner_cli._phase_skip_list(args, parser) == [
+        1.0,
+        2.0,
+        3.0,
+        4.0,
+        5.0,
+        6.0,
+        7.0,
+        8.0,
+        9.0,
+    ]
 
 
 def test_embed_image_sends_tos_url_as_string_input(monkeypatch, tmp_path):
@@ -432,6 +450,21 @@ def test_phase4_timeout_prints_subprocess_output_tails(monkeypatch, tmp_path, ca
     assert result["error"] == "orchestrator timed out"
     assert "inner stdout cause" in output
     assert "inner stderr cause" in output
+
+
+def test_phase4_never_lets_legacy_orchestrator_submit_video(monkeypatch, tmp_path):
+    (tmp_path / "STORYBOARD.json").write_text(json.dumps({"shots": []}))
+    observed = {}
+
+    def fake_run(cmd, **kwargs):
+        observed["cmd"] = cmd
+        return pipeline_core.subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(pipeline_core.subprocess, "run", fake_run)
+
+    pipeline_core.run_phase4(tmp_path, dry_run=False)
+
+    assert "--dry-run" in observed["cmd"]
 
 
 def test_submit_content_sends_top_level_agent_plan_payload(monkeypatch):

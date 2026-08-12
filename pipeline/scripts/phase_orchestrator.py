@@ -21,6 +21,7 @@ PHASES = [
     "phase7",
     "phase8",
     "phase9",
+    "phase9_5",
 ]
 PHASE_NUMBERS = {
     "phase1": "1",
@@ -32,6 +33,7 @@ PHASE_NUMBERS = {
     "phase7": "7",
     "phase8": "8",
     "phase9": "9",
+    "phase9_5": "9.5",
 }
 PIPELINE_DIR = Path(__file__).resolve().parents[1]
 RUNNER = PIPELINE_DIR / "src" / "pipeline_runner.py"

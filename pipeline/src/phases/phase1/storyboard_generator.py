@@ -167,12 +167,14 @@ INTENT_TO_CAMERA = {
 }
 
 SHOT_SIZE_MAP = {
+    "establishing": "Establishing wide shot",
     "extreme_wide": "Extreme wide shot",
     "wide": "Wide shot",
     "full": "Full shot",
     "medium_wide": "Medium wide shot",
     "medium": "Medium shot",
     "medium_close_up": "Medium close-up",
+    "medium_close": "Medium close-up",
     "close_up": "Close-up",
     "extreme_close_up": "Extreme close-up",
 }
@@ -185,6 +187,8 @@ CAMERA_TERMS = {
     "slow_pan": "左摇(pan left)",
     "tracking": "跟拍(tracking shot)",
     "tracking_shot": "跟拍(tracking shot)",
+    "tracking_left": "向左跟拍(tracking left)",
+    "tracking_right": "向右跟拍(tracking right)",
     "orbit": "环绕(orbit)",
     "handheld": "手持(handheld)",
     "static": "固定(fixed/locked)",
