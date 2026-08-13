@@ -12,6 +12,7 @@ Usage:
 import argparse
 import hashlib
 import json
+import math
 import os
 import random
 import subprocess
@@ -266,7 +267,7 @@ def _record_stage_checkpoint(output_dir: Path, phase_name: str, result: dict) ->
     """Persist a successful phase through the shared checkpoint module."""
     cp_path = _checkpoint_path(output_dir)
     status = result.get("status", "")
-    if status not in ("done", "skipped"):
+    if status != "done":
         return cp_path
     safe_result = {}
     for k, v in result.items():
@@ -3984,6 +3985,10 @@ def _finish_phase8(
 ) -> dict:
     """Apply the duration gate and fail closed when required footage is missing."""
     from phases.phase8.duration_gate import evaluate_duration_gate, trim_excess_to_target
+    from phases.phase8.reshoot_transaction import (
+        ReshootTransaction,
+        mark_cycle_completed,
+    )
 
     outputs = list(phase_result.get("outputs", []))
     for artifact in (
@@ -4022,12 +4027,14 @@ def _finish_phase8(
     phase_result["duration_gate"] = gate
     if target_duration is None:
         print("  ⊘ [8.3] target_duration=None，跳过时长闸门", flush=True)
+        mark_cycle_completed(output_dir)
         return phase_result
     if gate["passed"]:
         print(
             f"  ✓ [8.3] 时长闸门通过: {gate['actual_s']:.2f}s / {gate['target_s']:.2f}s",
             flush=True,
         )
+        mark_cycle_completed(output_dir)
         return phase_result
 
     print(
@@ -4058,14 +4065,20 @@ def _finish_phase8(
         phase_result["error"] = "Phase 8 duration gate failed and no reshoot candidates were found"
         return phase_result
 
-    deleted: list[str] = []
-    for shot in selected:
-        video_path = output_dir / "shots" / shot["shot_id"] / "output.mp4"
-        if video_path.is_file():
-            video_path.unlink()
-            deleted.append(shot["shot_id"])
+    selected_ids = [str(shot["shot_id"]) for shot in selected]
+    try:
+        transaction = ReshootTransaction.begin(
+            output_dir,
+            kind="duration_shortfall",
+            shot_ids=selected_ids,
+        )
+        transaction.remove_sources()
+    except Exception as exc:
+        phase_result["status"] = "error"
+        phase_result["error"] = f"Phase 8 could not prepare recoverable duration reshoot: {exc}"
+        return phase_result
     print(
-        f"  🔄 [8.3] 补录第 {reshoot_round + 1}/2 轮: {', '.join(deleted)}；"
+        f"  🔄 [8.3] 补录第 {reshoot_round + 1}/2 轮: {', '.join(selected_ids)}；"
         "其余镜头由 Phase 6 自动跳过",
         flush=True,
     )
@@ -4074,17 +4087,28 @@ def _finish_phase8(
         storyboard = json.loads(storyboard_path.read_text(encoding="utf-8"))
         generation = run_phase6(storyboard, output_dir, dry_run=False, chain_mode=chain_mode)
     except Exception as exc:
+        transaction.rollback(str(exc))
         print(f"  ⚠⚠ [8.3] 补录调用 Phase 6 失败: {exc}；阻止交付", flush=True)
         phase_result["status"] = "error"
         phase_result["error"] = f"Phase 8 duration reshoot could not run Phase 6: {exc}"
         return phase_result
     if generation.get("status") == "error":
+        failure = str(generation.get("error") or generation.get("errors"))
+        transaction.rollback(failure)
         print(f"  ⚠⚠ [8.3] Phase 6 补录失败: {generation.get('error') or generation.get('errors')}", flush=True)
         phase_result["status"] = "error"
         phase_result["error"] = (
             "Phase 8 duration reshoot failed in Phase 6: "
             f"{generation.get('error') or generation.get('errors')}"
         )
+        return phase_result
+
+    try:
+        transaction.commit()
+    except Exception as exc:
+        transaction.rollback(str(exc))
+        phase_result["status"] = "error"
+        phase_result["error"] = f"Phase 8 duration reshoot validation failed: {exc}"
         return phase_result
 
     history = reshoot_history + [{**reshoot_plan, "phase6_status": generation.get("status")}]
@@ -4118,6 +4142,9 @@ def run_phase8(output_dir: Path, dry_run: bool,
     print(f"  ⏱ Phase 8 开始 (预估 ~{int(phase8_estimate)}s)")
     output_dir = Path(output_dir)
     reshoot_history = list(_reshoot_history or [])
+    from phases.phase8.reshoot_transaction import durable_attempt_count
+
+    _reshoot_round = max(_reshoot_round, durable_attempt_count(output_dir))
 
     if dry_run:
         print("  ⊘ dry-run 模式，跳过视频组装")
@@ -4187,45 +4214,49 @@ def run_phase8(output_dir: Path, dry_run: bool,
                 "reshoot_history": reshoot_history,
             }
 
-        deleted: list[str] = []
-        for shot_id in reshoot_shots:
-            video_path = shots_dir / shot_id / "output.mp4"
-            if video_path.is_file():
-                # A rejected FLF2V result can be caused by an inconsistent
-                # generated endpoint (identity/framing drift). Repeating the
-                # exact first/last-frame route reproduces the same defect, so
-                # use the character-reference route for the reshoot.
-                meta_path = shots_dir / shot_id / "SHOT_META.json"
-                try:
-                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
-                    meta = {}
-                if meta.get("gen_strategy") == "flf2v":
-                    meta["gen_strategy"] = "phantom"
-                    meta["phase8_reshoot_route_reason"] = (
-                        "FLF2V visual QA failure; avoid reusing a possibly "
-                        "inconsistent generated endpoint"
-                    )
-                    meta_path.write_text(
-                        json.dumps(meta, ensure_ascii=False, indent=2),
-                        encoding="utf-8",
-                    )
-                    print(
-                        f"  ↪ [8.2] {shot_id}: FLF2V 补录改用 Phantom 角色参考路由",
-                        flush=True,
-                    )
-                video_path.unlink()
-                deleted.append(shot_id)
-        if deleted != reshoot_shots:
-            missing = sorted(set(reshoot_shots).difference(deleted))
+        from phases.phase8.reshoot_transaction import ReshootTransaction
+
+        try:
+            transaction = ReshootTransaction.begin(
+                output_dir,
+                kind="visual_quality",
+                shot_ids=reshoot_shots,
+            )
+        except Exception as exc:
             return {
                 "status": "error",
-                "error": f"Phase 8 cannot reshoot missing source clips: {', '.join(missing)}",
+                "error": f"Phase 8 could not prepare recoverable visual reshoot: {exc}",
                 "duration_s": _elapsed(start),
             }
 
+        for shot_id in reshoot_shots:
+            video_path = shots_dir / shot_id / "output.mp4"
+            # A rejected FLF2V result can be caused by an inconsistent
+            # generated endpoint. Change the route only after its metadata and
+            # source clip have both been backed up by the transaction.
+            meta_path = shots_dir / shot_id / "SHOT_META.json"
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                meta = {}
+            if meta.get("gen_strategy") == "flf2v":
+                meta["gen_strategy"] = "phantom"
+                meta["phase8_reshoot_route_reason"] = (
+                    "FLF2V visual QA failure; avoid reusing a possibly "
+                    "inconsistent generated endpoint"
+                )
+                meta_path.write_text(
+                    json.dumps(meta, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                print(
+                    f"  ↪ [8.2] {shot_id}: FLF2V 补录改用 Phantom 角色参考路由",
+                    flush=True,
+                )
+        transaction.remove_sources()
+
         print(
-            f"  🔄 [8.2] 视觉质检补录第 {_reshoot_round + 1}/2 轮: {', '.join(deleted)}",
+            f"  🔄 [8.2] 视觉质检补录第 {_reshoot_round + 1}/2 轮: {', '.join(reshoot_shots)}",
             flush=True,
         )
         storyboard_path = output_dir / "STORYBOARD.json"
@@ -4235,12 +4266,15 @@ def run_phase8(output_dir: Path, dry_run: bool,
                 storyboard, output_dir, dry_run=False, chain_mode=chain_mode
             )
         except Exception as exc:
+            transaction.rollback(str(exc))
             return {
                 "status": "error",
                 "error": f"Phase 8 visual reshoot could not run Phase 6: {exc}",
                 "duration_s": _elapsed(start),
             }
         if generation.get("status") == "error":
+            failure = str(generation.get("error") or generation.get("errors"))
+            transaction.rollback(failure)
             return {
                 "status": "error",
                 "error": (
@@ -4254,9 +4288,20 @@ def run_phase8(output_dir: Path, dry_run: bool,
             if not (shots_dir / shot_id / "output.mp4").is_file()
         ]
         if missing_outputs:
+            failure = "Phase 6 reported success without regenerated clips: " + ", ".join(missing_outputs)
+            transaction.rollback(failure)
             return {
                 "status": "error",
-                "error": f"Phase 6 reported success without regenerated clips: {', '.join(missing_outputs)}",
+                "error": failure,
+                "duration_s": _elapsed(start),
+            }
+        try:
+            transaction.commit()
+        except Exception as exc:
+            transaction.rollback(str(exc))
+            return {
+                "status": "error",
+                "error": f"Phase 8 visual reshoot validation failed: {exc}",
                 "duration_s": _elapsed(start),
             }
         history = reshoot_history + [{
@@ -4364,15 +4409,17 @@ def run_phase8(output_dir: Path, dry_run: bool,
         from phases.phase8.edit_decisions import build_edit_decisions, execute_edit_decisions
 
         print("  → 构建 reviewed edit_decisions（质检裁切 + 音频归一化）...")
+        assembly_profile = _get_profile_dict(media_profile)
         edit_decisions = build_edit_decisions(
             shots_dir=shots_dir,
-            target_width=1920,
-            target_height=1080,
+            target_width=int(assembly_profile["width"]),
+            target_height=int(assembly_profile["height"]),
             transition_decisions=transition_dicts,
             quality_report=frame_report,
             shot_order=reviewed_order,
             target_duration=target_duration,
             transition_duration=transition_duration,
+            fit_mode="cover",
         )
         print(f"  → 执行 reviewed edit_decisions（{len(edit_decisions['cuts'])} 个片段）...")
         reviewed_edit = execute_edit_decisions(
@@ -4395,7 +4442,7 @@ def run_phase8(output_dir: Path, dry_run: bool,
             return _finish_phase8({
                 "status": "done",
                 "duration_s": _elapsed(start),
-                "outputs": ["raw_assembly.mp4"],
+                "outputs": ["raw_assembly.mp4", "edit_timeline.json"],
                 "method": "reviewed_edit_decisions",
                 "transition": batch_transition,
                 "transition_duration": transition_duration,
@@ -4629,6 +4676,49 @@ def _detect_bgm(output_dir: Path, storyboard_path: Optional[Path] = None) -> Opt
     return None
 
 
+def _prepare_continuous_bgm(
+    bgm_path: str,
+    target_duration: float,
+    output_path: Path,
+    *,
+    crossfade_s: float = 2.0,
+) -> str:
+    """Extend one score across the film with equal-power loop crossfades."""
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", bgm_path],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=True,
+    )
+    source_duration = float(probe.stdout.strip().splitlines()[0])
+    if source_duration <= 0 or target_duration <= 0:
+        raise ValueError("BGM and target durations must be positive")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fade = min(crossfade_s, max(0.1, source_duration / 4))
+    count = max(1, math.ceil((target_duration - fade) / max(0.1, source_duration - fade)))
+    inputs = [item for _ in range(count) for item in ("-i", bgm_path)]
+    filters = [f"[{index}:a]aresample=48000,asetpts=PTS-STARTPTS[a{index}]" for index in range(count)]
+    current = "a0"
+    for index in range(1, count):
+        output = f"mix{index}"
+        filters.append(f"[{current}][a{index}]acrossfade=d={fade}:c1=qsin:c2=qsin[{output}]")
+        current = output
+    filters.append(
+        f"[{current}]atrim=duration={target_duration},"
+        f"afade=t=in:d=1,afade=t=out:st={max(0.0, target_duration - 2.0)}:d=2[out]"
+    )
+    command = [
+        "ffmpeg", "-y", *inputs, "-filter_complex", ";".join(filters),
+        "-map", "[out]", "-c:a", "aac", "-b:a", "192k", str(output_path),
+    ]
+    completed = subprocess.run(command, capture_output=True, timeout=600)
+    if completed.returncode != 0 or not output_path.is_file():
+        detail = completed.stderr.decode("utf-8", errors="replace")[-1000:]
+        raise RuntimeError(f"Failed to prepare continuous BGM: {detail}")
+    return str(output_path)
+
+
 def _probe_shot_duration(shots_dir: Path, shot_id: int) -> float:
     """Probe the real duration of a shot video via ffprobe.
 
@@ -4694,7 +4784,12 @@ def clean_subtitle_text(text: str) -> str:
     return " ".join(without_punctuation.split())
 
 
-def _merge_shot_transcripts(sb_shots: list, durations_ms: list[int], shot_transcripts: list[dict]) -> dict:
+def _merge_shot_transcripts(
+    sb_shots: list,
+    durations_ms: list[int],
+    shot_transcripts: list[dict],
+    edit_timeline: Optional[dict] = None,
+) -> dict:
     """Offset per-shot ASR words and create caption-burn segments.
 
     In a scripted-dialogue scene, the authored dialogue contract is the source
@@ -4706,6 +4801,11 @@ def _merge_shot_transcripts(sb_shots: list, durations_ms: list[int], shot_transc
     caption_segments = []
     cumulative_ms = 0
     shot_entries = []
+    timeline_by_shot = {
+        str(item.get("shot_id")): item
+        for item in (edit_timeline or {}).get("shots", [])
+        if isinstance(item, dict) and item.get("shot_id")
+    }
     scripted_scene = any(
         clean_subtitle_text(
             (shot.get("dialogue") or {}).get("line", "")
@@ -4717,14 +4817,26 @@ def _merge_shot_transcripts(sb_shots: list, durations_ms: list[int], shot_transc
     for index, (shot, duration_ms, transcription) in enumerate(
         zip(sb_shots, durations_ms, shot_transcripts), 1
     ):
+        shot_id = str(shot.get("shot_id") or f"S{index:02d}")
+        timeline_item = timeline_by_shot.get(shot_id)
+        if timeline_item:
+            shot_start_ms = round(float(timeline_item.get("output_start_s", 0.0)) * 1000)
+            shot_duration_ms = round(float(timeline_item.get("output_duration_s", 0.0)) * 1000)
+            source_in_ms = round(float(timeline_item.get("source_in_s", 0.0)) * 1000)
+            speed = float(timeline_item.get("speed", 1.0) or 1.0)
+        else:
+            shot_start_ms = cumulative_ms
+            shot_duration_ms = duration_ms
+            source_in_ms = 0
+            speed = 1.0
         if duration_ms <= 0 or transcription.get("skipped"):
             # Shot missing output.mp4 — skip caption generation entirely
             shot_entries.append({
-                "shot_id": shot.get("shot_id") or f"S{index:02d}",
+                "shot_id": shot_id,
                 "text": "",
                 "source": "skipped",
-                "start_ms": cumulative_ms,
-                "end_ms": cumulative_ms,
+                "start_ms": shot_start_ms,
+                "end_ms": shot_start_ms,
                 "segments": [],
             })
             continue
@@ -4740,8 +4852,8 @@ def _merge_shot_transcripts(sb_shots: list, durations_ms: list[int], shot_transc
             source = "dialogue_script"
             words = [{
                 "word": text,
-                "start_ms": round(cumulative_ms + duration_ms * 0.2),
-                "end_ms": round(cumulative_ms + duration_ms * 0.8),
+                "start_ms": round(shot_start_ms + shot_duration_ms * 0.2),
+                "end_ms": round(shot_start_ms + shot_duration_ms * 0.8),
                 "source": source,
             }]
         elif scripted_scene:
@@ -4756,18 +4868,36 @@ def _merge_shot_transcripts(sb_shots: list, durations_ms: list[int], shot_transc
                 cleaned_word = clean_subtitle_text(item.get("word") or item.get("text") or "")
                 if not cleaned_word:
                     continue
+                source_start_ms = int(item["start_ms"])
+                source_end_ms = int(item["end_ms"])
+                # Words outside the retained source window must not leak into
+                # the edited timeline after head/tail trims.
+                source_out_ms = source_in_ms + round(shot_duration_ms * speed)
+                if source_end_ms <= source_in_ms or source_start_ms >= source_out_ms:
+                    continue
+                mapped_start_ms = shot_start_ms + max(
+                    0, round((source_start_ms - source_in_ms) / speed)
+                )
+                mapped_end_ms = min(
+                    shot_start_ms + shot_duration_ms,
+                    shot_start_ms + max(
+                        0, round((source_end_ms - source_in_ms) / speed)
+                    ),
+                )
+                if mapped_end_ms <= mapped_start_ms:
+                    continue
                 words.append({
                     "word": cleaned_word,
-                    "start_ms": cumulative_ms + int(item["start_ms"]),
-                    "end_ms": cumulative_ms + int(item["end_ms"]),
+                    "start_ms": mapped_start_ms,
+                    "end_ms": mapped_end_ms,
                     "source": "asr",
                 })
             text = " ".join(item["word"] for item in words) if words else asr_text
             if not words and text:
                 words = [{
                     "word": text,
-                    "start_ms": cumulative_ms,
-                    "end_ms": cumulative_ms + duration_ms,
+                    "start_ms": shot_start_ms,
+                    "end_ms": shot_start_ms + shot_duration_ms,
                     "source": "asr",
                 }]
             source = "asr"
@@ -4778,11 +4908,11 @@ def _merge_shot_transcripts(sb_shots: list, durations_ms: list[int], shot_transc
 
         merged_words.extend(words)
         shot_entries.append({
-            "shot_id": shot.get("shot_id") or f"S{index:02d}",
+            "shot_id": shot_id,
             "text": text,
             "source": source,
-            "start_ms": cumulative_ms,
-            "end_ms": cumulative_ms + duration_ms,
+            "start_ms": shot_start_ms,
+            "end_ms": shot_start_ms + shot_duration_ms,
             "segments": words,
         })
         if words:
@@ -4799,9 +4929,12 @@ def _merge_shot_transcripts(sb_shots: list, durations_ms: list[int], shot_transc
                 } for item in words],
             })
         cumulative_ms += duration_ms
+    output_duration_ms = round(
+        float((edit_timeline or {}).get("duration_s", 0.0)) * 1000
+    ) or cumulative_ms
     return {
         "text": "".join(entry["text"] for entry in shot_entries if entry["text"]),
-        "duration_ms": cumulative_ms,
+        "duration_ms": output_duration_ms,
         "segments": merged_words,
         "shots": shot_entries,
         "caption_segments": caption_segments,
@@ -4875,9 +5008,12 @@ def _phase9_real_audio_tracks(
     storyboard_data: Optional[dict],
     transcript_data: Optional[dict],
     raw_video: Path,
+    bgm_path: Optional[str] = None,
 ) -> tuple[list[dict], int]:
     """Build the real-audio base and narration tracks for Phase 9."""
     tracks = [{"path": str(raw_video), "role": "music"}]
+    if bgm_path:
+        tracks.append({"path": bgm_path, "role": "music", "volume": 0.18})
     audio_options = storyboard_data.get("audio", {}) if storyboard_data else {}
     if not storyboard_data or not audio_options.get("enabled", False) or not audio_options.get("tts", True):
         return tracks, 0
@@ -4916,7 +5052,7 @@ def _phase9_real_audio_tracks(
 
 def _phase9_real_audio_mix_request(tracks: list[dict], audio_out: Path) -> dict:
     """Return the AudioMixer request for a preserved real-audio base track."""
-    has_tts = len(tracks) > 1
+    has_tts = any(track.get("role") == "speech" for track in tracks)
     return {
         "operation": "full_mix" if has_tts else "mix",
         "tracks": tracks,
@@ -4966,6 +5102,7 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
     outputs = []
     storyboard_path = output_dir / "STORYBOARD.json"
     sb_path_str = str(storyboard_path) if storyboard_path.exists() else None
+    storyboard_data = None
 
     # --- P0-D3: Check whether the audio track is genuinely audible ──────────
     # Previously this only checked "has audio stream" — but local Wan2.2 videos
@@ -5030,7 +5167,16 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             (asr_receipts_dir / f"S{index:02d}.json").write_text(
                 json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf-8"
             )
-        transcript_data = _merge_shot_transcripts(sb_shots, durations_ms, shot_transcripts)
+        timeline_path = output_dir / "edit_timeline.json"
+        edit_timeline = None
+        if timeline_path.is_file():
+            edit_timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
+        transcript_data = _merge_shot_transcripts(
+            sb_shots,
+            durations_ms,
+            shot_transcripts,
+            edit_timeline=edit_timeline,
+        )
         transcript_data["asr_summary"] = {
             "shots_submitted": len(shot_transcripts),
             "shots_with_text": sum(bool(item.get("text") or item.get("segments"))
@@ -5060,12 +5206,42 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
 
         # Track step statuses for quality gate integrity
         step_status = {}
-        storyboard_data = storyboard_data if sb_path_str else None
         if transcript_data is not None:
             step_status["asr_transcription"] = "done"
 
         # Step 9.1: Audio processing via OM AudioMixer
-        bgm_path = None
+        bgm_path = _detect_bgm(output_dir, storyboard_path)
+        if (
+            not bgm_path
+            and storyboard_data
+            and storyboard_data.get("audio", {}).get("enabled", False)
+        ):
+            try:
+                from phases.phase9.audio_mixer import AudioMixer as Phase9MaterialMixer
+
+                mood = (
+                    storyboard_data.get("audio", {}).get("mood")
+                    or storyboard_data.get("metadata", {}).get("mood")
+                )
+                selected_bgm = Phase9MaterialMixer().select_bgm(mood, target_duration)
+                bgm_path = selected_bgm.path if selected_bgm else None
+            except Exception as exc:
+                print(f"    ⚠ 全局配乐选择不可用: {exc}")
+        if bgm_path:
+            try:
+                bgm_path = _prepare_continuous_bgm(
+                    bgm_path,
+                    float(
+                        target_duration
+                        or _probe_av_durations(raw_video)["video"]
+                        or 0.0
+                    ),
+                    output_dir / "audio_layer" / "continuous_bgm.m4a",
+                )
+                outputs.append("audio_layer/continuous_bgm.m4a")
+                print("    ✓ 全局配乐已跨全片延展，并对循环点做等功率交叉淡化")
+            except Exception as exc:
+                print(f"    ⚠ 全局配乐延展失败，使用原始曲目: {exc}")
         if has_real_audio:
             audio_out = output_dir / "audio_processed.mp4"
             from vendor.video_tools.tools.audio.audio_mixer import AudioMixer
@@ -5081,9 +5257,9 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             extracted = _sp.run(extract_base, capture_output=True, text=True)
             base_track = base_audio if extracted.returncode == 0 and base_audio.is_file() else raw_video
             tracks, skipped_tts = _phase9_real_audio_tracks(
-                output_dir, storyboard_data, transcript_data, base_track
+                output_dir, storyboard_data, transcript_data, base_track, bgm_path
             )
-            overlay_count = len(tracks) - 1
+            overlay_count = sum(track.get("role") == "speech" for track in tracks)
             mixer = AudioMixer()
             mix_result = mixer.execute(_phase9_real_audio_mix_request(tracks, audio_out))
             audio_success = bool(mix_result.success)
@@ -5117,7 +5293,6 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             audio_out = output_dir / "audio_processed.mp4"
 
             # Detect background music for ducking
-            bgm_path = _detect_bgm(output_dir, storyboard_path)
             if bgm_path:
                 print(f"    ✓ BGM detected: {Path(bgm_path).name}")
             else:
@@ -5199,7 +5374,7 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
                     vid_info = probe_video(str(raw_video))
                     ambient_dur = vid_info.get("duration", 12.0)
                     # Pick scene hint from storyboard if available
-                    scene_hint = "lake_evening"
+                    scene_hint = "generic"
                     if storyboard_data:
                         scene_desc = str(storyboard_data.get("metadata", {}).get("scene", "")).lower()
                         if "forest" in scene_desc or "林" in scene_desc:
@@ -5406,7 +5581,9 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             "-i", final_out,
             "-vf", (
                 "setpts=PTS-STARTPTS,"
-                f"scale={profile['width']}:{profile['height']},"
+                f"scale={profile['width']}:{profile['height']}:"
+                "force_original_aspect_ratio=increase,"
+                f"crop={profile['width']}:{profile['height']},setsar=1,"
                 f"fps={profile['fps']}"
             ),
             "-af", "asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0",
@@ -5845,17 +6022,16 @@ def run_pipeline(
 
     # --- M6: --resume-from 支持 ---
     if resume_from:
-        try:
-            from utils.artifact_chain import PHASE_SEQUENCE, can_resume_from, phase_numbers_before
-            if resume_from not in PHASE_SEQUENCE:
-                raise ValueError(f"未知 Phase: {resume_from}")
-            if can_resume_from(resume_from, output_path):
-                skip_phase = phase_numbers_before(resume_from)
-                print(f"  🔄 [M6] Resume-from {resume_from}: 跳过 {skip_phase}")
-            else:
-                print(f"  ⚠ [M6] Resume-from {resume_from}: 前置依赖不满足，从头开始")
-        except Exception as e:
-            print(f"  ⚠ [M6] resume-from 解析失败: {e}")
+        from utils.artifact_chain import PHASE_SEQUENCE, can_resume_from, phase_numbers_before
+
+        if resume_from not in PHASE_SEQUENCE:
+            raise ValueError(f"未知 Phase: {resume_from}")
+        if not can_resume_from(resume_from, output_path):
+            raise RuntimeError(
+                f"Resume-from {resume_from} refused: prerequisite artifacts are incomplete"
+            )
+        skip_phase = phase_numbers_before(resume_from)
+        print(f"  🔄 [M6] Resume-from {resume_from}: 跳过 {skip_phase}")
 
     # ---- 进度报告系统初始化 ----
     # 编排器为每个 Phase 子进程设置 HONCUT_APPEND_EVENTS=1，跨阶段 events 历史保留。
@@ -6024,7 +6200,12 @@ def run_pipeline(
                             print(f"  🔄 Resuming from LangGraph checkpoint")
                             # Merge existing state with initial state
                             for key, value in state_values.items():
-                                if key not in ("text", "duration", "dry_run"):  # Don't override CLI args
+                                if key not in (
+                                    "text", "duration", "dry_run", "output_dir",
+                                    "shot_duration", "chain_mode", "transition",
+                                    "transition_duration", "media_profile",
+                                    "enable_reshoot", "auto_approve",
+                                ):  # Explicit CLI configuration remains authoritative.
                                     initial_state[key] = value
                 except Exception as e:
                     print(f"  ⚠ Failed to load checkpoint state: {e}")
@@ -6119,9 +6300,15 @@ def run_pipeline(
                 
         except Exception as e:
             print(f"\n  ⚠ LangGraph execution failed: {e}")
-            print(f"  Falling back to sequential execution")
             traceback.print_exc()
-            # Fall through to sequential execution
+            reporter.mark_failed(f"LangGraph execution failed: {e}")
+            report.update(
+                status="failed",
+                error=f"LangGraph execution failed: {e}",
+                total_duration_s=_elapsed(total_start),
+            )
+            _write_report(report, output_dir)
+            return report
     
     # --- Sequential execution (fallback or when skip_phase is used) ---
     if LANGGRAPH_AVAILABLE and not skip_phase:
@@ -6452,11 +6639,14 @@ def run_pipeline(
     else:
         try:
             from quality.video_qa import run_video_qa
+            delivery_profile = _get_profile_dict(media_profile)
             qa_report = run_video_qa(
                 output_dir,
                 storyboard_data=storyboard_data,
-                expected_width=None,  # Let QA infer from media profile
-                expected_height=None,
+                expected_width=int(delivery_profile["width"]),
+                expected_height=int(delivery_profile["height"]),
+                expected_min_duration=float(duration) - 1.0,
+                expected_max_duration=float(duration) + 1.0,
             )
             qa_passed = qa_report.verdict == "pass"
             p9_5 = {

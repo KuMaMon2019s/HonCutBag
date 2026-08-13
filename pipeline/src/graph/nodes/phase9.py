@@ -19,6 +19,7 @@ class Phase9Runner(Protocol):
         output_dir: Path,
         dry_run: bool,
         media_profile: str = "1080p",
+        target_duration: float | None = None,
     ) -> dict[str, Any]: ...
 
 
@@ -42,6 +43,7 @@ def phase9_node(
         output_dir=Path(state["output_dir"]),
         dry_run=state["dry_run"],
         media_profile=state.get("media_profile", "1080p"),
+        target_duration=state.get("duration"),
     )
     outputs = phase_receipt.get("outputs", [])
     final_video = ""

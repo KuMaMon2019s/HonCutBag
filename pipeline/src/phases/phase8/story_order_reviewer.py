@@ -162,33 +162,10 @@ def review_story_order(output_dir: Path, current_order: list[str]) -> dict:
         raise ValueError("HONCUT_STORYBOARD_REVIEW must be 'mock' or 'real'")
     mock_enabled = mode == "mock"
     llm_review: dict | None = None
-    review_error: str | None = None
-    if not mock_enabled and not missing and review_path.is_file():
-        try:
-            prior = json.loads(review_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            prior = {}
-        if (
-            prior.get("source") == "deterministic_fallback"
-            and prior.get("suggested_order") == expected
-            and current == expected
-        ):
-            prior["matches_current_order"] = True
-            prior["narrative_consistent"] = True
-            prior["reused"] = True
-            review_path.write_text(
-                json.dumps(prior, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            print("  [8.1] 复用本次运行的确定性顺序检查收据", flush=True)
-            return prior
     if not mock_enabled and not missing:
-        try:
-            llm_review = review_with_multimodal_llm(storyboard, images)
-        except Exception as exc:
-            # Narrative ID order is a safe deterministic fallback when all
-            # artifacts are present. Preserve the API failure in the receipt.
-            review_error = f"real multimodal review unavailable: {exc}"
-            print(f"  ⚠ [8.1] {review_error}；使用确定性分镜顺序校验", flush=True)
+        # Real mode is an explicit production contract. Falling back to ID
+        # order would prove only sorting, not narrative continuity.
+        llm_review = review_with_multimodal_llm(storyboard, images)
 
     if llm_review is not None:
         suggested = llm_review.get("suggested_order") or llm_review.get("ordered_shot_ids") or current
@@ -204,12 +181,6 @@ def review_story_order(output_dir: Path, current_order: list[str]) -> dict:
         consistent = True
         skipped_reason = None
         source = "mock"
-    elif review_error and not missing:
-        suggested = expected
-        consistent = current == expected
-        issues = [] if consistent else ["当前片段顺序与 STORYBOARD 镜头顺序不一致"]
-        skipped_reason = review_error
-        source = "deterministic_fallback"
     else:
         if mock_enabled and missing:
             reason = "; ".join(missing)

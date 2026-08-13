@@ -58,7 +58,10 @@ def _record_report_checkpoints(report: dict, output_dir: str | Path) -> None:
     """Persist every successful phase returned by the live runner path."""
     phase_names = {value: key for key, value in PHASE_NUMBERS.items()}
     for report_key, result in report.get("phases", {}).items():
-        if not isinstance(result, dict) or result.get("status") not in ("done", "skipped"):
+        # A phase-selection run reports every phase outside the selected range
+        # as skipped. Those phases did not execute and must never become resume
+        # checkpoints.
+        if not isinstance(result, dict) or result.get("status") != "done":
             continue
         phase_name = report_key if report_key in PHASES else phase_names.get(str(report_key))
         if phase_name:
@@ -229,9 +232,13 @@ def main() -> None:
     success = report["status"] in ("completed", "partial") and not phase_failed
     raise SystemExit(0 if success else 1)
 
-# Preserve the historical ``import pipeline_runner`` module identity. This is
-# important to callers that patch phase functions before invoking run_pipeline.
 if __name__ == "__main__":
     main()
-else:
-    sys.modules[__name__] = _core
+
+
+def __getattr__(name: str):
+    """Forward legacy helpers without replacing this module's public CLI."""
+    try:
+        return getattr(_core, name)
+    except AttributeError as exc:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc

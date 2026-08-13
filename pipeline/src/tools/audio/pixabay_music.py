@@ -260,7 +260,9 @@ class PixabayMusic(BaseTool):
         if not bootstrap_path or bootstrap_path == "":
             return []
 
-        bootstrap_url = f"{base_url}{bootstrap_path}"
+        parsed_referer = urllib.parse.urlsplit(referer)
+        base_url = f"{parsed_referer.scheme}://{parsed_referer.netloc}"
+        bootstrap_url = urllib.parse.urljoin(base_url + "/", bootstrap_path)
 
         req = urllib.request.Request(bootstrap_url)
         req.add_header("User-Agent", self._USER_AGENT)

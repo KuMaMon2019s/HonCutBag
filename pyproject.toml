@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "HonCut AI Video Generation Pipeline"
 readme = "README.md"
 requires-python = ">=3.11"
-license = {text = "MIT"}
+license = "MIT"
 authors = [
     {name = "Doraemon", email = "soda804507080@gmail.com"}
 ]
@@ -21,6 +21,12 @@ dependencies = [
     "pydantic-settings>=2.0.0",
     "numpy>=1.24.0",
     "Pillow>=10.0.0",
+    "python-dotenv>=1.0.0",
+    "langgraph>=1.2.0",
+    "langgraph-checkpoint-sqlite>=3.1.0",
+    "langchain-core>=1.5.0",
+    "websockets>=12.0",
+    "arq>=0.28.0",
 ]
 
 [project.optional-dependencies]
@@ -36,6 +42,9 @@ honcut = "honcut.pipeline_runner:main"
 
 [tool.setuptools.packages.find]
 where = ["pipeline/src"]
+
+[tool.setuptools]
+py-modules = ["pipeline_runner"]
 
 [tool.black]
 line-length = 100

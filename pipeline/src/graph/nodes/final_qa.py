@@ -26,6 +26,10 @@ class FinalQaRunner(Protocol):
         self,
         output_dir: Path,
         storyboard_data: dict[str, Any] | None = None,
+        expected_width: int | None = None,
+        expected_height: int | None = None,
+        expected_min_duration: float | None = None,
+        expected_max_duration: float | None = None,
     ) -> FinalQaReport: ...
 
 
@@ -50,9 +54,25 @@ def final_qa_node(
     try:
         if runner is None:
             raise ImportError("video_qa not available")
+        profile_name = state.get("media_profile", "1080p")
+        aliases = {"1080p": "generic_hd", "youtube": "youtube_landscape"}
+        width = height = None
+        try:
+            from utils.media_profiles import get_profile
+
+            profile = get_profile(aliases.get(profile_name, profile_name))
+            width, height = profile.width, profile.height
+        except (ImportError, ValueError):
+            fallbacks = {"480p": (854, 480), "720p": (1280, 720), "1080p": (1920, 1080)}
+            width, height = fallbacks.get(profile_name, (None, None))
+        target_duration = state.get("duration")
         qa_report = runner(
             Path(state["output_dir"]),
             storyboard_data=state.get("storyboard"),
+            expected_width=width,
+            expected_height=height,
+            expected_min_duration=(None if target_duration is None else float(target_duration) - 1.0),
+            expected_max_duration=(None if target_duration is None else float(target_duration) + 1.0),
         )
     except ImportError:
         return {

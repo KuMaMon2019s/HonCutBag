@@ -72,7 +72,7 @@ def is_silent_audio(video_path: str, threshold_db: float = -60.0) -> bool:
 def generate_ambient_audio(
     duration: float,
     output_path: str,
-    scene_hint: str = "lake_evening",
+    scene_hint: str = "generic",
     target_db: float = -20.0,
 ) -> bool:
     """Generate lightweight ambient audio using ffmpeg filters only.

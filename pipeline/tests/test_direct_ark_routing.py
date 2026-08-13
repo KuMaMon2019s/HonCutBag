@@ -27,6 +27,8 @@ from clients import ark_multimodal_client, local_video_client, seedance_client
 from clients.seedream_client import SeedreamClient
 from phases import pipeline_core
 from phases.phase5.storyboard_qa_gate import _calibrate_l3_severity
+from phases.phase8.edit_decisions import _build_timeline, build_edit_decisions
+from phases.phase8.reshoot_transaction import ReshootTransaction, durable_attempt_count
 from phases.phase8.story_order_reviewer import _shot_id, storyboard_shot_ids
 from runtime.bridge_execution import execute_bridge_video_task
 from runtime.capacity import (
@@ -460,11 +462,11 @@ def test_pipeline_runner_reconnects_successful_report_checkpoints(monkeypatch, t
     )
 
     checkpoint = json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))
-    assert checkpoint["completed"] == ["phase2", "phase4"]
+    assert checkpoint["completed"] == ["phase2"]
     assert checkpoint["results"]["phase2"]["status"] == "done"
     assert (tmp_path / "checkpoint.db").exists()
     sqlite_state = pipeline_core.load_state_from_sqlite(tmp_path, thread_id="pipeline_run")
-    assert sqlite_state["completed"] == ["phase2", "phase4"]
+    assert sqlite_state["completed"] == ["phase2"]
 
 
 def test_phase4_timeout_prints_subprocess_output_tails(monkeypatch, tmp_path, capsys):
@@ -798,9 +800,92 @@ def test_bridge_fallback_submit_timeout_becomes_uncertain(tmp_path):
     with pytest.raises(TimeoutError, match="fallback submit timed out"):
         execute_bridge_video_task(store, generate=uncertain_fallback, **arguments)
 
-    active = _enqueue_runtime_video(store).task
+    active = store.find_active(
+        run_id="run-1",
+        task_type="video.generate",
+        resource_id="S01",
+        provider_id="bridge",
+    )
+    assert active is not None
     assert active.status == "submission_uncertain"
     assert active.provider_job_id == "bridge-seedance-job"
+
+
+def test_generation_tasks_are_deduped_per_provider(tmp_path):
+    store = GenerationTaskStore(tmp_path / "runtime.db")
+    common = {
+        "run_id": "run-1",
+        "task_type": "video.generate",
+        "media_type": "video",
+        "resource_id": "S01",
+        "payload": {"shot_id": "S01"},
+    }
+
+    bridge = store.enqueue(**common, provider_id="bridge")
+    seedance = store.enqueue(**common, provider_id="seedance")
+
+    assert bridge.deduped is False
+    assert seedance.deduped is False
+    assert bridge.task.task_id != seedance.task.task_id
+
+
+def test_reshoot_transaction_restores_clip_and_metadata_after_failure(tmp_path):
+    shot = tmp_path / "shots" / "S01"
+    shot.mkdir(parents=True)
+    (shot / "output.mp4").write_bytes(b"old-video")
+    (shot / "SHOT_META.json").write_text(
+        '{"gen_strategy":"flf2v"}', encoding="utf-8"
+    )
+
+    transaction = ReshootTransaction.begin(
+        tmp_path, kind="visual_quality", shot_ids=["S01"]
+    )
+    transaction.remove_sources()
+    (shot / "output.mp4").write_bytes(b"partial-new-video")
+    (shot / "SHOT_META.json").write_text(
+        '{"gen_strategy":"phantom"}', encoding="utf-8"
+    )
+    transaction.rollback("provider quota exceeded")
+
+    assert (shot / "output.mp4").read_bytes() == b"old-video"
+    assert json.loads((shot / "SHOT_META.json").read_text())["gen_strategy"] == "flf2v"
+    assert durable_attempt_count(tmp_path) == 1
+
+
+def test_edit_timeline_accounts_for_trim_speed_and_overlap(tmp_path, monkeypatch):
+    shots = tmp_path / "shots"
+    for shot_id in ("S01", "S02"):
+        directory = shots / shot_id
+        directory.mkdir(parents=True)
+        (directory / "output.mp4").write_bytes(b"fixture")
+
+    monkeypatch.setattr(
+        "phases.phase8.edit_decisions.probe_video",
+        lambda _path: {
+            "duration": 10.0,
+            "width": 1920,
+            "height": 1080,
+            "fps": 30,
+            "has_audio": True,
+            "has_video": True,
+        },
+    )
+    monkeypatch.setattr(
+        "phases.phase8.edit_decisions.detect_black_frames",
+        lambda _path: {"trim_start": 1.0, "trim_end": 1.0},
+    )
+    decisions = build_edit_decisions(
+        str(shots),
+        transition_decisions=[{"decision": "dissolve"}],
+        transition_duration=0.5,
+        target_duration=None,
+    )
+    decisions["cuts"][0]["speed"] = 0.8
+
+    timeline = _build_timeline(decisions["cuts"], decisions["transitions"])
+
+    assert timeline[0]["output_duration_s"] == pytest.approx(10.0)
+    assert timeline[1]["output_start_s"] == pytest.approx(9.5)
 
 
 def test_seedance_http_400_is_definite_rejection_not_uncertain_submission():

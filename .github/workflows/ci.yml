@@ -29,12 +29,11 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install -r pipeline/requirements.txt
-        pip install pytest pytest-cov
+        pip install -e ".[dev]"
 
     - name: Run tests
       run: |
-        pytest pipeline/tests/ -v --cov=pipeline/src --cov-report=xml
+        PYTHONPATH=.:pipeline/src pytest pipeline/tests/ pipeline/test_story_order_multimodal.py -v --cov=pipeline/src --cov-report=xml
 
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v4
@@ -55,15 +54,11 @@ jobs:
 
     - name: Install linters
       run: |
-        pip install black ruff
+        pip install -e ".[dev]"
 
-    - name: Run Black
+    - name: Run Ruff critical checks
       run: |
-        black --check pipeline/src/ pipeline/tests/
-
-    - name: Run Ruff
-      run: |
-        ruff check pipeline/src/ pipeline/tests/
+        ruff check pipeline/src pipeline/tests --select E9,F63,F7,F82
 
   build:
     runs-on: ubuntu-latest

@@ -5,6 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Protocol
 
+from langgraph.graph import END
+from langgraph.types import Command
+
 from graph.state import HonCutState
 
 
@@ -23,7 +26,7 @@ def phase7_node(
     state: HonCutState,
     *,
     runner: Phase7Runner,
-) -> dict[str, Any]:
+) -> dict[str, Any] | Command:
     """Run consistency checks and expose the live quality-router metrics."""
 
     phase_receipt = runner(
@@ -35,12 +38,17 @@ def phase7_node(
         "slideshow_risk": phase_receipt.get("slideshow_risk", 0.0),
         "variation_score": phase_receipt.get("variation_score", 5.0),
     }
-    return {
+    update: dict[str, Any] = {
         "quality_report": quality_report,
         "phase_results": {
             **state.get("phase_results", {}),
             "phase7": phase_receipt,
         },
-        "completed_phases": [*state.get("completed_phases", []), "phase7"],
+        "completed_phases": state.get("completed_phases", [])
+        + (["phase7"] if phase_receipt.get("status") != "error" else []),
         "skip_phase": state.get("skip_phase", []),
     }
+    if phase_receipt.get("status") == "error":
+        update.update(status="failed", error=f"Phase 7 failed: {phase_receipt.get('error')}")
+        return Command(goto=END, update=update)
+    return update

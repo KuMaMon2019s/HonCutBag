@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -153,7 +154,17 @@ def run_video_qa(
     if storyboard_data:
         _crossref_storyboard(output_dir, storyboard_data, report)
 
-    # 6. VLM semantic check (optional)
+    # 6. VLM semantic check. A technical-only delivery may still pass, but it
+    # is explicitly downgraded so grade A always means semantic review passed.
+    if vlm_client is None and os.environ.get("HONCUT_FINAL_VLM_REVIEW", "auto").lower() not in {
+        "0", "false", "off", "no",
+    }:
+        try:
+            from clients.ark_multimodal_client import ArkMultimodalClient
+
+            vlm_client = ArkMultimodalClient()
+        except Exception:
+            vlm_client = None
     if vlm_client is not None:
         report.vlm_check_available = True
         try:
@@ -161,11 +172,25 @@ def run_video_qa(
         except Exception as e:
             report.vlm_result = {"error": str(e)}
     else:
-        # Check if ARK vision model is available via env
-        ark_key = os.environ.get("ARK_AGENT_API_KEY") or os.environ.get("VOLCANO_API_KEY")
-        if ark_key:
-            report.vlm_check_available = True
-            report.vlm_result = {"status": "skipped", "reason": "no vlm_client provided but API key exists"}
+        report.vlm_result = {"status": "unavailable", "reason": "no usable VLM client"}
+
+    semantic = report.vlm_result or {}
+    semantic_verdict = str(semantic.get("verdict", "")).lower()
+    if semantic_verdict in {"fail", "reshoot", "revise"}:
+        report.issues.append(QAIssue(
+            severity="critical",
+            check="semantic_review",
+            message="Final semantic review found storyboard or visual defects: "
+            + "; ".join(str(item) for item in semantic.get("issues", [])[:5]),
+            suggestion="Correct or reshoot the affected shots before delivery",
+        ))
+    elif semantic_verdict != "pass":
+        report.issues.append(QAIssue(
+            severity="warning",
+            check="semantic_review_unavailable",
+            message="Final semantic review did not complete; grade A is unavailable",
+            suggestion="Configure a working multimodal reviewer or inspect frames manually",
+        ))
 
     # Compute verdict and grade
     _compute_verdict(report)
@@ -279,6 +304,14 @@ def _ffprobe_validate(
             suggestion="Phase 9 may have stripped the video track",
         ))
 
+    if not audio_stream:
+        report.issues.append(QAIssue(
+            severity="critical",
+            check="audio_stream",
+            message="No audio stream found in polished.mp4",
+            suggestion="Phase 9 must deliver an audible or explicitly designed silent audio track",
+        ))
+
     return probe_data
 
 
@@ -334,8 +367,44 @@ def _sample_frames(
     if duration <= 0:
         return frames
 
-    # If we have storyboard data, use shot boundaries
-    if storyboard_data:
+    # Prefer Phase 8's canonical edited timeline. Storyboard durations do not
+    # account for trims, speed changes, reorder operations, or overlaps.
+    timeline_path = output_dir / "edit_timeline.json"
+    timeline_shots: list[dict] = []
+    if timeline_path.is_file():
+        try:
+            timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
+            timeline_shots = timeline.get("shots", [])
+        except (OSError, json.JSONDecodeError):
+            timeline_shots = []
+
+    if timeline_shots:
+        for i, item in enumerate(timeline_shots):
+            start = float(item.get("output_start_s", 0.0))
+            end = min(float(item.get("output_end_s", start)), duration)
+            shot_id = str(item.get("shot_id") or f"S{i+1:02d}")
+            if end <= start:
+                continue
+            for suffix, timestamp in (
+                ("first", min(start + 0.1, end - 0.01)),
+                ("mid", start + (end - start) / 2),
+                ("last", max(start + 0.01, end - 0.1)),
+            ):
+                frame = _extract_frame(
+                    video_path, frames_dir, max(0.0, timestamp), f"{shot_id}_{suffix}"
+                )
+                if frame:
+                    frames.append(frame)
+            if i > 0:
+                for suffix, timestamp in (
+                    ("trans_before", max(start - 0.2, 0.0)),
+                    ("trans_after", min(start + 0.2, duration - 0.1)),
+                ):
+                    frame = _extract_frame(video_path, frames_dir, timestamp, f"{shot_id}_{suffix}")
+                    if frame:
+                        frames.append(frame)
+    # If we have storyboard data but no EDL, use authored shot boundaries.
+    elif storyboard_data:
         shots = storyboard_data.get("shots", [])
         cumulative = 0.0
         for i, shot in enumerate(shots):
@@ -594,14 +663,24 @@ def _crossref_storyboard(
     video_path = output_dir / "polished.mp4"
     actual_duration = _get_duration(video_path)
 
-    # Sum of storyboard shot durations
-    storyboard_total = sum(
+    # Compare against the authoritative edit timeline when available.
+    authored_total = sum(
         s.get("suggested_duration", s.get("duration", 5)) for s in shots
     )
+    timeline_path = output_dir / "edit_timeline.json"
+    timeline = {}
+    if timeline_path.is_file():
+        try:
+            timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            timeline = {}
+    storyboard_total = float(timeline.get("duration_s") or authored_total)
 
     crossref_entry = {
         "storyboard_shot_count": len(shots),
         "storyboard_total_duration": round(storyboard_total, 2),
+        "authored_total_duration": round(authored_total, 2),
+        "duration_basis": "edit_timeline" if timeline else "storyboard",
         "actual_video_duration": round(actual_duration, 2),
         "duration_diff": round(abs(actual_duration - storyboard_total), 2),
     }
@@ -674,44 +753,43 @@ def _vlm_semantic_check(
     if not frames:
         return {"status": "skipped", "reason": "no frames to analyze"}
 
-    # Interface for VLM client — actual implementation depends on the client
-    # Expected vlm_client interface:
-    #   vlm_client.analyze(image_path: str, prompt: str) -> str
-    if not hasattr(vlm_client, "analyze"):
-        return {"status": "error", "reason": "vlm_client missing analyze() method"}
+    if not hasattr(vlm_client, "review"):
+        return {"status": "error", "reason": "vlm_client missing review() method"}
 
-    results = []
-    # Sample up to 5 frames for VLM analysis (cost control)
-    sample_frames = frames[:5] if len(frames) > 5 else frames
-
-    for frame in sample_frames:
-        try:
-            # Find corresponding storyboard description
-            prompt = "Describe this video frame briefly. Note any visual quality issues."
-            if storyboard_data:
-                shots = storyboard_data.get("shots", [])
-                # Try to match frame to shot by label
-                for shot in shots:
-                    shot_id = shot.get("shot_id", "")
-                    if shot_id in frame.label:
-                        visual = shot.get("visual", "")
-                        if visual:
-                            prompt = f"Does this frame match the description: '{visual[:100]}'? Note any quality issues."
-                        break
-
-            result = vlm_client.analyze(frame.path, prompt)
-            results.append({
-                "frame": frame.label,
-                "timestamp": frame.timestamp,
-                "vlm_response": result,
-            })
-        except Exception as e:
-            results.append({
-                "frame": frame.label,
-                "error": str(e),
-            })
-
-    return {"status": "completed", "results": results}
+    # Cover the entire film instead of sending the first five extracted frames.
+    sample_count = min(12, len(frames))
+    positions = {
+        round(index * (len(frames) - 1) / max(1, sample_count - 1))
+        for index in range(sample_count)
+    }
+    sample_frames = [frames[index] for index in sorted(positions)]
+    storyboard = {
+        "shots": [
+            {
+                key: shot.get(key)
+                for key in ("shot_id", "visual", "action", "who", "where", "time", "lighting")
+                if shot.get(key) not in (None, "", [])
+            }
+            for shot in (storyboard_data or {}).get("shots", [])
+        ]
+    }
+    prompt = (
+        "Review these chronologically sampled frames from the final edited film against the storyboard. "
+        "Detect wrong subjects or locations, missing key actions, identity drift, broken anatomy or geometry, "
+        "modern/watermark/text artifacts, and material continuity errors. Return JSON only with "
+        '{"verdict":"pass|revise","issues":["..."],"confidence":0.0}. '
+        f"Storyboard: {json.dumps(storyboard, ensure_ascii=False)}"
+    )
+    raw = vlm_client.review([Path(item.path) for item in sample_frames], prompt)
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", str(raw).strip(), flags=re.IGNORECASE)
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict) or parsed.get("verdict") not in {"pass", "revise", "fail"}:
+        return {"status": "error", "reason": "invalid semantic review response"}
+    parsed.update(
+        status="completed",
+        sampled_frames=[item.label for item in sample_frames],
+    )
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -741,7 +819,9 @@ def _compute_verdict(report: VideoQAReport) -> None:
         report.grade = "D"
     elif critical_count >= 1:
         report.grade = "C"
-    elif warning_count > 2:
+    elif warning_count > 2 or any(
+        issue.check == "semantic_review_unavailable" for issue in report.issues
+    ):
         report.grade = "B"
     else:
         report.grade = "A"

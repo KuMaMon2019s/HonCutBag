@@ -136,6 +136,7 @@ def build_edit_decisions(
     shot_order: Optional[list[str]] = None,
     target_duration: Optional[float] = None,
     transition_duration: float = 0.5,
+    fit_mode: str = "cover",
 ) -> dict:
     """Build reviewed edit decisions from shot videos.
 
@@ -232,11 +233,17 @@ def build_edit_decisions(
                 for cut in cuts:
                     cut["speed"] = round(speed, 6)
 
+    timeline = _build_timeline(cuts, transitions)
     return {
         "cuts": cuts,
         "transitions": transitions,
+        "timeline": timeline,
         "metadata": {
-            "compose_target": {"width": target_width, "height": target_height, "fit": "pad"},
+            "compose_target": {
+                "width": target_width,
+                "height": target_height,
+                "fit": fit_mode,
+            },
             "target_fps": 30,
             "target_duration": target_duration,
             "quality_reviewed": bool(quality_report),
@@ -356,8 +363,23 @@ def execute_edit_decisions(edit_decisions: dict, output_path: str) -> dict:
             _concat_copy(segments, output_path, temp_dir, temp_files)
 
         info = probe_video(str(output_path))
+        timeline = {
+            "version": 1,
+            "artifact": output_path.name,
+            "duration_s": info["duration"],
+            "shots": edit_decisions.get("timeline", []),
+            "transitions": transitions,
+            "compose_target": target,
+        }
+        timeline_path = output_path.parent / "edit_timeline.json"
+        temporary = timeline_path.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(timeline, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        temporary.replace(timeline_path)
         return {"success": True, "output": str(output_path),
-                "duration": info["duration"], "segments": len(segments)}
+                "duration": info["duration"], "segments": len(segments),
+                "timeline": str(timeline_path)}
 
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -372,6 +394,37 @@ def execute_edit_decisions(edit_decisions: dict, output_path: str) -> dict:
 
 
 # ─── P2-B: Boundary Frame Consistency Check ──────────────────────────────────
+
+
+def _build_timeline(cuts: list[dict], transitions: list[dict]) -> list[dict]:
+    """Build the canonical output-time mapping for all reviewed cuts."""
+    transitions_by_index = {int(item["index"]): item for item in transitions}
+    entries: list[dict] = []
+    output_start = 0.0
+    for index, cut in enumerate(cuts):
+        speed = float(cut.get("speed", 1.0) or 1.0)
+        source_in = float(cut["in_seconds"])
+        source_out = float(cut["out_seconds"])
+        output_duration = (source_out - source_in) / speed
+        output_end = output_start + output_duration
+        transition = transitions_by_index.get(index)
+        overlap = 0.0
+        if transition and transition.get("type") != "cut":
+            overlap = min(float(transition.get("duration", 0.0)), output_duration)
+        entries.append({
+            "index": index,
+            "shot_id": cut.get("shot_id") or Path(cut["source"]).parent.name,
+            "source": cut["source"],
+            "source_in_s": round(source_in, 6),
+            "source_out_s": round(source_out, 6),
+            "speed": speed,
+            "output_start_s": round(output_start, 6),
+            "output_end_s": round(output_end, 6),
+            "output_duration_s": round(output_duration, 6),
+            "overlap_to_next_s": round(overlap, 6),
+        })
+        output_start = output_end - overlap
+    return entries
 
 def check_boundary_consistency(video_a: Path, video_b: Path) -> dict:
     """检查两个相邻视频的边界帧一致性（参考 HonCut frame sampler）。
@@ -481,11 +534,14 @@ def _xfade_chain(segments: list, transitions: list, output_path: Path,
             # --- P2-B: 边界帧一致性检查（参考 HonCut AI Clip Chaining）---
             try:
                 boundary = check_boundary_consistency(current, following)
-                if not boundary["consistent"]:
-                    # 不一致时强制使用 dissolve，不用 cut
-                    if ttype == "cut":
-                        ttype = "dissolve"
-                        print(f"    [P2-B] 边界不一致({boundary['issues'][0]})，cut→dissolve")
+                if not boundary["consistent"] and ttype == "cut":
+                    # The edit decision is authoritative. Record the visual
+                    # recommendation without silently changing picture timing,
+                    # otherwise the persisted EDL would no longer match output.
+                    print(
+                        f"    [P2-B] 边界不一致({boundary['issues'][0]})，"
+                        "保留导演 cut 决策并使用音频软边界"
+                    )
             except Exception:
                 pass  # 检查失败不影响现有流程
 
@@ -546,5 +602,8 @@ def _xfade_chain(segments: list, transitions: list, output_path: Path,
         shutil.copy2(current, output_path)
     except (subprocess.CalledProcessError, RuntimeError) as e:
         stderr = getattr(e, "stderr", None)
-        print(f"  ⚠ xfade failed, fallback concat: {str(stderr)[:200] if stderr else e}")
-        _concat_copy(segments, output_path, temp_dir, temp_files)
+        detail = str(stderr)[:500] if stderr else str(e)
+        # A concat fallback changes the authored overlap durations and makes
+        # edit_timeline.json false. Fail closed so callers can retry or retain
+        # the previous assembly instead of publishing mistimed captions/audio.
+        raise RuntimeError(f"transition render failed: {detail}") from e

@@ -128,10 +128,16 @@ class GenerationTaskStore:
                 ON generation_tasks(status, queued_at)
                 """
             )
+            # The original index omitted provider_id, so a failed Bridge task
+            # captured a later direct-Seedance request for the same shot. Drop
+            # it explicitly so existing databases receive the corrected key.
+            connection.execute("DROP INDEX IF EXISTS idx_generation_tasks_active_dedupe")
             connection.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_generation_tasks_active_dedupe
-                ON generation_tasks(run_id, task_type, resource_id)
+                ON generation_tasks(
+                    run_id, task_type, resource_id, COALESCE(provider_id, '')
+                )
                 WHERE status IN (
                     'queued', 'running', 'submission_uncertain'
                 )
@@ -157,6 +163,7 @@ class GenerationTaskStore:
                 run_id=run_id,
                 task_type=task_type,
                 resource_id=resource_id,
+                provider_id=provider_id,
             )
             if existing is not None:
                 connection.commit()
@@ -197,18 +204,49 @@ class GenerationTaskStore:
         run_id: str,
         task_type: str,
         resource_id: str,
+        provider_id: str | None,
     ) -> GenerationTask | None:
         placeholders = ", ".join("?" for _ in ACTIVE_STATUSES)
         row = connection.execute(
             f"""
             SELECT * FROM generation_tasks
             WHERE run_id = ? AND task_type = ? AND resource_id = ?
+              AND provider_id IS ?
               AND status IN ({placeholders})
             ORDER BY queued_at DESC
             LIMIT 1
             """,
-            (run_id, task_type, resource_id, *ACTIVE_STATUSES),
+            (run_id, task_type, resource_id, provider_id, *ACTIVE_STATUSES),
         ).fetchone()
+        return GenerationTask.from_row(row) if row is not None else None
+
+    def find_active(
+        self,
+        *,
+        run_id: str,
+        task_type: str,
+        resource_id: str,
+        provider_id: str | None = None,
+    ) -> GenerationTask | None:
+        """Return one active task, optionally scoped to a provider."""
+        placeholders = ", ".join("?" for _ in ACTIVE_STATUSES)
+        provider_clause = "AND provider_id IS ?" if provider_id is not None else ""
+        parameters: tuple[Any, ...] = (run_id, task_type, resource_id)
+        if provider_id is not None:
+            parameters += (provider_id,)
+        parameters += ACTIVE_STATUSES
+        with self._connect() as connection:
+            row = connection.execute(
+                f"""
+                SELECT * FROM generation_tasks
+                WHERE run_id = ? AND task_type = ? AND resource_id = ?
+                  {provider_clause}
+                  AND status IN ({placeholders})
+                ORDER BY queued_at DESC
+                LIMIT 1
+                """,
+                parameters,
+            ).fetchone()
         return GenerationTask.from_row(row) if row is not None else None
 
     def get(self, task_id: str) -> GenerationTask | None:
