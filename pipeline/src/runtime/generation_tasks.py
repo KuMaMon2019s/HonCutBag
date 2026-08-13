@@ -166,6 +166,11 @@ class GenerationTaskStore:
                 provider_id=provider_id,
             )
             if existing is not None:
+                if existing.payload != payload:
+                    raise RuntimeError(
+                        "active generation task payload changed for "
+                        f"{resource_id}: task_id={existing.task_id}"
+                    )
                 connection.commit()
                 return EnqueuedTask(task=existing, deduped=True)
 
@@ -246,6 +251,35 @@ class GenerationTaskStore:
                 LIMIT 1
                 """,
                 parameters,
+            ).fetchone()
+        return GenerationTask.from_row(row) if row is not None else None
+
+    def find_succeeded(
+        self,
+        *,
+        run_id: str,
+        task_type: str,
+        resource_id: str,
+        payload: dict[str, Any],
+        provider_id: str,
+    ) -> GenerationTask | None:
+        """Return the newest successful task for exactly the same immutable input."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM generation_tasks
+                WHERE run_id = ? AND task_type = ? AND resource_id = ?
+                  AND provider_id = ? AND payload_json = ? AND status = 'succeeded'
+                ORDER BY finished_at DESC, queued_at DESC
+                LIMIT 1
+                """,
+                (
+                    run_id,
+                    task_type,
+                    resource_id,
+                    provider_id,
+                    _encode_json(payload),
+                ),
             ).fetchone()
         return GenerationTask.from_row(row) if row is not None else None
 

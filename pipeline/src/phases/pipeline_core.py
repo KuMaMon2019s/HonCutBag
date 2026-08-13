@@ -2527,6 +2527,7 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
         return {"status": "error", "error": "STORYBOARD.json not found", "duration_s": _elapsed(start)}
 
     try:
+        from phases.phase4.continuity_plan import write_continuity_plan
         from phases.phase4.scene_consistency import write_scene_consistency
 
         storyboard_for_consistency = json.loads(storyboard_path.read_text(encoding="utf-8"))
@@ -2544,7 +2545,7 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
             ),
             None,
         )
-        write_scene_consistency(
+        scene_consistency = write_scene_consistency(
             output_dir / "SCENE_CONSISTENCY.json",
             storyboard_for_consistency,
             characters_for_consistency,
@@ -2552,6 +2553,18 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
         )
         outputs.append("SCENE_CONSISTENCY.json")
         print("  ✓ 场景一致性契约: SCENE_CONSISTENCY.json")
+        continuity_plan = write_continuity_plan(
+            output_dir / "CONTINUITY_PLAN.json",
+            storyboard_for_consistency,
+            scene_consistency,
+        )
+        outputs.append("CONTINUITY_PLAN.json")
+        print("  ✓ 连续性计划: CONTINUITY_PLAN.json")
+        from runtime.continuity_memory import initialize_continuity_memory
+
+        initialize_continuity_memory(output_dir, continuity_plan)
+        outputs.append("CONTINUITY_MEMORY.json")
+        print("  ✓ 不可变连续性锚点: CONTINUITY_MEMORY.json")
 
         orchestrator_script = LEGACY_TOOLS_DIR / "orchestrator.py"
         if not orchestrator_script.exists():
@@ -3781,6 +3794,60 @@ def run_phase6(storyboard_data: dict, output_dir: Path, dry_run: bool, chain_mod
         print("  ⊘ dry-run 模式，跳过视频生成")
         return {"status": "skipped", "reason": "dry-run", "duration_s": _elapsed(start)}
 
+    try:
+        from runtime.continuity_chunks import write_shadow_runtime_report
+
+        continuity_runtime = write_shadow_runtime_report(output_dir)
+        if continuity_runtime["mode"] == "shadow":
+            print(
+                "  [continuity] shadow: "
+                f"{continuity_runtime.get('shot_count', 0)} shots / "
+                f"{continuity_runtime.get('chunk_count', 0)} chunks; provider route unchanged",
+                flush=True,
+            )
+    except (OSError, ValueError, RuntimeError) as error:
+        return {
+            "status": "error",
+            "error": f"Continuity runtime configuration failed: {error}",
+            "duration_s": _elapsed(start),
+        }
+
+    if continuity_runtime["mode"] == "auto":
+        try:
+            from quality.seam_calibration import load_seam_calibration
+            from runtime.continuity_chunks import load_continuity_plan
+            from runtime.continuity_provider import execute_phase6_auto_continuity
+
+            print(
+                "  [continuity] auto: certified chunk execution with bounded seam repair",
+                flush=True,
+            )
+            result = execute_phase6_auto_continuity(
+                output_dir,
+                load_continuity_plan(output_dir / "CONTINUITY_PLAN.json"),
+                load_seam_calibration(output_dir / "CONTINUITY_CALIBRATION.json"),
+            )
+            result["duration_s"] = _elapsed(start)
+            result["continuity_runtime"] = continuity_runtime
+            if result["status"] == "done":
+                qg_report = run_quality_check("phase6", output_dir)
+                if not qg_report.passed:
+                    return {
+                        "status": "error",
+                        "error": f"Phase 6 质检未通过: {qg_report.grade}",
+                        "quality_report": qg_report,
+                        "duration_s": _elapsed(start),
+                        "continuity_runtime": continuity_runtime,
+                    }
+            return result
+        except Exception as error:
+            return {
+                "status": "error",
+                "error": f"Continuity auto execution failed: {error}",
+                "duration_s": _elapsed(start),
+                "continuity_runtime": continuity_runtime,
+            }
+
     print("  → Phase 6 使用当前配置的视频提供方路由", flush=True)
     try:
         adapter = _LocalVideoVendorAdapter([
@@ -3792,6 +3859,7 @@ def run_phase6(storyboard_data: dict, output_dir: Path, dry_run: bool, chain_mod
         )
         result = tool_result.data or {"status": "error", "error": tool_result.error}
         result["duration_s"] = _elapsed(start)
+        result["continuity_runtime"] = continuity_runtime
         provider = result.get("provider", "unknown_provider")
         if result["status"] == "done":
             print(f"  ✓ Phase 6 完成: {len(result['outputs'])} 视频 ({provider})")
@@ -4404,6 +4472,16 @@ def run_phase8(output_dir: Path, dry_run: bool,
         [{"decision": value} for value in selected_transitions]
         if selected_transitions else None
     )
+    continuity_plan_path = output_dir / "CONTINUITY_PLAN.json"
+    continuity_plan_for_edit = (
+        json.loads(continuity_plan_path.read_text(encoding="utf-8"))
+        if continuity_plan_path.is_file()
+        else None
+    )
+    has_continuity_transition_lock = any(
+        shot.get("boundary_before") == "continuous"
+        for shot in (continuity_plan_for_edit or {}).get("shots", [])
+    )
     reviewed_edit_error = "reviewed edit path did not complete"
     try:
         from phases.phase8.edit_decisions import build_edit_decisions, execute_edit_decisions
@@ -4420,6 +4498,7 @@ def run_phase8(output_dir: Path, dry_run: bool,
             target_duration=target_duration,
             transition_duration=transition_duration,
             fit_mode="cover",
+            continuity_plan=continuity_plan_for_edit,
         )
         print(f"  → 执行 reviewed edit_decisions（{len(edit_decisions['cuts'])} 个片段）...")
         reviewed_edit = execute_edit_decisions(
@@ -4452,6 +4531,9 @@ def run_phase8(output_dir: Path, dry_run: bool,
                 "audio_transition_policy": edit_decisions.get("metadata", {}).get(
                     "audio_transition_policy"
                 ),
+                "transition_locks": edit_decisions.get("metadata", {}).get(
+                    "transition_locks", []
+                ),
                 "audio_transition_counts": {
                     kind: sum(
                         item.get("audio_transition") == kind
@@ -4481,6 +4563,16 @@ def run_phase8(output_dir: Path, dry_run: bool,
             "error": (
                 "Phase 8 cannot safely fall back to raw concat because reviewed trims are required: "
                 f"{reviewed_edit_error}"
+            ),
+            "duration_s": _elapsed(start),
+            "frame_analysis": frame_report.get("summary", {}),
+        }
+    if has_continuity_transition_lock:
+        return {
+            "status": "error",
+            "error": (
+                "Phase 8 cannot safely fall back to batch transitions because "
+                f"continuous boundary locks are required: {reviewed_edit_error}"
             ),
             "duration_s": _elapsed(start),
             "frame_analysis": frame_report.get("summary", {}),

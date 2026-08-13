@@ -17,16 +17,21 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional
-
 
 # ─── Probing ─────────────────────────────────────────────────────────────────
+
 
 def probe_video(video_path: str) -> dict:
     """Probe a video file for duration, resolution, fps, audio presence."""
     cmd = [
-        "ffprobe", "-v", "quiet", "-print_format", "json",
-        "-show_format", "-show_streams", str(video_path),
+        "ffprobe",
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+        str(video_path),
     ]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
@@ -71,17 +76,26 @@ def probe_video(video_path: str) -> dict:
             "video_duration": None if video_duration is None else round(video_duration, 3),
             "audio_duration": None if audio_duration is None else round(audio_duration, 3),
             "format_duration": round(format_duration, 3),
-            "width": width, "height": height,
+            "width": width,
+            "height": height,
             "fps": round(fps, 2),
-            "has_audio": has_audio, "has_video": has_video,
+            "has_audio": has_audio,
+            "has_video": has_video,
         }
     except Exception as e:
         print(f"  [probe] Error: {e}")
-        return {"duration": 0, "width": 1920, "height": 1080,
-                "fps": 30, "has_audio": False, "has_video": False}
+        return {
+            "duration": 0,
+            "width": 1920,
+            "height": 1080,
+            "fps": 30,
+            "has_audio": False,
+            "has_video": False,
+        }
 
 
 # ─── Black Frame Detection ───────────────────────────────────────────────────
+
 
 def detect_black_frames(video_path: str, threshold: float = 0.1) -> dict:
     """Detect leading/trailing black or static frames to trim.
@@ -97,9 +111,15 @@ def detect_black_frames(video_path: str, threshold: float = 0.1) -> dict:
 
     try:
         cmd = [
-            "ffmpeg", "-i", str(video_path),
-            "-vf", f"blackdetect=d=0.2:pix_th={threshold}",
-            "-an", "-f", "null", "-",
+            "ffmpeg",
+            "-i",
+            str(video_path),
+            "-vf",
+            f"blackdetect=d=0.2:pix_th={threshold}",
+            "-an",
+            "-f",
+            "null",
+            "-",
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         blacks = re.findall(r"black_start:([\d.]+)\s+black_end:([\d.]+)", result.stderr)
@@ -127,16 +147,18 @@ def detect_black_frames(video_path: str, threshold: float = 0.1) -> dict:
 
 # ─── Build Edit Decisions ────────────────────────────────────────────────────
 
+
 def build_edit_decisions(
     shots_dir: str,
     target_width: int = 1920,
     target_height: int = 1080,
-    transition_decisions: Optional[list] = None,
-    quality_report: Optional[dict] = None,
-    shot_order: Optional[list[str]] = None,
-    target_duration: Optional[float] = None,
+    transition_decisions: list | None = None,
+    quality_report: dict | None = None,
+    shot_order: list[str] | None = None,
+    target_duration: float | None = None,
     transition_duration: float = 0.5,
     fit_mode: str = "cover",
+    continuity_plan: dict | None = None,
 ) -> dict:
     """Build reviewed edit decisions from shot videos.
 
@@ -169,8 +191,7 @@ def build_edit_decisions(
         quality = quality_shots.get(shot_dir.name, {})
         if quality.get("action") == "reshoot":
             raise ValueError(
-                f"{shot_dir.name} still requires reshoot: "
-                f"{'; '.join(quality.get('reasons', []))}"
+                f"{shot_dir.name} still requires reshoot: {'; '.join(quality.get('reasons', []))}"
             )
         trims = detect_black_frames(str(video_path))
         in_s = max(float(trims["trim_start"]), float(quality.get("trim_start_s", 0.0)))
@@ -202,29 +223,50 @@ def build_edit_decisions(
 
     # Build transitions
     transitions = []
+    continuous_targets = {
+        str(shot.get("shot_id"))
+        for shot in (continuity_plan or {}).get("shots", [])
+        if shot.get("boundary_before") == "continuous"
+    }
+    transition_locks = []
     if transition_decisions:
         for i, td in enumerate(transition_decisions):
             if i < len(cuts) - 1:
-                transition_type = td["decision"]
-                transitions.append({
+                next_shot_id = str(cuts[i + 1]["shot_id"])
+                locked = next_shot_id in continuous_targets
+                transition_type = "cut" if locked else td["decision"]
+                if locked:
+                    transition_locks.append(
+                        {
+                            "index": i,
+                            "before_shot_id": next_shot_id,
+                            "reason": "continuous editorial boundary forbids transitions",
+                        }
+                    )
+                transition_entry = {
                     "index": i,
                     "type": transition_type,
-                    "duration": transition_duration,
+                    "duration": 0.0 if locked else transition_duration,
                     # A visual hard cut must not imply a hard cut in sound.
                     # Keep picture timing frame-accurate while gently fading
                     # both sides of the audio boundary.  Dissolves retain a
                     # true overlap, matched to the visual transition length.
                     "audio_transition": "edge_fade" if transition_type == "cut" else "crossfade",
                     "audio_duration": 0.35 if transition_type == "cut" else transition_duration,
-                })
+                }
+                if locked:
+                    transition_entry.update(
+                        locked=True,
+                        lock_reason="continuous editorial boundary",
+                    )
+                transitions.append(transition_entry)
 
     # Crossfades overlap neighboring clips. Compensate with one bounded speed
     # factor so the assembled timeline stays close to the requested duration.
     if target_duration and cuts:
         source_duration = sum(cut["out_seconds"] - cut["in_seconds"] for cut in cuts)
         overlap = sum(
-            0.01 if item["type"] == "cut" else float(item["duration"])
-            for item in transitions
+            0.01 if item["type"] == "cut" else float(item["duration"]) for item in transitions
         )
         projected = source_duration - overlap
         if projected < float(target_duration):
@@ -247,6 +289,7 @@ def build_edit_decisions(
             "target_fps": 30,
             "target_duration": target_duration,
             "quality_reviewed": bool(quality_report),
+            "transition_locks": transition_locks,
             "audio_transition_policy": {
                 "visual_cut": "equal_power_edge_fade",
                 "visual_dissolve": "equal_power_crossfade",
@@ -256,6 +299,7 @@ def build_edit_decisions(
 
 
 # ─── Execute Edit Decisions ──────────────────────────────────────────────────
+
 
 def execute_edit_decisions(edit_decisions: dict, output_path: str) -> dict:
     """Execute: trim → normalize → transition → concat.
@@ -295,48 +339,112 @@ def execute_edit_decisions(edit_decisions: dict, output_path: str) -> dict:
             has_audio = cut.get("has_audio", False)
 
             # --- P2-5c: cover fit mode（裁切填充，无黑边）---
-            fit_mode = edit_decisions.get("metadata", {}).get("compose_target", {}).get("fit", "pad")
+            fit_mode = (
+                edit_decisions.get("metadata", {}).get("compose_target", {}).get("fit", "pad")
+            )
             if fit_mode == "cover":
                 vf = [
                     f"scale={tw}:{th}:force_original_aspect_ratio=increase",
                     f"crop={tw}:{th}",
-                    "setsar=1", f"fps={tfps}",
+                    "setsar=1",
+                    f"fps={tfps}",
                 ]
             else:
                 # pad 模式（默认，带黑边）
                 vf = [
                     f"scale={tw}:{th}:force_original_aspect_ratio=decrease",
                     f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2:color=black",
-                    "setsar=1", f"fps={tfps}",
+                    "setsar=1",
+                    f"fps={tfps}",
                 ]
             af = []
             if speed != 1.0:
-                vf.append(f"setpts={1.0/speed}*PTS")
+                vf.append(f"setpts={1.0 / speed}*PTS")
                 af.append(f"atempo={speed}")
 
             if has_audio:
-                cmd = ["ffmpeg", "-y", "-ss", str(in_s), "-t", str(dur), "-i", str(src),
-                       "-filter:v", ",".join(vf)]
+                cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-ss",
+                    str(in_s),
+                    "-t",
+                    str(dur),
+                    "-i",
+                    str(src),
+                    "-filter:v",
+                    ",".join(vf),
+                ]
                 if af:
                     cmd += ["-filter:a", ",".join(af)]
-                cmd += ["-c:v", "libx264", "-crf", "23", "-preset", "medium",
-                        "-pix_fmt", "yuv420p", "-r", str(tfps),
-                        "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
-                        str(seg)]
+                cmd += [
+                    "-c:v",
+                    "libx264",
+                    "-crf",
+                    "23",
+                    "-preset",
+                    "medium",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-r",
+                    str(tfps),
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "192k",
+                    "-ar",
+                    "48000",
+                    "-ac",
+                    "2",
+                    str(seg),
+                ]
             else:
                 # Inject silent audio via lavfi
-                cmd = ["ffmpeg", "-y", "-ss", str(in_s), "-t", str(dur),
-                       "-i", str(src),
-                       "-f", "lavfi", "-t", str(dur),
-                       "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
-                       "-filter:v", ",".join(vf)]
+                cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-ss",
+                    str(in_s),
+                    "-t",
+                    str(dur),
+                    "-i",
+                    str(src),
+                    "-f",
+                    "lavfi",
+                    "-t",
+                    str(dur),
+                    "-i",
+                    "anullsrc=channel_layout=stereo:sample_rate=48000",
+                    "-filter:v",
+                    ",".join(vf),
+                ]
                 if af:
                     cmd += ["-filter:a", ",".join(af)]
-                cmd += ["-map", "0:v:0", "-map", "1:a:0",
-                        "-c:v", "libx264", "-crf", "23", "-preset", "medium",
-                        "-pix_fmt", "yuv420p", "-r", str(tfps),
-                        "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
-                        str(seg)]
+                cmd += [
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "1:a:0",
+                    "-c:v",
+                    "libx264",
+                    "-crf",
+                    "23",
+                    "-preset",
+                    "medium",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-r",
+                    str(tfps),
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "192k",
+                    "-ar",
+                    "48000",
+                    "-ac",
+                    "2",
+                    str(seg),
+                ]
 
             try:
                 subprocess.run(cmd, capture_output=True, timeout=120, check=True)
@@ -373,13 +481,15 @@ def execute_edit_decisions(edit_decisions: dict, output_path: str) -> dict:
         }
         timeline_path = output_path.parent / "edit_timeline.json"
         temporary = timeline_path.with_suffix(".json.tmp")
-        temporary.write_text(
-            json.dumps(timeline, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        temporary.write_text(json.dumps(timeline, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(timeline_path)
-        return {"success": True, "output": str(output_path),
-                "duration": info["duration"], "segments": len(segments),
-                "timeline": str(timeline_path)}
+        return {
+            "success": True,
+            "output": str(output_path),
+            "duration": info["duration"],
+            "segments": len(segments),
+            "timeline": str(timeline_path),
+        }
 
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -411,20 +521,23 @@ def _build_timeline(cuts: list[dict], transitions: list[dict]) -> list[dict]:
         overlap = 0.0
         if transition and transition.get("type") != "cut":
             overlap = min(float(transition.get("duration", 0.0)), output_duration)
-        entries.append({
-            "index": index,
-            "shot_id": cut.get("shot_id") or Path(cut["source"]).parent.name,
-            "source": cut["source"],
-            "source_in_s": round(source_in, 6),
-            "source_out_s": round(source_out, 6),
-            "speed": speed,
-            "output_start_s": round(output_start, 6),
-            "output_end_s": round(output_end, 6),
-            "output_duration_s": round(output_duration, 6),
-            "overlap_to_next_s": round(overlap, 6),
-        })
+        entries.append(
+            {
+                "index": index,
+                "shot_id": cut.get("shot_id") or Path(cut["source"]).parent.name,
+                "source": cut["source"],
+                "source_in_s": round(source_in, 6),
+                "source_out_s": round(source_out, 6),
+                "speed": speed,
+                "output_start_s": round(output_start, 6),
+                "output_end_s": round(output_end, 6),
+                "output_duration_s": round(output_duration, 6),
+                "overlap_to_next_s": round(overlap, 6),
+            }
+        )
         output_start = output_end - overlap
     return entries
+
 
 def check_boundary_consistency(video_a: Path, video_b: Path) -> dict:
     """检查两个相邻视频的边界帧一致性（参考 HonCut frame sampler）。
@@ -436,8 +549,16 @@ def check_boundary_consistency(video_a: Path, video_b: Path) -> dict:
 
     def _probe(path):
         try:
-            cmd = ["ffprobe", "-v", "quiet", "-print_format", "json",
-                   "-show_streams", "-show_format", str(path)]
+            cmd = [
+                "ffprobe",
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-show_streams",
+                "-show_format",
+                str(path),
+            ]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             return json.loads(result.stdout)
         except Exception:
@@ -493,21 +614,33 @@ def check_boundary_consistency(video_a: Path, video_b: Path) -> dict:
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
-def _concat_copy(segments: list, output_path: Path,
-                 temp_dir: Path, temp_files: list):
+
+def _concat_copy(segments: list, output_path: Path, temp_dir: Path, temp_files: list):
     """Simple concat with stream copy (all hard cuts)."""
     concat_list = temp_dir / "concat_list.txt"
     temp_files.append(concat_list)
     with open(concat_list, "w") as f:
         for seg in segments:
             f.write(f"file '{Path(seg).resolve()}'\n")
-    cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
-           "-i", str(concat_list), "-c", "copy", str(output_path)]
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(concat_list),
+        "-c",
+        "copy",
+        str(output_path),
+    ]
     subprocess.run(cmd, capture_output=True, timeout=120, check=True)
 
 
-def _xfade_chain(segments: list, transitions: list, output_path: Path,
-                 temp_dir: Path, temp_files: list):
+def _xfade_chain(
+    segments: list, transitions: list, output_path: Path, temp_dir: Path, temp_files: list
+):
     """Apply xfade transitions as bounded pairwise renders.
 
     FFmpeg 9 can truncate a long, nested xfade filter graph even when every
@@ -566,9 +699,7 @@ def _xfade_chain(segments: list, transitions: list, output_path: Path,
                     "[a0][a1]concat=n=2:v=0:a=1[a]"
                 )
             else:
-                xname = {
-                "dissolve": "fade", "fade": "fadeblack", "cut": "fade"
-                }.get(ttype, "fade")
+                xname = {"dissolve": "fade", "fade": "fadeblack", "cut": "fade"}.get(ttype, "fade")
                 offset = round(max(0, current_duration - tdur), 3)
                 filter_complex = (
                     "[0:v]settb=AVTB,setpts=PTS-STARTPTS[v0];"
@@ -580,12 +711,30 @@ def _xfade_chain(segments: list, transitions: list, output_path: Path,
                 )
             intermediate = temp_dir / f"xfade_{i:04d}.mp4"
             cmd = [
-                "ffmpeg", "-y", "-i", str(current), "-i", str(following),
-                "-filter_complex", filter_complex,
-                "-map", "[v]", "-map", "[a]",
-                "-c:v", "libx264", "-crf", "23", "-preset", "medium",
-                "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "192k",
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(current),
+                "-i",
+                str(following),
+                "-filter_complex",
+                filter_complex,
+                "-map",
+                "[v]",
+                "-map",
+                "[a]",
+                "-c:v",
+                "libx264",
+                "-crf",
+                "23",
+                "-preset",
+                "medium",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
                 str(intermediate),
             ]
             subprocess.run(cmd, capture_output=True, timeout=300, check=True)

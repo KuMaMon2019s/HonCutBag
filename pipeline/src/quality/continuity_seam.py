@@ -1,0 +1,190 @@
+"""Observe-only visual metrics for immediate generated-chunk boundaries."""
+
+from __future__ import annotations
+
+import subprocess
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+from PIL import Image
+
+
+def _pixels(value: Path | np.ndarray) -> np.ndarray:
+    if isinstance(value, np.ndarray):
+        pixels = value
+    else:
+        pixels = np.asarray(Image.open(value).convert("RGB"))
+    if pixels.ndim == 2:
+        pixels = np.repeat(pixels[:, :, None], 3, axis=2)
+    image = Image.fromarray(np.asarray(pixels, dtype=np.uint8)).resize((96, 54))
+    return np.asarray(image, dtype=np.float32)
+
+
+def _luminance(pixels: np.ndarray) -> np.ndarray:
+    return pixels[:, :, 0] * 0.299 + pixels[:, :, 1] * 0.587 + pixels[:, :, 2] * 0.114
+
+
+def _perceptual_hash(pixels: np.ndarray) -> np.ndarray:
+    gray = Image.fromarray(pixels.astype(np.uint8)).convert("L").resize((9, 8))
+    values = np.asarray(gray, dtype=np.float32)
+    return values[:, 1:] > values[:, :-1]
+
+
+def _centroid(pixels: np.ndarray) -> np.ndarray | None:
+    gray = _luminance(pixels)
+    weights = np.abs(gray - float(np.median(gray)))
+    total = float(weights.sum())
+    if total < 1e-6:
+        return None
+    yy, xx = np.indices(weights.shape)
+    return np.asarray([float((xx * weights).sum() / total), float((yy * weights).sum() / total)])
+
+
+def _motion_vector(frames: Sequence[np.ndarray]) -> np.ndarray | None:
+    if len(frames) < 2:
+        return None
+    first = _centroid(frames[-2])
+    second = _centroid(frames[-1])
+    if first is None or second is None:
+        return None
+    vector = second - first
+    return vector if float(np.linalg.norm(vector)) >= 0.25 else None
+
+
+def _motion_direction_change(
+    tail_frames: Sequence[np.ndarray], head_frames: Sequence[np.ndarray]
+) -> float | None:
+    tail_vector = _motion_vector(tail_frames)
+    head_vector = _motion_vector(head_frames[:2])
+    if tail_vector is None and head_vector is None:
+        return 0.0
+    if tail_vector is None or head_vector is None:
+        return 0.5
+    cosine = float(
+        np.dot(tail_vector, head_vector)
+        / (np.linalg.norm(tail_vector) * np.linalg.norm(head_vector))
+    )
+    return round(float(np.clip((1.0 - cosine) / 2.0, 0.0, 1.0)), 6)
+
+
+def compare_frame_sequences(
+    tail_frames: Sequence[Path | np.ndarray],
+    head_frames: Sequence[Path | np.ndarray],
+) -> dict[str, Any]:
+    """Return normalized raw evidence without assigning a pass/fail threshold."""
+    if not tail_frames or not head_frames:
+        raise ValueError("tail_frames and head_frames must not be empty")
+    tail = [_pixels(frame) for frame in tail_frames]
+    head = [_pixels(frame) for frame in head_frames]
+    previous = tail[-1]
+    following = head[0]
+    pixel_mae = float(np.abs(previous - following).mean() / 255.0)
+    brightness_delta = float(
+        abs(float(_luminance(previous).mean()) - float(_luminance(following).mean())) / 255.0
+    )
+    previous_color = previous.mean(axis=(0, 1))
+    following_color = following.mean(axis=(0, 1))
+    color_mean_delta = float(
+        np.linalg.norm(previous_color - following_color) / (255.0 * np.sqrt(3.0))
+    )
+    hash_distance = float(
+        np.not_equal(_perceptual_hash(previous), _perceptual_hash(following)).mean()
+    )
+    motion_change = _motion_direction_change(tail, head)
+    motion_component = 0.0 if motion_change is None else motion_change
+    provisional_risk = (
+        0.35 * pixel_mae
+        + 0.20 * brightness_delta
+        + 0.20 * color_mean_delta
+        + 0.15 * hash_distance
+        + 0.10 * motion_component
+    )
+    return {
+        "pixel_mae": round(pixel_mae, 6),
+        "brightness_delta": round(brightness_delta, 6),
+        "color_mean_delta": round(color_mean_delta, 6),
+        "perceptual_hash_distance": round(hash_distance, 6),
+        "motion_direction_change": motion_change,
+        "provisional_risk_score": round(provisional_risk, 6),
+        "policy": "observe_only",
+    }
+
+
+def _video_duration(video_path: Path) -> float:
+    completed = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=duration",
+            "-of",
+            "csv=p=0",
+            str(video_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    return float(completed.stdout.strip().splitlines()[0])
+
+
+def _extract_frame(video_path: Path, timestamp: float, output_path: Path) -> None:
+    completed = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-ss",
+            f"{timestamp:.6f}",
+            "-i",
+            str(video_path),
+            "-frames:v",
+            "1",
+            "-q:v",
+            "2",
+            str(output_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if completed.returncode != 0 or not output_path.is_file():
+        detail = completed.stderr.strip().splitlines()
+        raise RuntimeError(
+            f"cannot extract seam frame from {video_path}: "
+            f"{detail[-1] if detail else 'unknown ffmpeg error'}"
+        )
+
+
+def measure_video_seam(
+    previous_video: Path,
+    following_video: Path,
+    boundary_id: str,
+    *,
+    evidence_dir: Path,
+) -> dict[str, Any]:
+    """Extract bounded tail/head samples and measure one real video boundary."""
+    duration = _video_duration(previous_video)
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    tail_times = [max(0.0, duration - 0.25), max(0.0, duration - 0.08)]
+    head_times = [0.02, 0.18]
+    tail_paths = [evidence_dir / f"{boundary_id}_tail_{index}.jpg" for index in range(2)]
+    head_paths = [evidence_dir / f"{boundary_id}_head_{index}.jpg" for index in range(2)]
+    for timestamp, path in zip(tail_times, tail_paths, strict=True):
+        _extract_frame(previous_video, timestamp, path)
+    for timestamp, path in zip(head_times, head_paths, strict=True):
+        _extract_frame(following_video, timestamp, path)
+    return {
+        "boundary_id": boundary_id,
+        "previous_video": str(previous_video),
+        "following_video": str(following_video),
+        "tail_frames": [str(path) for path in tail_paths],
+        "head_frames": [str(path) for path in head_paths],
+        "metrics": compare_frame_sequences(tail_paths, head_paths),
+    }

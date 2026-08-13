@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,22 @@ class BridgeExecution:
     resumed: bool
 
 
+def _file_hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _matches_succeeded_output(path: Path, expected_hash: Any) -> bool:
+    return bool(
+        path.is_file()
+        and path.stat().st_size > 0
+        and (not expected_hash or _file_hash(path) == expected_hash)
+    )
+
+
 def execute_bridge_video_task(
     task_store: GenerationTaskStore,
     *,
@@ -34,6 +51,41 @@ def execute_bridge_video_task(
     generate: Callable[..., str | dict[str, Any]],
 ) -> BridgeExecution:
     """Persist a Bridge job ID before polling and resume it after interruption."""
+
+    destination = Path(output_path)
+    succeeded = task_store.find_succeeded(
+        run_id=run_id,
+        task_type="video.generate",
+        resource_id=resource_id,
+        payload=payload,
+        provider_id="bridge",
+    )
+    if succeeded is not None:
+        provider_job_id = succeeded.provider_job_id
+        if not provider_job_id:
+            raise RuntimeError(
+                f"successful Bridge ledger entry for {resource_id} has no provider job id"
+            )
+        generation_result: str | dict[str, Any] = dict(succeeded.outcome)
+        if not _matches_succeeded_output(
+            destination, succeeded.outcome.get("output_sha256")
+        ):
+            generation_result = generate(
+                resume_task_id=provider_job_id,
+                on_submit_start=lambda: None,
+                on_submitted=lambda _job_id: None,
+            )
+        if not _matches_succeeded_output(
+            destination, succeeded.outcome.get("output_sha256")
+        ):
+            raise RuntimeError(f"recovered Bridge output is invalid for {resource_id}")
+        return BridgeExecution(
+            task_id=succeeded.task_id,
+            provider_job_id=provider_job_id,
+            output_path=str(destination),
+            generation_result=generation_result,
+            resumed=True,
+        )
 
     enqueued = task_store.enqueue(
         run_id=run_id,
@@ -118,10 +170,11 @@ def execute_bridge_video_task(
         task_store.mark_submission_uncertain(task.task_id, message)
         raise SubmissionUncertainError(message)
 
-    destination = str(output_path)
+    destination_text = str(destination)
     outcome: dict[str, Any] = {
         "provider_job_id": latest_provider_job_id,
-        "output_path": destination,
+        "output_path": destination_text,
+        "output_sha256": _file_hash(destination),
     }
     if isinstance(generation_result, dict):
         outcome.update(
@@ -135,7 +188,7 @@ def execute_bridge_video_task(
     return BridgeExecution(
         task_id=task.task_id,
         provider_job_id=latest_provider_job_id,
-        output_path=destination,
+        output_path=destination_text,
         generation_result=generation_result,
         resumed=resumed,
     )

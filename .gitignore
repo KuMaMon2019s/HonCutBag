@@ -95,6 +95,9 @@ CODEX_*.md
 
 # Tests (local only, not for public repo)
 pipeline/tests/
+!pipeline/tests/
+pipeline/tests/*
+!pipeline/tests/test_continuity_foundation.py
 pipeline/prompts/test_validator.py
 
 # Documentation (internal, not published)

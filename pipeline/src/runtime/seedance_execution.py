@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +22,22 @@ class SeedanceExecution:
     video_url: str
     output_path: str
     resumed: bool
+
+
+def _file_hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _matches_succeeded_output(path: Path, expected_hash: Any) -> bool:
+    return bool(
+        path.is_file()
+        and path.stat().st_size > 0
+        and (not expected_hash or _file_hash(path) == expected_hash)
+    )
 
 
 def _provider_rejected_submission(error: Exception) -> bool:
@@ -51,6 +68,37 @@ def execute_seedance_video_task(
     download: Callable[[str, str], str],
 ) -> SeedanceExecution:
     """Submit once, persist the job id, then resume polling after failures."""
+    destination = Path(output_path)
+    succeeded = task_store.find_succeeded(
+        run_id=run_id,
+        task_type="video.generate",
+        resource_id=resource_id,
+        payload=payload,
+        provider_id="seedance",
+    )
+    if succeeded is not None:
+        provider_job_id = succeeded.provider_job_id
+        video_url = succeeded.outcome.get("video_url")
+        if not provider_job_id or not video_url:
+            raise RuntimeError(
+                f"successful Seedance ledger entry for {resource_id} is missing recovery data"
+            )
+        if not _matches_succeeded_output(
+            destination, succeeded.outcome.get("output_sha256")
+        ):
+            download(str(video_url), str(destination))
+        if not _matches_succeeded_output(
+            destination, succeeded.outcome.get("output_sha256")
+        ):
+            raise RuntimeError(f"recovered Seedance output is invalid for {resource_id}")
+        return SeedanceExecution(
+            task_id=succeeded.task_id,
+            provider_job_id=provider_job_id,
+            video_url=str(video_url),
+            output_path=str(destination),
+            resumed=True,
+        )
+
     enqueued = task_store.enqueue(
         run_id=run_id,
         task_type="video.generate",
@@ -109,10 +157,10 @@ def execute_seedance_video_task(
             provider_endpoint=provider_endpoint,
         )
 
-    destination = str(output_path)
+    destination_text = str(destination)
     try:
         video_url = poll(provider_job_id)
-        download(video_url, destination)
+        download(video_url, destination_text)
     except Exception as error:
         task_store.note_resumable_error(task.task_id, str(error))
         raise
@@ -122,13 +170,14 @@ def execute_seedance_video_task(
         {
             "provider_job_id": provider_job_id,
             "video_url": video_url,
-            "output_path": destination,
+            "output_path": destination_text,
+            "output_sha256": _file_hash(destination),
         },
     )
     return SeedanceExecution(
         task_id=task.task_id,
         provider_job_id=provider_job_id,
         video_url=video_url,
-        output_path=destination,
+        output_path=destination_text,
         resumed=resumed,
     )

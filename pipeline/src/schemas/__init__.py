@@ -1,5 +1,6 @@
 """Stable data contracts used during the gradual LangGraph migration."""
 
+from .continuity import ContinuityAnchors, ContinuityPlan, ContinuityShot, GenerationChunk
 from .quality import (
     ConsistencyResult,
     QAResult,
@@ -13,7 +14,11 @@ from .workflow import GraphRunConfig, PhaseError, PhaseResult, PhaseStatus, RunS
 __all__ = [
     "CharacterDefinition",
     "ConsistencyResult",
+    "ContinuityAnchors",
+    "ContinuityPlan",
+    "ContinuityShot",
     "DirectorPlan",
+    "GenerationChunk",
     "GraphRunConfig",
     "PhaseError",
     "PhaseResult",

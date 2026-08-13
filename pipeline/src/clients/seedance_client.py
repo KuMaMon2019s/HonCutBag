@@ -89,8 +89,9 @@ def _submit_direct(
     if reference_video_base64:
         video_url = None
         try:
-            from clients.tos_uploader import base64_to_signed_url
-            video_url = base64_to_signed_url(reference_video_base64)
+            from clients.tos_uploader import base64_video_to_signed_url
+
+            video_url = base64_video_to_signed_url(reference_video_base64)
         except Exception as e:
             print(f"  [seedance] Video TOS upload failed: {e}")
         if video_url:
@@ -157,6 +158,70 @@ def submit_content(
     if not task_id:
         raise RuntimeError(f"No task_id in response: {data}")
     return task_id
+
+
+def build_video_extension_content(
+    prompt: str,
+    reference_video_url: str,
+    *,
+    reference_image_urls: list[str] | None = None,
+) -> list[dict]:
+    """Build Seedance content for extending one prior video with stable anchors."""
+    sanitized_prompt, filtered_terms = sanitize_prompt(prompt)
+    if filtered_terms:
+        print(f"  [seedance] IP filter: removed {filtered_terms}")
+    if not reference_video_url:
+        raise ValueError("reference_video_url is required for video extension")
+    content: list[dict] = [{"type": "text", "text": sanitized_prompt}]
+    content.extend(
+        {
+            "type": "image_url",
+            "image_url": {"url": url},
+            "role": "reference_image",
+        }
+        for url in (reference_image_urls or [])
+        if url
+    )
+    content.append({
+        "type": "video_url",
+        "video_url": {"url": reference_video_url},
+        "role": "reference_video",
+    })
+    return content
+
+
+def submit_video_extension(
+    prompt: str,
+    reference_video_path: str,
+    *,
+    api_key: str,
+    model: str,
+    duration: int,
+    ratio: str = "16:9",
+    reference_image_urls: list[str] | None = None,
+    seed: int | None = None,
+    generate_audio: str | None = None,
+) -> str:
+    """Upload a prior chunk as video and submit an explicit Seedance extension task."""
+    from clients.tos_uploader import upload_media_file
+
+    video_url = upload_media_file(reference_video_path, prefix="volcengine/video")
+    if not video_url:
+        raise RuntimeError(f"failed to upload reference video: {reference_video_path}")
+    content = build_video_extension_content(
+        prompt,
+        video_url,
+        reference_image_urls=reference_image_urls,
+    )
+    return submit_content(
+        content,
+        api_key=api_key,
+        model=model,
+        duration=duration,
+        ratio=ratio,
+        seed=seed,
+        generate_audio=generate_audio,
+    )
 
 
 def submit(

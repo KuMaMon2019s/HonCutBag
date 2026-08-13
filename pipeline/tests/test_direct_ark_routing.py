@@ -773,6 +773,51 @@ def test_bridge_runtime_resumes_persisted_job_without_resubmitting(tmp_path):
     assert store.get(execution.task_id).status == "succeeded"
 
 
+def test_bridge_succeeded_ledger_recovers_missing_output_by_job_id(tmp_path):
+    store = GenerationTaskStore(tmp_path / "runtime.db")
+    output_path = tmp_path / "shots" / "S01" / "chunks" / "S01_C01.mp4"
+    output_path.parent.mkdir(parents=True)
+    payload = {"shot_id": "S01", "input_fingerprint": "same-input"}
+
+    def initial_generate(*, resume_task_id, on_submit_start, on_submitted):
+        assert resume_task_id is None
+        on_submit_start()
+        on_submitted("bridge-job-1")
+        output_path.write_bytes(b"video")
+        return str(output_path)
+
+    first = execute_bridge_video_task(
+        store,
+        run_id="run-1",
+        resource_id="S01_C01",
+        payload=payload,
+        provider_endpoint="http://bridge.test",
+        output_path=output_path,
+        generate=initial_generate,
+    )
+    output_path.unlink()
+    resume_ids = []
+
+    def recover_generate(*, resume_task_id, on_submit_start, on_submitted):
+        resume_ids.append(resume_task_id)
+        output_path.write_bytes(b"video")
+        return str(output_path)
+
+    recovered = execute_bridge_video_task(
+        store,
+        run_id="run-1",
+        resource_id="S01_C01",
+        payload=payload,
+        provider_endpoint="http://bridge.test",
+        output_path=output_path,
+        generate=recover_generate,
+    )
+
+    assert recovered.task_id == first.task_id
+    assert recovered.resumed is True
+    assert resume_ids == ["bridge-job-1"]
+
+
 def test_bridge_fallback_submit_timeout_becomes_uncertain(tmp_path):
     store = GenerationTaskStore(tmp_path / "runtime.db")
     output_path = tmp_path / "output.mp4"
@@ -1106,6 +1151,64 @@ def test_seedance_poll_failure_resumes_without_resubmitting(tmp_path):
     assert execution.provider_job_id == "provider-job-1"
     assert submissions == ["submitted"]
     assert store.get(execution.task_id).status == "succeeded"
+
+
+def test_seedance_succeeded_ledger_recovers_after_lineage_crash_without_resubmitting(
+    tmp_path,
+):
+    store = GenerationTaskStore(tmp_path / "runtime.db")
+    output_path = tmp_path / "shots" / "S01" / "chunks" / "S01_C01.mp4"
+    output_path.parent.mkdir(parents=True)
+    payload = {"shot_id": "S01", "input_fingerprint": "same-input"}
+    submissions = []
+
+    first = execute_seedance_video_task(
+        store,
+        run_id="run-1",
+        resource_id="S01_C01",
+        payload=payload,
+        provider_endpoint="https://seedance.test",
+        output_path=output_path,
+        submit=lambda: submissions.append("submit") or "provider-job-1",
+        poll=lambda provider_job_id: "https://video.test/output.mp4",
+        download=lambda url, path: Path(path).write_bytes(b"video") or path,
+    )
+    output_path.unlink()
+    downloads = []
+
+    recovered = execute_seedance_video_task(
+        store,
+        run_id="run-1",
+        resource_id="S01_C01",
+        payload=payload,
+        provider_endpoint="https://seedance.test",
+        output_path=output_path,
+        submit=lambda: pytest.fail("successful task must not be resubmitted"),
+        poll=lambda provider_job_id: pytest.fail("successful task must not be repolled"),
+        download=lambda url, path: downloads.append(url)
+        or Path(path).write_bytes(b"video")
+        or path,
+    )
+
+    assert recovered.task_id == first.task_id
+    assert recovered.resumed is True
+    assert submissions == ["submit"]
+    assert downloads == ["https://video.test/output.mp4"]
+
+
+def test_generation_runtime_rejects_changed_payload_for_an_active_resource(tmp_path):
+    store = GenerationTaskStore(tmp_path / "runtime.db")
+    _enqueue_runtime_video(store)
+
+    with pytest.raises(RuntimeError, match="payload changed"):
+        store.enqueue(
+            run_id="run-1",
+            task_type="video.generate",
+            media_type="video",
+            resource_id="S01",
+            payload={"shot_id": "S01", "input_fingerprint": "changed"},
+            provider_id="seedance",
+        )
 
 
 def test_uncertain_seedance_submission_blocks_automatic_resubmit(tmp_path):

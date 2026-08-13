@@ -8,6 +8,7 @@ import os
 import hashlib
 import hmac
 import base64
+import mimetypes
 import requests
 from urllib.parse import quote
 from datetime import datetime, timezone
@@ -353,6 +354,55 @@ def upload_file(
         print(f"  [tos] Upload error for {object_key}: {exc}")
         return None
     return get_signed_url(object_key, expires=7200)
+
+
+def upload_media_file(path: str | Path, *, prefix: str = "volcengine/media") -> str | None:
+    """Upload a media file without applying image compression or transcoding."""
+    source = Path(path)
+    if not source.is_file():
+        raise FileNotFoundError(f"media file not found: {source}")
+    media_data = source.read_bytes()
+    content_type = mimetypes.guess_type(source.name)[0] or "application/octet-stream"
+    content_hash = hashlib.sha256(media_data).hexdigest()
+    suffix = source.suffix.lower() or ".bin"
+    return upload_file(
+        media_data,
+        f"{prefix.rstrip('/')}/{content_hash}{suffix}",
+        content_type,
+    )
+
+
+def base64_video_to_signed_url(
+    base64_data: str,
+    *,
+    suffix: str = ".mp4",
+    content_type: str = "video/mp4",
+) -> str | None:
+    """Upload base64 video bytes without passing through image compression."""
+    if "," in base64_data:
+        header, base64_data = base64_data.split(",", 1)
+        if header.startswith("data:") and ";" in header:
+            declared_type = header[5:].split(";", 1)[0]
+            if declared_type.startswith("video/"):
+                content_type = declared_type
+                guessed_suffix = mimetypes.guess_extension(declared_type)
+                if guessed_suffix:
+                    suffix = guessed_suffix
+    try:
+        video_data = base64.b64decode(base64_data, validate=True)
+    except Exception as exc:
+        print(f"  [tos] Video base64 decode error: {exc}")
+        return None
+    if not video_data:
+        print("  [tos] Video base64 decode error: empty payload")
+        return None
+    content_hash = hashlib.sha256(video_data).hexdigest()
+    normalized_suffix = suffix if suffix.startswith(".") else f".{suffix}"
+    return upload_file(
+        video_data,
+        f"volcengine/video/{content_hash}{normalized_suffix}",
+        content_type,
+    )
 
 
 # ─── Main entry point ────────────────────────────────────────────────────────
