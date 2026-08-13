@@ -20,11 +20,12 @@ import time
 from contextlib import contextmanager
 import requests
 from typing import Optional
+from utils.config import ARK_BASE_URL
 from utils.ip_blacklist import sanitize_prompt
 
 
 # Agent Plan base URL (NOT /api/v3/ which is pay-as-you-go)
-BASE_URL = "https://ark.cn-beijing.volces.com/api/plan/v3"
+BASE_URL = ARK_BASE_URL.rstrip("/")
 IMAGE_ENDPOINT = f"{BASE_URL}/images/generations"
 
 # Agent Plan model (NOT doubao-seedream-3-0 which doesn't exist)

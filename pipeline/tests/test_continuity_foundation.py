@@ -15,10 +15,19 @@ from PIL import Image
 from pydantic import ValidationError
 
 from clients import seedance_client, tos_uploader
+from clients.seedream_client import IMAGE_ENDPOINT
 from phases import pipeline_core
 from phases.phase4.continuity_plan import build_continuity_plan, write_continuity_plan
 from phases.phase8 import edit_decisions as edit_decision_module
-from quality.continuity_seam import compare_frame_sequences, measure_video_seam
+from quality.continuity_bridge import detect_replayed_prefix, repair_continuity_boundary
+from quality.continuity_seam import (
+    compare_frame_sequences,
+    extract_ordered_video_frames,
+    extract_video_tail_frame,
+    extract_video_tail_window,
+    measure_video_replay_similarity,
+    measure_video_seam,
+)
 from quality.seam_calibration import calibrate_seam_policy, decide_seam
 from runtime.continuity_chunks import (
     ChunkExecutionRequest,
@@ -34,7 +43,9 @@ from runtime.continuity_memory import (
 )
 from runtime.continuity_provider import (
     _bridge_seedance_executor,
+    _continuity_bridge_preparer,
     _direct_seedance_executor,
+    _generation_seed,
     _provider_content,
     execute_phase6_auto_continuity,
     materialize_continuity_shot,
@@ -54,6 +65,9 @@ def test_planner_keeps_short_editorial_shots_backward_compatible():
             "chunk_id": "S01_C01",
             "sequence": 1,
             "target_duration_s": 8.0,
+            "requested_frames": 192,
+            "expected_overlap_frames": 0,
+            "expected_unique_frames": 192,
             "mode": "fresh",
             "depends_on": None,
         }
@@ -92,6 +106,7 @@ def test_planner_splits_long_shot_and_preserves_explicit_anchors(tmp_path):
     assert [chunk.depends_on for chunk in shot.chunks] == [None, "S03_C01", "S03_C02"]
     persisted = json.loads((tmp_path / "CONTINUITY_PLAN.json").read_text())
     assert persisted["version"] == 1
+    assert persisted["timeline_fps"] == 24
     assert persisted["shots"][1]["chunks"][2]["mode"] == "native_extend"
 
 
@@ -99,6 +114,32 @@ def test_planner_balances_a_sixteen_second_shot_without_a_one_second_tail():
     plan = build_continuity_plan({"shots": [{"id": 1, "duration": 16}]})
 
     assert [chunk.target_duration_s for chunk in plan.shots[0].chunks] == [8, 8]
+
+
+def test_planner_reserves_replayed_reference_frames_without_shortening_the_shot():
+    plan = build_continuity_plan(
+        {"shots": [{"id": "S01", "duration": 10}]},
+        provider_chunk_limit_s=5,
+        continuation_overlap_s=2,
+    )
+
+    shot = plan.shots[0]
+    assert shot.target_frames == 240
+    assert [chunk.target_duration_s for chunk in shot.chunks] == [5, 5, 4]
+    assert [chunk.requested_frames for chunk in shot.chunks] == [120, 120, 96]
+    assert [chunk.expected_overlap_frames for chunk in shot.chunks] == [0, 48, 48]
+    assert [chunk.expected_unique_frames for chunk in shot.chunks] == [120, 72, 48]
+    assert sum(chunk.expected_unique_frames or 0 for chunk in shot.chunks) == 240
+
+
+def test_planner_allocates_fractional_shots_from_cumulative_frame_endpoints():
+    plan = build_continuity_plan(
+        {"shots": [{"id": index, "duration": 0.06} for index in range(1, 4)]},
+        timeline_fps=24,
+    )
+
+    assert [shot.target_frames for shot in plan.shots] == [1, 2, 1]
+    assert sum(shot.target_frames or 0 for shot in plan.shots) == round(0.18 * 24)
 
 
 def test_chunk_contract_rejects_extension_without_a_dependency():
@@ -207,6 +248,69 @@ def test_video_extension_uses_reference_video_with_persistent_image_anchors(monk
     assert observed["kwargs"]["seed"] == 7
 
 
+def test_ark_agent_plan_generation_endpoints_share_the_canonical_base_url():
+    expected_base = "https://ark.cn-beijing.volces.com/api/plan/v3"
+
+    assert seedance_client.BASE_URL == expected_base
+    assert seedance_client.TASKS_ENDPOINT == (f"{expected_base}/contents/generations/tasks")
+    assert seedance_client.TASK_ENDPOINT == (
+        f"{expected_base}/contents/generations/tasks/{{task_id}}"
+    )
+    assert IMAGE_ENDPOINT == f"{expected_base}/images/generations"
+
+
+def test_seedance_task_management_uses_documented_urls_and_filters(monkeypatch):
+    observed = []
+
+    class Response:
+        status_code = 200
+        text = "ok"
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def json(self):
+            return self.payload
+
+    def fake_get(url, **kwargs):
+        observed.append(("GET", url, kwargs))
+        return Response({"id": "task-1", "status": "running"})
+
+    def fake_delete(url, **kwargs):
+        observed.append(("DELETE", url, kwargs))
+        return Response({"id": "task-1", "status": "cancelled"})
+
+    monkeypatch.setattr(seedance_client.requests, "get", fake_get)
+    monkeypatch.setattr(seedance_client.requests, "delete", fake_delete)
+
+    task = seedance_client.get_task("task-1", api_key="test-key")
+    listing = seedance_client.list_tasks(
+        api_key="test-key",
+        page_num=2,
+        page_size=7,
+        filter_status="succeeded",
+        task_ids=["task-1", "task-2"],
+        model="doubao-seedance-2.0-mini",
+    )
+    deleted = seedance_client.cancel_or_delete_task("task-1", api_key="test-key")
+
+    assert task["status"] == "running"
+    assert listing["id"] == "task-1"
+    assert deleted["status"] == "cancelled"
+    assert observed[0][1].endswith("/contents/generations/tasks/task-1")
+    assert observed[1][1] == seedance_client.TASKS_ENDPOINT
+    assert observed[1][2]["params"] == {
+        "page_num": 2,
+        "page_size": 7,
+        "filter.status": "succeeded",
+        "filter.task_ids": "task-1,task-2",
+        "filter.model": "doubao-seedance-2.0-mini",
+    }
+    assert observed[2][0] == "DELETE"
+    assert observed[2][1].endswith("/contents/generations/tasks/task-1")
+    assert all(call[2]["headers"]["Authorization"] == "Bearer test-key" for call in observed)
+
+
 def _materialize_test_shot(chunk_paths, output_path):
     output_path.write_bytes(b"|".join(path.read_bytes() for path in chunk_paths))
 
@@ -256,6 +360,53 @@ def test_chunk_runtime_serializes_dependencies_but_parallelizes_shots(tmp_path):
     assert report["executed_chunks"] == 4
     assert dict(sequences) == {"S01": [1, 2], "S02": [1, 2]}
     assert (tmp_path / "shots/S01/output.mp4").read_bytes() == b"S01_C01|S01_C02"
+
+
+def test_chunk_runtime_generates_a_bounded_continuation_topup_for_large_frame_deficit(
+    tmp_path,
+):
+    plan = build_continuity_plan(
+        {"shots": [{"id": "S01", "duration": 8}]},
+        provider_chunk_limit_s=5,
+        continuation_overlap_s=2,
+    )
+    calls = []
+    decoded_frames = {
+        "S01_C01": 100,
+        "S01_C02": 70,
+        "S01_T01": 24,
+        "output": 192,
+    }
+
+    def execute(request):
+        calls.append((request.resource_id, request.chunk.target_duration_s))
+        request.output_path.parent.mkdir(parents=True, exist_ok=True)
+        request.output_path.write_bytes(request.resource_id.encode())
+        return ChunkExecutionResult(request.output_path)
+
+    def probe(path, _fps):
+        return {"frames": decoded_frames[path.stem]}
+
+    def finalize(path, target_frames, fps):
+        assert target_frames == 192
+        assert fps == 24
+        return {"method": "exact_tail_trim", "after_frames": 192}
+
+    report = execute_continuity_plan(
+        plan,
+        tmp_path,
+        execute_chunk=execute,
+        inspect_seam=_inspect_test_seam,
+        materialize_shot=_materialize_test_shot,
+        probe_frames=probe,
+        finalize_shot=finalize,
+    )
+
+    timing = json.loads((tmp_path / "shots/S01/CONTINUITY_TIMING.json").read_text())
+    assert report["status"] == "done"
+    assert report["duration_topups"] == 1
+    assert calls == [("S01_C01", 5.0), ("S01_C02", 5.0), ("S01_T01", 3.0)]
+    assert [row["remaining_target_frames"] for row in timing["chunks"]] == [92, 22, -2]
 
 
 def test_chunk_runtime_resumes_and_invalidates_descendants(tmp_path):
@@ -392,7 +543,10 @@ def test_real_video_seam_measurement_separates_stable_and_discontinuous_boundari
 
     assert stable["metrics"]["provisional_risk_score"] < 0.01
     assert discontinuous["metrics"]["provisional_risk_score"] > 0.7
-    assert all((tmp_path / "stable_evidence" / path.split("/")[-1]).is_file() for path in stable["tail_frames"])
+    assert all(
+        (tmp_path / "stable_evidence" / path.split("/")[-1]).is_file()
+        for path in stable["tail_frames"]
+    )
 
 
 def _labelled_seam(observation_id, label, risk):
@@ -414,9 +568,7 @@ def test_seam_calibration_requires_balanced_labelled_samples():
 
     assert calibration.status == "insufficient"
     assert calibration.accept_threshold is None
-    assert decide_seam(
-        {"provisional_risk_score": 0.9}, calibration
-    )["action"] == "observe_only"
+    assert decide_seam({"provisional_risk_score": 0.9}, calibration)["action"] == "observe_only"
 
 
 def test_seam_calibration_creates_a_review_band_and_bounded_repair():
@@ -572,6 +724,96 @@ def test_chunk_runtime_stops_after_repair_budget_is_exhausted(tmp_path):
     assert "human review" in report["errors"][0]["error"]
 
 
+def test_replay_signal_blocks_an_otherwise_acceptable_seam(tmp_path):
+    plan = build_continuity_plan({"shots": [{"id": "S01", "duration": 16}]})
+
+    def execute(request):
+        request.output_path.parent.mkdir(parents=True, exist_ok=True)
+        request.output_path.write_bytes(request.resource_id.encode())
+        return ChunkExecutionResult(request.output_path, f"task-{request.resource_id}")
+
+    def inspect(_previous_path, _following_path, boundary_id):
+        return {
+            "boundary_id": boundary_id,
+            "metrics": {"provisional_risk_score": 0.02},
+            "replay": {
+                "likely_replay": True,
+                "policy": "human_review_only",
+            },
+        }
+
+    report = execute_continuity_plan(
+        plan,
+        tmp_path,
+        execute_chunk=execute,
+        inspect_seam=inspect,
+        materialize_shot=_materialize_test_shot,
+        seam_calibration=_certified_seam_calibration().model_dump(mode="json"),
+    )
+
+    lineage = json.loads((tmp_path / "CONTINUITY_LINEAGE.json").read_text())
+    decision = lineage["seams"]["S01_C01__S01_C02"]["decision"]
+    assert report["status"] == "error"
+    assert decision["action"] == "human_review"
+    assert decision["replay_policy"] == "human_review_only"
+    assert "replay" in decision["reason"]
+
+
+def test_exact_human_review_approval_regenerates_without_repeating_original_chunks(tmp_path):
+    plan = build_continuity_plan({"shots": [{"id": "S01", "duration": 16}]})
+    calls = []
+
+    def execute(request):
+        calls.append(request.resource_id)
+        payload = b"repaired" if request.repair_attempt else request.resource_id.encode()
+        request.output_path.write_bytes(payload)
+        return ChunkExecutionResult(request.output_path, f"task-{request.resource_id}")
+
+    def inspect(previous_path, following_path, boundary_id):
+        risk = 0.02 if following_path.read_bytes() == b"repaired" else 0.3
+        return {
+            "boundary_id": boundary_id,
+            "metrics": {"provisional_risk_score": risk},
+        }
+
+    kwargs = {
+        "execute_chunk": execute,
+        "inspect_seam": inspect,
+        "materialize_shot": _materialize_test_shot,
+        "seam_calibration": _certified_seam_calibration().model_dump(mode="json"),
+        "max_seam_repairs": 1,
+    }
+    first = execute_continuity_plan(plan, tmp_path, **kwargs)
+    lineage = json.loads((tmp_path / "CONTINUITY_LINEAGE.json").read_text())
+    seam = lineage["seams"]["S01_C01__S01_C02"]
+    (tmp_path / "CONTINUITY_REVIEW_DECISIONS.json").write_text(
+        json.dumps(
+            {
+                "kind": "honcut.continuity_review_decisions.v1",
+                "decisions": {
+                    "S01_C01__S01_C02": {
+                        "action": "regenerate",
+                        "approved_input_fingerprint": seam["input_fingerprint"],
+                        "approved_by": "human",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    repaired = execute_continuity_plan(plan, tmp_path, **kwargs)
+
+    lineage = json.loads((tmp_path / "CONTINUITY_LINEAGE.json").read_text())
+    assert first["status"] == "error"
+    assert repaired["status"] == "done"
+    assert repaired["skipped_chunks"] == 2
+    assert repaired["repair_attempts"] == 1
+    assert calls == ["S01_C01", "S01_C02", "S01_C02_R01"]
+    assert lineage["chunks"]["S01_C02"]["resource_id"] == "S01_C02_R01"
+    assert lineage["seams"]["S01_C01__S01_C02"]["decision"]["action"] == "accept"
+
+
 def test_chunk_runtime_resumes_the_same_repair_resource_after_provider_failure(tmp_path):
     plan = build_continuity_plan({"shots": [{"id": "S01", "duration": 32}]})
     calls = []
@@ -649,9 +891,7 @@ def test_auto_mode_requires_and_records_certified_calibration(monkeypatch, tmp_p
     assert report["calibration_fingerprint"] == calibration.dataset_fingerprint
 
 
-def test_extension_provider_content_keeps_images_as_anchors_and_adds_video(
-    monkeypatch, tmp_path
-):
+def test_extension_provider_content_keeps_images_as_anchors_and_adds_video(monkeypatch, tmp_path):
     shot_dir = tmp_path / "shots/S01"
     shot_dir.mkdir(parents=True)
     (shot_dir / "SHOT_META.json").write_text(
@@ -674,7 +914,27 @@ def test_extension_provider_content_keeps_images_as_anchors_and_adds_video(
     )
     monkeypatch.setattr(
         "clients.tos_uploader.upload_media_file",
-        lambda path, prefix: "https://video.test/previous.mp4",
+        lambda path, prefix: (
+            "https://video.test/tail-window.mp4"
+            if prefix == "volcengine/video"
+            else f"https://image.test/{Path(path).name}"
+        ),
+    )
+    monkeypatch.setattr(
+        "quality.continuity_seam.extract_video_tail_window",
+        lambda _video, output, window_s: output.parent.mkdir(parents=True, exist_ok=True)
+        or output.write_bytes(f"tail-{window_s}".encode())
+        or output,
+    )
+
+    def fake_extract_frames(_video, outputs):
+        for index, output in enumerate(outputs, 1):
+            output.write_bytes(f"frame-{index}".encode())
+        return tuple(outputs)
+
+    monkeypatch.setattr(
+        "quality.continuity_seam.extract_ordered_video_frames",
+        fake_extract_frames,
     )
     chunk = GenerationChunk(
         chunk_id="S01_C02",
@@ -692,6 +952,7 @@ def test_extension_provider_content_keeps_images_as_anchors_and_adds_video(
         previous_output_path=previous,
         input_fingerprint="fingerprint",
         memory_context="canonical anchors remain authoritative",
+        repair_attempt=1,
     )
 
     content, _meta, _seed, duration = _provider_content(tmp_path, request)
@@ -700,10 +961,47 @@ def test_extension_provider_content_keeps_images_as_anchors_and_adds_video(
     assert [item.get("role") for item in content] == [
         None,
         "reference_image",
+        "reference_image",
+        "reference_image",
+        "reference_image",
         "reference_video",
     ]
+    assert content[0]["text"].startswith("向后延长视频1")
+    assert "图片1、图片2、图片3" in content[0]["text"]
+    assert "严格参考图片3" in content[0]["text"]
+    assert "不得重播视频1中的运动轨迹" in content[0]["text"]
     assert "without a reset or cut" in content[0]["text"]
-    assert content[-1]["video_url"]["url"] == "https://video.test/previous.mp4"
+    assert "Do not skip forward in time" in content[0]["text"]
+    assert [item["image_url"]["url"] for item in content[1:4]] == [
+        f"https://image.test/{path.name}"
+        for path in sorted((tmp_path / "continuity_anchors").glob("*_frame_*.jpg"))
+    ]
+    assert content[-2]["image_url"]["url"] == "https://image.test/frame.png"
+    assert content[-1]["video_url"]["url"] == "https://video.test/tail-window.mp4"
+
+
+def test_continuity_generation_seed_is_stable_but_differs_by_chunk_and_repair(tmp_path):
+    first = _fresh_chunk_request(tmp_path)
+    second = ChunkExecutionRequest(
+        resource_id="S01_C02",
+        shot_id="S01",
+        chunk=GenerationChunk(
+            chunk_id="S01_C02",
+            sequence=2,
+            target_duration_s=8,
+            mode="native_extend",
+            depends_on="S01_C01",
+        ),
+        anchors={"scene": "roof"},
+        output_path=tmp_path / "S01_C02.mp4",
+        previous_output_path=tmp_path / "S01_C01.mp4",
+        input_fingerprint="fingerprint",
+        memory_context="anchors",
+    )
+    repair = ChunkExecutionRequest(**{**second.__dict__, "repair_attempt": 1})
+
+    assert _generation_seed(first) == _generation_seed(first)
+    assert len({_generation_seed(first), _generation_seed(second), _generation_seed(repair)}) == 3
 
 
 def _fresh_chunk_request(tmp_path):
@@ -818,6 +1116,153 @@ def test_bridge_continuity_adapter_reuses_succeeded_paid_task(monkeypatch, tmp_p
     shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
     reason="ffmpeg and ffprobe are required",
 )
+def test_extract_video_tail_frame_preserves_provider_video_geometry(tmp_path):
+    video = tmp_path / "chunk.mp4"
+    anchor = tmp_path / "anchors/chunk_tail.jpg"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:s=160x90:d=0.5",
+            "-pix_fmt",
+            "yuv420p",
+            str(video),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+
+    extracted = extract_video_tail_frame(video, anchor)
+
+    image = Image.open(extracted).convert("RGB")
+    assert image.size == (160, 90)
+    red, green, blue = np.asarray(image).mean(axis=(0, 1))
+    assert blue > red * 2
+    assert blue > green * 2
+
+
+def test_extract_video_tail_frame_falls_back_from_undecodable_final_timestamp(
+    monkeypatch, tmp_path
+):
+    video = tmp_path / "chunk.mp4"
+    anchor = tmp_path / "anchors/chunk_tail.jpg"
+    attempts = []
+    video.write_bytes(b"video")
+
+    monkeypatch.setattr("quality.continuity_seam._video_duration", lambda _path: 5.04)
+
+    def fake_extract(_video, timestamp, output):
+        attempts.append(timestamp)
+        if len(attempts) == 1:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(b"")
+            raise RuntimeError("final timestamp has no decodable frame")
+        output.write_bytes(b"jpeg")
+
+    monkeypatch.setattr("quality.continuity_seam._extract_frame", fake_extract)
+
+    extracted = extract_video_tail_frame(video, anchor)
+
+    assert extracted.read_bytes() == b"jpeg"
+    assert attempts == pytest.approx([4.96, 4.88])
+
+
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="ffmpeg and ffprobe are required",
+)
+def test_tail_window_and_ordered_frames_preserve_short_temporal_context(tmp_path):
+    source = tmp_path / "source.mp4"
+    tail = tmp_path / "anchors/tail.mp4"
+    frames = tuple(tmp_path / f"anchors/frame_{index}.jpg" for index in range(3))
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=160x90:r=24:d=3",
+            "-pix_fmt",
+            "yuv420p",
+            str(source),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+
+    extract_video_tail_window(source, tail, window_s=1.5)
+    extracted = extract_ordered_video_frames(tail, frames)
+    duration = float(
+        subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "csv=p=0",
+                str(tail),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        ).stdout.strip()
+    )
+
+    assert duration == pytest.approx(1.5, abs=0.05)
+    assert all(Image.open(path).size == (160, 90) for path in extracted)
+
+
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None,
+    reason="ffmpeg is required",
+)
+def test_video_replay_similarity_flags_motion_replay_but_not_static_frames(tmp_path):
+    moving = tmp_path / "moving.mp4"
+    moving_copy = tmp_path / "moving_copy.mp4"
+    static = tmp_path / "static.mp4"
+    for path, source in (
+        (moving, "testsrc2=s=160x90:r=24:d=2"),
+        (static, "color=c=blue:s=160x90:r=24:d=2"),
+    ):
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                source,
+                "-pix_fmt",
+                "yuv420p",
+                str(path),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+    shutil.copyfile(moving, moving_copy)
+
+    replay = measure_video_replay_similarity(moving, moving_copy)
+    static_pair = measure_video_replay_similarity(static, static)
+
+    assert replay["likely_replay"] is True
+    assert replay["motion_cosine_similarity"] == pytest.approx(1.0)
+    assert static_pair["likely_replay"] is False
+
+
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="ffmpeg and ffprobe are required",
+)
 def test_materialize_continuity_shot_concatenates_accepted_chunks(tmp_path):
     chunks = []
     for index, color in enumerate(("black", "white"), 1):
@@ -866,9 +1311,7 @@ def test_materialize_continuity_shot_concatenates_accepted_chunks(tmp_path):
     shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
     reason="ffmpeg and ffprobe are required",
 )
-def test_phase6_auto_runtime_repairs_real_decoded_seam_before_materializing(
-    monkeypatch, tmp_path
-):
+def test_phase6_auto_runtime_repairs_real_decoded_seam_before_materializing(monkeypatch, tmp_path):
     plan = write_continuity_plan(
         tmp_path / "CONTINUITY_PLAN.json",
         {"shots": [{"id": "S01", "duration": 16}]},
@@ -894,7 +1337,10 @@ def test_phase6_auto_runtime_repairs_real_decoded_seam_before_materializing(
                     "-f",
                     "lavfi",
                     "-i",
-                    f"color=c={color}:s=96x54:d=0.5",
+                    (
+                        f"color=c={color}:s=96x54:r=24:"
+                        f"d={request.chunk.target_duration_s}"
+                    ),
                     "-pix_fmt",
                     "yuv420p",
                     str(request.output_path),
@@ -914,6 +1360,10 @@ def test_phase6_auto_runtime_repairs_real_decoded_seam_before_materializing(
         "runtime.continuity_provider._direct_seedance_executor",
         fake_executor,
     )
+    monkeypatch.setattr(
+        "clients.tos_uploader.is_media_upload_configured",
+        lambda: True,
+    )
 
     report = execute_phase6_auto_continuity(tmp_path, plan, calibration)
 
@@ -925,6 +1375,205 @@ def test_phase6_auto_runtime_repairs_real_decoded_seam_before_materializing(
     assert seam["decision"]["action"] == "accept"
     assert len(seam["attempt_history"]) == 2
     assert (tmp_path / "shots/S01/output.mp4").stat().st_size > 0
+    timing = json.loads((tmp_path / "shots/S01/CONTINUITY_TIMING.json").read_text())
+    assert timing["target_frames"] == 384
+    assert timing["final_frames"] == 384
+    assert timing["delta_frames"] == 0
+
+
+def test_phase6_auto_preflights_extension_upload_before_paid_execution(monkeypatch, tmp_path):
+    plan = write_continuity_plan(
+        tmp_path / "CONTINUITY_PLAN.json",
+        {"shots": [{"id": "S01", "duration": 10}]},
+        provider_chunk_limit_s=5,
+    )
+
+    def unexpected_executor(_root, _store):
+        raise AssertionError("provider executor must not initialize before preflight")
+
+    monkeypatch.setenv("VIDEO_PROVIDER", "seedance")
+    monkeypatch.setattr(
+        "clients.tos_uploader.is_media_upload_configured",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        "runtime.continuity_provider._direct_seedance_executor",
+        unexpected_executor,
+    )
+
+    with pytest.raises(RuntimeError, match="before any paid provider submission"):
+        execute_phase6_auto_continuity(tmp_path, plan, _certified_seam_calibration())
+
+    assert not (tmp_path / "runtime.db").exists()
+
+
+def test_phase6_auto_requires_a_bridge_budgeted_plan_before_provider_init(monkeypatch, tmp_path):
+    plan = write_continuity_plan(
+        tmp_path / "CONTINUITY_PLAN.json",
+        {"shots": [{"id": "S01", "duration": 16}]},
+    )
+
+    def unexpected_executor(_root, _store):
+        raise AssertionError("provider executor must not initialize for a stale plan")
+
+    monkeypatch.setenv("VIDEO_PROVIDER", "seedance")
+    monkeypatch.setenv("HONCUT_CONTINUITY_BRIDGE", "auto")
+    monkeypatch.setattr(
+        "clients.tos_uploader.is_media_upload_configured",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "runtime.continuity_provider._direct_seedance_executor",
+        unexpected_executor,
+    )
+
+    with pytest.raises(RuntimeError, match="rerun Phase 4"):
+        execute_phase6_auto_continuity(tmp_path, plan, _certified_seam_calibration())
+
+    assert not (tmp_path / "runtime.db").exists()
+
+
+def test_chunk_runtime_uses_prepared_following_without_overwriting_provider_clip(tmp_path):
+    plan = build_continuity_plan({"shots": [{"id": "S01", "duration": 16}]})
+
+    def execute(request):
+        request.output_path.parent.mkdir(parents=True, exist_ok=True)
+        request.output_path.write_bytes(request.resource_id.encode())
+        return ChunkExecutionResult(request.output_path)
+
+    def prepare(_previous, following, boundary_id):
+        derived = tmp_path / "derived" / f"{boundary_id}.mp4"
+        derived.parent.mkdir(parents=True, exist_ok=True)
+        derived.write_bytes(b"prepared-" + following.read_bytes())
+        return {"status": "repaired", "output_path": str(derived)}
+
+    def inspect(_previous, following, boundary_id):
+        assert boundary_id == "S01_C01__S01_C02"
+        assert following.read_bytes() == b"prepared-S01_C02"
+        return {"metrics": {"provisional_risk_score": 0.02}}
+
+    def materialize(paths, output):
+        output.write_bytes(b"|".join(path.read_bytes() for path in paths))
+
+    report = execute_continuity_plan(
+        plan,
+        tmp_path,
+        execute_chunk=execute,
+        prepare_seam=prepare,
+        inspect_seam=inspect,
+        materialize_shot=materialize,
+    )
+
+    lineage = json.loads((tmp_path / "CONTINUITY_LINEAGE.json").read_text())
+    assert report["status"] == "done"
+    assert report["prepared_seams"] == 1
+    assert (tmp_path / "shots/S01/chunks/S01_C02.mp4").read_bytes() == b"S01_C02"
+    assert (tmp_path / "shots/S01/output.mp4").read_bytes() == (b"S01_C01|prepared-S01_C02")
+    assert lineage["seams"]["S01_C01__S01_C02"]["preparation"]["status"] == "repaired"
+
+
+def test_continuity_bridge_is_opt_in(monkeypatch, tmp_path):
+    monkeypatch.delenv("HONCUT_CONTINUITY_BRIDGE", raising=False)
+
+    assert _continuity_bridge_preparer(tmp_path) is None
+
+
+def test_continuity_bridge_rejects_invalid_candidate_frames_before_execution(monkeypatch, tmp_path):
+    monkeypatch.setenv("HONCUT_CONTINUITY_BRIDGE", "auto")
+    monkeypatch.setenv("HONCUT_CONTINUITY_BRIDGE_FRAMES", "2,8")
+
+    with pytest.raises(ValueError, match="between 4 and 24"):
+        _continuity_bridge_preparer(tmp_path)
+
+
+def test_continuity_bridge_auto_falls_back_to_provider_clip_on_local_failure(monkeypatch, tmp_path):
+    previous = tmp_path / "previous.mp4"
+    following = tmp_path / "following.mp4"
+    previous.write_bytes(b"not-a-video")
+    following.write_bytes(b"provider-video-stays-authoritative")
+    monkeypatch.setenv("HONCUT_CONTINUITY_BRIDGE", "auto")
+
+    prepare = _continuity_bridge_preparer(tmp_path)
+    assert prepare is not None
+    receipt = prepare(previous, following, "S01_C01__S01_C02")
+
+    assert receipt["status"] == "fallback"
+    assert receipt["output_path"] == str(following)
+    assert following.read_bytes() == b"provider-video-stays-authoritative"
+    assert "local continuity bridge failed" in receipt["reason"]
+
+
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="ffmpeg and ffprobe are required",
+)
+def test_detects_replayed_prefix_and_renders_a_smoother_derived_clip(tmp_path):
+    master = tmp_path / "master.mkv"
+    previous = tmp_path / "previous.mp4"
+    following = tmp_path / "following.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x90:rate=24:duration=3",
+            "-c:v",
+            "ffv1",
+            str(master),
+        ],
+        check=True,
+        timeout=30,
+    )
+    for start, output in ((0, previous), (1, following)):
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-v",
+                "error",
+                "-ss",
+                str(start),
+                "-i",
+                str(master),
+                "-t",
+                "2",
+                "-an",
+                "-c:v",
+                "libx264",
+                "-crf",
+                "12",
+                "-pix_fmt",
+                "yuv420p",
+                str(output),
+            ],
+            check=True,
+            timeout=30,
+        )
+
+    overlap = detect_replayed_prefix(previous, following, search_seconds=1.5)
+    output = tmp_path / "effective.mp4"
+    receipt = repair_continuity_boundary(
+        previous,
+        following,
+        output,
+        work_dir=tmp_path / "bridge-work",
+        overlap_seconds=overlap["overlap_seconds"],
+        candidate_frames=(4, 6),
+    )
+
+    assert overlap["detected"] is True
+    assert overlap["overlap_seconds"] == 1.0
+    assert output.is_file() and output.stat().st_size > 0
+    assert receipt["status"] == "repaired"
+    assert receipt["selected_bridge_frames"] in {4, 6}
+    assert receipt["selected_boundary_frame_mae"] < receipt["trimmed_boundary_frame_mae"]
+    assert receipt["trimmed_boundary_frame_mae"] < receipt["baseline_boundary_frame_mae"]
+    assert receipt["removed_replay_duration_seconds"] == pytest.approx(1.0, abs=0.05)
+    assert following.stat().st_size > 0
 
 
 def test_canonical_memory_is_immutable_and_generated_frames_stay_separate(tmp_path):
@@ -1030,6 +1679,7 @@ def test_phase8_forces_continuous_boundaries_to_hard_cuts(monkeypatch, tmp_path)
             "index": 0,
             "type": "cut",
             "duration": 0.0,
+            "duration_frames": 0,
             "locked": True,
             "lock_reason": "continuous editorial boundary",
             "audio_transition": "edge_fade",
@@ -1037,6 +1687,42 @@ def test_phase8_forces_continuous_boundaries_to_hard_cuts(monkeypatch, tmp_path)
         }
     ]
     assert decisions["metadata"]["transition_locks"][0]["before_shot_id"] == "S02"
+
+
+def test_phase8_preserves_finalized_continuity_frame_budget(monkeypatch, tmp_path):
+    shot_dir = tmp_path / "shots/S01"
+    shot_dir.mkdir(parents=True)
+    (shot_dir / "output.mp4").write_bytes(b"video")
+    (shot_dir / "CONTINUITY_TIMING.json").write_text(
+        json.dumps(
+            {
+                "kind": "honcut.continuity_timing.v1",
+                "target_frames": 120,
+                "final_frames": 120,
+                "internal_seams_finalized": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    observed = {}
+    monkeypatch.setattr(
+        edit_decision_module,
+        "probe_video",
+        lambda path: {"duration": 5.0, "has_audio": False},
+    )
+
+    def detect(path, *, trim_static_edges=True):
+        observed.update(path=path, trim_static_edges=trim_static_edges)
+        return {"trim_start": 0.0, "trim_end": 0.0}
+
+    monkeypatch.setattr(edit_decision_module, "detect_black_frames", detect)
+
+    decisions = edit_decision_module.build_edit_decisions(str(tmp_path / "shots"))
+
+    assert observed["trim_static_edges"] is False
+    assert decisions["cuts"][0]["in_seconds"] == 0.0
+    assert decisions["cuts"][0]["out_seconds"] == 5.0
+    assert decisions["cuts"][0]["continuity_timing"]["final_frames"] == 120
 
 
 def test_phase6_shadow_keeps_the_existing_provider_route(monkeypatch, tmp_path):

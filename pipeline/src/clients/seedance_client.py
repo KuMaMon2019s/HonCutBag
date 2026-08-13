@@ -8,13 +8,87 @@ import os
 import time
 import requests
 from typing import Optional
-from utils.ip_blacklist import sanitize_prompt
 from clients.video_client import VideoClient
+from utils.config import ARK_BASE_URL
+from utils.ip_blacklist import sanitize_prompt
 
 
-BASE_URL = "https://ark.cn-beijing.volces.com/api/plan/v3"
-SUBMIT_ENDPOINT = f"{BASE_URL}/contents/generations/tasks"
-POLL_ENDPOINT = f"{BASE_URL}/contents/generations/tasks/{{task_id}}"
+BASE_URL = ARK_BASE_URL.rstrip("/")
+TASKS_ENDPOINT = f"{BASE_URL}/contents/generations/tasks"
+TASK_ENDPOINT = f"{TASKS_ENDPOINT}/{{task_id}}"
+# Compatibility names retained for existing submit/resume call sites.
+SUBMIT_ENDPOINT = TASKS_ENDPOINT
+POLL_ENDPOINT = TASK_ENDPOINT
+
+
+def _authorization_headers(api_key: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+
+def _response_json(response: requests.Response, operation: str) -> dict:
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Seedance {operation} API {response.status_code}: {response.text[:500]}"
+        )
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Seedance {operation} returned a non-object response")
+    return payload
+
+
+def get_task(task_id: str, *, api_key: str, timeout: int = 30) -> dict:
+    """Query one video task through the Agent Plan task endpoint."""
+    if not task_id.strip():
+        raise ValueError("task_id must not be empty")
+    response = requests.get(
+        TASK_ENDPOINT.format(task_id=task_id),
+        headers=_authorization_headers(api_key),
+        timeout=timeout,
+    )
+    return _response_json(response, "get task")
+
+
+def list_tasks(
+    *,
+    api_key: str,
+    page_num: int = 1,
+    page_size: int = 20,
+    filter_status: str | None = None,
+    task_ids: list[str] | None = None,
+    model: str | None = None,
+    timeout: int = 30,
+) -> dict:
+    """List video tasks using Ark's documented dotted filter parameters."""
+    if page_num < 1 or page_size < 1:
+        raise ValueError("page_num and page_size must be positive")
+    params: dict[str, int | str] = {"page_num": page_num, "page_size": page_size}
+    if filter_status:
+        params["filter.status"] = filter_status
+    if task_ids:
+        params["filter.task_ids"] = ",".join(task_ids)
+    if model:
+        params["filter.model"] = model
+    response = requests.get(
+        TASKS_ENDPOINT,
+        headers=_authorization_headers(api_key),
+        params=params,
+        timeout=timeout,
+    )
+    return _response_json(response, "list tasks")
+
+
+def cancel_or_delete_task(task_id: str, *, api_key: str, timeout: int = 30) -> dict:
+    """Cancel or delete one video task; the provider decides by current task state."""
+    if not task_id.strip():
+        raise ValueError("task_id must not be empty")
+    response = requests.delete(
+        TASK_ENDPOINT.format(task_id=task_id),
+        headers=_authorization_headers(api_key),
+        timeout=timeout,
+    )
+    if response.status_code == 204:
+        return {}
+    return _response_json(response, "cancel/delete task")
 
 
 def _submit_direct(
@@ -43,10 +117,7 @@ def _submit_direct(
     if filtered_terms:
         print(f"  [seedance] IP filter: removed {filtered_terms}")
     
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+    headers = _authorization_headers(api_key)
 
     # Build content — always array format
     if reference_image_base64:
@@ -135,10 +206,7 @@ def submit_content(
     generate_audio: Optional[str] = None,
 ) -> str:
     """Submit a preassembled ARK Agent Plan content array. Returns task_id."""
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+    headers = _authorization_headers(api_key)
     payload = {
         "model": model,
         "content": content,
@@ -260,14 +328,9 @@ def poll(
     interval: int = 15,
 ) -> str:
     """Poll task until done. Returns video_url or raises."""
-    headers = {"Authorization": f"Bearer {api_key}"}
-    url = POLL_ENDPOINT.format(task_id=task_id)
-
     for attempt in range(1, max_attempts + 1):
         time.sleep(interval)
-        resp = requests.get(url, headers=headers, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
+        data = get_task(task_id, api_key=api_key)
         status = data.get("status", "")
 
         if status == "succeeded":

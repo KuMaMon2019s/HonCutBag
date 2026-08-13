@@ -9,28 +9,30 @@ from pathlib import Path
 from .frame_analysis import probe_duration
 
 
-def trim_excess_to_target(output_dir: Path, target_duration: float | None) -> dict | None:
-    """Losslessly trim a slightly long assembly to the delivery duration.
-
-    Phase 9 requires the delivered video to be within one second of the user
-    target. Phase 8 historically accepted any overlong output, so accumulated
-    transition rounding could pass here and fail later. Stream-copy trimming is
-    sufficient because the assembly starts at timestamp zero and is already a
-    normalized 30 fps H.264/AAC file.
-    """
+def trim_excess_to_target(
+    output_dir: Path,
+    target_duration: float | None,
+    *,
+    timeline_fps: int = 30,
+) -> dict | None:
+    """Trim an overlong assembly to the exact delivery frame budget."""
     if target_duration is None:
         return None
     video = Path(output_dir) / "raw_assembly.mp4"
     actual = probe_duration(video)
     target = float(target_duration)
-    if actual <= target:
+    target_frames = round(target * timeline_fps)
+    if round(actual * timeline_fps) <= target_frames:
         return None
     temporary = video.with_name("raw_assembly.duration_trim.mp4")
     completed = subprocess.run(
         [
-            "ffmpeg", "-y", "-i", str(video), "-t", f"{target:.6f}",
-            "-map", "0:v:0", "-map", "0:a?", "-c", "copy",
-            "-avoid_negative_ts", "make_zero", str(temporary),
+            "ffmpeg", "-y", "-i", str(video),
+            "-filter:v", f"trim=end_frame={target_frames},setpts=PTS-STARTPTS",
+            "-filter:a", f"atrim=duration={target_frames / timeline_fps:.9f},asetpts=PTS-STARTPTS",
+            "-map", "0:v:0", "-map", "0:a?", "-c:v", "libx264",
+            "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart",
+            str(temporary),
         ],
         capture_output=True,
         text=True,
@@ -45,7 +47,7 @@ def trim_excess_to_target(output_dir: Path, target_duration: float | None) -> di
             f"{detail[-1] if detail else 'unknown ffmpeg error'}"
         )
     trimmed = probe_duration(temporary)
-    if trimmed > target + 0.1 or trimmed < target - 1.0:
+    if abs(round(trimmed * timeline_fps) - target_frames) > 1:
         temporary.unlink(missing_ok=True)
         raise RuntimeError(
             f"trimmed assembly duration invalid: target={target:.3f}s actual={trimmed:.3f}s"
@@ -55,7 +57,9 @@ def trim_excess_to_target(output_dir: Path, target_duration: float | None) -> di
         "original_s": round(actual, 3),
         "target_s": round(target, 3),
         "trimmed_s": round(trimmed, 3),
-        "method": "stream_copy",
+        "target_frames": target_frames,
+        "trimmed_frames": round(trimmed * timeline_fps),
+        "method": "frame_exact_reencode",
     }
     (Path(output_dir) / "duration_trim.json").write_text(
         json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -101,6 +105,9 @@ def evaluate_duration_gate(
     target_duration: float | None,
     round_number: int = 0,
     reshoots: list[dict] | None = None,
+    *,
+    timeline_fps: int = 30,
+    tolerance_frames: int = 2,
 ) -> tuple[dict, dict | None]:
     output_dir = Path(output_dir)
     actual = probe_duration(output_dir / "raw_assembly.mp4")
@@ -117,13 +124,21 @@ def evaluate_duration_gate(
         reshoot_plan = None
     else:
         target = float(target_duration)
-        gap = max(0.0, target - actual)
-        passed = actual >= target * 0.9
+        target_frames = round(target * timeline_fps)
+        actual_frames = round(actual * timeline_fps)
+        delta_frames = actual_frames - target_frames
+        gap = max(0.0, -delta_frames / timeline_fps)
+        passed = abs(delta_frames) <= tolerance_frames
         gate = {
             "target_s": round(target, 3),
             "actual_s": round(actual, 3),
             "gap_s": round(gap, 3),
             "passed": passed,
+            "timeline_fps": timeline_fps,
+            "target_frames": target_frames,
+            "actual_frames": actual_frames,
+            "delta_frames": delta_frames,
+            "tolerance_frames": tolerance_frames,
             "reshoots": history,
         }
         reshoot_plan = None if passed else build_reshoot_list(output_dir / "shots", gap, round_number + 1)

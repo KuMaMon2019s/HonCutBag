@@ -79,6 +79,7 @@ def probe_video(video_path: str) -> dict:
             "width": width,
             "height": height,
             "fps": round(fps, 2),
+            "frame_count": round(duration * fps),
             "has_audio": has_audio,
             "has_video": has_video,
         }
@@ -97,7 +98,12 @@ def probe_video(video_path: str) -> dict:
 # ─── Black Frame Detection ───────────────────────────────────────────────────
 
 
-def detect_black_frames(video_path: str, threshold: float = 0.1) -> dict:
+def detect_black_frames(
+    video_path: str,
+    threshold: float = 0.1,
+    *,
+    trim_static_edges: bool = True,
+) -> dict:
     """Detect leading/trailing black or static frames to trim.
 
     Returns: {"trim_start": seconds, "trim_end": seconds}
@@ -133,9 +139,11 @@ def detect_black_frames(video_path: str, threshold: float = 0.1) -> dict:
     except Exception:
         pass
 
-    # Trim static first/last 0.1s (AI videos often have static frames)
-    trim_start = max(trim_start, 0.1)
-    trim_end = max(trim_end, 0.1)
+    # A continuity-finalized clip has already spent its boundary handles.
+    # Preserve its exact frame budget unless blackdetect found real black.
+    if trim_static_edges:
+        trim_start = max(trim_start, 0.1)
+        trim_end = max(trim_end, 0.1)
 
     # Don't trim more than 20%
     max_trim = duration * 0.2
@@ -193,7 +201,20 @@ def build_edit_decisions(
             raise ValueError(
                 f"{shot_dir.name} still requires reshoot: {'; '.join(quality.get('reasons', []))}"
             )
-        trims = detect_black_frames(str(video_path))
+        timing_path = shot_dir / "CONTINUITY_TIMING.json"
+        continuity_timing = None
+        if timing_path.is_file():
+            try:
+                candidate = json.loads(timing_path.read_text(encoding="utf-8"))
+                if candidate.get("internal_seams_finalized") is True:
+                    continuity_timing = candidate
+            except (OSError, json.JSONDecodeError):
+                continuity_timing = None
+        trims = (
+            detect_black_frames(str(video_path), trim_static_edges=False)
+            if continuity_timing is not None
+            else detect_black_frames(str(video_path))
+        )
         in_s = max(float(trims["trim_start"]), float(quality.get("trim_start_s", 0.0)))
         quality_end = float(quality.get("trim_end_s", info["duration"]) or info["duration"])
         out_s = min(info["duration"] - float(trims["trim_end"]), quality_end)
@@ -206,14 +227,15 @@ def build_edit_decisions(
         cut = {
             "source": str(video_path),
             "shot_id": shot_dir.name,
-            "in_seconds": round(in_s, 2),
-            "out_seconds": round(out_s, 2),
+            "in_seconds": round(in_s, 6),
+            "out_seconds": round(out_s, 6),
             "speed": 1.0,
             "has_audio": info["has_audio"],
             "original_duration": info["duration"],
             "trimmed": in_s > 0.15 or out_s < info["duration"] - 0.15,
             "quality_action": quality.get("action", "keep"),
             "quality_reasons": quality.get("reasons", []),
+            "continuity_timing": continuity_timing,
         }
         cuts.append(cut)
 
@@ -246,7 +268,7 @@ def build_edit_decisions(
                 transition_entry = {
                     "index": i,
                     "type": transition_type,
-                    "duration": 0.0 if locked else transition_duration,
+                    "duration": 0.0 if transition_type == "cut" else transition_duration,
                     # A visual hard cut must not imply a hard cut in sound.
                     # Keep picture timing frame-accurate while gently fading
                     # both sides of the audio boundary.  Dissolves retain a
@@ -254,6 +276,9 @@ def build_edit_decisions(
                     "audio_transition": "edge_fade" if transition_type == "cut" else "crossfade",
                     "audio_duration": 0.35 if transition_type == "cut" else transition_duration,
                 }
+                transition_frames = round(float(transition_entry["duration"]) * 30)
+                transition_entry["duration_frames"] = transition_frames
+                transition_entry["duration"] = round(transition_frames / 30, 6)
                 if locked:
                     transition_entry.update(
                         locked=True,
@@ -266,7 +291,7 @@ def build_edit_decisions(
     if target_duration and cuts:
         source_duration = sum(cut["out_seconds"] - cut["in_seconds"] for cut in cuts)
         overlap = sum(
-            0.01 if item["type"] == "cut" else float(item["duration"]) for item in transitions
+            0.0 if item["type"] == "cut" else float(item["duration"]) for item in transitions
         )
         projected = source_duration - overlap
         if projected < float(target_duration):
@@ -275,7 +300,8 @@ def build_edit_decisions(
                 for cut in cuts:
                     cut["speed"] = round(speed, 6)
 
-    timeline = _build_timeline(cuts, transitions)
+    timeline = _build_timeline(cuts, transitions, target_fps=30)
+    projected_frames = timeline[-1]["output_end_frame"] if timeline else 0
     return {
         "cuts": cuts,
         "transitions": transitions,
@@ -287,6 +313,8 @@ def build_edit_decisions(
                 "fit": fit_mode,
             },
             "target_fps": 30,
+            "target_frames": None if target_duration is None else round(target_duration * 30),
+            "projected_frames": projected_frames,
             "target_duration": target_duration,
             "quality_reviewed": bool(quality_report),
             "transition_locks": transition_locks,
@@ -475,6 +503,7 @@ def execute_edit_decisions(edit_decisions: dict, output_path: str) -> dict:
             "version": 1,
             "artifact": output_path.name,
             "duration_s": info["duration"],
+            "duration_frames": round(info["duration"] * tfps),
             "shots": edit_decisions.get("timeline", []),
             "transitions": transitions,
             "compose_target": target,
@@ -506,21 +535,33 @@ def execute_edit_decisions(edit_decisions: dict, output_path: str) -> dict:
 # ─── P2-B: Boundary Frame Consistency Check ──────────────────────────────────
 
 
-def _build_timeline(cuts: list[dict], transitions: list[dict]) -> list[dict]:
+def _build_timeline(
+    cuts: list[dict],
+    transitions: list[dict],
+    *,
+    target_fps: int = 30,
+) -> list[dict]:
     """Build the canonical output-time mapping for all reviewed cuts."""
     transitions_by_index = {int(item["index"]): item for item in transitions}
     entries: list[dict] = []
-    output_start = 0.0
+    output_start_frame = 0
     for index, cut in enumerate(cuts):
         speed = float(cut.get("speed", 1.0) or 1.0)
         source_in = float(cut["in_seconds"])
         source_out = float(cut["out_seconds"])
         output_duration = (source_out - source_in) / speed
-        output_end = output_start + output_duration
+        output_duration_frames = round(output_duration * target_fps)
+        output_end_frame = output_start_frame + output_duration_frames
         transition = transitions_by_index.get(index)
-        overlap = 0.0
+        overlap_frames = 0
         if transition and transition.get("type") != "cut":
-            overlap = min(float(transition.get("duration", 0.0)), output_duration)
+            overlap_frames = min(
+                int(
+                    transition.get("duration_frames")
+                    or round(float(transition.get("duration", 0.0)) * target_fps)
+                ),
+                output_duration_frames,
+            )
         entries.append(
             {
                 "index": index,
@@ -529,13 +570,17 @@ def _build_timeline(cuts: list[dict], transitions: list[dict]) -> list[dict]:
                 "source_in_s": round(source_in, 6),
                 "source_out_s": round(source_out, 6),
                 "speed": speed,
-                "output_start_s": round(output_start, 6),
-                "output_end_s": round(output_end, 6),
-                "output_duration_s": round(output_duration, 6),
-                "overlap_to_next_s": round(overlap, 6),
+                "output_start_frame": output_start_frame,
+                "output_end_frame": output_end_frame,
+                "output_duration_frames": output_duration_frames,
+                "overlap_to_next_frames": overlap_frames,
+                "output_start_s": round(output_start_frame / target_fps, 6),
+                "output_end_s": round(output_end_frame / target_fps, 6),
+                "output_duration_s": round(output_duration_frames / target_fps, 6),
+                "overlap_to_next_s": round(overlap_frames / target_fps, 6),
             }
         )
-        output_start = output_end - overlap
+        output_start_frame = output_end_frame - overlap_frames
     return entries
 
 

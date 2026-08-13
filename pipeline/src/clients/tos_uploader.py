@@ -70,6 +70,12 @@ def _get_tos_config() -> dict:
     }
 
 
+def is_media_upload_configured() -> bool:
+    """Return whether reference media can be uploaded without exposing secrets."""
+    config = _get_tos_config()
+    return all((config["ak"], config["sk"], config["bucket"]))
+
+
 # ─── TOS4-HMAC-SHA256 signing ────────────────────────────────────────────────
 
 def _signing_key(sk: str, date: str, region: str) -> bytes:

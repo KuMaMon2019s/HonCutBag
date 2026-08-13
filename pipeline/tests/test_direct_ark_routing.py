@@ -38,6 +38,7 @@ from runtime.capacity import (
     SlotTable,
 )
 from runtime.generation_tasks import GenerationTaskStore
+from runtime.execution_errors import ProviderPreparationError
 from runtime.seedance_execution import (
     ProviderEndpointChangedError,
     SubmissionUncertainError,
@@ -940,6 +941,9 @@ def test_seedance_http_400_is_definite_rejection_not_uncertain_submission():
     assert _provider_rejected_submission(
         TimeoutError("connection closed before submission response")
     ) is False
+    assert _provider_rejected_submission(
+        ProviderPreparationError("tail anchor extraction failed")
+    ) is True
 
 
 def test_task_store_releases_only_uncertain_task_without_provider_job(tmp_path):
@@ -1236,6 +1240,44 @@ def test_uncertain_seedance_submission_blocks_automatic_resubmit(tmp_path):
 
     assert calls == ["submit"]
     assert _enqueue_runtime_video(store).task.status == "submission_uncertain"
+
+
+def test_seedance_local_preparation_failure_is_safe_to_retry(tmp_path):
+    store = GenerationTaskStore(tmp_path / "runtime.db")
+    arguments = {
+        "run_id": "run-1",
+        "resource_id": "S01",
+        "payload": {"shot_id": "S01"},
+        "provider_endpoint": "https://seedance.test",
+        "output_path": tmp_path / "output.mp4",
+        "poll": lambda provider_job_id: "https://video.test/output.mp4",
+        "download": lambda url, path: Path(path).write_bytes(b"video") or path,
+    }
+
+    with pytest.raises(ProviderPreparationError, match="tail anchor"):
+        execute_seedance_video_task(
+            store,
+            submit=lambda: (_ for _ in ()).throw(
+                ProviderPreparationError("tail anchor extraction failed")
+            ),
+            **arguments,
+        )
+
+    with sqlite3.connect(store.database_path) as connection:
+        failed_status, failed_provider_job_id = connection.execute(
+            "SELECT status, provider_job_id FROM generation_tasks ORDER BY queued_at LIMIT 1"
+        ).fetchone()
+    assert failed_status == "failed"
+    assert failed_provider_job_id is None
+
+    recovered = execute_seedance_video_task(
+        store,
+        submit=lambda: "provider-job-1",
+        **arguments,
+    )
+
+    assert recovered.provider_job_id == "provider-job-1"
+    assert store.get(recovered.task_id).status == "succeeded"
 
 
 def test_seedance_resume_refuses_a_changed_provider_endpoint(tmp_path):

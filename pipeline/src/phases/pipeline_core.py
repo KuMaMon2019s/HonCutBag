@@ -207,16 +207,27 @@ def _probe_av_durations(path: Path) -> dict[str, float | None]:
     return durations
 
 
-def _assert_duration_conserved(before: dict[str, float | None], after: dict[str, float | None], tolerance_s: float = 1.0) -> None:
+def _assert_duration_conserved(
+    before: dict[str, float | None],
+    after: dict[str, float | None],
+    tolerance_s: float = 1.0,
+    *,
+    audio_tolerance_s: float | None = None,
+) -> None:
     """Assert final encoding conserved video and audio durations independently."""
     for kind in ("video", "audio"):
         expected, actual = before.get(kind), after.get(kind)
+        tolerance = (
+            audio_tolerance_s
+            if kind == "audio" and audio_tolerance_s is not None
+            else tolerance_s
+        )
         if expected is None:
             continue
-        if actual is None or abs(actual - expected) > tolerance_s:
+        if actual is None or abs(actual - expected) > tolerance:
             raise RuntimeError(
                 f"Final {kind} duration changed from {expected:.3f}s to "
-                f"{actual if actual is not None else 'missing'} (tolerance ±{tolerance_s:.1f}s)"
+                f"{actual if actual is not None else 'missing'} (tolerance ±{tolerance:.3f}s)"
             )
 
 
@@ -2557,6 +2568,11 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
             output_dir / "CONTINUITY_PLAN.json",
             storyboard_for_consistency,
             scene_consistency,
+            continuation_overlap_s=(
+                float(os.environ.get("HONCUT_CONTINUITY_OVERLAP_SECONDS", "2.0"))
+                if os.environ.get("HONCUT_CONTINUITY_BRIDGE", "off").strip().lower() == "auto"
+                else 0.0
+            ),
         )
         outputs.append("CONTINUITY_PLAN.json")
         print("  ✓ 连续性计划: CONTINUITY_PLAN.json")
@@ -5696,7 +5712,14 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             raise RuntimeError(f"Final encoding failed: {result.stderr[-1000:]}")
 
         encoded_durations = _probe_av_durations(Path(final_encoded))
-        _assert_duration_conserved(encode_input_durations, encoded_durations, tolerance_s=1.0)
+        duration_tolerance_s = 2 / float(profile["fps"])
+        audio_duration_tolerance_s = max(duration_tolerance_s, 0.05)
+        _assert_duration_conserved(
+            encode_input_durations,
+            encoded_durations,
+            tolerance_s=duration_tolerance_s,
+            audio_tolerance_s=audio_duration_tolerance_s,
+        )
 
         # Only promote the encoded artifact after its independent A/V duration
         # assertions pass.  The delivery gate deliberately probes polished.mp4.
@@ -5710,7 +5733,15 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
         }
         duration_gate_passed = all(
             encode_input_durations[kind] is None
-            or (polished_durations[kind] is not None and duration_deltas[kind] <= 1.0)
+            or (
+                polished_durations[kind] is not None
+                and duration_deltas[kind]
+                <= (
+                    audio_duration_tolerance_s
+                    if kind == "audio"
+                    else duration_tolerance_s
+                )
+            )
             for kind in ("video", "audio")
         )
         requested_duration_delta = (
@@ -5718,7 +5749,9 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             else round(abs(polished_durations["video"] - float(target_duration)), 6)
         )
         if requested_duration_delta is not None:
-            duration_gate_passed = duration_gate_passed and requested_duration_delta <= 1.0
+            duration_gate_passed = (
+                duration_gate_passed and requested_duration_delta <= duration_tolerance_s
+            )
         final_duration_gate = {
             "passed": duration_gate_passed,
             "artifact": "polished.mp4",
@@ -5727,13 +5760,22 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             "absolute_delta_s": duration_deltas,
             "requested_duration_s": target_duration,
             "requested_duration_delta_s": requested_duration_delta,
-            "tolerance_s": 1.0,
+            "tolerance_s": {
+                "video": duration_tolerance_s,
+                "audio": audio_duration_tolerance_s,
+            },
+            "tolerance_frames": 2,
             "basis": "Phase 9 encode input plus the requested delivery duration",
         }
         (output_dir / "final_duration_gate.json").write_text(
             json.dumps(final_duration_gate, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        _assert_duration_conserved(encode_input_durations, polished_durations, tolerance_s=1.0)
+        _assert_duration_conserved(
+            encode_input_durations,
+            polished_durations,
+            tolerance_s=duration_tolerance_s,
+            audio_tolerance_s=audio_duration_tolerance_s,
+        )
         if not duration_gate_passed:
             raise RuntimeError(
                 f"Final duration gate failed: target={target_duration}, actual={polished_durations}"

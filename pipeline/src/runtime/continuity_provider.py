@@ -25,9 +25,135 @@ from runtime.continuity_chunks import (
     ChunkExecutionResult,
     execute_continuity_plan,
 )
+from runtime.execution_errors import ProviderPreparationError
 from runtime.generation_tasks import GenerationTaskStore
 from runtime.seedance_execution import execute_seedance_video_task
 from schemas.continuity import ContinuityPlan
+
+CONTINUITY_BRIDGE_ENV = "HONCUT_CONTINUITY_BRIDGE"
+CONTINUITY_BRIDGE_MODES = {"off", "auto"}
+
+
+def probe_continuity_frames(path: Path, timeline_fps: int) -> dict[str, Any]:
+    """Count decoded video frames; duration metadata is only a fallback."""
+    completed = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-count_frames",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=nb_read_frames,nb_frames,avg_frame_rate,duration",
+            "-of",
+            "json",
+            str(path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(f"cannot count continuity frames in {path}")
+    streams = json.loads(completed.stdout).get("streams") or []
+    if not streams:
+        raise RuntimeError(f"continuity artifact has no video stream: {path}")
+    stream = streams[0]
+    frames = stream.get("nb_read_frames") or stream.get("nb_frames")
+    if frames in (None, "N/A"):
+        duration = float(stream.get("duration") or 0.0)
+        frames = round(duration * timeline_fps)
+    numerator, denominator = str(stream.get("avg_frame_rate") or f"{timeline_fps}/1").split(
+        "/", 1
+    )
+    source_fps = float(numerator) / max(float(denominator), 1.0)
+    return {
+        "frames": int(frames),
+        "duration_s": round(int(frames) / source_fps, 6),
+        "source_fps": round(source_fps, 6),
+    }
+
+
+def finalize_continuity_shot(
+    output_path: Path,
+    target_frames: int,
+    timeline_fps: int,
+) -> dict[str, Any]:
+    """Close a materialized editorial shot to its exact frame budget."""
+    before = probe_continuity_frames(output_path, timeline_fps)
+    actual_frames = int(before["frames"])
+    delta = target_frames - actual_frames
+    if delta == 0:
+        return {
+            "method": "none",
+            "before_frames": actual_frames,
+            "target_frames": target_frames,
+            "after_frames": actual_frames,
+        }
+    if delta > max(2, math.ceil(target_frames * 0.02)):
+        raise RuntimeError(
+            f"{output_path.parent.name} is short by {delta} frames; "
+            "additional continuation generation is required"
+        )
+
+    temporary = output_path.with_name(f"{output_path.stem}.duration_closure{output_path.suffix}")
+    if delta < 0:
+        video_filter = f"trim=end_frame={target_frames},setpts=PTS-STARTPTS"
+        method = "exact_tail_trim"
+    else:
+        stretch = target_frames / actual_frames
+        video_filter = (
+            f"setpts={stretch:.12f}*PTS,fps={timeline_fps},"
+            f"trim=end_frame={target_frames},setpts=PTS-STARTPTS"
+        )
+        method = "bounded_micro_retime"
+    completed = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(output_path),
+            "-vf",
+            video_filter,
+            "-frames:v",
+            str(target_frames),
+            "-an",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(temporary),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    if completed.returncode != 0 or not temporary.is_file() or temporary.stat().st_size == 0:
+        temporary.unlink(missing_ok=True)
+        detail = completed.stderr.strip().splitlines()
+        raise RuntimeError(
+            f"cannot close {output_path.parent.name} duration: "
+            f"{detail[-1] if detail else 'unknown ffmpeg error'}"
+        )
+    after = probe_continuity_frames(temporary, timeline_fps)
+    if int(after["frames"]) != target_frames:
+        temporary.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"duration closure produced {after['frames']} frames, expected {target_frames}"
+        )
+    os.replace(temporary, output_path)
+    return {
+        "method": method,
+        "before_frames": actual_frames,
+        "target_frames": target_frames,
+        "after_frames": int(after["frames"]),
+        "adjustment_frames": delta,
+    }
 
 
 def _read_shot_meta(output_dir: Path, shot_id: str) -> dict[str, Any]:
@@ -41,11 +167,21 @@ def _read_shot_meta(output_dir: Path, shot_id: str) -> dict[str, Any]:
     return value
 
 
-def _scene_seed(request: ChunkExecutionRequest) -> int | None:
+def _generation_seed(request: ChunkExecutionRequest) -> int | None:
     scene = str(request.anchors.get("scene") or "").strip()
     if not scene:
         return None
-    return int(hashlib.sha256(scene.encode()).hexdigest()[:8], 16) % 2_147_483_647
+    seed_material = json.dumps(
+        {
+            "scene": scene,
+            "chunk_id": request.chunk.chunk_id,
+            "repair_attempt": request.repair_attempt,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return int(hashlib.sha256(seed_material.encode()).hexdigest()[:8], 16) % 2_147_483_647
 
 
 def _chunk_duration(request: ChunkExecutionRequest) -> int:
@@ -67,9 +203,16 @@ def _chunk_prompt(request: ChunkExecutionRequest, shot_meta: dict[str, Any]) -> 
         if request.chunk.mode == "fresh"
         else "Continue directly from the reference video's final state without a reset or cut."
     )
+    repair = ""
+    if request.repair_attempt > 0:
+        repair = (
+            "\n[approved seam repair] Preserve subject position, scale, orientation, "
+            "screen direction, camera framing, lighting, and surrounding motion state. "
+            "Do not skip forward in time or reposition the subject before continuing."
+        )
     return (
         f"{prompt}\n\n[continuity chunk {request.chunk.sequence}] {continuation}\n"
-        f"{request.memory_context}"
+        f"{request.memory_context}{repair}"
     )
 
 
@@ -97,16 +240,57 @@ def _extension_content(
     previous_output_path: Path,
 ) -> list[dict[str, Any]]:
     from clients.tos_uploader import upload_media_file
+    from quality.continuity_seam import (
+        extract_ordered_video_frames,
+        extract_video_tail_window,
+    )
 
-    video_url = upload_media_file(previous_output_path, prefix="volcengine/video")
+    with previous_output_path.open("rb") as predecessor:
+        predecessor_hash = hashlib.file_digest(predecessor, "sha256").hexdigest()
+    anchor_dir = previous_output_path.parent / "continuity_anchors"
+    asset_stem = f"{previous_output_path.stem}_{predecessor_hash[:16]}_tail_2000ms"
+    tail_video_path = anchor_dir / f"{asset_stem}.mp4"
+    if not tail_video_path.is_file() or tail_video_path.stat().st_size == 0:
+        extract_video_tail_window(previous_output_path, tail_video_path, window_s=2.0)
+    frame_paths = tuple(anchor_dir / f"{asset_stem}_frame_{index:02d}.jpg" for index in range(1, 4))
+    if any(not path.is_file() or path.stat().st_size == 0 for path in frame_paths):
+        extract_ordered_video_frames(tail_video_path, frame_paths)
+    video_url = upload_media_file(tail_video_path, prefix="volcengine/video")
     if not video_url:
-        raise RuntimeError(f"failed to upload continuity predecessor {previous_output_path}")
-    normalized: list[dict[str, Any]] = []
+        raise RuntimeError(f"failed to upload continuity tail window {tail_video_path}")
+    frame_urls = []
+    for path in frame_paths:
+        url = upload_media_file(path, prefix="volcengine/image")
+        if not url:
+            raise RuntimeError(f"failed to upload ordered continuity anchor {path}")
+        frame_urls.append(url)
+
+    directive = (
+        "向后延长视频1。图片1、图片2、图片3是视频1末段按时间先后顺序截取的状态帧，"
+        "只用于判断主体的速度、方向和连续运动。新生成内容的第一帧必须紧接视频1最后一帧，"
+        "并严格参考图片3的最终状态；保持主体位置、大小、朝向、水波相位、机位和灯光，"
+        "继续最后的速度与方向。不得重播视频1中的运动轨迹，不得回到图片1或更早位置，"
+        "不得让主体重新入画。\n"
+    )
+    text_items = [dict(item) for item in content if item.get("type") == "text"]
+    normalized: list[dict[str, Any]] = text_items or [{"type": "text", "text": ""}]
+    text_item = next((item for item in normalized if item.get("type") == "text"), None)
+    if text_item is not None:
+        text_item["text"] = f"{directive}{text_item.get('text', '')}"
+    normalized.extend(
+        {
+            "type": "image_url",
+            "image_url": {"url": url},
+            "role": "reference_image",
+        }
+        for url in frame_urls
+    )
     for item in content:
+        if item.get("type") != "image_url":
+            continue
         copied = dict(item)
-        if copied.get("type") == "image_url":
-            copied["role"] = "reference_image"
-            copied.pop("priority", None)
+        copied["role"] = "reference_image"
+        copied.pop("priority", None)
         normalized.append(copied)
     normalized.append(
         {
@@ -128,7 +312,7 @@ def _provider_content(
         if request.previous_output_path is None:
             raise RuntimeError(f"{request.resource_id} has no predecessor video")
         content = _extension_content(content, request.previous_output_path)
-    return content, shot_meta, _scene_seed(request), _chunk_duration(request)
+    return content, shot_meta, _generation_seed(request), _chunk_duration(request)
 
 
 def _task_payload(
@@ -146,13 +330,24 @@ def _task_payload(
         "output_path": str(request.output_path),
         "model": model,
         "mode": request.chunk.mode,
+        "continuation_contract": (
+            "tail_window_ordered_frames_v1" if request.chunk.mode == "native_extend" else None
+        ),
+        "tail_window_seconds": 2.0 if request.chunk.mode == "native_extend" else None,
+        "ordered_frame_fractions": (
+            [0.2, 0.6, 0.95] if request.chunk.mode == "native_extend" else None
+        ),
         "duration": duration,
         "seed": seed,
         "repair_attempt": request.repair_attempt,
     }
 
 
-def _provider_input_context(output_dir: Path, shot_id: str) -> dict[str, str | None]:
+def _provider_input_context(
+    output_dir: Path,
+    shot_id: str,
+    chunk_id: str,
+) -> dict[str, str | None]:
     shot_meta = output_dir / "shots" / shot_id / "SHOT_META.json"
     storyboard_frame = output_dir / "storyboard_images" / f"{shot_id}.png"
     return {
@@ -162,6 +357,11 @@ def _provider_input_context(output_dir: Path, shot_id: str) -> dict[str, str | N
             if storyboard_frame.is_file()
             else None
         ),
+        "chunk_id": chunk_id,
+        "generation_seed_strategy": "scene_chunk_repair_v1",
+        "continuation_contract": "tail_window_ordered_frames_v1",
+        "tail_window_seconds": "2.0",
+        "ordered_frame_fractions": "0.2,0.6,0.95",
     }
 
 
@@ -180,12 +380,20 @@ def _direct_seedance_executor(
     leases = CrossProcessSlotTable(default_capacity_lease_path())
 
     def execute(request: ChunkExecutionRequest) -> ChunkExecutionResult:
-        seed = _scene_seed(request)
+        seed = _generation_seed(request)
         duration = _chunk_duration(request)
         payload = _task_payload(request, model=model, duration=duration, seed=seed)
 
         def submit() -> str:
-            content, _shot_meta, _seed, _duration = _provider_content(output_dir, request)
+            try:
+                content, _shot_meta, _seed, _duration = _provider_content(
+                    output_dir,
+                    request,
+                )
+            except Exception as exc:
+                raise ProviderPreparationError(
+                    f"cannot prepare provider content for {request.resource_id}: {exc}"
+                ) from exc
             return seedance_client.submit_content(
                 content,
                 api_key=api_key,
@@ -231,7 +439,7 @@ def _bridge_seedance_executor(
     slots = SlotTable()
 
     def execute(request: ChunkExecutionRequest) -> ChunkExecutionResult:
-        seed = _scene_seed(request)
+        seed = _generation_seed(request)
         duration = _chunk_duration(request)
         model = "seedance"
         payload = _task_payload(request, model=model, duration=duration, seed=seed)
@@ -319,6 +527,97 @@ def materialize_continuity_shot(
     os.replace(temporary, output_path)
 
 
+def _file_sha256(path: Path) -> str:
+    with path.open("rb") as source:
+        return hashlib.file_digest(source, "sha256").hexdigest()
+
+
+def _continuity_bridge_preparer(
+    output_dir: Path,
+) -> Callable[[Path, Path, str], dict[str, Any]] | None:
+    """Build the optional local trim/interpolation step used before seam scoring."""
+    mode = os.environ.get(CONTINUITY_BRIDGE_ENV, "off").strip().lower()
+    if mode not in CONTINUITY_BRIDGE_MODES:
+        expected = ", ".join(sorted(CONTINUITY_BRIDGE_MODES))
+        raise ValueError(f"{CONTINUITY_BRIDGE_ENV} must be one of {expected}, got {mode!r}")
+    if mode == "off":
+        return None
+    raw_candidates = os.environ.get("HONCUT_CONTINUITY_BRIDGE_FRAMES", "4,6,8")
+    try:
+        candidate_frames = tuple(int(item.strip()) for item in raw_candidates.split(","))
+    except ValueError as exc:
+        raise ValueError(
+            "HONCUT_CONTINUITY_BRIDGE_FRAMES must be comma-separated integers"
+        ) from exc
+    candidate_frames = tuple(sorted(set(candidate_frames)))
+    if not candidate_frames or any(frame < 4 or frame > 24 for frame in candidate_frames):
+        raise ValueError("HONCUT_CONTINUITY_BRIDGE_FRAMES values must be between 4 and 24")
+
+    def prepare(previous: Path, following: Path, boundary_id: str) -> dict[str, Any]:
+        from quality.continuity_bridge import detect_replayed_prefix, repair_continuity_boundary
+
+        boundary_dir = output_dir / "continuity_bridges" / boundary_id
+        output_path = boundary_dir / "effective_following.mp4"
+        receipt_path = boundary_dir / "CONTINUITY_BRIDGE.json"
+        input_fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "previous_sha256": _file_sha256(previous),
+                    "following_sha256": _file_sha256(following),
+                    "candidate_frames": candidate_frames,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        if receipt_path.is_file():
+            cached = json.loads(receipt_path.read_text(encoding="utf-8"))
+            cached_output = Path(str(cached.get("output_path") or following))
+            if (
+                cached.get("status") != "fallback"
+                and cached.get("input_fingerprint") == input_fingerprint
+                and cached_output.is_file()
+                and cached_output.stat().st_size > 0
+            ):
+                return cached
+
+        boundary_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            overlap = detect_replayed_prefix(previous, following)
+            if not overlap["detected"]:
+                receipt = {
+                    "kind": "honcut.continuity_bridge.v1",
+                    "status": "skipped",
+                    "reason": overlap["reason"],
+                    "overlap": overlap,
+                    "input_fingerprint": input_fingerprint,
+                    "output_path": str(following),
+                }
+            else:
+                receipt = repair_continuity_boundary(
+                    previous,
+                    following,
+                    output_path,
+                    work_dir=boundary_dir / "work",
+                    overlap_seconds=float(overlap["overlap_seconds"]),
+                    candidate_frames=candidate_frames,
+                )
+                receipt["input_fingerprint"] = input_fingerprint
+                receipt["overlap"] = overlap
+        except Exception as exc:
+            receipt = {
+                "kind": "honcut.continuity_bridge.v1",
+                "status": "fallback",
+                "reason": f"local continuity bridge failed: {exc}",
+                "input_fingerprint": input_fingerprint,
+                "output_path": str(following),
+            }
+        receipt_path.write_text(json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf-8")
+        return receipt
+
+    return prepare
+
+
 def execute_phase6_auto_continuity(
     output_dir: str | Path,
     plan: ContinuityPlan,
@@ -327,27 +626,59 @@ def execute_phase6_auto_continuity(
     """Run calibrated continuity generation through exactly one configured provider."""
     root = Path(output_dir)
     provider = os.environ.get("VIDEO_PROVIDER", "seedance").strip().lower()
-    task_store = GenerationTaskStore(root / "runtime.db")
     if provider == "seedance":
-        execute_chunk = _direct_seedance_executor(root, task_store)
+        executor_factory = _direct_seedance_executor
     elif provider == "bridge":
-        execute_chunk = _bridge_seedance_executor(root, task_store)
+        executor_factory = _bridge_seedance_executor
     else:
         raise RuntimeError(
             "continuity auto requires VIDEO_PROVIDER=seedance or bridge; "
             f"{provider!r} has no verified native video-extension contract"
         )
 
+    requires_video_upload = any(
+        chunk.mode == "native_extend" for shot in plan.shots for chunk in shot.chunks
+    )
+    if requires_video_upload:
+        from clients.tos_uploader import is_media_upload_configured
+
+        if not is_media_upload_configured():
+            raise RuntimeError(
+                "continuity auto preflight requires TOS_ACCESS_KEY, "
+                "TOS_SECRET_KEY, and TOS_BUCKET before any paid provider "
+                "submission for native_extend chunks"
+            )
+
+    prepare_seam = _continuity_bridge_preparer(root)
+    if prepare_seam is not None and any(
+        len(shot.chunks) > 1
+        and all(chunk.expected_overlap_frames == 0 for chunk in shot.chunks[1:])
+        for shot in plan.shots
+    ):
+        raise RuntimeError(
+            "continuity bridge requires an overlap-budgeted CONTINUITY_PLAN.json; "
+            "rerun Phase 4 with HONCUT_CONTINUITY_BRIDGE=auto"
+        )
+    task_store = GenerationTaskStore(root / "runtime.db")
+    execute_chunk = executor_factory(root, task_store)
+
     max_repairs = int(os.environ.get("HONCUT_CONTINUITY_MAX_REPAIRS", "1"))
-    if not 0 <= max_repairs <= 2:
-        raise ValueError("HONCUT_CONTINUITY_MAX_REPAIRS must be between 0 and 2")
+    if not 0 <= max_repairs <= 3:
+        raise ValueError("HONCUT_CONTINUITY_MAX_REPAIRS must be between 0 and 3")
     workers = max(1, int(os.environ.get("VIDEO_GEN_CONCURRENCY", "1")))
     report = execute_continuity_plan(
         plan,
         root,
         execute_chunk=execute_chunk,
+        prepare_seam=prepare_seam,
         materialize_shot=materialize_continuity_shot,
-        chunk_context=lambda shot, _chunk: _provider_input_context(root, shot.shot_id),
+        probe_frames=probe_continuity_frames,
+        finalize_shot=finalize_continuity_shot,
+        chunk_context=lambda shot, chunk: _provider_input_context(
+            root,
+            shot.shot_id,
+            chunk.chunk_id,
+        ),
         seam_calibration=calibration.model_dump(mode="json"),
         max_seam_repairs=max_repairs,
         max_workers=workers,
@@ -356,6 +687,7 @@ def execute_phase6_auto_continuity(
         {
             "provider": provider,
             "mode": "continuity_auto",
+            "continuity_bridge": os.environ.get(CONTINUITY_BRIDGE_ENV, "off").strip().lower(),
             "calibration_fingerprint": calibration.dataset_fingerprint,
         }
     )

@@ -31,6 +31,9 @@ class GenerationChunk(BaseModel):
     chunk_id: str = Field(min_length=1)
     sequence: int = Field(ge=1)
     target_duration_s: float = Field(gt=0)
+    requested_frames: int | None = Field(default=None, gt=0)
+    expected_overlap_frames: int = Field(default=0, ge=0)
+    expected_unique_frames: int | None = Field(default=None, gt=0)
     mode: ContinuityMode
     depends_on: str | None = None
 
@@ -40,6 +43,11 @@ class GenerationChunk(BaseModel):
             raise ValueError("fresh chunks cannot depend on a previous chunk")
         if self.mode == "native_extend" and not self.depends_on:
             raise ValueError("native_extend chunks require depends_on")
+        if self.mode == "fresh" and self.expected_overlap_frames:
+            raise ValueError("fresh chunks cannot reserve replay overlap")
+        if self.requested_frames is not None and self.expected_unique_frames is not None:
+            if self.expected_unique_frames != self.requested_frames - self.expected_overlap_frames:
+                raise ValueError("expected unique frames must equal requested frames minus overlap")
         return self
 
 
@@ -50,6 +58,7 @@ class ContinuityShot(BaseModel):
 
     shot_id: str = Field(min_length=1)
     target_duration_s: float = Field(gt=0)
+    target_frames: int | None = Field(default=None, gt=0)
     boundary_before: BoundaryKind = "cut"
     anchors: ContinuityAnchors = Field(default_factory=ContinuityAnchors)
     chunks: list[GenerationChunk] = Field(min_length=1)
@@ -68,7 +77,11 @@ class ContinuityShot(BaseModel):
                 raise ValueError("chunks must form one ordered fresh -> native_extend chain")
             seen.add(chunk.chunk_id)
             expected_dependency = chunk.chunk_id
-        if not math.isclose(
+        unique_frames = [chunk.expected_unique_frames for chunk in self.chunks]
+        if self.target_frames is not None and all(value is not None for value in unique_frames):
+            if sum(int(value) for value in unique_frames) != self.target_frames:
+                raise ValueError("chunk unique frames must add up to the editorial shot frame budget")
+        elif not math.isclose(
             sum(chunk.target_duration_s for chunk in self.chunks),
             self.target_duration_s,
             abs_tol=1e-6,
@@ -84,6 +97,7 @@ class ContinuityPlan(BaseModel):
 
     version: Literal[1] = 1
     provider_chunk_limit_s: float = Field(gt=0)
+    timeline_fps: int = Field(default=24, gt=0)
     shots: list[ContinuityShot] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -94,9 +108,17 @@ class ContinuityPlan(BaseModel):
             if shot.shot_id in shot_ids:
                 raise ValueError(f"duplicate shot_id: {shot.shot_id}")
             shot_ids.add(shot.shot_id)
+            if shot.target_frames is not None:
+                expected_target = round(shot.target_duration_s * self.timeline_fps)
+                if abs(shot.target_frames - expected_target) > 1:
+                    raise ValueError(f"{shot.shot_id} target frame budget disagrees with duration")
             for chunk in shot.chunks:
                 if chunk.target_duration_s > self.provider_chunk_limit_s + 1e-6:
                     raise ValueError(f"{chunk.chunk_id} exceeds provider chunk duration limit")
+                if chunk.requested_frames is not None:
+                    expected_requested = round(chunk.target_duration_s * self.timeline_fps)
+                    if chunk.requested_frames != expected_requested:
+                        raise ValueError(f"{chunk.chunk_id} requested frames disagree with duration")
                 if chunk.chunk_id in chunk_ids:
                     raise ValueError(f"duplicate chunk_id: {chunk.chunk_id}")
                 chunk_ids.add(chunk.chunk_id)

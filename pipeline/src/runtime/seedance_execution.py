@@ -10,6 +10,7 @@ from typing import Any
 
 from runtime.execution_errors import (
     ProviderEndpointChangedError,
+    ProviderPreparationError,
     SubmissionUncertainError,
 )
 from runtime.generation_tasks import GenerationTaskStore
@@ -41,6 +42,8 @@ def _matches_succeeded_output(path: Path, expected_hash: Any) -> bool:
 
 
 def _provider_rejected_submission(error: Exception) -> bool:
+    if isinstance(error, ProviderPreparationError):
+        return True
     message = str(error)
     rejection_markers = (
         "Seedance API 400",

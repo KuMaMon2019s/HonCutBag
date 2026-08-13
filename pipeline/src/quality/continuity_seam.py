@@ -134,7 +134,94 @@ def _video_duration(video_path: Path) -> float:
     return float(completed.stdout.strip().splitlines()[0])
 
 
+def _sample_video_frames(
+    video_path: Path,
+    *,
+    frames_per_second: int = 4,
+    width: int = 96,
+    height: int = 54,
+) -> np.ndarray:
+    completed = subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-i",
+            str(video_path),
+            "-vf",
+            f"fps={frames_per_second},scale={width}:{height}",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "pipe:1",
+        ],
+        check=False,
+        capture_output=True,
+        timeout=120,
+    )
+    frame_bytes = width * height * 3
+    if completed.returncode != 0 or len(completed.stdout) < frame_bytes * 2:
+        detail = completed.stderr.decode(errors="replace").strip().splitlines()
+        raise RuntimeError(
+            f"cannot sample continuation trajectory from {video_path}: "
+            f"{detail[-1] if detail else 'fewer than two decoded frames'}"
+        )
+    usable_bytes = len(completed.stdout) - (len(completed.stdout) % frame_bytes)
+    return np.frombuffer(completed.stdout[:usable_bytes], dtype=np.uint8).reshape(
+        -1,
+        height,
+        width,
+        3,
+    )
+
+
+def measure_video_replay_similarity(
+    previous_video: Path,
+    following_video: Path,
+) -> dict[str, Any]:
+    """Measure whether an extension replays its predecessor's aligned trajectory.
+
+    This is deliberately a human-review signal, not an automatic retry trigger:
+    locked cameras and very subtle action can legitimately look similar.
+    """
+    previous = _sample_video_frames(previous_video).astype(np.float32) / 255.0
+    following = _sample_video_frames(following_video).astype(np.float32) / 255.0
+    aligned_count = min(len(previous), len(following))
+    previous = previous[:aligned_count]
+    following = following[:aligned_count]
+    previous_motion = np.diff(previous, axis=0)
+    following_motion = np.diff(following, axis=0)
+    denominator = float(
+        np.linalg.norm(previous_motion) * np.linalg.norm(following_motion)
+    )
+    motion_cosine = (
+        float(np.sum(previous_motion * following_motion) / denominator)
+        if denominator > 1e-9
+        else 0.0
+    )
+    frame_similarity = 1.0 - float(np.abs(previous - following).mean())
+    previous_energy = float(np.abs(previous_motion).mean())
+    following_energy = float(np.abs(following_motion).mean())
+    likely_replay = (
+        aligned_count >= 8
+        and frame_similarity >= 0.95
+        and motion_cosine >= 0.75
+        and min(previous_energy, following_energy) >= 0.003
+    )
+    return {
+        "aligned_frame_count": aligned_count,
+        "aligned_frame_similarity": round(frame_similarity, 6),
+        "motion_cosine_similarity": round(motion_cosine, 6),
+        "previous_motion_energy": round(previous_energy, 6),
+        "following_motion_energy": round(following_energy, 6),
+        "likely_replay": likely_replay,
+        "policy": "human_review_only",
+    }
+
+
 def _extract_frame(video_path: Path, timestamp: float, output_path: Path) -> None:
+    output_path.unlink(missing_ok=True)
     completed = subprocess.run(
         [
             "ffmpeg",
@@ -154,12 +241,108 @@ def _extract_frame(video_path: Path, timestamp: float, output_path: Path) -> Non
         text=True,
         timeout=120,
     )
-    if completed.returncode != 0 or not output_path.is_file():
+    if (
+        completed.returncode != 0
+        or not output_path.is_file()
+        or output_path.stat().st_size == 0
+    ):
         detail = completed.stderr.strip().splitlines()
+        output_path.unlink(missing_ok=True)
         raise RuntimeError(
             f"cannot extract seam frame from {video_path}: "
             f"{detail[-1] if detail else 'unknown ffmpeg error'}"
         )
+
+
+def extract_video_tail_frame(video_path: Path, output_path: Path) -> Path:
+    """Extract a deterministic near-final frame for provider continuation anchoring."""
+    duration = _video_duration(video_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    last_error: RuntimeError | None = None
+    for distance_from_end in (0.08, 0.16, 0.25):
+        try:
+            _extract_frame(
+                video_path,
+                max(0.0, duration - distance_from_end),
+                output_path,
+            )
+            return output_path
+        except RuntimeError as exc:
+            last_error = exc
+    if last_error is None:  # pragma: no cover - the fixed candidate list is non-empty
+        raise RuntimeError(f"cannot extract tail frame from {video_path}")
+    raise last_error
+
+
+def extract_video_tail_window(
+    video_path: Path,
+    output_path: Path,
+    *,
+    window_s: float = 1.5,
+) -> Path:
+    """Render an exact, video-only tail window for continuation conditioning."""
+    if window_s <= 0:
+        raise ValueError("tail window duration must be positive")
+    source_duration = _video_duration(video_path)
+    actual_window = min(window_s, source_duration)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.unlink(missing_ok=True)
+    completed = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(video_path),
+            "-ss",
+            f"{max(0.0, source_duration - actual_window):.6f}",
+            "-t",
+            f"{actual_window:.6f}",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    if (
+        completed.returncode != 0
+        or not output_path.is_file()
+        or output_path.stat().st_size == 0
+    ):
+        detail = completed.stderr.strip().splitlines()
+        output_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"cannot extract tail video window from {video_path}: "
+            f"{detail[-1] if detail else 'unknown ffmpeg error'}"
+        )
+    return output_path
+
+
+def extract_ordered_video_frames(
+    video_path: Path,
+    output_paths: Sequence[Path],
+    *,
+    fractions: Sequence[float] = (0.2, 0.6, 0.95),
+) -> tuple[Path, ...]:
+    """Extract ordered state anchors across a short reference video."""
+    if len(output_paths) != len(fractions) or not output_paths:
+        raise ValueError("output paths and frame fractions must have equal non-zero length")
+    if any(not 0.0 <= fraction <= 1.0 for fraction in fractions):
+        raise ValueError("frame fractions must be between 0 and 1")
+    duration = _video_duration(video_path)
+    extracted = []
+    for path, fraction in zip(output_paths, fractions, strict=True):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _extract_frame(video_path, max(0.0, duration * fraction - 0.001), path)
+        extracted.append(path)
+    return tuple(extracted)
 
 
 def measure_video_seam(
@@ -187,4 +370,5 @@ def measure_video_seam(
         "tail_frames": [str(path) for path in tail_paths],
         "head_frames": [str(path) for path in head_paths],
         "metrics": compare_frame_sequences(tail_paths, head_paths),
+        "replay": measure_video_replay_similarity(previous_video, following_video),
     }
