@@ -4402,6 +4402,16 @@ def run_phase8(output_dir: Path, dry_run: bool,
                 "clip_count": len(edit_decisions["cuts"]),
                 "transition_selections": selected_transitions or None,
                 "edit_decisions_segments": reviewed_edit.get("segments"),
+                "audio_transition_policy": edit_decisions.get("metadata", {}).get(
+                    "audio_transition_policy"
+                ),
+                "audio_transition_counts": {
+                    kind: sum(
+                        item.get("audio_transition") == kind
+                        for item in edit_decisions.get("transitions", [])
+                    )
+                    for kind in ("edge_fade", "crossfade")
+                },
                 "frame_analysis": frame_report.get("summary", {}),
                 "reshoot_history": reshoot_history,
                 "audio_layer": audio_receipt,

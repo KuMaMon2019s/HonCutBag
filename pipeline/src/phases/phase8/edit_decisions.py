@@ -9,6 +9,7 @@ Key capabilities:
 3. Silent audio track injection (anullsrc for clips without audio)
 4. Per-cut speed adjustment (setpts + atempo chain)
 5. xfade transition chain (dissolve/fadeblack/cut)
+6. Audio-safe boundaries (equal-power crossfades and soft fades on visual cuts)
 """
 
 import json
@@ -203,10 +204,17 @@ def build_edit_decisions(
     if transition_decisions:
         for i, td in enumerate(transition_decisions):
             if i < len(cuts) - 1:
+                transition_type = td["decision"]
                 transitions.append({
                     "index": i,
-                    "type": td["decision"],
+                    "type": transition_type,
                     "duration": transition_duration,
+                    # A visual hard cut must not imply a hard cut in sound.
+                    # Keep picture timing frame-accurate while gently fading
+                    # both sides of the audio boundary.  Dissolves retain a
+                    # true overlap, matched to the visual transition length.
+                    "audio_transition": "edge_fade" if transition_type == "cut" else "crossfade",
+                    "audio_duration": 0.35 if transition_type == "cut" else transition_duration,
                 })
 
     # Crossfades overlap neighboring clips. Compensate with one bounded speed
@@ -232,6 +240,10 @@ def build_edit_decisions(
             "target_fps": 30,
             "target_duration": target_duration,
             "quality_reviewed": bool(quality_report),
+            "audio_transition_policy": {
+                "visual_cut": "equal_power_edge_fade",
+                "visual_dissolve": "equal_power_crossfade",
+            },
         },
     }
 
@@ -335,7 +347,10 @@ def execute_edit_decisions(edit_decisions: dict, output_path: str) -> dict:
         # Step 2: Concat with transitions
         if len(segments) == 1:
             shutil.copy2(segments[0], str(output_path))
-        elif transitions and any(t["type"] != "cut" for t in transitions):
+        elif transitions:
+            # Even an all-cut picture edit needs the transition renderer so
+            # independently generated shot audio is not concatenated with
+            # sample-level discontinuities.
             _xfade_chain(segments, transitions, output_path, temp_dir, temp_files)
         else:
             _concat_copy(segments, output_path, temp_dir, temp_files)
@@ -459,6 +474,9 @@ def _xfade_chain(segments: list, transitions: list, output_path: Path,
             t = trans_map.get(i, {"type": "cut", "duration": 0.5})
             ttype = t["type"]
             tdur = t.get("duration", 0.5)
+            following_duration = probe_video(str(following))["duration"]
+            if following_duration <= 0:
+                raise RuntimeError(f"invalid following segment duration: {following}")
 
             # --- P2-B: 边界帧一致性检查（参考 HonCut AI Clip Chaining）---
             try:
@@ -473,12 +491,22 @@ def _xfade_chain(segments: list, transitions: list, output_path: Path,
 
             if ttype == "cut":
                 tdur = 0.0
+                audio_fade = min(
+                    float(t.get("audio_duration", 0.35)),
+                    current_duration / 2,
+                    following_duration / 2,
+                )
+                fade_start = max(0.0, current_duration - audio_fade)
                 filter_complex = (
                     "[0:v]settb=AVTB,setpts=PTS-STARTPTS[v0];"
                     "[1:v]settb=AVTB,setpts=PTS-STARTPTS[v1];"
                     "[v0][v1]concat=n=2:v=1:a=0[v];"
-                    "[0:a]aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS[a0];"
-                    "[1:a]aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS[a1];"
+                    "[0:a]aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS,"
+                    f"apad,atrim=duration={current_duration},"
+                    f"afade=t=out:st={fade_start}:d={audio_fade}:curve=qsin[a0];"
+                    "[1:a]aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS,"
+                    f"apad,atrim=duration={following_duration},"
+                    f"afade=t=in:d={audio_fade}:curve=qsin[a1];"
                     "[a0][a1]concat=n=2:v=0:a=1[a]"
                 )
             else:
@@ -492,7 +520,7 @@ def _xfade_chain(segments: list, transitions: list, output_path: Path,
                     f"[v0][v1]xfade=transition={xname}:duration={tdur}:offset={offset}[v];"
                     "[0:a]aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS[a0];"
                     "[1:a]aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS[a1];"
-                    f"[a0][a1]acrossfade=d={tdur}[a]"
+                    f"[a0][a1]acrossfade=d={tdur}:c1=qsin:c2=qsin[a]"
                 )
             intermediate = temp_dir / f"xfade_{i:04d}.mp4"
             cmd = [
@@ -505,7 +533,6 @@ def _xfade_chain(segments: list, transitions: list, output_path: Path,
                 str(intermediate),
             ]
             subprocess.run(cmd, capture_output=True, timeout=300, check=True)
-            following_duration = probe_video(str(following))["duration"]
             rendered_duration = probe_video(str(intermediate))["duration"]
             expected_duration = current_duration + following_duration - tdur
             if abs(rendered_duration - expected_duration) > 0.25:
