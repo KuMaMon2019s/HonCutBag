@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import subprocess
 from collections.abc import Callable, Sequence
 from functools import partial
@@ -32,6 +33,7 @@ from schemas.continuity import ContinuityPlan
 
 CONTINUITY_BRIDGE_ENV = "HONCUT_CONTINUITY_BRIDGE"
 CONTINUITY_BRIDGE_MODES = {"off", "auto"}
+SEAM_DECISIONS_KIND = "honcut.continuity_seam_decisions.v1"
 
 
 def probe_continuity_frames(path: Path, timeline_fps: int) -> dict[str, Any]:
@@ -532,15 +534,88 @@ def _file_sha256(path: Path) -> str:
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
+def _load_phase8_seam_decisions(output_dir: Path) -> dict[str, dict[str, Any]]:
+    path = output_dir / "CONTINUITY_SEAM_DECISIONS.json"
+    if not path.is_file():
+        return {}
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if document.get("kind") != SEAM_DECISIONS_KIND:
+        raise ValueError(f"unsupported Phase 8 continuity decisions in {path}")
+    decisions = document.get("decisions")
+    if not isinstance(decisions, dict):
+        raise ValueError(f"{path} must contain a decisions object")
+    for boundary_id, decision in decisions.items():
+        if not isinstance(boundary_id, str) or not isinstance(decision, dict):
+            raise ValueError(f"{path} contains an invalid boundary decision")
+        if decision.get("action") != "hard_trim":
+            raise ValueError(f"{boundary_id} has unsupported Phase 8 action")
+        if int(decision.get("trim_frames") or 0) <= 0:
+            raise ValueError(f"{boundary_id} requires a positive trim_frames value")
+    return decisions
+
+
+def _render_phase8_hard_trim(
+    following: Path,
+    output_path: Path,
+    *,
+    trim_frames: int,
+    timeline_fps: int,
+) -> None:
+    """Materialize a frame-addressed, interpolation-free Phase 8 cut."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_path.with_name(f"{output_path.stem}.phase8{output_path.suffix}")
+    completed = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-i",
+            str(following),
+            "-vf",
+            (
+                f"trim=start_frame={trim_frames},setpts=PTS-STARTPTS,"
+                f"fps={timeline_fps},format=yuv420p"
+            ),
+            "-an",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(temporary),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    if completed.returncode != 0 or not temporary.is_file() or temporary.stat().st_size == 0:
+        temporary.unlink(missing_ok=True)
+        detail = completed.stderr.strip().splitlines()
+        raise RuntimeError(
+            "cannot apply Phase 8 continuity trim: "
+            f"{detail[-1] if detail else 'unknown ffmpeg error'}"
+        )
+    os.replace(temporary, output_path)
+
+
 def _continuity_bridge_preparer(
     output_dir: Path,
+    *,
+    planned_overlap_seconds: float = 0.0,
+    timeline_fps: int = 24,
 ) -> Callable[[Path, Path, str], dict[str, Any]] | None:
     """Build the optional local trim/interpolation step used before seam scoring."""
+    phase8_decisions = _load_phase8_seam_decisions(output_dir)
     mode = os.environ.get(CONTINUITY_BRIDGE_ENV, "off").strip().lower()
     if mode not in CONTINUITY_BRIDGE_MODES:
         expected = ", ".join(sorted(CONTINUITY_BRIDGE_MODES))
         raise ValueError(f"{CONTINUITY_BRIDGE_ENV} must be one of {expected}, got {mode!r}")
-    if mode == "off":
+    if mode == "off" and not phase8_decisions:
         return None
     raw_candidates = os.environ.get("HONCUT_CONTINUITY_BRIDGE_FRAMES", "4,6,8")
     try:
@@ -559,12 +634,15 @@ def _continuity_bridge_preparer(
         boundary_dir = output_dir / "continuity_bridges" / boundary_id
         output_path = boundary_dir / "effective_following.mp4"
         receipt_path = boundary_dir / "CONTINUITY_BRIDGE.json"
+        phase8_decision = phase8_decisions.get(boundary_id)
         input_fingerprint = hashlib.sha256(
             json.dumps(
                 {
                     "previous_sha256": _file_sha256(previous),
                     "following_sha256": _file_sha256(following),
                     "candidate_frames": candidate_frames,
+                    "planned_overlap_seconds": planned_overlap_seconds,
+                    "phase8_decision": phase8_decision,
                 },
                 sort_keys=True,
                 separators=(",", ":"),
@@ -582,17 +660,129 @@ def _continuity_bridge_preparer(
                 return cached
 
         boundary_dir.mkdir(parents=True, exist_ok=True)
+        if phase8_decision is not None:
+            expected = phase8_decision.get("source_fingerprint") or {}
+            actual = {
+                "previous_sha256": _file_sha256(previous),
+                "following_sha256": _file_sha256(following),
+            }
+            if expected != actual:
+                raise RuntimeError(
+                    f"{boundary_id} Phase 8 decision is stale; rerun seam adjudication"
+                )
+            trim_frames = int(phase8_decision["trim_frames"])
+            _render_phase8_hard_trim(
+                following,
+                output_path,
+                trim_frames=trim_frames,
+                timeline_fps=timeline_fps,
+            )
+            receipt = {
+                "kind": "honcut.continuity_bridge.v1",
+                "status": "adjudicated_trim",
+                "reason": phase8_decision["reason"],
+                "input_fingerprint": input_fingerprint,
+                "output_path": str(output_path),
+                "selected_bridge_frames": None,
+                "ghost_safe_fallback": True,
+                "phase8_decision": phase8_decision,
+                "overlap": {
+                    "detected": True,
+                    "overlap_seconds": trim_frames / timeline_fps,
+                    "overlap_frames": trim_frames,
+                    "source": "phase8_temporal_adjudication",
+                    "reason": phase8_decision["reason"],
+                },
+            }
+            receipt_path.write_text(
+                json.dumps(receipt, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            return receipt
+        if mode == "off":
+            receipt = {
+                "kind": "honcut.continuity_bridge.v1",
+                "status": "skipped",
+                "reason": "continuity bridge is disabled for this unadjudicated boundary",
+                "input_fingerprint": input_fingerprint,
+                "output_path": str(following),
+            }
+            receipt_path.write_text(
+                json.dumps(receipt, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            return receipt
         try:
             overlap = detect_replayed_prefix(previous, following)
             if not overlap["detected"]:
-                receipt = {
-                    "kind": "honcut.continuity_bridge.v1",
-                    "status": "skipped",
-                    "reason": overlap["reason"],
-                    "overlap": overlap,
-                    "input_fingerprint": input_fingerprint,
-                    "output_path": str(following),
-                }
+                if planned_overlap_seconds <= 0:
+                    receipt = {
+                        "kind": "honcut.continuity_bridge.v1",
+                        "status": "skipped",
+                        "reason": overlap["reason"],
+                        "overlap": overlap,
+                        "input_fingerprint": input_fingerprint,
+                        "output_path": str(following),
+                    }
+                else:
+                    trial = repair_continuity_boundary(
+                        previous,
+                        following,
+                        output_path,
+                        work_dir=boundary_dir / "work",
+                        overlap_seconds=planned_overlap_seconds,
+                        candidate_frames=candidate_frames,
+                    )
+                    baseline = float(trial["baseline_boundary_frame_mae"])
+                    selected = float(trial["selected_boundary_frame_mae"])
+                    trimmed = float(trial["trimmed_boundary_frame_mae"])
+                    if (
+                        trial.get("improved")
+                        and selected <= baseline * 0.5
+                        and trimmed < baseline
+                    ):
+                        # The interpolation result is evidence that the planned
+                        # cut point is useful, not necessarily a safe output.
+                        # With an uncertain trajectory, synthesized in-betweens
+                        # can create double contours around moving subjects.
+                        # Prefer the decoded hard trim: one small discontinuity
+                        # is less objectionable than a multi-frame ghost trail.
+                        trimmed_path = boundary_dir / "work" / "trimmed_hard_cut.mp4"
+                        temporary = output_path.with_name(
+                            f"{output_path.stem}.ghost_safe{output_path.suffix}"
+                        )
+                        shutil.copy2(trimmed_path, temporary)
+                        os.replace(temporary, output_path)
+                        receipt = trial
+                        receipt["status"] = "trimmed"
+                        receipt["output_path"] = str(output_path)
+                        receipt["selected_bridge_frames"] = None
+                        receipt["selected_boundary_frame_mae"] = trimmed
+                        receipt["ghost_safe_fallback"] = True
+                        receipt["detector_overlap"] = overlap
+                        receipt["overlap"] = {
+                            "detected": True,
+                            "overlap_seconds": planned_overlap_seconds,
+                            "source": "phase4_planned_budget",
+                            "reason": (
+                                "planned overlap trial reduced boundary-frame error "
+                                "by at least fifty percent; emitted a hard trim to "
+                                "avoid interpolation ghosting"
+                            ),
+                        }
+                    else:
+                        receipt = {
+                            "kind": "honcut.continuity_bridge.v1",
+                            "status": "skipped",
+                            "reason": (
+                                "planned overlap trial did not reduce boundary-frame "
+                                "error by at least fifty percent"
+                            ),
+                            "overlap": overlap,
+                            "planned_overlap_trial": trial,
+                            "input_fingerprint": input_fingerprint,
+                            "output_path": str(following),
+                        }
             else:
                 receipt = repair_continuity_boundary(
                     previous,
@@ -604,6 +794,7 @@ def _continuity_bridge_preparer(
                 )
                 receipt["input_fingerprint"] = input_fingerprint
                 receipt["overlap"] = overlap
+            receipt["input_fingerprint"] = input_fingerprint
         except Exception as exc:
             receipt = {
                 "kind": "honcut.continuity_bridge.v1",
@@ -649,7 +840,19 @@ def execute_phase6_auto_continuity(
                 "submission for native_extend chunks"
             )
 
-    prepare_seam = _continuity_bridge_preparer(root)
+    planned_overlap_seconds = max(
+        (
+            chunk.expected_overlap_frames / plan.timeline_fps
+            for shot in plan.shots
+            for chunk in shot.chunks
+        ),
+        default=0.0,
+    )
+    prepare_seam = _continuity_bridge_preparer(
+        root,
+        planned_overlap_seconds=planned_overlap_seconds,
+        timeline_fps=plan.timeline_fps,
+    )
     if prepare_seam is not None and any(
         len(shot.chunks) > 1
         and all(chunk.expected_overlap_frames == 0 for chunk in shot.chunks[1:])

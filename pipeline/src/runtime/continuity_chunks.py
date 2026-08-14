@@ -21,6 +21,7 @@ CONTINUITY_MODE_ENV = "HONCUT_CONTINUITY_MODE"
 CONTINUITY_MODES = {"off", "shadow", "auto"}
 LINEAGE_KIND = "honcut.continuity_lineage.v1"
 REVIEW_DECISIONS_KIND = "honcut.continuity_review_decisions.v1"
+SEAM_DECISIONS_KIND = "honcut.continuity_seam_decisions.v1"
 
 
 def _utc_now() -> str:
@@ -170,6 +171,24 @@ def _load_review_decisions(root: Path) -> dict[str, dict[str, Any]]:
     return decisions
 
 
+def _load_phase8_seam_decisions(root: Path) -> dict[str, dict[str, Any]]:
+    """Load machine decisions made after the full chunk trajectory was visible."""
+    path = root / "CONTINUITY_SEAM_DECISIONS.json"
+    if not path.is_file():
+        return {}
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if document.get("kind") != SEAM_DECISIONS_KIND:
+        raise ValueError(f"unsupported Phase 8 continuity decisions in {path}")
+    decisions = document.get("decisions")
+    if not isinstance(decisions, dict):
+        raise ValueError(f"{path} must contain a decisions object")
+    return {
+        str(boundary_id): decision
+        for boundary_id, decision in decisions.items()
+        if isinstance(decision, dict) and decision.get("action") == "hard_trim"
+    }
+
+
 def write_shadow_runtime_report(output_dir: str | Path) -> dict[str, Any]:
     """Validate rollout inputs and persist a report without invoking a provider."""
     root = Path(output_dir)
@@ -304,6 +323,7 @@ def execute_continuity_plan(
             )
     lineage = ContinuityLineageStore(root / "CONTINUITY_LINEAGE.json")
     review_decisions = _load_review_decisions(root)
+    phase8_seam_decisions = _load_phase8_seam_decisions(root)
     outputs: list[str] = []
     errors: list[dict[str, str]] = []
     skipped_chunks = 0
@@ -489,6 +509,20 @@ def execute_continuity_plan(
                                 "reason": f"{decision.get('reason', '')}; {replay_reason}",
                                 "replay_policy": "human_review_only",
                             }
+                    temporal_decision = phase8_seam_decisions.get(boundary_id)
+                    if (
+                        temporal_decision is not None
+                        and decision.get("action") in {"accept", "observe_only", "human_review"}
+                    ):
+                        decision = {
+                            **decision,
+                            "action": "accept",
+                            "reason": (
+                                "Phase 8 inspected the complete temporal trajectory and "
+                                "authorized an interpolation-free hard trim"
+                            ),
+                            "phase8_temporal_adjudication": temporal_decision,
+                        }
                     candidate_frames = [
                         *evidence.get("tail_frames", []),
                         *evidence.get("head_frames", []),

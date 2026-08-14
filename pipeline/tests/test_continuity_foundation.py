@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import shutil
 import subprocess
@@ -19,6 +20,11 @@ from clients.seedream_client import IMAGE_ENDPOINT
 from phases import pipeline_core
 from phases.phase4.continuity_plan import build_continuity_plan, write_continuity_plan
 from phases.phase8 import edit_decisions as edit_decision_module
+from phases.phase8.continuity_adjudication import (
+    SEAM_DECISIONS_KIND,
+    adjudicate_continuity_seams,
+    decide_temporal_seam,
+)
 from quality.continuity_bridge import detect_replayed_prefix, repair_continuity_boundary
 from quality.continuity_seam import (
     compare_frame_sequences,
@@ -28,6 +34,7 @@ from quality.continuity_seam import (
     measure_video_replay_similarity,
     measure_video_seam,
 )
+from quality.object_trajectory import decide_object_trajectory
 from quality.seam_calibration import calibrate_seam_policy, decide_seam
 from runtime.continuity_chunks import (
     ChunkExecutionRequest,
@@ -51,6 +58,7 @@ from runtime.continuity_provider import (
     materialize_continuity_shot,
 )
 from runtime.generation_tasks import GenerationTaskStore
+from sam3_runtime.policy import estimate_weight_bytes, resolve_runtime_policy
 from schemas.continuity import ContinuityPlan, GenerationChunk
 
 
@@ -101,6 +109,7 @@ def test_planner_splits_long_shot_and_preserves_explicit_anchors(tmp_path):
         "screen_direction": "left_to_right",
         "camera_motion": "tracking_right",
         "style": "STYLE_MAIN",
+        "tracking_prompt": "CHAR_01",
     }
     assert [chunk.target_duration_s for chunk in shot.chunks] == [13, 13, 12]
     assert [chunk.depends_on for chunk in shot.chunks] == [None, "S03_C01", "S03_C02"]
@@ -114,6 +123,22 @@ def test_planner_balances_a_sixteen_second_shot_without_a_one_second_tail():
     plan = build_continuity_plan({"shots": [{"id": 1, "duration": 16}]})
 
     assert [chunk.target_duration_s for chunk in plan.shots[0].chunks] == [8, 8]
+
+
+def test_planner_carries_an_explicit_subject_prompt_into_tracking_anchors():
+    plan = build_continuity_plan(
+        {
+            "shots": [
+                {
+                    "id": "S01",
+                    "duration": 8,
+                    "tracking_prompt": "small cobalt-blue paper boat",
+                }
+            ]
+        }
+    )
+
+    assert plan.shots[0].anchors.tracking_prompt == "small cobalt-blue paper boat"
 
 
 def test_planner_reserves_replayed_reference_frames_without_shortening_the_shot():
@@ -1478,12 +1503,319 @@ def test_continuity_bridge_is_opt_in(monkeypatch, tmp_path):
     assert _continuity_bridge_preparer(tmp_path) is None
 
 
+def test_phase8_temporal_adjudication_requires_object_or_human_corroboration():
+    values = [
+        0.0466, 0.0462, 0.0463, 0.0460, 0.0450, 0.0439, 0.0434,
+        0.0434, 0.0432, 0.0427, 0.0422, 0.0420, 0.0419,
+    ]
+    candidates = [
+        {
+            "frames": 48 + index * 2,
+            "seconds": (48 + index * 2) / 24,
+            "frame_mae": value,
+        }
+        for index, value in enumerate(values)
+    ]
+
+    uncorroborated = decide_temporal_seam(
+        candidates,
+        planned_overlap_frames=48,
+        timeline_fps=24,
+    )
+    corroborated = decide_temporal_seam(
+        candidates,
+        planned_overlap_frames=48,
+        timeline_fps=24,
+        object_trajectory_evidence={
+            "verdict": "rollback",
+            "confidence": 0.91,
+            "repair_action": "hard_trim",
+            "recommended_trim_frames": 72,
+        },
+    )
+
+    assert uncorroborated["action"] == "human_review"
+    assert uncorroborated["recommended_action"] == "hard_trim"
+    assert corroborated["action"] == "hard_trim"
+    assert corroborated["trim_frames"] == 72
+    assert corroborated["additional_trim_frames"] == 24
+
+
+def test_object_tracking_finds_the_subject_catchup_frame_after_rollback():
+    positions = [
+        (7, 0.58),
+        (8, 0.64),
+        (9, 0.70),
+        (10, 0.20),
+        (11, 0.30),
+        (12, 0.40),
+        (13, 0.50),
+        (14, 0.60),
+        (15, 0.70),
+    ]
+    evidence = decide_object_trajectory(
+        [
+            {"frame_idx": frame, "centroid": [x, 0.5], "score": 0.95}
+            for frame, x in positions
+        ],
+        seam_frame=10,
+        planned_overlap_frames=2,
+        screen_direction="left_to_right",
+        camera_motion="locked_off",
+    )
+
+    assert evidence["verdict"] == "rollback"
+    assert evidence["repair_action"] == "hard_trim"
+    assert evidence["recommended_trim_frames"] == 5
+    assert evidence["confidence"] >= 0.6
+
+
+def test_sam3_runtime_auto_policy_uses_fp16_on_apple_silicon():
+    policy = resolve_runtime_policy(
+        mps_available=True,
+        cuda_available=False,
+        cpu_count=10,
+    )
+
+    assert policy.device == "mps"
+    assert policy.precision == "fp16"
+    assert policy.quantize_linear is False
+    assert policy.cpu_threads == 6
+
+
+def test_sam3_runtime_auto_policy_uses_dynamic_int8_on_cpu():
+    policy = resolve_runtime_policy(
+        mps_available=False,
+        cuda_available=False,
+        cpu_count=4,
+    )
+
+    assert policy.device == "cpu"
+    assert policy.precision == "int8_dynamic"
+    assert policy.quantize_linear is True
+    assert estimate_weight_bytes(
+        total_parameters=100,
+        linear_parameters=80,
+        precision=policy.precision,
+    ) == 160
+
+
+def test_sam3_runtime_rejects_int8_on_mps():
+    with pytest.raises(ValueError, match="only on CPU"):
+        resolve_runtime_policy(
+            requested_device="mps",
+            requested_precision="int8_dynamic",
+            mps_available=True,
+        )
+
+
+def test_object_catchup_frame_overrides_background_dominated_pixel_cut():
+    values = [
+        0.0466, 0.0462, 0.0463, 0.0460, 0.0450, 0.0439, 0.0434,
+        0.0434, 0.0432, 0.0427, 0.0422, 0.0420, 0.0419,
+    ]
+    decision = decide_temporal_seam(
+        [
+            {
+                "frames": 48 + index * 2,
+                "seconds": (48 + index * 2) / 24,
+                "frame_mae": value,
+            }
+            for index, value in enumerate(values)
+        ],
+        planned_overlap_frames=48,
+        timeline_fps=24,
+        object_trajectory_evidence={
+            "verdict": "rollback",
+            "confidence": 0.9,
+            "repair_action": "hard_trim",
+            "recommended_trim_frames": 96,
+        },
+    )
+
+    assert decision["action"] == "hard_trim"
+    assert decision["trim_frames"] == 96
+    assert decision["trim_source"] == "object_trajectory_catchup"
+
+
+def test_phase8_uses_configured_sam3_trajectory_before_requesting_topup(
+    monkeypatch, tmp_path
+):
+    plan = build_continuity_plan(
+        {
+            "shots": [
+                {
+                    "id": "S01",
+                    "duration": 8,
+                    "tracking_prompt": "small blue paper boat",
+                    "screen_direction": "left_to_right",
+                    "camera_motion": "locked_off",
+                }
+            ]
+        },
+        provider_chunk_limit_s=5,
+        continuation_overlap_s=2,
+    )
+    (tmp_path / "CONTINUITY_PLAN.json").write_text(
+        plan.model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+    chunks = tmp_path / "shots" / "S01" / "chunks"
+    chunks.mkdir(parents=True)
+    (chunks / "S01_C01.mp4").write_bytes(b"first")
+    (chunks / "S01_C02.mp4").write_bytes(b"second")
+    (tmp_path / "shots" / "S01" / "CONTINUITY_TIMING.json").write_text(
+        json.dumps(
+            {
+                "materialized_frames_before_closure": 194,
+                "chunks": [
+                    {"chunk_id": "S01_C01", "effective_unique_frames": 121},
+                    {
+                        "chunk_id": "S01_C02",
+                        "effective_unique_frames": 73,
+                        "detected_overlap_frames": 48,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    values = [
+        0.0466, 0.0462, 0.0463, 0.0460, 0.0450, 0.0439, 0.0434,
+        0.0434, 0.0432, 0.0427, 0.0422, 0.0420, 0.0419,
+    ]
+    monkeypatch.setenv("HONCUT_SAM3_URL", "http://127.0.0.1:8001")
+
+    def collect(*_args, **kwargs):
+        assert kwargs["prompt"] == "small blue paper boat"
+        return {
+            "verdict": "rollback",
+            "confidence": 0.9,
+            "repair_action": "hard_trim",
+            "recommended_trim_frames": 72,
+        }
+
+    report = adjudicate_continuity_seams(
+        tmp_path,
+        detector=lambda *_args, **_kwargs: {
+            "candidates": [
+                {
+                    "frames": 48 + index * 2,
+                    "seconds": (48 + index * 2) / 24,
+                    "frame_mae": value,
+                }
+                for index, value in enumerate(values)
+            ]
+        },
+        frame_probe=lambda _path, _fps: {"frames": 121},
+        sam3_collector=collect,
+    )
+
+    assert report["status"] == "topup_required"
+    assert report["requires_human_review"] is False
+    assert report["shots"][0]["deficit_frames"] == 22
+    decisions = json.loads((tmp_path / "CONTINUITY_SEAM_DECISIONS.json").read_text())
+    assert decisions["decisions"]["S01_C01__S01_C02"]["trim_frames"] == 72
+
+
+def test_phase6_applies_an_exact_phase8_hard_trim_with_bridge_disabled(
+    monkeypatch, tmp_path
+):
+    previous = tmp_path / "previous.mp4"
+    following = tmp_path / "following.mp4"
+    previous.write_bytes(b"previous")
+    following.write_bytes(b"following")
+    boundary_id = "S01_C01__S01_C02"
+    source_fingerprint = {
+        "previous_sha256": hashlib.sha256(previous.read_bytes()).hexdigest(),
+        "following_sha256": hashlib.sha256(following.read_bytes()).hexdigest(),
+    }
+    (tmp_path / "CONTINUITY_SEAM_DECISIONS.json").write_text(
+        json.dumps(
+            {
+                "kind": SEAM_DECISIONS_KIND,
+                "decisions": {
+                    boundary_id: {
+                        "action": "hard_trim",
+                        "trim_frames": 72,
+                        "trim_seconds": 3,
+                        "reason": "temporal rollback",
+                        "source_fingerprint": source_fingerprint,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HONCUT_CONTINUITY_BRIDGE", "off")
+
+    def render(_following, output, **kwargs):
+        assert kwargs == {"trim_frames": 72, "timeline_fps": 24}
+        Path(output).write_bytes(b"hard-trimmed")
+
+    monkeypatch.setattr("runtime.continuity_provider._render_phase8_hard_trim", render)
+    prepare = _continuity_bridge_preparer(tmp_path, timeline_fps=24)
+    assert prepare is not None
+
+    receipt = prepare(previous, following, boundary_id)
+
+    assert receipt["status"] == "adjudicated_trim"
+    assert receipt["selected_bridge_frames"] is None
+    assert receipt["overlap"]["overlap_frames"] == 72
+
+
 def test_continuity_bridge_rejects_invalid_candidate_frames_before_execution(monkeypatch, tmp_path):
     monkeypatch.setenv("HONCUT_CONTINUITY_BRIDGE", "auto")
     monkeypatch.setenv("HONCUT_CONTINUITY_BRIDGE_FRAMES", "2,8")
 
     with pytest.raises(ValueError, match="between 4 and 24"):
         _continuity_bridge_preparer(tmp_path)
+
+
+def test_continuity_bridge_uses_a_strongly_improving_planned_overlap_trial(
+    monkeypatch, tmp_path
+):
+    previous = tmp_path / "previous.mp4"
+    following = tmp_path / "following.mp4"
+    previous.write_bytes(b"previous")
+    following.write_bytes(b"following")
+    monkeypatch.setenv("HONCUT_CONTINUITY_BRIDGE", "auto")
+    monkeypatch.setattr(
+        "quality.continuity_bridge.detect_replayed_prefix",
+        lambda *_args, **_kwargs: {
+            "detected": False,
+            "overlap_seconds": 0.0,
+            "reason": "trajectory detector uncertain",
+        },
+    )
+
+    def repair(_previous, _following, output, **kwargs):
+        Path(output).parent.mkdir(parents=True, exist_ok=True)
+        Path(output).write_bytes(b"effective")
+        trimmed = Path(kwargs["work_dir"]) / "trimmed_hard_cut.mp4"
+        trimmed.parent.mkdir(parents=True, exist_ok=True)
+        trimmed.write_bytes(b"ghost-safe-trim")
+        assert kwargs["overlap_seconds"] == 2.0
+        return {
+            "kind": "honcut.continuity_bridge.v1",
+            "status": "repaired",
+            "output_path": str(output),
+            "baseline_boundary_frame_mae": 0.06,
+            "trimmed_boundary_frame_mae": 0.04,
+            "selected_boundary_frame_mae": 0.01,
+            "improved": True,
+        }
+
+    monkeypatch.setattr("quality.continuity_bridge.repair_continuity_boundary", repair)
+    prepare = _continuity_bridge_preparer(tmp_path, planned_overlap_seconds=2.0)
+
+    receipt = prepare(previous, following, "S01_C01__S01_C02")
+
+    assert receipt["status"] == "trimmed"
+    assert receipt["ghost_safe_fallback"] is True
+    assert Path(receipt["output_path"]).read_bytes() == b"ghost-safe-trim"
+    assert receipt["overlap"]["source"] == "phase4_planned_budget"
+    assert receipt["overlap"]["overlap_seconds"] == 2.0
 
 
 def test_continuity_bridge_auto_falls_back_to_provider_clip_on_local_failure(monkeypatch, tmp_path):

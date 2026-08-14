@@ -165,7 +165,10 @@ def execute_seedance_video_task(
         video_url = poll(provider_job_id)
         download(video_url, destination_text)
     except Exception as error:
-        task_store.note_resumable_error(task.task_id, str(error))
+        if _provider_rejected_submission(error):
+            task_store.mark_failed(task.task_id, str(error))
+        else:
+            task_store.note_resumable_error(task.task_id, str(error))
         raise
 
     task_store.mark_succeeded(

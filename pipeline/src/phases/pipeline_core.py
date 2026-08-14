@@ -4218,7 +4218,8 @@ def run_phase8(output_dir: Path, dry_run: bool,
                enable_reshoot: bool = True,
                chain_mode: bool = False,
                _reshoot_round: int = 0,
-               _reshoot_history: Optional[list[dict]] = None) -> dict:
+               _reshoot_history: Optional[list[dict]] = None,
+               _continuity_round: int = 0) -> dict:
     """Phase 8: 逐镜质检、裁切/补录闭环与受审组装。"""
     _banner(8, 9, f"组装引擎 (Assembly) — {transition}", dry_run)
     start = _now()
@@ -4273,6 +4274,119 @@ def run_phase8(output_dir: Path, dry_run: bool,
     if not order_review["narrative_consistent"]:
         print(f"  ⚠ [8.1] 剧情连贯性问题: {order_review['issues']}", flush=True)
 
+    # Step 8.15: the complete chunk trajectory is now available.  Revisit
+    # provisional Phase 6 boundaries before per-shot QA or formal assembly.
+    from phases.phase8.continuity_adjudication import adjudicate_continuity_seams
+
+    try:
+        continuity_adjudication = adjudicate_continuity_seams(output_dir)
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error": f"Phase 8 continuity adjudication failed: {exc}",
+            "duration_s": _elapsed(start),
+        }
+    if continuity_adjudication.get("requires_human_review"):
+        review_boundaries = [
+            boundary["boundary_id"]
+            for shot in continuity_adjudication.get("shots", [])
+            for boundary in shot.get("boundaries", [])
+            if boundary.get("action") == "human_review"
+        ]
+        return {
+            "status": "error",
+            "error": (
+                "Phase 8 found appearance-level rollback evidence but requires "
+                "object-trajectory or human corroboration: "
+                + ", ".join(review_boundaries)
+            ),
+            "duration_s": _elapsed(start),
+            "continuity_adjudication": continuity_adjudication,
+            "review_artifact": "CONTINUITY_ADJUDICATION.json",
+        }
+    if continuity_adjudication.get("requires_phase6"):
+        requests = [
+            request
+            for request in json.loads(
+                (output_dir / "CONTINUITY_TOPUP_REQUESTS.json").read_text(encoding="utf-8")
+            ).get("requests", [])
+        ]
+        summary = ", ".join(
+            f"{item['shot_id']} 缺 {item['deficit_frames']} 帧" for item in requests
+        )
+        print(
+            f"  ↩ [8.15] 检出内部回退，已写入硬裁剪裁决；{summary}，回流 Phase 6",
+            flush=True,
+        )
+        if not enable_reshoot:
+            return {
+                "status": "error",
+                "error": (
+                    "Phase 8 temporal seam adjudication requires continuation top-up "
+                    f"but enable_reshoot=false: {summary}"
+                ),
+                "duration_s": _elapsed(start),
+                "continuity_adjudication": continuity_adjudication,
+            }
+        if _continuity_round >= 2:
+            return {
+                "status": "error",
+                "error": (
+                    "Phase 8 continuity still requires top-up after 2 feedback rounds: "
+                    f"{summary}"
+                ),
+                "duration_s": _elapsed(start),
+                "continuity_adjudication": continuity_adjudication,
+            }
+        storyboard_path = output_dir / "STORYBOARD.json"
+        try:
+            storyboard = json.loads(storyboard_path.read_text(encoding="utf-8"))
+            generation = run_phase6(
+                storyboard,
+                output_dir,
+                dry_run=False,
+                chain_mode=chain_mode,
+            )
+        except Exception as exc:
+            return {
+                "status": "error",
+                "error": f"Phase 8 continuity top-up could not run Phase 6: {exc}",
+                "duration_s": _elapsed(start),
+                "continuity_adjudication": continuity_adjudication,
+            }
+        if generation.get("status") == "error":
+            return {
+                "status": "error",
+                "error": (
+                    "Phase 8 continuity top-up failed in Phase 6: "
+                    f"{generation.get('error') or generation.get('errors')}"
+                ),
+                "duration_s": _elapsed(start),
+                "continuity_adjudication": continuity_adjudication,
+                "phase6_topup": generation,
+            }
+        history = reshoot_history + [
+            {
+                "kind": "continuity_topup",
+                "round": _continuity_round + 1,
+                "requests": requests,
+                "phase6_status": generation.get("status"),
+            }
+        ]
+        return run_phase8(
+            output_dir,
+            dry_run=False,
+            transition=transition,
+            transition_duration=transition_duration,
+            media_profile=media_profile,
+            target_duration=target_duration,
+            enable_reshoot=enable_reshoot,
+            chain_mode=chain_mode,
+            _reshoot_round=_reshoot_round,
+            _reshoot_history=history,
+            _continuity_round=_continuity_round + 1,
+        )
+
     # Step 8.2: dense per-shot review with actionable keep/trim/reshoot decisions.
     from phases.phase8.frame_analysis import analyze_shot_frames
 
@@ -4295,6 +4409,7 @@ def run_phase8(output_dir: Path, dry_run: bool,
                 "error": f"Phase 8 visual QA still fails after 2 reshoot rounds: {', '.join(reshoot_shots)}",
                 "duration_s": _elapsed(start),
                 "frame_analysis": frame_report.get("summary", {}),
+                "continuity_adjudication": continuity_adjudication,
                 "reshoot_history": reshoot_history,
             }
 

@@ -21,6 +21,7 @@ class ContinuityAnchors(BaseModel):
     screen_direction: str = ""
     camera_motion: str = ""
     style: str = ""
+    tracking_prompt: str = ""
 
 
 class GenerationChunk(BaseModel):

@@ -36,6 +36,26 @@ dev = [
     "black>=23.0.0",
     "ruff>=0.0.280",
 ]
+sam3 = [
+    "torch>=2.5",
+    "torchvision>=0.20",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "python-multipart>=0.0.9",
+    "psutil>=5.9",
+    "opencv-python-headless>=4.10",
+    "timm>=1.0.17",
+    "numpy>=1.26,<2",
+    "tqdm",
+    "ftfy==6.1.1",
+    "regex",
+    "iopath>=0.1.10",
+    "typing_extensions",
+    "huggingface_hub",
+    "einops>=0.8",
+    "pycocotools>=2.0.10",
+    "socksio>=1.0",
+]
 
 [project.scripts]
 honcut = "honcut.pipeline_runner:main"

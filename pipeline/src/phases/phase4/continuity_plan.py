@@ -93,12 +93,19 @@ def _anchors(shot: Mapping[str, Any], scene_contract: Mapping[str, Any]) -> Cont
     camera_motion = str(
         shot.get("camera_motion") or shot.get("camera_movement") or shot.get("camera") or ""
     )
+    tracking_prompt = str(
+        shot.get("tracking_prompt")
+        or shot.get("subject_description")
+        or ", ".join(str(value) for value in who if value)
+        or ""
+    ).strip()
     return ContinuityAnchors(
         characters=[str(value) for value in who if value],
         scene=str(shot.get("where") or scene_contract.get("scene_description") or ""),
         screen_direction=str(shot.get("screen_direction") or shot.get("camera_axis") or ""),
         camera_motion=camera_motion,
         style=str(scene_contract.get("style_anchor") or scene_contract.get("style_suffix") or ""),
+        tracking_prompt=tracking_prompt[:240],
     )
 
 

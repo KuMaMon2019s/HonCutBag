@@ -1157,6 +1157,33 @@ def test_seedance_poll_failure_resumes_without_resubmitting(tmp_path):
     assert store.get(execution.task_id).status == "succeeded"
 
 
+def test_seedance_provider_rejection_during_poll_is_terminal(tmp_path):
+    store = GenerationTaskStore(tmp_path / "runtime.db")
+    output = tmp_path / "clip.mp4"
+
+    with pytest.raises(RuntimeError, match="InvalidParameter"):
+        execute_seedance_video_task(
+            store,
+            run_id="run-1",
+            resource_id="S01_C01",
+            payload={"duration": 5},
+            provider_endpoint="https://ark.example.test/api/v3",
+            output_path=output,
+            submit=lambda: "provider-job-1",
+            poll=lambda _job_id: (_ for _ in ()).throw(
+                RuntimeError("Task failed: InvalidParameter")
+            ),
+            download=lambda _url, _path: pytest.fail("failed task must not download"),
+        )
+
+    with sqlite3.connect(tmp_path / "runtime.db") as connection:
+        status, provider_job_id = connection.execute(
+            "SELECT status, provider_job_id FROM generation_tasks"
+        ).fetchone()
+    assert status == "failed"
+    assert provider_job_id == "provider-job-1"
+
+
 def test_seedance_succeeded_ledger_recovers_after_lineage_crash_without_resubmitting(
     tmp_path,
 ):
