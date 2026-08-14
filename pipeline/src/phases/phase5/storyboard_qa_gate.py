@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from clients.ark_multimodal_client import ArkMultimodalClient
+from phases.phase1.adaptation_engine import generation_action_limit
 
 DEFAULT_SIMILARITY_THRESHOLD = 0.85
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
@@ -99,6 +100,158 @@ def run_l1_checks(storyboard: dict, visual_style: str) -> tuple[list[dict], dict
     return issues, per_shot
 
 
+def run_generation_capacity_checks(
+    storyboard: dict,
+    events_data: dict | None = None,
+) -> list[dict]:
+    """Block storyboards that exceed one video clip's narrative capacity."""
+    issues: list[dict] = []
+    observed_units: set[str] = set()
+    for index, shot in enumerate(storyboard.get("shots", [])):
+        if not isinstance(shot, dict):
+            continue
+        sid = _shot_id(shot, index)
+        raw_units = shot.get("source_action_unit_ids") or []
+        if isinstance(raw_units, str):
+            raw_units = [raw_units]
+        units = {str(value) for value in raw_units if str(value).strip()}
+        observed_units.update(units)
+        generation_actions = shot.get("generation_actions") or []
+        if isinstance(generation_actions, str):
+            generation_actions = [generation_actions]
+        duration = float(shot.get("duration") or shot.get("suggested_duration") or 0)
+        camera = str(
+            shot.get("camera_movement")
+            or shot.get("camera_movement_en")
+            or shot.get("camera")
+            or ""
+        ).lower()
+        storyboard_beats = [
+            beat
+            for beat in (shot.get("storyboard_beats") or [])
+            if isinstance(beat, dict)
+        ]
+
+        if storyboard_beats:
+            beat_duration_total = 0.0
+            beat_units_seen: list[str] = []
+            for position, beat in enumerate(storyboard_beats, 1):
+                beat_id = str(beat.get("beat_id") or f"{sid}_P{position:02d}")
+                beat_duration = float(beat.get("duration_s") or 0)
+                beat_duration_total += beat_duration
+                expected_mode = "fresh" if position == 1 else "extend"
+                if beat.get("generation_mode") != expected_mode:
+                    issues.append(_issue(
+                        "L1", "severe", "storyboard_beat_mode_invalid",
+                        f"{beat_id} must use {expected_mode}",
+                        [sid], beat_id=beat_id, expected_mode=expected_mode,
+                    ))
+                if not str(beat.get("action") or "").strip():
+                    issues.append(_issue(
+                        "L1", "severe", "storyboard_beat_action_missing",
+                        f"{beat_id} has no executable action contract",
+                        [sid], beat_id=beat_id,
+                    ))
+                beat_units = beat.get("source_action_unit_ids") or []
+                if isinstance(beat_units, str):
+                    beat_units = [beat_units]
+                beat_units = [str(value) for value in beat_units if str(value).strip()]
+                beat_units_seen.extend(beat_units)
+                if len(set(beat_units)) > 1:
+                    issues.append(_issue(
+                        "L1", "severe", "storyboard_beat_action_unit_overload",
+                        f"{beat_id} contains multiple action units; split into more Pxx beats",
+                        [sid], beat_id=beat_id, action_unit_ids=beat_units,
+                    ))
+                micro_actions = beat.get("micro_actions") or []
+                if isinstance(micro_actions, str):
+                    micro_actions = [micro_actions]
+                if len([value for value in micro_actions if str(value).strip()]) > 2:
+                    issues.append(_issue(
+                        "L1", "severe", "storyboard_beat_action_overload",
+                        f"{beat_id} contains more than two visible micro-actions",
+                        [sid], beat_id=beat_id,
+                    ))
+                if beat_duration < 3 or beat_duration > 7:
+                    issues.append(_issue(
+                        "L1", "severe", "storyboard_beat_duration_invalid",
+                        f"{beat_id} lasts {beat_duration:g}s; expected 3-7s",
+                        [sid], beat_id=beat_id, duration_seconds=beat_duration,
+                    ))
+            if duration and not math.isclose(
+                beat_duration_total,
+                duration,
+                abs_tol=0.05,
+            ):
+                issues.append(_issue(
+                    "L1", "severe", "storyboard_beat_duration_mismatch",
+                    f"{sid} internal beats total {beat_duration_total:g}s, "
+                    f"expected {duration:g}s",
+                    [sid], beat_duration_seconds=beat_duration_total,
+                    shot_duration_seconds=duration,
+                ))
+            if units and set(beat_units_seen) != units:
+                issues.append(_issue(
+                    "L1", "severe", "storyboard_beat_action_unit_coverage_mismatch",
+                    f"{sid} Pxx action-unit coverage differs from the director shot",
+                    [sid], expected_action_unit_ids=sorted(units),
+                    observed_action_unit_ids=sorted(set(beat_units_seen)),
+                ))
+
+        if len(units) > 1 and not storyboard_beats:
+            issues.append(_issue(
+                "L1", "severe", "action_unit_overload",
+                f"{sid} contains {len(units)} action units; generated clips support one",
+                [sid], action_unit_ids=sorted(units),
+            ))
+        if units and not generation_actions and not storyboard_beats:
+            issues.append(_issue(
+                "L1", "severe", "missing_generation_actions",
+                f"{sid} has screenplay action but no bounded generation action contract",
+                [sid],
+            ))
+        action_limit = generation_action_limit(duration)
+        if len(generation_actions) > action_limit and not storyboard_beats:
+            issues.append(_issue(
+                "L1", "severe", "generation_action_overload",
+                f"{sid} asks the video model to perform {len(generation_actions)} actions "
+                f"(max {action_limit} for {duration:g}s)",
+                [sid], prompted_actions=len(generation_actions), action_limit=action_limit,
+            ))
+        if units and duration > 6 and not storyboard_beats:
+            issues.append(_issue(
+                "L1", "severe", "action_shot_too_long",
+                f"{sid} action shot lasts {duration:g}s; split into 4-6s executable beats",
+                [sid], duration_seconds=duration,
+            ))
+        if units and camera in {"static", "fixed", "locked", "unspecified", ""} and not storyboard_beats:
+            issues.append(_issue(
+                "L1", "severe", "static_action_camera",
+                f"{sid} action shot uses a locked/static camera contract",
+                [sid], camera_movement=camera or "missing",
+            ))
+        if not units and duration > 6 and camera in {"static", "fixed", "locked", "unspecified", ""} and not storyboard_beats:
+            issues.append(_issue(
+                "L1", "severe", "static_hold_risk",
+                f"{sid} holds a static composition for {duration:g}s",
+                [sid], duration_seconds=duration,
+            ))
+
+    expected_units = {
+        str(event.get("action_unit_id"))
+        for event in (events_data or {}).get("events", [])
+        if isinstance(event, dict) and str(event.get("action_unit_id") or "").strip()
+    }
+    missing_units = sorted(expected_units - observed_units)
+    if missing_units:
+        issues.append(_issue(
+            "L1", "severe", "action_unit_coverage_missing",
+            f"Storyboard drops {len(missing_units)} screenplay action unit(s)",
+            [], missing_action_unit_ids=missing_units,
+        ))
+    return issues
+
+
 def _characters_in_shot(shot: dict, characters: list[dict]) -> list[str]:
     explicit = shot.get("character_ids", shot.get("characters", []))
     if isinstance(explicit, str):
@@ -126,6 +279,33 @@ def find_storyboard_images(output_dir: Path, storyboard: dict) -> dict[str, Path
     return result
 
 
+def find_storyboard_beat_images(output_dir: Path, storyboard: dict) -> dict[str, Path]:
+    """Resolve every exact Pxx image; callers can detect omissions by count."""
+    result: dict[str, Path] = {}
+    for shot_index, shot in enumerate(storyboard.get("shots", [])):
+        if not isinstance(shot, dict):
+            continue
+        sid = _shot_id(shot, shot_index)
+        for position, beat in enumerate(shot.get("storyboard_beats") or [], 1):
+            if not isinstance(beat, dict):
+                continue
+            beat_id = str(beat.get("beat_id") or f"{sid}_P{position:02d}")
+            value = str(beat.get("storyboard_image") or "").strip()
+            if not value:
+                continue
+            path = Path(value)
+            if not path.is_absolute():
+                path = output_dir / path
+            if path.is_file() and path.stat().st_size > 1024:
+                result[beat_id] = path
+    return result
+
+
+def _parent_shot_id(image_id: str) -> str:
+    match = re.match(r"^(.*)_P\d+$", image_id, flags=re.IGNORECASE)
+    return match.group(1) if match else image_id
+
+
 def cosine_similarity(left: list[float], right: list[float]) -> float:
     if not left or len(left) != len(right):
         raise ValueError("embedding vectors must be non-empty and have equal dimensions")
@@ -149,6 +329,10 @@ def run_l2_checks(storyboard: dict, characters_data: dict, images: dict[str, Pat
         shot_characters[_shot_id(shot, index)] = _characters_in_shot(shot, characters)
     vectors: dict[str, list[float]] = {}
     errors: list[str] = []
+    image_characters = {
+        image_id: shot_characters.get(_parent_shot_id(image_id), [])
+        for image_id in images
+    }
     for sid, path in images.items():
         try:
             vector = embedder(str(path))
@@ -161,7 +345,7 @@ def run_l2_checks(storyboard: dict, characters_data: dict, images: dict[str, Pat
     matrices: dict[str, dict] = {}
     for character in characters:
         cid = str(character.get("id", ""))
-        shot_ids = [sid for sid, ids in shot_characters.items() if cid in ids and sid in vectors]
+        shot_ids = [sid for sid, ids in image_characters.items() if cid in ids and sid in vectors]
         matrix: list[list[float]] = []
         for left in shot_ids:
             row = []
@@ -178,7 +362,8 @@ def run_l2_checks(storyboard: dict, characters_data: dict, images: dict[str, Pat
             for j in range(i + 1, len(shot_ids)):
                 score = matrix[i][j]
                 if score < threshold:
-                    issues.append(_issue("L2", "severe", "character_similarity_low", f"{cid} differs between {left} and {shot_ids[j]} (cosine={score:.3f})", [left, shot_ids[j]], character_id=cid, similarity=score, threshold=threshold))
+                    parent_ids = sorted({_parent_shot_id(left), _parent_shot_id(shot_ids[j])})
+                    issues.append(_issue("L2", "severe", "character_similarity_low", f"{cid} differs between {left} and {shot_ids[j]} (cosine={score:.3f})", parent_ids, character_id=cid, storyboard_ids=[left, shot_ids[j]], similarity=score, threshold=threshold))
     status = "completed" if vectors else "skipped"
     reason = None if vectors else ("ARK_AGENT_API_KEY missing or embedding service returned no vectors")
     return issues, {"status": status, "skipped_reason": reason, "threshold": threshold, "embedded_shots": sorted(vectors), "character_matrices": matrices, "errors": errors}
@@ -290,7 +475,8 @@ def run_l3_review(storyboard: dict, characters_data: dict, visual_style: str, im
     create_storyboard_grid(ordered, grid_path)
     if client is None and not (os.environ.get("ARK_AGENT_API_KEY") or os.environ.get("ARK_API_KEY")):
         return [], {"status": "skipped", "grid_path": str(grid_path), "skipped_reason": "ARK multimodal API key missing"}
-    prompt = f"""Review this storyboard grid against the supplied project artifacts. The grid has exactly 5 columns in row-major order, and every frame has its shot ID in a large black badge at the top-left. Associate observations only with that in-frame badge; never infer an ID from a neighbouring cell or row position. Apply red lines R1-R4: R1 character identity/gender/build continuity; R2 time-of-day and lighting continuity; R3 scene/action continuity; R4 storyboard-to-image semantic fidelity. Compare character continuity only against the supplied fictional character artifacts. Do not perform face recognition, name a public figure, or claim that a fictional face resembles a celebrity; appearance alone is not evidence of real-person identity. Each storyboard image is one decisive still from a multi-step shot, so it need not show every earlier and later action simultaneously. Reserve severe for production-breaking mismatches: wrong/missing character identity or gender, wrong location/time-of-day, reversed attacker/defender, or a wholly unrelated core action. Use moderate for same-color costume material nuances, exact blade angle, blocking position offsets, or omitted intermediate motion that a single still cannot contain. Only identify problems; do not propose or perform edits. Return JSON: {{"issues":[{{"red_line":"R1","severity":"severe|moderate|minor","shot_ids":["S01"],"message":"..."}}]}}. Do not invent shot IDs.
+    valid_storyboard_ids = list(images)
+    prompt = f"""Review this storyboard grid against the supplied project artifacts. The grid has exactly 5 columns in row-major order, and every frame has its exact Sxx or Sxx_Pxx ID in a large black badge at the top-left. Associate observations only with that in-frame badge; never infer an ID from a neighbouring cell or row position. Apply red lines R1-R4: R1 character identity/gender/build continuity; R2 time-of-day and lighting continuity; R3 scene/action continuity; R4 storyboard-to-image semantic fidelity. Compare character continuity only against the supplied project character artifacts. Do not perform face recognition or infer a public identity from appearance alone. Each Pxx image represents only its own authored action and must progress from the previous Pxx without pose reset or premature future action. Reserve severe for production-breaking mismatches: wrong/missing character identity or gender, wrong location/time-of-day, reversed attacker/defender, wholly unrelated core action, or a continuation panel that visibly resets/replays the prior state. Use moderate for material nuances, exact prop angle, blocking offsets, or minor intermediate-motion omissions. Only identify problems; do not propose or perform edits. Return JSON: {{"issues":[{{"red_line":"R1","severity":"severe|moderate|minor","shot_ids":["S01_P01"],"message":"..."}}]}}. Use only these exact IDs: {json.dumps(valid_storyboard_ids, ensure_ascii=False)}.
 STORYBOARD:
 {json.dumps(storyboard, ensure_ascii=False)}
 CHARACTERS:
@@ -314,8 +500,12 @@ VISUAL STYLE:
             severity = _calibrate_l3_severity(
                 red_line, requested_severity, message
             )
-            shot_ids = [sid for sid in value.get("shot_ids", []) if sid in valid_ids]
-            issues.append(_issue("L3", severity, red_line, message, shot_ids))
+            storyboard_ids = [sid for sid in value.get("shot_ids", []) if sid in valid_ids]
+            shot_ids = sorted({_parent_shot_id(sid) for sid in storyboard_ids})
+            issues.append(_issue(
+                "L3", severity, red_line, message, shot_ids,
+                storyboard_ids=storyboard_ids,
+            ))
         return issues, {"status": "completed", "grid_path": str(grid_path), "raw_issue_count": len(parsed["issues"])}
     except Exception as exc:
         return [], {"status": "skipped", "grid_path": str(grid_path), "skipped_reason": f"multimodal review unavailable: {exc}"}
@@ -343,22 +533,52 @@ def run_storyboard_qa_gate(output_dir: Path, similarity_threshold: float | None 
         characters = json.loads(characters_path.read_text(encoding="utf-8")) if characters_path.is_file() else {"characters": []}
         style_path = output_dir / "visual-style.md"
         visual_style = style_path.read_text(encoding="utf-8") if style_path.is_file() else ""
+        events_path = output_dir / "phase1_events.json"
+        events_data = (
+            json.loads(events_path.read_text(encoding="utf-8"))
+            if events_path.is_file()
+            else None
+        )
     except (OSError, json.JSONDecodeError) as exc:
         result = {"status": "error", "grade": "D", "gate_passed": False, "error": f"required artifact unreadable: {exc}", "issues": [_issue("L1", "severe", "artifact_unreadable", str(exc))], "failed_shot_ids": []}
         report_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         return result
 
-    images = find_storyboard_images(output_dir, storyboard)
+    beat_images = find_storyboard_beat_images(output_dir, storyboard)
+    expected_beats = [
+        str(beat.get("beat_id") or f"{_shot_id(shot, shot_index)}_P{position:02d}")
+        for shot_index, shot in enumerate(storyboard.get("shots", []))
+        if isinstance(shot, dict)
+        for position, beat in enumerate(shot.get("storyboard_beats") or [], 1)
+        if isinstance(beat, dict)
+    ]
+    images = beat_images or find_storyboard_images(output_dir, storyboard)
     l1_issues, per_shot = run_l1_checks(storyboard, visual_style)
     threshold = similarity_threshold if similarity_threshold is not None else float(os.environ.get("HONCUT_STORYBOARD_QA_SIMILARITY", DEFAULT_SIMILARITY_THRESHOLD))
     l2_issues, l2 = run_l2_checks(storyboard, characters, images, threshold, embedder)
     l3_issues, l3 = run_l3_review(storyboard, characters, visual_style, images, output_dir / "storyboard_qa_grid.jpg", multimodal_client)
-    issues = l1_issues + l2_issues + l3_issues
+    capacity_issues = run_generation_capacity_checks(storyboard, events_data)
+    artifact_issues = [
+        _issue(
+            "L1", "severe", "storyboard_beat_image_missing",
+            f"{beat_id} has no valid Phase 2 storyboard image",
+            [_parent_shot_id(beat_id)], beat_id=beat_id,
+        )
+        for beat_id in expected_beats
+        if beat_id not in beat_images
+    ]
+    issues = l1_issues + artifact_issues + capacity_issues + l2_issues + l3_issues
     for index, shot in enumerate(storyboard.get("shots", [])):
         sid = _shot_id(shot, index)
         detail = per_shot.setdefault(sid, {"issues": []})
         detail["characters"] = _characters_in_shot(shot, characters.get("characters", []))
+        shot_beat_images = {
+            image_id: str(path)
+            for image_id, path in beat_images.items()
+            if _parent_shot_id(image_id) == sid
+        }
         detail["image_path"] = str(images[sid]) if sid in images else None
+        detail["storyboard_beat_images"] = shot_beat_images
         detail["issues"] = [issue for issue in issues if sid in issue.get("shot_ids", [])]
     grade = grade_issues(issues)
     failed_shots = sorted({sid for issue in issues if issue.get("severity") == "severe" for sid in issue.get("shot_ids", [])})

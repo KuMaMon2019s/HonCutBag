@@ -667,6 +667,45 @@ def _integrate_storyboard_prompts(storyboard: dict, characters: list[dict]) -> d
     return storyboard
 
 
+def _attach_director_storyboard(
+    output_dir: Path,
+    storyboard: dict,
+    characters: Optional[list[dict]] = None,
+    *,
+    client=None,
+    dry_run: bool = False,
+) -> dict:
+    """Generate and register the mandatory Phase 1 director overview artifact."""
+    from phases.phase1.director_storyboard import generate_director_storyboard
+
+    video_width, video_height, aspect_ratio = _storyboard_canvas(storyboard)
+    storyboard.setdefault("aspect_ratio", aspect_ratio)
+    manifest = generate_director_storyboard(
+        output_dir,
+        storyboard,
+        characters,
+        client=client,
+        dry_run=dry_run,
+        size=_storyboard_image_size(
+            video_width=video_width,
+            video_height=video_height,
+        ),
+    )
+    storyboard["director_storyboard"] = {
+        "image": manifest["image"],
+        "manifest": "director_storyboard.json",
+        "prompt": manifest["prompt"],
+        "status": manifest["status"],
+        "provider": manifest["provider"],
+        "model": manifest["model"],
+        "panel_count": len(manifest["panels"]),
+        "preliminary_groups": list(dict.fromkeys(
+            panel["group_id"] for panel in manifest["panels"]
+        )),
+    }
+    return manifest
+
+
 def _extract_visual_style_text(script_text: str) -> Optional[str]:
     """Extract a declared art-style paragraph without interpreting the script."""
     match = re.search(
@@ -956,7 +995,16 @@ def run_phase1_screenwriter(
                 "total_duration": 15,
                 "style": "写实电影风格"
             }
+            from phases.phase1.storyboard_beats import plan_storyboard_beats
+
+            plan_storyboard_beats(mock_storyboard)
             _integrate_storyboard_prompts(mock_storyboard, mock_characters["characters"])
+            _attach_director_storyboard(
+                output_dir,
+                mock_storyboard,
+                mock_characters["characters"],
+                dry_run=True,
+            )
             
             if reporter:
                 reporter.step("phase1", f"dry-run: 生成 {len(mock_storyboard['shots'])} 个分镜", progress_pct=80)
@@ -970,7 +1018,10 @@ def run_phase1_screenwriter(
             characters_path.write_text(json.dumps(mock_characters, ensure_ascii=False, indent=2))
             events_path.write_text(json.dumps({"events": mock_events}, ensure_ascii=False, indent=2))
             
-            outputs = ["STORYBOARD.json", "CHARACTERS.json", "events.json"]
+            outputs = [
+                "STORYBOARD.json", "CHARACTERS.json", "events.json",
+                "director_storyboard_prompt.txt", "director_storyboard.json",
+            ]
             print(f"  ✓ Phase 1 完成 (dry-run): {outputs}")
             
             return {
@@ -1123,8 +1174,21 @@ def run_phase1_screenwriter(
             visual_style_path=str(visual_style_path) if visual_style_path else None,
             visual_style_text=visual_style_text,
         )
+        from phases.phase1.storyboard_beats import plan_storyboard_beats
+
+        plan_storyboard_beats(storyboard)
         _integrate_storyboard_prompts(storyboard, characters_list)
         annotate_shot_pacing(storyboard.get("shots", []))
+        print("  → Seedream: 生成单张手绘导演故事板总览...")
+        director_storyboard = _attach_director_storyboard(
+            output_dir,
+            storyboard,
+            characters_list,
+        )
+        print(
+            f"  ✓ 导演故事板总览: director_storyboard.png "
+            f"({len(director_storyboard['panels'])} 格)"
+        )
 
         # 写出文件
         storyboard_path = output_dir / "STORYBOARD.json"
@@ -1133,7 +1197,11 @@ def run_phase1_screenwriter(
         storyboard_path.write_text(json.dumps(storyboard, ensure_ascii=False, indent=2))
         characters_path.write_text(json.dumps(characters_result, ensure_ascii=False, indent=2))
 
-        outputs = ["STORYBOARD.json", "CHARACTERS.json"]
+        outputs = [
+            "STORYBOARD.json", "CHARACTERS.json",
+            "director_storyboard.png", "director_storyboard_prompt.txt",
+            "director_storyboard.json",
+        ]
         print(f"  ✓ Phase 1 完成: {outputs}")
 
         # Quality gate: Phase 1
@@ -1558,6 +1626,30 @@ def fit_to_aspect(image_path: Path, target_w: int, target_h: int, output_path: P
 SEEDREAM_MIN_PIXELS = 3686400
 
 
+def _storyboard_canvas(storyboard: dict) -> tuple[int, int, str]:
+    """Resolve the project canvas from storyboard metadata without forcing 16:9."""
+    first_shot = next(
+        (shot for shot in storyboard.get("shots", []) if isinstance(shot, dict)),
+        {},
+    )
+    width = int(storyboard.get("width") or first_shot.get("width") or 0)
+    height = int(storyboard.get("height") or first_shot.get("height") or 0)
+    ratio = str(
+        storyboard.get("aspect_ratio")
+        or first_shot.get("aspect_ratio")
+        or ""
+    ).strip()
+    if width > 0 and height > 0:
+        divisor = math.gcd(width, height)
+        return width, height, ratio or f"{width // divisor}:{height // divisor}"
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*[:/]\s*(\d+(?:\.\d+)?)\s*", ratio)
+    if match:
+        left, right = float(match.group(1)), float(match.group(2))
+        if left > 0 and right > 0:
+            return round(left * 1000), round(right * 1000), f"{match.group(1)}:{match.group(2)}"
+    return 16, 9, "16:9"
+
+
 def _storyboard_image_size(image_path: Optional[Path] = None, video_width: int = 1280, video_height: int = 720) -> str:
     """Return Seedream's WxH size string for storyboard/end-frame generation.
 
@@ -1933,6 +2025,9 @@ def _storyboard_keyframe_description(shot: dict) -> str:
     action = re.sub(r"[“\"](?:(?![”\"]).){1,120}[”\"]", "", action)
     action = re.sub(r"\s+", " ", action).strip()
     staging = str(shot.get("visual") or "").strip()
+    generation_actions = shot.get("generation_actions") or []
+    is_action_shot = bool(generation_actions) or str(shot.get("shot_intent") or "").lower() == "action"
+    start_state = str(shot.get("start_state") or "").strip()
     # Only explicit who=[] is an environment contract. Legacy storyboards may
     # omit ``who`` while carrying character identity and action in the older
     # subject/action fields.
@@ -1953,9 +2048,27 @@ def _storyboard_keyframe_description(shot: dict) -> str:
                 if identity
                 else ""
             ),
-            f"Exact action contract: {action}." if action else "",
-            "Show one decisive final pose of that exact action contract.",
-            f"Visual staging: {staging}." if staging else "",
+            (
+                f"Exact starting-state contract before any action begins: {start_state}."
+                if is_action_shot and start_state
+                else (
+                    f"Show the poised starting pose immediately before this first action: "
+                    f"{generation_actions[0]}."
+                    if is_action_shot and generation_actions
+                    else f"Exact action contract: {action}." if action else ""
+                )
+            ),
+            (
+                "This is frame zero: the first attack, impact, and result have not happened yet. "
+                "Do not depict contact, sparks, damage, or the final pose."
+                if is_action_shot
+                else "Show one decisive final pose of that exact action contract."
+            ),
+            (
+                f"Scene and composition: {shot.get('where', '')}."
+                if is_action_shot
+                else f"Visual staging: {staging}." if staging else ""
+            ),
             "Depict only subjects, props, and actions explicitly named in the contract.",
             "No exposed midriff unless the identity contract explicitly requires it.",
             "No text, no letters, no captions, no subtitles, and no speech bubbles; dialogue is audio-only.",
@@ -2203,6 +2316,8 @@ def _validate_storyboard_image_composition(output_dir: Path, storyboard_data: di
 
 def run_phase2(storyboard_data: dict, characters_data: dict, output_dir: Path, dry_run: bool) -> dict:
     """Phase 2: 使用 OM image_selector 生成故事板图片，不可用时降级到 Seedream API"""
+    import shutil
+
     _banner("2", 9, "故事板图片生成 (ImageSelector / Seedream)", dry_run)
     start = _now()
     _p25_est = estimate_phase_duration("phase2")
@@ -2212,6 +2327,69 @@ def run_phase2(storyboard_data: dict, characters_data: dict, output_dir: Path, d
     if dry_run:
         print("  ⊘ dry-run 模式，跳过故事板图片生成")
         return {"status": "skipped", "reason": "dry-run", "duration_s": _elapsed(start)}
+
+    # Phase 1 now owns the model-generated director overview. Reuse that exact
+    # image here so Phase 2 can focus on per-shot reference frames instead of
+    # paying for a second, semantically competing overview board.
+    director_ref = storyboard_data.get("director_storyboard") or {}
+    director_image = output_dir / str(
+        director_ref.get("image") or "director_storyboard.png"
+    )
+    if director_ref.get("status") == "done" and director_image.is_file():
+        storyboard_path = output_dir / "storyboard.png"
+        shutil.copy2(director_image, storyboard_path)
+        print("  ↻ 复用 Phase 1 模型生成的导演故事板总览")
+        qg_report = run_quality_check("phase2", output_dir)
+        if not qg_report.passed:
+            return {
+                "status": "error",
+                "error": f"Phase 2 质检未通过: {qg_report.grade}",
+                "quality_report": qg_report,
+                "duration_s": _elapsed(start),
+            }
+        from phases.phase2.shot_storyboards import (
+            generate_shot_storyboards,
+            validate_shot_storyboard_artifacts,
+        )
+
+        print("  → Seedream: 按 Sxx 生成内部手绘故事板...")
+        video_width, video_height, aspect_ratio = _storyboard_canvas(storyboard_data)
+        shot_storyboards = generate_shot_storyboards(
+            output_dir,
+            storyboard_data,
+            characters_data.get("characters", []),
+            size=_storyboard_image_size(
+                video_width=video_width,
+                video_height=video_height,
+            ),
+            director_storyboard_path=director_image,
+            aspect_ratio=aspect_ratio,
+        )
+        artifact_errors = validate_shot_storyboard_artifacts(
+            output_dir,
+            storyboard_data,
+        )
+        if artifact_errors:
+            return {
+                "status": "error",
+                "error": "Phase 2 Pxx artifact validation failed",
+                "artifact_errors": artifact_errors,
+                "duration_s": _elapsed(start),
+            }
+        # Persist the provider-returned board and model-generated Pxx references back
+        # into the canonical storyboard consumed by Phase 4.
+        (output_dir / "STORYBOARD.json").write_text(
+            json.dumps(storyboard_data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return {
+            "status": "done",
+            "duration_s": _elapsed(start),
+            "outputs": ["storyboard.png", "SHOT_STORYBOARDS.json"],
+            "provider": "seedream_shot_storyboards",
+            "shot_storyboards_generated": shot_storyboards["total_boards"],
+            "storyboard_panels_generated": shot_storyboards["total_panels"],
+        }
 
     print("[cooldown] 等待 120s 让 Agent Plan 限流窗口重置...", flush=True)
     time.sleep(120)
@@ -2617,10 +2795,24 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
         return {"status": "error", "error": "STORYBOARD.json not found", "duration_s": _elapsed(start)}
 
     try:
-        from phases.phase4.continuity_plan import write_continuity_plan
+        from phases.phase4.continuity_plan import write_continuity_plan, write_storyboard_groups
         from phases.phase4.scene_consistency import write_scene_consistency
 
         storyboard_for_consistency = json.loads(storyboard_path.read_text(encoding="utf-8"))
+        from phases.phase2.shot_storyboards import validate_shot_storyboard_artifacts
+
+        storyboard_artifact_errors = (
+            validate_shot_storyboard_artifacts(output_dir, storyboard_for_consistency)
+            if not dry_run
+            else []
+        )
+        if storyboard_artifact_errors:
+            return {
+                "status": "error",
+                "error": "Phase 4 requires complete Phase 2 Pxx storyboards",
+                "artifact_errors": storyboard_artifact_errors,
+                "duration_s": _elapsed(start),
+            }
         characters_path = output_dir / "CHARACTERS.json"
         characters_for_consistency = (
             json.loads(characters_path.read_text(encoding="utf-8"))
@@ -2652,9 +2844,24 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
             continuation_overlap_s=float(
                 os.environ.get("HONCUT_CONTINUITY_OVERLAP_SECONDS", "2.0")
             ),
+            continuity_group_max_shots=int(
+                os.environ.get("HONCUT_CONTINUITY_GROUP_MAX_SHOTS", "3")
+            ),
         )
         outputs.append("CONTINUITY_PLAN.json")
         print("  ✓ 连续性计划: CONTINUITY_PLAN.json")
+        storyboard_groups = write_storyboard_groups(
+            output_dir,
+            storyboard_for_consistency,
+            continuity_plan,
+        )
+        outputs.append("STORYBOARD_GROUPS.json")
+        outputs.extend(
+            str(group["storyboard_board"])
+            for group in storyboard_groups.get("groups", [])
+            if group.get("storyboard_board")
+        )
+        print("  ✓ 组级故事板: STORYBOARD_GROUPS.json + storyboard_groups/")
         from runtime.continuity_memory import initialize_continuity_memory
 
         initialize_continuity_memory(output_dir, continuity_plan)

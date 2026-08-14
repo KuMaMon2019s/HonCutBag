@@ -54,6 +54,9 @@ def load_storyboard(path: Path) -> dict:
 def parse_shots(storyboard: dict) -> list:
     """Extract shot metadata from storyboard."""
     shots = []
+    project_aspect_ratio = storyboard.get("aspect_ratio")
+    project_width = storyboard.get("width")
+    project_height = storyboard.get("height")
     for s in storyboard["shots"]:
         shot = {
             "id": s["id"],
@@ -78,6 +81,9 @@ def parse_shots(storyboard: dict) -> list:
             "dialogue": s.get("dialogue"),
             "speech_duration_s": s.get("speech_duration_s", 0),
             "audio": s.get("audio", s.get("sound")),
+            "aspect_ratio": s.get("aspect_ratio", project_aspect_ratio),
+            "width": s.get("width", project_width),
+            "height": s.get("height", project_height),
         }
         shots.append(shot)
     return shots
@@ -251,6 +257,9 @@ def setup_shot_dirs(shots: list) -> list:
             "dialogue": shot.get("dialogue"),
             "speech_duration_s": shot.get("speech_duration_s", 0),
             "audio": shot.get("audio"),
+            "aspect_ratio": shot.get("aspect_ratio"),
+            "width": shot.get("width"),
+            "height": shot.get("height"),
             "status": "pending",
             "task_id": None,
             "video_path": None,

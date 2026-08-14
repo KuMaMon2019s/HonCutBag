@@ -151,11 +151,6 @@ _ACTION_PHASES = {"none", "setup", "attack", "counter", "impact", "recovery", "c
 _GROUP_PARTICIPANT_RE = re.compile(
     r"(?:数[十百千]|机械(?:单位|身影|部队|群)|群众|人群|群体|军队|部队|居民群|敌群)"
 )
-_LOCATION_ANCHORS = (
-    "高架", "桥", "公路", "街道", "巷", "广场", "工地", "场地", "废墟", "巴士",
-    "钢梁", "立柱", "积水", "室内", "房间", "大厅", "走廊", "屋顶", "森林", "山",
-    "海", "河", "车站", "机场", "学校", "医院", "仓库", "工厂", "酒吧", "餐厅",
-)
 _NARRATIVE_JUMP_CUES = (
     "与此同时", "另一边", "次日", "翌日", "后来", "数小时后", "多年后", "回忆",
     "梦境", "转场", "来到", "抵达", "离开当前", "meanwhile", "later", "next day",
@@ -462,9 +457,21 @@ def _annotate_global_event_flow(events: List[Dict[str, Any]]) -> List[Dict[str, 
 def _locations_compatible(previous: Dict[str, Any], current: Dict[str, Any]) -> bool:
     previous_where = str(previous.get("where") or "")
     current_where = str(current.get("where") or "")
-    previous_anchors = {anchor for anchor in _LOCATION_ANCHORS if anchor in previous_where}
-    current_anchors = {anchor for anchor in _LOCATION_ANCHORS if anchor in current_where}
-    return bool(previous_anchors & current_anchors)
+
+    def tokens(value: str) -> set[str]:
+        normalized = re.sub(r"\s+", "", value.casefold())
+        word_tokens = set(re.findall(r"[a-z0-9_]{3,}", normalized))
+        cjk_runs = re.findall(r"[\u3400-\u9fff]{2,}", normalized)
+        cjk_bigrams = {
+            run[index:index + 2]
+            for run in cjk_runs
+            for index in range(len(run) - 1)
+        }
+        return word_tokens | cjk_bigrams
+
+    previous_tokens = tokens(previous_where)
+    current_tokens = tokens(current_where)
+    return bool(previous_tokens & current_tokens)
 
 
 def _should_repair_cross_segment_boundary(

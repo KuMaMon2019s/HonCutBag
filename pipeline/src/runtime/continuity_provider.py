@@ -198,7 +198,100 @@ def _chunk_duration(request: ChunkExecutionRequest) -> int:
     return int(rounded)
 
 
-def _chunk_prompt(request: ChunkExecutionRequest, shot_meta: dict[str, Any]) -> str:
+def _video_geometry(shot_meta: dict[str, Any]) -> tuple[str, int, int]:
+    """Resolve provider ratio and Bridge dimensions from the authored shot."""
+    width = int(shot_meta.get("width") or 0)
+    height = int(shot_meta.get("height") or 0)
+    ratio = str(
+        shot_meta.get("aspect_ratio") or shot_meta.get("ratio") or ""
+    ).strip()
+    if width > 0 and height > 0:
+        divisor = math.gcd(width, height)
+        return ratio or f"{width // divisor}:{height // divisor}", width, height
+    import re
+
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*[:/]\s*(\d+(?:\.\d+)?)\s*", ratio)
+    if match:
+        left, right = float(match.group(1)), float(match.group(2))
+        if left > 0 and right > 0:
+            if left >= right:
+                width, height = 1280, max(2, round(1280 * right / left / 2) * 2)
+            else:
+                height, width = 1280, max(2, round(1280 * left / right / 2) * 2)
+            return f"{match.group(1)}:{match.group(2)}", width, height
+    return "16:9", 1280, 720
+
+
+def _storyboard_group_for_shot(
+    output_dir: Path,
+    shot_id: str,
+) -> tuple[dict[str, Any] | None, Path | None]:
+    path = output_dir / "STORYBOARD_GROUPS.json"
+    if not path.is_file():
+        return None, None
+    try:
+        contract = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, None
+    group_id = (contract.get("shot_to_group") or {}).get(shot_id)
+    group = next(
+        (
+            item for item in contract.get("groups", [])
+            if isinstance(item, dict) and item.get("group_id") == group_id
+        ),
+        None,
+    )
+    if group is None:
+        return None, None
+    board_value = group.get("storyboard_board")
+    board = output_dir / str(board_value) if board_value else None
+    return group, board if board is not None and board.is_file() else None
+
+
+def _storyboard_group_prompt(group: dict[str, Any] | None, shot_id: str) -> str:
+    if not group:
+        return ""
+    beats = [beat for beat in group.get("beats", []) if isinstance(beat, dict)]
+    position = next((index for index, beat in enumerate(beats) if beat.get("shot_id") == shot_id), None)
+    if position is None:
+        return ""
+    current = beats[position]
+    previous = beats[position - 1] if position > 0 else None
+    following = beats[position + 1] if position + 1 < len(beats) else None
+    handoff = group.get("handoff_from_previous") or {}
+    has_inner_beats = bool(current.get("storyboard_beats"))
+    actions = " -> ".join(str(value) for value in current.get("generation_actions", []))
+    lines = [
+        f"[storyboard group {group.get('group_id')}; step {position + 1}/{len(beats)}]",
+        "The group board is a chronological narrative map, not a request to perform every panel now.",
+        (
+            f"Previous shot final state: {previous.get('end_state', '')}"
+            if previous
+            else (
+                f"Previous generation group {group.get('previous_group_id')} ended at: "
+                f"{handoff.get('previous_end_state', '')}. Begin this fresh editorial cut from the declared current start state."
+                if handoff
+                else "This is the fresh story entry."
+            )
+        ),
+        f"Current shot starting state: {current.get('start_state', '')}",
+        (
+            "The authoritative Pxx contract below defines the only action to execute now."
+            if has_inner_beats
+            else f"Execute only this current shot action contract: {actions or 'no authored body action'}"
+        ),
+        f"Current shot required result: {current.get('end_state', '')}",
+        f"Next shot will begin from: {following.get('start_state', '')}" if following else "This is the final shot in the group.",
+        "Do not jump to a later panel, combine later actions, replay the previous panel, or render a collage.",
+    ]
+    return "\n".join(line for line in lines if not line.endswith(": "))
+
+
+def _chunk_prompt(
+    request: ChunkExecutionRequest,
+    shot_meta: dict[str, Any],
+    group_prompt: str = "",
+) -> str:
     prompt = str(shot_meta.get("prompt") or "").strip()
     if not prompt:
         raise ValueError(f"{request.shot_id} SHOT_META.json has no prompt")
@@ -214,10 +307,64 @@ def _chunk_prompt(request: ChunkExecutionRequest, shot_meta: dict[str, Any]) -> 
             "screen direction, camera framing, lighting, and surrounding motion state. "
             "Do not skip forward in time or reposition the subject before continuing."
         )
+    beat_contract = ""
+    if request.chunk.storyboard_beat_id:
+        beat_contract = (
+            f"\n[authoritative storyboard beat {request.chunk.storyboard_beat_id}] "
+            f"Start state: {request.chunk.start_state or 'continue the supplied state'}. "
+            f"Execute only this visible action: {request.chunk.action_prompt or 'natural scene progression'}. "
+            f"Required end state: {request.chunk.end_state or 'complete that action'}. "
+            "Do not execute another Pxx panel, skip ahead, or replay an earlier panel."
+        )
     return (
         f"{prompt}\n\n[continuity chunk {request.chunk.sequence}] {continuation}\n"
-        f"{request.memory_context}{repair}"
+        f"{group_prompt}\n{request.memory_context}{beat_contract}{repair}"
     )
+
+
+def _append_group_board_reference(
+    content: list[dict[str, Any]],
+    board_path: Path | None,
+) -> list[dict[str, Any]]:
+    if board_path is None:
+        return content
+    from clients.tos_uploader import upload_image
+
+    try:
+        from PIL import Image
+
+        with Image.open(board_path) as board_image:
+            image_format = str(board_image.format or "").upper()
+        content_type = {
+            "JPEG": "image/jpeg",
+            "PNG": "image/png",
+            "WEBP": "image/webp",
+        }.get(image_format, "application/octet-stream")
+    except (ImportError, OSError, ValueError):
+        import mimetypes
+
+        content_type = mimetypes.guess_type(board_path.name)[0] or "application/octet-stream"
+    board_url = upload_image(board_path.read_bytes(), content_type)
+    if not board_url:
+        raise RuntimeError(f"failed to upload storyboard group board {board_path}")
+    image_number = sum(item.get("type") == "image_url" for item in content) + 1
+    directive = (
+        f"图片{image_number}是本连续组按时间从左到右、从上到下排列的总体分镜板，"
+        "仅用于确认当前镜头在故事中的位置和前后因果；不得复制整张拼图、不得同时演完其他格、"
+        "不得生成分格边框或板中文字。"
+    )
+    text_item = next((item for item in content if item.get("type") == "text"), None)
+    if text_item is None:
+        content.insert(0, {"type": "text", "text": directive})
+    else:
+        text_item["text"] = f"{directive}\n{text_item.get('text', '')}"
+    content.append({
+        "type": "image_url",
+        "image_url": {"url": board_url},
+        "role": "reference_image",
+        "priority": "low",
+    })
+    return content
 
 
 def _base_content(
@@ -228,10 +375,27 @@ def _base_content(
     from tools.asset_packager import build_content_for_shot
 
     content_meta = dict(shot_meta)
-    content_meta["prompt"] = _chunk_prompt(request, shot_meta)
+    group, board_path = _storyboard_group_for_shot(output_dir, request.shot_id)
+    content_meta["prompt"] = _chunk_prompt(
+        request,
+        shot_meta,
+        _storyboard_group_prompt(group, request.shot_id),
+    )
+    if request.chunk.storyboard_image:
+        content_meta["_storyboard_frame_path"] = request.chunk.storyboard_image
+        content_meta["_storyboard_beat_id"] = request.chunk.storyboard_beat_id
+        content_meta["generation_actions"] = [request.chunk.action_prompt]
+        content_meta["gen_strategy"] = "i2v"
+    reserved_group_board = 1 if board_path is not None else 0
     if request.chunk.mode == "native_extend":
         content_meta["_max_reference_images"] = (
-            SEEDANCE_MAX_REFERENCE_IMAGES - CONTINUITY_ANCHOR_FRAME_COUNT
+            SEEDANCE_MAX_REFERENCE_IMAGES
+            - CONTINUITY_ANCHOR_FRAME_COUNT
+            - reserved_group_board
+        )
+    elif reserved_group_board:
+        content_meta["_max_reference_images"] = (
+            SEEDANCE_MAX_REFERENCE_IMAGES - reserved_group_board
         )
     content = build_content_for_shot(
         output_dir=output_dir,
@@ -239,8 +403,8 @@ def _base_content(
         shot_meta=content_meta,
     )
     if not content:
-        return [{"type": "text", "text": content_meta["prompt"]}]
-    return content
+        content = [{"type": "text", "text": content_meta["prompt"]}]
+    return _append_group_board_reference(content, board_path)
 
 
 def _extension_content(
@@ -364,11 +528,24 @@ def _provider_input_context(
 ) -> dict[str, str | None]:
     shot_meta = output_dir / "shots" / shot_id / "SHOT_META.json"
     storyboard_frame = output_dir / "storyboard_images" / f"{shot_id}.png"
+    group, group_board = _storyboard_group_for_shot(output_dir, shot_id)
+    group_contract = output_dir / "STORYBOARD_GROUPS.json"
     return {
         "shot_meta_sha256": hashlib.sha256(shot_meta.read_bytes()).hexdigest(),
         "storyboard_frame_sha256": (
             hashlib.sha256(storyboard_frame.read_bytes()).hexdigest()
             if storyboard_frame.is_file()
+            else None
+        ),
+        "storyboard_group_id": str(group.get("group_id")) if group else None,
+        "storyboard_groups_sha256": (
+            hashlib.sha256(group_contract.read_bytes()).hexdigest()
+            if group_contract.is_file()
+            else None
+        ),
+        "storyboard_group_board_sha256": (
+            hashlib.sha256(group_board.read_bytes()).hexdigest()
+            if group_board is not None
             else None
         ),
         "chunk_id": chunk_id,
@@ -396,7 +573,11 @@ def _direct_seedance_executor(
     def execute(request: ChunkExecutionRequest) -> ChunkExecutionResult:
         seed = _generation_seed(request)
         duration = _chunk_duration(request)
+        ratio, _width, _height = _video_geometry(
+            _read_shot_meta(output_dir, request.shot_id)
+        )
         payload = _task_payload(request, model=model, duration=duration, seed=seed)
+        payload["ratio"] = ratio
 
         def submit() -> str:
             try:
@@ -413,7 +594,7 @@ def _direct_seedance_executor(
                 api_key=api_key,
                 model=model,
                 duration=duration,
-                ratio="16:9",
+                ratio=ratio,
                 seed=seed,
             )
 
@@ -456,7 +637,11 @@ def _bridge_seedance_executor(
         seed = _generation_seed(request)
         duration = _chunk_duration(request)
         model = "seedance"
+        ratio, width, height = _video_geometry(
+            _read_shot_meta(output_dir, request.shot_id)
+        )
         payload = _task_payload(request, model=model, duration=duration, seed=seed)
+        payload.update({"ratio": ratio, "width": width, "height": height})
 
         def generate(**runtime_kwargs: Any) -> str | dict[str, Any]:
             content, _shot_meta, _seed, _duration = _provider_content(output_dir, request)
@@ -469,8 +654,8 @@ def _bridge_seedance_executor(
                 output_path=str(request.output_path),
                 seed=seed if seed is not None else -1,
                 duration=duration,
-                width=1280,
-                height=720,
+                width=width,
+                height=height,
                 fps=24,
                 content=content,
                 batch_id=output_dir.name,

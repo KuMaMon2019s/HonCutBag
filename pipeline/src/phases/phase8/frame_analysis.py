@@ -169,6 +169,44 @@ def _frame_metrics(path: Path) -> dict[str, Any]:
     }
 
 
+def measure_motion_activity(frame_paths: list[Path]) -> dict[str, float]:
+    """Measure visible inter-sample change, including animated-still failures."""
+    arrays: list[np.ndarray] = []
+    for path in frame_paths:
+        pixels = _read_pixels(Path(path))
+        gray = pixels.mean(axis=2)
+        # Block averaging suppresses rain, grain, sparks, and codec shimmer so
+        # those high-frequency effects cannot masquerade as subject motion.
+        height, width = gray.shape
+        factor = max(1, min(height // 90, width // 160))
+        pooled_height = (height // factor) * factor
+        pooled_width = (width // factor) * factor
+        pooled = gray[:pooled_height, :pooled_width].reshape(
+            pooled_height // factor,
+            factor,
+            pooled_width // factor,
+            factor,
+        ).mean(axis=(1, 3))
+        arrays.append(pooled)
+    if len(arrays) < 2:
+        return {"median_mae": 0.0, "changed_pixel_ratio": 0.0, "pair_count": 0}
+    maes: list[float] = []
+    changed_ratios: list[float] = []
+    for previous, current in zip(arrays, arrays[1:]):
+        if previous.shape != current.shape:
+            continue
+        difference = np.abs(current - previous)
+        maes.append(float(difference.mean()))
+        changed_ratios.append(float((difference > 12.0).mean()))
+    return {
+        "median_mae": round(float(np.median(maes)), 4) if maes else 0.0,
+        "changed_pixel_ratio": (
+            round(float(np.median(changed_ratios)), 6) if changed_ratios else 0.0
+        ),
+        "pair_count": len(maes),
+    }
+
+
 def _detect_black_segments(video_path: Path) -> list[dict[str, float]]:
     completed = subprocess.run(
         [
@@ -229,6 +267,7 @@ def decide_shot_action(
     freeze_segments: list[dict[str, float]],
     semantic_review: dict[str, Any] | None = None,
     shot_meta: dict[str, Any] | None = None,
+    motion_activity: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Turn technical/semantic evidence into one keep, trim, or reshoot action."""
     boundary_tolerance = min(0.35, max(0.12, duration * 0.04))
@@ -279,6 +318,29 @@ def decide_shot_action(
     if long_freezes and not intentionally_static:
         reasons.append(f"unexpected long freeze detected: {long_freezes}")
 
+    activity = motion_activity or {}
+    camera_motion = str(
+        meta.get("camera_movement")
+        or meta.get("camera_movement_en")
+        or meta.get("camera")
+        or ""
+    ).lower()
+    generation_actions = meta.get("generation_actions") or []
+    requires_visible_motion = bool(generation_actions) or camera_motion not in {
+        "", "static", "fixed", "locked", "unspecified"
+    } or duration > 6.0
+    animated_still = (
+        activity.get("pair_count", 0) >= 2
+        and activity.get("median_mae", 0.0) < 3.5
+        and activity.get("changed_pixel_ratio", 0.0) < 0.06
+    )
+    if requires_visible_motion and animated_still:
+        reasons.append(
+            "animated-still motion failure: "
+            f"median_mae={activity.get('median_mae', 0.0):.3f}, "
+            f"changed_pixel_ratio={activity.get('changed_pixel_ratio', 0.0):.3f}"
+        )
+
     remaining = trim_end - trim_start
     if remaining < max(1.0, duration * 0.5):
         reasons.append(f"boundary trimming would leave only {remaining:.2f}s of {duration:.2f}s")
@@ -310,7 +372,8 @@ def _automatic_semantic_reviewer() -> SemanticReviewer | None:
         expected = {
             key: shot_meta.get(key)
             for key in (
-                "shot_id", "visual", "action", "action_description", "who", "where",
+                "shot_id", "visual", "action", "action_description", "generation_actions",
+                "who", "where",
                 "characters", "time", "time_of_day", "lighting", "lighting_key",
                 "lighting_description", "style_anchor",
             )
@@ -325,7 +388,9 @@ def _automatic_semantic_reviewer() -> SemanticReviewer | None:
             "micro-movements (small gaze/head/hand changes) are allowed unless they reverse the narrative action or "
             "create a true continuity jump. Do not call a hand or limb anatomically broken merely because it is "
             "partly hidden by a sleeve, prop, railing, crop, or camera angle; require visible positive evidence of "
-            "malformation. Judge shot-size drift only against explicit camera movement: a dolly-in must not become "
+            "malformation. Verify that generation_actions occur in their listed order with visible subject "
+            "displacement and a recognizable result; hair, rain, smoke, blinking, or camera drift alone do not "
+            "count as completion of body action. Judge shot-size drift only against explicit camera movement: a dolly-in must not become "
             "a sustained pull-back, while a fixed shot may contain minor stabilization drift. Return JSON only: "
             '{"verdict":"pass|reshoot","issues":["..."],"confidence":0.0}.'
         )
@@ -392,6 +457,7 @@ def analyze_shot_frames(
                 })
             black_segments = _detect_black_segments(video)
             freeze_segments = _detect_freeze_segments(video)
+            motion_activity = measure_motion_activity([item["path"] for item in extracted])
             semantic: dict[str, Any] | None = None
             if reviewer:
                 try:
@@ -403,13 +469,15 @@ def analyze_shot_frames(
                 except Exception as exc:
                     semantic = {"verdict": "unavailable", "issues": [], "error": str(exc)}
             decision = decide_shot_action(
-                duration, frames, black_segments, freeze_segments, semantic, shot_meta
+                duration, frames, black_segments, freeze_segments, semantic, shot_meta,
+                motion_activity,
             )
             entry = {
                 "duration_s": round(duration, 4),
                 "frames": frames,
                 "black_segments": black_segments,
                 "freeze_segments": freeze_segments,
+                "motion_activity": motion_activity,
                 "semantic_review": semantic,
                 **decision,
             }

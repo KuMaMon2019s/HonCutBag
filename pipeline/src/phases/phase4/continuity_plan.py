@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from collections.abc import Mapping
@@ -17,6 +18,148 @@ from schemas.continuity import (
 
 DEFAULT_PROVIDER_CHUNK_LIMIT_S = 15.0
 DEFAULT_TIMELINE_FPS = 24
+DEFAULT_CONTINUITY_GROUP_MAX_SHOTS = 3
+
+
+def _storyboard_group_contract(
+    storyboard: Mapping[str, Any],
+    plan: ContinuityPlan,
+) -> dict[str, Any]:
+    """Build the narrative map that sits above per-shot continuity chunks."""
+    storyboard_shots = {
+        _shot_id(shot, index): shot
+        for index, shot in enumerate(storyboard.get("shots", []), 1)
+        if isinstance(shot, Mapping)
+    }
+    grouped: dict[str, list[ContinuityShot]] = {}
+    for planned in plan.shots:
+        grouped.setdefault(planned.continuity_group_id, []).append(planned)
+
+    groups: list[dict[str, Any]] = []
+    shot_to_group: dict[str, str] = {}
+    def compact(value: Any, limit: int = 320) -> str:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+    for group_id, planned_shots in grouped.items():
+        beats = []
+        for position, planned in enumerate(planned_shots, 1):
+            source = storyboard_shots.get(planned.shot_id, {})
+            actions = source.get("generation_actions") or []
+            if isinstance(actions, str):
+                actions = [actions]
+            beat = {
+                "position": position,
+                "shot_id": planned.shot_id,
+                "mode": planned.chunks[0].mode,
+                "storyboard_image": f"storyboard_images/{planned.shot_id}.png",
+                "storyboard_board": source.get("storyboard_board"),
+                "storyboard_beats": source.get("storyboard_beats") or [],
+                "start_state": compact(
+                    source.get("start_state")
+                    or source.get("prev_shot_context")
+                    or source.get("what")
+                ),
+                "generation_actions": [str(action) for action in actions if str(action).strip()],
+                "end_state": compact(source.get("end_state") or source.get("what")),
+                "causal_link": compact(source.get("causal_link") or planned.continuity_reason),
+                "continuity_reason": planned.continuity_reason,
+            }
+            beats.append(beat)
+            shot_to_group[planned.shot_id] = group_id
+        groups.append({
+            "group_id": group_id,
+            "shot_ids": [shot.shot_id for shot in planned_shots],
+            "entry_shot_id": planned_shots[0].shot_id,
+            "extension_shot_ids": [shot.shot_id for shot in planned_shots[1:]],
+            "storyboard_board": f"storyboard_groups/{group_id}.jpg",
+            "beats": beats,
+        })
+    for index, group in enumerate(groups):
+        previous = groups[index - 1] if index > 0 else None
+        following = groups[index + 1] if index + 1 < len(groups) else None
+        previous_last = previous["beats"][-1] if previous and previous.get("beats") else None
+        current_first = group["beats"][0] if group.get("beats") else None
+        group["previous_group_id"] = previous.get("group_id") if previous else None
+        group["next_group_id"] = following.get("group_id") if following else None
+        group["handoff_from_previous"] = (
+            {
+                "previous_shot_id": previous_last.get("shot_id"),
+                "previous_end_state": previous_last.get("end_state", ""),
+                "entry_shot_id": current_first.get("shot_id") if current_first else None,
+                "entry_start_state": current_first.get("start_state", "") if current_first else "",
+                "edit": "fresh_editorial_cut",
+            }
+            if previous_last
+            else None
+        )
+    return {
+        "kind": "honcut.storyboard_groups.v1",
+        "version": 1,
+        "director_storyboard": storyboard.get("director_storyboard"),
+        "groups": groups,
+        "shot_to_group": shot_to_group,
+    }
+
+
+def _render_group_board(output_dir: Path, group: Mapping[str, Any]) -> str | None:
+    """Render one chronological contact sheet from the group's shot boards."""
+    try:
+        from PIL import Image, ImageOps
+    except ImportError:
+        return None
+    beats = [beat for beat in group.get("beats", []) if isinstance(beat, Mapping)]
+    # In the two-level pipeline one continuity group normally equals one Sxx.
+    # Reuse its Phase 2 multi-panel board directly so P01/P02 remain visible.
+    if len(beats) == 1 and beats[0].get("storyboard_board"):
+        authored = output_dir / str(beats[0]["storyboard_board"])
+        if authored.is_file():
+            return str(authored.relative_to(output_dir))
+
+    panels = []
+    for beat in beats:
+        source = output_dir / str(beat.get("storyboard_image") or "")
+        if not source.is_file():
+            continue
+        with Image.open(source) as image:
+            panel = ImageOps.fit(image.convert("RGB"), (640, 360), method=Image.Resampling.LANCZOS)
+        panels.append(panel)
+    if not panels:
+        return None
+    columns = min(4, len(panels))
+    rows = math.ceil(len(panels) / columns)
+    gutter = 12
+    board = Image.new(
+        "RGB",
+        (columns * 640 + (columns + 1) * gutter, rows * 360 + (rows + 1) * gutter),
+        color=(8, 10, 14),
+    )
+    for index, panel in enumerate(panels):
+        column, row = index % columns, index // columns
+        board.paste(panel, (gutter + column * (640 + gutter), gutter + row * (360 + gutter)))
+    relative = Path(str(group["storyboard_board"]))
+    destination = output_dir / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    board.save(destination, format="JPEG", quality=88, optimize=True)
+    return str(relative)
+
+
+def write_storyboard_groups(
+    output_dir: Path,
+    storyboard: Mapping[str, Any],
+    plan: ContinuityPlan,
+) -> dict[str, Any]:
+    """Persist group-level plot contracts and chronological storyboard boards."""
+    output_dir = Path(output_dir)
+    contract = _storyboard_group_contract(storyboard, plan)
+    for group in contract["groups"]:
+        rendered = _render_group_board(output_dir, group)
+        group["storyboard_board"] = rendered
+    destination = output_dir / "STORYBOARD_GROUPS.json"
+    temporary = destination.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(contract, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(destination)
+    return contract
 
 
 def _chunk_frame_budgets(
@@ -117,6 +260,32 @@ def _anchors(shot: Mapping[str, Any], scene_contract: Mapping[str, Any]) -> Cont
     )
 
 
+def _authored_storyboard_beats(shot: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    return [
+        beat
+        for beat in (shot.get("storyboard_beats") or [])
+        if isinstance(beat, Mapping)
+    ]
+
+
+def _beat_unique_frames(
+    beats: list[Mapping[str, Any]],
+    target_frames: int,
+) -> list[int]:
+    """Allocate the editorial frame budget across authored Pxx panels."""
+    weights = [max(0.001, float(beat.get("duration_s") or 1.0)) for beat in beats]
+    total = sum(weights)
+    endpoints = [round(sum(weights[:index]) / total * target_frames) for index in range(1, len(weights) + 1)]
+    result = []
+    previous = 0
+    for endpoint in endpoints:
+        result.append(endpoint - previous)
+        previous = endpoint
+    if any(value <= 0 for value in result):
+        raise ValueError("storyboard beats exceed the editorial shot frame budget")
+    return result
+
+
 def build_continuity_plan(
     storyboard: Mapping[str, Any],
     scene_consistency: Mapping[str, Any] | None = None,
@@ -124,6 +293,7 @@ def build_continuity_plan(
     provider_chunk_limit_s: float = DEFAULT_PROVIDER_CHUNK_LIMIT_S,
     timeline_fps: int = DEFAULT_TIMELINE_FPS,
     continuation_overlap_s: float = 0.0,
+    continuity_group_max_shots: int = DEFAULT_CONTINUITY_GROUP_MAX_SHOTS,
 ) -> ContinuityPlan:
     """Split long editorial shots into a linear sequence of provider-sized chunks."""
     if provider_chunk_limit_s <= 0:
@@ -132,6 +302,8 @@ def build_continuity_plan(
         raise ValueError("timeline_fps must be positive")
     if continuation_overlap_s < 0:
         raise ValueError("continuation_overlap_s must not be negative")
+    if continuity_group_max_shots < 1:
+        raise ValueError("continuity_group_max_shots must be positive")
 
     limit_frames = round(provider_chunk_limit_s * timeline_fps)
     overlap_frames = round(continuation_overlap_s * timeline_fps)
@@ -143,17 +315,42 @@ def build_continuity_plan(
     previous_storyboard_shot: Mapping[str, Any] | None = None
     previous_planned_shot: ContinuityShot | None = None
     group_number = 0
+    group_shot_count = 0
     for index, shot in enumerate(storyboard.get("shots", []), 1):
         shot_id = _shot_id(shot, index)
+        authored_beats = _authored_storyboard_beats(shot)
         boundary_before, continuity_reason = _boundary_before(
             shot,
             previous_storyboard_shot,
             index,
         )
-        initial_extension = boundary_before == "continuous" and previous_planned_shot is not None
+        first_beat_mode = str(
+            authored_beats[0].get("generation_mode") if authored_beats else ""
+        ).lower()
+        if authored_beats and first_beat_mode == "fresh" and index > 1:
+            boundary_before = "cut"
+            continuity_reason = (
+                "director-level shot starts from its Phase 2 P01 image; "
+                "only later Pxx panels extend video inside this shot"
+            )
+        requested_extension = (
+            boundary_before == "continuous"
+            and previous_planned_shot is not None
+            and (not authored_beats or first_beat_mode != "fresh")
+        )
+        capped_group = requested_extension and group_shot_count >= continuity_group_max_shots
+        initial_extension = requested_extension and not capped_group
+        if capped_group:
+            boundary_before = "cut"
+            continuity_reason = (
+                f"start a fresh generation group after {continuity_group_max_shots} "
+                "continuous editorial shots to prevent accumulated visual and narrative drift"
+            )
         if not initial_extension:
             group_number += 1
+            group_shot_count = 0
         continuity_group_id = f"CG{group_number:03d}"
+        group_shot_count += 1
         target_duration = _target_duration(shot)
         cumulative_duration += target_duration
         endpoint_frames = round(cumulative_duration * timeline_fps)
@@ -161,19 +358,24 @@ def build_continuity_plan(
         previous_endpoint_frames = endpoint_frames
         chunks: list[GenerationChunk] = []
         previous: str | None = None
-        budgets = _chunk_frame_budgets(
-            target_frames,
-            limit_frames,
-            overlap_frames,
-            fps=timeline_fps,
-            initial_extension=initial_extension,
-        )
         if initial_extension:
             previous = previous_planned_shot.chunks[-1].chunk_id
-        for sequence, (requested_frames, reserved_overlap, unique_frames) in enumerate(budgets, 1):
-            chunk_id = f"{shot_id}_C{sequence:02d}"
-            chunks.append(
-                GenerationChunk(
+        if authored_beats:
+            unique_budgets = _beat_unique_frames(authored_beats, target_frames)
+            for sequence, (beat, unique_frames) in enumerate(
+                zip(authored_beats, unique_budgets, strict=True),
+                1,
+            ):
+                reserved_overlap = overlap_frames if previous is not None else 0
+                requested_frames = unique_frames + reserved_overlap
+                if requested_frames > limit_frames:
+                    raise ValueError(
+                        f"{shot_id} storyboard beat {sequence} needs "
+                        f"{requested_frames / timeline_fps:g}s including overlap, "
+                        f"above provider limit {provider_chunk_limit_s:g}s"
+                    )
+                chunk_id = f"{shot_id}_C{sequence:02d}"
+                chunks.append(GenerationChunk(
                     chunk_id=chunk_id,
                     sequence=sequence,
                     target_duration_s=round(requested_frames / timeline_fps, 6),
@@ -182,9 +384,38 @@ def build_continuity_plan(
                     expected_unique_frames=unique_frames,
                     mode="native_extend" if previous is not None else "fresh",
                     depends_on=previous,
-                )
+                    storyboard_beat_id=str(
+                        beat.get("beat_id") or f"{shot_id}_P{sequence:02d}"
+                    ),
+                    storyboard_image=str(beat.get("storyboard_image") or "") or None,
+                    action_prompt=str(beat.get("action") or ""),
+                    start_state=str(beat.get("start_state") or ""),
+                    end_state=str(beat.get("end_state") or ""),
+                ))
+                previous = chunk_id
+        else:
+            budgets = _chunk_frame_budgets(
+                target_frames,
+                limit_frames,
+                overlap_frames,
+                fps=timeline_fps,
+                initial_extension=initial_extension,
             )
-            previous = chunk_id
+            for sequence, (requested_frames, reserved_overlap, unique_frames) in enumerate(budgets, 1):
+                chunk_id = f"{shot_id}_C{sequence:02d}"
+                chunks.append(
+                    GenerationChunk(
+                        chunk_id=chunk_id,
+                        sequence=sequence,
+                        target_duration_s=round(requested_frames / timeline_fps, 6),
+                        requested_frames=requested_frames,
+                        expected_overlap_frames=reserved_overlap,
+                        expected_unique_frames=unique_frames,
+                        mode="native_extend" if previous is not None else "fresh",
+                        depends_on=previous,
+                    )
+                )
+                previous = chunk_id
 
         planned_shots.append(
             ContinuityShot(
@@ -223,6 +454,7 @@ def write_continuity_plan(
     provider_chunk_limit_s: float = DEFAULT_PROVIDER_CHUNK_LIMIT_S,
     timeline_fps: int = DEFAULT_TIMELINE_FPS,
     continuation_overlap_s: float = 0.0,
+    continuity_group_max_shots: int = DEFAULT_CONTINUITY_GROUP_MAX_SHOTS,
 ) -> ContinuityPlan:
     """Persist a JSON-safe continuity plan through an atomic replace."""
     plan = build_continuity_plan(
@@ -231,6 +463,7 @@ def write_continuity_plan(
         provider_chunk_limit_s=provider_chunk_limit_s,
         timeline_fps=timeline_fps,
         continuation_overlap_s=continuation_overlap_s,
+        continuity_group_max_shots=continuity_group_max_shots,
     )
     output_path = Path(output_path)
     temporary = output_path.with_suffix(output_path.suffix + ".tmp")

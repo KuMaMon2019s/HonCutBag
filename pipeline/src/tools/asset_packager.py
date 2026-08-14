@@ -459,6 +459,14 @@ def build_content_for_shot(
         strategy = "i2v"
     if strategy == "flf2v":
         prompt_text = inject_flf2v_identity_lock(output_dir, shot_meta, prompt_text)
+    generation_actions = shot_meta.get("generation_actions") or []
+    if generation_actions:
+        prompt_text = (
+            f"{prompt_text}\n[motion-priority] Reference images constrain identity, costume, "
+            "environment, and boundary composition only. They do not constrain the reference pose. "
+            "Move the subjects through the ordered action contract with clear body displacement; "
+            "do not hold or gently animate the input pose."
+        ).strip()
     if prompt_text:
         content.append({"type": "text", "text": prompt_text})
 
@@ -471,16 +479,30 @@ def build_content_for_shot(
             f"  [assets] ⚠ storyboard_images directory missing: {storyboard_images_dir}; "
             "run Phase 2 to generate per-shot first frames"
         )
-    shot_frame_path = storyboard_images_dir / f"{shot_id}.png"
+    frame_override = shot_meta.get("_storyboard_frame_path")
+    shot_frame_path = (
+        Path(str(frame_override))
+        if frame_override and Path(str(frame_override)).is_absolute()
+        else output_dir / str(frame_override)
+        if frame_override
+        else storyboard_images_dir / f"{shot_id}.png"
+    )
     image_assets = []
     if shot_frame_path.exists() and shot_frame_path.stat().st_size > 1024:
+        beat_label = shot_meta.get("_storyboard_beat_id")
+        frame_label = (
+            f"{beat_label}手绘故事格"
+            if beat_label
+            else f"{shot_id}分镜首帧"
+        )
         image_assets.append({
             "path": shot_frame_path,
             "role": "first_frame",
             "priority": "high",
             "bind_subject": False,
             "reference_description": (
-                f"{shot_id}分镜首帧，用于锁定构图、角色站位、场景结构、"
+                f"{frame_label}，"
+                "用于锁定本生成片段的构图、角色站位、场景结构、"
                 "时间天气和光影"
             ),
         })
@@ -526,6 +548,17 @@ def build_content_for_shot(
             )
 
     max_reference_images = shot_meta.get("_max_reference_images")
+    if strategy == "phantom" and generation_actions:
+        # Dense identity packs over-constrain motion. For action, retain one
+        # identity image per character plus the composition frame; native
+        # continuation adds its ordered tail anchors outside this budget.
+        motion_budget = len(_detect_shot_characters(output_dir, shot_meta)) + 1
+        motion_budget = max(2, min(3, motion_budget))
+        max_reference_images = (
+            motion_budget
+            if max_reference_images is None
+            else min(int(max_reference_images), motion_budget)
+        )
     if max_reference_images is not None:
         max_reference_images = max(0, int(max_reference_images))
         if len(image_assets) > max_reference_images:
@@ -547,6 +580,23 @@ def build_content_for_shot(
             grouped: dict[str, list[dict]] = {}
             for asset in character_assets:
                 grouped.setdefault(str(asset.get("char_id") or ""), []).append(asset)
+            if strategy == "phantom" and generation_actions:
+                # Face close-ups bias an action generation toward portrait
+                # framing and can push the second fighter out of frame. Prefer
+                # a full-body identity anchor for choreography, then a state
+                # variant, and keep the face crop only as a last fallback.
+                def action_reference_rank(asset: dict) -> int:
+                    name = Path(asset.get("path", "")).name
+                    if name == "full_body.png":
+                        return 0
+                    if name.startswith("variant_"):
+                        return 1
+                    if name == "face_closeup.png":
+                        return 2
+                    return 3
+
+                for assets in grouped.values():
+                    assets.sort(key=action_reference_rank)
             selected_characters = []
             round_index = 0
             while len(selected_characters) < character_budget:

@@ -13,7 +13,7 @@ from typing import Optional
 # HonCut 产物链定义
 ARTIFACT_CHAIN = {
     "phase1":   {"produces": "director_plan.json + events.json + CHARACTERS.json + STORYBOARD.json", "requires": []},
-    "phase2":   {"produces": "storyboard_images/",                    "requires": ["STORYBOARD.json"]},
+    "phase2":   {"produces": "SHOT_STORYBOARDS.json + storyboard_beats/ + shot_storyboards/ + storyboard_images/", "requires": ["STORYBOARD.json"]},
     "phase3":   {"produces": "characters/",                           "requires": ["CHARACTERS.json"]},
     "phase4":   {"produces": "shots/",                                "requires": ["STORYBOARD.json"]},
     "phase5":   {"produces": "storyboard_qa_report.json",             "requires": ["STORYBOARD.json", "shots/"]},
@@ -110,6 +110,36 @@ def can_resume_from(phase: str, output_dir: Path) -> bool:
                 single = single.strip()
                 if single and not (output_dir / single).exists():
                     return False
+    if phase in {"phase4", "phase5", "phase6", "phase7", "phase8", "phase9", "phase9_5"}:
+        storyboard_path = output_dir / "STORYBOARD.json"
+        if storyboard_path.is_file():
+            try:
+                storyboard = json.loads(storyboard_path.read_text(encoding="utf-8"))
+                authored_beats = [
+                    beat
+                    for shot in storyboard.get("shots", [])
+                    if isinstance(shot, dict)
+                    for beat in (shot.get("storyboard_beats") or [])
+                    if isinstance(beat, dict)
+                ]
+                if authored_beats:
+                    manifest = output_dir / "SHOT_STORYBOARDS.json"
+                    if not manifest.is_file():
+                        return False
+                    document = json.loads(manifest.read_text(encoding="utf-8"))
+                    if document.get("status") != "done":
+                        return False
+                    for beat in authored_beats:
+                        value = str(beat.get("storyboard_image") or "").strip()
+                        if not value:
+                            return False
+                        image_path = Path(value)
+                        if not image_path.is_absolute():
+                            image_path = output_dir / image_path
+                        if not image_path.is_file() or image_path.stat().st_size <= 1024:
+                            return False
+            except (OSError, ValueError, json.JSONDecodeError):
+                return False
     return True
 
 

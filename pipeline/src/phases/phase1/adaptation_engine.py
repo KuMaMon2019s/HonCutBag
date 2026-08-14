@@ -28,6 +28,7 @@
 """
 
 import json
+import math
 import sys
 import os
 import argparse
@@ -93,16 +94,16 @@ USER_PROMPT_TEMPLATE = (
     "- 目的：让视频生成时画面自然衔接，不跳跃\n"
     "- 第一个镜头无需承接\n"
     "- 跨场景切换时不写承接（硬切）\n\n"
-    "【视频延长判定】\n"
-    "boundary_before=continuous 表示本镜必须使用上一镜视频作为素材延长生成；仅在同一时空、"
-    "同一主要主体、动作方向/速度/姿态连续且没有叙事时间跳跃时使用。景别或机位需要硬切、"
-    "地点/时间变化、主体切换、回忆/梦境/与此同时等情况必须为 cut。第一镜必须为 cut。\n\n"
+    "【导演镜头边界】\n"
+    "boundary_before=continuous 只表示叙事与空间连续，供导演总览和剪辑判断；每个 Sxx 仍从自己的"
+    "P01 手绘格重新图生视频，只有同一 Sxx 内的 P02 及以后使用视频延长。换场、跳时、主体切换、"
+    "回忆/梦境/与此同时等情况必须为 cut。第一镜必须为 cut。\n\n"
     "【小说化动作剧本】\n"
     "事件中的 event_role、sequence_id、action_unit_id、micro_actions、start_state、end_state、"
     "causal_link、continuity_before 是连续性事实，不是可自由改写的文案。\n"
-    "- 一个 action_unit 是完整的攻防/反应/结果单元，不得为了逐句对应而拆成互不相干的硬切。\n"
-    "- 同一 sequence_id 中相邻动作单元若 continuity_before=continuous，应优先设计成延长视频；"
-    "只有明确换机位、插入反应镜或生成能力无法容纳时才使用 cut，并在 continuity_reason 说明。\n"
+    "- 一个导演级镜头可以容纳同一 sequence_id 中多个连续 action_unit；必须保留全部动作单元，"
+    "后续由内部 Pxx 故事格按顺序拆成首段图生视频和延长视频。\n"
+    "- 不同 sequence_id、明确换场/跳时或独立 turning_point 不得为了减少镜头而错误合并。\n"
     "- visual 必须按 micro_actions 的原始顺序描述，保留 start_state→动作→end_state 和 causal_link，"
     "禁止概括成‘双方激烈打斗’。\n"
     "- turning_point/dramatic_turn 必须保留为独立叙事节拍，不得与普通交锋合并掉。\n"
@@ -172,12 +173,13 @@ BATCH_EXPAND_PROMPT = (
     "不得把 visual、what 或旁白当对白。\n\n"
     "【镜头连贯性规则】除第一镜和跨场景硬切外，visual 开头必须写"
     "「承接上镜：上镜定格于{{角色名}}{{位置/姿态/朝向}}，{{最后动作的终态}}——本镜由此延续」。\n"
-    "【视频延长判定】第一镜 boundary_before 必须为 cut。只有同一时空、同一主要主体、"
-    "动作方向/速度/姿态直接连续且无时间跳跃时，下一镜 boundary_before 才能为 continuous，"
-    "并填写 continuity_reason 与 continuity_subject；否则必须为 cut。\n"
+    "【导演镜头边界】第一镜 boundary_before 必须为 cut。同一时空和动作因果连续时，下一镜可标"
+    "continuous 并填写 continuity_reason；这只描述剪辑连续性，不表示跨 Sxx 延长视频。"
+    "每个 Sxx 的 P01 都重新图生视频，只有其内部 P02+ 延长。\n"
     "【小说化动作剧本】严格继承来源事件的 sequence_id/action_unit_id/micro_actions/start_state/"
     "end_state/causal_link/continuity_before；按动作原顺序展开，禁止用‘激烈打斗’代替具体招式与结果。"
-    "同一 sequence_id 的连续动作优先 boundary_before=continuous；turning_point 必须独立保留。\n"
+    "同一 sequence_id 的相邻 action_unit 可以归入同一个导演级镜头，必须保留全部 micro_actions，"
+    "供后续 Pxx 故事格顺序执行；跨 sequence 或 turning_point 必须独立保留。\n"
     "【片段间过渡规则】相邻片段用动作桥梁、情绪接力、空间视线或台词黏合消灭跳跃感。\n"
     "【铁律优先级】台词零删改 > 出场人物完整 > 只描述动作状态 > 长台词拆镜。\n\n"
     "【HonCut 分镜铁律】who 只能逐字引用角色主名，别名改主名，群众只进 visual；"
@@ -222,7 +224,10 @@ def determine_gen_strategy(shot: Dict[str, Any]) -> str:
     """
     searchable = " ".join(
         str(shot.get(field, ""))
-        for field in ("visual", "what", "prompt", "description")
+        for field in (
+            "visual", "what", "prompt", "description", "action_description",
+            "generation_actions",
+        )
     ).lower()
     if any(verb in searchable for verb in _ACTION_VERBS):
         return "flf2v"
@@ -242,6 +247,7 @@ MIN_SHOT_DURATION = 4  # 单镜头最小时长（秒）
 MAX_SHOT_DURATION = 15  # 单镜头最大时长（秒）
 CHARS_PER_SECOND = 4  # 中文剧本预估：约 4 字/秒（范围 3-5）
 DEFAULT_TARGET_DURATION = 60  # 默认目标时长（用户未指定时使用）
+MAX_GENERATION_ACTIONS_PER_SHOT = 4
 
 
 def estimate_duration_from_text(text: str) -> int:
@@ -294,6 +300,132 @@ def estimate_shot_count(target_duration: int, shot_duration: int = AVG_SHOT_DURA
 
     max_shots = max(1, (target_duration + shot_duration - 1) // shot_duration)
     return max_shots
+
+
+def estimate_action_aware_shot_count(
+    events: List[Dict[str, Any]],
+    target_duration: int,
+    requested_shot_duration: int,
+) -> int:
+    """Estimate editorial shots, leaving paid clip capacity to inner beats.
+
+    An editorial shot is a director-level story unit, not one provider call.
+    Dense action is expanded later into ``storyboard_beats`` where the first
+    beat starts from an image and subsequent beats extend its video.
+    """
+    baseline = estimate_shot_count(target_duration, requested_shot_duration)
+    return baseline
+
+
+def select_generation_actions(
+    micro_actions: List[str],
+    limit: int = MAX_GENERATION_ACTIONS_PER_SHOT,
+    duration_seconds: float | None = None,
+) -> List[str]:
+    """Select a duration-bounded ordered motion contract for a model.
+
+    ``micro_actions`` remains the complete screenplay ledger. The generated
+    prompt receives a bounded representative sequence, because asking a video
+    model to perform eight to twenty-six atomic movements in one clip causes it
+    to hold the reference pose and omit the action altogether. Four-to-five
+    second clips deliberately receive one visible authored action; the other
+    source actions remain in the audit ledger for adaptation decisions.
+    """
+    if duration_seconds is not None:
+        # Real Seedance probes showed that even three authored body actions in
+        # four seconds produced skipped choreography and broken limbs. Keep a
+        # 4-5s clip to one visible action; longer clips earn a larger budget.
+        limit = min(limit, generation_action_limit(duration_seconds))
+    actions = [str(value).strip() for value in micro_actions if str(value).strip()]
+    if len(actions) <= limit:
+        return actions
+    if limit <= 1:
+        return actions[:1]
+    indices = [round(index * (len(actions) - 1) / (limit - 1)) for index in range(limit)]
+    return [actions[index] for index in dict.fromkeys(indices)]
+
+
+def generation_action_limit(duration_seconds: float | int | None) -> int:
+    """Return the paid-generation action budget for one clip duration."""
+    if duration_seconds is None:
+        return MAX_GENERATION_ACTIONS_PER_SHOT
+    duration = float(duration_seconds)
+    if duration <= 5.0:
+        return 1
+    if duration <= 6.0:
+        return 2
+    if duration <= 8.0:
+        return 3
+    return MAX_GENERATION_ACTIONS_PER_SHOT
+
+
+def normalize_shot_durations(
+    shots: List[Dict[str, Any]], target_duration: int
+) -> List[Dict[str, Any]]:
+    """Assign exact seconds, giving dense action/dialogue enough Pxx capacity."""
+    if not shots:
+        return shots
+    if len(shots) * MIN_SHOT_DURATION > target_duration:
+        raise ValueError(
+            f"{len(shots)} shots cannot fit {target_duration}s at the "
+            f"{MIN_SHOT_DURATION}s provider minimum"
+        )
+    if len(shots) * MAX_SHOT_DURATION < target_duration:
+        raise ValueError(
+            f"{len(shots)} shots cannot fill {target_duration}s at the "
+            f"{MAX_SHOT_DURATION}s provider maximum"
+        )
+
+    def complexity(shot: Dict[str, Any]) -> float:
+        actions = shot.get("micro_actions") or []
+        if isinstance(actions, str):
+            actions = [actions]
+        units = shot.get("source_action_unit_ids") or []
+        if isinstance(units, str):
+            units = [units]
+        details = shot.get("_source_event_details") or []
+        if details:
+            detail_actions = [
+                action
+                for event in details if isinstance(event, dict)
+                for action in (event.get("micro_actions") or [])
+                if str(action).strip()
+            ]
+            detail_units = {
+                str(event.get("action_unit_id"))
+                for event in details if isinstance(event, dict)
+                and str(event.get("action_unit_id") or "").strip()
+            }
+            actions = actions or detail_actions
+            units = units or list(detail_units)
+        spoken = float(shot.get("speech_duration_s") or 0)
+        action_weight = math.ceil(len(actions) / 2) if actions else 0
+        return float(max(1, len(set(map(str, units))), action_weight, math.ceil(spoken / 4)))
+
+    weights = [complexity(shot) for shot in shots]
+    allocations = [MIN_SHOT_DURATION for _ in shots]
+    remaining = int(target_duration) - sum(allocations)
+    # Weighted fair allocation preserves exact total duration and provider caps.
+    while remaining:
+        candidates = [
+            index for index, value in enumerate(allocations)
+            if value < MAX_SHOT_DURATION
+        ]
+        if not candidates:
+            raise ValueError("duration allocation exhausted provider capacity")
+        selected = max(
+            candidates,
+            key=lambda index: (weights[index] / allocations[index], -index),
+        )
+        allocations[selected] += 1
+        remaining -= 1
+    for index, (shot, duration) in enumerate(zip(shots, allocations, strict=True)):
+        shot["suggested_duration"] = duration
+        shot["duration_allocation"] = {
+            "method": "semantic_weighted_provider_bounded",
+            "complexity_weight": weights[index],
+        }
+    return shots
 
 
 # ─── LLM 客户端 ─────────────────────────────────────────────────────────────
@@ -573,6 +705,34 @@ def _inherit_event_semantics(
         shot["source_action_unit_ids"] = list(dict.fromkeys(action_unit_ids))
         shot["source_event_roles"] = list(dict.fromkeys(roles))
         shot["micro_actions"] = micro_actions
+        generation_actions = select_generation_actions(
+            micro_actions,
+            duration_seconds=shot.get("suggested_duration") or shot.get("duration"),
+        )
+        shot["generation_actions"] = generation_actions
+        shot["generation_load"] = {
+            "source_action_units": len(set(shot["source_action_unit_ids"])),
+            "source_micro_actions": len(micro_actions),
+            "prompted_actions": len(generation_actions),
+            "compression": "representative" if len(generation_actions) < len(micro_actions) else "full",
+        }
+        if generation_actions:
+            shot["action_description"] = " → ".join(generation_actions)
+            shot["gen_strategy"] = determine_gen_strategy(shot)
+
+        first_source = details[0] if details else {}
+        last_source = details[-1] if details else {}
+        if first_source.get("start_state"):
+            shot["start_state"] = str(first_source["start_state"])
+        if last_source.get("end_state"):
+            shot["end_state"] = str(last_source["end_state"])
+        causal_links = [
+            str(event.get("causal_link") or "").strip()
+            for event in details
+            if str(event.get("causal_link") or "").strip()
+        ]
+        if causal_links:
+            shot["causal_link"] = "；".join(dict.fromkeys(causal_links))
 
         speaker_evidence = [
             dict(line)
@@ -600,7 +760,6 @@ def _inherit_event_semantics(
                         "dialogue_id": exact.get("dialogue_id"),
                     }
 
-        first_source = details[0] if details else {}
         source_boundary = str(first_source.get("continuity_before") or "").lower()
         source_subject = str(first_source.get("continuity_subject") or "").strip()
         same_sequence = bool(sequence_ids and previous_sequence_ids and sequence_ids[0] in previous_sequence_ids)
@@ -631,8 +790,9 @@ BEAT_SKELETON_PROMPT = (
     "2. 每个输入事件编号必须且至少被某个 beat 的 source_events 引用；删减事件也必须放入 action=drop 的 beat 显式声明。\n"
     "3. keep 保留关键因果/情感节点，merge 合并连续或重复事件，drop 只删不影响因果链的内容。\n"
     "4. 台词归属必须忠于原事件；who 只能使用角色列表主名，别名改为主名，群众不得写入 who。\n"
-    "5. action_unit_id 是已经按因果闭环分组的动作单元：不得按句号或单个招式再次打碎；"
-    "也不得把不同 turning_point 合并掉。长动作可以与相邻单元合并为 beat，但必须保持 micro_actions 原顺序。\n"
+    "5. beat 是导演级叙事镜头，不是单次视频调用。同一 sequence_id 的连续 action_unit 可以合并，"
+    "但必须完整保留 source_events 与 micro_actions 原顺序，后续会拆成 P01/P02…；不同 sequence_id、"
+    "换场/跳时及 turning_point 不得错误合并。\n"
     "6. sequence_id 与 continuity_before 是生成连续性依据。同一 sequence 的连续单元尽量落在相邻 beat，"
     "换场/跳时/关系转折不得为了省镜头而错误连拍。\n"
     "7. 只输出骨架决策，禁止展开对白、visual、Identity Anchor 或任何镜头生成细节。"
@@ -675,14 +835,49 @@ def _parse_beat_skeleton(response: str, expected_count: int, event_count: int) -
     return parsed
 
 
+def _validate_beat_action_capacity(
+    beats: List[Dict[str, Any]],
+    events: List[Dict[str, Any]],
+) -> None:
+    """Allow inner Pxx expansion while rejecting unrelated narrative merges."""
+    event_by_id = {i: event for i, event in enumerate(events, 1)}
+    for beat in beats:
+        if beat.get("action") == "drop":
+            continue
+        details = [
+            event_by_id[event_id]
+            for event_id in beat.get("source_events", [])
+            if event_id in event_by_id
+        ]
+        sequences = {
+            str(event.get("sequence_id"))
+            for event in details
+            if str(event.get("sequence_id") or "").strip()
+        }
+        turning_points = [
+            event for event in details
+            if event.get("event_role") in {"turning_point", "dramatic_turn"}
+        ]
+        if len(sequences) > 1:
+            raise ValueError(
+                f"beat {beat.get('beat_order')} merges unrelated sequences "
+                f"{sorted(sequences)}"
+            )
+        if turning_points and len(details) > len(turning_points):
+            raise ValueError(
+                f"beat {beat.get('beat_order')} merges a turning point with ordinary events"
+            )
+
+
 def _build_beat_skeleton(
     events: List[Dict[str, Any]],
     characters_summary: str,
     target_duration: int,
     shot_duration: int,
+    beat_count: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Build a globally informed, bounded beat table (Stage 1)."""
-    beat_count = estimate_shot_count(target_duration, shot_duration)
+    beat_count = beat_count or estimate_shot_count(target_duration, shot_duration)
     prompt = BEAT_SKELETON_PROMPT.format(
         target_duration=target_duration,
         shot_duration=shot_duration,
@@ -692,8 +887,15 @@ def _build_beat_skeleton(
     )
     for attempt in range(1 + MAX_RETRIES):
         try:
-            response = _call_llm_with_timeout_retry(prompt, max_tokens=8000)
+            attempt_prompt = prompt
+            if attempt:
+                attempt_prompt += (
+                    "\n\n【重试纠错】上次骨架合并了不相关叙事。同一 sequence_id 的连续"
+                    "action_unit 可以合并并保留完整顺序；跨 sequence 或 turning_point 必须拆开。"
+                )
+            response = _call_llm_with_timeout_retry(attempt_prompt, max_tokens=8000)
             skeleton = _parse_beat_skeleton(response, beat_count, len(events))
+            _validate_beat_action_capacity(skeleton["beats"], events)
             event_by_id = {i: dict(event, event_id=i) for i, event in enumerate(events, 1)}
             for beat in skeleton["beats"]:
                 beat["_source_event_details"] = [event_by_id[event_id] for event_id in beat["source_events"]]
@@ -853,6 +1055,7 @@ def _load_layered_checkpoints(
         try:
             candidate = json.loads(skeleton_path.read_text(encoding="utf-8"))
             _parse_beat_skeleton(json.dumps(candidate, ensure_ascii=False), expected_beats, len(events))
+            _validate_beat_action_capacity(candidate["beats"], events)
             event_by_id = {i: dict(event, event_id=i) for i, event in enumerate(events, 1)}
             for beat in candidate["beats"]:
                 beat["_source_event_details"] = [event_by_id[event_id] for event_id in beat["source_events"]]
@@ -931,8 +1134,12 @@ def adapt_events(
             f"（应在 {MIN_SHOT_DURATION}-{MAX_SHOT_DURATION} 秒）"
         )
 
-    # ── 计算最大 shot 数（智能分镜）──────────────────────────────────────
-    max_shots = estimate_shot_count(target_duration, shot_duration)
+    # ── 计算导演级 shot 数；内部生成容量由 storyboard_beats 承担 ─────────
+    max_shots = estimate_action_aware_shot_count(events, target_duration, shot_duration)
+    effective_shot_duration = max(
+        MIN_SHOT_DURATION,
+        min(MAX_SHOT_DURATION, round(target_duration / max_shots)),
+    )
 
     # ── 构建 prompt ───────────────────────────────────────────────────────
     events_json = _build_events_json(events)
@@ -948,12 +1155,14 @@ def adapt_events(
             skeleton, resumed_shots = _load_layered_checkpoints(checkpoint_dir, events, max_shots)
         if skeleton is None:
             skeleton = _build_beat_skeleton(
-                events, characters_summary, target_duration, shot_duration
+                events, characters_summary, target_duration, effective_shot_duration,
+                max_shots,
             )
             if checkpoint_dir is not None:
                 _atomic_write_json(checkpoint_dir / "beat_skeleton.json", skeleton)
+        normalize_shot_durations(skeleton["beats"], target_duration)
         shots = _expand_beats_to_shots(
-            skeleton["beats"], characters_summary, target_duration, shot_duration,
+            skeleton["beats"], characters_summary, target_duration, effective_shot_duration,
             output_dir=checkpoint_dir, resumed_shots=resumed_shots,
         )
         _validate_shots(shots)
@@ -962,6 +1171,7 @@ def adapt_events(
         for i, shot in enumerate(shots, 1):
             shot["shot_order"] = i
 
+        normalize_shot_durations(shots, target_duration)
         _inherit_event_semantics(shots, events)
 
         for i, shot in enumerate(shots):
@@ -991,6 +1201,8 @@ def adapt_events(
         return {
             "target_duration": target_duration,
             "estimated_shots": len(shots),
+            "requested_shot_duration": shot_duration,
+            "effective_shot_duration": effective_shot_duration,
             "total_duration": total_duration,
             "strategy": skeleton.get("strategy", ""),
             "shots": shots,
@@ -999,7 +1211,7 @@ def adapt_events(
     # [LEGACY-KEEP layered-adapt] 原单次调用路径；显式 single 或事件数 <= 10 时使用。
     user_prompt = USER_PROMPT_TEMPLATE.format(
         target_duration=target_duration,
-        shot_duration=shot_duration,
+        shot_duration=effective_shot_duration,
         max_shots=max_shots,
         events_json=events_json,
         characters_summary=characters_summary,
@@ -1031,6 +1243,7 @@ def adapt_events(
     for i, shot in enumerate(shots, 1):
         shot["shot_order"] = i
 
+    normalize_shot_durations(shots, target_duration)
     _inherit_event_semantics(shots, events)
 
     # Add continuity context between shots (镜头连贯性)
@@ -1059,6 +1272,8 @@ def adapt_events(
     result = {
         "target_duration": target_duration,
         "estimated_shots": len(shots),
+        "requested_shot_duration": shot_duration,
+        "effective_shot_duration": effective_shot_duration,
         "total_duration": total_duration,
         "strategy": parsed.get("strategy", ""),
         "shots": shots,

@@ -18,7 +18,20 @@ from pydantic import ValidationError
 from clients import seedance_client, tos_uploader
 from clients.seedream_client import IMAGE_ENDPOINT
 from phases import pipeline_core
-from phases.phase4.continuity_plan import build_continuity_plan, write_continuity_plan
+from phases.phase1.director_storyboard import (
+    build_director_storyboard_prompt,
+    generate_director_storyboard,
+)
+from phases.phase1.storyboard_beats import plan_storyboard_beats
+from phases.phase2.shot_storyboards import (
+    generate_shot_storyboards,
+    validate_shot_storyboard_artifacts,
+)
+from phases.phase4.continuity_plan import (
+    build_continuity_plan,
+    write_continuity_plan,
+    write_storyboard_groups,
+)
 from phases.phase8 import edit_decisions as edit_decision_module
 from phases.phase8.continuity_adjudication import (
     SEAM_DECISIONS_KIND,
@@ -34,6 +47,7 @@ from phases.phase9.rhythm_editor import (
 )
 from quality import object_trajectory as object_trajectory_module
 from quality import video_qa
+from phases.phase8.frame_analysis import decide_shot_action, measure_motion_activity
 from quality import sam3_sidecar as sam3_sidecar_module
 from quality.continuity_bridge import detect_replayed_prefix, repair_continuity_boundary
 from quality.continuity_seam import (
@@ -74,6 +88,7 @@ from sam3_runtime.policy import (
     resolve_runtime_policy,
 )
 from schemas.continuity import ContinuityPlan, GenerationChunk
+from utils.artifact_chain import can_resume_from
 
 
 def test_planner_keeps_short_editorial_shots_backward_compatible():
@@ -219,6 +234,516 @@ def test_planner_groups_action_continuations_and_restarts_on_scene_change():
     assert second.chunks[0].expected_overlap_frames == 48
     assert second.chunks[0].expected_unique_frames == 120
     assert third.chunks[0].mode == "fresh"
+
+
+def test_planner_starts_a_fresh_group_after_three_continuous_shots():
+    storyboard = {"shots": [
+        {
+            "id": f"S{index:02d}", "duration": 4, "where": "roof",
+            "who": ["凛"], "boundary_before": "cut" if index == 1 else "continuous",
+        }
+        for index in range(1, 6)
+    ]}
+
+    plan = build_continuity_plan(storyboard, continuation_overlap_s=2)
+
+    assert [shot.continuity_group_id for shot in plan.shots] == [
+        "CG001", "CG001", "CG001", "CG002", "CG002",
+    ]
+    assert [shot.chunks[0].mode for shot in plan.shots] == [
+        "fresh", "native_extend", "native_extend", "fresh", "native_extend",
+    ]
+    assert plan.shots[3].boundary_before == "cut"
+    assert "prevent accumulated visual and narrative drift" in plan.shots[3].continuity_reason
+
+
+def test_storyboard_groups_link_fresh_group_handoffs(tmp_path):
+    image_dir = tmp_path / "storyboard_images"
+    image_dir.mkdir()
+    storyboard = {"shots": []}
+    for index in range(1, 5):
+        shot_id = f"S{index:02d}"
+        Image.new("RGB", (64, 36), (index * 30, 0, 0)).save(image_dir / f"{shot_id}.png")
+        storyboard["shots"].append({
+            "id": shot_id,
+            "duration": 4,
+            "where": "roof",
+            "who": ["凛"],
+            "boundary_before": "cut" if index == 1 else "continuous",
+            "start_state": f"start-{index}",
+            "generation_actions": [f"action-{index}"],
+            "end_state": f"end-{index}",
+        })
+    plan = build_continuity_plan(storyboard, continuation_overlap_s=2)
+
+    contract = write_storyboard_groups(tmp_path, storyboard, plan)
+
+    first, second = contract["groups"]
+    assert first["next_group_id"] == "CG002"
+    assert second["previous_group_id"] == "CG001"
+    assert second["handoff_from_previous"] == {
+        "previous_shot_id": "S03",
+        "previous_end_state": "end-3",
+        "entry_shot_id": "S04",
+        "entry_start_state": "start-4",
+        "edit": "fresh_editorial_cut",
+    }
+
+
+def test_storyboard_groups_persist_plot_beats_and_render_chronological_board(tmp_path):
+    image_dir = tmp_path / "storyboard_images"
+    image_dir.mkdir()
+    Image.new("RGB", (1280, 720), "red").save(image_dir / "S01.png")
+    Image.new("RGB", (1280, 720), "blue").save(image_dir / "S02.png")
+    storyboard = {
+        "director_storyboard": {"image": "director_storyboard.png"},
+        "shots": [
+        {
+            "id": "S01", "duration": 4, "where": "roof", "who": ["凛"],
+            "start_state": "凛静止蓄力", "generation_actions": ["凛踩水冲出"],
+            "end_state": "凛冲到烬面前",
+        },
+        {
+            "id": "S02", "duration": 4, "where": "roof", "who": ["凛", "烬"],
+            "boundary_before": "continuous", "start_state": "凛冲到烬面前",
+            "generation_actions": ["刀锋撞上机械臂"], "end_state": "火星炸开",
+        },
+        ],
+    }
+    plan = build_continuity_plan(storyboard, continuation_overlap_s=2)
+
+    contract = write_storyboard_groups(tmp_path, storyboard, plan)
+
+    group = contract["groups"][0]
+    assert group["shot_ids"] == ["S01", "S02"]
+    assert group["entry_shot_id"] == "S01"
+    assert group["extension_shot_ids"] == ["S02"]
+    assert group["beats"][1]["generation_actions"] == ["刀锋撞上机械臂"]
+    assert contract["shot_to_group"] == {"S01": "CG001", "S02": "CG001"}
+    assert contract["director_storyboard"] == {"image": "director_storyboard.png"}
+    assert (tmp_path / group["storyboard_board"]).is_file()
+    assert json.loads((tmp_path / "STORYBOARD_GROUPS.json").read_text())["version"] == 1
+
+
+def test_director_storyboard_calls_image_model_with_one_overview_contract(tmp_path):
+    storyboard = {
+        "title": "雨夜交锋",
+        "shots": [
+            {
+                "id": index,
+                "duration": 4,
+                "who": ["凛", "烬"],
+                "where": "暴雨中的废弃高架与废车",
+                "generation_actions": [f"凛完成动作{index}"],
+                "shot_size": "wide" if index % 2 else "medium",
+                "camera_movement": "steadicam",
+                "boundary_before": "cut" if index in {1, 4} else "continuous",
+            }
+            for index in range(1, 6)
+        ],
+    }
+
+    calls = []
+
+    class FakeImageClient:
+        model = "fake-seedream"
+
+        def text_to_image(self, prompt, output_path, size, timeout):
+            calls.append({"prompt": prompt, "size": size, "timeout": timeout})
+            Image.new("RGB", (2560, 1440), "white").save(output_path)
+            return "https://image.invalid/director.png"
+
+    client = FakeImageClient()
+    manifest = generate_director_storyboard(
+        tmp_path,
+        storyboard,
+        [{"name": "凛", "description": "银白长发，暗银轻甲"}],
+        client=client,
+    )
+
+    assert (tmp_path / "director_storyboard.png").is_file()
+    assert manifest["kind"] == "honcut.director_storyboard.v2"
+    assert manifest["status"] == "done"
+    assert manifest["provider"] == "seedream"
+    assert manifest["model"] == "fake-seedream"
+    assert (manifest["columns"], manifest["rows"]) == (3, 2)
+    assert [panel["shot_id"] for panel in manifest["panels"]] == [
+        "S01", "S02", "S03", "S04", "S05",
+    ]
+    assert [panel["group_id"] for panel in manifest["panels"]] == [
+        "DG001", "DG001", "DG001", "DG002", "DG002",
+    ]
+    persisted = json.loads((tmp_path / "director_storyboard.json").read_text())
+    assert persisted["panels"][0]["summary"] == "凛完成动作1"
+    assert calls[0]["size"] == "2560x1440"
+    assert "严格使用 3 列 × 2 行，共 5 个面板" in calls[0]["prompt"]
+    assert "银白长发，暗银轻甲" in calls[0]["prompt"]
+    assert "S01 · 4s · WIDE · 内部1格" in calls[0]["prompt"]
+    assert "S02 · 4s · MEDIUM · 内部1格" in calls[0]["prompt"]
+    with Image.open(tmp_path / "director_storyboard.png") as image:
+        assert image.size == tuple(manifest["size_actual"])
+
+    cached = generate_director_storyboard(
+        tmp_path,
+        storyboard,
+        [{"name": "凛", "description": "银白长发，暗银轻甲"}],
+        client=client,
+    )
+    assert cached["cache_hit"] is True
+    assert len(calls) == 1
+
+
+def test_director_storyboard_prompt_uses_five_by_three_layout_for_15_shots():
+    storyboard = {
+        "shots": [
+            {"id": index, "duration": 4, "generation_actions": [f"动作{index}"]}
+            for index in range(1, 16)
+        ],
+    }
+
+    prompt, panels, layout = build_director_storyboard_prompt(storyboard)
+
+    assert layout == (5, 3)
+    assert len(panels) == 15
+    assert "共 15 个面板" in prompt
+    assert panels[-1]["shot_id"] == "S15"
+
+
+def test_phase1_registers_director_storyboard_in_text_storyboard(tmp_path):
+    storyboard = {
+        "shots": [{
+            "id": "S01", "duration": 4, "who": ["凛"],
+            "generation_actions": ["凛冲出"],
+        }],
+    }
+
+    class FakeImageClient:
+        model = "fake-seedream"
+
+        def text_to_image(self, prompt, output_path, size, timeout):
+            Image.new("RGB", (2560, 1440), "white").save(output_path)
+            return "https://image.invalid/director.png"
+
+    pipeline_core._attach_director_storyboard(
+        tmp_path,
+        storyboard,
+        client=FakeImageClient(),
+    )
+
+    assert storyboard["director_storyboard"] == {
+        "image": "director_storyboard.png",
+        "manifest": "director_storyboard.json",
+        "prompt": "director_storyboard_prompt.txt",
+        "status": "done",
+        "provider": "seedream",
+        "model": "fake-seedream",
+        "panel_count": 1,
+        "preliminary_groups": ["DG001"],
+    }
+
+
+def test_phase2_reuses_phase1_model_director_board_without_second_overview_call(
+    tmp_path,
+    monkeypatch,
+):
+    Image.new("RGB", (2560, 1440), "white").save(
+        tmp_path / "director_storyboard.png"
+    )
+    storyboard = {
+        "director_storyboard": {
+            "image": "director_storyboard.png",
+            "status": "done",
+            "provider": "seedream",
+        },
+        "shots": [],
+    }
+    monkeypatch.setattr(
+        pipeline_core,
+        "run_quality_check",
+        lambda *_args, **_kwargs: SimpleNamespace(passed=True, grade="A"),
+    )
+    monkeypatch.setattr(
+        "phases.phase2.shot_storyboards.generate_shot_storyboards",
+        lambda *_args, **_kwargs: {"total_boards": 0, "total_panels": 0},
+    )
+    monkeypatch.setattr(
+        pipeline_core.time,
+        "sleep",
+        lambda _seconds: pytest.fail("Phase 2 must not enter overview cooldown"),
+    )
+
+    result = pipeline_core.run_phase2(storyboard, {"characters": []}, tmp_path, False)
+
+    assert result["status"] == "done"
+    assert result["provider"] == "seedream_shot_storyboards"
+    assert (tmp_path / "storyboard.png").read_bytes() == (
+        tmp_path / "director_storyboard.png"
+    ).read_bytes()
+
+
+def test_per_shot_storyboard_beats_map_two_panels_to_fresh_then_extend(tmp_path):
+    storyboard = {
+        "shots": [
+            {
+                "id": "S01",
+                "duration": 10,
+                "who": ["凛", "烬"],
+                "where": "暴雨高架",
+                "shot_intent": "action",
+                "micro_actions": ["凛踩水冲出", "凛腾空劈刀", "烬举臂格挡", "火星炸开"],
+                "boundary_before": "cut",
+            },
+            {
+                "id": "S02",
+                "duration": 5,
+                "who": ["凛"],
+                "where": "断裂护栏旁",
+                "what": "凛回身望向机械部队",
+                "boundary_before": "continuous",
+            },
+        ],
+    }
+    plan_storyboard_beats(storyboard)
+    calls = []
+
+    class FakeImageClient:
+        model = "fake-seedream"
+
+        def text_to_image(self, prompt, output_path, size, timeout):
+            calls.append(("text_to_image", prompt, None))
+            Image.new("RGB", (2560, 1440), "blue").save(output_path)
+            return "https://image.invalid/panel.png"
+
+        def image_to_image(self, prompt, ref_image, output_path, size):
+            calls.append(("image_to_image", prompt, ref_image))
+            Image.new("RGB", (2560, 1440), "green").save(output_path)
+            return "https://image.invalid/extended-panel.png"
+
+    contract = generate_shot_storyboards(
+        tmp_path,
+        storyboard,
+        [],
+        client=FakeImageClient(),
+    )
+
+    assert [shot["storyboard_beat_count"] for shot in storyboard["shots"]] == [2, 1]
+    assert [beat["generation_mode"] for beat in storyboard["shots"][0]["storyboard_beats"]] == [
+        "fresh", "extend",
+    ]
+    assert contract["total_boards"] == 2
+    assert contract["total_panels"] == 3
+    assert [call[0] for call in calls] == [
+        "text_to_image", "image_to_image", "text_to_image",
+    ]
+    assert "S01_P01（第 1/2 格）" in calls[0][1]
+    assert "S01_P02（第 2/2 格）" in calls[1][1]
+    assert calls[1][2].endswith("storyboard_beats/S01_P01.png")
+    assert (tmp_path / "shot_storyboards/S01.png").is_file()
+    assert (tmp_path / "storyboard_beats/S01_P01.png").is_file()
+    assert (tmp_path / "storyboard_beats/S01_P02.png").is_file()
+    assert (tmp_path / "storyboard_images/S01.png").is_file()
+
+    continuity = build_continuity_plan(
+        storyboard,
+        continuation_overlap_s=2,
+    )
+    first, second = continuity.shots
+    assert [chunk.mode for chunk in first.chunks] == ["fresh", "native_extend"]
+    assert [chunk.storyboard_beat_id for chunk in first.chunks] == [
+        "S01_P01", "S01_P02",
+    ]
+    assert [chunk.storyboard_image for chunk in first.chunks] == [
+        "storyboard_beats/S01_P01.png", "storyboard_beats/S01_P02.png",
+    ]
+    assert [chunk.requested_frames for chunk in first.chunks] == [120, 168]
+    assert [chunk.expected_unique_frames for chunk in first.chunks] == [120, 120]
+    assert second.boundary_before == "cut"
+    assert [chunk.mode for chunk in second.chunks] == ["fresh"]
+    groups = write_storyboard_groups(tmp_path, storyboard, continuity)
+    assert groups["groups"][0]["storyboard_board"] == "shot_storyboards/S01.png"
+    assert groups["groups"][0]["beats"][0]["storyboard_beats"][1][
+        "storyboard_image"
+    ] == "storyboard_beats/S01_P02.png"
+
+
+def test_phase2_uses_director_board_as_visual_reference_for_every_shot(tmp_path):
+    director = tmp_path / "director_storyboard.png"
+    Image.new("RGB", (2560, 1440), "white").save(director)
+    storyboard = {
+        "director_storyboard": {"image": director.name, "status": "done"},
+        "shots": [
+            {"id": "S07", "duration": 10, "micro_actions": ["打开门", "走入房间"]},
+            {"id": "S08", "duration": 5, "micro_actions": ["抬头观察"]},
+        ],
+    }
+    plan_storyboard_beats(storyboard)
+    calls = []
+
+    class FakeImageClient:
+        model = "fake-seedream"
+
+        def text_to_image(self, **kwargs):
+            pytest.fail("P01 must inherit the director overview through i2i")
+
+        def image_to_image(self, prompt, ref_image, output_path, size):
+            calls.append((prompt, ref_image, size))
+            Image.new("RGB", (1440, 2560), "green").save(output_path)
+            return "https://image.invalid/reference-panel.png"
+
+    contract = generate_shot_storyboards(
+        tmp_path,
+        storyboard,
+        [],
+        client=FakeImageClient(),
+        size="1440x2560",
+        aspect_ratio="9:16",
+        director_storyboard_path=director,
+    )
+
+    assert len(calls) == 3
+    assert calls[0][1] == str(director)
+    assert calls[1][1] == [
+        str(tmp_path / "storyboard_beats/S07_P01.png"),
+        str(director),
+    ]
+    assert calls[2][1] == str(director)
+    assert "9:16" in calls[0][0]
+    assert contract["director_storyboard"] == "director_storyboard.png"
+    with Image.open(tmp_path / "shot_storyboards/S07.png") as board:
+        assert board.height > board.width / 2
+
+
+def test_missing_pxx_blocks_validation_and_resume(tmp_path):
+    storyboard = {
+        "shots": [{
+            "id": "S21",
+            "duration": 10,
+            "storyboard_beats": [
+                {
+                    "beat_id": "S21_P01",
+                    "duration_s": 5,
+                    "generation_mode": "fresh",
+                    "action": "进入",
+                    "storyboard_image": "storyboard_beats/S21_P01.png",
+                },
+                {
+                    "beat_id": "S21_P02",
+                    "duration_s": 5,
+                    "generation_mode": "extend",
+                    "action": "落座",
+                    "storyboard_image": "storyboard_beats/S21_P02.png",
+                },
+            ],
+        }],
+    }
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps(storyboard), encoding="utf-8"
+    )
+    (tmp_path / "SHOT_STORYBOARDS.json").write_text(
+        json.dumps({"status": "done", "total_panels": 2}), encoding="utf-8"
+    )
+    beat_dir = tmp_path / "storyboard_beats"
+    beat_dir.mkdir()
+    Image.new("RGB", (1280, 720), "blue").save(beat_dir / "S21_P01.png")
+
+    errors = validate_shot_storyboard_artifacts(tmp_path, storyboard)
+
+    assert any("S21_P02" in error for error in errors)
+    assert can_resume_from("phase4", tmp_path) is False
+
+
+def test_provider_uses_each_chunk_storyboard_panel_and_action(monkeypatch, tmp_path):
+    shot_dir = tmp_path / "shots/S01"
+    shot_dir.mkdir(parents=True)
+    (shot_dir / "SHOT_META.json").write_text(
+        json.dumps({"prompt": "完整镜头摘要", "gen_strategy": "phantom"}),
+        encoding="utf-8",
+    )
+    observed = {}
+
+    def fake_build(**kwargs):
+        observed.update(kwargs["shot_meta"])
+        return [{"type": "text", "text": kwargs["shot_meta"]["prompt"]}]
+
+    monkeypatch.setattr("tools.asset_packager.build_content_for_shot", fake_build)
+    request = ChunkExecutionRequest(
+        resource_id="S01_C02",
+        shot_id="S01",
+        chunk=GenerationChunk(
+            chunk_id="S01_C02",
+            sequence=2,
+            target_duration_s=7,
+            mode="native_extend",
+            depends_on="S01_C01",
+            storyboard_beat_id="S01_P02",
+            storyboard_image="storyboard_beats/S01_P02.png",
+            action_prompt="烬抬起机械臂格挡",
+            start_state="凛已经冲到面前",
+            end_state="火星炸开",
+        ),
+        anchors={"scene": "roof"},
+        output_path=tmp_path / "S01_C02.mp4",
+        previous_output_path=tmp_path / "S01_C01.mp4",
+        input_fingerprint="fingerprint",
+        memory_context="",
+    )
+
+    from runtime.continuity_provider import _base_content
+
+    content = _base_content(tmp_path, request, json.loads((shot_dir / "SHOT_META.json").read_text()))
+
+    assert observed["_storyboard_frame_path"] == "storyboard_beats/S01_P02.png"
+    assert observed["_storyboard_beat_id"] == "S01_P02"
+    assert observed["gen_strategy"] == "i2v"
+    assert observed["generation_actions"] == ["烬抬起机械臂格挡"]
+    assert "Execute only this visible action: 烬抬起机械臂格挡" in content[0]["text"]
+
+
+def test_storyboard_beat_planner_discards_quote_only_fragments():
+    storyboard = {"shots": [{
+        "id": "S01",
+        "duration": 10,
+        "action_description": (
+            "暴雨砸在高架上。凛与烬持刀对峙。"
+            "“为什么骗我？”“我只是不想你死。”"
+        ),
+    }]}
+
+    plan_storyboard_beats(storyboard)
+
+    actions = [beat["action"] for beat in storyboard["shots"][0]["storyboard_beats"]]
+    assert actions == ["暴雨砸在高架上", "凛与烬持刀对峙"]
+    assert all(action not in {"“", "”", "\""} for action in actions)
+
+
+def test_storyboard_beat_planner_is_semantic_and_never_samples_actions():
+    storyboard = {"shots": [
+        {
+            "id": "S07",
+            "duration": 13,
+            "what": "读者查阅旧书",
+            "micro_actions": ["读者翻开旧书"],
+        },
+        {
+            "id": "S08",
+            "duration": 7,
+            "micro_actions": ["抬头", "发现批注", "触摸纸页", "迟疑", "合上书"],
+        },
+    ]}
+
+    plan_storyboard_beats(storyboard)
+
+    long_quiet, dense_short = storyboard["shots"]
+    assert long_quiet["storyboard_beat_count"] == 2
+    assert "延续前格状态并推进至本镜结局：延续" not in " ".join(
+        beat["action"] for beat in long_quiet["storyboard_beats"]
+    )
+    assert dense_short["storyboard_beat_count"] == 2
+    assert [
+        action
+        for beat in dense_short["storyboard_beats"]
+        for action in beat["micro_actions"]
+    ] == ["抬头", "发现批注", "触摸纸页", "迟疑", "合上书"]
 
 
 def test_planner_allocates_fractional_shots_from_cumulative_frame_endpoints():
@@ -1035,6 +1560,20 @@ def test_extension_provider_content_keeps_images_as_anchors_and_adds_video(monke
         json.dumps({"prompt": "walk steadily right", "gen_strategy": "i2v"}),
         encoding="utf-8",
     )
+    board_dir = tmp_path / "storyboard_groups"
+    board_dir.mkdir()
+    (board_dir / "CG001.jpg").write_bytes(b"group-board")
+    (tmp_path / "STORYBOARD_GROUPS.json").write_text(json.dumps({
+        "shot_to_group": {"S01": "CG001"},
+        "groups": [{
+            "group_id": "CG001",
+            "storyboard_board": "storyboard_groups/CG001.jpg",
+            "beats": [{
+                "shot_id": "S01", "start_state": "at roof edge",
+                "generation_actions": ["walk steadily right"], "end_state": "at door",
+            }],
+        }],
+    }), encoding="utf-8")
     previous = tmp_path / "previous.mp4"
     previous.write_bytes(b"video")
     monkeypatch.setattr(
@@ -1056,6 +1595,10 @@ def test_extension_provider_content_keeps_images_as_anchors_and_adds_video(monke
             if prefix == "volcengine/video"
             else f"https://image.test/{Path(path).name}"
         ),
+    )
+    monkeypatch.setattr(
+        "clients.tos_uploader.upload_image",
+        lambda data, content_type: "https://image.test/CG001.jpg",
     )
     monkeypatch.setattr(
         "quality.continuity_seam.extract_video_tail_window",
@@ -1101,20 +1644,84 @@ def test_extension_provider_content_keeps_images_as_anchors_and_adds_video(monke
         "reference_image",
         "reference_image",
         "reference_image",
+        "reference_image",
         "reference_video",
     ]
     assert content[0]["text"].startswith("向后延长视频1")
-    assert "图片2、图片3、图片4" in content[0]["text"]
-    assert "严格参考图片4" in content[0]["text"]
+    assert "图片3、图片4、图片5" in content[0]["text"]
+    assert "严格参考图片5" in content[0]["text"]
     assert "不得重播视频1中的运动轨迹" in content[0]["text"]
     assert "without a reset or cut" in content[0]["text"]
     assert "Do not skip forward in time" in content[0]["text"]
+    assert "storyboard group CG001; step 1/1" in content[0]["text"]
+    assert "图片2是本连续组" in content[0]["text"]
     assert content[1]["image_url"]["url"] == "https://image.test/frame.png"
-    assert [item["image_url"]["url"] for item in content[2:5]] == [
+    assert content[2]["image_url"]["url"] == "https://image.test/CG001.jpg"
+    assert [item["image_url"]["url"] for item in content[3:6]] == [
         f"https://image.test/{path.name}"
         for path in sorted((tmp_path / "continuity_anchors").glob("*_frame_*.jpg"))
     ]
     assert content[-1]["video_url"]["url"] == "https://video.test/tail-window.mp4"
+
+
+def test_fresh_provider_content_uses_current_frame_and_group_storyboard(monkeypatch, tmp_path):
+    shot_dir = tmp_path / "shots/S01"
+    shot_dir.mkdir(parents=True)
+    (shot_dir / "SHOT_META.json").write_text(
+        json.dumps({"prompt": "凛踩水冲出", "gen_strategy": "phantom"}),
+        encoding="utf-8",
+    )
+    board_dir = tmp_path / "storyboard_groups"
+    board_dir.mkdir()
+    (board_dir / "CG001.jpg").write_bytes(b"group-board")
+    (tmp_path / "STORYBOARD_GROUPS.json").write_text(json.dumps({
+        "version": 1,
+        "shot_to_group": {"S01": "CG001", "S02": "CG001"},
+        "groups": [{
+            "group_id": "CG001",
+            "storyboard_board": "storyboard_groups/CG001.jpg",
+            "beats": [
+                {"shot_id": "S01", "start_state": "二人对峙", "generation_actions": ["凛踩水冲出"], "end_state": "凛逼近烬"},
+                {"shot_id": "S02", "start_state": "凛逼近烬", "generation_actions": ["烬举臂格挡"], "end_state": "火星炸开"},
+            ],
+        }],
+    }), encoding="utf-8")
+    observed = {}
+
+    def fake_build(**kwargs):
+        observed["max_images"] = kwargs["shot_meta"].get("_max_reference_images")
+        return [
+            {"type": "text", "text": kwargs["shot_meta"]["prompt"]},
+            {"type": "image_url", "image_url": {"url": "https://image.test/S01.png"}, "role": "reference_image"},
+        ]
+
+    monkeypatch.setattr("tools.asset_packager.build_content_for_shot", fake_build)
+    monkeypatch.setattr(
+        "clients.tos_uploader.upload_image",
+        lambda data, content_type: "https://image.test/CG001.jpg",
+    )
+    request = ChunkExecutionRequest(
+        resource_id="S01_C01",
+        shot_id="S01",
+        chunk=GenerationChunk(chunk_id="S01_C01", sequence=1, target_duration_s=4, mode="fresh"),
+        anchors={"scene": "roof"},
+        output_path=tmp_path / "S01_C01.mp4",
+        previous_output_path=None,
+        input_fingerprint="fingerprint",
+        memory_context="anchors",
+    )
+
+    content, *_ = _provider_content(tmp_path, request)
+
+    assert observed["max_images"] == 8
+    assert [item.get("image_url", {}).get("url") for item in content[1:]] == [
+        "https://image.test/S01.png",
+        "https://image.test/CG001.jpg",
+    ]
+    assert "storyboard group CG001; step 1/2" in content[0]["text"]
+    assert "Execute only this current shot action contract: 凛踩水冲出" in content[0]["text"]
+    assert "图片2是本连续组" in content[0]["text"]
+    assert "不得同时演完其他格" in content[0]["text"]
 
 
 def test_extension_provider_content_never_exceeds_seedance_image_budget(monkeypatch, tmp_path):
@@ -3026,3 +3633,29 @@ def test_final_qa_samples_delivery_timeline_before_edit_timeline(tmp_path, monke
     s02_first = next(frame for frame in frames if frame.label == "S02_first")
 
     assert s02_first.timestamp == pytest.approx(4.1)
+
+
+def test_animated_still_motion_metric_triggers_reshoot(tmp_path):
+    frame_paths = []
+    base = np.full((120, 160, 3), 80, dtype=np.uint8)
+    for index in range(5):
+        image = base.copy()
+        image[index:index + 2, :, :] += 2  # tiny rain-like change only
+        path = tmp_path / f"frame_{index}.png"
+        Image.fromarray(image).save(path)
+        frame_paths.append(path)
+
+    activity = measure_motion_activity(frame_paths)
+    decision = decide_shot_action(
+        10.0,
+        [],
+        [],
+        [],
+        None,
+        {"camera_movement": "static"},
+        activity,
+    )
+
+    assert activity["median_mae"] < 3.5
+    assert decision["action"] == "reshoot"
+    assert "animated-still motion failure" in decision["reasons"][0]

@@ -9,7 +9,11 @@ if str(SRC) not in sys.path:
 
 from clients import tos_uploader
 from phases.phase1.character_discoverer import _add_reference_contract
-from phases.pipeline_core import _extract_visual_style_text, _write_project_visual_style
+from phases.pipeline_core import (
+    _extract_visual_style_text,
+    _storyboard_keyframe_description,
+    _write_project_visual_style,
+)
 from phases.phase1.storyboard_generator import (
     _build_shot_prompt,
     _load_default_visual_style,
@@ -17,6 +21,7 @@ from phases.phase1.storyboard_generator import (
     _specific_lighting,
     generate_storyboard,
 )
+from phases.phase5.storyboard_qa_gate import run_generation_capacity_checks
 from phases.phase6.video_generator import build_video_prompt
 from phases.phase4.scene_consistency import build_scene_reference_prompt
 from prompt.prompt_router import route_prompt
@@ -123,6 +128,147 @@ def test_f4_source_excerpt_survives_blueprint_and_storyboard(monkeypatch):
     storyboard = generate_storyboard([shot], [], visual_style_text="赛璐璐")
     assert key_action in storyboard["shots"][0]["action_description"]
     assert "刀锋从鼻尖掠过削断几缕银发" in storyboard["shots"][0]["prompt"]
+
+
+def test_action_prompt_uses_real_duration_bounded_actions_and_dynamic_camera():
+    shot = {
+        "id": 2,
+        "who": ["凛", "烬"],
+        "where": "雨夜高架",
+        "suggested_duration": 4,
+        "shot_intent": "action",
+        "camera_movement": "static",
+        "generation_actions": ["凛冲刺", "跃起劈刀", "烬举臂格挡", "火星炸开"],
+        "source_excerpt": "不应进入模型提示的二十六步完整动作流水账",
+        "what": "首轮交锋",
+    }
+
+    prompt = _build_shot_prompt(shot, [])
+
+    assert "4.0秒" in prompt
+    assert "稳定器跟拍" in prompt
+    assert "凛冲刺 → 跃起劈刀 → 烬举臂格挡 → 火星炸开" in prompt
+    assert "不应进入模型提示的二十六步完整动作流水账" not in prompt
+    assert "补充：首轮交锋" not in prompt
+    assert "不得在首帧姿态原地停留" in prompt
+    assert "不得无动机切成特写" in prompt
+
+
+def test_action_prompt_does_not_inject_unrelated_emotion_gesture():
+    prompt = _build_shot_prompt({
+        "id": 1,
+        "who": ["凛", "烬"],
+        "where": "废弃高架",
+        "what": "凛攻击烬",
+        "emotion": "激烈、凌厉、高度紧张",
+        "shot_intent": "action",
+        "camera_movement": "steadicam",
+        "suggested_duration": 4,
+        "generation_actions": [
+            "凛踩碎积水冲出",
+            "凛腾空举刀下劈",
+            "烬以机械臂格挡",
+        ],
+    })
+
+    assert "凛踩碎积水冲出" in prompt
+    assert "频繁看手表" not in prompt
+    assert "手指敲击桌面" not in prompt
+
+
+def test_action_storyboard_keyframe_uses_start_state_not_final_impact():
+    prompt = _storyboard_keyframe_description({
+        "who": ["凛", "烬"],
+        "where": "废弃高架",
+        "shot_intent": "action",
+        "start_state": "凛与烬相隔数米对峙，双方武器尚未接触",
+        "generation_actions": ["凛踩水冲出", "刀锋撞上机械臂"],
+        "action_description": "凛踩水冲出 → 刀锋撞上机械臂并炸出火星",
+        "visual": "凛冲刺后与烬碰撞，火星炸开",
+    })
+
+    assert "凛与烬相隔数米对峙" in prompt
+    assert "frame zero" in prompt
+    assert "impact, and result have not happened" in prompt
+    assert "Visual staging: 凛冲刺后与烬碰撞" not in prompt
+
+
+def test_phase5_blocks_action_overload_static_hold_and_missing_coverage():
+    storyboard = {
+        "shots": [{
+            "id": 1,
+            "duration": 10,
+            "source_action_unit_ids": ["AU001", "AU002"],
+            "generation_actions": ["a", "b", "c", "d", "e"],
+            "camera_movement": "static",
+        }]
+    }
+    events = {"events": [
+        {"action_unit_id": "AU001"},
+        {"action_unit_id": "AU002"},
+        {"action_unit_id": "AU003"},
+    ]}
+
+    issues = run_generation_capacity_checks(storyboard, events)
+    codes = {issue["code"] for issue in issues}
+
+    assert {
+        "action_unit_overload",
+        "generation_action_overload",
+        "action_shot_too_long",
+        "static_action_camera",
+        "action_unit_coverage_missing",
+    } <= codes
+
+
+def test_phase5_uses_stricter_action_budget_for_four_second_clip():
+    issues = run_generation_capacity_checks({
+        "shots": [{
+            "id": 1,
+            "duration": 4,
+            "source_action_unit_ids": ["AU001"],
+            "generation_actions": ["a", "b", "c", "d"],
+            "camera_movement": "steadicam",
+        }]
+    })
+
+    overload = next(issue for issue in issues if issue["code"] == "generation_action_overload")
+    assert overload["details"]["action_limit"] == 1
+
+
+def test_action_phantom_references_are_motion_bounded(tmp_path, monkeypatch):
+    characters = [
+        {"id": "rin", "name": "凛", "aliases": []},
+        {"id": "jin", "name": "烬", "aliases": []},
+    ]
+    (tmp_path / "CHARACTERS.json").write_text(
+        json.dumps({"characters": characters}, ensure_ascii=False), encoding="utf-8"
+    )
+    for character in characters:
+        _write_character_assets(tmp_path, character["id"], character["id"][0].encode())
+    storyboard_dir = tmp_path / "storyboard_images"
+    storyboard_dir.mkdir()
+    (storyboard_dir / "S01.png").write_bytes(b"s" * 2048)
+    monkeypatch.setattr(
+        tos_uploader,
+        "upload_image",
+        lambda image_bytes, content_type: f"https://mock.invalid/{image_bytes[:1].decode()}.png",
+    )
+
+    content = build_content_for_shot(tmp_path, "S01", {
+        "prompt": "两人交锋",
+        "gen_strategy": "phantom",
+        "who": ["凛", "烬"],
+        "generation_actions": ["冲刺", "格挡", "分开"],
+    })
+
+    images = [item for item in content if item["type"] == "image_url"]
+    prompt = next(item["text"] for item in content if item["type"] == "text")
+    assert len(images) == 3
+    urls = [item["image_url"]["url"] for item in images]
+    assert "https://mock.invalid/R.png" in urls
+    assert "https://mock.invalid/J.png" in urls
+    assert "motion-priority" in prompt
 
 
 def test_f5_placeholder_rendering_ignores_first_frame_numbering():

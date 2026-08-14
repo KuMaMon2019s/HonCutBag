@@ -1,0 +1,499 @@
+"""Generate one model-drawn hand storyboard for every director-level shot."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import re
+import shutil
+from pathlib import Path
+from typing import Any, Protocol
+
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+
+
+SHOT_STORYBOARD_SIZE = "2560x1440"
+
+
+class ImageGenerationClient(Protocol):
+    model: str
+
+    def text_to_image(
+        self,
+        prompt: str,
+        output_path: str,
+        size: str,
+        timeout: int,
+    ) -> str: ...
+
+    def image_to_image(
+        self,
+        prompt: str,
+        ref_image: str | list[str],
+        output_path: str,
+        size: str,
+    ) -> str: ...
+
+
+def _shot_id(shot: dict[str, Any], index: int) -> str:
+    raw = shot.get("shot_id") or shot.get("id") or shot.get("shot_order") or index
+    text = str(raw).strip().upper()
+    if text.startswith("S"):
+        text = text[1:]
+    return f"S{int(text):02d}" if text.isdigit() else str(raw)
+
+
+def _compact(value: Any, limit: int = 180) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+def _character_contract(characters: list[dict[str, Any]], who: list[Any]) -> str:
+    requested = {str(value).casefold() for value in who}
+    lines = []
+    for character in characters:
+        names = {
+            str(character.get("id") or "").casefold(),
+            str(character.get("name") or "").casefold(),
+            *(str(value).casefold() for value in character.get("aliases", [])),
+        }
+        if requested and requested.isdisjoint(names):
+            continue
+        appearance = character.get("appearance") or {}
+        if isinstance(appearance, dict):
+            description = (
+                appearance.get("summary")
+                or appearance.get("description")
+                or json.dumps(appearance, ensure_ascii=False)
+            )
+        else:
+            description = appearance
+        description = (
+            description
+            or character.get("description")
+            or character.get("visual_description")
+        )
+        if description:
+            lines.append(
+                f"- {character.get('name') or character.get('id')}："
+                f"{_compact(description, 220)}"
+            )
+    return "\n".join(lines) or "- 严格使用 STORYBOARD.json 声明的角色设定，不自行增加人物。"
+
+
+def build_shot_storyboard_prompt(
+    shot: dict[str, Any],
+    shot_id: str,
+    characters: list[dict[str, Any]],
+    aspect_ratio: str = "16:9",
+) -> tuple[str, list[dict[str, Any]]]:
+    beats = [
+        dict(beat)
+        for beat in (shot.get("storyboard_beats") or [])
+        if isinstance(beat, dict)
+    ]
+    if not beats:
+        raise ValueError(f"{shot_id} has no storyboard_beats")
+    who = shot.get("who") or []
+    if not isinstance(who, list):
+        who = [who] if who else []
+    beat_lines = []
+    for position, beat in enumerate(beats, 1):
+        beat_id = str(beat.get("beat_id") or f"{shot_id}_P{position:02d}")
+        mode = "FRESH" if position == 1 else "EXTEND"
+        beat_lines.append(
+            f"故事格{position}【{beat_id} · {mode} · {float(beat.get('duration_s') or 5):g}秒】："
+            f"起始状态={_compact(beat.get('start_state'))}；"
+            f"本格只表现={_compact(beat.get('action'))}；"
+            f"结束状态={_compact(beat.get('end_state'))}；"
+            f"景别={beat.get('shot_size') or shot.get('shot_size') or 'medium'}；"
+            f"运镜={beat.get('camera_movement') or shot.get('camera_movement') or 'steadicam'}。"
+        )
+    prompt = f"""为导演级镜头 {shot_id} 绘制一张内部动作故事板。
+
+版式合同：
+- 单张 {aspect_ratio} 故事板纸，严格按时间顺序排列 {len(beats)} 格，恰好对应 P01 到 P{len(beats):02d}。
+- 每格顶部只写 {shot_id}_P01、{shot_id}_P02 这样的编号；不得增加、合并、重复或交换格子。
+- 这是 {shot_id} 自己的故事板，不要画其他 Sxx 的内容。
+
+绘画风格：
+- 专业 PREVIS 手绘工作稿，黑色粗铅笔和炭笔，少量灰色阴影，快速 gesture drawing。
+- 动作方向用红色手绘箭头，摄影机运动用蓝色手绘箭头。
+- 不是剧照、不是完成度很高的漫画或概念图；人物身份与项目角色设定保持一致。
+- 同一角色在所有格保持发型、服装、武器、受伤状态和左右站位连续。
+
+延长视频语义：
+- P01 是图生视频的起始构图。
+- P02 及以后必须从前一格的结束姿态继续，表现新的动作进展；不得回到 P01、不得重新入场、不得重复前格动作。
+- 每格只画其“本格只表现”的一个可见动作，不得提前画后续格结果。
+
+场景：{_compact(shot.get('where') or shot.get('visual'), 260)}
+角色：
+{_character_contract(characters, who)}
+
+逐格合同：
+{chr(10).join(beat_lines)}
+
+最终检查：恰好 {len(beats)} 格，动作按时间推进，P01→P02→P03 的姿态和运动方向能够直接用于视频延长。"""
+    return prompt, beats
+
+
+def _build_panel_prompt(
+    shot: dict[str, Any],
+    beat: dict[str, Any],
+    position: int,
+    count: int,
+    characters: list[dict[str, Any]],
+    *,
+    uses_director_board: bool = False,
+    aspect_ratio: str = "16:9",
+) -> str:
+    who = shot.get("who") or []
+    if not isinstance(who, list):
+        who = [who] if who else []
+    beat_id = str(beat.get("beat_id") or f"P{position:02d}")
+    continuation = (
+        "这是本镜的第一格，建立图生视频的起始构图。"
+        if position == 1
+        else (
+            "这是延长视频的下一格。严格继承上一参考图的角色身份、服装、场景、"
+            "机位轴线和动作方向，但姿态必须推进到本格的新状态；不得复制上一格。"
+        )
+    )
+    director_reference = (
+        "参考图中包含整部影片的导演总览板。只读取其中标为本 Sxx 的面板来继承机位、"
+        "人物站位、空间轴线和光影；输出必须是一张铺满画布的单格，绝不能复制总览板的网格、"
+        "边框、编号或其他 Sxx 内容。"
+        if uses_director_board
+        else ""
+    )
+    return f"""绘制一张单独的 {aspect_ratio} PREVIS 导演手绘故事格：{beat_id}（第 {position}/{count} 格）。
+
+{continuation}
+{director_reference}
+本格起始状态：{_compact(beat.get('start_state'))}
+本格唯一可见动作：{_compact(beat.get('action'))}
+本格必须到达的结束状态：{_compact(beat.get('end_state'))}
+场景：{_compact(shot.get('where') or shot.get('visual'), 260)}
+景别：{beat.get('shot_size') or shot.get('shot_size') or 'medium'}
+运镜意图：{beat.get('camera_movement') or shot.get('camera_movement') or 'steadicam'}
+
+角色：
+{_character_contract(characters, who)}
+
+风格要求：黑色粗铅笔与炭笔、少量灰色阴影、快速 gesture drawing、专业导演工作稿；
+动作方向可用红色手绘箭头，摄像机运动可用蓝色箭头。人物外形严格遵守项目角色合同。
+画面必须铺满 {aspect_ratio} 单格，禁止分格、拼贴、边框、大标题、字幕、对白气泡、编号和水印。
+只画本格动作，不得提前表现 P{position + 1:02d} 或其他 Sxx 的剧情。"""
+
+
+def _font(size: int) -> ImageFont.ImageFont:
+    for path in (
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ):
+        try:
+            return ImageFont.truetype(path, size=size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def _compose_board(
+    panel_paths: list[Path],
+    labels: list[str],
+    board_path: Path,
+) -> None:
+    with Image.open(panel_paths[0]) as first:
+        ratio = first.width / max(first.height, 1)
+    cell_height = 720
+    cell_width = max(320, round(cell_height * ratio))
+    label_height, gutter = 58, 12
+    board = Image.new(
+        "RGB",
+        (
+            len(panel_paths) * cell_width + (len(panel_paths) + 1) * gutter,
+            cell_height + label_height + 2 * gutter,
+        ),
+        "white",
+    )
+    draw = ImageDraw.Draw(board)
+    font = _font(30)
+    for index, (path, label) in enumerate(zip(panel_paths, labels, strict=True)):
+        with Image.open(path) as source:
+            panel = ImageOps.fit(
+                source.convert("RGB"),
+                (cell_width, cell_height),
+                method=Image.Resampling.LANCZOS,
+            )
+        x = gutter + index * (cell_width + gutter)
+        board.paste(panel, (x, gutter + label_height))
+        draw.text((x + 12, gutter + 10), label, fill="black", font=font)
+        draw.rectangle(
+            (x, gutter + label_height, x + cell_width, gutter + label_height + cell_height),
+            outline=(55, 55, 55),
+            width=3,
+        )
+    board.save(board_path, format="PNG", optimize=True)
+
+
+def _write_json(path: Path, value: dict[str, Any]) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def validate_shot_storyboard_artifacts(
+    output_dir: Path,
+    storyboard: dict[str, Any],
+) -> list[str]:
+    """Return every missing/corrupt Pxx artifact in a two-level storyboard."""
+    output_dir = Path(output_dir)
+    errors: list[str] = []
+    authored_count = 0
+    for shot in storyboard.get("shots", []):
+        if not isinstance(shot, dict):
+            continue
+        for beat in shot.get("storyboard_beats") or []:
+            if not isinstance(beat, dict):
+                continue
+            authored_count += 1
+            beat_id = str(beat.get("beat_id") or "<missing-beat-id>")
+            image_value = str(beat.get("storyboard_image") or "").strip()
+            if not image_value:
+                errors.append(f"{beat_id} has no storyboard_image")
+                continue
+            image_path = Path(image_value)
+            if not image_path.is_absolute():
+                image_path = output_dir / image_path
+            try:
+                if not image_path.is_file() or image_path.stat().st_size <= 1024:
+                    raise OSError("file missing or too small")
+                with Image.open(image_path) as image:
+                    image.verify()
+            except (OSError, ValueError) as exc:
+                errors.append(f"{beat_id} invalid storyboard image {image_value}: {exc}")
+    if authored_count:
+        manifest = output_dir / "SHOT_STORYBOARDS.json"
+        try:
+            document = json.loads(manifest.read_text(encoding="utf-8"))
+            if document.get("status") != "done":
+                errors.append("SHOT_STORYBOARDS.json is not complete")
+            if int(document.get("total_panels") or 0) != authored_count:
+                errors.append(
+                    "SHOT_STORYBOARDS.json panel count does not match STORYBOARD.json"
+                )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            errors.append(f"SHOT_STORYBOARDS.json unreadable: {exc}")
+    return errors
+
+
+def generate_shot_storyboards(
+    output_dir: Path,
+    storyboard: dict[str, Any],
+    characters: list[dict[str, Any]],
+    *,
+    client: ImageGenerationClient | None = None,
+    size: str = SHOT_STORYBOARD_SIZE,
+    director_storyboard_path: str | Path | None = None,
+    aspect_ratio: str | None = None,
+) -> dict[str, Any]:
+    """Generate each Pxx as 16:9 model art, then compose the Sxx overview."""
+    output_dir = Path(output_dir)
+    boards_dir = output_dir / "shot_storyboards"
+    boards_dir.mkdir(parents=True, exist_ok=True)
+    beats_dir = output_dir / "storyboard_beats"
+    beats_dir.mkdir(parents=True, exist_ok=True)
+    image_dir = output_dir / "storyboard_images"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    model = getattr(client, "model", None) or "doubao-seedream-5.0-lite"
+    contract: dict[str, Any] = {
+        "kind": "honcut.shot_storyboards.v1",
+        "version": 1,
+        "status": "running",
+        "provider": "seedream",
+        "model": model,
+        "shots": [],
+    }
+    if aspect_ratio is None:
+        aspect_ratio = str(storyboard.get("aspect_ratio") or "").strip()
+    if not aspect_ratio:
+        try:
+            width, height = (int(value) for value in size.lower().split("x", 1))
+            divisor = math.gcd(width, height)
+            aspect_ratio = f"{width // divisor}:{height // divisor}"
+        except (TypeError, ValueError):
+            aspect_ratio = "16:9"
+    contract["aspect_ratio"] = aspect_ratio
+    contract["size_requested"] = size
+    manifest_path = output_dir / "SHOT_STORYBOARDS.json"
+    _write_json(manifest_path, contract)
+    if client is None:
+        from clients.seedream_client import SeedreamClient
+
+        client = SeedreamClient()
+        contract["model"] = client.model
+
+    if director_storyboard_path is None:
+        director_ref = storyboard.get("director_storyboard") or {}
+        director_value = director_ref.get("image") if isinstance(director_ref, dict) else None
+        director_storyboard_path = director_value or "director_storyboard.png"
+    director_board = Path(director_storyboard_path)
+    if not director_board.is_absolute():
+        director_board = output_dir / director_board
+    if not director_board.is_file() or director_board.stat().st_size == 0:
+        director_board = None
+    contract["director_storyboard"] = (
+        str(director_board.relative_to(output_dir))
+        if director_board is not None and director_board.is_relative_to(output_dir)
+        else str(director_board) if director_board is not None else None
+    )
+
+    try:
+        for index, shot in enumerate(storyboard.get("shots", []), 1):
+            if not isinstance(shot, dict):
+                continue
+            shot_id = _shot_id(shot, index)
+            prompt, beats = build_shot_storyboard_prompt(
+                shot,
+                shot_id,
+                characters,
+                aspect_ratio,
+            )
+            prompt_path = boards_dir / f"{shot_id}_prompt.txt"
+            board_path = boards_dir / f"{shot_id}.png"
+            prompt_path.write_text(prompt, encoding="utf-8")
+            prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+            record = {
+                "shot_id": shot_id,
+                "board": str(board_path.relative_to(output_dir)),
+                "prompt": str(prompt_path.relative_to(output_dir)),
+                "prompt_sha256": prompt_sha,
+                "panel_count": len(beats),
+                "status": "planned",
+            }
+            panel_records = []
+            panel_paths: list[Path] = []
+            previous_panel: Path | None = None
+            for position, beat in enumerate(beats, 1):
+                beat_id = str(beat.get("beat_id") or f"{shot_id}_P{position:02d}")
+                panel_prompt = _build_panel_prompt(
+                    shot,
+                    beat,
+                    position,
+                    len(beats),
+                    characters,
+                    uses_director_board=director_board is not None,
+                    aspect_ratio=aspect_ratio,
+                )
+                panel_prompt_path = beats_dir / f"{beat_id}_prompt.txt"
+                panel_path = beats_dir / f"{beat_id}.png"
+                panel_sidecar = beats_dir / f"{beat_id}.json"
+                panel_prompt_path.write_text(panel_prompt, encoding="utf-8")
+                reference_paths: list[Path] = []
+                if previous_panel is not None:
+                    reference_paths.append(previous_panel)
+                if director_board is not None:
+                    reference_paths.append(director_board)
+                reference_hashes = [
+                    hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in reference_paths
+                ]
+                panel_sha = hashlib.sha256(
+                    f"{panel_prompt}\nreferences={','.join(reference_hashes)}".encode("utf-8")
+                ).hexdigest()
+                panel_record = {
+                    "beat_id": beat_id,
+                    "position": position,
+                    "mode": "image_to_image" if reference_paths else "text_to_image",
+                    "image": str(panel_path.relative_to(output_dir)),
+                    "prompt": str(panel_prompt_path.relative_to(output_dir)),
+                    "prompt_sha256": panel_sha,
+                    "model": contract["model"],
+                    "status": "planned",
+                }
+                cached = False
+                if panel_sidecar.is_file() and panel_path.is_file():
+                    try:
+                        previous_record = json.loads(
+                            panel_sidecar.read_text(encoding="utf-8")
+                        )
+                        if (
+                            previous_record.get("status") == "done"
+                            and previous_record.get("prompt_sha256") == panel_sha
+                            and previous_record.get("model") == contract["model"]
+                        ):
+                            with Image.open(panel_path) as image:
+                                image.verify()
+                            panel_record = previous_record
+                            panel_record["cache_hit"] = True
+                            cached = True
+                    except (OSError, ValueError, json.JSONDecodeError):
+                        cached = False
+                if not cached:
+                    if reference_paths and hasattr(client, "image_to_image"):
+                        result_url = client.image_to_image(
+                            prompt=panel_prompt,
+                            ref_image=(
+                                str(reference_paths[0])
+                                if len(reference_paths) == 1
+                                else [str(path) for path in reference_paths]
+                            ),
+                            output_path=str(panel_path),
+                            size=size,
+                        )
+                    else:
+                        panel_record["mode"] = "text_to_image"
+                        result_url = client.text_to_image(
+                            prompt=panel_prompt,
+                            output_path=str(panel_path),
+                            size=size,
+                            timeout=180,
+                        )
+                    if not panel_path.is_file() or panel_path.stat().st_size == 0:
+                        raise RuntimeError(f"Seedream returned without {panel_path.name}")
+                    with Image.open(panel_path) as image:
+                        image.verify()
+                    panel_record.update({
+                        "status": "done",
+                        "result_url": result_url,
+                        "reference_image_sha256": reference_hashes,
+                    })
+                _write_json(panel_sidecar, panel_record)
+                beat["storyboard_image"] = panel_record["image"]
+                panel_records.append(panel_record)
+                panel_paths.append(panel_path)
+                previous_panel = panel_path
+            _compose_board(
+                panel_paths,
+                [str(beat.get("beat_id")) for beat in beats],
+                board_path,
+            )
+            shutil.copy2(panel_paths[0], image_dir / f"{shot_id}.png")
+            record.update({
+                "status": "done",
+                "model": contract["model"],
+                "panels": panel_records,
+            })
+            shot["storyboard_board"] = record["board"]
+            shot["storyboard_beats"] = beats
+            _write_json(boards_dir / f"{shot_id}.json", record)
+            contract["shots"].append(record)
+            _write_json(manifest_path, contract)
+        contract["status"] = "done"
+        contract["total_boards"] = len(contract["shots"])
+        contract["total_panels"] = sum(
+            int(item.get("panel_count") or 0) for item in contract["shots"]
+        )
+        _write_json(manifest_path, contract)
+        return contract
+    except Exception as exc:
+        contract["status"] = "error"
+        contract["error"] = str(exc)
+        _write_json(manifest_path, contract)
+        raise

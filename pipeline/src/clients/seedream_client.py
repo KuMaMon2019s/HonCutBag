@@ -138,14 +138,22 @@ class SeedreamClient:
         encoded_references = []
         for reference_path in reference_paths:
             with open(reference_path, "rb") as f:
-                img_b64 = base64.b64encode(f.read()).decode()
-            ext = os.path.splitext(reference_path)[1].lower().lstrip(".")
-            mime = {
-                "png": "image/png",
-                "jpg": "image/jpeg",
-                "jpeg": "image/jpeg",
-                "webp": "image/webp",
-            }.get(ext, "image/png")
+                image_bytes = f.read()
+            img_b64 = base64.b64encode(image_bytes).decode()
+            if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+                mime = "image/png"
+            elif image_bytes.startswith(b"\xff\xd8\xff"):
+                mime = "image/jpeg"
+            elif image_bytes.startswith(b"RIFF") and image_bytes[8:12] == b"WEBP":
+                mime = "image/webp"
+            else:
+                ext = os.path.splitext(reference_path)[1].lower().lstrip(".")
+                mime = {
+                    "png": "image/png",
+                    "jpg": "image/jpeg",
+                    "jpeg": "image/jpeg",
+                    "webp": "image/webp",
+                }.get(ext, "image/png")
             encoded_references.append(f"data:{mime};base64,{img_b64}")
 
         # Agent Plan i2i: use image_url in content array

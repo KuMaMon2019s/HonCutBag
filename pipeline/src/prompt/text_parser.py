@@ -26,17 +26,6 @@ SEGMENT_TARGET_CHARS = 400
 SEGMENT_MAX_CHARS = 800
 SEGMENT_CONTEXT_CHARS = 320
 
-_ACTION_SCREENPLAY_MARKERS = (
-    "冲出", "冲来", "追击", "挥刀", "握刀", "横扫", "斩", "劈", "刺", "格挡",
-    "挡住", "躲开", "闪开", "后撤", "跳起", "落地", "旋身", "转腰", "抬膝",
-    "踹", "撞", "扣住", "抓住", "推开", "翻滚", "拔刀", "火星", "刀锋",
-)
-_SCENE_STATE_MARKERS = (
-    "暴雨", "雨幕", "夜色", "废弃", "远处", "霓虹", "积水", "烟雾", "钢梁",
-    "护甲", "战斗服", "风衣", "机械臂", "长发", "刀身",
-)
-
-
 def detect_script_format(text: str) -> str:
     """Detect prose screenplays whose meaning depends on adjacent paragraphs.
 
@@ -50,11 +39,21 @@ def detect_script_format(text: str) -> str:
         bool(re.fullmatch(r"[“\"『「].+?[”\"』」][。！？!?…]*", line))
         for line in stripped_lines
     )
-    action_hits = sum(text.count(marker) for marker in _ACTION_SCREENPLAY_MARKERS)
-    state_hits = sum(text.count(marker) for marker in _SCENE_STATE_MARKERS)
     short_lines = sum(len(line) <= 90 for line in stripped_lines)
     line_oriented = len(stripped_lines) >= 8 and short_lines / len(stripped_lines) >= 0.65
-    if line_oriented and action_hits >= 4 and (quoted_lines >= 2 or state_hits >= 3):
+    sentence_lines = sum(bool(re.search(r"[。！？!?…]$", line)) for line in stripped_lines)
+    compact_narrative_lines = sum(
+        len(line) <= 55
+        and not re.fullmatch(r"[“\"『「].+?[”\"』」][。！？!?…]*", line)
+        for line in stripped_lines
+    )
+    # Structural detection works for fights, dance, chases, quiet suspense, and
+    # non-Chinese action prose. Scenario vocabulary must never decide format.
+    if (
+        line_oriented
+        and sentence_lines >= 6
+        and (quoted_lines >= 2 or compact_narrative_lines >= 6)
+    ):
         return "prose_action_screenplay"
     return "general_prose"
 

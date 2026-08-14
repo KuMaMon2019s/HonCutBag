@@ -37,6 +37,15 @@ class GenerationChunk(BaseModel):
     expected_unique_frames: int | None = Field(default=None, gt=0)
     mode: ContinuityMode
     depends_on: str | None = None
+    storyboard_beat_id: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    storyboard_image: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    action_prompt: str = Field(default="", exclude_if=lambda value: not value)
+    start_state: str = Field(default="", exclude_if=lambda value: not value)
+    end_state: str = Field(default="", exclude_if=lambda value: not value)
 
     @model_validator(mode="after")
     def dependency_matches_mode(self) -> GenerationChunk:

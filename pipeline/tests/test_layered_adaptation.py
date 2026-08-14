@@ -235,6 +235,96 @@ def test_stage1_uses_timeout_retry_wrapper(monkeypatch):
     assert calls == [8000]
 
 
+def test_action_dense_script_keeps_director_shots_above_provider_beats():
+    action_events = [
+            {
+                "event_role": "action_chain",
+                "action_unit_id": f"AU{i:03d}",
+                "micro_actions": [f"动作{i}-{j}" for j in range(8)],
+            }
+            for i in range(1, 13)
+    ]
+    events = [
+        {"event_role": "scene_setup"},
+        *action_events[:4],
+        {"event_role": "dialogue"},
+        *action_events[4:8],
+        {"event_role": "dialogue"},
+        *action_events[8:],
+        {"event_role": "scene_setup"},
+    ]
+
+    assert engine.estimate_action_aware_shot_count(events, 60, 10) == 6
+
+
+def test_event_semantics_bounds_generation_actions_but_keeps_full_ledger():
+    events = [{
+        "action_unit_id": "AU001",
+        "sequence_id": "SEQ001",
+        "event_role": "action_chain",
+        "micro_actions": [f"动作{i}" for i in range(8)],
+        "start_state": "二人相隔数米对峙",
+        "end_state": "护栏断裂",
+    }]
+    shots = [{"source_events": [1]}]
+
+    engine._inherit_event_semantics(shots, events)
+
+    assert shots[0]["micro_actions"] == [f"动作{i}" for i in range(8)]
+    assert shots[0]["generation_actions"] == ["动作0", "动作2", "动作5", "动作7"]
+    assert shots[0]["action_description"] == "动作0 → 动作2 → 动作5 → 动作7"
+    assert shots[0]["generation_load"]["compression"] == "representative"
+    assert shots[0]["start_state"] == "二人相隔数米对峙"
+    assert shots[0]["end_state"] == "护栏断裂"
+
+
+def test_short_action_clip_uses_single_visible_action_budget():
+    actions = [f"动作{i}" for i in range(8)]
+
+    selected = engine.select_generation_actions(actions, duration_seconds=4)
+
+    assert selected == ["动作0"]
+    assert engine.generation_action_limit(4) == 1
+    assert engine.generation_action_limit(6) == 2
+
+
+def test_duration_normalization_closes_exact_target_with_integer_seconds():
+    shots = [{"suggested_duration": 12} for _ in range(13)]
+
+    engine.normalize_shot_durations(shots, 60)
+
+    assert sum(shot["suggested_duration"] for shot in shots) == 60
+    assert [shot["suggested_duration"] for shot in shots] == [5] * 8 + [4] * 5
+
+
+def test_duration_normalization_gives_dense_action_more_provider_capacity():
+    shots = [
+        {"micro_actions": ["翻开旧书"]},
+        {"micro_actions": ["抬头", "发现", "触摸", "迟疑", "合上"]},
+    ]
+
+    engine.normalize_shot_durations(shots, 20)
+
+    assert sum(shot["suggested_duration"] for shot in shots) == 20
+    assert shots[1]["suggested_duration"] > shots[0]["suggested_duration"]
+    assert shots[1]["suggested_duration"] >= 12
+    assert shots[1]["duration_allocation"]["complexity_weight"] == 3
+
+
+def test_beat_capacity_allows_continuous_action_units_but_rejects_cross_sequence_merge():
+    events = [
+        {"action_unit_id": "AU001", "sequence_id": "SEQ001"},
+        {"action_unit_id": "AU002", "sequence_id": "SEQ001"},
+    ]
+    beats = [{"beat_order": 1, "action": "merge", "source_events": [1, 2]}]
+
+    engine._validate_beat_action_capacity(beats, events)
+
+    events[1]["sequence_id"] = "SEQ002"
+    with pytest.raises(ValueError, match="unrelated sequences"):
+        engine._validate_beat_action_capacity(beats, events)
+
+
 def test_layered_mode_persists_skeleton_and_each_batch(monkeypatch, tmp_path):
     events = _events(11)
     beats = [_beat(i) for i in range(1, 4)]

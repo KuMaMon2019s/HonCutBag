@@ -199,6 +199,7 @@ CAMERA_TERMS = {
     "push_in": "推入(push in)",
     "whip_pan": "甩镜(whip-pan)",
     "rack_focus": "焦点转移(rack focus)",
+    "steadicam": "稳定器跟拍(steadicam tracking)",
 }
 
 EMOTION_ACTIONS = {
@@ -216,8 +217,9 @@ QUALITY_GUARDRAILS = (
 
 
 def _remove_fast_motion_words(text: str) -> str:
-    """Remove blur-prone speed words without corrupting words like breakfast."""
-    return re.sub(r"(?i)\bfast\b", "smooth", str(text)).replace("快速", "平稳")
+    """Remove blur-prone style phrases without slowing narrative actions."""
+    cleaned = re.sub(r"(?i)\bfast\s+motion\b", "clear continuous motion", str(text))
+    return cleaned.replace("快速运动镜头", "连续清晰运动镜头")
 
 
 # ─── LLM 客户端 ─────────────────────────────────────────────────────────────
@@ -607,28 +609,52 @@ def _build_eight_layer_prompt(
         references.append(f"参考{{图片N}}中的{char.get('name')}作为主体，保持身份与服装一致")
 
     intent = str(shot.get("shot_intent") or "establishing").lower()
+    generation_actions = [
+        str(value).strip()
+        for value in (shot.get("generation_actions") or [])
+        if str(value).strip()
+    ]
+    duration = float(shot.get("suggested_duration", shot.get("duration", 5)))
+    aspect_ratio = str(shot.get("aspect_ratio") or "16:9")
     camera_key = str(shot.get("camera_movement") or INTENT_TO_CAMERA.get(intent, "slow_pan")).lower()
-    if prev_shot and prev_shot.get("camera_movement") == camera_key:
-        camera_key = "fixed"
+    if generation_actions or intent == "action":
+        if camera_key in {"static", "fixed", "unspecified", ""}:
+            camera_key = "steadicam"
+    elif duration >= 4 and camera_key in {"static", "fixed", "unspecified", ""}:
+        camera_key = "dolly_in"
     shot["camera_movement"] = camera_key
     camera = CAMERA_TERMS.get(camera_key, "固定(fixed/locked)")
     framing = SHOT_SIZE_MAP.get(str(shot.get("shot_size") or "medium").lower(), "Medium shot")
     subject = _concrete_subject_description(shot, characters)
     emotion = str(shot.get("emotion") or "")
     source_action = (
-        shot.get("script_excerpt")
+        " → ".join(generation_actions)
         or shot.get("action_description")
+        or shot.get("script_excerpt")
         or shot.get("source_excerpt")
     )
     if source_action and len(str(source_action)) > 20:
         action = str(source_action)[:120]
         supplemental = str(shot.get("what") or "").strip()
-        if supplemental and supplemental not in action:
+        # generation_actions is already the paid model's complete executable
+        # contract. Re-appending the broad plot summary reintroduces omitted
+        # choreography ("continuous attacks", "fight fiercely") and defeats
+        # the duration budget.
+        if not generation_actions and supplemental and supplemental not in action:
             action = f"{action}；补充：{supplemental}"
     else:
         action = str(source_action or shot.get("what") or shot.get("visual") or "保持自然姿态")
     externalized = next((value for key, value in EMOTION_ACTIONS.items() if key in emotion), "")
-    if externalized and externalized not in action:
+    # Generic emotion gestures are only a fallback when the screenplay did not
+    # already provide physical blocking. Adding a "nervous" gesture such as
+    # checking a watch to a fight contract creates an impossible extra action
+    # and competes with the authored choreography.
+    if (
+        not generation_actions
+        and intent != "action"
+        and externalized
+        and externalized not in action
+    ):
         action = f"{action}，{externalized}"
     where = str(shot.get("where") or "当前场景")
     scene_suffix = (scene_style_map or {}).get(where, "")
@@ -636,22 +662,31 @@ def _build_eight_layer_prompt(
     lighting = _specific_lighting(shot, where, visual_style)
     audio = str(shot.get("audio") or shot.get("sound") or "环境底噪与动作同期声")
     style_anchor = visual_style.style_prompt_short or visual_style.style_prompt_full or "电影叙事风格，35mm胶片质感"
-    duration = shot.get("duration", 5)
+    motion_contract = (
+        "动作执行契约：整镜连续发生可见位移；按起始动作→核心接触/变化→明确结果依次完成。"
+        "人物不得在首帧姿态原地停留，不得只让头发、雨水、蒸汽或镜头轻微漂移来冒充动作。"
+        "保持指定景别，不得无动机切成特写或让交互角色离开画面；双人动作的起始与接触时刻必须同时看见双方。"
+        if generation_actions or intent == "action"
+        else
+        "动态画面契约：主体保持自然表演，环境和摄影机持续产生可见变化；"
+        "禁止把首帧做成仅有雨水、头发或呼吸轻动的静态动图。"
+    )
 
     layers = []
     if references:
         layers.append("元素参考声明：" + "；".join(references))
     subject_summary = build_subject_summary([
         ("景别与主体：", f"{framing}，{subject}"),
-        ("动作：", action),
         ("运镜：", camera),
         ("场景与光影：", f"{where}，{scene_suffix}，{lighting}".replace("，，", "，")),
     ])
     layers.extend([
         f"镜头{shot_number}：",
         f"主体总结：{subject_summary}",
+        f"动作：{action}",
+        f"运动契约：{motion_contract}",
         f"音效：{audio}",
-        f"全局收尾：{style_anchor}；约束词：{QUALITY_GUARDRAILS}；4K，16:9，{duration}秒",
+        f"全局收尾：{style_anchor}；约束词：{QUALITY_GUARDRAILS}；4K，{aspect_ratio}，{duration}秒",
     ])
     blueprint = "\n".join(layers)
     blueprint = _remove_fast_motion_words(blueprint)
@@ -776,7 +811,10 @@ def _generate_single_shot(
         "transition_to_next", "boundary_before", "continuity_reason",
         "continuity_subject", "screen_direction", "tracking_prompt",
         "source_excerpt", "source_sequence_ids", "source_action_unit_ids",
-        "source_event_roles", "micro_actions", "speaker_attribution",
+        "source_event_roles", "micro_actions", "generation_actions",
+        "generation_load", "start_state", "end_state", "causal_link",
+        "speaker_attribution",
+        "aspect_ratio", "width", "height",
     ):
         if shot.get(field):
             result[field] = shot[field]
@@ -816,6 +854,21 @@ def generate_storyboard(
     if not shots:
         raise ValueError("shot 列表为空，无法生成分镜")
 
+    pipeline_config = config if config is not None else load_config(config_path)
+    if not isinstance(pipeline_config, dict):
+        pipeline_config = {}
+    layout_config = pipeline_config.get("layout", {})
+    if not isinstance(layout_config, dict):
+        layout_config = {}
+    configured_aspect = str(
+        pipeline_config.get("aspect_ratio")
+        or layout_config.get("aspect_ratio")
+        or ""
+    ).strip()
+    if configured_aspect:
+        for shot in shots:
+            shot.setdefault("aspect_ratio", configured_aspect)
+
     # --- P1-B1: 同场景共享视觉参数（参考 HonCut 五层镜头构建）---
     # 同场景镜头共享 Layer 3-5（Subject/Lighting/Style），只有 Layer 1-2（Camera/Movement）随镜头变
     scene_style_map = {}  # {where: style_suffix}
@@ -837,8 +890,6 @@ def generate_storyboard(
     if os.environ.get("HONCUT_SHOT_QUEUE") == "1":
         from utils.shot_queue import make_payload, run_shot_queue
 
-        pipeline_config = config if isinstance(config, dict) else load_config(config_path)
-        pipeline_config = pipeline_config if isinstance(pipeline_config, dict) else {}
         inferred_dir = Path(visual_style_path).parent if visual_style_path else (Path(config_path).parent if config_path else Path.cwd())
         output_dir = Path(pipeline_config.get("output_dir", inferred_dir))
         run_tag = str(pipeline_config.get("run_tag") or output_dir.name)
@@ -866,9 +917,6 @@ def generate_storyboard(
             storyboard_shots = list(executor.map(generate_one, enumerate(shots, 1)))
 
     # 组装完整 STORYBOARD
-    pipeline_config = config if config is not None else load_config(config_path)
-    if not isinstance(pipeline_config, dict):
-        pipeline_config = {}
     audio_config = pipeline_config.get("audio", {})
     if not isinstance(audio_config, dict):
         audio_config = {}
@@ -886,6 +934,9 @@ def generate_storyboard(
         "title": title,
         "total_shots": len(storyboard_shots),
         "target_duration": total_duration,
+        "aspect_ratio": configured_aspect or str(
+            next((shot.get("aspect_ratio") for shot in storyboard_shots if shot.get("aspect_ratio")), "16:9")
+        ),
         "static_reference_images": {},
         "audio": {
             "enabled": bool(enabled),
