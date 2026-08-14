@@ -562,8 +562,8 @@ def test_phase1_checkpoints_are_written_and_reused(monkeypatch, tmp_path):
     stored_characters = json.loads((tmp_path / "phase1_characters.json").read_text())
     assert stored_events["events"] == events_payload["events"]
     assert stored_characters["characters"] == characters_payload["characters"]
-    assert stored_events["_checkpoint"]["schema_version"] == 2
-    assert stored_characters["_checkpoint"]["schema_version"] == 2
+    assert stored_events["_checkpoint"]["schema_version"] == pipeline_core.PHASE1_CHECKPOINT_SCHEMA_VERSION
+    assert stored_characters["_checkpoint"]["schema_version"] == pipeline_core.PHASE1_CHECKPOINT_SCHEMA_VERSION
 
 
 def test_phase1_legacy_checkpoint_is_regenerated(monkeypatch, tmp_path):

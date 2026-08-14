@@ -61,21 +61,31 @@ class ContinuityShot(BaseModel):
     target_duration_s: float = Field(gt=0)
     target_frames: int | None = Field(default=None, gt=0)
     boundary_before: BoundaryKind = "cut"
+    continuity_group_id: str = Field(default="", max_length=120)
+    extends_from_shot_id: str | None = None
+    extends_from_chunk_id: str | None = None
+    continuity_reason: str = ""
     anchors: ContinuityAnchors = Field(default_factory=ContinuityAnchors)
     chunks: list[GenerationChunk] = Field(min_length=1)
 
     @model_validator(mode="after")
     def chunks_form_a_linear_chain(self) -> ContinuityShot:
-        expected_dependency: str | None = None
+        if bool(self.extends_from_shot_id) != bool(self.extends_from_chunk_id):
+            raise ValueError("cross-shot continuation requires both predecessor ids")
+        if self.extends_from_chunk_id and self.boundary_before != "continuous":
+            raise ValueError("only continuous boundaries may extend a previous shot")
+        expected_dependency: str | None = self.extends_from_chunk_id
         seen: set[str] = set()
         for index, chunk in enumerate(self.chunks, 1):
             if chunk.sequence != index:
                 raise ValueError("chunk sequence must be contiguous and start at 1")
             if chunk.chunk_id in seen:
                 raise ValueError(f"duplicate chunk_id: {chunk.chunk_id}")
-            expected_mode = "fresh" if index == 1 else "native_extend"
+            expected_mode = "fresh" if expected_dependency is None else "native_extend"
             if chunk.mode != expected_mode or chunk.depends_on != expected_dependency:
-                raise ValueError("chunks must form one ordered fresh -> native_extend chain")
+                raise ValueError(
+                    "chunks must form one ordered fresh/previous-shot -> native_extend chain"
+                )
             seen.add(chunk.chunk_id)
             expected_dependency = chunk.chunk_id
         unique_frames = [chunk.expected_unique_frames for chunk in self.chunks]
@@ -108,6 +118,15 @@ class ContinuityPlan(BaseModel):
         for shot in self.shots:
             if shot.shot_id in shot_ids:
                 raise ValueError(f"duplicate shot_id: {shot.shot_id}")
+            if shot.extends_from_shot_id and shot.extends_from_shot_id not in shot_ids:
+                raise ValueError(
+                    f"{shot.shot_id} must extend an earlier shot, got {shot.extends_from_shot_id}"
+                )
+            if shot.extends_from_chunk_id and shot.extends_from_chunk_id not in chunk_ids:
+                raise ValueError(
+                    f"{shot.shot_id} references unknown predecessor chunk "
+                    f"{shot.extends_from_chunk_id}"
+                )
             shot_ids.add(shot.shot_id)
             if shot.target_frames is not None:
                 expected_target = round(shot.target_duration_s * self.timeline_fps)

@@ -24,6 +24,52 @@ from typing import List, Dict, Any
 
 SEGMENT_TARGET_CHARS = 400
 SEGMENT_MAX_CHARS = 800
+SEGMENT_CONTEXT_CHARS = 320
+
+_ACTION_SCREENPLAY_MARKERS = (
+    "冲出", "冲来", "追击", "挥刀", "握刀", "横扫", "斩", "劈", "刺", "格挡",
+    "挡住", "躲开", "闪开", "后撤", "跳起", "落地", "旋身", "转腰", "抬膝",
+    "踹", "撞", "扣住", "抓住", "推开", "翻滚", "拔刀", "火星", "刀锋",
+)
+_SCENE_STATE_MARKERS = (
+    "暴雨", "雨幕", "夜色", "废弃", "远处", "霓虹", "积水", "烟雾", "钢梁",
+    "护甲", "战斗服", "风衣", "机械臂", "长发", "刀身",
+)
+
+
+def detect_script_format(text: str) -> str:
+    """Detect prose screenplays whose meaning depends on adjacent paragraphs.
+
+    These scripts mix scene state, character appearance, bare quoted dialogue,
+    and line-by-line choreography without screenplay slug lines or speaker tags.
+    The hint lets event extraction use a continuity-aware contract while general
+    prose keeps the existing lightweight path.
+    """
+    stripped_lines = [line.strip() for line in text.splitlines() if line.strip()]
+    quoted_lines = sum(
+        bool(re.fullmatch(r"[“\"『「].+?[”\"』」][。！？!?…]*", line))
+        for line in stripped_lines
+    )
+    action_hits = sum(text.count(marker) for marker in _ACTION_SCREENPLAY_MARKERS)
+    state_hits = sum(text.count(marker) for marker in _SCENE_STATE_MARKERS)
+    short_lines = sum(len(line) <= 90 for line in stripped_lines)
+    line_oriented = len(stripped_lines) >= 8 and short_lines / len(stripped_lines) >= 0.65
+    if line_oriented and action_hits >= 4 and (quoted_lines >= 2 or state_hits >= 3):
+        return "prose_action_screenplay"
+    return "general_prose"
+
+
+def _attach_segment_context(
+    segments: List[Dict[str, Any]], script_format: str
+) -> List[Dict[str, Any]]:
+    """Attach read-only neighboring text without duplicating target content."""
+    for index, segment in enumerate(segments):
+        previous = str(segments[index - 1]["content"]) if index > 0 else ""
+        following = str(segments[index + 1]["content"]) if index + 1 < len(segments) else ""
+        segment["format_hint"] = script_format
+        segment["context_before"] = previous[-SEGMENT_CONTEXT_CHARS:]
+        segment["context_after"] = following[:SEGMENT_CONTEXT_CHARS]
+    return segments
 
 
 def detect_input_type(text: str) -> str:
@@ -220,12 +266,14 @@ def parse_text(text: str) -> Dict[str, Any]:
     if not text or not text.strip():
         return {
             "input_type": "short",
+            "document_format": "general_prose",
             "total_chars": 0,
             "segments": []
         }
     
     text = text.strip()
     input_type = detect_input_type(text)
+    document_format = detect_script_format(text)
     total_chars = len(text)
     
     segments = []
@@ -282,8 +330,10 @@ def parse_text(text: str) -> Dict[str, Any]:
                     })
                     segment_id += 1
     
+    _attach_segment_context(segments, document_format)
     return {
         "input_type": input_type,
+        "document_format": document_format,
         "total_chars": total_chars,
         "segments": segments
     }

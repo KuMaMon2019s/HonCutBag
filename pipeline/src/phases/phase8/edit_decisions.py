@@ -17,6 +17,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 # ─── Probing ─────────────────────────────────────────────────────────────────
 
@@ -243,6 +244,67 @@ def build_edit_decisions(
         audio_icon = "🔇" if not info["has_audio"] else "🔊"
         print(f"    • {shot_dir.name}: {info['duration']:.1f}s{trim_info} {audio_icon}")
 
+    # Cross-shot native extension deliberately carries a replay prefix. Phase
+    # 8 owns its frame-addressed removal because only now is the full temporal
+    # trajectory available. Internal chunk cuts remain materialized in Phase 6.
+    continuity_trim_receipts: list[dict[str, Any]] = []
+    if continuity_plan:
+        decisions_path = Path(shots_dir).parent / "CONTINUITY_SEAM_DECISIONS.json"
+        seam_decisions: dict[str, Any] = {}
+        if decisions_path.is_file():
+            document = json.loads(decisions_path.read_text(encoding="utf-8"))
+            if document.get("kind") != "honcut.continuity_seam_decisions.v1":
+                raise ValueError(f"unsupported continuity seam decisions in {decisions_path}")
+            seam_decisions = document.get("decisions") or {}
+            if not isinstance(seam_decisions, dict):
+                raise ValueError(f"{decisions_path} must contain a decisions object")
+        timeline_fps = int(continuity_plan.get("timeline_fps") or 24)
+        cuts_by_shot = {str(cut["shot_id"]): cut for cut in cuts}
+        for shot in continuity_plan.get("shots", []):
+            predecessor_chunk = str(shot.get("extends_from_chunk_id") or "")
+            chunks = shot.get("chunks") or []
+            if not predecessor_chunk or not chunks:
+                continue
+            first_chunk = chunks[0]
+            planned_frames = int(first_chunk.get("expected_overlap_frames") or 0)
+            if planned_frames <= 0:
+                continue
+            boundary_id = f"{predecessor_chunk}__{first_chunk['chunk_id']}"
+            decision = seam_decisions.get(boundary_id)
+            if not isinstance(decision, dict) or decision.get("action") != "hard_trim":
+                raise RuntimeError(
+                    f"continuous boundary {boundary_id} has no Phase 8 hard-trim decision"
+                )
+            trim_frames = int(decision.get("trim_frames") or 0)
+            if trim_frames < planned_frames:
+                raise RuntimeError(
+                    f"continuous boundary {boundary_id} trims {trim_frames} frames, "
+                    f"below planned replay prefix {planned_frames}"
+                )
+            shot_id = str(shot.get("shot_id") or "")
+            cut = cuts_by_shot.get(shot_id)
+            if cut is None:
+                raise RuntimeError(f"continuous target shot {shot_id} is missing from edit cuts")
+            trim_seconds = trim_frames / timeline_fps
+            # Both values are absolute offsets from the raw shot head; taking
+            # max avoids double-trimming when visual QA already noticed part
+            # of the replay prefix.
+            cut["in_seconds"] = round(
+                max(float(cut["in_seconds"]), trim_seconds), 6
+            )
+            cut["trimmed"] = True
+            cut["continuity_trim"] = {
+                "boundary_id": boundary_id,
+                "trim_frames": trim_frames,
+                "trim_seconds": round(trim_seconds, 6),
+                "frame_policy": "do_not_interpolate",
+            }
+            if float(cut["in_seconds"]) >= float(cut["out_seconds"]):
+                raise RuntimeError(f"continuity trim consumes all of {shot_id}")
+            continuity_trim_receipts.append(
+                {"shot_id": shot_id, **cut["continuity_trim"]}
+            )
+
     # Build transitions
     transitions = []
     continuous_targets = {
@@ -318,6 +380,7 @@ def build_edit_decisions(
             "target_duration": target_duration,
             "quality_reviewed": bool(quality_report),
             "transition_locks": transition_locks,
+            "continuity_trims": continuity_trim_receipts,
             "audio_transition_policy": {
                 "visual_cut": "equal_power_edge_fade",
                 "visual_dissolve": "equal_power_crossfade",

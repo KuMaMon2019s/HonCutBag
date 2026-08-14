@@ -25,6 +25,8 @@ from phases.phase8.continuity_adjudication import (
     adjudicate_continuity_seams,
     decide_temporal_seam,
 )
+from quality import object_trajectory as object_trajectory_module
+from quality import sam3_sidecar as sam3_sidecar_module
 from quality.continuity_bridge import detect_replayed_prefix, repair_continuity_boundary
 from quality.continuity_seam import (
     compare_frame_sequences,
@@ -58,7 +60,11 @@ from runtime.continuity_provider import (
     materialize_continuity_shot,
 )
 from runtime.generation_tasks import GenerationTaskStore
-from sam3_runtime.policy import estimate_weight_bytes, resolve_runtime_policy
+from sam3_runtime.policy import (
+    estimate_weight_bytes,
+    resolve_checkpoint_path,
+    resolve_runtime_policy,
+)
 from schemas.continuity import ContinuityPlan, GenerationChunk
 
 
@@ -112,7 +118,15 @@ def test_planner_splits_long_shot_and_preserves_explicit_anchors(tmp_path):
         "tracking_prompt": "CHAR_01",
     }
     assert [chunk.target_duration_s for chunk in shot.chunks] == [13, 13, 12]
-    assert [chunk.depends_on for chunk in shot.chunks] == [None, "S03_C01", "S03_C02"]
+    assert shot.continuity_group_id == "CG001"
+    assert shot.extends_from_shot_id == "S02"
+    assert shot.extends_from_chunk_id == "S02_C01"
+    assert [chunk.mode for chunk in shot.chunks] == [
+        "native_extend", "native_extend", "native_extend"
+    ]
+    assert [chunk.depends_on for chunk in shot.chunks] == [
+        "S02_C01", "S03_C01", "S03_C02"
+    ]
     persisted = json.loads((tmp_path / "CONTINUITY_PLAN.json").read_text())
     assert persisted["version"] == 1
     assert persisted["timeline_fps"] == 24
@@ -155,6 +169,48 @@ def test_planner_reserves_replayed_reference_frames_without_shortening_the_shot(
     assert [chunk.expected_overlap_frames for chunk in shot.chunks] == [0, 48, 48]
     assert [chunk.expected_unique_frames for chunk in shot.chunks] == [120, 72, 48]
     assert sum(chunk.expected_unique_frames or 0 for chunk in shot.chunks) == 240
+
+
+def test_planner_groups_action_continuations_and_restarts_on_scene_change():
+    plan = build_continuity_plan(
+        {
+            "shots": [
+                {
+                    "id": "S01",
+                    "duration": 5,
+                    "where": "reflecting pool",
+                    "who": ["paper boat"],
+                    "visual": "the paper boat drifts right",
+                },
+                {
+                    "id": "S02",
+                    "duration": 5,
+                    "where": "reflecting pool",
+                    "who": ["paper boat"],
+                    "visual": "承接上镜：纸船保持速度向右——本镜由此延续",
+                },
+                {
+                    "id": "S03",
+                    "duration": 5,
+                    "where": "train platform",
+                    "who": ["traveller"],
+                    "visual": "a traveller enters",
+                },
+            ]
+        },
+        continuation_overlap_s=2,
+    )
+
+    first, second, third = plan.shots
+    assert [shot.boundary_before for shot in plan.shots] == ["cut", "continuous", "cut"]
+    assert [shot.continuity_group_id for shot in plan.shots] == ["CG001", "CG001", "CG002"]
+    assert second.extends_from_shot_id == "S01"
+    assert second.chunks[0].mode == "native_extend"
+    assert second.chunks[0].depends_on == first.chunks[-1].chunk_id
+    assert second.chunks[0].requested_frames == 168
+    assert second.chunks[0].expected_overlap_frames == 48
+    assert second.chunks[0].expected_unique_frames == 120
+    assert third.chunks[0].mode == "fresh"
 
 
 def test_planner_allocates_fractional_shots_from_cumulative_frame_endpoints():
@@ -385,6 +441,51 @@ def test_chunk_runtime_serializes_dependencies_but_parallelizes_shots(tmp_path):
     assert report["executed_chunks"] == 4
     assert dict(sequences) == {"S01": [1, 2], "S02": [1, 2]}
     assert (tmp_path / "shots/S01/output.mp4").read_bytes() == b"S01_C01|S01_C02"
+
+
+def test_chunk_runtime_relays_previous_shot_video_inside_a_continuity_group(tmp_path):
+    plan = build_continuity_plan(
+        {
+            "shots": [
+                {"id": "S01", "duration": 5},
+                {
+                    "id": "S02",
+                    "duration": 5,
+                    "boundary_before": "continuous",
+                    "continuity_subject": "paper boat",
+                },
+                {"id": "S03", "duration": 5},
+            ]
+        }
+    )
+    observed = []
+
+    def execute(request):
+        observed.append(
+            (
+                request.shot_id,
+                request.chunk.mode,
+                request.previous_output_path,
+            )
+        )
+        request.output_path.parent.mkdir(parents=True, exist_ok=True)
+        request.output_path.write_bytes(request.resource_id.encode())
+        return ChunkExecutionResult(request.output_path)
+
+    report = execute_continuity_plan(
+        plan,
+        tmp_path,
+        execute_chunk=execute,
+        materialize_shot=_materialize_test_shot,
+        max_workers=2,
+    )
+
+    by_shot = {shot_id: (mode, predecessor) for shot_id, mode, predecessor in observed}
+    assert report["status"] == "done"
+    assert by_shot["S01"] == ("fresh", None)
+    assert by_shot["S02"][0] == "native_extend"
+    assert by_shot["S02"][1] == tmp_path / "shots/S01/output.mp4"
+    assert by_shot["S03"] == ("fresh", None)
 
 
 def test_chunk_runtime_generates_a_bounded_continuation_topup_for_large_frame_deficit(
@@ -875,7 +976,9 @@ def test_chunk_runtime_resumes_the_same_repair_resource_after_provider_failure(t
     assert calls == ["S01_C01", "S01_C02", "S01_C02_R01", "S01_C02_R01", "S01_C03"]
 
 
-def test_shadow_runtime_records_intent_without_provider_execution(monkeypatch, tmp_path):
+def test_auto_runtime_is_default_and_defers_uncalibrated_seams_to_phase8(
+    monkeypatch, tmp_path
+):
     write_continuity_plan(
         tmp_path / "CONTINUITY_PLAN.json",
         {"shots": [{"id": "S01", "duration": 16}]},
@@ -884,10 +987,11 @@ def test_shadow_runtime_records_intent_without_provider_execution(monkeypatch, t
 
     report = write_shadow_runtime_report(tmp_path)
 
-    assert report["mode"] == "shadow"
-    assert report["execution_enabled"] is False
+    assert report["mode"] == "auto"
+    assert report["execution_enabled"] is True
+    assert report["phase6_seam_policy"] == "observe_only"
     assert report["chunk_count"] == 2
-    assert json.loads((tmp_path / "CONTINUITY_RUNTIME.json").read_text())["mode"] == "shadow"
+    assert json.loads((tmp_path / "CONTINUITY_RUNTIME.json").read_text())["mode"] == "auto"
 
 
 def test_auto_mode_fails_before_any_provider_execution(monkeypatch, tmp_path):
@@ -1570,7 +1674,68 @@ def test_object_tracking_finds_the_subject_catchup_frame_after_rollback():
     assert evidence["confidence"] >= 0.6
 
 
-def test_sam3_runtime_auto_policy_uses_fp16_on_apple_silicon():
+def _moving_patch_frames(left_positions, *, frame_count=30):
+    frames = np.zeros((frame_count, 36, 64, 3), dtype=np.uint8)
+    for frame_index, left in enumerate(left_positions):
+        frames[frame_index, 14:20, left : left + 8] = 80
+        frames[frame_index, 14:17, left : left + 8] = 240
+        frames[frame_index, 15:19, left + 2 : left + 4] = 160
+    return frames
+
+
+def test_sam_bbox_template_tracking_refines_to_an_original_timeline_frame(
+    monkeypatch, tmp_path
+):
+    previous_positions = [max(4, frame_index) for frame_index in range(24)]
+    following_positions = [5 + frame_index for frame_index in range(30)]
+    previous_frames = _moving_patch_frames(previous_positions, frame_count=24)
+    following_frames = _moving_patch_frames(following_positions, frame_count=30)
+    previous = tmp_path / "previous.mp4"
+    following = tmp_path / "following.mp4"
+
+    monkeypatch.setattr(
+        object_trajectory_module,
+        "_decode_refinement_frames",
+        lambda path: previous_frames if path == previous else following_frames,
+    )
+    tracked = [
+        {"frame_idx": 3, "centroid": [0.30, 0.5]},
+        {"frame_idx": 4, "centroid": [0.34, 0.5]},
+        {
+            "frame_idx": 5,
+            "centroid": [0.375, 0.5],
+            "bbox": [20 / 64, 14 / 36, 28 / 64, 20 / 36],
+        },
+        {"frame_idx": 6, "centroid": [0.18, 0.5]},
+        {"frame_idx": 7, "centroid": [0.24, 0.5]},
+        {"frame_idx": 8, "centroid": [0.29, 0.5]},
+        {
+            "frame_idx": 9,
+            "centroid": [21 / 64, 0.5],
+            "bbox": [17 / 64, 14 / 36, 25 / 64, 20 / 36],
+        },
+    ]
+
+    refinement = object_trajectory_module.refine_object_catchup_frame(
+        previous,
+        following,
+        tracked=tracked,
+        seam_frame=6,
+        coarse_trim_analysis_frames=4,
+        analysis_fps=3,
+        timeline_fps=12,
+        planned_overlap_frames=8,
+        following_frames=30,
+        screen_direction="left_to_right",
+    )
+
+    assert refinement["status"] == "refined"
+    assert refinement["recommended_trim_frames"] == 18
+    assert refinement["remaining_frames"] == 12
+    assert refinement["median_correlation"] > 0.9
+
+
+def test_sam3_runtime_auto_policy_uses_stable_fp32_on_apple_silicon():
     policy = resolve_runtime_policy(
         mps_available=True,
         cuda_available=False,
@@ -1578,9 +1743,30 @@ def test_sam3_runtime_auto_policy_uses_fp16_on_apple_silicon():
     )
 
     assert policy.device == "mps"
-    assert policy.precision == "fp16"
+    assert policy.precision == "fp32"
     assert policy.quantize_linear is False
     assert policy.cpu_threads == 6
+
+
+def test_sam3_checkpoint_discovers_shared_sibling_without_copying(tmp_path):
+    repo_root = tmp_path / "honcut"
+    shared_checkpoint = tmp_path / "sam3" / "权重" / "sam3.pt"
+    shared_checkpoint.parent.mkdir(parents=True)
+    shared_checkpoint.write_bytes(b"checkpoint")
+
+    assert resolve_checkpoint_path(repo_root) == shared_checkpoint
+
+
+def test_sam3_explicit_checkpoint_overrides_shared_sibling(tmp_path):
+    explicit = tmp_path / "selected.pt"
+    shared_checkpoint = tmp_path / "sam3" / "权重" / "sam3.pt"
+    shared_checkpoint.parent.mkdir(parents=True)
+    shared_checkpoint.write_bytes(b"shared")
+
+    assert resolve_checkpoint_path(
+        tmp_path / "honcut",
+        configured_checkpoint=str(explicit),
+    ) == explicit
 
 
 def test_sam3_runtime_auto_policy_uses_dynamic_int8_on_cpu():
@@ -1607,6 +1793,160 @@ def test_sam3_runtime_rejects_int8_on_mps():
             requested_precision="int8_dynamic",
             mps_available=True,
         )
+
+
+def test_phase8_sam3_sidecar_is_off_by_default(monkeypatch, tmp_path):
+    monkeypatch.delenv("HONCUT_SAM3_MODE", raising=False)
+    monkeypatch.delenv("HONCUT_SAM3_URL", raising=False)
+
+    with sam3_sidecar_module.phase8_sam3_endpoint(tmp_path) as endpoint:
+        assert endpoint == ""
+
+
+def test_phase8_sam3_sidecar_preserves_external_url(monkeypatch, tmp_path):
+    monkeypatch.setenv("HONCUT_SAM3_MODE", "external")
+    monkeypatch.setenv("HONCUT_SAM3_URL", "http://sam3.internal:9000/")
+
+    with sam3_sidecar_module.phase8_sam3_endpoint(tmp_path) as endpoint:
+        assert endpoint == "http://sam3.internal:9000"
+
+
+def test_phase8_managed_sam3_starts_and_releases_owned_process(monkeypatch, tmp_path):
+    class FakeProcess:
+        terminated = False
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout):
+            assert timeout == 10
+            return 0
+
+    process = FakeProcess()
+    health_checks = iter([False, True])
+    monkeypatch.setenv("HONCUT_SAM3_MODE", "managed")
+    monkeypatch.delenv("HONCUT_SAM3_URL", raising=False)
+    monkeypatch.setattr(
+        sam3_sidecar_module,
+        "_service_is_healthy",
+        lambda _url: next(health_checks),
+    )
+    monkeypatch.setattr(
+        sam3_sidecar_module,
+        "_spawn_local_service",
+        lambda _script, _log: process,
+    )
+
+    with sam3_sidecar_module.phase8_sam3_endpoint(tmp_path) as endpoint:
+        assert endpoint == "http://127.0.0.1:8001"
+        assert process.terminated is False
+
+    assert process.terminated is True
+
+
+def test_sam3_low_fps_trim_is_converted_back_to_timeline_frames(
+    monkeypatch, tmp_path
+):
+    observed = {}
+    monkeypatch.setenv("HONCUT_SAM3_ANALYSIS_FPS", "6")
+    monkeypatch.setattr(
+        object_trajectory_module,
+        "build_tracking_clip",
+        lambda *_args, **_kwargs: 12,
+    )
+
+    class StubClient:
+        def __init__(self, _base_url):
+            pass
+
+        def track(self, *_args, **_kwargs):
+            return [{"frame_idx": 0, "centroid": [0.5, 0.5]}]
+
+    def decide(_frames, **kwargs):
+        observed.update(kwargs)
+        return {"verdict": "rollback", "recommended_trim_frames": 5}
+
+    monkeypatch.setattr(object_trajectory_module, "Sam3TrajectoryClient", StubClient)
+    monkeypatch.setattr(object_trajectory_module, "decide_object_trajectory", decide)
+
+    result = object_trajectory_module.collect_sam3_trajectory(
+        tmp_path / "previous.mp4",
+        tmp_path / "following.mp4",
+        boundary_id="S01_C01__S01_C02",
+        evidence_dir=tmp_path,
+        prompt="paper boat",
+        timeline_fps=24,
+        planned_overlap_frames=48,
+        following_frames=120,
+        screen_direction="left_to_right",
+        camera_motion="locked_off",
+        base_url="http://127.0.0.1:8001",
+    )
+
+    assert observed["seam_frame"] == 12
+    assert observed["planned_overlap_frames"] == 12
+    assert result["recommended_trim_analysis_frames"] == 5
+    assert result["recommended_trim_frames"] == 20
+    assert result["planned_overlap_frames"] == 48
+
+
+def test_sam3_timeline_refinement_rejects_a_cut_without_safe_tail(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HONCUT_SAM3_ANALYSIS_FPS", "3")
+    monkeypatch.setattr(
+        object_trajectory_module,
+        "build_tracking_clip",
+        lambda *_args, **_kwargs: 6,
+    )
+
+    class StubClient:
+        def __init__(self, _base_url):
+            pass
+
+        def track(self, *_args, **_kwargs):
+            return []
+
+    monkeypatch.setattr(object_trajectory_module, "Sam3TrajectoryClient", StubClient)
+    monkeypatch.setattr(
+        object_trajectory_module,
+        "decide_object_trajectory",
+        lambda *_args, **_kwargs: {
+            "verdict": "rollback",
+            "confidence": 0.9,
+            "repair_action": "hard_trim",
+            "recommended_trim_frames": 13,
+        },
+    )
+    monkeypatch.setattr(
+        object_trajectory_module,
+        "refine_object_catchup_frame",
+        lambda *_args, **_kwargs: {
+            "status": "no_safe_catchup",
+            "reason": "the exact catch-up leaves too little following material",
+        },
+    )
+
+    evidence = object_trajectory_module.collect_sam3_trajectory(
+        tmp_path / "previous.mp4",
+        tmp_path / "following.mp4",
+        boundary_id="S01_C01__S01_C02",
+        evidence_dir=tmp_path,
+        prompt="paper boat",
+        timeline_fps=24,
+        planned_overlap_frames=48,
+        following_frames=121,
+        screen_direction="left_to_right",
+        camera_motion="locked_off",
+        base_url="http://127.0.0.1:8001",
+    )
+
+    assert evidence["coarse_recommended_trim_frames"] == 104
+    assert evidence["repair_action"] == "regenerate"
+    assert evidence["timeline_refinement"]["status"] == "no_safe_catchup"
 
 
 def test_object_catchup_frame_overrides_background_dominated_pixel_cut():
@@ -1636,6 +1976,31 @@ def test_object_catchup_frame_overrides_background_dominated_pixel_cut():
     assert decision["action"] == "hard_trim"
     assert decision["trim_frames"] == 96
     assert decision["trim_source"] == "object_trajectory_catchup"
+
+
+def test_object_rollback_overrides_a_pixel_false_negative():
+    decision = decide_temporal_seam(
+        [
+            {
+                "frames": 48 + index * 2,
+                "seconds": (48 + index * 2) / 24,
+                "frame_mae": 0.04,
+            }
+            for index in range(13)
+        ],
+        planned_overlap_frames=48,
+        timeline_fps=24,
+        object_trajectory_evidence={
+            "verdict": "rollback",
+            "confidence": 0.97,
+            "repair_action": "hard_trim",
+            "recommended_trim_frames": 72,
+        },
+    )
+
+    assert decision["action"] == "hard_trim"
+    assert decision["trim_frames"] == 72
+    assert decision["confidence"] == "object_trajectory_override"
 
 
 def test_phase8_uses_configured_sam3_trajectory_before_requesting_topup(
@@ -1716,6 +2081,69 @@ def test_phase8_uses_configured_sam3_trajectory_before_requesting_topup(
     assert report["shots"][0]["deficit_frames"] == 22
     decisions = json.loads((tmp_path / "CONTINUITY_SEAM_DECISIONS.json").read_text())
     assert decisions["decisions"]["S01_C01__S01_C02"]["trim_frames"] == 72
+
+
+def test_phase8_skips_sam3_when_pixel_trajectory_is_continuous(monkeypatch, tmp_path):
+    plan = build_continuity_plan(
+        {
+            "shots": [
+                {
+                    "id": "S01",
+                    "duration": 8,
+                    "tracking_prompt": "small blue paper boat",
+                }
+            ]
+        },
+        provider_chunk_limit_s=5,
+        continuation_overlap_s=2,
+    )
+    (tmp_path / "CONTINUITY_PLAN.json").write_text(
+        plan.model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+    chunks = tmp_path / "shots" / "S01" / "chunks"
+    chunks.mkdir(parents=True)
+    (chunks / "S01_C01.mp4").write_bytes(b"first")
+    (chunks / "S01_C02.mp4").write_bytes(b"second")
+    (tmp_path / "shots" / "S01" / "CONTINUITY_TIMING.json").write_text(
+        json.dumps(
+            {
+                "materialized_frames_before_closure": 192,
+                "chunks": [
+                    {"chunk_id": "S01_C01", "effective_unique_frames": 120},
+                    {
+                        "chunk_id": "S01_C02",
+                        "effective_unique_frames": 72,
+                        "detected_overlap_frames": 48,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HONCUT_SAM3_URL", "http://127.0.0.1:8001")
+
+    def unexpected_collect(*_args, **_kwargs):
+        raise AssertionError("SAM3 must not run for a continuous pixel trajectory")
+
+    report = adjudicate_continuity_seams(
+        tmp_path,
+        detector=lambda *_args, **_kwargs: {
+            "candidates": [
+                {
+                    "frames": 48 + index * 2,
+                    "seconds": (48 + index * 2) / 24,
+                    "frame_mae": 0.04,
+                }
+                for index in range(13)
+            ]
+        },
+        frame_probe=lambda _path, _fps: {"frames": 121},
+        sam3_collector=unexpected_collect,
+    )
+
+    assert report["status"] == "passed"
+    assert not (tmp_path / "CONTINUITY_OBJECT_TRAJECTORIES.json").exists()
 
 
 def test_phase6_applies_an_exact_phase8_hard_trim_with_bridge_disabled(
@@ -1995,7 +2423,12 @@ def test_phase8_forces_continuous_boundaries_to_hard_cuts(monkeypatch, tmp_path)
         {
             "shots": [
                 {"id": "S01", "duration": 5},
-                {"id": "S02", "duration": 5, "boundary_before": "continuous"},
+                {
+                    "id": "S02",
+                    "duration": 5,
+                    "boundary_before": "continuous",
+                    "continuity_subject": "paper boat",
+                },
             ]
         }
     )
@@ -2019,6 +2452,108 @@ def test_phase8_forces_continuous_boundaries_to_hard_cuts(monkeypatch, tmp_path)
         }
     ]
     assert decisions["metadata"]["transition_locks"][0]["before_shot_id"] == "S02"
+
+
+def test_phase8_trims_cross_shot_extension_prefix_and_keeps_scene_cuts_for_transitions(
+    monkeypatch, tmp_path
+):
+    plan = build_continuity_plan(
+        {
+            "shots": [
+                {"id": "S01", "duration": 5},
+                {
+                    "id": "S02",
+                    "duration": 5,
+                    "boundary_before": "continuous",
+                    "continuity_subject": "paper boat",
+                },
+                {"id": "S03", "duration": 5},
+            ]
+        },
+        continuation_overlap_s=2,
+    )
+    (tmp_path / "CONTINUITY_PLAN.json").write_text(
+        plan.model_dump_json(indent=2), encoding="utf-8"
+    )
+    for shot in plan.shots:
+        shot_dir = tmp_path / "shots" / shot.shot_id
+        chunks_dir = shot_dir / "chunks"
+        chunks_dir.mkdir(parents=True)
+        for chunk in shot.chunks:
+            (chunks_dir / f"{chunk.chunk_id}.mp4").write_bytes(chunk.chunk_id.encode())
+        (shot_dir / "output.mp4").write_bytes(b"video")
+    (tmp_path / "shots/S02/CONTINUITY_TIMING.json").write_text(
+        json.dumps(
+            {
+                "materialized_frames_before_closure": 168,
+                "chunks": [
+                    {
+                        "chunk_id": "S02_C01",
+                        "effective_unique_frames": 168,
+                        "detected_overlap_frames": 0,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    sam3_calls = []
+
+    def collect(*_args, **kwargs):
+        sam3_calls.append(kwargs["boundary_id"])
+        return {"verdict": "continuous", "confidence": 0.97}
+
+    report = adjudicate_continuity_seams(
+        tmp_path,
+        detector=lambda *_args, **_kwargs: {
+            "candidates": [
+                {
+                    "frames": 48 + index * 2,
+                    "seconds": (48 + index * 2) / 24,
+                    "frame_mae": 0.04,
+                }
+                for index in range(13)
+            ]
+        },
+        frame_probe=lambda path, _fps: {
+            "frames": 168 if path.stem == "S02_C01" else 120
+        },
+        sam3_collector=collect,
+        sam3_base_url="http://127.0.0.1:8001",
+    )
+
+    assert report["status"] == "passed"
+    assert sam3_calls == ["S01_C01__S02_C01"]
+    persisted = json.loads((tmp_path / "CONTINUITY_SEAM_DECISIONS.json").read_text())
+    cross = persisted["decisions"]["S01_C01__S02_C01"]
+    assert cross["boundary_kind"] == "cross_shot"
+    assert cross["trim_frames"] == 48
+
+    monkeypatch.setattr(
+        edit_decision_module,
+        "probe_video",
+        lambda path: {
+            "duration": 7.0 if "S02" in str(path) else 5.0,
+            "has_audio": False,
+        },
+    )
+    monkeypatch.setattr(
+        edit_decision_module,
+        "detect_black_frames",
+        lambda *_args, **_kwargs: {"trim_start": 0.0, "trim_end": 0.0},
+    )
+    decisions = edit_decision_module.build_edit_decisions(
+        str(tmp_path / "shots"),
+        transition_decisions=[{"decision": "dissolve"}, {"decision": "dissolve"}],
+        continuity_plan=plan.model_dump(mode="json"),
+    )
+
+    assert decisions["cuts"][1]["in_seconds"] == 2.0
+    assert decisions["cuts"][1]["out_seconds"] == 7.0
+    assert decisions["transitions"][0]["type"] == "cut"
+    assert decisions["transitions"][1]["type"] == "dissolve"
+    assert decisions["metadata"]["continuity_trims"][0]["trim_frames"] == 48
 
 
 def test_phase8_preserves_finalized_continuity_frame_budget(monkeypatch, tmp_path):
@@ -2075,7 +2610,7 @@ def test_phase6_shadow_keeps_the_existing_provider_route(monkeypatch, tmp_path):
                 error=None,
             )
 
-    monkeypatch.delenv("HONCUT_CONTINUITY_MODE", raising=False)
+    monkeypatch.setenv("HONCUT_CONTINUITY_MODE", "shadow")
     monkeypatch.setattr(pipeline_core, "_LocalVideoVendorAdapter", FakeAdapter)
 
     receipt = pipeline_core.run_phase6({"shots": []}, tmp_path, dry_run=False)

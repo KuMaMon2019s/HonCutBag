@@ -3,6 +3,7 @@
 # pyre-unsafe
 
 import logging
+import os
 from collections import OrderedDict
 
 import torch
@@ -62,11 +63,18 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
             self._mem_dtype = torch.float32
             self.bf16_context = contextlib.nullcontext()
             self.bf16_context.__enter__()
-        else:
-            print("[Sam3TrackerPredictor] CPU branch: autocast bfloat16")
+        elif os.environ.get("SAM3_CPU_BF16", "").strip().lower() in {"1", "true", "yes"}:
+            print("[Sam3TrackerPredictor] CPU branch: autocast bfloat16 (explicit)")
             _autocast_dtype = torch.bfloat16
             self._mem_dtype = _autocast_dtype
             self.bf16_context = torch.autocast(device_type="cpu", dtype=_autocast_dtype)
+            self.bf16_context.__enter__()
+        else:
+            # QNNPACK dynamic INT8 requires FP32 activations. Keep CPU inference
+            # in FP32 unless BF16 was explicitly requested for a non-quantized run.
+            print("[Sam3TrackerPredictor] CPU branch: autocast DISABLED (float32)")
+            self._mem_dtype = torch.float32
+            self.bf16_context = contextlib.nullcontext()
             self.bf16_context.__enter__()
 
         self.iter_use_prev_mask_pred = True

@@ -14,12 +14,11 @@ from typing import Any
 import numpy as np
 from fastapi import FastAPI, Form, HTTPException
 
-from .policy import estimate_weight_bytes, resolve_runtime_policy
+from .policy import estimate_weight_bytes, resolve_checkpoint_path, resolve_runtime_policy
 
 LOGGER = logging.getLogger("honcut.sam3")
 REPO_ROOT = Path(__file__).resolve().parents[3]
 VENDORED_SAM3 = REPO_ROOT / "vendor" / "sam3"
-DEFAULT_CHECKPOINT = REPO_ROOT / "pipeline" / "models" / "sam3" / "sam3.pt"
 
 app = FastAPI(title="HonCut SAM 3 continuity tracker", version="1.0")
 _LOCK = threading.RLock()
@@ -37,8 +36,11 @@ def _capabilities(torch: Any) -> tuple[bool, bool]:
 
 
 def _checkpoint_path() -> Path:
-    configured = os.environ.get("SAM3_CHECKPOINT", "").strip()
-    return Path(configured).expanduser().resolve() if configured else DEFAULT_CHECKPOINT
+    return resolve_checkpoint_path(
+        REPO_ROOT,
+        configured_checkpoint=os.environ.get("SAM3_CHECKPOINT", ""),
+        asset_root=os.environ.get("SAM3_ASSET_ROOT", ""),
+    )
 
 
 def _policy_preview() -> dict[str, Any]:
@@ -98,6 +100,7 @@ def _apply_precision(predictor: Any, policy: Any, torch: Any) -> str | None:
         # Current macOS wheels expose QNNPACK but leave the active engine as
         # "none". Selecting it is required before packing quantized weights.
         torch.backends.quantized.engine = "qnnpack"
+        predictor.model.float()
         predictor.model = torch.ao.quantization.quantize_dynamic(
             predictor.model,
             {torch.nn.Linear},
@@ -228,6 +231,12 @@ def _serialise_objects(outputs: dict[str, Any]) -> list[dict[str, Any]]:
             {
                 "object_id": str(int(raw_object_id)),
                 "centroid": [round(float(xx.mean() / width), 6), round(float(yy.mean() / height), 6)],
+                "bbox": [
+                    round(float(xx.min() / width), 6),
+                    round(float(yy.min() / height), 6),
+                    round(float((xx.max() + 1) / width), 6),
+                    round(float((yy.max() + 1) / height), 6),
+                ],
                 "score": round(score, 6),
                 "area_ratio": round(float(len(xx) / (height * width)), 6),
             }

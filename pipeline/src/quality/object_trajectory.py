@@ -218,6 +218,15 @@ class Sam3TrajectoryClient:
                             "centroid": [round(float(centroid[0]), 6), round(float(centroid[1]), 6)],
                             "score": float(selected.get("score", 1.0)),
                         }
+                        bbox = selected.get("bbox")
+                        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                            tracked_by_frame[frame_index]["bbox"] = [
+                                round(float(value), 6) for value in bbox
+                            ]
+                        if selected.get("area_ratio") is not None:
+                            tracked_by_frame[frame_index]["area_ratio"] = float(
+                                selected["area_ratio"]
+                            )
                         continue
                 # Compatibility with Milimo's original mask-heavy response.
                 masks = frame.get("masks") or {}
@@ -310,6 +319,256 @@ def build_tracking_clip(
     return previous_analysis_frames
 
 
+def _decode_refinement_frames(
+    path: Path,
+    *,
+    width: int = 320,
+    height: int = 180,
+) -> np.ndarray:
+    completed = subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-i",
+            str(path),
+            "-an",
+            "-vf",
+            f"scale={width}:{height}",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "pipe:1",
+        ],
+        check=False,
+        capture_output=True,
+        timeout=120,
+    )
+    frame_bytes = width * height * 3
+    usable = len(completed.stdout) - len(completed.stdout) % frame_bytes
+    if completed.returncode != 0 or usable < frame_bytes:
+        detail = completed.stderr.decode(errors="replace").strip().splitlines()
+        raise RuntimeError(
+            f"cannot decode refinement frames from {path}: "
+            f"{detail[-1] if detail else 'no decoded video frames'}"
+        )
+    return np.frombuffer(completed.stdout[:usable], dtype=np.uint8).reshape(
+        -1, height, width, 3
+    )
+
+
+def _tracked_bbox(frame: dict[str, Any]) -> tuple[float, float, float, float] | None:
+    bbox = frame.get("bbox")
+    if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+        left, top, right, bottom = (float(value) for value in bbox)
+        if 0 <= left < right <= 1 and 0 <= top < bottom <= 1:
+            return left, top, right, bottom
+    return None
+
+
+def _track_template_centroids(
+    frames: np.ndarray,
+    bbox: tuple[float, float, float, float],
+) -> tuple[list[list[float]], list[float]]:
+    """Track one SAM-bounded patch over a short original-frame window."""
+    if len(frames) == 0:
+        return [], []
+    height, width = frames.shape[1:3]
+    left = max(0, math.floor(bbox[0] * width))
+    top = max(0, math.floor(bbox[1] * height))
+    right = min(width, math.ceil(bbox[2] * width))
+    bottom = min(height, math.ceil(bbox[3] * height))
+    box_width = right - left
+    box_height = bottom - top
+    if box_width < 4 or box_height < 4:
+        return [], []
+
+    gray = frames.astype(np.float32).mean(axis=3)
+    template = gray[0, top:bottom, left:right]
+    template_centered = template - float(template.mean())
+    template_norm = float(np.linalg.norm(template_centered))
+    if template_norm < 1e-6:
+        return [], []
+
+    centers = [[(left + right) / (2 * width), (top + bottom) / (2 * height)]]
+    correlations = [1.0]
+    radius = max(6, math.ceil(max(box_width, box_height) * 0.2))
+    for frame in gray[1:]:
+        search_left = max(0, left - radius)
+        search_top = max(0, top - radius)
+        search_right = min(width, left + box_width + radius)
+        search_bottom = min(height, top + box_height + radius)
+        search = frame[search_top:search_bottom, search_left:search_right]
+        if search.shape[0] < box_height or search.shape[1] < box_width:
+            break
+        windows = np.lib.stride_tricks.sliding_window_view(
+            search,
+            (box_height, box_width),
+        )
+        window_means = windows.mean(axis=(-2, -1), keepdims=True)
+        centered = windows - window_means
+        denominator = np.linalg.norm(centered, axis=(-2, -1)) * template_norm
+        numerator = np.sum(centered * template_centered, axis=(-2, -1))
+        scores = np.divide(
+            numerator,
+            denominator,
+            out=np.full_like(numerator, -1.0),
+            where=denominator > 1e-6,
+        )
+        row, column = np.unravel_index(int(np.argmax(scores)), scores.shape)
+        top = search_top + int(row)
+        left = search_left + int(column)
+        centers.append(
+            [
+                (left + box_width / 2) / width,
+                (top + box_height / 2) / height,
+            ]
+        )
+        correlations.append(float(scores[row, column]))
+    return centers, correlations
+
+
+def _trajectory_direction(
+    tracked: list[dict[str, Any]],
+    *,
+    seam_frame: int,
+    screen_direction: str,
+) -> np.ndarray | None:
+    explicit = {
+        "left_to_right": np.asarray([1.0, 0.0]),
+        "right_to_left": np.asarray([-1.0, 0.0]),
+        "top_to_bottom": np.asarray([0.0, 1.0]),
+        "bottom_to_top": np.asarray([0.0, -1.0]),
+    }
+    key = screen_direction.strip().lower().replace("-", "_")
+    if key in explicit:
+        return explicit[key]
+    before = [
+        np.asarray(frame["centroid"], dtype=float)
+        for frame in tracked
+        if int(frame.get("frame_idx", -1)) < seam_frame
+        and isinstance(frame.get("centroid"), (list, tuple))
+        and len(frame["centroid"]) == 2
+    ]
+    if len(before) < 2:
+        return None
+    displacement = np.median(np.diff(np.asarray(before[-6:]), axis=0), axis=0)
+    norm = float(np.linalg.norm(displacement))
+    return displacement / norm if norm >= 0.002 else None
+
+
+def refine_object_catchup_frame(
+    previous: Path,
+    following: Path,
+    *,
+    tracked: list[dict[str, Any]],
+    seam_frame: int,
+    coarse_trim_analysis_frames: int,
+    analysis_fps: int,
+    timeline_fps: int,
+    planned_overlap_frames: int,
+    following_frames: int,
+    screen_direction: str,
+) -> dict[str, Any]:
+    """Refine a coarse SAM catch-up to the original timeline with template tracking."""
+    if analysis_fps <= 0 or timeline_fps <= 0:
+        raise ValueError("analysis and timeline fps must be positive")
+    before = [frame for frame in tracked if int(frame.get("frame_idx", -1)) < seam_frame]
+    anchor_index = seam_frame + max(0, coarse_trim_analysis_frames - 1)
+    following_anchor = min(
+        (frame for frame in tracked if int(frame.get("frame_idx", -1)) >= seam_frame),
+        key=lambda frame: abs(int(frame["frame_idx"]) - anchor_index),
+        default=None,
+    )
+    previous_anchor = before[-1] if before else None
+    previous_bbox = _tracked_bbox(previous_anchor or {})
+    following_bbox = _tracked_bbox(following_anchor or {})
+    direction = _trajectory_direction(
+        tracked,
+        seam_frame=seam_frame,
+        screen_direction=screen_direction,
+    )
+    if previous_bbox is None or following_bbox is None or direction is None:
+        return {
+            "status": "unavailable",
+            "reason": "SAM trajectory lacks bounding boxes or a reliable direction",
+        }
+
+    previous_video = _decode_refinement_frames(previous)
+    following_video = _decode_refinement_frames(following)
+    stride = timeline_fps / analysis_fps
+    previous_window = max(2, math.ceil(stride))
+    previous_centers, previous_scores = _track_template_centroids(
+        previous_video[-previous_window:],
+        previous_bbox,
+    )
+    if len(previous_centers) != previous_window:
+        return {"status": "unavailable", "reason": "previous-tail template tracking failed"}
+    target = np.asarray(previous_centers[-1], dtype=float)
+
+    anchor_frame = max(
+        planned_overlap_frames,
+        round(max(0, coarse_trim_analysis_frames - 1) * stride),
+    )
+    minimum_remaining = max(12, math.ceil(timeline_fps * 0.5))
+    safe_last_trim = min(
+        following_frames,
+        len(following_video),
+    ) - minimum_remaining
+    if safe_last_trim < anchor_frame:
+        return {
+            "status": "no_safe_catchup",
+            "reason": "coarse catch-up leaves fewer than 0.5 seconds of following material",
+            "minimum_remaining_frames": minimum_remaining,
+        }
+    following_window = following_video[anchor_frame : safe_last_trim + 1]
+    following_centers, following_scores = _track_template_centroids(
+        following_window,
+        following_bbox,
+    )
+    if len(following_centers) != len(following_window):
+        return {"status": "unavailable", "reason": "following template tracking failed"}
+    min_correlation = float(os.environ.get("HONCUT_SAM3_REFINE_MIN_CORRELATION", "0.55"))
+    observed_scores = previous_scores[1:] + following_scores[1:]
+    median_correlation = float(np.median(observed_scores)) if observed_scores else 1.0
+    if median_correlation < min_correlation:
+        return {
+            "status": "unavailable",
+            "reason": "local template correlation is below the refinement threshold",
+            "median_correlation": round(median_correlation, 6),
+        }
+
+    catchup_frame = next(
+        (
+            anchor_frame + index
+            for index, centroid in enumerate(following_centers)
+            if float(np.dot(np.asarray(centroid, dtype=float) - target, direction)) >= -0.01
+        ),
+        None,
+    )
+    common = {
+        "method": "sam_bbox_template_tracking",
+        "window_start_frame": anchor_frame,
+        "window_end_frame": safe_last_trim,
+        "minimum_remaining_frames": minimum_remaining,
+        "median_correlation": round(median_correlation, 6),
+        "target_centroid": [round(float(value), 6) for value in target],
+    }
+    if catchup_frame is None:
+        return {
+            **common,
+            "status": "no_safe_catchup",
+            "reason": "the subject does not reach the exact previous-tail position before the safe trim limit",
+        }
+    return {
+        **common,
+        "status": "refined",
+        "recommended_trim_frames": catchup_frame,
+        "remaining_frames": min(following_frames, len(following_video)) - catchup_frame,
+    }
+
+
 def collect_sam3_trajectory(
     previous: Path,
     following: Path,
@@ -327,7 +586,7 @@ def collect_sam3_trajectory(
     """Track the continuity subject and return a compact adjudication signal."""
     analysis_fps = max(
         1,
-        min(timeline_fps, int(os.environ.get("HONCUT_SAM3_ANALYSIS_FPS", "6"))),
+        min(timeline_fps, int(os.environ.get("HONCUT_SAM3_ANALYSIS_FPS", "3"))),
     )
     tail_frames = min(2 * timeline_fps, following_frames)
     clip_path = evidence_dir / boundary_id / "tracking_clip.mp4"
@@ -356,9 +615,38 @@ def collect_sam3_trajectory(
     if "recommended_trim_frames" in decision:
         analysis_trim = int(decision["recommended_trim_frames"])
         decision["recommended_trim_analysis_frames"] = analysis_trim
-        decision["recommended_trim_frames"] = round(
-            analysis_trim * timeline_fps / analysis_fps
-        )
+        coarse_timeline_trim = round(analysis_trim * timeline_fps / analysis_fps)
+        decision["coarse_recommended_trim_frames"] = coarse_timeline_trim
+        decision["recommended_trim_frames"] = coarse_timeline_trim
+        try:
+            refinement = refine_object_catchup_frame(
+                previous,
+                following,
+                tracked=tracked,
+                seam_frame=seam_frame,
+                coarse_trim_analysis_frames=analysis_trim,
+                analysis_fps=analysis_fps,
+                timeline_fps=timeline_fps,
+                planned_overlap_frames=planned_overlap_frames,
+                following_frames=following_frames,
+                screen_direction=screen_direction,
+            )
+        except Exception as exc:
+            refinement = {
+                "status": "unavailable",
+                "reason": f"timeline refinement failed: {exc}",
+            }
+        decision["timeline_refinement"] = refinement
+        if refinement.get("status") == "refined":
+            decision["recommended_trim_frames"] = int(
+                refinement["recommended_trim_frames"]
+            )
+            decision["reason"] = (
+                "tracked subject catches up at an original-timeline refined frame"
+            )
+        elif refinement.get("status") == "no_safe_catchup":
+            decision["repair_action"] = "regenerate"
+            decision["reason"] = str(refinement["reason"])
     decision["planned_overlap_analysis_frames"] = analysis_overlap_frames
     decision["planned_overlap_frames"] = planned_overlap_frames
     return {
@@ -379,4 +667,5 @@ __all__ = [
     "build_tracking_clip",
     "collect_sam3_trajectory",
     "decide_object_trajectory",
+    "refine_object_catchup_frame",
 ]

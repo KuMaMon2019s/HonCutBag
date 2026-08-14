@@ -770,7 +770,14 @@ def _generate_single_shot(
     for field, value in defaults.items():
         if value:
             result[field] = value
-    for field in ("shot_size", "camera_movement", "lighting_key", "shot_intent", "gen_strategy", "where", "audio", "sound"):
+    for field in (
+        "shot_size", "camera_movement", "lighting_key", "shot_intent",
+        "gen_strategy", "where", "audio", "sound", "emotion",
+        "transition_to_next", "boundary_before", "continuity_reason",
+        "continuity_subject", "screen_direction", "tracking_prompt",
+        "source_excerpt", "source_sequence_ids", "source_action_unit_ids",
+        "source_event_roles", "micro_actions", "speaker_attribution",
+    ):
         if shot.get(field):
             result[field] = shot[field]
     assets = shot.get("associate_assets", [])

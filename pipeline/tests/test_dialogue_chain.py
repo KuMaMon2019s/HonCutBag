@@ -28,7 +28,9 @@ def _event_response(lines=None):
 def test_extracted_dialogue_lines_reach_adaptation_prompt(monkeypatch):
     expected_lines = [{"speaker": "凛", "line": "你为什么要拦我？"}]
     monkeypatch.setattr(event_extractor, "_call_llm", lambda _prompt: _event_response(expected_lines))
-    events = event_extractor.extract_events([{"id": 1, "content": "测试对白"}])["events"]
+    events = event_extractor.extract_events([
+        {"id": 1, "content": "凛质问：\"你为什么要拦我？\""}
+    ])["events"]
     prompts = []
 
     def fake_adaptation_call(prompt, max_tokens=32000):

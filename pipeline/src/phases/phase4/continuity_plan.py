@@ -25,19 +25,25 @@ def _chunk_frame_budgets(
     overlap_frames: int,
     *,
     fps: int,
+    initial_extension: bool = False,
 ) -> list[tuple[int, int, int]]:
     """Return requested, replay-overlap, and unique frame budgets per chunk."""
-    if target_frames <= limit_frames:
+    if target_frames <= limit_frames and not initial_extension:
         return [(target_frames, 0, target_frames)]
     if overlap_frames >= limit_frames:
         raise ValueError("continuation overlap must be shorter than the provider chunk limit")
 
     usable_extension_frames = limit_frames - overlap_frames
-    chunk_count = max(
-        2,
-        math.ceil((target_frames - overlap_frames) / usable_extension_frames),
-    )
-    requested_total = target_frames + (chunk_count - 1) * overlap_frames
+    if initial_extension:
+        chunk_count = max(1, math.ceil(target_frames / usable_extension_frames))
+        overlap_count = chunk_count
+    else:
+        chunk_count = 1 + max(
+            1,
+            math.ceil(max(0, target_frames - limit_frames) / usable_extension_frames),
+        )
+        overlap_count = chunk_count - 1
+    requested_total = target_frames + overlap_count * overlap_frames
 
     # Preserve whole-second provider requests whenever all inputs permit it.
     if requested_total % fps == 0 and limit_frames % fps == 0:
@@ -52,7 +58,7 @@ def _chunk_frame_budgets(
         raise ValueError("cannot fit overlap-aware chunk budget within provider limit")
     budgets = []
     for index, requested_frames in enumerate(requested):
-        reserved_overlap = 0 if index == 0 else overlap_frames
+        reserved_overlap = overlap_frames if initial_extension or index > 0 else 0
         unique_frames = requested_frames - reserved_overlap
         if unique_frames <= 0:
             raise ValueError("continuation overlap leaves no unique frames in a chunk")
@@ -77,13 +83,14 @@ def _target_duration(shot: Mapping[str, Any]) -> float:
     return float(raw)
 
 
-def _boundary_before(shot: Mapping[str, Any], index: int) -> str:
-    if index == 1:
-        return "cut"
-    explicit = (
-        str(shot.get("boundary_before") or shot.get("continuity_boundary") or "").strip().lower()
-    )
-    return "continuous" if explicit in {"continuous", "continue"} else "cut"
+def _boundary_before(
+    shot: Mapping[str, Any],
+    previous_shot: Mapping[str, Any] | None,
+    index: int,
+) -> tuple[str, str]:
+    from quality.shot_continuity import classify_boundary
+
+    return classify_boundary(previous_shot, shot, index=index)
 
 
 def _anchors(shot: Mapping[str, Any], scene_contract: Mapping[str, Any]) -> ContinuityAnchors:
@@ -94,7 +101,8 @@ def _anchors(shot: Mapping[str, Any], scene_contract: Mapping[str, Any]) -> Cont
         shot.get("camera_motion") or shot.get("camera_movement") or shot.get("camera") or ""
     )
     tracking_prompt = str(
-        shot.get("tracking_prompt")
+        shot.get("continuity_subject")
+        or shot.get("tracking_prompt")
         or shot.get("subject_description")
         or ", ".join(str(value) for value in who if value)
         or ""
@@ -132,8 +140,20 @@ def build_continuity_plan(
     planned_shots: list[ContinuityShot] = []
     cumulative_duration = 0.0
     previous_endpoint_frames = 0
+    previous_storyboard_shot: Mapping[str, Any] | None = None
+    previous_planned_shot: ContinuityShot | None = None
+    group_number = 0
     for index, shot in enumerate(storyboard.get("shots", []), 1):
         shot_id = _shot_id(shot, index)
+        boundary_before, continuity_reason = _boundary_before(
+            shot,
+            previous_storyboard_shot,
+            index,
+        )
+        initial_extension = boundary_before == "continuous" and previous_planned_shot is not None
+        if not initial_extension:
+            group_number += 1
+        continuity_group_id = f"CG{group_number:03d}"
         target_duration = _target_duration(shot)
         cumulative_duration += target_duration
         endpoint_frames = round(cumulative_duration * timeline_fps)
@@ -146,7 +166,10 @@ def build_continuity_plan(
             limit_frames,
             overlap_frames,
             fps=timeline_fps,
+            initial_extension=initial_extension,
         )
+        if initial_extension:
+            previous = previous_planned_shot.chunks[-1].chunk_id
         for sequence, (requested_frames, reserved_overlap, unique_frames) in enumerate(budgets, 1):
             chunk_id = f"{shot_id}_C{sequence:02d}"
             chunks.append(
@@ -157,7 +180,7 @@ def build_continuity_plan(
                     requested_frames=requested_frames,
                     expected_overlap_frames=reserved_overlap,
                     expected_unique_frames=unique_frames,
-                    mode="fresh" if sequence == 1 else "native_extend",
+                    mode="native_extend" if previous is not None else "fresh",
                     depends_on=previous,
                 )
             )
@@ -168,11 +191,23 @@ def build_continuity_plan(
                 shot_id=shot_id,
                 target_duration_s=target_duration,
                 target_frames=target_frames,
-                boundary_before=_boundary_before(shot, index),
+                boundary_before=boundary_before,
+                continuity_group_id=continuity_group_id,
+                extends_from_shot_id=(
+                    previous_planned_shot.shot_id if initial_extension else None
+                ),
+                extends_from_chunk_id=(
+                    previous_planned_shot.chunks[-1].chunk_id if initial_extension else None
+                ),
+                continuity_reason=str(
+                    shot.get("continuity_reason") or continuity_reason
+                ).strip(),
                 anchors=_anchors(shot, scene_shots.get(shot_id, {})),
                 chunks=chunks,
             )
         )
+        previous_storyboard_shot = shot
+        previous_planned_shot = planned_shots[-1]
     return ContinuityPlan(
         provider_chunk_limit_s=provider_chunk_limit_s,
         timeline_fps=timeline_fps,

@@ -84,14 +84,14 @@ Phases use contiguous integer IDs (`phase1`–`phase9`); every phase writes a ch
 
 | Phase | Name | Description |
 |-------|------|-------------|
-| Phase 1 | Screenwriter Engine | Director planning (scene/emotion/transition design), then text parsing → event extraction (concurrent) → character discovery → layered cinematic adaptation (beat skeleton + batch shot expansion) → per-shot storyboard JSON with eight-layer prompts. Sub-phase checkpoints and a 15s heartbeat keep it observable |
+| Phase 1 | Screenwriter Engine | Director planning (scene/emotion/transition design), then text parsing → event extraction (concurrent) → character discovery → layered cinematic adaptation → continuity-boundary classification → per-shot storyboard JSON with eight-layer prompts. Sub-phase checkpoints and a 15s heartbeat keep it observable |
 | Phase 2 | Storyboard Images | Per-shot storyboard images (Seedream) as visual reference for video generation |
 | Phase 3 | Character Factory | Character reference assets (face close-up + full-body + variants) + character cards, with skip-if-exists reuse |
-| Phase 4 | Scene Consistency | Shot directory layout, timeline planning, scene consistency contracts, and three-route model routing (first-last-frame / phantom reference / single-image) |
+| Phase 4 | Scene Consistency | Shot directory layout, timeline planning, scene consistency contracts, and continuity groups: a group starts from image references and later shots depend on the preceding video |
 | Phase 5 | QA Gate + Supervision | L1/L2/L3 structural quality gate plus an LLM supervision agent (continuity / character / style / pacing / dialogue); A/B/C/D grading, C/D blocks video generation. On pass, a graph router picks the Phase 6 strategy (txt2vid / img2vid / reference) |
-| Phase 6 | Video Generation | Shot video synthesis via Seedance on the crash-safe generation runtime (SQLite task store + cross-process capacity leases + resumable provider jobs), with an optional arq/Redis concurrent shot queue, wall-clock watchdog, and Wan2.2 local fallback through the Windows Bridge |
+| Phase 6 | Video Generation | Continuity groups execute serially through Seedance while independent groups remain concurrent: group heads use multi-image generation and later shots use predecessor-video extension on the crash-safe runtime |
 | Phase 7 | Consistency Guard | Cross-shot consistency checks, scene-change detection, and slideshow-risk scoring; failed shots are routed back to Phase 6 for bounded regeneration |
-| Phase 8 | Assembly Engine | Clip stitching with smart transitions, multimodal narrative-order review, frame analysis (black/still frame detection), and duration gate with optional reshoot loop |
+| Phase 8 | Assembly Engine | Temporal/SAM3 seam adjudication removes extension replay prefixes without interpolation; continuous boundaries use hard cuts while scene boundaries retain smart transitions, followed by narrative review and duration closure |
 | Phase 9 | Post-Production | Real SeedASR transcription → subtitle burn-in, three-track audio mixing (original bed + TTS dialogue + ducking), color grading, rhythm editing, final encode |
 | Phase 9.5 | Final QA | Delivery gate that validates the finished film before hand-off |
 
@@ -99,7 +99,8 @@ Phases use contiguous integer IDs (`phase1`–`phase9`); every phase writes a ch
 
 - **Eight-layer prompt framework** — every shot prompt is assembled from eight structured layers (element reference, shot summary, audio, style anchor, quality suffix, negative guardrails), balancing concise shot descriptions with full constraint coverage.
 - **Seedance-first with graceful fallback** — shots are generated via Seedance online API by default; on timeout or stall the pipeline falls back to local Wan2.2 generation through the Windows Bridge with explicit duration-loss logging.
-- **Chain mode (last-frame relay)** — optional serial generation where each shot's last frame becomes the next shot's first frame, physically inheriting character appearance, lighting, and scene continuity across shots.
+- **Continuity-group generation** — the screenwriter labels real action continuations; each group begins from canonical multi-image references and subsequent shots extend the preceding video. Scene changes start fresh and remain eligible for editorial transitions.
+- **Prose-action screenplay understanding** — Phase 1 recognizes scene-state prose, character damage/wardrobe state, unlabelled quoted dialogue, causal attack/counter chains, physical consequences, and relationship reversals. Neighboring text is supplied as read-only context, exact dialogue is confidence-attributed, and deterministic `sequence_id` / `action_unit_id` metadata survives into storyboard generation.
 - **Segmentation-aware shot duration** — shot length follows video-model segmentation best practice (medium-form video: fewer, longer shots, one clear plot beat per shot) instead of many short fragments. Duration is computed as `max(4, min(15, num_frames // fps))` and passed through to Seedance.
 - **Narrative-order verification (Phase 8)** — before assembly, storyboard images are reviewed against the full script with a multimodal LLM; extracted frames are scanned for black/still frames; a duration gate compares actual vs. target runtime and can trigger a bounded reshoot loop.
 - **Real ASR subtitles (Phase 9)** — the final audio track is transcribed via SeedASR WebSocket (`volc.seedasr.sauc.duration`), merged across shots with cumulative time offsets, and burned into the film. Shots without speech fall back to script captions, explicitly marked `script_fallback` — no fabricated timelines.

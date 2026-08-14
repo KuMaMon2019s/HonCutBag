@@ -812,9 +812,9 @@ def _continuity_bridge_preparer(
 def execute_phase6_auto_continuity(
     output_dir: str | Path,
     plan: ContinuityPlan,
-    calibration: SeamCalibration,
+    calibration: SeamCalibration | None,
 ) -> dict[str, Any]:
-    """Run calibrated continuity generation through exactly one configured provider."""
+    """Run continuity groups through exactly one configured provider."""
     root = Path(output_dir)
     provider = os.environ.get("VIDEO_PROVIDER", "seedance").strip().lower()
     if provider == "seedance":
@@ -882,7 +882,9 @@ def execute_phase6_auto_continuity(
             shot.shot_id,
             chunk.chunk_id,
         ),
-        seam_calibration=calibration.model_dump(mode="json"),
+        seam_calibration=(
+            calibration.model_dump(mode="json") if calibration is not None else None
+        ),
         max_seam_repairs=max_repairs,
         max_workers=workers,
     )
@@ -891,7 +893,9 @@ def execute_phase6_auto_continuity(
             "provider": provider,
             "mode": "continuity_auto",
             "continuity_bridge": os.environ.get(CONTINUITY_BRIDGE_ENV, "off").strip().lower(),
-            "calibration_fingerprint": calibration.dataset_fingerprint,
+            "calibration_fingerprint": (
+                calibration.dataset_fingerprint if calibration is not None else None
+            ),
         }
     )
     return report

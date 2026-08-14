@@ -73,6 +73,9 @@ USER_PROMPT_TEMPLATE = (
     "  - emotion: 字符串，情绪/情感\n"
     "  - visual: 字符串，画面描述（用于视频生成）\n"
     "  - suggested_duration: 整数，建议时长（秒）\n"
+    "  - boundary_before: 字符串，cut/continuous；只有同一时空、同一主体且动作状态直接承接时才能为 continuous\n"
+    "  - continuity_reason: 字符串，说明为何延长上一视频或为何重新起镜\n"
+    "  - continuity_subject: 字符串，continuous 时需要跨镜跟踪的主要人物或物体\n"
     "  - transition_to_next: 字符串，转场方式 cut/dissolve/fade\n"
     "  - associate_assets: 字符串数组，该镜头涉及的资产ID（格式 'char:角色id' 或 'scene:场景名'）\n"
     "  - shot_size: 字符串，景别（extreme_wide/wide/medium_wide/medium/medium_close/close_up/extreme_close_up/over_shoulder/insert/establishing）\n"
@@ -90,6 +93,20 @@ USER_PROMPT_TEMPLATE = (
     "- 目的：让视频生成时画面自然衔接，不跳跃\n"
     "- 第一个镜头无需承接\n"
     "- 跨场景切换时不写承接（硬切）\n\n"
+    "【视频延长判定】\n"
+    "boundary_before=continuous 表示本镜必须使用上一镜视频作为素材延长生成；仅在同一时空、"
+    "同一主要主体、动作方向/速度/姿态连续且没有叙事时间跳跃时使用。景别或机位需要硬切、"
+    "地点/时间变化、主体切换、回忆/梦境/与此同时等情况必须为 cut。第一镜必须为 cut。\n\n"
+    "【小说化动作剧本】\n"
+    "事件中的 event_role、sequence_id、action_unit_id、micro_actions、start_state、end_state、"
+    "causal_link、continuity_before 是连续性事实，不是可自由改写的文案。\n"
+    "- 一个 action_unit 是完整的攻防/反应/结果单元，不得为了逐句对应而拆成互不相干的硬切。\n"
+    "- 同一 sequence_id 中相邻动作单元若 continuity_before=continuous，应优先设计成延长视频；"
+    "只有明确换机位、插入反应镜或生成能力无法容纳时才使用 cut，并在 continuity_reason 说明。\n"
+    "- visual 必须按 micro_actions 的原始顺序描述，保留 start_state→动作→end_state 和 causal_link，"
+    "禁止概括成‘双方激烈打斗’。\n"
+    "- turning_point/dramatic_turn 必须保留为独立叙事节拍，不得与普通交锋合并掉。\n"
+    "- lines 中 speaker/confidence/evidence 是对白归属证据；低置信度时不得擅自换成另一角色。\n\n"
     "【片段间过渡规则】\n"
     "相邻片段之间必须设计过渡桥梁，消灭跳跃感：\n"
     "1. 动作桥梁：前段结尾=动作起始态，后段首镜=进行时/完成时\n"
@@ -137,13 +154,16 @@ BATCH_EXPAND_PROMPT = (
     "输出严格 JSON 对象，包含 strategy 和 shots。每个 shot 必须包含以下字段：\n"
     "beat_order（整数，必须等于该镜展开自哪个 beat 的 beat_order）、shot_order、"
     "source_events、action、reason、who、where、what、emotion、visual、"
-    "suggested_duration、transition_to_next、associate_assets、shot_size、"
+    "suggested_duration、boundary_before、continuity_reason、continuity_subject、"
+    "transition_to_next、associate_assets、shot_size、"
     "camera_movement、lighting_key、shot_intent、dialogue、gen_strategy。\n"
     "JSON 示例：{{\"strategy\":\"本批策略\",\"shots\":[{{\"beat_order\":1,"
     "\"shot_order\":1,\"source_events\":[1],\"action\":\"keep\","
     "\"reason\":\"理由\",\"who\":[\"角色主名\"],\"where\":\"地点\","
     "\"what\":\"事件\",\"emotion\":\"情绪\",\"visual\":\"画面\","
-    "\"suggested_duration\":12,\"transition_to_next\":\"cut\","
+    "\"suggested_duration\":12,\"boundary_before\":\"cut\","
+    "\"continuity_reason\":\"新场景\",\"continuity_subject\":\"\","
+    "\"transition_to_next\":\"cut\","
     "\"associate_assets\":[\"char:id\",\"scene:地点\"],\"shot_size\":\"medium\","
     "\"camera_movement\":\"static\",\"lighting_key\":\"natural\","
     "\"shot_intent\":\"action\",\"dialogue\":null,\"gen_strategy\":\"phantom\"}}]}}\n\n"
@@ -152,6 +172,12 @@ BATCH_EXPAND_PROMPT = (
     "不得把 visual、what 或旁白当对白。\n\n"
     "【镜头连贯性规则】除第一镜和跨场景硬切外，visual 开头必须写"
     "「承接上镜：上镜定格于{{角色名}}{{位置/姿态/朝向}}，{{最后动作的终态}}——本镜由此延续」。\n"
+    "【视频延长判定】第一镜 boundary_before 必须为 cut。只有同一时空、同一主要主体、"
+    "动作方向/速度/姿态直接连续且无时间跳跃时，下一镜 boundary_before 才能为 continuous，"
+    "并填写 continuity_reason 与 continuity_subject；否则必须为 cut。\n"
+    "【小说化动作剧本】严格继承来源事件的 sequence_id/action_unit_id/micro_actions/start_state/"
+    "end_state/causal_link/continuity_before；按动作原顺序展开，禁止用‘激烈打斗’代替具体招式与结果。"
+    "同一 sequence_id 的连续动作优先 boundary_before=continuous；turning_point 必须独立保留。\n"
     "【片段间过渡规则】相邻片段用动作桥梁、情绪接力、空间视线或台词黏合消灭跳跃感。\n"
     "【铁律优先级】台词零删改 > 出场人物完整 > 只描述动作状态 > 长台词拆镜。\n\n"
     "【HonCut 分镜铁律】who 只能逐字引用角色主名，别名改主名，群众只进 visual；"
@@ -509,6 +535,87 @@ def _build_events_json(events: List[Dict[str, Any]]) -> str:
     return json.dumps(numbered_events, ensure_ascii=False, indent=2)
 
 
+def _inherit_event_semantics(
+    shots: List[Dict[str, Any]], events: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Carry source screenplay evidence into shots after the LLM adaptation pass.
+
+    The model still chooses framing and whether a camera cut is useful, while
+    source ordering, exact excerpts, action units, and speaker evidence remain
+    deterministic and auditable downstream.
+    """
+    event_by_id = {index: event for index, event in enumerate(events, 1)}
+    previous_sequence_ids: List[str] = []
+    for shot_index, shot in enumerate(shots):
+        raw_ids = shot.get("source_events", [])
+        source_ids = raw_ids if isinstance(raw_ids, list) else []
+        details = [event_by_id[event_id] for event_id in source_ids if event_id in event_by_id]
+
+        excerpts = [str(event.get("source_excerpt") or "").strip() for event in details]
+        excerpts = [excerpt for excerpt in excerpts if excerpt]
+        if excerpts:
+            shot["source_excerpt"] = "\n".join(dict.fromkeys(excerpts))
+
+        sequence_ids = [str(event.get("sequence_id")) for event in details if event.get("sequence_id")]
+        sequence_ids = list(dict.fromkeys(sequence_ids))
+        action_unit_ids = [str(event.get("action_unit_id")) for event in details if event.get("action_unit_id")]
+        micro_actions = [
+            str(action)
+            for event in details
+            for action in (event.get("micro_actions") or [])
+            if str(action).strip()
+        ]
+        roles = [str(event.get("event_role")) for event in details if event.get("event_role")]
+        shot["source_sequence_ids"] = sequence_ids
+        shot["source_action_unit_ids"] = list(dict.fromkeys(action_unit_ids))
+        shot["source_event_roles"] = list(dict.fromkeys(roles))
+        shot["micro_actions"] = micro_actions
+
+        speaker_evidence = [
+            dict(line)
+            for event in details
+            for line in (event.get("lines") or [])
+            if isinstance(line, dict) and line.get("line")
+        ]
+        if speaker_evidence:
+            shot["speaker_attribution"] = speaker_evidence
+            dialogue = shot.get("dialogue")
+            if isinstance(dialogue, dict):
+                exact = next(
+                    (line for line in speaker_evidence if line.get("line") == dialogue.get("line")),
+                    None,
+                )
+                if exact is None:
+                    # A generated/paraphrased line violates the screenplay contract.
+                    shot["dialogue"] = None
+                else:
+                    shot["dialogue"] = {
+                        "speaker": exact.get("speaker", "未知"),
+                        "line": exact["line"],
+                        "confidence": exact.get("confidence", 0.0),
+                        "evidence": exact.get("evidence", ""),
+                        "dialogue_id": exact.get("dialogue_id"),
+                    }
+
+        first_source = details[0] if details else {}
+        source_boundary = str(first_source.get("continuity_before") or "").lower()
+        source_subject = str(first_source.get("continuity_subject") or "").strip()
+        same_sequence = bool(sequence_ids and previous_sequence_ids and sequence_ids[0] in previous_sequence_ids)
+        if shot_index == 0:
+            shot["boundary_before"] = "cut"
+        elif not str(shot.get("boundary_before") or "").strip() and source_boundary in {"cut", "continuous"}:
+            shot["boundary_before"] = source_boundary if same_sequence else "cut"
+        if shot.get("boundary_before") == "continuous":
+            if source_subject and not str(shot.get("continuity_subject") or "").strip():
+                shot["continuity_subject"] = source_subject
+            shot.setdefault(
+                "continuity_reason",
+                "source action unit directly continues within the same screenplay sequence",
+            )
+        previous_sequence_ids = sequence_ids
+    return shots
+
+
 BEAT_SKELETON_PROMPT = (
     "目标时长：{target_duration}秒，每镜约{shot_duration}秒。请把全部事件压缩为恰好{beat_count}个 beat。\n\n"
     "事件列表：\n{events_json}\n\n角色列表：\n{characters_summary}\n\n"
@@ -521,7 +628,11 @@ BEAT_SKELETON_PROMPT = (
     "2. 每个输入事件编号必须且至少被某个 beat 的 source_events 引用；删减事件也必须放入 action=drop 的 beat 显式声明。\n"
     "3. keep 保留关键因果/情感节点，merge 合并连续或重复事件，drop 只删不影响因果链的内容。\n"
     "4. 台词归属必须忠于原事件；who 只能使用角色列表主名，别名改为主名，群众不得写入 who。\n"
-    "5. 只输出骨架决策，禁止展开对白、visual、Identity Anchor 或任何镜头生成细节。"
+    "5. action_unit_id 是已经按因果闭环分组的动作单元：不得按句号或单个招式再次打碎；"
+    "也不得把不同 turning_point 合并掉。长动作可以与相邻单元合并为 beat，但必须保持 micro_actions 原顺序。\n"
+    "6. sequence_id 与 continuity_before 是生成连续性依据。同一 sequence 的连续单元尽量落在相邻 beat，"
+    "换场/跳时/关系转折不得为了省镜头而错误连拍。\n"
+    "7. 只输出骨架决策，禁止展开对白、visual、Identity Anchor 或任何镜头生成细节。"
 )
 
 
@@ -848,6 +959,8 @@ def adapt_events(
         for i, shot in enumerate(shots, 1):
             shot["shot_order"] = i
 
+        _inherit_event_semantics(shots, events)
+
         for i, shot in enumerate(shots):
             if i > 0:
                 prev = shots[i - 1]
@@ -864,6 +977,9 @@ def adapt_events(
                 shot["prev_shot_context"] = ""
 
         total_duration = sum(shot.get("suggested_duration", 0) for shot in shots)
+        from quality.shot_continuity import annotate_boundaries
+
+        annotate_boundaries(shots)
         if abs(total_duration - target_duration) > target_duration * 0.10:
             print(
                 f"  ⚠ 分镜建议总时长 {total_duration}秒与目标 {target_duration}秒偏差超过 10%",
@@ -912,6 +1028,8 @@ def adapt_events(
     for i, shot in enumerate(shots, 1):
         shot["shot_order"] = i
 
+    _inherit_event_semantics(shots, events)
+
     # Add continuity context between shots (镜头连贯性)
     for i, shot in enumerate(shots):
         if i > 0:
@@ -930,6 +1048,9 @@ def adapt_events(
             shot["prev_shot_context"] = ""  # First shot
 
     # 计算总时长
+    from quality.shot_continuity import annotate_boundaries
+
+    annotate_boundaries(shots)
     total_duration = sum(shot.get("suggested_duration", 0) for shot in shots)
 
     result = {

@@ -86,6 +86,16 @@ class ChunkExecutionResult:
     provider_task_id: str | None = None
 
 
+@dataclass(frozen=True)
+class ShotExecutionContext:
+    """Output state relayed only inside one cross-shot continuity group."""
+
+    shot_id: str
+    output_path: Path
+    last_chunk_id: str
+    output_fingerprint: str
+
+
 class ContinuityLineageStore:
     """Atomically persist chunk fingerprints while independent shots finish."""
 
@@ -137,8 +147,8 @@ class ContinuityLineageStore:
 
 
 def continuity_mode() -> str:
-    """Read and validate the rollout mode; shadow is the safe default."""
-    mode = os.environ.get(CONTINUITY_MODE_ENV, "shadow").strip().lower()
+    """Read and validate the rollout mode; continuity execution is the default."""
+    mode = os.environ.get(CONTINUITY_MODE_ENV, "auto").strip().lower()
     if mode not in CONTINUITY_MODES:
         expected = ", ".join(sorted(CONTINUITY_MODES))
         raise ValueError(f"{CONTINUITY_MODE_ENV} must be one of {expected}, got {mode!r}")
@@ -224,22 +234,36 @@ def write_shadow_runtime_report(output_dir: str | Path) -> dict[str, Any]:
             from quality.seam_calibration import load_seam_calibration
 
             calibration_path = root / "CONTINUITY_CALIBRATION.json"
-            if not calibration_path.is_file():
-                raise RuntimeError("continuity seam guard requires CONTINUITY_CALIBRATION.json")
-            calibration = load_seam_calibration(calibration_path)
-            if calibration.status != "certified":
-                raise RuntimeError(
-                    "continuity seam guard requires certified calibration, "
-                    f"got {calibration.status}"
-                )
             report.update(
                 {
                     "execution_enabled": True,
-                    "reason": "certified auto mode routes provider work through chunk lineage",
-                    "calibration_path": "CONTINUITY_CALIBRATION.json",
-                    "calibration_fingerprint": calibration.dataset_fingerprint,
+                    "reason": (
+                        "auto mode routes generation through continuity groups; "
+                        "Phase 8 owns final replay-prefix adjudication"
+                    ),
                 }
             )
+            if calibration_path.is_file():
+                calibration = load_seam_calibration(calibration_path)
+                if calibration.status != "certified":
+                    raise RuntimeError(
+                        "continuity seam guard requires certified calibration when "
+                        f"a calibration artifact is present, got {calibration.status}"
+                    )
+                report.update(
+                    {
+                        "calibration_path": "CONTINUITY_CALIBRATION.json",
+                        "calibration_fingerprint": calibration.dataset_fingerprint,
+                    }
+                )
+            else:
+                report.update(
+                    {
+                        "calibration_path": None,
+                        "calibration_fingerprint": None,
+                        "phase6_seam_policy": "observe_only",
+                    }
+                )
     _atomic_write_json(root / "CONTINUITY_RUNTIME.json", report)
     return report
 
@@ -335,16 +359,35 @@ def execute_continuity_plan(
     repair_attempts = 0
     totals_lock = threading.Lock()
 
-    def run_shot(shot: ContinuityShot) -> str:
+    def run_shot(
+        shot: ContinuityShot,
+        predecessor: ShotExecutionContext | None = None,
+    ) -> ShotExecutionContext:
         nonlocal executed_chunks, measured_seams, repair_attempts, skipped_chunks
         nonlocal timing_manifests, duration_topups
         chunk_paths: list[Path] = []
         executed_chunk_models: list[GenerationChunk] = []
         timing_rows: list[dict[str, Any]] = []
         seam_fingerprints: list[str] = []
-        parent_fingerprint: str | None = None
-        previous_output: Path | None = None
-        previous_chunk_id: str | None = None
+        if shot.extends_from_shot_id:
+            if predecessor is None or predecessor.shot_id != shot.extends_from_shot_id:
+                raise RuntimeError(
+                    f"{shot.shot_id} requires predecessor {shot.extends_from_shot_id}"
+                )
+            if predecessor.last_chunk_id != shot.extends_from_chunk_id:
+                raise RuntimeError(
+                    f"{shot.shot_id} predecessor chunk changed: "
+                    f"expected {shot.extends_from_chunk_id}, got {predecessor.last_chunk_id}"
+                )
+            parent_fingerprint: str | None = predecessor.output_fingerprint
+            previous_output: Path | None = predecessor.output_path
+            previous_chunk_id: str | None = predecessor.last_chunk_id
+        else:
+            if predecessor is not None:
+                raise RuntimeError(f"fresh shot {shot.shot_id} received a predecessor")
+            parent_fingerprint = None
+            previous_output = None
+            previous_chunk_id = None
 
         def execute_one(
             chunk: GenerationChunk,
@@ -619,6 +662,11 @@ def execute_continuity_plan(
         chunk_index = 0
         while chunk_index < len(scheduled_chunks):
             chunk = scheduled_chunks[chunk_index]
+            cross_shot_boundary = bool(
+                chunk_index == 0
+                and shot.extends_from_chunk_id
+                and chunk.depends_on == shot.extends_from_chunk_id
+            )
             chunk_path = root / "shots" / shot.shot_id / "chunks" / f"{chunk.chunk_id}.mp4"
             execution_context = chunk_context(shot, chunk) if chunk_context else None
             fingerprint = _chunk_fingerprint(
@@ -641,12 +689,14 @@ def execute_continuity_plan(
                 if record and record.get("input_fingerprint") == fingerprint:
                     resume_attempt = int(record.get("repair_attempts", 0))
                 execute_one(chunk, chunk_path, fingerprint, attempt=resume_attempt)
-            if previous_output is not None:
+            if previous_output is not None and not cross_shot_boundary:
                 seam_fingerprint, effective_path, preparation = inspect_boundary(
                     chunk, chunk_path, fingerprint
                 )
                 seam_fingerprints.append(seam_fingerprint)
             else:
+                # Cross-shot replay is intentionally preserved until Phase 8,
+                # where the complete trajectory and transition class are known.
                 effective_path = chunk_path
                 preparation = None
             chunk_paths.append(effective_path)
@@ -751,17 +801,32 @@ def execute_continuity_plan(
                     "target_frames": shot.target_frames,
                     "timeline_fps": plan.timeline_fps,
                     "enabled": finalize_shot is not None,
+                    "deferred_cross_shot_prefix": bool(shot.extends_from_chunk_id),
                 },
             }
         )
         shot_record = lineage.get_shot(shot.shot_id)
+        deferred_prefix_frames = (
+            int(shot.chunks[0].expected_overlap_frames)
+            if shot.extends_from_chunk_id
+            else 0
+        )
         if not _valid_record(shot_record, materialization_fingerprint, shot_output):
             materialize_shot(tuple(chunk_paths), shot_output)
             if not shot_output.is_file() or shot_output.stat().st_size == 0:
                 raise RuntimeError(f"{shot.shot_id} materialization produced no video bytes")
             closure = None
-            if finalize_shot is not None:
+            if finalize_shot is not None and deferred_prefix_frames <= 0:
                 closure = finalize_shot(shot_output, target_frames, plan.timeline_fps)
+            elif deferred_prefix_frames > 0:
+                closure = {
+                    "method": "deferred_phase8_prefix_trim",
+                    "before_frames": probe_frames(shot_output, plan.timeline_fps)["frames"]
+                    if probe_frames is not None
+                    else None,
+                    "target_frames": target_frames,
+                    "deferred_prefix_frames": deferred_prefix_frames,
+                }
             lineage.put_shot(
                 shot.shot_id,
                 {
@@ -795,6 +860,8 @@ def execute_continuity_plan(
                 "delta_frames": int(final_timing["frames"]) - target_frames,
                 "duration_closure": closure,
                 "internal_seams_finalized": True,
+                "boundary_before": shot.boundary_before,
+                "deferred_cross_shot_prefix_frames": deferred_prefix_frames,
             }
             _atomic_write_json(
                 root / "shots" / shot.shot_id / "CONTINUITY_TIMING.json",
@@ -802,17 +869,64 @@ def execute_continuity_plan(
             )
             with totals_lock:
                 timing_manifests += 1
-        return str(shot_output.relative_to(root))
+        return ShotExecutionContext(
+            shot_id=shot.shot_id,
+            output_path=shot_output,
+            last_chunk_id=executed_chunk_models[-1].chunk_id,
+            output_fingerprint=_canonical_hash(
+                {
+                    "shot_id": shot.shot_id,
+                    "output_sha256": _file_hash(shot_output),
+                    "last_chunk_id": executed_chunk_models[-1].chunk_id,
+                }
+            ),
+        )
 
-    worker_count = min(max_workers, max(1, len(plan.shots)))
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        futures = {executor.submit(run_shot, shot): shot for shot in plan.shots}
-        for future in as_completed(futures):
-            shot = futures[future]
+    groups: list[list[ContinuityShot]] = []
+    for shot in plan.shots:
+        if shot.extends_from_shot_id:
+            if not groups or groups[-1][-1].shot_id != shot.extends_from_shot_id:
+                raise RuntimeError(
+                    f"{shot.shot_id} cross-shot continuation is not adjacent to "
+                    f"{shot.extends_from_shot_id}"
+                )
+            groups[-1].append(shot)
+        else:
+            groups.append([shot])
+
+    def run_group(
+        group: list[ContinuityShot],
+    ) -> tuple[list[str], list[dict[str, str]]]:
+        group_outputs: list[str] = []
+        group_errors: list[dict[str, str]] = []
+        predecessor: ShotExecutionContext | None = None
+        for index, shot in enumerate(group):
             try:
-                outputs.append(future.result())
+                predecessor = run_shot(shot, predecessor)
+                group_outputs.append(str(predecessor.output_path.relative_to(root)))
             except Exception as exc:
-                errors.append({"shot_id": shot.shot_id, "error": str(exc)})
+                group_errors.append({"shot_id": shot.shot_id, "error": str(exc)})
+                for blocked in group[index + 1 :]:
+                    group_errors.append(
+                        {
+                            "shot_id": blocked.shot_id,
+                            "error": f"blocked by failed continuity predecessor {shot.shot_id}",
+                        }
+                    )
+                break
+        return group_outputs, group_errors
+
+    worker_count = min(max_workers, max(1, len(groups)))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = {executor.submit(run_group, group): group for group in groups}
+        for future in as_completed(futures):
+            group = futures[future]
+            try:
+                group_outputs, group_errors = future.result()
+                outputs.extend(group_outputs)
+                errors.extend(group_errors)
+            except Exception as exc:
+                errors.append({"shot_id": group[0].shot_id, "error": str(exc)})
 
     outputs.sort()
     errors.sort(key=lambda item: item["shot_id"])

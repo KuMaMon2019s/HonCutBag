@@ -1,4 +1,4 @@
-"""Phase 8 adjudication for temporal rollback inside multi-chunk shots.
+"""Phase 8 adjudication for temporal rollback at native-extension seams.
 
 Phase 6 can only make a provisional seam because it must finish generation before
 the complete motion trajectory is available.  This module revisits each planned
@@ -122,7 +122,43 @@ def decide_temporal_seam(
         "decreasing_ratio": round(decreasing_ratio, 6),
         "best_position": round(best_position, 6),
     }
+    object_evidence = object_trajectory_evidence or {}
+    object_confidence = float(object_evidence.get("confidence") or 0.0)
+    object_verdict = str(object_evidence.get("verdict") or "unavailable")
+    object_supports = object_verdict == "rollback" and object_confidence >= 0.6
+    object_contradicts = object_verdict in {"continuous", "forward"} and object_confidence >= 0.6
     if not rollback:
+        if object_supports:
+            tracked_trim = int(object_evidence.get("recommended_trim_frames") or 0)
+            if object_evidence.get("repair_action") == "hard_trim" and tracked_trim > 0:
+                selected = max(planned_overlap_frames, tracked_trim)
+                return {
+                    "action": "hard_trim",
+                    "rollback_detected": True,
+                    "reason": (
+                        "subject tracking detects rollback despite a background-dominated "
+                        "appearance trajectory"
+                    ),
+                    "trim_frames": selected,
+                    "trim_seconds": round(selected / timeline_fps, 6),
+                    "additional_trim_frames": selected - planned_overlap_frames,
+                    "frame_policy": "do_not_interpolate",
+                    "confidence": "object_trajectory_override",
+                    "trim_source": "object_trajectory_catchup",
+                    "evidence": evidence,
+                    "object_trajectory_evidence": object_evidence,
+                }
+            return {
+                "action": "human_review",
+                "recommended_action": "regenerate",
+                "rollback_detected": True,
+                "reason": (
+                    "subject tracking detects rollback but no safe catch-up frame exists"
+                ),
+                "confidence": "tracked_rollback_without_safe_cut",
+                "evidence": evidence,
+                "object_trajectory_evidence": object_evidence,
+            }
         return {
             "action": "keep",
             "rollback_detected": False,
@@ -141,11 +177,6 @@ def decide_temporal_seam(
         "frame_policy": "do_not_interpolate",
         "evidence": evidence,
     }
-    object_evidence = object_trajectory_evidence or {}
-    object_confidence = float(object_evidence.get("confidence") or 0.0)
-    object_verdict = str(object_evidence.get("verdict") or "unavailable")
-    object_supports = object_verdict == "rollback" and object_confidence >= 0.6
-    object_contradicts = object_verdict in {"continuous", "forward"} and object_confidence >= 0.6
     if human_approved:
         return {
             **proposed,
@@ -218,16 +249,29 @@ def adjudicate_continuity_seams(
     detector: Callable[..., dict[str, Any]] = detect_replayed_prefix,
     frame_probe: Callable[[Path, int], dict[str, Any]] = probe_continuity_frames,
     sam3_collector: Callable[..., dict[str, Any]] | None = None,
+    sam3_base_url: str | None = None,
 ) -> dict[str, Any]:
-    """Analyze all planned internal seams and persist Phase 6 instructions."""
+    """Analyze internal and cross-shot extension seams and persist edit instructions."""
     root = Path(output_dir)
     plan_path = root / "CONTINUITY_PLAN.json"
     if not plan_path.is_file():
         return {"status": "skipped", "reason": "CONTINUITY_PLAN.json not found"}
     plan = load_continuity_plan(plan_path)
-    multi_chunk_shots = [shot for shot in plan.shots if len(shot.chunks) > 1]
-    if not multi_chunk_shots:
-        return {"status": "skipped", "reason": "no internal continuity seams"}
+    planned_shots = [
+        shot for shot in plan.shots if len(shot.chunks) > 1 or shot.extends_from_chunk_id
+    ]
+    if not planned_shots:
+        return {"status": "skipped", "reason": "no native-extension continuity seams"}
+    chunk_owners = {
+        chunk.chunk_id: shot.shot_id
+        for shot in plan.shots
+        for chunk in shot.chunks
+    }
+    chunks_by_id = {
+        chunk.chunk_id: chunk
+        for shot in plan.shots
+        for chunk in shot.chunks
+    }
 
     object_trajectories = _load_boundary_map(
         root,
@@ -243,10 +287,14 @@ def adjudicate_continuity_seams(
     shot_reports: list[dict[str, Any]] = []
     topup_requests: list[dict[str, Any]] = []
     analyzed_at = datetime.now(UTC).isoformat()
-    sam3_url = os.environ.get("HONCUT_SAM3_URL", "").strip()
+    sam3_url = (
+        os.environ.get("HONCUT_SAM3_URL", "").strip()
+        if sam3_base_url is None
+        else sam3_base_url.strip()
+    )
     sam3_attempted = False
 
-    for shot in multi_chunk_shots:
+    for shot in planned_shots:
         timing_path = root / "shots" / shot.shot_id / "CONTINUITY_TIMING.json"
         timing = (
             json.loads(timing_path.read_text(encoding="utf-8"))
@@ -259,12 +307,33 @@ def adjudicate_continuity_seams(
         boundaries: list[dict[str, Any]] = []
         applied_delta_frames = 0
 
-        for previous_chunk, following_chunk in pairwise(shot.chunks):
+        seam_pairs: list[tuple[Any, Any]] = []
+        if shot.extends_from_chunk_id:
+            predecessor = chunks_by_id.get(shot.extends_from_chunk_id)
+            if predecessor is None:
+                raise RuntimeError(
+                    f"{shot.shot_id} references missing predecessor "
+                    f"{shot.extends_from_chunk_id}"
+                )
+            seam_pairs.append((predecessor, shot.chunks[0]))
+        seam_pairs.extend(pairwise(shot.chunks))
+
+        for previous_chunk, following_chunk in seam_pairs:
+            previous_shot_id = chunk_owners[previous_chunk.chunk_id]
+            following_shot_id = chunk_owners[following_chunk.chunk_id]
             previous_path = (
-                root / "shots" / shot.shot_id / "chunks" / f"{previous_chunk.chunk_id}.mp4"
+                root
+                / "shots"
+                / previous_shot_id
+                / "chunks"
+                / f"{previous_chunk.chunk_id}.mp4"
             )
             following_path = (
-                root / "shots" / shot.shot_id / "chunks" / f"{following_chunk.chunk_id}.mp4"
+                root
+                / "shots"
+                / following_shot_id
+                / "chunks"
+                / f"{following_chunk.chunk_id}.mp4"
             )
             boundary_id = f"{previous_chunk.chunk_id}__{following_chunk.chunk_id}"
             if not previous_path.is_file() or not following_path.is_file():
@@ -305,7 +374,28 @@ def adjudicate_continuity_seams(
             ):
                 object_evidence = None
             tracking_prompt = shot.anchors.tracking_prompt.strip()
-            if object_evidence is None and sam3_url and tracking_prompt:
+            candidates = list(trajectory.get("candidates", []))
+            preliminary = decide_temporal_seam(
+                candidates,
+                planned_overlap_frames=planned_frames,
+                timeline_fps=plan.timeline_fps,
+                max_extra_search_frames=max(0, searchable_frames - planned_frames),
+                object_trajectory_evidence=object_evidence,
+            )
+            cross_shot_boundary = previous_shot_id != following_shot_id
+            needs_object_corroboration = bool(
+                preliminary.get("action") == "human_review"
+                or (cross_shot_boundary and planned_frames > 0)
+            )
+            object_evidence_retriable = object_evidence is None or str(
+                object_evidence.get("verdict")
+            ) == "unavailable"
+            if (
+                needs_object_corroboration
+                and object_evidence_retriable
+                and sam3_url
+                and tracking_prompt
+            ):
                 sam3_attempted = True
                 try:
                     if sam3_collector is None:
@@ -338,14 +428,14 @@ def adjudicate_continuity_seams(
                     "source_fingerprint": source_fingerprint,
                 }
                 object_trajectories[boundary_id] = object_evidence
+                preliminary = decide_temporal_seam(
+                    candidates,
+                    planned_overlap_frames=planned_frames,
+                    timeline_fps=plan.timeline_fps,
+                    max_extra_search_frames=max(0, searchable_frames - planned_frames),
+                    object_trajectory_evidence=object_evidence,
+                )
             review = temporal_reviews.get(boundary_id) or {}
-            preliminary = decide_temporal_seam(
-                list(trajectory.get("candidates", [])),
-                planned_overlap_frames=planned_frames,
-                timeline_fps=plan.timeline_fps,
-                max_extra_search_frames=max(0, searchable_frames - planned_frames),
-                object_trajectory_evidence=object_evidence,
-            )
             human_approved = bool(
                 review.get("action") == "hard_trim"
                 and review.get("source_fingerprint") == source_fingerprint
@@ -364,8 +454,20 @@ def adjudicate_continuity_seams(
             )
             current_row = timing_rows.get(following_chunk.chunk_id, {})
             currently_trimmed = int(
-                current_row.get("detected_overlap_frames", planned_frames) or 0
+                current_row.get("detected_overlap_frames", 0) or 0
             )
+            if decision.get("action") == "keep" and planned_frames > currently_trimmed:
+                decision = {
+                    **decision,
+                    "action": "hard_trim",
+                    "rollback_detected": False,
+                    "trim_frames": planned_frames,
+                    "trim_seconds": round(planned_frames / plan.timeline_fps, 6),
+                    "additional_trim_frames": 0,
+                    "frame_policy": "do_not_interpolate",
+                    "confidence": "planned_overlap",
+                    "reason": "remove the intentionally generated native-extension replay prefix",
+                }
             selected_trim = (
                 int(decision.get("trim_frames", currently_trimmed))
                 if decision.get("action") == "hard_trim"
@@ -388,6 +490,11 @@ def adjudicate_continuity_seams(
                 decisions[boundary_id] = {
                     "action": "hard_trim",
                     "shot_id": shot.shot_id,
+                    "boundary_kind": (
+                        "cross_shot" if previous_shot_id != following_shot_id else "internal"
+                    ),
+                    "previous_shot_id": previous_shot_id,
+                    "following_shot_id": following_shot_id,
                     "previous_chunk_id": previous_chunk.chunk_id,
                     "following_chunk_id": following_chunk.chunk_id,
                     "trim_frames": int(decision["trim_frames"]),

@@ -697,7 +697,7 @@ def _summarize_visual_style_with_llm(script_text: str) -> Optional[str]:
         return None
 
 
-PHASE1_CHECKPOINT_SCHEMA_VERSION = 2
+PHASE1_CHECKPOINT_SCHEMA_VERSION = 3
 
 
 def _phase1_input_hash(items: list) -> str:
@@ -1018,7 +1018,7 @@ def run_phase1_screenwriter(
             print("    ↻ 复用 phase1_events.json，跳过事件提取")
         else:
             events_result = dict(extract_events(segments))
-            events_result.setdefault("schema_version", "2.0")
+            events_result.setdefault("schema_version", "3.0")
             events_result.setdefault("source_segments_hash", events_input_hash)
             events_result.setdefault("source_segment_count", len(nonempty_segments))
             events_result.setdefault("covered_segment_ids", expected_segment_ids)
@@ -2568,10 +2568,10 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
             output_dir / "CONTINUITY_PLAN.json",
             storyboard_for_consistency,
             scene_consistency,
-            continuation_overlap_s=(
-                float(os.environ.get("HONCUT_CONTINUITY_OVERLAP_SECONDS", "2.0"))
-                if os.environ.get("HONCUT_CONTINUITY_BRIDGE", "off").strip().lower() == "auto"
-                else 0.0
+            # Every native extension reserves replay context. Phase 8 removes
+            # the planned prefix (and any detected extra rollback) by frame.
+            continuation_overlap_s=float(
+                os.environ.get("HONCUT_CONTINUITY_OVERLAP_SECONDS", "2.0")
             ),
         )
         outputs.append("CONTINUITY_PLAN.json")
@@ -3835,13 +3835,17 @@ def run_phase6(storyboard_data: dict, output_dir: Path, dry_run: bool, chain_mod
             from runtime.continuity_provider import execute_phase6_auto_continuity
 
             print(
-                "  [continuity] auto: certified chunk execution with bounded seam repair",
+                "  [continuity] auto: grouped generation; Phase 8 owns final seam trim",
                 flush=True,
             )
             result = execute_phase6_auto_continuity(
                 output_dir,
                 load_continuity_plan(output_dir / "CONTINUITY_PLAN.json"),
-                load_seam_calibration(output_dir / "CONTINUITY_CALIBRATION.json"),
+                (
+                    load_seam_calibration(output_dir / "CONTINUITY_CALIBRATION.json")
+                    if (output_dir / "CONTINUITY_CALIBRATION.json").is_file()
+                    else None
+                ),
             )
             result["duration_s"] = _elapsed(start)
             result["continuity_runtime"] = continuity_runtime
@@ -4277,9 +4281,14 @@ def run_phase8(output_dir: Path, dry_run: bool,
     # Step 8.15: the complete chunk trajectory is now available.  Revisit
     # provisional Phase 6 boundaries before per-shot QA or formal assembly.
     from phases.phase8.continuity_adjudication import adjudicate_continuity_seams
+    from quality.sam3_sidecar import phase8_sam3_endpoint
 
     try:
-        continuity_adjudication = adjudicate_continuity_seams(output_dir)
+        with phase8_sam3_endpoint(output_dir) as sam3_url:
+            continuity_adjudication = adjudicate_continuity_seams(
+                output_dir,
+                sam3_base_url=sam3_url,
+            )
     except Exception as exc:
         return {
             "status": "error",

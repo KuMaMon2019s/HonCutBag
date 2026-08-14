@@ -3,6 +3,8 @@
 # pyre-unsafe
 import logging
 
+import cv2
+import numpy as np
 import torch
 
 try:
@@ -19,16 +21,18 @@ except ImportError:
 
 def connected_components_cpu_single(values: torch.Tensor):
     assert values.dim() == 2
-    from skimage.measure import label
-
-    labels, num = label(values.cpu().numpy(), return_num=True)
-    labels = torch.from_numpy(labels)
-    counts = torch.zeros_like(labels)
-    for i in range(1, num + 1):
-        cur_mask = labels == i
-        cur_count = cur_mask.sum()
-        counts[cur_mask] = cur_count
-    return labels, counts
+    binary = (values.detach().cpu().numpy() != 0).astype(np.uint8)
+    _, labels, stats, _ = cv2.connectedComponentsWithStats(
+        binary,
+        connectivity=8,
+    )
+    component_areas = stats[:, cv2.CC_STAT_AREA].astype(np.int64)
+    component_areas[0] = 0
+    counts = component_areas[labels]
+    return (
+        torch.from_numpy(labels.astype(np.int64, copy=False)),
+        torch.from_numpy(counts),
+    )
 
 
 def connected_components_cpu(input_tensor: torch.Tensor):

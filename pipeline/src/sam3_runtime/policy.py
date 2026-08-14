@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -18,6 +19,31 @@ class RuntimePolicy:
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
+
+
+def resolve_checkpoint_path(
+    repo_root: Path,
+    *,
+    configured_checkpoint: str = "",
+    asset_root: str = "",
+) -> Path:
+    """Resolve a local checkpoint without copying or implicitly downloading it."""
+    if configured_checkpoint.strip():
+        return Path(configured_checkpoint).expanduser().resolve()
+
+    local_checkpoint = repo_root / "pipeline" / "models" / "sam3" / "sam3.pt"
+    shared_root = (
+        Path(asset_root).expanduser().resolve()
+        if asset_root.strip()
+        else repo_root.parent / "sam3"
+    )
+    candidates = (
+        local_checkpoint,
+        shared_root / "sam3.pt",
+        shared_root / "权重" / "sam3.pt",
+        shared_root / "weights" / "sam3.pt",
+    )
+    return next((candidate for candidate in candidates if candidate.is_file()), local_checkpoint)
 
 
 def resolve_runtime_policy(
@@ -44,7 +70,13 @@ def resolve_runtime_policy(
     if precision not in {"auto", "fp32", "fp16", "int8_dynamic"}:
         raise ValueError(f"unsupported SAM3_PRECISION: {requested_precision}")
     if precision == "auto":
-        precision = "int8_dynamic" if device == "cpu" else "fp16"
+        precision = (
+            "int8_dynamic"
+            if device == "cpu"
+            else "fp16"
+            if device == "cuda"
+            else "fp32"
+        )
     if precision == "int8_dynamic" and device != "cpu":
         raise ValueError("dynamic INT8 quantization is supported only on CPU")
     if precision == "fp16" and device == "cpu":

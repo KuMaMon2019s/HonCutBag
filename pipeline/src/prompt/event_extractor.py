@@ -22,6 +22,7 @@ import sys
 import os
 import argparse
 import hashlib
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any
@@ -40,15 +41,19 @@ from utils.ark_llm import (
 # ─── LLM 配置 ───────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = (
-    "你是一个影视编剧助手。从文本中提取可视化事件。"
-    "每个事件必须能转化为一个视频镜头。输出严格 JSON 数组。"
+    "你是动作影视编剧与连续性编辑。从文本中提取可拍摄的叙事动作单元。"
+    "事件不是镜头：不要把每句话或每个招式机械拆成一个事件，镜头划分由下游导演完成。"
+    "你必须保留动作的起始状态、结束状态、因果关系和无署名对白的可靠归属。输出严格 JSON 数组。"
     "不要输出任何解释文字，只输出 JSON。"
 )
 
 USER_PROMPT_TEMPLATE = (
-    "从以下文本中提取事件：\n\n"
-    "{content}\n\n"
-    "输出 JSON 数组，每个元素包含：\n"
+    "文档类型：{format_hint}\n\n"
+    "以下前后文只用于判断人物、对白归属和动作承接，严禁从前后文重复提取事件：\n"
+    "<context_before>\n{context_before}\n</context_before>\n"
+    "<target>\n{content}\n</target>\n"
+    "<context_after>\n{context_after}\n</context_after>\n\n"
+    "只从 <target> 提取事件。输出 JSON 数组，每个元素包含：\n"
     "- who: 数组，参与者列表\n"
     "- where: 字符串，地点\n"
     "- what: 字符串，发生了什么\n"
@@ -56,10 +61,33 @@ USER_PROMPT_TEMPLATE = (
     "- visual: 字符串，描述画面（用于生成视频镜头）\n"
     "- time: 字符串，时间/季节\n"
     "- action_type: 字符串，事件类型（discovery/conflict/resolution/transition 等）\n"
+    "- event_role: 字符串，只能是 scene_setup/character_state/dialogue/action_chain/reaction/consequence/turning_point/transition\n"
+    "- source_excerpt: 字符串，逐字摘录 <target> 中支撑本事件的连续原文\n"
+    "- micro_actions: 字符串数组，按发生顺序列出本动作单元中的可见动作；非动作事件为 []\n"
+    "- action_phase: 字符串，只能是 none/setup/attack/counter/impact/recovery/consequence\n"
+    "- start_state: 字符串，本单元开始时人物、武器、空间与运动状态\n"
+    "- end_state: 字符串，本单元结束时可供下一段承接的定格状态\n"
+    "- causal_link: 字符串，说明本单元由上一事件的什么动作或决定引发；无则为空字符串\n"
+    "- continuity_before: 字符串，cut/continuous；只有同一时空且状态直接承接才为 continuous\n"
+    "- continuity_subject: 字符串，continuous 时跨单元跟踪的主要人物或物体，否则为空字符串\n"
+    "- dramatic_turn: 布尔值，立场、目标、关系或战局是否在这里发生转折\n"
     "- lines: 数组，本事件中角色说出的台词原文，每条为 "
-    "{{\"speaker\": \"角色名\", \"line\": \"逐字台词\"}}；无台词时为空数组 []\n"
+    "{{\"speaker\": \"角色名或未知\", \"line\": \"逐字台词\", "
+    "\"confidence\": 0到1, \"evidence\": \"归属依据\"}}；无台词时为空数组 []\n"
     "line 必须逐字保留剧本原文，禁止改写、摘要或翻译。\n"
     "剧本对白可能写作 角色名：\"台词\" 或 角色名:\"台词\"，全角/半角冒号与引号均可能出现。"
+    "只有证据充分才填写角色名；若只能猜测，speaker 写‘未知’并降低 confidence，禁止为了完整而编造。\n\n"
+    "【小说化动作剧本规则】\n"
+    "1. 环境建立、人物当前造型/受损状态、对白、动作链、后果和情绪反转是不同 event_role。\n"
+    "2. 连续的攻→防→反击→结果应按一个有因果闭环的动作单元提取，通常包含 2-8 个 micro_actions；"
+    "不要把‘抬手/挡住/后退’各自拆成独立事件。\n"
+    "3. 当动作改变场景或人物状态（护栏被斩断、柱体坍塌、武器停在颈侧）必须写入 end_state，"
+    "不能只概括为‘双方打斗’。\n"
+    "4. 原文中的停顿、救援、放下武器、共同迎敌等关系反转必须单列 turning_point，dramatic_turn=true。\n"
+    "5. 相邻事件若动作位置、朝向、速度和受力状态直接延续，continuity_before=continuous；"
+    "换场、跳时、视角独立重置或新叙事段落为 cut。\n"
+    "6. who 只放可作为角色资产的具名个体；‘数十道机械身影’‘群众’‘部队’等群体只写入 visual，"
+    "不得写入 who。"
 )
 
 LLM_TIMEOUT = 300
@@ -113,7 +141,86 @@ def _call_llm(prompt: str) -> str:
     )
 
 
-def _parse_events(response: str) -> List[Dict[str, Any]]:
+_EVENT_ROLES = {
+    "scene_setup", "character_state", "dialogue", "action_chain", "reaction",
+    "consequence", "turning_point", "transition",
+}
+_ACTION_PHASES = {"none", "setup", "attack", "counter", "impact", "recovery", "consequence"}
+_GROUP_PARTICIPANT_RE = re.compile(
+    r"(?:数[十百千]|机械(?:单位|身影|部队|群)|群众|人群|群体|军队|部队|居民群|敌群)"
+)
+_LOCATION_ANCHORS = (
+    "高架", "桥", "公路", "街道", "巷", "广场", "工地", "场地", "废墟", "巴士",
+    "钢梁", "立柱", "积水", "室内", "房间", "大厅", "走廊", "屋顶", "森林", "山",
+    "海", "河", "车站", "机场", "学校", "医院", "仓库", "工厂", "酒吧", "餐厅",
+)
+_NARRATIVE_JUMP_CUES = (
+    "与此同时", "另一边", "次日", "翌日", "后来", "数小时后", "多年后", "回忆",
+    "梦境", "转场", "来到", "抵达", "离开当前", "meanwhile", "later", "next day",
+)
+
+
+def _normalize_event(event: Dict[str, Any], source_content: str = "") -> Dict[str, Any]:
+    who = event.get("who", [])
+    if isinstance(who, str):
+        who = [who] if who.strip() else []
+    normalized_who = [str(name).strip() for name in who if str(name).strip()] if isinstance(who, list) else []
+    background_groups = [name for name in normalized_who if _GROUP_PARTICIPANT_RE.search(name)]
+    event["who"] = [name for name in normalized_who if name not in background_groups]
+    if background_groups:
+        event["background_groups"] = background_groups
+
+    role = str(event.get("event_role") or "").strip().lower()
+    if role not in _EVENT_ROLES:
+        action_type = str(event.get("action_type") or "").lower()
+        if action_type in {"conflict", "action", "fight", "chase"}:
+            role = "action_chain"
+        elif action_type in {"resolution", "reversal"}:
+            role = "turning_point"
+        elif action_type == "transition":
+            role = "transition"
+        else:
+            role = "scene_setup"
+    event["event_role"] = role
+
+    micro_actions = event.get("micro_actions", [])
+    if isinstance(micro_actions, str):
+        micro_actions = [micro_actions] if micro_actions.strip() else []
+    event["micro_actions"] = [str(item).strip() for item in micro_actions if str(item).strip()] if isinstance(micro_actions, list) else []
+    phase = str(event.get("action_phase") or "none").strip().lower()
+    event["action_phase"] = phase if phase in _ACTION_PHASES else "none"
+    for field in ("start_state", "end_state", "causal_link", "continuity_subject", "source_excerpt"):
+        event[field] = str(event.get(field) or "").strip()
+    boundary = str(event.get("continuity_before") or "cut").strip().lower()
+    event["continuity_before"] = boundary if boundary in {"cut", "continuous"} else "cut"
+    event["dramatic_turn"] = bool(event.get("dramatic_turn", role == "turning_point"))
+
+    lines = event.get("lines", [])
+    normalized_lines = []
+    if isinstance(lines, list):
+        for raw in lines:
+            if not isinstance(raw, dict) or not str(raw.get("line") or "").strip():
+                continue
+            line = str(raw["line"]).strip()
+            if source_content and line not in source_content:
+                raise ValueError(f"台词不是 target 中的逐字原文: {line}")
+            try:
+                confidence = float(raw.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                confidence = 0.0
+            confidence = max(0.0, min(1.0, confidence))
+            speaker = str(raw.get("speaker") or "未知").strip() or "未知"
+            normalized_lines.append({
+                "speaker": speaker,
+                "line": line,
+                "confidence": confidence,
+                "evidence": str(raw.get("evidence") or "").strip(),
+            })
+    event["lines"] = normalized_lines
+    return event
+
+
+def _parse_events(response: str, source_content: str = "") -> List[Dict[str, Any]]:
     """
     解析 LLM 响应为事件列表
 
@@ -156,7 +263,7 @@ def _parse_events(response: str) -> List[Dict[str, Any]]:
         missing = required_fields - set(event.keys())
         if missing:
             raise ValueError(f"第 {i+1} 个事件缺少字段: {missing}")
-        event.setdefault("lines", [])
+        _normalize_event(event, source_content)
 
     return parsed
 
@@ -180,13 +287,18 @@ def _extract_events_from_segment(segment: Dict[str, Any]) -> List[Dict[str, Any]
     if not content.strip():
         return []
 
-    prompt = USER_PROMPT_TEMPLATE.format(content=content)
+    prompt = USER_PROMPT_TEMPLATE.format(
+        content=content,
+        format_hint=segment.get("format_hint", "general_prose"),
+        context_before=segment.get("context_before", ""),
+        context_after=segment.get("context_after", ""),
+    )
 
     last_error = None
     for attempt in range(1 + MAX_RETRIES):
         try:
             response = _call_llm(prompt)
-            events = _parse_events(response)
+            events = _parse_events(response, content)
             return events
         except (json.JSONDecodeError, ValueError) as e:
             last_error = e
@@ -246,17 +358,93 @@ def extract_events(segments: List[Dict[str, Any]]) -> Dict[str, Any]:
             all_events.append(event)
             event_id += 1
 
+    _annotate_global_event_flow(all_events)
+
     source_hash = hashlib.sha256(
         json.dumps(source_segments, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
     return {
-        "schema_version": "2.0",
+        "schema_version": "3.0",
+        "document_format": next(
+            (str(segment.get("format_hint")) for segment in source_segments if segment.get("format_hint")),
+            "general_prose",
+        ),
         "source_segments_hash": source_hash,
         "source_segment_count": len(source_segments),
         "covered_segment_ids": [segment_id for segment_id, _events in ordered_results],
         "total_events": len(all_events),
         "events": all_events,
     }
+
+
+def _annotate_global_event_flow(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Assign deterministic global sequence/action/dialogue identities in source order."""
+    sequence_number = 0
+    action_number = 0
+    dialogue_number = 0
+    previous: Dict[str, Any] | None = None
+    current_sequence = ""
+    for index, event in enumerate(events, 1):
+        boundary = str(event.get("continuity_before") or "cut").lower()
+        exact_same_place = bool(
+            previous
+            and str(previous.get("where") or "").strip()
+            and str(previous.get("where") or "").strip() == str(event.get("where") or "").strip()
+        )
+        compatible_place = bool(previous and _locations_compatible(previous, event))
+        if previous and boundary == "cut" and _should_repair_cross_segment_boundary(previous, event):
+            event["model_continuity_before"] = "cut"
+            event["continuity_repair_reason"] = (
+                "cross-segment causal action state continues despite location wording drift"
+            )
+            boundary = "continuous"
+        if index == 1 or boundary != "continuous" or not (exact_same_place or compatible_place):
+            boundary = "cut"
+            sequence_number += 1
+            current_sequence = f"SEQ{sequence_number:03d}"
+        event["continuity_before"] = boundary
+        event["sequence_id"] = current_sequence
+
+        if event.get("event_role") in {"action_chain", "reaction", "consequence", "turning_point"} and (
+            event.get("micro_actions") or event.get("action_phase") != "none"
+        ):
+            action_number += 1
+            event["action_unit_id"] = f"AU{action_number:03d}"
+        else:
+            event["action_unit_id"] = None
+        for line in event.get("lines", []):
+            dialogue_number += 1
+            line["dialogue_id"] = f"D{dialogue_number:03d}"
+        previous = event
+    return events
+
+
+def _locations_compatible(previous: Dict[str, Any], current: Dict[str, Any]) -> bool:
+    previous_where = str(previous.get("where") or "")
+    current_where = str(current.get("where") or "")
+    previous_anchors = {anchor for anchor in _LOCATION_ANCHORS if anchor in previous_where}
+    current_anchors = {anchor for anchor in _LOCATION_ANCHORS if anchor in current_where}
+    return bool(previous_anchors & current_anchors)
+
+
+def _should_repair_cross_segment_boundary(
+    previous: Dict[str, Any], current: Dict[str, Any]
+) -> bool:
+    if previous.get("segment_id") == current.get("segment_id"):
+        return False
+    if current.get("event_role") in {"scene_setup", "transition"}:
+        return False
+    combined = " ".join(
+        str(current.get(field) or "")
+        for field in ("what", "start_state", "causal_link", "source_excerpt")
+    )
+    if any(cue in combined for cue in _NARRATIVE_JUMP_CUES):
+        return False
+    previous_who = set(previous.get("who") or [])
+    current_who = set(current.get("who") or [])
+    shared_subject = bool(previous_who & current_who)
+    causal = bool(str(current.get("causal_link") or "").strip())
+    return shared_subject and causal and _locations_compatible(previous, current)
 
 
 def extract_events_from_text(text: str) -> Dict[str, Any]:

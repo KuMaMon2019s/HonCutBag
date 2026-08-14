@@ -884,10 +884,18 @@ class Sam3ImageOnVideoMultiGPU(Sam3Image):
             assert len(feats["backbone_fpn"]) == 3  # SAM2 backbone always have 3 levels
             # cast the SAM2 backbone features to bfloat16 for all-gather (this is usually
             # a no-op, SAM2 backbone features are likely already in bfloat16 due to AMP)
-            # On MPS, bfloat16 is not supported in conv/linear layers, so skip the cast.
-            _fpn_dtype = torch.bfloat16
-            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                _fpn_dtype = torch.float32  # MPS does not support bfloat16
+            # CUDA uses BF16 communication. MPS and HonCut's quantized CPU path
+            # need FP32 because their following Conv/QNNPACK layers reject BF16.
+            cpu_bf16 = os.environ.get("SAM3_CPU_BF16", "").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+            }
+            _fpn_dtype = (
+                torch.bfloat16
+                if self.device.type == "cuda" or (self.device.type == "cpu" and cpu_bf16)
+                else torch.float32
+            )
             backbone_fpn_bf16 = [x.to(_fpn_dtype) for x in feats["backbone_fpn"]]
             fpn0, fpn_handle0 = self._gather_tensor(backbone_fpn_bf16[0])
             fpn1, fpn_handle1 = self._gather_tensor(backbone_fpn_bf16[1])

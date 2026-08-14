@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -43,6 +43,15 @@ class StoryboardShot(BaseModel):
     where: str = ""
     who: str | list[str] = Field(default_factory=list)
     dialogue: Any = None
+    boundary_before: Literal["cut", "continuous"] = "cut"
+    continuity_reason: str = ""
+    continuity_subject: str = ""
+    source_excerpt: str = ""
+    source_sequence_ids: list[str] = Field(default_factory=list)
+    source_action_unit_ids: list[str] = Field(default_factory=list)
+    source_event_roles: list[str] = Field(default_factory=list)
+    micro_actions: list[str] = Field(default_factory=list)
+    speaker_attribution: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class Storyboard(BaseModel):
