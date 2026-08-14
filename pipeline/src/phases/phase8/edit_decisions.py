@@ -168,6 +168,7 @@ def build_edit_decisions(
     transition_duration: float = 0.5,
     fit_mode: str = "cover",
     continuity_plan: dict | None = None,
+    allow_unresolved_reshoots: bool = False,
 ) -> dict:
     """Build reviewed edit decisions from shot videos.
 
@@ -188,6 +189,7 @@ def build_edit_decisions(
     quality_shots = (quality_report or {}).get("shots", {})
 
     cuts = []
+    unresolved_reshoots: list[str] = []
     for shot_dir in shot_dirs:
         video_path = shot_dir / "output.mp4"
         if not video_path.exists():
@@ -199,9 +201,12 @@ def build_edit_decisions(
 
         quality = quality_shots.get(shot_dir.name, {})
         if quality.get("action") == "reshoot":
-            raise ValueError(
-                f"{shot_dir.name} still requires reshoot: {'; '.join(quality.get('reasons', []))}"
-            )
+            if not allow_unresolved_reshoots:
+                raise ValueError(
+                    f"{shot_dir.name} still requires reshoot: "
+                    f"{'; '.join(quality.get('reasons', []))}"
+                )
+            unresolved_reshoots.append(shot_dir.name)
         timing_path = shot_dir / "CONTINUITY_TIMING.json"
         continuity_timing = None
         if timing_path.is_file():
@@ -379,6 +384,8 @@ def build_edit_decisions(
             "projected_frames": projected_frames,
             "target_duration": target_duration,
             "quality_reviewed": bool(quality_report),
+            "allow_unresolved_reshoots": allow_unresolved_reshoots,
+            "unresolved_reshoots": unresolved_reshoots,
             "transition_locks": transition_locks,
             "continuity_trims": continuity_trim_receipts,
             "audio_transition_policy": {

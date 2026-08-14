@@ -243,6 +243,17 @@ def _load_boundary_map(root: Path, filename: str, kind: str) -> dict[str, dict[s
     }
 
 
+def _object_evidence_needs_retry(evidence: dict[str, Any] | None) -> bool:
+    """Retry missing/transient SAM3 evidence, not deterministic same-source misses."""
+    if evidence is None:
+        return True
+    if str(evidence.get("verdict") or "") != "unavailable":
+        return False
+    return str(evidence.get("reason") or "").startswith(
+        "SAM 3 trajectory analysis failed:"
+    )
+
+
 def adjudicate_continuity_seams(
     output_dir: str | Path,
     *,
@@ -373,6 +384,12 @@ def adjudicate_continuity_seams(
                 and object_evidence.get("source_fingerprint") != source_fingerprint
             ):
                 object_evidence = None
+            review = temporal_reviews.get(boundary_id) or {}
+            exact_source_review = bool(
+                review.get("source_fingerprint") == source_fingerprint
+                and review.get("action") == "hard_trim"
+                and int(review.get("approved_trim_frames") or 0) > 0
+            )
             tracking_prompt = shot.anchors.tracking_prompt.strip()
             candidates = list(trajectory.get("candidates", []))
             preliminary = decide_temporal_seam(
@@ -387,12 +404,11 @@ def adjudicate_continuity_seams(
                 preliminary.get("action") == "human_review"
                 or (cross_shot_boundary and planned_frames > 0)
             )
-            object_evidence_retriable = object_evidence is None or str(
-                object_evidence.get("verdict")
-            ) == "unavailable"
+            object_evidence_retriable = _object_evidence_needs_retry(object_evidence)
             if (
                 needs_object_corroboration
                 and object_evidence_retriable
+                and not exact_source_review
                 and sam3_url
                 and tracking_prompt
             ):
@@ -435,12 +451,18 @@ def adjudicate_continuity_seams(
                     max_extra_search_frames=max(0, searchable_frames - planned_frames),
                     object_trajectory_evidence=object_evidence,
                 )
-            review = temporal_reviews.get(boundary_id) or {}
             human_approved = bool(
                 review.get("action") == "hard_trim"
                 and review.get("source_fingerprint") == source_fingerprint
                 and int(review.get("approved_trim_frames") or 0)
                 == int(preliminary.get("trim_frames") or 0)
+            )
+            human_selected_planned_trim = bool(
+                review.get("action") == "hard_trim"
+                and review.get("source_fingerprint") == source_fingerprint
+                and int(review.get("approved_trim_frames") or 0) == planned_frames
+                and preliminary.get("rollback_detected")
+                and int(preliminary.get("trim_frames") or 0) > planned_frames
             )
             decision = (
                 {
@@ -450,6 +472,26 @@ def adjudicate_continuity_seams(
                     "corroboration": "exact-source, exact-frame human review",
                 }
                 if human_approved and preliminary.get("rollback_detected")
+                else {
+                    **preliminary,
+                    "action": "hard_trim",
+                    "rollback_detected": False,
+                    "trim_frames": planned_frames,
+                    "trim_seconds": round(planned_frames / plan.timeline_fps, 6),
+                    "additional_trim_frames": 0,
+                    "frame_policy": "do_not_interpolate",
+                    "confidence": "human_confirmed_planned_overlap",
+                    "corroboration": (
+                        "exact-source human review rejected the appearance-only "
+                        "additional trim"
+                    ),
+                    "reason": (
+                        "remove only the intentional native-extension replay prefix; "
+                        "the apparent late rollback is background-dominated"
+                    ),
+                    "appearance_only_proposal": preliminary,
+                }
+                if human_selected_planned_trim
                 else preliminary
             )
             current_row = timing_rows.get(following_chunk.chunk_id, {})

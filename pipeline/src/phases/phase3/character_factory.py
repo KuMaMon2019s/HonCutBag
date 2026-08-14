@@ -279,6 +279,29 @@ FULL_BODY_IMAGE_RULES = (
 FULL_BODY_REFERENCE_SIZE = "1440x2560"
 
 
+def _reference_rendering_clause(style: str) -> str:
+    """Keep character references in the project's declared visual medium.
+
+    Character Factory historically forced every reference to be photorealistic,
+    even when ``style`` explicitly requested animation or illustration.  That
+    creates an identity/style mismatch which then propagates into every video
+    shot.  Preserve the legacy default only when no non-photographic medium is
+    declared.
+    """
+    normalized = str(style or "").lower()
+    non_photographic_markers = (
+        "二维", "动画", "动漫", "赛璐璐", "厚涂", "插画", "手绘", "漫画",
+        "2d", "animation", "anime", "cel shading", "illustration", "painted",
+    )
+    if any(marker in normalized for marker in non_photographic_markers):
+        return (
+            "2D cinematic character illustration in the exact declared project style, "
+            "painted cel shading, deliberately designed fictional facial features, "
+            "consistent linework and color blocks, no photoreal skin, no live-action person"
+        )
+    return "Photorealistic, natural skin texture"
+
+
 def build_model_reference_prompts(
     character_desc: str, style: str = "", target_model: str = "seedance"
 ) -> dict:
@@ -288,7 +311,8 @@ def build_model_reference_prompts(
         "This is a fully fictional AI-generated character (virtual avatar), "
         "not a real person; the face is a synthetic digital creation"
     )
-    identity = f"{fictional_decl}. {character_desc}{suffix}. Photorealistic, neutral expression"
+    rendering = _reference_rendering_clause(style)
+    identity = f"{fictional_decl}. {character_desc}{suffix}. {rendering}, neutral expression"
     if "kling" in target_model.lower():
         return {
             "front": f"{identity}, {SOURCE_IMAGE_RULES}, front portrait, identity reference",
@@ -324,9 +348,10 @@ def build_combined_sheet_prompt(
     style_suffix = f"，{style}" if style else ""
     full_desc = f"{character_desc}{style_suffix}"
     
+    rendering = _reference_rendering_clause(style)
     prompt = (
         "【宏观描述】所有角色均为 AI 生成的虚拟形象，非真实人物。"
-        "画面风格：真人写实风格，照片级渲染，细节超高清。"
+        f"画面媒介：{rendering}。"
         "根据以下角色描述，生成一张纯白背景的角色四视图设定表。"
         "要求服装、发型、配饰等所有细节在四个视角中完全一致。\n"
         "【微观描述】\n"
@@ -338,7 +363,7 @@ def build_combined_sheet_prompt(
         "   - 左下：90度侧面全身站立像（纯侧面轮廓，从头顶到脚底完整）\n"
         "   - 右下：背面全身站立像（后脑/背部/发尾清晰，从头顶到脚底完整）\n"
         "4. 自然站立，双臂自然下垂，双脚平行微分。\n"
-        "5. 四视图一致性，面容细腻渲染，发丝根根分明，皮肤真实质感。\n"
+        "5. 四视图身份、设计语言、线条和色块完全一致；面部与发型细节清晰，但不得改变既定画面媒介。\n"
         "6. 画面比例 1:1 正方形，2×2网格布局。图中不要有任何文字。\n"
         "质感十足，高质量，震撼的视觉效果。"
     )
@@ -636,13 +661,14 @@ def generate_character(
             try:
                 # Build variant prompt: base appearance + state change
                 # Emphasize face must remain identical
+                rendering = _reference_rendering_clause(style)
                 variant_prompt = (
                     f"Character reference sheet, same person as base reference. "
                     f"State change: {variant_desc}. "
                     f"CRITICAL: facial features, bone structure, and identity must remain "
                     f"100% identical to the base character. Only modify clothing, hair condition, "
                     f"or add props as described in the state change. "
-                    f"Photorealistic, front view, full body, white background, consistent lighting."
+                    f"{rendering}, front view, full body, white background, consistent lighting."
                 )
                 
                 print(f"  [variant] Generating {variant_filename}...")

@@ -143,6 +143,104 @@ def _probe_fps(path: str) -> float:
     return float(frac)
 
 
+def _duration_preserving_speed_map(
+    boundaries: list[float],
+    speed_map: dict[int, float],
+) -> dict[int, float]:
+    """Normalize relative segment speeds without changing total duration.
+
+    A rhythm map describes *relative* pacing, not permission to shorten or
+    lengthen the delivery.  If segment ``i`` has source duration ``d_i`` and
+    requested speed ``s_i``, scaling every speed by
+
+        sum(d_i / s_i) / sum(d_i)
+
+    makes ``sum(d_i / normalized_s_i)`` equal the source duration.  Segments
+    omitted from ``speed_map`` participate at 1.0x so faster action can borrow
+    time from calmer material instead of causing cumulative runtime drift.
+    """
+    if len(boundaries) < 2:
+        return {}
+
+    durations = [
+        max(0.0, float(boundaries[i + 1]) - float(boundaries[i]))
+        for i in range(len(boundaries) - 1)
+    ]
+    total_duration = sum(durations)
+    if total_duration <= 0:
+        return {}
+
+    requested: list[float] = []
+    for i in range(len(durations)):
+        speed = float(speed_map.get(i, 1.0))
+        if speed <= 0:
+            raise ValueError(f"Invalid non-positive speed for segment {i}: {speed}")
+        requested.append(speed)
+
+    scale = sum(
+        segment_duration / speed
+        for segment_duration, speed in zip(durations, requested)
+    ) / total_duration
+    return {
+        i: requested_speed * scale
+        for i, requested_speed in enumerate(requested)
+    }
+
+
+def _write_delivery_timeline(
+    output_path: str,
+    edit_timeline: dict,
+    source_boundaries: list[float],
+    normalized_speed_map: dict[int, float],
+) -> Optional[str]:
+    """Persist shot boundaries after rhythm time-warping.
+
+    Phase 8's ``edit_timeline.json`` remains the assembly receipt.  Phase 9
+    writes a separate delivery timebase so captions and final semantic QA do
+    not sample shots at stale pre-rhythm timestamps.
+    """
+    shots = edit_timeline.get("shots", []) if isinstance(edit_timeline, dict) else []
+    segment_count = max(0, len(source_boundaries) - 1)
+    if not shots or len(shots) != segment_count:
+        return None
+
+    delivery_shots: list[dict] = []
+    cursor = 0.0
+    for i, source_item in enumerate(shots):
+        source_duration = source_boundaries[i + 1] - source_boundaries[i]
+        rhythm_speed = normalized_speed_map.get(i, 1.0)
+        output_duration = source_duration / rhythm_speed
+        item = dict(source_item)
+        for stale_key in (
+            "output_start_frame", "output_end_frame", "output_duration_frames"
+        ):
+            item.pop(stale_key, None)
+        item["assembly_output_start_s"] = source_boundaries[i]
+        item["assembly_output_end_s"] = source_boundaries[i + 1]
+        item["rhythm_speed"] = round(rhythm_speed, 9)
+        item["speed"] = round(float(item.get("speed", 1.0) or 1.0) * rhythm_speed, 9)
+        item["output_start_s"] = round(cursor, 9)
+        cursor += output_duration
+        item["output_end_s"] = round(cursor, 9)
+        item["output_duration_s"] = round(output_duration, 9)
+        delivery_shots.append(item)
+
+    delivery = {
+        "version": 1,
+        "artifact": Path(output_path).name,
+        "basis": "Phase 8 edit timeline warped by Phase 9 rhythm speeds",
+        "duration_s": round(cursor, 9),
+        "shots": delivery_shots,
+        "transitions": edit_timeline.get("transitions", []),
+    }
+    delivery_path = str(Path(output_path).with_name("delivery_timeline.json"))
+    Path(delivery_path).write_text(
+        json.dumps(delivery, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    print(f"  [timeline] wrote {delivery_path}")
+    return delivery_path
+
+
 # ---------------------------------------------------------------------------
 # 核心函数
 # ---------------------------------------------------------------------------
@@ -237,10 +335,18 @@ def apply_speed_ramp(
     duration = _probe_duration(video_path)
 
     # 构建分段边界: [0, cut1, cut2, ..., duration]
-    boundaries = [0.0] + scene_cuts + [duration]
+    valid_cuts = sorted({
+        float(cut) for cut in scene_cuts
+        if 0.0 < float(cut) < duration
+    })
+    boundaries = [0.0] + valid_cuts + [duration]
+    normalized_speed_map = _duration_preserving_speed_map(boundaries, speed_map)
 
     # 检查是否所有段都是 1.0x（无需变速）
-    all_normal = all(speed_map.get(i, 1.0) == 1.0 for i in range(len(boundaries) - 1))
+    all_normal = all(
+        abs(normalized_speed_map.get(i, 1.0) - 1.0) < 1e-6
+        for i in range(len(boundaries) - 1)
+    )
     if all_normal:
         if video_path != output_path:
             _run(["cp", video_path, output_path], "copy (all 1.0x)")
@@ -258,7 +364,7 @@ def apply_speed_ramp(
         start = boundaries[i]
         end = boundaries[i + 1]
         seg_dur = end - start
-        speed = speed_map.get(i, 1.0)
+        speed = normalized_speed_map.get(i, 1.0)
 
         # 视频: trim → setpts
         filter_parts.append(
@@ -284,7 +390,18 @@ def apply_speed_ramp(
     # concat 所有段
     concat_str = "".join(concat_inputs)
     filter_parts.append(
-        f"{concat_str}concat=n={n_segments}:v=1:a=1[outv][outa]"
+        f"{concat_str}concat=n={n_segments}:v=1:a=1[joinedv][joineda]"
+    )
+    # Normalization preserves duration mathematically.  The final trim/pad
+    # closes codec/frame rounding to the exact source timebase for Phase 9's
+    # delivery gate (and prevents a short audio encoder tail).
+    filter_parts.append(
+        f"[joinedv]tpad=stop_mode=clone:stop_duration=1,"
+        f"trim=duration={duration:.9f},setpts=PTS-STARTPTS[outv]"
+    )
+    filter_parts.append(
+        f"[joineda]apad,atrim=duration={duration:.9f},"
+        f"asetpts=PTS-STARTPTS[outa]"
     )
 
     filter_complex = ";".join(filter_parts)
@@ -418,6 +535,7 @@ def edit_rhythm(
     video_path: str,
     storyboard_path: Optional[str] = None,
     bgm_path: Optional[str] = None,
+    timeline_path: Optional[str] = None,
     enable_speed_ramp: bool = True,
     enable_beat_sync: bool = True,
     enable_transition_refine: bool = True,
@@ -454,12 +572,38 @@ def edit_rhythm(
             shots = sb.get("shots", sb.get("segments", []))
         print(f"  storyboard: {len(shots)} shots loaded")
 
+    # Phase 8 owns the authoritative shot boundaries.  Scene detection is only
+    # a fallback because visual flashes inside an action shot are not cuts.
+    input_duration = _probe_duration(video_path)
+    edit_timeline: dict = {}
+    timeline_shots: list[dict] = []
+    if timeline_path and os.path.isfile(timeline_path):
+        try:
+            with open(timeline_path, encoding="utf-8") as f:
+                edit_timeline = json.load(f)
+            timeline_shots = list(edit_timeline.get("shots", []))
+        except (OSError, json.JSONDecodeError, TypeError):
+            edit_timeline = {}
+            timeline_shots = []
+
     # ---- Step 1: 分析节奏 ----
     print(f"\n[1/3] Analyzing rhythm...")
 
-    # 场景切割检测
-    scene_cuts = detect_scene_cuts(video_path)
-    print(f"  scene cuts: {len(scene_cuts)} detected")
+    if timeline_shots:
+        timeline_duration = float(
+            edit_timeline.get("duration_s")
+            or timeline_shots[-1].get("output_end_s")
+            or input_duration
+        )
+        timeline_scale = input_duration / timeline_duration if timeline_duration > 0 else 1.0
+        scene_cuts = [
+            float(item.get("output_end_s", 0.0)) * timeline_scale
+            for item in timeline_shots[:-1]
+        ]
+        print(f"  shot cuts: {len(scene_cuts)} loaded from edit timeline")
+    else:
+        scene_cuts = detect_scene_cuts(video_path)
+        print(f"  scene cuts: {len(scene_cuts)} detected")
 
     # BGM 节拍检测
     beats: list[float] = []
@@ -474,6 +618,10 @@ def edit_rhythm(
 
     # ---- Step 2: 变速调整 ----
     current_path = video_path
+    source_boundaries = [0.0] + scene_cuts + [input_duration]
+    normalized_speed_map = {
+        i: 1.0 for i in range(max(0, len(source_boundaries) - 1))
+    }
     if enable_speed_ramp and shots:
         print(f"\n[2/3] Applying speed ramp...")
         speed_map: dict[int, float] = {}
@@ -484,12 +632,21 @@ def edit_rhythm(
                 speed_map[i] = speed
 
         if speed_map:
+            normalized_speed_map = _duration_preserving_speed_map(
+                source_boundaries, speed_map
+            )
             ramped_path = output_path.rsplit(".", 1)[0] + "_ramped.mp4"
             apply_speed_ramp(video_path, speed_map, scene_cuts, ramped_path)
             current_path = ramped_path
-            # 变速后 scene_cuts 时间点会变化，需要重新检测或按比例调整
-            # 简化：重新检测
-            scene_cuts = detect_scene_cuts(current_path)
+            cursor = 0.0
+            warped_cuts: list[float] = []
+            for i in range(len(source_boundaries) - 1):
+                cursor += (
+                    source_boundaries[i + 1] - source_boundaries[i]
+                ) / normalized_speed_map[i]
+                if i < len(source_boundaries) - 2:
+                    warped_cuts.append(cursor)
+            scene_cuts = warped_cuts
         else:
             print(f"  no speed changes needed (all 1.0x)")
     else:
@@ -539,6 +696,14 @@ def edit_rhythm(
     if current_path != output_path:
         _run(["cp", current_path, output_path], "final copy")
 
+    if edit_timeline:
+        _write_delivery_timeline(
+            output_path,
+            edit_timeline,
+            source_boundaries,
+            normalized_speed_map,
+        )
+
     # 清理中间文件
     ramped = output_path.rsplit(".", 1)[0] + "_ramped.mp4"
     if os.path.isfile(ramped) and ramped != output_path:
@@ -567,6 +732,7 @@ def main():
     )
     parser.add_argument("--input", "-i", required=True, help="输入视频路径 (visual_final.mp4)")
     parser.add_argument("--storyboard", "-s", default=None, help="STORYBOARD.json 路径")
+    parser.add_argument("--timeline", default=None, help="Phase 8 edit_timeline.json 路径")
     parser.add_argument("--bgm", "-b", default=None, help="BGM 音频文件路径（用于卡点分析）")
     parser.add_argument("--output", "-o", default="polished.mp4", help="输出视频路径")
     parser.add_argument("--no-speed", action="store_true", help="禁用变速调整")
@@ -578,6 +744,7 @@ def main():
     edit_rhythm(
         video_path=args.input,
         storyboard_path=args.storyboard,
+        timeline_path=args.timeline,
         bgm_path=args.bgm,
         enable_speed_ramp=not args.no_speed,
         enable_beat_sync=not args.no_beat,

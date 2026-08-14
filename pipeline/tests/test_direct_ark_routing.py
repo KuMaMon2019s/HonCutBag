@@ -1706,6 +1706,54 @@ def test_storyboard_keyframe_prompt_prioritizes_identity_and_action():
     assert "No exposed midriff" in prompt
 
 
+def test_storyboard_keyframe_prompt_keeps_dialogue_out_of_image():
+    prompt = pipeline_core._storyboard_keyframe_description(
+        {
+            "who": ["凛", "烬"],
+            "action_description": "刀锋撞上机械臂。\n“凛，停下。”“放手！”",
+            "visual": "暴雨中的废弃高架",
+        }
+    )
+
+    assert "刀锋撞上机械臂" in prompt
+    assert "凛，停下" not in prompt
+    assert "放手" not in prompt
+    assert "no speech bubbles" in prompt
+
+
+def test_end_frame_prompt_uses_last_micro_action_and_full_cast():
+    prompt = pipeline_core.build_end_frame_prompt(
+        {
+            "who": ["凛", "烬"],
+            "micro_actions": ["凛冲出", "烬扣住刀背，二人陷入角力僵持"],
+            "subject_description": "凛银白长发；烬黑色机械左臂",
+            "prompt": "暴雨中的废弃高架",
+        }
+    )
+
+    assert "Exact final micro-action: 烬扣住刀背，二人陷入角力僵持" in prompt
+    assert "exactly 2 principal character(s): 凛, 烬" in prompt
+    assert "凛银白长发；烬黑色机械左臂" in prompt
+    assert "do not omit" in prompt
+    assert "no speech bubbles" in prompt
+
+
+def test_end_frame_prompt_locks_allies_to_same_enemy_direction():
+    prompt = pipeline_core.build_end_frame_prompt(
+        {
+            "who": ["凛", "烬"],
+            "what": "凛与烬并肩持刃共同迎敌",
+            "micro_actions": ["两柄黑刃同时抬起，指向前方"],
+            "prompt": "机械军阵正在远处雨幕中逼近",
+        }
+    )
+
+    assert "stand shoulder-to-shoulder" in prompt
+    assert "rear three-quarter camera behind the allies" in prompt
+    assert "blades stay parallel and must not cross" in prompt
+    assert "must never face, threaten, or point a weapon at each other" in prompt
+
+
 def test_storyboard_keyframe_explicit_empty_cast_is_environment_only():
     prompt = pipeline_core._storyboard_keyframe_description(
         {"who": [], "action_description": "云层翻涌", "visual": "金色云海"}

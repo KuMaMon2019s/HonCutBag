@@ -543,7 +543,13 @@ def test_phase1_checkpoints_are_written_and_reused(monkeypatch, tmp_path):
     characters_payload = {"characters": []}
 
     monkeypatch.setattr(text_parser, "parse_text", lambda _text: {"segments": [{"id": 1}]})
-    monkeypatch.setattr(event_extractor, "extract_events", lambda _segments: (calls.__setitem__("events", calls["events"] + 1) or events_payload))
+    monkeypatch.setattr(
+        event_extractor,
+        "extract_events",
+        lambda _segments, **_kwargs: (
+            calls.__setitem__("events", calls["events"] + 1) or events_payload
+        ),
+    )
     monkeypatch.setattr(character_discoverer, "discover_characters", lambda _events: (calls.__setitem__("characters", calls["characters"] + 1) or characters_payload))
     monkeypatch.setattr(adaptation_engine, "adapt_events", lambda *_args, **_kwargs: {"shots": [{}]})
     monkeypatch.setattr(storyboard_generator, "generate_storyboard", lambda *_args, **_kwargs: {"shots": []})
@@ -580,7 +586,7 @@ def test_phase1_legacy_checkpoint_is_regenerated(monkeypatch, tmp_path):
     monkeypatch.setattr(
         event_extractor,
         "extract_events",
-        lambda _segments: (
+        lambda _segments, **_kwargs: (
             calls.__setitem__("events", calls["events"] + 1)
             or {"events": [{"id": 1, "who": ["凛"]}]}
         ),

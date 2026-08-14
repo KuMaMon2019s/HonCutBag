@@ -22,10 +22,18 @@ from phases.phase4.continuity_plan import build_continuity_plan, write_continuit
 from phases.phase8 import edit_decisions as edit_decision_module
 from phases.phase8.continuity_adjudication import (
     SEAM_DECISIONS_KIND,
+    _object_evidence_needs_retry,
     adjudicate_continuity_seams,
     decide_temporal_seam,
 )
+from phases.phase9.rhythm_editor import (
+    _duration_preserving_speed_map,
+    _probe_duration,
+    _write_delivery_timeline,
+    apply_speed_ramp,
+)
 from quality import object_trajectory as object_trajectory_module
+from quality import video_qa
 from quality import sam3_sidecar as sam3_sidecar_module
 from quality.continuity_bridge import detect_replayed_prefix, repair_continuity_boundary
 from quality.continuity_seam import (
@@ -1096,17 +1104,90 @@ def test_extension_provider_content_keeps_images_as_anchors_and_adds_video(monke
         "reference_video",
     ]
     assert content[0]["text"].startswith("向后延长视频1")
-    assert "图片1、图片2、图片3" in content[0]["text"]
-    assert "严格参考图片3" in content[0]["text"]
+    assert "图片2、图片3、图片4" in content[0]["text"]
+    assert "严格参考图片4" in content[0]["text"]
     assert "不得重播视频1中的运动轨迹" in content[0]["text"]
     assert "without a reset or cut" in content[0]["text"]
     assert "Do not skip forward in time" in content[0]["text"]
-    assert [item["image_url"]["url"] for item in content[1:4]] == [
+    assert content[1]["image_url"]["url"] == "https://image.test/frame.png"
+    assert [item["image_url"]["url"] for item in content[2:5]] == [
         f"https://image.test/{path.name}"
         for path in sorted((tmp_path / "continuity_anchors").glob("*_frame_*.jpg"))
     ]
-    assert content[-2]["image_url"]["url"] == "https://image.test/frame.png"
     assert content[-1]["video_url"]["url"] == "https://video.test/tail-window.mp4"
+
+
+def test_extension_provider_content_never_exceeds_seedance_image_budget(monkeypatch, tmp_path):
+    shot_dir = tmp_path / "shots/S01"
+    shot_dir.mkdir(parents=True)
+    (shot_dir / "SHOT_META.json").write_text(
+        json.dumps({"prompt": "continue", "gen_strategy": "phantom"}),
+        encoding="utf-8",
+    )
+    previous = tmp_path / "previous.mp4"
+    previous.write_bytes(b"video")
+    observed = {}
+
+    def fake_build(**kwargs):
+        observed["max_images"] = kwargs["shot_meta"].get("_max_reference_images")
+        return [
+            {"type": "text", "text": kwargs["shot_meta"]["prompt"]},
+            *[
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"https://image.test/base-{index}.png"},
+                    "role": "reference_image",
+                }
+                for index in range(8)
+            ],
+        ]
+
+    monkeypatch.setattr("tools.asset_packager.build_content_for_shot", fake_build)
+    monkeypatch.setattr(
+        "clients.tos_uploader.upload_media_file",
+        lambda path, prefix: f"https://media.test/{Path(path).name}",
+    )
+    monkeypatch.setattr(
+        "quality.continuity_seam.extract_video_tail_window",
+        lambda _video, output, window_s: output.parent.mkdir(parents=True, exist_ok=True)
+        or output.write_bytes(b"tail")
+        or output,
+    )
+
+    def fake_extract_frames(_video, outputs):
+        for output in outputs:
+            output.write_bytes(b"frame")
+        return tuple(outputs)
+
+    monkeypatch.setattr(
+        "quality.continuity_seam.extract_ordered_video_frames",
+        fake_extract_frames,
+    )
+    chunk = GenerationChunk(
+        chunk_id="S01_C02",
+        sequence=2,
+        target_duration_s=8,
+        mode="native_extend",
+        depends_on="S01_C01",
+    )
+    request = ChunkExecutionRequest(
+        resource_id="S01_C02",
+        shot_id="S01",
+        chunk=chunk,
+        anchors={"scene": "roof"},
+        output_path=tmp_path / "S01_C02.mp4",
+        previous_output_path=previous,
+        input_fingerprint="fingerprint",
+        memory_context="anchors",
+    )
+
+    content, *_ = _provider_content(tmp_path, request)
+    images = [item for item in content if item.get("type") == "image_url"]
+
+    assert observed["max_images"] == 6
+    assert len(images) == 9
+    assert "图片7、图片8、图片9" in content[0]["text"]
+    assert "严格参考图片9" in content[0]["text"]
 
 
 def test_continuity_generation_seed_is_stable_but_differs_by_chunk_and_repair(tmp_path):
@@ -1645,6 +1726,25 @@ def test_phase8_temporal_adjudication_requires_object_or_human_corroboration():
     assert corroborated["additional_trim_frames"] == 24
 
 
+def test_phase8_retries_only_missing_or_transient_sam3_evidence():
+    assert _object_evidence_needs_retry(None) is True
+    assert _object_evidence_needs_retry(
+        {
+            "verdict": "unavailable",
+            "reason": "SAM 3 trajectory analysis failed: connection reset",
+        }
+    ) is True
+    assert _object_evidence_needs_retry(
+        {
+            "verdict": "unavailable",
+            "reason": "insufficient tracked subject frames across the boundary",
+        }
+    ) is False
+    assert _object_evidence_needs_retry(
+        {"verdict": "continuous", "confidence": 0.9}
+    ) is False
+
+
 def test_object_tracking_finds_the_subject_catchup_frame_after_rollback():
     positions = [
         (7, 0.58),
@@ -2081,6 +2181,98 @@ def test_phase8_uses_configured_sam3_trajectory_before_requesting_topup(
     assert report["shots"][0]["deficit_frames"] == 22
     decisions = json.loads((tmp_path / "CONTINUITY_SEAM_DECISIONS.json").read_text())
     assert decisions["decisions"]["S01_C01__S01_C02"]["trim_frames"] == 72
+
+
+def test_phase8_human_review_can_reject_appearance_only_extra_trim(
+    monkeypatch, tmp_path
+):
+    plan = build_continuity_plan(
+        {"shots": [{"id": "S01", "duration": 8}]},
+        provider_chunk_limit_s=5,
+        continuation_overlap_s=2,
+    )
+    (tmp_path / "CONTINUITY_PLAN.json").write_text(
+        plan.model_dump_json(indent=2), encoding="utf-8"
+    )
+    chunks = tmp_path / "shots" / "S01" / "chunks"
+    chunks.mkdir(parents=True)
+    previous = chunks / "S01_C01.mp4"
+    following = chunks / "S01_C02.mp4"
+    previous.write_bytes(b"first")
+    following.write_bytes(b"second")
+    (tmp_path / "shots" / "S01" / "CONTINUITY_TIMING.json").write_text(
+        json.dumps(
+            {
+                "materialized_frames_before_closure": 241,
+                "chunks": [
+                    {"chunk_id": "S01_C01", "effective_unique_frames": 120},
+                    {
+                        "chunk_id": "S01_C02",
+                        "effective_unique_frames": 121,
+                        "detected_overlap_frames": 0,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    source_fingerprint = {
+        "previous_sha256": hashlib.sha256(previous.read_bytes()).hexdigest(),
+        "following_sha256": hashlib.sha256(following.read_bytes()).hexdigest(),
+    }
+    (tmp_path / "CONTINUITY_TEMPORAL_REVIEW.json").write_text(
+        json.dumps(
+            {
+                "kind": "honcut.continuity_temporal_review.v1",
+                "boundaries": {
+                    "S01_C01__S01_C02": {
+                        "action": "hard_trim",
+                        "approved_trim_frames": 48,
+                        "source_fingerprint": source_fingerprint,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    values = [
+        0.112929,
+        0.112,
+        0.111,
+        0.110,
+        0.109,
+        0.108,
+        0.107,
+        0.106,
+        0.105,
+        0.1048,
+        0.1045,
+        0.1042,
+        0.10388,
+    ]
+
+    report = adjudicate_continuity_seams(
+        tmp_path,
+        detector=lambda *_args, **_kwargs: {
+            "candidates": [
+                {
+                    "frames": 48 + index * 2,
+                    "seconds": (48 + index * 2) / 24,
+                    "frame_mae": value,
+                }
+                for index, value in enumerate(values)
+            ]
+        },
+        frame_probe=lambda _path, _fps: {"frames": 121},
+    )
+
+    boundary = report["shots"][0]["boundaries"][0]
+    assert report["status"] == "passed"
+    assert report["requires_human_review"] is False
+    assert boundary["action"] == "hard_trim"
+    assert boundary["trim_frames"] == 48
+    assert boundary["additional_trim_frames"] == 0
+    assert boundary["confidence"] == "human_confirmed_planned_overlap"
 
 
 def test_phase8_skips_sam3_when_pixel_trajectory_is_continuous(monkeypatch, tmp_path):
@@ -2684,3 +2876,153 @@ def test_phase6_auto_routes_only_through_continuity_runtime(monkeypatch, tmp_pat
         "chunk_count": 2,
         "calibration": calibration.dataset_fingerprint,
     }
+
+
+def test_phase6_auto_normalizes_resumed_string_output_dir(monkeypatch, tmp_path):
+    write_continuity_plan(
+        tmp_path / "CONTINUITY_PLAN.json",
+        {"shots": [{"id": "S01", "duration": 16}]},
+    )
+    observed = {}
+
+    def fake_auto(output_dir, plan, loaded_calibration):
+        observed["output_dir"] = output_dir
+        observed["chunk_count"] = sum(len(shot.chunks) for shot in plan.shots)
+        observed["calibration"] = loaded_calibration
+        return {
+            "status": "done",
+            "outputs": ["shots/S01/output.mp4"],
+            "errors": [],
+            "provider": "offline-fake",
+        }
+
+    monkeypatch.setenv("HONCUT_CONTINUITY_MODE", "auto")
+    monkeypatch.setattr(
+        "runtime.continuity_provider.execute_phase6_auto_continuity",
+        fake_auto,
+    )
+    monkeypatch.setattr(
+        pipeline_core,
+        "run_quality_check",
+        lambda phase, output_dir: SimpleNamespace(passed=True),
+    )
+
+    receipt = pipeline_core.run_phase6({"shots": []}, str(tmp_path), dry_run=False)
+
+    assert receipt["status"] == "done"
+    assert observed == {
+        "output_dir": tmp_path,
+        "chunk_count": 2,
+        "calibration": None,
+    }
+
+
+def test_rhythm_speed_map_keeps_weighted_runtime():
+    boundaries = [0.0, 2.0, 5.0, 10.0]
+    normalized = _duration_preserving_speed_map(
+        boundaries,
+        {0: 1.2, 1: 0.8, 2: 1.1},
+    )
+
+    output_duration = sum(
+        (boundaries[i + 1] - boundaries[i]) / normalized[i]
+        for i in range(len(boundaries) - 1)
+    )
+
+    assert output_duration == pytest.approx(10.0)
+    assert normalized[0] / normalized[1] == pytest.approx(1.2 / 0.8)
+
+
+def test_rhythm_speed_ramp_closes_real_av_duration(tmp_path):
+    source = tmp_path / "source.mp4"
+    output = tmp_path / "ramped.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=4",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=4",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-shortest", str(source),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    apply_speed_ramp(
+        str(source),
+        {0: 1.2, 1: 0.8, 2: 1.1},
+        [1.0, 2.0, 3.0],
+        str(output),
+    )
+
+    assert _probe_duration(str(output)) == pytest.approx(
+        _probe_duration(str(source)), abs=2 / 24
+    )
+
+
+def test_phase9_duration_gate_accepts_frame_decimal_rounding():
+    pipeline_core._assert_duration_conserved(
+        {"video": 60.066667, "audio": 60.0},
+        {"video": 60.0, "audio": 60.0},
+        tolerance_s=2 / 30,
+        audio_tolerance_s=0.05,
+    )
+
+
+def test_delivery_timeline_tracks_warped_shot_boundaries(tmp_path):
+    output = tmp_path / "polished.mp4"
+    timeline = {
+        "shots": [
+            {"shot_id": "S01", "speed": 1.0},
+            {"shot_id": "S02", "speed": 1.0},
+        ],
+        "transitions": [{"type": "cut"}],
+    }
+    boundaries = [0.0, 4.0, 10.0]
+    speeds = _duration_preserving_speed_map(boundaries, {0: 1.2, 1: 0.8})
+
+    written = _write_delivery_timeline(str(output), timeline, boundaries, speeds)
+    delivery = json.loads(Path(written).read_text())
+
+    assert delivery["duration_s"] == pytest.approx(10.0)
+    assert delivery["shots"][0]["output_end_s"] == pytest.approx(4.0 / speeds[0])
+    assert delivery["shots"][1]["output_start_s"] == pytest.approx(
+        delivery["shots"][0]["output_end_s"]
+    )
+    assert delivery["shots"][1]["output_end_s"] == pytest.approx(10.0)
+
+
+def test_final_qa_samples_delivery_timeline_before_edit_timeline(tmp_path, monkeypatch):
+    video = tmp_path / "polished.mp4"
+    video.touch()
+    (tmp_path / "delivery_timeline.json").write_text(json.dumps({
+        "shots": [
+            {"shot_id": "S01", "output_start_s": 0.0, "output_end_s": 4.0},
+            {"shot_id": "S02", "output_start_s": 4.0, "output_end_s": 10.0},
+        ]
+    }))
+    (tmp_path / "edit_timeline.json").write_text(json.dumps({
+        "shots": [
+            {"shot_id": "S01", "output_start_s": 0.0, "output_end_s": 5.0},
+            {"shot_id": "S02", "output_start_s": 5.0, "output_end_s": 10.0},
+        ]
+    }))
+    monkeypatch.setattr(video_qa, "_get_duration", lambda _path: 10.0)
+    monkeypatch.setattr(
+        video_qa,
+        "_extract_frame",
+        lambda _video, _directory, timestamp, label: video_qa.FrameSample(
+            path=f"{label}.jpg", timestamp=timestamp, label=label
+        ),
+    )
+
+    frames = video_qa._sample_frames(
+        video,
+        tmp_path,
+        [0.0],
+        {"shots": []},
+        video_qa.VideoQAReport(verdict="pass", grade="A"),
+    )
+    s02_first = next(frame for frame in frames if frame.label == "S02_first")
+
+    assert s02_first.timestamp == pytest.approx(4.1)

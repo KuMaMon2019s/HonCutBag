@@ -34,6 +34,8 @@ from schemas.continuity import ContinuityPlan
 CONTINUITY_BRIDGE_ENV = "HONCUT_CONTINUITY_BRIDGE"
 CONTINUITY_BRIDGE_MODES = {"off", "auto"}
 SEAM_DECISIONS_KIND = "honcut.continuity_seam_decisions.v1"
+SEEDANCE_MAX_REFERENCE_IMAGES = 9
+CONTINUITY_ANCHOR_FRAME_COUNT = 3
 
 
 def probe_continuity_frames(path: Path, timeline_fps: int) -> dict[str, Any]:
@@ -227,6 +229,10 @@ def _base_content(
 
     content_meta = dict(shot_meta)
     content_meta["prompt"] = _chunk_prompt(request, shot_meta)
+    if request.chunk.mode == "native_extend":
+        content_meta["_max_reference_images"] = (
+            SEEDANCE_MAX_REFERENCE_IMAGES - CONTINUITY_ANCHOR_FRAME_COUNT
+        )
     content = build_content_for_shot(
         output_dir=output_dir,
         shot_id=request.shot_id,
@@ -267,11 +273,20 @@ def _extension_content(
             raise RuntimeError(f"failed to upload ordered continuity anchor {path}")
         frame_urls.append(url)
 
+    base_images = [dict(item) for item in content if item.get("type") == "image_url"]
+    base_images = base_images[
+        : SEEDANCE_MAX_REFERENCE_IMAGES - CONTINUITY_ANCHOR_FRAME_COUNT
+    ]
+    first_anchor_number = len(base_images) + 1
+    anchor_numbers = tuple(
+        range(first_anchor_number, first_anchor_number + CONTINUITY_ANCHOR_FRAME_COUNT)
+    )
+    anchor_labels = "、".join(f"图片{number}" for number in anchor_numbers)
     directive = (
-        "向后延长视频1。图片1、图片2、图片3是视频1末段按时间先后顺序截取的状态帧，"
+        f"向后延长视频1。{anchor_labels}是视频1末段按时间先后顺序截取的状态帧，"
         "只用于判断主体的速度、方向和连续运动。新生成内容的第一帧必须紧接视频1最后一帧，"
-        "并严格参考图片3的最终状态；保持主体位置、大小、朝向、水波相位、机位和灯光，"
-        "继续最后的速度与方向。不得重播视频1中的运动轨迹，不得回到图片1或更早位置，"
+        f"并严格参考图片{anchor_numbers[-1]}的最终状态；保持主体位置、大小、朝向、水波相位、机位和灯光，"
+        f"继续最后的速度与方向。不得重播视频1中的运动轨迹，不得回到图片{anchor_numbers[0]}或更早位置，"
         "不得让主体重新入画。\n"
     )
     text_items = [dict(item) for item in content if item.get("type") == "text"]
@@ -279,6 +294,10 @@ def _extension_content(
     text_item = next((item for item in normalized if item.get("type") == "text"), None)
     if text_item is not None:
         text_item["text"] = f"{directive}{text_item.get('text', '')}"
+    for item in base_images:
+        item["role"] = "reference_image"
+        item.pop("priority", None)
+        normalized.append(item)
     normalized.extend(
         {
             "type": "image_url",
@@ -287,13 +306,6 @@ def _extension_content(
         }
         for url in frame_urls
     )
-    for item in content:
-        if item.get("type") != "image_url":
-            continue
-        copied = dict(item)
-        copied["role"] = "reference_image"
-        copied.pop("priority", None)
-        normalized.append(copied)
     normalized.append(
         {
             "type": "video_url",

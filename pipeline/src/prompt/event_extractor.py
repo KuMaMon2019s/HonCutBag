@@ -25,6 +25,7 @@ import hashlib
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import List, Dict, Any
 
 from openai import OpenAI
@@ -33,6 +34,7 @@ from utils.ark_llm import (
     LLMIdleTimeout,
     LLMReadTimeout,
     LLMStreamError,
+    LLMWallTimeout,
     call_llm_stream,
     create_ark_client,
 )
@@ -306,7 +308,13 @@ def _extract_events_from_segment(segment: Dict[str, Any]) -> List[Dict[str, Any]
                 print(f"  JSON 解析失败，重试 ({attempt+1}/{MAX_RETRIES}): {e}", file=sys.stderr)
                 time.sleep(1)
             continue
-        except (LLMConnectTimeout, LLMReadTimeout, LLMIdleTimeout, LLMStreamError) as e:
+        except (
+            LLMConnectTimeout,
+            LLMReadTimeout,
+            LLMIdleTimeout,
+            LLMWallTimeout,
+            LLMStreamError,
+        ) as e:
             last_error = e
             if attempt < MAX_RETRIES:
                 print(f"  LLM 流中断，重试 ({attempt+1}/{MAX_RETRIES}): {e}", file=sys.stderr)
@@ -323,7 +331,9 @@ def _extract_events_from_segment(segment: Dict[str, Any]) -> List[Dict[str, Any]
     ) from last_error
 
 
-def extract_events(segments: List[Dict[str, Any]]) -> Dict[str, Any]:
+def extract_events(
+    segments: List[Dict[str, Any]], checkpoint_dir: str | Path | None = None
+) -> Dict[str, Any]:
     """
     核心函数：从 segments 列表中提取所有事件
 
@@ -341,10 +351,40 @@ def extract_events(segments: List[Dict[str, Any]]) -> Dict[str, Any]:
     all_events = []
     event_id = 1
 
+    segment_cache_dir = Path(checkpoint_dir) / "phase1_event_segments" if checkpoint_dir else None
+    if segment_cache_dir is not None:
+        segment_cache_dir.mkdir(parents=True, exist_ok=True)
+
     def extract_one(segment):
         segment_id = segment.get("id", 0)
+        segment_hash = hashlib.sha256(
+            json.dumps(segment, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        cache_path = (
+            segment_cache_dir / f"segment_{segment_id}_{segment_hash[:16]}.json"
+            if segment_cache_dir is not None else None
+        )
+        if cache_path is not None and cache_path.exists():
+            try:
+                cached = json.loads(cache_path.read_text(encoding="utf-8"))
+                events = _parse_events(
+                    json.dumps(cached.get("events", []), ensure_ascii=False),
+                    str(segment.get("content", "")),
+                )
+                print(f"复用 segment {segment_id} 事件缓存...", file=sys.stderr)
+                return segment_id, events
+            except (OSError, json.JSONDecodeError, ValueError, TypeError):
+                pass
         print(f"处理 segment {segment_id}...", file=sys.stderr)
-        return segment_id, _extract_events_from_segment(segment)
+        events = _extract_events_from_segment(segment)
+        if cache_path is not None:
+            temporary = cache_path.with_suffix(cache_path.suffix + ".tmp")
+            temporary.write_text(
+                json.dumps({"segment_hash": segment_hash, "events": events}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(temporary, cache_path)
+        return segment_id, events
 
     source_segments = [segment for segment in segments if str(segment.get("content", "")).strip()]
     with ThreadPoolExecutor(max_workers=3) as executor:

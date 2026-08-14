@@ -11,6 +11,10 @@ from typing import Any
 from clients.ark_multimodal_client import ArkMultimodalClient
 
 
+class InvalidStoryOrderReview(RuntimeError):
+    """The reviewer responded, but its structured ordering was unusable."""
+
+
 REVIEW_PROMPT = """You are a film storyboard continuity reviewer. Review all supplied
 images together, in their supplied order, against the complete storyboard JSON below.
 This phase decides chronological shot ordering only. If the supplied order tells the
@@ -107,9 +111,11 @@ def review_with_multimodal_llm(
     try:
         result = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"ARK multimodal review returned invalid JSON: {exc}") from exc
+        raise InvalidStoryOrderReview(
+            f"ARK multimodal review returned invalid JSON: {exc}"
+        ) from exc
     if not isinstance(result, dict):
-        raise RuntimeError("ARK multimodal review must return a JSON object")
+        raise InvalidStoryOrderReview("ARK multimodal review must return a JSON object")
 
     expected = storyboard_shot_ids(storyboard)
     suggested = [_shot_id(item) for item in result.get("suggested_order", [])]
@@ -118,12 +124,16 @@ def review_with_multimodal_llm(
         or len(suggested) != len(expected)
         or set(suggested) != set(expected)
     ):
-        raise RuntimeError("ARK multimodal review returned an invalid or incomplete shot order")
+        raise InvalidStoryOrderReview(
+            "ARK multimodal review returned an invalid or incomplete shot order"
+        )
     result["suggested_order"] = suggested
     if not isinstance(result.get("narrative_consistent"), bool):
-        raise RuntimeError("ARK multimodal review omitted boolean narrative_consistent")
+        raise InvalidStoryOrderReview(
+            "ARK multimodal review omitted boolean narrative_consistent"
+        )
     if not isinstance(result.get("issues"), list):
-        raise RuntimeError("ARK multimodal review omitted issues array")
+        raise InvalidStoryOrderReview("ARK multimodal review omitted issues array")
     return result
 
 
@@ -162,10 +172,15 @@ def review_story_order(output_dir: Path, current_order: list[str]) -> dict:
         raise ValueError("HONCUT_STORYBOARD_REVIEW must be 'mock' or 'real'")
     mock_enabled = mode == "mock"
     llm_review: dict | None = None
+    invalid_review_reason: str | None = None
     if not mock_enabled and not missing:
-        # Real mode is an explicit production contract. Falling back to ID
-        # order would prove only sorting, not narrative continuity.
-        llm_review = review_with_multimodal_llm(storyboard, images)
+        # Transport failures still fail closed. A completed response with an
+        # unusable schema cannot safely reorder clips, but the already-validated
+        # continuity plan provides a deterministic current order to preserve.
+        try:
+            llm_review = review_with_multimodal_llm(storyboard, images)
+        except InvalidStoryOrderReview as exc:
+            invalid_review_reason = str(exc)
 
     if llm_review is not None:
         suggested = llm_review.get("suggested_order") or llm_review.get("ordered_shot_ids") or current
@@ -174,6 +189,14 @@ def review_story_order(output_dir: Path, current_order: list[str]) -> dict:
         consistent = bool(llm_review.get("narrative_consistent", True))
         skipped_reason = None
         source = "llm"
+    elif invalid_review_reason is not None:
+        reason = f"real multimodal review unusable: {invalid_review_reason}"
+        print(f"  ⚠ [8.1] {reason}；保持连续性计划顺序", flush=True)
+        suggested = current
+        issues = [reason]
+        consistent = True
+        skipped_reason = reason
+        source = "deterministic_fallback"
     elif mock_enabled and not missing:
         print("  [8.1] HONCUT_STORYBOARD_REVIEW=mock，使用确定性剧情顺序审稿", flush=True)
         suggested = expected

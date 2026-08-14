@@ -525,6 +525,47 @@ def build_content_for_shot(
                 "composition/environment reference"
             )
 
+    max_reference_images = shot_meta.get("_max_reference_images")
+    if max_reference_images is not None:
+        max_reference_images = max(0, int(max_reference_images))
+        if len(image_assets) > max_reference_images:
+            # Continuation reserves three provider image slots for ordered tail
+            # anchors. Keep the composition frame and distribute the remaining
+            # identity budget across characters in rounds (face, body, variant)
+            # so one character cannot consume every slot.
+            composition_assets = [
+                asset
+                for asset in image_assets
+                if asset.get("reference_kind") == "storyboard_composition"
+            ][:1]
+            character_assets = [
+                asset
+                for asset in image_assets
+                if asset.get("reference_kind") != "storyboard_composition"
+            ]
+            character_budget = max(0, max_reference_images - len(composition_assets))
+            grouped: dict[str, list[dict]] = {}
+            for asset in character_assets:
+                grouped.setdefault(str(asset.get("char_id") or ""), []).append(asset)
+            selected_characters = []
+            round_index = 0
+            while len(selected_characters) < character_budget:
+                added = False
+                for assets in grouped.values():
+                    if round_index < len(assets):
+                        selected_characters.append(assets[round_index])
+                        added = True
+                        if len(selected_characters) >= character_budget:
+                            break
+                if not added:
+                    break
+                round_index += 1
+            image_assets = [*selected_characters, *composition_assets]
+            print(
+                "  [assets] continuation reference budget: "
+                f"trimmed to {len(image_assets)}/{max_reference_images} images"
+            )
+
     print(f"  [assets] {strategy}: images_used={len(image_assets)}")
     
     # Upload each image to TOS and add to content

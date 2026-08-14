@@ -367,9 +367,11 @@ def _sample_frames(
     if duration <= 0:
         return frames
 
-    # Prefer Phase 8's canonical edited timeline. Storyboard durations do not
-    # account for trims, speed changes, reorder operations, or overlaps.
-    timeline_path = output_dir / "edit_timeline.json"
+    # Prefer Phase 9's delivery timeline because rhythm changes can move shot
+    # boundaries. Fall back to Phase 8's canonical assembly timebase.
+    timeline_path = output_dir / "delivery_timeline.json"
+    if not timeline_path.is_file():
+        timeline_path = output_dir / "edit_timeline.json"
     timeline_shots: list[dict] = []
     if timeline_path.is_file():
         try:
@@ -663,11 +665,13 @@ def _crossref_storyboard(
     video_path = output_dir / "polished.mp4"
     actual_duration = _get_duration(video_path)
 
-    # Compare against the authoritative edit timeline when available.
+    # Compare against the authoritative delivery/edit timeline when available.
     authored_total = sum(
         s.get("suggested_duration", s.get("duration", 5)) for s in shots
     )
-    timeline_path = output_dir / "edit_timeline.json"
+    timeline_path = output_dir / "delivery_timeline.json"
+    if not timeline_path.is_file():
+        timeline_path = output_dir / "edit_timeline.json"
     timeline = {}
     if timeline_path.is_file():
         try:
@@ -680,7 +684,7 @@ def _crossref_storyboard(
         "storyboard_shot_count": len(shots),
         "storyboard_total_duration": round(storyboard_total, 2),
         "authored_total_duration": round(authored_total, 2),
-        "duration_basis": "edit_timeline" if timeline else "storyboard",
+        "duration_basis": timeline_path.name if timeline else "storyboard",
         "actual_video_duration": round(actual_duration, 2),
         "duration_diff": round(abs(actual_duration - storyboard_total), 2),
     }

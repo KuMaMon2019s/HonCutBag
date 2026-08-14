@@ -215,6 +215,7 @@ def _assert_duration_conserved(
     audio_tolerance_s: float | None = None,
 ) -> None:
     """Assert final encoding conserved video and audio durations independently."""
+    comparison_epsilon_s = 1e-6
     for kind in ("video", "audio"):
         expected, actual = before.get(kind), after.get(kind)
         tolerance = (
@@ -224,7 +225,10 @@ def _assert_duration_conserved(
         )
         if expected is None:
             continue
-        if actual is None or abs(actual - expected) > tolerance:
+        if (
+            actual is None
+            or abs(actual - expected) > tolerance + comparison_epsilon_s
+        ):
             raise RuntimeError(
                 f"Final {kind} duration changed from {expected:.3f}s to "
                 f"{actual if actual is not None else 'missing'} (tolerance ±{tolerance:.3f}s)"
@@ -1017,7 +1021,7 @@ def run_phase1_screenwriter(
         if events_result is not None:
             print("    ↻ 复用 phase1_events.json，跳过事件提取")
         else:
-            events_result = dict(extract_events(segments))
+            events_result = dict(extract_events(segments, checkpoint_dir=output_dir))
             events_result.setdefault("schema_version", "3.0")
             events_result.setdefault("source_segments_hash", events_input_hash)
             events_result.setdefault("source_segment_count", len(nonempty_segments))
@@ -1417,6 +1421,15 @@ def _derive_end_state(shot: dict) -> str:
     Returns a concrete end-state sentence for known action verbs,
     or a generic fallback for unknown actions.
     """
+    micro_actions = shot.get("micro_actions") or []
+    if isinstance(micro_actions, list):
+        explicit_end = next(
+            (str(item).strip() for item in reversed(micro_actions) if str(item).strip()),
+            "",
+        )
+        if explicit_end:
+            return explicit_end
+
     action_text = " ".join(
         str(shot.get(field, "")) for field in ("visual", "what", "description")
         if shot.get(field)
@@ -1440,6 +1453,32 @@ def build_end_frame_prompt(shot: dict) -> str:
     """
     prompt = shot.get("prompt", shot.get("visual", ""))
     end_state = _derive_end_state(shot)
+    subjects = shot.get("who") or []
+    subjects = subjects if isinstance(subjects, list) else [subjects]
+    subjects = [str(subject).strip() for subject in subjects if str(subject).strip()]
+    subject_contract = ""
+    if subjects:
+        subject_contract = (
+            f"The frame must contain exactly {len(subjects)} principal character(s): "
+            f"{', '.join(subjects)}. Every named principal character must remain visible; "
+            "do not omit, merge, duplicate, or replace anyone."
+        )
+    identity = str(shot.get("subject_description") or "").strip()
+    narrative_text = " ".join(
+        str(shot.get(field) or "") for field in ("what", "visual", "action_description")
+    )
+    alliance_spatial_contract = ""
+    if "并肩" in narrative_text and any(
+        marker in narrative_text for marker in ("迎敌", "共同", "指向前方", "指向远处")
+    ):
+        alliance_spatial_contract = (
+            "Alliance staging is mandatory: the allied characters stand shoulder-to-shoulder "
+            "on the same line and face the distant enemy formation in the same direction. Use a "
+            "rear three-quarter camera behind the allies so the enemy formation is visibly ahead "
+            "of them in the center background. Both blade tips extend toward that same enemy region; "
+            "the blades stay parallel and must not cross. The allies must never face, threaten, or "
+            "point a weapon at each other."
+        )
 
     # Extract character appearance from prompt (simple heuristic)
     char_desc = ""
@@ -1448,13 +1487,20 @@ def build_end_frame_prompt(shot: dict) -> str:
     elif "少年" in prompt or "boy" in prompt.lower():
         char_desc = "young man"
 
-    return (
-        f"{end_state}.\n\n"
+    contract_parts = [f"Exact final micro-action: {end_state}."]
+    if subject_contract:
+        contract_parts.append(subject_contract)
+    if identity:
+        contract_parts.append(f"Identity and costume contract: {identity}.")
+    if alliance_spatial_contract:
+        contract_parts.append(alliance_spatial_contract)
+    return "\n\n".join(contract_parts) + "\n\n" + (
         f"Scene: {prompt}.\n\n"
         f"Character: {char_desc if char_desc else 'the character'}.\n\n"
         f"Style: maintain the same artistic style, lighting, and composition as the start frame.\n\n"
         f"The action has just completed; the character is in the final resting position.\n\n"
-        f"Background, camera angle, and environment must match the start frame exactly."
+        f"Background, camera angle, and environment must match the start frame exactly.\n\n"
+        "No text, no letters, no captions, no subtitles, and no speech bubbles."
     )
 
 
@@ -1750,14 +1796,14 @@ def _generate_flf2v_end_frame(
     shot_item: dict,
     shot_id: str,
     first_frame_path: Path,
-    ref_image_path: Optional[Path],
+    ref_image_path: Optional[Path | list[Path]],
 ) -> bool:
     """Generate one idempotent Seedream end frame for an FLF2V shot.
 
-    M3 fix: prefer text_to_image (NOT image_to_image) to avoid near-identical copies.
-    t2i generates a fresh image from the rich prompt — end-state pose + scene + style.
-    The first frame is still used for VALIDATION (similarity band check) only.
-    Falls back to i2i if t2i fails.
+    Prefer character identity references over unconstrained text-to-image.  Pure
+    t2i can pass coarse similarity checks while silently dropping a character
+    or changing identity.  The start frame remains validation-only so the end
+    pose is not encouraged to become a near-copy.
 
     Cache: uses sidecar meta JSON with first_frame_sha + prompt_sha + validation.
     Validation: metric-based checks (resolution, brightness, sharpness, similarity band).
@@ -1776,7 +1822,7 @@ def _generate_flf2v_end_frame(
     prompt = build_end_frame_prompt(shot_item)
     first_frame_sha = _file_sha256(first_frame_path)
     import hashlib as _hashlib
-    prompt_sha = _hashlib.sha256(prompt.encode()).hexdigest()
+    prompt_sha = _hashlib.sha256(f"identity_refs_v2_micro_end\n{prompt}".encode()).hexdigest()
 
     # Check cache sidecar
     sidecar = _read_end_frame_sidecar(end_path)
@@ -1790,7 +1836,9 @@ def _generate_flf2v_end_frame(
         print(f"    ⏭ [FLF2V] {end_path.name} cached+validated, skipping")
         return False
 
-    # Generate end frame — M3: prefer t2i over i2i
+    # Generate end frame with all declared character identity references.  Do
+    # not include the start frame in the reference set: that previously caused
+    # near-identical copies with no action progress.
     from clients.seedream_client import SeedreamClient
     client = SeedreamClient()
     # M5: use video target aspect ratio (16:9), not first frame's dimensions
@@ -1798,17 +1846,34 @@ def _generate_flf2v_end_frame(
     video_h = shot_item.get("height", 720)
     size = _storyboard_image_size(video_width=video_w, video_height=video_h)
 
-    # Primary: text_to_image (no reference → no copy problem)
+    identity_refs = []
+    if isinstance(ref_image_path, list):
+        identity_refs = [Path(path) for path in ref_image_path if Path(path).exists()]
+    elif ref_image_path is not None and Path(ref_image_path).exists():
+        identity_refs = [Path(ref_image_path)]
+
     try:
-        client.text_to_image(
-            prompt=prompt,
-            output_path=str(end_path),
-            size=size,
-        )
-        print(f"    [FLF2V] 终帧 {end_path.name} ✓ (t2i)")
+        if identity_refs:
+            client.image_to_image(
+                prompt=prompt,
+                ref_image=[str(path) for path in identity_refs],
+                output_path=str(end_path),
+                size=size,
+            )
+            print(
+                f"    [FLF2V] 终帧 {end_path.name} ✓ "
+                f"(identity refs: {len(identity_refs)})"
+            )
+        else:
+            client.text_to_image(
+                prompt=prompt,
+                output_path=str(end_path),
+                size=size,
+            )
+            print(f"    [FLF2V] 终帧 {end_path.name} ✓ (t2i fallback: no identity refs)")
     except Exception as e:
-        # Fallback: i2i with first frame as reference
-        print(f"    ⚠ [FLF2V] t2i failed ({e}), falling back to i2i")
+        # Last-resort scene-preserving fallback.
+        print(f"    ⚠ [FLF2V] identity generation failed ({e}), falling back to start-frame i2i")
         client.image_to_image(
             prompt=prompt,
             ref_image=str(first_frame_path),
@@ -1824,13 +1889,21 @@ def _generate_flf2v_end_frame(
     if not validation["passed"]:
         reason = validation.get("reason", "unknown")
         print(f"    ⚠ [FLF2V] {end_path.name} validation FAILED: {reason}")
-        # Retry once with same approach (t2i)
+        # Retry once with the same identity-locked route.
         print(f"    [FLF2V] retrying {end_path.name}...")
-        client.text_to_image(
-            prompt=prompt,
-            output_path=str(end_path),
-            size=size,
-        )
+        if identity_refs:
+            client.image_to_image(
+                prompt=prompt,
+                ref_image=[str(path) for path in identity_refs],
+                output_path=str(end_path),
+                size=size,
+            )
+        else:
+            client.text_to_image(
+                prompt=prompt,
+                output_path=str(end_path),
+                size=size,
+            )
         validation = _validate_end_frame(first_frame_path, end_path)
         _write_end_frame_sidecar(end_path, first_frame_sha, prompt_sha, validation)
         
@@ -1854,6 +1927,11 @@ def _storyboard_keyframe_description(shot: dict) -> str:
     action = str(
         shot.get("action_description") or shot.get("what") or ""
     ).strip()
+    # Dialogue belongs to the later audio/subtitle track, not the visual
+    # keyframe.  Leaving quoted lines inside a Seedream prompt frequently
+    # produces comic speech bubbles which then become baked into the video.
+    action = re.sub(r"[“\"](?:(?![”\"]).){1,120}[”\"]", "", action)
+    action = re.sub(r"\s+", " ", action).strip()
     staging = str(shot.get("visual") or "").strip()
     # Only explicit who=[] is an environment contract. Legacy storyboards may
     # omit ``who`` while carrying character identity and action in the older
@@ -1880,6 +1958,7 @@ def _storyboard_keyframe_description(shot: dict) -> str:
             f"Visual staging: {staging}." if staging else "",
             "Depict only subjects, props, and actions explicitly named in the contract.",
             "No exposed midriff unless the identity contract explicitly requires it.",
+            "No text, no letters, no captions, no subtitles, and no speech bubbles; dialogue is audio-only.",
         ]
     return " ".join(part for part in parts if part)
 
@@ -2021,7 +2100,7 @@ def _generate_shot_images(
                 and not force_regenerate
             ):
                 _generate_flf2v_end_frame(
-                    shot_item, shot_id, shot_image_path, ref_image_path
+                    shot_item, shot_id, shot_image_path, ref_image_paths
                 )
                 return shot_id
             if stale_for_references:
@@ -2058,7 +2137,7 @@ def _generate_shot_images(
                         text_to_image(prompt=shot_prompt, output_path=str(shot_image_path), size=_m2_size)
                     print(f"    [M2] 分镜图 {shot_id}.png ✓")
                     _generate_flf2v_end_frame(
-                        shot_item, shot_id, shot_image_path, ref_image_path
+                        shot_item, shot_id, shot_image_path, ref_image_paths
                     )
                     return shot_id
                 except Exception as e:
@@ -3793,8 +3872,17 @@ class _LocalVideoVendorAdapter(VendorAdapter):
         return _PipelineVideoTool().execute(config)
 
 
-def run_phase6(storyboard_data: dict, output_dir: Path, dry_run: bool, chain_mode: bool = False) -> dict:
+def run_phase6(
+    storyboard_data: dict,
+    output_dir: str | Path,
+    dry_run: bool,
+    chain_mode: bool = False,
+) -> dict:
     """Phase 6: video generation through the configured provider route."""
+    # The phase orchestrator persists paths as strings when resuming.  Normalize
+    # at the public phase boundary so both the legacy provider route and the
+    # continuity runtime can safely compose child paths with ``/``.
+    output_dir = Path(output_dir)
     _banner(6, 9, "视频生成 (Seedance — reference_to_video)", dry_run)
     start = _now()
     
@@ -4234,6 +4322,14 @@ def run_phase8(output_dir: Path, dry_run: bool,
     from phases.phase8.reshoot_transaction import durable_attempt_count
 
     _reshoot_round = max(_reshoot_round, durable_attempt_count(output_dir))
+    exhausted_reshoot_policy = os.environ.get(
+        "HONCUT_PHASE8_EXHAUSTED_RESHOOT_POLICY", "fail"
+    ).strip().lower()
+    if exhausted_reshoot_policy not in {"fail", "assemble_best"}:
+        raise ValueError(
+            "HONCUT_PHASE8_EXHAUSTED_RESHOOT_POLICY must be 'fail' or "
+            "'assemble_best'"
+        )
 
     if dry_run:
         print("  ⊘ dry-run 模式，跳过视频组装")
@@ -4401,6 +4497,28 @@ def run_phase8(output_dir: Path, dry_run: bool,
 
     frame_report = analyze_shot_frames(shots_dir, output_dir / "frame_analysis.json")
     reshoot_shots = list(frame_report.get("summary", {}).get("reshoot", []))
+    if (
+        reshoot_shots
+        and _reshoot_round >= 2
+        and exhausted_reshoot_policy == "assemble_best"
+    ):
+        unresolved = list(reshoot_shots)
+        print(
+            "  ⚠ [8.2] 已达补录上限；按显式 assemble_best 策略组装最佳现有素材: "
+            + ", ".join(unresolved),
+            flush=True,
+        )
+        frame_report.setdefault("summary", {})["delivery_policy"] = "assemble_best"
+        frame_report["summary"]["unresolved_after_reshoot_limit"] = unresolved
+        reshoot_history.append(
+            {
+                "kind": "visual_quality_limit",
+                "round": _reshoot_round,
+                "shots": unresolved,
+                "policy": "assemble_best",
+            }
+        )
+        reshoot_shots = []
     if reshoot_shots:
         if not enable_reshoot:
             return {
@@ -4639,6 +4757,9 @@ def run_phase8(output_dir: Path, dry_run: bool,
             transition_duration=transition_duration,
             fit_mode="cover",
             continuity_plan=continuity_plan_for_edit,
+            allow_unresolved_reshoots=(
+                exhausted_reshoot_policy == "assemble_best" and _reshoot_round >= 2
+            ),
         )
         print(f"  → 执行 reviewed edit_decisions（{len(edit_decisions['cuts'])} 个片段）...")
         reviewed_edit = execute_edit_decisions(
@@ -5366,7 +5487,7 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
     transcript_data = None
     if sb_path_str:
         from clients.asr_client import transcribe_audio
-        from tools.audio_pipeline import extract_audio_track
+        from tools.audio_pipeline import extract_audio_track, is_silent_audio
 
         storyboard_data = json.loads(storyboard_path.read_text(encoding="utf-8"))
         sb_shots = storyboard_data.get("shots", [])
@@ -5385,11 +5506,30 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
                 durations_ms.append(0)
                 shot_transcripts.append({"text": "", "segments": [], "skipped": True})
                 continue
-            extract_audio_track(str(shot_video), str(wav_path))
             durations_ms.append(round(_probe_shot_duration(shots_dir, index) * 1000))
+            shot_id = _shot.get("shot_id") or _shot.get("id") or f"S{index:02d}"
+            if is_silent_audio(str(shot_video)):
+                print(f"    ⊘ S{index:02d}: 无可听音轨，跳过 ASR")
+                transcription = {
+                    "text": "",
+                    "segments": [],
+                    "skipped": True,
+                    "reason": "no_audible_audio",
+                }
+                shot_transcripts.append(transcription)
+                receipt = {
+                    "shot_id": str(shot_id),
+                    "audio_path": None,
+                    "duration_ms": durations_ms[-1],
+                    "transcription": transcription,
+                }
+                (asr_receipts_dir / f"S{index:02d}.json").write_text(
+                    json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+                continue
+            extract_audio_track(str(shot_video), str(wav_path))
             transcription = transcribe_audio(str(wav_path))
             shot_transcripts.append(transcription)
-            shot_id = _shot.get("shot_id") or _shot.get("id") or f"S{index:02d}"
             receipt = {
                 "shot_id": str(shot_id),
                 "audio_path": str(wav_path),
@@ -5410,7 +5550,11 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             edit_timeline=edit_timeline,
         )
         transcript_data["asr_summary"] = {
-            "shots_submitted": len(shot_transcripts),
+            "shots_considered": len(shot_transcripts),
+            "shots_submitted": sum(not item.get("skipped") for item in shot_transcripts),
+            "shots_skipped_no_audio": sum(
+                item.get("reason") == "no_audible_audio" for item in shot_transcripts
+            ),
             "shots_with_text": sum(bool(item.get("text") or item.get("segments"))
                                    for item in shot_transcripts),
             "raw_word_segments": sum(len(item.get("segments") or [])
@@ -5427,7 +5571,7 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
         summary = transcript_data["asr_summary"]
         print(
             "    ✓ ASR 完成: "
-            f"{summary['shots_with_text']}/{summary['shots_submitted']} 镜有语音, "
+            f"{summary['shots_with_text']}/{summary['shots_considered']} 镜有语音, "
             f"{summary['raw_word_segments']} 个原始词段; "
             f"生成 {summary['caption_segments']} 条字幕"
         )
@@ -5790,6 +5934,7 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             edit_rhythm(
                 video_path=current_video,
                 storyboard_path=sb_path_str,
+                timeline_path=str(output_dir / "edit_timeline.json"),
                 output_path=final_out,
             )
             outputs.append("polished.mp4")
@@ -5808,17 +5953,32 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
         profile = _get_profile_dict(media_profile)
         encode_input_durations = _probe_av_durations(Path(final_out))
 
+        video_filters = (
+            "setpts=PTS-STARTPTS,"
+            f"scale={profile['width']}:{profile['height']}:"
+            "force_original_aspect_ratio=increase,"
+            f"crop={profile['width']}:{profile['height']},setsar=1,"
+            f"fps={profile['fps']}"
+        )
+        audio_filters = "asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0"
+        if target_duration is not None:
+            # Close on the delivery frame grid after FPS conversion.  Trimming
+            # before ``fps`` can leave one or two duplicated tail frames due to
+            # timestamp rounding (for example 60.066667s at 30 fps).
+            target_frames = round(float(target_duration) * float(profile["fps"]))
+            video_filters += (
+                f",trim=end_frame={target_frames},setpts=PTS-STARTPTS"
+            )
+            audio_filters += (
+                f",apad,atrim=duration={float(target_duration):.9f},"
+                "asetpts=PTS-STARTPTS"
+            )
+
         cmd = [
             "ffmpeg", "-y",
             "-i", final_out,
-            "-vf", (
-                "setpts=PTS-STARTPTS,"
-                f"scale={profile['width']}:{profile['height']}:"
-                "force_original_aspect_ratio=increase,"
-                f"crop={profile['width']}:{profile['height']},setsar=1,"
-                f"fps={profile['fps']}"
-            ),
-            "-af", "asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0",
+            "-vf", video_filters,
+            "-af", audio_filters,
             "-c:v", profile["codec"],
             "-crf", str(profile["crf"]),
             "-preset", "medium",
@@ -5855,6 +6015,7 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
                    else round(abs(polished_durations[kind] - encode_input_durations[kind]), 6))
             for kind in ("video", "audio")
         }
+        comparison_epsilon_s = 1e-6
         duration_gate_passed = all(
             encode_input_durations[kind] is None
             or (
@@ -5864,7 +6025,7 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
                     audio_duration_tolerance_s
                     if kind == "audio"
                     else duration_tolerance_s
-                )
+                ) + comparison_epsilon_s
             )
             for kind in ("video", "audio")
         )
@@ -5874,7 +6035,9 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
         )
         if requested_duration_delta is not None:
             duration_gate_passed = (
-                duration_gate_passed and requested_duration_delta <= duration_tolerance_s
+                duration_gate_passed
+                and requested_duration_delta
+                <= duration_tolerance_s + comparison_epsilon_s
             )
         final_duration_gate = {
             "passed": duration_gate_passed,
