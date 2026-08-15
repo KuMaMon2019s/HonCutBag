@@ -440,6 +440,9 @@ def test_director_storyboard_calls_image_model_with_one_overview_contract(tmp_pa
     assert (tmp_path / "director_panels/S05.png").is_file()
     assert calls[0]["size"] == "2560x1440"
     assert "严格使用 3 列 × 2 行，共 5 个面板" in calls[0]["prompt"]
+    assert "必须可被机器切分的固定网格合同" in calls[0]["prompt"]
+    assert "16–24 像素纯白留白槽" in calls[0]["prompt"]
+    assert "禁止在行间额外重复任何 Sxx 标题" in calls[0]["prompt"]
     assert "银白长发，暗银轻甲" in calls[0]["prompt"]
     assert "S01 · 4s · WIDE · 内部1格" in calls[0]["prompt"]
     assert "S02 · 4s · MEDIUM · 内部1格" in calls[0]["prompt"]
@@ -484,6 +487,123 @@ def test_director_panel_extraction_fails_closed_without_detectable_divider(tmp_p
             1,
             tmp_path,
         )
+
+
+def test_director_panel_extraction_accepts_aligned_white_gutters(tmp_path):
+    overview = tmp_path / "director_storyboard.png"
+    pixels = np.full((600, 1200, 3), 210, dtype=np.uint8)
+    pixels[:, 394:407] = 255
+    pixels[:, 794:807] = 255
+    pixels[294:307, :] = 255
+    Image.fromarray(pixels).save(overview)
+
+    panels, extraction = materialize_director_panels(
+        overview,
+        [{"shot_id": f"S{index:02d}"} for index in range(1, 7)],
+        3,
+        2,
+        tmp_path,
+    )
+
+    assert extraction["method"] == "aligned-rule-or-gutter-v2"
+    assert extraction["vertical_dividers_px"] == [400, 800]
+    assert extraction["horizontal_dividers_px"] == [300]
+    assert len(panels) == 6
+
+
+def test_director_storyboard_retries_rejected_layout_once(tmp_path):
+    storyboard = {
+        "shots": [
+            {"id": index, "duration": 4, "generation_actions": [f"动作{index}"]}
+            for index in range(1, 5)
+        ],
+    }
+    calls = []
+
+    class RetryImageClient:
+        model = "fake-seedream"
+
+        def text_to_image(self, prompt, output_path, size, timeout):
+            calls.append(prompt)
+            if len(calls) == 1:
+                Image.new("RGB", (1200, 600), "white").save(output_path)
+            else:
+                _write_grid_image(
+                    Path(output_path),
+                    size=(1200, 600),
+                    vertical=[600],
+                    horizontal=[300],
+                )
+            return f"https://image.invalid/director-{len(calls)}.png"
+
+    manifest = generate_director_storyboard(
+        tmp_path,
+        storyboard,
+        client=RetryImageClient(),
+        size="1200x600",
+    )
+
+    assert len(calls) == 2
+    assert calls[0] != calls[1]
+    assert "版式纠错重生成（第 2/2 次）" in calls[1]
+    assert "必须从空白画布重新排版" in calls[1]
+    assert manifest["status"] == "done"
+    assert [attempt["status"] for attempt in manifest["generation_attempts"]] == [
+        "rejected_layout",
+        "accepted",
+    ]
+    rejected = tmp_path / manifest["generation_attempts"][0]["image"]
+    assert rejected.is_file()
+    rejected_prompt = tmp_path / manifest["generation_attempts"][0]["prompt"]
+    assert rejected_prompt.is_file()
+    assert (tmp_path / "director_storyboard.png").is_file()
+    assert not list(tmp_path.glob(".director_storyboard_attempt_*.png"))
+
+    cached = generate_director_storyboard(
+        tmp_path,
+        storyboard,
+        client=RetryImageClient(),
+        size="1200x600",
+    )
+    assert cached["cache_hit"] is True
+    assert len(calls) == 2
+    accepted_prompt = (tmp_path / "director_storyboard_prompt.txt").read_text()
+    assert hashlib.sha256(accepted_prompt.encode()).hexdigest() == cached["prompt_sha256"]
+
+
+def test_director_storyboard_stops_after_layout_retry_limit(tmp_path):
+    storyboard = {
+        "shots": [
+            {"id": 1, "duration": 4, "generation_actions": ["建立空间"]},
+            {"id": 2, "duration": 4, "generation_actions": ["角色进入"]},
+        ],
+    }
+    calls = []
+
+    class InvalidImageClient:
+        model = "fake-seedream"
+
+        def text_to_image(self, prompt, output_path, size, timeout):
+            calls.append(prompt)
+            Image.new("RGB", (1200, 600), "white").save(output_path)
+            return "https://image.invalid/invalid.png"
+
+    with pytest.raises(RuntimeError, match="vertical divider"):
+        generate_director_storyboard(
+            tmp_path,
+            storyboard,
+            client=InvalidImageClient(),
+            size="1200x600",
+        )
+
+    manifest = json.loads((tmp_path / "director_storyboard.json").read_text())
+    assert len(calls) == 2
+    assert manifest["status"] == "error"
+    assert len(manifest["generation_attempts"]) == 2
+    assert all(
+        attempt["status"] == "rejected_layout"
+        for attempt in manifest["generation_attempts"]
+    )
 
 
 def test_phase1_registers_director_storyboard_in_text_storyboard(tmp_path):

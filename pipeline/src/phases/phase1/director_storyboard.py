@@ -6,16 +6,21 @@ import hashlib
 import json
 import math
 import re
+import shutil
 from pathlib import Path
 from typing import Any, Protocol
 
 import numpy as np
 from PIL import Image
 
-
 DIRECTOR_STORYBOARD_SIZE = "2560x1440"
+DIRECTOR_STORYBOARD_MAX_ATTEMPTS = 2
 GROUP_MAX_SHOTS = 3
 DIRECTOR_PANEL_SCHEMA = "honcut.director-panels.v1"
+
+
+class DirectorStoryboardLayoutError(RuntimeError):
+    """The generated overview cannot be split into the authored panel grid."""
 
 
 class ImageGenerationClient(Protocol):
@@ -106,7 +111,7 @@ def build_director_storyboard_prompt(
     columns, rows = _layout(len(shots))
     panels: list[dict[str, Any]] = []
     panel_lines: list[str] = []
-    for index, (shot, group_id) in enumerate(zip(shots, groups), 1):
+    for index, (shot, group_id) in enumerate(zip(shots, groups, strict=True), 1):
         shot_id = _shot_id(shot, index)
         # Sxx is a director/editorial shot. Every Sxx starts from its own P01;
         # native extension is reserved for P02+ inside that same shot.
@@ -181,7 +186,11 @@ def build_director_storyboard_prompt(
 - 阅读顺序必须从左到右、从上到下；不得合并、遗漏、重复或打乱面板。
 - 每个面板顶部仅写清晰的大号编号 S01、S02……；底部可写不超过 8 个汉字的动作速记。
 - 每个 Sxx 是导演级叙事镜头；在编号旁清楚标注“×N格”，N 来自逐格合同中的内部故事格数量。
-- 用细黑线明确分隔每格，留出统一白边。
+- 这是必须可被机器切分的固定网格合同，版式准确性优先于绘画装饰和构图自由。
+- 所有列必须等宽，所有行必须等高；列边界从画布顶端贯通到底端，行边界从画布左端贯通到右端，不得错位或中断。
+- 相邻面板之间保留 16–24 像素纯白留白槽，并沿每个面板四周绘制清晰、连续、深黑色矩形边框；留白槽内禁止出现人物、道具、箭头或文字。
+- S01 至 S{len(shots):02d} 每个编号只能出现一次，并且必须位于对应面板内部；禁止在行间额外重复任何 Sxx 标题，禁止增加横幅、表头或第二组编号。
+- 面板不得跨格、合并、重叠或越过留白槽；任何动作、字幕与运镜箭头都必须完整留在所属面板内。
 
 绘画风格：
 - 真正的导演手绘分镜草图，不是成片剧照，不是彩色概念设计，不是漫画成稿。
@@ -200,7 +209,7 @@ def build_director_storyboard_prompt(
 逐格内容合同：
 {chr(10).join(panel_lines)}
 
-最终检查：画面中必须恰好出现 {len(shots)} 格，镜头编号连续且唯一，构图和动作按上述合同逐格对应。"""
+最终版式自检：输出前逐项确认画面恰好为 {columns}×{rows} 等分网格、恰好 {len(shots)} 格，S01 至 S{len(shots):02d} 连续且各出现一次，只有一组编号，所有贯通边界和纯白留白槽清晰可见；任一条件不满足时必须先重新排版再输出。构图和动作按上述合同逐格对应。"""
     return prompt, panels, (columns, rows)
 
 
@@ -213,20 +222,40 @@ def _write_manifest(path: Path, manifest: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _build_layout_retry_prompt(
+    prompt: str,
+    *,
+    attempt: int,
+    max_attempts: int,
+    previous_error: str,
+) -> str:
+    """Add explicit corrective layout instructions after a rejected image."""
+    return f"""{prompt}
+
+版式纠错重生成（第 {attempt}/{max_attempts} 次）：
+- 上一张图片已被机器版式审计拒绝：{previous_error}
+- 必须从空白画布重新排版，禁止沿用上一张的网格、标题带或面板边界。
+- 先建立严格等宽等高的固定网格与贯通留白槽，再在每个面板内部绘制内容。
+- 只允许一组 Sxx 编号；禁止重复行标题、额外表头、跨格画面和错位边界。
+- 输出前再次执行最终版式自检，任何一项不满足都不得提交。"""
+
+
 def _detect_dividers(
     gray: np.ndarray,
     count: int,
     *,
     axis: str,
 ) -> list[int]:
-    """Detect long dark grid dividers close to the authored uniform layout."""
+    """Detect aligned dark rules or white gutters near the uniform layout."""
     if count <= 1:
         return []
     if axis == "vertical":
         dark_profile = (gray < 120).mean(axis=0)
+        white_profile = (gray > 248).mean(axis=0)
         gradient = np.abs(np.diff(gray.astype(np.float32), axis=1)).mean(axis=0) / 255.0
     elif axis == "horizontal":
         dark_profile = (gray < 120).mean(axis=1)
+        white_profile = (gray > 248).mean(axis=1)
         gradient = np.abs(np.diff(gray.astype(np.float32), axis=0)).mean(axis=1) / 255.0
     else:
         raise ValueError(f"unknown director grid axis: {axis}")
@@ -239,6 +268,47 @@ def _detect_dividers(
         expected = round(length * divider_index / count)
         start = max(1, expected - search_radius)
         end = min(length - 1, expected + search_radius + 1)
+
+        # Image models commonly draw a clean white gutter instead of the
+        # requested black rule. Accept a narrow, high-whitespace band only
+        # when meaningful non-white content exists on both sides; this keeps
+        # an empty white canvas fail-closed.
+        minimum_gutter_width = max(3, round(cell_size * 0.004))
+        flank_width = max(8, round(cell_size * 0.04))
+        gutter_mask = white_profile[start:end] >= 0.97
+        gutter_runs: list[tuple[int, int]] = []
+        run_start: int | None = None
+        for offset, is_gutter in enumerate(gutter_mask):
+            if bool(is_gutter) and run_start is None:
+                run_start = offset
+            elif not bool(is_gutter) and run_start is not None:
+                gutter_runs.append((start + run_start, start + offset))
+                run_start = None
+        if run_start is not None:
+            gutter_runs.append((start + run_start, end))
+
+        valid_gutters: list[tuple[float, float, int]] = []
+        for gutter_start, gutter_end in gutter_runs:
+            if gutter_end - gutter_start < minimum_gutter_width:
+                continue
+            left = white_profile[max(start, gutter_start - flank_width):gutter_start]
+            right = white_profile[gutter_end:min(end, gutter_end + flank_width)]
+            if not left.size or not right.size:
+                continue
+            left_nonwhite = 1.0 - float(left.mean())
+            right_nonwhite = 1.0 - float(right.mean())
+            if min(left_nonwhite, right_nonwhite) < 0.05:
+                continue
+            center = round((gutter_start + gutter_end - 1) / 2)
+            valid_gutters.append((
+                abs(center - expected),
+                -float(white_profile[gutter_start:gutter_end].mean()),
+                center,
+            ))
+        if valid_gutters:
+            dividers.append(min(valid_gutters)[2])
+            continue
+
         combined = dark_profile[start:end] + gradient[start:end] * 0.75
         offset = int(np.argmax(combined))
         position = start + offset
@@ -247,13 +317,15 @@ def _detect_dividers(
             float(dark_profile[position]) < 0.28
             and float(gradient[position]) < 0.14
         ) or float(combined[offset]) < local_median + 0.05:
-            raise RuntimeError(
+            raise DirectorStoryboardLayoutError(
                 f"director storyboard {axis} divider {divider_index}/{count - 1} "
                 f"was not detected near pixel {expected}"
             )
         dividers.append(position)
     if dividers != sorted(set(dividers)):
-        raise RuntimeError(f"director storyboard {axis} dividers overlap")
+        raise DirectorStoryboardLayoutError(
+            f"director storyboard {axis} dividers overlap"
+        )
     return dividers
 
 
@@ -279,7 +351,7 @@ def materialize_director_panels(
         source = source_image.convert("RGB")
     width, height = source.size
     if width < columns * 64 or height < rows * 64:
-        raise RuntimeError(
+        raise DirectorStoryboardLayoutError(
             f"director storyboard is too small for {columns}x{rows}: {width}x{height}"
         )
     gray = np.asarray(source.convert("L"))
@@ -296,7 +368,7 @@ def materialize_director_panels(
         inset = max(2, round(min(right - left, bottom - top) * 0.006))
         bbox = [left + inset, top + inset, right - inset, bottom - inset]
         if bbox[2] - bbox[0] < 64 or bbox[3] - bbox[1] < 64:
-            raise RuntimeError(
+            raise DirectorStoryboardLayoutError(
                 f"director panel {shot_ids[index]} has invalid detected bbox {bbox}"
             )
         crop_path = panel_dir / f"{shot_ids[index]}.png"
@@ -319,7 +391,7 @@ def materialize_director_panels(
         })
     extraction = {
         "schema": DIRECTOR_PANEL_SCHEMA,
-        "method": "long-dark-divider-v1",
+        "method": "aligned-rule-or-gutter-v2",
         "source_image_sha256": hashlib.sha256(image_path.read_bytes()).hexdigest(),
         "source_size": [width, height],
         "vertical_dividers_px": vertical,
@@ -337,8 +409,11 @@ def generate_director_storyboard(
     client: ImageGenerationClient | None = None,
     dry_run: bool = False,
     size: str = DIRECTOR_STORYBOARD_SIZE,
+    max_layout_attempts: int = DIRECTOR_STORYBOARD_MAX_ATTEMPTS,
 ) -> dict[str, Any]:
     """Generate and audit one Phase 1 director board with Seedream."""
+    if max_layout_attempts < 1:
+        raise ValueError("max_layout_attempts must be at least 1")
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     aspect_ratio = str(storyboard.get("aspect_ratio") or "").strip()
@@ -357,7 +432,6 @@ def generate_director_storyboard(
     image_path = output_dir / "director_storyboard.png"
     prompt_path = output_dir / "director_storyboard_prompt.txt"
     manifest_path = output_dir / "director_storyboard.json"
-    prompt_path.write_text(prompt, encoding="utf-8")
     prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     requested_model = (
         getattr(client, "model", None) or "doubao-seedream-5.0-lite"
@@ -371,6 +445,7 @@ def generate_director_storyboard(
         "image": image_path.name,
         "prompt": prompt_path.name,
         "prompt_sha256": prompt_sha256,
+        "contract_prompt_sha256": prompt_sha256,
         "size_requested": size,
         "aspect_ratio": aspect_ratio,
         "columns": layout[0],
@@ -379,11 +454,13 @@ def generate_director_storyboard(
         "panels": panels,
     }
     if not panels:
+        prompt_path.write_text(prompt, encoding="utf-8")
         manifest["status"] = "no_shots"
         manifest["image"] = None
         _write_manifest(manifest_path, manifest)
         return manifest
     if dry_run:
+        prompt_path.write_text(prompt, encoding="utf-8")
         manifest["status"] = "dry_run"
         manifest["image"] = None
         _write_manifest(manifest_path, manifest)
@@ -396,7 +473,10 @@ def generate_director_storyboard(
             previous = json.loads(manifest_path.read_text(encoding="utf-8"))
             if (
                 previous.get("status") == "done"
-                and previous.get("prompt_sha256") == prompt_sha256
+                and previous.get(
+                    "contract_prompt_sha256",
+                    previous.get("prompt_sha256"),
+                ) == prompt_sha256
                 and previous.get("model") == requested_model
             ):
                 with Image.open(image_path) as generated:
@@ -419,7 +499,12 @@ def generate_director_storyboard(
                 })
                 _write_manifest(manifest_path, previous)
                 return previous
-        except (OSError, ValueError, json.JSONDecodeError):
+        except (
+            OSError,
+            ValueError,
+            json.JSONDecodeError,
+            DirectorStoryboardLayoutError,
+        ):
             pass
 
     _write_manifest(manifest_path, manifest)
@@ -429,31 +514,93 @@ def generate_director_storyboard(
 
             client = SeedreamClient()
             manifest["model"] = client.model
-        result_url = client.text_to_image(
-            prompt=prompt,
-            output_path=str(image_path),
-            size=size,
-            timeout=180,
-        )
-        if not image_path.is_file() or image_path.stat().st_size == 0:
-            raise RuntimeError(
-                "image provider returned without director_storyboard.png"
+        generation_attempts: list[dict[str, Any]] = []
+        previous_layout_error = ""
+        for attempt in range(1, max_layout_attempts + 1):
+            attempt_path = output_dir / f".director_storyboard_attempt_{attempt:02d}.png"
+            if attempt_path.exists():
+                attempt_path.unlink()
+            attempt_prompt = (
+                prompt
+                if not previous_layout_error
+                else _build_layout_retry_prompt(
+                    prompt,
+                    attempt=attempt,
+                    max_attempts=max_layout_attempts,
+                    previous_error=previous_layout_error,
+                )
             )
-        with Image.open(image_path) as generated:
-            generated.verify()
-        with Image.open(image_path) as generated:
-            manifest["size_actual"] = list(generated.size)
-        manifest["panels"], manifest["panel_extraction"] = materialize_director_panels(
-            image_path,
-            panels,
-            layout[0],
-            layout[1],
-            output_dir,
-        )
-        manifest["status"] = "done"
-        manifest["result_url"] = result_url
-        _write_manifest(manifest_path, manifest)
-        return manifest
+            attempt_prompt_sha256 = hashlib.sha256(
+                attempt_prompt.encode("utf-8")
+            ).hexdigest()
+            prompt_path.write_text(attempt_prompt, encoding="utf-8")
+            manifest["prompt_sha256"] = attempt_prompt_sha256
+            result_url = client.text_to_image(
+                prompt=attempt_prompt,
+                output_path=str(attempt_path),
+                size=size,
+                timeout=180,
+            )
+            if not attempt_path.is_file() or attempt_path.stat().st_size == 0:
+                raise RuntimeError(
+                    "image provider returned without director_storyboard.png"
+                )
+            with Image.open(attempt_path) as generated:
+                generated.verify()
+            with Image.open(attempt_path) as generated:
+                manifest["size_actual"] = list(generated.size)
+            try:
+                enriched_panels, extraction = materialize_director_panels(
+                    attempt_path,
+                    panels,
+                    layout[0],
+                    layout[1],
+                    output_dir,
+                )
+            except DirectorStoryboardLayoutError as exc:
+                rejected_dir = output_dir / "director_storyboard_attempts"
+                rejected_dir.mkdir(parents=True, exist_ok=True)
+                rejected_path = rejected_dir / f"attempt_{attempt:02d}_rejected.png"
+                rejected_prompt_path = (
+                    rejected_dir / f"attempt_{attempt:02d}_prompt.txt"
+                )
+                attempt_path.replace(rejected_path)
+                rejected_prompt_path.write_text(attempt_prompt, encoding="utf-8")
+                generation_attempts.append({
+                    "attempt": attempt,
+                    "status": "rejected_layout",
+                    "error": str(exc),
+                    "image": str(rejected_path.relative_to(output_dir)),
+                    "prompt": str(rejected_prompt_path.relative_to(output_dir)),
+                    "prompt_sha256": attempt_prompt_sha256,
+                })
+                previous_layout_error = str(exc)
+                manifest["generation_attempts"] = generation_attempts
+                _write_manifest(manifest_path, manifest)
+                if attempt < max_layout_attempts:
+                    print(
+                        "  ⚠️ 导演故事板版式审计失败，自动重新生成 "
+                        f"({attempt + 1}/{max_layout_attempts}): {exc}"
+                    )
+                    continue
+                raise
+
+            shutil.copy2(attempt_path, image_path)
+            attempt_path.unlink()
+            generation_attempts.append({
+                "attempt": attempt,
+                "status": "accepted",
+                "result_url": result_url,
+                "prompt_sha256": attempt_prompt_sha256,
+            })
+            manifest["generation_attempts"] = generation_attempts
+            manifest["panels"] = enriched_panels
+            manifest["panel_extraction"] = extraction
+            manifest["status"] = "done"
+            manifest["result_url"] = result_url
+            _write_manifest(manifest_path, manifest)
+            return manifest
+        raise RuntimeError("director storyboard generation exhausted without result")
     except Exception as exc:
         manifest["status"] = "error"
         manifest["error"] = str(exc)
