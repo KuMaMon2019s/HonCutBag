@@ -460,6 +460,29 @@ def create_storyboard_grid(image_paths: list[Path], output_path: Path, columns: 
     return output_path
 
 
+def _ordered_storyboard_images(
+    storyboard: dict, images: dict[str, Path]
+) -> list[Path]:
+    """Order beat-level images by shot and beat, falling back to shot images."""
+    ordered: list[Path] = []
+    for shot_index, shot in enumerate(storyboard.get("shots", [])):
+        if not isinstance(shot, dict):
+            continue
+        shot_id = _shot_id(shot, shot_index)
+        beat_paths: list[Path] = []
+        for position, beat in enumerate(shot.get("storyboard_beats") or [], 1):
+            if not isinstance(beat, dict):
+                continue
+            beat_id = str(beat.get("beat_id") or f"{shot_id}_P{position:02d}")
+            if beat_id in images:
+                beat_paths.append(images[beat_id])
+        if beat_paths:
+            ordered.extend(beat_paths)
+        elif shot_id in images:
+            ordered.append(images[shot_id])
+    return ordered
+
+
 def _calibrate_l3_severity(red_line: str, severity: str, message: str) -> str:
     """Keep L3 blocking for production-breaking mismatches, not pose minutiae."""
     if severity != "severe":
@@ -507,7 +530,12 @@ def _calibrate_l3_severity(red_line: str, severity: str, message: str) -> str:
 def run_l3_review(storyboard: dict, characters_data: dict, visual_style: str, images: dict[str, Path], grid_path: Path, client: ArkMultimodalClient | None = None) -> tuple[list[dict], dict]:
     if not images:
         return [], {"status": "skipped", "skipped_reason": "no storyboard images available"}
-    ordered = [images[_shot_id(shot, i)] for i, shot in enumerate(storyboard.get("shots", [])) if _shot_id(shot, i) in images]
+    ordered = _ordered_storyboard_images(storyboard, images)
+    if not ordered:
+        return [], {
+            "status": "skipped",
+            "skipped_reason": "no storyboard images match storyboard IDs",
+        }
     create_storyboard_grid(ordered, grid_path)
     if client is None and not (os.environ.get("ARK_AGENT_API_KEY") or os.environ.get("ARK_API_KEY")):
         return [], {"status": "skipped", "grid_path": str(grid_path), "skipped_reason": "ARK multimodal API key missing"}

@@ -47,7 +47,7 @@ if str(RUNNER.parent) not in sys.path:
 _ACTIVE_SUBPROCESSES: set = set()
 
 
-def _terminate_children(signum, frame):  # noqa: ARG001 - signal signature
+def _terminate_children(signum, frame):
     for process in list(_ACTIVE_SUBPROCESSES):
         try:
             process.terminate()
@@ -420,6 +420,8 @@ def run_phase(phase: str, config: dict) -> dict:
         cmd.append("--dry-run")
     if config.get("chain_mode"):
         cmd.append("--chain-mode")
+    if config.get("_resume"):
+        cmd.append("--resume")
     cmd.append(
         "--enable-reshoot"
         if config.get("enable_reshoot", True)
@@ -487,6 +489,7 @@ def main() -> None:
         if not configured_path.is_absolute():
             configured_path = RUNNER.parent / configured_path
         config[path_key] = str(configured_path.resolve())
+    config["_resume"] = bool(args.resume_from)
 
     progress_file = Path(config["output_dir"]) / "phase_progress.json"
     phases = PHASES[PHASES.index(args.resume_from) :] if args.resume_from else PHASES

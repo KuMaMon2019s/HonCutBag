@@ -8,10 +8,9 @@ from __future__ import annotations
 
 import argparse
 import os
-from pathlib import Path
 import re
 import sys
-
+from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 _SAFE_TAG = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -22,19 +21,23 @@ def build_launch_command(
     *,
     project_root: str | Path = PROJECT_ROOT,
     python_executable: str | None = None,
+    resume_from: str | None = None,
 ) -> list[str]:
     """Build a portable command without assuming conda or a machine path."""
 
     root = Path(project_root).resolve()
     config = Path(config_path).expanduser().resolve()
     executable = python_executable or os.environ.get("HONCUT_PYTHON") or sys.executable
-    return [
+    command = [
         executable,
         "-u",
         str(root / "pipeline" / "scripts" / "phase_orchestrator.py"),
         "--config",
         str(config),
     ]
+    if resume_from:
+        command.extend(["--resume-from", resume_from])
+    return command
 
 
 def _read_daemon_pid(fd: int) -> int:
@@ -52,7 +55,9 @@ def _read_daemon_pid(fd: int) -> int:
     return int(payload)
 
 
-def launch(config_path: str | Path, tag: str) -> int:
+def launch(
+    config_path: str | Path, tag: str, *, resume_from: str | None = None
+) -> int:
     """Double-fork and return the actual long-running daemon PID."""
 
     if not _SAFE_TAG.fullmatch(tag):
@@ -64,7 +69,7 @@ def launch(config_path: str | Path, tag: str) -> int:
 
     log_path = Path("/tmp") / f"honcut_{tag}.log"
     pid_path = Path("/tmp") / f"honcut_{tag}.pid"
-    command = build_launch_command(config)
+    command = build_launch_command(config, resume_from=resume_from)
     read_fd, write_fd = os.pipe()
 
     first_pid = os.fork()
@@ -121,9 +126,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config_path")
     parser.add_argument("tag")
+    parser.add_argument("--resume-from")
     args = parser.parse_args(argv)
     try:
-        launch(args.config_path, args.tag)
+        launch(args.config_path, args.tag, resume_from=args.resume_from)
     except (FileNotFoundError, RuntimeError, ValueError) as exc:
         parser.error(str(exc))
     return 0

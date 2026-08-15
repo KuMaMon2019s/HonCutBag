@@ -12,12 +12,16 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / "pipeline" / "src"
+SCRIPTS = ROOT / "pipeline" / "scripts"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
 
 import detached_pipeline_launch
+import phase_orchestrator
 import pipeline_runner as pipeline_runner_cli
 from phases import pipeline_core
 from phases.phase1 import adaptation_engine, director_planner
@@ -160,6 +164,46 @@ def test_detached_launcher_is_portable_and_reads_the_daemon_pid(tmp_path):
         assert detached_pipeline_launch._read_daemon_pid(read_fd) == 43210
     finally:
         os.close(read_fd)
+
+
+def test_detached_launcher_forwards_resume_phase(tmp_path):
+    config = tmp_path / "pipeline.json"
+    config.write_text("{}", encoding="utf-8")
+
+    command = detached_pipeline_launch.build_launch_command(
+        config,
+        project_root=tmp_path,
+        python_executable="/opt/honcut/python",
+        resume_from="phase5",
+    )
+
+    assert command[-2:] == ["--resume-from", "phase5"]
+
+
+def test_phase_orchestrator_marks_resumed_children(monkeypatch, tmp_path):
+    captured: dict[str, list[str]] = {}
+
+    def fake_stream(cmd, _log_path, _cwd, _env, monitor=None):
+        captured["cmd"] = cmd
+        return {"returncode": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(phase_orchestrator, "_stream_subprocess", fake_stream)
+    result = phase_orchestrator.run_phase(
+        "phase5",
+        {
+            "input": str(tmp_path / "input.txt"),
+            "duration": 60,
+            "shot_duration": 10,
+            "output_dir": str(tmp_path),
+            "media_profile": "720p",
+            "transition_duration": 0.5,
+            "enable_reshoot": True,
+            "_resume": True,
+        },
+    )
+
+    assert result["exit_code"] == 0
+    assert "--resume" in captured["cmd"]
 
 
 def test_repository_tests_do_not_reference_a_user_home_fixture():
@@ -514,3 +558,79 @@ def test_phase8_vlm_compares_video_frames_with_character_reference(
     assert result["verdict"] == "pass"
     assert captured["paths"] == [character_reference, frame]
     assert "canonical character references" in captured["prompt"]
+
+
+def test_phase5_l3_orders_beat_images_without_shot_image_keys(tmp_path):
+    from PIL import Image
+
+    from phases.phase5 import storyboard_qa_gate
+
+    storyboard = {
+        "shots": [
+            {
+                "id": 1,
+                "storyboard_beats": [
+                    {"beat_id": "S01_P01"},
+                    {"beat_id": "S01_P02"},
+                ],
+            }
+        ]
+    }
+    images = {}
+    for beat_id in ("S01_P01", "S01_P02"):
+        path = tmp_path / f"{beat_id}.png"
+        Image.new("RGB", (160, 90), "white").save(path)
+        images[beat_id] = path
+
+    class ReviewClient:
+        def __init__(self):
+            self.calls = []
+
+        def review(self, image_paths, prompt):
+            self.calls.append((image_paths, prompt))
+            return '{"issues": []}'
+
+    client = ReviewClient()
+    grid_path = tmp_path / "storyboard_qa_grid.jpg"
+    issues, layer = storyboard_qa_gate.run_l3_review(
+        storyboard,
+        {"characters": []},
+        "cinematic",
+        images,
+        grid_path,
+        client,
+    )
+
+    assert issues == []
+    assert layer["status"] == "completed"
+    assert grid_path.is_file()
+    assert client.calls[0][0] == [grid_path]
+    assert '"S01_P01", "S01_P02"' in client.calls[0][1]
+
+
+def test_phase5_l3_skips_unmatched_image_ids_instead_of_crashing(tmp_path):
+    from PIL import Image
+
+    from phases.phase5 import storyboard_qa_gate
+
+    path = tmp_path / "S99_P01.png"
+    Image.new("RGB", (160, 90), "white").save(path)
+
+    class ReviewClient:
+        def review(self, _image_paths, _prompt):
+            raise AssertionError("unmatched images must not reach the review client")
+
+    issues, layer = storyboard_qa_gate.run_l3_review(
+        {"shots": [{"id": 1}]},
+        {"characters": []},
+        "cinematic",
+        {"S99_P01": path},
+        tmp_path / "storyboard_qa_grid.jpg",
+        ReviewClient(),
+    )
+
+    assert issues == []
+    assert layer == {
+        "status": "skipped",
+        "skipped_reason": "no storyboard images match storyboard IDs",
+    }
