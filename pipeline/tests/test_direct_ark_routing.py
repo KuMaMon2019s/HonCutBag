@@ -450,6 +450,56 @@ def test_pipeline_runner_prints_selected_phase_error(monkeypatch, capsys):
     assert "Phase phase4 failed: orchestrator timed out" in capsys.readouterr().out
 
 
+def test_pipeline_runner_rejects_partial_top_level_status(monkeypatch):
+    monkeypatch.setattr(
+        pipeline_runner_cli._core,
+        "run_pipeline",
+        lambda **kwargs: {"status": "partial", "phases": {}},
+    )
+    monkeypatch.setattr(
+        pipeline_runner_cli, "_record_run_memory", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(sys, "argv", ["pipeline_runner.py", "--text", "story"])
+
+    with pytest.raises(SystemExit, match="1"):
+        pipeline_runner_cli.main()
+
+
+@pytest.mark.parametrize(
+    ("enable_reshoot", "expected_flag"),
+    [(True, "--enable-reshoot"), (False, "--disable-reshoot")],
+)
+def test_orchestrator_forwards_reshoot_and_transition_configuration(
+    tmp_path, monkeypatch, enable_reshoot, expected_flag
+):
+    captured = {}
+
+    def fake_stream(command, *args, **kwargs):
+        captured["command"] = command
+        return {"returncode": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(phase_orchestrator, "_stream_subprocess", fake_stream)
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    config = {
+        "input": str(tmp_path / "story.txt"),
+        "duration": 30,
+        "shot_duration": 5,
+        "output_dir": str(output_dir),
+        "media_profile": "720p",
+        "transition_duration": 0.75,
+        "enable_reshoot": enable_reshoot,
+    }
+
+    phase_orchestrator.run_phase("phase8", config)
+
+    command = captured["command"]
+    assert command[command.index("--transition-duration") + 1] == "0.75"
+    assert expected_flag in command
+    opposite = "--disable-reshoot" if enable_reshoot else "--enable-reshoot"
+    assert opposite not in command
+
+
 def test_pipeline_runner_reconnects_successful_report_checkpoints(monkeypatch, tmp_path):
     pipeline_runner_cli._record_report_checkpoints(
         {
@@ -565,6 +615,7 @@ def _write_shot(output_dir):
 
 
 def _mock_common_direct(monkeypatch, shot_dir):
+    monkeypatch.setenv("VIDEO_GENERATION_MODE", "direct")
     monkeypatch.setattr(pipeline_core, "get_api_key", lambda service: "test-key")
     monkeypatch.setattr("utils.config.VIDEO_GEN_CONCURRENCY", 1)
     monkeypatch.setattr(
@@ -650,6 +701,68 @@ def test_explicit_bridge_providers_use_local_client(tmp_path, monkeypatch, provi
 
     assert result["status"] == "done"
     assert len(bridge_calls) == 1
+
+
+def test_seedance_provider_honors_bridge_generation_mode(tmp_path, monkeypatch):
+    _write_shot(tmp_path)
+    monkeypatch.setenv("VIDEO_PROVIDER", "seedance")
+    monkeypatch.setenv("VIDEO_GENERATION_MODE", "bridge")
+    monkeypatch.setattr("utils.config.VIDEO_GEN_CONCURRENCY", 1)
+    monkeypatch.setattr(local_video_client, "is_available", lambda timeout: True)
+    calls = []
+
+    def fake_generate(**kwargs):
+        kwargs["on_submit_start"]()
+        kwargs["on_submitted"]("bridge-seedance-1")
+        Path(kwargs["output_path"]).write_bytes(b"v" * 11000)
+        calls.append(kwargs)
+        return {
+            "output_path": kwargs["output_path"],
+            "last_frame_path": None,
+            "actual_model": kwargs["model"],
+        }
+
+    monkeypatch.setattr(local_video_client, "generate_video", fake_generate)
+    monkeypatch.setattr(local_video_client, "generate_video_with_fallback", fake_generate)
+    monkeypatch.setattr(
+        asset_packager,
+        "build_content_for_shot",
+        lambda **kwargs: [{"type": "text", "text": "shot"}],
+    )
+    monkeypatch.setattr(
+        seedance_client,
+        "submit_content",
+        lambda *args, **kwargs: pytest.fail("Bridge mode must not call direct ARK"),
+    )
+
+    result = pipeline_core._run_phase6_fallback(tmp_path)
+
+    assert result["status"] == "done"
+    assert calls[0]["model"] == "seedance"
+
+
+def test_direct_seedance_receives_storyboard_aspect_ratio(tmp_path, monkeypatch):
+    shot_dir = _write_shot(tmp_path)
+    meta_path = shot_dir / "SHOT_META.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["aspect_ratio"] = "9:16"
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    _mock_common_direct(monkeypatch, shot_dir)
+    monkeypatch.setenv("VIDEO_PROVIDER", "seedance")
+    calls = []
+    monkeypatch.setattr(
+        seedance_client,
+        "submit_content",
+        lambda content, **kwargs: calls.append(kwargs) or "task-portrait-1",
+    )
+
+    result = pipeline_core._run_phase6_fallback(tmp_path)
+
+    assert result["status"] == "done"
+    assert calls[0]["ratio"] == "9:16"
+    persisted = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert persisted["ratio"] == "9:16"
+    assert (persisted["width"], persisted["height"]) == (720, 1280)
 
 
 def test_local_client_resume_skips_submission(tmp_path, monkeypatch):
@@ -1342,6 +1455,7 @@ def test_phase6_resumes_persisted_seedance_job_after_poll_interruption(
 ):
     shot_dir = _write_shot(tmp_path)
     monkeypatch.delenv("VIDEO_PROVIDER", raising=False)
+    monkeypatch.setenv("VIDEO_GENERATION_MODE", "direct")
     monkeypatch.setattr("utils.config.VIDEO_GEN_CONCURRENCY", 1)
     monkeypatch.setattr(pipeline_core, "get_api_key", lambda service: "test-key")
     monkeypatch.setattr(
@@ -1584,6 +1698,7 @@ def test_phase6_honors_seedance_provider_capacity(tmp_path, monkeypatch):
         )
 
     monkeypatch.delenv("VIDEO_PROVIDER", raising=False)
+    monkeypatch.setenv("VIDEO_GENERATION_MODE", "direct")
     monkeypatch.setenv("HONCUT_SEEDANCE_VIDEO_CONCURRENCY", "2")
     monkeypatch.setattr("utils.config.VIDEO_GEN_CONCURRENCY", 5)
     monkeypatch.setattr(pipeline_core, "get_api_key", lambda service: "test-key")

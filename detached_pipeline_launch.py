@@ -1,50 +1,133 @@
 #!/usr/bin/env python3
-"""HonCut 全链路启动器 — 双 fork + setsid 完全脱离进程树，gateway 重启杀不死
-用法: python3 detached_pipeline_launch.py <config_path> <tag>
+"""Launch the HonCut pipeline as a detached daemon.
+
+Usage: ``python3 detached_pipeline_launch.py <config_path> <tag>``
 """
+
+from __future__ import annotations
+
+import argparse
 import os
+from pathlib import Path
+import re
 import sys
 
-if len(sys.argv) != 3:
-    print("用法: detached_pipeline_launch.py <config_path> <tag>")
-    sys.exit(1)
 
-CONFIG = os.path.abspath(sys.argv[1])
-TAG = sys.argv[2]  # e.g. 2026-08-10_02
-LOG = f"/tmp/honcut_{TAG}.log"
-PIDFILE = f"/tmp/honcut_{TAG}.pid"
-CWD = "/Users/soda/projects/honcut"
+PROJECT_ROOT = Path(__file__).resolve().parent
+_SAFE_TAG = re.compile(r"^[A-Za-z0-9_.-]+$")
 
-def launch():
-    pid = os.fork()
-    if pid > 0:
-        with open(PIDFILE, "w") as f:
-            f.write(str(pid))
-        print(f"✅ 管线启动器已脱离进程树，子进程 PID: {pid}")
-        sys.exit(0)
 
-    # 子进程：setsid 创建新会话
-    os.setsid()
+def build_launch_command(
+    config_path: str | Path,
+    *,
+    project_root: str | Path = PROJECT_ROOT,
+    python_executable: str | None = None,
+) -> list[str]:
+    """Build a portable command without assuming conda or a machine path."""
 
-    # 第二次 fork 防重获控制终端
-    pid2 = os.fork()
-    if pid2 > 0:
-        os._exit(0)
+    root = Path(project_root).resolve()
+    config = Path(config_path).expanduser().resolve()
+    executable = python_executable or os.environ.get("HONCUT_PYTHON") or sys.executable
+    return [
+        executable,
+        "-u",
+        str(root / "pipeline" / "scripts" / "phase_orchestrator.py"),
+        "--config",
+        str(config),
+    ]
 
-    os.chdir(CWD)
-    log_fd = os.open(LOG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-    os.dup2(log_fd, 1)
-    os.dup2(log_fd, 2)
 
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
-    env["VIDEO_PROVIDER"] = "seedance"
+def _read_daemon_pid(fd: int) -> int:
+    """Read the second-fork PID announced by the intermediate child."""
 
-    os.execvp("conda", [
-        "conda", "run", "--no-capture-output", "-n", "honcut",
-        "python", "-u", "pipeline/scripts/phase_orchestrator.py",
-        "--config", CONFIG
-    ])
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(fd, 64)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    payload = b"".join(chunks).decode("ascii", errors="strict").strip()
+    if not payload.isdigit() or int(payload) <= 0:
+        raise RuntimeError("detached launcher did not report a daemon PID")
+    return int(payload)
+
+
+def launch(config_path: str | Path, tag: str) -> int:
+    """Double-fork and return the actual long-running daemon PID."""
+
+    if not _SAFE_TAG.fullmatch(tag):
+        raise ValueError("tag may contain only letters, digits, '.', '_' and '-'")
+
+    config = Path(config_path).expanduser().resolve()
+    if not config.is_file():
+        raise FileNotFoundError(f"config file does not exist: {config}")
+
+    log_path = Path("/tmp") / f"honcut_{tag}.log"
+    pid_path = Path("/tmp") / f"honcut_{tag}.pid"
+    command = build_launch_command(config)
+    read_fd, write_fd = os.pipe()
+
+    first_pid = os.fork()
+    if first_pid > 0:
+        os.close(write_fd)
+        try:
+            daemon_pid = _read_daemon_pid(read_fd)
+        finally:
+            os.close(read_fd)
+            os.waitpid(first_pid, 0)
+        pid_path.write_text(str(daemon_pid), encoding="ascii")
+        print(f"✅ 管线已脱离进程树，后台进程 PID: {daemon_pid}")
+        print(f"   日志: {log_path}")
+        return daemon_pid
+
+    os.close(read_fd)
+    try:
+        os.setsid()
+        daemon_pid = os.fork()
+        if daemon_pid > 0:
+            os.write(write_fd, str(daemon_pid).encode("ascii"))
+            os.close(write_fd)
+            os._exit(0)
+
+        os.close(write_fd)
+        os.chdir(PROJECT_ROOT)
+        log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        try:
+            os.dup2(log_fd, 1)
+            os.dup2(log_fd, 2)
+        finally:
+            if log_fd > 2:
+                os.close(log_fd)
+        devnull_fd = os.open(os.devnull, os.O_RDONLY)
+        try:
+            os.dup2(devnull_fd, 0)
+        finally:
+            if devnull_fd > 2:
+                os.close(devnull_fd)
+
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        # Provider and routing remain owned by the config/environment.  The
+        # launcher must not silently force Seedance or bypass Bridge mode.
+        os.execvpe(command[0], command, env)
+    except BaseException as exc:
+        try:
+            os.write(2, f"detached launcher failed: {exc}\n".encode())
+        finally:
+            os._exit(1)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("config_path")
+    parser.add_argument("tag")
+    args = parser.parse_args(argv)
+    try:
+        launch(args.config_path, args.tag)
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        parser.error(str(exc))
+    return 0
+
 
 if __name__ == "__main__":
-    launch()
+    raise SystemExit(main())

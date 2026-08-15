@@ -30,6 +30,7 @@ from runtime.execution_errors import ProviderPreparationError
 from runtime.generation_tasks import GenerationTaskStore
 from runtime.seedance_execution import execute_seedance_video_task
 from schemas.continuity import ContinuityPlan
+from utils.video_geometry import resolve_video_geometry
 
 CONTINUITY_BRIDGE_ENV = "HONCUT_CONTINUITY_BRIDGE"
 CONTINUITY_BRIDGE_MODES = {"off", "auto"}
@@ -200,26 +201,7 @@ def _chunk_duration(request: ChunkExecutionRequest) -> int:
 
 def _video_geometry(shot_meta: dict[str, Any]) -> tuple[str, int, int]:
     """Resolve provider ratio and Bridge dimensions from the authored shot."""
-    width = int(shot_meta.get("width") or 0)
-    height = int(shot_meta.get("height") or 0)
-    ratio = str(
-        shot_meta.get("aspect_ratio") or shot_meta.get("ratio") or ""
-    ).strip()
-    if width > 0 and height > 0:
-        divisor = math.gcd(width, height)
-        return ratio or f"{width // divisor}:{height // divisor}", width, height
-    import re
-
-    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*[:/]\s*(\d+(?:\.\d+)?)\s*", ratio)
-    if match:
-        left, right = float(match.group(1)), float(match.group(2))
-        if left > 0 and right > 0:
-            if left >= right:
-                width, height = 1280, max(2, round(1280 * right / left / 2) * 2)
-            else:
-                height, width = 1280, max(2, round(1280 * left / right / 2) * 2)
-            return f"{match.group(1)}:{match.group(2)}", width, height
-    return "16:9", 1280, 720
+    return resolve_video_geometry(shot_meta)
 
 
 def _storyboard_group_for_shot(

@@ -102,6 +102,19 @@ def _normalize_enable_reshoot(config: dict) -> bool:
     return enable_reshoot
 
 
+def _normalize_transition_duration(config: dict) -> float:
+    """Validate the Phase 8 transition duration before spawning children."""
+
+    try:
+        duration = float(config.get("transition_duration", 0.5))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("config transition_duration must be a number") from exc
+    if duration < 0:
+        raise ValueError("config transition_duration must not be negative")
+    config["transition_duration"] = duration
+    return duration
+
+
 def _write_progress(progress_file: Path, payload: dict) -> None:
     """Atomically replace the progress file so cron never reads partial JSON."""
     progress_file.parent.mkdir(parents=True, exist_ok=True)
@@ -396,6 +409,8 @@ def run_phase(phase: str, config: dict) -> dict:
         phase,
         "--media-profile",
         config.get("media_profile", "720p"),
+        "--transition-duration",
+        str(config.get("transition_duration", 0.5)),
     ]
     if config.get("transition"):
         cmd.extend(["--transition", str(config["transition"])])
@@ -405,8 +420,11 @@ def run_phase(phase: str, config: dict) -> dict:
         cmd.append("--dry-run")
     if config.get("chain_mode"):
         cmd.append("--chain-mode")
-    if config.get("enable_reshoot"):
-        cmd.append("--enable-reshoot")
+    cmd.append(
+        "--enable-reshoot"
+        if config.get("enable_reshoot", True)
+        else "--disable-reshoot"
+    )
 
     log_dir = Path(config["output_dir"]) / "phase_logs"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -458,6 +476,7 @@ def main() -> None:
         _normalize_shot_duration(config)
         _normalize_chain_mode(config)
         _normalize_enable_reshoot(config)
+        _normalize_transition_duration(config)
     except ValueError as error:
         parser.error(str(error))
 

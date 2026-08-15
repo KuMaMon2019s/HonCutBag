@@ -142,12 +142,12 @@ IDENTITY_LOCK_PHRASES = [
 ]
 
 CAMERA_OPENERS = {
-    "establishing": "Wide establishing shot, slow cinematic push-in, cinematic lighting, photorealistic, 35mm film quality.",
-    "close_up": "Medium close-up, subtle handheld motion, shallow depth of field, photorealistic, 35mm film.",
-    "action": "Dynamic tracking shot, cinematic lighting, photorealistic, 35mm film quality, crisp subject detail.",
-    "reaction": "One continuous shot, natural head movement, photorealistic, 35mm film grain, no cuts, no zoom.",
-    "transition": "Slow pan across scene, cinematic lighting, photorealistic, volumetric haze, 35mm film.",
-    "atmosphere": "Wide aerial shot, slow drift, golden hour lighting, photorealistic, 35mm film quality.",
+    "establishing": "Wide establishing shot, slow cinematic push-in, authored lighting and rendering style.",
+    "close_up": "Medium close-up, subtle handheld motion, shallow depth of field in the authored rendering style.",
+    "action": "Dynamic tracking shot, authored lighting, crisp subject detail.",
+    "reaction": "One continuous shot, natural head movement, no cuts, no zoom.",
+    "transition": "Slow pan across scene, authored lighting and atmosphere.",
+    "atmosphere": "Wide aerial shot, slow drift, authored time-of-day lighting.",
 }
 
 CAMERA_NEGATIONS = {
@@ -485,17 +485,31 @@ def _build_shot_prompt_legacy(
                 )
     ref_binding = " ".join(ref_parts) if ref_parts else "No character reference."
     
-    # Add emotion and style enrichment
+    visual_style = _load_default_visual_style(visual_style_path)
+
+    # Add emotion and style enrichment. The historical emotion helper owns a
+    # photorealistic anchor, so a declared project style must replace that
+    # anchor instead of being appended after a contradictory instruction.
     try:
         from prompt.emotion_mapping import build_style_suffix
         style_suffix = build_style_suffix(emotion=emotion, scene=where)
     except ImportError:
         style_suffix = ""
+    if visual_style_path and (
+        visual_style.style_prompt_short or visual_style.style_prompt_full
+    ):
+        style_suffix = (
+            visual_style.style_prompt_short or visual_style.style_prompt_full
+        )
     
     scene_suffix = scene_style_map.get(where, "") if scene_style_map else ""
     lighting = shot.get("lighting_key") or "natural"
     action = shot.get("what") or visual
-    style = "Photorealistic, cinematic, 35mm film quality, no 3D, no cartoon, no VFX aesthetic."
+    style = (
+        visual_style.style_prompt_short
+        or visual_style.style_prompt_full
+        or "cinematic narrative rendering"
+    )
     audio = "Ambient natural sound, no music."
     eight_part_prompt = (
         f"{framing}. {camera_desc} Camera movement: {camera}; {camera_negation}.\n"
@@ -514,7 +528,6 @@ def _build_shot_prompt_legacy(
     )
 
     # Append the portable design system after identity-lock and camera rules.
-    visual_style = _load_default_visual_style(visual_style_path)
     if visual_style.style_prompt_full:
         prompt = f"{prompt}\n\nVisual style: {visual_style.style_prompt_full}"
     shot.setdefault("speech_duration_s", estimate_shot_duration(len(prompt.split())))
@@ -733,6 +746,12 @@ def _generate_single_shot(
     if shot.get("source_excerpt") and not shot.get("action_description"):
         shot["action_description"] = shot["source_excerpt"]
     duration = shot.get("suggested_duration", 5)
+    visual_style = _load_default_visual_style(visual_style_path)
+    fallback_style = (
+        visual_style.style_prompt_short
+        or visual_style.style_prompt_full
+        or "cinematic narrative rendering"
+    )
     user_prompt = _build_shot_prompt(
         shot, characters, scene_style_map=scene_style_map,
         prev_shot=previous_shot, visual_style_path=visual_style_path,
@@ -742,7 +761,10 @@ def _generate_single_shot(
     for attempt in range(1 + MAX_RETRIES):
         if time.monotonic() + LLM_TIMEOUT > shot_deadline:
             print(f"Shot {index} 总时限 {SHOT_WALL_CLOCK_S}s 到，使用降级方案", file=sys.stderr)
-            llm_result = {"prompt": f"Cinematic shot, {shot.get('visual', 'scene')}, natural lighting, film grain", "caption": shot.get("what", "")}
+            llm_result = {
+                "prompt": f"{fallback_style}, {shot.get('visual', 'scene')}, natural lighting",
+                "caption": shot.get("what", ""),
+            }
             break
         try:
             prompt = user_prompt if attempt == 0 else user_prompt + f"\n\n[重试反馈] 上次失败原因: {last_error}。请确保输出有效的 JSON 格式。"
@@ -763,14 +785,19 @@ def _generate_single_shot(
             else:
                 print(f"Shot {index} LLM 调用失败，使用降级方案: {exc}", file=sys.stderr)
         if attempt == MAX_RETRIES:
-            llm_result = {"prompt": f"Cinematic shot, {shot.get('visual', 'scene')}, natural lighting, film grain", "caption": shot.get("what", "")}
+            llm_result = {
+                "prompt": f"{fallback_style}, {shot.get('visual', 'scene')}, natural lighting",
+                "caption": shot.get("what", ""),
+            }
 
     if llm_result is None:
-        llm_result = {"prompt": f"Cinematic shot, {shot.get('visual', 'scene')}, natural lighting, film grain", "caption": shot.get("what", "")}
+        llm_result = {
+            "prompt": f"{fallback_style}, {shot.get('visual', 'scene')}, natural lighting",
+            "caption": shot.get("what", ""),
+        }
     prompt_blueprint = user_prompt.partition("场景：")[2].partition("\n角色：")[0].strip()
     if prompt_blueprint:
         llm_result["prompt"] = f"{prompt_blueprint}\n{llm_result['prompt']}".strip()
-    visual_style = _load_default_visual_style(visual_style_path)
     if visual_style.style_prompt_full and visual_style.style_prompt_full not in llm_result["prompt"]:
         llm_result["prompt"] = f"{llm_result['prompt']}\n\nVisual style: {visual_style.style_prompt_full}"
     llm_result["prompt"] = _remove_fast_motion_words(llm_result["prompt"])

@@ -42,12 +42,22 @@ from utils.ark_llm import (
 
 # ─── LLM 配置 ───────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = (
-    "你是动作影视编剧与连续性编辑。从文本中提取可拍摄的叙事动作单元。"
+GENERAL_SYSTEM_PROMPT = (
+    "你是影视编剧与连续性编辑。从文本中提取可拍摄的叙事事件。"
     "事件不是镜头：不要把每句话或每个招式机械拆成一个事件，镜头划分由下游导演完成。"
     "你必须保留动作的起始状态、结束状态、因果关系和无署名对白的可靠归属。输出严格 JSON 数组。"
     "不要输出任何解释文字，只输出 JSON。"
 )
+
+ACTION_SYSTEM_PROMPT = (
+    "你是动作影视编剧与连续性编辑。从动作型文本中提取可拍摄的因果动作单元。"
+    "事件不是镜头：不要把每句话或每个招式机械拆成一个事件，镜头划分由下游导演完成。"
+    "你必须保留动作的起始状态、结束状态、因果关系和无署名对白的可靠归属。输出严格 JSON 数组。"
+    "不要输出任何解释文字，只输出 JSON。"
+)
+
+# Backward-compatible export for integrations that imported the old constant.
+SYSTEM_PROMPT = GENERAL_SYSTEM_PROMPT
 
 USER_PROMPT_TEMPLATE = (
     "文档类型：{format_hint}\n\n"
@@ -79,17 +89,29 @@ USER_PROMPT_TEMPLATE = (
     "line 必须逐字保留剧本原文，禁止改写、摘要或翻译。\n"
     "剧本对白可能写作 角色名：\"台词\" 或 角色名:\"台词\"，全角/半角冒号与引号均可能出现。"
     "只有证据充分才填写角色名；若只能猜测，speaker 写‘未知’并降低 confidence，禁止为了完整而编造。\n\n"
-    "【小说化动作剧本规则】\n"
-    "1. 环境建立、人物当前造型/受损状态、对白、动作链、后果和情绪反转是不同 event_role。\n"
-    "2. 连续的攻→防→反击→结果应按一个有因果闭环的动作单元提取，通常包含 2-8 个 micro_actions；"
-    "不要把‘抬手/挡住/后退’各自拆成独立事件。\n"
-    "3. 当动作改变场景或人物状态（护栏被斩断、柱体坍塌、武器停在颈侧）必须写入 end_state，"
-    "不能只概括为‘双方打斗’。\n"
-    "4. 原文中的停顿、救援、放下武器、共同迎敌等关系反转必须单列 turning_point，dramatic_turn=true。\n"
-    "5. 相邻事件若动作位置、朝向、速度和受力状态直接延续，continuity_before=continuous；"
-    "换场、跳时、视角独立重置或新叙事段落为 cut。\n"
-    "6. who 只放可作为角色资产的具名个体；‘数十道机械身影’‘群众’‘部队’等群体只写入 visual，"
-    "不得写入 who。"
+    "{format_contract}"
+)
+
+GENERAL_PROSE_CONTRACT = (
+    "【通用叙事规则】\n"
+    "1. 场景建立、人物状态、对白、行为、反应、后果与关系变化按叙事功能划分 event_role。\n"
+    "2. 只在原文明确描述可见行为时填写 micro_actions；氛围、说明与内心信息不得虚构肢体动作。\n"
+    "3. 对人物、物体或空间造成的持久变化必须进入 end_state，供后续事件承接。\n"
+    "4. 目标、关系、认知或处境发生转折时单列 turning_point，并设置 dramatic_turn=true。\n"
+    "5. 同一时空的状态直接承接才使用 continuous；换场、跳时或独立叙事段落使用 cut。\n"
+    "6. who 只放可作为角色资产的具名个体；群体与背景参与者写入 visual，不得写入 who。"
+)
+
+ACTION_SCREENPLAY_CONTRACT = (
+    "【动作型叙事规则】\n"
+    "1. 场景建立、人物当前状态、对白、动作链、反应、后果和叙事转折是不同 event_role。\n"
+    "2. 连续动作按因果闭环组织为动作单元，通常包含 2-8 个有序 micro_actions；"
+    "不要把同一连续动作中的每个姿态机械拆成独立事件。\n"
+    "3. 动作造成的人物、物体、空间、朝向、速度或受力状态变化必须写入 end_state。\n"
+    "4. 目标、立场、关系或局势发生变化时单列 turning_point，并设置 dramatic_turn=true。\n"
+    "5. 相邻事件的位置、朝向、速度和受力状态直接延续时使用 continuous；"
+    "换场、跳时或独立叙事段落使用 cut。\n"
+    "6. who 只放可作为角色资产的具名个体；群体与背景参与者写入 visual，不得写入 who。"
 )
 
 LLM_TIMEOUT = 300
@@ -116,7 +138,7 @@ def _get_client() -> OpenAI:
     return create_ark_client(read_timeout=LLM_IDLE_TIMEOUT)
 
 
-def _call_llm(prompt: str) -> str:
+def _call_llm(prompt: str, system_prompt: str = GENERAL_SYSTEM_PROMPT) -> str:
     """
     调用 LLM 并返回原始响应文本
 
@@ -133,7 +155,7 @@ def _call_llm(prompt: str) -> str:
 
     return call_llm_stream(
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ],
         max_tokens=16000,
@@ -284,17 +306,23 @@ def _extract_events_from_segment(segment: Dict[str, Any]) -> List[Dict[str, Any]
     if not content.strip():
         return []
 
+    format_hint = str(segment.get("format_hint") or "general_prose")
+    is_action_format = format_hint == "prose_action_screenplay"
     prompt = USER_PROMPT_TEMPLATE.format(
         content=content,
-        format_hint=segment.get("format_hint", "general_prose"),
+        format_hint=format_hint,
         context_before=segment.get("context_before", ""),
         context_after=segment.get("context_after", ""),
+        format_contract=(
+            ACTION_SCREENPLAY_CONTRACT if is_action_format else GENERAL_PROSE_CONTRACT
+        ),
     )
+    system_prompt = ACTION_SYSTEM_PROMPT if is_action_format else GENERAL_SYSTEM_PROMPT
 
     last_error = None
     for attempt in range(1 + MAX_RETRIES):
         try:
-            response = _call_llm(prompt)
+            response = _call_llm(prompt, system_prompt=system_prompt)
             events = _parse_events(response, content)
             return events
         except (json.JSONDecodeError, ValueError) as e:

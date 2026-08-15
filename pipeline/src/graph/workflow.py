@@ -75,7 +75,9 @@ def build_workflow(
         quality_gate_router,
         {
             "pass": "phase8",
-            "retry": "phase6_txt2vid",
+            "retry_txt2vid": "phase6_txt2vid",
+            "retry_img2vid": "phase6_img2vid",
+            "retry_reference": "phase6_reference",
         },
     )
     graph.add_conditional_edges(

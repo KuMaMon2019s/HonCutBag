@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from clients.ark_multimodal_client import ArkMultimodalClient
-from phases.phase1.adaptation_engine import generation_action_limit
+from utils.video_capabilities import capabilities_for
 
 DEFAULT_SIMILARITY_THRESHOLD = 0.85
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
@@ -68,6 +68,7 @@ def run_l1_checks(storyboard: dict, visual_style: str) -> tuple[list[dict], dict
     for index, shot in enumerate(shots):
         if not isinstance(shot, dict):
             continue
+        profile = capabilities_for({**storyboard, **shot})
         sid = _shot_id(shot, index)
         per_shot[sid] = {"issues": [], "characters": []}
         lighting = " ".join(_text(shot.get(key)) for key in ("lighting_description", "lighting", "prompt", "description", "name"))
@@ -110,6 +111,7 @@ def run_generation_capacity_checks(
     for index, shot in enumerate(storyboard.get("shots", [])):
         if not isinstance(shot, dict):
             continue
+        profile = capabilities_for({**storyboard, **shot})
         sid = _shot_id(shot, index)
         raw_units = shot.get("source_action_unit_ids") or []
         if isinstance(raw_units, str):
@@ -157,25 +159,35 @@ def run_generation_capacity_checks(
                     beat_units = [beat_units]
                 beat_units = [str(value) for value in beat_units if str(value).strip()]
                 beat_units_seen.extend(beat_units)
-                if len(set(beat_units)) > 1:
+                if len(set(beat_units)) > profile.max_action_units_per_beat:
                     issues.append(_issue(
                         "L1", "severe", "storyboard_beat_action_unit_overload",
-                        f"{beat_id} contains multiple action units; split into more Pxx beats",
+                        f"{beat_id} exceeds {profile.name}'s action-unit capacity "
+                        f"({profile.max_action_units_per_beat})",
                         [sid], beat_id=beat_id, action_unit_ids=beat_units,
                     ))
                 micro_actions = beat.get("micro_actions") or []
                 if isinstance(micro_actions, str):
                     micro_actions = [micro_actions]
-                if len([value for value in micro_actions if str(value).strip()]) > 2:
+                if (
+                    len([value for value in micro_actions if str(value).strip()])
+                    > profile.max_micro_actions_per_beat
+                ):
                     issues.append(_issue(
                         "L1", "severe", "storyboard_beat_action_overload",
-                        f"{beat_id} contains more than two visible micro-actions",
+                        f"{beat_id} exceeds {profile.name}'s visible-action capacity "
+                        f"({profile.max_micro_actions_per_beat})",
                         [sid], beat_id=beat_id,
                     ))
-                if beat_duration < 3 or beat_duration > 7:
+                if (
+                    beat_duration < profile.min_unique_beat_s
+                    or beat_duration > profile.max_unique_beat_s
+                ):
                     issues.append(_issue(
                         "L1", "severe", "storyboard_beat_duration_invalid",
-                        f"{beat_id} lasts {beat_duration:g}s; expected 3-7s",
+                        f"{beat_id} lasts {beat_duration:g}s; expected "
+                        f"{profile.min_unique_beat_s:g}-{profile.max_unique_beat_s:g}s "
+                        f"for {profile.name}",
                         [sid], beat_id=beat_id, duration_seconds=beat_duration,
                     ))
             if duration and not math.isclose(
@@ -198,10 +210,11 @@ def run_generation_capacity_checks(
                     observed_action_unit_ids=sorted(set(beat_units_seen)),
                 ))
 
-        if len(units) > 1 and not storyboard_beats:
+        if len(units) > profile.max_action_units_per_beat and not storyboard_beats:
             issues.append(_issue(
                 "L1", "severe", "action_unit_overload",
-                f"{sid} contains {len(units)} action units; generated clips support one",
+                f"{sid} contains {len(units)} action units; {profile.name} supports "
+                f"{profile.max_action_units_per_beat}",
                 [sid], action_unit_ids=sorted(units),
             ))
         if units and not generation_actions and not storyboard_beats:
@@ -210,7 +223,7 @@ def run_generation_capacity_checks(
                 f"{sid} has screenplay action but no bounded generation action contract",
                 [sid],
             ))
-        action_limit = generation_action_limit(duration)
+        action_limit = profile.action_limit(duration)
         if len(generation_actions) > action_limit and not storyboard_beats:
             issues.append(_issue(
                 "L1", "severe", "generation_action_overload",
@@ -218,10 +231,12 @@ def run_generation_capacity_checks(
                 f"(max {action_limit} for {duration:g}s)",
                 [sid], prompted_actions=len(generation_actions), action_limit=action_limit,
             ))
-        if units and duration > 6 and not storyboard_beats:
+        if units and duration > profile.max_unique_beat_s and not storyboard_beats:
             issues.append(_issue(
                 "L1", "severe", "action_shot_too_long",
-                f"{sid} action shot lasts {duration:g}s; split into 4-6s executable beats",
+                f"{sid} action shot lasts {duration:g}s; split within "
+                f"{profile.name}'s {profile.min_unique_beat_s:g}-"
+                f"{profile.max_unique_beat_s:g}s beat range",
                 [sid], duration_seconds=duration,
             ))
         if units and camera in {"static", "fixed", "locked", "unspecified", ""} and not storyboard_beats:
@@ -230,7 +245,12 @@ def run_generation_capacity_checks(
                 f"{sid} action shot uses a locked/static camera contract",
                 [sid], camera_movement=camera or "missing",
             ))
-        if not units and duration > 6 and camera in {"static", "fixed", "locked", "unspecified", ""} and not storyboard_beats:
+        if (
+            not units
+            and duration > profile.max_unique_beat_s
+            and camera in {"static", "fixed", "locked", "unspecified", ""}
+            and not storyboard_beats
+        ):
             issues.append(_issue(
                 "L1", "severe", "static_hold_risk",
                 f"{sid} holds a static composition for {duration:g}s",

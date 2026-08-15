@@ -8,7 +8,7 @@ import time
 from typing import Callable, Optional
 
 import httpx
-from openai import APIConnectionError, APITimeoutError, OpenAI
+from openai import APIConnectionError, APITimeoutError, DefaultHttpxClient, OpenAI
 
 from utils.config import ARK_BASE_URL
 
@@ -56,11 +56,17 @@ def create_ark_client(connect_timeout: float = 10.0, read_timeout: float = 60.0)
     timeout = httpx.Timeout(
         connect=connect_timeout, read=read_timeout, write=30.0, pool=10.0
     )
+    # Ark is intentionally direct-routed (see utils.config).  Explicitly
+    # disable ambient HTTP/SOCKS proxies at the transport boundary: relying on
+    # NO_PROXY alone still makes the OpenAI client initialize a SOCKS transport
+    # and fail when optional socksio is absent.
+    http_client = DefaultHttpxClient(timeout=timeout, trust_env=False)
     return OpenAI(
         api_key=api_key,
         base_url=ARK_BASE_URL,
         timeout=timeout,
         max_retries=0,
+        http_client=http_client,
     )
 
 

@@ -6,10 +6,16 @@ import math
 import re
 from typing import Any
 
+from utils.video_capabilities import (
+    SEEDANCE_2_CAPABILITIES,
+    VideoModelCapabilities,
+    capabilities_for,
+)
 
-MIN_BEAT_SECONDS = 3
-MAX_BEAT_SECONDS = 7
-MAX_ACTIONS_PER_BEAT = 2
+
+MIN_BEAT_SECONDS = int(SEEDANCE_2_CAPABILITIES.min_unique_beat_s)
+MAX_BEAT_SECONDS = int(SEEDANCE_2_CAPABILITIES.max_unique_beat_s)
+MAX_ACTIONS_PER_BEAT = SEEDANCE_2_CAPABILITIES.max_micro_actions_per_beat
 
 
 def _shot_id(shot: dict[str, Any], index: int) -> str:
@@ -51,7 +57,12 @@ def _duration_budgets(total: float, count: int) -> list[float]:
     return values
 
 
-def _beat_count(shot: dict[str, Any], duration: float, actions: list[str]) -> int:
+def _beat_count(
+    shot: dict[str, Any],
+    duration: float,
+    actions: list[str],
+    capabilities: VideoModelCapabilities,
+) -> int:
     """Choose Pxx count from authored semantics, bounded by provider duration."""
     existing = shot.get("storyboard_beats")
     if isinstance(existing, list) and existing:
@@ -65,10 +76,10 @@ def _beat_count(shot: dict[str, Any], duration: float, actions: list[str]) -> in
         1,
         explicit,
         action_units,
-        math.ceil(len(actions) / MAX_ACTIONS_PER_BEAT),
+        math.ceil(len(actions) / capabilities.max_micro_actions_per_beat),
     )
-    duration_count = max(1, math.ceil(duration / MAX_BEAT_SECONDS))
-    capacity = max(1, int(duration // MIN_BEAT_SECONDS))
+    duration_count = max(1, math.ceil(duration / capabilities.max_unique_beat_s))
+    capacity = max(1, int(duration // capabilities.min_unique_beat_s))
     return min(capacity, max(semantic_count, duration_count))
 
 
@@ -89,12 +100,16 @@ def _action_for_bucket(
     return _compact(f"继续推进本镜动作：{fallback_action}")
 
 
-def plan_storyboard_beats(storyboard: dict[str, Any]) -> dict[str, Any]:
+def plan_storyboard_beats(
+    storyboard: dict[str, Any],
+    capabilities: VideoModelCapabilities | None = None,
+) -> dict[str, Any]:
     """Attach one fresh/extend execution ladder to every editorial shot."""
     total = 0
     for index, shot in enumerate(storyboard.get("shots", []), 1):
         if not isinstance(shot, dict):
             continue
+        profile = capabilities or capabilities_for({**storyboard, **shot})
         sid = _shot_id(shot, index)
         duration = float(shot.get("duration") or shot.get("suggested_duration") or 5)
         source_actions = shot.get("micro_actions") or shot.get("generation_actions") or []
@@ -128,7 +143,7 @@ def plan_storyboard_beats(storyboard: dict[str, Any]) -> dict[str, Any]:
         )
         if not source_actions:
             source_actions = [fallback_action]
-        count = _beat_count(shot, duration, source_actions)
+        count = _beat_count(shot, duration, source_actions, profile)
         action_buckets = _partition(source_actions, count)
         raw_units = shot.get("source_action_unit_ids") or []
         if isinstance(raw_units, str):
@@ -190,6 +205,7 @@ def plan_storyboard_beats(storyboard: dict[str, Any]) -> dict[str, Any]:
             **(shot.get("generation_load") or {}),
             "storyboard_beats": len(beats),
             "execution": "fresh_then_extend",
+            "capability_profile": profile.name,
         }
         total += len(beats)
     storyboard["storyboard_beat_count"] = total

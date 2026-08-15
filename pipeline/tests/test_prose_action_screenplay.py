@@ -16,6 +16,8 @@ from phases.phase1.adaptation_engine import (
     _inherit_event_semantics,
 )
 from prompt.event_extractor import (
+    ACTION_SCREENPLAY_CONTRACT,
+    GENERAL_PROSE_CONTRACT,
     USER_PROMPT_TEMPLATE as EVENT_PROMPT,
     _annotate_global_event_flow,
     _parse_events,
@@ -111,7 +113,8 @@ def test_parser_detects_prose_action_and_attaches_neighbor_context():
 def test_event_prompt_uses_read_only_context_and_action_unit_contract():
     assert "严禁从前后文重复提取事件" in EVENT_PROMPT
     assert "事件不是镜头" in EVENT_PROMPT or "动作单元" in EVENT_PROMPT
-    assert "2-8 个 micro_actions" in EVENT_PROMPT
+    assert "2-8 个有序 micro_actions" in ACTION_SCREENPLAY_CONTRACT
+    assert "氛围、说明与内心信息不得虚构肢体动作" in GENERAL_PROSE_CONTRACT
     assert "speaker 写‘未知’" in EVENT_PROMPT
     assert "continuity_before" in EVENT_PROMPT
 

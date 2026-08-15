@@ -24,17 +24,18 @@ class Phase6Runner(Protocol):
 
 
 class Phase6NodeRunner(Protocol):
-    """Callable contract for the live txt2vid compatibility facade."""
+    """Backward-compatible callable contract for a Phase 6 graph facade."""
 
     def __call__(self, state: HonCutState) -> dict[str, Any]: ...
 
 
-def phase6_txt2vid_node(
+def _phase6_node(
     state: HonCutState,
     *,
     runner: Phase6Runner,
+    generation_mode: str,
 ) -> dict[str, Any] | Command:
-    """Run the shared Phase 6 implementation and preserve retry bookkeeping."""
+    """Run Phase 6 while preserving the graph's concrete route identity."""
 
     output_dir = Path(state["output_dir"])
     replacement = None
@@ -57,7 +58,7 @@ def phase6_txt2vid_node(
             replacement.remove_sources()
 
     try:
-        phase_receipt = runner(
+        raw_receipt = runner(
             storyboard_data=state.get("storyboard"),
             output_dir=output_dir,
             dry_run=state["dry_run"],
@@ -68,6 +69,7 @@ def phase6_txt2vid_node(
             replacement.rollback(str(exc))
         raise
 
+    phase_receipt = {**raw_receipt, "generation_mode": generation_mode}
     update: dict[str, Any] = {
         "videos": phase_receipt.get("outputs", []),
         "phase_results": {
@@ -77,6 +79,7 @@ def phase6_txt2vid_node(
         "completed_phases": state.get("completed_phases", [])
         + (["phase6"] if phase_receipt.get("status") != "error" else []),
         "retry_count": state.get("retry_count", 0) + 1,
+        "video_generation_mode": generation_mode,
         "skip_phase": state.get("skip_phase", []),
     }
     if phase_receipt.get("status") == "error":
@@ -89,21 +92,31 @@ def phase6_txt2vid_node(
     return update
 
 
+def phase6_txt2vid_node(
+    state: HonCutState,
+    *,
+    runner: Phase6Runner,
+) -> dict[str, Any] | Command:
+    """Run Phase 6 through the text-to-video graph route."""
+
+    return _phase6_node(state, runner=runner, generation_mode="txt2vid")
+
+
 def phase6_img2vid_node(
     state: HonCutState,
     *,
-    txt2vid_node: Phase6NodeRunner,
-) -> dict[str, Any]:
-    """Preserve the current image-to-video delegation to txt2vid."""
+    runner: Phase6Runner,
+) -> dict[str, Any] | Command:
+    """Run Phase 6 through the storyboard-image route."""
 
-    return txt2vid_node(state)
+    return _phase6_node(state, runner=runner, generation_mode="img2vid")
 
 
 def phase6_reference_node(
     state: HonCutState,
     *,
-    txt2vid_node: Phase6NodeRunner,
-) -> dict[str, Any]:
-    """Preserve the current reference-to-video delegation to txt2vid."""
+    runner: Phase6Runner,
+) -> dict[str, Any] | Command:
+    """Run Phase 6 through the multi-reference route."""
 
-    return txt2vid_node(state)
+    return _phase6_node(state, runner=runner, generation_mode="reference")

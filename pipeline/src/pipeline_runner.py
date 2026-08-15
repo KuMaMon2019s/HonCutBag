@@ -229,7 +229,7 @@ def main() -> None:
     phase_failed = selected_result and selected_result.get("status") == "error"
     if phase_failed:
         print(f"Phase {args.phase} failed: {selected_result.get('error', 'unknown error')}", flush=True)
-    success = report["status"] in ("completed", "partial") and not phase_failed
+    success = report["status"] == "completed" and not phase_failed
     raise SystemExit(0 if success else 1)
 
 if __name__ == "__main__":

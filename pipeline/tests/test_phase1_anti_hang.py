@@ -163,7 +163,7 @@ def test_event_extractor_concurrent_results_remain_ordered(monkeypatch):
 def test_event_extractor_retries_stream_interruption(monkeypatch):
     calls = 0
 
-    def call(_prompt):
+    def call(_prompt, **_kwargs):
         nonlocal calls
         calls += 1
         if calls == 1:

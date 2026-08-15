@@ -333,6 +333,10 @@ def apply_speed_ramp(
         return output_path
 
     duration = _probe_duration(video_path)
+    fps = _probe_fps(video_path)
+    if fps <= 0:
+        raise ValueError(f"Invalid source frame rate: {fps}")
+    target_frames = max(1, round(duration * fps))
 
     # 构建分段边界: [0, cut1, cut2, ..., duration]
     valid_cuts = sorted({
@@ -396,8 +400,8 @@ def apply_speed_ramp(
     # closes codec/frame rounding to the exact source timebase for Phase 9's
     # delivery gate (and prevents a short audio encoder tail).
     filter_parts.append(
-        f"[joinedv]tpad=stop_mode=clone:stop_duration=1,"
-        f"trim=duration={duration:.9f},setpts=PTS-STARTPTS[outv]"
+        f"[joinedv]fps={fps:.12g},tpad=stop_mode=clone:stop_duration=1,"
+        f"trim=end_frame={target_frames},setpts=N/({fps:.12g}*TB)[outv]"
     )
     filter_parts.append(
         f"[joineda]apad,atrim=duration={duration:.9f},"
@@ -412,6 +416,7 @@ def apply_speed_ramp(
         "-map", "[outv]", "-map", "[outa]",
         "-c:v", "libx264", "-preset", "medium", "-crf", "18",
         "-c:a", "aac", "-b:a", "192k",
+        "-t", f"{duration:.9f}", "-shortest",
         output_path,
     ]
     _run(cmd, f"speed ramp ({n_segments} segments)")

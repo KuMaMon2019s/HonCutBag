@@ -46,6 +46,12 @@ from utils.ark_llm import (
     call_llm_stream,
     create_ark_client,
 )
+from utils.video_capabilities import (
+    SEEDANCE_2_CAPABILITIES,
+    VideoModelCapabilities,
+    capabilities_for,
+    get_video_capabilities,
+)
 
 
 # ─── LLM 配置 ───────────────────────────────────────────────────────────────
@@ -243,11 +249,11 @@ LLM_IDLE_TIMEOUT = 75  # 只在流连续 75 秒没有任何 chunk 时判定停�
 MAX_RETRIES = 1  # 解析失败重试次数
 NETWORK_RETRIES = 2  # 网络超时自动重试次数（2026-08-09 R7: 70事件大prompt一次超时即死太脆）
 AVG_SHOT_DURATION = 12  # 默认每镜时长（秒）
-MIN_SHOT_DURATION = 4  # 单镜头最小时长（秒）
-MAX_SHOT_DURATION = 15  # 单镜头最大时长（秒）
+MIN_SHOT_DURATION = int(SEEDANCE_2_CAPABILITIES.min_shot_duration_s)
+MAX_SHOT_DURATION = int(SEEDANCE_2_CAPABILITIES.max_shot_duration_s)
 CHARS_PER_SECOND = 4  # 中文剧本预估：约 4 字/秒（范围 3-5）
 DEFAULT_TARGET_DURATION = 60  # 默认目标时长（用户未指定时使用）
-MAX_GENERATION_ACTIONS_PER_SHOT = 4
+MAX_GENERATION_ACTIONS_PER_SHOT = SEEDANCE_2_CAPABILITIES.action_limit(None)
 
 
 def estimate_duration_from_text(text: str) -> int:
@@ -282,7 +288,11 @@ def estimate_duration_from_text(text: str) -> int:
     return int(estimated)
 
 
-def estimate_shot_count(target_duration: int, shot_duration: int = AVG_SHOT_DURATION) -> int:
+def estimate_shot_count(
+    target_duration: int,
+    shot_duration: int = AVG_SHOT_DURATION,
+    capabilities: VideoModelCapabilities | None = None,
+) -> int:
     """
     根据目标时长和单镜时长计算合理的镜头数量。
 
@@ -295,8 +305,11 @@ def estimate_shot_count(target_duration: int, shot_duration: int = AVG_SHOT_DURA
     Returns:
         建议的最大镜头数
     """
-    # 将 shot_duration 限制在合理范围内
-    shot_duration = max(MIN_SHOT_DURATION, min(MAX_SHOT_DURATION, shot_duration))
+    profile = capabilities or get_video_capabilities()
+    shot_duration = max(
+        profile.min_shot_duration_s,
+        min(profile.max_shot_duration_s, shot_duration),
+    )
 
     max_shots = max(1, (target_duration + shot_duration - 1) // shot_duration)
     return max_shots
@@ -321,6 +334,7 @@ def select_generation_actions(
     micro_actions: List[str],
     limit: int = MAX_GENERATION_ACTIONS_PER_SHOT,
     duration_seconds: float | None = None,
+    capabilities: VideoModelCapabilities | None = None,
 ) -> List[str]:
     """Select a duration-bounded ordered motion contract for a model.
 
@@ -332,10 +346,8 @@ def select_generation_actions(
     source actions remain in the audit ledger for adaptation decisions.
     """
     if duration_seconds is not None:
-        # Real Seedance probes showed that even three authored body actions in
-        # four seconds produced skipped choreography and broken limbs. Keep a
-        # 4-5s clip to one visible action; longer clips earn a larger budget.
-        limit = min(limit, generation_action_limit(duration_seconds))
+        profile = capabilities or get_video_capabilities()
+        limit = min(limit, profile.action_limit(duration_seconds))
     actions = [str(value).strip() for value in micro_actions if str(value).strip()]
     if len(actions) <= limit:
         return actions
@@ -345,35 +357,39 @@ def select_generation_actions(
     return [actions[index] for index in dict.fromkeys(indices)]
 
 
-def generation_action_limit(duration_seconds: float | int | None) -> int:
-    """Return the paid-generation action budget for one clip duration."""
-    if duration_seconds is None:
-        return MAX_GENERATION_ACTIONS_PER_SHOT
-    duration = float(duration_seconds)
-    if duration <= 5.0:
-        return 1
-    if duration <= 6.0:
-        return 2
-    if duration <= 8.0:
-        return 3
-    return MAX_GENERATION_ACTIONS_PER_SHOT
+def generation_action_limit(
+    duration_seconds: float | int | None,
+    *,
+    model: str | None = None,
+    provider: str | None = None,
+    capabilities: VideoModelCapabilities | None = None,
+) -> int:
+    """Return the action budget owned by the selected video-model profile."""
+
+    profile = capabilities or get_video_capabilities(model=model, provider=provider)
+    return profile.action_limit(duration_seconds)
 
 
 def normalize_shot_durations(
-    shots: List[Dict[str, Any]], target_duration: int
+    shots: List[Dict[str, Any]],
+    target_duration: int,
+    capabilities: VideoModelCapabilities | None = None,
 ) -> List[Dict[str, Any]]:
     """Assign exact seconds, giving dense action/dialogue enough Pxx capacity."""
     if not shots:
         return shots
-    if len(shots) * MIN_SHOT_DURATION > target_duration:
+    profile = capabilities or capabilities_for(shots[0])
+    minimum = int(profile.min_shot_duration_s)
+    maximum = int(profile.max_shot_duration_s)
+    if len(shots) * minimum > target_duration:
         raise ValueError(
             f"{len(shots)} shots cannot fit {target_duration}s at the "
-            f"{MIN_SHOT_DURATION}s provider minimum"
+            f"{minimum}s {profile.name} minimum"
         )
-    if len(shots) * MAX_SHOT_DURATION < target_duration:
+    if len(shots) * maximum < target_duration:
         raise ValueError(
             f"{len(shots)} shots cannot fill {target_duration}s at the "
-            f"{MAX_SHOT_DURATION}s provider maximum"
+            f"{maximum}s {profile.name} maximum"
         )
 
     def complexity(shot: Dict[str, Any]) -> float:
@@ -403,13 +419,13 @@ def normalize_shot_durations(
         return float(max(1, len(set(map(str, units))), action_weight, math.ceil(spoken / 4)))
 
     weights = [complexity(shot) for shot in shots]
-    allocations = [MIN_SHOT_DURATION for _ in shots]
+    allocations = [minimum for _ in shots]
     remaining = int(target_duration) - sum(allocations)
     # Weighted fair allocation preserves exact total duration and provider caps.
     while remaining:
         candidates = [
             index for index, value in enumerate(allocations)
-            if value < MAX_SHOT_DURATION
+            if value < maximum
         ]
         if not candidates:
             raise ValueError("duration allocation exhausted provider capacity")
@@ -424,6 +440,7 @@ def normalize_shot_durations(
         shot["duration_allocation"] = {
             "method": "semantic_weighted_provider_bounded",
             "complexity_weight": weights[index],
+            "capability_profile": profile.name,
         }
     return shots
 
@@ -1128,17 +1145,27 @@ def adapt_events(
     if target_duration < 10:
         raise ValueError(f"目标时长不合理：{target_duration}秒（最少 10 秒）")
 
-    if not MIN_SHOT_DURATION <= shot_duration <= MAX_SHOT_DURATION:
+    capability_profile = get_video_capabilities()
+    if not (
+        capability_profile.min_shot_duration_s
+        <= shot_duration
+        <= capability_profile.max_shot_duration_s
+    ):
         raise ValueError(
             f"每镜时长不合理：{shot_duration}秒"
-            f"（应在 {MIN_SHOT_DURATION}-{MAX_SHOT_DURATION} 秒）"
+            f"（{capability_profile.name} 应在 "
+            f"{capability_profile.min_shot_duration_s:g}-"
+            f"{capability_profile.max_shot_duration_s:g} 秒）"
         )
 
     # ── 计算导演级 shot 数；内部生成容量由 storyboard_beats 承担 ─────────
     max_shots = estimate_action_aware_shot_count(events, target_duration, shot_duration)
     effective_shot_duration = max(
-        MIN_SHOT_DURATION,
-        min(MAX_SHOT_DURATION, round(target_duration / max_shots)),
+        capability_profile.min_shot_duration_s,
+        min(
+            capability_profile.max_shot_duration_s,
+            round(target_duration / max_shots),
+        ),
     )
 
     # ── 构建 prompt ───────────────────────────────────────────────────────
@@ -1160,7 +1187,9 @@ def adapt_events(
             )
             if checkpoint_dir is not None:
                 _atomic_write_json(checkpoint_dir / "beat_skeleton.json", skeleton)
-        normalize_shot_durations(skeleton["beats"], target_duration)
+        normalize_shot_durations(
+            skeleton["beats"], target_duration, capability_profile
+        )
         shots = _expand_beats_to_shots(
             skeleton["beats"], characters_summary, target_duration, effective_shot_duration,
             output_dir=checkpoint_dir, resumed_shots=resumed_shots,
@@ -1171,7 +1200,7 @@ def adapt_events(
         for i, shot in enumerate(shots, 1):
             shot["shot_order"] = i
 
-        normalize_shot_durations(shots, target_duration)
+        normalize_shot_durations(shots, target_duration, capability_profile)
         _inherit_event_semantics(shots, events)
 
         for i, shot in enumerate(shots):
@@ -1243,7 +1272,7 @@ def adapt_events(
     for i, shot in enumerate(shots, 1):
         shot["shot_order"] = i
 
-    normalize_shot_durations(shots, target_duration)
+    normalize_shot_durations(shots, target_duration, capability_profile)
     _inherit_event_semantics(shots, events)
 
     # Add continuity context between shots (镜头连贯性)

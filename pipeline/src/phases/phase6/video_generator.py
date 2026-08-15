@@ -12,6 +12,7 @@ from typing import Any
 from clients.video_client import VideoClient
 from prompt.eight_layer_summary import build_subject_summary
 from utils.style_slices import get_slice
+from utils.video_geometry import resolve_video_geometry
 
 
 BASE_NEGATIVE_PROMPT = (
@@ -142,7 +143,12 @@ def build_video_prompt(
         "人物、建筑、地点、道具或剧情元素"
     )
     style = get_slice(style, "video")
-    quality = scene.get("quality_suffix") or f"4K, 16:9, {shot_meta.get('duration', 5)}秒"
+    ratio, _width, _height = resolve_video_geometry({**scene, **shot_meta})
+    quality = str(
+        scene.get("quality_suffix")
+        or f"4K, {ratio}, {shot_meta.get('duration', 5)}秒"
+    )
+    quality = re.sub(r"(?<!\d)\d+(?:\.\d+)?:\d+(?:\.\d+)?(?!\d)", ratio, quality)
     time_lock, time_negative = _time_continuity_contract(
         shot_meta.get("time_of_day"),
         shot_meta.get("time"),
@@ -167,7 +173,6 @@ def build_video_prompt(
     negatives.extend(str(char.get("negative_guardrails", "")).strip() for char in selected)
     negative_prompt = ", ".join(dict.fromkeys(item for item in negatives if item))
     prompt = "。".join(parts)
-    prompt = re.sub(r"(?i)\bfast\b", "smooth", prompt).replace("快速", "平稳")
     if explicit_scenery:
         scenery_lock = (
             "纯环境镜头硬约束：画面中保持零人物、零人形主体、零服装与零角色道具，"

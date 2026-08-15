@@ -3284,8 +3284,17 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
     if not shots_dir.exists():
         return {"status": "skipped", "reason": "no shots directory"}
 
-    video_provider = os.environ.get("VIDEO_PROVIDER", "seedance").lower()
-    use_local = video_provider in {"local", "wan", "bridge"}
+    from utils.config import get_video_route
+
+    configured_provider = os.environ.get("VIDEO_PROVIDER", "seedance").lower()
+    # ``bridge`` was historically overloaded as a provider name.  Keep it as
+    # a compatibility alias for Seedance-over-Bridge while new configuration
+    # uses VIDEO_PROVIDER=seedance + VIDEO_GENERATION_MODE=bridge.
+    video_provider = (
+        "seedance" if configured_provider in {"bridge", "ark"} else configured_provider
+    )
+    video_route = get_video_route(configured_provider)
+    use_local = video_route in {"bridge", "local"}
     if use_local:
         try:
             from clients import local_video_client
@@ -3295,15 +3304,20 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
         if not local_video_client.is_available(timeout=3.0):
             print("  ✗ Phase 6 前置检查失败: 本地视频 API 不可达", flush=True)
             return {"status": "error", "error": "local video API unreachable"}
-        if video_provider == "bridge":
-            print("  → 路由: 通过 Bridge 使用 Seedance 在线模型", flush=True)
+        if video_route == "bridge":
+            print(f"  → 路由: 通过 Bridge 使用 {video_provider} 模型", flush=True)
         else:
             print("  → 路由: 仅使用本地视频 API (192.168.31.221:9100)", flush=True)
-        if chain_mode and video_provider != "bridge":
+        if chain_mode and video_provider != "seedance":
             print("  [chain] 当前 provider 不是 seedance，Wan2.2 本地不支持接力；按普通模式执行", flush=True)
             chain_mode = False
     else:
-        print("  → 路由: 直连 ARK Agent Plan", flush=True)
+        if video_provider != "seedance":
+            return {
+                "status": "error",
+                "error": f"direct route is not implemented for provider {video_provider}",
+            }
+        print("  → 路由: Seedance 直连 ARK Agent Plan", flush=True)
 
     from runtime.generation_tasks import GenerationTaskStore
 
@@ -3503,9 +3517,10 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
             "phantom": "dialogue/emotion shot",
             "i2v": "scenery/ambient or default",
         }[gen_strategy]
-        video_provider = os.environ.get("VIDEO_PROVIDER", "seedance").lower()
-        if video_provider == "bridge":
+        if video_route == "bridge" and video_provider == "seedance":
             bridge_model = "seedance"
+        elif video_provider in {"wan", "wan22", "local"}:
+            bridge_model = "wan22"
         else:
             bridge_model = {"flf2v": "flf2v", "phantom": "phantom", "i2v": "wan22"}[gen_strategy]
         print(f"    [route] {shot_dir.name} → {gen_strategy} ({route_reason})")
@@ -3725,6 +3740,9 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
 
                         from runtime.bridge_execution import execute_bridge_video_task
 
+                        from utils.video_geometry import resolve_video_geometry
+
+                        aspect_ratio, video_width, video_height = resolve_video_geometry(meta)
                         bridge_generate = partial(
                             generate,
                             prompt=prompt,
@@ -3732,8 +3750,8 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                             reference_image_base64=first_frame_b64,
                             seed=shot_seed if shot_seed is not None else -1,
                             duration=duration,
-                            width=1280,
-                            height=720,
+                            width=video_width,
+                            height=video_height,
                             fps=24,
                             asset_zip_path=zip_path,
                             image_base64_list=base64_list,
@@ -3754,6 +3772,9 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                                 "duration": duration,
                                 "seed": shot_seed if shot_seed is not None else -1,
                                 "task_dir": task_dir_id,
+                                "ratio": aspect_ratio,
+                                "width": video_width,
+                                "height": video_height,
                             },
                             provider_endpoint=local_video_client.get_api_url(),
                             output_path=out_path,
@@ -3814,6 +3835,9 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
 
                 from runtime.seedance_execution import execute_seedance_video_task
 
+                from utils.video_geometry import resolve_video_geometry
+
+                aspect_ratio, video_width, video_height = resolve_video_geometry(meta)
                 execution = execute_seedance_video_task(
                     generation_tasks,
                     run_id=str(output_dir.resolve()),
@@ -3824,6 +3848,9 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                         "model": direct_model,
                         "duration": duration or 12,
                         "seed": shot_seed,
+                        "ratio": aspect_ratio,
+                        "width": video_width,
+                        "height": video_height,
                     },
                     provider_endpoint=seedance_client.BASE_URL,
                     output_path=out_path,
@@ -3833,7 +3860,7 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                         api_key=api_key,
                         model=direct_model,
                         duration=duration or 12,
-                        ratio="16:9",
+                        ratio=aspect_ratio,
                         seed=shot_seed,
                     ),
                     poll=partial(seedance_client.poll, api_key=api_key),
@@ -3882,6 +3909,9 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                     "video_path": out_path,
                     "actual_model": direct_model,
                     "actual_duration": actual_duration,
+                    "ratio": aspect_ratio,
+                    "width": video_width,
+                    "height": video_height,
                 })
                 if shot_seed is not None:
                     meta["seed"] = shot_seed
@@ -6535,16 +6565,16 @@ if LANGGRAPH_AVAILABLE:
         return phase6_txt2vid_node(state, runner=run_phase6)
 
     def node_phase6_img2vid(state: HonCutState) -> dict:
-        """Compatibility facade preserving delegation to txt2vid."""
+        """Compatibility facade for the migrated img2vid node."""
         from graph.nodes.phase6 import phase6_img2vid_node
 
-        return phase6_img2vid_node(state, txt2vid_node=node_phase6_txt2vid)
+        return phase6_img2vid_node(state, runner=run_phase6)
 
     def node_phase6_reference(state: HonCutState) -> dict:
-        """Compatibility facade preserving delegation to txt2vid."""
+        """Compatibility facade for the migrated reference node."""
         from graph.nodes.phase6 import phase6_reference_node
 
-        return phase6_reference_node(state, txt2vid_node=node_phase6_txt2vid)
+        return phase6_reference_node(state, runner=run_phase6)
 
     def node_phase7(state: HonCutState) -> dict:
         """Compatibility facade for the migrated Phase 7 graph node."""
@@ -6567,7 +6597,10 @@ if LANGGRAPH_AVAILABLE:
                 # Retry Phase 6 (max 2 times)
                 print(f"\n  ⚠ 质检不通过 (slideshow_risk={slideshow_risk}, variation={variation_score})")
                 print(f"  🔄 回退到 Phase 6 重新生成 (retry {retry_count + 1}/2)")
-                return "retry"
+                mode = state.get("video_generation_mode") or route_phase5(state)
+                if mode not in {"txt2vid", "img2vid", "reference"}:
+                    mode = "txt2vid"
+                return f"retry_{mode}"
             else:
                 print(f"\n  ⚠ 质检不通过，但已达最大重试次数，继续执行")
         
@@ -6883,7 +6916,7 @@ def run_pipeline(
                     "langgraph": True,
                 }
                 
-                if report["status"] in ("completed", "partial"):
+                if report["status"] == "completed":
                     reporter.mark_completed()
                 else:
                     reporter.mark_failed(
@@ -7144,7 +7177,12 @@ def run_pipeline(
         p5 = run_phase6(storyboard_data, output_dir, dry_run, chain_mode=chain_mode)
         report["phases"]["phase6"] = p5
         if p5["status"] == "error":
-            report["status"] = "partial"
+            report["status"] = "failed"
+            report["error"] = p5.get("error", "Phase 6 video generation failed")
+            report["total_duration_s"] = _elapsed(total_start)
+            reporter.mark_failed(report["error"])
+            _write_report(report, output_dir)
+            return report
         else:
             _record_stage_checkpoint(output_path, "phase6", p5)
 
@@ -7426,7 +7464,7 @@ def main():
         resume_from=args.resume_from,
     )
 
-    sys.exit(0 if report["status"] in ("completed", "partial") else 1)
+    sys.exit(0 if report["status"] == "completed" else 1)
 
 
 if __name__ == "__main__":

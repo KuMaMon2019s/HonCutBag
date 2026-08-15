@@ -68,5 +68,6 @@ class HonCutState(TypedDict, total=False):
     shots: list[dict[str, Any]]
     videos: list[str]
     quality_report: dict[str, Any]
+    video_generation_mode: str
     retry_count: int
     error: str
