@@ -71,6 +71,22 @@ def run_l1_checks(storyboard: dict, visual_style: str) -> tuple[list[dict], dict
         profile = capabilities_for({**storyboard, **shot})
         sid = _shot_id(shot, index)
         per_shot[sid] = {"issues": [], "characters": []}
+        character_assets = [
+            str(value)
+            for value in (shot.get("associate_assets") or [])
+            if str(value).startswith("char:")
+        ]
+        if shot.get("who") == [] and character_assets:
+            item = _issue(
+                "L1",
+                "severe",
+                "no_character_contract_conflict",
+                f"{sid} declares who=[] but binds character assets",
+                [sid],
+                character_assets=character_assets,
+            )
+            issues.append(item)
+            per_shot[sid]["issues"].append(item)
         lighting = " ".join(_text(shot.get(key)) for key in ("lighting_description", "lighting", "prompt", "description", "name"))
         shot_periods = _periods(lighting)
         if style_periods and shot_periods and style_periods.isdisjoint(shot_periods):
@@ -574,6 +590,46 @@ def run_storyboard_qa_gate(output_dir: Path, similarity_threshold: float | None 
     ]
     images = beat_images or find_storyboard_images(output_dir, storyboard)
     l1_issues, per_shot = run_l1_checks(storyboard, visual_style)
+    # These checks inspect only storyboard metadata, so they belong before the
+    # paid video boundary. Running them in Phase 7 used to discover an
+    # unfixable storyboard defect only after Phase 6 had spent quota.
+    from quality.slideshow_risk import score_slideshow_risk
+    from quality.variation_checker import check_scene_variation
+
+    scenes = [shot for shot in storyboard.get("shots", []) if isinstance(shot, dict)]
+    variation = check_scene_variation(scenes)
+    slideshow = score_slideshow_risk(scenes)
+    variation_quality = round(5.0 - float(variation.get("score", 5.0)), 2)
+    slideshow_risk = round(float(slideshow.get("average", 5.0)) / 5.0, 3)
+    (output_dir / "variation_report.json").write_text(
+        json.dumps(variation, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (output_dir / "slideshow_risk_report.json").write_text(
+        json.dumps(slideshow, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    structural_issues = []
+    if variation_quality < 3.0:
+        structural_issues.append(
+            _issue(
+                "L1",
+                "severe",
+                "scene_variation_insufficient",
+                f"Storyboard variation quality {variation_quality:g}/5 requires revision",
+                details={"violations": variation.get("violations", [])},
+            )
+        )
+    if slideshow_risk > 0.7:
+        structural_issues.append(
+            _issue(
+                "L1",
+                "severe",
+                "slideshow_risk_high",
+                f"Storyboard slideshow risk {slideshow_risk:.3f} exceeds 0.7",
+                details={"dimensions": slideshow.get("dimensions", {})},
+            )
+        )
     threshold = similarity_threshold if similarity_threshold is not None else float(os.environ.get("HONCUT_STORYBOARD_QA_SIMILARITY", DEFAULT_SIMILARITY_THRESHOLD))
     l2_issues, l2 = run_l2_checks(storyboard, characters, images, threshold, embedder)
     l3_issues, l3 = run_l3_review(storyboard, characters, visual_style, images, output_dir / "storyboard_qa_grid.jpg", multimodal_client)
@@ -587,7 +643,7 @@ def run_storyboard_qa_gate(output_dir: Path, similarity_threshold: float | None 
         for beat_id in expected_beats
         if beat_id not in beat_images
     ]
-    issues = l1_issues + artifact_issues + capacity_issues + l2_issues + l3_issues
+    issues = l1_issues + structural_issues + artifact_issues + capacity_issues + l2_issues + l3_issues
     for index, shot in enumerate(storyboard.get("shots", [])):
         sid = _shot_id(shot, index)
         detail = per_shot.setdefault(sid, {"issues": []})
@@ -602,7 +658,7 @@ def run_storyboard_qa_gate(output_dir: Path, similarity_threshold: float | None 
         detail["issues"] = [issue for issue in issues if sid in issue.get("shot_ids", [])]
     grade = grade_issues(issues)
     failed_shots = sorted({sid for issue in issues if issue.get("severity") == "severe" for sid in issue.get("shot_ids", [])})
-    report = {"status": "done" if grade in {"A", "B"} else "error", "grade": grade, "gate_passed": grade in {"A", "B"}, "issues": issues, "issue_counts": {severity: sum(item.get("severity") == severity for item in issues) for severity in ("severe", "moderate", "minor")}, "failed_shot_ids": failed_shots, "shots": per_shot, "layers": {"L1": {"status": "completed"}, "L2": l2, "L3": l3}, "outputs": ["storyboard_qa_report.json", *( ["storyboard_qa_grid.jpg"] if grid_path_exists(output_dir) else [])]}
+    report = {"status": "done" if grade in {"A", "B"} else "error", "grade": grade, "gate_passed": grade in {"A", "B"}, "issues": issues, "issue_counts": {severity: sum(item.get("severity") == severity for item in issues) for severity in ("severe", "moderate", "minor")}, "failed_shot_ids": failed_shots, "shots": per_shot, "variation_score": variation_quality, "slideshow_risk": slideshow_risk, "layers": {"L1": {"status": "completed"}, "L2": l2, "L3": l3}, "outputs": ["storyboard_qa_report.json", "variation_report.json", "slideshow_risk_report.json", *( ["storyboard_qa_grid.jpg"] if grid_path_exists(output_dir) else [])]}
     if not report["gate_passed"]:
         report["error"] = f"Storyboard QA grade {grade} blocks Phase 6; redraw only failed_shot_ids"
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")

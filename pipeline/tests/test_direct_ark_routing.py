@@ -748,6 +748,41 @@ def test_phase6_does_not_reuse_large_unledgered_output(tmp_path, monkeypatch):
     assert (shot_dir / "output.mp4").read_bytes() == b"v" * 11000
 
 
+def test_phase6_current_failure_is_not_hidden_by_an_old_clip(
+    tmp_path, monkeypatch
+):
+    failed_shot = _write_shot(tmp_path)
+    failed_meta = failed_shot / "SHOT_META.json"
+    failed_meta.write_text(
+        json.dumps({"prompt": "fail this shot", "gen_strategy": "i2v"}),
+        encoding="utf-8",
+    )
+    old_clip = b"old-video" * 2_000
+    (failed_shot / "output.mp4").write_bytes(old_clip)
+    successful_shot = tmp_path / "shots/S02"
+    successful_shot.mkdir(parents=True)
+    (successful_shot / "SHOT_META.json").write_text(
+        json.dumps({"prompt": "good shot", "gen_strategy": "i2v"}),
+        encoding="utf-8",
+    )
+    _mock_common_direct(monkeypatch, failed_shot)
+
+    def submit(content, **_kwargs):
+        text = " ".join(str(item.get("text", "")) for item in content)
+        if "fail this shot" in text:
+            raise RuntimeError("Seedance API 400: InvalidParameter test rejection")
+        return "good-provider-job"
+
+    monkeypatch.setattr(seedance_client, "submit_content", submit)
+
+    result = pipeline_core._run_phase6_fallback(tmp_path)
+
+    assert result["status"] == "error"
+    assert result["missing_shots"] == ["S01"]
+    assert result["outputs"] == ["shots/S02/output.mp4"]
+    assert (failed_shot / "output.mp4").read_bytes() == old_clip
+
+
 @pytest.mark.parametrize("provider", ["local", "wan", "bridge"])
 def test_explicit_bridge_providers_use_local_client(tmp_path, monkeypatch, provider):
     _write_shot(tmp_path)

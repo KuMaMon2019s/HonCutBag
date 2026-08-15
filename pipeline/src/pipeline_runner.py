@@ -127,21 +127,21 @@ def _record_run_memory(
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Honcut AI Video Pipeline — 端到端管线")
-    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group = parser.add_mutually_exclusive_group(required=False)
     input_group.add_argument("--text", type=str, help="故事文本")
     input_group.add_argument("--input", type=str, help="故事文本文件路径")
-    parser.add_argument("--duration", type=int, default=60, help="目标视频时长（秒），默认 60")
-    parser.add_argument("--shot-duration", type=int, default=_core.AVG_SHOT_DURATION,
+    parser.add_argument("--duration", type=int, default=None, help="目标视频时长（秒），默认 60")
+    parser.add_argument("--shot-duration", type=int, default=None,
                         help=f"每镜平均时长（秒），默认 {_core.AVG_SHOT_DURATION}")
-    parser.add_argument("--chain-mode", action="store_true",
+    parser.add_argument("--chain-mode", action="store_true", default=None,
                         help="Seedance 尾帧接力模式（镜头串行生成）")
-    parser.add_argument("--dry-run", action="store_true", help="dry-run 模式")
+    parser.add_argument("--dry-run", action="store_true", default=None, help="dry-run 模式")
     parser.add_argument("--output-dir", type=str, default=".", help="输出目录，默认当前目录")
     parser.add_argument("--skip-phase", type=float, nargs="+", default=[], help="跳过指定 Phase")
     parser.add_argument(
-        "--transition", choices=["crossfade", "fade", "cut"], default="crossfade", help="Phase 8 转场模式"
+        "--transition", choices=["crossfade", "fade", "cut"], default=None, help="Phase 8 转场模式"
     )
-    parser.add_argument("--transition-duration", type=float, default=0.5, help="Phase 8 转场时长（秒）")
+    parser.add_argument("--transition-duration", type=float, default=None, help="Phase 8 转场时长（秒）")
     reshoot_group = parser.add_mutually_exclusive_group()
     reshoot_group.add_argument(
         "--enable-reshoot", dest="enable_reshoot", action="store_true",
@@ -151,9 +151,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--disable-reshoot", dest="enable_reshoot", action="store_false",
         help="禁止付费补录；检测到必须补录的坏镜头时阻断组装",
     )
-    parser.set_defaults(enable_reshoot=True)
+    parser.set_defaults(enable_reshoot=None)
     parser.add_argument(
-        "--media-profile", choices=_core.AVAILABLE_PROFILES, default="1080p", help="编码配置（默认 1080p）"
+        "--media-profile", choices=_core.AVAILABLE_PROFILES, default=None, help="编码配置（默认 1080p）"
     )
     parser.add_argument("--resume", action="store_true", help="从检查点恢复")
     parser.add_argument("--auto-approve", action="store_true", help="自动批准人工审核节点")
@@ -196,22 +196,55 @@ def _phase_skip_list(args: argparse.Namespace, parser: argparse.ArgumentParser) 
     return skipped
 
 
+def _resolved_run_arguments(args: argparse.Namespace) -> dict:
+    """Restore omitted resume settings from the immutable run manifest."""
+    stored: dict = {}
+    if args.resume:
+        manifest_path = Path(args.output_dir) / "RUN_MANIFEST.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            candidate = manifest.get("resolved_config", {})
+            if isinstance(candidate, dict):
+                stored = candidate
+        except (OSError, json.JSONDecodeError):
+            # The core runner emits the authoritative fail-closed error.
+            stored = {}
+
+    def choose(name: str, fallback):
+        explicit = getattr(args, name)
+        return explicit if explicit is not None else stored.get(name, fallback)
+
+    return {
+        "duration": choose("duration", 60),
+        "shot_duration": choose("shot_duration", _core.AVG_SHOT_DURATION),
+        "chain_mode": choose("chain_mode", False),
+        "dry_run": choose("dry_run", False),
+        "transition": choose("transition", "crossfade"),
+        "transition_duration": choose("transition_duration", 0.5),
+        "media_profile": choose("media_profile", "1080p"),
+        "enable_reshoot": choose("enable_reshoot", True),
+    }
+
+
 def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
+    if not (args.text or args.input or args.resume):
+        parser.error("one of --text/--input is required unless --resume is used")
+    resolved = _resolved_run_arguments(args)
     report = _core.run_pipeline(
         text=args.text,
         input_file=args.input,
-        duration=args.duration,
-        shot_duration=args.shot_duration,
-        chain_mode=args.chain_mode,
-        dry_run=args.dry_run,
+        duration=resolved["duration"],
+        shot_duration=resolved["shot_duration"],
+        chain_mode=resolved["chain_mode"],
+        dry_run=resolved["dry_run"],
         skip_phase=_phase_skip_list(args, parser),
         output_dir=args.output_dir,
-        transition=args.transition,
-        transition_duration=args.transition_duration,
-        media_profile=args.media_profile,
-        enable_reshoot=args.enable_reshoot,
+        transition=resolved["transition"],
+        transition_duration=resolved["transition_duration"],
+        media_profile=resolved["media_profile"],
+        enable_reshoot=resolved["enable_reshoot"],
         resume=args.resume,
         auto_approve=args.auto_approve,
         resume_from=args.resume_from,

@@ -49,8 +49,23 @@ def _compact(value: Any, limit: int = 180) -> str:
     return text if len(text) <= limit else text[:limit].rstrip() + "…"
 
 
-def _character_contract(characters: list[dict[str, Any]], who: list[Any]) -> str:
-    requested = {str(value).casefold() for value in who}
+def _shot_who(shot: dict[str, Any]) -> list[Any] | None:
+    """Preserve missing ``who`` separately from an explicit empty contract."""
+    if "who" not in shot:
+        return None
+    raw = shot.get("who")
+    if isinstance(raw, list):
+        return raw
+    return [raw] if raw else []
+
+
+def _character_contract(
+    characters: list[dict[str, Any]],
+    who: list[Any] | None,
+) -> str:
+    if who == []:
+        return "- 无人物镜头；禁止生成任何角色、群众、剪影或人形主体。"
+    requested = {str(value).casefold() for value in who or []}
     lines = []
     for character in characters:
         names = {
@@ -95,9 +110,7 @@ def build_shot_storyboard_prompt(
     ]
     if not beats:
         raise ValueError(f"{shot_id} has no storyboard_beats")
-    who = shot.get("who") or []
-    if not isinstance(who, list):
-        who = [who] if who else []
+    who = _shot_who(shot)
     beat_lines = []
     for position, beat in enumerate(beats, 1):
         beat_id = str(beat.get("beat_id") or f"{shot_id}_P{position:02d}")
@@ -149,9 +162,7 @@ def _build_panel_prompt(
     uses_director_board: bool = False,
     aspect_ratio: str = "16:9",
 ) -> str:
-    who = shot.get("who") or []
-    if not isinstance(who, list):
-        who = [who] if who else []
+    who = _shot_who(shot)
     beat_id = str(beat.get("beat_id") or f"P{position:02d}")
     continuation = (
         "这是本镜的第一格，建立图生视频的起始构图。"
@@ -246,6 +257,105 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+def _director_panel_references(
+    output_dir: Path,
+    director_board: Path,
+    shot_ids: list[str],
+) -> dict[str, Path]:
+    """Load exact Sxx crops bound to the current director overview bytes."""
+    manifest_path = director_board.with_suffix(".json")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"director panel lookup requires readable {manifest_path.name}: {exc}"
+        ) from exc
+    extraction = manifest.get("panel_extraction")
+    if (
+        manifest.get("status") != "done"
+        or not isinstance(extraction, dict)
+        or extraction.get("schema") != "honcut.director-panels.v1"
+    ):
+        raise RuntimeError(
+            "director storyboard has no completed exact-panel extraction receipt"
+        )
+    source_sha = hashlib.sha256(director_board.read_bytes()).hexdigest()
+    if extraction.get("source_image_sha256") != source_sha:
+        raise RuntimeError("director panel extraction belongs to different overview bytes")
+
+    references: dict[str, Path] = {}
+    for panel in manifest.get("panels", []):
+        if not isinstance(panel, dict):
+            continue
+        shot_id = str(panel.get("shot_id") or "")
+        crop_value = str(panel.get("crop") or "")
+        if not shot_id or not crop_value:
+            continue
+        crop = Path(crop_value)
+        if not crop.is_absolute():
+            crop = output_dir / crop
+        try:
+            if hashlib.sha256(crop.read_bytes()).hexdigest() != panel.get("crop_sha256"):
+                raise RuntimeError("crop hash mismatch")
+            with Image.open(crop) as image:
+                image.verify()
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise RuntimeError(f"invalid director crop for {shot_id}: {exc}") from exc
+        references[shot_id] = crop
+    missing = [shot_id for shot_id in shot_ids if shot_id not in references]
+    if missing:
+        raise RuntimeError(
+            "director storyboard is missing exact crops for: " + ", ".join(missing)
+        )
+    return references
+
+
+def _character_reference_paths(
+    output_dir: Path,
+    characters: list[dict[str, Any]],
+    who: list[Any] | None,
+) -> list[Path]:
+    """Resolve only the character references owned by this shot contract."""
+    if who == []:
+        return []
+    requested = {str(value).casefold() for value in who or []}
+    references: list[Path] = []
+    for character in characters:
+        names = {
+            str(character.get("id") or "").casefold(),
+            str(character.get("name") or "").casefold(),
+            *(str(value).casefold() for value in character.get("aliases", [])),
+        }
+        if requested and requested.isdisjoint(names):
+            continue
+        character_id = str(character.get("id") or "").strip()
+        if not character_id:
+            continue
+        reference = None
+        for character_dir in (
+            output_dir / "characters" / character_id,
+            output_dir / "characters" / "characters" / character_id,
+        ):
+            reference = next(
+                (
+                    path
+                    for path in (
+                        character_dir / "face_closeup.png",
+                        character_dir / "full_body.png",
+                        *sorted(character_dir.glob("variant_*.png")),
+                        character_dir / "front.png",
+                    )
+                    if path.is_file() and path.stat().st_size > 0
+                ),
+                None,
+            )
+            if reference is not None:
+                break
+        if reference is not None and reference not in references:
+            references.append(reference)
+    return references
 
 
 def validate_shot_storyboard_artifacts(
@@ -353,6 +463,23 @@ def generate_shot_storyboards(
         if director_board is not None and director_board.is_relative_to(output_dir)
         else str(director_board) if director_board is not None else None
     )
+    authored_shot_ids = [
+        _shot_id(shot, index)
+        for index, shot in enumerate(storyboard.get("shots", []), 1)
+        if isinstance(shot, dict)
+    ]
+    director_panels = (
+        _director_panel_references(
+            output_dir,
+            director_board,
+            authored_shot_ids,
+        )
+        if director_board is not None and authored_shot_ids
+        else {}
+    )
+    contract["director_panel_schema"] = (
+        "honcut.director-panels.v1" if director_panels else None
+    )
 
     try:
         for index, shot in enumerate(storyboard.get("shots", []), 1):
@@ -369,17 +496,28 @@ def generate_shot_storyboards(
             board_path = boards_dir / f"{shot_id}.png"
             prompt_path.write_text(prompt, encoding="utf-8")
             prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+            director_panel = director_panels.get(shot_id)
             record = {
                 "shot_id": shot_id,
                 "board": str(board_path.relative_to(output_dir)),
                 "prompt": str(prompt_path.relative_to(output_dir)),
                 "prompt_sha256": prompt_sha,
                 "panel_count": len(beats),
+                "director_panel": (
+                    str(director_panel.relative_to(output_dir))
+                    if director_panel is not None and director_panel.is_relative_to(output_dir)
+                    else str(director_panel) if director_panel is not None else None
+                ),
                 "status": "planned",
             }
             panel_records = []
             panel_paths: list[Path] = []
             previous_panel: Path | None = None
+            character_references = _character_reference_paths(
+                output_dir,
+                characters,
+                _shot_who(shot),
+            )
             for position, beat in enumerate(beats, 1):
                 beat_id = str(beat.get("beat_id") or f"{shot_id}_P{position:02d}")
                 panel_prompt = _build_panel_prompt(
@@ -388,7 +526,7 @@ def generate_shot_storyboards(
                     position,
                     len(beats),
                     characters,
-                    uses_director_board=director_board is not None,
+                    uses_director_board=director_panel is not None,
                     aspect_ratio=aspect_ratio,
                 )
                 panel_prompt_path = beats_dir / f"{beat_id}_prompt.txt"
@@ -398,8 +536,9 @@ def generate_shot_storyboards(
                 reference_paths: list[Path] = []
                 if previous_panel is not None:
                     reference_paths.append(previous_panel)
-                if director_board is not None:
-                    reference_paths.append(director_board)
+                reference_paths.extend(character_references)
+                if director_panel is not None:
+                    reference_paths.append(director_panel)
                 reference_hashes = [
                     hashlib.sha256(path.read_bytes()).hexdigest()
                     for path in reference_paths
@@ -415,6 +554,12 @@ def generate_shot_storyboards(
                     "prompt": str(panel_prompt_path.relative_to(output_dir)),
                     "prompt_sha256": panel_sha,
                     "model": contract["model"],
+                    "character_references": [
+                        str(path.relative_to(output_dir))
+                        if path.is_relative_to(output_dir)
+                        else str(path)
+                        for path in character_references
+                    ],
                     "status": "planned",
                 }
                 cached = False

@@ -15,7 +15,7 @@ def route_prompt(model_name: str, mode: str, shot_data: dict, assets: list = Non
         model_name: 模型名（如 "seedance-2-0", "wan2.6"）
         mode: "multi_shot" | "single_shot" | "first_last_frame"
         shot_data: 镜头数据 dict（含 prompt/visual/who/where/emotion 等）
-        assets: 角色资产列表 [{"name": "林夏", "description": "..."}]
+        assets: 角色资产列表 [{"name": "CHARACTER_A", "description": "..."}]
     
     Returns:
         格式化后的提示词字符串

@@ -21,6 +21,7 @@ from phases import pipeline_core
 from phases.phase1.director_storyboard import (
     build_director_storyboard_prompt,
     generate_director_storyboard,
+    materialize_director_panels,
 )
 from phases.phase1.storyboard_beats import plan_storyboard_beats
 from phases.phase2.shot_storyboards import (
@@ -89,6 +90,22 @@ from sam3_runtime.policy import (
 )
 from schemas.continuity import ContinuityPlan, GenerationChunk
 from utils.artifact_chain import can_resume_from
+
+
+def _write_grid_image(
+    path: Path,
+    *,
+    size: tuple[int, int],
+    vertical: list[int],
+    horizontal: list[int],
+) -> None:
+    width, height = size
+    pixels = np.full((height, width, 3), 255, dtype=np.uint8)
+    for position in vertical:
+        pixels[:, max(0, position - 3):min(width, position + 4)] = 0
+    for position in horizontal:
+        pixels[max(0, position - 3):min(height, position + 4), :] = 0
+    Image.fromarray(pixels).save(path)
 
 
 def test_planner_keeps_short_editorial_shots_backward_compatible():
@@ -350,7 +367,12 @@ def test_director_storyboard_calls_image_model_with_one_overview_contract(tmp_pa
 
         def text_to_image(self, prompt, output_path, size, timeout):
             calls.append({"prompt": prompt, "size": size, "timeout": timeout})
-            Image.new("RGB", (2560, 1440), "white").save(output_path)
+            _write_grid_image(
+                Path(output_path),
+                size=(2560, 1440),
+                vertical=[900, 1750],
+                horizontal=[690],
+            )
             return "https://image.invalid/director.png"
 
     client = FakeImageClient()
@@ -362,7 +384,7 @@ def test_director_storyboard_calls_image_model_with_one_overview_contract(tmp_pa
     )
 
     assert (tmp_path / "director_storyboard.png").is_file()
-    assert manifest["kind"] == "honcut.director_storyboard.v2"
+    assert manifest["kind"] == "honcut.director_storyboard.v3"
     assert manifest["status"] == "done"
     assert manifest["provider"] == "seedream"
     assert manifest["model"] == "fake-seedream"
@@ -375,6 +397,20 @@ def test_director_storyboard_calls_image_model_with_one_overview_contract(tmp_pa
     ]
     persisted = json.loads((tmp_path / "director_storyboard.json").read_text())
     assert persisted["panels"][0]["summary"] == "凛完成动作1"
+    assert all(
+        abs(observed - expected) <= 5
+        for observed, expected in zip(
+            persisted["panel_extraction"]["vertical_dividers_px"],
+            [900, 1750],
+            strict=True,
+        )
+    )
+    assert abs(persisted["panel_extraction"]["horizontal_dividers_px"][0] - 690) <= 5
+    assert persisted["panels"][0]["crop"] == "director_panels/S01.png"
+    assert persisted["panels"][4]["grid_row"] == 1
+    assert persisted["panels"][4]["grid_column"] == 1
+    assert (tmp_path / "director_panels/S01.png").is_file()
+    assert (tmp_path / "director_panels/S05.png").is_file()
     assert calls[0]["size"] == "2560x1440"
     assert "严格使用 3 列 × 2 行，共 5 个面板" in calls[0]["prompt"]
     assert "银白长发，暗银轻甲" in calls[0]["prompt"]
@@ -409,6 +445,20 @@ def test_director_storyboard_prompt_uses_five_by_three_layout_for_15_shots():
     assert panels[-1]["shot_id"] == "S15"
 
 
+def test_director_panel_extraction_fails_closed_without_detectable_divider(tmp_path):
+    overview = tmp_path / "director_storyboard.png"
+    Image.new("RGB", (1200, 600), "white").save(overview)
+
+    with pytest.raises(RuntimeError, match="vertical divider"):
+        materialize_director_panels(
+            overview,
+            [{"shot_id": "S01"}, {"shot_id": "S02"}],
+            2,
+            1,
+            tmp_path,
+        )
+
+
 def test_phase1_registers_director_storyboard_in_text_storyboard(tmp_path):
     storyboard = {
         "shots": [{
@@ -438,6 +488,8 @@ def test_phase1_registers_director_storyboard_in_text_storyboard(tmp_path):
         "provider": "seedream",
         "model": "fake-seedream",
         "panel_count": 1,
+        "panel_schema": "honcut.director-panels.v1",
+        "panel_dir": "director_panels",
         "preliminary_groups": ["DG001"],
     }
 
@@ -568,7 +620,28 @@ def test_per_shot_storyboard_beats_map_two_panels_to_fresh_then_extend(tmp_path)
 
 def test_phase2_uses_director_board_as_visual_reference_for_every_shot(tmp_path):
     director = tmp_path / "director_storyboard.png"
-    Image.new("RGB", (2560, 1440), "white").save(director)
+    _write_grid_image(
+        director,
+        size=(2560, 1440),
+        vertical=[1300],
+        horizontal=[],
+    )
+    director_panels, extraction = materialize_director_panels(
+        director,
+        [{"position": 1, "shot_id": "S07"}, {"position": 2, "shot_id": "S08"}],
+        2,
+        1,
+        tmp_path,
+    )
+    (tmp_path / "director_storyboard.json").write_text(
+        json.dumps({
+            "kind": "honcut.director_storyboard.v3",
+            "status": "done",
+            "panels": director_panels,
+            "panel_extraction": extraction,
+        }),
+        encoding="utf-8",
+    )
     storyboard = {
         "director_storyboard": {"image": director.name, "status": "done"},
         "shots": [
@@ -601,16 +674,44 @@ def test_phase2_uses_director_board_as_visual_reference_for_every_shot(tmp_path)
     )
 
     assert len(calls) == 3
-    assert calls[0][1] == str(director)
+    assert calls[0][1] == str(tmp_path / "director_panels/S07.png")
     assert calls[1][1] == [
         str(tmp_path / "storyboard_beats/S07_P01.png"),
-        str(director),
+        str(tmp_path / "director_panels/S07.png"),
     ]
-    assert calls[2][1] == str(director)
+    assert calls[2][1] == str(tmp_path / "director_panels/S08.png")
+    assert all(str(director) not in str(call[1]) for call in calls)
     assert "9:16" in calls[0][0]
     assert contract["director_storyboard"] == "director_storyboard.png"
+    assert contract["director_panel_schema"] == "honcut.director-panels.v1"
     with Image.open(tmp_path / "shot_storyboards/S07.png") as board:
         assert board.height > board.width / 2
+
+
+def test_phase2_refuses_an_overview_without_exact_director_crops(tmp_path):
+    director = tmp_path / "director_storyboard.png"
+    Image.new("RGB", (1280, 720), "white").save(director)
+    storyboard = {
+        "shots": [{
+            "id": "S01",
+            "duration": 5,
+            "storyboard_beats": [{
+                "beat_id": "S01_P01",
+                "duration_s": 5,
+                "generation_mode": "fresh",
+                "action": "opens the door",
+            }],
+        }],
+    }
+
+    with pytest.raises(RuntimeError, match="director panel lookup requires readable"):
+        generate_shot_storyboards(
+            tmp_path,
+            storyboard,
+            [],
+            client=object(),
+            director_storyboard_path=director,
+        )
 
 
 def test_missing_pxx_blocks_validation_and_resume(tmp_path):

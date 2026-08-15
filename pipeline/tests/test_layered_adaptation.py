@@ -360,6 +360,9 @@ def test_layered_mode_persists_skeleton_and_each_batch(monkeypatch, tmp_path):
 
 def test_layered_resume_skips_cached_skeleton_and_batches(monkeypatch, tmp_path):
     events = _events(11)
+    fingerprint = engine._layered_input_fingerprint(
+        events, "（无角色信息）", 72, 12, 6
+    )
     public_beats = []
     for i in range(1, 7):
         beat = _beat(i)
@@ -367,13 +370,29 @@ def test_layered_resume_skips_cached_skeleton_and_batches(monkeypatch, tmp_path)
         public_beats.append(beat)
     public_beats[-1]["source_events"] = list(range(6, 12))
     (tmp_path / "beat_skeleton.json").write_text(
-        json.dumps({"strategy": "cached strategy", "beats": public_beats}), encoding="utf-8"
+        json.dumps({
+            "_checkpoint": {
+                "schema": engine.LAYERED_CHECKPOINT_SCHEMA,
+                "input_fingerprint": fingerprint,
+            },
+            "strategy": "cached strategy",
+            "beats": public_beats,
+        }),
+        encoding="utf-8",
     )
     cached_shots = [_shot(i) for i in range(1, 4)]
     for shot in cached_shots:
         shot.pop("beat_order")
     (tmp_path / "shots_partial.json").write_text(
-        json.dumps({"completed_batches": [1], "shots": cached_shots}), encoding="utf-8"
+        json.dumps({
+            "_checkpoint": {
+                "schema": engine.LAYERED_CHECKPOINT_SCHEMA,
+                "input_fingerprint": fingerprint,
+            },
+            "completed_batches": [1],
+            "shots": cached_shots,
+        }),
+        encoding="utf-8",
     )
     calls = []
     monkeypatch.setattr(engine, "estimate_shot_count", lambda *_: 6)

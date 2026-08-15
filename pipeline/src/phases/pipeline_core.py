@@ -27,8 +27,6 @@ from utils.config import get_api_key
 from utils.progress_reporter import ProgressReporter
 from quality.quality_gate import run_quality_check
 from utils.timing_estimator import estimate_phase_duration, estimate_total, estimate_remaining
-from quality.slideshow_risk import score_slideshow_risk
-from quality.variation_checker import check_scene_variation
 from quality.delivery_promise import classify_from_brief
 from prompt.speech_pacing import annotate_shot_pacing
 from tools.base_tool import BaseTool, ToolResult, ToolRuntime
@@ -148,9 +146,9 @@ _PROFILE_NAME_MAP = {
 # Hardcoded fallbacks for profiles not in OM
 _LEGACY_FALLBACKS = {
     "480p": {"name": "480p", "width": 854, "height": 480, "fps": 30, "codec": "libx264",
-             "audio_codec": "aac", "crf": 23, "pixel_format": "yuv420p"},
+             "audio_codec": "aac", "crf": 23, "pixel_format": "yuv420p", "aspect_ratio": "16:9"},
     "720p": {"name": "720p", "width": 1280, "height": 720, "fps": 30, "codec": "libx264",
-             "audio_codec": "aac", "crf": 23, "pixel_format": "yuv420p"},
+             "audio_codec": "aac", "crf": 23, "pixel_format": "yuv420p", "aspect_ratio": "16:9"},
 }
 
 # All available profile names for argparse choices
@@ -187,7 +185,8 @@ def _get_profile_dict(profile_name: str = "1080p") -> dict:
 
     # Ultimate fallback: 1080p generic
     return {"name": "1080p", "width": 1920, "height": 1080, "fps": 30,
-            "codec": "libx264", "audio_codec": "aac", "crf": 23, "pixel_format": "yuv420p"}
+            "codec": "libx264", "audio_codec": "aac", "crf": 23,
+            "pixel_format": "yuv420p", "aspect_ratio": "16:9"}
 
 
 def _project_video_spec(media_profile: str) -> dict[str, Any]:
@@ -195,9 +194,14 @@ def _project_video_spec(media_profile: str) -> dict[str, Any]:
     profile = _get_profile_dict(media_profile)
     width = int(profile["width"])
     height = int(profile["height"])
-    divisor = math.gcd(width, height)
+    semantic_ratio = profile.get("aspect_ratio")
+    if hasattr(semantic_ratio, "value"):
+        semantic_ratio = semantic_ratio.value
+    if not semantic_ratio:
+        divisor = math.gcd(width, height)
+        semantic_ratio = f"{width // divisor}:{height // divisor}"
     return {
-        "aspect_ratio": f"{width // divisor}:{height // divisor}",
+        "aspect_ratio": str(semantic_ratio),
         "width": width,
         "height": height,
         "fps": float(profile.get("fps") or 30),
@@ -642,9 +646,14 @@ def run_phase1_director(text: str, output_dir: Path, dry_run: bool) -> dict:
     """Phase 1: 导演规划（M1 增量模块）"""
     _banner("1", 9, "导演规划 (Director Planner)", dry_run)
     start = _now()
+    plan_path = Path(output_dir) / "director_plan.json"
     try:
         from phases.phase1.director_planner import plan_director
         result = plan_director(text, output_dir, dry_run)
+        if result.get("status") != "done":
+            # A fail-open director step must not leave an earlier plan visible
+            # to Phase 4 as if it belonged to the current attempt.
+            plan_path.unlink(missing_ok=True)
         # Lock the intended production medium before providers can downgrade it.
         delivery_promise = classify_from_brief("cinematic", {}).to_dict()
         result.setdefault("delivery_promise", delivery_promise)
@@ -667,11 +676,12 @@ def run_phase1_director(text: str, output_dir: Path, dry_run: bool) -> dict:
                     "duration_s": annotation["speech_duration_s"],
                     "emotion": annotation["emotion"],
                 }
-            plan_path = Path(result.get("output", output_dir / "director_plan.json"))
-            plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+            result_path = Path(result.get("output", plan_path))
+            result_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
         result["duration_s"] = _elapsed(start)
         return result
     except Exception as e:
+        plan_path.unlink(missing_ok=True)
         print(f"  ⚠ [M1] Phase 1 降级跳过: {e}")
         return {"status": "skipped", "reason": str(e), "duration_s": _elapsed(start)}
 
@@ -734,6 +744,12 @@ def _attach_director_storyboard(
         "provider": manifest["provider"],
         "model": manifest["model"],
         "panel_count": len(manifest["panels"]),
+        "panel_schema": (
+            manifest.get("panel_extraction", {}).get("schema")
+            if isinstance(manifest.get("panel_extraction"), dict)
+            else None
+        ),
+        "panel_dir": "director_panels",
         "preliminary_groups": list(dict.fromkeys(
             panel["group_id"] for panel in manifest["panels"]
         )),
@@ -2773,22 +2789,60 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
         if not qg_report.passed:
             return {"status": "error", "error": f"Phase 3 质检未通过: {qg_report.grade} — 角色图片缺失，不能继续", "quality_report": qg_report, "duration_s": _elapsed(start)}
 
-        # Phase 2 deliberately defers character-bearing shot images until the
-        # reference packs exist. Refresh older t2i artifacts from legacy runs.
+        # Phase 3 owns the first point at which character reference packs are
+        # guaranteed to exist. Regenerate the canonical Pxx chain here so the
+        # continuity runtime and ordinary Sxx path consume the same identity-
+        # locked visual truth.
         storyboard_path = output_dir / "STORYBOARD.json"
         if storyboard_path.is_file():
             storyboard = json.loads(storyboard_path.read_text(encoding="utf-8"))
             expected_shots = len(storyboard.get("shots", []))
-            generated_shots = _generate_shot_images(output_dir, storyboard)
-            if generated_shots != expected_shots:
+            from phases.phase2.shot_storyboards import (
+                generate_shot_storyboards,
+                validate_shot_storyboard_artifacts,
+            )
+
+            video_width, video_height, aspect_ratio = _storyboard_canvas(storyboard)
+            director_reference = storyboard.get("director_storyboard") or {}
+            refreshed = generate_shot_storyboards(
+                output_dir,
+                storyboard,
+                characters_list,
+                size=_storyboard_image_size(
+                    video_width=video_width,
+                    video_height=video_height,
+                ),
+                director_storyboard_path=(
+                    director_reference.get("image")
+                    if isinstance(director_reference, dict)
+                    else None
+                ),
+                aspect_ratio=aspect_ratio,
+            )
+            if refreshed.get("total_boards") != expected_shots:
                 return {
                     "status": "error",
                     "error": (
-                        "Phase 3 could not produce all character-locked storyboard "
-                        f"images: {generated_shots}/{expected_shots}"
+                        "Phase 3 could not refresh all character-locked Pxx boards: "
+                        f"{refreshed.get('total_boards', 0)}/{expected_shots}"
                     ),
                     "duration_s": _elapsed(start),
                 }
+            artifact_errors = validate_shot_storyboard_artifacts(
+                output_dir,
+                storyboard,
+            )
+            if artifact_errors:
+                return {
+                    "status": "error",
+                    "error": "Phase 3 character-locked Pxx validation failed",
+                    "artifact_errors": artifact_errors,
+                    "duration_s": _elapsed(start),
+                }
+            storyboard_path.write_text(
+                json.dumps(storyboard, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
             composition_report = _validate_storyboard_image_composition(
                 output_dir, storyboard
             )
@@ -3536,6 +3590,7 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
             )
 
     outputs = []
+    successful_receipts: dict[str, dict[str, Any]] = {}
     # --- P1-C: Seed Locking（参考 HonCut asset_manifest seed）---
     # 同场景镜头使用相同 seed，确保背景一致性
     scene_seed_map = {}  # {where: seed}
@@ -3965,6 +4020,8 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                                 "last_frame_path": None,
                                 "actual_model": bridge_model,
                             }
+                        generation_result["generation_task_id"] = execution.task_id
+                        generation_result["input_fingerprint"] = input_fingerprint
                         generation_result["relative_output"] = f"shots/{shot_dir.name}/output.mp4"
                         return generation_result
                     except Exception as local_err:
@@ -4109,6 +4166,8 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                         str(last_frame_path) if last_frame_path.exists() else None
                     ),
                     "actual_model": direct_model,
+                    "generation_task_id": execution.task_id,
+                    "input_fingerprint": input_fingerprint,
                     "relative_output": f"shots/{shot_dir.name}/output.mp4",
                 }
             except Exception as e:
@@ -4202,6 +4261,7 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
             )
             if result:
                 outputs.append(result["relative_output"])
+                successful_receipts[shot_dir.name] = result
             if chain_mode:
                 actual_model = result.get("actual_model") if result else None
                 if actual_model == "wan22":
@@ -4231,22 +4291,41 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                     result = future.result()
                     if result:
                         outputs.append(result["relative_output"])
+                        successful_receipts[shot_dir.name] = result
                 except Exception as e:
                     print(f"    ✗ {shot_dir.name}: 并发处理异常 — {e}")
 
     provider = "local_video_client" if use_local else "seedance_client"
 
-    # --- Bug 3 fix: detect shots with missing/invalid output.mp4 ---
+    # A live file is not proof that this run produced it. Accept a shot only
+    # when the current execution returned a task receipt whose immutable input,
+    # ledger status, output hash, and decoded video all still match.
+    from utils.video_validation import is_valid_video
+
     errors = []
     missing_shots = []
     for sd in shot_dirs:
         out_mp4 = sd / "output.mp4"
-        if not out_mp4.exists():
+        receipt = successful_receipts.get(sd.name)
+        task = generation_tasks.get(str(receipt.get("generation_task_id"))) if receipt else None
+        failure = None
+        if receipt is None:
+            failure = "no successful current-input generation receipt"
+        elif task is None or task.status != "succeeded":
+            failure = "generation ledger receipt is missing or not succeeded"
+        elif task.resource_id != sd.name:
+            failure = "generation ledger receipt belongs to a different shot"
+        elif task.payload.get("input_fingerprint") != receipt.get("input_fingerprint"):
+            failure = "generation ledger input fingerprint mismatch"
+        elif not out_mp4.is_file():
+            failure = "output.mp4 missing after successful generation"
+        elif task.outcome.get("output_sha256") != _file_sha256(out_mp4):
+            failure = "output.mp4 hash does not match generation ledger"
+        elif not is_valid_video(out_mp4):
+            failure = "output.mp4 failed ffprobe validation"
+        if failure:
             missing_shots.append(sd.name)
-            errors.append({"shot": sd.name, "error": "output.mp4 missing after Phase 6"})
-        elif out_mp4.stat().st_size < 10 * 1024:
-            missing_shots.append(sd.name)
-            errors.append({"shot": sd.name, "error": f"output.mp4 too small ({out_mp4.stat().st_size} bytes) after Phase 6"})
+            errors.append({"shot": sd.name, "error": failure})
     if missing_shots:
         print(f"  ⚠ Phase 6 部分镜头无产出: {', '.join(missing_shots)}")
 
@@ -4411,152 +4490,56 @@ def run_phase6(
 
 
 # ---------------------------------------------------------------------------
-# Phase 7: 一致性守卫 + 场景变化检测 + 幻灯片风险评分
+# Phase 7: paid-generation handoff into pixel-level Phase 8 QA
 def run_phase7(output_dir: Path, dry_run: bool, storyboard_data: dict = None) -> dict:
-    """Phase 7: consistency_guard + scene_variation_check + slideshow_risk_score
-    
-    集成三个质检模块：
-    1. consistency_guard — 角色一致性检查与修复
-    2. scene_variation_check — 场景变化检测（抄自 OM variation_checker）
-    3. slideshow_risk_score — 幻灯片风险评分（抄自 OM slideshow_risk）
+    """Validate the pre-paid QA receipt before Phase 8 reviews real pixels.
+
+    Prompt/metadata checks live in Phase 5. Phase 8 is the single owner of
+    per-shot video sampling, reference-image identity review, and recoverable
+    selective reshoots. Keeping that decision in one place prevents a text-
+    only check from masquerading as generated-video consistency QA.
     """
-    _banner(7, 9, "一致性守卫 + 场景变化检测 + 幻灯片风险评分", dry_run)
+    _banner(7, 9, "视频质检交接 (Phase 8 owns pixel QA)", dry_run)
     start = _now()
-    _p6_est = estimate_phase_duration("phase7")
-    print(f"  ⏱ Phase 7 开始 (预估 ~{int(_p6_est)}s)")
     output_dir = Path(output_dir)
-    outputs = []
-    consistency_result = None
 
     if dry_run:
-        print("  ⊘ dry-run 模式，跳过一致性检查")
+        print("  ⊘ dry-run 模式，跳过视频质检交接")
         return {"status": "skipped", "reason": "dry-run", "duration_s": _elapsed(start)}
 
-    # --- 1. consistency_guard (原有逻辑) ---
     try:
-        from quality.consistency_guard import run_consistency_check
-
-        print("  → run_consistency_check: 检查角色一致性...")
-        result = run_consistency_check(output_dir=output_dir)
-        consistency_result = result
-        outputs.append("consistency_report.json")
-        print(f"  ✓ 角色一致性检查完成")
-
-    except ImportError as e:
-        print(f"  ⚠ consistency_guard 不可用: {e}")
-        consistency_result = {"passed": False, "error": str(e)}
-    except Exception as e:
-        traceback.print_exc()
-        print(f"  ⚠ 角色一致性检查失败: {e}")
-        consistency_result = {"passed": False, "error": str(e)}
-
-    # --- 2. scene_variation_check (新增，抄自 OM variation_checker) ---
-    if storyboard_data:
-        print("  → scene_variation_check: 检查场景变化...")
-        scenes = storyboard_data.get("shots", [])
-        if scenes:
-            variation_result = check_scene_variation(scenes)
-            variation_report_path = output_dir / "variation_report.json"
-            variation_report_path.write_text(json.dumps(variation_result, ensure_ascii=False, indent=2))
-            outputs.append("variation_report.json")
-            
-            print(f"    评分: {variation_result['score']}/5.0 ({variation_result['verdict']})")
-            if variation_result["violations"]:
-                print(f"    发现 {len(variation_result['violations'])} 个问题:")
-                for v in variation_result["violations"][:3]:
-                    print(f"      - {v}")
-            else:
-                print(f"    ✓ 场景变化良好")
-        else:
-            print(f"  ⊘ 无场景数据，跳过场景变化检测")
-    else:
-        print(f"  ⊘ 无 storyboard_data，跳过场景变化检测")
-
-    # --- 3. slideshow_risk_score (新增，抄自 OM slideshow_risk) ---
-    if storyboard_data:
-        print("  → slideshow_risk_score: 评估幻灯片风险...")
-        scenes = storyboard_data.get("shots", [])
-        if scenes:
-            slideshow_result = score_slideshow_risk(scenes)
-            slideshow_report_path = output_dir / "slideshow_risk_report.json"
-            slideshow_report_path.write_text(json.dumps(slideshow_result, ensure_ascii=False, indent=2))
-            outputs.append("slideshow_risk_report.json")
-            
-            print(f"    平均评分: {slideshow_result['average']}/5.0 ({slideshow_result['verdict']})")
-            print(f"    维度评分:")
-            for dim_name, dim_data in slideshow_result["dimensions"].items():
-                print(f"      - {dim_name}: {dim_data['score']}/5.0 — {dim_data['reason']}")
-        else:
-            print(f"  ⊘ 无场景数据，跳过幻灯片风险评分")
-    else:
-        print(f"  ⊘ 无 storyboard_data，跳过幻灯片风险评分")
-
-    if not consistency_result or not consistency_result.get("passed", False):
-        score = (consistency_result or {}).get("consistency_score", 0)
-        error = (consistency_result or {}).get("error")
-        reason = error or f"角色一致性分数 {score} < 70"
-        print(f"  ✗ Phase 7 质检未通过: {reason}")
+        gate = json.loads(
+            (output_dir / "storyboard_qa_report.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError) as exc:
         return {
             "status": "error",
-            "error": reason,
+            "error": f"Phase 7 requires the Phase 5 QA receipt: {exc}",
             "duration_s": _elapsed(start),
-            "outputs": outputs,
-            "consistency_score": score,
         }
-
-    print(f"  ✓ Phase 7 完成")
-    
-    # 提取质检指标供 quality_gate 使用
-    quality_metrics = {}
-    if storyboard_data:
-        # 从已生成的报告中提取评分
-        variation_report_path = output_dir / "variation_report.json"
-        slideshow_report_path = output_dir / "slideshow_risk_report.json"
-        
-        if variation_report_path.exists():
-            try:
-                variation_data = json.loads(variation_report_path.read_text())
-                # variation_score 范围 0-5，需要归一化到 0-1
-                quality_metrics["variation_score"] = variation_data.get("score", 5.0)
-            except (json.JSONDecodeError, KeyError):
-                pass
-        
-        if slideshow_report_path.exists():
-            try:
-                slideshow_data = json.loads(slideshow_report_path.read_text())
-                # slideshow_risk 的 average 范围 0-5，归一化到 0-1
-                avg = slideshow_data.get("average", 0.0)
-                quality_metrics["slideshow_risk"] = avg / 5.0
-            except (json.JSONDecodeError, KeyError):
-                pass
-
-    metadata_quality_failures = []
-    if quality_metrics.get("slideshow_risk", 0.0) > 0.7:
-        metadata_quality_failures.append(
-            f"slideshow_risk={quality_metrics['slideshow_risk']:.3f} > 0.7"
-        )
-    if quality_metrics.get("variation_score", 5.0) < 3.0:
-        metadata_quality_failures.append(
-            f"variation_score={quality_metrics['variation_score']:.3f} < 3.0"
-        )
-    if metadata_quality_failures:
+    if gate.get("gate_passed") is not True:
         return {
             "status": "error",
-            "error": (
-                "Phase 7 metadata quality BLOCK; repair the storyboard instead "
-                "of resubmitting identical paid video inputs: "
-                + "; ".join(metadata_quality_failures)
-            ),
+            "error": "Phase 7 refused a non-passing Phase 5 QA receipt",
             "duration_s": _elapsed(start),
-            "outputs": outputs,
-            **quality_metrics,
         }
-    
+
+    print("  ✓ Phase 7 交接完成；逐镜头像素/VLM 检查由 Phase 8 执行")
     return {
-        "status": "done", 
-        "duration_s": _elapsed(start), 
-        "outputs": outputs,
-        **quality_metrics,  # 将质检指标合并到返回值
+        "status": "done",
+        "duration_s": _elapsed(start),
+        "outputs": [
+            name
+            for name in (
+                "storyboard_qa_report.json",
+                "variation_report.json",
+                "slideshow_risk_report.json",
+            )
+            if (output_dir / name).is_file()
+        ],
+        "variation_score": float(gate.get("variation_score", 5.0)),
+        "slideshow_risk": float(gate.get("slideshow_risk", 0.0)),
+        "video_quality_owner": "phase8",
     }
 
 
@@ -6792,14 +6775,11 @@ if LANGGRAPH_AVAILABLE:
         return phase7_node(state, runner=run_phase7)
 
     def quality_gate_router(state: HonCutState) -> str:
-        """Quality gate: decide whether to pass or retry Phase 6"""
+        """Block stale structural failures; Phase 8 owns video reshoots."""
         quality = state.get("quality_report", {})
-        retry_count = state.get("retry_count", 0)
-        
+
         slideshow_risk = quality.get("slideshow_risk", 0.0)
         variation_score = quality.get("variation_score", 5.0)
-        failed_shots = quality.get("failed_shots", [])
-
         # These two scores are computed from the immutable storyboard, not the
         # generated pixels. Re-submitting identical paid video inputs cannot
         # improve them, so all execution modes block and request storyboard
@@ -6812,21 +6792,9 @@ if LANGGRAPH_AVAILABLE:
             )
             return "block"
         
-        # Pixel-level QA may request a selective retry, but it must identify
-        # exact shot ids. Never fall back to deleting every generated clip.
-        if failed_shots:
-            if retry_count < 2:
-                print(f"\n  ⚠ 镜头质检不通过: {', '.join(failed_shots)}")
-                print(f"  🔄 回退到 Phase 6 重新生成 (retry {retry_count + 1}/2)")
-                mode = state.get("video_generation_mode") or route_phase5(state)
-                if mode not in {"txt2vid", "img2vid", "reference"}:
-                    mode = "txt2vid"
-                return f"retry_{mode}"
-            else:
-                print(f"\n  ✗ 质检不通过且已达最大重试次数，阻断流水线")
-                return "block"
-        
-        # Quality passed.
+        # Phase 8 is the only pixel-level decision owner and performs its own
+        # recoverable per-shot reshoot transaction. Phase 7 never fabricates a
+        # selective retry from prompt-only evidence.
         return "pass"
 
     def node_phase8(state: HonCutState) -> dict:
@@ -6913,6 +6881,15 @@ def run_pipeline(
     text = text or ""
     project_video_spec = _project_video_spec(media_profile)
     from runtime.run_manifest import prepare_run_manifest
+    from utils.config import get_video_route
+
+    configured_video_provider = os.environ.get("VIDEO_PROVIDER", "seedance").lower()
+    effective_video_provider = (
+        "seedance"
+        if configured_video_provider in {"bridge", "ark"}
+        else configured_video_provider
+    )
+    effective_video_route = get_video_route(configured_video_provider)
 
     run_manifest = prepare_run_manifest(
         output_path,
@@ -6926,8 +6903,8 @@ def run_pipeline(
             "media_profile": media_profile,
             "enable_reshoot": enable_reshoot,
             "dry_run": dry_run,
-            "video_provider": os.environ.get("VIDEO_PROVIDER", "seedance").lower(),
-            "video_generation_mode": os.environ.get("VIDEO_GENERATION_MODE", "direct").lower(),
+            "video_provider": effective_video_provider,
+            "video_generation_mode": effective_video_route,
             "video_model": os.environ.get(
                 "SEEDANCE_MODEL",
                 os.environ.get("VIDEO_MODEL", "doubao-seedance-2.0-mini"),
@@ -7399,7 +7376,55 @@ def run_pipeline(
     # This is deliberately immediately before Phase 6: a resumed or partially
     # selected run must not bypass the last zero/video-cost checkpoint.
     if 5 in skip_phase:
-        report["phases"]["phase5"] = {"status": "skipped", "reason": "user-specified"}
+        if 6 not in skip_phase:
+            from utils.artifact_chain import can_resume_from
+
+            checkpoint = _read_checkpoint(output_path)
+            phase5_receipt = (
+                checkpoint.get("results", {}).get("phase5")
+                if isinstance(checkpoint, dict)
+                else None
+            )
+            try:
+                gate_report = json.loads(
+                    (output_path / "storyboard_qa_report.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+            except (OSError, json.JSONDecodeError):
+                gate_report = None
+            gate_is_current_and_passing = bool(
+                isinstance(phase5_receipt, dict)
+                and phase5_receipt.get("status") == "done"
+                and isinstance(gate_report, dict)
+                and gate_report.get("gate_passed") is True
+                and can_resume_from("phase6", output_path)
+            )
+            if not gate_is_current_and_passing:
+                error = (
+                    "Phase 6 refused: the current run has no passing Phase 5 "
+                    "checkpoint and storyboard QA receipt"
+                )
+                report["phases"]["phase5"] = {
+                    "status": "error",
+                    "error": error,
+                }
+                report["status"] = "failed"
+                report["error"] = error
+                report["total_duration_s"] = _elapsed(total_start)
+                reporter.mark_failed(error)
+                _write_report(report, output_dir)
+                return report
+            report["phases"]["phase5"] = {
+                **phase5_receipt,
+                "resumed": True,
+                "gate_validation": "current-run checkpoint",
+            }
+        else:
+            report["phases"]["phase5"] = {
+                "status": "skipped",
+                "reason": "user-specified",
+            }
     elif storyboard_data is None:
         report["phases"]["phase5"] = {"status": "skipped", "reason": "no storyboard data"}
     else:
@@ -7453,7 +7478,7 @@ def run_pipeline(
         else:
             _record_stage_checkpoint(output_path, "phase6", p5)
 
-    # ---- Phase 7: 一致性守卫 + 场景变化检测 + 幻灯片风险评分 ----
+    # ---- Phase 7: handoff into Phase 8 pixel-level QA ----
     if 7 in skip_phase:
         report["phases"]["phase7"] = {"status": "skipped", "reason": "user-specified"}
     elif resume and "phase7" in completed_phases:
@@ -7481,32 +7506,10 @@ def run_pipeline(
         else:
             _record_stage_checkpoint(output_path, "phase7", p6)
 
-        # ---- 质检门：检查 Phase 7 结果，决定是否回退到 Phase 6 ----
-        quality_gate_passed = True
-        if p6.get("status") != "error" and not dry_run:
-            # 从 consistency_report.json 读取角色一致性分数
-            consistency_report_path = output_path / "consistency_report.json"
-            if consistency_report_path.exists():
-                try:
-                    consistency_data = json.loads(consistency_report_path.read_text())
-                    consistency_score = consistency_data.get("consistency_score", 100)
-                    # 阈值：70 分以下视为不通过
-                    if consistency_score < 70:
-                        quality_gate_passed = False
-                        print(f"  ⚠ 质检门未通过: 角色一致性分数 {consistency_score} < 70")
-                        print(f"  🔄 建议回退到 Phase 6 重新生成视频")
-                except (json.JSONDecodeError, KeyError):
-                    pass
-
-        # 兼容旧报告的二次门禁；run_phase7 已经对新执行失败关闭。
-        if not quality_gate_passed:
-            report["quality_gate"] = {
-                "passed": False,
-                "reason": "角色一致性分数低于阈值",
-                "recommendation": "回退到 Phase 6"
-            }
-        else:
-            report["quality_gate"] = {"passed": True}
+        report["quality_gate"] = {
+            "passed": True,
+            "video_quality_owner": "phase8",
+        }
 
     # ---- Phase 8: 组装引擎 ----
     if 8 in skip_phase:

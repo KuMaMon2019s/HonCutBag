@@ -357,7 +357,74 @@ def decide_shot_action(
     return {"action": "keep", "reasons": [], "trim_start_s": 0.0, "trim_end_s": round(duration, 4)}
 
 
-def _automatic_semantic_reviewer() -> SemanticReviewer | None:
+def _character_reference_paths(
+    output_dir: Path | None,
+    shot_meta: dict[str, Any],
+) -> list[tuple[str, Path]]:
+    """Resolve the canonical character images explicitly owned by one shot."""
+    if output_dir is None:
+        return []
+    requested: set[str] = set()
+    who = shot_meta.get("who")
+    if who == []:
+        return []
+    if isinstance(who, list):
+        requested.update(str(value).casefold() for value in who if value)
+    elif who:
+        requested.add(str(who).casefold())
+    for asset in shot_meta.get("associate_assets") or []:
+        if isinstance(asset, str) and asset.startswith("char:"):
+            requested.add(asset[5:].split(":", 1)[0].casefold())
+    if not requested:
+        return []
+
+    try:
+        characters = json.loads(
+            (output_dir / "CHARACTERS.json").read_text(encoding="utf-8")
+        ).get("characters", [])
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return []
+
+    references: list[tuple[str, Path]] = []
+    for character in characters:
+        character_id = str(character.get("id") or "").strip()
+        keys = {
+            character_id.casefold(),
+            str(character.get("name") or "").casefold(),
+            *(
+                str(value).casefold()
+                for value in character.get("aliases", [])
+                if value
+            ),
+        }
+        if not character_id or requested.isdisjoint(keys):
+            continue
+        for character_dir in (
+            output_dir / "characters" / character_id,
+            output_dir / "characters" / "characters" / character_id,
+        ):
+            reference = next(
+                (
+                    path
+                    for path in (
+                        character_dir / "face_closeup.png",
+                        character_dir / "full_body.png",
+                        *sorted(character_dir.glob("variant_*.png")),
+                        character_dir / "front.png",
+                    )
+                    if path.is_file() and path.stat().st_size > 0
+                ),
+                None,
+            )
+            if reference is not None:
+                references.append((character_id, reference))
+                break
+    return references
+
+
+def _automatic_semantic_reviewer(
+    output_dir: Path | None = None,
+) -> SemanticReviewer | None:
     setting = os.environ.get("HONCUT_SHOT_VLM_REVIEW", "auto").strip().lower()
     if setting in {"0", "false", "off", "no"}:
         return None
@@ -369,6 +436,7 @@ def _automatic_semantic_reviewer() -> SemanticReviewer | None:
         return None
 
     def review(frame_paths: list[Path], shot_meta: dict[str, Any]) -> dict[str, Any]:
+        character_references = _character_reference_paths(output_dir, shot_meta)
         expected = {
             key: shot_meta.get(key)
             for key in (
@@ -379,8 +447,13 @@ def _automatic_semantic_reviewer() -> SemanticReviewer | None:
             )
             if shot_meta.get(key) not in (None, "", [])
         }
+        reference_labels = [character_id for character_id, _path in character_references]
+        review_paths = [path for _character_id, path in character_references] + frame_paths
         prompt = (
-            "Review these ordered frames from one generated video shot. Compare them with the expected "
+            f"The first {len(character_references)} supplied image(s) are canonical character references "
+            f"in this exact order: {json.dumps(reference_labels, ensure_ascii=False)}. All remaining images "
+            "are ordered frames from one generated video shot. Compare the video frames with those references "
+            "and with the expected "
             f"shot metadata: {json.dumps(expected, ensure_ascii=False)}. Detect character identity drift, "
             "extra or missing limbs/objects, broken anatomy, impossible geometry, continuity jumps, text or "
             "watermark artifacts, wrong time of day, daylight/night drift, weather drift, and lighting that "
@@ -394,7 +467,7 @@ def _automatic_semantic_reviewer() -> SemanticReviewer | None:
             "a sustained pull-back, while a fixed shot may contain minor stabilization drift. Return JSON only: "
             '{"verdict":"pass|reshoot","issues":["..."],"confidence":0.0}.'
         )
-        raw = client.review(frame_paths, prompt).strip()
+        raw = client.review(review_paths, prompt).strip()
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE)
         parsed = json.loads(raw)
         return parsed if isinstance(parsed, dict) else {"verdict": "reshoot", "issues": ["invalid semantic review"]}
@@ -419,7 +492,7 @@ def analyze_shot_frames(
             flush=True,
         )
     elif semantic_reviewer is None or semantic_reviewer is True:
-        reviewer = _automatic_semantic_reviewer()
+        reviewer = _automatic_semantic_reviewer(Path(output_path).parent)
     elif semantic_reviewer is False:
         reviewer = None
     else:

@@ -11,6 +11,20 @@ from typing import Any
 
 RUN_MANIFEST_SCHEMA = "honcut.run-manifest.v1"
 
+_RUN_OWNED_MARKERS = (
+    "STORYBOARD.json",
+    "CHARACTERS.json",
+    "director_plan.json",
+    "beat_skeleton.json",
+    "shots_partial.json",
+    "shots",
+    "storyboard_images",
+    "storyboard_beats",
+    "characters",
+    "scenes",
+    "polished.mp4",
+)
+
 
 def _sha256_json(value: Any) -> str:
     encoded = json.dumps(
@@ -98,6 +112,25 @@ def prepare_run_manifest(
         "code_version": _code_version(Path(repo_root)),
     }
     identity["run_fingerprint"] = _sha256_json(identity)
+
+    if not resume:
+        if existing is not None and existing.get("run_fingerprint") != identity[
+            "run_fingerprint"
+        ]:
+            raise RuntimeError(
+                "new run refused: output_dir belongs to a different immutable run; "
+                "choose a new output directory or resume the stored run"
+            )
+        if existing is None:
+            stale_markers = [name for name in _RUN_OWNED_MARKERS if (root / name).exists()]
+            if path.exists() or stale_markers:
+                details = [path.name] if path.exists() else []
+                details.extend(stale_markers)
+                raise RuntimeError(
+                    "new run refused: output_dir contains unowned pipeline artifacts: "
+                    + ", ".join(details[:8])
+                    + "; choose an empty output directory"
+                )
 
     if resume:
         mismatches = {

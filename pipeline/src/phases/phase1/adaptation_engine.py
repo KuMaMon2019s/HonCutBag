@@ -27,6 +27,7 @@
 5. 输出排序后的 shot 列表
 """
 
+import hashlib
 import json
 import math
 import sys
@@ -124,7 +125,7 @@ USER_PROMPT_TEMPLATE = (
     "台词零删改 > 出场人物完整 > 只描述动作状态 > 长台词拆镜\n\n"
     "【HonCut 分镜铁律】\n"
     "0. who 只能逐字引用上方角色列表中的主名，别名必须改写为对应主名；"
-    "群体/群众/背景元素（如‘数百名机械居民’‘企业执法机械体群’）不得写入 who，只能写入 visual。\n"
+    "群体/群众/背景元素不得写入 who，只能写入 visual；who=[] 是无人物硬合同。\n"
     "1. 每片段时长≤15秒，超过必须拆分\n"
     "2. 单镜台词>20字必须拆镜（台词4字/秒计算：20字=5秒）\n"
     "3. 在场人物不消失：同场景内角色不能无故离场，必须交代去向\n"
@@ -133,20 +134,18 @@ USER_PROMPT_TEMPLATE = (
     "6. 群演不抢戏：群演只做背景动作，不给特写和台词\n"
     "7. 景别视角错开：相邻镜头不应使用相同景别和角度\n\n"
     "【HonCut Identity Anchor】\n"
-    "每个镜头的 visual 字段必须以「角色名 — 3-6个视觉特征」开头。\n"
-    "特征从角色列表的 appearance.summary 提取，逐字复述，不省略不用代词。\n"
-    "错误示例：'她站在门口' / '该角色转身'\n"
-    "正确示例：'林夏 — 黑色长直发及肩, 白色修身衬衫, 深蓝西装裤 — 站在便利店门口'\n\n"
+    "身份只通过 who 与 associate_assets 结构化绑定；visual 只描述动作、表情、站位和环境，"
+    "不得重复人物外貌。who=[] 时 visual 和 associate_assets 都不得引入任何角色。\n\n"
     "【HonCut 资产绑定（associateAssetsIds）】\n"
     "每个镜头必须声明 associate_assets，列出画面中可见的角色和场景：\n"
-    "- 角色出现即引用：格式 'char:角色id'（如 'char:lin_xia'）\n"
-    "- 场景必选：格式 'scene:场景名'（如 'scene:便利店门口'）\n"
-    "- 示例：[\"char:lin_xia\", \"char:shen_yu\", \"scene:便利店门口\"]\n\n"
+    "- 角色出现即引用：格式 'char:CHARACTER_ID'\n"
+    "- 场景必选：格式 'scene:LOCATION_ID'\n"
+    "- who=[] 时只能绑定场景资产，不得包含 char: 资产\n\n"
     "【HonCut 空间位置基准】\n"
     "如果提供了 director_plan 中的 spatial_positions，每个镜头的 visual 必须按基准表标注角色位置：\n"
     "- 格式：'角色名在画面左前/右前/居中，面朝左/右/镜头'\n"
     "- 同场景内角色位置不应无故跳变（左前突然变右前）\n"
-    "- 位置变化必须有动作交代（如'林夏从左侧走到右侧'）\n\n"
+    "- 位置变化必须有可见动作交代\n\n"
     "注意：所有 shot 的 suggested_duration 总和应接近 target_duration（允许 ±10% 偏差）。"
 )
 
@@ -192,10 +191,10 @@ BATCH_EXPAND_PROMPT = (
     "每片段≤15秒；单镜台词>20字必须拆镜（按4字/秒）；同场景人物不得无故消失；"
     "人物外观不进提示词；声音只写环境音和音效，禁止配乐/BGM/背景音乐；"
     "群演只做背景动作；相邻镜头景别和角度必须错开。\n\n"
-    "【HonCut Identity Anchor】每镜 visual 必须以「角色名 — 3-6个视觉特征」开头，"
-    "特征逐字取自 appearance.summary，不用代词。\n\n"
+    "【HonCut Identity Anchor】身份只通过 who 与 associate_assets 结构化绑定；visual 不重复外貌。"
+    "who=[] 时不得写角色或绑定 char: 资产。\n\n"
     "【HonCut 资产绑定（associateAssetsIds）】每镜 associate_assets 必须列出可见角色"
-    "（char:角色id）和必选场景（scene:场景名）。\n\n"
+    "（char:CHARACTER_ID）和必选场景（scene:LOCATION_ID）。\n\n"
     "【HonCut 空间位置基准】若 director_plan 提供 spatial_positions，visual 必须标注角色"
     "在画面左前/右前/居中及朝向；同场景位置不得无故跳变，变化必须有动作交代。\n\n"
     "本批所有 shot 的 suggested_duration 总和应接近 {batch_target} 秒（允许 ±10% 偏差）。"
@@ -208,7 +207,7 @@ _ACTION_VERBS = (
     "推开", "拉开", "打开", "关上", "递给", "接过", "弯腰", "回头",
     "冲出", "冲来", "追击", "挥刀", "拔刀", "举刀", "横扫", "斩", "劈", "刺击",
     "格挡", "挡住刀锋", "抽刀", "旋身", "踹", "抬膝", "扫腿", "翻滚", "撞出",
-    "撑住钢梁", "扣住手腕", "刀锋", "两刃碰撞",
+    "撑住钢梁", "扣住手腕", "两刃碰撞",
     "raises her hand", "raises his hand", "walks over", "walks toward", "sits down",
     "stands up", "turns around", "embraces", "hugs", "holds hands", "runs toward",
 )
@@ -228,12 +227,20 @@ def determine_gen_strategy(shot: Dict[str, Any]) -> str:
     character reference images constrain appearance consistently. Scenery and
     ambient shots without characters use single-image I2V.
     """
+    # Prefer authored action fields, while retaining compatibility with older
+    # storyboards that wrote real movement only into ``visual``/``what``.
+    # Noun-only tokens such as ``刀锋`` must not appear in _ACTION_VERBS: a
+    # blade lying on a table is not evidence that FLF2V is required.
+    authored_actions = shot.get("generation_actions") or []
+    if isinstance(authored_actions, str):
+        authored_actions = [authored_actions]
     searchable = " ".join(
-        str(shot.get(field, ""))
-        for field in (
-            "visual", "what", "prompt", "description", "action_description",
-            "generation_actions",
-        )
+        [str(value) for value in authored_actions]
+        + [
+            str(shot.get("action_description") or ""),
+            str(shot.get("visual") or ""),
+            str(shot.get("what") or ""),
+        ]
     ).lower()
     if any(verb in searchable for verb in _ACTION_VERBS):
         return "flf2v"
@@ -973,6 +980,7 @@ def _expand_beats_to_shots(
     shot_duration: int,
     output_dir: Optional[Path] = None,
     resumed_shots: Optional[List[Dict[str, Any]]] = None,
+    checkpoint_fingerprint: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Expand three beats at a time, relaying only the previous final shot."""
     shots: List[Dict[str, Any]] = list(resumed_shots or [])
@@ -1039,6 +1047,10 @@ def _expand_beats_to_shots(
             _atomic_write_json(
                 output_dir / "shots_partial.json",
                 {
+                    "_checkpoint": {
+                        "schema": LAYERED_CHECKPOINT_SCHEMA,
+                        "input_fingerprint": checkpoint_fingerprint,
+                    },
                     "completed_batches": list(range(1, (len(shots) + 2) // 3 + 1)),
                     "shots": shots,
                 },
@@ -1060,10 +1072,49 @@ def _atomic_write_json(path: Path, value: Any) -> None:
     os.replace(temporary, path)
 
 
+LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v1"
+
+
+def _layered_input_fingerprint(
+    events: List[Dict[str, Any]],
+    characters_summary: str,
+    target_duration: int,
+    shot_duration: int,
+    expected_beats: int,
+) -> str:
+    """Bind layered checkpoints to the complete semantic adaptation input."""
+    contract = {
+        "schema": LAYERED_CHECKPOINT_SCHEMA,
+        "events": events,
+        "characters_summary": characters_summary,
+        "target_duration": target_duration,
+        "shot_duration": shot_duration,
+        "expected_beats": expected_beats,
+    }
+    encoded = json.dumps(
+        contract,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _checkpoint_matches(value: Any, input_fingerprint: str) -> bool:
+    metadata = value.get("_checkpoint") if isinstance(value, dict) else None
+    return bool(
+        isinstance(metadata, dict)
+        and metadata.get("schema") == LAYERED_CHECKPOINT_SCHEMA
+        and metadata.get("input_fingerprint") == input_fingerprint
+    )
+
+
 def _load_layered_checkpoints(
     output_dir: Path,
     events: List[Dict[str, Any]],
     expected_beats: int,
+    input_fingerprint: str,
 ) -> tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
     """Load only valid, contiguous layered checkpoints."""
     skeleton = None
@@ -1071,6 +1122,8 @@ def _load_layered_checkpoints(
     if skeleton_path.exists():
         try:
             candidate = json.loads(skeleton_path.read_text(encoding="utf-8"))
+            if not _checkpoint_matches(candidate, input_fingerprint):
+                raise ValueError("layered skeleton belongs to a different input")
             _parse_beat_skeleton(json.dumps(candidate, ensure_ascii=False), expected_beats, len(events))
             _validate_beat_action_capacity(candidate["beats"], events)
             event_by_id = {i: dict(event, event_id=i) for i, event in enumerate(events, 1)}
@@ -1086,6 +1139,8 @@ def _load_layered_checkpoints(
     if skeleton is not None and partial_path.exists():
         try:
             partial = json.loads(partial_path.read_text(encoding="utf-8"))
+            if not _checkpoint_matches(partial, input_fingerprint):
+                raise ValueError("partial shots belong to a different input")
             candidate_shots = partial.get("shots", [])
             completed = partial.get("completed_batches", [])
             if not isinstance(candidate_shots, list) or not isinstance(completed, list):
@@ -1176,15 +1231,31 @@ def adapt_events(
     use_layered = requested_mode != "single" and len(events) > 10
     if use_layered:
         checkpoint_dir = Path(output_dir) if output_dir is not None else None
+        layered_fingerprint = _layered_input_fingerprint(
+            events,
+            characters_summary,
+            target_duration,
+            effective_shot_duration,
+            max_shots,
+        )
         skeleton = None
         resumed_shots: List[Dict[str, Any]] = []
         if checkpoint_dir is not None:
-            skeleton, resumed_shots = _load_layered_checkpoints(checkpoint_dir, events, max_shots)
+            skeleton, resumed_shots = _load_layered_checkpoints(
+                checkpoint_dir,
+                events,
+                max_shots,
+                layered_fingerprint,
+            )
         if skeleton is None:
             skeleton = _build_beat_skeleton(
                 events, characters_summary, target_duration, effective_shot_duration,
                 max_shots,
             )
+            skeleton["_checkpoint"] = {
+                "schema": LAYERED_CHECKPOINT_SCHEMA,
+                "input_fingerprint": layered_fingerprint,
+            }
             if checkpoint_dir is not None:
                 _atomic_write_json(checkpoint_dir / "beat_skeleton.json", skeleton)
         normalize_shot_durations(
@@ -1192,7 +1263,9 @@ def adapt_events(
         )
         shots = _expand_beats_to_shots(
             skeleton["beats"], characters_summary, target_duration, effective_shot_duration,
-            output_dir=checkpoint_dir, resumed_shots=resumed_shots,
+            output_dir=checkpoint_dir,
+            resumed_shots=resumed_shots,
+            checkpoint_fingerprint=layered_fingerprint,
         )
         _validate_shots(shots)
 
