@@ -1909,21 +1909,86 @@ def test_extension_provider_content_keeps_images_as_anchors_and_adds_video(monke
         "reference_image",
         "reference_video",
     ]
-    assert content[0]["text"].startswith("向后延长视频1")
-    assert "图片3、图片4、图片5" in content[0]["text"]
-    assert "严格参考图片5" in content[0]["text"]
+    assert "向后延长视频1" in content[0]["text"]
+    assert "图片2、图片3、图片4" in content[0]["text"]
+    assert "严格参考图片4" in content[0]["text"]
     assert "不得重播视频1中的运动轨迹" in content[0]["text"]
     assert "without a reset or cut" in content[0]["text"]
     assert "Do not skip forward in time" in content[0]["text"]
     assert "storyboard group CG001; step 1/1" in content[0]["text"]
-    assert "图片2是本连续组" in content[0]["text"]
+    assert "图片5是本连续组" in content[0]["text"]
     assert content[1]["image_url"]["url"] == "https://image.test/frame.png"
-    assert content[2]["image_url"]["url"] == "https://image.test/CG001.jpg"
-    assert [item["image_url"]["url"] for item in content[3:6]] == [
+    assert [item["image_url"]["url"] for item in content[2:5]] == [
         f"https://image.test/{path.name}"
         for path in sorted((tmp_path / "continuity_anchors").glob("*_frame_*.jpg"))
     ]
+    assert content[5]["image_url"]["url"] == "https://image.test/CG001.jpg"
     assert content[-1]["video_url"]["url"] == "https://video.test/tail-window.mp4"
+
+
+def test_fresh_provider_does_not_mix_first_frame_with_group_board(monkeypatch, tmp_path):
+    shot_dir = tmp_path / "shots/S01"
+    shot_dir.mkdir(parents=True)
+    (shot_dir / "SHOT_META.json").write_text(
+        json.dumps({"prompt": "凛踩水冲出", "gen_strategy": "i2v"}),
+        encoding="utf-8",
+    )
+    board_dir = tmp_path / "storyboard_groups"
+    board_dir.mkdir()
+    (board_dir / "CG001.jpg").write_bytes(b"group-board")
+    (tmp_path / "STORYBOARD_GROUPS.json").write_text(json.dumps({
+        "shot_to_group": {"S01": "CG001"},
+        "groups": [{
+            "group_id": "CG001",
+            "storyboard_board": "storyboard_groups/CG001.jpg",
+            "beats": [{
+                "shot_id": "S01",
+                "start_state": "二人对峙",
+                "generation_actions": ["凛踩水冲出"],
+                "end_state": "凛逼近烬",
+            }],
+        }],
+    }), encoding="utf-8")
+    uploaded = []
+    monkeypatch.setattr(
+        "tools.asset_packager.build_content_for_shot",
+        lambda **kwargs: [
+            {"type": "text", "text": kwargs["shot_meta"]["prompt"]},
+            {
+                "type": "image_url",
+                "image_url": {"url": "https://image.test/S01.png"},
+                "role": "first_frame",
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        "clients.tos_uploader.upload_image",
+        lambda *_args, **_kwargs: uploaded.append(True),
+    )
+    request = ChunkExecutionRequest(
+        resource_id="S01_C01",
+        shot_id="S01",
+        chunk=GenerationChunk(
+            chunk_id="S01_C01",
+            sequence=1,
+            target_duration_s=4,
+            mode="fresh",
+            storyboard_beat_id="S01_P01",
+            storyboard_image="storyboard_beats/S01_P01.png",
+            action_prompt="凛踩水冲出",
+        ),
+        anchors={"scene": "roof"},
+        output_path=tmp_path / "S01_C01.mp4",
+        previous_output_path=None,
+        input_fingerprint="fingerprint",
+        memory_context="anchors",
+    )
+
+    content, *_ = _provider_content(tmp_path, request)
+
+    assert [item.get("role") for item in content] == [None, "first_frame"]
+    assert uploaded == []
+    assert "storyboard group CG001; step 1/1" in content[0]["text"]
 
 
 def test_fresh_provider_content_uses_current_frame_and_group_storyboard(monkeypatch, tmp_path):

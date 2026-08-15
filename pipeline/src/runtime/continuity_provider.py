@@ -310,6 +310,16 @@ def _append_group_board_reference(
 ) -> list[dict[str, Any]]:
     if board_path is None:
         return content
+    frame_roles = {
+        item.get("role")
+        for item in content
+        if item.get("type") == "image_url"
+    }
+    if frame_roles & {"first_frame", "last_frame"}:
+        # Seedance rejects first/last-frame control mixed with reference media.
+        # The same group contract is already embedded in the text prompt, so the
+        # board remains a media reference only for reference-only requests.
+        return content
     from clients.tos_uploader import upload_image
 
     try:
@@ -340,12 +350,17 @@ def _append_group_board_reference(
         content.insert(0, {"type": "text", "text": directive})
     else:
         text_item["text"] = f"{directive}\n{text_item.get('text', '')}"
-    content.append({
+    board_item = {
         "type": "image_url",
         "image_url": {"url": board_url},
         "role": "reference_image",
         "priority": "low",
-    })
+    }
+    video_index = next(
+        (index for index, item in enumerate(content) if item.get("type") == "video_url"),
+        len(content),
+    )
+    content.insert(video_index, board_item)
     return content
 
 
@@ -386,7 +401,7 @@ def _base_content(
     )
     if not content:
         content = [{"type": "text", "text": content_meta["prompt"]}]
-    return _append_group_board_reference(content, board_path)
+    return content
 
 
 def _extension_content(
@@ -472,6 +487,8 @@ def _provider_content(
         if request.previous_output_path is None:
             raise RuntimeError(f"{request.resource_id} has no predecessor video")
         content = _extension_content(content, request.previous_output_path)
+    _, board_path = _storyboard_group_for_shot(output_dir, request.shot_id)
+    content = _append_group_board_reference(content, board_path)
     return content, shot_meta, _generation_seed(request), _chunk_duration(request)
 
 

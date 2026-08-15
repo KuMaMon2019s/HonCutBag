@@ -38,6 +38,27 @@ def _response_json(response: requests.Response, operation: str) -> dict:
     return payload
 
 
+def _validate_content_media_roles(content: list[dict]) -> None:
+    """Reject Seedance media-role combinations that Ark cannot accept."""
+    frame_roles = {
+        item.get("role")
+        for item in content
+        if item.get("type") == "image_url"
+        and item.get("role") in {"first_frame", "last_frame"}
+    }
+    reference_roles = {
+        item.get("role")
+        for item in content
+        if item.get("role") in {"reference_image", "reference_video"}
+    }
+    if frame_roles and reference_roles:
+        raise ValueError(
+            "Seedance content cannot mix first/last frame control with reference "
+            f"media (frame_roles={sorted(frame_roles)}, "
+            f"reference_roles={sorted(reference_roles)})"
+        )
+
+
 def get_task(task_id: str, *, api_key: str, timeout: int = 30) -> dict:
     """Query one video task through the Agent Plan task endpoint."""
     if not task_id.strip():
@@ -174,6 +195,8 @@ def _submit_direct(
                 "role": "reference_video",
             })
 
+    _validate_content_media_roles(content)
+
     # ALL params at top level — CRITICAL
     payload = {
         "model": model,
@@ -208,6 +231,7 @@ def submit_content(
     generate_audio: Optional[str] = None,
 ) -> str:
     """Submit a preassembled ARK Agent Plan content array. Returns task_id."""
+    _validate_content_media_roles(content)
     headers = _authorization_headers(api_key)
     payload = {
         "model": model,

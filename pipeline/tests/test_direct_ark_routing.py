@@ -646,6 +646,34 @@ def test_submit_content_sends_top_level_agent_plan_payload(monkeypatch):
     assert "parameters" not in posted["json"]
 
 
+def test_submit_content_rejects_frame_control_mixed_with_reference_media(monkeypatch):
+    monkeypatch.setattr(
+        seedance_client.requests,
+        "post",
+        lambda *_args, **_kwargs: pytest.fail("invalid content must not reach Seedance"),
+    )
+
+    with pytest.raises(ValueError, match="cannot mix first/last frame control"):
+        seedance_client.submit_content(
+            [
+                {"type": "text", "text": "move slowly"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.test/frame.jpg"},
+                    "role": "first_frame",
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.test/board.jpg"},
+                    "role": "reference_image",
+                },
+            ],
+            api_key="test-key",
+            model="doubao-seedance-2.0-mini",
+            duration=8,
+        )
+
+
 def test_seedance_download_is_atomic_on_interrupted_stream(tmp_path, monkeypatch):
     destination = tmp_path / "output.mp4"
     destination.write_bytes(b"previous-complete-video")
