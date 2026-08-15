@@ -17,7 +17,7 @@ from PIL import Image
 from pydantic import ValidationError
 
 from clients import seedance_client, tos_uploader
-from clients.seedream_client import IMAGE_ENDPOINT
+from clients.seedream_client import IMAGE_ENDPOINT, _reference_data_url
 from phases import pipeline_core
 from phases.phase1.director_storyboard import (
     build_director_storyboard_prompt,
@@ -108,6 +108,20 @@ def _write_grid_image(
     for position in horizontal:
         pixels[max(0, position - 3):min(height, position + 4), :] = 0
     Image.fromarray(pixels).save(path)
+
+
+def test_seedream_compacts_large_reference_in_memory_without_touching_source(tmp_path):
+    reference = tmp_path / "large-reference.png"
+    Image.new("RGB", (2560, 1440), "navy").save(reference)
+    original = reference.read_bytes()
+
+    data_url = _reference_data_url(str(reference))
+
+    header, encoded = data_url.split(",", 1)
+    with Image.open(io.BytesIO(base64.b64decode(encoded))) as compacted:
+        assert header == "data:image/jpeg;base64"
+        assert max(compacted.size) == 1600
+    assert reference.read_bytes() == original
 
 
 def test_planner_keeps_short_editorial_shots_backward_compatible():

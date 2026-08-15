@@ -15,10 +15,12 @@ Usage:
 
 import os
 import base64
+import io
 import threading
 import time
 from contextlib import contextmanager
 import requests
+from PIL import Image, ImageOps
 from typing import Optional
 from utils.config import ARK_BASE_URL
 from utils.ip_blacklist import sanitize_prompt
@@ -31,6 +33,65 @@ IMAGE_ENDPOINT = f"{BASE_URL}/images/generations"
 # Agent Plan model (NOT doubao-seedream-3-0 which doesn't exist)
 DEFAULT_MODEL = "doubao-seedream-5.0-lite"
 DEFAULT_IMAGE_SIZE = "1920x1920"
+REFERENCE_UPLOAD_MAX_EDGE = 1600
+REFERENCE_UPLOAD_MAX_BYTES = 1_500_000
+
+
+def _reference_data_url(reference_path: str) -> str:
+    """Encode one reference without sending oversized raw PNG payloads."""
+    with open(reference_path, "rb") as reference_file:
+        image_bytes = reference_file.read()
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        mime = "image/png"
+    elif image_bytes.startswith(b"\xff\xd8\xff"):
+        mime = "image/jpeg"
+    elif image_bytes.startswith(b"RIFF") and image_bytes[8:12] == b"WEBP":
+        mime = "image/webp"
+    else:
+        ext = os.path.splitext(reference_path)[1].lower().lstrip(".")
+        mime = {
+            "png": "image/png",
+            "jpg": "image/jpeg",
+            "jpeg": "image/jpeg",
+            "webp": "image/webp",
+        }.get(ext, "image/png")
+
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as source:
+            width, height = source.size
+            needs_compaction = (
+                len(image_bytes) > REFERENCE_UPLOAD_MAX_BYTES
+                or max(width, height) > REFERENCE_UPLOAD_MAX_EDGE
+            )
+            if needs_compaction:
+                image = ImageOps.exif_transpose(source).convert("RGB")
+                image.thumbnail(
+                    (REFERENCE_UPLOAD_MAX_EDGE, REFERENCE_UPLOAD_MAX_EDGE),
+                    Image.Resampling.LANCZOS,
+                )
+                compact = io.BytesIO()
+                image.save(
+                    compact,
+                    format="JPEG",
+                    quality=90,
+                    subsampling=0,
+                    optimize=True,
+                )
+                compact_bytes = compact.getvalue()
+                print(
+                    f"  [seedream] compact reference {os.path.basename(reference_path)}: "
+                    f"{len(image_bytes)} → {len(compact_bytes)} bytes, "
+                    f"{width}x{height} → {image.width}x{image.height}",
+                    flush=True,
+                )
+                image_bytes = compact_bytes
+                mime = "image/jpeg"
+    except (OSError, ValueError):
+        # Preserve the provider's original validation behavior for unusual but
+        # otherwise supported image formats.
+        pass
+
+    return f"data:{mime};base64,{base64.b64encode(image_bytes).decode()}"
 
 
 class _SeedreamRateLimiter:
@@ -137,24 +198,7 @@ class SeedreamClient:
             raise ValueError("image_to_image requires at least one reference image")
         encoded_references = []
         for reference_path in reference_paths:
-            with open(reference_path, "rb") as f:
-                image_bytes = f.read()
-            img_b64 = base64.b64encode(image_bytes).decode()
-            if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
-                mime = "image/png"
-            elif image_bytes.startswith(b"\xff\xd8\xff"):
-                mime = "image/jpeg"
-            elif image_bytes.startswith(b"RIFF") and image_bytes[8:12] == b"WEBP":
-                mime = "image/webp"
-            else:
-                ext = os.path.splitext(reference_path)[1].lower().lstrip(".")
-                mime = {
-                    "png": "image/png",
-                    "jpg": "image/jpeg",
-                    "jpeg": "image/jpeg",
-                    "webp": "image/webp",
-                }.get(ext, "image/png")
-            encoded_references.append(f"data:{mime};base64,{img_b64}")
+            encoded_references.append(_reference_data_url(reference_path))
 
         # Agent Plan i2i: use image_url in content array
         payload = {
