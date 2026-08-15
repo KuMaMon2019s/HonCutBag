@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
 import shutil
 import subprocess
@@ -79,6 +80,7 @@ from runtime.continuity_provider import (
     _direct_seedance_executor,
     _generation_seed,
     _provider_content,
+    _seedance_reference_image_payload,
     execute_phase6_auto_continuity,
     materialize_continuity_shot,
 )
@@ -1924,6 +1926,43 @@ def test_extension_provider_content_keeps_images_as_anchors_and_adds_video(monke
     ]
     assert content[5]["image_url"]["url"] == "https://image.test/CG001.jpg"
     assert content[-1]["video_url"]["url"] == "https://video.test/tail-window.mp4"
+
+
+@pytest.mark.parametrize(
+    ("source_size", "unchanged_axis"),
+    [((400, 100), "width"), ((100, 400), "height")],
+)
+def test_seedance_group_board_payload_pads_extreme_aspect_without_cropping(
+    tmp_path,
+    source_size,
+    unchanged_axis,
+):
+    board = tmp_path / "group-board.png"
+    Image.new("RGB", source_size, (240, 240, 240)).save(board)
+
+    payload, content_type = _seedance_reference_image_payload(board)
+
+    with Image.open(io.BytesIO(payload)) as adapted:
+        ratio = adapted.width / adapted.height
+        assert 0.40 <= ratio <= 2.50
+        if unchanged_axis == "width":
+            assert adapted.width == source_size[0]
+            assert adapted.height > source_size[1]
+        else:
+            assert adapted.height == source_size[1]
+            assert adapted.width > source_size[0]
+    assert content_type == "image/png"
+
+
+def test_seedance_group_board_payload_preserves_legal_image_bytes(tmp_path):
+    board = tmp_path / "group-board.png"
+    Image.new("RGB", (160, 90), "white").save(board)
+    original = board.read_bytes()
+
+    payload, content_type = _seedance_reference_image_payload(board)
+
+    assert payload == original
+    assert content_type == "image/png"
 
 
 def test_fresh_provider_does_not_mix_first_frame_with_group_board(monkeypatch, tmp_path):

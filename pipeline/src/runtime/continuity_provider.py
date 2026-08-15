@@ -37,6 +37,9 @@ CONTINUITY_BRIDGE_MODES = {"off", "auto"}
 SEAM_DECISIONS_KIND = "honcut.continuity_seam_decisions.v1"
 SEEDANCE_MAX_REFERENCE_IMAGES = 9
 CONTINUITY_ANCHOR_FRAME_COUNT = 3
+SEEDANCE_MIN_IMAGE_ASPECT = 0.40
+SEEDANCE_MAX_IMAGE_ASPECT = 2.50
+SEEDANCE_IMAGE_ASPECT_MARGIN = 0.01
 
 
 def probe_continuity_frames(path: Path, timeline_fps: int) -> dict[str, Any]:
@@ -304,6 +307,65 @@ def _chunk_prompt(
     )
 
 
+def _seedance_reference_image_payload(board_path: Path) -> tuple[bytes, str]:
+    """Return a complete, uncropped board inside Seedance's aspect limits."""
+    raw = board_path.read_bytes()
+    try:
+        import io
+
+        from PIL import Image, ImageOps
+
+        with Image.open(io.BytesIO(raw)) as source:
+            image_format = str(source.format or "PNG").upper()
+            image = ImageOps.exif_transpose(source).convert("RGB")
+        content_type = {
+            "JPEG": "image/jpeg",
+            "PNG": "image/png",
+            "WEBP": "image/webp",
+        }.get(image_format, "image/png")
+        width, height = image.size
+        aspect = width / height
+        if SEEDANCE_MIN_IMAGE_ASPECT <= aspect <= SEEDANCE_MAX_IMAGE_ASPECT:
+            return raw, content_type
+
+        safe_min = SEEDANCE_MIN_IMAGE_ASPECT + SEEDANCE_IMAGE_ASPECT_MARGIN
+        safe_max = SEEDANCE_MAX_IMAGE_ASPECT - SEEDANCE_IMAGE_ASPECT_MARGIN
+        target_width = max(width, math.ceil(height * safe_min))
+        target_height = max(height, math.ceil(width / safe_max))
+        corners = (
+            image.getpixel((0, 0)),
+            image.getpixel((width - 1, 0)),
+            image.getpixel((0, height - 1)),
+            image.getpixel((width - 1, height - 1)),
+        )
+        fill = tuple(
+            round(sum(pixel[channel] for pixel in corners) / 4)
+            for channel in range(3)
+        )
+        canvas = Image.new("RGB", (target_width, target_height), fill)
+        canvas.paste(image, ((target_width - width) // 2, (target_height - height) // 2))
+
+        encoded = io.BytesIO()
+        output_format = image_format if image_format in {"JPEG", "PNG", "WEBP"} else "PNG"
+        save_options = (
+            {"quality": 95, "optimize": True}
+            if output_format in {"JPEG", "WEBP"}
+            else {"optimize": True}
+        )
+        canvas.save(encoded, format=output_format, **save_options)
+        print(
+            "  [continuity] padded storyboard board for Seedance: "
+            f"{width}x{height} ({aspect:.3f}) -> "
+            f"{target_width}x{target_height} ({target_width / target_height:.3f})"
+        )
+        return encoded.getvalue(), content_type
+    except (ImportError, OSError, ValueError):
+        import mimetypes
+
+        content_type = mimetypes.guess_type(board_path.name)[0] or "application/octet-stream"
+        return raw, content_type
+
+
 def _append_group_board_reference(
     content: list[dict[str, Any]],
     board_path: Path | None,
@@ -322,21 +384,8 @@ def _append_group_board_reference(
         return content
     from clients.tos_uploader import upload_image
 
-    try:
-        from PIL import Image
-
-        with Image.open(board_path) as board_image:
-            image_format = str(board_image.format or "").upper()
-        content_type = {
-            "JPEG": "image/jpeg",
-            "PNG": "image/png",
-            "WEBP": "image/webp",
-        }.get(image_format, "application/octet-stream")
-    except (ImportError, OSError, ValueError):
-        import mimetypes
-
-        content_type = mimetypes.guess_type(board_path.name)[0] or "application/octet-stream"
-    board_url = upload_image(board_path.read_bytes(), content_type)
+    board_payload, content_type = _seedance_reference_image_payload(board_path)
+    board_url = upload_image(board_payload, content_type)
     if not board_url:
         raise RuntimeError(f"failed to upload storyboard group board {board_path}")
     image_number = sum(item.get("type") == "image_url" for item in content) + 1
