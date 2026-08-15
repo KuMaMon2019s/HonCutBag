@@ -326,6 +326,14 @@ def build_model_reference_prompts(
             f"{identity}, {FULL_BODY_IMAGE_RULES}, separate full-body standing reference, complete outfit and footwear visible, "
             "same identity and clothing as the face reference"
         ),
+        "side": (
+            f"{identity}, {FULL_BODY_IMAGE_RULES}, strict 90-degree side-profile full-body standing reference, "
+            "complete outfit and footwear visible, same identity, proportions, clothing and accessories as the supplied face and body references"
+        ),
+        "back": (
+            f"{identity}, {FULL_BODY_IMAGE_RULES}, strict back-view full-body standing reference, "
+            "complete rear hair, outfit and footwear visible, same identity, proportions, clothing and accessories as the supplied face and body references"
+        ),
     }
 
 
@@ -503,6 +511,8 @@ def create_character_card(
         "reference_images": reference_images or {
             "face_closeup": f"characters/{char_id}/face_closeup.png",
             "full_body": f"characters/{char_id}/full_body.png",
+            "side": f"characters/{char_id}/side.png",
+            "back": f"characters/{char_id}/back.png",
         },
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "generator": seedream_model,
@@ -517,8 +527,9 @@ def create_angle_map(
     """Create angle_map.json — maps camera angles to best reference images."""
     mappings = custom_mappings or {
         "正面/特写/对话": "face_closeup.png",
-        "侧面/行走/奔跑": "full_body.png",
-        "背面/远去/离开": "full_body.png",
+        "正面/全身/站立": "full_body.png",
+        "侧面/行走/奔跑": "side.png",
+        "背面/远去/离开": "back.png",
         "面部/情绪/泪水": "face_closeup.png",
     }
     return {
@@ -583,11 +594,22 @@ def generate_character(
             first_path = None
             for index, (view_name, reference_prompt) in enumerate(reference_prompts.items()):
                 view_path = os.path.join(char_dir, f"{view_name}.png")
-                view_size = FULL_BODY_REFERENCE_SIZE if view_name == "full_body" else size
+                view_size = (
+                    FULL_BODY_REFERENCE_SIZE
+                    if view_name in {"full_body", "side", "back"}
+                    else size
+                )
                 if index and first_path and hasattr(client, "image_to_image"):
+                    reference_paths = [first_path]
+                    if target_model == "seedance" and views.get("full_body"):
+                        reference_paths.append(views["full_body"])
                     client.image_to_image(
                         prompt=f"{REFERENCE_WEIGHT_NOTE}. {reference_prompt}",
-                        ref_image=first_path,
+                        ref_image=(
+                            reference_paths[0]
+                            if len(reference_paths) == 1
+                            else reference_paths
+                        ),
                         output_path=view_path,
                         size=view_size,
                     )
@@ -621,9 +643,15 @@ def generate_character(
         seedream_model=seedream_model,
         reference_images={name: f"characters/{char_id}/{name}.png" for name in views},
     )
-    card["face_reference"] = f"characters/{char_id}/face_closeup.png"
-    card["body_reference"] = f"characters/{char_id}/full_body.png"
-    card["reference_strategy"] = "kling_four_views" if "kling" in target_model.lower() else "seedance_face_and_body"
+    face_view = "face_closeup" if "face_closeup" in views else "closeup"
+    body_view = "full_body" if "full_body" in views else "front"
+    card["face_reference"] = f"characters/{char_id}/{face_view}.png"
+    card["body_reference"] = f"characters/{char_id}/{body_view}.png"
+    card["reference_strategy"] = (
+        "kling_four_views"
+        if "kling" in target_model.lower()
+        else "seedance_four_views"
+    )
     card["source_image_rules"] = SOURCE_IMAGE_RULES
     card_path = os.path.join(char_dir, "character_card.json")
     with open(card_path, "w", encoding="utf-8") as f:
@@ -632,7 +660,17 @@ def generate_character(
 
     # Step 3: Create angle_map.json
     print("[Step 3/3] Creating angle_map.json...")
-    angle_map = create_angle_map(char_id=char_id)
+    angle_map = create_angle_map(
+        char_id=char_id,
+        default_view=face_view,
+        custom_mappings={
+            "正面/特写/对话": f"{face_view}.png",
+            "正面/全身/站立": f"{body_view}.png",
+            "侧面/行走/奔跑": "side.png",
+            "背面/远去/离开": "back.png",
+            "面部/情绪/泪水": f"{face_view}.png",
+        },
+    )
     angle_path = os.path.join(char_dir, "angle_map.json")
     with open(angle_path, "w", encoding="utf-8") as f:
         json.dump(angle_map, f, ensure_ascii=False, indent=2)

@@ -102,7 +102,11 @@ def run_l1_checks(storyboard: dict, visual_style: str) -> tuple[list[dict], dict
         else:
             durations.append(float(duration))
 
-        present = [key for key in dialogue_fields if key in shot]
+        present = [
+            key
+            for key in dialogue_fields
+            if key in shot and shot.get(key) is not None
+        ]
         if present and all(not _text(shot.get(key)).strip() for key in present):
             item = _issue("L1", "moderate", "empty_spoken_content", f"{sid} declares spoken-content fields but all are empty", [sid])
             issues.append(item)
@@ -157,7 +161,18 @@ def run_generation_capacity_checks(
                 beat_id = str(beat.get("beat_id") or f"{sid}_P{position:02d}")
                 beat_duration = float(beat.get("duration_s") or 0)
                 beat_duration_total += beat_duration
-                expected_mode = "fresh" if position == 1 else "extend"
+                expected_mode = (
+                    "extend"
+                    if position > 1
+                    or (
+                        position == 1
+                        and str(shot.get("boundary_before") or "")
+                        .strip()
+                        .lower()
+                        == "continuous"
+                    )
+                    else "fresh"
+                )
                 if beat.get("generation_mode") != expected_mode:
                     issues.append(_issue(
                         "L1", "severe", "storyboard_beat_mode_invalid",
@@ -353,22 +368,20 @@ def cosine_similarity(left: list[float], right: list[float]) -> float:
 
 
 def run_l2_checks(storyboard: dict, characters_data: dict, images: dict[str, Path], threshold: float = DEFAULT_SIMILARITY_THRESHOLD, embedder: Callable[[str], list[float] | None] | None = None) -> tuple[list[dict], dict]:
-    """Embed shot images and compare every pair containing the same character."""
+    """Embed whole frames as scene diagnostics, never as character crops.
+
+    A whole-frame embedding cannot isolate a particular person.  Older code
+    copied the same frame matrix under every character ID and treated it as
+    identity evidence.  L2 now reports one honest scene-level matrix; canonical
+    character-reference comparison is delegated to the multimodal L3 review.
+    """
     if not 0 <= threshold <= 1:
         raise ValueError("similarity threshold must be between 0 and 1")
     if embedder is None:
         from utils.shot_embedder import embed_image
         embedder = embed_image
-    characters = characters_data.get("characters", []) if isinstance(characters_data, dict) else []
-    shot_characters: dict[str, list[str]] = {}
-    for index, shot in enumerate(storyboard.get("shots", [])):
-        shot_characters[_shot_id(shot, index)] = _characters_in_shot(shot, characters)
     vectors: dict[str, list[float]] = {}
     errors: list[str] = []
-    image_characters = {
-        image_id: shot_characters.get(_parent_shot_id(image_id), [])
-        for image_id in images
-    }
     for sid, path in images.items():
         try:
             vector = embedder(str(path))
@@ -377,32 +390,31 @@ def run_l2_checks(storyboard: dict, characters_data: dict, images: dict[str, Pat
         except Exception as exc:  # preserve the failure in the report
             errors.append(f"{sid}: {exc}")
 
-    issues: list[dict] = []
-    matrices: dict[str, dict] = {}
-    for character in characters:
-        cid = str(character.get("id", ""))
-        shot_ids = [sid for sid, ids in image_characters.items() if cid in ids and sid in vectors]
-        matrix: list[list[float]] = []
-        for left in shot_ids:
-            row = []
-            for right in shot_ids:
-                try:
-                    score = cosine_similarity(vectors[left], vectors[right])
-                except ValueError as exc:
-                    errors.append(f"{left}/{right}: {exc}")
-                    score = 0.0
-                row.append(round(score, 6))
-            matrix.append(row)
-        matrices[cid] = {"shot_ids": shot_ids, "matrix": matrix}
-        for i, left in enumerate(shot_ids):
-            for j in range(i + 1, len(shot_ids)):
-                score = matrix[i][j]
-                if score < threshold:
-                    parent_ids = sorted({_parent_shot_id(left), _parent_shot_id(shot_ids[j])})
-                    issues.append(_issue("L2", "severe", "character_similarity_low", f"{cid} differs between {left} and {shot_ids[j]} (cosine={score:.3f})", parent_ids, character_id=cid, storyboard_ids=[left, shot_ids[j]], similarity=score, threshold=threshold))
+    image_ids = [image_id for image_id in images if image_id in vectors]
+    matrix: list[list[float]] = []
+    for left in image_ids:
+        row: list[float] = []
+        for right in image_ids:
+            try:
+                score = cosine_similarity(vectors[left], vectors[right])
+            except ValueError as exc:
+                errors.append(f"{left}/{right}: {exc}")
+                score = 0.0
+            row.append(round(score, 6))
+        matrix.append(row)
     status = "completed" if vectors else "skipped"
     reason = None if vectors else ("ARK_AGENT_API_KEY missing or embedding service returned no vectors")
-    return issues, {"status": status, "skipped_reason": reason, "threshold": threshold, "embedded_shots": sorted(vectors), "character_matrices": matrices, "errors": errors}
+    return [], {
+        "status": status,
+        "skipped_reason": reason,
+        "scope": "whole_frame_scene_consistency",
+        "character_isolation": False,
+        "identity_review_layer": "L3_canonical_references",
+        "threshold": threshold,
+        "embedded_shots": sorted(vectors),
+        "scene_matrix": {"storyboard_ids": image_ids, "matrix": matrix},
+        "errors": errors,
+    }
 
 
 def create_storyboard_grid(image_paths: list[Path], output_path: Path, columns: int = 5) -> Path:
@@ -483,6 +495,50 @@ def _ordered_storyboard_images(
     return ordered
 
 
+def find_character_reference_images(
+    output_dir: Path,
+    characters_data: dict,
+) -> dict[str, list[Path]]:
+    """Resolve canonical Phase 3 references in stable identity-first order."""
+    output_dir = Path(output_dir)
+    result: dict[str, list[Path]] = {}
+    for character in characters_data.get("characters", []):
+        if not isinstance(character, dict):
+            continue
+        character_id = str(character.get("id") or "").strip()
+        if not character_id:
+            continue
+        character_dir = output_dir / "characters" / character_id
+        card_path = character_dir / "character_card.json"
+        declared: dict[str, Any] = {}
+        try:
+            card = json.loads(card_path.read_text(encoding="utf-8"))
+            if isinstance(card.get("reference_images"), dict):
+                declared = card["reference_images"]
+        except (OSError, json.JSONDecodeError):
+            pass
+        paths: list[Path] = []
+        for view_name in (
+            "face_closeup",
+            "full_body",
+            "closeup",
+            "front",
+            "side",
+            "back",
+            "three_quarter",
+            "detail",
+        ):
+            value = declared.get(view_name)
+            path = Path(str(value)) if value else character_dir / f"{view_name}.png"
+            if not path.is_absolute():
+                path = output_dir / path
+            if path.is_file() and path.stat().st_size > 0 and path not in paths:
+                paths.append(path)
+        if paths:
+            result[character_id] = paths
+    return result
+
+
 def _calibrate_l3_severity(red_line: str, severity: str, message: str) -> str:
     """Keep L3 blocking for production-breaking mismatches, not pose minutiae."""
     if severity != "severe":
@@ -507,6 +563,11 @@ def _calibrate_l3_severity(red_line: str, severity: str, message: str) -> str:
         "wrong character",
         "reversed attacker",
         "wrong location",
+        "reset",
+        "replay",
+        "replays prior",
+        "wholly unrelated",
+        "unrelated core action",
         "身份错误",
         "身份不一致",
         "性别错误",
@@ -517,6 +578,11 @@ def _calibrate_l3_severity(red_line: str, severity: str, message: str) -> str:
         "人物错误",
         "攻守颠倒",
         "场景错误",
+        "重置",
+        "重放",
+        "重复前格",
+        "回到初始",
+        "核心动作缺失",
     )
     if normalized_line == "R1" and not any(term in text for term in hard_blockers):
         return "moderate"
@@ -527,7 +593,16 @@ def _calibrate_l3_severity(red_line: str, severity: str, message: str) -> str:
     return severity
 
 
-def run_l3_review(storyboard: dict, characters_data: dict, visual_style: str, images: dict[str, Path], grid_path: Path, client: ArkMultimodalClient | None = None) -> tuple[list[dict], dict]:
+def run_l3_review(
+    storyboard: dict,
+    characters_data: dict,
+    visual_style: str,
+    images: dict[str, Path],
+    grid_path: Path,
+    client: ArkMultimodalClient | None = None,
+    *,
+    character_reference_images: dict[str, list[Path]] | None = None,
+) -> tuple[list[dict], dict]:
     if not images:
         return [], {"status": "skipped", "skipped_reason": "no storyboard images available"}
     ordered = _ordered_storyboard_images(storyboard, images)
@@ -540,7 +615,32 @@ def run_l3_review(storyboard: dict, characters_data: dict, visual_style: str, im
     if client is None and not (os.environ.get("ARK_AGENT_API_KEY") or os.environ.get("ARK_API_KEY")):
         return [], {"status": "skipped", "grid_path": str(grid_path), "skipped_reason": "ARK multimodal API key missing"}
     valid_storyboard_ids = list(images)
-    prompt = f"""Review this storyboard grid against the supplied project artifacts. The grid has exactly 5 columns in row-major order, and every frame has its exact Sxx or Sxx_Pxx ID in a large black badge at the top-left. Associate observations only with that in-frame badge; never infer an ID from a neighbouring cell or row position. Apply red lines R1-R4: R1 character identity/gender/build continuity; R2 time-of-day and lighting continuity; R3 scene/action continuity; R4 storyboard-to-image semantic fidelity. Compare character continuity only against the supplied project character artifacts. Do not perform face recognition or infer a public identity from appearance alone. Each Pxx image represents only its own authored action and must progress from the previous Pxx without pose reset or premature future action. Reserve severe for production-breaking mismatches: wrong/missing character identity or gender, wrong location/time-of-day, reversed attacker/defender, wholly unrelated core action, or a continuation panel that visibly resets/replays the prior state. Use moderate for material nuances, exact prop angle, blocking offsets, or minor intermediate-motion omissions. Only identify problems; do not propose or perform edits. Return JSON: {{"issues":[{{"red_line":"R1","severity":"severe|moderate|minor","shot_ids":["S01_P01"],"message":"..."}}]}}. Use only these exact IDs: {json.dumps(valid_storyboard_ids, ensure_ascii=False)}.
+    reference_inputs: list[Path] = []
+    reference_manifest: list[dict[str, Any]] = []
+    references = character_reference_images or {}
+    ordered_character_ids = [
+        str(character.get("id") or "")
+        for character in characters_data.get("characters", [])
+        if isinstance(character, dict) and str(character.get("id") or "")
+    ]
+    ordered_character_ids.extend(
+        sorted(set(references) - set(ordered_character_ids))
+    )
+    for character_id in ordered_character_ids:
+        for path in references.get(character_id, []):
+            path = Path(path)
+            if not path.is_file() or path in reference_inputs:
+                continue
+            reference_inputs.append(path)
+            reference_manifest.append({
+                "input_index": len(reference_inputs),
+                "character_id": character_id,
+                "view": path.stem,
+            })
+    grid_input_index = len(reference_inputs) + 1
+    prompt = f"""Review the final input image, which is the storyboard grid, against the supplied project artifacts and canonical character reference images. Inputs 1 through {len(reference_inputs)} are character references described by REFERENCE INPUTS below; input {grid_input_index} is the storyboard grid. The grid has exactly 5 columns in row-major order, and every frame has its exact Sxx or Sxx_Pxx ID in a large black badge at the top-left. Associate observations only with that in-frame badge; never infer an ID from a neighbouring cell or row position. Apply red lines R1-R4: R1 character identity/gender/build/clothing continuity against the canonical references; R2 time-of-day and lighting continuity; R3 scene/action continuity; R4 storyboard-to-image semantic fidelity. Do not perform face recognition or infer a public identity from appearance alone. Each Pxx image represents only its own authored action and must progress from the previous Pxx without pose reset or premature future action. Reserve severe for production-breaking mismatches: wrong/missing character identity or gender, wrong location/time-of-day, reversed attacker/defender, wholly unrelated core action, or a continuation panel that visibly resets/replays the prior state. Use moderate for material nuances, exact prop angle, blocking offsets, or minor intermediate-motion omissions. Only identify problems; do not propose or perform edits. Return JSON: {{"issues":[{{"red_line":"R1","severity":"severe|moderate|minor","shot_ids":["S01_P01"],"message":"..."}}]}}. Use only these exact IDs: {json.dumps(valid_storyboard_ids, ensure_ascii=False)}.
+REFERENCE INPUTS:
+{json.dumps(reference_manifest, ensure_ascii=False)}
 STORYBOARD:
 {json.dumps(storyboard, ensure_ascii=False)}
 CHARACTERS:
@@ -548,7 +648,9 @@ CHARACTERS:
 VISUAL STYLE:
 {visual_style}"""
     try:
-        raw = (client or ArkMultimodalClient()).review([grid_path], prompt)
+        raw = (client or ArkMultimodalClient()).review(
+            [*reference_inputs, grid_path], prompt
+        )
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.IGNORECASE)
         parsed = json.loads(raw)
         if not isinstance(parsed, dict) or not isinstance(parsed.get("issues"), list):
@@ -575,12 +677,50 @@ VISUAL STYLE:
         return [], {"status": "skipped", "grid_path": str(grid_path), "skipped_reason": f"multimodal review unavailable: {exc}"}
 
 
+def is_blocking_issue(issue: dict) -> bool:
+    """Return whether an issue must stop paid video generation."""
+    if issue.get("severity") == "severe":
+        return True
+    return (
+        issue.get("severity") == "moderate"
+        and issue.get("layer") == "L3"
+        and str(issue.get("code") or "").upper() in {"R1", "R2", "R3", "R4"}
+        and len(set(issue.get("shot_ids") or [])) >= 2
+    )
+
+
+def blocking_issues(issues: list[dict]) -> list[dict]:
+    """Include individually severe and collectively systemic L3 findings."""
+    blocking_ids = {
+        id(issue) for issue in issues if is_blocking_issue(issue)
+    }
+    moderate_groups: dict[tuple[str, str], list[dict]] = {}
+    for issue in issues:
+        if (
+            issue.get("severity") == "moderate"
+            and issue.get("layer") == "L3"
+            and str(issue.get("code") or "").upper() in {"R1", "R2", "R3", "R4"}
+        ):
+            key = ("L3", str(issue.get("code") or "").upper())
+            moderate_groups.setdefault(key, []).append(issue)
+    for grouped in moderate_groups.values():
+        affected_shots = {
+            shot_id
+            for issue in grouped
+            for shot_id in issue.get("shot_ids") or []
+        }
+        if len(affected_shots) >= 2:
+            blocking_ids.update(id(issue) for issue in grouped)
+    return [issue for issue in issues if id(issue) in blocking_ids]
+
+
 def grade_issues(issues: list[dict]) -> str:
-    severe = sum(issue.get("severity") == "severe" for issue in issues)
+    blocking = blocking_issues(issues)
+    severe = sum(issue.get("severity") == "severe" for issue in blocking)
     moderate = sum(issue.get("severity") == "moderate" for issue in issues)
-    if severe >= 3:
+    if severe >= 3 or len(blocking) >= 3:
         return "D"
-    if severe:
+    if blocking:
         return "C"
     if moderate > 2:
         return "B"
@@ -660,7 +800,19 @@ def run_storyboard_qa_gate(output_dir: Path, similarity_threshold: float | None 
         )
     threshold = similarity_threshold if similarity_threshold is not None else float(os.environ.get("HONCUT_STORYBOARD_QA_SIMILARITY", DEFAULT_SIMILARITY_THRESHOLD))
     l2_issues, l2 = run_l2_checks(storyboard, characters, images, threshold, embedder)
-    l3_issues, l3 = run_l3_review(storyboard, characters, visual_style, images, output_dir / "storyboard_qa_grid.jpg", multimodal_client)
+    character_reference_images = find_character_reference_images(
+        output_dir,
+        characters,
+    )
+    l3_issues, l3 = run_l3_review(
+        storyboard,
+        characters,
+        visual_style,
+        images,
+        output_dir / "storyboard_qa_grid.jpg",
+        multimodal_client,
+        character_reference_images=character_reference_images,
+    )
     capacity_issues = run_generation_capacity_checks(storyboard, events_data)
     artifact_issues = [
         _issue(
@@ -685,7 +837,11 @@ def run_storyboard_qa_gate(output_dir: Path, similarity_threshold: float | None 
         detail["storyboard_beat_images"] = shot_beat_images
         detail["issues"] = [issue for issue in issues if sid in issue.get("shot_ids", [])]
     grade = grade_issues(issues)
-    failed_shots = sorted({sid for issue in issues if issue.get("severity") == "severe" for sid in issue.get("shot_ids", [])})
+    failed_shots = sorted({
+        sid
+        for issue in blocking_issues(issues)
+        for sid in issue.get("shot_ids", [])
+    })
     report = {"status": "done" if grade in {"A", "B"} else "error", "grade": grade, "gate_passed": grade in {"A", "B"}, "issues": issues, "issue_counts": {severity: sum(item.get("severity") == severity for item in issues) for severity in ("severe", "moderate", "minor")}, "failed_shot_ids": failed_shots, "shots": per_shot, "variation_score": variation_quality, "slideshow_risk": slideshow_risk, "layers": {"L1": {"status": "completed"}, "L2": l2, "L3": l3}, "outputs": ["storyboard_qa_report.json", "variation_report.json", "slideshow_risk_report.json", *( ["storyboard_qa_grid.jpg"] if grid_path_exists(output_dir) else [])]}
     if not report["gate_passed"]:
         report["error"] = f"Storyboard QA grade {grade} blocks Phase 6; redraw only failed_shot_ids"

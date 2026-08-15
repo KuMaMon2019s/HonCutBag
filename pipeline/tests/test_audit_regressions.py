@@ -24,17 +24,27 @@ import detached_pipeline_launch
 import phase_orchestrator
 import pipeline_runner as pipeline_runner_cli
 from phases import pipeline_core
-from phases.phase1 import adaptation_engine, director_planner
+from phases.phase1 import (
+    adaptation_engine,
+    character_discoverer,
+    director_planner,
+    storyboard_generator,
+)
 from phases.phase1.director_storyboard import materialize_director_panels
 from phases.phase1.storyboard_beats import plan_storyboard_beats
 from phases.phase1.storyboard_generator import _build_shot_prompt_legacy
 from phases.phase2.shot_storyboards import (
+    _character_reference_paths,
     build_shot_storyboard_prompt,
     generate_shot_storyboards,
 )
+from phases.phase3 import character_factory
+from phases.phase4.continuity_plan import build_continuity_plan
+from phases.phase5 import storyboard_qa_gate
 from phases.phase6.video_generator import build_video_prompt
 from phases.pipeline_core import _write_project_visual_style
 from prompt import event_extractor
+from quality.quality_gate import run_quality_check
 from runtime.run_manifest import prepare_run_manifest
 from utils.video_capabilities import get_video_capabilities
 from utils.video_geometry import resolve_video_geometry
@@ -634,3 +644,322 @@ def test_phase5_l3_skips_unmatched_image_ids_instead_of_crashing(tmp_path):
         "status": "skipped",
         "skipped_reason": "no storyboard images match storyboard IDs",
     }
+
+
+def test_phase1_keeps_qualified_profession_characters():
+    stats = {
+        "Agent": {"events": [1], "contexts": []},
+        "敌方保安": {"events": [1], "contexts": []},
+    }
+
+    filtered = character_discoverer._filter_descriptive_phrases(stats)
+
+    assert set(filtered) == {"Agent", "敌方保安"}
+
+
+def test_phase1_partitions_reused_event_actions_without_replay():
+    events = [
+        {
+            "sequence_id": "SEQ001",
+            "action_unit_id": "AU001",
+            "micro_actions": ["进入走廊", "警灯亮起", "重力失效", "身体浮起"],
+            "start_state": "正常重力",
+            "end_state": "完全失重",
+        }
+    ]
+    shots = [
+        {"shot_order": 1, "source_events": [1]},
+        {"shot_order": 2, "source_events": [1]},
+    ]
+
+    adaptation_engine._inherit_event_semantics(shots, events)
+
+    assert shots[0]["micro_actions"] == ["进入走廊", "警灯亮起"]
+    assert shots[1]["micro_actions"] == ["重力失效", "身体浮起"]
+    assert shots[1]["start_state"] == shots[0]["end_state"]
+    assert shots[0]["micro_actions"] + shots[1]["micro_actions"] == events[0][
+        "micro_actions"
+    ]
+
+
+def test_phase1_canonical_storyboard_preserves_event_partition_audit(monkeypatch):
+    monkeypatch.setattr(
+        storyboard_generator,
+        "_call_llm",
+        lambda *_args, **_kwargs: json.dumps(
+            {"prompt": "cinematic corridor", "caption": "继续推进"}
+        ),
+    )
+    shot = {
+        "suggested_duration": 5,
+        "who": [],
+        "where": "运输船走廊",
+        "what": "镜头继续推进",
+        "visual": "空走廊",
+        "source_events": [2],
+        "source_event_slices": [
+            {
+                "event_id": 2,
+                "occurrence": 2,
+                "occurrence_count": 2,
+                "micro_actions": ["穿过舱门"],
+            }
+        ],
+    }
+
+    canonical = storyboard_generator._generate_single_shot(shot, 1, 1)
+
+    assert canonical["source_events"] == [2]
+    assert canonical["source_event_slices"] == shot["source_event_slices"]
+
+
+def test_phase1_beat_planner_never_emits_over_capacity_beats():
+    storyboard = {
+        "video_provider": "seedance",
+        "shots": [
+            {
+                "id": "S01",
+                "duration": 10,
+                "micro_actions": [f"action-{index}" for index in range(7)],
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError, match="cannot fit 7 micro-actions"):
+        plan_storyboard_beats(storyboard)
+
+
+def test_phase1_marks_continuous_shot_p01_as_extend():
+    storyboard = {
+        "video_provider": "seedance",
+        "shots": [
+            {"id": "S01", "duration": 5, "micro_actions": ["进入"], "boundary_before": "cut"},
+            {
+                "id": "S02",
+                "duration": 5,
+                "micro_actions": ["继续前进"],
+                "boundary_before": "continuous",
+            },
+        ],
+    }
+
+    plan_storyboard_beats(storyboard)
+
+    assert storyboard["shots"][0]["storyboard_beats"][0]["generation_mode"] == "fresh"
+    assert storyboard["shots"][1]["storyboard_beats"][0]["generation_mode"] == "extend"
+
+
+def test_phase1_detects_explicit_one_take_direction():
+    assert pipeline_core._continuity_mode_from_text(
+        "科幻动作片，60秒，一镜到底。"
+    ) == "one_take"
+    assert pipeline_core._continuity_mode_from_text(
+        "科幻动作片，采用常规覆盖镜头。"
+    ) is None
+
+
+def test_phase2_uses_face_and_body_references_for_each_character(tmp_path):
+    from PIL import Image
+
+    char_dir = tmp_path / "characters/agent"
+    char_dir.mkdir(parents=True)
+    for name in ("face_closeup.png", "full_body.png", "side.png", "back.png"):
+        Image.new("RGB", (64, 64), "white").save(char_dir / name)
+
+    references = _character_reference_paths(
+        tmp_path,
+        [{"id": "agent", "name": "特工"}],
+        ["特工"],
+    )
+
+    assert [path.name for path in references] == ["face_closeup.png", "full_body.png"]
+
+
+def test_phase2_defers_character_storyboards_until_phase3(monkeypatch, tmp_path):
+    from PIL import Image
+
+    director = tmp_path / "director_storyboard.png"
+    Image.new("RGB", (128, 128), "white").save(director)
+    storyboard = {
+        "director_storyboard": {"image": director.name, "status": "done"},
+        "shots": [
+            {
+                "id": "S01",
+                "who": ["特工"],
+                "storyboard_beats": [{"beat_id": "S01_P01", "duration_s": 5}],
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        pipeline_core,
+        "run_quality_check",
+        lambda *_args, **_kwargs: type("Report", (), {"passed": True, "grade": "A"})(),
+    )
+
+    result = pipeline_core.run_phase2(
+        storyboard,
+        {"characters": [{"id": "agent", "name": "特工"}]},
+        tmp_path,
+        False,
+    )
+
+    assert result["status"] == "done"
+    assert result["provider"] == "deferred_to_phase3"
+    assert result["storyboard_panels_generated"] == 0
+
+
+def test_phase3_seedance_contract_and_gate_require_four_views(tmp_path):
+    from PIL import Image
+
+    def write_reference(path):
+        Image.effect_noise((512, 512), 96).convert("RGB").save(path)
+
+    prompts = character_factory.build_model_reference_prompts(
+        "深灰色战术服特工", target_model="seedance"
+    )
+    assert list(prompts) == ["face_closeup", "full_body", "side", "back"]
+
+    char_dir = tmp_path / "characters/agent"
+    char_dir.mkdir(parents=True)
+    card = {
+        "reference_images": {
+            name: f"characters/agent/{name}.png" for name in prompts
+        }
+    }
+    (char_dir / "character_card.json").write_text(
+        json.dumps(card), encoding="utf-8"
+    )
+    write_reference(char_dir / "face_closeup.png")
+
+    incomplete = run_quality_check("phase3", tmp_path)
+    assert incomplete.passed is False
+
+    for name in ("full_body", "side", "back"):
+        write_reference(char_dir / f"{name}.png")
+    complete = run_quality_check("phase3", tmp_path)
+    assert complete.passed is True
+
+
+def test_phase4_preserves_authored_continuous_boundary_with_legacy_fresh_p01():
+    storyboard = {
+        "shots": [
+            {
+                "id": "S01",
+                "duration": 5,
+                "boundary_before": "cut",
+                "storyboard_beats": [
+                    {
+                        "beat_id": "S01_P01",
+                        "duration_s": 5,
+                        "generation_mode": "fresh",
+                    }
+                ],
+            },
+            {
+                "id": "S02",
+                "duration": 5,
+                "boundary_before": "continuous",
+                "storyboard_beats": [
+                    {
+                        "beat_id": "S02_P01",
+                        "duration_s": 5,
+                        "generation_mode": "fresh",
+                    }
+                ],
+            },
+        ]
+    }
+
+    plan = build_continuity_plan(storyboard)
+
+    assert plan.shots[1].boundary_before == "continuous"
+    assert plan.shots[1].chunks[0].mode == "native_extend"
+    assert plan.shots[1].chunks[0].depends_on == "S01_C01"
+
+
+def test_phase5_null_dialogue_is_not_empty_spoken_content():
+    issues, _ = storyboard_qa_gate.run_l1_checks(
+        {"shots": [{"id": "S01", "duration": 5, "dialogue": None}]},
+        "",
+    )
+
+    assert "empty_spoken_content" not in {issue["code"] for issue in issues}
+
+
+def test_phase5_reset_or_replay_remains_a_severe_l3_issue():
+    assert storyboard_qa_gate._calibrate_l3_severity(
+        "R3",
+        "severe",
+        "S02_P01 resets and replays the previous action state",
+    ) == "severe"
+    assert storyboard_qa_gate._calibrate_l3_severity(
+        "R3",
+        "severe",
+        "S02_P01 动作重置并重复前格状态",
+    ) == "severe"
+
+
+def test_phase5_systemic_moderate_continuity_issue_blocks_generation():
+    issues = [
+        storyboard_qa_gate._issue(
+            "L3",
+            "moderate",
+            "R3",
+            "all continuous shots reset",
+            ["S01", "S02", "S03"],
+        )
+    ]
+
+    assert storyboard_qa_gate.grade_issues(issues) == "C"
+    assert storyboard_qa_gate.is_blocking_issue(issues[0]) is True
+
+
+def test_phase5_separate_moderate_findings_become_systemic_across_shots():
+    issues = [
+        storyboard_qa_gate._issue(
+            "L3", "moderate", "R1", f"identity drift in {shot_id}", [shot_id]
+        )
+        for shot_id in ("S01", "S02", "S03")
+    ]
+
+    assert storyboard_qa_gate.grade_issues(issues) == "D"
+    assert storyboard_qa_gate.blocking_issues(issues) == issues
+
+
+def test_phase5_l3_supplies_canonical_character_images(tmp_path):
+    from PIL import Image
+
+    beat_path = tmp_path / "S01_P01.png"
+    face_path = tmp_path / "face_closeup.png"
+    body_path = tmp_path / "full_body.png"
+    for path in (beat_path, face_path, body_path):
+        Image.new("RGB", (160, 90), "white").save(path)
+
+    class ReviewClient:
+        def __init__(self):
+            self.paths = []
+
+        def review(self, image_paths, _prompt):
+            self.paths = list(image_paths)
+            return '{"issues": []}'
+
+    client = ReviewClient()
+    storyboard_qa_gate.run_l3_review(
+        {
+            "shots": [
+                {
+                    "id": "S01",
+                    "storyboard_beats": [{"beat_id": "S01_P01"}],
+                }
+            ]
+        },
+        {"characters": [{"id": "agent", "name": "特工"}]},
+        "cinematic",
+        {"S01_P01": beat_path},
+        tmp_path / "grid.jpg",
+        client,
+        character_reference_images={"agent": [face_path, body_path]},
+    )
+
+    assert client.paths[:-1] == [face_path, body_path]
+    assert client.paths[-1] == tmp_path / "grid.jpg"

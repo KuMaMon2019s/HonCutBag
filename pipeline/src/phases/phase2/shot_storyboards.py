@@ -164,13 +164,14 @@ def _build_panel_prompt(
 ) -> str:
     who = _shot_who(shot)
     beat_id = str(beat.get("beat_id") or f"P{position:02d}")
+    generation_mode = str(beat.get("generation_mode") or "").strip().lower()
     continuation = (
-        "这是本镜的第一格，建立图生视频的起始构图。"
-        if position == 1
-        else (
+        (
             "这是延长视频的下一格。严格继承上一参考图的角色身份、服装、场景、"
             "机位轴线和动作方向，但姿态必须推进到本格的新状态；不得复制上一格。"
         )
+        if generation_mode == "extend"
+        else "这是新连续性组的第一格，建立图生视频的起始构图。"
     )
     director_reference = (
         "参考图中包含整部影片的导演总览板。只读取其中标为本 Sxx 的面板来继承机位、"
@@ -333,28 +334,36 @@ def _character_reference_paths(
         character_id = str(character.get("id") or "").strip()
         if not character_id:
             continue
-        reference = None
+        character_references: list[Path] = []
         for character_dir in (
             output_dir / "characters" / character_id,
             output_dir / "characters" / "characters" / character_id,
         ):
-            reference = next(
-                (
+            character_references = [
+                path
+                for path in (
+                    character_dir / "face_closeup.png",
+                    character_dir / "full_body.png",
+                )
+                if path.is_file() and path.stat().st_size > 0
+            ]
+            if not character_references:
+                character_references = [
                     path
                     for path in (
-                        character_dir / "face_closeup.png",
-                        character_dir / "full_body.png",
-                        *sorted(character_dir.glob("variant_*.png")),
+                        character_dir / "closeup.png",
                         character_dir / "front.png",
+                        character_dir / "side.png",
+                        character_dir / "back.png",
+                        *sorted(character_dir.glob("variant_*.png")),
                     )
                     if path.is_file() and path.stat().st_size > 0
-                ),
-                None,
-            )
-            if reference is not None:
+                ][:2]
+            if character_references:
                 break
-        if reference is not None and reference not in references:
-            references.append(reference)
+        for reference in character_references:
+            if reference not in references:
+                references.append(reference)
     return references
 
 
@@ -481,6 +490,7 @@ def generate_shot_storyboards(
         "honcut.director-panels.v1" if director_panels else None
     )
 
+    previous_storyboard_panel: Path | None = None
     try:
         for index, shot in enumerate(storyboard.get("shots", []), 1):
             if not isinstance(shot, dict):
@@ -512,7 +522,12 @@ def generate_shot_storyboards(
             }
             panel_records = []
             panel_paths: list[Path] = []
-            previous_panel: Path | None = None
+            previous_panel = (
+                previous_storyboard_panel
+                if str(shot.get("boundary_before") or "").strip().lower()
+                == "continuous"
+                else None
+            )
             character_references = _character_reference_paths(
                 output_dir,
                 characters,
@@ -534,9 +549,9 @@ def generate_shot_storyboards(
                 panel_sidecar = beats_dir / f"{beat_id}.json"
                 panel_prompt_path.write_text(panel_prompt, encoding="utf-8")
                 reference_paths: list[Path] = []
+                reference_paths.extend(character_references)
                 if previous_panel is not None:
                     reference_paths.append(previous_panel)
-                reference_paths.extend(character_references)
                 if director_panel is not None:
                     reference_paths.append(director_panel)
                 reference_hashes = [
@@ -559,6 +574,12 @@ def generate_shot_storyboards(
                         if path.is_relative_to(output_dir)
                         else str(path)
                         for path in character_references
+                    ],
+                    "reference_images": [
+                        str(path.relative_to(output_dir))
+                        if path.is_relative_to(output_dir)
+                        else str(path)
+                        for path in reference_paths
                     ],
                     "status": "planned",
                 }
@@ -629,6 +650,8 @@ def generate_shot_storyboards(
             shot["storyboard_beats"] = beats
             _write_json(boards_dir / f"{shot_id}.json", record)
             contract["shots"].append(record)
+            if panel_paths:
+                previous_storyboard_panel = panel_paths[-1]
             _write_json(manifest_path, contract)
         contract["status"] = "done"
         contract["total_boards"] = len(contract["shots"])

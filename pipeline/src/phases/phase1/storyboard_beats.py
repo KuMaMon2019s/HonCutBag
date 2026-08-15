@@ -72,14 +72,21 @@ def _beat_count(
     if isinstance(raw_units, str):
         raw_units = [raw_units]
     action_units = len({str(value) for value in raw_units if str(value).strip()})
+    action_count = math.ceil(len(actions) / capabilities.max_micro_actions_per_beat)
     semantic_count = max(
         1,
         explicit,
         action_units,
-        math.ceil(len(actions) / capabilities.max_micro_actions_per_beat),
+        action_count,
     )
     duration_count = max(1, math.ceil(duration / capabilities.max_unique_beat_s))
     capacity = max(1, int(duration // capabilities.min_unique_beat_s))
+    if semantic_count > capacity:
+        raise ValueError(
+            f"{_shot_id(shot, 1)} cannot fit {len(actions)} micro-actions into "
+            f"{duration:g}s for {capabilities.name}: requires {semantic_count} beats, "
+            f"but the duration supports at most {capacity}"
+        )
     return min(capacity, max(semantic_count, duration_count))
 
 
@@ -164,6 +171,9 @@ def plan_storyboard_beats(
             if isinstance(beat, dict)
         ]
         beats: list[dict[str, Any]] = []
+        continues_previous = (
+            str(shot.get("boundary_before") or "").strip().lower() == "continuous"
+        )
         for position in range(1, count + 1):
             existing_beat = existing_beats[position - 1] if position <= len(existing_beats) else {}
             action = _compact(existing_beat.get("action")) or _action_for_bucket(
@@ -184,7 +194,9 @@ def plan_storyboard_beats(
                 "beat_id": f"{sid}_P{position:02d}",
                 "position": position,
                 "duration_s": durations[position - 1],
-                "generation_mode": "fresh" if position == 1 else "extend",
+                "generation_mode": (
+                    "extend" if position > 1 or continues_previous else "fresh"
+                ),
                 "start_state": _compact(existing_beat.get("start_state")) or previous_state,
                 "action": action,
                 "micro_actions": action_buckets[position - 1],
@@ -209,5 +221,5 @@ def plan_storyboard_beats(
         }
         total += len(beats)
     storyboard["storyboard_beat_count"] = total
-    storyboard["storyboard_execution"] = "per_shot_fresh_then_extend"
+    storyboard["storyboard_execution"] = "continuity_aware_fresh_then_extend"
     return storyboard

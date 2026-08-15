@@ -316,6 +316,9 @@ def build_continuity_plan(
     previous_planned_shot: ContinuityShot | None = None
     group_number = 0
     group_shot_count = 0
+    preserve_one_take = str(
+        storyboard.get("continuity_mode") or ""
+    ).strip().lower() in {"one_take", "single_take", "oner"}
     for index, shot in enumerate(storyboard.get("shots", []), 1):
         shot_id = _shot_id(shot, index)
         authored_beats = _authored_storyboard_beats(shot)
@@ -324,21 +327,15 @@ def build_continuity_plan(
             previous_storyboard_shot,
             index,
         )
-        first_beat_mode = str(
-            authored_beats[0].get("generation_mode") if authored_beats else ""
-        ).lower()
-        if authored_beats and first_beat_mode == "fresh" and index > 1:
-            boundary_before = "cut"
-            continuity_reason = (
-                "director-level shot starts from its Phase 2 P01 image; "
-                "only later Pxx panels extend video inside this shot"
-            )
         requested_extension = (
             boundary_before == "continuous"
             and previous_planned_shot is not None
-            and (not authored_beats or first_beat_mode != "fresh")
         )
-        capped_group = requested_extension and group_shot_count >= continuity_group_max_shots
+        capped_group = (
+            requested_extension
+            and not preserve_one_take
+            and group_shot_count >= continuity_group_max_shots
+        )
         initial_extension = requested_extension and not capped_group
         if capped_group:
             boundary_before = "cut"

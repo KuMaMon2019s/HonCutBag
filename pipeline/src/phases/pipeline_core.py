@@ -861,6 +861,21 @@ def _write_project_visual_style(output_dir: Path, style_text: str) -> Path:
     )
     return style_path
 
+
+def _continuity_mode_from_text(text: str) -> str | None:
+    """Extract only explicit single-take direction from the source brief."""
+    normalized = re.sub(r"\s+", " ", str(text or "")).casefold()
+    markers = (
+        "一镜到底",
+        "单镜到底",
+        "one take",
+        "one-take",
+        "single continuous shot",
+        "continuous oner",
+    )
+    return "one_take" if any(marker in normalized for marker in markers) else None
+
+
 def run_phase1_screenwriter(
     text: str,
     output_dir: Path,
@@ -1237,6 +1252,9 @@ def run_phase1_screenwriter(
             visual_style_text=visual_style_text,
             config=project_video_spec or _project_video_spec("1080p"),
         )
+        continuity_mode = _continuity_mode_from_text(text)
+        if continuity_mode:
+            storyboard["continuity_mode"] = continuity_mode
         from phases.phase1.storyboard_beats import plan_storyboard_beats
 
         plan_storyboard_beats(storyboard)
@@ -2401,15 +2419,48 @@ def run_phase2(storyboard_data: dict, characters_data: dict, output_dir: Path, d
                 "duration_s": _elapsed(start),
             }
         from phases.phase2.shot_storyboards import (
+            _character_reference_paths,
             generate_shot_storyboards,
             validate_shot_storyboard_artifacts,
         )
+
+        characters = characters_data.get("characters", [])
+        deferred_shot_ids: list[str] = []
+        for shot_index, shot in enumerate(storyboard_data.get("shots", []), 1):
+            if not isinstance(shot, dict):
+                continue
+            who = shot.get("who") or shot.get("character_ids") or []
+            if isinstance(who, str):
+                who = [who]
+            if not who:
+                continue
+            references_ready = all(
+                len(_character_reference_paths(output_dir, characters, [identity])) >= 2
+                for identity in who
+            )
+            if not references_ready:
+                deferred_shot_ids.append(
+                    str(shot.get("id") or shot.get("shot_id") or f"S{shot_index:02d}")
+                )
+        if deferred_shot_ids:
+            print(
+                "  ↷ 角色参考尚未由 Phase 3 建立；延后含角色的 Pxx 生成，避免重复付费"
+            )
+            return {
+                "status": "done",
+                "duration_s": _elapsed(start),
+                "outputs": ["storyboard.png"],
+                "provider": "deferred_to_phase3",
+                "shot_storyboards_generated": 0,
+                "storyboard_panels_generated": 0,
+                "deferred_shot_ids": deferred_shot_ids,
+            }
 
         print("  → Seedream: 按 Sxx 生成内部手绘故事板...")
         shot_storyboards = generate_shot_storyboards(
             output_dir,
             storyboard_data,
-            characters_data.get("characters", []),
+            characters,
             size=_storyboard_image_size(
                 video_width=video_width,
                 video_height=video_height,
@@ -2694,7 +2745,7 @@ def detect_derive_assets(characters_data: dict) -> list:
 
 
 def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
-    """Phase 3: character_factory — 生成角色三视图 + 衍生资产检测"""
+    """Phase 3: character_factory — 生成角色四视图 + 衍生资产检测"""
     _banner(3, 9, "角色工厂 (Character Factory + Derive Assets)", dry_run)
     start = _now()
     outputs = []
@@ -2718,7 +2769,7 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
             for da in derive_assets:
                 print(f"      - {da['parent_name']}·{da['name']}: {da['desc']}")
 
-        # Step 3.2: 生成基础角色三视图
+        # Step 3.2: 生成基础角色四视图
         visual_style_path = output_dir / "visual-style.md"
         character_style = ""
         if visual_style_path.is_file():

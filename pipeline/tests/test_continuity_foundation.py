@@ -274,6 +274,33 @@ def test_planner_starts_a_fresh_group_after_three_continuous_shots():
     assert "prevent accumulated visual and narrative drift" in plan.shots[3].continuity_reason
 
 
+def test_planner_never_caps_an_explicit_one_take_continuity_group():
+    storyboard = {
+        "continuity_mode": "one_take",
+        "shots": [
+            {
+                "id": f"S{index:02d}",
+                "duration": 10,
+                "where": "rotating corridor",
+                "boundary_before": "cut" if index == 1 else "continuous",
+            }
+            for index in range(1, 7)
+        ],
+    }
+
+    plan = build_continuity_plan(storyboard)
+
+    assert {shot.continuity_group_id for shot in plan.shots} == {"CG001"}
+    assert [shot.chunks[0].mode for shot in plan.shots] == [
+        "fresh",
+        "native_extend",
+        "native_extend",
+        "native_extend",
+        "native_extend",
+        "native_extend",
+    ]
+
+
 def test_storyboard_groups_link_fresh_group_handoffs(tmp_path):
     image_dir = tmp_path / "storyboard_images"
     image_dir.mkdir()
@@ -585,11 +612,17 @@ def test_per_shot_storyboard_beats_map_two_panels_to_fresh_then_extend(tmp_path)
     assert contract["total_boards"] == 2
     assert contract["total_panels"] == 3
     assert [call[0] for call in calls] == [
-        "text_to_image", "image_to_image", "text_to_image",
+        "text_to_image", "image_to_image", "image_to_image",
     ]
     assert "S01_P01（第 1/2 格）" in calls[0][1]
     assert "S01_P02（第 2/2 格）" in calls[1][1]
     assert calls[1][2].endswith("storyboard_beats/S01_P01.png")
+    second_shot_record = json.loads(
+        (tmp_path / "storyboard_beats/S02_P01.json").read_text(encoding="utf-8")
+    )
+    assert second_shot_record["reference_images"] == [
+        "storyboard_beats/S01_P02.png"
+    ]
     assert (tmp_path / "shot_storyboards/S01.png").is_file()
     assert (tmp_path / "storyboard_beats/S01_P01.png").is_file()
     assert (tmp_path / "storyboard_beats/S01_P02.png").is_file()
@@ -609,10 +642,11 @@ def test_per_shot_storyboard_beats_map_two_panels_to_fresh_then_extend(tmp_path)
     ]
     assert [chunk.requested_frames for chunk in first.chunks] == [120, 168]
     assert [chunk.expected_unique_frames for chunk in first.chunks] == [120, 120]
-    assert second.boundary_before == "cut"
-    assert [chunk.mode for chunk in second.chunks] == ["fresh"]
+    assert second.boundary_before == "continuous"
+    assert [chunk.mode for chunk in second.chunks] == ["native_extend"]
+    assert second.chunks[0].depends_on == "S01_C02"
     groups = write_storyboard_groups(tmp_path, storyboard, continuity)
-    assert groups["groups"][0]["storyboard_board"] == "shot_storyboards/S01.png"
+    assert groups["groups"][0]["storyboard_board"] == "storyboard_groups/CG001.jpg"
     assert groups["groups"][0]["beats"][0]["storyboard_beats"][1][
         "storyboard_image"
     ] == "storyboard_beats/S01_P02.png"
@@ -817,7 +851,7 @@ def test_storyboard_beat_planner_discards_quote_only_fragments():
     assert all(action not in {"“", "”", "\""} for action in actions)
 
 
-def test_storyboard_beat_planner_is_semantic_and_never_samples_actions():
+def test_storyboard_beat_planner_is_semantic_and_rejects_impossible_density():
     storyboard = {"shots": [
         {
             "id": "S07",
@@ -828,7 +862,7 @@ def test_storyboard_beat_planner_is_semantic_and_never_samples_actions():
         {
             "id": "S08",
             "duration": 7,
-            "micro_actions": ["抬头", "发现批注", "触摸纸页", "迟疑", "合上书"],
+            "micro_actions": ["抬头", "发现批注", "触摸纸页", "迟疑"],
         },
     ]}
 
@@ -844,7 +878,14 @@ def test_storyboard_beat_planner_is_semantic_and_never_samples_actions():
         action
         for beat in dense_short["storyboard_beats"]
         for action in beat["micro_actions"]
-    ] == ["抬头", "发现批注", "触摸纸页", "迟疑", "合上书"]
+    ] == ["抬头", "发现批注", "触摸纸页", "迟疑"]
+
+    impossible = {
+        "video_provider": "seedance",
+        "shots": [{"id": "S09", "duration": 7, "micro_actions": list("12345")}],
+    }
+    with pytest.raises(ValueError, match="cannot fit 5 micro-actions"):
+        plan_storyboard_beats(impossible)
 
 
 def test_planner_allocates_fractional_shots_from_cumulative_frame_endpoints():

@@ -78,13 +78,10 @@ QUALITY_RULES: Dict[str, Dict[str, Any]] = {
     "phase3": {
         "name": "角色工厂",
         "red_lines": [
-            ("character_images_exist", "每个角色至少有一张参考图（face_closeup/full_body/front）且 > 10KB"),
+            ("character_images_exist", "每个角色声明的四张身份参考图均存在且 > 10KB"),
             ("character_card_exists", "每个角色有 character_card.json"),
         ],
-        "dimensions": [
-            ("all_views_present", "每个角色有 front/side/back 三视图",
-             lambda d: True),  # checked via file system in red lines
-        ],
+        "dimensions": [],
     },
     "phase6": {
         "name": "视频生成",
@@ -275,19 +272,31 @@ def _check_red_line(rule_id: str, output_dir: Path,
         chars_dir = _find_chars_dir(output_dir)
         if chars_dir is None:
             return False
+        character_count = 0
         for cd in chars_dir.iterdir():
             if not cd.is_dir():
                 continue
-            # 八层框架改造后角色参考图为"大头照+全身照"分离模式
-            # （官方文档不建议三视图），兼容旧版 front.png
-            candidates = [
-                cd / "face_closeup.png",
-                cd / "full_body.png",
-                cd / "front.png",
-            ]
-            if not any(f.exists() and f.stat().st_size > 10_240 for f in candidates):
+            character_count += 1
+            card_path = cd / "character_card.json"
+            try:
+                card = json.loads(card_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
                 return False
-        return True
+            declared = card.get("reference_images")
+            if not isinstance(declared, dict) or len(declared) < 4:
+                return False
+            references: list[Path] = []
+            for value in declared.values():
+                path = Path(str(value))
+                if not path.is_absolute():
+                    path = output_dir / path
+                references.append(path)
+            if len(set(references)) < 4 or not all(
+                path.is_file() and path.stat().st_size > 10_240
+                for path in references
+            ):
+                return False
+        return character_count > 0
 
     if rule_id == "character_card_exists":
         chars_dir = _find_chars_dir(output_dir)
@@ -334,9 +343,14 @@ def _check_red_line(rule_id: str, output_dir: Path,
 
 def _find_chars_dir(output_dir: Path) -> Optional[Path]:
     """Find the characters directory (handles nested structure)."""
-    for candidate in (output_dir / "characters",
-                      output_dir / "characters" / "characters"):
-        if candidate.exists() and any(candidate.iterdir()):
+    for candidate in (
+        output_dir / "characters",
+        output_dir / "characters" / "characters",
+    ):
+        if not candidate.is_dir():
+            continue
+        character_dirs = [path for path in candidate.iterdir() if path.is_dir()]
+        if any((path / "character_card.json").is_file() for path in character_dirs):
             return candidate
     return None
 
@@ -360,7 +374,7 @@ def _probe_stream(filepath: Path, stream_type: str) -> bool:
 def _get_suggestion(rule_id: str) -> str:
     return {
         "character_images_exist":
-            "检查 Seedream API 尺寸参数，确认三视图生成成功",
+            "检查 Seedream API 尺寸与引用链，确认角色四视图生成成功",
         "videos_exist":
             "检查 Seedance API key 和 prompt，确认视频生成成功",
         "assembly_has_video":

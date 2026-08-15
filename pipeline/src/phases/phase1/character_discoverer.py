@@ -440,14 +440,12 @@ def _filter_descriptive_phrases(stats: Dict[str, Dict[str, Any]]) -> Dict[str, D
     ]
     
     # 通用角色描述词
-    generic_role_keywords = [
+    generic_background_names = {
         "路人", "行人", "游客", "观众", "听众", "读者",
         "女性", "男性", "老人", "小孩", "孩子", "青年", "中年",
-        "店员", "服务员", "顾客", "司机", "乘客",
         "人群", "群众", "观众", "大家",
         "情侣", "夫妻", "朋友", "同事", "邻居",
-        "收银员", "保安", "警察", "医生", "护士",
-    ]
+    }
     
     for name, info in stats.items():
         # 检查是否包含描述性修饰语
@@ -456,7 +454,10 @@ def _filter_descriptive_phrases(stats: Dict[str, Dict[str, Any]]) -> Dict[str, D
             continue
         
         # 检查是否是通用角色描述
-        if any(keyword in name for keyword in generic_role_keywords):
+        # Active occupational roles (for example ``敌方保安``) still need a
+        # stable visual asset.  Only discard exact background placeholders;
+        # substring matching used to erase qualified antagonists.
+        if name in generic_background_names:
             print(f"  过滤通用角色描述: {name}", file=sys.stderr)
             continue
         

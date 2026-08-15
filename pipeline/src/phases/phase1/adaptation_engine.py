@@ -704,11 +704,55 @@ def _inherit_event_semantics(
     deterministic and auditable downstream.
     """
     event_by_id = {index: event for index, event in enumerate(events, 1)}
-    previous_sequence_ids: List[str] = []
+    event_occurrences: Dict[int, List[int]] = {}
     for shot_index, shot in enumerate(shots):
         raw_ids = shot.get("source_events", [])
         source_ids = raw_ids if isinstance(raw_ids, list) else []
+        for event_id in dict.fromkeys(source_ids):
+            if event_id in event_by_id:
+                event_occurrences.setdefault(event_id, []).append(shot_index)
+
+    event_slices: Dict[tuple[int, int], Dict[str, Any]] = {}
+    for event_id, occurrence_shots in event_occurrences.items():
+        event = event_by_id[event_id]
+        actions = [
+            str(action).strip()
+            for action in (event.get("micro_actions") or [])
+            if str(action).strip()
+        ]
+        base, remainder = divmod(len(actions), len(occurrence_shots))
+        cursor = 0
+        previous_state = str(event.get("start_state") or "").strip()
+        for occurrence, shot_index in enumerate(occurrence_shots):
+            size = base + (1 if occurrence < remainder else 0)
+            action_slice = actions[cursor : cursor + size]
+            cursor += size
+            is_last = occurrence == len(occurrence_shots) - 1
+            if is_last:
+                end_state = str(event.get("end_state") or "").strip()
+            elif action_slice:
+                end_state = f"已完成动作：{action_slice[-1]}"
+            else:
+                end_state = previous_state
+            event_slices[(event_id, shot_index)] = {
+                "micro_actions": action_slice,
+                "start_state": previous_state,
+                "end_state": end_state,
+                "occurrence": occurrence + 1,
+                "occurrence_count": len(occurrence_shots),
+            }
+            previous_state = end_state
+
+    previous_sequence_ids: List[str] = []
+    for shot_index, shot in enumerate(shots):
+        raw_ids = shot.get("source_events", [])
+        source_ids = list(dict.fromkeys(raw_ids)) if isinstance(raw_ids, list) else []
         details = [event_by_id[event_id] for event_id in source_ids if event_id in event_by_id]
+        slices = [
+            (event_id, event_slices[(event_id, shot_index)])
+            for event_id in source_ids
+            if (event_id, shot_index) in event_slices
+        ]
 
         excerpts = [str(event.get("source_excerpt") or "").strip() for event in details]
         excerpts = [excerpt for excerpt in excerpts if excerpt]
@@ -719,15 +763,23 @@ def _inherit_event_semantics(
         sequence_ids = list(dict.fromkeys(sequence_ids))
         action_unit_ids = [str(event.get("action_unit_id")) for event in details if event.get("action_unit_id")]
         micro_actions = [
-            str(action)
-            for event in details
-            for action in (event.get("micro_actions") or [])
-            if str(action).strip()
+            action
+            for _event_id, event_slice in slices
+            for action in event_slice["micro_actions"]
         ]
         roles = [str(event.get("event_role")) for event in details if event.get("event_role")]
         shot["source_sequence_ids"] = sequence_ids
         shot["source_action_unit_ids"] = list(dict.fromkeys(action_unit_ids))
         shot["source_event_roles"] = list(dict.fromkeys(roles))
+        shot["source_event_slices"] = [
+            {
+                "event_id": event_id,
+                "occurrence": event_slice["occurrence"],
+                "occurrence_count": event_slice["occurrence_count"],
+                "micro_actions": list(event_slice["micro_actions"]),
+            }
+            for event_id, event_slice in slices
+        ]
         shot["micro_actions"] = micro_actions
         generation_actions = select_generation_actions(
             micro_actions,
@@ -745,11 +797,10 @@ def _inherit_event_semantics(
             shot["gen_strategy"] = determine_gen_strategy(shot)
 
         first_source = details[0] if details else {}
-        last_source = details[-1] if details else {}
-        if first_source.get("start_state"):
-            shot["start_state"] = str(first_source["start_state"])
-        if last_source.get("end_state"):
-            shot["end_state"] = str(last_source["end_state"])
+        if slices and slices[0][1].get("start_state"):
+            shot["start_state"] = str(slices[0][1]["start_state"])
+        if slices and slices[-1][1].get("end_state"):
+            shot["end_state"] = str(slices[-1][1]["end_state"])
         causal_links = [
             str(event.get("causal_link") or "").strip()
             for event in details
@@ -811,7 +862,8 @@ BEAT_SKELETON_PROMPT = (
     '"where":"地点","what":"一句话事件","suggested_duration":12}}]}}。\n'
     "【全局铁律】\n"
     "1. beats 数量必须恰好等于 {beat_count}，总建议时长应接近 {target_duration} 秒（±10%）。\n"
-    "2. 每个输入事件编号必须且至少被某个 beat 的 source_events 引用；删减事件也必须放入 action=drop 的 beat 显式声明。\n"
+    "2. 每个输入事件编号必须且至少被某个 beat 的 source_events 引用；删减事件也必须放入 action=drop 的 beat 显式声明。"
+    "同一事件若分配给多个 beat，后一个 beat 必须承接前一个，只负责该事件后续尚未表现的动作，禁止重放整段事件。\n"
     "3. keep 保留关键因果/情感节点，merge 合并连续或重复事件，drop 只删不影响因果链的内容。\n"
     "4. 台词归属必须忠于原事件；who 只能使用角色列表主名，别名改为主名，群众不得写入 who。\n"
     "5. beat 是导演级叙事镜头，不是单次视频调用。同一 sequence_id 的连续 action_unit 可以合并，"
