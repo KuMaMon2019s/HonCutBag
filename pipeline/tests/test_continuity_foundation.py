@@ -1841,6 +1841,7 @@ def _fresh_chunk_request(tmp_path):
 
 
 def test_direct_continuity_adapter_reuses_succeeded_paid_task(monkeypatch, tmp_path):
+    monkeypatch.setattr("utils.video_validation.is_valid_video", lambda _path: True)
     shot_dir = tmp_path / "shots/S01"
     shot_dir.mkdir(parents=True)
     (shot_dir / "SHOT_META.json").write_text(
@@ -1886,6 +1887,7 @@ def test_direct_continuity_adapter_reuses_succeeded_paid_task(monkeypatch, tmp_p
 
 
 def test_bridge_continuity_adapter_reuses_succeeded_paid_task(monkeypatch, tmp_path):
+    monkeypatch.setattr("utils.video_validation.is_valid_video", lambda _path: True)
     shot_dir = tmp_path / "shots/S01"
     shot_dir.mkdir(parents=True)
     (shot_dir / "SHOT_META.json").write_text(

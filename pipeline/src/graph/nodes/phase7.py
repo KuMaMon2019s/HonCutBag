@@ -37,6 +37,7 @@ def phase7_node(
     quality_report = {
         "slideshow_risk": phase_receipt.get("slideshow_risk", 0.0),
         "variation_score": phase_receipt.get("variation_score", 5.0),
+        "failed_shots": phase_receipt.get("failed_shots", []),
     }
     update: dict[str, Any] = {
         "quality_report": quality_report,

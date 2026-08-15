@@ -111,11 +111,12 @@ PIPELINE_SRC_DIR = SCRIPT_DIR
 LEGACY_TOOLS_DIR = SCRIPT_DIR.parent.parent / "vendor" / "legacy"
 OM_TOOLS_DIR = SCRIPT_DIR.parent.parent / "vendor" / "video_tools"
 
-# 优先加载当前源码目录，然后是兼容工具目录
-for d in (PIPELINE_SRC_DIR, LEGACY_TOOLS_DIR, str(OM_TOOLS_DIR)):
+# 优先加载当前源码目录，然后是兼容工具目录。insert(0) 必须反序执行。
+for d in reversed((PIPELINE_SRC_DIR, LEGACY_TOOLS_DIR, str(OM_TOOLS_DIR))):
     s = str(d)
-    if s not in sys.path:
-        sys.path.insert(0, s)
+    if s in sys.path:
+        sys.path.remove(s)
+    sys.path.insert(0, s)
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +188,21 @@ def _get_profile_dict(profile_name: str = "1080p") -> dict:
     # Ultimate fallback: 1080p generic
     return {"name": "1080p", "width": 1920, "height": 1080, "fps": 30,
             "codec": "libx264", "audio_codec": "aac", "crf": 23, "pixel_format": "yuv420p"}
+
+
+def _project_video_spec(media_profile: str) -> dict[str, Any]:
+    """Resolve the one geometry/delivery contract shared by every phase."""
+    profile = _get_profile_dict(media_profile)
+    width = int(profile["width"])
+    height = int(profile["height"])
+    divisor = math.gcd(width, height)
+    return {
+        "aspect_ratio": f"{width // divisor}:{height // divisor}",
+        "width": width,
+        "height": height,
+        "fps": float(profile.get("fps") or 30),
+        "delivery_profile": media_profile,
+    }
 
 
 def _probe_av_durations(path: Path) -> dict[str, float | None]:
@@ -293,7 +309,21 @@ def _record_stage_checkpoint(output_dir: Path, phase_name: str, result: dict) ->
             safe_result[k] = v
         except (TypeError, ValueError):
             safe_result[k] = str(v)
-    checkpoint = write_stage_checkpoint(cp_path, phase_name, safe_result)
+    run_fingerprint = None
+    manifest_path = Path(output_dir) / "RUN_MANIFEST.json"
+    if manifest_path.is_file():
+        try:
+            run_fingerprint = json.loads(
+                manifest_path.read_text(encoding="utf-8")
+            ).get("run_fingerprint")
+        except (OSError, json.JSONDecodeError):
+            pass
+    checkpoint = write_stage_checkpoint(
+        cp_path,
+        phase_name,
+        safe_result,
+        run_fingerprint=run_fingerprint,
+    )
 
     if LANGGRAPH_AVAILABLE:
         try:
@@ -316,8 +346,13 @@ def _read_checkpoint(output_dir: Path) -> Optional[dict]:
         # 基本校验
         if not isinstance(checkpoint.get("completed"), list):
             return None
+        manifest_path = Path(output_dir) / "RUN_MANIFEST.json"
+        if manifest_path.is_file():
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if checkpoint.get("run_fingerprint") != manifest.get("run_fingerprint"):
+                return None
         return checkpoint
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError, TypeError):
         return None
 
 
@@ -817,6 +852,7 @@ def run_phase1_screenwriter(
     dry_run: bool,
     reporter: Optional[ProgressReporter] = None,
     shot_duration: int = AVG_SHOT_DURATION,
+    project_video_spec: dict[str, Any] | None = None,
 ) -> dict:
     """Phase 1: text_parser → event_extractor → character_discoverer → adaptation_engine → storyboard_generator"""
     _banner(1, 9, "编剧引擎 (Screenwriter)", dry_run)
@@ -956,6 +992,7 @@ def run_phase1_screenwriter(
                 reporter.step("phase1", f"dry-run: 发现 {len(mock_characters['characters'])} 个角色", progress_pct=60)
             
             # 模拟分镜数据
+            resolved_video_spec = project_video_spec or _project_video_spec("1080p")
             mock_storyboard = {
                 "shots": [
                     {
@@ -963,7 +1000,9 @@ def run_phase1_screenwriter(
                         "prompt": "A young man discovers a mysterious map in a dimly lit room, cinematic lighting, 35mm film, natural light, tense atmosphere",
                         "caption": "发现神秘地图",
                         "duration": 5,
-                        "aspect_ratio": "16:9",
+                        "aspect_ratio": resolved_video_spec["aspect_ratio"],
+                        "width": resolved_video_spec["width"],
+                        "height": resolved_video_spec["height"],
                         "scene": "昏暗的房间",
                         "action": "发现地图",
                         "camera": "中景",
@@ -974,7 +1013,9 @@ def run_phase1_screenwriter(
                         "prompt": "Two people discussing plans under bright sunlight, hopeful atmosphere, cinematic composition, natural lighting",
                         "caption": "讨论计划",
                         "duration": 5,
-                        "aspect_ratio": "16:9",
+                        "aspect_ratio": resolved_video_spec["aspect_ratio"],
+                        "width": resolved_video_spec["width"],
+                        "height": resolved_video_spec["height"],
                         "scene": "阳光明媚的户外",
                         "action": "讨论计划",
                         "camera": "双人镜头",
@@ -985,7 +1026,9 @@ def run_phase1_screenwriter(
                         "prompt": "A determined man standing alone on a mountain top at sunset, looking into the distance, epic cinematic shot, golden hour lighting",
                         "caption": "眺望远方",
                         "duration": 5,
-                        "aspect_ratio": "16:9",
+                        "aspect_ratio": resolved_video_spec["aspect_ratio"],
+                        "width": resolved_video_spec["width"],
+                        "height": resolved_video_spec["height"],
                         "scene": "山顶",
                         "action": "眺望",
                         "camera": "远景",
@@ -993,7 +1036,10 @@ def run_phase1_screenwriter(
                     }
                 ],
                 "total_duration": 15,
-                "style": "写实电影风格"
+                "style": "写实电影风格",
+                "aspect_ratio": resolved_video_spec["aspect_ratio"],
+                "width": resolved_video_spec["width"],
+                "height": resolved_video_spec["height"],
             }
             from phases.phase1.storyboard_beats import plan_storyboard_beats
 
@@ -1173,6 +1219,7 @@ def run_phase1_screenwriter(
             characters_list,
             visual_style_path=str(visual_style_path) if visual_style_path else None,
             visual_style_text=visual_style_text,
+            config=project_video_spec or _project_video_spec("1080p"),
         )
         from phases.phase1.storyboard_beats import plan_storyboard_beats
 
@@ -1259,6 +1306,7 @@ def run_phase1(
     dry_run: bool,
     reporter: Optional[ProgressReporter] = None,
     shot_duration: int = AVG_SHOT_DURATION,
+    project_video_spec: dict[str, Any] | None = None,
 ) -> dict:
     """Phase 1: director planning followed by the screenwriter engine."""
     started = _now()
@@ -1289,6 +1337,7 @@ def run_phase1(
             dry_run,
             reporter=reporter,
             shot_duration=shot_duration,
+            project_video_spec=project_video_spec,
         )
     finally:
         configure_heartbeat_callback(None)
@@ -1441,7 +1490,7 @@ def _shot_storyboard_reference(output_dir: Path, shot_id: Any) -> Optional[Path]
     return None
 
 
-# Action verb → end-state mapping (for FLF2V end frames)
+# Action verb → generic end-state mapping (for FLF2V end frames)
 _ACTION_END_STATES = {
     # Chinese
     "抬手": "hand raised to its highest point, arm extended",
@@ -1464,9 +1513,9 @@ _ACTION_END_STATES = {
     "look back": "head turned to look back over the shoulder",
     "stand up": "standing upright, fully risen from the seated position",
     "wave": "hand raised in a waving gesture, arm extended",
-    # English (conjugated variants — S05 "raises her hand to brush away hair")
-    "raises her hand": "hand lowered back to resting position, hair now clear of the face",
-    "raises his hand": "hand lowered back to resting position",
+    # English conjugated variants. Do not infer an unmentioned purpose.
+    "raises her hand": "hand raised in the explicitly described gesture",
+    "raises his hand": "hand raised in the explicitly described gesture",
     "brush away": "hand lowered after brushing, action completed",
     "brushes away": "hand lowered after brushing, action completed",
     "walks over": "has arrived at the destination, standing steadily",
@@ -1532,21 +1581,6 @@ def build_end_frame_prompt(shot: dict) -> str:
             "do not omit, merge, duplicate, or replace anyone."
         )
     identity = str(shot.get("subject_description") or "").strip()
-    narrative_text = " ".join(
-        str(shot.get(field) or "") for field in ("what", "visual", "action_description")
-    )
-    alliance_spatial_contract = ""
-    if "并肩" in narrative_text and any(
-        marker in narrative_text for marker in ("迎敌", "共同", "指向前方", "指向远处")
-    ):
-        alliance_spatial_contract = (
-            "Alliance staging is mandatory: the allied characters stand shoulder-to-shoulder "
-            "on the same line and face the distant enemy formation in the same direction. Use a "
-            "rear three-quarter camera behind the allies so the enemy formation is visibly ahead "
-            "of them in the center background. Both blade tips extend toward that same enemy region; "
-            "the blades stay parallel and must not cross. The allies must never face, threaten, or "
-            "point a weapon at each other."
-        )
 
     # Extract character appearance from prompt (simple heuristic)
     char_desc = ""
@@ -1560,8 +1594,6 @@ def build_end_frame_prompt(shot: dict) -> str:
         contract_parts.append(subject_contract)
     if identity:
         contract_parts.append(f"Identity and costume contract: {identity}.")
-    if alliance_spatial_contract:
-        contract_parts.append(alliance_spatial_contract)
     return "\n\n".join(contract_parts) + "\n\n" + (
         f"Scene: {prompt}.\n\n"
         f"Character: {char_desc if char_desc else 'the character'}.\n\n"
@@ -2091,6 +2123,7 @@ def _generate_shot_images(
         Number of successfully generated images
     """
     try:
+        video_width, video_height, _aspect_ratio = _storyboard_canvas(storyboard_data)
         storyboard_images_dir = output_dir / "storyboard_images"
         storyboard_images_dir.mkdir(exist_ok=True)
         shots = storyboard_data.get("shots", [])
@@ -2230,8 +2263,10 @@ def _generate_shot_images(
             _m2_wait_times = [120, 240, 480]
             for _m2_attempt in range(1, _m2_max_retries + 1):
                 try:
-                    # Preserve 16:9 while meeting Seedream's minimum pixel count.
-                    _m2_size = _storyboard_image_size(video_width=1920, video_height=1080)
+                    _m2_size = _storyboard_image_size(
+                        video_width=video_width,
+                        video_height=video_height,
+                    )
                     if ref_image_paths and all(path.exists() for path in ref_image_paths):
                         # P0-1c: Use image_to_image mode (with reference image)
                         from clients.seedream_client import SeedreamClient
@@ -2328,6 +2363,8 @@ def run_phase2(storyboard_data: dict, characters_data: dict, output_dir: Path, d
         print("  ⊘ dry-run 模式，跳过故事板图片生成")
         return {"status": "skipped", "reason": "dry-run", "duration_s": _elapsed(start)}
 
+    video_width, video_height, aspect_ratio = _storyboard_canvas(storyboard_data)
+
     # Phase 1 now owns the model-generated director overview. Reuse that exact
     # image here so Phase 2 can focus on per-shot reference frames instead of
     # paying for a second, semantically competing overview board.
@@ -2353,7 +2390,6 @@ def run_phase2(storyboard_data: dict, characters_data: dict, output_dir: Path, d
         )
 
         print("  → Seedream: 按 Sxx 生成内部手绘故事板...")
-        video_width, video_height, aspect_ratio = _storyboard_canvas(storyboard_data)
         shot_storyboards = generate_shot_storyboards(
             output_dir,
             storyboard_data,
@@ -2418,9 +2454,9 @@ def run_phase2(storyboard_data: dict, characters_data: dict, output_dir: Path, d
 
         result = selector.execute({
             "prompt": prompt,
-            "width": 1920,
-            "height": 1080,
-            "aspect_ratio": "16:9",
+            "width": video_width,
+            "height": video_height,
+            "aspect_ratio": aspect_ratio,
             "output_path": str(storyboard_path),
         })
 
@@ -2521,7 +2557,10 @@ def run_phase2(storyboard_data: dict, characters_data: dict, output_dir: Path, d
     try:
         from clients.seedream_client import SeedreamClient
         client = SeedreamClient()
-        seedream_size = _storyboard_image_size(video_width=1920, video_height=1080)
+        seedream_size = _storyboard_image_size(
+            video_width=video_width,
+            video_height=video_height,
+        )
         print(f"  → seedream: 生成故事板图片 ({seedream_size}, timeout=180s, retry=3)...")
 
         # Use retry policy for API call
@@ -2907,10 +2946,14 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
         if result.returncode != 0:
             print(f"  ⚠ orchestrator stdout tail: {result.stdout[-1500:]}")
             print(f"  ⚠ orchestrator stderr tail: {result.stderr[-1000:]}")
-            print(f"  ⚠ orchestrator stderr: {result.stderr[-500:]}")
-            # 非致命：可能只是没有视频文件
-            if "shots" in str(result.stdout) or dry_run:
-                print("  → 继续（dry-run 模式下部分错误可接受）")
+            return {
+                "status": "error",
+                "error": f"orchestrator exited with code {result.returncode}",
+                "returncode": result.returncode,
+                "stdout_tail": result.stdout[-1500:],
+                "stderr_tail": result.stderr[-1000:],
+                "duration_s": _elapsed(start),
+            }
 
         # 扫描输出
         shots_dir = output_dir / "shots"
@@ -2920,6 +2963,28 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
                     outputs.append(f"shots/{d.name}/")
 
         storyboard = json.loads(storyboard_path.read_text(encoding="utf-8"))
+        expected_shot_ids = {
+            shot_id
+            for shot in storyboard.get("shots", [])
+            if (shot_id := _normalize_shot_id(shot)) is not None
+        }
+        actual_shot_ids = {
+            directory.name
+            for directory in shots_dir.iterdir()
+            if directory.is_dir()
+            and directory.name.startswith("S")
+            and (directory / "SHOT_META.json").is_file()
+        } if shots_dir.is_dir() else set()
+        if actual_shot_ids != expected_shot_ids:
+            return {
+                "status": "error",
+                "error": "Phase 4 shot directory invariant failed",
+                "expected_shot_ids": sorted(expected_shot_ids),
+                "actual_shot_ids": sorted(actual_shot_ids),
+                "missing_shot_ids": sorted(expected_shot_ids - actual_shot_ids),
+                "unexpected_shot_ids": sorted(actual_shot_ids - expected_shot_ids),
+                "duration_s": _elapsed(start),
+            }
         provider_candidates = [
             {"name": "local_video", "provider": "local", "capabilities": ["i2v", "flf2v"], "quality": .8, "control": .9, "reliability": .8, "cost": 0, "latency_score": .7},
             {"name": "seedance", "provider": "volcengine", "capabilities": ["i2v", "t2v", "reference_image"], "quality": .9, "control": .7, "reliability": .75, "cost": .4, "latency_score": .6},
@@ -3276,6 +3341,101 @@ def _privacy_fallback_strategy(gen_strategy: str) -> str:
     return "phantom" if gen_strategy == "flf2v" else gen_strategy
 
 
+def _generation_input_fingerprint(
+    *,
+    output_dir: Path,
+    shot_id: str,
+    meta: dict,
+    prompt: str,
+    first_frame_b64: str | None,
+    content: list[dict] | None,
+    chain_source: tuple[str, Path] | None,
+) -> str:
+    """Hash the immutable semantic and local-media inputs to one paid clip."""
+    semantic_fields = (
+        "who",
+        "associate_assets",
+        "gen_strategy",
+        "generation_actions",
+        "generation_load",
+        "source_action_unit_ids",
+        "start_state",
+        "end_state",
+        "causal_link",
+        "action_description",
+        "camera_movement",
+        "shot_size",
+        "where",
+        "lighting_description",
+        "style_anchor",
+    )
+    local_assets = []
+    for candidate in (
+        output_dir / "storyboard_images" / f"{shot_id}.png",
+        output_dir / "storyboard_images" / f"{shot_id}_end.png",
+    ):
+        if candidate.is_file():
+            local_assets.append(
+                {"path": str(candidate.relative_to(output_dir)), "sha256": _file_sha256(candidate)}
+            )
+    try:
+        from tools.asset_packager import collect_character_reference_assets
+
+        for asset in collect_character_reference_assets(output_dir, meta):
+            candidate = Path(asset["path"])
+            if candidate.is_file():
+                local_assets.append(
+                    {
+                        "path": str(candidate.relative_to(output_dir)),
+                        "sha256": _file_sha256(candidate),
+                    }
+                )
+    except (OSError, KeyError, ValueError):
+        pass
+    if chain_source is not None and chain_source[1].is_file():
+        local_assets.append(
+            {
+                "path": str(chain_source[1]),
+                "sha256": _file_sha256(chain_source[1]),
+            }
+        )
+
+    stable_content = []
+    for item in content or []:
+        stable_item = {
+            key: item.get(key)
+            for key in ("type", "role", "priority", "text")
+            if item.get(key) is not None
+        }
+        stable_content.append(stable_item)
+
+    run_manifest = output_dir / "RUN_MANIFEST.json"
+    run_fingerprint = None
+    if run_manifest.is_file():
+        try:
+            run_fingerprint = json.loads(run_manifest.read_text(encoding="utf-8")).get(
+                "run_fingerprint"
+            )
+        except (OSError, json.JSONDecodeError):
+            pass
+    contract = {
+        "schema": "honcut.phase6-input.v1",
+        "shot_id": shot_id,
+        "prompt": prompt,
+        "meta": {field: meta.get(field) for field in semantic_fields},
+        "first_frame_sha256": (
+            hashlib.sha256(first_frame_b64.encode("ascii")).hexdigest()
+            if first_frame_b64
+            else None
+        ),
+        "content": stable_content,
+        "local_assets": sorted(local_assets, key=lambda item: item["path"]),
+        "run_fingerprint": run_fingerprint,
+    }
+    serialized = json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
 def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
     """Generate Phase 6 video through direct ARK or the explicit local Bridge."""
     output_dir = Path(output_dir)
@@ -3307,7 +3467,7 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
         if video_route == "bridge":
             print(f"  → 路由: 通过 Bridge 使用 {video_provider} 模型", flush=True)
         else:
-            print("  → 路由: 仅使用本地视频 API (192.168.31.221:9100)", flush=True)
+            print("  → 路由: 仅使用配置的本地视频 API", flush=True)
         if chain_mode and video_provider != "seedance":
             print("  [chain] 当前 provider 不是 seedance，Wan2.2 本地不支持接力；按普通模式执行", flush=True)
             chain_mode = False
@@ -3352,10 +3512,16 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                     break
             if reference_path is not None:
                 b64 = _b64.b64encode(reference_path.read_bytes()).decode()
-                # Map multiple keys for matching: Chinese name, pinyin id, id without underscores
-                char_ref_map[char["name"].lower()] = b64
-                char_ref_map[char["id"].lower()] = b64
-                char_ref_map[char["id"].replace("_", "").lower()] = b64
+                # Canonical id, display name, and declared aliases are the only
+                # supported identity lookup keys.
+                for match_key in (
+                    char["name"],
+                    char["id"],
+                    char["id"].replace("_", ""),
+                    *char.get("aliases", []),
+                ):
+                    if match_key:
+                        char_ref_map[str(match_key).casefold()] = b64
                 char_list.append((char["id"], char["name"], b64))
             else:
                 missing_character_fronts.add(char["id"])
@@ -3368,10 +3534,6 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                 + ", ".join(sorted(missing_character_fronts)),
                 flush=True,
             )
-
-    # Determine protagonist (first character) for default injection
-    protagonist_b64 = char_list[0][2] if char_list else None
-    protagonist_name = char_list[0][1] if char_list else None
 
     outputs = []
     # --- P1-C: Seed Locking（参考 HonCut asset_manifest seed）---
@@ -3423,14 +3585,9 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
     )
 
     shot_dirs = [d for d in sorted(shots_dir.iterdir()) if d.is_dir() and d.name.startswith("S")]
-    pending_shot_dirs = []
-    for shot_dir in shot_dirs:
-        existing_output = shot_dir / "output.mp4"
-        if existing_output.exists() and existing_output.stat().st_size > 10 * 1024:
-            print(f"  ⏭ {shot_dir.name}: output.mp4 exists, skipping")
-            outputs.append(f"shots/{shot_dir.name}/output.mp4")
-        else:
-            pending_shot_dirs.append(shot_dir)
+    # Every shot enters its durable execution boundary. Reuse is allowed only
+    # by an exact succeeded ledger entry plus hash and ffprobe validation.
+    pending_shot_dirs = list(shot_dirs)
 
     task_dir_id = None
     if use_local and os.environ.get("HONCUT_TASK_DIR_MODE") == "1" and pending_shot_dirs:
@@ -3625,14 +3782,18 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                     first_frame_b64 = b64
                     print(f"    [ref] 注入角色参考: {char_name}")
                     break
-        # Fallback: inject protagonist for shots with human activity keywords
+        # Structured cast fallback. Never infer an identity from arbitrary
+        # natural-language substrings or inject the first project character.
         shot_who = meta.get("who") or meta.get("characters") or []
-        if first_frame_b64 is None and protagonist_b64 and shot_who:
-            human_keywords = ["woman", "man", "girl", "boy", "person", "she", "he",
-                              "her", "his", "lin xia", "shen yu", "xia", "yu"]
-            if any(kw in prompt_lower for kw in human_keywords):
-                first_frame_b64 = protagonist_b64
-                print(f"    [ref] 注入主角参考 (fallback): {protagonist_name}")
+        if not isinstance(shot_who, list):
+            shot_who = [shot_who] if shot_who else []
+        if first_frame_b64 is None:
+            for cast_key in shot_who:
+                cast_reference = char_ref_map.get(str(cast_key).casefold())
+                if cast_reference:
+                    first_frame_b64 = cast_reference
+                    print(f"    [ref] 按结构化 who 注入角色参考: {cast_key}")
+                    break
 
         # --- P0-A3: 场景参考图（逐镜图/角色参考缺失时使用）---
         if first_frame_b64 is None:
@@ -3741,8 +3902,18 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                         from runtime.bridge_execution import execute_bridge_video_task
 
                         from utils.video_geometry import resolve_video_geometry
+                        from utils.video_validation import is_valid_video
 
                         aspect_ratio, video_width, video_height = resolve_video_geometry(meta)
+                        input_fingerprint = _generation_input_fingerprint(
+                            output_dir=output_dir,
+                            shot_id=shot_id,
+                            meta=content_meta,
+                            prompt=prompt,
+                            first_frame_b64=first_frame_b64,
+                            content=content_list,
+                            chain_source=active_source,
+                        )
                         bridge_generate = partial(
                             generate,
                             prompt=prompt,
@@ -3775,10 +3946,12 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                                 "ratio": aspect_ratio,
                                 "width": video_width,
                                 "height": video_height,
+                                "input_fingerprint": input_fingerprint,
                             },
                             provider_endpoint=local_video_client.get_api_url(),
                             output_path=out_path,
                             generate=bridge_generate,
+                            validate_output=is_valid_video,
                         )
                         generation_result = execution.generation_result
 
@@ -3836,8 +4009,18 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                 from runtime.seedance_execution import execute_seedance_video_task
 
                 from utils.video_geometry import resolve_video_geometry
+                from utils.video_validation import is_valid_video
 
                 aspect_ratio, video_width, video_height = resolve_video_geometry(meta)
+                input_fingerprint = _generation_input_fingerprint(
+                    output_dir=output_dir,
+                    shot_id=shot_id,
+                    meta=content_meta,
+                    prompt=prompt,
+                    first_frame_b64=first_frame_b64,
+                    content=content_list,
+                    chain_source=active_source,
+                )
                 execution = execute_seedance_video_task(
                     generation_tasks,
                     run_id=str(output_dir.resolve()),
@@ -3851,6 +4034,7 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                         "ratio": aspect_ratio,
                         "width": video_width,
                         "height": video_height,
+                        "input_fingerprint": input_fingerprint,
                     },
                     provider_endpoint=seedance_client.BASE_URL,
                     output_path=out_path,
@@ -3865,6 +4049,7 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                     ),
                     poll=partial(seedance_client.poll, api_key=api_key),
                     download=seedance_client.download,
+                    validate_output=is_valid_video,
                 )
                 task_id = execution.provider_job_id
 
@@ -4344,6 +4529,28 @@ def run_phase7(output_dir: Path, dry_run: bool, storyboard_data: dict = None) ->
                 quality_metrics["slideshow_risk"] = avg / 5.0
             except (json.JSONDecodeError, KeyError):
                 pass
+
+    metadata_quality_failures = []
+    if quality_metrics.get("slideshow_risk", 0.0) > 0.7:
+        metadata_quality_failures.append(
+            f"slideshow_risk={quality_metrics['slideshow_risk']:.3f} > 0.7"
+        )
+    if quality_metrics.get("variation_score", 5.0) < 3.0:
+        metadata_quality_failures.append(
+            f"variation_score={quality_metrics['variation_score']:.3f} < 3.0"
+        )
+    if metadata_quality_failures:
+        return {
+            "status": "error",
+            "error": (
+                "Phase 7 metadata quality BLOCK; repair the storyboard instead "
+                "of resubmitting identical paid video inputs: "
+                + "; ".join(metadata_quality_failures)
+            ),
+            "duration_s": _elapsed(start),
+            "outputs": outputs,
+            **quality_metrics,
+        }
     
     return {
         "status": "done", 
@@ -6423,6 +6630,8 @@ if LANGGRAPH_AVAILABLE:
         transition_duration: float
         enable_reshoot: bool
         media_profile: str
+        project_video_spec: dict
+        run_fingerprint: str
         skip_phase: list
         resume: bool
         auto_approve: bool
@@ -6589,22 +6798,35 @@ if LANGGRAPH_AVAILABLE:
         
         slideshow_risk = quality.get("slideshow_risk", 0.0)
         variation_score = quality.get("variation_score", 5.0)
-        
-        # Check if quality is acceptable
+        failed_shots = quality.get("failed_shots", [])
+
+        # These two scores are computed from the immutable storyboard, not the
+        # generated pixels. Re-submitting identical paid video inputs cannot
+        # improve them, so all execution modes block and request storyboard
+        # repair instead of burning another provider attempt.
         if slideshow_risk > 0.7 or variation_score < 3.0:
-            # Quality failed
+            print(
+                f"\n  ✗ 故事板质检不通过 "
+                f"(slideshow_risk={slideshow_risk}, variation={variation_score})，"
+                "阻断视频重拍"
+            )
+            return "block"
+        
+        # Pixel-level QA may request a selective retry, but it must identify
+        # exact shot ids. Never fall back to deleting every generated clip.
+        if failed_shots:
             if retry_count < 2:
-                # Retry Phase 6 (max 2 times)
-                print(f"\n  ⚠ 质检不通过 (slideshow_risk={slideshow_risk}, variation={variation_score})")
+                print(f"\n  ⚠ 镜头质检不通过: {', '.join(failed_shots)}")
                 print(f"  🔄 回退到 Phase 6 重新生成 (retry {retry_count + 1}/2)")
                 mode = state.get("video_generation_mode") or route_phase5(state)
                 if mode not in {"txt2vid", "img2vid", "reference"}:
                     mode = "txt2vid"
                 return f"retry_{mode}"
             else:
-                print(f"\n  ⚠ 质检不通过，但已达最大重试次数，继续执行")
+                print(f"\n  ✗ 质检不通过且已达最大重试次数，阻断流水线")
+                return "block"
         
-        # Quality passed or max retries reached
+        # Quality passed.
         return "pass"
 
     def node_phase8(state: HonCutState) -> dict:
@@ -6681,6 +6903,48 @@ def run_pipeline(
     output_path = Path(output_dir).resolve()
     _ensure_dir(output_path)
 
+    # Resolve source and run identity before consulting any checkpoint. This
+    # prevents an old "all phases complete" record from short-circuiting a new
+    # script, model, provider, geometry, or code version.
+    if text is None and input_file:
+        text = Path(input_file).read_text(encoding="utf-8")
+    if not text and not resume:
+        raise ValueError("必须提供 --text 或 --input 参数")
+    text = text or ""
+    project_video_spec = _project_video_spec(media_profile)
+    from runtime.run_manifest import prepare_run_manifest
+
+    run_manifest = prepare_run_manifest(
+        output_path,
+        source_text=text,
+        resolved_config={
+            "duration": duration,
+            "shot_duration": shot_duration,
+            "chain_mode": chain_mode,
+            "transition": transition,
+            "transition_duration": transition_duration,
+            "media_profile": media_profile,
+            "enable_reshoot": enable_reshoot,
+            "dry_run": dry_run,
+            "video_provider": os.environ.get("VIDEO_PROVIDER", "seedance").lower(),
+            "video_generation_mode": os.environ.get("VIDEO_GENERATION_MODE", "direct").lower(),
+            "video_model": os.environ.get(
+                "SEEDANCE_MODEL",
+                os.environ.get("VIDEO_MODEL", "doubao-seedance-2.0-mini"),
+            ),
+            "project_video_spec": project_video_spec,
+        },
+        repo_root=SCRIPT_DIR.parent.parent,
+        resume=resume,
+    )
+    spec_path = output_path / "PROJECT_VIDEO_SPEC.json"
+    spec_temporary = spec_path.with_suffix(".json.tmp")
+    spec_temporary.write_text(
+        json.dumps(project_video_spec, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    os.replace(spec_temporary, spec_path)
+
     # --- M6: --resume-from 支持 ---
     if resume_from:
         from utils.artifact_chain import PHASE_SEQUENCE, can_resume_from, phase_numbers_before
@@ -6717,6 +6981,11 @@ def run_pipeline(
         if not completed_phases:
             # Fallback: try to read completed phases from SQLite checkpoint
             sqlite_state = load_state_from_sqlite(output_path, thread_id="pipeline_run")
+            if sqlite_state and sqlite_state.get("run_fingerprint") != run_manifest.get(
+                "run_fingerprint"
+            ):
+                print("\n  ⚠ SQLite checkpoint run fingerprint mismatch; ignoring stale state")
+                sqlite_state = None
             if sqlite_state and isinstance(sqlite_state, dict):
                 sqlite_completed = sqlite_state.get("completed_phases", [])
                 if sqlite_completed:
@@ -6748,15 +7017,6 @@ def run_pipeline(
                     "output_dir": str(output_dir),
                     "timestamp": cp.get("timestamp", "") if cp else "",
                 }
-
-    # 读取文本（resume 模式下如果文本未提供，尝试从检查点恢复）
-    if text is None and input_file:
-        text = Path(input_file).read_text(encoding="utf-8")
-    if not text and resume:
-        # resume 模式下文本可以不提供（Phase 1 会被跳过如果已完成）
-        text = ""
-    if not text:
-        raise ValueError("必须提供 --text 或 --input 参数")
 
     total_start = _now()
     report = {
@@ -6838,6 +7098,8 @@ def run_pipeline(
                 "transition": transition,
                 "transition_duration": transition_duration,
                 "media_profile": media_profile,
+                "project_video_spec": project_video_spec,
+                "run_fingerprint": run_manifest["run_fingerprint"],
                 "enable_reshoot": enable_reshoot,
                 "skip_phase": skip_phase or [],
                 "resume": resume,
@@ -6848,7 +7110,11 @@ def run_pipeline(
             }
             
             # Config for threading
-            config = {"configurable": {"thread_id": "pipeline_run"}}
+            config = {
+                "configurable": {
+                    "thread_id": run_manifest["run_fingerprint"],
+                }
+            }
             
             # Handle resume: if resuming, try to get existing state
             if resume and checkpointer:
@@ -7006,6 +7272,7 @@ def run_pipeline(
             dry_run,
             reporter=reporter,
             shot_duration=shot_duration,
+            project_video_spec=project_video_spec,
         )
         # 提取内部数据（不写入 report）
         storyboard_data = p2.pop("_storyboard", None)

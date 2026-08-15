@@ -39,15 +39,28 @@ def _phase6_node(
 
     output_dir = Path(state["output_dir"])
     replacement = None
-    if state.get("retry_count", 0) > 0 and not state.get("dry_run", False):
+    is_retry = "phase6" in state.get("phase_results", {})
+    if is_retry and not state.get("dry_run", False):
         from phases.phase8.reshoot_transaction import ReshootTransaction
 
-        shots_dir = output_dir / "shots"
-        shot_ids = [
-            item.name
-            for item in sorted(shots_dir.iterdir()) if item.is_dir()
-            and item.name.startswith("S") and (item / "output.mp4").is_file()
-        ] if shots_dir.is_dir() else []
+        shot_ids = sorted(
+            {
+                str(shot_id)
+                for shot_id in state.get("quality_report", {}).get("failed_shots", [])
+                if str(shot_id).startswith("S")
+            }
+        )
+        if not shot_ids:
+            return Command(
+                goto=END,
+                update={
+                    "status": "failed",
+                    "error": (
+                        "Phase 6 retry refused: quality decision did not provide "
+                        "specific failed_shots"
+                    ),
+                },
+            )
         if shot_ids:
             replacement = ReshootTransaction.begin(
                 output_dir,
@@ -78,7 +91,7 @@ def _phase6_node(
         },
         "completed_phases": state.get("completed_phases", [])
         + (["phase6"] if phase_receipt.get("status") != "error" else []),
-        "retry_count": state.get("retry_count", 0) + 1,
+        "retry_count": state.get("retry_count", 0) + (1 if is_retry else 0),
         "video_generation_mode": generation_mode,
         "skip_phase": state.get("skip_phase", []),
     }

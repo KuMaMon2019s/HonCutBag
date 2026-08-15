@@ -137,7 +137,7 @@ def test_f4_source_excerpt_survives_blueprint_and_storyboard(monkeypatch):
     assert "刀锋从鼻尖掠过削断几缕银发" in storyboard["shots"][0]["prompt"]
 
 
-def test_action_prompt_uses_real_duration_bounded_actions_and_dynamic_camera():
+def test_action_prompt_preserves_explicit_static_camera_and_bounded_actions():
     shot = {
         "id": 2,
         "who": ["凛", "烬"],
@@ -153,7 +153,8 @@ def test_action_prompt_uses_real_duration_bounded_actions_and_dynamic_camera():
     prompt = _build_shot_prompt(shot, [])
 
     assert "4.0秒" in prompt
-    assert "稳定器跟拍" in prompt
+    assert "固定(fixed/locked)" in prompt
+    assert shot["camera_movement"] == "static"
     assert "凛冲刺 → 跃起劈刀 → 烬举臂格挡 → 火星炸开" in prompt
     assert "不应进入模型提示的二十六步完整动作流水账" not in prompt
     assert "补充：首轮交锋" not in prompt
@@ -320,6 +321,15 @@ def test_specific_lighting_uses_neutral_fallback_without_time_of_day():
 
     assert "与全片美术风格一致的自然光照" in lighting
     assert "黄金时段" not in lighting
+
+
+def test_specific_lighting_does_not_turn_generic_outdoors_into_moonlight():
+    style = VisualStyle(name="day-neutral", style_prompt_full="自然纪实，真实色彩")
+
+    lighting = _specific_lighting({}, "学校室外操场", style)
+
+    assert "月光" not in lighting
+    assert "自然光照" in lighting
 
 
 def test_video_prompt_preserves_scene_lighting_description():

@@ -24,6 +24,7 @@ class HonCutState(TypedDict, total=False):
     transition: str
     transition_duration_s: float
     media_profile: str
+    project_video_spec: dict[str, Any]
     enable_reshoot: bool
     resume: bool
     resume_from: str | None

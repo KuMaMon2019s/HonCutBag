@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-DEFAULT_BRIDGE_API_URL = "http://192.168.31.221:9100"
+DEFAULT_BRIDGE_API_URL = "http://127.0.0.1:9100"
 VIDEO_ROUTE_VALUES = {"bridge", "direct", "local"}
 
 
@@ -427,7 +427,7 @@ DEFAULT_VIDEO_MODEL = Models.ARK_VIDEO
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # 本地视频生成 API URL（Windows ComfyUI 机器）
-LOCAL_VIDEO_API_URL = os.environ.get("LOCAL_VIDEO_API_URL", "http://192.168.31.221:9100")
+LOCAL_VIDEO_API_URL = os.environ.get("LOCAL_VIDEO_API_URL", DEFAULT_BRIDGE_API_URL)
 
 # 是否优先使用本地视频 API（True = 优先本地，False = 仅用 ARK）
 USE_LOCAL_VIDEO_API = os.environ.get("USE_LOCAL_VIDEO_API", "true").lower() in ("true", "1", "yes")

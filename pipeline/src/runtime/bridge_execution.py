@@ -49,6 +49,7 @@ def execute_bridge_video_task(
     provider_endpoint: str,
     output_path: str | Path,
     generate: Callable[..., str | dict[str, Any]],
+    validate_output: Callable[[Path], bool] | None = None,
 ) -> BridgeExecution:
     """Persist a Bridge job ID before polling and resume it after interruption."""
 
@@ -67,9 +68,10 @@ def execute_bridge_video_task(
                 f"successful Bridge ledger entry for {resource_id} has no provider job id"
             )
         generation_result: str | dict[str, Any] = dict(succeeded.outcome)
-        if not _matches_succeeded_output(
+        output_matches = _matches_succeeded_output(
             destination, succeeded.outcome.get("output_sha256")
-        ):
+        ) and (validate_output is None or validate_output(destination))
+        if not output_matches:
             generation_result = generate(
                 resume_task_id=provider_job_id,
                 on_submit_start=lambda: None,
@@ -77,6 +79,8 @@ def execute_bridge_video_task(
             )
         if not _matches_succeeded_output(
             destination, succeeded.outcome.get("output_sha256")
+        ) or (
+            validate_output is not None and not validate_output(destination)
         ):
             raise RuntimeError(f"recovered Bridge output is invalid for {resource_id}")
         return BridgeExecution(
@@ -169,6 +173,13 @@ def execute_bridge_video_task(
         message = "Bridge generation completed without reporting its provider job ID"
         task_store.mark_submission_uncertain(task.task_id, message)
         raise SubmissionUncertainError(message)
+
+    if not destination.is_file() or destination.stat().st_size <= 0 or (
+        validate_output is not None and not validate_output(destination)
+    ):
+        message = f"Bridge output is not a valid video for {resource_id}"
+        task_store.note_resumable_error(task.task_id, message)
+        raise RuntimeError(message)
 
     destination_text = str(destination)
     outcome: dict[str, Any] = {

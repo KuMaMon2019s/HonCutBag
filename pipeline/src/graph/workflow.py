@@ -78,6 +78,7 @@ def build_workflow(
             "retry_txt2vid": "phase6_txt2vid",
             "retry_img2vid": "phase6_img2vid",
             "retry_reference": "phase6_reference",
+            "block": END,
         },
     )
     graph.add_conditional_edges(

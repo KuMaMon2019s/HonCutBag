@@ -544,6 +544,7 @@ def _direct_seedance_executor(
 ) -> Callable[[ChunkExecutionRequest], ChunkExecutionResult]:
     from clients import seedance_client
     from utils.config import SEEDANCE_MODEL, get_api_key_or_raise
+    from utils.video_validation import is_valid_video
 
     api_key = get_api_key_or_raise("ARK_AGENT")
     model = SEEDANCE_MODEL
@@ -597,6 +598,7 @@ def _direct_seedance_executor(
                     submit=submit,
                     poll=partial(seedance_client.poll, api_key=api_key),
                     download=seedance_client.download,
+                    validate_output=is_valid_video,
                 )
         return ChunkExecutionResult(
             output_path=Path(execution.output_path),
@@ -611,6 +613,7 @@ def _bridge_seedance_executor(
     task_store: GenerationTaskStore,
 ) -> Callable[[ChunkExecutionRequest], ChunkExecutionResult]:
     from clients import local_video_client
+    from utils.video_validation import is_valid_video
 
     capacity = max(1, int(os.environ.get("VIDEO_GEN_CONCURRENCY", "1")))
     slots = SlotTable()
@@ -646,15 +649,16 @@ def _bridge_seedance_executor(
             )
 
         with slots.reserve("bridge", "video", request.resource_id, capacity=capacity):
-            execution = execute_bridge_video_task(
+                execution = execute_bridge_video_task(
                 task_store,
                 run_id=str(output_dir.resolve()),
                 resource_id=request.resource_id,
                 payload=payload,
                 provider_endpoint=local_video_client.get_api_url(),
-                output_path=request.output_path,
-                generate=generate,
-            )
+                    output_path=request.output_path,
+                    generate=generate,
+                    validate_output=is_valid_video,
+                )
         return ChunkExecutionResult(
             output_path=Path(execution.output_path),
             provider_task_id=execution.provider_job_id,

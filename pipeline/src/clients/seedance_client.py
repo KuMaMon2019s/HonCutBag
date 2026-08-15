@@ -6,11 +6,13 @@ Never nest in "parameters". watermark=false MUST be included.
 
 import os
 import time
+import tempfile
 import requests
 from typing import Optional
 from clients.video_client import VideoClient
 from utils.config import ARK_BASE_URL
 from utils.ip_blacklist import sanitize_prompt
+from runtime.execution_errors import ProviderJobFailedError
 
 
 BASE_URL = ARK_BASE_URL.rstrip("/")
@@ -342,7 +344,7 @@ def poll(
                 raise RuntimeError(f"Succeeded but no video_url: {data}")
             return video_url
         elif status in ("failed", "error"):
-            raise RuntimeError(f"Task {task_id} failed: {data}")
+            raise ProviderJobFailedError(f"Task {task_id} failed: {data}")
         else:
             print(f"  [poll {attempt}/{max_attempts}] status={status}")
 
@@ -350,12 +352,33 @@ def poll(
 
 
 def download(url: str, output_path: str) -> str:
-    """Download video to output_path. Returns the path."""
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    resp = requests.get(url, stream=True, timeout=120)
-    resp.raise_for_status()
-    with open(output_path, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=8192):
-            f.write(chunk)
-    print(f"  [download] saved {output_path} ({os.path.getsize(output_path)} bytes)")
-    return output_path
+    """Download atomically so an interrupted response never looks complete."""
+    destination = os.path.abspath(output_path)
+    destination_dir = os.path.dirname(destination) or "."
+    os.makedirs(destination_dir, exist_ok=True)
+    temporary_path = None
+    try:
+        with requests.get(url, stream=True, timeout=120) as response:
+            response.raise_for_status()
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                prefix=f".{os.path.basename(destination)}.",
+                suffix=".part",
+                dir=destination_dir,
+                delete=False,
+            ) as target:
+                temporary_path = target.name
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        target.write(chunk)
+                target.flush()
+                os.fsync(target.fileno())
+        if not temporary_path or os.path.getsize(temporary_path) <= 0:
+            raise RuntimeError("Seedance download returned an empty file")
+        os.replace(temporary_path, destination)
+        temporary_path = None
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+    print(f"  [download] saved {destination} ({os.path.getsize(destination)} bytes)")
+    return destination

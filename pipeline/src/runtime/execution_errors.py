@@ -11,3 +11,7 @@ class ProviderEndpointChangedError(RuntimeError):
 
 class ProviderPreparationError(RuntimeError):
     """Local provider inputs failed before any paid submission was attempted."""
+
+
+class ProviderJobFailedError(RuntimeError):
+    """The provider explicitly reported a terminal failed job state."""

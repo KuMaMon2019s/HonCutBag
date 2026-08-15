@@ -1,6 +1,6 @@
 """Local video generation API client — HonCutBag ComfyUI backend.
 
-Connects to a local ComfyUI-based video generation API at http://192.168.31.221:9100
+Connects to a configurable local ComfyUI-based video generation API.
 Supports I2V (image-to-video) and T2V (text-to-video) generation.
 
 API Spec (HonCutBag_API_v3.1):
@@ -21,7 +21,7 @@ from pathlib import Path
 import requests
 
 # Default local API URL (can be overridden via config or env)
-DEFAULT_API_URL = "http://192.168.31.221:9100"
+DEFAULT_API_URL = "http://127.0.0.1:9100"
 
 # Model-specific generation constraints. Additional Bridge routes can use the
 # same ``fps``/``valid_frames`` shape when their safe frame sets are verified.

@@ -10,6 +10,7 @@ from typing import Any
 
 from runtime.execution_errors import (
     ProviderEndpointChangedError,
+    ProviderJobFailedError,
     ProviderPreparationError,
     SubmissionUncertainError,
 )
@@ -69,6 +70,7 @@ def execute_seedance_video_task(
     submit: Callable[[], str],
     poll: Callable[[str], str],
     download: Callable[[str, str], str],
+    validate_output: Callable[[Path], bool] | None = None,
 ) -> SeedanceExecution:
     """Submit once, persist the job id, then resume polling after failures."""
     destination = Path(output_path)
@@ -86,12 +88,15 @@ def execute_seedance_video_task(
             raise RuntimeError(
                 f"successful Seedance ledger entry for {resource_id} is missing recovery data"
             )
-        if not _matches_succeeded_output(
+        output_matches = _matches_succeeded_output(
             destination, succeeded.outcome.get("output_sha256")
-        ):
+        ) and (validate_output is None or validate_output(destination))
+        if not output_matches:
             download(str(video_url), str(destination))
         if not _matches_succeeded_output(
             destination, succeeded.outcome.get("output_sha256")
+        ) or (
+            validate_output is not None and not validate_output(destination)
         ):
             raise RuntimeError(f"recovered Seedance output is invalid for {resource_id}")
         return SeedanceExecution(
@@ -165,11 +170,22 @@ def execute_seedance_video_task(
         video_url = poll(provider_job_id)
         download(video_url, destination_text)
     except Exception as error:
-        if _provider_rejected_submission(error):
-            task_store.mark_failed(task.task_id, str(error))
+        if isinstance(error, ProviderJobFailedError):
+            task_store.mark_failed(
+                task.task_id,
+                str(error),
+                provider_terminal=True,
+            )
         else:
             task_store.note_resumable_error(task.task_id, str(error))
         raise
+
+    if not destination.is_file() or destination.stat().st_size <= 0 or (
+        validate_output is not None and not validate_output(destination)
+    ):
+        message = f"downloaded Seedance output is not a valid video for {resource_id}"
+        task_store.note_resumable_error(task.task_id, message)
+        raise RuntimeError(message)
 
     task_store.mark_succeeded(
         task.task_id,

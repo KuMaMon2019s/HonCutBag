@@ -38,7 +38,7 @@ from runtime.capacity import (
     SlotTable,
 )
 from runtime.generation_tasks import GenerationTaskStore
-from runtime.execution_errors import ProviderPreparationError
+from runtime.execution_errors import ProviderJobFailedError, ProviderPreparationError
 from runtime.seedance_execution import (
     ProviderEndpointChangedError,
     SubmissionUncertainError,
@@ -59,6 +59,10 @@ _runner_spec.loader.exec_module(pipeline_runner_cli)
 @pytest.fixture(autouse=True)
 def _isolate_provider_capacity_database(tmp_path, monkeypatch):
     monkeypatch.setenv("HONCUT_CAPACITY_DB", str(tmp_path / "provider-capacity.db"))
+    # Most routing tests use byte strings instead of encoded MP4 fixtures. The
+    # strict ffprobe contract has dedicated tests below; keep unrelated routing
+    # tests focused on provider behavior.
+    monkeypatch.setattr("utils.video_validation.is_valid_video", lambda _path: True)
 
 
 def test_phase_ids_are_contiguous_in_execution_order():
@@ -556,6 +560,34 @@ def test_phase4_never_lets_legacy_orchestrator_submit_video(monkeypatch, tmp_pat
     assert "--dry-run" in observed["cmd"]
 
 
+def test_phase4_nonzero_exit_cannot_be_masked_by_partial_shot_dirs(
+    monkeypatch, tmp_path
+):
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps({"shots": [{"id": 1}, {"id": 2}]}),
+        encoding="utf-8",
+    )
+    partial = tmp_path / "shots" / "S01"
+    partial.mkdir(parents=True)
+    (partial / "SHOT_META.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        pipeline_core.subprocess,
+        "run",
+        lambda cmd, **kwargs: pipeline_core.subprocess.CompletedProcess(
+            cmd,
+            9,
+            stdout="created S01 then crashed",
+            stderr="orchestrator failure",
+        ),
+    )
+
+    result = pipeline_core.run_phase4(tmp_path, dry_run=True)
+
+    assert result["status"] == "error"
+    assert result["returncode"] == 9
+    assert "exited with code 9" in result["error"]
+
+
 def test_submit_content_sends_top_level_agent_plan_payload(monkeypatch):
     content = [
         {"type": "text", "text": "move slowly"},
@@ -602,6 +634,39 @@ def test_submit_content_sends_top_level_agent_plan_payload(monkeypatch):
     }
     assert posted["json"]["content"] is content
     assert "parameters" not in posted["json"]
+
+
+def test_seedance_download_is_atomic_on_interrupted_stream(tmp_path, monkeypatch):
+    destination = tmp_path / "output.mp4"
+    destination.write_bytes(b"previous-complete-video")
+
+    class InterruptedResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size):
+            assert chunk_size == 8192
+            yield b"partial"
+            raise ConnectionError("stream interrupted")
+
+    monkeypatch.setattr(
+        seedance_client.requests,
+        "get",
+        lambda *args, **kwargs: InterruptedResponse(),
+    )
+
+    with pytest.raises(ConnectionError, match="interrupted"):
+        seedance_client.download("https://video.test/output.mp4", str(destination))
+
+    assert destination.read_bytes() == b"previous-complete-video"
+    assert list(tmp_path.glob("*.part")) == []
+    assert list(tmp_path.glob(".*.part")) == []
 
 
 def _write_shot(output_dir):
@@ -663,6 +728,24 @@ def test_direct_providers_bypass_bridge(tmp_path, monkeypatch, provider):
     assert len(direct_calls) == 1
     assert direct_calls[0][1]["duration"] == 12
     assert (shot_dir / "output.mp4").exists()
+
+
+def test_phase6_does_not_reuse_large_unledgered_output(tmp_path, monkeypatch):
+    shot_dir = _write_shot(tmp_path)
+    (shot_dir / "output.mp4").write_bytes(b"partial" * 4_000)
+    _mock_common_direct(monkeypatch, shot_dir)
+    submissions = []
+    monkeypatch.setattr(
+        seedance_client,
+        "submit_content",
+        lambda content, **kwargs: submissions.append(kwargs) or "new-provider-job",
+    )
+
+    result = pipeline_core._run_phase6_fallback(tmp_path)
+
+    assert result["status"] == "done"
+    assert len(submissions) == 1
+    assert (shot_dir / "output.mp4").read_bytes() == b"v" * 11000
 
 
 @pytest.mark.parametrize("provider", ["local", "wan", "bridge"])
@@ -1270,6 +1353,103 @@ def test_seedance_poll_failure_resumes_without_resubmitting(tmp_path):
     assert store.get(execution.task_id).status == "succeeded"
 
 
+@pytest.mark.parametrize("status_code", [403, 429, 500])
+def test_seedance_poll_http_error_never_resubmits_paid_job(tmp_path, status_code):
+    store = GenerationTaskStore(tmp_path / "runtime.db")
+    output_path = tmp_path / "output.mp4"
+    submissions = []
+    arguments = {
+        "run_id": "run-1",
+        "resource_id": "S01",
+        "payload": {"shot_id": "S01", "input_fingerprint": "same"},
+        "provider_endpoint": "https://seedance.test",
+        "output_path": output_path,
+        "submit": lambda: submissions.append("submit") or "provider-job-1",
+        "download": lambda _url, path: Path(path).write_bytes(b"video") or path,
+    }
+
+    with pytest.raises(RuntimeError, match=str(status_code)):
+        execute_seedance_video_task(
+            store,
+            poll=lambda _job_id: (_ for _ in ()).throw(
+                RuntimeError(f"Seedance get task API {status_code}: transient")
+            ),
+            **arguments,
+        )
+
+    active = store.find_active(
+        run_id="run-1",
+        task_type="video.generate",
+        resource_id="S01",
+        provider_id="seedance",
+    )
+    assert active is not None
+    assert active.status == "running"
+    assert active.provider_job_id == "provider-job-1"
+
+    recovered = execute_seedance_video_task(
+        store,
+        poll=lambda _job_id: "https://video.test/output.mp4",
+        **arguments,
+    )
+    assert recovered.resumed is True
+    assert submissions == ["submit"]
+
+
+def test_generation_store_refuses_nonterminal_failure_after_provider_job(tmp_path):
+    store = GenerationTaskStore(tmp_path / "runtime.db")
+    task = _enqueue_runtime_video(store).task
+    store.claim(task.task_id)
+    store.persist_provider_job(
+        task.task_id,
+        provider_job_id="provider-job-1",
+        provider_endpoint="https://seedance.test",
+    )
+
+    with pytest.raises(RuntimeError, match="refusing to fail"):
+        store.mark_failed(task.task_id, "temporary network failure")
+
+    assert store.get(task.task_id).status == "running"
+
+
+def test_seedance_invalid_succeeded_cache_redownloads_without_resubmit(tmp_path):
+    store = GenerationTaskStore(tmp_path / "runtime.db")
+    output_path = tmp_path / "output.mp4"
+    payload = {"input_fingerprint": "same"}
+    first = execute_seedance_video_task(
+        store,
+        run_id="run-1",
+        resource_id="S01",
+        payload=payload,
+        provider_endpoint="https://seedance.test",
+        output_path=output_path,
+        submit=lambda: "provider-job-1",
+        poll=lambda _job_id: "https://video.test/output.mp4",
+        download=lambda _url, path: Path(path).write_bytes(b"valid") or path,
+        validate_output=lambda path: path.read_bytes() == b"valid",
+    )
+    output_path.write_bytes(b"x" * 20_000)
+    downloads = []
+
+    recovered = execute_seedance_video_task(
+        store,
+        run_id="run-1",
+        resource_id="S01",
+        payload=payload,
+        provider_endpoint="https://seedance.test",
+        output_path=output_path,
+        submit=lambda: pytest.fail("cache recovery must not resubmit"),
+        poll=lambda _job_id: pytest.fail("succeeded job must not be repolled"),
+        download=lambda url, path: downloads.append(url)
+        or Path(path).write_bytes(b"valid")
+        or path,
+        validate_output=lambda path: path.read_bytes() == b"valid",
+    )
+
+    assert recovered.task_id == first.task_id
+    assert downloads == ["https://video.test/output.mp4"]
+
+
 def test_seedance_provider_rejection_during_poll_is_terminal(tmp_path):
     store = GenerationTaskStore(tmp_path / "runtime.db")
     output = tmp_path / "clip.mp4"
@@ -1284,7 +1464,7 @@ def test_seedance_provider_rejection_during_poll_is_terminal(tmp_path):
             output_path=output,
             submit=lambda: "provider-job-1",
             poll=lambda _job_id: (_ for _ in ()).throw(
-                RuntimeError("Task failed: InvalidParameter")
+                ProviderJobFailedError("Task failed: InvalidParameter")
             ),
             download=lambda _url, _path: pytest.fail("failed task must not download"),
         )
@@ -1853,7 +2033,7 @@ def test_end_frame_prompt_uses_last_micro_action_and_full_cast():
     assert "no speech bubbles" in prompt
 
 
-def test_end_frame_prompt_locks_allies_to_same_enemy_direction():
+def test_end_frame_prompt_does_not_invent_alliance_staging():
     prompt = pipeline_core.build_end_frame_prompt(
         {
             "who": ["凛", "烬"],
@@ -1863,10 +2043,10 @@ def test_end_frame_prompt_locks_allies_to_same_enemy_direction():
         }
     )
 
-    assert "stand shoulder-to-shoulder" in prompt
-    assert "rear three-quarter camera behind the allies" in prompt
-    assert "blades stay parallel and must not cross" in prompt
-    assert "must never face, threaten, or point a weapon at each other" in prompt
+    assert "两柄黑刃同时抬起，指向前方" in prompt
+    assert "stand shoulder-to-shoulder" not in prompt
+    assert "rear three-quarter camera behind the allies" not in prompt
+    assert "blades stay parallel and must not cross" not in prompt
 
 
 def test_storyboard_keyframe_explicit_empty_cast_is_environment_only():

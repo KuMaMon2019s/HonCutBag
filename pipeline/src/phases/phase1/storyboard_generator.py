@@ -57,7 +57,7 @@ def _load_default_visual_style(
         return parse_visual_style(style_path.read_text(encoding="utf-8"))
     return VisualStyle(
         name="fallback",
-        style_prompt_full="cinematic, warm tones, 16:9",
+        style_prompt_full="cinematic, warm tones",
     )
 
 
@@ -200,13 +200,6 @@ CAMERA_TERMS = {
     "whip_pan": "甩镜(whip-pan)",
     "rack_focus": "焦点转移(rack focus)",
     "steadicam": "稳定器跟拍(steadicam tracking)",
-}
-
-EMOTION_ACTIONS = {
-    "悲伤": "低头，肩膀微颤，眼眶泛红，手指攥紧衣角",
-    "喜悦": "嘴角上扬，眉眼舒展，脚步轻快",
-    "紧张": "频繁看手表，手指敲击桌面，呼吸急促，眼神闪躲",
-    "愤怒": "双拳紧握，下颌紧绷，胸口起伏",
 }
 
 QUALITY_GUARDRAILS = (
@@ -569,7 +562,7 @@ def _specific_lighting(
             if not any(token in lighting for token in ("气氛", "氛围", "雾", "雨", "尘", "颗粒", "潮湿")):
                 lighting += "，空气颗粒轻微可见，气氛与剧情情绪一致"
             return lighting
-    if any(token in where for token in ("夜", "月", "室外")):
+    if any(token in where for token in ("夜", "月")):
         return "冷蓝月光从镜头右上方射入，色温5600K，暖橙环境光轻微补亮轮廓，气氛克制"
     if any(token in where for token in ("室内", "房", "店", "办公室")):
         return "暖白LED主光从镜头左上方照射，色温4200K，右侧冷色窗光勾勒轮廓，气氛沉静"
@@ -629,12 +622,13 @@ def _build_eight_layer_prompt(
     ]
     duration = float(shot.get("suggested_duration", shot.get("duration", 5)))
     aspect_ratio = str(shot.get("aspect_ratio") or "16:9")
-    camera_key = str(shot.get("camera_movement") or INTENT_TO_CAMERA.get(intent, "slow_pan")).lower()
-    if generation_actions or intent == "action":
-        if camera_key in {"static", "fixed", "unspecified", ""}:
+    declared_camera = str(shot.get("camera_movement") or "").strip().lower()
+    camera_key = declared_camera or INTENT_TO_CAMERA.get(intent, "slow_pan")
+    if declared_camera in {"", "unspecified"}:
+        if generation_actions or intent == "action":
             camera_key = "steadicam"
-    elif duration >= 4 and camera_key in {"static", "fixed", "unspecified", ""}:
-        camera_key = "dolly_in"
+        elif duration >= 4:
+            camera_key = "dolly_in"
     shot["camera_movement"] = camera_key
     camera = CAMERA_TERMS.get(camera_key, "固定(fixed/locked)")
     framing = SHOT_SIZE_MAP.get(str(shot.get("shot_size") or "medium").lower(), "Medium shot")
@@ -657,18 +651,6 @@ def _build_eight_layer_prompt(
             action = f"{action}；补充：{supplemental}"
     else:
         action = str(source_action or shot.get("what") or shot.get("visual") or "保持自然姿态")
-    externalized = next((value for key, value in EMOTION_ACTIONS.items() if key in emotion), "")
-    # Generic emotion gestures are only a fallback when the screenplay did not
-    # already provide physical blocking. Adding a "nervous" gesture such as
-    # checking a watch to a fight contract creates an impossible extra action
-    # and competes with the authored choreography.
-    if (
-        not generation_actions
-        and intent != "action"
-        and externalized
-        and externalized not in action
-    ):
-        action = f"{action}，{externalized}"
     where = str(shot.get("where") or "当前场景")
     scene_suffix = (scene_style_map or {}).get(where, "")
     visual_style = _load_default_visual_style(visual_style_path)
@@ -892,9 +874,19 @@ def generate_storyboard(
         or layout_config.get("aspect_ratio")
         or ""
     ).strip()
+    configured_width = int(
+        pipeline_config.get("width") or layout_config.get("width") or 0
+    )
+    configured_height = int(
+        pipeline_config.get("height") or layout_config.get("height") or 0
+    )
     if configured_aspect:
         for shot in shots:
             shot.setdefault("aspect_ratio", configured_aspect)
+            if configured_width > 0:
+                shot.setdefault("width", configured_width)
+            if configured_height > 0:
+                shot.setdefault("height", configured_height)
 
     # --- P1-B1: 同场景共享视觉参数（参考 HonCut 五层镜头构建）---
     # 同场景镜头共享 Layer 3-5（Subject/Lighting/Style），只有 Layer 1-2（Camera/Movement）随镜头变
@@ -963,6 +955,12 @@ def generate_storyboard(
         "target_duration": total_duration,
         "aspect_ratio": configured_aspect or str(
             next((shot.get("aspect_ratio") for shot in storyboard_shots if shot.get("aspect_ratio")), "16:9")
+        ),
+        "width": configured_width or next(
+            (shot.get("width") for shot in storyboard_shots if shot.get("width")), None
+        ),
+        "height": configured_height or next(
+            (shot.get("height") for shot in storyboard_shots if shot.get("height")), None
         ),
         "static_reference_images": {},
         "audio": {

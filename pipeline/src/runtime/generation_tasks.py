@@ -356,7 +356,24 @@ class GenerationTaskStore:
             (_encode_json(outcome), now, now),
         )
 
-    def mark_failed(self, task_id: str, message: str) -> GenerationTask:
+    def mark_failed(
+        self,
+        task_id: str,
+        message: str,
+        *,
+        provider_terminal: bool = False,
+    ) -> GenerationTask:
+        current = self.get(task_id)
+        if (
+            current is not None
+            and current.provider_job_id
+            and not provider_terminal
+        ):
+            raise RuntimeError(
+                "refusing to fail a submitted provider job without an explicit "
+                f"terminal provider state: task_id={task_id}, "
+                f"provider_job_id={current.provider_job_id}"
+            )
         now = _utc_now()
         return self._update_running(
             task_id,

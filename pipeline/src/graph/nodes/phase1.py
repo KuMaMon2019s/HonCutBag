@@ -22,6 +22,7 @@ class Phase1Runner(Protocol):
         dry_run: bool,
         reporter: Any | None = None,
         shot_duration: int = ...,
+        project_video_spec: dict[str, Any] | None = ...,
     ) -> dict[str, Any]: ...
 
 
@@ -41,6 +42,7 @@ def phase1_node(
         dry_run=state["dry_run"],
         reporter=reporter,
         shot_duration=state.get("shot_duration", default_shot_duration),
+        project_video_spec=state.get("project_video_spec"),
     )
 
     storyboard = phase_receipt.pop("_storyboard", None)
