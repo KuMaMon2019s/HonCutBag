@@ -88,7 +88,10 @@ class GraphRunConfig(BaseModel):
     )
     dry_run: bool = False
     chain_mode: bool = False
-    auto_approve: bool = False
+    # Human storyboard review is permanently disabled. Keep this field for
+    # checkpoint/config compatibility; the workflow treats either value as
+    # an unconditional skip and new configurations serialize the true value.
+    auto_approve: bool = True
     transition: str = "crossfade"
     transition_duration_s: float = Field(
         default=0.5,

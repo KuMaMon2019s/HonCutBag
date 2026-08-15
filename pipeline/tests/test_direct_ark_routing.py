@@ -555,9 +555,19 @@ def test_phase4_never_lets_legacy_orchestrator_submit_video(monkeypatch, tmp_pat
 
     monkeypatch.setattr(pipeline_core.subprocess, "run", fake_run)
 
-    pipeline_core.run_phase4(tmp_path, dry_run=False)
+    result = pipeline_core.run_phase4(tmp_path, dry_run=False)
 
     assert "--dry-run" in observed["cmd"]
+    review = result["constraint_review"]
+    assert review["mode"] == "deterministic_code"
+    assert review["human_review_required"] is False
+    assert review["model_review_used"] is False
+    assert {item["id"] for item in review["checks"]} == {
+        "storyboard_artifacts_complete",
+        "scene_and_continuity_contracts_written",
+        "legacy_orchestrator_metadata_only",
+        "shot_meta_ids_exact",
+    }
 
 
 def test_phase4_nonzero_exit_cannot_be_masked_by_partial_shot_dirs(

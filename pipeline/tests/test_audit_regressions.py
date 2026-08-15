@@ -615,7 +615,10 @@ def test_phase5_l3_orders_beat_images_without_shot_image_keys(tmp_path):
     assert issues == []
     assert layer["status"] == "completed"
     assert grid_path.is_file()
-    assert client.calls[0][0] == [grid_path]
+    assert client.calls[0][0][-1] == grid_path
+    assert len(client.calls[0][0]) == 2
+    assert client.calls[0][0][0].name == "storyboard_reference_S01.jpg"
+    assert (tmp_path / "storyboard_qa_inputs.json").is_file()
     assert '"S01_P01", "S01_P02"' in client.calls[0][1]
 
 
@@ -966,6 +969,32 @@ def test_phase5_r1_color_claim_requires_distinct_canonical_panel_evidence():
     assert valid is True
     assert details["evidence_status"] == "validated"
 
+    valid, details = storyboard_qa_gate._r1_attribute_evidence(
+        {
+            "mismatch_type": "clothing_color",
+            "expected": "深黑色战术服",
+            "observed": "深色战术服",
+            "reference_input_indices": [1],
+            "confidence": 0.99,
+            "panel_evidence": [
+                {"shot_id": "S02_P01", "observed": "深色战术服"},
+            ],
+            "character_evidence": [{
+                "character_id": "agent",
+                "reference_input_indices": [1],
+                "expected": "深黑色战术服",
+                "observed": "深色战术服",
+                "storyboard_ids": ["S02_P01"],
+            }],
+        },
+        ["S02_P01"],
+        {1: "agent"},
+        {"agent": "深灰色战术作战服配黑色作战靴"},
+    )
+
+    assert valid is False
+    assert "expected_not_exact_canonical_contract" in details["evidence_reasons"]
+
 
 def test_phase2_panel_prompt_enforces_disarm_and_final_state_contracts():
     prompt = _build_panel_prompt(
@@ -1029,10 +1058,22 @@ def test_phase5_l3_supplies_canonical_character_images(tmp_path):
         character_reference_images={"agent": [face_path, body_path]},
     )
 
-    assert client.paths[:-1] == [face_path, body_path]
+    assert client.paths[:2] == [face_path, body_path]
+    assert client.paths[-2].name == "storyboard_reference_S01.jpg"
     assert client.paths[-1] == tmp_path / "grid.jpg"
+    manifest = json.loads((tmp_path / "storyboard_qa_inputs.json").read_text())
+    assert [item["kind"] for item in manifest["inputs"]] == [
+        "canonical_character_reference",
+        "canonical_character_reference",
+        "storyboard_shot_board",
+        "storyboard_overview_grid",
+    ]
+    assert manifest["inputs"][0]["path"] == str(face_path)
+    assert manifest["inputs"][2]["source_images"][0]["path"] == str(beat_path)
     assert 'mismatch_type="clothing_color"' in client.prompt
     assert "reference_input_indices" in client.prompt
+    assert "canonical_contract" in client.prompt
+    assert "character_evidence" in client.prompt
     assert "panel_evidence" in client.prompt
     assert "A mutual weapon-disarm action is not satisfied" in client.prompt
     assert "stable/stopped/freeze-frame" in client.prompt

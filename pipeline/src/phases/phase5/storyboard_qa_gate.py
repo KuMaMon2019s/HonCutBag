@@ -7,6 +7,7 @@ storyboard; it reports the shots that need to be redrawn before Phase 6.
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 import re
@@ -472,6 +473,67 @@ def create_storyboard_grid(image_paths: list[Path], output_path: Path, columns: 
     return output_path
 
 
+def create_storyboard_shot_boards(
+    storyboard: dict,
+    images: dict[str, Path],
+    output_dir: Path,
+) -> list[dict[str, Any]]:
+    """Create one high-detail, labelled evidence board per authored shot."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    boards: list[dict[str, Any]] = []
+    for shot_index, shot in enumerate(storyboard.get("shots", [])):
+        if not isinstance(shot, dict):
+            continue
+        shot_id = _shot_id(shot, shot_index)
+        storyboard_ids: list[str] = []
+        paths: list[Path] = []
+        for position, beat in enumerate(shot.get("storyboard_beats") or [], 1):
+            if not isinstance(beat, dict):
+                continue
+            beat_id = str(beat.get("beat_id") or f"{shot_id}_P{position:02d}")
+            if beat_id in images:
+                storyboard_ids.append(beat_id)
+                paths.append(images[beat_id])
+        if not paths and shot_id in images:
+            storyboard_ids.append(shot_id)
+            paths.append(images[shot_id])
+        if not paths:
+            continue
+        board_path = output_dir / f"storyboard_reference_{shot_id}.jpg"
+        create_storyboard_grid(
+            paths,
+            board_path,
+            columns=max(1, min(len(paths), 3)),
+        )
+        boards.append({
+            "shot_id": shot_id,
+            "storyboard_ids": storyboard_ids,
+            "path": board_path,
+            "source_paths": paths,
+        })
+    return boards
+
+
+def _sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_l3_input_manifest(path: Path, records: list[dict[str, Any]]) -> Path:
+    """Persist the exact ordered pixels sent to the Phase 5 vision model."""
+    payload = {
+        "schema": "honcut.storyboard-qa-inputs.v1",
+        "input_count": len(records),
+        "inputs": records,
+    }
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+    return path
+
+
 def _ordered_storyboard_images(
     storyboard: dict, images: dict[str, Path]
 ) -> list[Path]:
@@ -627,7 +689,8 @@ def _normalized_visual_attribute(value: Any) -> str:
 def _r1_attribute_evidence(
     value: dict[str, Any],
     storyboard_ids: list[str],
-    reference_count: int,
+    reference_context: int | dict[int, str],
+    canonical_contracts: dict[str, str] | None = None,
 ) -> tuple[bool, dict[str, Any]]:
     """Validate evidence for clothing/color continuity claims.
 
@@ -648,6 +711,17 @@ def _r1_attribute_evidence(
     } or any(term in message for term in _R1_ATTRIBUTE_TERMS)
     if not is_attribute_claim:
         return True, {"evidence_status": "not_attribute_claim"}
+
+    reference_characters = (
+        dict(reference_context)
+        if isinstance(reference_context, dict)
+        else {}
+    )
+    reference_count = (
+        max(reference_characters, default=0)
+        if isinstance(reference_context, dict)
+        else int(reference_context)
+    )
 
     expected = str(value.get("expected") or "").strip()
     observed = str(value.get("observed") or "").strip()
@@ -685,6 +759,56 @@ def _r1_attribute_evidence(
         reasons.append("missing_per_panel_evidence")
     if not math.isfinite(confidence) or confidence < 0.75 or confidence > 1.0:
         reasons.append("confidence_below_0.75")
+    character_evidence = value.get("character_evidence") or []
+    if reference_characters:
+        if not isinstance(character_evidence, list) or not character_evidence:
+            reasons.append("missing_character_evidence")
+            character_evidence = []
+        covered_storyboard_ids: set[str] = set()
+        for evidence in character_evidence:
+            if not isinstance(evidence, dict):
+                reasons.append("invalid_character_evidence")
+                continue
+            character_id = str(evidence.get("character_id") or "").strip()
+            contract = str((canonical_contracts or {}).get(character_id) or "").strip()
+            expected_for_character = str(evidence.get("expected") or "").strip()
+            observed_for_character = str(evidence.get("observed") or "").strip()
+            raw_indices = evidence.get("reference_input_indices") or []
+            if not isinstance(raw_indices, list):
+                raw_indices = [raw_indices]
+            evidence_indices = {
+                int(index) for index in raw_indices if str(index).isdigit()
+            }
+            if (
+                not character_id
+                or not evidence_indices
+                or any(
+                    reference_characters.get(index) != character_id
+                    for index in evidence_indices
+                )
+            ):
+                reasons.append("character_reference_mapping_invalid")
+            if not contract or (
+                _normalized_visual_attribute(expected_for_character)
+                != _normalized_visual_attribute(contract)
+            ):
+                reasons.append("expected_not_exact_canonical_contract")
+            if (
+                not observed_for_character
+                or _normalized_visual_attribute(observed_for_character)
+                == _normalized_visual_attribute(expected_for_character)
+            ):
+                reasons.append("character_expected_equals_observed")
+            raw_ids = evidence.get("storyboard_ids") or []
+            if not isinstance(raw_ids, list):
+                raw_ids = [raw_ids]
+            covered_storyboard_ids.update(
+                str(storyboard_id)
+                for storyboard_id in raw_ids
+                if str(storyboard_id) in storyboard_ids
+            )
+        if not set(storyboard_ids).issubset(covered_storyboard_ids):
+            reasons.append("character_evidence_missing_storyboard_ids")
     return not reasons, {
         "evidence_status": "validated" if not reasons else "unverified",
         "evidence_reasons": reasons,
@@ -693,6 +817,7 @@ def _r1_attribute_evidence(
         "observed": observed,
         "reference_input_indices": reference_indices,
         "confidence": confidence,
+        "character_evidence": character_evidence,
     }
 
 
@@ -715,12 +840,22 @@ def run_l3_review(
             "skipped_reason": "no storyboard images match storyboard IDs",
         }
     create_storyboard_grid(ordered, grid_path)
-    if client is None and not (os.environ.get("ARK_AGENT_API_KEY") or os.environ.get("ARK_API_KEY")):
-        return [], {"status": "skipped", "grid_path": str(grid_path), "skipped_reason": "ARK multimodal API key missing"}
-    valid_storyboard_ids = list(images)
     reference_inputs: list[Path] = []
     reference_manifest: list[dict[str, Any]] = []
+    canonical_contracts: dict[str, str] = {}
     references = character_reference_images or {}
+    for character in characters_data.get("characters", []):
+        if not isinstance(character, dict):
+            continue
+        character_id = str(character.get("id") or "").strip()
+        appearance = character.get("appearance") or {}
+        if character_id and isinstance(appearance, dict):
+            canonical_contracts[character_id] = str(
+                appearance.get("summary")
+                or appearance.get("clothing")
+                or character.get("description")
+                or ""
+            ).strip()
     ordered_character_ids = [
         str(character.get("id") or "")
         for character in characters_data.get("characters", [])
@@ -737,26 +872,90 @@ def run_l3_review(
             reference_inputs.append(path)
             reference_manifest.append({
                 "input_index": len(reference_inputs),
+                "kind": "canonical_character_reference",
                 "character_id": character_id,
                 "view": path.stem,
+                "canonical_contract": canonical_contracts.get(character_id, ""),
+                "path": str(path),
+                "sha256": _sha256_file(path),
             })
-    grid_input_index = len(reference_inputs) + 1
-    prompt = f"""Review the final input image, which is the storyboard grid, against the supplied project artifacts and canonical character reference images. Inputs 1 through {len(reference_inputs)} are character references described by REFERENCE INPUTS below; input {grid_input_index} is the storyboard grid. The grid has exactly 5 columns in row-major order, and every frame has its exact Sxx or Sxx_Pxx ID in a large black badge at the top-left. Associate observations only with that in-frame badge; never infer an ID from a neighbouring cell or row position.
+    evidence_dir = grid_path.parent / "phase5_reference_boards"
+    shot_boards = create_storyboard_shot_boards(
+        storyboard,
+        images,
+        evidence_dir,
+    )
+    valid_storyboard_ids = [
+        storyboard_id
+        for board in shot_boards
+        for storyboard_id in board["storyboard_ids"]
+    ]
+    input_paths = list(reference_inputs)
+    storyboard_manifest: list[dict[str, Any]] = []
+    for board in shot_boards:
+        path = Path(board["path"])
+        input_paths.append(path)
+        storyboard_manifest.append({
+            "input_index": len(input_paths),
+            "kind": "storyboard_shot_board",
+            "shot_id": board["shot_id"],
+            "storyboard_ids": board["storyboard_ids"],
+            "path": str(path),
+            "sha256": _sha256_file(path),
+            "source_images": [
+                {"path": str(source), "sha256": _sha256_file(Path(source))}
+                for source in board["source_paths"]
+            ],
+        })
+    input_paths.append(grid_path)
+    grid_input_index = len(input_paths)
+    overview_manifest = {
+        "input_index": grid_input_index,
+        "kind": "storyboard_overview_grid",
+        "storyboard_ids": valid_storyboard_ids,
+        "path": str(grid_path),
+        "sha256": _sha256_file(grid_path),
+    }
+    input_records = [*reference_manifest, *storyboard_manifest, overview_manifest]
+    input_manifest_path = _write_l3_input_manifest(
+        grid_path.parent / "storyboard_qa_inputs.json",
+        input_records,
+    )
+    if client is None and not (os.environ.get("ARK_AGENT_API_KEY") or os.environ.get("ARK_API_KEY")):
+        return [], {
+            "status": "skipped",
+            "grid_path": str(grid_path),
+            "input_manifest_path": str(input_manifest_path),
+            "input_count": len(input_paths),
+            "skipped_reason": "ARK multimodal API key missing",
+        }
+    prompt = f"""Review the supplied storyboard evidence against the canonical character references and authored project artifacts. Every image listed below is attached to this exact request in ascending input_index order.
+
+INPUT CONTRACT:
+- Inputs 1 through {len(reference_inputs)} are original canonical Phase 3 character reference images, mapped to character_id and view in CHARACTER REFERENCE INPUTS.
+- Inputs {len(reference_inputs) + 1} through {len(reference_inputs) + len(storyboard_manifest)} are high-detail per-shot storyboard boards. Each board contains only the exact Pxx images named in STORYBOARD SHOT INPUTS, with a large black ID badge inside every panel.
+- Input {grid_input_index} is the complete storyboard overview grid for cross-shot continuity only. Use the per-shot boards, not the overview, for fine identity, clothing, prop, and action evidence.
+- Never swap the expected and observed sides: canonical character inputs define EXPECTED; storyboard shot boards define OBSERVED. Never call a character reference a storyboard image.
+- Associate observations only with the in-frame Sxx or Sxx_Pxx badge; never infer an ID from a neighbouring cell or row position.
 
 Apply red lines R1-R4: R1 character identity/gender/build/clothing continuity against the canonical references; R2 time-of-day and lighting continuity; R3 scene/action continuity; R4 storyboard-to-image semantic fidelity. Do not perform face recognition or infer a public identity from appearance alone. Each Pxx image represents only its own authored action and must progress from the previous Pxx without pose reset or premature future action.
 
 Evidence rules:
 - Report only visible contradictions. Absence of proof is not proof of mismatch. Do not infer clothing-color drift from red warning light, shadow, monochrome PREVIS rendering, highlights, or low saturation.
-- For every R1 clothing/color/uniform claim, set mismatch_type="clothing_color" and provide: canonical reference input indices, a concise expected attribute, a concise observed attribute, confidence from 0 to 1, and separate panel_evidence for every listed ID. Expected and observed must name genuinely different visible attributes. If both are dark gray, both are navy, or the difference is only illumination/style, emit no issue.
+- For every R1 clothing/color/uniform claim, set mismatch_type="clothing_color". For each affected character, add one character_evidence object containing the exact character_id, only that character's canonical reference_input_indices, expected copied verbatim from canonical_contract, an observed visual description, and the exact storyboard_ids checked. Do not paraphrase or invent the expected contract. Also provide confidence from 0 to 1 and separate panel_evidence for every listed ID. Expected and observed must name genuinely different visible attributes. If both are dark gray, both are navy, or the difference is only illumination/style, emit no issue.
 - Never copy one panel observation across a range. List multiple IDs only after independently checking each badge; panel_evidence must contain one observation per listed ID.
 - For R4, compare the literal actor → action → target → prop ownership → end state. A mutual weapon-disarm action is not satisfied by one actor aiming a weapon. Do not reverse attacker/defender or weapon ownership.
 - For the final Pxx, verify the authored result is visibly complete. If the contract says stable/stopped/freeze-frame while another character flies toward or hits a target, ongoing mutual fighting or generic floating is a mismatch.
 
 Reserve severe for production-breaking mismatches: wrong/missing character identity or gender, wrong location/time-of-day, reversed attacker/defender, wholly unrelated core action, or a continuation panel that visibly resets/replays the prior state. Use moderate for material but recoverable semantic mismatches, exact prop/action-state errors, blocking offsets, or intermediate/final-state omissions. Only identify problems; do not propose or perform edits.
 
-Return JSON only: {{"issues":[{{"red_line":"R1|R2|R3|R4","severity":"severe|moderate|minor","mismatch_type":"identity|gender|clothing_color|lighting|action|end_state|other","shot_ids":["S01_P01"],"message":"...","reference_input_indices":[1],"expected":"canonical concise fact","observed":"visibly different concise fact","confidence":0.90,"panel_evidence":[{{"shot_id":"S01_P01","observed":"specific visible evidence in this panel"}}]}}]}}. Use only these exact IDs: {json.dumps(valid_storyboard_ids, ensure_ascii=False)}.
-REFERENCE INPUTS:
+Return JSON only: {{"issues":[{{"red_line":"R1|R2|R3|R4","severity":"severe|moderate|minor","mismatch_type":"identity|gender|clothing_color|lighting|action|end_state|other","shot_ids":["S01_P01"],"message":"...","reference_input_indices":[1],"expected":"canonical concise fact","observed":"visibly different concise fact","confidence":0.90,"character_evidence":[{{"character_id":"agent","reference_input_indices":[1,2],"expected":"exact canonical_contract text","observed":"specific visible storyboard attribute","storyboard_ids":["S01_P01"]}}],"panel_evidence":[{{"shot_id":"S01_P01","observed":"specific visible evidence in this panel"}}]}}]}}. Use only these exact IDs: {json.dumps(valid_storyboard_ids, ensure_ascii=False)}.
+CHARACTER REFERENCE INPUTS:
 {json.dumps(reference_manifest, ensure_ascii=False)}
+STORYBOARD SHOT INPUTS:
+{json.dumps(storyboard_manifest, ensure_ascii=False)}
+OVERVIEW INPUT:
+{json.dumps(overview_manifest, ensure_ascii=False)}
 STORYBOARD:
 {json.dumps(storyboard, ensure_ascii=False)}
 CHARACTERS:
@@ -765,13 +964,13 @@ VISUAL STYLE:
 {visual_style}"""
     try:
         raw = (client or ArkMultimodalClient()).review(
-            [*reference_inputs, grid_path], prompt
+            input_paths, prompt
         )
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.IGNORECASE)
         parsed = json.loads(raw)
         if not isinstance(parsed, dict) or not isinstance(parsed.get("issues"), list):
             raise ValueError("response must contain an issues array")
-        valid_ids = set(images)
+        valid_ids = set(valid_storyboard_ids)
         issues = []
         for value in parsed["issues"]:
             if not isinstance(value, dict):
@@ -786,7 +985,11 @@ VISUAL STYLE:
             evidence_valid, evidence_details = _r1_attribute_evidence(
                 value,
                 storyboard_ids,
-                len(reference_inputs),
+                {
+                    int(item["input_index"]): str(item["character_id"])
+                    for item in reference_manifest
+                },
+                canonical_contracts,
             ) if red_line.upper() == "R1" else (True, {"evidence_status": "not_required"})
             if not evidence_valid:
                 severity = "minor"
@@ -796,9 +999,21 @@ VISUAL STYLE:
                 storyboard_ids=storyboard_ids,
                 **evidence_details,
             ))
-        return issues, {"status": "completed", "grid_path": str(grid_path), "raw_issue_count": len(parsed["issues"])}
+        return issues, {
+            "status": "completed",
+            "grid_path": str(grid_path),
+            "input_manifest_path": str(input_manifest_path),
+            "input_count": len(input_paths),
+            "raw_issue_count": len(parsed["issues"]),
+        }
     except Exception as exc:
-        return [], {"status": "skipped", "grid_path": str(grid_path), "skipped_reason": f"multimodal review unavailable: {exc}"}
+        return [], {
+            "status": "skipped",
+            "grid_path": str(grid_path),
+            "input_manifest_path": str(input_manifest_path),
+            "input_count": len(input_paths),
+            "skipped_reason": f"multimodal review unavailable: {exc}",
+        }
 
 
 def is_blocking_issue(issue: dict) -> bool:
@@ -966,7 +1181,7 @@ def run_storyboard_qa_gate(output_dir: Path, similarity_threshold: float | None 
         for issue in blocking_issues(issues)
         for sid in issue.get("shot_ids", [])
     })
-    report = {"status": "done" if grade in {"A", "B"} else "error", "grade": grade, "gate_passed": grade in {"A", "B"}, "issues": issues, "issue_counts": {severity: sum(item.get("severity") == severity for item in issues) for severity in ("severe", "moderate", "minor")}, "failed_shot_ids": failed_shots, "shots": per_shot, "variation_score": variation_quality, "slideshow_risk": slideshow_risk, "layers": {"L1": {"status": "completed"}, "L2": l2, "L3": l3}, "outputs": ["storyboard_qa_report.json", "variation_report.json", "slideshow_risk_report.json", *( ["storyboard_qa_grid.jpg"] if grid_path_exists(output_dir) else [])]}
+    report = {"status": "done" if grade in {"A", "B"} else "error", "grade": grade, "gate_passed": grade in {"A", "B"}, "issues": issues, "issue_counts": {severity: sum(item.get("severity") == severity for item in issues) for severity in ("severe", "moderate", "minor")}, "failed_shot_ids": failed_shots, "shots": per_shot, "variation_score": variation_quality, "slideshow_risk": slideshow_risk, "layers": {"L1": {"status": "completed"}, "L2": l2, "L3": l3}, "outputs": ["storyboard_qa_report.json", "variation_report.json", "slideshow_risk_report.json", *( ["storyboard_qa_grid.jpg"] if grid_path_exists(output_dir) else []), *( ["storyboard_qa_inputs.json"] if (output_dir / "storyboard_qa_inputs.json").is_file() else [])]}
     if not report["gate_passed"]:
         report["error"] = f"Storyboard QA grade {grade} blocks Phase 6; redraw only failed_shot_ids"
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")

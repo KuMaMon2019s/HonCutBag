@@ -156,7 +156,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--media-profile", choices=_core.AVAILABLE_PROFILES, default=None, help="编码配置（默认 1080p）"
     )
     parser.add_argument("--resume", action="store_true", help="从检查点恢复")
-    parser.add_argument("--auto-approve", action="store_true", help="自动批准人工审核节点")
+    parser.add_argument(
+        "--auto-approve",
+        action="store_true",
+        default=True,
+        help="兼容参数；人工故事板复查已永久禁用并始终跳过",
+    )
     parser.add_argument("--resume-from", help="从指定阶段恢复（如 phase5）")
     parser.add_argument(
         "--phase", choices=PHASES, help="Execute single phase only (e.g., 'phase1', 'phase6')"

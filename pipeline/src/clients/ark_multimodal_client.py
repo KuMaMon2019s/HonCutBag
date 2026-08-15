@@ -97,7 +97,11 @@ class ArkMultimodalClient:
                 [
                     {
                         "type": "text",
-                        "text": f"Storyboard image {position}: {path.stem}",
+                        # Some inputs are canonical character references and
+                        # others are storyboard evidence boards. Calling all
+                        # of them "Storyboard image" caused the model to swap
+                        # the reference and observed sides of comparisons.
+                        "text": f"Input image {position}: {path.stem}",
                     },
                     {
                         "type": "image_url",
