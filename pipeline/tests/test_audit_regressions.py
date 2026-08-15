@@ -34,6 +34,7 @@ from phases.phase1.director_storyboard import materialize_director_panels
 from phases.phase1.storyboard_beats import plan_storyboard_beats
 from phases.phase1.storyboard_generator import _build_shot_prompt_legacy
 from phases.phase2.shot_storyboards import (
+    _build_panel_prompt,
     _character_reference_paths,
     build_shot_storyboard_prompt,
     generate_shot_storyboards,
@@ -926,6 +927,71 @@ def test_phase5_separate_moderate_findings_become_systemic_across_shots():
     assert storyboard_qa_gate.blocking_issues(issues) == issues
 
 
+def test_phase5_r1_color_claim_requires_distinct_canonical_panel_evidence():
+    valid, details = storyboard_qa_gate._r1_attribute_evidence(
+        {
+            "mismatch_type": "clothing_color",
+            "expected": "深灰色战术服",
+            "observed": "深灰色战术服",
+            "reference_input_indices": [1],
+            "confidence": 0.96,
+            "panel_evidence": [
+                {"shot_id": "S02_P01", "observed": "深灰色战术服"},
+                {"shot_id": "S03_P01", "observed": "深灰色战术服"},
+            ],
+        },
+        ["S02_P01", "S03_P01"],
+        2,
+    )
+
+    assert valid is False
+    assert "expected_equals_observed" in details["evidence_reasons"]
+
+    valid, details = storyboard_qa_gate._r1_attribute_evidence(
+        {
+            "mismatch_type": "clothing_color",
+            "expected": "深灰色战术服",
+            "observed": "亮白色太空服",
+            "reference_input_indices": [1],
+            "confidence": 0.93,
+            "panel_evidence": [
+                {"shot_id": "S02_P01", "observed": "亮白色太空服"},
+                {"shot_id": "S03_P01", "observed": "亮白色太空服"},
+            ],
+        },
+        ["S02_P01", "S03_P01"],
+        2,
+    )
+
+    assert valid is True
+    assert details["evidence_status"] == "validated"
+
+
+def test_phase2_panel_prompt_enforces_disarm_and_final_state_contracts():
+    prompt = _build_panel_prompt(
+        {"who": ["agent", "guard"], "where": "旋转运输船走廊"},
+        {
+            "beat_id": "S06_P02",
+            "generation_mode": "extend",
+            "start_state": "双方仍在失重翻滚",
+            "action": "Agent 解除保安武器并将保安扔向观察窗",
+            "end_state": "Agent 恢复稳定，保安飞向观察窗，画面定格",
+        },
+        2,
+        2,
+        [
+            {"id": "agent", "appearance": {"summary": "深灰色战术服"}},
+            {"id": "guard", "appearance": {"summary": "藏蓝色保安制服"}},
+        ],
+    )
+
+    assert "项目角色参考与下方角色合同始终优先于上一格" in prompt
+    assert "双方同时接触并控制同一武器" in prompt
+    assert "动作→对象→道具→结束状态" in prompt
+    assert "不得仍停留在搏斗、准备、过渡或前一动作中" in prompt
+    assert "不得用运动线否定静止/定格" in prompt
+
+
 def test_phase5_l3_supplies_canonical_character_images(tmp_path):
     from PIL import Image
 
@@ -938,9 +1004,11 @@ def test_phase5_l3_supplies_canonical_character_images(tmp_path):
     class ReviewClient:
         def __init__(self):
             self.paths = []
+            self.prompt = ""
 
-        def review(self, image_paths, _prompt):
+        def review(self, image_paths, prompt):
             self.paths = list(image_paths)
+            self.prompt = prompt
             return '{"issues": []}'
 
     client = ReviewClient()
@@ -963,3 +1031,61 @@ def test_phase5_l3_supplies_canonical_character_images(tmp_path):
 
     assert client.paths[:-1] == [face_path, body_path]
     assert client.paths[-1] == tmp_path / "grid.jpg"
+    assert 'mismatch_type="clothing_color"' in client.prompt
+    assert "reference_input_indices" in client.prompt
+    assert "panel_evidence" in client.prompt
+    assert "A mutual weapon-disarm action is not satisfied" in client.prompt
+    assert "stable/stopped/freeze-frame" in client.prompt
+
+
+def test_phase5_unverified_systemic_clothing_claim_is_non_blocking(tmp_path):
+    from PIL import Image
+
+    images = {}
+    for beat_id in ("S02_P01", "S03_P01"):
+        path = tmp_path / f"{beat_id}.png"
+        Image.new("RGB", (160, 90), "gray").save(path)
+        images[beat_id] = path
+    reference = tmp_path / "agent_full_body.png"
+    Image.new("RGB", (90, 160), "gray").save(reference)
+
+    class ContradictoryReviewClient:
+        def review(self, _image_paths, _prompt):
+            return json.dumps({
+                "issues": [{
+                    "red_line": "R1",
+                    "severity": "moderate",
+                    "mismatch_type": "clothing_color",
+                    "shot_ids": ["S02_P01", "S03_P01"],
+                    "message": "服装颜色不符",
+                    "reference_input_indices": [1],
+                    "expected": "深灰色战术服",
+                    "observed": "深灰色战术服",
+                    "confidence": 0.98,
+                    "panel_evidence": [
+                        {"shot_id": "S02_P01", "observed": "深灰色战术服"},
+                        {"shot_id": "S03_P01", "observed": "深灰色战术服"},
+                    ],
+                }],
+            }, ensure_ascii=False)
+
+    issues, status = storyboard_qa_gate.run_l3_review(
+        {
+            "shots": [
+                {"id": "S02", "storyboard_beats": [{"beat_id": "S02_P01"}]},
+                {"id": "S03", "storyboard_beats": [{"beat_id": "S03_P01"}]},
+            ],
+        },
+        {"characters": [{"id": "agent"}]},
+        "cinematic",
+        images,
+        tmp_path / "grid.jpg",
+        ContradictoryReviewClient(),
+        character_reference_images={"agent": [reference]},
+    )
+
+    assert status["status"] == "completed"
+    assert issues[0]["severity"] == "minor"
+    assert issues[0]["details"]["evidence_status"] == "unverified"
+    assert "expected_equals_observed" in issues[0]["details"]["evidence_reasons"]
+    assert storyboard_qa_gate.grade_issues(issues) == "A"

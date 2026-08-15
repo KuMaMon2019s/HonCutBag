@@ -180,10 +180,25 @@ def _build_panel_prompt(
         if uses_director_board
         else ""
     )
+    previous_state_contract = (
+        "上一参考图只用于继承空间轴线、机位、动作方向和上一格结束姿态；"
+        "项目角色参考与下方角色合同始终优先于上一格。若上一格的发型、服装基础色、"
+        "身份或武器归属有偏差，本格必须纠正，不得继续放大偏差。"
+        if generation_mode == "extend"
+        else "项目角色参考与下方角色合同是人物身份、发型、服装基础色和装备的唯一准绳。"
+    )
+    final_beat_contract = (
+        "这是本镜最后一格：必须把“结束状态”作为画面最醒目的已完成事实。若结束状态包含"
+        "稳定、停止、定格、落地、倒地、飞向或撞向等结果，必须清楚画出该结果；"
+        "不得仍停留在搏斗、准备、过渡或前一动作中，也不得用运动线否定静止/定格。"
+        if position == count
+        else "这不是本镜最后一格：只推进到本格结束状态，不得抢先画后续格的结果。"
+    )
     return f"""绘制一张单独的 {aspect_ratio} PREVIS 导演手绘故事格：{beat_id}（第 {position}/{count} 格）。
 
 {continuation}
 {director_reference}
+{previous_state_contract}
 本格起始状态：{_compact(beat.get('start_state'))}
 本格唯一可见动作：{_compact(beat.get('action'))}
 本格必须到达的结束状态：{_compact(beat.get('end_state'))}
@@ -194,10 +209,16 @@ def _build_panel_prompt(
 角色：
 {_character_contract(characters, who)}
 
+角色与动作硬约束：
+- 逐字遵守角色合同中的发型、服装基础色、制服类型、体型和装备；警示灯、阴影和炭笔风格只能改变受光，不得把服装基础色改成另一角色的颜色。
+- 每个动作的执行者、承受者、左右位置、朝向以及武器持有者必须与“本格唯一可见动作”一致；禁止交换人物、攻守关系或武器归属。
+- “解除武器/争夺武器”必须画出双方同时接触并控制同一武器的过程，不得替换为单方持枪瞄准、开枪或普通对打；其他动作也不得用相邻剧情或泛化搏斗代替。
+- {final_beat_contract}
+
 风格要求：黑色粗铅笔与炭笔、少量灰色阴影、快速 gesture drawing、专业导演工作稿；
 动作方向可用红色手绘箭头，摄像机运动可用蓝色箭头。人物外形严格遵守项目角色合同。
 画面必须铺满 {aspect_ratio} 单格，禁止分格、拼贴、边框、大标题、字幕、对白气泡、编号和水印。
-只画本格动作，不得提前表现 P{position + 1:02d} 或其他 Sxx 的剧情。"""
+只画本格动作，不得提前表现 P{position + 1:02d} 或其他 Sxx 的剧情。生成前先核对角色→动作→对象→道具→结束状态五项；任一项冲突时必须重新构图后再输出。"""
 
 
 def _font(size: int) -> ImageFont.ImageFont:

@@ -593,6 +593,109 @@ def _calibrate_l3_severity(red_line: str, severity: str, message: str) -> str:
     return severity
 
 
+_R1_ATTRIBUTE_TERMS = (
+    "color",
+    "colour",
+    "clothing",
+    "costume",
+    "uniform",
+    "outfit",
+    "颜色",
+    "服装",
+    "制服",
+    "衣服",
+    "穿着",
+)
+
+
+def _normalized_visual_attribute(value: Any) -> str:
+    """Normalize concise expected/observed R1 attribute claims."""
+    text = str(value or "").casefold()
+    aliases = {
+        "dark grey": "darkgray",
+        "dark gray": "darkgray",
+        "深灰色": "深灰",
+        "navy blue": "navy",
+        "dark blue": "navy",
+        "藏蓝色": "藏蓝",
+    }
+    for source, target in aliases.items():
+        text = text.replace(source, target)
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", text)
+
+
+def _r1_attribute_evidence(
+    value: dict[str, Any],
+    storyboard_ids: list[str],
+    reference_count: int,
+) -> tuple[bool, dict[str, Any]]:
+    """Validate evidence for clothing/color continuity claims.
+
+    R1 identity and gender findings remain governed by the severe mismatch
+    calibration. Attribute drift is more vulnerable to lighting/style
+    hallucinations, so it needs explicit canonical and per-panel evidence
+    before it can block paid generation.
+    """
+    mismatch_type = str(value.get("mismatch_type") or "").casefold()
+    message = str(value.get("message") or "").casefold()
+    is_attribute_claim = mismatch_type in {
+        "clothing_color",
+        "clothing",
+        "costume",
+        "uniform",
+        "color",
+        "colour",
+    } or any(term in message for term in _R1_ATTRIBUTE_TERMS)
+    if not is_attribute_claim:
+        return True, {"evidence_status": "not_attribute_claim"}
+
+    expected = str(value.get("expected") or "").strip()
+    observed = str(value.get("observed") or "").strip()
+    raw_reference_indices = value.get("reference_input_indices") or []
+    if not isinstance(raw_reference_indices, list):
+        raw_reference_indices = [raw_reference_indices]
+    reference_indices = sorted({
+        int(index)
+        for index in raw_reference_indices
+        if str(index).isdigit() and 1 <= int(index) <= reference_count
+    })
+    raw_panel_evidence = value.get("panel_evidence") or []
+    if not isinstance(raw_panel_evidence, list):
+        raw_panel_evidence = []
+    evidence_ids = {
+        str(item.get("shot_id") or "")
+        for item in raw_panel_evidence
+        if isinstance(item, dict)
+        and str(item.get("observed") or "").strip()
+    }
+    try:
+        confidence = float(value.get("confidence"))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    expected_normalized = _normalized_visual_attribute(expected)
+    observed_normalized = _normalized_visual_attribute(observed)
+    reasons = []
+    if not expected_normalized or not observed_normalized:
+        reasons.append("missing_expected_or_observed")
+    elif expected_normalized == observed_normalized:
+        reasons.append("expected_equals_observed")
+    if not reference_indices:
+        reasons.append("missing_canonical_reference")
+    if not storyboard_ids or not set(storyboard_ids).issubset(evidence_ids):
+        reasons.append("missing_per_panel_evidence")
+    if not math.isfinite(confidence) or confidence < 0.75 or confidence > 1.0:
+        reasons.append("confidence_below_0.75")
+    return not reasons, {
+        "evidence_status": "validated" if not reasons else "unverified",
+        "evidence_reasons": reasons,
+        "mismatch_type": mismatch_type or "unspecified_attribute",
+        "expected": expected,
+        "observed": observed,
+        "reference_input_indices": reference_indices,
+        "confidence": confidence,
+    }
+
+
 def run_l3_review(
     storyboard: dict,
     characters_data: dict,
@@ -638,7 +741,20 @@ def run_l3_review(
                 "view": path.stem,
             })
     grid_input_index = len(reference_inputs) + 1
-    prompt = f"""Review the final input image, which is the storyboard grid, against the supplied project artifacts and canonical character reference images. Inputs 1 through {len(reference_inputs)} are character references described by REFERENCE INPUTS below; input {grid_input_index} is the storyboard grid. The grid has exactly 5 columns in row-major order, and every frame has its exact Sxx or Sxx_Pxx ID in a large black badge at the top-left. Associate observations only with that in-frame badge; never infer an ID from a neighbouring cell or row position. Apply red lines R1-R4: R1 character identity/gender/build/clothing continuity against the canonical references; R2 time-of-day and lighting continuity; R3 scene/action continuity; R4 storyboard-to-image semantic fidelity. Do not perform face recognition or infer a public identity from appearance alone. Each Pxx image represents only its own authored action and must progress from the previous Pxx without pose reset or premature future action. Reserve severe for production-breaking mismatches: wrong/missing character identity or gender, wrong location/time-of-day, reversed attacker/defender, wholly unrelated core action, or a continuation panel that visibly resets/replays the prior state. Use moderate for material nuances, exact prop angle, blocking offsets, or minor intermediate-motion omissions. Only identify problems; do not propose or perform edits. Return JSON: {{"issues":[{{"red_line":"R1","severity":"severe|moderate|minor","shot_ids":["S01_P01"],"message":"..."}}]}}. Use only these exact IDs: {json.dumps(valid_storyboard_ids, ensure_ascii=False)}.
+    prompt = f"""Review the final input image, which is the storyboard grid, against the supplied project artifacts and canonical character reference images. Inputs 1 through {len(reference_inputs)} are character references described by REFERENCE INPUTS below; input {grid_input_index} is the storyboard grid. The grid has exactly 5 columns in row-major order, and every frame has its exact Sxx or Sxx_Pxx ID in a large black badge at the top-left. Associate observations only with that in-frame badge; never infer an ID from a neighbouring cell or row position.
+
+Apply red lines R1-R4: R1 character identity/gender/build/clothing continuity against the canonical references; R2 time-of-day and lighting continuity; R3 scene/action continuity; R4 storyboard-to-image semantic fidelity. Do not perform face recognition or infer a public identity from appearance alone. Each Pxx image represents only its own authored action and must progress from the previous Pxx without pose reset or premature future action.
+
+Evidence rules:
+- Report only visible contradictions. Absence of proof is not proof of mismatch. Do not infer clothing-color drift from red warning light, shadow, monochrome PREVIS rendering, highlights, or low saturation.
+- For every R1 clothing/color/uniform claim, set mismatch_type="clothing_color" and provide: canonical reference input indices, a concise expected attribute, a concise observed attribute, confidence from 0 to 1, and separate panel_evidence for every listed ID. Expected and observed must name genuinely different visible attributes. If both are dark gray, both are navy, or the difference is only illumination/style, emit no issue.
+- Never copy one panel observation across a range. List multiple IDs only after independently checking each badge; panel_evidence must contain one observation per listed ID.
+- For R4, compare the literal actor → action → target → prop ownership → end state. A mutual weapon-disarm action is not satisfied by one actor aiming a weapon. Do not reverse attacker/defender or weapon ownership.
+- For the final Pxx, verify the authored result is visibly complete. If the contract says stable/stopped/freeze-frame while another character flies toward or hits a target, ongoing mutual fighting or generic floating is a mismatch.
+
+Reserve severe for production-breaking mismatches: wrong/missing character identity or gender, wrong location/time-of-day, reversed attacker/defender, wholly unrelated core action, or a continuation panel that visibly resets/replays the prior state. Use moderate for material but recoverable semantic mismatches, exact prop/action-state errors, blocking offsets, or intermediate/final-state omissions. Only identify problems; do not propose or perform edits.
+
+Return JSON only: {{"issues":[{{"red_line":"R1|R2|R3|R4","severity":"severe|moderate|minor","mismatch_type":"identity|gender|clothing_color|lighting|action|end_state|other","shot_ids":["S01_P01"],"message":"...","reference_input_indices":[1],"expected":"canonical concise fact","observed":"visibly different concise fact","confidence":0.90,"panel_evidence":[{{"shot_id":"S01_P01","observed":"specific visible evidence in this panel"}}]}}]}}. Use only these exact IDs: {json.dumps(valid_storyboard_ids, ensure_ascii=False)}.
 REFERENCE INPUTS:
 {json.dumps(reference_manifest, ensure_ascii=False)}
 STORYBOARD:
@@ -667,10 +783,18 @@ VISUAL STYLE:
                 red_line, requested_severity, message
             )
             storyboard_ids = [sid for sid in value.get("shot_ids", []) if sid in valid_ids]
+            evidence_valid, evidence_details = _r1_attribute_evidence(
+                value,
+                storyboard_ids,
+                len(reference_inputs),
+            ) if red_line.upper() == "R1" else (True, {"evidence_status": "not_required"})
+            if not evidence_valid:
+                severity = "minor"
             shot_ids = sorted({_parent_shot_id(sid) for sid in storyboard_ids})
             issues.append(_issue(
                 "L3", severity, red_line, message, shot_ids,
                 storyboard_ids=storyboard_ids,
+                **evidence_details,
             ))
         return issues, {"status": "completed", "grid_path": str(grid_path), "raw_issue_count": len(parsed["issues"])}
     except Exception as exc:
