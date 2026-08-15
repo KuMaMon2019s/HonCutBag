@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+import json
 
 
 SRC = Path(__file__).resolve().parents[1] / "src"
@@ -9,6 +10,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from phases import pipeline_core
+from phases.phase3.character_factory import build_model_reference_prompts
 from phases.phase6.video_generator import build_video_prompt
 from utils.style_slices import get_slice, split_visual_style
 
@@ -80,6 +82,60 @@ def test_phase3_character_builder_receives_sliced_style(tmp_path, monkeypatch):
     assert "blue palette" in captured[0]
     assert "believable physics" not in captured[0]
     assert len(captured[0]) < len(STYLE)
+
+
+def test_phase3_persists_and_generates_from_no_real_person_contract(tmp_path, monkeypatch):
+    captured = []
+    monkeypatch.setenv("HONCUT_NO_REAL_PERSON", "1")
+
+    def fake_batch(characters, output_dir, skip_images=False):
+        captured.extend(characters)
+        return ["characters/agent/"]
+
+    monkeypatch.setattr("phases.phase3.character_factory.batch_generate", fake_batch)
+    monkeypatch.setattr(
+        pipeline_core,
+        "run_quality_check",
+        lambda *args, **kwargs: type("Report", (), {"passed": True})(),
+    )
+    source = {
+        "characters": [
+            {
+                "id": "agent",
+                "name": "Agent",
+                "role": "protagonist",
+                "style": "真人写实",
+                "appearance": {
+                    "hair": "黑色短发",
+                    "face": "高鼻梁",
+                    "clothing": "深灰色战术服",
+                    "summary": "男性真人特工",
+                },
+            }
+        ]
+    }
+
+    result = pipeline_core.run_phase3(tmp_path, source, dry_run=True)
+
+    persisted = json.loads((tmp_path / "CHARACTERS.json").read_text(encoding="utf-8"))
+    assert result["status"] == "done"
+    assert persisted["visual_identity_policy"] == "synthetic_faceless_android_v1"
+    assert "全封闭机械头盔" in captured[0]["description"]
+    assert "风格化三维 CGI" in captured[0]["style"]
+    assert "photorealistic human" in captured[0]["negative"]
+
+
+def test_cgi_character_style_never_falls_back_to_photoreal_skin():
+    prompts = build_model_reference_prompts(
+        "全封闭机械头盔的虚构合成人",
+        "高成本风格化三维 CGI 科幻动画",
+    )
+
+    assert all("no visible human face" in prompt for prompt in prompts.values())
+    assert all(
+        "Photorealistic, natural skin texture" not in prompt
+        for prompt in prompts.values()
+    )
 
 
 def test_storyboard_prompt_builder_does_not_receive_plot_bearing_global_style(tmp_path, monkeypatch):

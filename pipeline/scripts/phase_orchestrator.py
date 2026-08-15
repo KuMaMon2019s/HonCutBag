@@ -420,6 +420,8 @@ def run_phase(phase: str, config: dict) -> dict:
         cmd.append("--dry-run")
     if config.get("chain_mode"):
         cmd.append("--chain-mode")
+    if config.get("no_real_person"):
+        cmd.append("--no-real-person")
     if config.get("_resume"):
         cmd.append("--resume")
     cmd.append(

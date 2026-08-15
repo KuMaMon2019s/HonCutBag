@@ -439,6 +439,7 @@ def test_semantic_media_ratios_and_cli_resume_defaults(tmp_path):
                     "transition_duration": 0.0,
                     "media_profile": "cinematic",
                     "enable_reshoot": False,
+                    "no_real_person": True,
                 }
             }
         ),
@@ -452,6 +453,7 @@ def test_semantic_media_ratios_and_cli_resume_defaults(tmp_path):
     assert pipeline_runner_cli._resolved_run_arguments(args)["media_profile"] == (
         "cinematic"
     )
+    assert pipeline_runner_cli._resolved_run_arguments(args)["no_real_person"] is True
 
 
 def test_director_failure_removes_a_stale_plan(tmp_path, monkeypatch):
@@ -480,12 +482,14 @@ def test_manifest_records_effective_route_and_phase6_requires_phase5(
         text="a clean-room test script",
         output_dir=str(tmp_path),
         dry_run=True,
+        no_real_person=True,
         skip_phase=all_phases,
     )
     manifest = json.loads((tmp_path / "RUN_MANIFEST.json").read_text())
 
     assert initial["status"] == "completed"
     assert manifest["resolved_config"]["video_generation_mode"] == "direct"
+    assert manifest["resolved_config"]["no_real_person"] is True
 
     (tmp_path / "STORYBOARD.json").write_text(
         json.dumps({"shots": [{"id": "S01", "duration": 5}]}),
@@ -506,6 +510,7 @@ def test_manifest_records_effective_route_and_phase6_requires_phase5(
         text="a clean-room test script",
         output_dir=str(tmp_path),
         dry_run=True,
+        no_real_person=True,
         skip_phase=[1, 2, 3, 4, 5, 7, 8, 9, 9.5],
     )
 

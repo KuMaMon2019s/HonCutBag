@@ -93,7 +93,15 @@ def _character_contract(
                 f"- {character.get('name') or character.get('id')}："
                 f"{_compact(description, 220)}"
             )
-    return "\n".join(lines) or "- 严格使用 STORYBOARD.json 声明的角色设定，不自行增加人物。"
+    contract = "\n".join(lines) or "- 严格使用 STORYBOARD.json 声明的角色设定，不自行增加人物。"
+    from utils.privacy_visual_policy import (
+        is_no_real_person_enabled,
+        no_real_person_prompt_contract,
+    )
+
+    if is_no_real_person_enabled():
+        contract = f"- {no_real_person_prompt_contract()}\n{contract}"
+    return contract
 
 
 def build_shot_storyboard_prompt(
@@ -222,6 +230,7 @@ Phase 5 定向纠偏合同：
 {_character_contract(characters, who)}
 
 角色与动作硬约束：
+- 若角色合同启用“非真人视觉硬约束”，角色在每一格都必须保持全封闭不透明面甲，禁止露出人脸、皮肤、头发或真人肖像特征；旧剧情中的男性、脸、头发、真人写实描述不得覆盖该约束。
 - 逐字遵守角色合同中的发型、服装基础色、制服类型、体型和装备；警示灯、阴影和炭笔风格只能改变受光，不得把服装基础色改成另一角色的颜色。
 - 每个动作的执行者、承受者、左右位置、朝向以及武器持有者必须与“本格唯一可见动作”一致；禁止交换人物、攻守关系或武器归属。
 - “解除武器/争夺武器”必须画出双方同时接触并控制同一武器的过程，不得替换为单方持枪瞄准、开枪或普通对打；其他动作也不得用相邻剧情或泛化搏斗代替。

@@ -956,6 +956,33 @@ def test_provider_uses_each_chunk_storyboard_panel_and_action(monkeypatch, tmp_p
     assert "Execute only this visible action: 烬抬起机械臂格挡" in content[0]["text"]
 
 
+def test_provider_prepends_no_real_person_visual_contract(monkeypatch, tmp_path):
+    shot_dir = tmp_path / "shots/S01"
+    shot_dir.mkdir(parents=True)
+    (shot_dir / "SHOT_META.json").write_text(
+        json.dumps({"prompt": "写实男性特工近身搏斗", "gen_strategy": "i2v"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HONCUT_NO_REAL_PERSON", "1")
+    monkeypatch.setattr(
+        "tools.asset_packager.build_content_for_shot",
+        lambda **kwargs: [{"type": "text", "text": kwargs["shot_meta"]["prompt"]}],
+    )
+    request = _fresh_chunk_request(tmp_path)
+
+    from runtime.continuity_provider import _base_content
+
+    content = _base_content(
+        tmp_path,
+        request,
+        json.loads((shot_dir / "SHOT_META.json").read_text()),
+    )
+
+    assert content[0]["text"].startswith("【非真人视觉硬约束】")
+    assert "全封闭机械头盔" in content[0]["text"]
+    assert "旧描述，一律忽略" in content[0]["text"]
+
+
 def test_storyboard_beat_planner_discards_quote_only_fragments():
     storyboard = {"shots": [{
         "id": "S01",
@@ -2250,6 +2277,72 @@ def test_direct_continuity_adapter_reuses_succeeded_paid_task(monkeypatch, tmp_p
     assert first.provider_task_id == "seedance-job-1"
     assert recovered.provider_task_id == "seedance-job-1"
     assert len(submissions) == 1
+
+
+def test_direct_continuity_adapter_drops_provider_rejected_privacy_images_once(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr("utils.video_validation.is_valid_video", lambda _path: True)
+    shot_dir = tmp_path / "shots/S01"
+    shot_dir.mkdir(parents=True)
+    (shot_dir / "SHOT_META.json").write_text(
+        json.dumps({"prompt": "continue synthetic android fight", "gen_strategy": "i2v"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ARK_AGENT_API_KEY", "test-key")
+    monkeypatch.setenv("HONCUT_CAPACITY_DB", str(tmp_path / "capacity.db"))
+    monkeypatch.setenv("VIDEO_GEN_CONCURRENCY", "1")
+    provider_content = [
+        {"type": "text", "text": "synthetic androids only"},
+        {"type": "image_url", "image_url": {"url": "safe-storyboard"}},
+        {"type": "image_url", "image_url": {"url": "rejected-1"}},
+        {"type": "image_url", "image_url": {"url": "rejected-2"}},
+        {"type": "image_url", "image_url": {"url": "rejected-3"}},
+        {"type": "image_url", "image_url": {"url": "safe-group-board"}},
+    ]
+    monkeypatch.setattr(
+        "tools.asset_packager.build_content_for_shot",
+        lambda **_kwargs: [dict(item) for item in provider_content],
+    )
+    submissions = []
+
+    def fake_submit(content, **_kwargs):
+        submissions.append(content)
+        if len(submissions) == 1:
+            raise RuntimeError(
+                "InputImageSensitiveContentDetected.PrivacyInformation: "
+                "content[2], content[3], content[4] may contain real person"
+            )
+        return "seedance-job-corrected"
+
+    monkeypatch.setattr(seedance_client, "submit_content", fake_submit)
+    monkeypatch.setattr(
+        seedance_client,
+        "poll",
+        lambda task_id, api_key: "https://video.test/output.mp4",
+    )
+    monkeypatch.setattr(
+        seedance_client,
+        "download",
+        lambda url, path: Path(path).write_bytes(b"video") or path,
+    )
+    request = _fresh_chunk_request(tmp_path)
+    request.output_path.parent.mkdir(parents=True, exist_ok=True)
+    execute = _direct_seedance_executor(
+        tmp_path,
+        GenerationTaskStore(tmp_path / "runtime.db"),
+    )
+
+    result = execute(request)
+
+    assert result.provider_task_id == "seedance-job-corrected"
+    assert len(submissions) == 2
+    retained_urls = [
+        item["image_url"]["url"]
+        for item in submissions[1]
+        if item.get("type") == "image_url"
+    ]
+    assert retained_urls == ["safe-storyboard", "safe-group-board"]
 
 
 def test_bridge_continuity_adapter_reuses_succeeded_paid_task(monkeypatch, tmp_path):

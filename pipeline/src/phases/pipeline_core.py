@@ -2754,6 +2754,22 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
         from phases.phase3.character_factory import batch_generate
 
         chars_dir = _ensure_dir(output_dir / "characters")
+        from utils.privacy_visual_policy import (
+            apply_no_real_person_character_policy,
+            is_no_real_person_enabled,
+        )
+
+        if is_no_real_person_enabled():
+            characters_data = apply_no_real_person_character_policy(characters_data)
+            characters_path = output_dir / "CHARACTERS.json"
+            characters_temporary = characters_path.with_suffix(".json.tmp")
+            characters_temporary.write_text(
+                json.dumps(characters_data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(characters_temporary, characters_path)
+            print("  🛡 非真人模式：角色身份已锁定为全封闭面甲的虚构合成人")
+
         characters_list = characters_data.get("characters", [])
 
         if not characters_list:
@@ -2786,6 +2802,7 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
                 "style": "\n\n".join(
                     part for part in (c.get("style", ""), character_style) if part
                 ),
+                "negative": c.get("negative", ""),
             })
 
         _p3_est = estimate_phase_duration("phase3", num_characters=len(char_dicts))
@@ -6914,6 +6931,7 @@ def run_pipeline(
     transition_duration: float = 0.5,
     media_profile: str = "1080p",
     enable_reshoot: bool = True,
+    no_real_person: bool = False,
     resume: bool = False,
     auto_approve: bool = True,
     resume_from: str = None,
@@ -6934,6 +6952,7 @@ def run_pipeline(
         transition_duration: Phase 8 转场时长（秒），默认 0.5
         media_profile: 编码配置名称，从 MEDIA_PROFILES 中选择（默认 "1080p"）
         enable_reshoot: 视觉缺陷或时长不足时是否允许调用 Phase 6 补录（默认 True，最多两轮）
+        no_real_person: 将所有角色锁定为无可见人脸/皮肤的虚构合成人 CGI 设计
         resume: 从检查点恢复，跳过已完成的 Phase
 
     Returns:
@@ -6942,6 +6961,7 @@ def run_pipeline(
     skip_phase = list(skip_phase or [])
     output_path = Path(output_dir).resolve()
     _ensure_dir(output_path)
+    os.environ["HONCUT_NO_REAL_PERSON"] = "1" if no_real_person else "0"
 
     # Resolve source and run identity before consulting any checkpoint. This
     # prevents an old "all phases complete" record from short-circuiting a new
@@ -6974,6 +6994,7 @@ def run_pipeline(
             "transition_duration": transition_duration,
             "media_profile": media_profile,
             "enable_reshoot": enable_reshoot,
+            "no_real_person": no_real_person,
             "dry_run": dry_run,
             "video_provider": effective_video_provider,
             "video_generation_mode": effective_video_route,
@@ -7738,6 +7759,11 @@ def main():
         help="禁止补录；检测到必须补录的坏镜头时阻断组装",
     )
     parser.set_defaults(enable_reshoot=True)
+    parser.add_argument(
+        "--no-real-person",
+        action="store_true",
+        help="只生成无可见人脸/皮肤的虚构合成人 CGI 角色",
+    )
     parser.add_argument("--media-profile", type=str, default="1080p",
                         choices=AVAILABLE_PROFILES,
                         help="编码配置（默认 1080p）")
@@ -7765,6 +7791,7 @@ def main():
         transition_duration=args.transition_duration,
         media_profile=args.media_profile,
         enable_reshoot=args.enable_reshoot,
+        no_real_person=args.no_real_person,
         resume=args.resume,
         auto_approve=args.auto_approve,
         resume_from=args.resume_from,

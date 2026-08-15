@@ -291,13 +291,16 @@ def _reference_rendering_clause(style: str) -> str:
     normalized = str(style or "").lower()
     non_photographic_markers = (
         "二维", "动画", "动漫", "赛璐璐", "厚涂", "插画", "手绘", "漫画",
-        "2d", "animation", "anime", "cel shading", "illustration", "painted",
+        "三维动画", "风格化三维", "合成人", "机器人", "机械面甲",
+        "2d", "3d cgi", "stylized 3d", "cgi animation", "animation", "anime",
+        "cel shading", "illustration", "painted", "synthetic", "android", "robot",
     )
     if any(marker in normalized for marker in non_photographic_markers):
         return (
-            "2D cinematic character illustration in the exact declared project style, "
-            "painted cel shading, deliberately designed fictional facial features, "
-            "consistent linework and color blocks, no photoreal skin, no live-action person"
+            "High-end stylized CGI character design in the exact declared project medium, "
+            "deliberately synthetic materials and designed digital geometry, consistent "
+            "silhouette and color blocks, no photoreal skin, no visible human face, "
+            "no live-action person and no likeness of a real person"
         )
     return "Photorealistic, natural skin texture"
 
@@ -309,7 +312,8 @@ def build_model_reference_prompts(
     suffix = f", {style}" if style else ""
     fictional_decl = (
         "This is a fully fictional AI-generated character (virtual avatar), "
-        "not a real person; the face is a synthetic digital creation"
+        "not a real person; the entire visual identity is a designed digital creation "
+        "with no real-person likeness"
     )
     rendering = _reference_rendering_clause(style)
     identity = f"{fictional_decl}. {character_desc}{suffix}. {rendering}, neutral expression"

@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 from collections.abc import Callable, Sequence
@@ -427,6 +428,15 @@ def _base_content(
         shot_meta,
         _storyboard_group_prompt(group, request.shot_id),
     )
+    from utils.privacy_visual_policy import (
+        is_no_real_person_enabled,
+        no_real_person_prompt_contract,
+    )
+
+    if is_no_real_person_enabled():
+        content_meta["prompt"] = (
+            f"{no_real_person_prompt_contract()}\n{content_meta['prompt']}"
+        )
     if request.chunk.storyboard_image:
         content_meta["_storyboard_frame_path"] = request.chunk.storyboard_image
         content_meta["_storyboard_beat_id"] = request.chunk.storyboard_beat_id
@@ -566,6 +576,7 @@ def _task_payload(
         "duration": duration,
         "seed": seed,
         "repair_attempt": request.repair_attempt,
+        "privacy_fallback": "drop_provider_rejected_images_once_v1",
     }
 
 
@@ -578,6 +589,11 @@ def _provider_input_context(
     storyboard_frame = output_dir / "storyboard_images" / f"{shot_id}.png"
     group, group_board = _storyboard_group_for_shot(output_dir, shot_id)
     group_contract = output_dir / "STORYBOARD_GROUPS.json"
+    from utils.privacy_visual_policy import (
+        NO_REAL_PERSON_POLICY,
+        is_no_real_person_enabled,
+    )
+
     return {
         "shot_meta_sha256": hashlib.sha256(shot_meta.read_bytes()).hexdigest(),
         "storyboard_frame_sha256": (
@@ -601,7 +617,43 @@ def _provider_input_context(
         "continuation_contract": "tail_window_ordered_frames_v1",
         "tail_window_seconds": "2.0",
         "ordered_frame_fractions": "0.2,0.6,0.95",
+        "visual_identity_policy": (
+            NO_REAL_PERSON_POLICY if is_no_real_person_enabled() else None
+        ),
     }
+
+
+def _privacy_rejected_image_indices(
+    content: Sequence[dict[str, Any]],
+    error: BaseException,
+) -> tuple[int, ...]:
+    """Resolve only provider-addressed image items from a privacy rejection."""
+    message = str(error)
+    privacy_markers = (
+        "PrivacyInformation",
+        "InputImageSensitiveContentDetected",
+        "real person",
+    )
+    if not any(marker.casefold() in message.casefold() for marker in privacy_markers):
+        return ()
+    indices = []
+    for raw_index in re.findall(r"content\[(\d+)\]", message):
+        index = int(raw_index)
+        if (
+            0 <= index < len(content)
+            and content[index].get("type") == "image_url"
+            and index not in indices
+        ):
+            indices.append(index)
+    return tuple(indices)
+
+
+def _without_content_indices(
+    content: Sequence[dict[str, Any]],
+    rejected_indices: Sequence[int],
+) -> list[dict[str, Any]]:
+    rejected = set(rejected_indices)
+    return [dict(item) for index, item in enumerate(content) if index not in rejected]
 
 
 def _direct_seedance_executor(
@@ -638,14 +690,37 @@ def _direct_seedance_executor(
                 raise ProviderPreparationError(
                     f"cannot prepare provider content for {request.resource_id}: {exc}"
                 ) from exc
-            return seedance_client.submit_content(
-                content,
-                api_key=api_key,
-                model=model,
-                duration=duration,
-                ratio=ratio,
-                seed=seed,
-            )
+            try:
+                return seedance_client.submit_content(
+                    content,
+                    api_key=api_key,
+                    model=model,
+                    duration=duration,
+                    ratio=ratio,
+                    seed=seed,
+                )
+            except Exception as exc:
+                rejected_indices = _privacy_rejected_image_indices(content, exc)
+                if not rejected_indices:
+                    raise
+                corrected_content = _without_content_indices(
+                    content,
+                    rejected_indices,
+                )
+                print(
+                    "  🛡 Seedance 隐私纠偏：移除服务商明确拒绝的参考图 "
+                    + ", ".join(f"content[{index}]" for index in rejected_indices)
+                    + "，限次重试 1 次",
+                    flush=True,
+                )
+                return seedance_client.submit_content(
+                    corrected_content,
+                    api_key=api_key,
+                    model=model,
+                    duration=duration,
+                    ratio=ratio,
+                    seed=seed,
+                )
 
         with slots.reserve("seedance", "video", request.resource_id, capacity=capacity):
             with leases.reserve(

@@ -152,6 +152,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="禁止付费补录；检测到必须补录的坏镜头时阻断组装",
     )
     parser.set_defaults(enable_reshoot=None)
+    person_group = parser.add_mutually_exclusive_group()
+    person_group.add_argument(
+        "--no-real-person",
+        dest="no_real_person",
+        action="store_true",
+        help="只生成无可见人脸/皮肤的虚构合成人 CGI 角色",
+    )
+    person_group.add_argument(
+        "--allow-real-person",
+        dest="no_real_person",
+        action="store_false",
+        help="允许项目原始角色视觉媒介包含真人写实外观",
+    )
+    parser.set_defaults(no_real_person=None)
     parser.add_argument(
         "--media-profile", choices=_core.AVAILABLE_PROFILES, default=None, help="编码配置（默认 1080p）"
     )
@@ -228,6 +242,7 @@ def _resolved_run_arguments(args: argparse.Namespace) -> dict:
         "transition_duration": choose("transition_duration", 0.5),
         "media_profile": choose("media_profile", "1080p"),
         "enable_reshoot": choose("enable_reshoot", True),
+        "no_real_person": choose("no_real_person", False),
     }
 
 
@@ -250,6 +265,7 @@ def main() -> None:
         transition_duration=resolved["transition_duration"],
         media_profile=resolved["media_profile"],
         enable_reshoot=resolved["enable_reshoot"],
+        no_real_person=resolved["no_real_person"],
         resume=args.resume,
         auto_approve=args.auto_approve,
         resume_from=args.resume_from,
