@@ -774,6 +774,58 @@ def test_per_shot_storyboard_beats_map_two_panels_to_fresh_then_extend(tmp_path)
     ] == "storyboard_beats/S01_P02.png"
 
 
+def test_storyboard_output_safety_rejection_gets_one_non_contact_retry(tmp_path):
+    storyboard = {
+        "shots": [
+            {
+                "id": "S03",
+                "duration": 5,
+                "who": ["agent", "guard"],
+                "where": "rotating corridor",
+                "storyboard_beats": [
+                    {
+                        "beat_id": "S03_P01",
+                        "position": 1,
+                        "duration_s": 5,
+                        "generation_mode": "fresh",
+                        "action": "双方进行膝击攻防",
+                        "start_state": "双方悬浮对峙",
+                        "end_state": "完成格挡",
+                    }
+                ],
+            }
+        ]
+    }
+    prompts = []
+
+    class FakeImageClient:
+        model = "fake-seedream"
+
+        def text_to_image(self, prompt, output_path, size, timeout):
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                raise RuntimeError(
+                    "OutputImageSensitiveContentDetected: output image may contain sensitive information"
+                )
+            Image.new("RGB", (1280, 720), "blue").save(output_path)
+            return "https://image.invalid/safe-panel.png"
+
+    contract = generate_shot_storyboards(
+        tmp_path,
+        storyboard,
+        [],
+        client=FakeImageClient(),
+        director_storyboard_path=tmp_path / "missing.png",
+    )
+
+    assert len(prompts) == 2
+    assert prompts[1].startswith("【自动安全重生成合同｜最高优先级】")
+    assert "不要画拳、肘、膝或武器真正击中身体的瞬间" in prompts[1]
+    panel = contract["shots"][0]["panels"][0]
+    assert panel["safety_retry"]["policy"] == "synthetic_non_contact_stunt_v1"
+    assert (tmp_path / panel["safety_retry"]["prompt"]).is_file()
+
+
 def test_phase2_uses_director_board_as_visual_reference_for_every_shot(tmp_path):
     director = tmp_path / "director_storyboard.png"
     _write_grid_image(

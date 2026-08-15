@@ -303,6 +303,29 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _is_output_image_safety_rejection(error: BaseException) -> bool:
+    message = str(error).casefold()
+    return any(
+        marker.casefold() in message
+        for marker in (
+            "OutputImageSensitiveContentDetected",
+            "output image may contain sensitive information",
+        )
+    )
+
+
+def _storyboard_safety_retry_prompt(prompt: str) -> str:
+    """Preserve blocking/action semantics while removing graphic implications."""
+    return f"""【自动安全重生成合同｜最高优先级】
+- 这是完全虚构的非真人机械合成人特技预演图，不是真人打斗或现实暴力。
+- 所有角色必须保持全封闭不透明机械面甲；禁止人脸、皮肤、头发或生物伤口。
+- 用错开的预接触姿态、格挡姿态和红色动作箭头表达动作方向；不要画拳、肘、膝或武器真正击中身体的瞬间。
+- 无血液、无伤口、无痛苦表情、无骨折、无身体损伤、无处决、无武器开火。
+- 必须保留原合同的角色身份、攻守关系、空间轴线和结束状态，但把接触表现为安全的机械训练编排。
+
+{prompt}"""
+
+
 def _director_panel_references(
     output_dir: Path,
     director_board: Path,
@@ -678,25 +701,48 @@ def generate_shot_storyboards(
                     except (OSError, ValueError, json.JSONDecodeError):
                         cached = False
                 if not cached:
-                    if reference_paths and hasattr(client, "image_to_image"):
-                        result_url = client.image_to_image(
-                            prompt=panel_prompt,
-                            ref_image=(
-                                str(reference_paths[0])
-                                if len(reference_paths) == 1
-                                else [str(path) for path in reference_paths]
-                            ),
-                            output_path=str(panel_path),
-                            size=size,
-                        )
-                    else:
+                    def generate_panel(generation_prompt: str):
+                        if reference_paths and hasattr(client, "image_to_image"):
+                            return client.image_to_image(
+                                prompt=generation_prompt,
+                                ref_image=(
+                                    str(reference_paths[0])
+                                    if len(reference_paths) == 1
+                                    else [str(path) for path in reference_paths]
+                                ),
+                                output_path=str(panel_path),
+                                size=size,
+                            )
                         panel_record["mode"] = "text_to_image"
-                        result_url = client.text_to_image(
-                            prompt=panel_prompt,
+                        return client.text_to_image(
+                            prompt=generation_prompt,
                             output_path=str(panel_path),
                             size=size,
                             timeout=180,
                         )
+
+                    try:
+                        result_url = generate_panel(panel_prompt)
+                    except Exception as exc:
+                        if not _is_output_image_safety_rejection(exc):
+                            raise
+                        safety_prompt = _storyboard_safety_retry_prompt(panel_prompt)
+                        safety_prompt_path = beats_dir / f"{beat_id}_safety_retry_prompt.txt"
+                        safety_prompt_path.write_text(safety_prompt, encoding="utf-8")
+                        print(
+                            f"  [seedream] {beat_id} 输出安全拒绝；改为非接触机械特技预演，限次重试 1 次",
+                            flush=True,
+                        )
+                        result_url = generate_panel(safety_prompt)
+                        panel_record["safety_retry"] = {
+                            "reason": "output_image_sensitive_content",
+                            "attempts": 1,
+                            "policy": "synthetic_non_contact_stunt_v1",
+                            "prompt": str(safety_prompt_path.relative_to(output_dir)),
+                            "prompt_sha256": hashlib.sha256(
+                                safety_prompt.encode("utf-8")
+                            ).hexdigest(),
+                        }
                     if not panel_path.is_file() or panel_path.stat().st_size == 0:
                         raise RuntimeError(f"Seedream returned without {panel_path.name}")
                     with Image.open(panel_path) as image:
