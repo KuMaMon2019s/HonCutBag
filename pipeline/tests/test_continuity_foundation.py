@@ -826,6 +826,57 @@ def test_storyboard_output_safety_rejection_gets_one_non_contact_retry(tmp_path)
     assert (tmp_path / panel["safety_retry"]["prompt"]).is_file()
 
 
+def test_storyboard_reference_transport_failure_retries_same_request_twice(tmp_path):
+    from requests.exceptions import ConnectionError as RequestsConnectionError
+
+    storyboard = {
+        "shots": [
+            {
+                "id": "S04",
+                "duration": 5,
+                "storyboard_beats": [
+                    {
+                        "beat_id": "S04_P01",
+                        "position": 1,
+                        "duration_s": 5,
+                        "generation_mode": "fresh",
+                        "action": "mechanical training motion",
+                    }
+                ],
+            }
+        ]
+    }
+    prompts = []
+
+    class FakeImageClient:
+        model = "fake-seedream"
+
+        def text_to_image(self, prompt, output_path, size, timeout):
+            prompts.append(prompt)
+            if len(prompts) < 3:
+                raise RequestsConnectionError(
+                    "Connection aborted: write operation timed out"
+                )
+            Image.new("RGB", (1280, 720), "green").save(output_path)
+            return "https://image.invalid/recovered-panel.png"
+
+    contract = generate_shot_storyboards(
+        tmp_path,
+        storyboard,
+        [],
+        client=FakeImageClient(),
+        director_storyboard_path=tmp_path / "missing.png",
+    )
+
+    assert len(prompts) == 3
+    assert len(set(prompts)) == 1
+    retry = contract["shots"][0]["panels"][0]["transport_retry"]
+    assert retry == {
+        "attempts": 2,
+        "policy": "same_request_bounded_transport_retry_v1",
+    }
+
+
 def test_phase2_uses_director_board_as_visual_reference_for_every_shot(tmp_path):
     director = tmp_path / "director_storyboard.png"
     _write_grid_image(

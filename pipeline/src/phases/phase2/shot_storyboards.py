@@ -10,6 +10,7 @@ import shutil
 from pathlib import Path
 from typing import Any, Protocol
 
+import requests
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 SHOT_STORYBOARD_SIZE = "2560x1440"
@@ -310,6 +311,29 @@ def _is_output_image_safety_rejection(error: BaseException) -> bool:
         for marker in (
             "OutputImageSensitiveContentDetected",
             "output image may contain sensitive information",
+        )
+    )
+
+
+def _is_transient_image_transport_error(error: BaseException) -> bool:
+    if isinstance(
+        error,
+        (
+            TimeoutError,
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+        ),
+    ):
+        return True
+    message = str(error).casefold()
+    return any(
+        marker in message
+        for marker in (
+            "write operation timed out",
+            "read timed out",
+            "connection aborted",
+            "connection reset",
+            "remote disconnected",
         )
     )
 
@@ -721,8 +745,29 @@ def generate_shot_storyboards(
                             timeout=180,
                         )
 
+                    transport_retries = 0
+
+                    def generate_with_transport_retry(generation_prompt: str):
+                        nonlocal transport_retries
+                        max_transport_retries = 2
+                        for attempt in range(max_transport_retries + 1):
+                            try:
+                                return generate_panel(generation_prompt)
+                            except Exception as exc:
+                                if (
+                                    not _is_transient_image_transport_error(exc)
+                                    or attempt >= max_transport_retries
+                                ):
+                                    raise
+                                transport_retries += 1
+                                print(
+                                    f"  [seedream] {beat_id} 参考图传输中断；"
+                                    f"同请求限次重试 {attempt + 1}/{max_transport_retries}",
+                                    flush=True,
+                                )
+
                     try:
-                        result_url = generate_panel(panel_prompt)
+                        result_url = generate_with_transport_retry(panel_prompt)
                     except Exception as exc:
                         if not _is_output_image_safety_rejection(exc):
                             raise
@@ -733,7 +778,7 @@ def generate_shot_storyboards(
                             f"  [seedream] {beat_id} 输出安全拒绝；改为非接触机械特技预演，限次重试 1 次",
                             flush=True,
                         )
-                        result_url = generate_panel(safety_prompt)
+                        result_url = generate_with_transport_retry(safety_prompt)
                         panel_record["safety_retry"] = {
                             "reason": "output_image_sensitive_content",
                             "attempts": 1,
@@ -742,6 +787,11 @@ def generate_shot_storyboards(
                             "prompt_sha256": hashlib.sha256(
                                 safety_prompt.encode("utf-8")
                             ).hexdigest(),
+                        }
+                    if transport_retries:
+                        panel_record["transport_retry"] = {
+                            "attempts": transport_retries,
+                            "policy": "same_request_bounded_transport_retry_v1",
                         }
                     if not panel_path.is_file() or panel_path.stat().st_size == 0:
                         raise RuntimeError(f"Seedream returned without {panel_path.name}")
