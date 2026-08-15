@@ -1021,6 +1021,224 @@ def test_phase2_panel_prompt_enforces_disarm_and_final_state_contracts():
     assert "不得用运动线否定静止/定格" in prompt
 
 
+def test_phase2_panel_prompt_turns_phase5_evidence_into_negative_constraints():
+    prompt = _build_panel_prompt(
+        {"who": ["agent", "guard"], "where": "透明观察窗前"},
+        {
+            "beat_id": "S06_P02",
+            "generation_mode": "extend",
+            "start_state": "保安飞向观察窗",
+            "action": "Agent 恢复稳定姿态",
+            "end_state": "观察窗保持完整，Agent 定格",
+        },
+        2,
+        2,
+        [
+            {"id": "agent", "appearance": {"summary": "深灰色战术服"}},
+            {"id": "guard", "appearance": {"summary": "藏蓝色保安制服"}},
+        ],
+        correction_contract=(
+            "这是第 1 轮自动纠偏，只修复 S06。\n"
+            "- 纠偏项 1（R4）：必须满足=观察窗保持完整；"
+            "已观察到且禁止复现=保安撞破观察窗飞入太空。"
+        ),
+    )
+
+    assert "Phase 5 定向纠偏合同" in prompt
+    assert "观察窗保持完整" in prompt
+    assert "保安撞破观察窗飞入太空" in prompt
+    assert "禁止复现的负面约束，不是要继续画入画面的剧情" in prompt
+    assert "不得通过增加破坏、伤亡、道具或画外事件来规避问题" in prompt
+
+
+def test_phase5_automatically_redraws_failed_shots_then_rechecks(tmp_path):
+    blocking_issue = storyboard_qa_gate._issue(
+        "L3",
+        "moderate",
+        "R4",
+        "最终动作状态偏离合同",
+        ["S05", "S06"],
+        storyboard_ids=["S05_P02", "S06_P02"],
+        expected="观察窗完整且 Agent 稳定定格",
+        observed="观察窗破裂且人物飞入太空",
+    )
+    qa_results = iter([
+        {
+            "status": "error",
+            "grade": "C",
+            "gate_passed": False,
+            "issues": [blocking_issue],
+            "failed_shot_ids": ["S05", "S06"],
+            "outputs": ["storyboard_qa_report.json"],
+        },
+        {
+            "status": "done",
+            "grade": "A",
+            "gate_passed": True,
+            "issues": [],
+            "failed_shot_ids": [],
+            "outputs": ["storyboard_qa_report.json"],
+        },
+    ])
+    redraw_calls = []
+
+    def redraw(output_dir, shot_ids, issues, attempt):
+        redraw_calls.append((output_dir, shot_ids, issues, attempt))
+        return {"status": "redrawn", "shot_ids": shot_ids, "attempt": attempt}
+
+    result = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        max_correction_attempts=2,
+        qa_runner=lambda _output_dir: next(qa_results),
+        redraw_runner=redraw,
+    )
+
+    assert result["status"] == "done"
+    assert result["gate_passed"] is True
+    assert redraw_calls[0][0] == tmp_path
+    assert redraw_calls[0][1] == ["S05", "S06"]
+    assert redraw_calls[0][3] == 1
+    assert result["correction"]["attempts_used"] == 1
+    assert result["correction"]["final_gate_passed"] is True
+    assert "phase5_correction_report.json" in result["outputs"]
+    persisted = json.loads(
+        (tmp_path / "storyboard_qa_report.json").read_text(encoding="utf-8")
+    )
+    assert persisted["correction"]["history"][0]["status"] == "passed"
+
+
+def test_phase5_correction_is_bounded_and_fails_closed(tmp_path):
+    blocking_issue = storyboard_qa_gate._issue(
+        "L3", "severe", "R4", "动作完全错误", ["S03"],
+        expected="Agent 解除武器", observed="保安持枪射击",
+    )
+    qa_calls = 0
+    redraw_attempts = []
+
+    def qa(_output_dir):
+        nonlocal qa_calls
+        qa_calls += 1
+        return {
+            "status": "error",
+            "grade": "C",
+            "gate_passed": False,
+            "issues": [blocking_issue],
+            "failed_shot_ids": ["S03"],
+        }
+
+    def redraw(_output_dir, _shot_ids, _issues, attempt):
+        redraw_attempts.append(attempt)
+        return {"status": "redrawn", "attempt": attempt}
+
+    result = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        max_correction_attempts=2,
+        qa_runner=qa,
+        redraw_runner=redraw,
+    )
+
+    assert qa_calls == 3
+    assert redraw_attempts == [1, 2]
+    assert result["status"] == "error"
+    assert result["gate_passed"] is False
+    assert "after 2/2 automatic correction attempt" in result["error"]
+    assert result["correction"]["attempts_used"] == 2
+
+
+def test_phase5_real_redraw_reuses_generator_and_archives_failed_shot(tmp_path):
+    from PIL import Image
+
+    storyboard = {
+        "shots": [
+            {
+                "id": "S01",
+                "where": "走廊入口",
+                "storyboard_beats": [{
+                    "beat_id": "S01_P01",
+                    "duration_s": 5,
+                    "generation_mode": "fresh",
+                    "action": "Agent 进入走廊",
+                    "end_state": "Agent 看向前方",
+                }],
+            },
+            {
+                "id": "S02",
+                "where": "完整透明观察窗前",
+                "storyboard_beats": [{
+                    "beat_id": "S02_P01",
+                    "duration_s": 5,
+                    "generation_mode": "fresh",
+                    "action": "Agent 将保安扔向观察窗",
+                    "end_state": "观察窗保持完整，Agent 稳定定格",
+                }],
+            },
+        ]
+    }
+    (tmp_path / "CHARACTERS.json").write_text(
+        '{"characters": []}', encoding="utf-8"
+    )
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps(storyboard, ensure_ascii=False), encoding="utf-8"
+    )
+    generated_prompts = []
+
+    class FakeClient:
+        model = "fake-seedream"
+
+        def text_to_image(self, prompt, output_path, size, timeout):
+            generated_prompts.append(prompt)
+            Image.effect_noise((320, 180), 80).convert("RGB").save(output_path)
+            return "https://image.invalid/panel.png"
+
+        def image_to_image(self, **_kwargs):
+            pytest.fail("reset-boundary shots without characters use text-to-image")
+
+    client = FakeClient()
+    generate_shot_storyboards(
+        tmp_path,
+        storyboard,
+        [],
+        client=client,
+        director_storyboard_path=tmp_path / "missing.png",
+    )
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps(storyboard, ensure_ascii=False), encoding="utf-8"
+    )
+    (tmp_path / "storyboard_qa_report.json").write_text(
+        '{"status":"error","grade":"C"}', encoding="utf-8"
+    )
+    issue = storyboard_qa_gate._issue(
+        "L3",
+        "severe",
+        "R4",
+        "观察窗状态错误",
+        ["S02"],
+        storyboard_ids=["S02_P01"],
+        expected="观察窗保持完整，Agent 稳定定格",
+        observed="保安撞破观察窗飞入太空",
+    )
+
+    receipt = storyboard_qa_gate._redraw_failed_storyboards(
+        tmp_path,
+        ["S02"],
+        [issue],
+        1,
+        image_client=client,
+    )
+
+    assert len(generated_prompts) == 3
+    assert "Phase 5 定向纠偏合同" in generated_prompts[-1]
+    assert "观察窗保持完整，Agent 稳定定格" in generated_prompts[-1]
+    assert "保安撞破观察窗飞入太空" in generated_prompts[-1]
+    archive = tmp_path / receipt["archive"]["archive_dir"] / "before"
+    assert (archive / "storyboard_beats/S02_P01.png").is_file()
+    assert (archive / "storyboard_qa_report.json").is_file()
+    manifest = json.loads(
+        (tmp_path / "SHOT_STORYBOARDS.json").read_text(encoding="utf-8")
+    )
+    assert manifest["correction"] == {"attempt": 1, "shot_ids": ["S02"]}
+
+
 def test_phase5_l3_supplies_canonical_character_images(tmp_path):
     from PIL import Image
 

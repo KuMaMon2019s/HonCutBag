@@ -1,17 +1,20 @@
 """Phase 5: pre-generation storyboard quality gate.
 
-Every judgment is derived from project artifacts.  The gate never repairs a
-storyboard; it reports the shots that need to be redrawn before Phase 6.
+Every judgment is derived from project artifacts.  The pure gate reports the
+shots that need to be redrawn; the Phase 5 correction wrapper may then perform
+a bounded, auditable redraw-and-recheck loop before Phase 6.
 """
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import math
 import os
 import re
+import shutil
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +22,8 @@ from clients.ark_multimodal_client import ArkMultimodalClient
 from utils.video_capabilities import capabilities_for
 
 DEFAULT_SIMILARITY_THRESHOLD = 0.85
+DEFAULT_MAX_CORRECTION_ATTEMPTS = 2
+MAX_CORRECTION_ATTEMPTS = 3
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
 
 _LIGHT_PERIODS = {
@@ -994,10 +999,18 @@ VISUAL STYLE:
             if not evidence_valid:
                 severity = "minor"
             shot_ids = sorted({_parent_shot_id(sid) for sid in storyboard_ids})
+            correction_evidence = {
+                "storyboard_ids": storyboard_ids,
+                "mismatch_type": str(value.get("mismatch_type") or "other"),
+                "expected": str(value.get("expected") or "").strip(),
+                "observed": str(value.get("observed") or "").strip(),
+                "confidence": value.get("confidence"),
+                "panel_evidence": value.get("panel_evidence") or [],
+            }
+            correction_evidence.update(evidence_details)
             issues.append(_issue(
                 "L3", severity, red_line, message, shot_ids,
-                storyboard_ids=storyboard_ids,
-                **evidence_details,
+                **correction_evidence,
             ))
         return issues, {
             "status": "completed",
@@ -1186,6 +1199,274 @@ def run_storyboard_qa_gate(output_dir: Path, similarity_threshold: float | None 
         report["error"] = f"Storyboard QA grade {grade} blocks Phase 6; redraw only failed_shot_ids"
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return report
+
+
+def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _resolved_correction_attempts(value: int | None) -> int:
+    raw: Any = (
+        os.environ.get(
+            "HONCUT_PHASE5_MAX_CORRECTIONS",
+            str(DEFAULT_MAX_CORRECTION_ATTEMPTS),
+        )
+        if value is None
+        else value
+    )
+    if isinstance(raw, bool):
+        raise ValueError("Phase 5 correction attempts must be an integer")
+    try:
+        attempts = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Phase 5 correction attempts must be an integer") from exc
+    if attempts < 0 or attempts > MAX_CORRECTION_ATTEMPTS:
+        raise ValueError(
+            f"Phase 5 correction attempts must be between 0 and {MAX_CORRECTION_ATTEMPTS}"
+        )
+    return attempts
+
+
+def _correctable_issues(report: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return only blocking visual issues that a storyboard redraw can fix."""
+    result: list[dict[str, Any]] = []
+    for issue in blocking_issues(report.get("issues") or []):
+        if not issue.get("shot_ids"):
+            continue
+        layer = str(issue.get("layer") or "").upper()
+        code = str(issue.get("code") or "").upper()
+        if layer == "L3" and code in {"R1", "R2", "R3", "R4"}:
+            result.append(issue)
+    return result
+
+
+def _archive_correction_inputs(
+    output_dir: Path,
+    shot_ids: list[str],
+    attempt: int,
+) -> dict[str, Any]:
+    """Copy the exact pre-redraw evidence into an immutable attempt folder."""
+    correction_root = output_dir / "phase5_corrections"
+    attempt_dir = correction_root / f"attempt_{attempt:02d}"
+    revision = 1
+    while attempt_dir.exists():
+        revision += 1
+        attempt_dir = correction_root / f"attempt_{attempt:02d}_r{revision:02d}"
+    before_dir = attempt_dir / "before"
+    before_dir.mkdir(parents=True, exist_ok=True)
+    copied: list[str] = []
+    root_files = ("storyboard_qa_report.json", "SHOT_STORYBOARDS.json")
+    for name in root_files:
+        source = output_dir / name
+        if source.is_file():
+            target = before_dir / name
+            shutil.copy2(source, target)
+            copied.append(str(target.relative_to(output_dir)))
+    patterns = []
+    for shot_id in shot_ids:
+        patterns.extend(
+            (
+                f"storyboard_beats/{shot_id}_P*",
+                f"shot_storyboards/{shot_id}*",
+                f"storyboard_images/{shot_id}.*",
+            )
+        )
+    for pattern in patterns:
+        for source in sorted(output_dir.glob(pattern)):
+            if not source.is_file():
+                continue
+            target = before_dir / source.relative_to(output_dir)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            copied.append(str(target.relative_to(output_dir)))
+    return {
+        "attempt": attempt,
+        "archive_dir": str(attempt_dir.relative_to(output_dir)),
+        "copied": copied,
+    }
+
+
+def _redraw_failed_storyboards(
+    output_dir: Path,
+    shot_ids: list[str],
+    issues: list[dict[str, Any]],
+    attempt: int,
+    *,
+    image_client: Any = None,
+) -> dict[str, Any]:
+    """Redraw only failed shots while retaining canonical visual references."""
+    storyboard_path = output_dir / "STORYBOARD.json"
+    storyboard = json.loads(storyboard_path.read_text(encoding="utf-8"))
+    characters_path = output_dir / "CHARACTERS.json"
+    characters_data = (
+        json.loads(characters_path.read_text(encoding="utf-8"))
+        if characters_path.is_file()
+        else {"characters": []}
+    )
+    valid_shot_ids = {
+        _shot_id(shot, index)
+        for index, shot in enumerate(storyboard.get("shots", []))
+        if isinstance(shot, dict)
+    }
+    targets = sorted(set(shot_ids) & valid_shot_ids)
+    if not targets:
+        raise RuntimeError("Phase 5 correction has no valid failed shot IDs")
+    context_by_shot = {
+        shot_id: [
+            issue
+            for issue in issues
+            if shot_id in (issue.get("shot_ids") or [])
+        ]
+        for shot_id in targets
+    }
+    archive = _archive_correction_inputs(output_dir, targets, attempt)
+    previous_manifest_path = output_dir / "SHOT_STORYBOARDS.json"
+    try:
+        previous_manifest = json.loads(
+            previous_manifest_path.read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        previous_manifest = {}
+
+    from phases.phase2.shot_storyboards import (
+        SHOT_STORYBOARD_SIZE,
+        generate_shot_storyboards,
+        validate_shot_storyboard_artifacts,
+    )
+
+    director_reference = storyboard.get("director_storyboard") or {}
+    contract = generate_shot_storyboards(
+        output_dir,
+        storyboard,
+        characters_data.get("characters", []),
+        client=image_client,
+        size=str(previous_manifest.get("size_requested") or SHOT_STORYBOARD_SIZE),
+        director_storyboard_path=(
+            director_reference.get("image")
+            if isinstance(director_reference, dict)
+            else None
+        ),
+        aspect_ratio=(
+            str(previous_manifest.get("aspect_ratio") or "").strip() or None
+        ),
+        correction_context_by_shot=context_by_shot,
+        correction_attempt=attempt,
+    )
+    artifact_errors = validate_shot_storyboard_artifacts(output_dir, storyboard)
+    if artifact_errors:
+        raise RuntimeError(
+            "Phase 5 correction produced invalid storyboard artifacts: "
+            + "; ".join(artifact_errors[:8])
+        )
+    _atomic_json(storyboard_path, storyboard)
+    receipt = {
+        "attempt": attempt,
+        "status": "redrawn",
+        "shot_ids": targets,
+        "issue_codes": sorted({str(issue.get("code") or "") for issue in issues}),
+        "archive": archive,
+        "total_boards": contract.get("total_boards"),
+        "total_panels": contract.get("total_panels"),
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
+    attempt_dir = output_dir / archive["archive_dir"]
+    _atomic_json(attempt_dir / "redraw_receipt.json", receipt)
+    return receipt
+
+
+def run_storyboard_qa_with_correction(
+    output_dir: Path,
+    *,
+    max_correction_attempts: int | None = None,
+    qa_runner: Callable[[Path], dict[str, Any]] | None = None,
+    redraw_runner: Callable[[Path, list[str], list[dict[str, Any]], int], dict[str, Any]] | None = None,
+    image_client: Any = None,
+) -> dict[str, Any]:
+    """Run Phase 5 with a bounded failed-shot redraw and recheck loop."""
+    output_dir = Path(output_dir)
+    attempts_allowed = _resolved_correction_attempts(max_correction_attempts)
+    qa = qa_runner or run_storyboard_qa_gate
+    result = qa(output_dir)
+    history: list[dict[str, Any]] = []
+
+    for attempt in range(1, attempts_allowed + 1):
+        if result.get("gate_passed") is True or result.get("status") != "error":
+            break
+        issues = _correctable_issues(result)
+        target_ids = sorted({
+            shot_id
+            for issue in issues
+            for shot_id in (issue.get("shot_ids") or [])
+        })
+        if not issues or not target_ids:
+            break
+        before_grade = result.get("grade")
+        try:
+            if redraw_runner is not None:
+                redraw_receipt = redraw_runner(
+                    output_dir, target_ids, issues, attempt
+                )
+            else:
+                redraw_receipt = _redraw_failed_storyboards(
+                    output_dir,
+                    target_ids,
+                    issues,
+                    attempt,
+                    image_client=image_client,
+                )
+        except Exception as exc:
+            history.append({
+                "attempt": attempt,
+                "status": "redraw_error",
+                "shot_ids": target_ids,
+                "before_grade": before_grade,
+                "error": str(exc),
+            })
+            result = {
+                **result,
+                "status": "error",
+                "gate_passed": False,
+                "error": f"Phase 5 automatic correction failed: {exc}",
+            }
+            break
+        result = qa(output_dir)
+        history.append({
+            "attempt": attempt,
+            "status": "passed" if result.get("gate_passed") is True else "rejected",
+            "shot_ids": target_ids,
+            "before_grade": before_grade,
+            "after_grade": result.get("grade"),
+            "redraw": redraw_receipt,
+        })
+
+    if history:
+        correction = {
+            "enabled": attempts_allowed > 0,
+            "max_attempts": attempts_allowed,
+            "attempts_used": len(history),
+            "history": history,
+            "final_gate_passed": result.get("gate_passed") is True,
+        }
+        result["correction"] = correction
+        outputs = list(result.get("outputs") or [])
+        if "phase5_correction_report.json" not in outputs:
+            outputs.append("phase5_correction_report.json")
+        result["outputs"] = outputs
+        if result.get("gate_passed") is not True and not str(result.get("error") or "").startswith(
+            "Phase 5 automatic correction failed:"
+        ):
+            result["error"] = (
+                "Storyboard QA still blocks Phase 6 after "
+                f"{len(history)}/{attempts_allowed} automatic correction attempt(s)"
+            )
+        _atomic_json(output_dir / "phase5_correction_report.json", correction)
+        _atomic_json(output_dir / "storyboard_qa_report.json", result)
+    return result
 
 
 def grid_path_exists(output_dir: Path) -> bool:

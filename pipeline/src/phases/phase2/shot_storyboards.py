@@ -12,7 +12,6 @@ from typing import Any, Protocol
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-
 SHOT_STORYBOARD_SIZE = "2560x1440"
 
 
@@ -161,6 +160,7 @@ def _build_panel_prompt(
     *,
     uses_director_board: bool = False,
     aspect_ratio: str = "16:9",
+    correction_contract: str = "",
 ) -> str:
     who = _shot_who(shot)
     beat_id = str(beat.get("beat_id") or f"P{position:02d}")
@@ -194,6 +194,18 @@ def _build_panel_prompt(
         if position == count
         else "这不是本镜最后一格：只推进到本格结束状态，不得抢先画后续格的结果。"
     )
+    correction_section = (
+        f"""
+
+Phase 5 定向纠偏合同：
+{correction_contract}
+- 上述“已观察到的错误”是本轮禁止复现的负面约束，不是要继续画入画面的剧情。
+- 纠偏时仍以本格起始状态、唯一动作、结束状态和角色合同为最高事实源；不得通过增加破坏、伤亡、道具或画外事件来规避问题。
+- 输出前逐项确认：原偏差已经消失，且没有引入新的角色、动作、道具、环境结果或连续性跳变。
+"""
+        if correction_contract.strip()
+        else ""
+    )
     return f"""绘制一张单独的 {aspect_ratio} PREVIS 导演手绘故事格：{beat_id}（第 {position}/{count} 格）。
 
 {continuation}
@@ -214,6 +226,7 @@ def _build_panel_prompt(
 - 每个动作的执行者、承受者、左右位置、朝向以及武器持有者必须与“本格唯一可见动作”一致；禁止交换人物、攻守关系或武器归属。
 - “解除武器/争夺武器”必须画出双方同时接触并控制同一武器的过程，不得替换为单方持枪瞄准、开枪或普通对打；其他动作也不得用相邻剧情或泛化搏斗代替。
 - {final_beat_contract}
+{correction_section}
 
 风格要求：黑色粗铅笔与炭笔、少量灰色阴影、快速 gesture drawing、专业导演工作稿；
 动作方向可用红色手绘箭头，摄像机运动可用蓝色箭头。人物外形严格遵守项目角色合同。
@@ -442,6 +455,8 @@ def generate_shot_storyboards(
     size: str = SHOT_STORYBOARD_SIZE,
     director_storyboard_path: str | Path | None = None,
     aspect_ratio: str | None = None,
+    correction_context_by_shot: dict[str, list[dict[str, Any]]] | None = None,
+    correction_attempt: int = 0,
 ) -> dict[str, Any]:
     """Generate each Pxx as 16:9 model art, then compose the Sxx overview."""
     output_dir = Path(output_dir)
@@ -460,6 +475,12 @@ def generate_shot_storyboards(
         "model": model,
         "shots": [],
     }
+    correction_context_by_shot = correction_context_by_shot or {}
+    if correction_context_by_shot:
+        contract["correction"] = {
+            "attempt": int(correction_attempt),
+            "shot_ids": sorted(correction_context_by_shot),
+        }
     if aspect_ratio is None:
         aspect_ratio = str(storyboard.get("aspect_ratio") or "").strip()
     if not aspect_ratio:
@@ -528,6 +549,25 @@ def generate_shot_storyboards(
             prompt_path.write_text(prompt, encoding="utf-8")
             prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
             director_panel = director_panels.get(shot_id)
+            correction_issues = correction_context_by_shot.get(shot_id, [])
+            correction_lines: list[str] = []
+            for issue_index, issue in enumerate(correction_issues, 1):
+                details = issue.get("details") if isinstance(issue.get("details"), dict) else {}
+                expected = _compact(details.get("expected"), 320)
+                observed = _compact(details.get("observed"), 320)
+                message = _compact(issue.get("message"), 420)
+                code = str(issue.get("code") or "QA").upper()
+                correction_lines.append(
+                    f"- 纠偏项 {issue_index}（{code}）：必须满足="
+                    f"{expected or '严格恢复本格动作与结束状态合同'}；"
+                    f"已观察到且禁止复现={observed or message}。"
+                )
+            correction_contract = "\n".join(correction_lines)
+            if correction_contract:
+                correction_contract = (
+                    f"这是第 {int(correction_attempt)} 轮自动纠偏，只修复 {shot_id}。\n"
+                    + correction_contract
+                )
             record = {
                 "shot_id": shot_id,
                 "board": str(board_path.relative_to(output_dir)),
@@ -541,6 +581,11 @@ def generate_shot_storyboards(
                 ),
                 "status": "planned",
             }
+            if correction_issues:
+                record["correction"] = {
+                    "attempt": int(correction_attempt),
+                    "issues": correction_issues,
+                }
             panel_records = []
             panel_paths: list[Path] = []
             previous_panel = (
@@ -564,6 +609,7 @@ def generate_shot_storyboards(
                     characters,
                     uses_director_board=director_panel is not None,
                     aspect_ratio=aspect_ratio,
+                    correction_contract=correction_contract,
                 )
                 panel_prompt_path = beats_dir / f"{beat_id}_prompt.txt"
                 panel_path = beats_dir / f"{beat_id}.png"

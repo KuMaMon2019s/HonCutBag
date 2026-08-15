@@ -6805,14 +6805,19 @@ if LANGGRAPH_AVAILABLE:
     def node_phase5_quality(state: HonCutState) -> dict:
         """Compatibility facade for the migrated Phase 5 graph node."""
         from graph.nodes.phase5 import phase5_node
-        from phases.phase5.storyboard_qa_gate import run_storyboard_qa_gate
+        from phases.phase5 import storyboard_qa_gate
         from quality.supervision_agent import SupervisionBlockedError
 
         # Resolve all existing callables at invocation time so monkeypatches
         # remain effective even when the graph was built earlier.
         return phase5_node(
             state,
-            qa_runner=run_storyboard_qa_gate,
+            qa_runner=lambda output_dir: (
+                storyboard_qa_gate.run_storyboard_qa_with_correction(
+                    output_dir,
+                    qa_runner=storyboard_qa_gate.run_storyboard_qa_gate,
+                )
+            ),
             supervision_runner=_run_storyboard_supervision,
             supervision_blocked_error=SupervisionBlockedError,
         )
@@ -7452,10 +7457,13 @@ def run_pipeline(
     elif storyboard_data is None:
         report["phases"]["phase5"] = {"status": "skipped", "reason": "no storyboard data"}
     else:
-        from phases.phase5.storyboard_qa_gate import run_storyboard_qa_gate
+        from phases.phase5 import storyboard_qa_gate
 
         reporter.phase_start("phase5", "分镜质检闸门")
-        p4_5 = run_storyboard_qa_gate(output_path)
+        p4_5 = storyboard_qa_gate.run_storyboard_qa_with_correction(
+            output_path,
+            qa_runner=storyboard_qa_gate.run_storyboard_qa_gate,
+        )
         report["phases"]["phase5"] = p4_5
         reporter.phase_done("phase5", f"分镜质检 {p4_5.get('grade', '?')} 级", duration_s=p4_5.get("duration_s"))
         if p4_5["status"] == "error":
