@@ -1,15 +1,11 @@
-"""Scene detection tool wrapping PySceneDetect.
-
-Detects scene boundaries and shot changes in video. Falls back to
-FFmpeg-based detection if PySceneDetect is not installed.
-"""
+"""Scene detection tool wrapping the required PySceneDetect runtime."""
 
 from __future__ import annotations
 
 import json
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from tools.base_tool import (
     BaseTool,
@@ -18,7 +14,6 @@ from tools.base_tool import (
     ResourceProfile,
     ToolResult,
     ToolStability,
-    ToolStatus,
     ToolTier,
 )
 
@@ -33,20 +28,20 @@ class SceneDetect(BaseTool):
     execution_mode = ExecutionMode.SYNC
     determinism = Determinism.DETERMINISTIC
 
-    dependencies = ["cmd:ffmpeg"]
+    dependencies: ClassVar[list[str]] = ["cmd:ffmpeg", "python:scenedetect"]
     install_instructions = (
-        "FFmpeg is required. For better detection install PySceneDetect:\n"
-        "pip install scenedetect[opencv]"
+        "FFmpeg and PySceneDetect are required:\n"
+        "uv pip install --python .venv/bin/python -e ."
     )
-    agent_skills = ["ffmpeg"]
+    agent_skills: ClassVar[list[str]] = ["ffmpeg"]
 
-    capabilities = [
+    capabilities: ClassVar[list[str]] = [
         "detect_scenes",
         "detect_content_changes",
         "detect_threshold",
     ]
 
-    input_schema = {
+    input_schema: ClassVar[dict[str, Any]] = {
         "type": "object",
         "required": ["input_path"],
         "properties": {
@@ -70,18 +65,11 @@ class SceneDetect(BaseTool):
     }
 
     resource_profile = ResourceProfile(cpu_cores=2, ram_mb=1024, vram_mb=0, disk_mb=100)
-    idempotency_key_fields = ["input_path", "method", "threshold"]
-    side_effects = ["writes scene list JSON to output_path"]
-    user_visible_verification = [
+    idempotency_key_fields: ClassVar[list[str]] = ["input_path", "method", "threshold"]
+    side_effects: ClassVar[list[str]] = ["writes scene list JSON to output_path"]
+    user_visible_verification: ClassVar[list[str]] = [
         "Spot-check detected scene boundaries against the video",
     ]
-
-    def _has_pyscenedetect(self) -> bool:
-        try:
-            import scenedetect  # noqa: F401
-            return True
-        except ImportError:
-            return False
 
     def execute(self, inputs: dict[str, Any]) -> ToolResult:
         input_path = Path(inputs["input_path"])
@@ -90,10 +78,8 @@ class SceneDetect(BaseTool):
 
         start = time.time()
 
-        if self._has_pyscenedetect():
-            scenes = self._detect_pyscenedetect(inputs)
-        else:
-            scenes = self._detect_ffmpeg(inputs)
+        self.check_dependencies()
+        scenes = self._detect_pyscenedetect(inputs)
 
         elapsed = time.time() - start
 
@@ -109,7 +95,7 @@ class SceneDetect(BaseTool):
             data={
                 "scene_count": len(scenes),
                 "scenes": scenes,
-                "method": "pyscenedetect" if self._has_pyscenedetect() else "ffmpeg",
+                "method": "pyscenedetect",
                 "output": str(output_path),
             },
             artifacts=[str(output_path)],
@@ -118,8 +104,8 @@ class SceneDetect(BaseTool):
 
     def _detect_pyscenedetect(self, inputs: dict[str, Any]) -> list[dict]:
         """Use PySceneDetect for scene detection."""
-        from scenedetect import open_video, SceneManager
-        from scenedetect.detectors import ContentDetector, ThresholdDetector, AdaptiveDetector
+        from scenedetect import SceneManager, open_video
+        from scenedetect.detectors import AdaptiveDetector, ContentDetector, ThresholdDetector
 
         input_path = str(inputs["input_path"])
         method = inputs.get("method", "content")

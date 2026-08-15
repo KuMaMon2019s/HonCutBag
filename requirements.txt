@@ -8,7 +8,7 @@ requests>=2.34.0          # HTTP — seedance_client, seedream_client, tos_uploa
 PyYAML>=6.0               # pipeline_config.py
 python-dotenv>=1.0.0       # project-root .env loading for pipeline subprocesses
 
-# --- LangGraph (optional but recommended; pipeline falls back to sequential if missing) ---
+# --- Orchestration (required; startup fails with an install command if missing) ---
 langgraph>=1.2.0
 langgraph-checkpoint-sqlite>=3.1.0
 langchain-core>=1.5.0
@@ -18,6 +18,8 @@ arq>=0.28.0
 # --- Visual analysis (required by Phase 8 frame QA and image gates) ---
 numpy>=1.24.0
 Pillow>=10.0.0
+scenedetect>=0.6.4,<0.7     # Core scene boundary detection (headless-compatible)
+opencv-python-headless>=4.10
 
 # --- System binaries (NOT pip — install via Homebrew) ---
 #   brew install ffmpeg          # ffmpeg + ffprobe (64 + 15 call sites)

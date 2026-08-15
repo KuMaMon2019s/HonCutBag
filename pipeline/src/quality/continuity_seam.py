@@ -200,6 +200,11 @@ def measure_video_replay_similarity(
         if denominator > 1e-9
         else 0.0
     )
+    # Identical decoded trajectories can land a few ulps below 1.0 depending
+    # on the NumPy reduction implementation. Preserve the mathematical
+    # identity instead of exposing a dependency-version artifact.
+    if abs(1.0 - motion_cosine) <= 1e-5:
+        motion_cosine = 1.0
     frame_similarity = 1.0 - float(np.abs(previous - following).mean())
     previous_energy = float(np.abs(previous_motion).mean())
     following_energy = float(np.abs(following_motion).mean())
