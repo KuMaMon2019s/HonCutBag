@@ -46,6 +46,7 @@ from phases.phase6.video_generator import build_video_prompt
 from phases.pipeline_core import _write_project_visual_style
 from prompt import event_extractor
 from quality.quality_gate import run_quality_check
+from quality.shot_continuity import annotate_boundaries, classify_boundary
 from runtime.run_manifest import prepare_run_manifest
 from utils.video_capabilities import get_video_capabilities
 from utils.video_geometry import resolve_video_geometry
@@ -77,6 +78,246 @@ def test_seedance_limits_are_provider_capabilities_not_global_director_rules():
     assert generic_board["shots"][0]["generation_load"]["capability_profile"] == (
         "generic-video"
     )
+
+
+def test_secondary_v4_reserves_bridge_time_before_content_capacity():
+    storyboard = {
+        "video_provider": "seedance",
+        "shots": [
+            {
+                "id": "S01",
+                "duration": 10,
+                "where": "旋转走廊",
+                "who": ["Agent"],
+                "micro_actions": ["Agent抓住扶手"],
+                "end_state": "Agent抓住扶手稳定身体",
+            },
+            {
+                "id": "S02",
+                "duration": 5,
+                "where": "旋转走廊",
+                "who": ["Agent"],
+                "micro_actions": ["Agent穿过舱门"],
+                "boundary_before": "continuous",
+                "start_state": "Agent抓住扶手稳定身体",
+            },
+        ],
+    }
+
+    plan_storyboard_beats(storyboard)
+
+    first = storyboard["shots"][0]
+    assert [beat["generation_mode"] for beat in first["storyboard_beats"]] == [
+        "multi_image",
+        "first_last_frame_bridge",
+    ]
+    assert [beat["duration_s"] for beat in first["storyboard_beats"]] == [7, 3]
+    assert first["secondary_storyboard_planning"]["content_duration_s"] == 7
+    assert first["secondary_storyboard_planning"]["bridge_duration_s"] == 3
+
+
+def test_secondary_v4_rejects_false_continuity_and_fractional_seedance_duration():
+    boundary, reason = classify_boundary(
+        {"where": "走廊", "who": ["Agent"]},
+        {
+            "where": "机库",
+            "who": ["敌人"],
+            "boundary_before": "continuous",
+        },
+        index=2,
+    )
+    assert boundary == "cut"
+    assert "location" in reason
+
+    with pytest.raises(ValueError, match="duration quantum"):
+        plan_storyboard_beats({
+            "video_provider": "seedance",
+            "shots": [{"id": "S01", "duration": 10.5, "micro_actions": ["挥拳"]}],
+        })
+
+
+def test_generic_action_unit_capacity_does_not_inherit_seedance_split():
+    storyboard = {
+        "video_provider": "kling",
+        "shots": [{
+            "id": "S01",
+            "duration": 8,
+            "micro_actions": ["挥拳"],
+            "source_action_unit_ids": ["U1", "U2"],
+        }],
+    }
+
+    plan_storyboard_beats(storyboard)
+
+    assert [
+        beat["generation_mode"] for beat in storyboard["shots"][0]["storyboard_beats"]
+    ] == ["multi_image"]
+
+
+def test_secondary_v4_cannot_downgrade_to_legacy_or_put_plot_in_bridge():
+    storyboard = {
+        "video_provider": "seedance",
+        "shots": [
+            {
+                "id": "S01",
+                "duration": 6,
+                "where": "走廊",
+                "who": ["Agent"],
+                "micro_actions": ["Agent稳定姿态"],
+                "end_state": "Agent扶住门框",
+            },
+            {
+                "id": "S02",
+                "duration": 5,
+                "where": "走廊",
+                "who": ["Agent"],
+                "micro_actions": ["Agent进入下一舱"],
+                "boundary_before": "continuous",
+                "start_state": "Agent扶住门框",
+            },
+        ],
+    }
+    plan_storyboard_beats(storyboard)
+
+    downgraded = json.loads(json.dumps(storyboard))
+    downgraded["shots"][0]["storyboard_beats"][0]["generation_mode"] = "fresh"
+    downgrade_codes = {
+        issue["code"]
+        for issue in storyboard_qa_gate.run_generation_capacity_checks(downgraded)
+    }
+    assert "secondary_storyboard_mode_invalid" in downgrade_codes
+    with pytest.raises(ValueError, match="invalid secondary storyboard contract"):
+        build_continuity_plan(downgraded)
+
+    invented = json.loads(json.dumps(storyboard))
+    bridge = invented["shots"][0]["storyboard_beats"][-1]
+    bridge["micro_actions"] = ["凭空击败敌人"]
+    bridge["source_action_unit_ids"] = ["INVENTED"]
+    invented_codes = {
+        issue["code"]
+        for issue in storyboard_qa_gate.run_generation_capacity_checks(invented)
+    }
+    assert "secondary_storyboard_bridge_contains_plot" in invented_codes
+    with pytest.raises(ValueError, match="bridge must not carry"):
+        build_continuity_plan(invented)
+
+
+def test_action_aware_adaptation_splits_paid_probe_before_secondary_planning():
+    events = [
+        {
+            "sequence_id": "SEQ001",
+            "continuity_before": "cut",
+            "micro_actions": ["挥拳", "肘击", "膝击", "缴械", "抓门框", "稳定"],
+        },
+        {
+            "sequence_id": "SEQ001",
+            "continuity_before": "continuous",
+            "micro_actions": ["穿门", "避让工具箱", "推向观察窗", "稳定"],
+        },
+    ]
+    assert adaptation_engine.estimate_action_aware_shot_count(events, 24, 12) == 3
+
+    shots = [
+        {
+            "id": "S01",
+            "where": "旋转走廊",
+            "who": ["Agent"],
+            "micro_actions": events[0]["micro_actions"][:3],
+            "boundary_before": "cut",
+        },
+        {
+            "id": "S02",
+            "where": "旋转走廊",
+            "who": ["Agent"],
+            "micro_actions": events[0]["micro_actions"][3:],
+            "boundary_before": "continuous",
+        },
+        {
+            "id": "S03",
+            "where": "旋转走廊",
+            "who": ["Agent"],
+            "micro_actions": events[1]["micro_actions"],
+            "boundary_before": "continuous",
+        },
+    ]
+    annotate_boundaries(shots)
+    adaptation_engine.normalize_shot_durations(shots, 24)
+    assert [shot["suggested_duration"] for shot in shots] == [9, 9, 6]
+
+    storyboard = {"video_provider": "seedance", "shots": shots}
+    plan_storyboard_beats(storyboard)
+    assert [
+        [beat["generation_mode"] for beat in shot["storyboard_beats"]]
+        for shot in shots
+    ] == [
+        ["multi_image", "tail_video_extend", "first_last_frame_bridge"],
+        ["multi_image", "tail_video_extend", "first_last_frame_bridge"],
+        ["multi_image", "tail_video_extend"],
+    ]
+
+
+def test_capacity_repair_deterministically_fixes_paid_model_event_mapping():
+    events = [
+        {
+            "sequence_id": "SEQ001",
+            "event_role": "scene_setup",
+            "who": ["Agent"],
+            "where": "旋转走廊",
+            "what": "建立失重走廊",
+            "visual": "红色警示灯闪烁，Agent进入走廊",
+            "micro_actions": [],
+        },
+        {
+            "sequence_id": "SEQ001",
+            "action_unit_id": "AU001",
+            "who": ["Agent", "敌方保安"],
+            "where": "旋转走廊",
+            "what": "Agent完成连续格斗并抓住门框",
+            "visual": "Agent依次挥拳、肘击、膝击、缴械并抓住门框",
+            "micro_actions": ["挥拳", "肘击", "膝击", "缴械", "抓住门框"],
+        },
+        {
+            "sequence_id": "SEQ001",
+            "action_unit_id": "AU002",
+            "who": ["Agent", "敌方保安"],
+            "where": "旋转走廊",
+            "what": "Agent穿门并把保安推向观察窗",
+            "visual": "Agent穿门、避让、推敌并稳定",
+            "micro_actions": ["穿门", "避让", "推向观察窗", "稳定"],
+        },
+    ]
+    model_beats = [
+        {"beat_order": 1, "source_events": [1], "action": "keep", "reason": "", "who": ["Agent"], "where": "旋转走廊", "what": "建立", "visual": "建立", "suggested_duration": 8},
+        {"beat_order": 2, "source_events": [2], "action": "keep", "reason": "", "who": ["Agent"], "where": "旋转走廊", "what": "格斗", "visual": "格斗", "suggested_duration": 8},
+        {"beat_order": 3, "source_events": [3], "action": "keep", "reason": "", "who": ["Agent"], "where": "旋转走廊", "what": "穿门", "visual": "穿门", "suggested_duration": 8},
+    ]
+
+    repaired = adaptation_engine._repair_beat_action_capacity(model_beats, events)
+
+    assert [beat["source_events"] for beat in repaired] == [[1, 2], [2], [3]]
+    assert repaired[0]["capacity_repair"]["event_id"] == 2
+    assert "挥拳" in repaired[0]["visual"]
+    adaptation_engine._validate_beat_action_capacity(repaired, events)
+
+
+def test_source_event_identity_overrides_llm_character_synonyms():
+    events = [{
+        "who": ["Agent", "敌方保安"],
+        "where": "旋转走廊",
+        "what": "Agent抓住门框",
+        "micro_actions": ["Agent抓住门框"],
+        "sequence_id": "SEQ001",
+    }]
+    shots = [{
+        "source_events": [1],
+        "who": ["特工", "敌方保安"],
+        "where": "旋转走廊",
+        "what": "特工抓住门框",
+    }]
+
+    adaptation_engine._inherit_event_semantics(shots, events)
+
+    assert shots[0]["who"] == ["Agent", "敌方保安"]
 
 
 def test_event_extractor_selects_a_generic_or_action_contract(monkeypatch):
@@ -939,6 +1180,49 @@ def test_phase5_separate_moderate_findings_become_systemic_across_shots():
     assert storyboard_qa_gate.blocking_issues(issues) == issues
 
 
+def test_phase5_verified_single_shot_end_state_omission_triggers_correction():
+    issue = storyboard_qa_gate._issue(
+        "L3",
+        "moderate",
+        "R4",
+        "最终动作未完成",
+        ["S03"],
+        storyboard_ids=["S03_P02"],
+        mismatch_type="end_state",
+        expected="敌方保安抵达透明观察窗",
+        observed="敌方保安仅漂浮在观察窗前方",
+        confidence=0.85,
+        panel_evidence=[{
+            "shot_id": "S03_P02",
+            "observed": "保安停在观察窗前，未完成最终接触",
+        }],
+        evidence_status="not_required",
+    )
+
+    assert storyboard_qa_gate.is_blocking_issue(issue) is True
+    assert storyboard_qa_gate.grade_issues([issue]) == "C"
+    assert storyboard_qa_gate._correctable_issues({"issues": [issue]}) == [issue]
+
+
+def test_phase5_low_confidence_single_shot_end_state_claim_stays_non_blocking():
+    issue = storyboard_qa_gate._issue(
+        "L3",
+        "moderate",
+        "R4",
+        "疑似终态偏差",
+        ["S03"],
+        mismatch_type="end_state",
+        expected="抵达观察窗",
+        observed="可能仍在窗前",
+        confidence=0.6,
+        panel_evidence=[{"shot_id": "S03_P02", "observed": "画面遮挡"}],
+        evidence_status="not_required",
+    )
+
+    assert storyboard_qa_gate.is_blocking_issue(issue) is False
+    assert storyboard_qa_gate.grade_issues([issue]) == "A"
+
+
 def test_phase5_r1_color_claim_requires_distinct_canonical_panel_evidence():
     valid, details = storyboard_qa_gate._r1_attribute_evidence(
         {
@@ -1024,10 +1308,47 @@ def test_phase2_panel_prompt_enforces_disarm_and_final_state_contracts():
     )
 
     assert "项目角色参考与下方角色合同始终优先于上一格" in prompt
-    assert "双方同时接触并控制同一武器" in prompt
+    assert "解除武器的完成态" in prompt
+    assert "敌方不得继续握持武器" in prompt
+    assert "所有列出动作完成后的终态快照" in prompt
+    assert "每个角色只出现一次" in prompt
     assert "动作→对象→道具→结束状态" in prompt
-    assert "不得仍停留在搏斗、准备、过渡或前一动作中" in prompt
-    assert "不得用运动线否定静止/定格" in prompt
+    assert "不得仍停留在搏斗、争夺、准备或前一动作中" in prompt
+    assert "不得用运动线否定静止" in prompt
+
+
+def test_phase2_bridge_panel_is_not_treated_as_the_last_story_beat():
+    content_prompt = _build_panel_prompt(
+        {"who": ["Agent", "敌方保安"], "where": "旋转走廊"},
+        {
+            "beat_id": "S02_P01",
+            "generation_mode": "multi_image",
+            "action": "Agent解除敌方保安的武器 → Agent抓住门框稳定身体",
+            "end_state": "敌方已被缴械，Agent抓住门框稳定身体",
+        },
+        1,
+        2,
+        [],
+        is_last_content_beat=True,
+    )
+    bridge_prompt = _build_panel_prompt(
+        {"who": ["Agent", "敌方保安"], "where": "旋转走廊"},
+        {
+            "beat_id": "S02_P02",
+            "generation_mode": "first_last_frame_bridge",
+            "action": "保持当前终态并接到 S03_P01",
+            "end_state": "敌方已被缴械，Agent抓住门框稳定身体",
+        },
+        2,
+        2,
+        [],
+        is_last_content_beat=False,
+    )
+
+    assert "最后一个承载剧情的故事格" in content_prompt
+    assert "不得仍停留在搏斗、争夺" in content_prompt
+    assert "桥接预览格，不是新的剧情动作格" in bridge_prompt
+    assert "绝不能把不同参考图复制成多个实体" in bridge_prompt
 
 
 def test_phase2_panel_prompt_turns_phase5_evidence_into_negative_constraints():

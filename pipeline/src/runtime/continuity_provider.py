@@ -31,13 +31,14 @@ from runtime.execution_errors import ProviderPreparationError
 from runtime.generation_tasks import GenerationTaskStore
 from runtime.seedance_execution import execute_seedance_video_task
 from schemas.continuity import ContinuityPlan
+from utils.video_capabilities import SEEDANCE_2_CAPABILITIES
 from utils.video_geometry import resolve_video_geometry
 
 CONTINUITY_BRIDGE_ENV = "HONCUT_CONTINUITY_BRIDGE"
 CONTINUITY_BRIDGE_MODES = {"off", "auto"}
 SEAM_DECISIONS_KIND = "honcut.continuity_seam_decisions.v1"
-SEEDANCE_MAX_REFERENCE_IMAGES = 9
-CONTINUITY_ANCHOR_FRAME_COUNT = 3
+SEEDANCE_MAX_REFERENCE_IMAGES = SEEDANCE_2_CAPABILITIES.max_reference_images or 9
+CONTINUITY_ANCHOR_FRAME_COUNT = SEEDANCE_2_CAPABILITIES.continuity_anchor_frame_count
 SEEDANCE_MIN_IMAGE_ASPECT = 0.40
 SEEDANCE_MAX_IMAGE_ASPECT = 2.50
 SEEDANCE_IMAGE_ASPECT_MARGIN = 0.01
@@ -195,12 +196,28 @@ def _generation_seed(request: ChunkExecutionRequest) -> int | None:
 
 def _chunk_duration(request: ChunkExecutionRequest) -> int:
     duration = float(request.chunk.target_duration_s)
-    rounded = round(duration)
-    if not math.isclose(duration, rounded, abs_tol=1e-6):
+    quantum = SEEDANCE_2_CAPABILITIES.duration_quantum_s
+    units = round(duration / quantum)
+    quantized = units * quantum
+    if not math.isclose(duration, quantized, abs_tol=1e-6):
         raise ValueError(
-            f"{request.resource_id} duration {duration} cannot be represented by Seedance seconds"
+            f"{request.resource_id} duration {duration} cannot be represented by "
+            f"Seedance's {quantum:g}s duration quantum"
         )
-    return int(rounded)
+    if (
+        request.chunk.execution_strategy != "legacy"
+        and not (
+            SEEDANCE_2_CAPABILITIES.min_unique_beat_s
+            <= quantized
+            <= SEEDANCE_2_CAPABILITIES.max_unique_beat_s
+        )
+    ):
+        raise ValueError(
+            f"{request.resource_id} duration {duration:g}s is outside Seedance's "
+            f"{SEEDANCE_2_CAPABILITIES.min_unique_beat_s:g}-"
+            f"{SEEDANCE_2_CAPABILITIES.max_unique_beat_s:g}s secondary-beat range"
+        )
+    return int(quantized)
 
 
 def _video_geometry(shot_meta: dict[str, Any]) -> tuple[str, int, int]:
@@ -293,8 +310,9 @@ def _chunk_prompt(
         ),
         "first_last_frame_bridge": (
             "Generate only the transition between the previous secondary beat's "
-            "actual final frame and the next primary shot's P01 frame. Finish the "
-            "current primary-shot action, but do not execute the next shot's action."
+            "actual final frame and the next primary shot's P01 frame. The current "
+            "primary-shot action is already complete: do not add, finish, repeat, or "
+            "reinterpret any plot action, and do not execute the next shot's action."
         ),
     }.get(
         strategy,
@@ -680,10 +698,12 @@ def _task_payload(
             else None
         ),
         "tail_window_seconds": (
-            2.0 if request.chunk.execution_strategy == "tail_video_extend" else None
+            SEEDANCE_2_CAPABILITIES.tail_reference_window_s
+            if request.chunk.execution_strategy == "tail_video_extend"
+            else None
         ),
         "ordered_frame_fractions": (
-            [0.2, 0.6, 0.95]
+            list(SEEDANCE_2_CAPABILITIES.tail_reference_frame_fractions)
             if request.chunk.execution_strategy == "tail_video_extend"
             else None
         ),

@@ -714,9 +714,10 @@ def test_complex_shot_maps_to_three_secondary_generation_strategies(tmp_path):
                 "id": "S02",
                 "duration": 5,
                 "who": ["凛"],
-                "where": "断裂护栏旁",
+                "where": "暴雨高架",
                 "what": "凛回身望向机械部队",
                 "boundary_before": "continuous",
+                "continuity_reason": "凛在同一高架空间承接上镜动作",
             },
         ],
     }
@@ -826,18 +827,24 @@ def test_secondary_strategies_follow_content_capacity_and_boundary_semantics():
     continuous_boundary = {
         "video_provider": "seedance",
         "shots": [
-            {
-                "id": "S01",
-                "duration": 6,
-                "micro_actions": ["Agent抓住门框稳住身体"],
-                "transition_to_next": "cut",
-            },
-            {
-                "id": "S02",
-                "duration": 5,
-                "micro_actions": ["Agent顺势穿过舱门"],
-                "boundary_before": "continuous",
-            },
+                {
+                    "id": "S01",
+                    "duration": 6,
+                    "where": "旋转走廊",
+                    "who": ["Agent"],
+                    "micro_actions": ["Agent抓住门框稳住身体"],
+                    "end_state": "Agent抓住门框稳定身体",
+                    "transition_to_next": "cut",
+                },
+                {
+                    "id": "S02",
+                    "duration": 5,
+                    "where": "旋转走廊",
+                    "who": ["Agent"],
+                    "micro_actions": ["Agent顺势穿过舱门"],
+                    "boundary_before": "continuous",
+                    "start_state": "Agent抓住门框稳定身体",
+                },
         ],
     }
     plan_storyboard_beats(continuous_boundary)
@@ -1381,6 +1388,7 @@ def test_phase5_blocks_secondary_plot_reordering_and_wrong_bridge_target():
                 "id": "S01",
                 "duration": 10,
                 "who": ["agent", "guard"],
+                "where": "旋转走廊",
                 "shot_intent": "action",
                 "camera_movement": "dolly_in",
                 "micro_actions": ["抓住扶手", "解除武器", "穿过舱门"],
@@ -1390,6 +1398,8 @@ def test_phase5_blocks_secondary_plot_reordering_and_wrong_bridge_target():
             {
                 "id": "S02",
                 "duration": 5,
+                "who": ["agent", "guard"],
+                "where": "旋转走廊",
                 "micro_actions": ["进入下一舱段"],
                 "boundary_before": "continuous",
                 "start_state": "二人刚穿过舱门",
@@ -1653,6 +1663,8 @@ def test_chunk_runtime_relays_previous_shot_video_inside_a_continuity_group(tmp_
                 {
                     "id": "S02",
                     "duration": 5,
+                    "who": ["agent", "guard"],
+                    "where": "旋转走廊",
                     "boundary_before": "continuous",
                     "continuity_subject": "paper boat",
                 },

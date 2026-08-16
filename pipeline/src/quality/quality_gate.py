@@ -16,10 +16,11 @@ Usage:
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Callable, List, Tuple, Dict, Any
+from typing import Any, Dict, List, Optional
 import json
 import re
-import os
+
+from utils.video_capabilities import capabilities_for, max_primary_story_duration
 
 
 class Severity(Enum):
@@ -397,13 +398,13 @@ def _print_report(report: QualityReport, phase_name: str) -> None:
             if issue.suggestion:
                 print(f"  │   → 建议: {issue.suggestion}")
     else:
-        print(f"  │ 无问题")
+        print("  │ 无问题")
     if report.step_summary:
-        print(f"  │ ── 步骤执行清单 ──")
+        print("  │ ── 步骤执行清单 ──")
         for step, st in report.step_summary.items():
             icon = "✓" if st == "done" else ("✗" if st == "failed" else "⊘")
             print(f"  │   {icon} {step}: {st}")
-    print(f"  └──────────────────────────────────────────\n")
+    print("  └──────────────────────────────────────────\n")
 
 
 # ---------------------------------------------------------------------------
@@ -479,10 +480,15 @@ def run_storyboard_review(storyboard_data: dict, script_text: str, characters: l
                 if q not in script_text:
                     severe_issues.append(f"[R2] {shot_id}: 台词 '{q[:20]}...' 不在原文中")
         
-        # P0-2b: 片段时长检查（HonCut 铁律: ≤15秒）
+        # P0-2b: 一级分镜必须能由一次基础段加至多一次延长段完整承载。
         duration = shot.get("suggested_duration", shot.get("duration", 0))
-        if duration and duration > 15:
-            severe_issues.append(f"[时长] {shot_id}: {duration}s 超过15秒上限")
+        profile = capabilities_for({**storyboard_data, **shot})
+        maximum = max_primary_story_duration(profile)
+        if duration and duration > maximum:
+            severe_issues.append(
+                f"[时长] {shot_id}: {duration}s 超过 {profile.name} 的 "
+                f"{maximum:g}秒一级分镜承载上限"
+            )
         
         # P0-2c: 长台词拆镜检查（HonCut 铁律: >20字强制拆镜）
         dialogue = shot.get("dialogue") or shot.get("what") or ""

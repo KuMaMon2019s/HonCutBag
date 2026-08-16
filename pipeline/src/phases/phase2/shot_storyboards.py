@@ -179,10 +179,14 @@ def _build_panel_prompt(
     uses_director_board: bool = False,
     aspect_ratio: str = "16:9",
     correction_contract: str = "",
+    is_last_content_beat: bool | None = None,
 ) -> str:
     who = _shot_who(shot)
     beat_id = str(beat.get("beat_id") or f"P{position:02d}")
     generation_mode = str(beat.get("generation_mode") or "").strip().lower()
+    is_bridge = generation_mode == "first_last_frame_bridge"
+    if is_last_content_beat is None:
+        is_last_content_beat = position == count and not is_bridge
     is_continuation = generation_mode in {
         "extend",
         "tail_video_extend",
@@ -217,15 +221,56 @@ def _build_panel_prompt(
         f"这是首尾帧交接格：仍只完成 {beat.get('parent_shot_id') or '当前一级分镜'} "
         f"的剧情；结束构图必须能够无跳变地接到下一一级分镜 "
         f"{beat.get('bridge_target_beat_id') or 'P01'} 的起始状态。禁止提前执行下一镜动作。"
-        if generation_mode == "first_last_frame_bridge"
+        if is_bridge
         else ""
     )
-    final_beat_contract = (
-        "这是本镜最后一格：必须把“结束状态”作为画面最醒目的已完成事实。若结束状态包含"
-        "稳定、停止、定格、落地、倒地、飞向或撞向等结果，必须清楚画出该结果；"
-        "不得仍停留在搏斗、准备、过渡或前一动作中，也不得用运动线否定静止/定格。"
-        if position == count
-        else "这不是本镜最后一格：只推进到本格结束状态，不得抢先画后续格的结果。"
+    if is_bridge:
+        final_beat_contract = (
+            "这是桥接预览格，不是新的剧情动作格。只能保持上一剧情格已经完成的结束状态，"
+            "并为下一 Sxx 的 P01 构图留出连续路径；不得回到动作进行中，不得新增、复制或"
+            "删除人物，不得改变武器归属。多张参考图里的同名角色都是同一个角色，绝不能"
+            "把不同参考图复制成多个实体。"
+        )
+    elif is_last_content_beat:
+        final_beat_contract = (
+            "这是本 Sxx 最后一个承载剧情的故事格；即使后面还有桥接格，本格也必须先完整"
+            "完成当前 Sxx 的全部剧情。画面是所有列出动作完成后的终态快照，不是中间过程拼贴。"
+            "必须把“结束状态”作为最醒目的已完成事实；稳定、停止、定格、落地、倒地、飞向或"
+            "撞向等结果必须清楚可见，不得仍停留在搏斗、争夺、准备或前一动作中，也不得用"
+            "运动线否定静止或定格。"
+        )
+    else:
+        final_beat_contract = (
+            "本格仍必须画出本格动作完成后的结束状态快照；只是不准抢先执行后续剧情格的动作。"
+        )
+    action_text = _compact(beat.get("action"), 500)
+    end_state_text = _compact(beat.get("end_state"), 500)
+    semantic_text = f"{action_text} {end_state_text}".casefold()
+    disarm_requested = bool(
+        ("解除" in semantic_text and "武器" in semantic_text)
+        or any(
+            marker in semantic_text
+            for marker in ("缴械", "disarm", "weapon removed")
+        )
+    )
+    disarm_contract = (
+        "- 本格要求的是解除武器的完成态：结束画面中敌方不得继续握持武器，双方不得仍共同争夺"
+        "同一武器；武器只能已由 Agent 控制、固定在远离敌方的位置或独立失重漂浮。画面中恰好"
+        "一件该武器，禁止复制武器。\n"
+        if disarm_requested
+        else (
+            "- 只有剧情明确写成尚未完成的‘争夺武器’时，才可画双方共同控制同一武器的过程；"
+            "不得替换为单方持枪瞄准、开枪或普通对打。\n"
+        )
+    )
+    canonical_cast = list(dict.fromkeys(
+        str(name) for name in (who or []) if str(name).strip()
+    ))
+    cast_contract = (
+        f"- 画面中恰好出现 {len(canonical_cast)} 个具名角色实体："
+        f"{'、'.join(canonical_cast) if canonical_cast else '零个角色'}。"
+        "每个角色只出现一次；多张近景、全身、上一格和导演参考图只是同一身份的不同参考，"
+        "绝不能复制成额外人物。\n"
     )
     correction_section = (
         f"""
@@ -259,7 +304,8 @@ Phase 5 定向纠偏合同：
 - 若角色合同启用“非真人视觉硬约束”，角色在每一格都必须保持全封闭不透明面甲，禁止露出人脸、皮肤、头发或真人肖像特征；旧剧情中的男性、脸、头发、真人写实描述不得覆盖该约束。
 - 逐字遵守角色合同中的发型、服装基础色、制服类型、体型和装备；警示灯、阴影和炭笔风格只能改变受光，不得把服装基础色改成另一角色的颜色。
 - 每个动作的执行者、承受者、左右位置、朝向以及武器持有者必须与“本格唯一可见动作”一致；禁止交换人物、攻守关系或武器归属。
-- “解除武器/争夺武器”必须画出双方同时接触并控制同一武器的过程，不得替换为单方持枪瞄准、开枪或普通对打；其他动作也不得用相邻剧情或泛化搏斗代替。
+- 静态故事格只画本格全部顺序动作完成后的单一终态，不得把多个时间点或动作过程同时拼进一张图；实际动作过程由后续视频生成完成。
+{disarm_contract}{cast_contract}- 其他动作不得用相邻剧情或泛化搏斗代替。
 - {final_beat_contract}
 {correction_section}
 
@@ -538,6 +584,7 @@ def generate_shot_storyboards(
     aspect_ratio: str | None = None,
     correction_context_by_shot: dict[str, list[dict[str, Any]]] | None = None,
     correction_attempt: int = 0,
+    target_shot_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     """Generate each Pxx as 16:9 model art, then compose the Sxx overview."""
     output_dir = Path(output_dir)
@@ -548,13 +595,35 @@ def generate_shot_storyboards(
     image_dir = output_dir / "storyboard_images"
     image_dir.mkdir(parents=True, exist_ok=True)
     model = getattr(client, "model", None) or "doubao-seedream-5.0-lite"
+    manifest_path = output_dir / "SHOT_STORYBOARDS.json"
+    previous_manifest: dict[str, Any] = {}
+    if target_shot_ids and manifest_path.is_file():
+        try:
+            previous_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                "targeted storyboard regeneration requires a readable prior manifest"
+            ) from exc
+    normalized_targets = {
+        str(shot_id).strip() for shot_id in (target_shot_ids or set())
+        if str(shot_id).strip()
+    }
+    previous_records = {
+        str(record.get("shot_id") or ""): record
+        for record in (previous_manifest.get("shots") or [])
+        if isinstance(record, dict) and record.get("shot_id")
+    }
+    preserved_records = [
+        record for shot_id, record in previous_records.items()
+        if shot_id not in normalized_targets
+    ]
     contract: dict[str, Any] = {
         "kind": "honcut.shot_storyboards.v1",
         "version": 1,
         "status": "running",
         "provider": "seedream",
         "model": model,
-        "shots": [],
+        "shots": preserved_records,
     }
     correction_context_by_shot = correction_context_by_shot or {}
     if correction_context_by_shot:
@@ -573,7 +642,6 @@ def generate_shot_storyboards(
             aspect_ratio = "16:9"
     contract["aspect_ratio"] = aspect_ratio
     contract["size_requested"] = size
-    manifest_path = output_dir / "SHOT_STORYBOARDS.json"
     _write_json(manifest_path, contract)
     if client is None:
         from clients.seedream_client import SeedreamClient
@@ -619,6 +687,27 @@ def generate_shot_storyboards(
             if not isinstance(shot, dict):
                 continue
             shot_id = _shot_id(shot, index)
+            if normalized_targets and shot_id not in normalized_targets:
+                if shot_id not in previous_records:
+                    raise RuntimeError(
+                        f"targeted storyboard regeneration has no prior record for {shot_id}"
+                    )
+                authored_beats = [
+                    beat for beat in (shot.get("storyboard_beats") or [])
+                    if isinstance(beat, dict)
+                ]
+                if authored_beats:
+                    last_beat_id = str(
+                        authored_beats[-1].get("beat_id")
+                        or f"{shot_id}_P{len(authored_beats):02d}"
+                    )
+                    candidate = beats_dir / f"{last_beat_id}.png"
+                    if not candidate.is_file() or candidate.stat().st_size == 0:
+                        raise RuntimeError(
+                            f"targeted storyboard regeneration is missing prior panel {candidate}"
+                        )
+                    previous_storyboard_panel = candidate
+                continue
             prompt, beats = build_shot_storyboard_prompt(
                 shot,
                 shot_id,
@@ -631,24 +720,6 @@ def generate_shot_storyboards(
             prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
             director_panel = director_panels.get(shot_id)
             correction_issues = correction_context_by_shot.get(shot_id, [])
-            correction_lines: list[str] = []
-            for issue_index, issue in enumerate(correction_issues, 1):
-                details = issue.get("details") if isinstance(issue.get("details"), dict) else {}
-                expected = _compact(details.get("expected"), 320)
-                observed = _compact(details.get("observed"), 320)
-                message = _compact(issue.get("message"), 420)
-                code = str(issue.get("code") or "QA").upper()
-                correction_lines.append(
-                    f"- 纠偏项 {issue_index}（{code}）：必须满足="
-                    f"{expected or '严格恢复本格动作与结束状态合同'}；"
-                    f"已观察到且禁止复现={observed or message}。"
-                )
-            correction_contract = "\n".join(correction_lines)
-            if correction_contract:
-                correction_contract = (
-                    f"这是第 {int(correction_attempt)} 轮自动纠偏，只修复 {shot_id}。\n"
-                    + correction_contract
-                )
             record = {
                 "shot_id": shot_id,
                 "board": str(board_path.relative_to(output_dir)),
@@ -680,8 +751,49 @@ def generate_shot_storyboards(
                 characters,
                 _shot_who(shot),
             )
+            content_positions = [
+                beat_position
+                for beat_position, authored_beat in enumerate(beats, 1)
+                if str(authored_beat.get("generation_mode") or "").strip().lower()
+                != "first_last_frame_bridge"
+            ]
+            last_content_position = max(content_positions, default=0)
             for position, beat in enumerate(beats, 1):
                 beat_id = str(beat.get("beat_id") or f"{shot_id}_P{position:02d}")
+                beat_correction_issues = []
+                for issue in correction_issues:
+                    details = (
+                        issue.get("details")
+                        if isinstance(issue.get("details"), dict)
+                        else {}
+                    )
+                    storyboard_ids = [
+                        str(value) for value in (details.get("storyboard_ids") or [])
+                    ]
+                    if not storyboard_ids or beat_id in storyboard_ids:
+                        beat_correction_issues.append(issue)
+                correction_lines: list[str] = []
+                for issue_index, issue in enumerate(beat_correction_issues, 1):
+                    details = (
+                        issue.get("details")
+                        if isinstance(issue.get("details"), dict)
+                        else {}
+                    )
+                    expected = _compact(details.get("expected"), 320)
+                    observed = _compact(details.get("observed"), 320)
+                    message = _compact(issue.get("message"), 420)
+                    code = str(issue.get("code") or "QA").upper()
+                    correction_lines.append(
+                        f"- 纠偏项 {issue_index}（{code}）：必须满足="
+                        f"{expected or '严格恢复本格动作与结束状态合同'}；"
+                        f"已观察到且禁止复现={observed or message}。"
+                    )
+                correction_contract = "\n".join(correction_lines)
+                if correction_contract:
+                    correction_contract = (
+                        f"这是第 {int(correction_attempt)} 轮自动纠偏，只修复 "
+                        f"{beat_id}。\n{correction_contract}"
+                    )
                 panel_prompt = _build_panel_prompt(
                     shot,
                     beat,
@@ -691,6 +803,7 @@ def generate_shot_storyboards(
                     uses_director_board=director_panel is not None,
                     aspect_ratio=aspect_ratio,
                     correction_contract=correction_contract,
+                    is_last_content_beat=position == last_content_position,
                 )
                 panel_prompt_path = beats_dir / f"{beat_id}_prompt.txt"
                 panel_path = beats_dir / f"{beat_id}.png"
@@ -847,6 +960,11 @@ def generate_shot_storyboards(
             shot["storyboard_beats"] = beats
             _write_json(boards_dir / f"{shot_id}.json", record)
             contract["shots"].append(record)
+            contract["shots"].sort(
+                key=lambda item: authored_shot_ids.index(str(item.get("shot_id")))
+                if str(item.get("shot_id")) in authored_shot_ids
+                else len(authored_shot_ids)
+            )
             if panel_paths:
                 previous_storyboard_panel = panel_paths[-1]
             _write_json(manifest_path, contract)

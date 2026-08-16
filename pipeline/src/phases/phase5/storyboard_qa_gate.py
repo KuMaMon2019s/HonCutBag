@@ -19,8 +19,11 @@ from pathlib import Path
 from typing import Any
 
 from clients.ark_multimodal_client import ArkMultimodalClient
-from phases.phase1.storyboard_beats import required_content_beat_count
-from quality.shot_continuity import classify_boundary
+from phases.phase1.storyboard_beats import (
+    secondary_contract_declared,
+    secondary_storyboard_contract_errors,
+    secondary_storyboard_requirements,
+)
 from utils.video_capabilities import capabilities_for
 
 DEFAULT_SIMILARITY_THRESHOLD = 0.85
@@ -76,7 +79,6 @@ def run_l1_checks(storyboard: dict, visual_style: str) -> tuple[list[dict], dict
     for index, shot in enumerate(shots):
         if not isinstance(shot, dict):
             continue
-        profile = capabilities_for({**storyboard, **shot})
         sid = _shot_id(shot, index)
         per_shot[sid] = {"issues": [], "characters": []}
         character_assets = [
@@ -136,6 +138,7 @@ def run_generation_capacity_checks(
     """Block storyboards that exceed one video clip's narrative capacity."""
     issues: list[dict] = []
     observed_units: set[str] = set()
+    uses_strict_secondary_contract = secondary_contract_declared(storyboard)
     ordered_shots = [
         shot for shot in storyboard.get("shots", []) if isinstance(shot, dict)
     ]
@@ -166,11 +169,26 @@ def run_generation_capacity_checks(
             if isinstance(beat, dict)
         ]
 
+        if uses_strict_secondary_contract:
+            for contract_error in secondary_storyboard_contract_errors(
+                storyboard,
+                index,
+                profile,
+            ):
+                issues.append(_issue(
+                    "L1",
+                    "severe",
+                    str(contract_error["code"]),
+                    str(contract_error["message"]),
+                    [sid],
+                    **(contract_error.get("details") or {}),
+                ))
+
         if storyboard_beats:
             beat_duration_total = 0.0
             beat_units_seen: list[str] = []
             beat_micro_actions_seen: list[str] = []
-            uses_secondary_contract = all(
+            uses_secondary_contract = uses_strict_secondary_contract or all(
                 str(beat.get("generation_mode") or "").strip().lower()
                 in {
                     "multi_image",
@@ -182,19 +200,17 @@ def run_generation_capacity_checks(
             expected_modes: list[str] = []
             bridge_required = False
             if uses_secondary_contract:
-                content_count = required_content_beat_count(shot, profile)
-                if index + 1 < len(ordered_shots):
-                    boundary_after, _boundary_reason = classify_boundary(
-                        shot,
-                        ordered_shots[index + 1],
-                        index=index + 2,
+                try:
+                    requirement = secondary_storyboard_requirements(
+                        storyboard,
+                        index,
+                        profile,
                     )
-                    bridge_required = boundary_after == "continuous"
-                expected_modes = ["multi_image"]
-                if content_count > 1:
-                    expected_modes.append("tail_video_extend")
-                if bridge_required:
-                    expected_modes.append("first_last_frame_bridge")
+                except (TypeError, ValueError):
+                    requirement = None
+                if requirement is not None:
+                    bridge_required = requirement["bridge_required"]
+                    expected_modes = list(requirement["modes"])
                 actual_modes = [
                     str(beat.get("generation_mode") or "").strip().lower()
                     for beat in storyboard_beats
@@ -1150,6 +1166,25 @@ def is_blocking_issue(issue: dict) -> bool:
     """Return whether an issue must stop paid video generation."""
     if issue.get("severity") == "severe":
         return True
+    details = issue.get("details") if isinstance(issue.get("details"), dict) else {}
+    try:
+        confidence = float(details.get("confidence"))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    material_semantic_mismatch = bool(
+        issue.get("severity") == "moderate"
+        and issue.get("layer") == "L3"
+        and str(issue.get("code") or "").upper() in {"R3", "R4"}
+        and str(details.get("mismatch_type") or "").lower()
+        in {"action", "end_state"}
+        and str(details.get("expected") or "").strip()
+        and str(details.get("observed") or "").strip()
+        and details.get("panel_evidence")
+        and confidence >= 0.75
+        and details.get("evidence_status") != "unverified"
+    )
+    if material_semantic_mismatch:
+        return True
     return (
         issue.get("severity") == "moderate"
         and issue.get("layer") == "L3"
@@ -1473,6 +1508,7 @@ def _redraw_failed_storyboards(
         ),
         correction_context_by_shot=context_by_shot,
         correction_attempt=attempt,
+        target_shot_ids=set(targets),
     )
     artifact_errors = validate_shot_storyboard_artifacts(output_dir, storyboard)
     if artifact_errors:

@@ -59,12 +59,12 @@ def _terminate_children(signum, frame):
 signal.signal(signal.SIGINT, _terminate_children)
 signal.signal(signal.SIGTERM, _terminate_children)
 
-from phases.phase1.adaptation_engine import (  # noqa: E402
-    AVG_SHOT_DURATION,
-    MAX_SHOT_DURATION,
-    MIN_SHOT_DURATION,
-)
+from phases.phase1.adaptation_engine import AVG_SHOT_DURATION  # noqa: E402
 from utils.phase_policy import get_policy  # noqa: E402
+from utils.video_capabilities import (  # noqa: E402
+    get_video_capabilities,
+    max_primary_story_duration,
+)
 
 
 def _normalize_shot_duration(config: dict) -> int:
@@ -72,11 +72,17 @@ def _normalize_shot_duration(config: dict) -> int:
     shot_duration = config.get("shot_duration", AVG_SHOT_DURATION)
     if isinstance(shot_duration, bool) or not isinstance(shot_duration, int):
         raise ValueError("config shot_duration must be an integer number of seconds")
-    clamped = max(MIN_SHOT_DURATION, min(MAX_SHOT_DURATION, shot_duration))
+    profile = get_video_capabilities(
+        model=config.get("video_model"),
+        provider=config.get("video_provider"),
+    )
+    minimum = int(profile.min_shot_duration_s)
+    maximum = int(max_primary_story_duration(profile))
+    clamped = max(minimum, min(maximum, shot_duration))
     if clamped != shot_duration:
         print(
             f"Warning: shot_duration {shot_duration}s is outside "
-            f"[{MIN_SHOT_DURATION}, {MAX_SHOT_DURATION}]; clamped to {clamped}s",
+            f"[{minimum}, {maximum}] for {profile.name}; clamped to {clamped}s",
             file=sys.stderr,
             flush=True,
         )

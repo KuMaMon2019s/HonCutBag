@@ -32,11 +32,46 @@ _TIME_JUMP_CUES = (
     "years later",
     "flashback",
 )
-_SCENE_TRANSITIONS = {"dissolve", "fade", "fade_to_black", "wipe", "match_cut"}
+_SCENE_TRANSITIONS = {
+    "cross_dissolve",
+    "crossfade",
+    "dissolve",
+    "fade",
+    "fade_in",
+    "fade_out",
+    "fade_to_black",
+    "flash_cut",
+    "iris",
+    "match_cut",
+    "scene_transition",
+    "smash_cut",
+    "wipe",
+    "叠化",
+    "淡入",
+    "淡出",
+    "淡黑",
+    "闪切",
+    "划变",
+    "转场",
+}
 
 
 def _text(value: Any) -> str:
     return str(value or "").strip().lower()
+
+
+def _transition(value: Any) -> str:
+    return _text(value).replace("-", "_").replace(" ", "_")
+
+
+def _is_scene_transition(value: Any) -> bool:
+    normalized = _transition(value)
+    if normalized in _SCENE_TRANSITIONS:
+        return True
+    return any(
+        marker in normalized
+        for marker in ("dissolve", "crossfade", "fade_", "wipe", "iris", "转场", "叠化")
+    )
 
 
 def _subjects(shot: Mapping[str, Any]) -> set[str]:
@@ -59,6 +94,7 @@ def classify_boundary(
     current: Mapping[str, Any],
     *,
     index: int,
+    allow_unverified_explicit: bool = False,
 ) -> tuple[str, str]:
     """Return ``(cut|continuous, reason)`` without guessing across weak evidence."""
     if index <= 1 or previous is None:
@@ -71,34 +107,76 @@ def classify_boundary(
     # A declared scene transition is a hard boundary even when the next shot
     # was accidentally labelled continuous by an upstream model.  Bridge-video
     # planning must never interpolate across dissolves, fades, wipes or jumps.
-    previous_transition = _text(previous.get("transition_to_next"))
-    if previous_transition in _SCENE_TRANSITIONS:
+    previous_transition = _transition(previous.get("transition_to_next"))
+    if _is_scene_transition(previous_transition):
         return "cut", f"previous shot requests a scene transition ({previous_transition})"
-
-    if explicit in CONTINUOUS_VALUES:
-        return (
-            "continuous",
-            _text(current.get("continuity_reason"))
-            or "storyboard explicitly continues the previous moving state",
-        )
 
     previous_place = _text(previous.get("where") or previous.get("scene"))
     current_place = _text(current.get("where") or current.get("scene"))
-    if not previous_place or not current_place or previous_place != current_place:
-        return "cut", "location is missing or changes across the boundary"
+    if previous_place and current_place and previous_place != current_place:
+        return "cut", "location changes across the boundary"
 
     combined = " ".join(
-        _text(current.get(field)) for field in ("visual", "what", "action_description")
+        _text(current.get(field))
+        for field in ("visual", "what", "action_description", "continuity_reason")
     )
     if any(cue in combined for cue in _TIME_JUMP_CUES):
         return "cut", "the next shot contains a temporal or narrative jump"
 
     previous_subjects = _subjects(previous)
     current_subjects = _subjects(current)
-    if not previous_subjects or not current_subjects or previous_subjects.isdisjoint(current_subjects):
+    if previous_subjects and current_subjects and previous_subjects.isdisjoint(current_subjects):
         return "cut", "no stable subject is shared across the boundary"
 
-    if not any(cue in combined for cue in _CONTINUATION_CUES):
+    previous_sequence_values = previous.get("source_sequence_ids") or []
+    current_sequence_values = current.get("source_sequence_ids") or []
+    if not isinstance(previous_sequence_values, (list, tuple, set)):
+        previous_sequence_values = [previous_sequence_values]
+    if not isinstance(current_sequence_values, (list, tuple, set)):
+        current_sequence_values = [current_sequence_values]
+    previous_sequences = {
+        _text(value) for value in previous_sequence_values if _text(value)
+    }
+    current_sequences = {
+        _text(value) for value in current_sequence_values if _text(value)
+    }
+    if previous_sequences and current_sequences and previous_sequences.isdisjoint(current_sequences):
+        return "cut", "screenplay sequence changes across the boundary"
+
+    same_place = bool(previous_place and current_place and previous_place == current_place)
+    shared_subject = bool(previous_subjects and current_subjects and previous_subjects & current_subjects)
+    same_sequence = bool(previous_sequences and current_sequences and previous_sequences & current_sequences)
+    previous_end = _text(previous.get("end_state"))
+    current_start = _text(current.get("start_state") or current.get("prev_shot_context"))
+    same_state = bool(previous_end and current_start and previous_end == current_start)
+    has_continuation_cue = any(cue in combined for cue in _CONTINUATION_CUES)
+
+    if explicit in CONTINUOUS_VALUES:
+        if not (
+            (same_place and shared_subject)
+            or same_sequence
+            or same_state
+            or (shared_subject and has_continuation_cue)
+        ):
+            if allow_unverified_explicit:
+                return (
+                    "continuous",
+                    _text(current.get("continuity_reason"))
+                    or "legacy storyboard explicitly continues the previous shot",
+                )
+            return "cut", "continuous label lacks matching place/subject/sequence/state evidence"
+        return (
+            "continuous",
+            _text(current.get("continuity_reason"))
+            or "storyboard explicitly continues a verified moving state",
+        )
+
+    if not previous_place or not current_place:
+        return "cut", "location evidence is missing across the boundary"
+    if not previous_subjects or not current_subjects:
+        return "cut", "subject evidence is missing across the boundary"
+
+    if not has_continuation_cue:
         return "cut", "no explicit action-state continuation cue is present"
 
     return "continuous", "same place and subject with an explicit action-state continuation cue"
@@ -110,8 +188,9 @@ def annotate_boundaries(shots: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for index, shot in enumerate(shots, 1):
         boundary, reason = classify_boundary(previous, shot, index=index)
         shot["boundary_before"] = boundary
-        if not str(shot.get("continuity_reason") or "").strip():
-            shot["continuity_reason"] = reason
+        # Keep the explanation consistent with the normalized decision; stale
+        # model prose must not claim continuity after code has forced a cut.
+        shot["continuity_reason"] = reason
         if boundary == "continuous" and not str(shot.get("continuity_subject") or "").strip():
             shared = sorted(_subjects(previous or {}) & _subjects(shot))
             if shared:

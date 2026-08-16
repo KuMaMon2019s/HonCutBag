@@ -235,7 +235,7 @@ def test_stage1_uses_timeout_retry_wrapper(monkeypatch):
     assert calls == [8000]
 
 
-def test_action_dense_script_keeps_director_shots_above_provider_beats():
+def test_action_dense_script_fails_when_full_detail_cannot_fit_target_runtime():
     action_events = [
             {
                 "event_role": "action_chain",
@@ -254,7 +254,8 @@ def test_action_dense_script_keeps_director_shots_above_provider_beats():
         {"event_role": "scene_setup"},
     ]
 
-    assert engine.estimate_action_aware_shot_count(events, 60, 10) == 6
+    with pytest.raises(ValueError, match="cannot carry the authored action detail"):
+        engine.estimate_action_aware_shot_count(events, 60, 10)
 
 
 def test_event_semantics_bounds_generation_actions_but_keeps_full_ledger():
@@ -300,7 +301,7 @@ def test_duration_normalization_closes_exact_target_with_integer_seconds():
 def test_duration_normalization_gives_dense_action_more_provider_capacity():
     shots = [
         {"micro_actions": ["翻开旧书"]},
-        {"micro_actions": ["抬头", "发现", "触摸", "迟疑", "合上"]},
+        {"micro_actions": ["抬头", "发现", "触摸", "迟疑"]},
     ]
 
     engine.normalize_shot_durations(shots, 20)
@@ -308,7 +309,7 @@ def test_duration_normalization_gives_dense_action_more_provider_capacity():
     assert sum(shot["suggested_duration"] for shot in shots) == 20
     assert shots[1]["suggested_duration"] > shots[0]["suggested_duration"]
     assert shots[1]["suggested_duration"] >= 12
-    assert shots[1]["duration_allocation"]["complexity_weight"] == 3
+    assert shots[1]["duration_allocation"]["complexity_weight"] == 2
 
 
 def test_beat_capacity_allows_continuous_action_units_but_rejects_cross_sequence_merge():

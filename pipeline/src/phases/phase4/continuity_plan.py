@@ -9,6 +9,10 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from phases.phase1.storyboard_beats import (
+    secondary_contract_declared,
+    secondary_storyboard_contract_errors,
+)
 from schemas.continuity import (
     ContinuityAnchors,
     ContinuityPlan,
@@ -230,10 +234,17 @@ def _boundary_before(
     shot: Mapping[str, Any],
     previous_shot: Mapping[str, Any] | None,
     index: int,
+    *,
+    allow_unverified_explicit: bool = False,
 ) -> tuple[str, str]:
     from quality.shot_continuity import classify_boundary
 
-    return classify_boundary(previous_shot, shot, index=index)
+    return classify_boundary(
+        previous_shot,
+        shot,
+        index=index,
+        allow_unverified_explicit=allow_unverified_explicit,
+    )
 
 
 def _anchors(shot: Mapping[str, Any], scene_contract: Mapping[str, Any]) -> ContinuityAnchors:
@@ -339,6 +350,24 @@ def build_continuity_plan(
     if continuity_group_max_shots < 1:
         raise ValueError("continuity_group_max_shots must be positive")
 
+    storyboard_contract = dict(storyboard)
+    strict_secondary_contract = secondary_contract_declared(storyboard_contract)
+    if strict_secondary_contract:
+        contract_shots = [
+            shot for shot in storyboard.get("shots", []) if isinstance(shot, Mapping)
+        ]
+        strict_errors = [
+            error
+            for shot_index in range(len(contract_shots))
+            for error in secondary_storyboard_contract_errors(
+                storyboard_contract,
+                shot_index,
+            )
+        ]
+        if strict_errors:
+            summary = "; ".join(error["message"] for error in strict_errors[:8])
+            raise ValueError(f"invalid secondary storyboard contract: {summary}")
+
     limit_frames = round(provider_chunk_limit_s * timeline_fps)
     overlap_frames = round(continuation_overlap_s * timeline_fps)
 
@@ -360,6 +389,7 @@ def build_continuity_plan(
             shot,
             previous_storyboard_shot,
             index,
+            allow_unverified_explicit=not strict_secondary_contract,
         )
         requested_extension = (
             boundary_before == "continuous"

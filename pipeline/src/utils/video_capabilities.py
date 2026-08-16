@@ -11,6 +11,8 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
+MAX_CONTENT_BEATS_PER_PRIMARY_SHOT = 2
+
 
 @dataclass(frozen=True)
 class VideoModelCapabilities:
@@ -24,6 +26,11 @@ class VideoModelCapabilities:
     max_action_units_per_beat: int
     max_micro_actions_per_beat: int
     action_budget_steps: tuple[tuple[float, int], ...]
+    duration_quantum_s: float = 0.001
+    tail_reference_window_s: float | None = None
+    tail_reference_frame_fractions: tuple[float, ...] = ()
+    max_reference_images: int | None = None
+    continuity_anchor_frame_count: int = 0
 
     def action_limit(self, duration_seconds: float | int | None) -> int:
         if duration_seconds is None:
@@ -47,6 +54,11 @@ SEEDANCE_2_CAPABILITIES = VideoModelCapabilities(
     max_action_units_per_beat=1,
     max_micro_actions_per_beat=2,
     action_budget_steps=((5, 1), (6, 2), (8, 3), (15, 4)),
+    duration_quantum_s=1,
+    tail_reference_window_s=2,
+    tail_reference_frame_fractions=(0.2, 0.6, 0.95),
+    max_reference_images=9,
+    continuity_anchor_frame_count=3,
 )
 
 
@@ -63,6 +75,20 @@ GENERIC_VIDEO_CAPABILITIES = VideoModelCapabilities(
     max_micro_actions_per_beat=4,
     action_budget_steps=((5, 2), (10, 4), (60, 6)),
 )
+
+
+def max_primary_story_duration(
+    capabilities: VideoModelCapabilities,
+    *,
+    max_content_beats: int = MAX_CONTENT_BEATS_PER_PRIMARY_SHOT,
+) -> float:
+    """Return the largest primary-shot duration one base clip plus extensions can carry."""
+    if max_content_beats < 1:
+        raise ValueError("max_content_beats must be positive")
+    return min(
+        capabilities.max_shot_duration_s,
+        capabilities.max_unique_beat_s * max_content_beats,
+    )
 
 
 def get_video_capabilities(
@@ -106,8 +132,10 @@ def capabilities_for(mapping: dict[str, Any] | None) -> VideoModelCapabilities:
 
 __all__ = [
     "GENERIC_VIDEO_CAPABILITIES",
+    "MAX_CONTENT_BEATS_PER_PRIMARY_SHOT",
     "SEEDANCE_2_CAPABILITIES",
     "VideoModelCapabilities",
     "capabilities_for",
     "get_video_capabilities",
+    "max_primary_story_duration",
 ]
