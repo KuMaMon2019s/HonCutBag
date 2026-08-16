@@ -66,7 +66,9 @@ USER_PROMPT_TEMPLATE = (
     "<target>\n{content}\n</target>\n"
     "<context_after>\n{context_after}\n</context_after>\n\n"
     "只从 <target> 提取事件。输出 JSON 数组，每个元素包含：\n"
-    "- who: 数组，参与者列表\n"
+    "- who: 数组，只写可跨事件复用的稳定身份标签；服装、年龄、伤势、动作、站位和地点修饰不得进入 who，"
+    "应写入 visual/start_state/end_state。相同人物在 target 与上下文中必须沿用同一标签；"
+    "不得把多词姓名截短，也不得用主角/他/她替换已有标签\n"
     "- where: 字符串，地点\n"
     "- what: 字符串，发生了什么\n"
     "- emotion: 字符串，情绪氛围\n"
@@ -99,7 +101,9 @@ GENERAL_PROSE_CONTRACT = (
     "3. 对人物、物体或空间造成的持久变化必须进入 end_state，供后续事件承接。\n"
     "4. 目标、关系、认知或处境发生转折时单列 turning_point，并设置 dramatic_turn=true。\n"
     "5. 同一时空的状态直接承接才使用 continuous；换场、跳时或独立叙事段落使用 cut。\n"
-    "6. who 只放可作为角色资产的具名个体；群体与背景参与者写入 visual，不得写入 who。"
+    "6. who 只放可作为角色资产的具名个体；群体与背景参与者写入 visual，不得写入 who。\n"
+    "7. who 的每个值必须是稳定身份标签，不得包含服装、年龄、伤势、动作、站位或地点修饰；"
+    "同一人物必须沿用 target/上下文中已有的最短无歧义标签。"
 )
 
 ACTION_SCREENPLAY_CONTRACT = (
@@ -111,7 +115,9 @@ ACTION_SCREENPLAY_CONTRACT = (
     "4. 目标、立场、关系或局势发生变化时单列 turning_point，并设置 dramatic_turn=true。\n"
     "5. 相邻事件的位置、朝向、速度和受力状态直接延续时使用 continuous；"
     "换场、跳时或独立叙事段落使用 cut。\n"
-    "6. who 只放可作为角色资产的具名个体；群体与背景参与者写入 visual，不得写入 who。"
+    "6. who 只放可作为角色资产的具名个体；群体与背景参与者写入 visual，不得写入 who。\n"
+    "7. who 的每个值必须是稳定身份标签，不得包含服装、年龄、伤势、动作、站位或地点修饰；"
+    "同一人物必须沿用 target/上下文中已有的最短无歧义标签。"
 )
 
 LLM_TIMEOUT = 300

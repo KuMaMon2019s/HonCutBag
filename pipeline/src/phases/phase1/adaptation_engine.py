@@ -54,6 +54,10 @@ from utils.video_capabilities import (
     get_video_capabilities,
     max_primary_story_duration,
 )
+from utils.character_identity import (
+    normalize_character_reference,
+    resolve_character_name,
+)
 
 
 # ─── LLM 配置 ───────────────────────────────────────────────────────────────
@@ -822,8 +826,48 @@ def _build_events_json(events: List[Dict[str, Any]]) -> str:
     return json.dumps(numbered_events, ensure_ascii=False, indent=2)
 
 
+def _normalize_character_reference(value: Any) -> str:
+    """Backward-compatible wrapper around the shared identity normalizer."""
+    return normalize_character_reference(value)
+
+
+def _canonical_character_name(
+    value: Any,
+    characters: Optional[List[Dict[str, Any]]],
+) -> str:
+    """Resolve a source mention or qualified description to one character name."""
+    original = str(value or "").strip()
+    return resolve_character_name(original, characters) or original
+
+
+def _canonicalize_shot_characters(
+    shots: List[Dict[str, Any]],
+    characters: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """Canonicalize ``who`` while retaining original source mentions for audit."""
+    if not characters:
+        return shots
+    for shot in shots:
+        raw_who = shot.get("who") or []
+        if isinstance(raw_who, str):
+            raw_who = [raw_who]
+        original = [str(name).strip() for name in raw_who if str(name).strip()]
+        canonical = list(
+            dict.fromkeys(
+                _canonical_character_name(name, characters) for name in original
+            )
+        )
+        canonical = [name for name in canonical if name]
+        if canonical != original:
+            shot["source_character_mentions"] = original
+        shot["who"] = canonical
+    return shots
+
+
 def _inherit_event_semantics(
-    shots: List[Dict[str, Any]], events: List[Dict[str, Any]]
+    shots: List[Dict[str, Any]],
+    events: List[Dict[str, Any]],
+    characters: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Carry source screenplay evidence into shots after the LLM adaptation pass.
 
@@ -889,9 +933,9 @@ def _inherit_event_semantics(
             if str(name).strip()
         ))
         if details:
-            # Character identity is a source-ledger contract. The adaptation
-            # model may call "Agent" a synonym such as "特工", which breaks
-            # Phase 3 reference lookup and falsely reports a disappearance.
+            # Character identity is a source-ledger contract. A model synonym
+            # would break downstream reference lookup and falsely report a
+            # disappearance, so source labels are restored before resolution.
             shot["who"] = canonical_who
 
         excerpts = [str(event.get("source_excerpt") or "").strip() for event in details]
@@ -990,7 +1034,7 @@ def _inherit_event_semantics(
                 "source action unit directly continues within the same screenplay sequence",
             )
         previous_sequence_ids = sequence_ids
-    return shots
+    return _canonicalize_shot_characters(shots, characters)
 
 
 BEAT_SKELETON_PROMPT = (
@@ -1717,7 +1761,7 @@ def adapt_events(
         for i, shot in enumerate(shots, 1):
             shot["shot_order"] = i
 
-        _inherit_event_semantics(shots, events)
+        _inherit_event_semantics(shots, events, characters)
         from quality.shot_continuity import annotate_boundaries
 
         annotate_boundaries(shots)
@@ -1809,7 +1853,7 @@ def adapt_events(
     for i, shot in enumerate(shots, 1):
         shot["shot_order"] = i
 
-    _inherit_event_semantics(shots, events)
+    _inherit_event_semantics(shots, events, characters)
     from quality.shot_continuity import annotate_boundaries
 
     annotate_boundaries(shots)

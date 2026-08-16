@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 import json
 import re
 
+from utils.character_identity import is_declared_character_reference
 from utils.video_capabilities import capabilities_for, max_primary_story_duration
 
 
@@ -429,8 +430,7 @@ def run_storyboard_review(storyboard_data: dict, script_text: str, characters: l
     moderate_issues = []
     
     shots = storyboard_data.get("shots", [])
-    char_names = {c.get("name", "").lower() for c in characters} if characters else set()
-    char_ids = {c.get("id", "").lower() for c in characters} if characters else set()
+    has_declared_characters = bool(characters)
     
     # 抽象笼统词黑名单（R3）— 扩充至 30+ 词
     abstract_words = [
@@ -448,18 +448,11 @@ def run_storyboard_review(storyboard_data: dict, script_text: str, characters: l
         visual = shot.get("visual") or ""
         what = shot.get("what") or ""
         
-        # R1: 资产引用合法（子串模糊匹配：LLM 分镜常用描述性长名，
-        # 角色列表存的是过滤后的短名，精确匹配会误杀，如
-        # "三十岁左右普通上班族男人" vs 角色表中的 "男人"）
-        if char_names:
+        # R1: 资产引用合法。Qualified mentions may contain a declared name,
+        # but matching must remain token-safe and unambiguous.
+        if has_declared_characters:
             for name in who:
-                lowered = name.lower()
-                matched = (
-                    lowered in char_names
-                    or lowered in char_ids
-                    or any(cn and (cn in lowered or lowered in cn) for cn in char_names)
-                )
-                if not matched:
+                if not is_declared_character_reference(name, characters):
                     severe_issues.append(f"[R1] {shot_id}: 角色 '{name}' 不在角色列表中")
         
         # R3: 具象可感

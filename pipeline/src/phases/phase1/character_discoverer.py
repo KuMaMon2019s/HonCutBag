@@ -39,6 +39,7 @@ from utils.ark_llm import (
     call_llm_stream,
     create_ark_client,
 )
+from utils.character_identity import resolve_character_name
 
 
 # ─── LLM 配置 ───────────────────────────────────────────────────────────────
@@ -53,6 +54,9 @@ SYSTEM_PROMPT = (
     "复数群体（如'保安们'应合并为'保安'）、物品、概念。"
     "同一角色的编号、职业称呼和通用指代必须合并为一个对象："
     "保留最具体的主名，其余写入 aliases；禁止将'主角'、'他'、'她'单独输出为角色。"
+    "方括号中的来源称呼可能混有服装、年龄、伤势、动作或地点修饰；name 必须是可跨镜头复用的"
+    "稳定身份名，aliases 必须逐字收录所有属于该角色的来源称呼，瞬时修饰只能进入 appearance/variants。"
+    "不得因为来源称呼使用中文、英文、编号、职业名或多词名称而丢弃角色，也不得凭子串把两个角色合并。"
     "最多保留5个主要人物角色。"
     "\n\n外貌描述具体化要求：\n"
     "- hair 必须写明发色+发长+发型（如'黑色长直发及肩'），不能只写'长发'\n"
@@ -69,6 +73,9 @@ USER_PROMPT_TEMPLATE = (
     "抽象指代（如'说话者'、'观察者'）、复数群体。"
     "同一实体的编号/职业/主角指代只输出一个对象，其余称呼放入 aliases；"
     "'主角'、'他'、'她'不得独立成条。最多保留5个主要角色。\n\n"
+    "身份归一化硬约束：每个【来源称呼】必须被审计。若称呼带有服装、年龄、伤势、动作或地点修饰，"
+    "从中提取稳定身份作为 name，并把完整【来源称呼】逐字放入 aliases；若它只是物品、环境或群众描述，"
+    "则不得生成角色。禁止按语言或字母类型区别处理，禁止把多词姓名截成最后一个词，禁止以模糊子串合并。\n\n"
     "忠实度要求：事件上下文中明确出现的服装颜色、层次、材质、发型和配饰必须逐项保留；"
     "只能补全未指定的细节，不能把淡粉改成月白、把轻纱改成其他面料或擅自换装。\n\n"
     "为每个角色输出 JSON 对象，组成数组。每个对象包含：\n"
@@ -118,7 +125,42 @@ ENTITY_SUFFIXES = (
 )
 MAX_ENTITY_NAME_CHINESE_CHARS = 12
 GENERIC_CHARACTER_NAMES = {"主角", "主人公", "男主", "女主", "人物", "他", "她", "它"}
-CHARACTER_CONTEXT_SCHEMA_VERSION = 2
+CHARACTER_CONTEXT_SCHEMA_VERSION = 4
+
+GENERIC_BACKGROUND_CHARACTER_NAMES = {
+    "路人", "行人", "游客", "观众", "听众", "读者",
+    "女性", "男性", "老人", "小孩", "孩子", "青年", "中年",
+    "人群", "群众", "大家", "情侣", "夫妻", "朋友", "同事", "邻居",
+}
+
+# A qualified ``who`` label can accidentally end in an object or environment
+# noun.  Such tails are evidence that the entire label is not an identity.
+NON_CHARACTER_IDENTITY_SUFFIXES = (
+    "衣", "裙", "裤", "鞋", "帽", "眼镜", "伞", "包", "箱",
+    "刀", "剑", "枪", "武器", "门", "窗", "墙", "灯", "光",
+    "云海", "山脉", "河流", "道路", "车辆", "建筑", "房间", "走廊",
+)
+RELATIONAL_CHARACTER_LABELS = {
+    "父亲", "母亲", "爸爸", "妈妈", "丈夫", "妻子", "哥哥", "姐姐",
+    "弟弟", "妹妹", "儿子", "女儿",
+}
+MAX_QUALIFIER_CHINESE_CHARS = 16
+
+ABSTRACT_CHARACTER_NAMES = {
+    "说话者", "观察者", "记录者", "思考者", "行走者", "试验者", "打探人员",
+}
+NON_HUMAN_EXACT_NAMES = {
+    "冷空气", "风", "雨", "雪", "雷", "电",
+    "鸡", "鸭", "狗", "猫", "鸟", "鱼",
+    "桌子", "椅子", "车", "书", "刀", "剑", "枪", "武器",
+    "积水", "路面", "钢梁", "混凝土", "高楼", "玻璃", "灰尘",
+}
+NON_HUMAN_ENTITY_SUFFIXES = (
+    "霓虹牌", "电缆", "路面", "钢梁", "混凝土", "高楼", "塑料布",
+    "纸屑", "玻璃", "水浪", "灰尘", "碎石", "残骸", "护臂", "手掌",
+    "手指", "车门", "刀具", "武器", "护甲", "铠甲", "弓箭",
+    "云海", "山脉", "河流", "道路", "车辆", "建筑", "房间", "走廊",
+)
 
 
 def _get_client() -> OpenAI:
@@ -331,6 +373,13 @@ def _build_character_context(stats: Dict[str, Dict[str, Any]]) -> str:
         event_count = len(info["events"])
         first_event = min(info["events"]) if info["events"] else 0
         lines.append(f"【{name}】出场 {event_count} 次，首次出场于事件 {first_event}")
+        source_aliases = [
+            str(alias).strip()
+            for alias in (info.get("source_aliases") or [])
+            if str(alias).strip() and str(alias).strip() != name
+        ]
+        if source_aliases:
+            lines.append(f"  - 必须归并的来源称呼：{json.dumps(source_aliases, ensure_ascii=False)}")
         # 最多展示 5 条事件上下文
         for ctx in info["contexts"][:5]:
             lines.append(f"  - {ctx}")
@@ -362,6 +411,10 @@ def _is_human_character(name: str) -> bool:
     - 无人机、机器人等智能设备（可作为主角）
     - 工程师、运维员等职业角色
     """
+    name = str(name or "").strip()
+    if not name:
+        return False
+
     # 排除复数群体
     if name.endswith("们"):
         return False
@@ -371,24 +424,19 @@ def _is_human_character(name: str) -> bool:
     if any(keyword in name for keyword in robot_whitelist):
         return True
     
-    # 排除抽象指代（以"者"、"员"结尾的抽象名词）
-    if name.endswith("者") or name.endswith("员"):
-        # 但保留一些可能是人物的（如"记者"、"演员"等职业）
-        human_suffixes = ["记者", "演员", "医生", "教师", "工人", "农民", "士兵", "保安", "工程师", "运维员"]
-        if not any(name.endswith(suffix) for suffix in human_suffixes):
-            return False
-    
-    # 排除常见非人物实体
-    non_human_keywords = [
-        "冷空气", "风", "雨", "雪", "雷", "电",  # 天气
-        "鸡", "鸭", "狗", "猫", "鸟", "鱼",  # 动物
-        "桌子", "椅子", "车", "书",  # 物品
-        "刀", "剑", "枪", "刃", "武器", "护甲", "铠甲", "弓", "箭",  # 武器/装备（2026-08-09: "两把金属刀具"混入角色列表实锤）
-        "霓虹牌", "电缆", "积水", "路面", "钢梁", "混凝土", "高楼",
-        "塑料布", "纸屑", "玻璃", "水浪", "灰尘", "碎石", "残骸",
-        "护臂", "手掌", "手指", "车门",
-    ]
-    if any(keyword in name for keyword in non_human_keywords):
+    # Suffixes such as “员/者/师” are commonly active occupations and may not
+    # be rejected generically. Only exact abstract placeholders are excluded.
+    if name in ABSTRACT_CHARACTER_NAMES:
+        return False
+
+    # A declared character/entity suffix wins over an object word elsewhere
+    # in the label (for example a weapon-carrying fighter or racing driver).
+    if any(name.endswith(suffix) for suffix in ENTITY_SUFFIXES):
+        return True
+
+    if name in NON_HUMAN_EXACT_NAMES:
+        return False
+    if any(name.endswith(suffix) for suffix in NON_HUMAN_ENTITY_SUFFIXES):
         return False
     
     return True
@@ -414,6 +462,72 @@ def _filter_non_human_characters(stats: Dict[str, Dict[str, Any]]) -> Dict[str, 
     return filtered
 
 
+def _qualified_mention_tail(name: str) -> tuple[str, str] | None:
+    """Split ``qualifier 的 identity`` without assuming a language or role."""
+    if "的" not in name:
+        return None
+    qualifier, candidate = name.rsplit("的", 1)
+    qualifier = qualifier.strip(" ，,；;：:（）()[]【】")
+    candidate = candidate.strip(" ，,；;：:（）()[]【】")
+    return (qualifier, candidate) if qualifier and candidate else None
+
+
+def _looks_like_stable_identity(
+    candidate: str,
+    known_mentions: set[str],
+) -> bool:
+    """Conservatively recognize a reusable identity at a qualified tail."""
+    if candidate in known_mentions:
+        return True
+    if candidate in GENERIC_BACKGROUND_CHARACTER_NAMES:
+        return False
+    if candidate in RELATIONAL_CHARACTER_LABELS:
+        # A relational role needs its owner (for example whose father) unless
+        # the same label is independently established elsewhere.
+        return False
+    if any(candidate.endswith(suffix) for suffix in NON_CHARACTER_IDENTITY_SUFFIXES):
+        return False
+    if not _is_human_character(candidate):
+        return False
+
+    latin_name = re.fullmatch(
+        r"[A-Za-z][A-Za-z0-9]*(?:[\s_-]+[A-Za-z0-9]+)*",
+        candidate,
+    )
+    if latin_name:
+        return True
+    if any(candidate.endswith(suffix) for suffix in ENTITY_SUFFIXES):
+        return True
+    chinese_chars = [char for char in candidate if "\u4e00" <= char <= "\u9fff"]
+    return len(chinese_chars) == len(candidate) and 2 <= len(chinese_chars) <= 4
+
+
+def _stable_identity_from_qualified_mention(
+    name: str,
+    known_mentions: set[str],
+) -> str | None:
+    split = _qualified_mention_tail(name)
+    if split is None:
+        return None
+    qualifier, candidate = split
+    qualifier_length = sum("\u4e00" <= char <= "\u9fff" for char in qualifier)
+    if qualifier_length > MAX_QUALIFIER_CHINESE_CHARS:
+        return None
+    return candidate if _looks_like_stable_identity(candidate, known_mentions) else None
+
+
+def _qualified_tail_is_non_character(name: str) -> bool:
+    split = _qualified_mention_tail(name)
+    if split is None:
+        return False
+    _qualifier, candidate = split
+    return (
+        candidate in GENERIC_BACKGROUND_CHARACTER_NAMES
+        or any(candidate.endswith(suffix) for suffix in NON_CHARACTER_IDENTITY_SUFFIXES)
+        or not _is_human_character(candidate)
+    )
+
+
 def _filter_descriptive_phrases(stats: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     """
     过滤描述性短语（非真实角色名）
@@ -431,33 +545,45 @@ def _filter_descriptive_phrases(stats: Dict[str, Dict[str, Any]]) -> Dict[str, D
     """
     filtered = {}
     
-    # 描述性修饰语关键词
-    descriptive_keywords = [
-        "年轻的", "年老的", "中年的", "美丽的", "帅气的", "高大的", "瘦小的",
-        "没带伞的", "带伞的", "穿", "戴", "拿", "提", "背",
-        "都市", "城市", "乡村", "古代", "现代", "未来",
-        "神秘", "陌生", "熟悉", "友好", "冷漠",
-    ]
-    
-    # 通用角色描述词
-    generic_background_names = {
-        "路人", "行人", "游客", "观众", "听众", "读者",
-        "女性", "男性", "老人", "小孩", "孩子", "青年", "中年",
-        "人群", "群众", "观众", "大家",
-        "情侣", "夫妻", "朋友", "同事", "邻居",
-    }
-    
+    def merge_info(target: Dict[str, Any], source: Dict[str, Any]) -> None:
+        for key in ("events", "contexts"):
+            combined = [*(target.get(key) or []), *(source.get(key) or [])]
+            target[key] = list(dict.fromkeys(combined))
+        target["dialogue_count"] = int(target.get("dialogue_count") or 0) + int(
+            source.get("dialogue_count") or 0
+        )
+        target["source_aliases"] = list(dict.fromkeys([
+            *(target.get("source_aliases") or []),
+            *(source.get("source_aliases") or []),
+        ]))
+
+    known_mentions = {str(name).strip() for name in stats if str(name).strip()}
     for name, info in stats.items():
-        # 检查是否包含描述性修饰语
-        if any(keyword in name for keyword in descriptive_keywords):
-            print(f"  过滤描述性短语: {name}", file=sys.stderr)
+        canonical_name = _stable_identity_from_qualified_mention(name, known_mentions)
+        if canonical_name:
+            normalized_info = dict(info)
+            normalized_info["source_aliases"] = list(dict.fromkeys([
+                *(normalized_info.get("source_aliases") or []),
+                name,
+            ]))
+            if canonical_name in filtered:
+                merge_info(filtered[canonical_name], normalized_info)
+            else:
+                filtered[canonical_name] = normalized_info
+            print(
+                f"  归一化限定角色名: {name} → {canonical_name}",
+                file=sys.stderr,
+            )
             continue
-        
+
+        if _qualified_tail_is_non_character(name):
+            print(f"  过滤非角色限定短语: {name}", file=sys.stderr)
+            continue
+
         # 检查是否是通用角色描述
-        # Active occupational roles (for example ``敌方保安``) still need a
-        # stable visual asset.  Only discard exact background placeholders;
-        # substring matching used to erase qualified antagonists.
-        if name in generic_background_names:
+        # Active occupational roles still need a stable visual asset. Only
+        # discard exact background placeholders.
+        if name in GENERIC_BACKGROUND_CHARACTER_NAMES:
             print(f"  过滤通用角色描述: {name}", file=sys.stderr)
             continue
         
@@ -471,7 +597,10 @@ def _filter_descriptive_phrases(stats: Dict[str, Dict[str, Any]]) -> Dict[str, D
             print(f"  过滤过长名称: {name} ({len(chinese_chars)} 字)", file=sys.stderr)
             continue
         
-        filtered[name] = info
+        if name in filtered:
+            merge_info(filtered[name], info)
+        else:
+            filtered[name] = info
     
     return filtered
 
@@ -593,6 +722,58 @@ def _add_reference_contract(character: Dict[str, Any]) -> None:
     )
 
 
+def _attach_source_identity_evidence(
+    characters: List[Dict[str, Any]],
+    stats: Dict[str, Dict[str, Any]],
+) -> None:
+    """Attach source aliases and aggregate appearance evidence deterministically."""
+    characters_by_name = {
+        str(character.get("name") or "").strip(): character
+        for character in characters
+        if str(character.get("name") or "").strip()
+    }
+    evidence: Dict[str, Dict[str, Any]] = {
+        name: {"events": set(), "aliases": []}
+        for name in characters_by_name
+    }
+
+    for stat_name, stat_info in stats.items():
+        source_mentions = list(dict.fromkeys([
+            str(stat_name).strip(),
+            *(
+                str(alias).strip()
+                for alias in (stat_info.get("source_aliases") or [])
+                if str(alias).strip()
+            ),
+        ]))
+        resolved = {
+            canonical
+            for mention in source_mentions
+            if (canonical := resolve_character_name(mention, characters))
+        }
+        if len(resolved) != 1:
+            continue
+        canonical = next(iter(resolved))
+        if canonical not in evidence:
+            continue
+        evidence[canonical]["events"].update(stat_info.get("events") or [])
+        evidence[canonical]["aliases"].extend(source_mentions)
+
+    for canonical, character in characters_by_name.items():
+        event_ids = sorted(evidence[canonical]["events"])
+        character["first_appearance"] = event_ids[0] if event_ids else 0
+        character["appearance_count"] = len(event_ids)
+        aliases = list(dict.fromkeys([
+            *(character.get("aliases") or []),
+            *evidence[canonical]["aliases"],
+        ]))
+        character["aliases"] = [
+            alias
+            for alias in aliases
+            if alias and alias != canonical
+        ]
+
+
 def discover_characters(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     核心函数：从事件列表中发现所有角色并生成 CHARACTERS.json
@@ -687,25 +868,10 @@ def discover_characters(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     # 3.5 后处理过滤：移除 LLM 可能错误包含的非人物角色
     characters = _post_filter_characters(characters)
 
-    # 4. 补充统计信息（first_appearance, appearance_count）
-    for char in characters:
-        name = char.get("name", "")
-        if name in stats:
-            char["first_appearance"] = min(stats[name]["events"]) if stats[name]["events"] else 0
-            char["appearance_count"] = len(stats[name]["events"])
-        else:
-            # 尝试匹配别名
-            matched = False
-            for stat_name, stat_info in stats.items():
-                aliases = char.get("aliases", [])
-                if stat_name in aliases or stat_name == name:
-                    char["first_appearance"] = min(stat_info["events"]) if stat_info["events"] else 0
-                    char["appearance_count"] = len(stat_info["events"])
-                    matched = True
-                    break
-            if not matched:
-                char["first_appearance"] = 0
-                char["appearance_count"] = 0
+    # 4. Reconcile every source label against the canonical roster. This also
+    # preserves qualified source mentions as aliases and aggregates repeated
+    # labels for the same character instead of taking only the first match.
+    _attach_source_identity_evidence(characters, stats)
 
     # 5. 按出场次数排序（主角在前）
     characters.sort(key=lambda c: (-c.get("appearance_count", 0), c.get("first_appearance", 0)))
@@ -745,7 +911,7 @@ def _fallback_characters(stats: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any
         characters.append({
             "id": char_id,
             "name": name,
-            "aliases": [],
+            "aliases": list(info.get("source_aliases") or []),
             "role": "supporting" if len(info["events"]) < 3 else "protagonist",
             "appearance": {
                 "gender": "unknown",

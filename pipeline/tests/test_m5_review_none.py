@@ -54,6 +54,47 @@ def test_storyboard_review_accepts_structured_dialogue():
     assert "grade" in result
 
 
+def test_storyboard_review_accepts_qualified_declared_alias():
+    result = run_storyboard_review(
+        {
+            "shots": [{
+                "shot_id": "S01",
+                "who": ["身穿深灰色战术服的Agent", "敌方保安"],
+                "where": "旋转走廊",
+                "what": "双方开始搏斗",
+                "visual": "双方在旋转走廊内抓住扶手进行清晰的近身搏斗",
+            }],
+        },
+        script_text="双方开始搏斗",
+        characters=[
+            {"id": "agent", "name": "特工", "aliases": ["Agent"]},
+            {"id": "security_guard", "name": "敌方保安", "aliases": ["保安"]},
+        ],
+    )
+
+    assert result["severe"] == 0
+    assert not any("[R1]" in issue for issue in result["issues"])
+
+
+def test_storyboard_review_rejects_partial_latin_alias_collision():
+    result = run_storyboard_review(
+        {
+            "shots": [{
+                "shot_id": "S01",
+                "who": ["Agent007"],
+                "where": "机库",
+                "what": "陌生人进入机库",
+                "visual": "陌生人从机库入口走到中央控制台前",
+            }],
+        },
+        script_text="陌生人进入机库",
+        characters=[{"id": "agent", "name": "特工", "aliases": ["Agent"]}],
+    )
+
+    assert result["severe"] == 1
+    assert any("[R1]" in issue for issue in result["issues"])
+
+
 def test_phase1_screenwriter_m5_fallback_returns_result():
     tree = ast.parse(inspect.getsource(pipeline_core.run_phase1_screenwriter))
 

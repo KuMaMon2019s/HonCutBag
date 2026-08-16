@@ -320,6 +320,33 @@ def test_source_event_identity_overrides_llm_character_synonyms():
     assert shots[0]["who"] == ["Agent", "敌方保安"]
 
 
+def test_source_event_identity_resolves_qualified_alias_to_character_asset():
+    events = [{
+        "who": ["身穿深灰色战术服的Agent", "敌方保安"],
+        "where": "旋转走廊",
+        "what": "Agent与敌方保安搏斗",
+        "micro_actions": ["Agent挥拳"],
+        "sequence_id": "SEQ001",
+    }]
+    shots = [{
+        "source_events": [1],
+        "who": ["Agent", "敌方保安"],
+        "where": "旋转走廊",
+        "what": "双方搏斗",
+    }]
+    characters = [
+        {"id": "agent", "name": "特工", "aliases": ["Agent", "他"]},
+        {"id": "security_guard", "name": "敌方保安", "aliases": ["保安"]},
+    ]
+
+    adaptation_engine._inherit_event_semantics(shots, events, characters)
+
+    assert shots[0]["who"] == ["特工", "敌方保安"]
+    assert shots[0]["source_character_mentions"] == [
+        "身穿深灰色战术服的Agent", "敌方保安",
+    ]
+
+
 def test_event_extractor_selects_a_generic_or_action_contract(monkeypatch):
     calls: list[tuple[str, str]] = []
 
@@ -905,6 +932,112 @@ def test_phase1_keeps_qualified_profession_characters():
     filtered = character_discoverer._filter_descriptive_phrases(stats)
 
     assert set(filtered) == {"Agent", "敌方保安"}
+
+
+def test_phase1_normalizes_visual_description_around_explicit_agent_name():
+    stats = {
+        "身穿深灰色战术服的Agent": {
+            "events": [1, 2],
+            "contexts": ["事件1", "事件2"],
+            "dialogue_count": 0,
+        },
+        "敌方保安": {
+            "events": [2],
+            "contexts": ["事件2"],
+            "dialogue_count": 0,
+        },
+    }
+
+    filtered = character_discoverer._filter_descriptive_phrases(stats)
+
+    assert set(filtered) == {"Agent", "敌方保安"}
+    assert filtered["Agent"]["events"] == [1, 2]
+    assert filtered["Agent"]["source_aliases"] == ["身穿深灰色战术服的Agent"]
+
+
+def test_phase1_normalizes_qualified_identities_without_script_language_bias():
+    stats = {
+        "头戴护目镜的Mira Chen": {"events": [1], "contexts": []},
+        "身披红色斗篷的机械师": {"events": [2], "contexts": []},
+        "受伤的林岚": {"events": [3], "contexts": []},
+        "未来战士": {"events": [4], "contexts": []},
+    }
+
+    filtered = character_discoverer._filter_descriptive_phrases(stats)
+
+    assert set(filtered) == {"Mira Chen", "机械师", "林岚", "未来战士"}
+    assert filtered["Mira Chen"]["source_aliases"] == ["头戴护目镜的Mira Chen"]
+    assert filtered["机械师"]["source_aliases"] == ["身披红色斗篷的机械师"]
+    assert filtered["林岚"]["source_aliases"] == ["受伤的林岚"]
+
+
+def test_phase1_does_not_promote_qualified_objects_or_merge_relational_roles():
+    stats = {
+        "穿着漂亮的红裙": {"events": [1], "contexts": []},
+        "金色夕阳下的无边云海": {"events": [1], "contexts": []},
+        "小明的父亲": {"events": [2], "contexts": []},
+    }
+
+    filtered = character_discoverer._filter_descriptive_phrases(stats)
+
+    assert set(filtered) == {"小明的父亲"}
+
+
+def test_phase1_character_filter_does_not_confuse_role_vocabulary_with_objects():
+    for name in ("持枪的枪手", "背剑的剑客", "职业车手", "宇航员", "林海"):
+        assert character_discoverer._is_human_character(name)
+
+    for name in ("两把金属刀具", "断裂的车门", "无边云海", "冷空气"):
+        assert not character_discoverer._is_human_character(name)
+
+
+def test_phase1_source_identity_evidence_aggregates_aliases_and_events():
+    characters = [{
+        "id": "mira_chen",
+        "name": "米拉",
+        "aliases": ["Mira Chen"],
+        "role": "protagonist",
+    }]
+    stats = {
+        "Mira Chen": {
+            "events": [1, 2],
+            "contexts": [],
+            "source_aliases": ["头戴护目镜的Mira Chen"],
+        },
+        "米拉": {"events": [3], "contexts": []},
+    }
+
+    character_discoverer._attach_source_identity_evidence(characters, stats)
+
+    assert characters[0]["first_appearance"] == 1
+    assert characters[0]["appearance_count"] == 3
+    assert characters[0]["aliases"] == [
+        "Mira Chen",
+        "头戴护目镜的Mira Chen",
+    ]
+
+
+def test_character_identity_resolution_is_token_safe_and_unambiguous():
+    from utils.character_identity import resolve_character_name
+
+    characters = [
+        {"id": "ann", "name": "安", "aliases": ["Ann"]},
+        {"id": "mira", "name": "米拉", "aliases": ["Captain Mira"]},
+    ]
+
+    assert resolve_character_name("受伤的 Ann", characters) == "安"
+    assert resolve_character_name("injured Captain Mira", characters) == "米拉"
+    assert resolve_character_name("Joanne", characters) is None
+    assert resolve_character_name("Ann007", characters) is None
+
+
+def test_event_extractor_contract_keeps_transient_descriptors_out_of_who():
+    assert "稳定身份标签" in event_extractor.USER_PROMPT_TEMPLATE
+    assert "服装、年龄、伤势、动作、站位和地点修饰不得进入 who" in (
+        event_extractor.USER_PROMPT_TEMPLATE
+    )
+    assert "同一人物必须沿用" in event_extractor.GENERAL_PROSE_CONTRACT
+    assert "同一人物必须沿用" in event_extractor.ACTION_SCREENPLAY_CONTRACT
 
 
 def test_phase1_partitions_reused_event_actions_without_replay():
