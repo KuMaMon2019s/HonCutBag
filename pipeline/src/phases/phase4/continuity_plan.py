@@ -19,8 +19,9 @@ from schemas.continuity import (
     ContinuityShot,
     GenerationChunk,
 )
+from utils.video_capabilities import SEEDANCE_2_CAPABILITIES, capabilities_for
 
-DEFAULT_PROVIDER_CHUNK_LIMIT_S = 15.0
+DEFAULT_PROVIDER_CHUNK_LIMIT_S = SEEDANCE_2_CAPABILITIES.max_shot_duration_s
 DEFAULT_TIMELINE_FPS = 24
 DEFAULT_CONTINUITY_GROUP_MAX_SHOTS = 3
 
@@ -384,6 +385,7 @@ def build_continuity_plan(
     ).strip().lower() in {"one_take", "single_take", "oner"}
     for index, shot in enumerate(storyboard.get("shots", []), 1):
         shot_id = _shot_id(shot, index)
+        capability_profile = capabilities_for({**storyboard_contract, **dict(shot)})
         authored_beats = _authored_storyboard_beats(shot)
         boundary_before, continuity_reason = _boundary_before(
             shot,
@@ -448,7 +450,19 @@ def build_continuity_plan(
                     and strategy != "first_last_frame_bridge"
                     else 0
                 )
-                requested_frames = unique_frames + reserved_overlap
+                minimum_request_s, _maximum_request_s = (
+                    capability_profile.request_duration_bounds(strategy)
+                )
+                minimum_request_frames = math.ceil(
+                    minimum_request_s * timeline_fps - 1e-9
+                )
+                requested_frames = max(
+                    unique_frames + reserved_overlap,
+                    minimum_request_frames,
+                )
+                provider_padding_frames = (
+                    requested_frames - unique_frames - reserved_overlap
+                )
                 if requested_frames > limit_frames:
                     raise ValueError(
                         f"{shot_id} storyboard beat {sequence} needs "
@@ -456,12 +470,19 @@ def build_continuity_plan(
                         f"above provider limit {provider_chunk_limit_s:g}s"
                     )
                 chunk_id = f"{shot_id}_C{sequence:02d}"
+                capability_profile.validate_chunk_durations(
+                    requested_frames / timeline_fps,
+                    unique_frames / timeline_fps,
+                    strategy,
+                    resource_id=chunk_id,
+                )
                 chunks.append(GenerationChunk(
                     chunk_id=chunk_id,
                     sequence=sequence,
                     target_duration_s=round(requested_frames / timeline_fps, 6),
                     requested_frames=requested_frames,
                     expected_overlap_frames=reserved_overlap,
+                    expected_provider_padding_frames=provider_padding_frames,
                     expected_unique_frames=unique_frames,
                     mode="native_extend" if previous is not None else "fresh",
                     depends_on=previous,

@@ -315,6 +315,9 @@ def execute_continuity_plan(
     materialize_shot: Callable[[Sequence[Path], Path], None] = _default_materialize,
     probe_frames: Callable[[Path, int], dict[str, Any]] | None = None,
     finalize_shot: Callable[[Path, int, int], dict[str, Any]] | None = None,
+    normalize_chunk: Callable[
+        [Path, GenerationChunk, int], dict[str, Any]
+    ] | None = None,
     chunk_context: Callable[[ContinuityShot, GenerationChunk], Any] | None = None,
     seam_calibration: dict[str, Any] | None = None,
     max_seam_repairs: int = 1,
@@ -699,6 +702,27 @@ def execute_continuity_plan(
                 # where the complete trajectory and transition class are known.
                 effective_path = chunk_path
                 preparation = None
+            normalization = None
+            if chunk.expected_provider_padding_frames:
+                if normalize_chunk is None:
+                    raise RuntimeError(
+                        f"{chunk.chunk_id} has provider-minimum padding but no "
+                        "chunk normalizer is configured"
+                    )
+                normalization = normalize_chunk(
+                    effective_path,
+                    chunk,
+                    plan.timeline_fps,
+                )
+                normalized_path = Path(
+                    str(normalization.get("output_path") or "")
+                )
+                if not normalized_path.is_file() or normalized_path.stat().st_size == 0:
+                    raise RuntimeError(
+                        f"{chunk.chunk_id} provider-padding normalization produced "
+                        "no video bytes"
+                    )
+                effective_path = normalized_path
             chunk_paths.append(effective_path)
             executed_chunk_models.append(chunk)
             if probe_frames is not None:
@@ -721,6 +745,8 @@ def execute_continuity_plan(
                         "bridge_frames": int(
                             (preparation or {}).get("selected_bridge_frames") or 0
                         ),
+                        "provider_padding_frames": chunk.expected_provider_padding_frames,
+                        "provider_padding_normalization": normalization,
                         "effective_unique_frames": int(effective_timing["frames"]),
                         "effective_path": _portable_path(effective_path, root),
                     }
@@ -930,8 +956,17 @@ def execute_continuity_plan(
 
     outputs.sort()
     errors.sort(key=lambda item: item["shot_id"])
+    error_summary = None
+    if errors:
+        details = "; ".join(
+            f"{item['shot_id']}: {item['error']}" for item in errors[:6]
+        )
+        if len(errors) > 6:
+            details += f"; and {len(errors) - 6} more"
+        error_summary = f"Phase 6 continuity generation failed: {details}"
     return {
         "status": "error" if errors else "done",
+        "error": error_summary,
         "outputs": outputs,
         "errors": errors,
         "executed_chunks": executed_chunks,

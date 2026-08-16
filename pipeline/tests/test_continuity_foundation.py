@@ -78,6 +78,7 @@ from runtime.continuity_memory import (
 from runtime.continuity_provider import (
     _base_content,
     _bridge_seedance_executor,
+    _chunk_duration,
     _continuity_bridge_preparer,
     _direct_seedance_executor,
     _generation_seed,
@@ -85,6 +86,8 @@ from runtime.continuity_provider import (
     _seedance_reference_image_payload,
     execute_phase6_auto_continuity,
     materialize_continuity_shot,
+    normalize_provider_minimum_padding,
+    probe_continuity_frames,
 )
 from runtime.generation_tasks import GenerationTaskStore
 from sam3_runtime.policy import (
@@ -790,8 +793,9 @@ def test_complex_shot_maps_to_three_secondary_generation_strategies(tmp_path):
         "storyboard_beats/S01_P02.png",
         "storyboard_beats/S01_P03.png",
     ]
-    assert [chunk.requested_frames for chunk in first.chunks] == [96, 120, 72]
+    assert [chunk.requested_frames for chunk in first.chunks] == [96, 120, 96]
     assert [chunk.expected_unique_frames for chunk in first.chunks] == [96, 72, 72]
+    assert [chunk.expected_provider_padding_frames for chunk in first.chunks] == [0, 0, 24]
     assert first.chunks[2].bridge_target_storyboard_image == (
         "storyboard_beats/S02_P01.png"
     )
@@ -1267,7 +1271,10 @@ def test_secondary_third_beat_uses_previous_tail_and_next_primary_p01(
         chunk=GenerationChunk(
             chunk_id="S01_C03",
             sequence=3,
-            target_duration_s=3,
+            target_duration_s=4,
+            requested_frames=96,
+            expected_provider_padding_frames=24,
+            expected_unique_frames=72,
             mode="native_extend",
             depends_on="S01_C02",
             execution_strategy="first_last_frame_bridge",
@@ -1287,7 +1294,7 @@ def test_secondary_third_beat_uses_previous_tail_and_next_primary_p01(
 
     content, _meta, _seed, duration = _provider_content(tmp_path, request)
 
-    assert duration == 3
+    assert duration == 4
     assert [item.get("role") for item in content] == [
         None,
         "first_frame",
@@ -1297,6 +1304,57 @@ def test_secondary_third_beat_uses_previous_tail_and_next_primary_p01(
     assert content[2]["image_url"]["url"].endswith("frame-2.jpg")
     assert "图片1是上一二级分镜视频真实尾帧" in content[0]["text"]
     assert "不得提前执行图片2所属一级分镜的动作" in content[0]["text"]
+
+
+def test_seedance_duration_separates_provider_request_from_effective_story_time(
+    tmp_path,
+):
+    tail_request = ChunkExecutionRequest(
+        resource_id="S04_C02",
+        shot_id="S04",
+        chunk=GenerationChunk(
+            chunk_id="S04_C02",
+            sequence=2,
+            target_duration_s=8,
+            requested_frames=192,
+            expected_overlap_frames=48,
+            expected_unique_frames=144,
+            mode="native_extend",
+            depends_on="S04_C01",
+            execution_strategy="tail_video_extend",
+        ),
+        anchors={},
+        output_path=tmp_path / "S04_C02.mp4",
+        previous_output_path=tmp_path / "S04_C01.mp4",
+        input_fingerprint="fingerprint",
+        memory_context="",
+    )
+
+    assert _chunk_duration(tail_request) == 8
+
+    invalid_bridge = ChunkExecutionRequest(
+        resource_id="S03_C03",
+        shot_id="S03",
+        chunk=GenerationChunk(
+            chunk_id="S03_C03",
+            sequence=3,
+            target_duration_s=3,
+            mode="native_extend",
+            depends_on="S03_C02",
+            execution_strategy="first_last_frame_bridge",
+            bridge_target_shot_id="S04",
+            bridge_target_beat_id="S04_P01",
+            bridge_target_storyboard_image="storyboard_beats/S04_P01.png",
+        ),
+        anchors={},
+        output_path=tmp_path / "S03_C03.mp4",
+        previous_output_path=tmp_path / "S03_C02.mp4",
+        input_fingerprint="fingerprint",
+        memory_context="",
+    )
+
+    with pytest.raises(ValueError, match=r"provider request duration 3s.*4-15s"):
+        _chunk_duration(invalid_bridge)
 
 
 def test_provider_prepends_no_real_person_visual_contract(monkeypatch, tmp_path):
@@ -1653,6 +1711,21 @@ def test_chunk_runtime_serializes_dependencies_but_parallelizes_shots(tmp_path):
     assert report["executed_chunks"] == 4
     assert dict(sequences) == {"S01": [1, 2], "S02": [1, 2]}
     assert (tmp_path / "shots/S01/output.mp4").read_bytes() == b"S01_C01|S01_C02"
+
+
+def test_chunk_runtime_returns_a_top_level_failure_summary(tmp_path):
+    plan = build_continuity_plan({"shots": [{"id": "S01", "duration": 5}]})
+
+    def fail(_request):
+        raise RuntimeError("provider rejected the request")
+
+    report = execute_continuity_plan(plan, tmp_path, execute_chunk=fail)
+
+    assert report["status"] == "error"
+    assert report["error"] == (
+        "Phase 6 continuity generation failed: "
+        "S01: provider rejected the request"
+    )
 
 
 def test_chunk_runtime_relays_previous_shot_video_inside_a_continuity_group(tmp_path):
@@ -2931,6 +3004,52 @@ def test_video_replay_similarity_flags_motion_replay_but_not_static_frames(tmp_p
     shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
     reason="ffmpeg and ffprobe are required",
 )
+def test_provider_minimum_padding_is_retimed_to_effective_story_frames(tmp_path):
+    source = tmp_path / "S03_C03.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=160x90:r=24:d=4",
+            "-pix_fmt",
+            "yuv420p",
+            str(source),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+    chunk = GenerationChunk(
+        chunk_id="S03_C03",
+        sequence=3,
+        target_duration_s=4,
+        requested_frames=96,
+        expected_provider_padding_frames=24,
+        expected_unique_frames=72,
+        mode="native_extend",
+        depends_on="S03_C02",
+        execution_strategy="first_last_frame_bridge",
+        bridge_target_shot_id="S04",
+        bridge_target_beat_id="S04_P01",
+        bridge_target_storyboard_image="storyboard_beats/S04_P01.png",
+    )
+
+    receipt = normalize_provider_minimum_padding(source, chunk, 24)
+    normalized = Path(receipt["output_path"])
+
+    assert receipt["method"] == "provider_minimum_endpoint_preserving_retime"
+    assert receipt["provider_padding_frames"] == 24
+    assert normalized != source
+    assert probe_continuity_frames(normalized, 24)["frames"] == 72
+
+
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="ffmpeg and ffprobe are required",
+)
 def test_materialize_continuity_shot_concatenates_accepted_chunks(tmp_path):
     chunks = []
     for index, color in enumerate(("black", "white"), 1):
@@ -3064,6 +3183,31 @@ def test_phase6_auto_preflights_extension_upload_before_paid_execution(monkeypat
         "clients.tos_uploader.is_media_upload_configured",
         lambda: False,
     )
+    monkeypatch.setattr(
+        "runtime.continuity_provider._direct_seedance_executor",
+        unexpected_executor,
+    )
+
+    with pytest.raises(RuntimeError, match="before any paid provider submission"):
+        execute_phase6_auto_continuity(tmp_path, plan, _certified_seam_calibration())
+
+    assert not (tmp_path / "runtime.db").exists()
+
+
+def test_phase6_auto_preflights_all_chunk_durations_before_paid_execution(
+    monkeypatch,
+    tmp_path,
+):
+    plan = build_continuity_plan({"shots": [{"id": "S01", "duration": 5}]})
+    stale_chunk = plan.shots[0].chunks[0]
+    stale_chunk.target_duration_s = 3
+    stale_chunk.requested_frames = 72
+    stale_chunk.expected_unique_frames = 72
+
+    def unexpected_executor(_root, _store):
+        raise AssertionError("provider executor must not initialize before duration preflight")
+
+    monkeypatch.setenv("VIDEO_PROVIDER", "seedance")
     monkeypatch.setattr(
         "runtime.continuity_provider._direct_seedance_executor",
         unexpected_executor,

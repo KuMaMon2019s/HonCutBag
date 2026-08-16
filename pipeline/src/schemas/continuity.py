@@ -40,6 +40,11 @@ class GenerationChunk(BaseModel):
     target_duration_s: float = Field(gt=0)
     requested_frames: int | None = Field(default=None, gt=0)
     expected_overlap_frames: int = Field(default=0, ge=0)
+    expected_provider_padding_frames: int = Field(
+        default=0,
+        ge=0,
+        exclude_if=lambda value: value == 0,
+    )
     expected_unique_frames: int | None = Field(default=None, gt=0)
     mode: ContinuityMode
     depends_on: str | None = None
@@ -94,9 +99,22 @@ class GenerationChunk(BaseModel):
                 raise ValueError(
                     "first_last_frame_bridge must not reserve reference-video replay"
                 )
+        if self.expected_provider_padding_frames and (
+            self.requested_frames is None or self.expected_unique_frames is None
+        ):
+            raise ValueError(
+                "provider-minimum padding requires requested and expected unique frames"
+            )
         if self.requested_frames is not None and self.expected_unique_frames is not None:
-            if self.expected_unique_frames != self.requested_frames - self.expected_overlap_frames:
-                raise ValueError("expected unique frames must equal requested frames minus overlap")
+            if self.expected_unique_frames != (
+                self.requested_frames
+                - self.expected_overlap_frames
+                - self.expected_provider_padding_frames
+            ):
+                raise ValueError(
+                    "expected unique frames must equal requested frames minus overlap "
+                    "and provider-minimum padding"
+                )
         return self
 
 

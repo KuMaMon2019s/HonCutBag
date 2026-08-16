@@ -30,7 +30,7 @@ from runtime.continuity_chunks import (
 from runtime.execution_errors import ProviderPreparationError
 from runtime.generation_tasks import GenerationTaskStore
 from runtime.seedance_execution import execute_seedance_video_task
-from schemas.continuity import ContinuityPlan
+from schemas.continuity import ContinuityPlan, GenerationChunk
 from utils.video_capabilities import SEEDANCE_2_CAPABILITIES
 from utils.video_geometry import resolve_video_geometry
 
@@ -166,6 +166,87 @@ def finalize_continuity_shot(
     }
 
 
+def normalize_provider_minimum_padding(
+    input_path: Path,
+    chunk: GenerationChunk,
+    timeline_fps: int,
+) -> dict[str, Any]:
+    """Retime provider-minimum padding away while preserving both endpoints."""
+    padding_frames = int(chunk.expected_provider_padding_frames)
+    if padding_frames <= 0:
+        return {
+            "method": "none",
+            "output_path": str(input_path),
+            "provider_padding_frames": 0,
+        }
+    if chunk.expected_unique_frames is None:
+        raise ValueError(
+            f"{chunk.chunk_id} provider padding requires expected_unique_frames"
+        )
+    before = probe_continuity_frames(input_path, timeline_fps)
+    source_duration = float(before["duration_s"])
+    target_frames = int(chunk.expected_unique_frames)
+    target_duration = target_frames / timeline_fps
+    if source_duration <= 0:
+        raise RuntimeError(f"{chunk.chunk_id} provider output has no positive duration")
+    speed_ratio = target_duration / source_duration
+    destination = input_path.with_name(
+        f"{input_path.stem}.story_clock{input_path.suffix}"
+    )
+    temporary = destination.with_name(
+        f"{destination.stem}.tmp{destination.suffix}"
+    )
+    completed = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(input_path),
+            "-vf",
+            (
+                f"setpts={speed_ratio:.12f}*PTS,fps={timeline_fps},"
+                f"trim=end_frame={target_frames},setpts=PTS-STARTPTS"
+            ),
+            "-frames:v",
+            str(target_frames),
+            "-an",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(temporary),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    if completed.returncode != 0 or not temporary.is_file() or temporary.stat().st_size == 0:
+        temporary.unlink(missing_ok=True)
+        detail = completed.stderr.strip().splitlines()
+        raise RuntimeError(
+            f"cannot normalize provider padding for {chunk.chunk_id}: "
+            f"{detail[-1] if detail else 'unknown ffmpeg error'}"
+        )
+    after = probe_continuity_frames(temporary, timeline_fps)
+    if int(after["frames"]) != target_frames:
+        temporary.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"{chunk.chunk_id} provider-padding normalization produced "
+            f"{after['frames']} frames, expected {target_frames}"
+        )
+    os.replace(temporary, destination)
+    return {
+        "method": "provider_minimum_endpoint_preserving_retime",
+        "output_path": str(destination),
+        "source_frames": int(before["frames"]),
+        "target_frames": target_frames,
+        "provider_padding_frames": padding_frames,
+    }
+
+
 def _read_shot_meta(output_dir: Path, shot_id: str) -> dict[str, Any]:
     path = output_dir / "shots" / shot_id / "SHOT_META.json"
     try:
@@ -194,30 +275,49 @@ def _generation_seed(request: ChunkExecutionRequest) -> int | None:
     return int(hashlib.sha256(seed_material.encode()).hexdigest()[:8], 16) % 2_147_483_647
 
 
+def _chunk_unique_duration(chunk: GenerationChunk) -> float:
+    """Recover effective story time without counting replay/reference overlap."""
+    request_duration = float(chunk.target_duration_s)
+    if chunk.requested_frames and chunk.expected_unique_frames:
+        return request_duration * chunk.expected_unique_frames / chunk.requested_frames
+    return request_duration
+
+
+def _validated_seedance_chunk_duration(
+    chunk: GenerationChunk,
+    resource_id: str,
+) -> int:
+    request_duration, _unique_duration = SEEDANCE_2_CAPABILITIES.validate_chunk_durations(
+        float(chunk.target_duration_s),
+        _chunk_unique_duration(chunk),
+        chunk.execution_strategy,
+        resource_id=resource_id,
+    )
+    return int(request_duration)
+
+
 def _chunk_duration(request: ChunkExecutionRequest) -> int:
-    duration = float(request.chunk.target_duration_s)
-    quantum = SEEDANCE_2_CAPABILITIES.duration_quantum_s
-    units = round(duration / quantum)
-    quantized = units * quantum
-    if not math.isclose(duration, quantized, abs_tol=1e-6):
-        raise ValueError(
-            f"{request.resource_id} duration {duration} cannot be represented by "
-            f"Seedance's {quantum:g}s duration quantum"
+    return _validated_seedance_chunk_duration(request.chunk, request.resource_id)
+
+
+def _validate_seedance_continuity_plan(plan: ContinuityPlan) -> None:
+    """Reject every invalid request before initializing a paid provider route."""
+    errors: list[str] = []
+    for shot in plan.shots:
+        for chunk in shot.chunks:
+            try:
+                _validated_seedance_chunk_duration(chunk, chunk.chunk_id)
+            except ValueError as exc:
+                errors.append(str(exc))
+    if errors:
+        detail = "; ".join(errors[:8])
+        if len(errors) > 8:
+            detail += f"; and {len(errors) - 8} more"
+        raise RuntimeError(
+            "Seedance continuity preflight failed before any paid provider "
+            f"submission: {detail}. Regenerate Phase 1-4 artifacts with the current "
+            "secondary-storyboard contract"
         )
-    if (
-        request.chunk.execution_strategy != "legacy"
-        and not (
-            SEEDANCE_2_CAPABILITIES.min_unique_beat_s
-            <= quantized
-            <= SEEDANCE_2_CAPABILITIES.max_unique_beat_s
-        )
-    ):
-        raise ValueError(
-            f"{request.resource_id} duration {duration:g}s is outside Seedance's "
-            f"{SEEDANCE_2_CAPABILITIES.min_unique_beat_s:g}-"
-            f"{SEEDANCE_2_CAPABILITIES.max_unique_beat_s:g}s secondary-beat range"
-        )
-    return int(quantized)
 
 
 def _video_geometry(shot_meta: dict[str, Any]) -> tuple[str, int, int]:
@@ -679,6 +779,18 @@ def _task_payload(
     duration: int,
     seed: int | None,
 ) -> dict[str, Any]:
+    unique_duration = _chunk_unique_duration(request.chunk)
+    requested_frames = request.chunk.requested_frames
+    overlap_duration = (
+        duration * request.chunk.expected_overlap_frames / requested_frames
+        if requested_frames
+        else 0.0
+    )
+    padding_duration = (
+        duration * request.chunk.expected_provider_padding_frames / requested_frames
+        if requested_frames
+        else 0.0
+    )
     return {
         "shot_id": request.shot_id,
         "chunk_id": request.chunk.chunk_id,
@@ -709,6 +821,10 @@ def _task_payload(
         ),
         "bridge_target_beat_id": request.chunk.bridge_target_beat_id,
         "duration": duration,
+        "provider_request_duration_s": duration,
+        "effective_story_duration_s": round(unique_duration, 6),
+        "reference_overlap_duration_s": round(overlap_duration, 6),
+        "provider_minimum_padding_duration_s": round(padding_duration, 6),
         "seed": seed,
         "repair_attempt": request.repair_attempt,
         "privacy_fallback": "drop_provider_rejected_images_once_v1",
@@ -1301,6 +1417,8 @@ def execute_phase6_auto_continuity(
             f"{provider!r} has no verified native video-extension contract"
         )
 
+    _validate_seedance_continuity_plan(plan)
+
     requires_video_upload = any(
         chunk.mode == "native_extend" for shot in plan.shots for chunk in shot.chunks
     )
@@ -1351,6 +1469,7 @@ def execute_phase6_auto_continuity(
         materialize_shot=materialize_continuity_shot,
         probe_frames=probe_continuity_frames,
         finalize_shot=finalize_continuity_shot,
+        normalize_chunk=normalize_provider_minimum_padding,
         chunk_context=lambda shot, chunk: _provider_input_context(
             root,
             shot.shot_id,

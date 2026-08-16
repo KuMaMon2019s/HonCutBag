@@ -12,8 +12,8 @@ from utils.video_capabilities import (
     capabilities_for,
 )
 
-SECONDARY_STORYBOARD_VERSION = "honcut.secondary-storyboard.v4"
-SECONDARY_EXECUTION = "content_capacity_boundary_aware_v4"
+SECONDARY_STORYBOARD_VERSION = "honcut.secondary-storyboard.v5"
+SECONDARY_EXECUTION = "content_capacity_boundary_aware_v5"
 SECONDARY_GENERATION_MODES = frozenset({
     "multi_image",
     "tail_video_extend",
@@ -73,29 +73,41 @@ def _duration_budgets(
     total: float,
     count: int,
     capabilities: VideoModelCapabilities,
+    *,
+    minimum_durations: list[float] | None = None,
+    maximum_durations: list[float] | None = None,
 ) -> list[float]:
     """Distribute duration without creating values the selected provider cannot execute."""
     if count < 1:
         raise ValueError("duration budget count must be positive")
     quantum = capabilities.duration_quantum_s
     total_units = _quantized_units(total, capabilities)
-    minimum_units = math.ceil(capabilities.min_unique_beat_s / quantum - 1e-9)
-    maximum_units = math.floor(capabilities.max_unique_beat_s / quantum + 1e-9)
-    if total_units < minimum_units * count:
+    minimum_values = minimum_durations or [capabilities.min_unique_beat_s] * count
+    maximum_values = maximum_durations or [capabilities.max_unique_beat_s] * count
+    if len(minimum_values) != count or len(maximum_values) != count:
+        raise ValueError("duration bound count must match duration budget count")
+    minimum_units = [math.ceil(value / quantum - 1e-9) for value in minimum_values]
+    maximum_units = [math.floor(value / quantum + 1e-9) for value in maximum_values]
+    if any(
+        minimum > maximum
+        for minimum, maximum in zip(minimum_units, maximum_units, strict=True)
+    ):
+        raise ValueError("duration minimum cannot exceed duration maximum")
+    if total_units < sum(minimum_units):
         raise ValueError(
             f"{total:g}s cannot fund {count} {capabilities.name} beats at "
-            f"{capabilities.min_unique_beat_s:g}s minimum"
+            f"the required provider minima {minimum_values}"
         )
-    if total_units > maximum_units * count:
+    if total_units > sum(maximum_units):
         raise ValueError(
             f"{total:g}s exceeds {count} {capabilities.name} beats at "
-            f"{capabilities.max_unique_beat_s:g}s maximum"
+            f"the effective-story maxima {maximum_values}"
         )
-    values = [minimum_units for _ in range(count)]
+    values = list(minimum_units)
     remaining = total_units - sum(values)
     position = 0
     while remaining:
-        if values[position] < maximum_units:
+        if values[position] < maximum_units[position]:
             values[position] += 1
             remaining -= 1
         position = (position + 1) % count
@@ -306,9 +318,17 @@ def secondary_storyboard_requirements(
     duration = float(shot.get("duration") or shot.get("suggested_duration") or 5)
     _quantized_units(duration, profile)
     bridge_required, bridge_reason = _bridge_requirement(shots, index)
+    bridge_request_minimum, _bridge_maximum = profile.request_duration_bounds(
+        "first_last_frame_bridge"
+    )
     bridge_duration = profile.min_unique_beat_s if bridge_required else 0.0
     if bridge_required:
-        _duration_budgets(bridge_duration, 1, profile)
+        profile.validate_chunk_durations(
+            bridge_request_minimum,
+            bridge_duration,
+            "first_last_frame_bridge",
+            resource_id=f"{sid}_bridge",
+        )
     content_duration = round(duration - bridge_duration, 6)
     if content_duration <= 0:
         raise ValueError(
@@ -321,7 +341,13 @@ def secondary_storyboard_requirements(
         source_actions,
         profile,
     )
-    content_durations = _duration_budgets(content_duration, content_count, profile)
+    content_durations = _duration_budgets(
+        content_duration,
+        content_count,
+        profile,
+        minimum_durations=[profile.min_unique_beat_s] * content_count,
+        maximum_durations=[profile.max_unique_beat_s] * content_count,
+    )
     modes = ["multi_image"]
     if content_count > 1:
         modes.append("tail_video_extend")
@@ -373,7 +399,7 @@ def secondary_storyboard_contract_errors(
     index: int,
     capabilities: VideoModelCapabilities | None = None,
 ) -> list[dict[str, Any]]:
-    """Return strict v4 contract violations shared by Phase 4 and Phase 5."""
+    """Return strict v5 contract violations shared by Phase 4 and Phase 5."""
     if not secondary_contract_declared(storyboard):
         return []
     shots = [shot for shot in storyboard.get("shots", []) if isinstance(shot, dict)]
@@ -471,6 +497,13 @@ def secondary_storyboard_contract_errors(
                 f"{beat_id} execution strategy must equal generation mode",
                 observed=beat.get("execution_strategy"),
                 expected=mode,
+            )
+        if beat.get("duration_semantics") != (
+            "effective_story_time_excluding_reference_overlap_and_provider_padding"
+        ):
+            add(
+                "secondary_storyboard_duration_semantics_missing",
+                f"{beat_id} must declare effective story-time duration semantics",
             )
         if str(beat.get("parent_shot_id") or "") != sid:
             add(
@@ -636,6 +669,11 @@ def plan_storyboard_beats(
             "bridge_duration_s": requirement["bridge_duration"],
             "provider_capacity": provider_capacity,
             "duration_quantum_s": profile.duration_quantum_s,
+            "min_effective_story_duration_s": profile.min_unique_beat_s,
+            "min_provider_request_duration_s": profile.min_shot_duration_s,
+            "min_first_last_frame_request_duration_s": (
+                profile.request_duration_bounds("first_last_frame_bridge")[0]
+            ),
             "selected_count": total_count,
         }
         planned.append((shot, requirement))
@@ -688,6 +726,9 @@ def plan_storyboard_beats(
                 "beat_id": f"{sid}_P{position:02d}",
                 "position": position,
                 "duration_s": durations[position - 1],
+                "duration_semantics": (
+                    "effective_story_time_excluding_reference_overlap_and_provider_padding"
+                ),
                 "generation_mode": generation_mode,
                 "execution_strategy": generation_mode,
                 "planner_version": SECONDARY_STORYBOARD_VERSION,
@@ -712,6 +753,9 @@ def plan_storyboard_beats(
                 "beat_id": f"{sid}_P{position:02d}",
                 "position": position,
                 "duration_s": durations[position - 1],
+                "duration_semantics": (
+                    "effective_story_time_excluding_reference_overlap_and_provider_padding"
+                ),
                 "generation_mode": "first_last_frame_bridge",
                 "execution_strategy": "first_last_frame_bridge",
                 "planner_version": SECONDARY_STORYBOARD_VERSION,

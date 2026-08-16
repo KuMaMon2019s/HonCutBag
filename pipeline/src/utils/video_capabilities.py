@@ -7,6 +7,7 @@ Seedance probe result in a global director rule.
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -31,6 +32,8 @@ class VideoModelCapabilities:
     tail_reference_frame_fractions: tuple[float, ...] = ()
     max_reference_images: int | None = None
     continuity_anchor_frame_count: int = 0
+    min_first_last_frame_duration_s: float | None = None
+    max_first_last_frame_duration_s: float | None = None
 
     def action_limit(self, duration_seconds: float | int | None) -> int:
         if duration_seconds is None:
@@ -40,6 +43,70 @@ class VideoModelCapabilities:
             if duration <= upper_bound:
                 return limit
         return self.action_budget_steps[-1][1]
+
+    def request_duration_bounds(self, execution_strategy: str) -> tuple[float, float]:
+        """Return provider-request limits for one execution strategy.
+
+        Narrative time and provider request time are deliberately different:
+        a tail extension may request replay context in addition to its new story
+        time, while FLF2V has its own API minimum even when a shorter narrative
+        bridge would otherwise be valid.
+        """
+        if execution_strategy == "first_last_frame_bridge":
+            return (
+                self.min_first_last_frame_duration_s
+                if self.min_first_last_frame_duration_s is not None
+                else self.min_shot_duration_s,
+                self.max_first_last_frame_duration_s
+                if self.max_first_last_frame_duration_s is not None
+                else self.max_shot_duration_s,
+            )
+        return self.min_shot_duration_s, self.max_shot_duration_s
+
+    def validate_chunk_durations(
+        self,
+        request_duration_s: float,
+        unique_duration_s: float,
+        execution_strategy: str,
+        *,
+        resource_id: str = "chunk",
+    ) -> tuple[float, float]:
+        """Validate provider-request and effective-story clocks independently."""
+        request_duration = float(request_duration_s)
+        unique_duration = float(unique_duration_s)
+        quantum = self.duration_quantum_s
+        if quantum <= 0:
+            raise ValueError(f"{self.name} duration quantum must be positive")
+        units = round(request_duration / quantum)
+        quantized = units * quantum
+        if not math.isclose(request_duration, quantized, abs_tol=1e-6):
+            raise ValueError(
+                f"{resource_id} provider request duration {request_duration:g}s cannot be "
+                f"represented by {self.name}'s {quantum:g}s duration quantum"
+            )
+        minimum, maximum = self.request_duration_bounds(execution_strategy)
+        if not minimum - 1e-6 <= quantized <= maximum + 1e-6:
+            raise ValueError(
+                f"{resource_id} {execution_strategy} provider request duration "
+                f"{quantized:g}s is outside {self.name}'s {minimum:g}-{maximum:g}s "
+                "request range"
+            )
+        if execution_strategy != "legacy" and not (
+            self.min_unique_beat_s - 1e-6
+            <= unique_duration
+            <= self.max_unique_beat_s + 1e-6
+        ):
+            raise ValueError(
+                f"{resource_id} effective story duration {unique_duration:g}s is outside "
+                f"{self.name}'s {self.min_unique_beat_s:g}-"
+                f"{self.max_unique_beat_s:g}s secondary-beat range"
+            )
+        if unique_duration > quantized + 1e-6:
+            raise ValueError(
+                f"{resource_id} effective story duration {unique_duration:g}s exceeds "
+                f"its {quantized:g}s provider request"
+            )
+        return round(quantized, 6), round(unique_duration, 6)
 
 
 # Values below are the conservative results of the project's Seedance 2.x
@@ -59,6 +126,8 @@ SEEDANCE_2_CAPABILITIES = VideoModelCapabilities(
     tail_reference_frame_fractions=(0.2, 0.6, 0.95),
     max_reference_images=9,
     continuity_anchor_frame_count=3,
+    min_first_last_frame_duration_s=4,
+    max_first_last_frame_duration_s=15,
 )
 
 

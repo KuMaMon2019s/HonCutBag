@@ -80,7 +80,7 @@ def test_seedance_limits_are_provider_capabilities_not_global_director_rules():
     )
 
 
-def test_secondary_v4_reserves_bridge_time_before_content_capacity():
+def test_secondary_v5_reserves_provider_valid_bridge_time_before_content_capacity():
     storyboard = {
         "video_provider": "seedance",
         "shots": [
