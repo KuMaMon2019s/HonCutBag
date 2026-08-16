@@ -190,6 +190,7 @@ def build_edit_decisions(
 
     cuts = []
     unresolved_reshoots: list[str] = []
+    phase8_duration_trims: list[dict[str, Any]] = []
     for shot_dir in shot_dirs:
         video_path = shot_dir / "output.mp4"
         if not video_path.exists():
@@ -224,6 +225,29 @@ def build_edit_decisions(
         in_s = max(float(trims["trim_start"]), float(quality.get("trim_start_s", 0.0)))
         quality_end = float(quality.get("trim_end_s", info["duration"]) or info["duration"])
         out_s = min(info["duration"] - float(trims["trim_end"]), quality_end)
+        duration_trim = None
+        if continuity_timing is not None:
+            timing_fps = int(continuity_timing.get("timeline_fps") or 24)
+            target_frames = int(continuity_timing.get("target_frames") or 0)
+            final_frames = int(continuity_timing.get("final_frames") or 0)
+            available_frames = round((out_s - in_s) * timing_fps)
+            if (
+                target_frames > 0
+                and final_frames > target_frames
+                and available_frames > target_frames
+            ):
+                phase8_out_s = in_s + (target_frames / timing_fps)
+                if phase8_out_s < out_s:
+                    out_s = phase8_out_s
+                    duration_trim = {
+                        "method": "phase8_per_shot_excess_trim",
+                        "timeline_fps": timing_fps,
+                        "target_frames": target_frames,
+                        "discarded_excess_frames": available_frames - target_frames,
+                    }
+                    phase8_duration_trims.append(
+                        {"shot_id": shot_dir.name, **duration_trim}
+                    )
         if out_s <= in_s:
             raise ValueError(
                 f"{shot_dir.name} quality trims are invalid: {in_s:.3f}s-{out_s:.3f}s "
@@ -242,6 +266,7 @@ def build_edit_decisions(
             "quality_action": quality.get("action", "keep"),
             "quality_reasons": quality.get("reasons", []),
             "continuity_timing": continuity_timing,
+            "phase8_duration_trim": duration_trim,
         }
         cuts.append(cut)
 
@@ -388,6 +413,7 @@ def build_edit_decisions(
             "unresolved_reshoots": unresolved_reshoots,
             "transition_locks": transition_locks,
             "continuity_trims": continuity_trim_receipts,
+            "phase8_duration_trims": phase8_duration_trims,
             "audio_transition_policy": {
                 "visual_cut": "equal_power_edge_fade",
                 "visual_dissolve": "equal_power_crossfade",

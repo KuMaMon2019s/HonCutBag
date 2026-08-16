@@ -291,12 +291,20 @@ def required_content_beat_count(
 
 
 def _bridge_requirement(
+    storyboard: dict[str, Any],
     shots: list[dict[str, Any]],
     index: int,
 ) -> tuple[bool, str]:
     """Create a bridge only across a proven continuous primary-shot boundary."""
     if index + 1 >= len(shots):
         return False, "final primary shot has no following boundary"
+    continuity_mode = str(storyboard.get("continuity_mode") or "").strip().lower()
+    if continuity_mode in {"one_take", "single_take", "oner"}:
+        return (
+            True,
+            "one-take contract requires a generated moving bridge into the next "
+            "primary shot P01 composition",
+        )
     from quality.shot_continuity import classify_boundary
 
     boundary, reason = classify_boundary(shots[index], shots[index + 1], index=index + 2)
@@ -317,7 +325,7 @@ def secondary_storyboard_requirements(
     sid = _shot_id(shot, index + 1)
     duration = float(shot.get("duration") or shot.get("suggested_duration") or 5)
     _quantized_units(duration, profile)
-    bridge_required, bridge_reason = _bridge_requirement(shots, index)
+    bridge_required, bridge_reason = _bridge_requirement(storyboard, shots, index)
     bridge_request_minimum, _bridge_maximum = profile.request_duration_bounds(
         "first_last_frame_bridge"
     )
@@ -650,6 +658,26 @@ def plan_storyboard_beats(
     """Attach plot-faithful content clips plus boundary-driven bridge clips."""
     total = 0
     shots = [shot for shot in storyboard.get("shots", []) if isinstance(shot, dict)]
+    continuity_mode = str(storyboard.get("continuity_mode") or "").strip().lower()
+    if continuity_mode in {"one_take", "single_take", "oner"}:
+        for index, shot in enumerate(shots):
+            if index == 0:
+                shot["boundary_before"] = "cut"
+                shot["continuity_reason"] = "first shot opens the one-take camera path"
+                continue
+            authored_boundary = str(shot.get("boundary_before") or "").strip()
+            if authored_boundary and authored_boundary != "continuous":
+                shot.setdefault("authored_boundary_before", authored_boundary)
+            previous = shots[index - 1]
+            authored_transition = str(previous.get("transition_to_next") or "").strip()
+            if authored_transition and authored_transition != "continuous":
+                previous.setdefault("authored_transition_to_next", authored_transition)
+            previous["transition_to_next"] = "continuous"
+            shot["boundary_before"] = "continuous"
+            shot["continuity_reason"] = (
+                "one-take contract: preserve the moving camera and action state through "
+                "a generated bridge from the preceding primary shot"
+            )
     planned: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for index, shot in enumerate(shots):
         profile = capabilities or capabilities_for({**storyboard, **shot})

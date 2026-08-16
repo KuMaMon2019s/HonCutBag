@@ -42,6 +42,7 @@ from phases.phase8.continuity_adjudication import (
     adjudicate_continuity_seams,
     decide_temporal_seam,
 )
+from phases.phase8.frame_analysis import decide_shot_action, measure_motion_activity
 from phases.phase9.rhythm_editor import (
     _duration_preserving_speed_map,
     _probe_duration,
@@ -49,9 +50,8 @@ from phases.phase9.rhythm_editor import (
     apply_speed_ramp,
 )
 from quality import object_trajectory as object_trajectory_module
-from quality import video_qa
-from phases.phase8.frame_analysis import decide_shot_action, measure_motion_activity
 from quality import sam3_sidecar as sam3_sidecar_module
+from quality import video_qa
 from quality.continuity_bridge import detect_replayed_prefix, repair_continuity_boundary
 from quality.continuity_seam import (
     compare_frame_sequences,
@@ -85,6 +85,7 @@ from runtime.continuity_provider import (
     _provider_content,
     _seedance_reference_image_payload,
     execute_phase6_auto_continuity,
+    finalize_continuity_shot,
     materialize_continuity_shot,
     normalize_provider_minimum_padding,
     probe_continuity_frames,
@@ -320,6 +321,64 @@ def test_planner_never_caps_an_explicit_one_take_continuity_group():
         "native_extend",
         "native_extend",
     ]
+
+
+def test_one_take_forces_every_primary_boundary_to_emit_a_bridge():
+    storyboard = {
+        "continuity_mode": "one_take",
+        "video_provider": "seedance",
+        "shots": [
+            {
+                "id": "S01",
+                "duration": 10,
+                "where": "运输船走廊",
+                "who": ["Agent"],
+                "micro_actions": ["Agent沿走廊前进"],
+                "transition_to_next": "dissolve",
+            },
+            {
+                "id": "S02",
+                "duration": 10,
+                "where": "旋转舱门",
+                "who": ["Agent", "Guard"],
+                "micro_actions": ["Agent与Guard失重搏斗"],
+                "boundary_before": "cut",
+            },
+            {
+                "id": "S03",
+                "duration": 10,
+                "where": "观察窗",
+                "who": ["Agent", "Guard"],
+                "micro_actions": ["Agent将Guard推向观察窗"],
+                "boundary_before": "cut",
+            },
+        ],
+    }
+
+    plan_storyboard_beats(storyboard)
+
+    assert [shot["boundary_before"] for shot in storyboard["shots"]] == [
+        "cut", "continuous", "continuous",
+    ]
+    assert [shot.get("transition_to_next") for shot in storyboard["shots"][:2]] == [
+        "continuous", "continuous",
+    ]
+    assert [
+        shot["storyboard_beats"][-1]["execution_strategy"]
+        for shot in storyboard["shots"][:-1]
+    ] == ["first_last_frame_bridge", "first_last_frame_bridge"]
+    assert [
+        shot["storyboard_beats"][-1]["bridge_target_shot_id"]
+        for shot in storyboard["shots"][:-1]
+    ] == ["S02", "S03"]
+
+    continuity = build_continuity_plan(storyboard)
+    assert [shot.boundary_before for shot in continuity.shots] == [
+        "cut", "continuous", "continuous",
+    ]
+    assert [
+        shot.chunks[-1].execution_strategy for shot in continuity.shots[:-1]
+    ] == ["first_last_frame_bridge", "first_last_frame_bridge"]
 
 
 def test_storyboard_groups_link_fresh_group_handoffs(tmp_path):
@@ -1711,6 +1770,55 @@ def test_chunk_runtime_serializes_dependencies_but_parallelizes_shots(tmp_path):
     assert report["executed_chunks"] == 4
     assert dict(sequences) == {"S01": [1, 2], "S02": [1, 2]}
     assert (tmp_path / "shots/S01/output.mp4").read_bytes() == b"S01_C01|S01_C02"
+
+
+def test_chunk_runtime_archives_primary_shot_bridge_videos(tmp_path):
+    storyboard = {
+        "continuity_mode": "one_take",
+        "video_provider": "seedance",
+        "shots": [
+            {
+                "id": "S01",
+                "duration": 10,
+                "where": "走廊",
+                "who": ["Agent"],
+                "micro_actions": ["Agent穿过旋转走廊"],
+            },
+            {
+                "id": "S02",
+                "duration": 5,
+                "where": "观察窗",
+                "who": ["Agent"],
+                "micro_actions": ["Agent在观察窗前稳定身体"],
+            },
+        ],
+    }
+    plan_storyboard_beats(storyboard)
+    plan = build_continuity_plan(storyboard)
+
+    def execute(request):
+        request.output_path.parent.mkdir(parents=True, exist_ok=True)
+        request.output_path.write_bytes(request.resource_id.encode())
+        return ChunkExecutionResult(request.output_path)
+
+    report = execute_continuity_plan(
+        plan,
+        tmp_path,
+        execute_chunk=execute,
+        inspect_seam=_inspect_test_seam,
+        materialize_shot=_materialize_test_shot,
+        normalize_chunk=lambda path, _chunk, _fps: {"output_path": str(path)},
+    )
+
+    manifest = json.loads((tmp_path / "PRIMARY_SHOT_BRIDGES.json").read_text())
+    bridge_path = tmp_path / "shot_bridges/S01__S02.mp4"
+    assert report["status"] == "done"
+    assert report["bridge_outputs"] == ["shot_bridges/S01__S02.mp4"]
+    assert bridge_path.is_file()
+    assert manifest["kind"] == "honcut.primary_shot_bridges.v1"
+    assert manifest["count"] == 1
+    assert manifest["bridges"][0]["embedded_in_preceding_shot_output"] is True
+    assert manifest["bridges"][0]["target_beat_id"] == "S02_P01"
 
 
 def test_chunk_runtime_returns_a_top_level_failure_summary(tmp_path):
@@ -3243,6 +3351,96 @@ def test_phase6_auto_requires_a_bridge_budgeted_plan_before_provider_init(monkey
         execute_phase6_auto_continuity(tmp_path, plan, _certified_seam_calibration())
 
     assert not (tmp_path / "runtime.db").exists()
+
+
+def test_phase6_auto_accepts_zero_overlap_first_last_bridge(monkeypatch, tmp_path):
+    storyboard = {
+        "continuity_mode": "one_take",
+        "video_provider": "seedance",
+        "shots": [
+            {"id": "S01", "duration": 6, "micro_actions": ["Agent穿过舱门"]},
+            {"id": "S02", "duration": 5, "micro_actions": ["Agent继续前进"]},
+        ],
+    }
+    plan_storyboard_beats(storyboard)
+    plan = build_continuity_plan(storyboard)
+    assert plan.shots[0].chunks[-1].execution_strategy == "first_last_frame_bridge"
+    assert plan.shots[0].chunks[-1].expected_overlap_frames == 0
+
+    monkeypatch.setenv("VIDEO_PROVIDER", "seedance")
+    monkeypatch.setenv("HONCUT_CONTINUITY_BRIDGE", "auto")
+    monkeypatch.setattr(
+        "runtime.continuity_provider._direct_seedance_executor",
+        lambda _root, _store: lambda _request: None,
+    )
+    monkeypatch.setattr(
+        "runtime.continuity_provider.execute_continuity_plan",
+        lambda *_args, **_kwargs: {"status": "done", "errors": []},
+    )
+
+    report = execute_phase6_auto_continuity(tmp_path, plan, None)
+
+    assert report["status"] == "done"
+
+
+def test_pre_phase8_duration_closure_preserves_overlong_shot(monkeypatch, tmp_path):
+    output = tmp_path / "shots/S01/output.mp4"
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b"provider-video")
+    monkeypatch.setattr(
+        "runtime.continuity_provider.probe_continuity_frames",
+        lambda _path, _fps: {"frames": 250, "duration_s": 250 / 24, "source_fps": 24},
+    )
+    monkeypatch.setattr(
+        "runtime.continuity_provider.subprocess.run",
+        lambda *_args, **_kwargs: pytest.fail("overlong pre-Phase-8 shot must not be trimmed"),
+    )
+
+    receipt = finalize_continuity_shot(output, target_frames=240, timeline_fps=24)
+
+    assert receipt == {
+        "method": "deferred_phase8_excess_trim",
+        "before_frames": 250,
+        "target_frames": 240,
+        "after_frames": 250,
+        "excess_frames": 10,
+        "minimum_target_met": True,
+    }
+    assert output.read_bytes() == b"provider-video"
+
+
+def test_phase8_trims_pre_phase8_excess_per_primary_shot(monkeypatch, tmp_path):
+    shot_dir = tmp_path / "shots/S01"
+    shot_dir.mkdir(parents=True)
+    (shot_dir / "output.mp4").write_bytes(b"provider-video")
+    (shot_dir / "CONTINUITY_TIMING.json").write_text(
+        json.dumps({
+            "kind": "honcut.continuity_timing.v1",
+            "internal_seams_finalized": True,
+            "timeline_fps": 24,
+            "target_frames": 240,
+            "final_frames": 252,
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        edit_decision_module,
+        "probe_video",
+        lambda _path: {"duration": 10.5, "has_audio": False},
+    )
+    monkeypatch.setattr(
+        edit_decision_module,
+        "detect_black_frames",
+        lambda _path, **_kwargs: {"trim_start": 0.0, "trim_end": 0.0},
+    )
+
+    decisions = edit_decision_module.build_edit_decisions(str(tmp_path / "shots"))
+
+    cut = decisions["cuts"][0]
+    assert cut["in_seconds"] == 0.0
+    assert cut["out_seconds"] == 10.0
+    assert cut["phase8_duration_trim"]["discarded_excess_frames"] == 12
+    assert decisions["metadata"]["phase8_duration_trims"][0]["shot_id"] == "S01"
 
 
 def test_chunk_runtime_uses_prepared_following_without_overwriting_provider_clip(tmp_path):

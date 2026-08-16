@@ -22,6 +22,7 @@ CONTINUITY_MODES = {"off", "shadow", "auto"}
 LINEAGE_KIND = "honcut.continuity_lineage.v1"
 REVIEW_DECISIONS_KIND = "honcut.continuity_review_decisions.v1"
 SEAM_DECISIONS_KIND = "honcut.continuity_seam_decisions.v1"
+PRIMARY_SHOT_BRIDGES_KIND = "honcut.primary_shot_bridges.v1"
 
 
 def _utc_now() -> str:
@@ -360,6 +361,7 @@ def execute_continuity_plan(
     timing_manifests = 0
     duration_topups = 0
     repair_attempts = 0
+    primary_shot_bridges: list[dict[str, Any]] = []
     totals_lock = threading.Lock()
 
     def run_shot(
@@ -467,7 +469,10 @@ def execute_continuity_plan(
             while True:
                 preparation: dict[str, Any] | None = None
                 effective_following = following_path
-                if prepare_seam is not None:
+                if (
+                    prepare_seam is not None
+                    and chunk.execution_strategy != "first_last_frame_bridge"
+                ):
                     preparation = prepare_seam(previous_output, following_path, boundary_id)
                     prepared_path = Path(str(preparation.get("output_path") or following_path))
                     if prepared_path.resolve() != following_path.resolve():
@@ -723,6 +728,30 @@ def execute_continuity_plan(
                         "no video bytes"
                     )
                 effective_path = normalized_path
+            if chunk.execution_strategy == "first_last_frame_bridge":
+                target_shot_id = str(chunk.bridge_target_shot_id or "").strip()
+                if not target_shot_id:
+                    raise RuntimeError(
+                        f"{chunk.chunk_id} has no target primary shot for bridge archival"
+                    )
+                bridge_dir = root / "shot_bridges"
+                bridge_dir.mkdir(parents=True, exist_ok=True)
+                bridge_path = bridge_dir / f"{shot.shot_id}__{target_shot_id}.mp4"
+                temporary_bridge = bridge_path.with_suffix(".mp4.tmp")
+                shutil.copy2(effective_path, temporary_bridge)
+                os.replace(temporary_bridge, bridge_path)
+                bridge_record = {
+                    "boundary_id": f"{shot.shot_id}__{target_shot_id}",
+                    "source_shot_id": shot.shot_id,
+                    "target_shot_id": target_shot_id,
+                    "target_beat_id": chunk.bridge_target_beat_id,
+                    "chunk_id": chunk.chunk_id,
+                    "path": _portable_path(bridge_path, root),
+                    "embedded_in_preceding_shot_output": True,
+                    "phase8_transition_policy": "hard_cut_after_generated_camera_bridge",
+                }
+                with totals_lock:
+                    primary_shot_bridges.append(bridge_record)
             chunk_paths.append(effective_path)
             executed_chunk_models.append(chunk)
             if probe_frames is not None:
@@ -827,6 +856,7 @@ def execute_continuity_plan(
                     "target_frames": shot.target_frames,
                     "timeline_fps": plan.timeline_fps,
                     "enabled": finalize_shot is not None,
+                    "pre_phase8_policy": "minimum_target_allow_excess",
                     "deferred_cross_shot_prefix": bool(shot.extends_from_chunk_id),
                 },
             }
@@ -884,6 +914,11 @@ def execute_continuity_plan(
                 ),
                 "final_frames": int(final_timing["frames"]),
                 "delta_frames": int(final_timing["frames"]) - target_frames,
+                "pre_phase8_duration_policy": "minimum_target_allow_excess",
+                "minimum_target_met": int(final_timing["frames"]) >= target_frames,
+                "excess_frames_before_phase8": max(
+                    0, int(final_timing["frames"]) - target_frames
+                ),
                 "duration_closure": closure,
                 "internal_seams_finalized": True,
                 "boundary_before": shot.boundary_before,
@@ -956,6 +991,16 @@ def execute_continuity_plan(
 
     outputs.sort()
     errors.sort(key=lambda item: item["shot_id"])
+    primary_shot_bridges.sort(
+        key=lambda item: (item["source_shot_id"], item["target_shot_id"])
+    )
+    bridge_manifest = {
+        "kind": PRIMARY_SHOT_BRIDGES_KIND,
+        "status": "partial" if errors else "done",
+        "count": len(primary_shot_bridges),
+        "bridges": primary_shot_bridges,
+    }
+    _atomic_write_json(root / "PRIMARY_SHOT_BRIDGES.json", bridge_manifest)
     error_summary = None
     if errors:
         details = "; ".join(
@@ -977,4 +1022,6 @@ def execute_continuity_plan(
         "repair_attempts": repair_attempts,
         "skipped_chunks": skipped_chunks,
         "lineage_path": "CONTINUITY_LINEAGE.json",
+        "primary_shot_bridges_path": "PRIMARY_SHOT_BRIDGES.json",
+        "bridge_outputs": [item["path"] for item in primary_shot_bridges],
     }

@@ -393,6 +393,12 @@ def build_continuity_plan(
             index,
             allow_unverified_explicit=not strict_secondary_contract,
         )
+        if preserve_one_take and index > 1:
+            boundary_before = "continuous"
+            continuity_reason = (
+                "one-take contract overrides authored cut/location-change metadata; "
+                "the preceding primary shot must bridge into this P01 composition"
+            )
         requested_extension = (
             boundary_before == "continuous"
             and previous_planned_shot is not None

@@ -91,7 +91,7 @@ def finalize_continuity_shot(
     target_frames: int,
     timeline_fps: int,
 ) -> dict[str, Any]:
-    """Close a materialized editorial shot to its exact frame budget."""
+    """Enforce the pre-Phase-8 minimum duration without discarding valid frames."""
     before = probe_continuity_frames(output_path, timeline_fps)
     actual_frames = int(before["frames"])
     delta = target_frames - actual_frames
@@ -102,6 +102,15 @@ def finalize_continuity_shot(
             "target_frames": target_frames,
             "after_frames": actual_frames,
         }
+    if delta < 0:
+        return {
+            "method": "deferred_phase8_excess_trim",
+            "before_frames": actual_frames,
+            "target_frames": target_frames,
+            "after_frames": actual_frames,
+            "excess_frames": -delta,
+            "minimum_target_met": True,
+        }
     if delta > max(2, math.ceil(target_frames * 0.02)):
         raise RuntimeError(
             f"{output_path.parent.name} is short by {delta} frames; "
@@ -109,16 +118,12 @@ def finalize_continuity_shot(
         )
 
     temporary = output_path.with_name(f"{output_path.stem}.duration_closure{output_path.suffix}")
-    if delta < 0:
-        video_filter = f"trim=end_frame={target_frames},setpts=PTS-STARTPTS"
-        method = "exact_tail_trim"
-    else:
-        stretch = target_frames / actual_frames
-        video_filter = (
-            f"setpts={stretch:.12f}*PTS,fps={timeline_fps},"
-            f"trim=end_frame={target_frames},setpts=PTS-STARTPTS"
-        )
-        method = "bounded_micro_retime"
+    stretch = target_frames / actual_frames
+    video_filter = (
+        f"setpts={stretch:.12f}*PTS,fps={timeline_fps},"
+        f"trim=end_frame={target_frames},setpts=PTS-STARTPTS"
+    )
+    method = "bounded_micro_retime"
     completed = subprocess.run(
         [
             "ffmpeg",
@@ -1420,7 +1425,10 @@ def execute_phase6_auto_continuity(
     _validate_seedance_continuity_plan(plan)
 
     requires_video_upload = any(
-        chunk.mode == "native_extend" for shot in plan.shots for chunk in shot.chunks
+        chunk.mode == "native_extend"
+        and chunk.execution_strategy != "first_last_frame_bridge"
+        for shot in plan.shots
+        for chunk in shot.chunks
     )
     if requires_video_upload:
         from clients.tos_uploader import is_media_upload_configured
@@ -1445,14 +1453,21 @@ def execute_phase6_auto_continuity(
         planned_overlap_seconds=planned_overlap_seconds,
         timeline_fps=plan.timeline_fps,
     )
-    if prepare_seam is not None and any(
-        len(shot.chunks) > 1
-        and all(chunk.expected_overlap_frames == 0 for chunk in shot.chunks[1:])
+    missing_replay_overlap = [
+        chunk.chunk_id
         for shot in plan.shots
-    ):
+        for chunk in shot.chunks
+        if (
+            chunk.mode == "native_extend"
+            and chunk.execution_strategy != "first_last_frame_bridge"
+            and chunk.expected_overlap_frames <= 0
+        )
+    ]
+    if prepare_seam is not None and missing_replay_overlap:
         raise RuntimeError(
             "continuity bridge requires an overlap-budgeted CONTINUITY_PLAN.json; "
-            "rerun Phase 4 with HONCUT_CONTINUITY_BRIDGE=auto"
+            "rerun Phase 4 with HONCUT_CONTINUITY_BRIDGE=auto; missing overlap on "
+            + ", ".join(missing_replay_overlap[:6])
         )
     task_store = GenerationTaskStore(root / "runtime.db")
     execute_chunk = executor_factory(root, task_store)
