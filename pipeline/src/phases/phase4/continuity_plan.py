@@ -269,7 +269,7 @@ def _authored_storyboard_beats(shot: Mapping[str, Any]) -> list[Mapping[str, Any
 
 
 def _secondary_strategy(beat: Mapping[str, Any], sequence: int) -> str:
-    """Normalize the v2 strategy while keeping old storyboard artifacts readable."""
+    """Normalize the secondary strategy while keeping legacy artifacts readable."""
     value = str(
         beat.get("execution_strategy") or beat.get("generation_mode") or ""
     ).strip().lower()
@@ -281,6 +281,25 @@ def _secondary_strategy(beat: Mapping[str, Any], sequence: int) -> str:
     if value in aliases:
         return aliases[value]
     return "legacy"
+
+
+def _validate_secondary_strategy_sequence(
+    shot_id: str,
+    strategies: list[str],
+) -> None:
+    """Enforce content-first ordering without assigning semantics by position."""
+    valid = {
+        ("multi_image",),
+        ("multi_image", "tail_video_extend"),
+        ("multi_image", "first_last_frame_bridge"),
+        ("multi_image", "tail_video_extend", "first_last_frame_bridge"),
+    }
+    if tuple(strategies) not in valid:
+        raise ValueError(
+            f"{shot_id} has invalid secondary execution sequence {strategies}; "
+            "expected P01 multi-image, optional capacity extension, then optional "
+            "continuous-boundary bridge"
+        )
 
 
 def _beat_unique_frames(
@@ -350,19 +369,22 @@ def build_continuity_plan(
             _secondary_strategy(beat, sequence)
             for sequence, beat in enumerate(authored_beats, 1)
         ]
-        uses_secondary_v2 = bool(authored_beats) and all(
+        uses_secondary_contract = bool(authored_beats) and all(
             strategy != "legacy" for strategy in secondary_strategies
         )
+        if uses_secondary_contract:
+            _validate_secondary_strategy_sequence(shot_id, secondary_strategies)
         capped_group = (
             requested_extension
             and not preserve_one_take
             and group_shot_count >= continuity_group_max_shots
         )
         logical_extension = requested_extension and not capped_group
-        # V2 performs the cross-primary handoff in the preceding shot's third
-        # beat.  Every next primary P01 therefore starts from its own multi-image
-        # contract instead of extending a predecessor video a second time.
-        initial_extension = logical_extension and not uses_secondary_v2
+        # The secondary contract performs a continuous cross-primary handoff in
+        # the preceding shot's final bridge beat (P02 or P03).  Every next P01
+        # therefore starts from its own multi-image contract instead of extending
+        # a predecessor video a second time.
+        initial_extension = logical_extension and not uses_secondary_contract
         if capped_group:
             boundary_before = "cut"
             continuity_reason = (
@@ -390,19 +412,6 @@ def build_continuity_plan(
                 1,
             ):
                 strategy = secondary_strategies[sequence - 1]
-                if uses_secondary_v2:
-                    expected_strategy = (
-                        "multi_image"
-                        if sequence == 1
-                        else "tail_video_extend"
-                        if sequence == 2
-                        else "first_last_frame_bridge"
-                    )
-                    if strategy != expected_strategy:
-                        raise ValueError(
-                            f"{shot_id} beat {sequence} must use {expected_strategy}, "
-                            f"got {strategy}"
-                        )
                 reserved_overlap = (
                     overlap_frames
                     if previous is not None

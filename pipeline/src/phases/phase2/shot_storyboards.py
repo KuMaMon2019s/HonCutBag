@@ -122,7 +122,14 @@ def build_shot_storyboard_prompt(
     beat_lines = []
     for position, beat in enumerate(beats, 1):
         beat_id = str(beat.get("beat_id") or f"{shot_id}_P{position:02d}")
-        mode = "FRESH" if position == 1 else "EXTEND"
+        generation_mode = str(
+            beat.get("generation_mode") or ""
+        ).strip().lower()
+        mode = {
+            "multi_image": "MULTI_IMAGE",
+            "tail_video_extend": "TAIL_VIDEO_EXTEND",
+            "first_last_frame_bridge": "FIRST_LAST_FRAME_BRIDGE",
+        }.get(generation_mode, "FRESH" if position == 1 else "EXTEND")
         beat_lines.append(
             f"故事格{position}【{beat_id} · {mode} · {float(beat.get('duration_s') or 5):g}秒】："
             f"起始状态={_compact(beat.get('start_state'))}；"
@@ -146,8 +153,9 @@ def build_shot_storyboard_prompt(
 
 二级分镜执行语义：
 - P01 是“多图生成视频”的当前一级分镜起始构图；角色图锁身份，本格故事图锁场景、站位与当前剧情。
-- P02 从 P01 生成视频的末段状态继续，用于“截取前段视频后延长”；不得重新入场、回到 P01 或重复前格动作。
-- 若存在 P03，P03 只完成本一级分镜的收束与交接；Phase 6 将用 P02 视频尾帧作首帧、下一一级分镜 P01 作尾帧。P03 不得提前执行下一一级分镜的动作。
+- 只有标记为 TAIL_VIDEO_EXTEND 的格才是容量延长格：它表示前一段最大叙事时长/动作容量不足以完整承载本 Sxx，必须从前段视频末态继续，禁止重新入场、回放或重复动作。
+- 只有标记为 FIRST_LAST_FRAME_BRIDGE 的最后一格才是跨一级分镜桥接格：它只在下一 Sxx 与当前 Sxx 剧情连续时存在；Phase 6 用前段真实尾帧作首帧、下一 Sxx 的 P01 作尾帧。它不得承担当前 Sxx 尚未完成的动作，也不得提前执行下一 Sxx 的动作。
+- 若下一一级分镜是换场、跳时、主体切换、回忆、梦境或其他 cut/fade/dissolve 转场，本 Sxx 不得绘制 FIRST_LAST_FRAME_BRIDGE 格。
 - 每格只能细分当前 Sxx 已写明的动作与状态，不得新增角色、道具、冲突、伤亡或剧情结果。
 
 场景：{_compact(shot.get('where') or shot.get('visual'), 260)}
@@ -157,7 +165,7 @@ def build_shot_storyboard_prompt(
 逐格合同：
 {chr(10).join(beat_lines)}
 
-最终检查：恰好 {len(beats)} 格，动作按时间推进；P01 可作为多图首段的构图参考，P02 可承接前段视频末态，P03（若有）可安全交接到下一 Sxx 的 P01，且没有提前执行下一镜剧情。"""
+最终检查：恰好 {len(beats)} 格，严格服从每格标记的执行模式；全部当前 Sxx 动作只能由 MULTI_IMAGE/TAIL_VIDEO_EXTEND 格按原顺序覆盖，FIRST_LAST_FRAME_BRIDGE（若有）必须位于最后且只负责连续边界交接。"""
     return prompt, beats
 
 

@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Any
 
 from clients.ark_multimodal_client import ArkMultimodalClient
+from phases.phase1.storyboard_beats import required_content_beat_count
+from quality.shot_continuity import classify_boundary
 from utils.video_capabilities import capabilities_for
 
 DEFAULT_SIMILARITY_THRESHOLD = 0.85
@@ -168,7 +170,7 @@ def run_generation_capacity_checks(
             beat_duration_total = 0.0
             beat_units_seen: list[str] = []
             beat_micro_actions_seen: list[str] = []
-            uses_secondary_v2 = all(
+            uses_secondary_contract = all(
                 str(beat.get("generation_mode") or "").strip().lower()
                 in {
                     "multi_image",
@@ -177,23 +179,52 @@ def run_generation_capacity_checks(
                 }
                 for beat in storyboard_beats
             )
-            if uses_secondary_v2 and not 1 <= len(storyboard_beats) <= 3:
+            expected_modes: list[str] = []
+            bridge_required = False
+            if uses_secondary_contract:
+                content_count = required_content_beat_count(shot, profile)
+                if index + 1 < len(ordered_shots):
+                    boundary_after, _boundary_reason = classify_boundary(
+                        shot,
+                        ordered_shots[index + 1],
+                        index=index + 2,
+                    )
+                    bridge_required = boundary_after == "continuous"
+                expected_modes = ["multi_image"]
+                if content_count > 1:
+                    expected_modes.append("tail_video_extend")
+                if bridge_required:
+                    expected_modes.append("first_last_frame_bridge")
+                actual_modes = [
+                    str(beat.get("generation_mode") or "").strip().lower()
+                    for beat in storyboard_beats
+                ]
+                if actual_modes != expected_modes:
+                    issues.append(_issue(
+                        "L1", "severe", "secondary_storyboard_strategy_mismatch",
+                        f"{sid} secondary beats must follow content capacity and the "
+                        "next primary-shot boundary",
+                        [sid], expected_modes=expected_modes, observed_modes=actual_modes,
+                        bridge_required=bridge_required,
+                    ))
+            if uses_secondary_contract and not 1 <= len(storyboard_beats) <= 3:
                 issues.append(_issue(
                     "L1", "severe", "secondary_storyboard_count_invalid",
-                    f"{sid} must contain one to three complexity-selected Pxx beats",
+                    f"{sid} must contain one to three capacity/boundary-selected Pxx beats",
                     [sid], observed_count=len(storyboard_beats),
                 ))
             for position, beat in enumerate(storyboard_beats, 1):
                 beat_id = str(beat.get("beat_id") or f"{sid}_P{position:02d}")
                 beat_duration = float(beat.get("duration_s") or 0)
                 beat_duration_total += beat_duration
-                if uses_secondary_v2:
+                actual_mode = str(
+                    beat.get("generation_mode") or ""
+                ).strip().lower()
+                if uses_secondary_contract:
                     expected_mode = (
-                        "multi_image"
-                        if position == 1
-                        else "tail_video_extend"
-                        if position == 2
-                        else "first_last_frame_bridge"
+                        expected_modes[position - 1]
+                        if position <= len(expected_modes)
+                        else "<no-extra-beat>"
                     )
                 else:
                     expected_mode = (
@@ -208,7 +239,7 @@ def run_generation_capacity_checks(
                         )
                         else "fresh"
                     )
-                if beat.get("generation_mode") != expected_mode:
+                if actual_mode != expected_mode:
                     issues.append(_issue(
                         "L1", "severe", "storyboard_beat_mode_invalid",
                         f"{beat_id} must use {expected_mode}",
@@ -248,7 +279,7 @@ def run_generation_capacity_checks(
                         f"({profile.max_micro_actions_per_beat})",
                         [sid], beat_id=beat_id,
                     ))
-                if uses_secondary_v2:
+                if uses_secondary_contract:
                     if str(beat.get("parent_shot_id") or "") != sid:
                         issues.append(_issue(
                             "L1", "severe", "secondary_storyboard_parent_mismatch",
@@ -263,7 +294,7 @@ def run_generation_capacity_checks(
                             f"{beat_id} has no primary-shot plot fidelity contract",
                             [sid], beat_id=beat_id,
                         ))
-                    if expected_mode == "first_last_frame_bridge":
+                    if actual_mode == "first_last_frame_bridge":
                         expected_target_shot = (
                             shot_ids[index + 1] if index + 1 < len(shot_ids) else None
                         )
@@ -271,7 +302,9 @@ def run_generation_capacity_checks(
                             f"{expected_target_shot}_P01" if expected_target_shot else None
                         )
                         if (
-                            beat.get("bridge_target_shot_id") != expected_target_shot
+                            not bridge_required
+                            or position != len(storyboard_beats)
+                            or beat.get("bridge_target_shot_id") != expected_target_shot
                             or beat.get("bridge_target_beat_id") != expected_target_beat
                             or not str(
                                 beat.get("bridge_target_storyboard_image") or ""
@@ -320,7 +353,7 @@ def run_generation_capacity_checks(
                 str(value) for value in source_micro_actions if str(value).strip()
             ]
             if (
-                uses_secondary_v2
+                uses_secondary_contract
                 and source_micro_actions
                 and source_micro_actions != beat_micro_actions_seen
             ):

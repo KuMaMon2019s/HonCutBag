@@ -742,7 +742,7 @@ def test_phase1_starts_each_primary_shot_p01_with_multi_image_generation():
     storyboard = {
         "video_provider": "seedance",
         "shots": [
-            {"id": "S01", "duration": 5, "micro_actions": ["进入"], "boundary_before": "cut"},
+            {"id": "S01", "duration": 6, "micro_actions": ["进入"], "boundary_before": "cut"},
             {
                 "id": "S02",
                 "duration": 5,

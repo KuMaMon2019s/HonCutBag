@@ -67,16 +67,20 @@ def classify_boundary(
     explicit = _text(current.get("boundary_before") or current.get("continuity_boundary"))
     if explicit in CUT_VALUES:
         return "cut", _text(current.get("continuity_reason")) or "storyboard explicitly starts fresh"
+
+    # A declared scene transition is a hard boundary even when the next shot
+    # was accidentally labelled continuous by an upstream model.  Bridge-video
+    # planning must never interpolate across dissolves, fades, wipes or jumps.
+    previous_transition = _text(previous.get("transition_to_next"))
+    if previous_transition in _SCENE_TRANSITIONS:
+        return "cut", f"previous shot requests a scene transition ({previous_transition})"
+
     if explicit in CONTINUOUS_VALUES:
         return (
             "continuous",
             _text(current.get("continuity_reason"))
             or "storyboard explicitly continues the previous moving state",
         )
-
-    previous_transition = _text(previous.get("transition_to_next"))
-    if previous_transition in _SCENE_TRANSITIONS:
-        return "cut", f"previous shot requests a scene transition ({previous_transition})"
 
     previous_place = _text(previous.get("where") or previous.get("scene"))
     current_place = _text(current.get("where") or current.get("scene"))

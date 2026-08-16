@@ -15,8 +15,8 @@ from utils.video_capabilities import (
 MIN_BEAT_SECONDS = int(SEEDANCE_2_CAPABILITIES.min_unique_beat_s)
 MAX_BEAT_SECONDS = int(SEEDANCE_2_CAPABILITIES.max_unique_beat_s)
 MAX_ACTIONS_PER_BEAT = SEEDANCE_2_CAPABILITIES.max_micro_actions_per_beat
-SECONDARY_STORYBOARD_VERSION = "honcut.secondary-storyboard.v2"
-SECONDARY_EXECUTION = "complexity_aware_three_stage_v2"
+SECONDARY_STORYBOARD_VERSION = "honcut.secondary-storyboard.v3"
+SECONDARY_EXECUTION = "content_capacity_boundary_aware_v3"
 MAX_SECONDARY_BEATS = 3
 
 
@@ -59,95 +59,39 @@ def _duration_budgets(total: float, count: int) -> list[float]:
     return values
 
 
-def _beat_count(
+def _content_beat_requirement(
     shot: dict[str, Any],
     duration: float,
     actions: list[str],
     capabilities: VideoModelCapabilities,
-    *,
-    has_next_shot: bool,
-) -> int:
-    """Choose one to three Pxx beats from narrative and staging complexity."""
-    explicit = int(shot.get("secondary_storyboard_beat_count") or 0)
+) -> tuple[int, list[str]]:
+    """Return one or two story-bearing clips required by provider capacity.
+
+    Camera movement, genre and visual intensity never create an extension by
+    themselves.  P02 exists only when P01 cannot carry the complete authored
+    duration/action contract within one provider narrative window.
+    """
     raw_units = shot.get("source_action_unit_ids") or []
     if isinstance(raw_units, str):
         raw_units = [raw_units]
     action_units = len({str(value) for value in raw_units if str(value).strip()})
     action_count = math.ceil(len(actions) / capabilities.max_micro_actions_per_beat)
-    semantic_minimum = max(
-        1,
-        explicit,
-        action_units,
-        action_count,
-    )
     duration_count = max(1, math.ceil(duration / capabilities.max_unique_beat_s))
-    provider_capacity = max(1, int(duration // capabilities.min_unique_beat_s))
-    if semantic_minimum > provider_capacity:
+    required = max(1, action_units, action_count, duration_count)
+    reasons: list[str] = []
+    if duration_count > 1:
+        reasons.append("p01_max_narrative_duration_exceeded")
+    if action_count > 1:
+        reasons.append("p01_micro_action_capacity_exceeded")
+    if action_units > 1:
+        reasons.append("p01_action_unit_capacity_exceeded")
+    if required > 2:
         raise ValueError(
             f"{_shot_id(shot, 1)} cannot fit {len(actions)} micro-actions into "
-            f"{duration:g}s for {capabilities.name}: requires {semantic_minimum} beats, "
-            f"but the duration supports at most {provider_capacity}"
+            f"one base clip plus one extension for {capabilities.name}: "
+            f"requires {required} story-bearing clips"
         )
-    capacity = min(MAX_SECONDARY_BEATS, provider_capacity)
-    # The third strategy needs the next primary shot's P01 as its last frame.
-    if not has_next_shot:
-        capacity = min(capacity, 2)
-    if semantic_minimum > capacity:
-        raise ValueError(
-            f"{_shot_id(shot, 1)} requires {semantic_minimum} secondary beats, "
-            f"but the three-stage contract supports at most {capacity} here"
-        )
-
-    desired = max(semantic_minimum, duration_count)
-    if capabilities.name == SEEDANCE_2_CAPABILITIES.name:
-        who = shot.get("who") or shot.get("characters") or []
-        if isinstance(who, str):
-            who = [who]
-        camera = str(
-            shot.get("camera_movement")
-            or shot.get("camera_movement_en")
-            or shot.get("camera")
-            or ""
-        ).strip().lower()
-        intent = str(shot.get("shot_intent") or "").strip().lower()
-        narrative = " ".join(
-            str(shot.get(field) or "")
-            for field in ("action_description", "what", "visual")
-        ).lower()
-        complexity_score = 0
-        complexity_reasons: list[str] = []
-        if len(actions) >= 2:
-            complexity_score += 2
-            complexity_reasons.append("multiple_ordered_actions")
-        if len(actions) >= 3:
-            complexity_score += 1
-            complexity_reasons.append("three_or_more_actions")
-        if len([value for value in who if str(value).strip()]) >= 2:
-            complexity_score += 1
-            complexity_reasons.append("multi_character_interaction")
-        if intent in {"action", "transition", "chase", "fight"}:
-            complexity_score += 1
-            complexity_reasons.append(f"intent:{intent}")
-        if camera not in {"", "static", "fixed", "locked", "unspecified"}:
-            complexity_score += 1
-            complexity_reasons.append("moving_camera")
-        if re.search(
-            r"失重|旋转|翻滚|穿过|解除|漂浮|zero.gravity|rotat|roll|disarm|debris",
-            narrative,
-        ):
-            complexity_score += 1
-            complexity_reasons.append("complex_spatial_choreography")
-        if complexity_score >= 2:
-            desired = max(desired, 2)
-        if complexity_score >= 4 and has_next_shot:
-            desired = max(desired, 3)
-        shot["secondary_storyboard_complexity"] = {
-            "score": complexity_score,
-            "reasons": complexity_reasons,
-            "provider_capacity": provider_capacity,
-            "selected_count": min(capacity, desired),
-        }
-    return min(capacity, desired)
+    return required, reasons
 
 
 def _source_actions(shot: dict[str, Any]) -> list[str]:
@@ -200,6 +144,35 @@ def _source_actions(shot: dict[str, Any]) -> list[str]:
     return [fallback]
 
 
+def required_content_beat_count(
+    shot: dict[str, Any],
+    capabilities: VideoModelCapabilities | None = None,
+) -> int:
+    """Public deterministic capacity check shared by planning and Phase 5 QA."""
+    profile = capabilities or capabilities_for(shot)
+    duration = float(shot.get("duration") or shot.get("suggested_duration") or 5)
+    required, _reasons = _content_beat_requirement(
+        shot,
+        duration,
+        _source_actions(shot),
+        profile,
+    )
+    return required
+
+
+def _bridge_requirement(
+    shots: list[dict[str, Any]],
+    index: int,
+) -> tuple[bool, str]:
+    """Create a bridge only across a proven continuous primary-shot boundary."""
+    if index + 1 >= len(shots):
+        return False, "final primary shot has no following boundary"
+    from quality.shot_continuity import classify_boundary
+
+    boundary, reason = classify_boundary(shots[index], shots[index + 1], index=index + 2)
+    return boundary == "continuous", reason
+
+
 def _action_for_bucket(
     bucket: list[str],
     *,
@@ -221,33 +194,77 @@ def plan_storyboard_beats(
     storyboard: dict[str, Any],
     capabilities: VideoModelCapabilities | None = None,
 ) -> dict[str, Any]:
-    """Attach a plot-faithful, complexity-aware secondary storyboard ladder."""
+    """Attach plot-faithful content clips plus boundary-driven bridge clips."""
     total = 0
     shots = [shot for shot in storyboard.get("shots", []) if isinstance(shot, dict)]
-    planned: list[tuple[dict[str, Any], str, list[str], int, VideoModelCapabilities]] = []
-    for index, shot in enumerate(shots, 1):
+    planned: list[
+        tuple[
+            dict[str, Any],
+            str,
+            list[str],
+            int,
+            bool,
+            str,
+            VideoModelCapabilities,
+        ]
+    ] = []
+    for index, shot in enumerate(shots):
         if not isinstance(shot, dict):
             continue
         profile = capabilities or capabilities_for({**storyboard, **shot})
-        sid = _shot_id(shot, index)
+        sid = _shot_id(shot, index + 1)
         duration = float(shot.get("duration") or shot.get("suggested_duration") or 5)
         source_actions = _source_actions(shot)
-        fallback_action = _compact(
-            shot.get("action_description")
-            or shot.get("what")
-            or shot.get("visual")
-            or "保持当前场景中的自然表演"
-        )
-        count = _beat_count(
+        content_count, extension_reasons = _content_beat_requirement(
             shot,
             duration,
             source_actions,
             profile,
-            has_next_shot=index < len(shots),
         )
-        planned.append((shot, sid, source_actions, count, profile))
+        bridge_required, bridge_reason = _bridge_requirement(shots, index)
+        total_count = content_count + int(bridge_required)
+        provider_capacity = max(1, int(duration // profile.min_unique_beat_s))
+        if total_count > MAX_SECONDARY_BEATS:
+            raise ValueError(
+                f"{sid} requires {content_count} story-bearing clips plus a continuity "
+                f"bridge, above the {MAX_SECONDARY_BEATS}-beat contract"
+            )
+        if total_count > provider_capacity:
+            raise ValueError(
+                f"{sid} needs {total_count} secondary beats for content and boundary "
+                f"continuity, but {duration:g}s supports only {provider_capacity} at "
+                f"{profile.min_unique_beat_s:g}s minimum per beat"
+            )
+        shot["secondary_storyboard_planning"] = {
+            "content_beat_count": content_count,
+            "extension_required": content_count > 1,
+            "extension_reasons": extension_reasons,
+            "bridge_required": bridge_required,
+            "bridge_reason": bridge_reason,
+            "provider_capacity": provider_capacity,
+            "selected_count": total_count,
+        }
+        planned.append(
+            (
+                shot,
+                sid,
+                source_actions,
+                content_count,
+                bridge_required,
+                bridge_reason,
+                profile,
+            )
+        )
 
-    for index, (shot, sid, source_actions, count, profile) in enumerate(planned, 1):
+    for index, (
+        shot,
+        sid,
+        source_actions,
+        content_count,
+        bridge_required,
+        bridge_reason,
+        profile,
+    ) in enumerate(planned):
         duration = float(shot.get("duration") or shot.get("suggested_duration") or 5)
         fallback_action = _compact(
             shot.get("action_description")
@@ -255,15 +272,16 @@ def plan_storyboard_beats(
             or shot.get("visual")
             or "保持当前场景中的自然表演"
         )
-        action_buckets = _partition(source_actions, count)
+        total_count = content_count + int(bridge_required)
+        action_buckets = _partition(source_actions, content_count)
         raw_units = shot.get("source_action_unit_ids") or []
         if isinstance(raw_units, str):
             raw_units = [raw_units]
         action_units = list(dict.fromkeys(
             str(value) for value in raw_units if str(value).strip()
         ))
-        unit_buckets = _partition(action_units, count)
-        durations = _duration_budgets(duration, count)
+        unit_buckets = _partition(action_units, content_count)
+        durations = _duration_budgets(duration, total_count)
         start_state = _compact(
             shot.get("start_state")
             or shot.get("prev_shot_context")
@@ -271,26 +289,24 @@ def plan_storyboard_beats(
         )
         final_state = _compact(shot.get("end_state") or shot.get("what"))
         beats: list[dict[str, Any]] = []
-        for position in range(1, count + 1):
+        for position in range(1, content_count + 1):
             action = _action_for_bucket(
                 action_buckets[position - 1],
                 position=position,
-                count=count,
+                count=content_count,
                 fallback_action=fallback_action,
                 final_state=final_state,
             )
             previous_state = beats[-1]["end_state"] if beats else start_state
             next_state = (
                 final_state
-                if position == count
+                if position == content_count
                 else _compact(f"已完成本格动作：{action}")
             )
             generation_mode = (
                 "multi_image"
                 if position == 1
                 else "tail_video_extend"
-                if position == 2
-                else "first_last_frame_bridge"
             )
             normalized = {
                 "beat_id": f"{sid}_P{position:02d}",
@@ -311,31 +327,59 @@ def plan_storyboard_beats(
                 or shot.get("camera_movement_en"),
             }
             beats.append(normalized)
-        if len(beats) == 3:
-            next_shot, next_sid, *_ = planned[index]
-            bridge = beats[-1]
-            bridge.update({
+        if bridge_required:
+            next_shot, next_sid, *_ = planned[index + 1]
+            next_start_state = _compact(
+                next_shot.get("start_state")
+                or next_shot.get("prev_shot_context")
+                or next_shot.get("what")
+            )
+            position = len(beats) + 1
+            bridge = {
+                "beat_id": f"{sid}_P{position:02d}",
+                "position": position,
+                "duration_s": durations[position - 1],
+                "generation_mode": "first_last_frame_bridge",
+                "execution_strategy": "first_last_frame_bridge",
+                "planner_version": SECONDARY_STORYBOARD_VERSION,
+                "parent_shot_id": sid,
+                "plot_fidelity_contract": "primary_shot_source_only_no_invention",
+                "start_state": final_state,
+                "action": _compact(
+                    f"保持{sid}结束动作的因果连续，从当前终态平滑过渡到"
+                    f"{next_sid}_P01 起始构图；不得执行{next_sid}的新动作"
+                ),
+                "micro_actions": [],
+                "source_action_unit_ids": [],
+                "end_state": next_start_state,
+                "shot_size": shot.get("shot_size") or shot.get("shot_type"),
+                "camera_movement": shot.get("camera_movement")
+                or shot.get("camera_movement_en"),
                 "bridge_target_shot_id": next_sid,
                 "bridge_target_beat_id": f"{next_sid}_P01",
                 "bridge_target_storyboard_image": f"storyboard_beats/{next_sid}_P01.png",
-                "bridge_target_start_state": _compact(
-                    next_shot.get("start_state")
-                    or next_shot.get("prev_shot_context")
-                    or next_shot.get("what")
-                ),
+                "bridge_target_start_state": next_start_state,
+                "bridge_boundary_reason": bridge_reason,
                 "bridge_contract": (
                     "end on the next primary shot's P01 composition without executing "
                     "the next primary shot's action"
                 ),
-            })
+            }
+            beats.append(bridge)
         shot["storyboard_beats"] = beats
         shot["storyboard_beat_count"] = len(beats)
         # The top-level shot prompt is a narrative summary. Paid video prompts
         # are narrowed to one beat later by the continuity provider.
-        shot["generation_actions"] = [beat["action"] for beat in beats]
+        shot["generation_actions"] = [
+            beat["action"]
+            for beat in beats
+            if beat["generation_mode"] != "first_last_frame_bridge"
+        ]
         shot["generation_load"] = {
             **(shot.get("generation_load") or {}),
             "storyboard_beats": len(beats),
+            "content_beats": content_count,
+            "bridge_beats": int(bridge_required),
             "execution": SECONDARY_EXECUTION,
             "capability_profile": profile.name,
         }

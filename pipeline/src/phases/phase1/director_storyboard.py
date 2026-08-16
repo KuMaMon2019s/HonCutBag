@@ -114,7 +114,7 @@ def build_director_storyboard_prompt(
     for index, (shot, group_id) in enumerate(zip(shots, groups, strict=True), 1):
         shot_id = _shot_id(shot, index)
         # Sxx is a director/editorial shot. Every Sxx starts from its own P01;
-        # native extension is reserved for P02+ inside that same shot.
+        # later Pxx are selected by content capacity and the next boundary.
         generation_mode = "FRESH"
         actions = shot.get("generation_actions") or []
         if isinstance(actions, str):
@@ -200,7 +200,7 @@ def build_director_storyboard_prompt(
 
 跨面板连续性：
 - 同名角色在所有面板保持相同发型、服装、武器和身体比例。
-- 每个 Sxx 都是 FRESH 导演镜头，由自己的 P01 建立构图；视频延长仅发生在该 Sxx 内部的 P02+。
+- 每个 Sxx 都由自己的 P01 建立构图；只有单段容量不足时才在该 Sxx 内增加视频延长格，只有下一 Sxx 剧情连续时才在末尾增加首尾帧桥接格，转场边界不得增加桥接格。
 - DG 编号相同的相邻 Sxx 虽然重新构图，仍须保持空间轴线、天气和叙事因果连续。
 
 角色设计约束：

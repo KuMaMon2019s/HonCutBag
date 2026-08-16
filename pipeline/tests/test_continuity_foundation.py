@@ -805,6 +805,95 @@ def test_complex_shot_maps_to_three_secondary_generation_strategies(tmp_path):
     ] == "storyboard_beats/S01_P02.png"
 
 
+def test_secondary_strategies_follow_content_capacity_and_boundary_semantics():
+    intense_but_single_clip = {
+        "video_provider": "seedance",
+        "shots": [{
+            "id": "S01",
+            "duration": 5,
+            "who": ["agent", "guard"],
+            "shot_intent": "action",
+            "camera_movement": "orbital",
+            "micro_actions": ["双方在失重旋转中抓住扶手"],
+        }],
+    }
+    plan_storyboard_beats(intense_but_single_clip)
+    assert [
+        beat["generation_mode"]
+        for beat in intense_but_single_clip["shots"][0]["storyboard_beats"]
+    ] == ["multi_image"]
+
+    continuous_boundary = {
+        "video_provider": "seedance",
+        "shots": [
+            {
+                "id": "S01",
+                "duration": 6,
+                "micro_actions": ["Agent抓住门框稳住身体"],
+                "transition_to_next": "cut",
+            },
+            {
+                "id": "S02",
+                "duration": 5,
+                "micro_actions": ["Agent顺势穿过舱门"],
+                "boundary_before": "continuous",
+            },
+        ],
+    }
+    plan_storyboard_beats(continuous_boundary)
+    first = continuous_boundary["shots"][0]
+    assert [beat["generation_mode"] for beat in first["storyboard_beats"]] == [
+        "multi_image",
+        "first_last_frame_bridge",
+    ]
+    assert first["storyboard_beats"][1]["micro_actions"] == []
+    continuity = build_continuity_plan(continuous_boundary)
+    assert [
+        chunk.execution_strategy for chunk in continuity.shots[0].chunks
+    ] == ["multi_image", "first_last_frame_bridge"]
+
+    transition_boundary = {
+        "video_provider": "seedance",
+        "shots": [
+            {
+                "id": "S01",
+                "duration": 10,
+                "micro_actions": ["Agent离开走廊"],
+                "transition_to_next": "dissolve",
+            },
+            {
+                "id": "S02",
+                "duration": 5,
+                "micro_actions": ["Agent出现在观察舱"],
+                "boundary_before": "continuous",
+            },
+        ],
+    }
+    plan_storyboard_beats(transition_boundary)
+    assert [
+        beat["generation_mode"]
+        for beat in transition_boundary["shots"][0]["storyboard_beats"]
+    ] == ["multi_image", "tail_video_extend"]
+    assert transition_boundary["shots"][0]["secondary_storyboard_planning"][
+        "bridge_required"
+    ] is False
+    assert run_generation_capacity_checks(transition_boundary) == []
+    invalid_transition = json.loads(json.dumps(transition_boundary))
+    invalid_bridge = invalid_transition["shots"][0]["storyboard_beats"][1]
+    invalid_bridge.update({
+        "generation_mode": "first_last_frame_bridge",
+        "execution_strategy": "first_last_frame_bridge",
+        "bridge_target_shot_id": "S02",
+        "bridge_target_beat_id": "S02_P01",
+        "bridge_target_storyboard_image": "storyboard_beats/S02_P01.png",
+    })
+    transition_codes = {
+        issue["code"] for issue in run_generation_capacity_checks(invalid_transition)
+    }
+    assert "secondary_storyboard_strategy_mismatch" in transition_codes
+    assert "secondary_storyboard_bridge_invalid" in transition_codes
+
+
 def test_storyboard_output_safety_rejection_gets_one_non_contact_retry(tmp_path):
     storyboard = {
         "shots": [
@@ -1302,6 +1391,7 @@ def test_phase5_blocks_secondary_plot_reordering_and_wrong_bridge_target():
                 "id": "S02",
                 "duration": 5,
                 "micro_actions": ["进入下一舱段"],
+                "boundary_before": "continuous",
                 "start_state": "二人刚穿过舱门",
                 "end_state": "进入下一舱段",
             },
