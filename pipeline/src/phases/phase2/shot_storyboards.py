@@ -144,10 +144,11 @@ def build_shot_storyboard_prompt(
 - 不是剧照、不是完成度很高的漫画或概念图；人物身份与项目角色设定保持一致。
 - 同一角色在所有格保持发型、服装、武器、受伤状态和左右站位连续。
 
-延长视频语义：
-- P01 是图生视频的起始构图。
-- P02 及以后必须从前一格的结束姿态继续，表现新的动作进展；不得回到 P01、不得重新入场、不得重复前格动作。
-- 每格只画其“本格只表现”的一个可见动作，不得提前画后续格结果。
+二级分镜执行语义：
+- P01 是“多图生成视频”的当前一级分镜起始构图；角色图锁身份，本格故事图锁场景、站位与当前剧情。
+- P02 从 P01 生成视频的末段状态继续，用于“截取前段视频后延长”；不得重新入场、回到 P01 或重复前格动作。
+- 若存在 P03，P03 只完成本一级分镜的收束与交接；Phase 6 将用 P02 视频尾帧作首帧、下一一级分镜 P01 作尾帧。P03 不得提前执行下一一级分镜的动作。
+- 每格只能细分当前 Sxx 已写明的动作与状态，不得新增角色、道具、冲突、伤亡或剧情结果。
 
 场景：{_compact(shot.get('where') or shot.get('visual'), 260)}
 角色：
@@ -156,7 +157,7 @@ def build_shot_storyboard_prompt(
 逐格合同：
 {chr(10).join(beat_lines)}
 
-最终检查：恰好 {len(beats)} 格，动作按时间推进，P01→P02→P03 的姿态和运动方向能够直接用于视频延长。"""
+最终检查：恰好 {len(beats)} 格，动作按时间推进；P01 可作为多图首段的构图参考，P02 可承接前段视频末态，P03（若有）可安全交接到下一 Sxx 的 P01，且没有提前执行下一镜剧情。"""
     return prompt, beats
 
 
@@ -174,13 +175,21 @@ def _build_panel_prompt(
     who = _shot_who(shot)
     beat_id = str(beat.get("beat_id") or f"P{position:02d}")
     generation_mode = str(beat.get("generation_mode") or "").strip().lower()
+    is_continuation = generation_mode in {
+        "extend",
+        "tail_video_extend",
+        "first_last_frame_bridge",
+    }
     continuation = (
         (
-            "这是延长视频的下一格。严格继承上一参考图的角色身份、服装、场景、"
+            "这是当前一级分镜内的后续剧情格。严格继承上一参考图的角色身份、服装、场景、"
             "机位轴线和动作方向，但姿态必须推进到本格的新状态；不得复制上一格。"
         )
-        if generation_mode == "extend"
-        else "这是新连续性组的第一格，建立图生视频的起始构图。"
+        if is_continuation
+        else (
+            "这是当前一级分镜的 P01，将与角色图等多张参考图共同生成第一段视频；"
+            "建立本 Sxx 的起始构图，但保持整部剧本的一镜到底空间连续性。"
+        )
     )
     director_reference = (
         "参考图中包含整部影片的导演总览板。只读取其中标为本 Sxx 的面板来继承机位、"
@@ -193,8 +202,15 @@ def _build_panel_prompt(
         "上一参考图只用于继承空间轴线、机位、动作方向和上一格结束姿态；"
         "项目角色参考与下方角色合同始终优先于上一格。若上一格的发型、服装基础色、"
         "身份或武器归属有偏差，本格必须纠正，不得继续放大偏差。"
-        if generation_mode == "extend"
+        if is_continuation
         else "项目角色参考与下方角色合同是人物身份、发型、服装基础色和装备的唯一准绳。"
+    )
+    bridge_contract = (
+        f"这是首尾帧交接格：仍只完成 {beat.get('parent_shot_id') or '当前一级分镜'} "
+        f"的剧情；结束构图必须能够无跳变地接到下一一级分镜 "
+        f"{beat.get('bridge_target_beat_id') or 'P01'} 的起始状态。禁止提前执行下一镜动作。"
+        if generation_mode == "first_last_frame_bridge"
+        else ""
     )
     final_beat_contract = (
         "这是本镜最后一格：必须把“结束状态”作为画面最醒目的已完成事实。若结束状态包含"
@@ -220,6 +236,7 @@ Phase 5 定向纠偏合同：
 {continuation}
 {director_reference}
 {previous_state_contract}
+{bridge_contract}
 本格起始状态：{_compact(beat.get('start_state'))}
 本格唯一可见动作：{_compact(beat.get('action'))}
 本格必须到达的结束状态：{_compact(beat.get('end_state'))}

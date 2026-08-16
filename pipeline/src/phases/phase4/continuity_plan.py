@@ -268,6 +268,21 @@ def _authored_storyboard_beats(shot: Mapping[str, Any]) -> list[Mapping[str, Any
     ]
 
 
+def _secondary_strategy(beat: Mapping[str, Any], sequence: int) -> str:
+    """Normalize the v2 strategy while keeping old storyboard artifacts readable."""
+    value = str(
+        beat.get("execution_strategy") or beat.get("generation_mode") or ""
+    ).strip().lower()
+    aliases = {
+        "multi_image": "multi_image",
+        "tail_video_extend": "tail_video_extend",
+        "first_last_frame_bridge": "first_last_frame_bridge",
+    }
+    if value in aliases:
+        return aliases[value]
+    return "legacy"
+
+
 def _beat_unique_frames(
     beats: list[Mapping[str, Any]],
     target_frames: int,
@@ -331,19 +346,30 @@ def build_continuity_plan(
             boundary_before == "continuous"
             and previous_planned_shot is not None
         )
+        secondary_strategies = [
+            _secondary_strategy(beat, sequence)
+            for sequence, beat in enumerate(authored_beats, 1)
+        ]
+        uses_secondary_v2 = bool(authored_beats) and all(
+            strategy != "legacy" for strategy in secondary_strategies
+        )
         capped_group = (
             requested_extension
             and not preserve_one_take
             and group_shot_count >= continuity_group_max_shots
         )
-        initial_extension = requested_extension and not capped_group
+        logical_extension = requested_extension and not capped_group
+        # V2 performs the cross-primary handoff in the preceding shot's third
+        # beat.  Every next primary P01 therefore starts from its own multi-image
+        # contract instead of extending a predecessor video a second time.
+        initial_extension = logical_extension and not uses_secondary_v2
         if capped_group:
             boundary_before = "cut"
             continuity_reason = (
                 f"start a fresh generation group after {continuity_group_max_shots} "
                 "continuous editorial shots to prevent accumulated visual and narrative drift"
             )
-        if not initial_extension:
+        if not logical_extension:
             group_number += 1
             group_shot_count = 0
         continuity_group_id = f"CG{group_number:03d}"
@@ -363,7 +389,26 @@ def build_continuity_plan(
                 zip(authored_beats, unique_budgets, strict=True),
                 1,
             ):
-                reserved_overlap = overlap_frames if previous is not None else 0
+                strategy = secondary_strategies[sequence - 1]
+                if uses_secondary_v2:
+                    expected_strategy = (
+                        "multi_image"
+                        if sequence == 1
+                        else "tail_video_extend"
+                        if sequence == 2
+                        else "first_last_frame_bridge"
+                    )
+                    if strategy != expected_strategy:
+                        raise ValueError(
+                            f"{shot_id} beat {sequence} must use {expected_strategy}, "
+                            f"got {strategy}"
+                        )
+                reserved_overlap = (
+                    overlap_frames
+                    if previous is not None
+                    and strategy != "first_last_frame_bridge"
+                    else 0
+                )
                 requested_frames = unique_frames + reserved_overlap
                 if requested_frames > limit_frames:
                     raise ValueError(
@@ -381,10 +426,20 @@ def build_continuity_plan(
                     expected_unique_frames=unique_frames,
                     mode="native_extend" if previous is not None else "fresh",
                     depends_on=previous,
+                    execution_strategy=strategy,
                     storyboard_beat_id=str(
                         beat.get("beat_id") or f"{shot_id}_P{sequence:02d}"
                     ),
                     storyboard_image=str(beat.get("storyboard_image") or "") or None,
+                    bridge_target_shot_id=(
+                        str(beat.get("bridge_target_shot_id") or "") or None
+                    ),
+                    bridge_target_beat_id=(
+                        str(beat.get("bridge_target_beat_id") or "") or None
+                    ),
+                    bridge_target_storyboard_image=(
+                        str(beat.get("bridge_target_storyboard_image") or "") or None
+                    ),
                     action_prompt=str(beat.get("action") or ""),
                     start_state=str(beat.get("start_state") or ""),
                     end_state=str(beat.get("end_state") or ""),

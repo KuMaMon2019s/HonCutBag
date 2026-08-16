@@ -738,7 +738,7 @@ def test_phase1_beat_planner_never_emits_over_capacity_beats():
         plan_storyboard_beats(storyboard)
 
 
-def test_phase1_marks_continuous_shot_p01_as_extend():
+def test_phase1_starts_each_primary_shot_p01_with_multi_image_generation():
     storyboard = {
         "video_provider": "seedance",
         "shots": [
@@ -754,8 +754,12 @@ def test_phase1_marks_continuous_shot_p01_as_extend():
 
     plan_storyboard_beats(storyboard)
 
-    assert storyboard["shots"][0]["storyboard_beats"][0]["generation_mode"] == "fresh"
-    assert storyboard["shots"][1]["storyboard_beats"][0]["generation_mode"] == "extend"
+    assert storyboard["shots"][0]["storyboard_beats"][0]["generation_mode"] == (
+        "multi_image"
+    )
+    assert storyboard["shots"][1]["storyboard_beats"][0]["generation_mode"] == (
+        "multi_image"
+    )
 
 
 def test_phase1_detects_explicit_one_take_direction():

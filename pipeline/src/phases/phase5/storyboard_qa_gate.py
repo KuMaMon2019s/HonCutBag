@@ -134,7 +134,11 @@ def run_generation_capacity_checks(
     """Block storyboards that exceed one video clip's narrative capacity."""
     issues: list[dict] = []
     observed_units: set[str] = set()
-    for index, shot in enumerate(storyboard.get("shots", [])):
+    ordered_shots = [
+        shot for shot in storyboard.get("shots", []) if isinstance(shot, dict)
+    ]
+    shot_ids = [_shot_id(shot, index) for index, shot in enumerate(ordered_shots)]
+    for index, shot in enumerate(ordered_shots):
         if not isinstance(shot, dict):
             continue
         profile = capabilities_for({**storyboard, **shot})
@@ -163,22 +167,47 @@ def run_generation_capacity_checks(
         if storyboard_beats:
             beat_duration_total = 0.0
             beat_units_seen: list[str] = []
+            beat_micro_actions_seen: list[str] = []
+            uses_secondary_v2 = all(
+                str(beat.get("generation_mode") or "").strip().lower()
+                in {
+                    "multi_image",
+                    "tail_video_extend",
+                    "first_last_frame_bridge",
+                }
+                for beat in storyboard_beats
+            )
+            if uses_secondary_v2 and not 1 <= len(storyboard_beats) <= 3:
+                issues.append(_issue(
+                    "L1", "severe", "secondary_storyboard_count_invalid",
+                    f"{sid} must contain one to three complexity-selected Pxx beats",
+                    [sid], observed_count=len(storyboard_beats),
+                ))
             for position, beat in enumerate(storyboard_beats, 1):
                 beat_id = str(beat.get("beat_id") or f"{sid}_P{position:02d}")
                 beat_duration = float(beat.get("duration_s") or 0)
                 beat_duration_total += beat_duration
-                expected_mode = (
-                    "extend"
-                    if position > 1
-                    or (
-                        position == 1
-                        and str(shot.get("boundary_before") or "")
-                        .strip()
-                        .lower()
-                        == "continuous"
+                if uses_secondary_v2:
+                    expected_mode = (
+                        "multi_image"
+                        if position == 1
+                        else "tail_video_extend"
+                        if position == 2
+                        else "first_last_frame_bridge"
                     )
-                    else "fresh"
-                )
+                else:
+                    expected_mode = (
+                        "extend"
+                        if position > 1
+                        or (
+                            position == 1
+                            and str(shot.get("boundary_before") or "")
+                            .strip()
+                            .lower()
+                            == "continuous"
+                        )
+                        else "fresh"
+                    )
                 if beat.get("generation_mode") != expected_mode:
                     issues.append(_issue(
                         "L1", "severe", "storyboard_beat_mode_invalid",
@@ -206,6 +235,9 @@ def run_generation_capacity_checks(
                 micro_actions = beat.get("micro_actions") or []
                 if isinstance(micro_actions, str):
                     micro_actions = [micro_actions]
+                beat_micro_actions_seen.extend(
+                    str(value) for value in micro_actions if str(value).strip()
+                )
                 if (
                     len([value for value in micro_actions if str(value).strip()])
                     > profile.max_micro_actions_per_beat
@@ -216,6 +248,41 @@ def run_generation_capacity_checks(
                         f"({profile.max_micro_actions_per_beat})",
                         [sid], beat_id=beat_id,
                     ))
+                if uses_secondary_v2:
+                    if str(beat.get("parent_shot_id") or "") != sid:
+                        issues.append(_issue(
+                            "L1", "severe", "secondary_storyboard_parent_mismatch",
+                            f"{beat_id} must remain owned by primary shot {sid}",
+                            [sid], beat_id=beat_id,
+                        ))
+                    if beat.get("plot_fidelity_contract") != (
+                        "primary_shot_source_only_no_invention"
+                    ):
+                        issues.append(_issue(
+                            "L1", "severe", "secondary_storyboard_fidelity_missing",
+                            f"{beat_id} has no primary-shot plot fidelity contract",
+                            [sid], beat_id=beat_id,
+                        ))
+                    if expected_mode == "first_last_frame_bridge":
+                        expected_target_shot = (
+                            shot_ids[index + 1] if index + 1 < len(shot_ids) else None
+                        )
+                        expected_target_beat = (
+                            f"{expected_target_shot}_P01" if expected_target_shot else None
+                        )
+                        if (
+                            beat.get("bridge_target_shot_id") != expected_target_shot
+                            or beat.get("bridge_target_beat_id") != expected_target_beat
+                            or not str(
+                                beat.get("bridge_target_storyboard_image") or ""
+                            ).strip()
+                        ):
+                            issues.append(_issue(
+                                "L1", "severe", "secondary_storyboard_bridge_invalid",
+                                f"{beat_id} must end on {expected_target_beat}",
+                                [sid], beat_id=beat_id,
+                                expected_target_beat_id=expected_target_beat,
+                            ))
                 if (
                     beat_duration < profile.min_unique_beat_s
                     or beat_duration > profile.max_unique_beat_s
@@ -245,6 +312,23 @@ def run_generation_capacity_checks(
                     f"{sid} Pxx action-unit coverage differs from the director shot",
                     [sid], expected_action_unit_ids=sorted(units),
                     observed_action_unit_ids=sorted(set(beat_units_seen)),
+                ))
+            source_micro_actions = shot.get("micro_actions") or []
+            if isinstance(source_micro_actions, str):
+                source_micro_actions = [source_micro_actions]
+            source_micro_actions = [
+                str(value) for value in source_micro_actions if str(value).strip()
+            ]
+            if (
+                uses_secondary_v2
+                and source_micro_actions
+                and source_micro_actions != beat_micro_actions_seen
+            ):
+                issues.append(_issue(
+                    "L1", "severe", "secondary_storyboard_action_order_mismatch",
+                    f"{sid} Pxx actions must preserve every primary-shot action in order",
+                    [sid], expected_actions=source_micro_actions,
+                    observed_actions=beat_micro_actions_seen,
                 ))
 
         if len(units) > profile.max_action_units_per_beat and not storyboard_beats:

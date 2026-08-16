@@ -34,6 +34,7 @@ from phases.phase4.continuity_plan import (
     write_continuity_plan,
     write_storyboard_groups,
 )
+from phases.phase5.storyboard_qa_gate import run_generation_capacity_checks
 from phases.phase8 import edit_decisions as edit_decision_module
 from phases.phase8.continuity_adjudication import (
     SEAM_DECISIONS_KIND,
@@ -75,6 +76,7 @@ from runtime.continuity_memory import (
     select_memory_keyframes,
 )
 from runtime.continuity_provider import (
+    _base_content,
     _bridge_seedance_executor,
     _continuity_bridge_preparer,
     _direct_seedance_executor,
@@ -696,7 +698,7 @@ def test_phase2_reuses_phase1_model_director_board_without_second_overview_call(
     ).read_bytes()
 
 
-def test_per_shot_storyboard_beats_map_two_panels_to_fresh_then_extend(tmp_path):
+def test_complex_shot_maps_to_three_secondary_generation_strategies(tmp_path):
     storyboard = {
         "shots": [
             {
@@ -741,27 +743,31 @@ def test_per_shot_storyboard_beats_map_two_panels_to_fresh_then_extend(tmp_path)
         client=FakeImageClient(),
     )
 
-    assert [shot["storyboard_beat_count"] for shot in storyboard["shots"]] == [2, 1]
+    assert [shot["storyboard_beat_count"] for shot in storyboard["shots"]] == [3, 1]
     assert [beat["generation_mode"] for beat in storyboard["shots"][0]["storyboard_beats"]] == [
-        "fresh", "extend",
+        "multi_image", "tail_video_extend", "first_last_frame_bridge",
     ]
+    assert storyboard["shots"][0]["storyboard_beats"][2]["bridge_target_beat_id"] == (
+        "S02_P01"
+    )
     assert contract["total_boards"] == 2
-    assert contract["total_panels"] == 3
+    assert contract["total_panels"] == 4
     assert [call[0] for call in calls] == [
-        "text_to_image", "image_to_image", "image_to_image",
+        "text_to_image", "image_to_image", "image_to_image", "image_to_image",
     ]
-    assert "S01_P01（第 1/2 格）" in calls[0][1]
-    assert "S01_P02（第 2/2 格）" in calls[1][1]
+    assert "S01_P01（第 1/3 格）" in calls[0][1]
+    assert "S01_P02（第 2/3 格）" in calls[1][1]
     assert calls[1][2].endswith("storyboard_beats/S01_P01.png")
     second_shot_record = json.loads(
         (tmp_path / "storyboard_beats/S02_P01.json").read_text(encoding="utf-8")
     )
     assert second_shot_record["reference_images"] == [
-        "storyboard_beats/S01_P02.png"
+        "storyboard_beats/S01_P03.png"
     ]
     assert (tmp_path / "shot_storyboards/S01.png").is_file()
     assert (tmp_path / "storyboard_beats/S01_P01.png").is_file()
     assert (tmp_path / "storyboard_beats/S01_P02.png").is_file()
+    assert (tmp_path / "storyboard_beats/S01_P03.png").is_file()
     assert (tmp_path / "storyboard_images/S01.png").is_file()
 
     continuity = build_continuity_plan(
@@ -769,18 +775,29 @@ def test_per_shot_storyboard_beats_map_two_panels_to_fresh_then_extend(tmp_path)
         continuation_overlap_s=2,
     )
     first, second = continuity.shots
-    assert [chunk.mode for chunk in first.chunks] == ["fresh", "native_extend"]
+    assert [chunk.mode for chunk in first.chunks] == [
+        "fresh", "native_extend", "native_extend",
+    ]
+    assert [chunk.execution_strategy for chunk in first.chunks] == [
+        "multi_image", "tail_video_extend", "first_last_frame_bridge",
+    ]
     assert [chunk.storyboard_beat_id for chunk in first.chunks] == [
-        "S01_P01", "S01_P02",
+        "S01_P01", "S01_P02", "S01_P03",
     ]
     assert [chunk.storyboard_image for chunk in first.chunks] == [
-        "storyboard_beats/S01_P01.png", "storyboard_beats/S01_P02.png",
+        "storyboard_beats/S01_P01.png",
+        "storyboard_beats/S01_P02.png",
+        "storyboard_beats/S01_P03.png",
     ]
-    assert [chunk.requested_frames for chunk in first.chunks] == [120, 168]
-    assert [chunk.expected_unique_frames for chunk in first.chunks] == [120, 120]
+    assert [chunk.requested_frames for chunk in first.chunks] == [96, 120, 72]
+    assert [chunk.expected_unique_frames for chunk in first.chunks] == [96, 72, 72]
+    assert first.chunks[2].bridge_target_storyboard_image == (
+        "storyboard_beats/S02_P01.png"
+    )
     assert second.boundary_before == "continuous"
-    assert [chunk.mode for chunk in second.chunks] == ["native_extend"]
-    assert second.chunks[0].depends_on == "S01_C02"
+    assert [chunk.mode for chunk in second.chunks] == ["fresh"]
+    assert second.chunks[0].execution_strategy == "multi_image"
+    assert second.chunks[0].depends_on is None
     groups = write_storyboard_groups(tmp_path, storyboard, continuity)
     assert groups["groups"][0]["storyboard_board"] == "storyboard_groups/CG001.jpg"
     assert groups["groups"][0]["beats"][0]["storyboard_beats"][1][
@@ -1073,6 +1090,119 @@ def test_provider_uses_each_chunk_storyboard_panel_and_action(monkeypatch, tmp_p
     assert "Execute only this visible action: 烬抬起机械臂格挡" in content[0]["text"]
 
 
+def test_secondary_first_beat_uses_multi_image_generation(monkeypatch, tmp_path):
+    shot_dir = tmp_path / "shots/S01"
+    shot_dir.mkdir(parents=True)
+    meta = {"prompt": "失重走廊内开始搏斗", "gen_strategy": "i2v"}
+    (shot_dir / "SHOT_META.json").write_text(json.dumps(meta), encoding="utf-8")
+    observed = {}
+
+    def fake_build(**kwargs):
+        observed.update(kwargs["shot_meta"])
+        return [{"type": "text", "text": kwargs["shot_meta"]["prompt"]}]
+
+    monkeypatch.setattr("tools.asset_packager.build_content_for_shot", fake_build)
+    request = ChunkExecutionRequest(
+        resource_id="S01_C01",
+        shot_id="S01",
+        chunk=GenerationChunk(
+            chunk_id="S01_C01",
+            sequence=1,
+            target_duration_s=4,
+            mode="fresh",
+            execution_strategy="multi_image",
+            storyboard_beat_id="S01_P01",
+            storyboard_image="storyboard_beats/S01_P01.png",
+            action_prompt="Agent抓住扶手接近保安",
+        ),
+        anchors={"scene": "rotating corridor"},
+        output_path=tmp_path / "S01_C01.mp4",
+        previous_output_path=None,
+        input_fingerprint="fingerprint",
+        memory_context="",
+    )
+
+    content = _base_content(tmp_path, request, meta)
+
+    assert observed["gen_strategy"] == "phantom"
+    assert observed["_storyboard_frame_path"] == "storyboard_beats/S01_P01.png"
+    assert "ordered multi-image" in content[0]["text"]
+
+
+def test_secondary_third_beat_uses_previous_tail_and_next_primary_p01(
+    monkeypatch,
+    tmp_path,
+):
+    shot_dir = tmp_path / "shots/S01"
+    shot_dir.mkdir(parents=True)
+    (shot_dir / "SHOT_META.json").write_text(
+        json.dumps({"prompt": "完成当前镜头并交接到下一镜"}),
+        encoding="utf-8",
+    )
+    target = tmp_path / "storyboard_beats/S02_P01.png"
+    target.parent.mkdir(parents=True)
+    Image.new("RGB", (1280, 720), "navy").save(target)
+    previous = tmp_path / "shots/S01/chunks/S01_C02.mp4"
+    previous.parent.mkdir(parents=True)
+    previous.write_bytes(b"previous-video")
+
+    def fake_extract(_video, output):
+        Image.new("RGB", (1280, 720), "black").save(output)
+        return output
+
+    monkeypatch.setattr(
+        "quality.continuity_seam.extract_video_tail_frame",
+        fake_extract,
+    )
+    uploaded = []
+
+    def fake_upload(_data, _content_type):
+        uploaded.append(len(uploaded) + 1)
+        return f"https://image.test/frame-{uploaded[-1]}.jpg"
+
+    monkeypatch.setattr("clients.tos_uploader.upload_image", fake_upload)
+    monkeypatch.setattr(
+        "tools.asset_packager.build_content_for_shot",
+        lambda **_kwargs: pytest.fail("first/last bridge must not upload reference media"),
+    )
+    request = ChunkExecutionRequest(
+        resource_id="S01_C03",
+        shot_id="S01",
+        chunk=GenerationChunk(
+            chunk_id="S01_C03",
+            sequence=3,
+            target_duration_s=3,
+            mode="native_extend",
+            depends_on="S01_C02",
+            execution_strategy="first_last_frame_bridge",
+            storyboard_beat_id="S01_P03",
+            storyboard_image="storyboard_beats/S01_P03.png",
+            bridge_target_shot_id="S02",
+            bridge_target_beat_id="S02_P01",
+            bridge_target_storyboard_image="storyboard_beats/S02_P01.png",
+            action_prompt="完成当前镜头动作并进入下一镜构图",
+        ),
+        anchors={"scene": "rotating corridor"},
+        output_path=tmp_path / "S01_C03.mp4",
+        previous_output_path=previous,
+        input_fingerprint="fingerprint",
+        memory_context="",
+    )
+
+    content, _meta, _seed, duration = _provider_content(tmp_path, request)
+
+    assert duration == 3
+    assert [item.get("role") for item in content] == [
+        None,
+        "first_frame",
+        "last_frame",
+    ]
+    assert content[1]["image_url"]["url"].endswith("frame-1.jpg")
+    assert content[2]["image_url"]["url"].endswith("frame-2.jpg")
+    assert "图片1是上一二级分镜视频真实尾帧" in content[0]["text"]
+    assert "不得提前执行图片2所属一级分镜的动作" in content[0]["text"]
+
+
 def test_provider_prepends_no_real_person_visual_contract(monkeypatch, tmp_path):
     shot_dir = tmp_path / "shots/S01"
     shot_dir.mkdir(parents=True)
@@ -1152,6 +1282,47 @@ def test_storyboard_beat_planner_is_semantic_and_rejects_impossible_density():
     }
     with pytest.raises(ValueError, match="cannot fit 5 micro-actions"):
         plan_storyboard_beats(impossible)
+
+
+def test_phase5_blocks_secondary_plot_reordering_and_wrong_bridge_target():
+    storyboard = {
+        "video_provider": "seedance",
+        "shots": [
+            {
+                "id": "S01",
+                "duration": 10,
+                "who": ["agent", "guard"],
+                "shot_intent": "action",
+                "camera_movement": "dolly_in",
+                "micro_actions": ["抓住扶手", "解除武器", "穿过舱门"],
+                "start_state": "二人在旋转走廊内相持",
+                "end_state": "二人穿过舱门",
+            },
+            {
+                "id": "S02",
+                "duration": 5,
+                "micro_actions": ["进入下一舱段"],
+                "start_state": "二人刚穿过舱门",
+                "end_state": "进入下一舱段",
+            },
+        ],
+    }
+    plan_storyboard_beats(storyboard)
+
+    assert run_generation_capacity_checks(storyboard) == []
+
+    beats = storyboard["shots"][0]["storyboard_beats"]
+    beats[0]["micro_actions"], beats[1]["micro_actions"] = (
+        beats[1]["micro_actions"],
+        beats[0]["micro_actions"],
+    )
+    beats[2]["bridge_target_beat_id"] = "S99_P01"
+    codes = {
+        issue["code"] for issue in run_generation_capacity_checks(storyboard)
+    }
+
+    assert "secondary_storyboard_action_order_mismatch" in codes
+    assert "secondary_storyboard_bridge_invalid" in codes
 
 
 def test_planner_allocates_fractional_shots_from_cumulative_frame_endpoints():

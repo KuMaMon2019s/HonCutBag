@@ -9,6 +9,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 BoundaryKind = Literal["cut", "continuous"]
 ContinuityMode = Literal["fresh", "native_extend"]
+ChunkExecutionStrategy = Literal[
+    "legacy",
+    "multi_image",
+    "tail_video_extend",
+    "first_last_frame_bridge",
+]
 
 
 class ContinuityAnchors(BaseModel):
@@ -37,10 +43,22 @@ class GenerationChunk(BaseModel):
     expected_unique_frames: int | None = Field(default=None, gt=0)
     mode: ContinuityMode
     depends_on: str | None = None
+    execution_strategy: ChunkExecutionStrategy = Field(
+        default="legacy", exclude_if=lambda value: value == "legacy"
+    )
     storyboard_beat_id: str | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
     storyboard_image: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    bridge_target_shot_id: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    bridge_target_beat_id: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    bridge_target_storyboard_image: str | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
     action_prompt: str = Field(default="", exclude_if=lambda value: not value)
@@ -55,6 +73,27 @@ class GenerationChunk(BaseModel):
             raise ValueError("native_extend chunks require depends_on")
         if self.mode == "fresh" and self.expected_overlap_frames:
             raise ValueError("fresh chunks cannot reserve replay overlap")
+        if self.execution_strategy == "multi_image" and self.mode != "fresh":
+            raise ValueError("multi_image chunks must start fresh")
+        if self.execution_strategy == "tail_video_extend" and self.mode != "native_extend":
+            raise ValueError("tail_video_extend chunks must use native_extend dependency")
+        if self.execution_strategy == "first_last_frame_bridge":
+            if self.mode != "native_extend":
+                raise ValueError(
+                    "first_last_frame_bridge chunks must use native_extend dependency"
+                )
+            if not all((
+                self.bridge_target_shot_id,
+                self.bridge_target_beat_id,
+                self.bridge_target_storyboard_image,
+            )):
+                raise ValueError(
+                    "first_last_frame_bridge requires the next primary shot P01 target"
+                )
+            if self.expected_overlap_frames:
+                raise ValueError(
+                    "first_last_frame_bridge must not reserve reference-video replay"
+                )
         if self.requested_frames is not None and self.expected_unique_frames is not None:
             if self.expected_unique_frames != self.requested_frames - self.expected_overlap_frames:
                 raise ValueError("expected unique frames must equal requested frames minus overlap")

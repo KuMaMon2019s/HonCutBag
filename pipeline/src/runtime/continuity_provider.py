@@ -281,10 +281,28 @@ def _chunk_prompt(
     prompt = str(shot_meta.get("prompt") or "").strip()
     if not prompt:
         raise ValueError(f"{request.shot_id} SHOT_META.json has no prompt")
-    continuation = (
-        "Generate the opening chunk of this editorial shot."
-        if request.chunk.mode == "fresh"
-        else "Continue directly from the reference video's final state without a reset or cut."
+    strategy = request.chunk.execution_strategy
+    continuation = {
+        "multi_image": (
+            "Generate the opening secondary beat from the ordered multi-image "
+            "identity, environment, and current-storyboard references."
+        ),
+        "tail_video_extend": (
+            "Extend the extracted tail section of the previous secondary-beat "
+            "video without a reset, cut, replay, or re-entry."
+        ),
+        "first_last_frame_bridge": (
+            "Generate only the transition between the previous secondary beat's "
+            "actual final frame and the next primary shot's P01 frame. Finish the "
+            "current primary-shot action, but do not execute the next shot's action."
+        ),
+    }.get(
+        strategy,
+        (
+            "Generate the opening chunk of this editorial shot."
+            if request.chunk.mode == "fresh"
+            else "Continue directly from the reference video's final state without a reset or cut."
+        ),
     )
     repair = ""
     if request.repair_attempt > 0:
@@ -437,11 +455,20 @@ def _base_content(
         content_meta["prompt"] = (
             f"{no_real_person_prompt_contract()}\n{content_meta['prompt']}"
         )
+    strategy = request.chunk.execution_strategy
+    if strategy == "first_last_frame_bridge":
+        # Frame roles cannot be mixed with reference media in Seedance.  The
+        # bridge helper adds the actual predecessor tail and next P01 below.
+        return [{"type": "text", "text": content_meta["prompt"]}]
     if request.chunk.storyboard_image:
         content_meta["_storyboard_frame_path"] = request.chunk.storyboard_image
         content_meta["_storyboard_beat_id"] = request.chunk.storyboard_beat_id
         content_meta["generation_actions"] = [request.chunk.action_prompt]
-        content_meta["gen_strategy"] = "i2v"
+        content_meta["gen_strategy"] = (
+            "phantom"
+            if strategy in {"multi_image", "tail_video_extend"}
+            else "i2v"
+        )
     reserved_group_board = 1 if board_path is not None else 0
     if request.chunk.mode == "native_extend":
         content_meta["_max_reference_images"] = (
@@ -476,6 +503,7 @@ def _extension_content(
     with previous_output_path.open("rb") as predecessor:
         predecessor_hash = hashlib.file_digest(predecessor, "sha256").hexdigest()
     anchor_dir = previous_output_path.parent / "continuity_anchors"
+    anchor_dir.mkdir(parents=True, exist_ok=True)
     asset_stem = f"{previous_output_path.stem}_{predecessor_hash[:16]}_tail_2000ms"
     tail_video_path = anchor_dir / f"{asset_stem}.mp4"
     if not tail_video_path.is_file() or tail_video_path.stat().st_size == 0:
@@ -536,13 +564,88 @@ def _extension_content(
     return normalized
 
 
+def _first_last_bridge_content(
+    content: Sequence[dict[str, Any]],
+    previous_output_path: Path,
+    target_storyboard_path: Path,
+) -> list[dict[str, Any]]:
+    """Bind a transition to the real predecessor tail and next primary P01."""
+    from clients.tos_uploader import upload_image
+    from quality.continuity_seam import extract_video_tail_frame
+
+    if not target_storyboard_path.is_file() or target_storyboard_path.stat().st_size == 0:
+        raise FileNotFoundError(
+            f"next primary storyboard frame missing: {target_storyboard_path}"
+        )
+    with previous_output_path.open("rb") as predecessor:
+        predecessor_hash = hashlib.file_digest(predecessor, "sha256").hexdigest()
+    anchor_dir = previous_output_path.parent / "continuity_anchors"
+    anchor_dir.mkdir(parents=True, exist_ok=True)
+    tail_frame = anchor_dir / (
+        f"{previous_output_path.stem}_{predecessor_hash[:16]}_final.jpg"
+    )
+    if not tail_frame.is_file() or tail_frame.stat().st_size == 0:
+        extract_video_tail_frame(previous_output_path, tail_frame)
+
+    first_payload, first_content_type = _seedance_reference_image_payload(tail_frame)
+    last_payload, last_content_type = _seedance_reference_image_payload(
+        target_storyboard_path
+    )
+    first_url = upload_image(first_payload, first_content_type)
+    last_url = upload_image(last_payload, last_content_type)
+    if not first_url or not last_url:
+        raise RuntimeError(
+            "failed to upload first/last frames for secondary-storyboard bridge"
+        )
+    directive = (
+        "图片1是上一二级分镜视频真实尾帧，必须作为新视频第一帧；"
+        "图片2是下一一级分镜P01，必须作为新视频最后一帧。"
+        "只生成两帧之间的连续过渡并完成当前一级分镜的收束，"
+        "不得提前执行图片2所属一级分镜的动作，不得新增剧情、角色或道具。\n"
+    )
+    text_value = next(
+        (str(item.get("text") or "") for item in content if item.get("type") == "text"),
+        "",
+    )
+    return [
+        {"type": "text", "text": f"{directive}{text_value}"},
+        {
+            "type": "image_url",
+            "image_url": {"url": first_url},
+            "role": "first_frame",
+            "priority": "high",
+        },
+        {
+            "type": "image_url",
+            "image_url": {"url": last_url},
+            "role": "last_frame",
+            "priority": "high",
+        },
+    ]
+
+
 def _provider_content(
     output_dir: Path,
     request: ChunkExecutionRequest,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], int | None, int]:
     shot_meta = _read_shot_meta(output_dir, request.shot_id)
     content = _base_content(output_dir, request, shot_meta)
-    if request.chunk.mode == "native_extend":
+    strategy = request.chunk.execution_strategy
+    if strategy == "first_last_frame_bridge":
+        if request.previous_output_path is None:
+            raise RuntimeError(f"{request.resource_id} has no predecessor video")
+        target_value = request.chunk.bridge_target_storyboard_image
+        if not target_value:
+            raise RuntimeError(f"{request.resource_id} has no next-primary P01 target")
+        target_path = Path(target_value)
+        if not target_path.is_absolute():
+            target_path = output_dir / target_path
+        content = _first_last_bridge_content(
+            content,
+            request.previous_output_path,
+            target_path,
+        )
+    elif request.chunk.mode == "native_extend":
         if request.previous_output_path is None:
             raise RuntimeError(f"{request.resource_id} has no predecessor video")
         content = _extension_content(content, request.previous_output_path)
@@ -566,13 +669,25 @@ def _task_payload(
         "output_path": str(request.output_path),
         "model": model,
         "mode": request.chunk.mode,
+        "execution_strategy": request.chunk.execution_strategy,
         "continuation_contract": (
-            "tail_window_ordered_frames_v1" if request.chunk.mode == "native_extend" else None
+            "next_primary_p01_first_last_frame_v1"
+            if request.chunk.execution_strategy == "first_last_frame_bridge"
+            else "tail_window_ordered_frames_v1"
+            if request.chunk.mode == "native_extend"
+            else "multi_image_storyboard_identity_v1"
+            if request.chunk.execution_strategy == "multi_image"
+            else None
         ),
-        "tail_window_seconds": 2.0 if request.chunk.mode == "native_extend" else None,
+        "tail_window_seconds": (
+            2.0 if request.chunk.execution_strategy == "tail_video_extend" else None
+        ),
         "ordered_frame_fractions": (
-            [0.2, 0.6, 0.95] if request.chunk.mode == "native_extend" else None
+            [0.2, 0.6, 0.95]
+            if request.chunk.execution_strategy == "tail_video_extend"
+            else None
         ),
+        "bridge_target_beat_id": request.chunk.bridge_target_beat_id,
         "duration": duration,
         "seed": seed,
         "repair_attempt": request.repair_attempt,
@@ -584,6 +699,9 @@ def _provider_input_context(
     output_dir: Path,
     shot_id: str,
     chunk_id: str,
+    *,
+    storyboard_image: str | None = None,
+    bridge_target_storyboard_image: str | None = None,
 ) -> dict[str, str | None]:
     shot_meta = output_dir / "shots" / shot_id / "SHOT_META.json"
     storyboard_frame = output_dir / "storyboard_images" / f"{shot_id}.png"
@@ -593,6 +711,14 @@ def _provider_input_context(
         NO_REAL_PERSON_POLICY,
         is_no_real_person_enabled,
     )
+
+    def optional_hash(value: str | None) -> str | None:
+        if not value:
+            return None
+        path = Path(value)
+        if not path.is_absolute():
+            path = output_dir / path
+        return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
 
     return {
         "shot_meta_sha256": hashlib.sha256(shot_meta.read_bytes()).hexdigest(),
@@ -613,6 +739,10 @@ def _provider_input_context(
             else None
         ),
         "chunk_id": chunk_id,
+        "secondary_storyboard_image_sha256": optional_hash(storyboard_image),
+        "bridge_target_storyboard_image_sha256": optional_hash(
+            bridge_target_storyboard_image
+        ),
         "generation_seed_strategy": "scene_chunk_repair_v1",
         "continuation_contract": "tail_window_ordered_frames_v1",
         "tail_window_seconds": "2.0",
@@ -1205,6 +1335,8 @@ def execute_phase6_auto_continuity(
             root,
             shot.shot_id,
             chunk.chunk_id,
+            storyboard_image=chunk.storyboard_image,
+            bridge_target_storyboard_image=chunk.bridge_target_storyboard_image,
         ),
         seam_calibration=(
             calibration.model_dump(mode="json") if calibration is not None else None

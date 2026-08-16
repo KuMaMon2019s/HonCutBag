@@ -534,10 +534,16 @@ def build_content_for_shot(
             if asset["role"] == "first_frame"
         ]
         character_assets = collect_character_reference_assets(output_dir, shot_meta)
-        if not character_assets:
+        expected_characters = _detect_shot_characters(output_dir, shot_meta)
+        if expected_characters and not character_assets:
             raise FileNotFoundError(
                 "Phantom character references missing for shot "
                 f"{shot_id}; expected face_closeup.png, full_body.png, or variant_*.png"
+            )
+        if not character_assets and not storyboard_assets:
+            raise FileNotFoundError(
+                "Phantom references missing for shot "
+                f"{shot_id}; expected a storyboard frame or character reference"
             )
         image_assets = character_assets
         image_assets.extend(storyboard_assets)
