@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 
 from utils.ark_llm import call_llm_stream, create_ark_client
-from utils.config import get_api_key
+from utils.config import DEFAULT_TEXT_MODEL, get_api_key
 
 LLM_WALL_TIMEOUT = 240
 LLM_IDLE_TIMEOUT = 75
@@ -108,7 +108,7 @@ def plan_director(script_text: str, output_dir: Path, dry_run: bool = False) -> 
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
-            model="doubao-seed-2.1-turbo",
+            model=DEFAULT_TEXT_MODEL,
             max_tokens=8000,
             wall_timeout=LLM_WALL_TIMEOUT,
             idle_timeout=LLM_IDLE_TIMEOUT,

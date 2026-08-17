@@ -13,6 +13,7 @@ if str(SRC) not in sys.path:
 
 from clients.ark_multimodal_client import ArkMultimodalClient
 import phases.phase8.story_order_reviewer as story_order_reviewer
+from utils.config import DEFAULT_MULTIMODAL_MODEL
 
 
 class FakeCompletions:
@@ -35,11 +36,11 @@ def test_ark_client_constructs_one_request_with_multiple_images(tmp_path):
     completions = FakeCompletions('{"ok": true}')
     transport = SimpleNamespace(chat=SimpleNamespace(completions=completions))
 
-    client = ArkMultimodalClient(client=transport, model="doubao-seed-2.1-turbo")
+    client = ArkMultimodalClient(client=transport, model=DEFAULT_MULTIMODAL_MODEL)
     assert client.review([first, second], "review these") == '{"ok": true}'
 
     request = completions.kwargs
-    assert request["model"] == "doubao-seed-2.1-turbo"
+    assert request["model"] == DEFAULT_MULTIMODAL_MODEL
     assert request["response_format"] == {"type": "json_object"}
     content = request["messages"][0]["content"]
     urls = [part["image_url"]["url"] for part in content if part["type"] == "image_url"]

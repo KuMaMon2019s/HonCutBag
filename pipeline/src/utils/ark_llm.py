@@ -12,7 +12,7 @@ from typing import Callable, Optional
 import httpx
 from openai import APIConnectionError, APIStatusError, APITimeoutError, DefaultHttpxClient, OpenAI
 
-from utils.config import ARK_BASE_URL
+from utils.config import ARK_BASE_URL, DEFAULT_TEXT_MODEL
 
 _default_heartbeat_callback: Optional[Callable[[], None]] = None
 
@@ -143,7 +143,7 @@ def create_ark_client(connect_timeout: float = 10.0, read_timeout: float = 60.0)
 def _attempt_llm_stream(
     messages: list[dict],
     *,
-    model: str = "doubao-seed-2.1-turbo",
+    model: str = DEFAULT_TEXT_MODEL,
     max_tokens: int = 16000,
     wall_timeout: float = 180.0,
     read_timeout: float = 60.0,
@@ -297,7 +297,7 @@ def _attempt_llm_stream(
 def call_llm_stream(
     messages: list[dict],
     *,
-    model: str = "doubao-seed-2.1-turbo",
+    model: str = DEFAULT_TEXT_MODEL,
     max_tokens: int = 16000,
     wall_timeout: float = 180.0,
     read_timeout: float = 60.0,

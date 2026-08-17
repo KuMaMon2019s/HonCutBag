@@ -219,9 +219,9 @@ class Models:
     """AI 模型配置"""
     
     # 火山方舟 - 文本生成
-    ARK_TEXT_LITE: str = "doubao-seed-2.1-turbo"     # 标准级(2026-08-09升级自2.0-lite)
+    ARK_TEXT_LITE: str = "doubao-seed-evolving"      # 标准文本模型（1M 上下文）
     ARK_TEXT_PRO: str = "doubao-seed-2.0-pro"        # 进阶级
-    ARK_TEXT_TURBO: str = "doubao-seed-2.1-turbo"    # 快速
+    ARK_TEXT_TURBO: str = "doubao-seed-evolving"     # 兼容旧快速路由名
 
     # 火山方舟 - 多模态理解。不要复用文本默认模型；Phase 5/8 会传图片。
     ARK_MULTIMODAL: str = "doubao-seed-2.0-lite"

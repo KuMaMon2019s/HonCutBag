@@ -16,6 +16,7 @@ import phases.phase1.storyboard_generator as storyboard_generator
 from phases import pipeline_core
 from prompt import event_extractor, text_parser
 from utils import ark_llm
+from utils.config import DEFAULT_TEXT_MODEL
 from utils.progress_reporter import ProgressReporter
 
 
@@ -81,6 +82,7 @@ def test_idle_timeout_closes_stalled_stream_before_wall_timeout():
 
 def test_active_stream_refreshes_idle_timeout_and_throttles_heartbeat():
     callbacks = []
+    observed = {}
 
     class ActiveStream:
         def __iter__(self):
@@ -93,7 +95,11 @@ def test_active_stream_refreshes_idle_timeout_and_throttles_heartbeat():
         def close(self):
             pass
 
-    completions = SimpleNamespace(create=lambda **_kwargs: ActiveStream())
+    def create_stream(**kwargs):
+        observed.update(kwargs)
+        return ActiveStream()
+
+    completions = SimpleNamespace(create=create_stream)
     client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
 
     content = ark_llm.call_llm_stream(
@@ -107,6 +113,7 @@ def test_active_stream_refreshes_idle_timeout_and_throttles_heartbeat():
 
     assert content == "abc"
     assert len(callbacks) == 1
+    assert observed["model"] == DEFAULT_TEXT_MODEL == "doubao-seed-evolving"
 
 
 def test_incomplete_chunked_stream_is_classified_as_retryable():
@@ -286,6 +293,7 @@ def test_director_planner_uses_shared_streaming_client(monkeypatch, tmp_path):
     assert observed["stream_args"]["_client"] is client
     assert observed["stream_args"]["wall_timeout"] == director_planner.LLM_WALL_TIMEOUT
     assert observed["stream_args"]["idle_timeout"] == director_planner.LLM_IDLE_TIMEOUT
+    assert observed["stream_args"]["model"] == DEFAULT_TEXT_MODEL
     assert observed["messages"][0]["role"] == "system"
     assert json.loads((tmp_path / "director_plan.json").read_text())["scenes"] == []
 
