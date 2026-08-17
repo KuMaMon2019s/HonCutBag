@@ -582,6 +582,9 @@ def build_continuity_plan(
             "first_last_frame_bridge",
             resource_id=str(spec.get("bridge_id") or f"{source_shot_id}__{target_shot_id}"),
         )
+        storyboard_transition = spec.get("storyboard_transition")
+        if not isinstance(storyboard_transition, Mapping):
+            storyboard_transition = {}
         planned_bridges.append(
             PrimaryShotBridge(
                 bridge_id=str(
@@ -595,6 +598,15 @@ def build_continuity_plan(
                 action_prompt=str(spec.get("action_prompt") or ""),
                 start_state=str(spec.get("start_state") or ""),
                 end_state=str(spec.get("end_state") or ""),
+                storyboard_transition_image=(
+                    str(storyboard_transition.get("image") or "") or None
+                ),
+                storyboard_transition_prompt=(
+                    str(storyboard_transition.get("prompt") or "") or None
+                ),
+                storyboard_transition_usage=(
+                    storyboard_transition.get("usage") or None
+                ),
             )
         )
     return ContinuityPlan(

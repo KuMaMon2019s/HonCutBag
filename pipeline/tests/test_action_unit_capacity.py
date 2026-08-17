@@ -45,6 +45,24 @@ EVOLVING_FIXTURE = (
     Path(__file__).resolve().parent / "fixtures" / "flashmob_60s_evolving_events.json"
 )
 
+# These snapshots predate the structured extractor field.  Mark their authored
+# per-event concurrency here so the regression exercises the current contract
+# instead of relying on production keyword rules for one screenplay's nouns.
+LEGACY_COMPOSITE_EVENTS = {2, 3, 6, 8, 13, 15, 18}
+EVOLVING_COMPOSITE_EVENTS = {2, 3, 6, 8, 13, 14, 15, 16, 19, 20, 22}
+
+
+def _load_capacity_fixture(path: Path, composite_events: set[int]) -> list[dict]:
+    events = json.loads(path.read_text(encoding="utf-8"))
+    for event_id, event in enumerate(events, 1):
+        if not event.get("micro_actions"):
+            event["generation_motion_mode"] = "none"
+        else:
+            event["generation_motion_mode"] = (
+                "composite" if event_id in composite_events else "atomic"
+            )
+    return events
+
 
 # ── classifier unit tests ───────────────────────────────────────────────────
 
@@ -54,13 +72,13 @@ def test_classifier_sequential_combat_actions():
         assert classify_micro_action(text) == "sequential", text
 
 
-def test_classifier_simultaneous_group_groove():
+def test_classifier_simultaneous_coordinated_actions():
     for text in [
-        "路人从斑马线加入",
-        "更多普通行人陆续开始加入",
-        "原本正常经过的人突然开始跟着音乐Groove",
-        "跳舞人数从1人逐渐变成3～5人",
-        "背景舞者连贯衔接肩胸律动",
+        "两名搬运员同步抬起箱体",
+        "更多参与者陆续加入",
+        "队伍一同向前移动",
+        "人数从1人逐渐变成3～5人",
+        "多人协同调整道具位置",
         "新加入者同步程度逐渐提高",
     ]:
         assert classify_micro_action(text) == "simultaneous", text
@@ -68,17 +86,14 @@ def test_classifier_simultaneous_group_groove():
 
 def test_classifier_sustained_camera_and_state():
     for text in [
-        "摄影师以朋友视角持iPhone跟拍女主",
+        "记录者以手持设备跟拍主体",
         "视频开场直接呈现表演状态，无空镜、无静止站立摆拍环节",
         "露出轻松自然的笑容",
         "与镜头保持自信的眼神交流",
         "整段动作一气呵成并向前推进",
-        "第一个路人注意到音乐和女主的动作",
-        "音乐进入更加明显的节奏段落",
-        "音乐播放至最后几个重拍节点",
-        "视频录制进入收尾阶段",
-        "女主不停止舞蹈，互动动作融入舞步",
-        "女主与全体舞者未停止舞蹈，也未集体站住摆最终Pose",
+        "观察者注意到主体的动作",
+        "录制进入收尾阶段",
+        "主体不停止当前活动",
     ]:
         assert classify_micro_action(text) == "sustained", text
 
@@ -98,10 +113,10 @@ def test_classifier_keeps_actor_actions_with_incidental_frame_language():
 
 def test_simultaneous_actions_merge_into_one_unit():
     actions = [
-        "背景舞者做快速前进Groove",
-        "背景舞者连贯衔接肩胸律动",
-        "背景舞者衔接身体波浪",
-        "背景舞者衔接大幅挥臂",
+        "搬运组同步抬起箱体",
+        "多人协同转动箱体",
+        "全体一同跨过门槛",
+        "队伍同时放下箱体",
     ]
     assert normalized_action_unit_count(actions) == 1
 
@@ -110,7 +125,7 @@ def test_sustained_only_actions_cost_zero_units():
     actions = [
         "露出轻松自然的笑容",
         "与镜头保持自信的眼神交流",
-        "摄影师以朋友视角持iPhone跟拍女主",
+        "记录者以手持设备跟拍主体",
     ]
     assert normalized_action_unit_count(actions) == 0
 
@@ -150,18 +165,17 @@ def test_repeated_action_inside_one_event_remains_distinct():
     assert result["units"] == 2
 
 
-def test_source_authored_compound_dance_is_one_generation_unit():
+def test_source_authored_compound_motion_is_one_generation_unit():
     event = {
-        "what": "女主完成一段连贯复合舞蹈",
+        "what": "操作员完成一个复合装配动作",
         "source_excerpt": (
-            "肩胸隔离、胯部点缀、绕臂和脚步全部融为一段复合律动，"
-            "而不是逐个执行分离动作。"
+            "双手对齐、压合与夹具收紧在同一时刻并行完成，"
+            "融为一个整体，而不是逐个执行。"
         ),
         "micro_actions": [
-            "肩部做隔离",
-            "胸部做隔离",
-            "脚步轻快向前推进",
-            "手臂完成绕臂",
+            "左手对齐零件",
+            "右手压合接缝",
+            "夹具同步收紧",
         ],
     }
 
@@ -187,34 +201,28 @@ def test_sequential_fight_is_not_collapsed_without_dance_evidence():
     assert normalized["units"] == 3
 
 
-def test_document_compound_dance_contract_preserves_real_progression():
+def test_structured_motion_contract_preserves_real_progression():
     events = [
         {
-            "what": "定义整支短片的舞蹈语法",
-            "source_excerpt": (
-                "剧本中所有舞蹈描述都表示每个瞬间一个连贯的复合律动，"
-                "而非一连串需要逐个执行的分离动作清单。"
-            ),
-            "micro_actions": [],
+            "what": "三人协同搬运箱体",
+            "source_excerpt": "三人在同一时刻并行发力，融为一个整体。",
+            "micro_actions": ["左侧抬升", "右侧抬升", "后方稳定"],
+            "generation_motion_mode": "composite",
         },
         {
-            "what": "女主与背景舞者跳出同步版本",
-            "source_excerpt": "背景舞者连贯衔接肩胸律动、身体波浪与大幅挥臂。",
-            "micro_actions": ["快速前进", "肩胸律动", "身体波浪", "大幅挥臂"],
-        },
-        {
-            "what": "路人逐渐被感染并加入",
-            "source_excerpt": "一开始只是点头，随后调整步伐，最终抬手模仿。",
-            "micro_actions": ["点头", "调整步伐", "抬手模仿"],
+            "what": "操作员按顺序锁定箱体",
+            "source_excerpt": "一开始对齐，随后落锁，最终松手。",
+            "micro_actions": ["对齐", "落锁", "松手"],
+            "generation_motion_mode": "atomic",
         },
     ]
 
     assert annotate_event_motion_modes(events) is True
 
-    assert events[1]["generation_motion_mode"] == "composite"
-    assert normalize_event_action_units(events[1])["units"] == 1
-    assert events[2]["generation_motion_mode"] == "atomic"
-    assert normalize_event_action_units(events[2])["units"] == 3
+    assert events[0]["generation_motion_mode"] == "composite"
+    assert normalize_event_action_units(events[0])["units"] == 1
+    assert events[1]["generation_motion_mode"] == "atomic"
+    assert normalize_event_action_units(events[1])["units"] == 3
 
 
 def test_same_event_repeats_survive_shot_slicing_but_later_event_deduplicates():
@@ -260,38 +268,40 @@ def test_zero_cost_event_still_requires_one_primary_occurrence():
 
 
 def test_flashmob_60s_script_passes_capacity_gate():
-    events = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    events = _load_capacity_fixture(FIXTURE, LEGACY_COMPOSITE_EVENTS)
     assert len(events) == 26
 
     _annotate_global_event_flow(events, continuity_mode="one_take")
     plan = engine._estimate_action_capacity_plan(events, 60, 12)
 
-    assert plan["generation_action_units"] == 19
+    assert plan["generation_action_units"] == 22
     assert plan["primary_shots"] == 4
-    assert plan["minimum_material_duration"] == 70
-    assert plan["material_duration"] == 75
+    assert plan["minimum_material_duration"] == 75
+    assert plan["material_duration"] == 78
     assert plan["maximum_material_duration"] == 78
     shots = engine.estimate_action_aware_shot_count(events, 60, 12)
     assert shots == 4
 
 
 def test_evolving_model_flashmob_artifact_has_stable_capacity():
-    events = json.loads(EVOLVING_FIXTURE.read_text(encoding="utf-8"))
+    events = _load_capacity_fixture(
+        EVOLVING_FIXTURE, EVOLVING_COMPOSITE_EVENTS
+    )
     assert len(events) == 26
 
     _annotate_global_event_flow(events, continuity_mode="one_take")
     plan = engine._estimate_action_capacity_plan(events, 60, 12)
 
     assert {event["sequence_id"] for event in events} == {"SEQ001"}
-    assert plan["generation_action_units"] == 19
+    assert plan["generation_action_units"] == 22
     assert plan["primary_shots"] == 4
-    assert plan["minimum_material_duration"] == 70
-    assert plan["material_duration"] == 75
+    assert plan["minimum_material_duration"] == 75
+    assert plan["material_duration"] == 78
     assert plan["maximum_material_duration"] == 78
 
 
 def test_sequence_fragmentation_is_rejected_before_skeleton_llm():
-    events = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    events = _load_capacity_fixture(FIXTURE, LEGACY_COMPOSITE_EVENTS)
 
     with pytest.raises(
         ValueError,
@@ -301,9 +311,9 @@ def test_sequence_fragmentation_is_rejected_before_skeleton_llm():
 
 
 def test_flashmob_one_take_has_a_feasible_four_beat_skeleton(monkeypatch):
-    events = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    events = _load_capacity_fixture(FIXTURE, LEGACY_COMPOSITE_EVENTS)
     _annotate_global_event_flow(events, continuity_mode="one_take")
-    source_groups = [range(1, 6), range(6, 11), range(11, 19), range(19, 27)]
+    source_groups = [range(1, 6), range(6, 8), range(8, 19), range(19, 27)]
     shot_sizes = ["medium_wide", "medium", "wide", "medium_close"]
     beats = [
         {
@@ -339,7 +349,7 @@ def test_flashmob_one_take_has_a_feasible_four_beat_skeleton(monkeypatch):
 
     skeleton = engine._build_beat_skeleton(events, "", 75, 19, 4)
 
-    assert engine._beat_content_loads(skeleton["beats"], events, profile) == [3, 3, 2, 2]
+    assert engine._beat_content_loads(skeleton["beats"], events, profile) == [3, 2, 3, 3]
 
 
 def test_layered_expansion_preserves_skeleton_shot_language(monkeypatch):
@@ -446,6 +456,7 @@ def test_composite_motion_keeps_full_ledger_through_pxx_and_qa():
             "id": "S01",
             "duration": 15,
             "micro_actions": actions,
+            "generation_motion_mode": "composite",
             "shot_size": "medium_wide",
             "camera_movement": "handheld",
             "lighting_key": "natural",

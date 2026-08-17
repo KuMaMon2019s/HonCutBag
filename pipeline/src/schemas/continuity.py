@@ -181,6 +181,15 @@ class PrimaryShotBridge(BaseModel):
     action_prompt: str = ""
     start_state: str = ""
     end_state: str = ""
+    storyboard_transition_image: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    storyboard_transition_prompt: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    storyboard_transition_usage: Literal[
+        "visual_continuity_plan_not_video_endpoint"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
     generation_phase: Literal["post_primary_shots"] = "post_primary_shots"
     first_frame_source: Literal["source_primary_video_tail_frame"] = (
         "source_primary_video_tail_frame"

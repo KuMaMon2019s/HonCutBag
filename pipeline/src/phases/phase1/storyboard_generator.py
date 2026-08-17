@@ -663,7 +663,8 @@ def _build_eight_layer_prompt(
     style_anchor = visual_style.style_prompt_short or visual_style.style_prompt_full or "电影叙事风格，35mm胶片质感"
     motion_contract = (
         "动作执行契约：整镜连续发生可见位移；按起始动作→核心接触/变化→明确结果依次完成。"
-        "人物不得在首帧姿态原地停留，不得只让头发、雨水、蒸汽或镜头轻微漂移来冒充动作。"
+        "人物不得在首帧姿态原地停留；动作执行者的躯干、四肢、关节、重心和相关道具必须按合同连续产生可见变化。"
+        "不得只让背景人群、车辆、光影、粒子、布料、头发、雨水、蒸汽或镜头运动来冒充主体动作。"
         "保持指定景别，不得无动机切成特写或让交互角色离开画面；双人动作的起始与接触时刻必须同时看见双方。"
         if generation_actions or intent == "action"
         else

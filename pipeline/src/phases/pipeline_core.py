@@ -2556,6 +2556,9 @@ def run_phase2(storyboard_data: dict, characters_data: dict, output_dir: Path, d
             "provider": "seedream_shot_storyboards",
             "shot_storyboards_generated": shot_storyboards["total_boards"],
             "storyboard_panels_generated": shot_storyboards["total_panels"],
+            "storyboard_transition_panels_generated": shot_storyboards.get(
+                "total_transition_panels", 0
+            ),
         }
 
     print("[cooldown] 等待 120s 让 Agent Plan 限流窗口重置...", flush=True)

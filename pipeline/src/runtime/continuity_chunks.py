@@ -1075,8 +1075,17 @@ def execute_continuity_plan(
                         "duration_s": bridge.target_duration_s,
                         "path": _portable_path(bridge_path, root),
                         "generated_after_primary_shots": True,
+                        "storyboard_transition_image": (
+                            bridge.storyboard_transition_image
+                        ),
+                        "storyboard_transition_usage": (
+                            bridge.storyboard_transition_usage
+                        ),
                         "first_frame_source": "source_primary_video_tail_frame",
                         "last_frame_source": "target_primary_video_first_frame",
+                        "video_endpoint_policy": (
+                            "actual_completed_primary_frames_not_storyboard_transition"
+                        ),
                         "embedded_in_preceding_shot_output": False,
                         "phase8_transition_policy": "insert_generated_bridge_without_effect",
                     }

@@ -53,7 +53,8 @@ GENERAL_SYSTEM_PROMPT = (
 ACTION_SYSTEM_PROMPT = (
     "你是动作影视编剧与连续性编辑。从动作型文本中提取可拍摄的因果动作单元。"
     "事件不是镜头：不要把每句话或每个招式机械拆成一个事件，镜头划分由下游导演完成。"
-    "micro_actions 是按时间先后生成的动作阶段，不是舞蹈词汇清单；同一瞬间的复合律动必须合成一条。"
+    "micro_actions 是按时间先后生成的动作阶段，不是同时发生的姿态、部位或动作词汇清单；"
+    "同一时刻并行完成的复合动作必须合成一条。"
     "你必须保留动作的起始状态、结束状态、因果关系和无署名对白的可靠归属。输出严格 JSON 数组。"
     "不要输出任何解释文字，只输出 JSON。"
 )
@@ -80,6 +81,9 @@ USER_PROMPT_TEMPLATE = (
     "- event_role: 字符串，只能是 scene_setup/character_state/dialogue/action_chain/reaction/consequence/turning_point/transition\n"
     "- source_excerpt: 字符串，逐字摘录 <target> 中支撑本事件的连续原文\n"
     "- micro_actions: 字符串数组，按发生顺序列出本动作单元中的可见动作；非动作事件为 []\n"
+    "- generation_motion_mode: 字符串，只能是 none/atomic/composite；micro_actions=[] 时为 none；"
+    "需按先后执行的动作阶段为 atomic；原文明确说明同一时刻并行完成、"
+    "融为一个整体且不是逐个执行时才为 composite\n"
     "- action_phase: 字符串，只能是 none/setup/attack/counter/impact/recovery/consequence\n"
     "- start_state: 字符串，本单元开始时人物、武器、空间与运动状态\n"
     "- end_state: 字符串，本单元结束时可供下一段承接的定格状态\n"
@@ -111,9 +115,9 @@ GENERAL_PROSE_CONTRACT = (
 ACTION_SCREENPLAY_CONTRACT = (
     "【动作型叙事规则】\n"
     "1. 场景建立、人物当前状态、对白、动作链、反应、后果和叙事转折是不同 event_role。\n"
-    "2. micro_actions 只表示视频模型需要按时间先后完成的可见动作阶段，不是姿态、身体部位或舞蹈词汇清单。"
-    "原文明确写出‘复合律动’‘同一瞬间’‘融为一段’或‘并非逐个执行’时，"
-    "必须把同一瞬间的肩、胸、胯、脚步及多人同步动作合成一条复合 micro_action；"
+    "2. micro_actions 只表示视频模型需要按时间先后完成的可见动作阶段，"
+    "不是姿态、对象部件或动作词汇清单。原文明确说明多个贡献在同一时刻并行完成、"
+    "融为一个整体且并非逐个执行时，必须合成一条复合 micro_action 并设为 composite；"
     "‘连贯衔接’或‘一气呵成’本身不代表同时发生；原文明示先、随后、逐渐、最终等状态变化时仍须拆成多条。\n"
     "3. 动作造成的人物、物体、空间、朝向、速度或受力状态变化必须写入 end_state。\n"
     "4. 目标、立场、关系或局势发生变化时单列 turning_point，并设置 dramatic_turn=true。\n"
@@ -189,7 +193,7 @@ _NARRATIVE_JUMP_CUES = (
     "与此同时", "另一边", "次日", "翌日", "后来", "数小时后", "多年后", "回忆",
     "梦境", "转场", "来到", "抵达", "离开当前", "meanwhile", "later", "next day",
 )
-EVENT_FLOW_SCHEMA_VERSION = "5.0"
+EVENT_FLOW_SCHEMA_VERSION = "6.0"
 
 
 def _normalize_event(event: Dict[str, Any], source_content: str = "") -> Dict[str, Any]:
@@ -219,6 +223,13 @@ def _normalize_event(event: Dict[str, Any], source_content: str = "") -> Dict[st
     if isinstance(micro_actions, str):
         micro_actions = [micro_actions] if micro_actions.strip() else []
     event["micro_actions"] = [str(item).strip() for item in micro_actions if str(item).strip()] if isinstance(micro_actions, list) else []
+    motion_mode = str(event.get("generation_motion_mode") or "").strip().lower()
+    if not event["micro_actions"]:
+        event["generation_motion_mode"] = "none"
+    else:
+        event["generation_motion_mode"] = (
+            motion_mode if motion_mode in {"atomic", "composite"} else "atomic"
+        )
     phase = str(event.get("action_phase") or "none").strip().lower()
     event["action_phase"] = phase if phase in _ACTION_PHASES else "none"
     for field in ("start_state", "end_state", "causal_link", "continuity_subject", "source_excerpt"):

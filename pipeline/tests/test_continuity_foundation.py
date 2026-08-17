@@ -855,8 +855,9 @@ def test_complex_shot_maps_to_three_secondary_generation_strategies(tmp_path):
     assert storyboard["primary_shot_bridges"][0]["target_shot_id"] == "S02"
     assert contract["total_boards"] == 2
     assert contract["total_panels"] == 3
+    assert contract["total_transition_panels"] == 1
     assert [call[0] for call in calls] == [
-        "text_to_image", "image_to_image", "image_to_image",
+        "text_to_image", "image_to_image", "image_to_image", "image_to_image",
     ]
     assert "S01_P01（第 1/2 格）" in calls[0][1]
     assert "S01_P02（第 2/2 格）" in calls[1][1]
@@ -867,6 +868,25 @@ def test_complex_shot_maps_to_three_secondary_generation_strategies(tmp_path):
     assert second_shot_record["reference_images"] == [
         "storyboard_beats/S01_P02.png"
     ]
+    assert calls[-1][2] == [
+        str(tmp_path / "storyboard_beats/S01_P02.png"),
+        str(tmp_path / "storyboard_beats/S02_P01.png"),
+    ]
+    assert "PREVIS 手绘过渡分镜：S01__S02" in calls[-1][1]
+    assert "不得让角色保持图片1原姿势" in calls[-1][1]
+    transition = storyboard["primary_shot_bridges"][0]["storyboard_transition"]
+    assert transition == {
+        "image": "storyboard_bridges/S01__S02.png",
+        "prompt": "storyboard_bridges/S01__S02_prompt.txt",
+        "reference_images": [
+            "storyboard_beats/S01_P02.png",
+            "storyboard_beats/S02_P01.png",
+        ],
+        "generation_phase": "post_primary_storyboards",
+        "usage": "visual_continuity_plan_not_video_endpoint",
+    }
+    assert (tmp_path / "storyboard_bridges/S01__S02.png").is_file()
+    assert validate_shot_storyboard_artifacts(tmp_path, storyboard) == []
     assert (tmp_path / "shot_storyboards/S01.png").is_file()
     assert (tmp_path / "storyboard_beats/S01_P01.png").is_file()
     assert (tmp_path / "storyboard_beats/S01_P02.png").is_file()
@@ -893,6 +913,15 @@ def test_complex_shot_maps_to_three_secondary_generation_strategies(tmp_path):
     assert [chunk.expected_unique_frames for chunk in first.chunks] == [216, 168]
     assert [chunk.expected_provider_padding_frames for chunk in first.chunks] == [0, 0]
     assert continuity.bridges[0].bridge_id == "S01__S02"
+    assert continuity.bridges[0].storyboard_transition_image == (
+        "storyboard_bridges/S01__S02.png"
+    )
+    assert continuity.bridges[0].first_frame_source == (
+        "source_primary_video_tail_frame"
+    )
+    assert continuity.bridges[0].last_frame_source == (
+        "target_primary_video_first_frame"
+    )
     assert second.boundary_before == "continuous"
     assert [chunk.mode for chunk in second.chunks] == ["fresh"]
     assert second.chunks[0].execution_strategy == "multi_image"
@@ -1436,6 +1465,7 @@ def test_provider_uses_each_chunk_storyboard_panel_and_action(monkeypatch, tmp_p
     assert observed["generation_actions"] == ["烬抬起机械臂格挡"]
     assert "Execute only this visible action: 烬抬起机械臂格挡" in content[0]["text"]
     assert "摄影机箭头控制机位的移动方向和轨迹" in content[0]["text"]
+    assert "背景与运镜只能辅助，不能替代主体完成动作" in content[0]["text"]
     assert "最终视频的任何一帧都不得出现或残留箭头" in content[0]["text"]
 
 
@@ -2018,6 +2048,9 @@ def test_chunk_runtime_archives_primary_shot_bridge_videos(tmp_path):
     assert manifest["bridges"][0]["generated_after_primary_shots"] is True
     assert manifest["bridges"][0]["last_frame_source"] == (
         "target_primary_video_first_frame"
+    )
+    assert manifest["bridges"][0]["video_endpoint_policy"] == (
+        "actual_completed_primary_frames_not_storyboard_transition"
     )
     assert [request.resource_id for request in requests] == [
         "S01_C01", "S02_C01", "S01__S02_B01",

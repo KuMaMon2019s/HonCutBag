@@ -116,7 +116,18 @@ def build_video_prompt(
             stable = [str(appearance.get(key, "")).strip() for key in ("hair", "face", "clothing") if appearance.get(key)][:3]
             traits.append(f"{character.get('name')}—{'，'.join(stable)}")
         subject = "；".join(traits) or shot_meta.get("visual") or "场景主体"
-    action = str(shot_meta.get("action_description") or shot_meta.get("what") or "保持自然姿态")
+    generation_actions = shot_meta.get("generation_actions") or []
+    if isinstance(generation_actions, str):
+        generation_actions = [generation_actions]
+    generation_actions = [
+        str(value).strip() for value in generation_actions if str(value).strip()
+    ]
+    action = str(
+        " → ".join(generation_actions)
+        or shot_meta.get("action_description")
+        or shot_meta.get("what")
+        or "保持自然姿态"
+    )
     camera_key = str(shot_meta.get("camera_movement") or "fixed").lower()
     camera = CAMERA_MOVEMENTS.get(camera_key, str(shot_meta.get("camera_movement") or "固定(fixed/locked)"))
     layout = scene.get("spatial_layout", {})
@@ -130,6 +141,11 @@ def build_video_prompt(
         ("场景与光影：", scene_and_lighting),
     ])
     parts.append(f"主体总结：{subject_summary}")
+    if generation_actions:
+        # The bounded eight-layer summary is deliberately short. Keep the full
+        # authored action ledger outside that limiter so legacy Phase 6 routing
+        # cannot silently drop later body actions and animate only the scenery.
+        parts.append("主体动作逐项硬合同：" + " → ".join(generation_actions))
     audio = shot_meta.get("audio") or shot_meta.get("sound")
     if audio:
         parts.append(f"音效：{audio}")

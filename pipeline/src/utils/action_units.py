@@ -6,7 +6,7 @@ distinguishes what actually costs provider story-time:
 
   sequential    ordered plot actions that cannot run in parallel
                 → 1 unit each (deduplicated across events via a shared seen set)
-  simultaneous  concurrent composite motions / group grooves / multi-person joins
+  simultaneous  concurrent composite motions / coordinated multi-person actions
                 → merged to 1 unit per concurrent cluster
   sustained     sustained states, emotions, camera constraints
                 → 0 units
@@ -28,7 +28,7 @@ from typing import Any
 
 # C: camera / shooting constraints — never paid provider work
 _CAMERA = re.compile(
-    r"镜头|摄像|拍摄|机位|对焦|构图|景别|运镜|摄影师|iPhone|iphone|画面|空镜|摆拍|"
+    r"镜头|摄像|摄影|拍摄|录制|机位|对焦|构图|景别|运镜|画面|空镜|摆拍|"
     r"变焦|Zoom|zoom|跟拍|视角|视频开场|视频整体|一镜到底"
 )
 
@@ -42,40 +42,27 @@ _NEGATIVE = re.compile(
 # C: sustained states — emotion, expression, ongoing vibe
 _SUSTAINED = re.compile(
     r"持续|保持|始终|一直|不断|维持|处于|状态|氛围|情绪|笑容|眼神|自信|享受|"
-    r"感染力|魅力|气质|自然|轻松|投入|表情|对口型|唱歌|微笑|偶尔|随音乐|"
-    r"响应音乐|跟随音乐|一气呵成|注意到|察觉|意识到|"
-    r"音乐(?:进入|播放至|达到)|视频录制(?:进入|结束)|录制(?:进入|结束)|"
-    r"继续(?:跳舞|舞蹈|律动|向前移动|前进)"
+    r"感染力|魅力|气质|自然|轻松|投入|表情|对口型|演唱|微笑|偶尔|"
+    r"一气呵成|注意到|察觉|意识到|继续"
 )
 
-# B: simultaneous signals — multi-person concurrent / group groove / gradual merge
+# B: simultaneous signals — concurrent, coordinated, or gradually joined work
 _SIMULTANEOUS = re.compile(
-    r"同时|陆续|逐渐|渐渐|一起|一同|同步|齐舞|模仿|跟随|感染|加入舞蹈|加入$|加入|"
-    r"汇聚|人群|队伍|人数|群体|群舞|背景舞者|波浪|扩散|传播|Groove|groove|"
-    r"律动|隔离|Isolation|绕臂|挥臂|肩.{0,3}胸|胸.{0,3}胯|"
-    r"身体(?:波浪|响应|协调|整体)|从.{1,8}(?:加入|出现)|有人.{0,10}(?:加入|Groove|跳)|"
-    r"形成(?:松散|小型|大型|移动|Flash|flash|队形|队伍|包围|阵型)"
+    r"同时|同一时刻|同一瞬间|并行|并发|陆续|逐渐|渐渐|一起|一同|"
+    r"同步|共同|协同|齐步|模仿|跟随|加入$|加入|汇聚|人群|队伍|人数|"
+    r"群体|多人|全体|波浪|扩散|传播|从.{1,8}(?:加入|出现)"
 )
 
-# Source-authored choreography can explicitly state that several named body
-# movements happen as one compound groove rather than as ordered plot steps.
-# The event context is required here: the same verbs in a fight remain
-# sequential and must never be collapsed merely because they are adjacent.
-_DANCE_CONTEXT = re.compile(
-    r"舞蹈|跳舞|舞步|舞者|群舞|街舞|Groove|groove|律动|"
-    r"Hip-?Hop|hip-?hop|Waacking|waacking|K-?Pop|k-?pop"
-)
+# Source text may explicitly define several entries as one concurrent compound
+# action. This deliberately uses domain-neutral temporal language: the same
+# contract works for performance, sport, assembly, or crowd motion instead of
+# recognizing one regression screenplay's nouns.
 _COMPOSITE_MOTION_CUE = re.compile(
-    r"复合(?:律动|舞蹈|舞步|动作)|"
-    r"连贯(?:的)?(?:Groove|groove|律动|舞蹈)|"
-    r"(?:所有|全部|整段).{0,30}(?:舞蹈|舞步|动作).{0,30}(?:融为|融入)|"
-    r"(?:不是|并非|而非).{0,30}(?:逐个|分离动作|动作清单)|"
-    r"每个瞬间.{0,30}(?:连贯|复合)(?:律动|舞蹈|动作)"
-)
-_GLOBAL_COMPOSITE_DANCE_CUE = re.compile(
-    r"(?:剧本中)?(?:所有|全部).{0,30}舞蹈描述.{0,60}"
-    r"每个瞬间.{0,60}复合律动.{0,80}"
-    r"(?:而非|不是|并非).{0,60}(?:逐个|分离动作|动作清单)"
+    r"复合(?:动作|运动|过程|表演|律动)?|"
+    r"同一(?:时刻|瞬间)|同时发生|并行完成|"
+    r"融为(?:一体|一个整体|一段|同一动作)|"
+    r"融合为|合成为|组合成|作为一个整体|"
+    r"(?:不是|并非|而非).{0,30}(?:逐个|依次|顺序|分离|清单)"
 )
 _TEMPORAL_PROGRESSION_CUE = re.compile(
     r"一开始|随后|然后|接着|逐步|逐渐|最终|最后|先.{0,30}再"
@@ -136,18 +123,17 @@ def _event_motion_evidence(event: dict[str, Any]) -> str:
 def _has_local_composite_motion(event: dict[str, Any]) -> bool:
     evidence = _event_motion_evidence(event)
     return bool(
-        _DANCE_CONTEXT.search(evidence)
-        and _COMPOSITE_MOTION_CUE.search(evidence)
+        _COMPOSITE_MOTION_CUE.search(evidence)
+        and not _TEMPORAL_PROGRESSION_CUE.search(evidence)
     )
 
 
 def event_uses_composite_motion(event: dict[str, Any]) -> bool:
-    """Whether the source says this dance event is one concurrent motion.
+    """Whether the source says this event is one concurrent compound motion.
 
     Only source evidence and the event summary participate.  ``visual`` is
-    deliberately excluded because an extractor may mention a protagonist's
-    background groove while the event itself describes a real progression
-    such as notice → respond → join.
+    deliberately excluded because an extractor may mention background motion
+    while the event itself describes a real ordered progression.
     """
 
     declared_mode = str(event.get("generation_motion_mode") or "").strip().lower()
@@ -157,39 +143,34 @@ def event_uses_composite_motion(event: dict[str, Any]) -> bool:
 
 
 def annotate_event_motion_modes(events: list[dict[str, Any]]) -> bool:
-    """Persist a document-wide compound-dance contract on eligible events.
+    """Normalize explicit per-event semantics with a conservative fallback.
 
-    A global source instruction can govern later segments even though the LLM
-    extracts them independently.  Events with explicit temporal progression
-    remain atomic; their notice → respond → join phases are real story changes,
-    not a list of simultaneous dance vocabulary.
+    The extractor owns this decision. For legacy artifacts without the field,
+    only an unambiguous local concurrent-action statement is inferred; a
+    document-wide keyword rule must never rewrite unrelated events.
     """
 
-    document_evidence = "\n".join(
-        _event_motion_evidence(event)
-        for event in events
-    )
-    has_global_contract = bool(
-        _GLOBAL_COMPOSITE_DANCE_CUE.search(document_evidence)
-    )
+    has_composite_contract = False
     for event in events:
         actions = event.get("micro_actions") or []
         if not actions:
             continue
+        declared_mode = str(event.get("generation_motion_mode") or "").strip().lower()
+        if declared_mode in {"composite", "atomic"}:
+            event["generation_motion_mode"] = declared_mode
+            event["generation_motion_mode_reason"] = "event extraction contract"
+            has_composite_contract = (
+                has_composite_contract or declared_mode == "composite"
+            )
+            continue
         evidence = _event_motion_evidence(event)
         local_contract = _has_local_composite_motion(event)
-        inherited_contract = bool(
-            has_global_contract
-            and _DANCE_CONTEXT.search(evidence)
-            and not _TEMPORAL_PROGRESSION_CUE.search(evidence)
-        )
-        if local_contract or inherited_contract:
+        if local_contract:
             event["generation_motion_mode"] = "composite"
             event["generation_motion_mode_reason"] = (
-                "source explicitly defines this choreography as concurrent compound motion"
-                if local_contract
-                else "document-wide compound-dance contract"
+                "source explicitly defines this event as concurrent compound motion"
             )
+            has_composite_contract = True
         else:
             event["generation_motion_mode"] = "atomic"
             event["generation_motion_mode_reason"] = (
@@ -197,7 +178,7 @@ def annotate_event_motion_modes(events: list[dict[str, Any]]) -> bool:
                 if _TEMPORAL_PROGRESSION_CUE.search(evidence)
                 else "no compound-motion source contract"
             )
-    return has_global_contract
+    return has_composite_contract
 
 
 def _dedupe_key(text: str) -> str:

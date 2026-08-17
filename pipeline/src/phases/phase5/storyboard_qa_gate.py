@@ -1491,6 +1491,8 @@ def _archive_correction_inputs(
                 f"storyboard_beats/{shot_id}_P*",
                 f"shot_storyboards/{shot_id}*",
                 f"storyboard_images/{shot_id}.*",
+                f"storyboard_bridges/{shot_id}__*",
+                f"storyboard_bridges/*__{shot_id}*",
             )
         )
     for pattern in patterns:

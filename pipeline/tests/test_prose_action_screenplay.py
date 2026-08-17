@@ -115,10 +115,13 @@ def test_parser_detects_prose_action_and_attaches_neighbor_context():
 def test_event_prompt_uses_read_only_context_and_action_unit_contract():
     assert "严禁从前后文重复提取事件" in EVENT_PROMPT
     assert "事件不是镜头" in EVENT_PROMPT or "动作单元" in EVENT_PROMPT
-    assert "同一瞬间" in ACTION_SCREENPLAY_CONTRACT
+    assert "同一时刻" in ACTION_SCREENPLAY_CONTRACT
     assert "合成一条复合 micro_action" in ACTION_SCREENPLAY_CONTRACT
+    assert "generation_motion_mode" in EVENT_PROMPT
     assert "一气呵成’本身不代表同时发生" in ACTION_SCREENPLAY_CONTRACT
     assert "对前文剧情的总结不是新的时间线动作" in ACTION_SCREENPLAY_CONTRACT
+    assert "肩、胸、胯" not in ACTION_SCREENPLAY_CONTRACT
+    assert "舞蹈词汇清单" not in ACTION_SCREENPLAY_CONTRACT
     assert "氛围、说明与内心信息不得虚构肢体动作" in GENERAL_PROSE_CONTRACT
     assert "speaker 写‘未知’" in EVENT_PROMPT
     assert "continuity_before" in EVENT_PROMPT
@@ -140,6 +143,7 @@ def test_event_parser_preserves_speaker_evidence_and_action_state():
 
     assert parsed[0]["event_role"] == "action_chain"
     assert parsed[0]["micro_actions"] == ["凛冲出", "烬格挡"]
+    assert parsed[0]["generation_motion_mode"] == "atomic"
     assert parsed[0]["end_state"] == "刀锋压在机械臂上"
     assert parsed[0]["lines"][0]["speaker"] == "凛"
     assert parsed[0]["lines"][0]["confidence"] == 0.92

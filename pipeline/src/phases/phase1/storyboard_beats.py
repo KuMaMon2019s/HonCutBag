@@ -155,7 +155,13 @@ def _generation_action_units(
         ]
     return [
         dict(unit)
-        for unit in normalize_action_units(actions)["generation_action_units"]
+        for unit in normalize_action_units(
+            actions,
+            composite_motion=(
+                str(shot.get("generation_motion_mode") or "").strip().lower()
+                == "composite"
+            ),
+        )["generation_action_units"]
     ]
 
 

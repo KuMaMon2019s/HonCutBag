@@ -154,7 +154,8 @@ def build_shot_storyboard_prompt(
 二级分镜执行语义：
 - P01 是“多图生成视频”的当前一级分镜起始构图；角色图锁身份，本格故事图锁场景、站位与当前剧情。
 - P01 视频必须为 8–15 秒；只有标记为 TAIL_VIDEO_EXTEND 的格才是 6–10 秒容量延长格。延长格表示前一段时长/动作容量不足，必须从前段视频末态继续，禁止重新入场、回放或重复动作。
-- 跨一级分镜桥接不占 Pxx、不绘制故事板格。所有一级视频完成后，Phase 6 才会以相邻成片的真实尾帧和真实首帧生成 3–6 秒桥接视频。
+- 跨一级分镜桥接不占 Pxx。全部 Sxx/Pxx 一级分镜完成后，另生成一张相邻 Sxx 之间的过渡分镜；它只规划连续动作与运镜路径，不新增剧情。
+- 过渡分镜不是视频首尾帧替代品。所有一级视频完成后，Phase 6 仍只以相邻成片的真实尾帧和真实首帧生成 3–6 秒桥接视频。
 - 换场、跳时、主体切换、回忆、梦境或其他 cut/fade/dissolve 边界不生成桥接视频，由 Phase 8 添加转场特效。
 - 每格只能细分当前 Sxx 已写明的动作与状态，不得新增角色、道具、冲突、伤亡或剧情结果。
 
@@ -310,7 +311,8 @@ Phase 5 定向纠偏合同：
 - 每个动作的执行者、承受者、左右位置、朝向以及武器持有者必须与“本格唯一可见动作”一致；禁止交换人物、攻守关系或武器归属。
 - 每个角色只执行本格明确分配给自己的动作；不得把其他角色或群体的动作复制给旁观者、记录者、驾驶者、守卫或任何未被指定的角色。
 - 严格保留本格声明的道具类型、持有者和使用方式；不得替换设备、交换道具或让角色无故放下道具。
-- 静态故事格只画本格全部顺序动作完成后的单一终态，不得把多个时间点或动作过程同时拼进一张图；实际动作过程由后续视频生成完成。
+- 静态故事格只能画一个时间点，不得把多个时间点或动作过程拼贴在一起；但若本格给主体分配了肢体或位移动作，必须选择达到结束状态时仍具动力学信息的瞬间，以关节弯曲、肢体伸展、重心偏移、接触关系和动作方向清楚表现该动作。不得把“终态”误画成人物中性站立；只有源合同明确要求静止、停止或定格时才画静止姿态。
+- 主动作角色必须是画面的主要运动来源。不得只让背景人群、车辆、光影、粒子、衣物、头发或摄影机产生动感，而让被分配动作的主体保持参考图原姿势；背景与运镜只能辅助，不能替代主体动作。
 {disarm_contract}{cast_contract}- 其他动作不得用相邻剧情或泛化搏斗代替。
 - {final_beat_contract}
 {correction_section}
@@ -379,6 +381,196 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+def _artifact_path(output_dir: Path, value: Any) -> Path:
+    path = Path(str(value or ""))
+    return path if path.is_absolute() else output_dir / path
+
+
+def _portable_path(output_dir: Path, path: Path) -> str:
+    return (
+        str(path.relative_to(output_dir))
+        if path.is_relative_to(output_dir)
+        else str(path)
+    )
+
+
+def _build_primary_bridge_storyboard_prompt(
+    bridge: dict[str, Any],
+    source_beat: dict[str, Any],
+    target_beat: dict[str, Any],
+    *,
+    aspect_ratio: str,
+) -> str:
+    """Describe one non-narrative midpoint between adjacent Sxx boards."""
+    bridge_id = str(bridge.get("bridge_id") or "Sxx__Sxx")
+    source_shot_id = str(bridge.get("source_shot_id") or "上一一级分镜")
+    target_shot_id = str(bridge.get("target_shot_id") or "下一一级分镜")
+    return f"""绘制一张单独的 {aspect_ratio} PREVIS 手绘过渡分镜：{bridge_id}。
+
+参考图合同：
+- 图片1是 {source_shot_id} 最后一个 Pxx 故事格，代表上一一级分镜已经完成的结束状态。
+- 图片2是 {target_shot_id} 的 P01 故事格，代表下一一级分镜尚未执行新动作时的起始状态。
+- 两张参考图中的同名角色是同一实体；严格保持人物身份、数量、服装、道具归属、场景轴线、光影和屏幕方向连续。
+
+过渡任务：
+- 只画图片1到图片2之间一个时间点的连续过渡姿态与摄影机路径；不得照抄任一端点，也不得做拼贴、叠化、双重曝光或左右对比图。
+- 上一状态：{_compact(bridge.get('start_state') or source_beat.get('end_state'), 420)}
+- 过渡动作：{_compact(bridge.get('action_prompt'), 520)}
+- 下一状态：{_compact(bridge.get('end_state') or target_beat.get('start_state'), 420)}
+- 角色若处于连续身体动作中，必须通过躯干、四肢、关节、重心、接触关系与道具运动画出物理上可达的中间姿态；不得让角色保持图片1原姿势，只让背景、光影或摄影机移动。
+- 不得提前执行 {target_shot_id} 的新剧情动作，不得重复 {source_shot_id} 已完成的动作，不得新增角色、道具、事件或剧情结果。
+
+用途边界：这张图只用于导演检查跨一级分镜的连续路径，不会替代视频生成的首尾帧。Phase 6 必须继续使用两段已完成一级视频的真实尾帧和真实首帧。
+
+风格要求：黑色粗铅笔与炭笔、少量灰色阴影、快速 gesture drawing、专业导演工作稿；主体动作方向可用红色手绘箭头，摄影机运动可用蓝色手绘箭头。画面铺满 {aspect_ratio} 单格，禁止分格、边框、标题、字幕、对白气泡、编号和水印。"""
+
+
+def _generate_primary_bridge_storyboards(
+    output_dir: Path,
+    storyboard: dict[str, Any],
+    *,
+    client: ImageGenerationClient,
+    model: str,
+    size: str,
+    aspect_ratio: str,
+) -> list[dict[str, Any]]:
+    """Generate bridge boards only after every ordinary Sxx/Pxx board exists."""
+    bridges = [
+        bridge
+        for bridge in (storyboard.get("primary_shot_bridges") or [])
+        if isinstance(bridge, dict)
+    ]
+    if not bridges:
+        return []
+    if not hasattr(client, "image_to_image"):
+        raise RuntimeError(
+            "primary bridge storyboards require a two-reference image_to_image client"
+        )
+
+    shots = {
+        _shot_id(shot, index): shot
+        for index, shot in enumerate(storyboard.get("shots", []), 1)
+        if isinstance(shot, dict)
+    }
+    bridge_dir = output_dir / "storyboard_bridges"
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    records: list[dict[str, Any]] = []
+    for bridge in bridges:
+        bridge_id = str(
+            bridge.get("bridge_id")
+            or f"{bridge.get('source_shot_id')}__{bridge.get('target_shot_id')}"
+        )
+        source_shot = shots.get(str(bridge.get("source_shot_id") or ""))
+        target_shot = shots.get(str(bridge.get("target_shot_id") or ""))
+        source_beats = [
+            beat
+            for beat in ((source_shot or {}).get("storyboard_beats") or [])
+            if isinstance(beat, dict)
+        ]
+        target_beats = [
+            beat
+            for beat in ((target_shot or {}).get("storyboard_beats") or [])
+            if isinstance(beat, dict)
+        ]
+        if not source_beats or not target_beats:
+            raise RuntimeError(
+                f"{bridge_id} transition storyboard requires both adjacent Pxx chains"
+            )
+        source_beat = source_beats[-1]
+        target_beat = target_beats[0]
+        source_image = _artifact_path(
+            output_dir, source_beat.get("storyboard_image")
+        )
+        target_image = _artifact_path(
+            output_dir, target_beat.get("storyboard_image")
+        )
+        for label, path in (
+            ("source final Pxx", source_image),
+            ("target P01", target_image),
+        ):
+            if not path.is_file() or path.stat().st_size == 0:
+                raise RuntimeError(f"{bridge_id} {label} is missing: {path}")
+
+        prompt = _build_primary_bridge_storyboard_prompt(
+            bridge,
+            source_beat,
+            target_beat,
+            aspect_ratio=aspect_ratio,
+        )
+        image_path = bridge_dir / f"{bridge_id}.png"
+        prompt_path = bridge_dir / f"{bridge_id}_prompt.txt"
+        sidecar_path = bridge_dir / f"{bridge_id}.json"
+        prompt_path.write_text(prompt, encoding="utf-8")
+        reference_paths = [source_image, target_image]
+        reference_hashes = [
+            hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in reference_paths
+        ]
+        prompt_sha = hashlib.sha256(
+            f"{prompt}\nreferences={','.join(reference_hashes)}".encode()
+        ).hexdigest()
+        record: dict[str, Any] = {
+            "bridge_id": bridge_id,
+            "source_shot_id": str(bridge.get("source_shot_id") or ""),
+            "target_shot_id": str(bridge.get("target_shot_id") or ""),
+            "image": _portable_path(output_dir, image_path),
+            "prompt": _portable_path(output_dir, prompt_path),
+            "prompt_sha256": prompt_sha,
+            "model": model,
+            "reference_images": [
+                _portable_path(output_dir, path) for path in reference_paths
+            ],
+            "reference_image_sha256": reference_hashes,
+            "generation_phase": "post_primary_storyboards",
+            "usage": "visual_continuity_plan_not_video_endpoint",
+            "status": "planned",
+        }
+        cached = False
+        if sidecar_path.is_file() and image_path.is_file():
+            try:
+                previous = json.loads(sidecar_path.read_text(encoding="utf-8"))
+                if (
+                    previous.get("status") == "done"
+                    and previous.get("prompt_sha256") == prompt_sha
+                    and previous.get("model") == model
+                ):
+                    with Image.open(image_path) as image:
+                        image.verify()
+                    record = previous
+                    record["cache_hit"] = True
+                    cached = True
+            except (OSError, ValueError, json.JSONDecodeError):
+                cached = False
+        if not cached:
+            for attempt in range(3):
+                try:
+                    result_url = client.image_to_image(
+                        prompt=prompt,
+                        ref_image=[str(path) for path in reference_paths],
+                        output_path=str(image_path),
+                        size=size,
+                    )
+                    break
+                except Exception as exc:
+                    if not _is_transient_image_transport_error(exc) or attempt == 2:
+                        raise
+            if not image_path.is_file() or image_path.stat().st_size == 0:
+                raise RuntimeError(f"Seedream returned without {image_path.name}")
+            with Image.open(image_path) as image:
+                image.verify()
+            record.update({"status": "done", "result_url": result_url})
+        _write_json(sidecar_path, record)
+        bridge["storyboard_transition"] = {
+            "image": record["image"],
+            "prompt": record["prompt"],
+            "reference_images": record["reference_images"],
+            "generation_phase": record["generation_phase"],
+            "usage": record["usage"],
+        }
+        records.append(record)
+    return records
 
 
 def _is_output_image_safety_rejection(error: BaseException) -> bool:
@@ -627,7 +819,39 @@ def validate_shot_storyboard_artifacts(
                     image.verify()
             except (OSError, ValueError) as exc:
                 errors.append(f"{beat_id} invalid storyboard image {image_value}: {exc}")
-    if authored_count:
+    bridge_specs = [
+        bridge
+        for bridge in (storyboard.get("primary_shot_bridges") or [])
+        if isinstance(bridge, dict)
+    ]
+    bridge_count = 0
+    for bridge in bridge_specs:
+        bridge_id = str(bridge.get("bridge_id") or "<missing-bridge-id>")
+        transition = bridge.get("storyboard_transition")
+        if not isinstance(transition, dict):
+            errors.append(f"{bridge_id} has no post-primary storyboard transition")
+            continue
+        if transition.get("generation_phase") != "post_primary_storyboards":
+            errors.append(
+                f"{bridge_id} storyboard transition has invalid generation phase"
+            )
+        image_value = str(transition.get("image") or "").strip()
+        if not image_value:
+            errors.append(f"{bridge_id} storyboard transition has no image")
+            continue
+        image_path = _artifact_path(output_dir, image_value)
+        try:
+            if not image_path.is_file() or image_path.stat().st_size <= 1024:
+                raise OSError("file missing or too small")
+            with Image.open(image_path) as image:
+                image.verify()
+        except (OSError, ValueError) as exc:
+            errors.append(
+                f"{bridge_id} invalid storyboard transition {image_value}: {exc}"
+            )
+            continue
+        bridge_count += 1
+    if authored_count or bridge_specs:
         manifest = output_dir / "SHOT_STORYBOARDS.json"
         try:
             document = json.loads(manifest.read_text(encoding="utf-8"))
@@ -636,6 +860,24 @@ def validate_shot_storyboard_artifacts(
             if int(document.get("total_panels") or 0) != authored_count:
                 errors.append(
                     "SHOT_STORYBOARDS.json panel count does not match STORYBOARD.json"
+                )
+            if int(document.get("total_transition_panels") or 0) != len(
+                bridge_specs
+            ):
+                errors.append(
+                    "SHOT_STORYBOARDS.json transition count does not match STORYBOARD.json"
+                )
+            manifest_bridge_ids = {
+                str(record.get("bridge_id") or "")
+                for record in (document.get("bridges") or [])
+                if isinstance(record, dict) and record.get("status") == "done"
+            }
+            expected_bridge_ids = {
+                str(bridge.get("bridge_id") or "") for bridge in bridge_specs
+            }
+            if bridge_count != len(bridge_specs) or manifest_bridge_ids != expected_bridge_ids:
+                errors.append(
+                    "SHOT_STORYBOARDS.json has incomplete post-primary transitions"
                 )
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             errors.append(f"SHOT_STORYBOARDS.json unreadable: {exc}")
@@ -1199,11 +1441,21 @@ def generate_shot_storyboards(
             if panel_paths:
                 previous_storyboard_panel = panel_paths[-1]
             _write_json(manifest_path, contract)
+        bridge_records = _generate_primary_bridge_storyboards(
+            output_dir,
+            storyboard,
+            client=client,
+            model=str(contract["model"]),
+            size=size,
+            aspect_ratio=aspect_ratio,
+        )
+        contract["bridges"] = bridge_records
         contract["status"] = "done"
         contract["total_boards"] = len(contract["shots"])
         contract["total_panels"] = sum(
             int(item.get("panel_count") or 0) for item in contract["shots"]
         )
+        contract["total_transition_panels"] = len(bridge_records)
         _write_json(manifest_path, contract)
         return contract
     except Exception as exc:

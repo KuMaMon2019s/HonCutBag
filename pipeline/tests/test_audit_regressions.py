@@ -435,6 +435,29 @@ def test_video_prompt_keeps_requested_ratio_and_fast_action_semantics():
     assert "最终视频的任何一帧都不得出现或残留箭头" in prompt
 
 
+def test_video_prompt_preserves_full_subject_action_ledger_and_rejects_background_only_motion():
+    actions = ["演员屈膝下沉并抬起双臂", "演员转移重心后跨步旋转"]
+
+    prompt = build_video_prompt(
+        {
+            "id": 2,
+            "duration": 8,
+            "where": "排练厅",
+            "who": ["CHAR_A"],
+            "generation_actions": actions,
+            "action_description": "演员完成动作",
+        },
+        {"characters": [{"id": "CHAR_A", "name": "演员"}]},
+        {},
+        "seedance",
+    )
+
+    assert f"主体动作逐项硬合同：{' → '.join(actions)}" in prompt
+    assert "躯干、四肢、关节、重心及相关道具必须按动作连续产生可见变化" in prompt
+    assert "不得只让背景人群、车辆、光影、粒子、布料、头发或摄影机产生运动" in prompt
+    assert "action_description" not in prompt
+
+
 def test_shared_video_geometry_supports_portrait_and_explicit_dimensions():
     assert resolve_video_geometry({"aspect_ratio": "9:16"}) == ("9:16", 720, 1280)
     assert resolve_video_geometry({"width": 1080, "height": 1920}) == (
@@ -1743,6 +1766,27 @@ def test_storyboard_prompts_use_generic_role_and_prop_fidelity_contracts():
     assert "摄影师是持机记录者，不是舞者" not in prompt
     assert "Groove" not in prompt
     assert "手机HDR高光" not in director_prompt
+
+
+def test_phase2_panel_prompt_requires_a_kinetic_subject_pose_not_a_neutral_end_pose():
+    prompt = _build_panel_prompt(
+        {"who": ["表演者"], "where": "排练空间"},
+        {
+            "beat_id": "S01_P01",
+            "generation_mode": "multi_image",
+            "start_state": "表演者准备移动",
+            "action": "表演者屈膝、摆臂并向前跨步",
+            "end_state": "表演者到达前方标记点并继续动作",
+        },
+        1,
+        1,
+        [],
+    )
+
+    assert "不得把“终态”误画成人物中性站立" in prompt
+    assert "关节弯曲、肢体伸展、重心偏移" in prompt
+    assert "主动作角色必须是画面的主要运动来源" in prompt
+    assert "背景与运镜只能辅助，不能替代主体动作" in prompt
 
 
 def test_generic_role_contract_does_not_rewrite_dslr_photojournalist():
