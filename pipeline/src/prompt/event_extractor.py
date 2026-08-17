@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import List, Dict, Any
 
 from openai import OpenAI
+from utils.action_units import annotate_event_motion_modes
 from utils.ark_llm import (
     LLMConnectTimeout,
     LLMIdleTimeout,
@@ -52,6 +53,7 @@ GENERAL_SYSTEM_PROMPT = (
 ACTION_SYSTEM_PROMPT = (
     "你是动作影视编剧与连续性编辑。从动作型文本中提取可拍摄的因果动作单元。"
     "事件不是镜头：不要把每句话或每个招式机械拆成一个事件，镜头划分由下游导演完成。"
+    "micro_actions 是按时间先后生成的动作阶段，不是舞蹈词汇清单；同一瞬间的复合律动必须合成一条。"
     "你必须保留动作的起始状态、结束状态、因果关系和无署名对白的可靠归属。输出严格 JSON 数组。"
     "不要输出任何解释文字，只输出 JSON。"
 )
@@ -109,15 +111,19 @@ GENERAL_PROSE_CONTRACT = (
 ACTION_SCREENPLAY_CONTRACT = (
     "【动作型叙事规则】\n"
     "1. 场景建立、人物当前状态、对白、动作链、反应、后果和叙事转折是不同 event_role。\n"
-    "2. 连续动作按因果闭环组织为动作单元，通常包含 2-8 个有序 micro_actions；"
-    "不要把同一连续动作中的每个姿态机械拆成独立事件。\n"
+    "2. micro_actions 只表示视频模型需要按时间先后完成的可见动作阶段，不是姿态、身体部位或舞蹈词汇清单。"
+    "原文明确写出‘复合律动’‘同一瞬间’‘融为一段’或‘并非逐个执行’时，"
+    "必须把同一瞬间的肩、胸、胯、脚步及多人同步动作合成一条复合 micro_action；"
+    "‘连贯衔接’或‘一气呵成’本身不代表同时发生；原文明示先、随后、逐渐、最终等状态变化时仍须拆成多条。\n"
     "3. 动作造成的人物、物体、空间、朝向、速度或受力状态变化必须写入 end_state。\n"
     "4. 目标、立场、关系或局势发生变化时单列 turning_point，并设置 dramatic_turn=true。\n"
     "5. 相邻事件的位置、朝向、速度和受力状态直接延续时使用 continuous；"
     "换场、跳时或独立叙事段落使用 cut。\n"
     "6. who 只放可作为角色资产的具名个体；群体与背景参与者写入 visual，不得写入 who。\n"
     "7. who 的每个值必须是稳定身份标签，不得包含服装、年龄、伤势、动作、站位或地点修饰；"
-    "同一人物必须沿用 target/上下文中已有的最短无歧义标签。"
+    "同一人物必须沿用 target/上下文中已有的最短无歧义标签。\n"
+    "8. 风格说明、摄影约束、负面约束和对前文剧情的总结不是新的时间线动作；"
+    "可以保留为 scene_setup/character_state，但 micro_actions 必须为 []，不得把已发生的剧情再提取一遍。"
 )
 
 LLM_TIMEOUT = 300
@@ -183,7 +189,7 @@ _NARRATIVE_JUMP_CUES = (
     "与此同时", "另一边", "次日", "翌日", "后来", "数小时后", "多年后", "回忆",
     "梦境", "转场", "来到", "抵达", "离开当前", "meanwhile", "later", "next day",
 )
-EVENT_FLOW_SCHEMA_VERSION = "4.0"
+EVENT_FLOW_SCHEMA_VERSION = "5.0"
 
 
 def _normalize_event(event: Dict[str, Any], source_content: str = "") -> Dict[str, Any]:
@@ -391,7 +397,14 @@ def extract_events(
     def extract_one(segment):
         segment_id = segment.get("id", 0)
         segment_hash = hashlib.sha256(
-            json.dumps(segment, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            json.dumps(
+                {
+                    "event_extraction_schema_version": EVENT_FLOW_SCHEMA_VERSION,
+                    "segment": segment,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode("utf-8")
         ).hexdigest()
         cache_path = (
             segment_cache_dir / f"segment_{segment_id}_{segment_hash[:16]}.json"
@@ -468,6 +481,7 @@ def _annotate_global_event_flow(
         "single_take",
         "oner",
     }
+    annotate_event_motion_modes(events)
     sequence_number = 0
     action_number = 0
     dialogue_number = 0
@@ -558,7 +572,21 @@ def _has_narrative_jump(event: dict[str, Any]) -> bool:
         str(event.get(field) or "")
         for field in ("what", "start_state", "causal_link", "source_excerpt")
     )
-    return any(cue in combined for cue in _NARRATIVE_JUMP_CUES)
+    for cue in _NARRATIVE_JUMP_CUES:
+        start = 0
+        while True:
+            position = combined.find(cue, start)
+            if position < 0:
+                break
+            prefix = combined[max(0, position - 16):position]
+            if not re.search(
+                r"(?:不|不要|不得|禁止|避免|没有|并无|无)\s*"
+                r"(?:发生|进行|使用|出现|允许)?\s*$",
+                prefix,
+            ):
+                return True
+            start = position + len(cue)
+    return False
 
 
 def extract_events_from_text(text: str) -> Dict[str, Any]:

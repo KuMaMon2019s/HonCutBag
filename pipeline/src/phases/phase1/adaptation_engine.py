@@ -40,7 +40,11 @@ from typing import Any, Dict, List, Optional
 
 from openai import APITimeoutError, OpenAI
 
-from utils.action_units import normalize_action_units, normalized_action_unit_count
+from utils.action_units import (
+    normalize_action_units,
+    normalize_event_action_units,
+    normalized_action_unit_count,
+)
 from utils.ark_llm import (
     LLMConnectTimeout,
     LLMIdleTimeout,
@@ -590,7 +594,7 @@ def _event_content_beat_requirement(
         actions = [actions]
     if not actions:
         return 0
-    units = normalized_action_unit_count(actions, seen=seen)
+    units = normalize_event_action_units(event, actions=actions, seen=seen)["units"]
     if units == 0:
         return 0
     return max(
@@ -606,12 +610,7 @@ def _event_generation_action_unit_counts(
 
     seen: set = set()
     return {
-        event_id: normalized_action_unit_count(
-            [event.get("micro_actions")]
-            if isinstance(event.get("micro_actions"), str)
-            else (event.get("micro_actions") or []),
-            seen=seen,
-        )
+        event_id: normalize_event_action_units(event, seen=seen)["units"]
         for event_id, event in enumerate(events, 1)
     }
 
@@ -1144,8 +1143,9 @@ def _inherit_event_semantics(
         event_actions = event.get("micro_actions") or []
         if isinstance(event_actions, str):
             event_actions = [event_actions]
-        normalize_action_units(
-            [str(action).strip() for action in event_actions if str(action).strip()],
+        normalize_event_action_units(
+            event,
+            actions=[str(action).strip() for action in event_actions if str(action).strip()],
             seen=preceding_event_keys,
         )
 
@@ -1204,8 +1204,9 @@ def _inherit_event_semantics(
         ledger_offset = 0
         for event_id, event_slice in slices:
             slice_actions = list(event_slice["micro_actions"])
-            normalized = normalize_action_units(
-                slice_actions,
+            normalized = normalize_event_action_units(
+                event_by_id[event_id],
+                actions=slice_actions,
                 seen=set(seen_before_event[event_id]),
             )
             generation_categories.extend(normalized["categories"])

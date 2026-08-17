@@ -32,12 +32,18 @@ from phases.phase5.storyboard_qa_gate import (  # noqa: E402
 )
 from prompt.event_extractor import _annotate_global_event_flow  # noqa: E402
 from utils.action_units import (  # noqa: E402
+    annotate_event_motion_modes,
     classify_micro_action,
+    event_uses_composite_motion,
     normalize_action_units,
+    normalize_event_action_units,
     normalized_action_unit_count,
 )
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "flashmob_60s_events.json"
+EVOLVING_FIXTURE = (
+    Path(__file__).resolve().parent / "fixtures" / "flashmob_60s_evolving_events.json"
+)
 
 
 # ── classifier unit tests ───────────────────────────────────────────────────
@@ -144,6 +150,73 @@ def test_repeated_action_inside_one_event_remains_distinct():
     assert result["units"] == 2
 
 
+def test_source_authored_compound_dance_is_one_generation_unit():
+    event = {
+        "what": "女主完成一段连贯复合舞蹈",
+        "source_excerpt": (
+            "肩胸隔离、胯部点缀、绕臂和脚步全部融为一段复合律动，"
+            "而不是逐个执行分离动作。"
+        ),
+        "micro_actions": [
+            "肩部做隔离",
+            "胸部做隔离",
+            "脚步轻快向前推进",
+            "手臂完成绕臂",
+        ],
+    }
+
+    normalized = normalize_event_action_units(event)
+
+    assert event_uses_composite_motion(event) is True
+    assert normalized["motion_mode"] == "composite"
+    assert normalized["units"] == 1
+    assert normalized["ledger"] == event["micro_actions"]
+
+
+def test_sequential_fight_is_not_collapsed_without_dance_evidence():
+    event = {
+        "what": "两人在舞台上完成一气呵成的连续交锋",
+        "source_excerpt": "舞台灯亮起，凛先挥拳，随后肘击，最后抬膝撞向腹部。",
+        "micro_actions": ["挥拳", "肘击", "膝击"],
+    }
+
+    normalized = normalize_event_action_units(event)
+
+    assert event_uses_composite_motion(event) is False
+    assert normalized["motion_mode"] == "atomic"
+    assert normalized["units"] == 3
+
+
+def test_document_compound_dance_contract_preserves_real_progression():
+    events = [
+        {
+            "what": "定义整支短片的舞蹈语法",
+            "source_excerpt": (
+                "剧本中所有舞蹈描述都表示每个瞬间一个连贯的复合律动，"
+                "而非一连串需要逐个执行的分离动作清单。"
+            ),
+            "micro_actions": [],
+        },
+        {
+            "what": "女主与背景舞者跳出同步版本",
+            "source_excerpt": "背景舞者连贯衔接肩胸律动、身体波浪与大幅挥臂。",
+            "micro_actions": ["快速前进", "肩胸律动", "身体波浪", "大幅挥臂"],
+        },
+        {
+            "what": "路人逐渐被感染并加入",
+            "source_excerpt": "一开始只是点头，随后调整步伐，最终抬手模仿。",
+            "micro_actions": ["点头", "调整步伐", "抬手模仿"],
+        },
+    ]
+
+    assert annotate_event_motion_modes(events) is True
+
+    assert events[1]["generation_motion_mode"] == "composite"
+    assert normalize_event_action_units(events[1])["units"] == 1
+    assert events[2]["generation_motion_mode"] == "atomic"
+    assert normalize_event_action_units(events[2])["units"] == 3
+
+
 def test_same_event_repeats_survive_shot_slicing_but_later_event_deduplicates():
     events = [
         {
@@ -200,6 +273,21 @@ def test_flashmob_60s_script_passes_capacity_gate():
     assert plan["maximum_material_duration"] == 78
     shots = engine.estimate_action_aware_shot_count(events, 60, 12)
     assert shots == 4
+
+
+def test_evolving_model_flashmob_artifact_has_stable_capacity():
+    events = json.loads(EVOLVING_FIXTURE.read_text(encoding="utf-8"))
+    assert len(events) == 26
+
+    _annotate_global_event_flow(events, continuity_mode="one_take")
+    plan = engine._estimate_action_capacity_plan(events, 60, 12)
+
+    assert {event["sequence_id"] for event in events} == {"SEQ001"}
+    assert plan["generation_action_units"] == 19
+    assert plan["primary_shots"] == 4
+    assert plan["minimum_material_duration"] == 70
+    assert plan["material_duration"] == 75
+    assert plan["maximum_material_duration"] == 78
 
 
 def test_sequence_fragmentation_is_rejected_before_skeleton_llm():

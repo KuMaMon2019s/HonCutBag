@@ -44,7 +44,8 @@ _SUSTAINED = re.compile(
     r"持续|保持|始终|一直|不断|维持|处于|状态|氛围|情绪|笑容|眼神|自信|享受|"
     r"感染力|魅力|气质|自然|轻松|投入|表情|对口型|唱歌|微笑|偶尔|随音乐|"
     r"响应音乐|跟随音乐|一气呵成|注意到|察觉|意识到|"
-    r"音乐(?:进入|播放至|达到)|视频录制(?:进入|结束)|录制(?:进入|结束)"
+    r"音乐(?:进入|播放至|达到)|视频录制(?:进入|结束)|录制(?:进入|结束)|"
+    r"继续(?:跳舞|舞蹈|律动|向前移动|前进)"
 )
 
 # B: simultaneous signals — multi-person concurrent / group groove / gradual merge
@@ -52,7 +53,32 @@ _SIMULTANEOUS = re.compile(
     r"同时|陆续|逐渐|渐渐|一起|一同|同步|齐舞|模仿|跟随|感染|加入舞蹈|加入$|加入|"
     r"汇聚|人群|队伍|人数|群体|群舞|背景舞者|波浪|扩散|传播|Groove|groove|"
     r"律动|隔离|Isolation|绕臂|挥臂|肩.{0,3}胸|胸.{0,3}胯|"
-    r"身体(?:波浪|响应|协调|整体)|从.{1,8}(?:加入|出现)|有人.{0,10}(?:加入|Groove|跳)"
+    r"身体(?:波浪|响应|协调|整体)|从.{1,8}(?:加入|出现)|有人.{0,10}(?:加入|Groove|跳)|"
+    r"形成(?:松散|小型|大型|移动|Flash|flash|队形|队伍|包围|阵型)"
+)
+
+# Source-authored choreography can explicitly state that several named body
+# movements happen as one compound groove rather than as ordered plot steps.
+# The event context is required here: the same verbs in a fight remain
+# sequential and must never be collapsed merely because they are adjacent.
+_DANCE_CONTEXT = re.compile(
+    r"舞蹈|跳舞|舞步|舞者|群舞|街舞|Groove|groove|律动|"
+    r"Hip-?Hop|hip-?hop|Waacking|waacking|K-?Pop|k-?pop"
+)
+_COMPOSITE_MOTION_CUE = re.compile(
+    r"复合(?:律动|舞蹈|舞步|动作)|"
+    r"连贯(?:的)?(?:Groove|groove|律动|舞蹈)|"
+    r"(?:所有|全部|整段).{0,30}(?:舞蹈|舞步|动作).{0,30}(?:融为|融入)|"
+    r"(?:不是|并非|而非).{0,30}(?:逐个|分离动作|动作清单)|"
+    r"每个瞬间.{0,30}(?:连贯|复合)(?:律动|舞蹈|动作)"
+)
+_GLOBAL_COMPOSITE_DANCE_CUE = re.compile(
+    r"(?:剧本中)?(?:所有|全部).{0,30}舞蹈描述.{0,60}"
+    r"每个瞬间.{0,60}复合律动.{0,80}"
+    r"(?:而非|不是|并非).{0,60}(?:逐个|分离动作|动作清单)"
+)
+_TEMPORAL_PROGRESSION_CUE = re.compile(
+    r"一开始|随后|然后|接着|逐步|逐渐|最终|最后|先.{0,30}再"
 )
 
 # A: sequential signals — ordered plot steps that cannot run in parallel
@@ -100,6 +126,80 @@ def classify_micro_action(text: str) -> str:
     return "sequential"  # conservative default: costs a unit
 
 
+def _event_motion_evidence(event: dict[str, Any]) -> str:
+    return " ".join(
+        str(event.get(field) or "")
+        for field in ("what", "source_excerpt")
+    )
+
+
+def _has_local_composite_motion(event: dict[str, Any]) -> bool:
+    evidence = _event_motion_evidence(event)
+    return bool(
+        _DANCE_CONTEXT.search(evidence)
+        and _COMPOSITE_MOTION_CUE.search(evidence)
+    )
+
+
+def event_uses_composite_motion(event: dict[str, Any]) -> bool:
+    """Whether the source says this dance event is one concurrent motion.
+
+    Only source evidence and the event summary participate.  ``visual`` is
+    deliberately excluded because an extractor may mention a protagonist's
+    background groove while the event itself describes a real progression
+    such as notice → respond → join.
+    """
+
+    declared_mode = str(event.get("generation_motion_mode") or "").strip().lower()
+    if declared_mode in {"composite", "atomic"}:
+        return declared_mode == "composite"
+    return _has_local_composite_motion(event)
+
+
+def annotate_event_motion_modes(events: list[dict[str, Any]]) -> bool:
+    """Persist a document-wide compound-dance contract on eligible events.
+
+    A global source instruction can govern later segments even though the LLM
+    extracts them independently.  Events with explicit temporal progression
+    remain atomic; their notice → respond → join phases are real story changes,
+    not a list of simultaneous dance vocabulary.
+    """
+
+    document_evidence = "\n".join(
+        _event_motion_evidence(event)
+        for event in events
+    )
+    has_global_contract = bool(
+        _GLOBAL_COMPOSITE_DANCE_CUE.search(document_evidence)
+    )
+    for event in events:
+        actions = event.get("micro_actions") or []
+        if not actions:
+            continue
+        evidence = _event_motion_evidence(event)
+        local_contract = _has_local_composite_motion(event)
+        inherited_contract = bool(
+            has_global_contract
+            and _DANCE_CONTEXT.search(evidence)
+            and not _TEMPORAL_PROGRESSION_CUE.search(evidence)
+        )
+        if local_contract or inherited_contract:
+            event["generation_motion_mode"] = "composite"
+            event["generation_motion_mode_reason"] = (
+                "source explicitly defines this choreography as concurrent compound motion"
+                if local_contract
+                else "document-wide compound-dance contract"
+            )
+        else:
+            event["generation_motion_mode"] = "atomic"
+            event["generation_motion_mode_reason"] = (
+                "source contains ordered state progression"
+                if _TEMPORAL_PROGRESSION_CUE.search(evidence)
+                else "no compound-motion source contract"
+            )
+    return has_global_contract
+
+
 def _dedupe_key(text: str) -> str:
     """Return a stable key for repeated screenplay summaries.
 
@@ -116,6 +216,7 @@ def normalize_action_units(
     actions: list[str],
     *,
     seen: set[str] | None = None,
+    composite_motion: bool = False,
 ) -> dict[str, Any]:
     """Classify every micro_action and count generation action units.
 
@@ -145,6 +246,8 @@ def normalize_action_units(
     for index, raw in enumerate(actions):
         text = str(raw).strip()
         category = classify_micro_action(text)
+        if composite_motion and category == "sequential":
+            category = "simultaneous"
         key = _dedupe_key(text)
         if category in {"sequential", "simultaneous"} and key in prior_event_keys:
             categories.append("duplicate")
@@ -191,7 +294,30 @@ def normalize_action_units(
         "generation_action_units": generation_units,
         "sequential": sequential_units,
         "simultaneous_clusters": simultaneous_clusters,
+        "motion_mode": "composite" if composite_motion else "atomic",
     }
+
+
+def normalize_event_action_units(
+    event: dict[str, Any],
+    *,
+    actions: list[str] | None = None,
+    seen: set[str] | None = None,
+) -> dict[str, Any]:
+    """Normalize one event using its source-authored choreography semantics."""
+
+    event_actions = (
+        event.get("micro_actions") or []
+        if actions is None
+        else actions
+    )
+    if isinstance(event_actions, str):
+        event_actions = [event_actions]
+    return normalize_action_units(
+        [str(action).strip() for action in event_actions if str(action).strip()],
+        seen=seen,
+        composite_motion=event_uses_composite_motion(event),
+    )
 
 
 def normalized_action_unit_count(

@@ -17,6 +17,7 @@ from phases.phase1.adaptation_engine import (
 )
 from prompt.event_extractor import (
     ACTION_SCREENPLAY_CONTRACT,
+    EVENT_FLOW_SCHEMA_VERSION,
     GENERAL_PROSE_CONTRACT,
     USER_PROMPT_TEMPLATE as EVENT_PROMPT,
     _annotate_global_event_flow,
@@ -113,7 +114,10 @@ def test_parser_detects_prose_action_and_attaches_neighbor_context():
 def test_event_prompt_uses_read_only_context_and_action_unit_contract():
     assert "严禁从前后文重复提取事件" in EVENT_PROMPT
     assert "事件不是镜头" in EVENT_PROMPT or "动作单元" in EVENT_PROMPT
-    assert "2-8 个有序 micro_actions" in ACTION_SCREENPLAY_CONTRACT
+    assert "同一瞬间" in ACTION_SCREENPLAY_CONTRACT
+    assert "合成一条复合 micro_action" in ACTION_SCREENPLAY_CONTRACT
+    assert "一气呵成’本身不代表同时发生" in ACTION_SCREENPLAY_CONTRACT
+    assert "对前文剧情的总结不是新的时间线动作" in ACTION_SCREENPLAY_CONTRACT
     assert "氛围、说明与内心信息不得虚构肢体动作" in GENERAL_PROSE_CONTRACT
     assert "speaker 写‘未知’" in EVENT_PROMPT
     assert "continuity_before" in EVENT_PROMPT
@@ -227,6 +231,60 @@ def test_one_take_mode_does_not_hide_an_explicit_time_jump():
 
     assert [event["sequence_id"] for event in events] == ["SEQ001", "SEQ002"]
     assert events[1]["continuity_before"] == "cut"
+
+
+def test_one_take_mode_ignores_negated_jump_constraints():
+    events = [
+        _event(continuity_before="cut", where="街道"),
+        _event(
+            continuity_before="cut",
+            where="街道",
+            event_role="scene_setup",
+            micro_actions=[],
+            what="规定一镜到底的负面约束",
+            source_excerpt="不要转场。不要时间跳跃。禁止场景切换。",
+        ),
+    ]
+
+    _annotate_global_event_flow(events, continuity_mode="one_take")
+
+    assert [event["sequence_id"] for event in events] == ["SEQ001", "SEQ001"]
+    assert events[1]["continuity_before"] == "continuous"
+
+
+def test_segment_cache_is_invalidated_by_extractor_schema(tmp_path, monkeypatch):
+    calls = 0
+
+    def fake_call(_prompt: str, system_prompt: str) -> str:
+        nonlocal calls
+        calls += 1
+        assert system_prompt
+        return "[]"
+
+    segment = {
+        "id": 1,
+        "content": "她跃过矮墙。",
+        "format_hint": "prose_action_screenplay",
+        "context_before": "",
+        "context_after": "",
+    }
+    monkeypatch.setattr("prompt.event_extractor._call_llm", fake_call)
+
+    from prompt import event_extractor
+
+    event_extractor.extract_events([segment], checkpoint_dir=tmp_path)
+    event_extractor.extract_events([segment], checkpoint_dir=tmp_path)
+    assert calls == 1
+
+    monkeypatch.setattr(
+        event_extractor,
+        "EVENT_FLOW_SCHEMA_VERSION",
+        EVENT_FLOW_SCHEMA_VERSION + "-next",
+    )
+    event_extractor.extract_events([segment], checkpoint_dir=tmp_path)
+
+    assert calls == 2
+    assert len(list((tmp_path / "phase1_event_segments").glob("*.json"))) == 2
 
 
 def test_group_participants_are_not_promoted_to_character_assets():
