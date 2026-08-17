@@ -406,8 +406,9 @@ def _event_primary_occurrence_requirement(
 ) -> int:
     """Return how many primary shots an event needs under the one-extension rule."""
     content_beats = _event_content_beat_requirement(event, capabilities, seen=seen)
-    return math.ceil(
-        content_beats / MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
+    return max(
+        1,
+        math.ceil(content_beats / MAX_CONTENT_BEATS_PER_PRIMARY_SHOT),
     )
 
 
@@ -476,7 +477,13 @@ def _event_primary_occurrence_requirements(
 ) -> Dict[int, int]:
     content = _event_content_beat_requirements(events, capabilities)
     return {
-        event_id: math.ceil(beats / MAX_CONTENT_BEATS_PER_PRIMARY_SHOT)
+        # Even a zero-cost state/camera event still needs one explicit primary
+        # occurrence in the source ledger; zero only means it consumes no
+        # generation action capacity.
+        event_id: max(
+            1,
+            math.ceil(beats / MAX_CONTENT_BEATS_PER_PRIMARY_SHOT),
+        )
         for event_id, beats in content.items()
     }
 
@@ -965,8 +972,23 @@ def _inherit_event_semantics(
             }
             previous_state = end_state
 
+    # Capture the actionable keys owned by earlier source events once.  Every
+    # slice of the same event receives the same snapshot, so a deliberate
+    # repeated action split across two shots is preserved while a later event's
+    # exact repeat is still classified as a cross-event duplicate.
+    seen_before_event: Dict[int, set[str]] = {}
+    preceding_event_keys: set[str] = set()
+    for event_id, event in event_by_id.items():
+        seen_before_event[event_id] = set(preceding_event_keys)
+        event_actions = event.get("micro_actions") or []
+        if isinstance(event_actions, str):
+            event_actions = [event_actions]
+        normalize_action_units(
+            [str(action).strip() for action in event_actions if str(action).strip()],
+            seen=preceding_event_keys,
+        )
+
     previous_sequence_ids: List[str] = []
-    generation_seen: set = set()
     for shot_index, shot in enumerate(shots):
         raw_ids = shot.get("source_events", [])
         source_ids = list(dict.fromkeys(raw_ids)) if isinstance(raw_ids, list) else []
@@ -1021,7 +1043,10 @@ def _inherit_event_semantics(
         ledger_offset = 0
         for event_id, event_slice in slices:
             slice_actions = list(event_slice["micro_actions"])
-            normalized = normalize_action_units(slice_actions, seen=generation_seen)
+            normalized = normalize_action_units(
+                slice_actions,
+                seen=set(seen_before_event[event_id]),
+            )
             generation_categories.extend(normalized["categories"])
             for unit in normalized["generation_action_units"]:
                 serialized = dict(unit)
@@ -1039,7 +1064,7 @@ def _inherit_event_semantics(
                 generation_units.append(serialized)
             ledger_offset += len(slice_actions)
         if not slices and micro_actions:
-            normalized = normalize_action_units(micro_actions, seen=generation_seen)
+            normalized = normalize_action_units(micro_actions)
             generation_categories = list(normalized["categories"])
             generation_units = [
                 dict(unit) for unit in normalized["generation_action_units"]

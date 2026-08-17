@@ -69,6 +69,16 @@ def test_classifier_sustained_camera_and_state():
         assert classify_micro_action(text) == "sustained", text
 
 
+def test_classifier_keeps_actor_actions_with_incidental_frame_language():
+    for text in [
+        "角色冲进画面并挥拳",
+        "镜头跟随角色转身挥拳",
+        "他没有犹豫，挥拳",
+    ]:
+        assert classify_micro_action(text) == "sequential", text
+    assert classify_micro_action("镜头转向角色") == "sustained"
+
+
 # ── normalization semantics ─────────────────────────────────────────────────
 
 
@@ -115,7 +125,54 @@ def test_ledger_is_preserved_with_categories():
     assert result["categories"][0] == "sequential"
     assert result["categories"][1] == "simultaneous"
     assert result["categories"][2] == "sustained"
-    assert result["units"] == 2  # 挥拳 + one groove cluster
+    assert result["categories"][3] == "sequential"
+    assert result["units"] == 3  # two authored punches + one groove cluster
+
+
+def test_repeated_action_inside_one_event_remains_distinct():
+    result = normalize_action_units(["挥拳", "挥拳"])
+
+    assert result["categories"] == ["sequential", "sequential"]
+    assert result["units"] == 2
+
+
+def test_same_event_repeats_survive_shot_slicing_but_later_event_deduplicates():
+    events = [
+        {
+            "event_role": "action_chain",
+            "sequence_id": "SEQ001",
+            "action_unit_id": "AU001",
+            "micro_actions": ["挥拳", "挥拳"],
+        },
+        {
+            "event_role": "action_chain",
+            "sequence_id": "SEQ001",
+            "action_unit_id": "AU002",
+            "micro_actions": ["挥拳"],
+        },
+    ]
+    shots = [
+        {"source_events": [1], "suggested_duration": 15},
+        {"source_events": [1], "suggested_duration": 15},
+        {"source_events": [2], "suggested_duration": 15},
+    ]
+
+    engine._inherit_event_semantics(shots, events)
+
+    assert [shot["micro_actions"] for shot in shots] == [["挥拳"], ["挥拳"], ["挥拳"]]
+    assert [shot["generation_action_categories"] for shot in shots] == [
+        ["sequential"],
+        ["sequential"],
+        ["duplicate"],
+    ]
+    assert [len(shot["generation_action_units"]) for shot in shots] == [1, 1, 0]
+
+
+def test_zero_cost_event_still_requires_one_primary_occurrence():
+    profile = engine.get_video_capabilities()
+
+    assert engine._event_primary_occurrence_requirement({}, profile) == 1
+    assert engine._event_primary_occurrence_requirements([{}], profile) == {1: 1}
 
 
 # ── gate regression: 60s flash-mob script must pass ─────────────────────────

@@ -34,7 +34,7 @@ _CAMERA = re.compile(
 
 # C: negative constraints — "don't do X" directives
 _NEGATIVE = re.compile(
-    r"不要|不得|禁止|避免|不能|不出现|而不是|无空镜|没有|不突然|不露|拒绝|无静止"
+    r"不要|不得|禁止|避免|不能|不出现|而不是|无空镜|不突然|不露|拒绝|无静止"
 )
 
 # C: sustained states — emotion, expression, ongoing vibe
@@ -59,13 +59,34 @@ _SEQUENTIAL = re.compile(
     r"接住|稳定|避让|走向|点头"
 )
 
+# Some authored actions legitimately mention the frame/camera while describing
+# paid actor motion.  These unambiguous verbs must not be zeroed merely because
+# the same sentence also contains ``镜头`` or ``画面``.  Ambiguous camera verbs
+# such as ``转向`` deliberately stay out so ``镜头转向角色`` remains a camera
+# constraint rather than an actor action.
+_ACTOR_ACTION_IN_CAMERA_TEXT = re.compile(
+    r"挥拳|肘击|膝击|踢|夺|缴械|推开|穿过|穿门|倒地|站起|开口|说道|喊道|"
+    r"递给|接住|避让|走向|冲进"
+)
+_ACTOR_CONCURRENCY_IN_CAMERA_TEXT = re.compile(
+    r"同时|一起|一同|同步|齐舞|群舞|多人|全体|人群|队伍"
+)
+
 
 def classify_micro_action(text: str) -> str:
     """Return one of: sequential / simultaneous / sustained."""
     text = str(text).strip()
     if not text:
         return "sustained"
-    if _NEGATIVE.search(text) or _CAMERA.search(text):
+    if _NEGATIVE.search(text):
+        return "sustained"
+    if _CAMERA.search(text):
+        if _ACTOR_ACTION_IN_CAMERA_TEXT.search(text):
+            return (
+                "simultaneous"
+                if _ACTOR_CONCURRENCY_IN_CAMERA_TEXT.search(text)
+                else "sequential"
+            )
         return "sustained"
     if _SEQUENTIAL.search(text) and not _SIMULTANEOUS.search(text):
         return "sequential"
@@ -106,6 +127,12 @@ def normalize_action_units(
     """
     if seen is None:
         seen = set()
+    # ``seen`` represents actions completed by *earlier events*.  Snapshot it
+    # before this event so an intentional repeat inside the same event remains
+    # a distinct sequential unit.  Publish all observed keys only after the
+    # complete event has been normalized for the next event's dedupe pass.
+    prior_event_keys = set(seen)
+    observed_actionable_keys: set[str] = set()
     categories: list[str] = []
     generation_units: list[dict[str, Any]] = []
     sequential_units = 0
@@ -116,13 +143,13 @@ def normalize_action_units(
         text = str(raw).strip()
         category = classify_micro_action(text)
         key = _dedupe_key(text)
-        if category in {"sequential", "simultaneous"} and key in seen:
+        if category in {"sequential", "simultaneous"} and key in prior_event_keys:
             categories.append("duplicate")
             if category == "sequential":
                 active_simultaneous = None
             continue
         if category in {"sequential", "simultaneous"}:
-            seen.add(key)
+            observed_actionable_keys.add(key)
 
         if category == "sequential":
             active_simultaneous = None
@@ -147,6 +174,8 @@ def normalize_action_units(
             active_simultaneous["ledger_indexes"].append(index)
         else:
             categories.append("sustained")
+
+    seen.update(observed_actionable_keys)
 
     for position, unit in enumerate(generation_units, 1):
         unit["unit_id"] = f"GAU{position:03d}"
