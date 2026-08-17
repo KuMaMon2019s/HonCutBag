@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import os
+import random
+import sys
 import threading
 import time
 from typing import Callable, Optional
 
 import httpx
-from openai import APIConnectionError, APITimeoutError, DefaultHttpxClient, OpenAI
+from openai import APIConnectionError, APIStatusError, APITimeoutError, DefaultHttpxClient, OpenAI
 
 from utils.config import ARK_BASE_URL
 
@@ -43,6 +45,74 @@ class LLMEmptyResponse(ValueError):
     pass
 
 
+class LLMRateLimitedError(LLMStreamError):
+    """Server-side burst protection / rate limiting rejected the request.
+
+    Subclasses ``LLMStreamError`` so call sites that already retry stream
+    interruptions get this case for free when the internal backoff budget
+    is exhausted.
+    """
+
+
+_RATE_LIMIT_MARKERS = (
+    "system protection triggered",
+    "request burst",
+    "rate limit",
+    "ratelimit",
+    "too many requests",
+    "quota",
+    "throttl",
+    "slow down traffic",
+)
+
+
+def is_rate_limited_error(exc: BaseException) -> bool:
+    """Classify server-side rate-limit / burst-protection failures."""
+    from openai import RateLimitError
+
+    if isinstance(exc, RateLimitError):
+        return True
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+    if status in (429, 503):
+        return True
+    message = str(exc).lower()
+    return any(marker in message for marker in _RATE_LIMIT_MARKERS)
+
+
+_LAUNCH_STAGGER_ENV = "HONCUT_LLM_LAUNCH_STAGGER_S"
+_launch_lock = threading.Lock()
+_next_launch_at = 0.0
+
+
+def _default_launch_stagger_s() -> float:
+    raw = os.environ.get(_LAUNCH_STAGGER_ENV, "").strip()
+    if not raw:
+        return 1.5
+    try:
+        value = float(raw)
+    except ValueError:
+        return 1.5
+    return max(0.0, value)
+
+
+def _wait_for_launch_slot(launch_stagger: float) -> None:
+    """Serialize request launches to avoid self-inflicted burst spikes."""
+    global _next_launch_at
+    if launch_stagger <= 0:
+        return
+    while True:
+        with _launch_lock:
+            now = time.monotonic()
+            if now >= _next_launch_at:
+                _next_launch_at = now + launch_stagger
+                return
+            wait_s = _next_launch_at - now
+        time.sleep(wait_s)
+
+
 def configure_heartbeat_callback(callback: Optional[Callable[[], None]]) -> None:
     """Set the process-level callback used by Phase 1 LLM calls."""
     global _default_heartbeat_callback
@@ -70,7 +140,7 @@ def create_ark_client(connect_timeout: float = 10.0, read_timeout: float = 60.0)
     )
 
 
-def call_llm_stream(
+def _attempt_llm_stream(
     messages: list[dict],
     *,
     model: str = "doubao-seed-2.1-turbo",
@@ -196,11 +266,17 @@ def call_llm_stream(
         if idle_expired.is_set():
             raise LLMIdleTimeout(f"LLM stream idle timeout after {idle_timeout}s") from exc
         raise LLMStreamError(str(exc)) from exc
+    except APIStatusError as exc:
+        if is_rate_limited_error(exc):
+            raise LLMRateLimitedError(str(exc)) from exc
+        raise
     except Exception as exc:
         if wall_expired.is_set():
             raise LLMWallTimeout(f"LLM wall timeout after {wall_timeout}s") from exc
         if idle_expired.is_set():
             raise LLMIdleTimeout(f"LLM stream idle timeout after {idle_timeout}s") from exc
+        if is_rate_limited_error(exc):
+            raise LLMRateLimitedError(str(exc)) from exc
         raise
     finally:
         wall_timer.cancel()
@@ -216,3 +292,70 @@ def call_llm_stream(
     if not content.strip():
         raise LLMEmptyResponse("LLM 返回空内容")
     return content
+
+
+def call_llm_stream(
+    messages: list[dict],
+    *,
+    model: str = "doubao-seed-2.1-turbo",
+    max_tokens: int = 16000,
+    wall_timeout: float = 180.0,
+    read_timeout: float = 60.0,
+    connect_timeout: float = 10.0,
+    idle_timeout: Optional[float] = None,
+    heartbeat_callback: Optional[Callable[[], None]] = None,
+    heartbeat_interval: float = 5.0,
+    rate_limit_retries: int = 3,
+    rate_limit_base_wait: float = 10.0,
+    rate_limit_max_wait: float = 120.0,
+    rate_limit_jitter: float = 1.0,
+    launch_stagger: Optional[float] = None,
+    _client=None,
+) -> str:
+    """Public streaming entry point shared by every pipeline LLM caller.
+
+    Wraps ``_attempt_llm_stream`` with two burst protections:
+
+    * **Launch stagger** — concurrent callers (ThreadPoolExecutor fans in
+      Phase 1) acquire serialized launch slots so requests do not volley at
+      the same instant and trip server-side burst protection.
+    * **Rate-limit backoff** — when the server answers with 429/503 or a
+      burst-protection message, wait with exponential backoff (base×2,
+      capped, plus jitter) and retry before failing the whole phase.
+    """
+    if rate_limit_retries < 0:
+        raise ValueError("rate_limit_retries must be non-negative")
+    if rate_limit_base_wait <= 0:
+        raise ValueError("rate_limit_base_wait must be positive")
+    stagger = _default_launch_stagger_s() if launch_stagger is None else launch_stagger
+    client = _client or create_ark_client(connect_timeout, read_timeout)
+    _wait_for_launch_slot(stagger)
+
+    attempt = 0
+    while True:
+        try:
+            return _attempt_llm_stream(
+                messages,
+                model=model,
+                max_tokens=max_tokens,
+                wall_timeout=wall_timeout,
+                read_timeout=read_timeout,
+                connect_timeout=connect_timeout,
+                idle_timeout=idle_timeout,
+                heartbeat_callback=heartbeat_callback,
+                heartbeat_interval=heartbeat_interval,
+                _client=client,
+            )
+        except LLMRateLimitedError as exc:
+            if attempt >= rate_limit_retries:
+                raise
+            wait = min(rate_limit_base_wait * (2 ** attempt), rate_limit_max_wait)
+            if rate_limit_jitter > 0:
+                wait += random.uniform(0, rate_limit_jitter)
+            attempt += 1
+            print(
+                f"  LLM 限流/burst 保护，{wait:.1f}s 后指数退避重试 "
+                f"({attempt}/{rate_limit_retries}): {exc}",
+                file=sys.stderr,
+            )
+            time.sleep(wait)
