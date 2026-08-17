@@ -129,6 +129,42 @@ def run_l1_checks(storyboard: dict, visual_style: str) -> tuple[list[dict], dict
         tolerance = max(1.0, float(target) * 0.05)
         if abs(actual - float(target)) > tolerance:
             issues.append(_issue("L1", "moderate", "duration_budget_mismatch", f"Storyboard duration {actual:g}s differs from target {float(target):g}s", details={"actual_seconds": actual, "target_seconds": float(target), "tolerance_seconds": tolerance}))
+        delivery_target = storyboard.get("delivery_target_duration")
+        ratio_limit = storyboard.get("pre_edit_duration_ratio_limit", 1.3)
+        if (
+            isinstance(delivery_target, (int, float))
+            and not isinstance(delivery_target, bool)
+            and delivery_target > 0
+            and isinstance(ratio_limit, (int, float))
+            and not isinstance(ratio_limit, bool)
+            and ratio_limit >= 1
+        ):
+            maximum_material = float(delivery_target) * float(ratio_limit)
+            if actual + 1e-6 < float(delivery_target):
+                issues.append(_issue(
+                    "L1",
+                    "severe",
+                    "pre_edit_material_below_delivery_target",
+                    f"Storyboard material {actual:g}s is below the "
+                    f"{float(delivery_target):g}s delivery target",
+                    details={
+                        "material_seconds": actual,
+                        "delivery_target_seconds": float(delivery_target),
+                    },
+                ))
+            elif actual > maximum_material + 1e-6:
+                issues.append(_issue(
+                    "L1",
+                    "severe",
+                    "pre_edit_material_ratio_exceeded",
+                    f"Storyboard material {actual:g}s exceeds the "
+                    f"{float(ratio_limit):g}x pre-edit limit of {maximum_material:g}s",
+                    details={
+                        "material_seconds": actual,
+                        "delivery_target_seconds": float(delivery_target),
+                        "ratio_limit": float(ratio_limit),
+                    },
+                ))
     return issues, per_shot
 
 

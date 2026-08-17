@@ -34,14 +34,17 @@ _CAMERA = re.compile(
 
 # C: negative constraints — "don't do X" directives
 _NEGATIVE = re.compile(
-    r"不要|不得|禁止|避免|不能|不出现|而不是|无空镜|不突然|不露|拒绝|无静止"
+    r"不要|不得|禁止|避免|不能|不出现|而不是|无空镜|不突然|不露|拒绝|无静止|"
+    r"不停止|不停下|不站住|不摆(?:最终)?Pose|不摆姿势|"
+    r"未停止|未停下|未集体站住|未出现"
 )
 
 # C: sustained states — emotion, expression, ongoing vibe
 _SUSTAINED = re.compile(
     r"持续|保持|始终|一直|不断|维持|处于|状态|氛围|情绪|笑容|眼神|自信|享受|"
     r"感染力|魅力|气质|自然|轻松|投入|表情|对口型|唱歌|微笑|偶尔|随音乐|"
-    r"响应音乐|跟随音乐|一气呵成"
+    r"响应音乐|跟随音乐|一气呵成|注意到|察觉|意识到|"
+    r"音乐(?:进入|播放至|达到)|视频录制(?:进入|结束)|录制(?:进入|结束)"
 )
 
 # B: simultaneous signals — multi-person concurrent / group groove / gradual merge

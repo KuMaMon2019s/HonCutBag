@@ -28,7 +28,9 @@ from phases.phase1 import adaptation_engine as engine  # noqa: E402
 from phases.phase1.storyboard_beats import plan_storyboard_beats  # noqa: E402
 from phases.phase5.storyboard_qa_gate import (  # noqa: E402
     run_generation_capacity_checks,
+    run_l1_checks,
 )
+from prompt.event_extractor import _annotate_global_event_flow  # noqa: E402
 from utils.action_units import (  # noqa: E402
     classify_micro_action,
     normalize_action_units,
@@ -65,6 +67,12 @@ def test_classifier_sustained_camera_and_state():
         "露出轻松自然的笑容",
         "与镜头保持自信的眼神交流",
         "整段动作一气呵成并向前推进",
+        "第一个路人注意到音乐和女主的动作",
+        "音乐进入更加明显的节奏段落",
+        "音乐播放至最后几个重拍节点",
+        "视频录制进入收尾阶段",
+        "女主不停止舞蹈，互动动作融入舞步",
+        "女主与全体舞者未停止舞蹈，也未集体站住摆最终Pose",
     ]:
         assert classify_micro_action(text) == "sustained", text
 
@@ -181,8 +189,88 @@ def test_zero_cost_event_still_requires_one_primary_occurrence():
 def test_flashmob_60s_script_passes_capacity_gate():
     events = json.loads(FIXTURE.read_text(encoding="utf-8"))
     assert len(events) == 26
+
+    _annotate_global_event_flow(events, continuity_mode="one_take")
+    plan = engine._estimate_action_capacity_plan(events, 60, 12)
+
+    assert plan["generation_action_units"] == 19
+    assert plan["primary_shots"] == 4
+    assert plan["minimum_material_duration"] == 70
+    assert plan["material_duration"] == 75
+    assert plan["maximum_material_duration"] == 78
     shots = engine.estimate_action_aware_shot_count(events, 60, 12)
-    assert shots >= 1
+    assert shots == 4
+
+
+def test_sequence_fragmentation_is_rejected_before_skeleton_llm():
+    events = json.loads(FIXTURE.read_text(encoding="utf-8"))
+
+    with pytest.raises(
+        ValueError,
+        match=r"sequence-isolated primary shots.*packing: SEQ001=1u",
+    ):
+        engine.estimate_action_aware_shot_count(events, 60, 12)
+
+
+def test_flashmob_one_take_has_a_feasible_four_beat_skeleton(monkeypatch):
+    events = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    _annotate_global_event_flow(events, continuity_mode="one_take")
+    source_groups = [range(1, 6), range(6, 11), range(11, 19), range(19, 27)]
+    beats = [
+        {
+            "beat_order": index,
+            "source_events": list(source_group),
+            "action": "merge",
+            "reason": "按连续动作容量装箱",
+            "who": [],
+            "where": "日本都市街头",
+            "what": f"连续舞蹈段落 {index}",
+            "suggested_duration": duration,
+        }
+        for index, (source_group, duration) in enumerate(
+            zip(source_groups, [20, 20, 18, 17], strict=True),
+            1,
+        )
+    ]
+    monkeypatch.setattr(
+        engine,
+        "_call_llm_with_timeout_retry",
+        lambda *_args, **_kwargs: json.dumps(
+            {"strategy": "四段连续动作装箱", "beats": beats},
+            ensure_ascii=False,
+        ),
+    )
+    profile = engine.get_video_capabilities()
+
+    skeleton = engine._build_beat_skeleton(events, "", 75, 19, 4)
+
+    assert engine._beat_content_loads(skeleton["beats"], events, profile) == [3, 3, 2, 2]
+
+
+def test_storyboard_material_may_exceed_delivery_only_within_1_3x():
+    valid = {
+        "target_duration": 75,
+        "delivery_target_duration": 60,
+        "pre_edit_duration_ratio_limit": 1.3,
+        "shots": [{"id": "S01", "duration": 75}],
+    }
+    issues, _ = run_l1_checks(valid, "")
+    assert not {
+        issue["code"] for issue in issues
+    } & {
+        "pre_edit_material_below_delivery_target",
+        "pre_edit_material_ratio_exceeded",
+    }
+
+    too_long = {**valid, "target_duration": 79, "shots": [{"id": "S01", "duration": 79}]}
+    issues, _ = run_l1_checks(too_long, "")
+    assert "pre_edit_material_ratio_exceeded" in {issue["code"] for issue in issues}
+
+    too_short = {**valid, "target_duration": 59, "shots": [{"id": "S01", "duration": 59}]}
+    issues, _ = run_l1_checks(too_short, "")
+    assert "pre_edit_material_below_delivery_target" in {
+        issue["code"] for issue in issues
+    }
 
 
 def test_composite_motion_keeps_full_ledger_through_pxx_and_qa():
@@ -221,10 +309,11 @@ def test_dense_sequential_combat_chain_still_fails_when_budget_too_small():
         "event_role": "action_chain",
         "micro_actions": [
             "起势蓄力", "挥拳", "肘击", "膝击", "扫腿",
-            "擒拿", "过肩摔", "地面压制", "锁技", "降服拍地",
+            "擒拿", "过肩摔", "地面压制", "锁技", "锁喉",
+            "翻滚压制", "降服拍地",
         ],
     }]
-    with pytest.raises(ValueError, match="cannot carry the authored action detail"):
+    with pytest.raises(ValueError, match="delivery allows at most"):
         engine.estimate_action_aware_shot_count(events, 30, 12)
 
 
@@ -246,5 +335,5 @@ def test_generic_dense_actions_still_fail():
         *generic[8:],
         {"event_role": "scene_setup"},
     ]
-    with pytest.raises(ValueError, match="cannot carry the authored action detail"):
+    with pytest.raises(ValueError, match="delivery allows at most"):
         engine.estimate_action_aware_shot_count(events, 60, 10)

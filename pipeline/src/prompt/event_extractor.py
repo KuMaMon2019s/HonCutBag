@@ -183,6 +183,7 @@ _NARRATIVE_JUMP_CUES = (
     "与此同时", "另一边", "次日", "翌日", "后来", "数小时后", "多年后", "回忆",
     "梦境", "转场", "来到", "抵达", "离开当前", "meanwhile", "later", "next day",
 )
+EVENT_FLOW_SCHEMA_VERSION = "4.0"
 
 
 def _normalize_event(event: Dict[str, Any], source_content: str = "") -> Dict[str, Any]:
@@ -361,7 +362,10 @@ def _extract_events_from_segment(segment: Dict[str, Any]) -> List[Dict[str, Any]
 
 
 def extract_events(
-    segments: List[Dict[str, Any]], checkpoint_dir: str | Path | None = None
+    segments: list[dict[str, Any]],
+    checkpoint_dir: str | Path | None = None,
+    *,
+    continuity_mode: str | None = None,
 ) -> Dict[str, Any]:
     """
     核心函数：从 segments 列表中提取所有事件
@@ -427,13 +431,14 @@ def extract_events(
             all_events.append(event)
             event_id += 1
 
-    _annotate_global_event_flow(all_events)
+    _annotate_global_event_flow(all_events, continuity_mode=continuity_mode)
 
     source_hash = hashlib.sha256(
         json.dumps(source_segments, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
     return {
-        "schema_version": "3.0",
+        "schema_version": EVENT_FLOW_SCHEMA_VERSION,
+        "continuity_mode": continuity_mode,
         "document_format": next(
             (str(segment.get("format_hint")) for segment in source_segments if segment.get("format_hint")),
             "general_prose",
@@ -446,8 +451,23 @@ def extract_events(
     }
 
 
-def _annotate_global_event_flow(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Assign deterministic global sequence/action/dialogue identities in source order."""
+def _annotate_global_event_flow(
+    events: list[dict[str, Any]],
+    *,
+    continuity_mode: str | None = None,
+) -> list[dict[str, Any]]:
+    """Assign deterministic global sequence/action/dialogue identities in source order.
+
+    An explicit one-take direction is a source-level continuity fact. Segment-local
+    extraction may still call later paragraphs a ``cut`` because their location is
+    paraphrased (``street``, ``road ahead``, ``sidewalk``). In one-take mode those
+    paragraph boundaries must not become unrelated screenplay sequences.
+    """
+    preserve_one_take = str(continuity_mode or "").strip().lower() in {
+        "one_take",
+        "single_take",
+        "oner",
+    }
     sequence_number = 0
     action_number = 0
     dialogue_number = 0
@@ -461,13 +481,22 @@ def _annotate_global_event_flow(events: List[Dict[str, Any]]) -> List[Dict[str, 
             and str(previous.get("where") or "").strip() == str(event.get("where") or "").strip()
         )
         compatible_place = bool(previous and _locations_compatible(previous, event))
-        if previous and boundary == "cut" and _should_repair_cross_segment_boundary(previous, event):
+        if previous and preserve_one_take and not _has_narrative_jump(event):
+            if boundary != "continuous":
+                event["model_continuity_before"] = boundary
+                event["continuity_repair_reason"] = (
+                    "explicit one-take source keeps all events in one screenplay sequence"
+                )
+            boundary = "continuous"
+        elif previous and boundary == "cut" and _should_repair_cross_segment_boundary(previous, event):
             event["model_continuity_before"] = "cut"
             event["continuity_repair_reason"] = (
                 "cross-segment causal action state continues despite location wording drift"
             )
             boundary = "continuous"
-        if index == 1 or boundary != "continuous" or not (exact_same_place or compatible_place):
+        if index == 1 or boundary != "continuous" or (
+            not preserve_one_take and not (exact_same_place or compatible_place)
+        ):
             boundary = "cut"
             sequence_number += 1
             current_sequence = f"SEQ{sequence_number:03d}"
@@ -515,17 +544,21 @@ def _should_repair_cross_segment_boundary(
         return False
     if current.get("event_role") in {"scene_setup", "transition"}:
         return False
-    combined = " ".join(
-        str(current.get(field) or "")
-        for field in ("what", "start_state", "causal_link", "source_excerpt")
-    )
-    if any(cue in combined for cue in _NARRATIVE_JUMP_CUES):
+    if _has_narrative_jump(current):
         return False
     previous_who = set(previous.get("who") or [])
     current_who = set(current.get("who") or [])
     shared_subject = bool(previous_who & current_who)
     causal = bool(str(current.get("causal_link") or "").strip())
     return shared_subject and causal and _locations_compatible(previous, current)
+
+
+def _has_narrative_jump(event: dict[str, Any]) -> bool:
+    combined = " ".join(
+        str(event.get(field) or "")
+        for field in ("what", "start_state", "causal_link", "source_excerpt")
+    )
+    return any(cue in combined for cue in _NARRATIVE_JUMP_CUES)
 
 
 def extract_events_from_text(text: str) -> Dict[str, Any]:

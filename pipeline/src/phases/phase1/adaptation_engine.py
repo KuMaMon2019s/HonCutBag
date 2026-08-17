@@ -16,13 +16,13 @@
   what, emotion, visual, suggested_duration, transition_to_next）
 
 逻辑：
-1. 计算可用时长：target_duration / avg_shot_duration = 最大 shot 数
+1. 计算 sequence 装箱下限与最多 1.3× 的剪辑前素材预算
 2. 调用 LLM 做改编决策：
    - keep：重要事件保留
    - merge：相似/连续事件合并
    - drop：重复/不重要事件删减
    - expand：关键情感时刻可扩展为多镜
-3. 为每个 shot 分配时长（总计不超过 target_duration）
+3. 为每个 shot 分配可执行素材时长；Phase 8 再按交付时长精确剪辑
 4. 建议转场方式（cut/dissolve/fade）
 5. 输出排序后的 shot 列表
 """
@@ -72,7 +72,7 @@ SYSTEM_PROMPT = (
 
 USER_PROMPT_TEMPLATE = (
     "目标时长：{target_duration}秒，每镜约{shot_duration}秒，必须输出恰好{max_shots}个镜头。"
-    "每镜只完成一个明确情节。\n\n"
+    "每镜只完成一个明确情节，并遵守当前视频模型的 generation_action_units 上限。\n\n"
     "事件列表：\n{events_json}\n\n"
     "角色列表：\n{characters_summary}\n\n"
     "请输出一个 JSON 对象，包含：\n"
@@ -125,10 +125,11 @@ USER_PROMPT_TEMPLATE = (
     "- 一个导演级镜头可以容纳同一 sequence_id 中多个连续 action_unit；必须保留全部动作单元，"
     "后续由编剧引擎按单段内容承载能力与相邻一级分镜边界自动拆成 1–3 个内部 Pxx；拆分只能重排时长，"
     "必须逐项覆盖当前 Sxx 的 micro_actions，保持原顺序和 start_state→end_state 因果，不得新增剧情。\n"
-    "- 不同 sequence_id、明确换场/跳时或独立 turning_point 不得为了减少镜头而错误合并。\n"
+    "- 不同 sequence_id、明确换场/跳时不得为了减少镜头而错误合并。\n"
     "- visual 必须按 micro_actions 的原始顺序描述，保留 start_state→动作→end_state 和 causal_link，"
     "禁止概括成‘双方激烈打斗’。\n"
-    "- turning_point/dramatic_turn 必须保留为独立叙事节拍，不得与普通交锋合并掉。\n"
+    "- turning_point/dramatic_turn 必须在 what/visual 中明确保留；同一 sequence 内可与紧邻因果动作"
+    "共用一个导演级镜头，但不得被概括或吞掉。\n"
     "- lines 中 speaker/confidence/evidence 是对白归属证据；低置信度时不得擅自换成另一角色。\n\n"
     "【片段间过渡规则】\n"
     "相邻片段之间必须设计过渡桥梁，消灭跳跃感：\n"
@@ -206,7 +207,7 @@ BATCH_EXPAND_PROMPT = (
     "end_state/causal_link/continuity_before；按动作原顺序展开，禁止用‘激烈打斗’代替具体招式与结果。"
     "同一 sequence_id 的相邻 action_unit 可以归入同一个导演级镜头，必须保留全部 micro_actions，"
     "供后续编剧引擎按内容承载能力与相邻边界拆成 1–3 个 Pxx 顺序执行；剧情格必须逐项覆盖当前 Sxx 的原始动作，"
-    "不得改序、遗漏、新增剧情或提前执行下一 Sxx；跨 sequence 或 turning_point 必须独立保留。"
+    "不得改序、遗漏、新增剧情或提前执行下一 Sxx；跨 sequence 必须拆开，turning_point 必须明确保留。"
     "每个事件在 shots 中的 source_events 引用次数不得少于输入中的 minimum_primary_beat_occurrences；"
     "重复引用只分担该事件尚未表现的后续动作。\n"
     "【片段间过渡规则】相邻片段用动作桥梁、情绪接力、空间视线或台词黏合消灭跳跃感。\n"
@@ -282,6 +283,11 @@ NETWORK_RETRIES = 2  # 网络超时自动重试次数（2026-08-09 R7: 70事件�
 AVG_SHOT_DURATION = 12  # 默认每镜时长（秒）
 CHARS_PER_SECOND = 4  # 中文剧本预估：约 4 字/秒（范围 3-5）
 DEFAULT_TARGET_DURATION = 60  # 默认目标时长（用户未指定时使用）
+
+# Phase 1 plans source material; Phase 8 owns the frame-exact delivery trim.
+# Keep the delivery duration unchanged downstream while permitting at most 30%
+# pre-edit coverage for redundant motion, continuity work and transition handles.
+MAX_PRE_EDIT_DURATION_RATIO = 1.3
 
 
 def estimate_duration_from_text(text: str) -> int:
@@ -362,9 +368,131 @@ def estimate_action_aware_shot_count(
     sustained states and camera constraints cost nothing.  The full ledger is
     preserved for audit and beat partitioning.
     """
+    return _estimate_action_capacity_plan(
+        events,
+        target_duration,
+        requested_shot_duration,
+    )["primary_shots"]
+
+
+def _minimum_primary_duration_for_units(
+    generation_units: int,
+    capabilities: VideoModelCapabilities,
+) -> int:
+    """Return executable story time for one base clip plus its extensions."""
+    content_beats = max(
+        1,
+        math.ceil(generation_units / capabilities.max_micro_actions_per_beat),
+    )
+    if content_beats > MAX_CONTENT_BEATS_PER_PRIMARY_SHOT:
+        raise ValueError(
+            f"{generation_units} generation action units exceed one primary shot's "
+            f"{MAX_CONTENT_BEATS_PER_PRIMARY_SHOT}-clip capacity"
+        )
+    first_minimum, _ = capabilities.effective_duration_bounds("multi_image")
+    tail_minimum, _ = capabilities.effective_duration_bounds("tail_video_extend")
+    return math.ceil(max(
+        min_primary_story_duration(capabilities),
+        first_minimum + max(0, content_beats - 1) * tail_minimum,
+    ))
+
+
+def _sequence_material_cost(
+    generation_units: int,
+    primary_shots: int,
+    capabilities: VideoModelCapabilities,
+    *,
+    maximize: bool = False,
+) -> float:
+    """Find an executable allocation bound for one isolated sequence."""
+    if primary_shots < 1:
+        return math.inf
+    unit_capacity = (
+        capabilities.max_micro_actions_per_beat
+        * MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
+    )
+    if generation_units > primary_shots * unit_capacity:
+        return math.inf
+
+    costs: dict[int, float] = {0: 0.0}
+    for _ in range(primary_shots):
+        next_costs: dict[int, float] = {}
+        for assigned, current_cost in costs.items():
+            remaining = generation_units - assigned
+            for shot_units in range(min(unit_capacity, remaining) + 1):
+                total = assigned + shot_units
+                candidate = current_cost + _minimum_primary_duration_for_units(
+                    shot_units,
+                    capabilities,
+                )
+                previous = next_costs.get(total)
+                if previous is None or (
+                    candidate > previous if maximize else candidate < previous
+                ):
+                    next_costs[total] = candidate
+        costs = next_costs
+    return costs.get(generation_units, math.inf)
+
+
+def _sequence_generation_unit_counts(
+    events: list[dict[str, Any]],
+) -> list[tuple[str, int]]:
+    """Aggregate normalized action units by non-mergeable screenplay sequence."""
+    unit_counts = _event_generation_action_unit_counts(events)
+    ordered: dict[str, int] = {}
+    for event_id, event in enumerate(events, 1):
+        sequence = str(event.get("sequence_id") or "").strip() or "__unspecified__"
+        ordered.setdefault(sequence, 0)
+        ordered[sequence] += unit_counts[event_id]
+    return list(ordered.items())
+
+
+def _material_duration_bound(
+    sequence_units: list[tuple[str, int]],
+    primary_shots: int,
+    capabilities: VideoModelCapabilities,
+    *,
+    maximize: bool = False,
+) -> float:
+    """Return a layout-duration bound with every shot owned by one sequence."""
+    allocations: dict[int, float] = {0: 0.0}
+    unit_capacity = (
+        capabilities.max_micro_actions_per_beat
+        * MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
+    )
+    for _sequence, units in sequence_units:
+        minimum_shots = max(1, math.ceil(units / unit_capacity))
+        next_allocations: dict[int, float] = {}
+        for used, current_cost in allocations.items():
+            for count in range(minimum_shots, primary_shots - used + 1):
+                sequence_cost = _sequence_material_cost(
+                    units,
+                    count,
+                    capabilities,
+                    maximize=maximize,
+                )
+                if math.isinf(sequence_cost):
+                    continue
+                total_shots = used + count
+                candidate = current_cost + sequence_cost
+                previous = next_allocations.get(total_shots)
+                if previous is None or (
+                    candidate > previous if maximize else candidate < previous
+                ):
+                    next_allocations[total_shots] = candidate
+        allocations = next_allocations
+    return allocations.get(primary_shots, math.inf)
+
+
+def _estimate_action_capacity_plan(
+    events: list[dict[str, Any]],
+    delivery_duration: int,
+    requested_shot_duration: int,
+) -> dict[str, Any]:
+    """Plan truthful sequence packing inside the bounded pre-edit allowance."""
     profile = get_video_capabilities()
     baseline = estimate_shot_count(
-        target_duration,
+        delivery_duration,
         requested_shot_duration,
         profile,
     )
@@ -373,30 +501,63 @@ def estimate_action_aware_shot_count(
         for event in events
         if str(event.get("event_role") or "") != "drop"
     ]
-    content_requirements = _event_content_beat_requirements(authored_events, profile)
-    required_primary_shots = baseline
-    action_content_beats = 0
-    for event_id, event in enumerate(authored_events, 1):
-        beats = content_requirements[event_id]
-        if event.get("micro_actions"):
-            action_content_beats += beats
-        required_primary_shots += max(
-            0,
-            math.ceil(beats / MAX_CONTENT_BEATS_PER_PRIMARY_SHOT) - 1,
-        )
-    required_primary_shots = max(1, required_primary_shots)
-    required_content_beats = max(baseline, action_content_beats)
-    minimum_runtime = max(
-        required_primary_shots * min_primary_story_duration(profile),
-        required_content_beats * profile.min_unique_beat_s,
+    sequence_units = _sequence_generation_unit_counts(authored_events)
+    if not sequence_units:
+        sequence_units = [("__unspecified__", 0)]
+    unit_capacity = (
+        profile.max_micro_actions_per_beat * MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
     )
-    if target_duration + 1e-6 < minimum_runtime:
+    structural_shots = sum(
+        max(1, math.ceil(units / unit_capacity))
+        for _sequence, units in sequence_units
+    )
+    primary_shots = max(1, baseline, structural_shots)
+    minimum_material_duration = _material_duration_bound(
+        sequence_units,
+        primary_shots,
+        profile,
+    )
+    worst_case_material_duration = _material_duration_bound(
+        sequence_units,
+        primary_shots,
+        profile,
+        maximize=True,
+    )
+    maximum_material_duration = math.floor(
+        float(delivery_duration) * MAX_PRE_EDIT_DURATION_RATIO + 1e-6
+    )
+    if minimum_material_duration > maximum_material_duration + 1e-6:
+        sequence_summary = ", ".join(
+            f"{sequence}={units}u"
+            for sequence, units in sequence_units
+        ) or "no authored sequences"
         raise ValueError(
-            f"{target_duration}s cannot carry the authored action detail across "
-            f"{required_primary_shots} primary shots for {profile.name}; requires at "
-            f"least {minimum_runtime:g}s"
+            "cannot carry the authored action detail: "
+            f"{delivery_duration}s delivery allows at most "
+            f"{maximum_material_duration}s of pre-edit material (1.3x), but the "
+            f"authored structure needs at least {minimum_material_duration:g}s across "
+            f"{primary_shots} sequence-isolated primary shots for {profile.name}; "
+            f"packing: {sequence_summary}"
         )
-    return max(baseline, required_primary_shots)
+    return {
+        "primary_shots": primary_shots,
+        "structural_shots": structural_shots,
+        "generation_action_units": sum(units for _sequence, units in sequence_units),
+        "sequence_generation_action_units": dict(sequence_units),
+        "minimum_material_duration": math.ceil(minimum_material_duration),
+        "worst_case_material_duration": math.ceil(worst_case_material_duration),
+        "maximum_material_duration": maximum_material_duration,
+        "pre_edit_duration_ratio_limit": MAX_PRE_EDIT_DURATION_RATIO,
+        "material_duration": max(
+            int(delivery_duration),
+            min(
+                maximum_material_duration,
+                math.ceil(worst_case_material_duration),
+            ),
+        ),
+        "delivery_duration": int(delivery_duration),
+        "capability_profile": profile.name,
+    }
 
 
 def _event_primary_occurrence_requirement(
@@ -1152,14 +1313,17 @@ BEAT_SKELETON_PROMPT = (
     '"action":"keep/merge/drop","reason":"一句话理由","who":["角色主名"],'
     '"where":"地点","what":"一句话事件","suggested_duration":15}}]}}。\n'
     "【全局铁律】\n"
-    "1. beats 数量必须恰好等于 {beat_count}，总建议时长应接近 {target_duration} 秒（±10%）。\n"
+    "1. beats 数量必须恰好等于 {beat_count}，总建议时长应接近 {target_duration} 秒（±10%）；"
+    "每个 beat 的 generation_action_unit_count 合计不得超过 "
+    "{max_generation_action_units_per_beat}。\n"
     "2. 每个输入事件编号必须且至少被某个 beat 的 source_events 引用；删减事件也必须放入 action=drop 的 beat 显式声明。"
     "同一事件若分配给多个 beat，后一个 beat 必须承接前一个，只负责该事件后续尚未表现的动作，禁止重放整段事件。\n"
     "3. keep 保留关键因果/情感节点，merge 合并连续或重复事件，drop 只删不影响因果链的内容。\n"
     "4. 台词归属必须忠于原事件；who 只能使用角色列表主名，别名改为主名，群众不得写入 who。\n"
     "5. beat 是导演级叙事镜头，不是单次视频调用。同一 sequence_id 的连续 action_unit 可以合并，"
     "但必须完整保留 source_events 与 micro_actions 原顺序，后续会拆成 P01/P02…；不同 sequence_id、"
-    "换场/跳时及 turning_point 不得错误合并。每个事件在 beats 中的引用次数不得少于输入中的 "
+    "换场/跳时不得错误合并。turning_point 可与同 sequence 中紧邻的因果动作共用 beat，但必须明确"
+    "保留转折。每个事件在 beats 中的引用次数不得少于输入中的 "
     "minimum_primary_beat_occurrences；同一事件的后续引用只承载尚未表现的动作，不得重放。\n"
     "6. sequence_id 与 continuity_before 是生成连续性依据。同一 sequence 的连续单元尽量落在相邻 beat，"
     "换场/跳时/关系转折不得为了省镜头而错误连拍。\n"
@@ -1225,18 +1389,10 @@ def _validate_beat_action_capacity(
             for event in details
             if str(event.get("sequence_id") or "").strip()
         }
-        turning_points = [
-            event for event in details
-            if event.get("event_role") in {"turning_point", "dramatic_turn"}
-        ]
         if len(sequences) > 1:
             raise ValueError(
                 f"beat {beat.get('beat_order')} merges unrelated sequences "
                 f"{sorted(sequences)}"
-            )
-        if turning_points and len(details) > len(turning_points):
-            raise ValueError(
-                f"beat {beat.get('beat_order')} merges a turning point with ordinary events"
             )
     content_loads = _beat_content_loads(beats, events, profile)
     for index, content_beats in enumerate(content_loads, 1):
@@ -1261,6 +1417,31 @@ def _validate_beat_action_capacity(
                 f"its normalized generation action units while preserving all "
                 f"{len(actions)} micro-actions; observed {observed}"
             )
+
+
+def _validate_beat_material_duration(
+    beats: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    material_duration: int,
+    capabilities: VideoModelCapabilities,
+) -> None:
+    """Reject a capacity-valid layout whose clip minima exceed its material clock."""
+    content_loads = _beat_content_loads(beats, events, capabilities)
+    first_minimum, _ = capabilities.effective_duration_bounds("multi_image")
+    tail_minimum, _ = capabilities.effective_duration_bounds("tail_video_extend")
+    lower_bounds = [
+        math.ceil(max(
+            min_primary_story_duration(capabilities),
+            first_minimum + max(0, load - 1) * tail_minimum,
+        ))
+        for load in content_loads
+    ]
+    required = sum(lower_bounds)
+    if required > material_duration:
+        raise ValueError(
+            f"beat layout needs at least {required}s of provider-executable material; "
+            f"budget is {material_duration}s (per-beat minima: {lower_bounds})"
+        )
 
 
 def _beat_content_loads(
@@ -1327,12 +1508,6 @@ def _repair_beat_action_capacity(
     event_by_id = {index: event for index, event in enumerate(events, 1)}
     occurrence_requirements = _event_primary_occurrence_requirements(events, profile)
 
-    def is_turning(event: Dict[str, Any]) -> bool:
-        return bool(
-            event.get("dramatic_turn")
-            or event.get("event_role") in {"turning_point", "dramatic_turn"}
-        )
-
     def legal_merge(event_id: int, beat: Dict[str, Any]) -> bool:
         if beat.get("action") == "drop":
             return False
@@ -1350,8 +1525,6 @@ def _repair_beat_action_capacity(
             if str(detail.get("sequence_id") or "").strip()
         }
         if sequence and other_sequences and other_sequences != {sequence}:
-            return False
-        if is_turning(event) or any(is_turning(detail) for detail in details):
             return False
         return True
 
@@ -1399,8 +1572,8 @@ def _repair_beat_action_capacity(
             if not candidates:
                 raise ValueError(
                     f"event {event_id} needs {required} primary beats, but no adjacent "
-                    "beat can accept another occurrence without crossing a sequence, "
-                    "merging a turning point, or exceeding provider capacity"
+                    "beat can accept another occurrence without crossing a sequence "
+                    "or exceeding provider capacity"
                 )
             candidate = min(candidates)[-1]
             repaired[candidate]["source_events"] = sorted(
@@ -1473,17 +1646,23 @@ def _build_beat_skeleton(
         profile,
     )
     occurrence_requirements = _event_primary_occurrence_requirements(events, profile)
+    generation_unit_counts = _event_generation_action_unit_counts(events)
     prompt_events = []
     for event_id, event in enumerate(events, 1):
         prompt_event = dict(event)
         prompt_event["minimum_primary_beat_occurrences"] = occurrence_requirements[
             event_id
         ]
+        prompt_event["generation_action_unit_count"] = generation_unit_counts[event_id]
         prompt_events.append(prompt_event)
     prompt = BEAT_SKELETON_PROMPT.format(
         target_duration=target_duration,
         shot_duration=shot_duration,
         beat_count=beat_count,
+        max_generation_action_units_per_beat=(
+            profile.max_micro_actions_per_beat
+            * MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
+        ),
         events_json=_build_events_json(prompt_events),
         characters_summary=characters_summary,
     )
@@ -1493,7 +1672,10 @@ def _build_beat_skeleton(
             if attempt:
                 attempt_prompt += (
                     "\n\n【重试纠错】上次骨架合并了不相关叙事。同一 sequence_id 的连续"
-                    "action_unit 可以合并并保留完整顺序；跨 sequence 或 turning_point 必须拆开。"
+                    "action_unit 可以合并并保留完整顺序；跨 sequence 必须拆开；turning_point"
+                    "必须明确保留但可以与同 sequence 的紧邻因果动作共用 beat。"
+                    f"每个 beat 最多承载 {profile.max_micro_actions_per_beat * MAX_CONTENT_BEATS_PER_PRIMARY_SHOT}"
+                    "个 generation_action_units。"
                     "每个事件在 beats 中出现的次数不得少于它的 "
                     "minimum_primary_beat_occurrences；重复引用只分担尚未表现的后续动作。"
                 )
@@ -1503,6 +1685,15 @@ def _build_beat_skeleton(
                 skeleton["beats"], events, profile
             )
             _validate_beat_action_capacity(skeleton["beats"], events, profile)
+            if target_duration >= len(skeleton["beats"]) * math.ceil(
+                min_primary_story_duration(profile)
+            ):
+                _validate_beat_material_duration(
+                    skeleton["beats"],
+                    events,
+                    target_duration,
+                    profile,
+                )
             event_by_id = {i: dict(event, event_id=i) for i, event in enumerate(events, 1)}
             for beat in skeleton["beats"]:
                 beat["_source_event_details"] = [event_by_id[event_id] for event_id in beat["source_events"]]
@@ -1655,7 +1846,7 @@ def _atomic_write_json(path: Path, value: Any) -> None:
     os.replace(temporary, path)
 
 
-LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v2"
+LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v3"
 
 
 def _layered_input_fingerprint(
@@ -1756,12 +1947,12 @@ def adapt_events(
     Args:
         events: 事件列表（event_extractor.py 输出）
         characters: 角色列表（character_discoverer.py 输出，可选）
-        target_duration: 目标总时长（秒），默认 None（根据剧本长度智能预估）
+        target_duration: 最终交付时长（秒），默认 None（根据剧本长度智能预估）
         shot_duration: 每镜平均时长（秒），默认 12
         source_text: 原始剧本文本（用于智能预估时长）
 
     Returns:
-        包含 target_duration, estimated_shots, strategy, shots 的字典
+        包含交付时长、剪辑前素材时长、容量计划与 shots 的字典
 
     Raises:
         ValueError: 事件为空或时长不合理
@@ -1787,13 +1978,19 @@ def adapt_events(
     if shot_duration <= 0:
         raise ValueError(f"每镜时长不合理：{shot_duration}秒（必须大于 0）")
 
-    # ── 计算导演级 shot 数；内部生成容量由 storyboard_beats 承担 ─────────
-    max_shots = estimate_action_aware_shot_count(events, target_duration, shot_duration)
+    # ── 分离交付时长与 Phase 8 剪辑前的素材时长 ───────────────────────────
+    capacity_plan = _estimate_action_capacity_plan(
+        events,
+        target_duration,
+        shot_duration,
+    )
+    max_shots = capacity_plan["primary_shots"]
+    material_duration = capacity_plan["material_duration"]
     effective_shot_duration = max(
         min_primary_story_duration(capability_profile),
         min(
             max_primary_story_duration(capability_profile),
-            round(target_duration / max_shots),
+            round(material_duration / max_shots),
         ),
     )
 
@@ -1801,12 +1998,14 @@ def adapt_events(
     occurrence_requirements = _event_primary_occurrence_requirements(
         events, capability_profile
     )
+    generation_unit_counts = _event_generation_action_unit_counts(events)
     prompt_events = []
     for event_id, event in enumerate(events, 1):
         prompt_event = dict(event)
         prompt_event["minimum_primary_beat_occurrences"] = occurrence_requirements[
             event_id
         ]
+        prompt_event["generation_action_unit_count"] = generation_unit_counts[event_id]
         prompt_events.append(prompt_event)
     events_json = _build_events_json(prompt_events)
     characters_summary = _build_characters_summary(characters)
@@ -1818,7 +2017,7 @@ def adapt_events(
         layered_fingerprint = _layered_input_fingerprint(
             events,
             characters_summary,
-            target_duration,
+            material_duration,
             effective_shot_duration,
             max_shots,
         )
@@ -1833,7 +2032,7 @@ def adapt_events(
             )
         if skeleton is None:
             skeleton = _build_beat_skeleton(
-                events, characters_summary, target_duration, effective_shot_duration,
+                events, characters_summary, material_duration, effective_shot_duration,
                 max_shots,
             )
             skeleton["_checkpoint"] = {
@@ -1843,7 +2042,7 @@ def adapt_events(
             if checkpoint_dir is not None:
                 _atomic_write_json(checkpoint_dir / "beat_skeleton.json", skeleton)
         shots = _expand_beats_to_shots(
-            skeleton["beats"], characters_summary, target_duration, effective_shot_duration,
+            skeleton["beats"], characters_summary, material_duration, effective_shot_duration,
             output_dir=checkpoint_dir,
             resumed_shots=resumed_shots,
             checkpoint_fingerprint=layered_fingerprint,
@@ -1858,7 +2057,7 @@ def adapt_events(
         from quality.shot_continuity import annotate_boundaries
 
         annotate_boundaries(shots)
-        normalize_shot_durations(shots, target_duration, capability_profile)
+        normalize_shot_durations(shots, material_duration, capability_profile)
 
         for i, shot in enumerate(shots):
             if i > 0:
@@ -1876,13 +2075,17 @@ def adapt_events(
                 shot["prev_shot_context"] = ""
 
         total_duration = sum(shot.get("suggested_duration", 0) for shot in shots)
-        if abs(total_duration - target_duration) > target_duration * 0.10:
+        if abs(total_duration - material_duration) > material_duration * 0.10:
             print(
-                f"  ⚠ 分镜建议总时长 {total_duration}秒与目标 {target_duration}秒偏差超过 10%",
+                f"  ⚠ 分镜建议总时长 {total_duration}秒与素材目标 "
+                f"{material_duration}秒偏差超过 10%",
                 file=sys.stderr,
             )
         return {
             "target_duration": target_duration,
+            "delivery_target_duration": target_duration,
+            "material_duration": material_duration,
+            "capacity_plan": capacity_plan,
             "estimated_shots": len(shots),
             "requested_shot_duration": shot_duration,
             "effective_shot_duration": effective_shot_duration,
@@ -1893,9 +2096,13 @@ def adapt_events(
 
     # [LEGACY-KEEP layered-adapt] 原单次调用路径；显式 single 或事件数 <= 10 时使用。
     user_prompt = USER_PROMPT_TEMPLATE.format(
-        target_duration=target_duration,
+        target_duration=material_duration,
         shot_duration=effective_shot_duration,
         max_shots=max_shots,
+        max_generation_action_units_per_shot=(
+            capability_profile.max_micro_actions_per_beat
+            * MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
+        ),
         events_json=events_json,
         characters_summary=characters_summary,
     )
@@ -1926,6 +2133,12 @@ def adapt_events(
                 events,
                 capability_profile,
             )
+            _validate_beat_material_duration(
+                parsed["shots"],
+                events,
+                material_duration,
+                capability_profile,
+            )
             break
         except (json.JSONDecodeError, ValueError) as e:
             if attempt < MAX_RETRIES:
@@ -1950,7 +2163,7 @@ def adapt_events(
     from quality.shot_continuity import annotate_boundaries
 
     annotate_boundaries(shots)
-    normalize_shot_durations(shots, target_duration, capability_profile)
+    normalize_shot_durations(shots, material_duration, capability_profile)
 
     # Add continuity context between shots (镜头连贯性)
     for i, shot in enumerate(shots):
@@ -1974,6 +2187,9 @@ def adapt_events(
 
     result = {
         "target_duration": target_duration,
+        "delivery_target_duration": target_duration,
+        "material_duration": material_duration,
+        "capacity_plan": capacity_plan,
         "estimated_shots": len(shots),
         "requested_shot_duration": shot_duration,
         "effective_shot_duration": effective_shot_duration,

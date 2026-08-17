@@ -189,6 +189,46 @@ def test_global_flow_repairs_cross_segment_location_wording_drift():
     assert "cross-segment" in events[1]["continuity_repair_reason"]
 
 
+def test_global_flow_keeps_explicit_one_take_in_one_sequence():
+    events = [
+        _event(continuity_before="cut", where="繁忙的现代日本城市街道"),
+        _event(continuity_before="cut", where="镜头前方的行进路径"),
+        _event(
+            continuity_before="cut",
+            where="街边",
+            event_role="scene_setup",
+            micro_actions=[],
+        ),
+    ]
+
+    _annotate_global_event_flow(events, continuity_mode="one_take")
+
+    assert [event["sequence_id"] for event in events] == ["SEQ001"] * 3
+    assert [event["continuity_before"] for event in events] == [
+        "cut",
+        "continuous",
+        "continuous",
+    ]
+    assert events[1]["model_continuity_before"] == "cut"
+    assert "one-take" in events[1]["continuity_repair_reason"]
+
+
+def test_one_take_mode_does_not_hide_an_explicit_time_jump():
+    events = [
+        _event(continuity_before="cut", where="街道"),
+        _event(
+            continuity_before="cut",
+            where="街道",
+            what="次日回到同一条街道",
+        ),
+    ]
+
+    _annotate_global_event_flow(events, continuity_mode="one_take")
+
+    assert [event["sequence_id"] for event in events] == ["SEQ001", "SEQ002"]
+    assert events[1]["continuity_before"] == "cut"
+
+
 def test_group_participants_are_not_promoted_to_character_assets():
     payload = [_event(who=["凛", "烬", "数十机械单位"])]
 

@@ -820,12 +820,16 @@ def _generate_single_shot(
         "continuity_subject", "screen_direction", "tracking_prompt",
         "source_excerpt", "source_sequence_ids", "source_action_unit_ids",
         "source_events", "source_event_slices", "source_event_roles",
-        "micro_actions", "generation_actions",
+        "micro_actions", "generation_actions", "generation_action_units",
+        "generation_action_categories",
         "generation_load", "start_state", "end_state", "causal_link",
         "speaker_attribution",
         "aspect_ratio", "width", "height",
     ):
-        if shot.get(field):
+        if field in {"generation_action_units", "generation_action_categories"}:
+            if field in shot:
+                result[field] = shot[field]
+        elif shot.get(field):
             result[field] = shot[field]
     assets = shot.get("associate_assets", [])
     if assets:

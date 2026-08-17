@@ -1124,7 +1124,6 @@ def run_phase1_screenwriter(
         
         # 正常模式：调用 API
         try:
-            from prompt.event_extractor import extract_events
             from phases.phase1.character_discoverer import (
                 CHARACTER_CONTEXT_SCHEMA_VERSION,
                 _is_human_character,
@@ -1132,6 +1131,7 @@ def run_phase1_screenwriter(
             )
             from phases.phase1.adaptation_engine import adapt_events
             from phases.phase1.storyboard_generator import generate_storyboard
+            from prompt.event_extractor import EVENT_FLOW_SCHEMA_VERSION, extract_events
         except ImportError as e:
             return {"status": "error", "error": f"Phase 1 import failed: {e}", "duration_s": _elapsed(start)}
 
@@ -1143,7 +1143,14 @@ def run_phase1_screenwriter(
         nonempty_segments = [
             segment for segment in segments if str(segment.get("content", "")).strip()
         ]
-        events_input_hash = _phase1_input_hash(nonempty_segments)
+        continuity_mode = _continuity_mode_from_text(text)
+        events_input_hash = _phase1_input_hash([
+            {
+                "event_flow_schema_version": EVENT_FLOW_SCHEMA_VERSION,
+                "continuity_mode": continuity_mode,
+            },
+            *nonempty_segments,
+        ])
         expected_segment_ids = [segment.get("id", 0) for segment in nonempty_segments]
         events_result = _load_phase1_checkpoint(
             events_checkpoint,
@@ -1162,9 +1169,14 @@ def run_phase1_screenwriter(
         if events_result is not None:
             print("    ↻ 复用 phase1_events.json，跳过事件提取")
         else:
-            events_result = dict(extract_events(segments, checkpoint_dir=output_dir))
-            events_result.setdefault("schema_version", "3.0")
-            events_result.setdefault("source_segments_hash", events_input_hash)
+            events_result = dict(extract_events(
+                segments,
+                checkpoint_dir=output_dir,
+                continuity_mode=continuity_mode,
+            ))
+            events_result["schema_version"] = EVENT_FLOW_SCHEMA_VERSION
+            events_result["continuity_mode"] = continuity_mode
+            events_result["source_segments_hash"] = events_input_hash
             events_result.setdefault("source_segment_count", len(nonempty_segments))
             events_result.setdefault("covered_segment_ids", expected_segment_ids)
             events_result.setdefault("total_events", len(events_result.get("events", [])))
@@ -1265,7 +1277,16 @@ def run_phase1_screenwriter(
             visual_style_text=visual_style_text,
             config=project_video_spec or _project_video_spec("1080p"),
         )
-        continuity_mode = _continuity_mode_from_text(text)
+        storyboard["delivery_target_duration"] = duration
+        storyboard["material_duration"] = adapted.get(
+            "material_duration",
+            storyboard.get("target_duration"),
+        )
+        if adapted.get("capacity_plan"):
+            storyboard["capacity_plan"] = adapted["capacity_plan"]
+            storyboard["pre_edit_duration_ratio_limit"] = adapted["capacity_plan"].get(
+                "pre_edit_duration_ratio_limit"
+            )
         if continuity_mode:
             storyboard["continuity_mode"] = continuity_mode
         from phases.phase1.storyboard_beats import plan_storyboard_beats
