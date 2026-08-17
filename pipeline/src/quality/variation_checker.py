@@ -5,19 +5,22 @@ from typing import Any
 
 GENERIC_PHRASES = {"a person", "a beautiful", "modern", "futuristic", "cutting-edge", "sleek design", "innovative", "state-of-the-art", "next-generation", "revolutionary", "a professional", "dynamic", "vibrant", "stunning", "breathtaking", "amazing", "incredible", "powerful", "seamless", "elegant solution"}
 
+def _shot_language_value(
+    scene: dict[str, Any], key: str, default: str = "unspecified"
+) -> Any:
+    """Accept both the nested quality schema and Phase 1's flat schema."""
+    nested = scene.get("shot_language")
+    if isinstance(nested, dict) and nested.get(key) not in (None, ""):
+        return nested[key]
+    return scene.get(key, default)
+
 
 def check_scene_variation(scenes: list[dict[str, Any]]) -> dict[str, Any]:
     if not scenes:
         return {"score": 5.0, "verdict": "fail", "violations": ["No scenes to check"], "suggestions": []}
     violations, suggestions = [], []
-    def shot_language_value(scene: dict[str, Any], key: str, default: str = "unspecified") -> Any:
-        """Accept both the nested quality schema and Phase 1's flat shot schema."""
-        nested = scene.get("shot_language")
-        if isinstance(nested, dict) and nested.get(key) not in (None, ""):
-            return nested[key]
-        return scene.get(key, default)
 
-    sizes = [shot_language_value(s, "shot_size") for s in scenes]
+    sizes = [_shot_language_value(s, "shot_size") for s in scenes]
     if len(scenes) >= 4:
         size, count = Counter(sizes).most_common(1)[0]
         if count / len(scenes) > .5:
@@ -28,15 +31,15 @@ def check_scene_variation(scenes: list[dict[str, Any]]) -> dict[str, Any]:
         current = current + 1 if size == previous and size != "unspecified" else 1
         longest = max(longest, current)
     if longest >= 3: violations.append(f"{longest} consecutive same-size shots. Vary shot sizes between scenes for editorial rhythm.")
-    movements = [shot_language_value(s, "camera_movement") for s in scenes]
+    movements = [_shot_language_value(s, "camera_movement") for s in scenes]
     static = sum(m in ("static", "unspecified") for m in movements)
     if len(scenes) >= 4 and static / len(scenes) > .6:
         violations.append(f"{static}/{len(scenes)} scenes are static or unspecified movement. Add intentional camera movement to at least 40% of scenes.")
         suggestions.append("Consider dolly_in for emphasis, tracking for energy, or crane for scale.")
     lighting = {
-        shot_language_value(s, "lighting_key", "")
+        _shot_language_value(s, "lighting_key", "")
         for s in scenes
-        if shot_language_value(s, "lighting_key", "")
+        if _shot_language_value(s, "lighting_key", "")
     }
     if len(scenes) >= 4 and len(lighting) <= 1: violations.append(f"Only {len(lighting)} unique lighting setup(s) across {len(scenes)} scenes. Vary lighting to create mood shifts.")
     heroes = [(i, s) for i, s in enumerate(scenes) if s.get("hero_moment")]
@@ -44,9 +47,9 @@ def check_scene_variation(scenes: list[dict[str, Any]]) -> dict[str, Any]:
         violations.append("No hero_moment flagged. Every video should have at least one visual peak.")
         suggestions.append("Mark the most impactful scene as hero_moment=true.")
     for index, hero in heroes:
-        hero_size = shot_language_value(hero, "shot_size", "")
+        hero_size = _shot_language_value(hero, "shot_size", "")
         for neighbor in (index - 1, index + 1):
-            if 0 <= neighbor < len(scenes) and hero_size and hero_size == shot_language_value(scenes[neighbor], "shot_size", ""):
+            if 0 <= neighbor < len(scenes) and hero_size and hero_size == _shot_language_value(scenes[neighbor], "shot_size", ""):
                 violations.append(f"Hero scene '{hero.get('id')}' has same shot size as neighbor. Hero moments should be visually distinct from surrounding scenes.")
     generic = sum(
         any(

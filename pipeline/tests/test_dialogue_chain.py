@@ -48,6 +48,12 @@ def test_extracted_dialogue_lines_reach_adaptation_prompt(monkeypatch):
             "what": "凛质问烬",
             "visual": "两人隔着轨道对峙",
             "suggested_duration": 15,
+            "shot_size": "medium",
+            "camera_movement": "dolly_in",
+            "lighting_key": "low_key",
+            "shot_intent": "dialogue",
+            "hero_moment": False,
+            "texture_keywords": ["雨水反光", "轨道金属"],
             "dialogue": expected_lines[0],
         }]}, ensure_ascii=False)
 

@@ -654,6 +654,11 @@ def _build_eight_layer_prompt(
     scene_suffix = (scene_style_map or {}).get(where, "")
     visual_style = _load_default_visual_style(visual_style_path)
     lighting = _specific_lighting(shot, where, visual_style)
+    texture_keywords = [
+        str(value).strip()
+        for value in (shot.get("texture_keywords") or [])
+        if str(value).strip()
+    ]
     audio = str(shot.get("audio") or shot.get("sound") or "环境底噪与动作同期声")
     style_anchor = visual_style.style_prompt_short or visual_style.style_prompt_full or "电影叙事风格，35mm胶片质感"
     motion_contract = (
@@ -669,16 +674,25 @@ def _build_eight_layer_prompt(
     layers = []
     if references:
         layers.append("元素参考声明：" + "；".join(references))
-    subject_summary = build_subject_summary([
+    subject_layers = [
         ("景别与主体：", f"{framing}，{subject}"),
         ("运镜：", camera),
         ("场景与光影：", f"{where}，{scene_suffix}，{lighting}".replace("，，", "，")),
-    ])
+    ]
+    if texture_keywords:
+        subject_layers.append(("材质纹理：", "、".join(texture_keywords)))
+    subject_summary = build_subject_summary(subject_layers)
     layers.extend([
         f"镜头{shot_number}：",
         f"主体总结：{subject_summary}",
         f"动作：{action}",
         f"运动契约：{motion_contract}",
+    ])
+    if shot.get("hero_moment"):
+        layers.append(
+            "视觉峰值：这是全片 hero moment，构图、动作结果与环境层次必须形成清晰视觉峰值。"
+        )
+    layers.extend([
         f"音效：{audio}",
         f"全局收尾：{style_anchor}；约束词：{QUALITY_GUARDRAILS}；4K，{aspect_ratio}，{duration}秒",
     ])
@@ -815,6 +829,7 @@ def _generate_single_shot(
             result[field] = value
     for field in (
         "shot_size", "camera_movement", "lighting_key", "shot_intent",
+        "hero_moment", "texture_keywords",
         "gen_strategy", "where", "audio", "sound", "emotion",
         "transition_to_next", "boundary_before", "continuity_reason",
         "continuity_subject", "screen_direction", "tracking_prompt",
@@ -826,7 +841,12 @@ def _generate_single_shot(
         "speaker_attribution",
         "aspect_ratio", "width", "height",
     ):
-        if field in {"generation_action_units", "generation_action_categories"}:
+        if field in {
+            "generation_action_units",
+            "generation_action_categories",
+            "hero_moment",
+            "texture_keywords",
+        }:
             if field in shot:
                 result[field] = shot[field]
         elif shot.get(field):

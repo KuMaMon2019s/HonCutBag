@@ -304,6 +304,7 @@ def test_flashmob_one_take_has_a_feasible_four_beat_skeleton(monkeypatch):
     events = json.loads(FIXTURE.read_text(encoding="utf-8"))
     _annotate_global_event_flow(events, continuity_mode="one_take")
     source_groups = [range(1, 6), range(6, 11), range(11, 19), range(19, 27)]
+    shot_sizes = ["medium_wide", "medium", "wide", "medium_close"]
     beats = [
         {
             "beat_order": index,
@@ -314,6 +315,12 @@ def test_flashmob_one_take_has_a_feasible_four_beat_skeleton(monkeypatch):
             "where": "日本都市街头",
             "what": f"连续舞蹈段落 {index}",
             "suggested_duration": duration,
+            "shot_size": shot_sizes[index - 1],
+            "camera_movement": "handheld",
+            "lighting_key": "natural",
+            "shot_intent": "reveal" if index == 4 else "action",
+            "hero_moment": index == 4,
+            "texture_keywords": ["城市路面", f"街头层次{index}"],
         }
         for index, (source_group, duration) in enumerate(
             zip(source_groups, [20, 20, 18, 17], strict=True),
@@ -333,6 +340,69 @@ def test_flashmob_one_take_has_a_feasible_four_beat_skeleton(monkeypatch):
     skeleton = engine._build_beat_skeleton(events, "", 75, 19, 4)
 
     assert engine._beat_content_loads(skeleton["beats"], events, profile) == [3, 3, 2, 2]
+
+
+def test_layered_expansion_preserves_skeleton_shot_language(monkeypatch):
+    beat = {
+        "beat_order": 1,
+        "source_events": [1],
+        "action": "keep",
+        "reason": "保留开场",
+        "who": [],
+        "where": "日本都市街头",
+        "what": "建立街头空间",
+        "suggested_duration": 15,
+        "shot_size": "medium_wide",
+        "camera_movement": "handheld",
+        "lighting_key": "overcast_soft",
+        "shot_intent": "establishing",
+        "hero_moment": True,
+        "texture_keywords": ["湿润路面", "手机HDR高光"],
+    }
+    expanded = {
+        "strategy": "展开",
+        "shots": [{
+            "beat_order": 1,
+            "shot_order": 1,
+            "source_events": [1],
+            "action": "keep",
+            "reason": "展开",
+            "who": [],
+            "where": "日本都市街头",
+            "what": "建立街头空间",
+            "emotion": "自然",
+            "visual": "手机街头画面",
+            "suggested_duration": 15,
+            "boundary_before": "cut",
+            "continuity_reason": "开场",
+            "continuity_subject": "",
+            "transition_to_next": "cut",
+            "associate_assets": ["scene:日本都市街头"],
+            "shot_size": "wide",
+            "camera_movement": "static",
+            "lighting_key": "natural",
+            "shot_intent": "atmosphere",
+            "hero_moment": False,
+            "texture_keywords": [],
+            "dialogue": None,
+            "gen_strategy": "phantom",
+        }],
+    }
+    monkeypatch.setattr(
+        engine,
+        "_call_llm_with_timeout_retry",
+        lambda *_args, **_kwargs: json.dumps(expanded, ensure_ascii=False),
+    )
+
+    shots = engine._expand_beats_to_shots([beat], "", 15, 15)
+
+    assert {
+        field: shots[0][field]
+        for field in engine._SHOT_LANGUAGE_FIELDS
+    } == {
+        field: beat[field]
+        for field in engine._SHOT_LANGUAGE_FIELDS
+    }
 
 
 def test_storyboard_material_may_exceed_delivery_only_within_1_3x():
@@ -372,7 +442,17 @@ def test_composite_motion_keeps_full_ledger_through_pxx_and_qa():
     ]
     storyboard = {
         "video_provider": "seedance",
-        "shots": [{"id": "S01", "duration": 15, "micro_actions": actions}],
+        "shots": [{
+            "id": "S01",
+            "duration": 15,
+            "micro_actions": actions,
+            "shot_size": "medium_wide",
+            "camera_movement": "handheld",
+            "lighting_key": "natural",
+            "shot_intent": "action",
+            "hero_moment": True,
+            "texture_keywords": ["街道路面", "手机HDR高光"],
+        }],
     }
 
     plan_storyboard_beats(storyboard)
@@ -386,6 +466,13 @@ def test_composite_motion_keeps_full_ledger_through_pxx_and_qa():
     assert observed == actions
     assert len(shot["generation_action_units"]) == 1
     assert shot["storyboard_beat_count"] == 1
+    assert {
+        field: shot["storyboard_beats"][0][field]
+        for field in engine._SHOT_LANGUAGE_FIELDS
+    } == {
+        field: shot[field]
+        for field in engine._SHOT_LANGUAGE_FIELDS
+    }
     assert run_generation_capacity_checks(storyboard) == []
 
 

@@ -14,6 +14,7 @@ from phases.phase1.adaptation_engine import (
     BEAT_SKELETON_PROMPT,
     USER_PROMPT_TEMPLATE as ADAPTATION_PROMPT,
     _inherit_event_semantics,
+    _parse_beat_skeleton,
 )
 from prompt.event_extractor import (
     ACTION_SCREENPLAY_CONTRACT,
@@ -332,3 +333,32 @@ def test_adaptation_prompts_preserve_action_units_and_turning_points():
         assert "turning_point" in prompt
     assert "同一 sequence_id" in ADAPTATION_PROMPT
     assert "micro_actions 原顺序" in BEAT_SKELETON_PROMPT
+
+
+def test_beat_skeleton_requires_explicit_global_shot_language():
+    for field in (
+        "shot_size",
+        "camera_movement",
+        "lighting_key",
+        "shot_intent",
+        "hero_moment",
+        "texture_keywords",
+    ):
+        assert field in BEAT_SKELETON_PROMPT
+
+    response = json.dumps({
+        "strategy": "旧格式",
+        "beats": [{
+            "beat_order": 1,
+            "source_events": [1],
+            "action": "keep",
+            "reason": "保留",
+            "who": [],
+            "where": "街头",
+            "what": "人物前进",
+            "suggested_duration": 15,
+        }],
+    })
+
+    with pytest.raises(ValueError, match="缺少字段"):
+        _parse_beat_skeleton(response, expected_count=1, event_count=1)

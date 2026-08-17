@@ -17,6 +17,7 @@ def _events(count):
 
 
 def _beat(i):
+    shot_sizes = ("medium_wide", "medium", "wide", "extreme_wide")
     return {
         "beat_order": i,
         "source_events": [i],
@@ -26,11 +27,18 @@ def _beat(i):
         "where": "庭院",
         "what": f"发生事件{i}",
         "suggested_duration": 12,
+        "shot_size": shot_sizes[(i - 1) % len(shot_sizes)],
+        "camera_movement": "handheld",
+        "lighting_key": "natural",
+        "shot_intent": "action",
+        "hero_moment": i % 4 == 0,
+        "texture_keywords": ["庭院石板", f"空间层次{i}"],
         "_source_event_details": [{"event_id": i, "summary": f"事件{i}"}],
     }
 
 
 def _shot(order, visual=None):
+    shot_sizes = ("medium_wide", "medium", "wide", "extreme_wide")
     return {
         "beat_order": order,
         "shot_order": order,
@@ -45,10 +53,12 @@ def _shot(order, visual=None):
         "suggested_duration": 12,
         "transition_to_next": "cut",
         "associate_assets": ["char:lin", "scene:庭院"],
-        "shot_size": "medium",
-        "camera_movement": "static",
+        "shot_size": shot_sizes[(order - 1) % len(shot_sizes)],
+        "camera_movement": "handheld",
         "lighting_key": "natural",
         "shot_intent": "action",
+        "hero_moment": order % 4 == 0,
+        "texture_keywords": ["庭院石板", f"空间层次{order}"],
         "dialogue": None,
         "gen_strategy": "phantom",
     }

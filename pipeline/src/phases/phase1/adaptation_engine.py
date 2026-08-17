@@ -100,7 +100,9 @@ USER_PROMPT_TEMPLATE = (
     "  - shot_size: 字符串，景别（extreme_wide/wide/medium_wide/medium/medium_close/close_up/extreme_close_up/over_shoulder/insert/establishing）\n"
     "  - camera_movement: 字符串，摄影机运动（static/pan_left/pan_right/tilt_up/tilt_down/dolly_in/dolly_out/tracking_left/tracking_right/crane_up/crane_down/handheld/steadicam/orbital/zoom_in/zoom_out）\n"
     "  - lighting_key: 字符串，光影基调（high_key/low_key/natural/golden_hour/blue_hour/tungsten_warm/neon/silhouette/rim_lit/volumetric/overcast_soft）\n"
-    "  - shot_intent: 字符串，镜头叙事意图（establishing/reveal/reaction/dialogue/action/transition/atmosphere/detail）\n\n"
+    "  - shot_intent: 字符串，镜头叙事意图（establishing/reveal/reaction/dialogue/action/transition/atmosphere/detail）\n"
+    "  - hero_moment: 布尔值，是否为全片视觉峰值；4 镜以上至少且通常恰好一个为 true\n"
+    "  - texture_keywords: 2–4 个具体环境材质/光影纹理关键词组成的字符串数组\n\n"
     "  - dialogue: 对象或 null；有角色在本镜头说话时为 {{\"speaker\": \"角色名\", \"line\": \"剧本台词原文\"}}，无对白时必须为 null\n"
     "  - gen_strategy: 字符串，视频生成策略（flf2v/phantom/i2v）；最终值会由确定性规则校正\n\n"
     "【对白铁律】\n"
@@ -153,6 +155,11 @@ USER_PROMPT_TEMPLATE = (
     "5. 声音只写环境音+音效，禁止写配乐/BGM/背景音乐\n"
     "6. 群演不抢戏：群演只做背景动作，不给特写和台词\n"
     "7. 景别视角错开：相邻镜头不应使用相同景别和角度\n\n"
+    "【镜头语言容量闸门】\n"
+    "shot_size、camera_movement、lighting_key、shot_intent、hero_moment、texture_keywords "
+    "都是必填生成合同，不得省略或全部套用默认值。相邻镜头景别必须形成节奏差异；动作镜头不得"
+    "全部 static；4 镜以上必须指定视觉峰值并为每镜提供具体纹理。连续长镜头可以保持同一真实"
+    "光源，但应依据剧本允许的构图距离、运镜和环境纹理形成变化，不得虚构时空跳变。\n\n"
     "【HonCut Identity Anchor】\n"
     "身份只通过 who 与 associate_assets 结构化绑定；visual 只描述动作、表情、站位和环境，"
     "不得重复人物外貌。who=[] 时 visual 和 associate_assets 都不得引入任何角色。\n\n"
@@ -182,7 +189,8 @@ BATCH_EXPAND_PROMPT = (
     "source_events、action、reason、who、where、what、emotion、visual、"
     "suggested_duration、boundary_before、continuity_reason、continuity_subject、"
     "transition_to_next、associate_assets、shot_size、"
-    "camera_movement、lighting_key、shot_intent、dialogue、gen_strategy。\n"
+    "camera_movement、lighting_key、shot_intent、hero_moment、texture_keywords、"
+    "dialogue、gen_strategy。\n"
     "JSON 示例：{{\"strategy\":\"本批策略\",\"shots\":[{{\"beat_order\":1,"
     "\"shot_order\":1,\"source_events\":[1],\"action\":\"keep\","
     "\"reason\":\"理由\",\"who\":[\"角色主名\"],\"where\":\"地点\","
@@ -191,8 +199,10 @@ BATCH_EXPAND_PROMPT = (
     "\"continuity_reason\":\"新场景\",\"continuity_subject\":\"\","
     "\"transition_to_next\":\"cut\","
     "\"associate_assets\":[\"char:id\",\"scene:地点\"],\"shot_size\":\"medium\","
-    "\"camera_movement\":\"static\",\"lighting_key\":\"natural\","
-    "\"shot_intent\":\"action\",\"dialogue\":null,\"gen_strategy\":\"phantom\"}}]}}\n\n"
+    "\"camera_movement\":\"dolly_in\",\"lighting_key\":\"natural\","
+    "\"shot_intent\":\"action\",\"hero_moment\":false,"
+    "\"texture_keywords\":[\"场景中的具体材质\",\"场景中的具体光影\"],"
+    "\"dialogue\":null,\"gen_strategy\":\"phantom\"}}]}}\n\n"
     "【对白铁律】dialogue 有对白时为 {{\"speaker\":\"角色名\",\"line\":\"剧本台词原文\"}}，"
     "line 必须逐字来自来源事件，禁止改写、摘要或编造；无人真正说话时必须为 null，"
     "不得把 visual、what 或旁白当对白。\n\n"
@@ -220,6 +230,9 @@ BATCH_EXPAND_PROMPT = (
     "每片段必须在 15–30 秒一级镜头及其 8–15/6–10 秒二级片段承载范围内；单镜台词>20字必须拆镜（按4字/秒）；同场景人物不得无故消失；"
     "人物外观不进提示词；声音只写环境音和音效，禁止配乐/BGM/背景音乐；"
     "群演只做背景动作；相邻镜头景别和角度必须错开。\n\n"
+    "【镜头语言继承】本批每个 shot 的 shot_size、camera_movement、lighting_key、shot_intent、"
+    "hero_moment、texture_keywords 必须逐字复制对应 beat 的全局镜头语言合同，不得重新规划或"
+    "退回 wide/static/natural 默认组合。\n\n"
     "【HonCut Identity Anchor】身份只通过 who 与 associate_assets 结构化绑定；visual 不重复外貌。"
     "who=[] 时不得写角色或绑定 char: 资产。\n\n"
     "【HonCut 资产绑定（associateAssetsIds）】每镜 associate_assets 必须列出可见角色"
@@ -882,6 +895,91 @@ def _call_llm_with_timeout_retry(user_prompt: str, max_tokens: int = 32000) -> s
     raise RuntimeError("LLM 调用失败: 意外退出重试循环")  # 不可达，满足类型检查
 
 
+_VALID_SHOT_SIZES = {
+    "extreme_wide", "wide", "medium_wide", "medium", "medium_close",
+    "close_up", "extreme_close_up", "over_shoulder", "insert", "establishing",
+}
+_VALID_CAMERA_MOVEMENTS = {
+    "static", "pan_left", "pan_right", "tilt_up", "tilt_down",
+    "dolly_in", "dolly_out", "tracking_left", "tracking_right",
+    "crane_up", "crane_down", "handheld", "steadicam", "orbital",
+    "zoom_in", "zoom_out", "rack_focus",
+}
+_VALID_LIGHTING_KEYS = {
+    "high_key", "low_key", "natural", "golden_hour", "blue_hour",
+    "tungsten_warm", "neon", "silhouette", "rim_lit", "volumetric",
+    "overcast_soft",
+}
+_VALID_SHOT_INTENTS = {
+    "establishing", "reveal", "reaction", "dialogue", "action",
+    "transition", "atmosphere", "detail",
+}
+_SHOT_LANGUAGE_FIELDS = (
+    "shot_size",
+    "camera_movement",
+    "lighting_key",
+    "shot_intent",
+    "hero_moment",
+    "texture_keywords",
+)
+
+
+def _validate_authored_shot_language(
+    shots: List[Dict[str, Any]], *, label: str
+) -> None:
+    """Require explicit shot language where the planner owns the contract."""
+    for index, shot in enumerate(shots, 1):
+        missing = set(_SHOT_LANGUAGE_FIELDS) - set(shot)
+        if missing:
+            raise ValueError(f"第 {index} 个 {label} 缺少镜头语言字段: {missing}")
+        if shot["shot_size"] not in _VALID_SHOT_SIZES:
+            raise ValueError(
+                f"第 {index} 个 {label} shot_size 无效: {shot['shot_size']}"
+            )
+        if shot["camera_movement"] not in _VALID_CAMERA_MOVEMENTS:
+            raise ValueError(
+                f"第 {index} 个 {label} camera_movement 无效: "
+                f"{shot['camera_movement']}"
+            )
+        if shot["lighting_key"] not in _VALID_LIGHTING_KEYS:
+            raise ValueError(
+                f"第 {index} 个 {label} lighting_key 无效: {shot['lighting_key']}"
+            )
+        if shot["shot_intent"] not in _VALID_SHOT_INTENTS:
+            raise ValueError(
+                f"第 {index} 个 {label} shot_intent 无效: {shot['shot_intent']}"
+            )
+        if not isinstance(shot["hero_moment"], bool):
+            raise ValueError(f"第 {index} 个 {label} hero_moment 必须是布尔值")
+        textures = shot["texture_keywords"]
+        if (
+            not isinstance(textures, list)
+            or not 2 <= len(textures) <= 4
+            or any(not isinstance(value, str) or not value.strip() for value in textures)
+        ):
+            raise ValueError(
+                f"第 {index} 个 {label} texture_keywords 必须包含 2–4 个非空字符串"
+            )
+
+
+def _validate_shot_language_variation(
+    shots: List[Dict[str, Any]], *, minimum_quality: float = 3.0
+) -> Dict[str, Any]:
+    """Fail in Phase 1 before paid storyboard/video work can start."""
+    from quality.variation_checker import check_scene_variation
+
+    report = check_scene_variation(shots)
+    quality = round(5.0 - float(report.get("score", 5.0)), 2)
+    report = {**report, "quality": quality}
+    if quality < minimum_quality:
+        violations = "; ".join(str(value) for value in report["violations"])
+        raise ValueError(
+            f"shot-language variation quality {quality:g}/5 is below "
+            f"{minimum_quality:g} before paid storyboard generation: {violations}"
+        )
+    return report
+
+
 def _validate_shots(shots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Validate and normalize a shot list shared by both adaptation modes."""
     if not isinstance(shots, list):
@@ -895,26 +993,8 @@ def _validate_shots(shots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if missing:
             raise ValueError(f"第 {i+1} 个 shot 缺少字段: {missing}")
 
-    # 规范化结构化字段（shot_size/camera_movement/lighting_key/shot_intent）
+    # 兼容旧单次调用/检查点；全局骨架路径会在此前严格要求显式字段。
     # 如果 LLM 没返回，给默认值而不是缺失
-    _VALID_SHOT_SIZES = {
-        "extreme_wide", "wide", "medium_wide", "medium", "medium_close",
-        "close_up", "extreme_close_up", "over_shoulder", "insert", "establishing",
-    }
-    _VALID_CAMERA_MOVEMENTS = {
-        "static", "pan_left", "pan_right", "tilt_up", "tilt_down",
-        "dolly_in", "dolly_out", "tracking_left", "tracking_right",
-        "crane_up", "crane_down", "handheld", "steadicam", "orbital",
-        "zoom_in", "zoom_out", "rack_focus",
-    }
-    _VALID_LIGHTING_KEYS = {
-        "high_key", "low_key", "natural", "golden_hour", "blue_hour",
-        "tungsten_warm", "neon", "silhouette", "rim_lit", "volumetric", "overcast_soft",
-    }
-    _VALID_SHOT_INTENTS = {
-        "establishing", "reveal", "reaction", "dialogue", "action",
-        "transition", "atmosphere", "detail",
-    }
     for shot in shots:
         ss = shot.get("shot_size", "")
         if ss not in _VALID_SHOT_SIZES:
@@ -928,6 +1008,16 @@ def _validate_shots(shots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         si = shot.get("shot_intent", "")
         if si not in _VALID_SHOT_INTENTS:
             shot["shot_intent"] = "atmosphere"
+        if not isinstance(shot.get("hero_moment"), bool):
+            shot["hero_moment"] = False
+        textures = shot.get("texture_keywords")
+        if isinstance(textures, str):
+            textures = [textures]
+        if not isinstance(textures, list):
+            textures = []
+        shot["texture_keywords"] = [
+            str(value).strip() for value in textures if str(value).strip()
+        ][:4]
         who = shot.get("who", [])
         if isinstance(who, str):
             shot["who"] = [who] if who else []
@@ -949,7 +1039,9 @@ def _validate_shots(shots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return shots
 
 
-def _parse_response(response: str) -> Dict[str, Any]:
+def _parse_response(
+    response: str, *, require_authored_shot_language: bool = False
+) -> Dict[str, Any]:
     """
     解析 LLM 响应为结构化字典
 
@@ -984,6 +1076,8 @@ def _parse_response(response: str) -> Dict[str, Any]:
     if "strategy" not in parsed:
         parsed["strategy"] = ""
 
+    if require_authored_shot_language:
+        _validate_authored_shot_language(parsed["shots"], label="shot")
     parsed["shots"] = _validate_shots(parsed["shots"])
 
     return parsed
@@ -1309,10 +1403,13 @@ def _inherit_event_semantics(
 BEAT_SKELETON_PROMPT = (
     "目标时长：{target_duration}秒，每镜约{shot_duration}秒。请把全部事件压缩为恰好{beat_count}个 beat。\n\n"
     "事件列表：\n{events_json}\n\n角色列表：\n{characters_summary}\n\n"
-    "只做全局改编决策，不要输出 visual、镜头语言、景别或摄影细节。输出严格 JSON 对象："
+    "只做全局改编与镜头语言规划，不要展开 visual 或人物外貌。输出严格 JSON 对象："
     '{{"strategy":"一句话改编策略","beats":[{{"beat_order":1,"source_events":[1],'
     '"action":"keep/merge/drop","reason":"一句话理由","who":["角色主名"],'
-    '"where":"地点","what":"一句话事件","suggested_duration":15}}]}}。\n'
+    '"where":"地点","what":"一句话事件","suggested_duration":15,'
+    '"shot_size":"medium_wide","camera_movement":"dolly_in",'
+    '"lighting_key":"natural","shot_intent":"establishing",'
+    '"hero_moment":false,"texture_keywords":["场景中的具体材质","场景中的具体光影"]}}]}}。\n'
     "【全局铁律】\n"
     "1. beats 数量必须恰好等于 {beat_count}，总建议时长应接近 {target_duration} 秒（±10%）；"
     "每个 beat 的 generation_action_unit_count 合计不得超过 "
@@ -1328,7 +1425,12 @@ BEAT_SKELETON_PROMPT = (
     "minimum_primary_beat_occurrences；同一事件的后续引用只承载尚未表现的动作，不得重放。\n"
     "6. sequence_id 与 continuity_before 是生成连续性依据。同一 sequence 的连续单元尽量落在相邻 beat，"
     "换场/跳时/关系转折不得为了省镜头而错误连拍。\n"
-    "7. 只输出骨架决策，禁止展开对白、visual、Identity Anchor 或任何镜头生成细节。"
+    "7. shot_size、camera_movement、lighting_key、shot_intent、hero_moment、texture_keywords "
+    "是骨架的全局结构字段，全部必填。相邻 beat 景别必须形成差异，动作 beat 不得全部 static；"
+    "4 个及以上 beat 必须至少一个 hero_moment=true，每个 beat 给出 2–4 个具体纹理关键词。"
+    "一镜到底可以保持同一真实光源，但镜头变化必须来自源文本允许的构图距离与运镜；禁止为了"
+    "追求差异虚构转场、跳时、摇臂、无人机、环绕或剧本明令禁止的运镜。禁止展开对白、visual、"
+    "Identity Anchor 或人物外貌。"
 )
 
 
@@ -1345,7 +1447,17 @@ def _parse_beat_skeleton(response: str, expected_count: int, event_count: int) -
     beats = parsed["beats"]
     if len(beats) != expected_count:
         raise ValueError(f"beat 数量应为 {expected_count}，实际为 {len(beats)}")
-    required = {"beat_order", "source_events", "action", "reason", "who", "where", "what", "suggested_duration"}
+    required = {
+        "beat_order",
+        "source_events",
+        "action",
+        "reason",
+        "who",
+        "where",
+        "what",
+        "suggested_duration",
+        *_SHOT_LANGUAGE_FIELDS,
+    }
     covered = set()
     for i, beat in enumerate(beats, 1):
         if not isinstance(beat, dict):
@@ -1364,6 +1476,7 @@ def _parse_beat_skeleton(response: str, expected_count: int, event_count: int) -
     missing_events = set(range(1, event_count + 1)) - covered
     if missing_events:
         raise ValueError(f"beat 未覆盖事件编号: {sorted(missing_events)}")
+    _validate_authored_shot_language(beats, label="beat")
     parsed.setdefault("strategy", "")
     return parsed
 
@@ -1667,6 +1780,7 @@ def _build_beat_skeleton(
         events_json=_build_events_json(prompt_events),
         characters_summary=characters_summary,
     )
+    last_validation_error = ""
     for attempt in range(1 + MAX_RETRIES):
         try:
             attempt_prompt = prompt
@@ -1680,10 +1794,18 @@ def _build_beat_skeleton(
                     "每个事件在 beats 中出现的次数不得少于它的 "
                     "minimum_primary_beat_occurrences；重复引用只分担尚未表现的后续动作。"
                 )
+                if last_validation_error:
+                    attempt_prompt += (
+                        "\n上次响应的具体失败原因："
+                        f"{last_validation_error}。必须修正该结构问题后再输出。"
+                    )
             response = _call_llm_with_timeout_retry(attempt_prompt, max_tokens=8000)
             skeleton = _parse_beat_skeleton(response, beat_count, len(events))
             skeleton["beats"] = _repair_beat_action_capacity(
                 skeleton["beats"], events, profile
+            )
+            skeleton["shot_language_plan"] = _validate_shot_language_variation(
+                skeleton["beats"]
             )
             _validate_beat_action_capacity(skeleton["beats"], events, profile)
             if target_duration >= len(skeleton["beats"]) * math.ceil(
@@ -1700,6 +1822,7 @@ def _build_beat_skeleton(
                 beat["_source_event_details"] = [event_by_id[event_id] for event_id in beat["source_events"]]
             return skeleton
         except (json.JSONDecodeError, ValueError) as e:
+            last_validation_error = str(e)
             if attempt < MAX_RETRIES:
                 print(f"骨架解析失败，重试中（{attempt + 1}/{MAX_RETRIES}）: {e}", file=sys.stderr)
                 time.sleep(1)
@@ -1782,13 +1905,17 @@ def _expand_beats_to_shots(
                     "shot_order", "source_events", "action", "reason", "who", "where",
                     "what", "emotion", "visual", "suggested_duration", "transition_to_next",
                     "associate_assets", "shot_size", "camera_movement", "lighting_key",
-                    "shot_intent", "dialogue", "gen_strategy",
+                    "shot_intent", "hero_moment", "texture_keywords", "dialogue",
+                    "gen_strategy",
                 }
                 for index, shot in enumerate(parsed["shots"], 1):
+                    beat = batch[index - 1]
+                    for field in _SHOT_LANGUAGE_FIELDS:
+                        value = beat[field]
+                        shot[field] = list(value) if isinstance(value, list) else value
                     missing = expanded_fields - set(shot)
                     if missing:
                         raise ValueError(f"本批第 {index} 镜缺少完整字段: {missing}")
-                    beat = batch[index - 1]
                     if shot.get("beat_order") != beat["beat_order"]:
                         raise ValueError(
                             f"本批第 {index} 镜 beat_order 错配: "
@@ -1847,7 +1974,7 @@ def _atomic_write_json(path: Path, value: Any) -> None:
     os.replace(temporary, path)
 
 
-LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v3"
+LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v4"
 
 
 def _layered_input_fingerprint(
@@ -1901,6 +2028,9 @@ def _load_layered_checkpoints(
                 raise ValueError("layered skeleton belongs to a different input")
             _parse_beat_skeleton(json.dumps(candidate, ensure_ascii=False), expected_beats, len(events))
             _validate_beat_action_capacity(candidate["beats"], events)
+            candidate["shot_language_plan"] = _validate_shot_language_variation(
+                candidate["beats"]
+            )
             event_by_id = {i: dict(event, event_id=i) for i, event in enumerate(events, 1)}
             for beat in candidate["beats"]:
                 beat["_source_event_details"] = [event_by_id[event_id] for event_id in beat["source_events"]]
@@ -2049,6 +2179,7 @@ def adapt_events(
             checkpoint_fingerprint=layered_fingerprint,
         )
         _validate_shots(shots)
+        shot_language_plan = _validate_shot_language_variation(shots)
 
         # Defensive assembly: batch responses may ignore their requested offset.
         for i, shot in enumerate(shots, 1):
@@ -2091,6 +2222,7 @@ def adapt_events(
             "requested_shot_duration": shot_duration,
             "effective_shot_duration": effective_shot_duration,
             "total_duration": total_duration,
+            "shot_language_plan": shot_language_plan,
             "strategy": skeleton.get("strategy", ""),
             "shots": shots,
         }
@@ -2110,6 +2242,7 @@ def adapt_events(
 
     # ── 调用 LLM（带重试）─────────────────────────────────────────────────
     parsed = None
+    shot_language_plan: Optional[Dict[str, Any]] = None
     for attempt in range(1 + MAX_RETRIES):
         try:
             attempt_prompt = user_prompt
@@ -2121,7 +2254,9 @@ def adapt_events(
                     "尚未表现的后续动作，不得重放。"
                 )
             response = _call_llm_with_timeout_retry(attempt_prompt)
-            parsed = _parse_response(response)
+            parsed = _parse_response(
+                response, require_authored_shot_language=True
+            )
             if len(parsed["shots"]) != max_shots:
                 raise ValueError(
                     f"必须输出 {max_shots} 个镜头，实际为 {len(parsed['shots'])}"
@@ -2140,6 +2275,7 @@ def adapt_events(
                 material_duration,
                 capability_profile,
             )
+            shot_language_plan = _validate_shot_language_variation(parsed["shots"])
             break
         except (json.JSONDecodeError, ValueError) as e:
             if attempt < MAX_RETRIES:
@@ -2195,6 +2331,7 @@ def adapt_events(
         "requested_shot_duration": shot_duration,
         "effective_shot_duration": effective_shot_duration,
         "total_duration": total_duration,
+        "shot_language_plan": shot_language_plan,
         "strategy": parsed.get("strategy", ""),
         "shots": shots,
     }

@@ -1451,6 +1451,17 @@ def _correctable_issues(report: dict[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
+def _global_uncorrectable_issues(
+    report: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Return blockers that cannot be isolated to a storyboard redraw."""
+    return [
+        issue
+        for issue in blocking_issues(report.get("issues") or [])
+        if not issue.get("shot_ids")
+    ]
+
+
 def _archive_correction_inputs(
     output_dir: Path,
     shot_ids: list[str],
@@ -1601,6 +1612,49 @@ def run_storyboard_qa_with_correction(
     result = qa(output_dir)
     history: list[dict[str, Any]] = []
 
+    global_issues = _global_uncorrectable_issues(result)
+    if result.get("gate_passed") is not True and global_issues:
+        issue_codes = sorted({
+            str(issue.get("code") or "unknown") for issue in global_issues
+        })
+        structural_codes = {
+            "scene_variation_insufficient",
+            "slideshow_risk_high",
+        }
+        restart_phase = (
+            "phase1"
+            if any(code.casefold() in structural_codes for code in issue_codes)
+            else "phase2"
+        )
+        correction = {
+            "enabled": attempts_allowed > 0,
+            "max_attempts": attempts_allowed,
+            "attempts_used": 0,
+            "status": "requires_replanning",
+            "global_issue_codes": issue_codes,
+            "recommended_restart_phase": restart_phase,
+            "history": [],
+            "final_gate_passed": False,
+        }
+        result = {
+            **result,
+            "status": "error",
+            "gate_passed": False,
+            "correction": correction,
+            "error": (
+                "Storyboard QA has global blocking issues that cannot be "
+                "corrected by redrawing isolated shots; restart from "
+                f"{restart_phase}: {', '.join(issue_codes)}"
+            ),
+        }
+        outputs = list(result.get("outputs") or [])
+        if "phase5_correction_report.json" not in outputs:
+            outputs.append("phase5_correction_report.json")
+        result["outputs"] = outputs
+        _atomic_json(output_dir / "phase5_correction_report.json", correction)
+        _atomic_json(output_dir / "storyboard_qa_report.json", result)
+        return result
+
     for attempt in range(1, attempts_allowed + 1):
         if result.get("gate_passed") is True or result.get("status") != "error":
             break
@@ -1664,9 +1718,10 @@ def run_storyboard_qa_with_correction(
         if "phase5_correction_report.json" not in outputs:
             outputs.append("phase5_correction_report.json")
         result["outputs"] = outputs
-        if result.get("gate_passed") is not True and not str(result.get("error") or "").startswith(
+        automatic_failure = str(result.get("error") or "").startswith(
             "Phase 5 automatic correction failed:"
-        ):
+        )
+        if result.get("gate_passed") is not True and not automatic_failure:
             result["error"] = (
                 "Storyboard QA still blocks Phase 6 after "
                 f"{len(history)}/{attempts_allowed} automatic correction attempt(s)"

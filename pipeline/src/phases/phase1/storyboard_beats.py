@@ -826,6 +826,10 @@ def plan_storyboard_beats(
                 "shot_size": shot.get("shot_size") or shot.get("shot_type"),
                 "camera_movement": shot.get("camera_movement")
                 or shot.get("camera_movement_en"),
+                "lighting_key": shot.get("lighting_key"),
+                "shot_intent": shot.get("shot_intent"),
+                "hero_moment": bool(shot.get("hero_moment")),
+                "texture_keywords": list(shot.get("texture_keywords") or []),
             }
             beats.append(normalized)
         if bridge_required:

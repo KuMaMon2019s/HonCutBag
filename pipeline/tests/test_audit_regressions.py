@@ -15,6 +15,9 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / "pipeline" / "src"
 SCRIPTS = ROOT / "pipeline" / "scripts"
+PHASE5_VARIATION_FIXTURE = (
+    ROOT / "pipeline" / "tests" / "fixtures" / "flashmob_60s_phase5_storyboard.json"
+)
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 if str(SRC) not in sys.path:
@@ -32,7 +35,10 @@ from phases.phase1 import (
     director_planner,
     storyboard_generator,
 )
-from phases.phase1.director_storyboard import materialize_director_panels
+from phases.phase1.director_storyboard import (
+    build_director_storyboard_prompt,
+    materialize_director_panels,
+)
 from phases.phase1.storyboard_beats import plan_storyboard_beats
 from phases.phase1.storyboard_generator import _build_shot_prompt_legacy
 from phases.phase2.shot_storyboards import (
@@ -50,6 +56,7 @@ from prompt import event_extractor
 from quality import video_qa
 from quality.quality_gate import run_quality_check
 from quality.shot_continuity import annotate_boundaries, classify_boundary
+from quality.variation_checker import check_scene_variation
 from runtime.run_manifest import prepare_run_manifest
 from utils.video_capabilities import get_video_capabilities
 from utils.video_geometry import resolve_video_geometry
@@ -1713,6 +1720,240 @@ def test_phase2_panel_prompt_turns_phase5_evidence_into_negative_constraints():
     assert "保安撞破观察窗飞入太空" in prompt
     assert "禁止复现的负面约束，不是要继续画入画面的剧情" in prompt
     assert "不得通过增加破坏、伤亡、道具或画外事件来规避问题" in prompt
+
+
+def test_storyboard_prompts_use_generic_role_and_prop_fidelity_contracts():
+    storyboard = json.loads(PHASE5_VARIATION_FIXTURE.read_text(encoding="utf-8"))
+    shot = storyboard["shots"][0]
+    director_prompt, _panels, _layout = build_director_storyboard_prompt(
+        storyboard
+    )
+    prompt = _build_panel_prompt(
+        shot,
+        shot["storyboard_beats"][0],
+        1,
+        1,
+        [],
+    )
+
+    assert "每个角色只执行本格明确分配给自己的动作" in prompt
+    assert "严格保留本格声明的道具类型、持有者和使用方式" in prompt
+    assert "角色职责与道具合同" in director_prompt
+    assert "每个具名角色只执行逐格内容合同明确分配给自己的动作" in director_prompt
+    assert "摄影师是持机记录者，不是舞者" not in prompt
+    assert "Groove" not in prompt
+    assert "手机HDR高光" not in director_prompt
+
+
+def test_generic_role_contract_does_not_rewrite_dslr_photojournalist():
+    shot = {
+        "id": "S01",
+        "who": ["战地摄影师"],
+        "where": "临时避难所",
+        "what": "战地摄影师使用 DSLR 记录撤离行动",
+        "visual": "摄影师趴在掩体后用长焦相机拍摄",
+        "source_excerpt": "摄影师不得暴露位置",
+        "storyboard_beats": [{
+            "beat_id": "S01_P01",
+            "action": "摄影师保持隐蔽并使用 DSLR 拍摄",
+            "start_state": "摄影师伏低身体",
+            "end_state": "摄影师仍握持 DSLR",
+        }],
+    }
+    storyboard = {"shots": [shot]}
+    director_prompt, _panels, _layout = build_director_storyboard_prompt(storyboard)
+    panel_prompt = _build_panel_prompt(
+        shot,
+        shot["storyboard_beats"][0],
+        1,
+        1,
+        [],
+    )
+
+    assert "DSLR" in director_prompt
+    assert "DSLR" in panel_prompt
+    for forbidden in ("iPhone/手机", "不是舞者", "Groove", "领舞姿态"):
+        assert forbidden not in director_prompt
+        assert forbidden not in panel_prompt
+
+
+def test_generic_role_contract_preserves_explicitly_authored_participation():
+    shot = {
+        "id": "S01",
+        "who": ["记录员"],
+        "where": "排练厅",
+        "what": "记录员放下记录板后按导演指令加入队形",
+        "visual": "记录员完成记录工作，然后加入集体动作",
+        "storyboard_beats": [{
+            "beat_id": "S01_P01",
+            "action": "记录员放下记录板并加入队形",
+            "start_state": "记录员手持记录板",
+            "end_state": "记录员位于队形末端",
+        }],
+    }
+    prompt = _build_panel_prompt(
+        shot,
+        shot["storyboard_beats"][0],
+        1,
+        1,
+        [],
+    )
+
+    assert "记录员放下记录板并加入队形" in prompt
+    assert "让角色无故放下道具" in prompt
+    assert "禁止参与" not in prompt
+
+
+def test_phase1_rejects_real_17_06_default_shot_language_before_paid_work():
+    storyboard = json.loads(PHASE5_VARIATION_FIXTURE.read_text(encoding="utf-8"))
+
+    with pytest.raises(ValueError, match=r"variation quality 1\.4/5"):
+        adaptation_engine._validate_shot_language_variation(storyboard["shots"])
+
+
+def test_phase5_global_variation_requires_replanning_without_mutation(tmp_path):
+    storyboard = json.loads(PHASE5_VARIATION_FIXTURE.read_text(encoding="utf-8"))
+    storyboard_path = tmp_path / "STORYBOARD.json"
+    storyboard_path.write_text(
+        json.dumps(storyboard, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    before = storyboard_path.read_bytes()
+    issue = storyboard_qa_gate._issue(
+        "L1",
+        "severe",
+        "scene_variation_insufficient",
+        "Storyboard variation quality 1.4/5 requires revision",
+        [],
+    )
+    qa_calls = []
+
+    def qa(_output_dir):
+        qa_calls.append(_output_dir)
+        return {
+            "status": "error",
+            "grade": "C",
+            "gate_passed": False,
+            "issues": [issue],
+            "failed_shot_ids": [],
+        }
+
+    result = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        max_correction_attempts=2,
+        qa_runner=qa,
+        redraw_runner=lambda *_args: pytest.fail("global issue must not redraw images"),
+    )
+
+    assert result["gate_passed"] is False
+    assert result["correction"]["status"] == "requires_replanning"
+    assert result["correction"]["recommended_restart_phase"] == "phase1"
+    assert result["correction"]["attempts_used"] == 0
+    assert result["correction"]["global_issue_codes"] == [
+        "scene_variation_insufficient"
+    ]
+    assert storyboard_path.read_bytes() == before
+    assert qa_calls == [tmp_path]
+    assert not (tmp_path / "phase5_corrections").exists()
+
+
+def test_phase5_global_issue_prevents_wasted_visual_redraw(tmp_path):
+    storyboard = json.loads(PHASE5_VARIATION_FIXTURE.read_text(encoding="utf-8"))
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps(storyboard, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    variation_issue = storyboard_qa_gate._issue(
+        "L1",
+        "severe",
+        "scene_variation_insufficient",
+        "Storyboard variation quality 1.4/5 requires revision",
+        [],
+    )
+    camera_issue = storyboard_qa_gate._issue(
+        "L3",
+        "severe",
+        "R4",
+        "摄影师参与舞蹈",
+        ["S02"],
+        expected="摄影师持 iPhone 拍摄",
+        observed="摄影师模仿女主舞蹈",
+    )
+    qa_calls = []
+    redraw_calls = []
+
+    def qa(_output_dir):
+        qa_calls.append(_output_dir)
+        return {
+            "status": "error",
+            "grade": "D",
+            "gate_passed": False,
+            "issues": [variation_issue, camera_issue],
+            "failed_shot_ids": ["S02"],
+        }
+
+    def redraw(_output_dir, shot_ids, issues, attempt):
+        redraw_calls.append((shot_ids, issues, attempt))
+        return {"status": "redrawn", "shot_ids": shot_ids, "attempt": attempt}
+
+    result = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        max_correction_attempts=2,
+        qa_runner=qa,
+        redraw_runner=redraw,
+    )
+
+    assert result["gate_passed"] is False
+    assert redraw_calls == []
+    assert qa_calls == [tmp_path]
+    assert result["correction"]["status"] == "requires_replanning"
+    assert result["correction"]["attempts_used"] == 0
+    assert result["issues"] == [variation_issue, camera_issue]
+
+
+@pytest.mark.parametrize("shot_count", [3, 5, 8])
+def test_variation_check_is_pure_for_different_storyboard_shapes(shot_count):
+    scenes = [
+        {
+            "id": f"S{index:02d}",
+            "what": "博物馆导览继续",
+            "visual": "刻意保持统一广角构图和三脚架机位",
+            "shot_size": "wide",
+            "camera_movement": "static",
+            "lighting_key": "natural",
+            "shot_intent": "atmosphere",
+            "texture_keywords": ["石材墙面", "玻璃反射"],
+        }
+        for index in range(1, shot_count + 1)
+    ]
+    before = json.loads(json.dumps(scenes, ensure_ascii=False))
+
+    report = check_scene_variation(scenes)
+
+    assert scenes == before
+    assert report["verdict"] in {"strong", "acceptable", "revise", "fail"}
+
+
+def test_production_sources_do_not_contain_flashmob_specific_fixups():
+    sources = [
+        ROOT / "pipeline" / "src" / "phases" / "phase1" / "adaptation_engine.py",
+        ROOT / "pipeline" / "src" / "phases" / "phase1" / "director_storyboard.py",
+        ROOT / "pipeline" / "src" / "phases" / "phase2" / "shot_storyboards.py",
+        ROOT / "pipeline" / "src" / "quality" / "variation_checker.py",
+    ]
+    production_text = "\n".join(
+        path.read_text(encoding="utf-8") for path in sources
+    )
+
+    for leaked_fixup in (
+        "摄影师是持机记录者，不是舞者",
+        "手机HDR高光",
+        "路面纹理",
+        "Groove",
+        "领舞姿态",
+        "_SHOT_SIZE_PALETTE",
+    ):
+        assert leaked_fixup not in production_text
 
 
 def test_phase5_automatically_redraws_failed_shots_then_rechecks(tmp_path):

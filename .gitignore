@@ -107,6 +107,7 @@ pipeline/tests/fixtures/*
 !pipeline/tests/fixtures/prose_action_rainy_overpass_zh.txt
 !pipeline/tests/fixtures/flashmob_60s_events.json
 !pipeline/tests/fixtures/flashmob_60s_evolving_events.json
+!pipeline/tests/fixtures/flashmob_60s_phase5_storyboard.json
 pipeline/prompts/test_validator.py
 
 # Documentation (internal, not published)

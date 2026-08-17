@@ -1,0 +1,84 @@
+{
+  "shots": [
+    {
+      "id": "S01",
+      "who": ["女歌手兼舞者", "摄影师"],
+      "where": "繁忙的现代日本城市街道",
+      "what": "开场即进入女主独舞，摄影师在前方持 iPhone 后退跟拍",
+      "visual": "手机手持广角街头记录，女主迎着镜头持续向前跳舞",
+      "source_excerpt": "摄影师始终位于女主前方，一边自然向后走，一边持续拍摄女主。",
+      "shot_size": "wide",
+      "camera_movement": "static",
+      "lighting_key": "natural",
+      "shot_intent": "atmosphere",
+      "storyboard_beats": [
+        {
+          "beat_id": "S01_P01",
+          "action": "女主持续向前跳舞，摄影师持 iPhone 后退拍摄",
+          "shot_size": "wide",
+          "camera_movement": "static"
+        }
+      ]
+    },
+    {
+      "id": "S02",
+      "who": ["女歌手兼舞者"],
+      "where": "街边",
+      "what": "路人逐渐被音乐感染并加入女主的舞蹈",
+      "visual": "连续 iPhone 手持跟拍，快闪队伍从一人逐步形成",
+      "source_excerpt": "摄影师保持在前方跟拍，加入过程必须渐进。",
+      "shot_size": "wide",
+      "camera_movement": "static",
+      "lighting_key": "natural",
+      "shot_intent": "atmosphere",
+      "storyboard_beats": [
+        {
+          "beat_id": "S02_P01",
+          "action": "路人逐渐加入，摄影师继续持机拍摄",
+          "shot_size": "wide",
+          "camera_movement": "static"
+        }
+      ]
+    },
+    {
+      "id": "S03",
+      "who": ["女歌手兼舞者", "摄影师"],
+      "where": "城市街头",
+      "what": "摄影师后撤拉宽画面，群舞规模增长至大型快闪",
+      "visual": "摄影师通过实际向后移动容纳更多舞者，女主保持中心",
+      "source_excerpt": "摄影师继续在女主前方后退拍摄，禁止明显 Zoom。",
+      "shot_size": "wide",
+      "camera_movement": "static",
+      "lighting_key": "natural",
+      "shot_intent": "atmosphere",
+      "storyboard_beats": [
+        {
+          "beat_id": "S03_P01",
+          "action": "摄影师持 iPhone 后退拍摄并自然拉开距离",
+          "shot_size": "wide",
+          "camera_movement": "static"
+        }
+      ]
+    },
+    {
+      "id": "S04",
+      "who": ["女歌手兼舞者"],
+      "where": "城市街道",
+      "what": "最终高潮群舞完成大型同步重拍动作",
+      "visual": "全体舞者形成向前推进的人群浪潮，女主保持视觉峰值",
+      "source_excerpt": "最后几个音乐重拍完成大型同步动作，画面在自然舞动中结束。",
+      "shot_size": "wide",
+      "camera_movement": "static",
+      "lighting_key": "natural",
+      "shot_intent": "atmosphere",
+      "storyboard_beats": [
+        {
+          "beat_id": "S04_P01",
+          "action": "全体完成高潮同步动作并继续自然舞动",
+          "shot_size": "wide",
+          "camera_movement": "static"
+        }
+      ]
+    }
+  ]
+}

@@ -42,6 +42,12 @@ class StoryboardShot(BaseModel):
     action: str = ""
     where: str = ""
     who: str | list[str] = Field(default_factory=list)
+    shot_size: str = ""
+    camera_movement: str = ""
+    lighting_key: str = ""
+    shot_intent: str = ""
+    hero_moment: bool = False
+    texture_keywords: list[str] = Field(default_factory=list)
     dialogue: Any = None
     boundary_before: Literal["cut", "continuous"] = "cut"
     continuity_reason: str = ""
