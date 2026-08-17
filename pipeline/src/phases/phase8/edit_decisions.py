@@ -335,48 +335,160 @@ def build_edit_decisions(
                 {"shot_id": shot_id, **cut["continuity_trim"]}
             )
 
-    # Build transitions
-    transitions = []
-    continuous_targets = {
+    # Insert post-primary FLF2V bridges only at authored continuous boundaries.
+    # Cut/transition boundaries deliberately remain adjacent so Phase 8 can
+    # apply their edit effect below.
+    primary_cuts = list(cuts)
+    primary_pairs = [
+        (str(primary_cuts[index]["shot_id"]), str(primary_cuts[index + 1]["shot_id"]))
+        for index in range(max(0, len(primary_cuts) - 1))
+    ]
+    transition_by_pair = dict(
+        zip(
+            primary_pairs,
+            transition_decisions or [],
+            strict=False,
+        )
+    )
+    bridge_manifest_path = Path(shots_dir).parent / "PRIMARY_SHOT_BRIDGES.json"
+    bridge_records: dict[tuple[str, str], dict[str, Any]] = {}
+    if bridge_manifest_path.is_file():
+        bridge_document = json.loads(bridge_manifest_path.read_text(encoding="utf-8"))
+        if bridge_document.get("kind") != "honcut.primary_shot_bridges.v2":
+            raise ValueError(f"unsupported primary bridge manifest in {bridge_manifest_path}")
+        bridge_records = {
+            (str(item.get("source_shot_id")), str(item.get("target_shot_id"))): item
+            for item in bridge_document.get("bridges", [])
+            if isinstance(item, dict)
+        }
+    continuous_pairs = {
+        (str(bridge.get("source_shot_id")), str(bridge.get("target_shot_id")))
+        for bridge in (continuity_plan or {}).get("bridges", [])
+        if isinstance(bridge, dict)
+    }
+    legacy_continuous_targets = {
         str(shot.get("shot_id"))
         for shot in (continuity_plan or {}).get("shots", [])
         if shot.get("boundary_before") == "continuous"
-    }
+    } if not (continuity_plan or {}).get("bridges") else set()
+    assembled_cuts: list[dict[str, Any]] = []
+    inserted_bridges: list[dict[str, Any]] = []
+    inserted_bridge_pairs: set[tuple[str, str]] = set()
+    for index, cut in enumerate(primary_cuts):
+        assembled_cuts.append(cut)
+        if index + 1 >= len(primary_cuts):
+            continue
+        pair = (str(cut["shot_id"]), str(primary_cuts[index + 1]["shot_id"]))
+        bridge_record = bridge_records.get(pair)
+        if pair in continuous_pairs:
+            if bridge_record is None:
+                raise RuntimeError(
+                    f"continuous primary boundary {pair[0]}__{pair[1]} has no generated bridge"
+                )
+            bridge_path = Path(shots_dir).parent / str(bridge_record.get("path") or "")
+            if not bridge_path.is_file() or bridge_path.stat().st_size == 0:
+                raise RuntimeError(
+                    f"continuous primary boundary {pair[0]}__{pair[1]} bridge is missing"
+                )
+            bridge_info = probe_video(str(bridge_path))
+            if bridge_info["duration"] <= 0:
+                raise RuntimeError(f"bridge has no decodable duration: {bridge_path}")
+            bridge_id = f"BRIDGE_{pair[0]}__{pair[1]}"
+            assembled_cuts.append(
+                {
+                    "source": str(bridge_path),
+                    "shot_id": bridge_id,
+                    "in_seconds": 0.0,
+                    "out_seconds": bridge_info["duration"],
+                    "speed": 1.0,
+                    "has_audio": bridge_info["has_audio"],
+                    "original_duration": bridge_info["duration"],
+                    "trimmed": False,
+                    "quality_action": "generated_continuity_bridge",
+                    "quality_reasons": [],
+                    "primary_bridge": bridge_record,
+                }
+            )
+            inserted_bridges.append(
+                {
+                    "boundary_id": f"{pair[0]}__{pair[1]}",
+                    "shot_id": bridge_id,
+                    "path": str(bridge_path),
+                }
+            )
+            inserted_bridge_pairs.add(pair)
+        elif bridge_record is not None:
+            raise RuntimeError(
+                f"cut/transition boundary {pair[0]}__{pair[1]} must not contain a bridge"
+            )
+    missing_bridges = continuous_pairs - inserted_bridge_pairs
+    if missing_bridges:
+        missing = ", ".join(f"{source}__{target}" for source, target in sorted(missing_bridges))
+        raise RuntimeError(
+            f"planned continuous primary bridges are not adjacent in assembly order: {missing}"
+        )
+    unexpected_bridges = set(bridge_records) - continuous_pairs
+    if (continuity_plan or {}).get("bridges") and unexpected_bridges:
+        unexpected = ", ".join(
+            f"{source}__{target}" for source, target in sorted(unexpected_bridges)
+        )
+        raise RuntimeError(
+            f"bridge manifest contains cut/transition or unplanned boundaries: {unexpected}"
+        )
+    cuts = assembled_cuts
+
+    # Build transitions
+    transitions = []
     transition_locks = []
     if transition_decisions:
-        for i, td in enumerate(transition_decisions):
-            if i < len(cuts) - 1:
-                next_shot_id = str(cuts[i + 1]["shot_id"])
-                locked = next_shot_id in continuous_targets
-                transition_type = "cut" if locked else td["decision"]
-                if locked:
-                    transition_locks.append(
-                        {
-                            "index": i,
-                            "before_shot_id": next_shot_id,
-                            "reason": "continuous editorial boundary forbids transitions",
-                        }
-                    )
-                transition_entry = {
-                    "index": i,
-                    "type": transition_type,
-                    "duration": 0.0 if transition_type == "cut" else transition_duration,
-                    # A visual hard cut must not imply a hard cut in sound.
-                    # Keep picture timing frame-accurate while gently fading
-                    # both sides of the audio boundary.  Dissolves retain a
-                    # true overlap, matched to the visual transition length.
-                    "audio_transition": "edge_fade" if transition_type == "cut" else "crossfade",
-                    "audio_duration": 0.35 if transition_type == "cut" else transition_duration,
-                }
-                transition_frames = round(float(transition_entry["duration"]) * 30)
-                transition_entry["duration_frames"] = transition_frames
-                transition_entry["duration"] = round(transition_frames / 30, 6)
-                if locked:
-                    transition_entry.update(
-                        locked=True,
-                        lock_reason="continuous editorial boundary",
-                    )
-                transitions.append(transition_entry)
+        for i in range(len(cuts) - 1):
+            current_id = str(cuts[i]["shot_id"])
+            next_shot_id = str(cuts[i + 1]["shot_id"])
+            touches_bridge = current_id.startswith("BRIDGE_") or next_shot_id.startswith(
+                "BRIDGE_"
+            )
+            if touches_bridge:
+                transition_type = "cut"
+                locked = True
+                lock_reason = "generated continuity bridge"
+                decision = {"decision": "cut"}
+            else:
+                decision = transition_by_pair.get((current_id, next_shot_id), {"decision": "cut"})
+                locked = next_shot_id in legacy_continuous_targets
+                transition_type = "cut" if locked else str(decision["decision"])
+                lock_reason = "continuous editorial boundary"
+            if locked:
+                transition_locks.append(
+                    {
+                        "index": i,
+                        "before_shot_id": next_shot_id,
+                        "reason": f"{lock_reason} forbids transition effects",
+                    }
+                )
+            transition_entry = {
+                "index": i,
+                "type": transition_type,
+                "duration": 0.0 if transition_type == "cut" else transition_duration,
+                # A visual hard cut must not imply a hard cut in sound.
+                # Keep picture timing frame-accurate while gently fading
+                # both sides of the audio boundary. Dissolves retain a
+                # true overlap, matched to the visual transition length.
+                "audio_transition": (
+                    "edge_fade" if transition_type == "cut" else "crossfade"
+                ),
+                "audio_duration": (
+                    0.35 if transition_type == "cut" else transition_duration
+                ),
+            }
+            transition_frames = round(float(transition_entry["duration"]) * 30)
+            transition_entry["duration_frames"] = transition_frames
+            transition_entry["duration"] = round(transition_frames / 30, 6)
+            if locked:
+                transition_entry.update(
+                    locked=True,
+                    lock_reason=lock_reason,
+                )
+            transitions.append(transition_entry)
 
     # Crossfades overlap neighboring clips. Compensate with one bounded speed
     # factor so the assembled timeline stays close to the requested duration.
@@ -414,6 +526,7 @@ def build_edit_decisions(
             "transition_locks": transition_locks,
             "continuity_trims": continuity_trim_receipts,
             "phase8_duration_trims": phase8_duration_trims,
+            "inserted_primary_bridges": inserted_bridges,
             "audio_transition_policy": {
                 "visual_cut": "equal_power_edge_fade",
                 "visual_dissolve": "equal_power_crossfade",

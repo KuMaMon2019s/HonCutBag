@@ -136,7 +136,7 @@ def test_single_mode_uses_legacy_path(monkeypatch):
     monkeypatch.setattr(engine, "_call_llm_with_timeout_retry", single)
     monkeypatch.setattr(engine, "_build_beat_skeleton", lambda *args: calls.__setitem__("skeleton", 1))
 
-    result = engine.adapt_events(_events(11), target_duration=12)
+    result = engine.adapt_events(_events(11), target_duration=15)
 
     assert calls == {"single": 1, "skeleton": 0}
     assert result["strategy"] == "批次"
@@ -171,7 +171,7 @@ def test_small_script_automatically_uses_single(monkeypatch):
     monkeypatch.setattr(engine, "_call_llm_with_timeout_retry", lambda *args, **kwargs: _batch_response(1, count=1))
     monkeypatch.setattr(engine, "_build_beat_skeleton", lambda *args: pytest.fail("small script used layered mode"))
 
-    assert engine.adapt_events(_events(10), target_duration=12)["estimated_shots"] == 1
+    assert engine.adapt_events(_events(10), target_duration=15)["estimated_shots"] == 1
 
 
 def test_beat_order_mismatch_retries_batch(monkeypatch):
@@ -290,12 +290,12 @@ def test_short_action_clip_uses_single_visible_action_budget():
 
 
 def test_duration_normalization_closes_exact_target_with_integer_seconds():
-    shots = [{"suggested_duration": 12} for _ in range(13)]
+    shots = [{"suggested_duration": 15} for _ in range(4)]
 
     engine.normalize_shot_durations(shots, 60)
 
     assert sum(shot["suggested_duration"] for shot in shots) == 60
-    assert [shot["suggested_duration"] for shot in shots] == [5] * 8 + [4] * 5
+    assert [shot["suggested_duration"] for shot in shots] == [15] * 4
 
 
 def test_duration_normalization_gives_dense_action_more_provider_capacity():
@@ -304,9 +304,9 @@ def test_duration_normalization_gives_dense_action_more_provider_capacity():
         {"micro_actions": ["抬头", "发现", "触摸", "迟疑"]},
     ]
 
-    engine.normalize_shot_durations(shots, 20)
+    engine.normalize_shot_durations(shots, 31)
 
-    assert sum(shot["suggested_duration"] for shot in shots) == 20
+    assert sum(shot["suggested_duration"] for shot in shots) == 31
     assert shots[1]["suggested_duration"] > shots[0]["suggested_duration"]
     assert shots[1]["suggested_duration"] >= 12
     assert shots[1]["duration_allocation"]["complexity_weight"] == 2
@@ -346,7 +346,7 @@ def test_layered_mode_persists_skeleton_and_each_batch(monkeypatch, tmp_path):
         writes.append((path.name, json.loads(path.read_text(encoding="utf-8"))))
 
     monkeypatch.setattr(engine, "_atomic_write_json", recording_write)
-    result = engine.adapt_events(events, target_duration=36, output_dir=tmp_path)
+    result = engine.adapt_events(events, target_duration=45, output_dir=tmp_path)
 
     persisted_skeleton = json.loads((tmp_path / "beat_skeleton.json").read_text(encoding="utf-8"))
     partial = json.loads((tmp_path / "shots_partial.json").read_text(encoding="utf-8"))
@@ -362,7 +362,7 @@ def test_layered_mode_persists_skeleton_and_each_batch(monkeypatch, tmp_path):
 def test_layered_resume_skips_cached_skeleton_and_batches(monkeypatch, tmp_path):
     events = _events(11)
     fingerprint = engine._layered_input_fingerprint(
-        events, "（无角色信息）", 72, 12, 6
+        events, "（无角色信息）", 90, 15, 6
     )
     public_beats = []
     for i in range(1, 7):
@@ -408,7 +408,7 @@ def test_layered_resume_skips_cached_skeleton_and_batches(monkeypatch, tmp_path)
         return json.dumps(response)
 
     monkeypatch.setattr(engine, "_call_llm_with_timeout_retry", expand_only_missing)
-    result = engine.adapt_events(events, target_duration=72, output_dir=tmp_path)
+    result = engine.adapt_events(events, target_duration=90, output_dir=tmp_path)
 
     assert len(calls) == 1
     assert "第一个 shot_order 必须为 4" in calls[0]

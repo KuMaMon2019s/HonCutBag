@@ -87,13 +87,9 @@ class GenerationChunk(BaseModel):
                 raise ValueError(
                     "first_last_frame_bridge chunks must use native_extend dependency"
                 )
-            if not all((
-                self.bridge_target_shot_id,
-                self.bridge_target_beat_id,
-                self.bridge_target_storyboard_image,
-            )):
+            if not self.bridge_target_shot_id:
                 raise ValueError(
-                    "first_last_frame_bridge requires the next primary shot P01 target"
+                    "first_last_frame_bridge requires the target primary shot"
                 )
             if self.expected_overlap_frames:
                 raise ValueError(
@@ -167,6 +163,33 @@ class ContinuityShot(BaseModel):
         return self
 
 
+class PrimaryShotBridge(BaseModel):
+    """Post-primary FLF2V bridge between two completed continuous shots."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    bridge_id: str = Field(min_length=1)
+    source_shot_id: str = Field(min_length=1)
+    target_shot_id: str = Field(min_length=1)
+    target_duration_s: float = Field(ge=3, le=6)
+    requested_frames: int = Field(gt=0)
+    execution_strategy: Literal["first_last_frame_bridge"] = (
+        "first_last_frame_bridge"
+    )
+    boundary_kind: Literal["continuous"] = "continuous"
+    continuity_reason: str = ""
+    action_prompt: str = ""
+    start_state: str = ""
+    end_state: str = ""
+    generation_phase: Literal["post_primary_shots"] = "post_primary_shots"
+    first_frame_source: Literal["source_primary_video_tail_frame"] = (
+        "source_primary_video_tail_frame"
+    )
+    last_frame_source: Literal["target_primary_video_first_frame"] = (
+        "target_primary_video_first_frame"
+    )
+
+
 class ContinuityPlan(BaseModel):
     """Phase 4 artifact consumed by the future continuity-aware Phase 6 runner."""
 
@@ -176,11 +199,13 @@ class ContinuityPlan(BaseModel):
     provider_chunk_limit_s: float = Field(gt=0)
     timeline_fps: int = Field(default=24, gt=0)
     shots: list[ContinuityShot] = Field(default_factory=list)
+    bridges: list[PrimaryShotBridge] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def resource_ids_are_globally_unique(self) -> ContinuityPlan:
         shot_ids: set[str] = set()
         chunk_ids: set[str] = set()
+        ordered_shot_ids: list[str] = []
         for shot in self.shots:
             if shot.shot_id in shot_ids:
                 raise ValueError(f"duplicate shot_id: {shot.shot_id}")
@@ -194,6 +219,7 @@ class ContinuityPlan(BaseModel):
                     f"{shot.extends_from_chunk_id}"
                 )
             shot_ids.add(shot.shot_id)
+            ordered_shot_ids.append(shot.shot_id)
             if shot.target_frames is not None:
                 expected_target = round(shot.target_duration_s * self.timeline_fps)
                 if abs(shot.target_frames - expected_target) > 1:
@@ -208,4 +234,37 @@ class ContinuityPlan(BaseModel):
                 if chunk.chunk_id in chunk_ids:
                     raise ValueError(f"duplicate chunk_id: {chunk.chunk_id}")
                 chunk_ids.add(chunk.chunk_id)
+        bridge_ids: set[str] = set()
+        shot_positions = {shot_id: index for index, shot_id in enumerate(ordered_shot_ids)}
+        for bridge in self.bridges:
+            if bridge.bridge_id in bridge_ids:
+                raise ValueError(f"duplicate bridge_id: {bridge.bridge_id}")
+            bridge_ids.add(bridge.bridge_id)
+            if bridge.source_shot_id not in shot_positions:
+                raise ValueError(
+                    f"{bridge.bridge_id} references unknown source shot "
+                    f"{bridge.source_shot_id}"
+                )
+            if bridge.target_shot_id not in shot_positions:
+                raise ValueError(
+                    f"{bridge.bridge_id} references unknown target shot "
+                    f"{bridge.target_shot_id}"
+                )
+            source_position = shot_positions[bridge.source_shot_id]
+            if source_position + 1 >= len(ordered_shot_ids) or (
+                ordered_shot_ids[source_position + 1] != bridge.target_shot_id
+            ):
+                raise ValueError(
+                    f"{bridge.bridge_id} must connect adjacent primary shots"
+                )
+            expected_frames = round(bridge.target_duration_s * self.timeline_fps)
+            if bridge.requested_frames != expected_frames:
+                raise ValueError(
+                    f"{bridge.bridge_id} requested frames disagree with duration"
+                )
+            target_shot = self.shots[source_position + 1]
+            if target_shot.boundary_before != "continuous":
+                raise ValueError(
+                    f"{bridge.bridge_id} is forbidden across a cut/transition boundary"
+                )
         return self

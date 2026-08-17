@@ -1071,6 +1071,20 @@ def run_phase1_screenwriter(
                 "width": resolved_video_spec["width"],
                 "height": resolved_video_spec["height"],
             }
+            # Dry-run artifacts must obey the same 15-30s primary contract as
+            # paid runs; otherwise later phases validate a fixture that can
+            # never exist in production.
+            requested_duration = max(15, int(duration or 15))
+            mock_shot_count = max(1, math.ceil(requested_duration / 30))
+            templates = list(mock_storyboard["shots"])
+            base_duration, remainder = divmod(requested_duration, mock_shot_count)
+            mock_storyboard["shots"] = []
+            for index in range(mock_shot_count):
+                shot = dict(templates[index % len(templates)])
+                shot["id"] = index + 1
+                shot["duration"] = base_duration + (1 if index < remainder else 0)
+                mock_storyboard["shots"].append(shot)
+            mock_storyboard["total_duration"] = requested_duration
             from phases.phase1.storyboard_beats import plan_storyboard_beats
 
             plan_storyboard_beats(mock_storyboard)

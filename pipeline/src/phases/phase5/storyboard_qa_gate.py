@@ -332,15 +332,15 @@ def run_generation_capacity_checks(
                                 [sid], beat_id=beat_id,
                                 expected_target_beat_id=expected_target_beat,
                             ))
-                if (
-                    beat_duration < profile.min_unique_beat_s
-                    or beat_duration > profile.max_unique_beat_s
-                ):
+                duration_minimum, duration_maximum = (
+                    profile.effective_duration_bounds(actual_mode)
+                )
+                if not duration_minimum <= beat_duration <= duration_maximum:
                     issues.append(_issue(
                         "L1", "severe", "storyboard_beat_duration_invalid",
                         f"{beat_id} lasts {beat_duration:g}s; expected "
-                        f"{profile.min_unique_beat_s:g}-{profile.max_unique_beat_s:g}s "
-                        f"for {profile.name}",
+                        f"{duration_minimum:g}-{duration_maximum:g}s for "
+                        f"{profile.name} {actual_mode}",
                         [sid], beat_id=beat_id, duration_seconds=beat_duration,
                     ))
             if duration and not math.isclose(

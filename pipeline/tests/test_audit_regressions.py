@@ -64,11 +64,11 @@ def test_seedance_limits_are_provider_capabilities_not_global_director_rules():
 
     seedance_board = {
         "video_provider": "seedance",
-        "shots": [{"id": 1, "duration": 8, "micro_actions": ["a", "b", "c", "d"]}],
+        "shots": [{"id": 1, "duration": 20, "micro_actions": ["a", "b", "c", "d"]}],
     }
     generic_board = {
         "video_provider": "kling",
-        "shots": [{"id": 1, "duration": 8, "micro_actions": ["a", "b", "c", "d"]}],
+        "shots": [{"id": 1, "duration": 20, "micro_actions": ["a", "b", "c", "d"]}],
     }
     plan_storyboard_beats(seedance_board)
     plan_storyboard_beats(generic_board)
@@ -80,13 +80,40 @@ def test_seedance_limits_are_provider_capabilities_not_global_director_rules():
     )
 
 
-def test_secondary_v5_reserves_provider_valid_bridge_time_before_content_capacity():
+@pytest.mark.parametrize(
+    ("duration", "expected_durations"),
+    [
+        (15, [15]),
+        (16, [9, 7]),
+        (25, [15, 10]),
+        (26, [10, 8, 8]),
+        (30, [12, 9, 9]),
+    ],
+)
+def test_secondary_v6_enforces_strategy_ranges_and_primary_assembly_budget(
+    duration, expected_durations
+):
+    storyboard = {
+        "video_provider": "seedance",
+        "shots": [{"id": "S01", "duration": duration, "micro_actions": ["前进"]}],
+    }
+
+    plan_storyboard_beats(storyboard)
+    beats = storyboard["shots"][0]["storyboard_beats"]
+
+    assert [beat["duration_s"] for beat in beats] == expected_durations
+    assert 8 <= beats[0]["duration_s"] <= 15
+    assert all(6 <= beat["duration_s"] <= 10 for beat in beats[1:])
+    assert sum(beat["duration_s"] for beat in beats) == duration
+
+
+def test_secondary_v6_keeps_bridge_time_outside_primary_content_capacity():
     storyboard = {
         "video_provider": "seedance",
         "shots": [
             {
                 "id": "S01",
-                "duration": 10,
+                "duration": 15,
                 "where": "旋转走廊",
                 "who": ["Agent"],
                 "micro_actions": ["Agent抓住扶手"],
@@ -94,7 +121,7 @@ def test_secondary_v5_reserves_provider_valid_bridge_time_before_content_capacit
             },
             {
                 "id": "S02",
-                "duration": 5,
+                "duration": 15,
                 "where": "旋转走廊",
                 "who": ["Agent"],
                 "micro_actions": ["Agent穿过舱门"],
@@ -109,11 +136,13 @@ def test_secondary_v5_reserves_provider_valid_bridge_time_before_content_capacit
     first = storyboard["shots"][0]
     assert [beat["generation_mode"] for beat in first["storyboard_beats"]] == [
         "multi_image",
-        "first_last_frame_bridge",
     ]
-    assert [beat["duration_s"] for beat in first["storyboard_beats"]] == [7, 3]
-    assert first["secondary_storyboard_planning"]["content_duration_s"] == 7
+    assert [beat["duration_s"] for beat in first["storyboard_beats"]] == [15]
+    assert first["secondary_storyboard_planning"]["content_duration_s"] == 15
     assert first["secondary_storyboard_planning"]["bridge_duration_s"] == 3
+    assert storyboard["primary_shot_bridges"][0]["generation_phase"] == (
+        "post_primary_shots"
+    )
 
 
 def test_secondary_v4_rejects_false_continuity_and_fractional_seedance_duration():
@@ -154,13 +183,13 @@ def test_generic_action_unit_capacity_does_not_inherit_seedance_split():
     ] == ["multi_image"]
 
 
-def test_secondary_v4_cannot_downgrade_to_legacy_or_put_plot_in_bridge():
+def test_secondary_v6_cannot_downgrade_or_use_storyboard_proxy_for_bridge():
     storyboard = {
         "video_provider": "seedance",
         "shots": [
             {
                 "id": "S01",
-                "duration": 6,
+                "duration": 15,
                 "where": "走廊",
                 "who": ["Agent"],
                 "micro_actions": ["Agent稳定姿态"],
@@ -168,7 +197,7 @@ def test_secondary_v4_cannot_downgrade_to_legacy_or_put_plot_in_bridge():
             },
             {
                 "id": "S02",
-                "duration": 5,
+                "duration": 15,
                 "where": "走廊",
                 "who": ["Agent"],
                 "micro_actions": ["Agent进入下一舱"],
@@ -190,15 +219,14 @@ def test_secondary_v4_cannot_downgrade_to_legacy_or_put_plot_in_bridge():
         build_continuity_plan(downgraded)
 
     invented = json.loads(json.dumps(storyboard))
-    bridge = invented["shots"][0]["storyboard_beats"][-1]
-    bridge["micro_actions"] = ["凭空击败敌人"]
-    bridge["source_action_unit_ids"] = ["INVENTED"]
+    bridge = invented["primary_shot_bridges"][0]
+    bridge["last_frame_source"] = "target_storyboard_image"
     invented_codes = {
         issue["code"]
         for issue in storyboard_qa_gate.run_generation_capacity_checks(invented)
     }
-    assert "secondary_storyboard_bridge_contains_plot" in invented_codes
-    with pytest.raises(ValueError, match="bridge must not carry"):
+    assert "secondary_storyboard_bridge_invalid" in invented_codes
+    with pytest.raises(ValueError, match="invalid secondary storyboard contract"):
         build_continuity_plan(invented)
 
 
@@ -215,7 +243,7 @@ def test_action_aware_adaptation_splits_paid_probe_before_secondary_planning():
             "micro_actions": ["穿门", "避让工具箱", "推向观察窗", "稳定"],
         },
     ]
-    assert adaptation_engine.estimate_action_aware_shot_count(events, 24, 12) == 3
+    assert adaptation_engine.estimate_action_aware_shot_count(events, 45, 12) == 3
 
     shots = [
         {
@@ -241,8 +269,8 @@ def test_action_aware_adaptation_splits_paid_probe_before_secondary_planning():
         },
     ]
     annotate_boundaries(shots)
-    adaptation_engine.normalize_shot_durations(shots, 24)
-    assert [shot["suggested_duration"] for shot in shots] == [9, 9, 6]
+    adaptation_engine.normalize_shot_durations(shots, 45)
+    assert [shot["suggested_duration"] for shot in shots] == [15, 15, 15]
 
     storyboard = {"video_provider": "seedance", "shots": shots}
     plan_storyboard_beats(storyboard)
@@ -250,9 +278,12 @@ def test_action_aware_adaptation_splits_paid_probe_before_secondary_planning():
         [beat["generation_mode"] for beat in shot["storyboard_beats"]]
         for shot in shots
     ] == [
-        ["multi_image", "tail_video_extend", "first_last_frame_bridge"],
-        ["multi_image", "tail_video_extend", "first_last_frame_bridge"],
         ["multi_image", "tail_video_extend"],
+        ["multi_image", "tail_video_extend"],
+        ["multi_image", "tail_video_extend"],
+    ]
+    assert [bridge["bridge_id"] for bridge in storyboard["primary_shot_bridges"]] == [
+        "S01__S02", "S02__S03",
     ]
 
 
@@ -294,9 +325,8 @@ def test_capacity_repair_deterministically_fixes_paid_model_event_mapping():
 
     repaired = adaptation_engine._repair_beat_action_capacity(model_beats, events)
 
-    assert [beat["source_events"] for beat in repaired] == [[1, 2], [2], [3]]
-    assert repaired[0]["capacity_repair"]["event_id"] == 2
-    assert "挥拳" in repaired[0]["visual"]
+    assert [beat["source_events"] for beat in repaired] == [[1], [2], [3]]
+    assert "capacity_repair" not in repaired[0]
     adaptation_engine._validate_beat_action_capacity(repaired, events)
 
 
@@ -1105,7 +1135,7 @@ def test_phase1_beat_planner_never_emits_over_capacity_beats():
         "shots": [
             {
                 "id": "S01",
-                "duration": 10,
+                "duration": 20,
                 "micro_actions": [f"action-{index}" for index in range(7)],
             }
         ],
@@ -1119,10 +1149,10 @@ def test_phase1_starts_each_primary_shot_p01_with_multi_image_generation():
     storyboard = {
         "video_provider": "seedance",
         "shots": [
-            {"id": "S01", "duration": 6, "micro_actions": ["进入"], "boundary_before": "cut"},
+            {"id": "S01", "duration": 15, "micro_actions": ["进入"], "boundary_before": "cut"},
             {
                 "id": "S02",
-                "duration": 5,
+                "duration": 15,
                 "micro_actions": ["继续前进"],
                 "boundary_before": "continuous",
             },

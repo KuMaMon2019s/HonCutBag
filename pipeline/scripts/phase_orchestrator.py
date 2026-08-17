@@ -64,6 +64,7 @@ from utils.phase_policy import get_policy  # noqa: E402
 from utils.video_capabilities import (  # noqa: E402
     get_video_capabilities,
     max_primary_story_duration,
+    min_primary_story_duration,
 )
 
 
@@ -76,7 +77,7 @@ def _normalize_shot_duration(config: dict) -> int:
         model=config.get("video_model"),
         provider=config.get("video_provider"),
     )
-    minimum = int(profile.min_shot_duration_s)
+    minimum = int(min_primary_story_duration(profile))
     maximum = int(max_primary_story_duration(profile))
     clamped = max(minimum, min(maximum, shot_duration))
     if clamped != shot_duration:

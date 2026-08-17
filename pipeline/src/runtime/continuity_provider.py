@@ -315,6 +315,16 @@ def _validate_seedance_continuity_plan(plan: ContinuityPlan) -> None:
                 _validated_seedance_chunk_duration(chunk, chunk.chunk_id)
             except ValueError as exc:
                 errors.append(str(exc))
+    for bridge in plan.bridges:
+        try:
+            SEEDANCE_2_CAPABILITIES.validate_chunk_durations(
+                bridge.target_duration_s,
+                bridge.target_duration_s,
+                "first_last_frame_bridge",
+                resource_id=bridge.bridge_id,
+            )
+        except ValueError as exc:
+            errors.append(str(exc))
     if errors:
         detail = "; ".join(errors[:8])
         if len(errors) > 8:
@@ -415,10 +425,10 @@ def _chunk_prompt(
             "video without a reset, cut, replay, or re-entry."
         ),
         "first_last_frame_bridge": (
-            "Generate only the transition between the previous secondary beat's "
-            "actual final frame and the next primary shot's P01 frame. The current "
-            "primary-shot action is already complete: do not add, finish, repeat, or "
-            "reinterpret any plot action, and do not execute the next shot's action."
+            "Generate only the transition between the completed source primary "
+            "video's actual final frame and the completed target primary video's "
+            "actual first frame. Both primary actions are already complete: do not "
+            "add, finish, repeat, or reinterpret plot action."
         ),
     }.get(
         strategy,
@@ -692,16 +702,21 @@ def _extension_content(
 def _first_last_bridge_content(
     content: Sequence[dict[str, Any]],
     previous_output_path: Path,
-    target_storyboard_path: Path,
+    target_output_path: Path,
 ) -> list[dict[str, Any]]:
-    """Bind a transition to the real predecessor tail and next primary P01."""
+    """Bind a transition to completed source-tail and target-head frames."""
     from clients.tos_uploader import upload_image
-    from quality.continuity_seam import extract_video_tail_frame
+    from quality.continuity_seam import (
+        extract_video_head_frame,
+        extract_video_tail_frame,
+    )
 
-    if not target_storyboard_path.is_file() or target_storyboard_path.stat().st_size == 0:
-        raise FileNotFoundError(
-            f"next primary storyboard frame missing: {target_storyboard_path}"
-        )
+    for label, path in (
+        ("source primary video", previous_output_path),
+        ("target primary video", target_output_path),
+    ):
+        if not path.is_file() or path.stat().st_size == 0:
+            raise FileNotFoundError(f"{label} missing: {path}")
     with previous_output_path.open("rb") as predecessor:
         predecessor_hash = hashlib.file_digest(predecessor, "sha256").hexdigest()
     anchor_dir = previous_output_path.parent / "continuity_anchors"
@@ -711,11 +726,16 @@ def _first_last_bridge_content(
     )
     if not tail_frame.is_file() or tail_frame.stat().st_size == 0:
         extract_video_tail_frame(previous_output_path, tail_frame)
+    with target_output_path.open("rb") as target:
+        target_hash = hashlib.file_digest(target, "sha256").hexdigest()
+    head_frame = anchor_dir / (
+        f"{target_output_path.parent.name}_{target_hash[:16]}_first.jpg"
+    )
+    if not head_frame.is_file() or head_frame.stat().st_size == 0:
+        extract_video_head_frame(target_output_path, head_frame)
 
     first_payload, first_content_type = _seedance_reference_image_payload(tail_frame)
-    last_payload, last_content_type = _seedance_reference_image_payload(
-        target_storyboard_path
-    )
+    last_payload, last_content_type = _seedance_reference_image_payload(head_frame)
     first_url = upload_image(first_payload, first_content_type)
     last_url = upload_image(last_payload, last_content_type)
     if not first_url or not last_url:
@@ -723,12 +743,10 @@ def _first_last_bridge_content(
             "failed to upload first/last frames for secondary-storyboard bridge"
         )
     directive = (
-        "图片1是上一二级分镜视频真实尾帧，必须作为新视频第一帧；"
-        "图片2是下一一级分镜P01，必须作为新视频最后一帧。"
-        "图片2中的主体动作箭头和摄影机箭头只用于指示过渡的运动方向与轨迹，"
-        "箭头、轨迹线、文字、编号和分格标记不得出现在新视频任何一帧。"
-        "只生成两帧之间的连续过渡并完成当前一级分镜的收束，"
-        "不得提前执行图片2所属一级分镜的动作，不得新增剧情、角色或道具。\n"
+        "图片1来自已完成的上一一级分镜视频真实尾帧，必须作为新视频第一帧；"
+        "图片2来自已完成的下一一级分镜视频真实首帧，必须作为新视频最后一帧。"
+        "只生成两帧之间的连续摄影机与动作过渡，不得重复两侧已完成剧情，"
+        "不得新增剧情、角色、道具、文字、箭头、轨迹线、编号或分格标记。\n"
     )
     text_value = next(
         (str(item.get("text") or "") for item in content if item.get("type") == "text"),
@@ -761,23 +779,20 @@ def _provider_content(
     if strategy == "first_last_frame_bridge":
         if request.previous_output_path is None:
             raise RuntimeError(f"{request.resource_id} has no predecessor video")
-        target_value = request.chunk.bridge_target_storyboard_image
-        if not target_value:
-            raise RuntimeError(f"{request.resource_id} has no next-primary P01 target")
-        target_path = Path(target_value)
-        if not target_path.is_absolute():
-            target_path = output_dir / target_path
+        if request.target_output_path is None:
+            raise RuntimeError(f"{request.resource_id} has no completed target video")
         content = _first_last_bridge_content(
             content,
             request.previous_output_path,
-            target_path,
+            request.target_output_path,
         )
     elif request.chunk.mode == "native_extend":
         if request.previous_output_path is None:
             raise RuntimeError(f"{request.resource_id} has no predecessor video")
         content = _extension_content(content, request.previous_output_path)
-    _, board_path = _storyboard_group_for_shot(output_dir, request.shot_id)
-    content = _append_group_board_reference(content, board_path)
+    if strategy != "first_last_frame_bridge":
+        _, board_path = _storyboard_group_for_shot(output_dir, request.shot_id)
+        content = _append_group_board_reference(content, board_path)
     return content, shot_meta, _generation_seed(request), _chunk_duration(request)
 
 
@@ -1463,7 +1478,7 @@ def execute_phase6_auto_continuity(
         for chunk in shot.chunks
         if (
             chunk.mode == "native_extend"
-            and chunk.execution_strategy != "first_last_frame_bridge"
+            and chunk.execution_strategy == "legacy"
             and chunk.expected_overlap_frames <= 0
         )
     ]

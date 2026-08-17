@@ -22,7 +22,7 @@ CONTINUITY_MODES = {"off", "shadow", "auto"}
 LINEAGE_KIND = "honcut.continuity_lineage.v1"
 REVIEW_DECISIONS_KIND = "honcut.continuity_review_decisions.v1"
 SEAM_DECISIONS_KIND = "honcut.continuity_seam_decisions.v1"
-PRIMARY_SHOT_BRIDGES_KIND = "honcut.primary_shot_bridges.v1"
+PRIMARY_SHOT_BRIDGES_KIND = "honcut.primary_shot_bridges.v2"
 
 
 def _utc_now() -> str:
@@ -76,6 +76,7 @@ class ChunkExecutionRequest:
     previous_output_path: Path | None
     input_fingerprint: str
     memory_context: str
+    target_output_path: Path | None = None
     repair_attempt: int = 0
 
 
@@ -990,6 +991,108 @@ def execute_continuity_plan(
                 errors.append({"shot_id": group[0].shot_id, "error": str(exc)})
 
     outputs.sort()
+    errors.sort(key=lambda item: item["shot_id"])
+    # Cross-primary bridges are intentionally deferred until every primary
+    # video has completed. This guarantees FLF2V uses the actual adjacent
+    # outputs rather than a storyboard proxy or an unfinished chunk.
+    if not errors:
+        shots_by_id = {shot.shot_id: shot for shot in plan.shots}
+        for bridge in plan.bridges:
+            source_shot = shots_by_id[bridge.source_shot_id]
+            source_path = root / "shots" / bridge.source_shot_id / "output.mp4"
+            target_path = root / "shots" / bridge.target_shot_id / "output.mp4"
+            bridge_path = root / "shot_bridges" / f"{bridge.bridge_id}.mp4"
+            bridge_path.parent.mkdir(parents=True, exist_ok=True)
+            chunk_id = f"{bridge.bridge_id}_B01"
+            bridge_chunk = GenerationChunk(
+                chunk_id=chunk_id,
+                sequence=1,
+                target_duration_s=bridge.target_duration_s,
+                requested_frames=bridge.requested_frames,
+                expected_unique_frames=bridge.requested_frames,
+                mode="native_extend",
+                depends_on=source_shot.chunks[-1].chunk_id,
+                execution_strategy="first_last_frame_bridge",
+                bridge_target_shot_id=bridge.target_shot_id,
+                action_prompt=bridge.action_prompt,
+                start_state=bridge.start_state,
+                end_state=bridge.end_state,
+            )
+            fingerprint = _canonical_hash(
+                {
+                    "bridge": bridge.model_dump(mode="json"),
+                    "source_video_sha256": _file_hash(source_path),
+                    "target_video_sha256": _file_hash(target_path),
+                    "source_anchors": source_shot.anchors.model_dump(mode="json"),
+                }
+            )
+            record = lineage.get_chunk(chunk_id)
+            try:
+                if _valid_record(record, fingerprint, bridge_path):
+                    with totals_lock:
+                        skipped_chunks += 1
+                else:
+                    request = ChunkExecutionRequest(
+                        resource_id=chunk_id,
+                        shot_id=bridge.source_shot_id,
+                        chunk=bridge_chunk,
+                        anchors=source_shot.anchors.model_dump(mode="json"),
+                        output_path=bridge_path,
+                        previous_output_path=source_path,
+                        target_output_path=target_path,
+                        input_fingerprint=fingerprint,
+                        memory_context=render_continuity_memory_context(
+                            root, plan, bridge.source_shot_id
+                        ),
+                    )
+                    result = execute_chunk(request)
+                    produced_path = Path(result.output_path)
+                    if produced_path.resolve() != bridge_path.resolve():
+                        raise RuntimeError(
+                            f"{chunk_id} wrote {produced_path}, expected {bridge_path}"
+                        )
+                    if not bridge_path.is_file() or bridge_path.stat().st_size == 0:
+                        raise RuntimeError(f"{chunk_id} produced no video bytes")
+                    lineage.put_chunk(
+                        chunk_id,
+                        {
+                            "status": "succeeded",
+                            "input_fingerprint": fingerprint,
+                            "output_path": _portable_path(bridge_path, root),
+                            "output_sha256": _file_hash(bridge_path),
+                            "provider_task_id": result.provider_task_id,
+                            "updated_at": _utc_now(),
+                        },
+                    )
+                    with totals_lock:
+                        executed_chunks += 1
+                primary_shot_bridges.append(
+                    {
+                        "boundary_id": bridge.bridge_id,
+                        "source_shot_id": bridge.source_shot_id,
+                        "target_shot_id": bridge.target_shot_id,
+                        "chunk_id": chunk_id,
+                        "duration_s": bridge.target_duration_s,
+                        "path": _portable_path(bridge_path, root),
+                        "generated_after_primary_shots": True,
+                        "first_frame_source": "source_primary_video_tail_frame",
+                        "last_frame_source": "target_primary_video_first_frame",
+                        "embedded_in_preceding_shot_output": False,
+                        "phase8_transition_policy": "insert_generated_bridge_without_effect",
+                    }
+                )
+            except Exception as exc:
+                lineage.put_chunk(
+                    chunk_id,
+                    {
+                        "status": "failed",
+                        "input_fingerprint": fingerprint,
+                        "error": str(exc),
+                        "updated_at": _utc_now(),
+                    },
+                )
+                errors.append({"shot_id": bridge.bridge_id, "error": str(exc)})
+                break
     errors.sort(key=lambda item: item["shot_id"])
     primary_shot_bridges.sort(
         key=lambda item: (item["source_shot_id"], item["target_shot_id"])

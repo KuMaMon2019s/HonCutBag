@@ -47,12 +47,12 @@ def test_extracted_dialogue_lines_reach_adaptation_prompt(monkeypatch):
             "where": "雨夜轨道",
             "what": "凛质问烬",
             "visual": "两人隔着轨道对峙",
-            "suggested_duration": 12,
+            "suggested_duration": 15,
             "dialogue": expected_lines[0],
         }]}, ensure_ascii=False)
 
     monkeypatch.setattr(adaptation_engine, "_call_llm_with_timeout_retry", fake_adaptation_call)
-    adaptation_engine.adapt_events(events, target_duration=12)
+    adaptation_engine.adapt_events(events, target_duration=15)
 
     assert expected_lines[0]["line"] in prompts[0]
     assert '"lines"' in prompts[0]

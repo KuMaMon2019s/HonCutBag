@@ -53,6 +53,7 @@ from utils.video_capabilities import (
     capabilities_for,
     get_video_capabilities,
     max_primary_story_duration,
+    min_primary_story_duration,
 )
 from utils.character_identity import (
     normalize_character_reference,
@@ -108,12 +109,13 @@ USER_PROMPT_TEMPLATE = (
     "- 跨场景切换时不写承接（硬切）\n\n"
     "【导演镜头边界】\n"
     "boundary_before=continuous 只表示叙事与空间连续，供导演总览和剪辑判断；每个 Sxx 仍从自己的"
-    "P01 以角色图+本格故事图等多图生成第一段。只有当 P01 的最大叙事时长或动作容量不足以完整"
-    "覆盖当前 Sxx 的全部剧情细节时，才生成一个 P02 容量延长格，截取前段视频末段后延长；不得仅因"
+    "P01 以角色图+本格故事图等多图生成 8–15 秒第一段。只有当 P01 的最大叙事时长或动作容量不足以完整"
+    "覆盖当前 Sxx 的全部剧情细节时，才生成 6–10 秒容量延长格，截取前段视频末段后延长；可按容量增加"
+    "至多两个延长格，但不得仅因"
     "动作激烈、人物多或运镜复杂就强行增加延长格。若下一 Sxx 的 boundary_before=continuous，当前"
-    "Sxx 末尾再追加一个首尾帧桥接格（它可能是 P02，也可能是 P03），以前一内容段真实尾帧作首帧、"
-    "下一 Sxx 的 P01 作尾帧，只保持边界连续，不承担未完成剧情。下一 Sxx 为 cut，或存在换场、跳时、"
-    "主体切换、回忆/梦境/与此同时、fade/dissolve/wipe 等转场时，绝不生成桥接格。第一镜必须为 cut。\n\n"
+    "Sxx 只声明独立的 3–6 秒后置桥接任务，不占用 Pxx 和一级镜头剧情时长。所有一级视频完成后，"
+    "以前一一级成片真实尾帧作首帧、下一一级成片真实首帧作尾帧生成桥接。下一 Sxx 为 cut，或存在换场、跳时、"
+    "主体切换、回忆/梦境/与此同时、fade/dissolve/wipe 等转场时，绝不生成桥接，由 Phase 8 添加转场特效。第一镜必须为 cut。\n\n"
     "时长分配必须给上述结构留足当前视频模型可执行的最小时长，并服从其时长量化粒度；"
     "若目标总时长不足，优先调整一级分镜边界/时长，不得生成不可执行的伪 Pxx。\n\n"
     "【小说化动作剧本】\n"
@@ -138,7 +140,7 @@ USER_PROMPT_TEMPLATE = (
     "【HonCut 分镜铁律】\n"
     "0. who 只能逐字引用上方角色列表中的主名，别名必须改写为对应主名；"
     "群体/群众/背景元素不得写入 who，只能写入 visual；who=[] 是无人物硬合同。\n"
-    "1. 每片段不得超过当前视频模型一次基础段加一次容量延长所能完整承载的上限，超过必须拆分\n"
+    "1. 每个一级片段必须为15–30秒，并由一个8–15秒基础段加零至两个6–10秒容量延长段完整承载，超过必须拆分\n"
     "2. 单镜台词>20字必须拆镜（台词4字/秒计算：20字=5秒）\n"
     "3. 在场人物不消失：同场景内角色不能无故离场，必须交代去向\n"
     "4. 人物外观不进提示词：发型/服装/体态由角色参考图承载，visual只写动作和表情\n"
@@ -179,7 +181,7 @@ BATCH_EXPAND_PROMPT = (
     "\"shot_order\":1,\"source_events\":[1],\"action\":\"keep\","
     "\"reason\":\"理由\",\"who\":[\"角色主名\"],\"where\":\"地点\","
     "\"what\":\"事件\",\"emotion\":\"情绪\",\"visual\":\"画面\","
-    "\"suggested_duration\":12,\"boundary_before\":\"cut\","
+    "\"suggested_duration\":15,\"boundary_before\":\"cut\","
     "\"continuity_reason\":\"新场景\",\"continuity_subject\":\"\","
     "\"transition_to_next\":\"cut\","
     "\"associate_assets\":[\"char:id\",\"scene:地点\"],\"shot_size\":\"medium\","
@@ -192,11 +194,11 @@ BATCH_EXPAND_PROMPT = (
     "「承接上镜：上镜定格于{{角色名}}{{位置/姿态/朝向}}，{{最后动作的终态}}——本镜由此延续」。\n"
     "【导演镜头边界】第一镜 boundary_before 必须为 cut。同一时空和动作因果连续时，下一镜可标"
     "continuous 并填写 continuity_reason；这只描述剪辑连续性，不表示跨 Sxx 延长视频。"
-    "每个 Sxx 的 P01 用角色图+本格故事图等多图生成。只有 P01 最大叙事时长或动作容量不能覆盖"
-    "当前 Sxx 全部剧情细节时，才生成一个容量延长格并截取前段视频末段后延长；不得仅凭视觉复杂度"
-    "增加延长格。只有下一 Sxx 明确 continuous 时，当前 Sxx 末尾才追加首尾帧桥接格（P02 或 P03），"
-    "以前一内容段真实尾帧作首帧、下一 Sxx 的 P01 作尾帧；cut、换场、跳时、主体切换及"
-    "fade/dissolve/wipe 等转场绝不生成桥接格。\n"
+    "每个 Sxx 总时长 15–30 秒；P01 用角色图+本格故事图等多图生成 8–15 秒。只有 P01 最大叙事时长"
+    "或动作容量不能覆盖当前 Sxx 全部剧情细节时，才生成一个或两个 6–10 秒容量延长格并截取前段"
+    "视频末段后延长；不得仅凭视觉复杂度增加延长格。只有下一 Sxx 明确 continuous 时，才声明独立"
+    "3–6 秒后置桥接任务：所有一级视频完成后，以当前一级成片真实尾帧和下一一级成片真实首帧生成；"
+    "cut、换场、跳时、主体切换及 fade/dissolve/wipe 等转场绝不生成桥接，由 Phase 8 添加转场特效。\n"
     "时长必须匹配当前视频模型的最小时长、最大时长和时长量化粒度；不足时调整一级分镜时长或边界，"
     "不得输出不可执行的伪 Pxx。\n"
     "【小说化动作剧本】严格继承来源事件的 sequence_id/action_unit_id/micro_actions/start_state/"
@@ -209,7 +211,7 @@ BATCH_EXPAND_PROMPT = (
     "【片段间过渡规则】相邻片段用动作桥梁、情绪接力、空间视线或台词黏合消灭跳跃感。\n"
     "【铁律优先级】台词零删改 > 出场人物完整 > 只描述动作状态 > 长台词拆镜。\n\n"
     "【HonCut 分镜铁律】who 只能逐字引用角色主名，别名改主名，群众只进 visual；"
-    "每片段不得超过当前模型一次基础段加一次延长段的承载上限；单镜台词>20字必须拆镜（按4字/秒）；同场景人物不得无故消失；"
+    "每片段必须在 15–30 秒一级镜头及其 8–15/6–10 秒二级片段承载范围内；单镜台词>20字必须拆镜（按4字/秒）；同场景人物不得无故消失；"
     "人物外观不进提示词；声音只写环境音和音效，禁止配乐/BGM/背景音乐；"
     "群演只做背景动作；相邻镜头景别和角度必须错开。\n\n"
     "【HonCut Identity Anchor】身份只通过 who 与 associate_assets 结构化绑定；visual 不重复外貌。"
@@ -321,7 +323,7 @@ def estimate_shot_count(
     """
     根据目标时长和单镜时长计算合理的镜头数量。
 
-    单镜时长由所选视频模型及“一次基础段+一次延长段”合同共同限制。
+    单镜时长由所选视频模型及“一次基础段+有界延长段”合同共同限制。
 
     Args:
         target_duration: 目标总时长（秒）
@@ -333,7 +335,7 @@ def estimate_shot_count(
     profile = capabilities or get_video_capabilities()
     semantic_maximum = max_primary_story_duration(profile)
     shot_duration = max(
-        profile.min_shot_duration_s,
+        min_primary_story_duration(profile),
         min(semantic_maximum, shot_duration),
     )
 
@@ -374,22 +376,9 @@ def estimate_action_aware_shot_count(
         if event.get("micro_actions")
     )
     required_content_beats = max(baseline, action_content_beats)
-    required_bridge_beats = sum(
-        max(0, _event_primary_occurrence_requirement(event, profile) - 1)
-        for event in authored_events
-    )
-    for previous, current in zip(authored_events, authored_events[1:]):
-        explicit_continuity = str(current.get("continuity_before") or "").lower()
-        same_sequence = bool(
-            previous.get("sequence_id")
-            and previous.get("sequence_id") == current.get("sequence_id")
-        )
-        if explicit_continuity == "continuous" or same_sequence:
-            required_bridge_beats += 1
     minimum_runtime = max(
-        required_primary_shots * profile.min_shot_duration_s,
-        (required_content_beats + required_bridge_beats)
-        * profile.min_unique_beat_s,
+        required_primary_shots * min_primary_story_duration(profile),
+        required_content_beats * profile.min_unique_beat_s,
     )
     if target_duration + 1e-6 < minimum_runtime:
         raise ValueError(
@@ -475,6 +464,7 @@ def normalize_shot_durations(
     if not shots:
         return shots
     profile = capabilities or capabilities_for(shots[0])
+    primary_minimum = math.ceil(min_primary_story_duration(profile))
     primary_maximum = int(max_primary_story_duration(profile))
 
     def requirements(
@@ -517,20 +507,18 @@ def normalize_shot_durations(
                 f"a primary shot requires {content_beats} story-bearing clips for "
                 f"{profile.name}; split the source event before duration allocation"
             )
-        bridge_duration = profile.min_unique_beat_s if bridge_required else 0.0
+        first_minimum, _first_maximum = profile.effective_duration_bounds(
+            "multi_image"
+        )
+        tail_minimum, _tail_maximum = profile.effective_duration_bounds(
+            "tail_video_extend"
+        )
         lower = math.ceil(max(
-            profile.min_shot_duration_s,
-            content_beats * profile.min_unique_beat_s + bridge_duration,
-            spoken + bridge_duration,
+            primary_minimum,
+            first_minimum + max(0, content_beats - 1) * tail_minimum,
+            spoken,
         ))
-        upper = math.floor(min(
-            primary_maximum,
-            (
-                MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
-                * profile.max_unique_beat_s
-                + bridge_duration
-            ),
-        ))
+        upper = primary_maximum
         weight = float(max(content_beats, spoken / max(profile.min_unique_beat_s, 1)))
         return weight, lower, upper
 
@@ -548,12 +536,13 @@ def normalize_shot_durations(
     if sum(lower_bounds) > target_duration:
         raise ValueError(
             f"{len(shots)} shots need at least {sum(lower_bounds)}s to preserve all "
-            f"actions and continuity bridges, above the {target_duration}s target"
+            f"actions across {profile.name}'s 15-30s primary-shot contract, "
+            f"above the {target_duration}s target"
         )
     if sum(upper_bounds) < target_duration:
         raise ValueError(
             f"{len(shots)} shots can carry at most {sum(upper_bounds)}s under the "
-            f"one-extension {profile.name} contract, below the {target_duration}s target"
+            f"bounded-extension {profile.name} contract, below the {target_duration}s target"
         )
 
     allocations = list(lower_bounds)
@@ -1043,7 +1032,7 @@ BEAT_SKELETON_PROMPT = (
     "只做全局改编决策，不要输出 visual、镜头语言、景别或摄影细节。输出严格 JSON 对象："
     '{{"strategy":"一句话改编策略","beats":[{{"beat_order":1,"source_events":[1],'
     '"action":"keep/merge/drop","reason":"一句话理由","who":["角色主名"],'
-    '"where":"地点","what":"一句话事件","suggested_duration":12}}]}}。\n'
+    '"where":"地点","what":"一句话事件","suggested_duration":15}}]}}。\n'
     "【全局铁律】\n"
     "1. beats 数量必须恰好等于 {beat_count}，总建议时长应接近 {target_duration} 秒（±10%）。\n"
     "2. 每个输入事件编号必须且至少被某个 beat 的 source_events 引用；删减事件也必须放入 action=drop 的 beat 显式声明。"
@@ -1685,22 +1674,13 @@ def adapt_events(
         raise ValueError(f"目标时长不合理：{target_duration}秒（最少 10 秒）")
 
     capability_profile = get_video_capabilities()
-    if not (
-        capability_profile.min_shot_duration_s
-        <= shot_duration
-        <= max_primary_story_duration(capability_profile)
-    ):
-        raise ValueError(
-            f"每镜时长不合理：{shot_duration}秒"
-            f"（{capability_profile.name} 应在 "
-            f"{capability_profile.min_shot_duration_s:g}-"
-            f"{max_primary_story_duration(capability_profile):g} 秒）"
-        )
+    if shot_duration <= 0:
+        raise ValueError(f"每镜时长不合理：{shot_duration}秒（必须大于 0）")
 
     # ── 计算导演级 shot 数；内部生成容量由 storyboard_beats 承担 ─────────
     max_shots = estimate_action_aware_shot_count(events, target_duration, shot_duration)
     effective_shot_duration = max(
-        capability_profile.min_shot_duration_s,
+        min_primary_story_duration(capability_profile),
         min(
             max_primary_story_duration(capability_profile),
             round(target_duration / max_shots),

@@ -18,6 +18,7 @@ from schemas.continuity import (
     ContinuityPlan,
     ContinuityShot,
     GenerationChunk,
+    PrimaryShotBridge,
 )
 from utils.video_capabilities import SEEDANCE_2_CAPABILITIES, capabilities_for
 
@@ -300,17 +301,16 @@ def _validate_secondary_strategy_sequence(
     strategies: list[str],
 ) -> None:
     """Enforce content-first ordering without assigning semantics by position."""
-    valid = {
-        ("multi_image",),
-        ("multi_image", "tail_video_extend"),
-        ("multi_image", "first_last_frame_bridge"),
-        ("multi_image", "tail_video_extend", "first_last_frame_bridge"),
-    }
-    if tuple(strategies) not in valid:
+    valid = (
+        1 <= len(strategies) <= 3
+        and strategies[0] == "multi_image"
+        and all(strategy == "tail_video_extend" for strategy in strategies[1:])
+    )
+    if not valid:
         raise ValueError(
             f"{shot_id} has invalid secondary execution sequence {strategies}; "
-            "expected P01 multi-image, optional capacity extension, then optional "
-            "continuous-boundary bridge"
+            "expected P01 multi-image followed by zero, one, or two capacity "
+            "extensions; cross-primary bridges are separate post-generation tasks"
         )
 
 
@@ -417,12 +417,13 @@ def build_continuity_plan(
             and not preserve_one_take
             and group_shot_count >= continuity_group_max_shots
         )
-        logical_extension = requested_extension and not capped_group
-        # The secondary contract performs a continuous cross-primary handoff in
-        # the preceding shot's final bridge beat (P02 or P03).  Every next P01
-        # therefore starts from its own multi-image contract instead of extending
-        # a predecessor video a second time.
-        initial_extension = logical_extension and not uses_secondary_contract
+        # Modern Pxx shots are independently completed first. Their continuous
+        # boundary is bridged later from the actual source tail to target head,
+        # so primary shots must not form a cross-shot provider dependency group.
+        logical_extension = (
+            requested_extension and not capped_group and not uses_secondary_contract
+        )
+        initial_extension = logical_extension
         if capped_group:
             boundary_before = "cut"
             continuity_reason = (
@@ -453,7 +454,7 @@ def build_continuity_plan(
                 reserved_overlap = (
                     overlap_frames
                     if previous is not None
-                    and strategy != "first_last_frame_bridge"
+                    and strategy == "legacy"
                     else 0
                 )
                 minimum_request_s, _maximum_request_s = (
@@ -557,10 +558,50 @@ def build_continuity_plan(
         )
         previous_storyboard_shot = shot
         previous_planned_shot = planned_shots[-1]
+    bridge_specs = [
+        item
+        for item in (storyboard.get("primary_shot_bridges") or [])
+        if isinstance(item, Mapping)
+    ]
+    planned_by_id = {shot.shot_id: shot for shot in planned_shots}
+    planned_bridges: list[PrimaryShotBridge] = []
+    for spec in bridge_specs:
+        source_shot_id = str(spec.get("source_shot_id") or "")
+        target_shot_id = str(spec.get("target_shot_id") or "")
+        source = planned_by_id.get(source_shot_id)
+        target = planned_by_id.get(target_shot_id)
+        if source is None or target is None:
+            raise ValueError(
+                f"bridge {source_shot_id}__{target_shot_id} references unknown primary shot"
+            )
+        duration_s = float(spec.get("duration_s") or 0)
+        profile = capabilities_for(storyboard_contract)
+        profile.validate_chunk_durations(
+            duration_s,
+            duration_s,
+            "first_last_frame_bridge",
+            resource_id=str(spec.get("bridge_id") or f"{source_shot_id}__{target_shot_id}"),
+        )
+        planned_bridges.append(
+            PrimaryShotBridge(
+                bridge_id=str(
+                    spec.get("bridge_id") or f"{source_shot_id}__{target_shot_id}"
+                ),
+                source_shot_id=source_shot_id,
+                target_shot_id=target_shot_id,
+                target_duration_s=duration_s,
+                requested_frames=round(duration_s * timeline_fps),
+                continuity_reason=str(spec.get("boundary_reason") or ""),
+                action_prompt=str(spec.get("action_prompt") or ""),
+                start_state=str(spec.get("start_state") or ""),
+                end_state=str(spec.get("end_state") or ""),
+            )
+        )
     return ContinuityPlan(
         provider_chunk_limit_s=provider_chunk_limit_s,
         timeline_fps=timeline_fps,
         shots=planned_shots,
+        bridges=planned_bridges,
     )
 
 

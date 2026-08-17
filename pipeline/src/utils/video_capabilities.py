@@ -12,7 +12,7 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
-MAX_CONTENT_BEATS_PER_PRIMARY_SHOT = 2
+MAX_CONTENT_BEATS_PER_PRIMARY_SHOT = 3
 
 
 @dataclass(frozen=True)
@@ -34,6 +34,12 @@ class VideoModelCapabilities:
     continuity_anchor_frame_count: int = 0
     min_first_last_frame_duration_s: float | None = None
     max_first_last_frame_duration_s: float | None = None
+    min_multi_image_duration_s: float | None = None
+    max_multi_image_duration_s: float | None = None
+    min_tail_extend_duration_s: float | None = None
+    max_tail_extend_duration_s: float | None = None
+    min_primary_story_duration_s: float | None = None
+    max_primary_story_duration_s: float | None = None
 
     def action_limit(self, duration_seconds: float | int | None) -> int:
         if duration_seconds is None:
@@ -52,6 +58,24 @@ class VideoModelCapabilities:
         time, while FLF2V has its own API minimum even when a shorter narrative
         bridge would otherwise be valid.
         """
+        if execution_strategy == "multi_image":
+            return (
+                self.min_multi_image_duration_s
+                if self.min_multi_image_duration_s is not None
+                else self.min_shot_duration_s,
+                self.max_multi_image_duration_s
+                if self.max_multi_image_duration_s is not None
+                else self.max_shot_duration_s,
+            )
+        if execution_strategy == "tail_video_extend":
+            return (
+                self.min_tail_extend_duration_s
+                if self.min_tail_extend_duration_s is not None
+                else self.min_shot_duration_s,
+                self.max_tail_extend_duration_s
+                if self.max_tail_extend_duration_s is not None
+                else self.max_shot_duration_s,
+            )
         if execution_strategy == "first_last_frame_bridge":
             return (
                 self.min_first_last_frame_duration_s
@@ -62,6 +86,16 @@ class VideoModelCapabilities:
                 else self.max_shot_duration_s,
             )
         return self.min_shot_duration_s, self.max_shot_duration_s
+
+    def effective_duration_bounds(self, execution_strategy: str) -> tuple[float, float]:
+        """Return the visible story-time range for one generated clip."""
+        if execution_strategy == "multi_image":
+            return self.request_duration_bounds(execution_strategy)
+        if execution_strategy == "tail_video_extend":
+            return self.request_duration_bounds(execution_strategy)
+        if execution_strategy == "first_last_frame_bridge":
+            return self.request_duration_bounds(execution_strategy)
+        return self.min_unique_beat_s, self.max_unique_beat_s
 
     def validate_chunk_durations(
         self,
@@ -91,15 +125,18 @@ class VideoModelCapabilities:
                 f"{quantized:g}s is outside {self.name}'s {minimum:g}-{maximum:g}s "
                 "request range"
             )
+        effective_minimum, effective_maximum = self.effective_duration_bounds(
+            execution_strategy
+        )
         if execution_strategy != "legacy" and not (
-            self.min_unique_beat_s - 1e-6
+            effective_minimum - 1e-6
             <= unique_duration
-            <= self.max_unique_beat_s + 1e-6
+            <= effective_maximum + 1e-6
         ):
             raise ValueError(
                 f"{resource_id} effective story duration {unique_duration:g}s is outside "
-                f"{self.name}'s {self.min_unique_beat_s:g}-"
-                f"{self.max_unique_beat_s:g}s secondary-beat range"
+                f"{self.name}'s {effective_minimum:g}-"
+                f"{effective_maximum:g}s {execution_strategy} range"
             )
         if unique_duration > quantized + 1e-6:
             raise ValueError(
@@ -126,8 +163,14 @@ SEEDANCE_2_CAPABILITIES = VideoModelCapabilities(
     tail_reference_frame_fractions=(0.2, 0.6, 0.95),
     max_reference_images=9,
     continuity_anchor_frame_count=3,
-    min_first_last_frame_duration_s=4,
-    max_first_last_frame_duration_s=15,
+    min_first_last_frame_duration_s=3,
+    max_first_last_frame_duration_s=6,
+    min_multi_image_duration_s=8,
+    max_multi_image_duration_s=15,
+    min_tail_extend_duration_s=6,
+    max_tail_extend_duration_s=10,
+    min_primary_story_duration_s=15,
+    max_primary_story_duration_s=30,
 )
 
 
@@ -154,10 +197,18 @@ def max_primary_story_duration(
     """Return the largest primary-shot duration one base clip plus extensions can carry."""
     if max_content_beats < 1:
         raise ValueError("max_content_beats must be positive")
-    return min(
-        capabilities.max_shot_duration_s,
-        capabilities.max_unique_beat_s * max_content_beats,
-    )
+    if capabilities.max_primary_story_duration_s is not None:
+        return capabilities.max_primary_story_duration_s
+    return capabilities.max_unique_beat_s * max_content_beats
+
+
+def min_primary_story_duration(
+    capabilities: VideoModelCapabilities,
+) -> float:
+    """Return the minimum assembled duration of one primary story shot."""
+    if capabilities.min_primary_story_duration_s is not None:
+        return capabilities.min_primary_story_duration_s
+    return capabilities.min_shot_duration_s
 
 
 def get_video_capabilities(
@@ -207,4 +258,5 @@ __all__ = [
     "capabilities_for",
     "get_video_capabilities",
     "max_primary_story_duration",
+    "min_primary_story_duration",
 ]

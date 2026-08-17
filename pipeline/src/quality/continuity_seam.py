@@ -279,6 +279,13 @@ def extract_video_tail_frame(video_path: Path, output_path: Path) -> Path:
     raise last_error
 
 
+def extract_video_head_frame(video_path: Path, output_path: Path) -> Path:
+    """Extract the actual first decodable frame of a completed primary video."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _extract_frame(video_path, 0.0, output_path)
+    return output_path
+
+
 def extract_video_tail_window(
     video_path: Path,
     output_path: Path,

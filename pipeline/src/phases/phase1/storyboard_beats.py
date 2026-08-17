@@ -10,17 +10,19 @@ from utils.video_capabilities import (
     MAX_CONTENT_BEATS_PER_PRIMARY_SHOT,
     VideoModelCapabilities,
     capabilities_for,
+    max_primary_story_duration,
+    min_primary_story_duration,
 )
 
-SECONDARY_STORYBOARD_VERSION = "honcut.secondary-storyboard.v5"
-SECONDARY_EXECUTION = "content_capacity_boundary_aware_v5"
+SECONDARY_STORYBOARD_VERSION = "honcut.secondary-storyboard.v6"
+SECONDARY_EXECUTION = "content_capacity_post_primary_bridge_v6"
 SECONDARY_GENERATION_MODES = frozenset({
     "multi_image",
     "tail_video_extend",
     "first_last_frame_bridge",
 })
 MAX_CONTENT_BEATS = MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
-MAX_SECONDARY_BEATS = 3
+MAX_SECONDARY_BEATS = MAX_CONTENT_BEATS
 SPOKEN_CHARACTERS_PER_SECOND = 4.0
 
 
@@ -144,7 +146,7 @@ def _content_beat_requirement(
     actions: list[str],
     capabilities: VideoModelCapabilities,
 ) -> tuple[int, list[str]]:
-    """Return one or two story-bearing clips required by provider capacity.
+    """Return the number of story-bearing clips required by provider capacity.
 
     Camera movement, genre and visual intensity never create an extension by
     themselves.  P02 exists only when P01 cannot carry the complete authored
@@ -165,7 +167,17 @@ def _content_beat_requirement(
         narrative_units / capabilities.max_action_units_per_beat
     ) if narrative_units else 1
     action_count = math.ceil(len(actions) / capabilities.max_micro_actions_per_beat)
-    duration_count = max(1, math.ceil(duration / capabilities.max_unique_beat_s))
+    first_minimum, first_maximum = capabilities.effective_duration_bounds("multi_image")
+    tail_minimum, tail_maximum = capabilities.effective_duration_bounds(
+        "tail_video_extend"
+    )
+    duration_count = MAX_CONTENT_BEATS + 1
+    for candidate in range(1, MAX_CONTENT_BEATS + 1):
+        minimum = first_minimum + (candidate - 1) * tail_minimum
+        maximum = first_maximum + (candidate - 1) * tail_maximum
+        if minimum - 1e-6 <= duration <= maximum + 1e-6:
+            duration_count = candidate
+            break
     spoken_duration = _spoken_duration(shot)
     if spoken_duration > duration + 1e-6:
         raise ValueError(
@@ -174,9 +186,11 @@ def _content_beat_requirement(
         )
     dialogue_count = max(
         1,
-        math.ceil(spoken_duration / capabilities.max_unique_beat_s),
+        math.ceil(spoken_duration / max(first_maximum, tail_maximum)),
     )
     required = max(1, unit_count, action_count, duration_count, dialogue_count)
+    required_minimum = first_minimum + max(0, required - 1) * tail_minimum
+    required_maximum = first_maximum + max(0, required - 1) * tail_maximum
     reasons: list[str] = []
     if duration_count > 1:
         reasons.append("p01_max_narrative_duration_exceeded")
@@ -189,8 +203,14 @@ def _content_beat_requirement(
     if required > MAX_CONTENT_BEATS:
         raise ValueError(
             f"{_shot_id(shot, 1)} cannot fit {len(actions)} micro-actions into "
-            f"one base clip plus one extension for {capabilities.name}: "
+            f"one base clip plus bounded extensions for {capabilities.name}: "
             f"requires {required} story-bearing clips"
+        )
+    if not required_minimum - 1e-6 <= duration <= required_maximum + 1e-6:
+        raise ValueError(
+            f"{_shot_id(shot, 1)} needs {required} story-bearing clips for its "
+            f"content complexity, but {duration:g}s is outside their executable "
+            f"{required_minimum:g}-{required_maximum:g}s range"
         )
     return required, reasons
 
@@ -325,23 +345,28 @@ def secondary_storyboard_requirements(
     sid = _shot_id(shot, index + 1)
     duration = float(shot.get("duration") or shot.get("suggested_duration") or 5)
     _quantized_units(duration, profile)
+    primary_minimum = min_primary_story_duration(profile)
+    primary_maximum = max_primary_story_duration(profile)
+    if not primary_minimum - 1e-6 <= duration <= primary_maximum + 1e-6:
+        raise ValueError(
+            f"{sid} primary duration {duration:g}s is outside the assembled "
+            f"{primary_minimum:g}-{primary_maximum:g}s range"
+        )
     bridge_required, bridge_reason = _bridge_requirement(storyboard, shots, index)
-    bridge_request_minimum, _bridge_maximum = profile.request_duration_bounds(
+    bridge_minimum, _bridge_maximum = profile.effective_duration_bounds(
         "first_last_frame_bridge"
     )
-    bridge_duration = profile.min_unique_beat_s if bridge_required else 0.0
+    bridge_duration = bridge_minimum if bridge_required else 0.0
     if bridge_required:
         profile.validate_chunk_durations(
-            bridge_request_minimum,
+            bridge_duration,
             bridge_duration,
             "first_last_frame_bridge",
             resource_id=f"{sid}_bridge",
         )
-    content_duration = round(duration - bridge_duration, 6)
-    if content_duration <= 0:
-        raise ValueError(
-            f"{sid} has no story-bearing duration after reserving its continuity bridge"
-        )
+    # A cross-primary bridge is a post-generation assembly asset. It must not
+    # consume the story-time budget of either primary shot.
+    content_duration = round(duration, 6)
     source_actions = _source_actions(shot)
     content_count, extension_reasons = _content_beat_requirement(
         shot,
@@ -349,18 +374,16 @@ def secondary_storyboard_requirements(
         source_actions,
         profile,
     )
+    first_minimum, first_maximum = profile.effective_duration_bounds("multi_image")
+    tail_minimum, tail_maximum = profile.effective_duration_bounds("tail_video_extend")
     content_durations = _duration_budgets(
         content_duration,
         content_count,
         profile,
-        minimum_durations=[profile.min_unique_beat_s] * content_count,
-        maximum_durations=[profile.max_unique_beat_s] * content_count,
+        minimum_durations=[first_minimum] + [tail_minimum] * (content_count - 1),
+        maximum_durations=[first_maximum] + [tail_maximum] * (content_count - 1),
     )
-    modes = ["multi_image"]
-    if content_count > 1:
-        modes.append("tail_video_extend")
-    if bridge_required:
-        modes.append("first_last_frame_bridge")
+    modes = ["multi_image"] + ["tail_video_extend"] * (content_count - 1)
     if len(modes) > MAX_SECONDARY_BEATS:
         raise ValueError(
             f"{sid} requires {len(modes)} secondary beats, above the "
@@ -380,7 +403,7 @@ def secondary_storyboard_requirements(
         "bridge_reason": bridge_reason,
         "bridge_duration": bridge_duration,
         "modes": modes,
-        "durations": content_durations + ([bridge_duration] if bridge_required else []),
+        "durations": content_durations,
     }
 
 
@@ -389,7 +412,7 @@ def secondary_contract_declared(storyboard: dict[str, Any]) -> bool:
     if "secondary_storyboard_version" in storyboard:
         return True
     if str(storyboard.get("storyboard_execution") or "").startswith(
-        "content_capacity_boundary_aware_"
+        ("content_capacity_boundary_aware_", "content_capacity_post_primary_bridge_")
     ):
         return True
     return any(
@@ -482,7 +505,17 @@ def secondary_storyboard_contract_errors(
     observed_actions: list[str] = []
     observed_units: list[str] = []
     content_actions: list[str] = []
-    bridge = None
+    bridge_specs = [
+        item
+        for item in (storyboard.get("primary_shot_bridges") or [])
+        if isinstance(item, dict) and str(item.get("source_shot_id") or "") == sid
+    ]
+    bridge = bridge_specs[0] if len(bridge_specs) == 1 else None
+    if len(bridge_specs) > 1:
+        add(
+            "primary_shot_bridge_duplicate",
+            f"{sid} declares more than one bridge for the same outgoing boundary",
+        )
     for position, beat in enumerate(beats, 1):
         beat_id = str(beat.get("beat_id") or f"{sid}_P{position:02d}")
         mode = actual_modes[position - 1]
@@ -546,19 +579,9 @@ def secondary_storyboard_contract_errors(
         if isinstance(beat_units, str):
             beat_units = [beat_units]
         beat_units = [str(value) for value in beat_units if str(value).strip()]
-        if mode == "first_last_frame_bridge":
-            bridge = beat
-            if beat_actions or beat_units:
-                add(
-                    "secondary_storyboard_bridge_contains_plot",
-                    f"{beat_id} bridge must not carry screenplay actions or action units",
-                    micro_actions=beat_actions,
-                    source_action_unit_ids=beat_units,
-                )
-        else:
-            observed_actions.extend(beat_actions)
-            observed_units.extend(beat_units)
-            content_actions.append(str(beat.get("action") or ""))
+        observed_actions.extend(beat_actions)
+        observed_units.extend(beat_units)
+        content_actions.append(str(beat.get("action") or ""))
 
     if requirement:
         if observed_actions != requirement["source_actions"]:
@@ -613,18 +636,26 @@ def secondary_storyboard_contract_errors(
             if bridge is None:
                 add("secondary_storyboard_bridge_missing", f"{sid} requires a bridge")
             else:
-                expected_target = f"{next_sid}_P01"
                 if (
-                    bridge.get("bridge_target_shot_id") != next_sid
-                    or bridge.get("bridge_target_beat_id") != expected_target
-                    or bridge.get("bridge_target_storyboard_image")
-                    != f"storyboard_beats/{expected_target}.png"
+                    bridge.get("target_shot_id") != next_sid
+                    or bridge.get("execution_strategy")
+                    != "first_last_frame_bridge"
+                    or bridge.get("generation_phase") != "post_primary_shots"
+                    or bridge.get("first_frame_source")
+                    != "source_primary_video_tail_frame"
+                    or bridge.get("last_frame_source")
+                    != "target_primary_video_first_frame"
                     or str(bridge.get("start_state") or "") != expected_current_end
                     or str(bridge.get("end_state") or "") != expected_next_start
+                    or not math.isclose(
+                        float(bridge.get("duration_s") or 0),
+                        float(requirement["bridge_duration"]),
+                        abs_tol=1e-6,
+                    )
                 ):
                     add(
                         "secondary_storyboard_bridge_invalid",
-                        f"{sid} bridge must connect its exact end state to {expected_target}",
+                        f"{sid} bridge must use the completed source tail and target head",
                     )
         elif bridge is not None:
             add(
@@ -655,7 +686,7 @@ def plan_storyboard_beats(
     storyboard: dict[str, Any],
     capabilities: VideoModelCapabilities | None = None,
 ) -> dict[str, Any]:
-    """Attach plot-faithful content clips plus boundary-driven bridge clips."""
+    """Attach plot-faithful Pxx clips and separate post-primary bridges."""
     total = 0
     shots = [shot for shot in storyboard.get("shots", []) if isinstance(shot, dict)]
     continuity_mode = str(storyboard.get("continuity_mode") or "").strip().lower()
@@ -683,10 +714,10 @@ def plan_storyboard_beats(
         profile = capabilities or capabilities_for({**storyboard, **shot})
         requirement = secondary_storyboard_requirements(storyboard, index, profile)
         total_count = len(requirement["modes"])
-        provider_capacity = max(
-            1,
-            int(requirement["duration"] // profile.min_unique_beat_s),
-        )
+        provider_capacity = MAX_CONTENT_BEATS
+        multi_bounds = profile.effective_duration_bounds("multi_image")
+        tail_bounds = profile.effective_duration_bounds("tail_video_extend")
+        bridge_bounds = profile.effective_duration_bounds("first_last_frame_bridge")
         shot["secondary_storyboard_planning"] = {
             "content_beat_count": requirement["content_count"],
             "content_duration_s": requirement["content_duration"],
@@ -697,15 +728,19 @@ def plan_storyboard_beats(
             "bridge_duration_s": requirement["bridge_duration"],
             "provider_capacity": provider_capacity,
             "duration_quantum_s": profile.duration_quantum_s,
-            "min_effective_story_duration_s": profile.min_unique_beat_s,
-            "min_provider_request_duration_s": profile.min_shot_duration_s,
-            "min_first_last_frame_request_duration_s": (
-                profile.request_duration_bounds("first_last_frame_bridge")[0]
-            ),
+            "primary_duration_range_s": [
+                min_primary_story_duration(profile),
+                max_primary_story_duration(profile),
+            ],
+            "multi_image_duration_range_s": list(multi_bounds),
+            "tail_video_extend_duration_range_s": list(tail_bounds),
+            "first_last_frame_bridge_duration_range_s": list(bridge_bounds),
+            "bridge_generation_phase": "post_primary_shots",
             "selected_count": total_count,
         }
         planned.append((shot, requirement))
 
+    primary_bridges: list[dict[str, Any]] = []
     for index, (shot, requirement) in enumerate(planned):
         sid = requirement["shot_id"]
         source_actions = requirement["source_actions"]
@@ -776,41 +811,32 @@ def plan_storyboard_beats(
             next_shot, next_requirement = planned[index + 1]
             next_sid = next_requirement["shot_id"]
             next_start_state = _start_state(next_shot)
-            position = len(beats) + 1
             bridge = {
-                "beat_id": f"{sid}_P{position:02d}",
-                "position": position,
-                "duration_s": durations[position - 1],
-                "duration_semantics": (
-                    "effective_story_time_excluding_reference_overlap_and_provider_padding"
-                ),
-                "generation_mode": "first_last_frame_bridge",
+                "bridge_id": f"{sid}__{next_sid}",
+                "source_shot_id": sid,
+                "target_shot_id": next_sid,
+                "duration_s": requirement["bridge_duration"],
                 "execution_strategy": "first_last_frame_bridge",
                 "planner_version": SECONDARY_STORYBOARD_VERSION,
-                "parent_shot_id": sid,
                 "plot_fidelity_contract": "primary_shot_source_only_no_invention",
                 "start_state": final_state,
-                "action": _compact(
+                "action_prompt": _compact(
                     f"保持{sid}结束动作的因果连续，从当前终态平滑过渡到"
-                    f"{next_sid}_P01 起始构图；不得执行{next_sid}的新动作"
+                    f"{next_sid}成片起始状态；不得执行{next_sid}的新动作"
                 ),
-                "micro_actions": [],
-                "source_action_unit_ids": [],
                 "end_state": next_start_state,
-                "shot_size": shot.get("shot_size") or shot.get("shot_type"),
-                "camera_movement": shot.get("camera_movement")
-                or shot.get("camera_movement_en"),
-                "bridge_target_shot_id": next_sid,
-                "bridge_target_beat_id": f"{next_sid}_P01",
-                "bridge_target_storyboard_image": f"storyboard_beats/{next_sid}_P01.png",
-                "bridge_target_start_state": next_start_state,
-                "bridge_boundary_reason": bridge_reason,
+                "boundary_kind": "continuous",
+                "boundary_reason": bridge_reason,
+                "generation_phase": "post_primary_shots",
+                "first_frame_source": "source_primary_video_tail_frame",
+                "last_frame_source": "target_primary_video_first_frame",
                 "bridge_contract": (
-                    "end on the next primary shot's P01 composition without executing "
-                    "the next primary shot's action"
+                    "generate only after every primary video is complete; use the actual "
+                    "source video tail as frame one and actual target video head as the "
+                    "last frame"
                 ),
             }
-            beats.append(bridge)
+            primary_bridges.append(bridge)
         shot["storyboard_beats"] = beats
         shot["storyboard_beat_count"] = len(beats)
         # The top-level shot prompt is a narrative summary. Paid video prompts
@@ -818,18 +844,19 @@ def plan_storyboard_beats(
         shot["generation_actions"] = [
             beat["action"]
             for beat in beats
-            if beat["generation_mode"] != "first_last_frame_bridge"
         ]
         shot["generation_load"] = {
             **(shot.get("generation_load") or {}),
             "storyboard_beats": len(beats),
             "content_beats": content_count,
-            "bridge_beats": int(bridge_required),
+            "bridge_beats": 0,
+            "post_primary_bridges": int(bridge_required),
             "execution": SECONDARY_EXECUTION,
             "capability_profile": profile.name,
         }
         total += len(beats)
     storyboard["storyboard_beat_count"] = total
+    storyboard["primary_shot_bridges"] = primary_bridges
     storyboard["storyboard_execution"] = SECONDARY_EXECUTION
     storyboard["secondary_storyboard_version"] = SECONDARY_STORYBOARD_VERSION
     contract_errors = [

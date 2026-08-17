@@ -153,9 +153,9 @@ def build_shot_storyboard_prompt(
 
 二级分镜执行语义：
 - P01 是“多图生成视频”的当前一级分镜起始构图；角色图锁身份，本格故事图锁场景、站位与当前剧情。
-- 只有标记为 TAIL_VIDEO_EXTEND 的格才是容量延长格：它表示前一段最大叙事时长/动作容量不足以完整承载本 Sxx，必须从前段视频末态继续，禁止重新入场、回放或重复动作。
-- 只有标记为 FIRST_LAST_FRAME_BRIDGE 的最后一格才是跨一级分镜桥接格：它只在下一 Sxx 与当前 Sxx 剧情连续时存在；Phase 6 用前段真实尾帧作首帧、下一 Sxx 的 P01 作尾帧。它不得承担当前 Sxx 尚未完成的动作，也不得提前执行下一 Sxx 的动作。
-- 若下一一级分镜是换场、跳时、主体切换、回忆、梦境或其他 cut/fade/dissolve 转场，本 Sxx 不得绘制 FIRST_LAST_FRAME_BRIDGE 格。
+- P01 视频必须为 8–15 秒；只有标记为 TAIL_VIDEO_EXTEND 的格才是 6–10 秒容量延长格。延长格表示前一段时长/动作容量不足，必须从前段视频末态继续，禁止重新入场、回放或重复动作。
+- 跨一级分镜桥接不占 Pxx、不绘制故事板格。所有一级视频完成后，Phase 6 才会以相邻成片的真实尾帧和真实首帧生成 3–6 秒桥接视频。
+- 换场、跳时、主体切换、回忆、梦境或其他 cut/fade/dissolve 边界不生成桥接视频，由 Phase 8 添加转场特效。
 - 每格只能细分当前 Sxx 已写明的动作与状态，不得新增角色、道具、冲突、伤亡或剧情结果。
 
 场景：{_compact(shot.get('where') or shot.get('visual'), 260)}
@@ -165,7 +165,7 @@ def build_shot_storyboard_prompt(
 逐格合同：
 {chr(10).join(beat_lines)}
 
-最终检查：恰好 {len(beats)} 格，严格服从每格标记的执行模式；全部当前 Sxx 动作只能由 MULTI_IMAGE/TAIL_VIDEO_EXTEND 格按原顺序覆盖，FIRST_LAST_FRAME_BRIDGE（若有）必须位于最后且只负责连续边界交接。"""
+最终检查：恰好 {len(beats)} 格，严格服从每格标记的执行模式；全部当前 Sxx 动作只能由 MULTI_IMAGE/TAIL_VIDEO_EXTEND 格按原顺序覆盖，不得绘制跨一级分镜桥接格。"""
     return prompt, beats
 
 
@@ -233,7 +233,7 @@ def _build_panel_prompt(
         )
     elif is_last_content_beat:
         final_beat_contract = (
-            "这是本 Sxx 最后一个承载剧情的故事格；即使后面还有桥接格，本格也必须先完整"
+            "这是本 Sxx 最后一个承载剧情的故事格；本格必须完整"
             "完成当前 Sxx 的全部剧情。画面是所有列出动作完成后的终态快照，不是中间过程拼贴。"
             "必须把“结束状态”作为最醒目的已完成事实；稳定、停止、定格、落地、倒地、飞向或"
             "撞向等结果必须清楚可见，不得仍停留在搏斗、争夺、准备或前一动作中，也不得用"

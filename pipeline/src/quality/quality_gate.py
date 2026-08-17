@@ -21,7 +21,11 @@ import json
 import re
 
 from utils.character_identity import is_declared_character_reference
-from utils.video_capabilities import capabilities_for, max_primary_story_duration
+from utils.video_capabilities import (
+    capabilities_for,
+    max_primary_story_duration,
+    min_primary_story_duration,
+)
 
 
 class Severity(Enum):
@@ -473,14 +477,15 @@ def run_storyboard_review(storyboard_data: dict, script_text: str, characters: l
                 if q not in script_text:
                     severe_issues.append(f"[R2] {shot_id}: 台词 '{q[:20]}...' 不在原文中")
         
-        # P0-2b: 一级分镜必须能由一次基础段加至多一次延长段完整承载。
+        # P0-2b: 一级分镜必须能由基础段加有界延长段完整承载。
         duration = shot.get("suggested_duration", shot.get("duration", 0))
         profile = capabilities_for({**storyboard_data, **shot})
+        minimum = min_primary_story_duration(profile)
         maximum = max_primary_story_duration(profile)
-        if duration and duration > maximum:
+        if duration and not minimum <= duration <= maximum:
             severe_issues.append(
-                f"[时长] {shot_id}: {duration}s 超过 {profile.name} 的 "
-                f"{maximum:g}秒一级分镜承载上限"
+                f"[时长] {shot_id}: {duration}s 不在 {profile.name} 的 "
+                f"{minimum:g}-{maximum:g}秒一级分镜承载范围"
             )
         
         # P0-2c: 长台词拆镜检查（HonCut 铁律: >20字强制拆镜）
