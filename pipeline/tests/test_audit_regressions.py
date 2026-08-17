@@ -410,6 +410,27 @@ def test_event_extractor_selects_a_generic_or_action_contract(monkeypatch):
     assert not any(word in calls[0][0] for word in contaminated_examples)
 
 
+def test_event_extractor_allows_healthy_long_streams_but_keeps_idle_guard(
+    monkeypatch,
+):
+    captured: dict[str, object] = {}
+    client = object()
+
+    monkeypatch.setattr(event_extractor, "_get_client", lambda: client)
+
+    def fake_call_llm_stream(**kwargs):
+        captured.update(kwargs)
+        return "[]"
+
+    monkeypatch.setattr(event_extractor, "call_llm_stream", fake_call_llm_stream)
+
+    assert event_extractor._call_llm("提取事件") == "[]"
+    assert captured["_client"] is client
+    assert captured["wall_timeout"] == event_extractor.LLM_TIMEOUT == 900
+    assert captured["idle_timeout"] == event_extractor.LLM_IDLE_TIMEOUT == 75
+    assert event_extractor.LLM_TIMEOUT > event_extractor.LLM_IDLE_TIMEOUT
+
+
 def test_video_prompt_keeps_requested_ratio_and_fast_action_semantics():
     prompt = build_video_prompt(
         {

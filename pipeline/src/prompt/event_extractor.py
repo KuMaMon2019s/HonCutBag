@@ -130,7 +130,7 @@ ACTION_SCREENPLAY_CONTRACT = (
     "可以保留为 scene_setup/character_state，但 micro_actions 必须为 []，不得把已发生的剧情再提取一遍。"
 )
 
-LLM_TIMEOUT = 300
+LLM_TIMEOUT = 900  # 健康大段落长流可超过 300s；空闲停滞仍由 75s 独立阈值处理
 LLM_IDLE_TIMEOUT = 75
 MAX_RETRIES = 1  # 解析失败重试次数
 
