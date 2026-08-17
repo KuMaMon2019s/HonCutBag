@@ -1,0 +1,329 @@
+[
+ {
+  "id": 1,
+  "event_role": "scene_setup",
+  "action_type": "scene_setup",
+  "action_unit_id": null,
+  "sequence_id": "SEQ001",
+  "micro_actions": []
+ },
+ {
+  "id": 2,
+  "event_role": "action_chain",
+  "action_type": "performance",
+  "action_unit_id": "AU001",
+  "sequence_id": "SEQ001",
+  "micro_actions": [
+   "朝镜头方向持续向前移动",
+   "持续进行高密度舞蹈表演",
+   "偶尔自然对口型唱歌",
+   "露出轻松自然的笑容",
+   "与镜头保持自信的眼神交流",
+   "肩部、胸部、胯部做身体隔离",
+   "做绕臂波浪动作",
+   "以轻快脚步持续向前推进",
+   "肩膀、胸部、胯部、手臂、头部和整个身体持续响应音乐节奏"
+  ]
+ },
+ {
+  "id": 3,
+  "event_role": "action_chain",
+  "action_type": "performance",
+  "action_unit_id": "AU002",
+  "sequence_id": "SEQ002",
+  "micro_actions": [
+   "视频开场直接呈现表演状态，无空镜、无静止站立摆拍环节",
+   "女主面向镜头方向持续向前移动",
+   "膝盖随Hip-Hop节奏做律动",
+   "肩部、胸部配合节奏完成隔离动作",
+   "胯部随节奏做点缀性律动",
+   "手臂随音乐律动自然绕动",
+   "保持轻快的前进脚步",
+   "所有动作自然流动变化，融合为连贯复合律动，呈现边走边舞的状态"
+  ]
+ },
+ {
+  "id": 4,
+  "event_role": "scene_setup",
+  "action_type": "setup",
+  "action_unit_id": null,
+  "sequence_id": "SEQ003",
+  "micro_actions": []
+ },
+ {
+  "id": 5,
+  "event_role": "reaction",
+  "action_type": "reaction",
+  "action_unit_id": "AU003",
+  "sequence_id": "SEQ003",
+  "micro_actions": [
+   "女主继续保持高密度舞蹈并向前移动",
+   "第一个路人注意到音乐和女主的动作",
+   "第一个路人非常轻微地点头",
+   "第一个路人肩膀做出Groove",
+   "第一个路人出现轻微步伐变化",
+   "第一个路人逐渐开始模仿女主的一部分舞蹈"
+  ]
+ },
+ {
+  "id": 6,
+  "event_role": "turning_point",
+  "action_type": "transition",
+  "action_unit_id": "AU004",
+  "sequence_id": "SEQ003",
+  "micro_actions": [
+   "女主与第一个路人短暂同步做出Chest Hit + Arm Sweep"
+  ]
+ },
+ {
+  "id": 7,
+  "event_role": "consequence",
+  "action_type": "transition",
+  "action_unit_id": "AU005",
+  "sequence_id": "SEQ003",
+  "micro_actions": [
+   "更多普通行人陆续开始加入",
+   "有人从商店门口加入舞蹈",
+   "有人从街边加入舞蹈",
+   "有人从女主后方加入舞蹈",
+   "原本正常经过的人突然开始跟着音乐Groove",
+   "跳舞人数从1人逐渐变成3～5人",
+   "逐渐形成小型舞蹈队伍"
+  ]
+ },
+ {
+  "id": 8,
+  "event_role": "character_state",
+  "action_type": "transition",
+  "action_unit_id": null,
+  "sequence_id": "SEQ004",
+  "micro_actions": [
+   "音乐进入更加明显的节奏段落",
+   "女主绕臂幅度增大",
+   "女主肩胸律动变得更连续",
+   "女主加入身体波浪动作",
+   "女主加入方向性Groove",
+   "女主保持脚步持续向前移动"
+  ]
+ },
+ {
+  "id": 9,
+  "event_role": "consequence",
+  "action_type": "transition",
+  "action_unit_id": "AU006",
+  "sequence_id": "SEQ004",
+  "micro_actions": [
+   "背景舞者逐渐调整相互位置",
+   "形成松散的自然队形",
+   "呈现宽松V字或错位或层次或扩散排列"
+  ]
+ },
+ {
+  "id": 10,
+  "event_role": "action_chain",
+  "action_type": "transition",
+  "action_unit_id": "AU007",
+  "sequence_id": "SEQ004",
+  "micro_actions": [
+   "路人从人行道自然加入",
+   "路人从斑马线加入",
+   "路人从街角加入",
+   "路人从商铺入口加入",
+   "路人从巷口加入",
+   "路人从背景人群中加入",
+   "新加入者先模仿部分动作",
+   "新加入者同步程度逐渐提高",
+   "队伍人数逐渐增长到十几人"
+  ]
+ },
+ {
+  "id": 11,
+  "event_role": "action_chain",
+  "action_type": "action",
+  "action_unit_id": "AU008",
+  "sequence_id": "SEQ004",
+  "micro_actions": [
+   "摄影师在女主前方后退拍摄",
+   "摄影师自然增加与女主之间的距离",
+   "画面逐渐变宽",
+   "女主保持在画面中心"
+  ]
+ },
+ {
+  "id": 12,
+  "event_role": "action_chain",
+  "action_type": "transition",
+  "action_unit_id": "AU009",
+  "sequence_id": "SEQ004",
+  "micro_actions": [
+   "摄影师持iPhone向后退步",
+   "摄影师保持镜头对准女主",
+   "女主在画面中心持续向前舞蹈",
+   "构图逐渐变宽且不使用明显变焦"
+  ]
+ },
+ {
+  "id": 13,
+  "event_role": "action_chain",
+  "action_type": "escalation",
+  "action_unit_id": "AU010",
+  "sequence_id": "SEQ004",
+  "micro_actions": [
+   "群舞做出统一的肩胸律动",
+   "手臂波浪由中心向两侧扩散",
+   "动作波浪从前排传播到后排"
+  ]
+ },
+ {
+  "id": 14,
+  "event_role": "turning_point",
+  "action_type": "turning_point",
+  "action_unit_id": "AU011",
+  "sequence_id": "SEQ004",
+  "micro_actions": []
+ },
+ {
+  "id": 15,
+  "event_role": "action_chain",
+  "action_type": "escalation",
+  "action_unit_id": "AU012",
+  "sequence_id": "SEQ004",
+  "micro_actions": [
+   "女主完成更复杂、更有明星感的舞段",
+   "背景舞者做快速前进Groove",
+   "背景舞者连贯衔接肩胸律动",
+   "背景舞者衔接身体波浪",
+   "背景舞者衔接大幅挥臂",
+   "整段动作一气呵成并向前推进"
+  ]
+ },
+ {
+  "id": 16,
+  "event_role": "action_chain",
+  "action_type": "character_beat",
+  "action_unit_id": "AU013",
+  "sequence_id": "SEQ004",
+  "micro_actions": [
+   "女主对着iPhone镜头唱歌",
+   "女主短暂指向镜头",
+   "女主微笑",
+   "女主通过眼神与镜头互动",
+   "女主不停止舞蹈，互动动作融入舞步"
+  ]
+ },
+ {
+  "id": 17,
+  "event_role": "transition",
+  "action_type": "transition",
+  "action_unit_id": null,
+  "sequence_id": "SEQ004",
+  "micro_actions": []
+ },
+ {
+  "id": 18,
+  "event_role": "action_chain",
+  "action_type": "action",
+  "action_unit_id": "AU014",
+  "sequence_id": "SEQ004",
+  "micro_actions": [
+   "女主带领大型舞蹈队伍沿街道向镜头方向持续移动",
+   "全体舞者同步做出连续快速脚步动作",
+   "全体舞者同步做出强烈肩胸律动",
+   "全体舞者同步做出大幅绕臂动作",
+   "全体舞者同步完成多人同步身体冲击动作",
+   "所有舞蹈动作融合为向前推进的复合律动，队伍如浪潮般持续前移"
+  ]
+ },
+ {
+  "id": 19,
+  "event_role": "action_chain",
+  "action_type": "action",
+  "action_unit_id": "AU015",
+  "sequence_id": "SEQ004",
+  "micro_actions": [
+   "音乐播放至最后几个重拍节点",
+   "女主与全体舞者同步完成一次明显的大型舞蹈动作"
+  ]
+ },
+ {
+  "id": 20,
+  "event_role": "action_chain",
+  "action_type": "action",
+  "action_unit_id": "AU016",
+  "sequence_id": "SEQ004",
+  "micro_actions": [
+   "女主将视线转向拍摄用的iPhone镜头",
+   "女主露出自然、自信的微笑",
+   "女主全程保持舞蹈动作，未出现停顿"
+  ]
+ },
+ {
+  "id": 21,
+  "event_role": "consequence",
+  "action_type": "resolution",
+  "action_unit_id": "AU017",
+  "sequence_id": "SEQ004",
+  "micro_actions": [
+   "视频录制进入收尾阶段",
+   "女主与全体舞者未停止舞蹈，也未集体站住摆最终Pose",
+   "手机停止录制时，所有人仍处于自然舞蹈、向前移动的状态"
+  ]
+ },
+ {
+  "id": 22,
+  "event_role": "scene_setup",
+  "action_type": "scene_setup",
+  "action_unit_id": null,
+  "sequence_id": "SEQ005",
+  "micro_actions": []
+ },
+ {
+  "id": 23,
+  "event_role": "action_chain",
+  "action_type": "action_chain",
+  "action_unit_id": "AU018",
+  "sequence_id": "SEQ005",
+  "micro_actions": [
+   "摄影师位于女主前方",
+   "摄影师自然向后走",
+   "摄影师持续拍摄女主",
+   "镜头基本面对女主",
+   "女主保持全身或接近全身构图"
+  ]
+ },
+ {
+  "id": 24,
+  "event_role": "turning_point",
+  "action_type": "transition",
+  "action_unit_id": "AU019",
+  "sequence_id": "SEQ005",
+  "micro_actions": [
+   "Flash Mob增长，更多舞者加入",
+   "摄影师自然稍微拉开距离",
+   "更多舞者进入画面",
+   "高潮时形成较宽的手机广角群舞画面",
+   "女主在群舞画面中始终明显突出"
+  ]
+ },
+ {
+  "id": 25,
+  "event_role": "consequence",
+  "action_type": "resolution",
+  "action_unit_id": "AU020",
+  "sequence_id": "SEQ005",
+  "micro_actions": [
+   "摄影师以朋友视角持iPhone跟拍女主",
+   "越来越多普通路人被音乐感染",
+   "普通路人逐渐加入舞蹈",
+   "街头表演演变成大型街头Flash Mob"
+  ]
+ },
+ {
+  "id": 26,
+  "event_role": "scene_setup",
+  "action_type": "scene_setup",
+  "action_unit_id": null,
+  "sequence_id": "SEQ006",
+  "micro_actions": []
+ }
+]

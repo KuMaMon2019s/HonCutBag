@@ -21,7 +21,7 @@ import time
 import traceback
 import re
 from pathlib import Path
-from typing import Optional, TypedDict, Any
+from typing import Any, Callable, Optional, TypedDict
 
 from utils.config import get_api_key
 from utils.progress_reporter import ProgressReporter
@@ -1961,6 +1961,36 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _phase6_output_failure(
+    shot_id: str,
+    output_path: Path,
+    receipt: dict[str, Any] | None,
+    task: Any,
+    *,
+    validate_video: Callable[[Path], bool] | None = None,
+) -> str | None:
+    """Return why a Phase 6 file is not proven to belong to this execution."""
+    if receipt is None:
+        return "no successful current-input generation receipt"
+    if task is None or task.status != "succeeded":
+        return "generation ledger receipt is missing or not succeeded"
+    if task.resource_id != shot_id:
+        return "generation ledger receipt belongs to a different shot"
+    if task.payload.get("input_fingerprint") != receipt.get("input_fingerprint"):
+        return "generation ledger input fingerprint mismatch"
+    if not output_path.is_file():
+        return "output.mp4 missing after successful generation"
+    if task.outcome.get("output_sha256") != _file_sha256(output_path):
+        return "output.mp4 hash does not match generation ledger"
+    if validate_video is None:
+        from utils.video_validation import is_valid_video
+
+        validate_video = is_valid_video
+    if not validate_video(output_path):
+        return "output.mp4 failed ffprobe validation"
+    return None
 
 
 def _generate_flf2v_end_frame(
@@ -4426,29 +4456,13 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
     # A live file is not proof that this run produced it. Accept a shot only
     # when the current execution returned a task receipt whose immutable input,
     # ledger status, output hash, and decoded video all still match.
-    from utils.video_validation import is_valid_video
-
     errors = []
     missing_shots = []
     for sd in shot_dirs:
         out_mp4 = sd / "output.mp4"
         receipt = successful_receipts.get(sd.name)
         task = generation_tasks.get(str(receipt.get("generation_task_id"))) if receipt else None
-        failure = None
-        if receipt is None:
-            failure = "no successful current-input generation receipt"
-        elif task is None or task.status != "succeeded":
-            failure = "generation ledger receipt is missing or not succeeded"
-        elif task.resource_id != sd.name:
-            failure = "generation ledger receipt belongs to a different shot"
-        elif task.payload.get("input_fingerprint") != receipt.get("input_fingerprint"):
-            failure = "generation ledger input fingerprint mismatch"
-        elif not out_mp4.is_file():
-            failure = "output.mp4 missing after successful generation"
-        elif task.outcome.get("output_sha256") != _file_sha256(out_mp4):
-            failure = "output.mp4 hash does not match generation ledger"
-        elif not is_valid_video(out_mp4):
-            failure = "output.mp4 failed ffprobe validation"
+        failure = _phase6_output_failure(sd.name, out_mp4, receipt, task)
         if failure:
             missing_shots.append(sd.name)
             errors.append({"shot": sd.name, "error": failure})

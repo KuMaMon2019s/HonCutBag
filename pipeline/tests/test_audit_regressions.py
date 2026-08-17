@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -45,6 +47,7 @@ from phases.phase5 import storyboard_qa_gate
 from phases.phase6.video_generator import build_video_prompt
 from phases.pipeline_core import _write_project_visual_style
 from prompt import event_extractor
+from quality import video_qa
 from quality.quality_gate import run_quality_check
 from quality.shot_continuity import annotate_boundaries, classify_boundary
 from runtime.run_manifest import prepare_run_manifest
@@ -527,6 +530,38 @@ def test_repository_tests_do_not_reference_a_user_home_fixture():
     assert offenders == []
 
 
+def test_phase1_production_prompts_are_symbolic_and_identity_is_structured():
+    production_source = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (ROOT / "pipeline/src/phases/phase1").glob("*.py")
+    )
+    forbidden_story_terms = (
+        "数百名机械居民",
+        "企业执法机械体群",
+        "林夏",
+        "便利店门口",
+        "char:lin_xia",
+        "char:shen_yu",
+    )
+
+    assert not any(term in production_source for term in forbidden_story_terms)
+    assert "3-6 个视觉特征" not in adaptation_engine.USER_PROMPT_TEMPLATE
+    assert "3–6 个视觉特征" not in adaptation_engine.USER_PROMPT_TEMPLATE
+    assert "身份只通过 who 与 associate_assets 结构化绑定" in (
+        adaptation_engine.USER_PROMPT_TEMPLATE
+    )
+    assert "who=[] 时 visual 和 associate_assets 都不得引入任何角色" in (
+        adaptation_engine.USER_PROMPT_TEMPLATE
+    )
+
+
+def test_ci_fails_when_codecov_upload_fails():
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+
+    assert "fail_ci_if_error: true" in workflow
+    assert "fail_ci_if_error: false" not in workflow
+
+
 def test_ark_llm_client_does_not_require_ambient_socks_proxy(monkeypatch):
     monkeypatch.setenv("ARK_AGENT_API_KEY", "test-key")
     monkeypatch.setenv("ALL_PROXY", "socks5://127.0.0.1:65535")
@@ -564,6 +599,139 @@ def test_new_run_refuses_a_different_run_in_the_same_workspace(tmp_path):
             repo_root=ROOT,
             resume=False,
         )
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "content"),
+    [
+        ("visual-style.md", b"old style"),
+        ("music.mp3", b"old music"),
+        ("audio/old.wav", b"old audio"),
+        ("audio_layer/continuous_bgm.m4a", b"old mix"),
+    ],
+)
+def test_new_run_refuses_stale_style_and_audio_assets(
+    tmp_path, relative_path, content
+):
+    stale = tmp_path / relative_path
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_bytes(content)
+    spec = pipeline_core._project_video_spec("1080p")
+
+    with pytest.raises(RuntimeError, match="unowned pipeline artifacts"):
+        prepare_run_manifest(
+            tmp_path,
+            source_text="new script",
+            resolved_config={
+                "duration": 30,
+                "shot_duration": 5,
+                "video_provider": "seedance",
+                "video_model": "doubao-seedance-2.0-mini",
+                "project_video_spec": spec,
+            },
+            repo_root=ROOT,
+            resume=False,
+        )
+
+
+def test_phase6_stale_output_requires_current_succeeded_ledger_receipt(tmp_path):
+    output = tmp_path / "output.mp4"
+    output.write_bytes(b"old output from another execution")
+
+    assert pipeline_core._phase6_output_failure(
+        "S01", output, None, None, validate_video=lambda _path: True
+    ) == "no successful current-input generation receipt"
+
+    receipt = {"input_fingerprint": "current"}
+    task = SimpleNamespace(
+        status="succeeded",
+        resource_id="S01",
+        payload={"input_fingerprint": "current"},
+        outcome={"output_sha256": pipeline_core._file_sha256(output)},
+    )
+    assert pipeline_core._phase6_output_failure(
+        "S01", output, receipt, task, validate_video=lambda _path: True
+    ) is None
+
+    output.write_bytes(b"stale file replaced the ledger output")
+    assert pipeline_core._phase6_output_failure(
+        "S01", output, receipt, task, validate_video=lambda _path: True
+    ) == "output.mp4 hash does not match generation ledger"
+
+
+def test_phase6_current_ledger_receipt_accepts_a_real_minimal_video(tmp_path):
+    output = tmp_path / "output.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-f", "lavfi", "-i",
+            "color=c=blue:s=64x64:d=0.4:r=12",
+            "-pix_fmt", "yuv420p", str(output),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    receipt = {"input_fingerprint": "current"}
+    task = SimpleNamespace(
+        status="succeeded",
+        resource_id="S01",
+        payload={"input_fingerprint": "current"},
+        outcome={"output_sha256": pipeline_core._file_sha256(output)},
+    )
+
+    assert pipeline_core._phase6_output_failure(
+        "S01", output, receipt, task
+    ) is None
+
+
+def test_final_vlm_reviews_every_shot_without_a_global_twelve_frame_cap():
+    frames = [
+        video_qa.FrameSample(
+            path=f"/tmp/{shot_id}_{suffix}.jpg",
+            timestamp=float(index),
+            label=f"{shot_id}_{suffix}",
+        )
+        for index, shot_id in enumerate(
+            f"S{number:02d}" for number in range(1, 21)
+        )
+        for suffix in ("first", "mid", "last")
+    ]
+    storyboard = {
+        "shots": [
+            {
+                "shot_id": f"S{number:02d}",
+                "who": ["CHAR_A"] if number == 3 else [],
+                "shot_intent": "action" if number == 4 else "establishing",
+            }
+            for number in range(1, 21)
+        ]
+    }
+    calls = []
+
+    class FakeClient:
+        def review(self, paths, prompt):
+            calls.append((paths, prompt))
+            return '{"verdict":"pass","issues":[],"confidence":0.99}'
+
+    result = video_qa._vlm_semantic_check(FakeClient(), frames, storyboard)
+
+    assert result["status"] == "completed"
+    assert result["review_batches"] >= 2
+    assert len(result["sampled_frames"]) > 12
+    assert set(result["covered_shots"]) == {
+        f"S{number:02d}" for number in range(1, 21)
+    }
+    assert all(
+        f"S{number:02d}_mid" in result["sampled_frames"]
+        for number in range(1, 21)
+    )
+    assert {"S03_first", "S03_mid", "S03_last"}.issubset(
+        result["sampled_frames"]
+    )
+    assert {"S04_first", "S04_mid", "S04_last"}.issubset(
+        result["sampled_frames"]
+    )
+    assert all(len(paths) <= 12 for paths, _prompt in calls)
 
 
 def test_layered_checkpoints_are_bound_to_the_full_semantic_input(tmp_path):

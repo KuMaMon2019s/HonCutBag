@@ -760,40 +760,156 @@ def _vlm_semantic_check(
     if not hasattr(vlm_client, "review"):
         return {"status": "error", "reason": "vlm_client missing review() method"}
 
-    # Cover the entire film instead of sending the first five extracted frames.
-    sample_count = min(12, len(frames))
-    positions = {
-        round(index * (len(frames) - 1) / max(1, sample_count - 1))
-        for index in range(sample_count)
-    }
-    sample_frames = [frames[index] for index in sorted(positions)]
-    storyboard = {
-        "shots": [
-            {
-                key: shot.get(key)
-                for key in ("shot_id", "visual", "action", "who", "where", "time", "lighting")
-                if shot.get(key) not in (None, "", [])
+    shots = [
+        shot
+        for shot in (storyboard_data or {}).get("shots", [])
+        if isinstance(shot, dict)
+    ]
+    shot_by_id: dict[str, dict] = {}
+    for index, shot in enumerate(shots, 1):
+        shot_id = str(shot.get("shot_id") or shot.get("id") or f"S{index:02d}")
+        if shot_id.isdigit():
+            shot_id = f"S{int(shot_id):02d}"
+        shot_by_id[shot_id] = shot
+
+    suffixes = ("trans_before", "trans_after", "first", "mid", "last")
+
+    def frame_shot_id(frame: FrameSample) -> str | None:
+        for suffix in suffixes:
+            marker = f"_{suffix}"
+            if frame.label.endswith(marker):
+                return frame.label[: -len(marker)]
+        return None
+
+    frames_by_shot: dict[str, list[FrameSample]] = {}
+    unmatched: list[FrameSample] = []
+    for frame in frames:
+        shot_id = frame_shot_id(frame)
+        if shot_id is None:
+            unmatched.append(frame)
+        else:
+            frames_by_shot.setdefault(shot_id, []).append(frame)
+
+    selected: list[FrameSample] = []
+    selected_ids: set[int] = set()
+
+    def add(frame: FrameSample | None) -> None:
+        if frame is not None and id(frame) not in selected_ids:
+            selected.append(frame)
+            selected_ids.add(id(frame))
+
+    def labelled(candidates: list[FrameSample], suffix: str) -> FrameSample | None:
+        return next(
+            (frame for frame in candidates if frame.label.endswith(f"_{suffix}")),
+            None,
+        )
+
+    # Preserve one semantic sample for every delivered Sxx. Character and
+    # high-risk motion shots receive first/middle/last coverage. This list is
+    # intentionally not globally capped: provider limits are handled by the
+    # bounded review batches below.
+    for shot_id, candidates in frames_by_shot.items():
+        shot = shot_by_id.get(shot_id, {})
+        has_characters = bool(
+            shot.get("who")
+            or shot.get("characters")
+            or any(
+                isinstance(asset, str) and asset.startswith("char:")
+                for asset in (shot.get("associate_assets") or [])
+            )
+        )
+        high_risk = bool(
+            shot.get("generation_actions")
+            or str(shot.get("gen_strategy") or "").lower() == "flf2v"
+            or str(shot.get("shot_intent") or "").lower() == "action"
+        )
+        if has_characters or high_risk:
+            for suffix in ("first", "mid", "last"):
+                add(labelled(candidates, suffix))
+            if high_risk:
+                add(labelled(candidates, "trans_before"))
+                add(labelled(candidates, "trans_after"))
+        else:
+            add(labelled(candidates, "mid") or candidates[len(candidates) // 2])
+
+    if not selected:
+        # Without shot-labelled frames, retain the legacy bounded uniform
+        # behavior instead of pretending per-shot coverage is available.
+        sample_count = min(12, len(frames))
+        positions = {
+            round(index * (len(frames) - 1) / max(1, sample_count - 1))
+            for index in range(sample_count)
+        }
+        for index in sorted(positions):
+            add(frames[index])
+    else:
+        for frame in unmatched:
+            add(frame)
+
+    review_batch_size = 12
+    batch_results: list[dict] = []
+    issues: list[str] = []
+    verdict = "pass"
+    confidence_values: list[float] = []
+    verdict_rank = {"pass": 0, "revise": 1, "fail": 2}
+
+    for batch_index in range(0, len(selected), review_batch_size):
+        sample_frames = selected[batch_index : batch_index + review_batch_size]
+        batch_shot_ids = list(
+            dict.fromkeys(filter(None, map(frame_shot_id, sample_frames)))
+        )
+        storyboard = {
+            "shots": [
+                {
+                    key: shot_by_id[shot_id].get(key)
+                    for key in (
+                        "shot_id", "id", "visual", "action", "generation_actions",
+                        "who", "where", "time", "lighting", "gen_strategy",
+                    )
+                    if shot_by_id[shot_id].get(key) not in (None, "", [])
+                }
+                for shot_id in batch_shot_ids
+                if shot_id in shot_by_id
+            ]
+        }
+        prompt = (
+            "Review these chronologically sampled frames from the final edited film against the storyboard. "
+            f"This is semantic review batch {len(batch_results) + 1}; frame labels in order are "
+            f"{json.dumps([item.label for item in sample_frames], ensure_ascii=False)}. "
+            "Detect wrong subjects or locations, missing key actions, identity drift, broken anatomy or geometry, "
+            "modern/watermark/text artifacts, and material continuity errors. Return JSON only with "
+            '{"verdict":"pass|revise|fail","issues":["..."],"confidence":0.0}. '
+            f"Storyboard: {json.dumps(storyboard, ensure_ascii=False)}"
+        )
+        raw = vlm_client.review([Path(item.path) for item in sample_frames], prompt)
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", str(raw).strip(), flags=re.IGNORECASE)
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict) or parsed.get("verdict") not in verdict_rank:
+            return {
+                "status": "error",
+                "reason": "invalid semantic review response",
+                "sampled_frames": [item.label for item in selected],
+                "review_batches": len(batch_results) + 1,
             }
-            for shot in (storyboard_data or {}).get("shots", [])
-        ]
+        batch_results.append(parsed)
+        if verdict_rank[parsed["verdict"]] > verdict_rank[verdict]:
+            verdict = parsed["verdict"]
+        issues.extend(str(issue) for issue in parsed.get("issues", []) if issue)
+        try:
+            confidence_values.append(float(parsed["confidence"]))
+        except (KeyError, TypeError, ValueError):
+            pass
+
+    return {
+        "status": "completed",
+        "verdict": verdict,
+        "issues": issues,
+        "confidence": min(confidence_values) if confidence_values else None,
+        "sampled_frames": [item.label for item in selected],
+        "covered_shots": list(frames_by_shot),
+        "review_batches": len(batch_results),
+        "batch_results": batch_results,
     }
-    prompt = (
-        "Review these chronologically sampled frames from the final edited film against the storyboard. "
-        "Detect wrong subjects or locations, missing key actions, identity drift, broken anatomy or geometry, "
-        "modern/watermark/text artifacts, and material continuity errors. Return JSON only with "
-        '{"verdict":"pass|revise","issues":["..."],"confidence":0.0}. '
-        f"Storyboard: {json.dumps(storyboard, ensure_ascii=False)}"
-    )
-    raw = vlm_client.review([Path(item.path) for item in sample_frames], prompt)
-    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", str(raw).strip(), flags=re.IGNORECASE)
-    parsed = json.loads(raw)
-    if not isinstance(parsed, dict) or parsed.get("verdict") not in {"pass", "revise", "fail"}:
-        return {"status": "error", "reason": "invalid semantic review response"}
-    parsed.update(
-        status="completed",
-        sampled_frames=[item.label for item in sample_frames],
-    )
-    return parsed
 
 
 # ---------------------------------------------------------------------------

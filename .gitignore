@@ -101,9 +101,11 @@ pipeline/tests/*
 !pipeline/tests/test_continuity_foundation.py
 !pipeline/tests/test_prose_action_screenplay.py
 !pipeline/tests/test_audit_regressions.py
+!pipeline/tests/test_action_unit_capacity.py
 !pipeline/tests/fixtures/
 pipeline/tests/fixtures/*
 !pipeline/tests/fixtures/prose_action_rainy_overpass_zh.txt
+!pipeline/tests/fixtures/flashmob_60s_events.json
 pipeline/prompts/test_validator.py
 
 # Documentation (internal, not published)

@@ -24,6 +24,7 @@ from phases.phase1.storyboard_beats import (
     secondary_storyboard_contract_errors,
     secondary_storyboard_requirements,
 )
+from utils.action_units import normalize_action_units
 from utils.video_capabilities import capabilities_for
 
 DEFAULT_SIMILARITY_THRESHOLD = 0.85
@@ -153,9 +154,26 @@ def run_generation_capacity_checks(
             raw_units = [raw_units]
         units = {str(value) for value in raw_units if str(value).strip()}
         observed_units.update(units)
+        source_micro_actions = shot.get("micro_actions") or []
+        if isinstance(source_micro_actions, str):
+            source_micro_actions = [source_micro_actions]
+        source_micro_actions = [
+            str(value) for value in source_micro_actions if str(value).strip()
+        ]
+        if "generation_action_units" in shot:
+            shot_generation_units = [
+                unit
+                for unit in (shot.get("generation_action_units") or [])
+                if isinstance(unit, dict)
+            ]
+        else:
+            shot_generation_units = normalize_action_units(source_micro_actions)[
+                "generation_action_units"
+            ]
         generation_actions = shot.get("generation_actions") or []
         if isinstance(generation_actions, str):
             generation_actions = [generation_actions]
+        has_generation_action = bool(shot_generation_units or generation_actions)
         duration = float(shot.get("duration") or shot.get("suggested_duration") or 0)
         camera = str(
             shot.get("camera_movement")
@@ -272,28 +290,30 @@ def run_generation_capacity_checks(
                     beat_units = [beat_units]
                 beat_units = [str(value) for value in beat_units if str(value).strip()]
                 beat_units_seen.extend(beat_units)
-                if len(set(beat_units)) > profile.max_action_units_per_beat:
-                    issues.append(_issue(
-                        "L1", "severe", "storyboard_beat_action_unit_overload",
-                        f"{beat_id} exceeds {profile.name}'s action-unit capacity "
-                        f"({profile.max_action_units_per_beat})",
-                        [sid], beat_id=beat_id, action_unit_ids=beat_units,
-                    ))
                 micro_actions = beat.get("micro_actions") or []
                 if isinstance(micro_actions, str):
                     micro_actions = [micro_actions]
                 beat_micro_actions_seen.extend(
                     str(value) for value in micro_actions if str(value).strip()
                 )
-                if (
-                    len([value for value in micro_actions if str(value).strip()])
-                    > profile.max_micro_actions_per_beat
-                ):
+                if "generation_action_units" in beat:
+                    beat_generation_units = [
+                        unit
+                        for unit in (beat.get("generation_action_units") or [])
+                        if isinstance(unit, dict)
+                    ]
+                else:
+                    beat_generation_units = normalize_action_units(
+                        [str(value) for value in micro_actions if str(value).strip()]
+                    )["generation_action_units"]
+                if len(beat_generation_units) > profile.max_micro_actions_per_beat:
                     issues.append(_issue(
-                        "L1", "severe", "storyboard_beat_action_overload",
-                        f"{beat_id} exceeds {profile.name}'s visible-action capacity "
+                        "L1", "severe", "storyboard_beat_generation_action_overload",
+                        f"{beat_id} exceeds {profile.name}'s normalized generation-action "
+                        "capacity "
                         f"({profile.max_micro_actions_per_beat})",
                         [sid], beat_id=beat_id,
+                        generation_action_units=len(beat_generation_units),
                     ))
                 if uses_secondary_contract:
                     if str(beat.get("parent_shot_id") or "") != sid:
@@ -362,12 +382,6 @@ def run_generation_capacity_checks(
                     [sid], expected_action_unit_ids=sorted(units),
                     observed_action_unit_ids=sorted(set(beat_units_seen)),
                 ))
-            source_micro_actions = shot.get("micro_actions") or []
-            if isinstance(source_micro_actions, str):
-                source_micro_actions = [source_micro_actions]
-            source_micro_actions = [
-                str(value) for value in source_micro_actions if str(value).strip()
-            ]
             if (
                 uses_secondary_contract
                 and source_micro_actions
@@ -380,14 +394,18 @@ def run_generation_capacity_checks(
                     observed_actions=beat_micro_actions_seen,
                 ))
 
-        if len(units) > profile.max_action_units_per_beat and not storyboard_beats:
+        if (
+            len(shot_generation_units) > profile.max_micro_actions_per_beat
+            and not storyboard_beats
+        ):
             issues.append(_issue(
-                "L1", "severe", "action_unit_overload",
-                f"{sid} contains {len(units)} action units; {profile.name} supports "
-                f"{profile.max_action_units_per_beat}",
-                [sid], action_unit_ids=sorted(units),
+                "L1", "severe", "generation_action_unit_overload",
+                f"{sid} contains {len(shot_generation_units)} normalized generation "
+                f"action units; {profile.name} supports "
+                f"{profile.max_micro_actions_per_beat} per beat",
+                [sid], generation_action_units=len(shot_generation_units),
             ))
-        if units and not generation_actions and not storyboard_beats:
+        if has_generation_action and not generation_actions and not storyboard_beats:
             issues.append(_issue(
                 "L1", "severe", "missing_generation_actions",
                 f"{sid} has screenplay action but no bounded generation action contract",
@@ -401,7 +419,7 @@ def run_generation_capacity_checks(
                 f"(max {action_limit} for {duration:g}s)",
                 [sid], prompted_actions=len(generation_actions), action_limit=action_limit,
             ))
-        if units and duration > profile.max_unique_beat_s and not storyboard_beats:
+        if has_generation_action and duration > profile.max_unique_beat_s and not storyboard_beats:
             issues.append(_issue(
                 "L1", "severe", "action_shot_too_long",
                 f"{sid} action shot lasts {duration:g}s; split within "
@@ -409,14 +427,14 @@ def run_generation_capacity_checks(
                 f"{profile.max_unique_beat_s:g}s beat range",
                 [sid], duration_seconds=duration,
             ))
-        if units and camera in {"static", "fixed", "locked", "unspecified", ""} and not storyboard_beats:
+        if has_generation_action and camera in {"static", "fixed", "locked", "unspecified", ""} and not storyboard_beats:
             issues.append(_issue(
                 "L1", "severe", "static_action_camera",
                 f"{sid} action shot uses a locked/static camera contract",
                 [sid], camera_movement=camera or "missing",
             ))
         if (
-            not units
+            not has_generation_action
             and duration > profile.max_unique_beat_s
             and camera in {"static", "fixed", "locked", "unspecified", ""}
             and not storyboard_beats

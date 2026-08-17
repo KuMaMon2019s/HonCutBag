@@ -225,12 +225,12 @@ def test_phase5_blocks_action_overload_static_hold_and_missing_coverage():
     codes = {issue["code"] for issue in issues}
 
     assert {
-        "action_unit_overload",
         "generation_action_overload",
         "action_shot_too_long",
         "static_action_camera",
         "action_unit_coverage_missing",
     } <= codes
+    assert "action_unit_overload" not in codes
 
 
 def test_phase5_uses_stricter_action_budget_for_four_second_clip():

@@ -6,6 +6,7 @@ import math
 import re
 from typing import Any
 
+from utils.action_units import normalize_action_units
 from utils.video_capabilities import (
     MAX_CONTENT_BEATS_PER_PRIMARY_SHOT,
     VideoModelCapabilities,
@@ -140,6 +141,24 @@ def _spoken_duration(shot: dict[str, Any]) -> float:
     return visible_characters / SPOKEN_CHARACTERS_PER_SECOND
 
 
+def _generation_action_units(
+    shot: dict[str, Any],
+    actions: list[str],
+) -> list[dict[str, Any]]:
+    """Read persisted normalized units or derive them without mutating the ledger."""
+
+    if "generation_action_units" in shot:
+        return [
+            dict(unit)
+            for unit in (shot.get("generation_action_units") or [])
+            if isinstance(unit, dict)
+        ]
+    return [
+        dict(unit)
+        for unit in normalize_action_units(actions)["generation_action_units"]
+    ]
+
+
 def _content_beat_requirement(
     shot: dict[str, Any],
     duration: float,
@@ -152,21 +171,13 @@ def _content_beat_requirement(
     themselves.  P02 exists only when P01 cannot carry the complete authored
     duration/action contract within one provider narrative window.
     """
-    raw_units = shot.get("source_action_unit_ids") or []
-    if isinstance(raw_units, str):
-        raw_units = [raw_units]
-    action_units = len({str(value) for value in raw_units if str(value).strip()})
-    source_slices = shot.get("source_event_slices") or []
-    if isinstance(source_slices, dict):
-        source_slices = [source_slices]
-    narrative_units = max(
-        action_units,
-        len([value for value in source_slices if isinstance(value, dict)]),
+    generation_action_units = _generation_action_units(shot, actions)
+    action_count = (
+        math.ceil(
+            len(generation_action_units) / capabilities.max_micro_actions_per_beat
+        )
+        if generation_action_units else 1
     )
-    unit_count = math.ceil(
-        narrative_units / capabilities.max_action_units_per_beat
-    ) if narrative_units else 1
-    action_count = math.ceil(len(actions) / capabilities.max_micro_actions_per_beat)
     first_minimum, first_maximum = capabilities.effective_duration_bounds("multi_image")
     tail_minimum, tail_maximum = capabilities.effective_duration_bounds(
         "tail_video_extend"
@@ -188,23 +199,22 @@ def _content_beat_requirement(
         1,
         math.ceil(spoken_duration / max(first_maximum, tail_maximum)),
     )
-    required = max(1, unit_count, action_count, duration_count, dialogue_count)
+    required = max(1, action_count, duration_count, dialogue_count)
     required_minimum = first_minimum + max(0, required - 1) * tail_minimum
     required_maximum = first_maximum + max(0, required - 1) * tail_maximum
     reasons: list[str] = []
     if duration_count > 1:
         reasons.append("p01_max_narrative_duration_exceeded")
     if action_count > 1:
-        reasons.append("p01_micro_action_capacity_exceeded")
-    if unit_count > 1:
-        reasons.append("p01_action_unit_capacity_exceeded")
+        reasons.append("p01_generation_action_unit_capacity_exceeded")
     if dialogue_count > 1:
         reasons.append("p01_spoken_content_capacity_exceeded")
     if required > MAX_CONTENT_BEATS:
         raise ValueError(
             f"{_shot_id(shot, 1)} cannot fit {len(actions)} micro-actions into "
             f"one base clip plus bounded extensions for {capabilities.name}: "
-            f"requires {required} story-bearing clips"
+            f"{len(generation_action_units)} normalized generation action units "
+            f"require {required} story-bearing clips"
         )
     if not required_minimum - 1e-6 <= duration <= required_maximum + 1e-6:
         raise ValueError(
@@ -368,6 +378,7 @@ def secondary_storyboard_requirements(
     # consume the story-time budget of either primary shot.
     content_duration = round(duration, 6)
     source_actions = _source_actions(shot)
+    generation_action_units = _generation_action_units(shot, source_actions)
     content_count, extension_reasons = _content_beat_requirement(
         shot,
         content_duration,
@@ -394,6 +405,7 @@ def secondary_storyboard_requirements(
         "profile": profile,
         "duration": duration,
         "source_actions": source_actions,
+        "generation_action_units": generation_action_units,
         "content_duration": content_duration,
         "content_count": content_count,
         "content_durations": content_durations,
@@ -720,6 +732,9 @@ def plan_storyboard_beats(
         bridge_bounds = profile.effective_duration_bounds("first_last_frame_bridge")
         shot["secondary_storyboard_planning"] = {
             "content_beat_count": requirement["content_count"],
+            "generation_action_unit_count": len(
+                requirement["generation_action_units"]
+            ),
             "content_duration_s": requirement["content_duration"],
             "extension_required": requirement["extension_required"],
             "extension_reasons": requirement["extension_reasons"],
@@ -755,13 +770,18 @@ def plan_storyboard_beats(
             or "保持当前场景中的自然表演"
         )
         action_buckets = _partition(source_actions, content_count)
+        generation_action_units = requirement["generation_action_units"]
+        generation_unit_buckets = _partition(
+            generation_action_units, content_count
+        )
+        shot["generation_action_units"] = generation_action_units
         raw_units = shot.get("source_action_unit_ids") or []
         if isinstance(raw_units, str):
             raw_units = [raw_units]
         action_units = list(dict.fromkeys(
             str(value) for value in raw_units if str(value).strip()
         ))
-        unit_buckets = _partition(action_units, content_count)
+        source_unit_buckets = _partition(action_units, content_count)
         durations = requirement["durations"]
         start_state = _start_state(shot)
         final_state = _end_state(shot)
@@ -800,7 +820,8 @@ def plan_storyboard_beats(
                 "start_state": previous_state,
                 "action": action,
                 "micro_actions": action_buckets[position - 1],
-                "source_action_unit_ids": unit_buckets[position - 1],
+                "generation_action_units": generation_unit_buckets[position - 1],
+                "source_action_unit_ids": source_unit_buckets[position - 1],
                 "end_state": next_state,
                 "shot_size": shot.get("shot_size") or shot.get("shot_type"),
                 "camera_movement": shot.get("camera_movement")
@@ -849,6 +870,7 @@ def plan_storyboard_beats(
             **(shot.get("generation_load") or {}),
             "storyboard_beats": len(beats),
             "content_beats": content_count,
+            "generation_action_units": len(generation_action_units),
             "bridge_beats": 0,
             "post_primary_bridges": int(bridge_required),
             "execution": SECONDARY_EXECUTION,

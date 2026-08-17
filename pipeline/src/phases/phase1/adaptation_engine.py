@@ -27,18 +27,20 @@
 5. 输出排序后的 shot 列表
 """
 
+import argparse
 import hashlib
 import json
 import math
-import sys
 import os
-import argparse
 import re
+import sys
 import time
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional
 
-from openai import OpenAI, APITimeoutError
+from openai import APITimeoutError, OpenAI
+
+from utils.action_units import normalize_action_units, normalized_action_unit_count
 from utils.ark_llm import (
     LLMConnectTimeout,
     LLMIdleTimeout,
@@ -46,6 +48,10 @@ from utils.ark_llm import (
     LLMStreamError,
     call_llm_stream,
     create_ark_client,
+)
+from utils.character_identity import (
+    normalize_character_reference,
+    resolve_character_name,
 )
 from utils.video_capabilities import (
     MAX_CONTENT_BEATS_PER_PRIMARY_SHOT,
@@ -55,11 +61,6 @@ from utils.video_capabilities import (
     max_primary_story_duration,
     min_primary_story_duration,
 )
-from utils.character_identity import (
-    normalize_character_reference,
-    resolve_character_name,
-)
-
 
 # ─── LLM 配置 ───────────────────────────────────────────────────────────────
 
@@ -353,6 +354,13 @@ def estimate_action_aware_shot_count(
     An editorial shot is a director-level story unit, not one provider call.
     Dense action is expanded later into ``storyboard_beats`` where the first
     beat starts from an image and subsequent beats extend its video.
+
+    Capacity math consumes normalized generation action units (see
+    ``utils.action_units``), never the raw micro_actions ledger: sequential
+    plot actions cost one unit each (deduplicated across events through a
+    shared seen set), simultaneous composite motions merge into one unit,
+    sustained states and camera constraints cost nothing.  The full ledger is
+    preserved for audit and beat partitioning.
     """
     profile = get_video_capabilities()
     baseline = estimate_shot_count(
@@ -365,16 +373,18 @@ def estimate_action_aware_shot_count(
         for event in events
         if str(event.get("event_role") or "") != "drop"
     ]
-    required_primary_shots = baseline + sum(
-        max(0, _event_primary_occurrence_requirement(event, profile) - 1)
-        for event in authored_events
-    )
+    content_requirements = _event_content_beat_requirements(authored_events, profile)
+    required_primary_shots = baseline
+    action_content_beats = 0
+    for event_id, event in enumerate(authored_events, 1):
+        beats = content_requirements[event_id]
+        if event.get("micro_actions"):
+            action_content_beats += beats
+        required_primary_shots += max(
+            0,
+            math.ceil(beats / MAX_CONTENT_BEATS_PER_PRIMARY_SHOT) - 1,
+        )
     required_primary_shots = max(1, required_primary_shots)
-    action_content_beats = sum(
-        _event_content_beat_requirement(event, profile)
-        for event in authored_events
-        if event.get("micro_actions")
-    )
     required_content_beats = max(baseline, action_content_beats)
     minimum_runtime = max(
         required_primary_shots * min_primary_story_duration(profile),
@@ -392,9 +402,10 @@ def estimate_action_aware_shot_count(
 def _event_primary_occurrence_requirement(
     event: Dict[str, Any],
     capabilities: VideoModelCapabilities,
+    seen: Optional[set] = None,
 ) -> int:
     """Return how many primary shots an event needs under the one-extension rule."""
-    content_beats = _event_content_beat_requirement(event, capabilities)
+    content_beats = _event_content_beat_requirement(event, capabilities, seen=seen)
     return math.ceil(
         content_beats / MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
     )
@@ -403,14 +414,71 @@ def _event_primary_occurrence_requirement(
 def _event_content_beat_requirement(
     event: Dict[str, Any],
     capabilities: VideoModelCapabilities,
+    seen: Optional[set] = None,
 ) -> int:
+    """Return content beats from normalized generation action units.
+
+    Sustained states, camera constraints and cross-event duplicates cost
+    nothing; simultaneous composite motions merge into one unit.  Pass a
+    shared ``seen`` set across events in one gate pass to deduplicate
+    repeated sequential actions globally.
+    """
     actions = event.get("micro_actions") or []
     if isinstance(actions, str):
         actions = [actions]
+    if not actions:
+        return 0
+    units = normalized_action_unit_count(actions, seen=seen)
+    if units == 0:
+        return 0
     return max(
         1,
-        math.ceil(len(actions) / capabilities.max_micro_actions_per_beat),
+        math.ceil(units / capabilities.max_micro_actions_per_beat),
     )
+
+
+def _event_generation_action_unit_counts(
+    events: List[Dict[str, Any]],
+) -> Dict[int, int]:
+    """Count normalized units for an ordered ledger with cross-event dedupe."""
+
+    seen: set = set()
+    return {
+        event_id: normalized_action_unit_count(
+            [event.get("micro_actions")]
+            if isinstance(event.get("micro_actions"), str)
+            else (event.get("micro_actions") or []),
+            seen=seen,
+        )
+        for event_id, event in enumerate(events, 1)
+    }
+
+
+def _event_content_beat_requirements(
+    events: List[Dict[str, Any]],
+    capabilities: VideoModelCapabilities,
+) -> Dict[int, int]:
+    """Normalize an ordered event ledger once, including cross-event dedupe."""
+
+    unit_counts = _event_generation_action_unit_counts(events)
+    return {
+        event_id: (
+            math.ceil(units / capabilities.max_micro_actions_per_beat)
+            if units else 0
+        )
+        for event_id, units in unit_counts.items()
+    }
+
+
+def _event_primary_occurrence_requirements(
+    events: List[Dict[str, Any]],
+    capabilities: VideoModelCapabilities,
+) -> Dict[int, int]:
+    content = _event_content_beat_requirements(events, capabilities)
+    return {
+        event_id: math.ceil(beats / MAX_CONTENT_BEATS_PER_PRIMARY_SHOT)
+        for event_id, beats in content.items()
+    }
 
 
 def select_generation_actions(
@@ -475,9 +543,6 @@ def normalize_shot_durations(
         actions = shot.get("micro_actions") or []
         if isinstance(actions, str):
             actions = [actions]
-        units = shot.get("source_action_unit_ids") or []
-        if isinstance(units, str):
-            units = [units]
         details = shot.get("_source_event_details") or []
         if details:
             detail_actions = [
@@ -486,22 +551,18 @@ def normalize_shot_durations(
                 for action in (event.get("micro_actions") or [])
                 if str(action).strip()
             ]
-            detail_units = {
-                str(event.get("action_unit_id"))
-                for event in details if isinstance(event, dict)
-                and str(event.get("action_unit_id") or "").strip()
-            }
             actions = actions or detail_actions
-            units = units or list(detail_units)
+        if "generation_action_units" in shot:
+            raw_generation_units = shot.get("generation_action_units") or []
+            generation_unit_count = len(raw_generation_units)
+        else:
+            generation_unit_count = normalized_action_unit_count(actions)
         spoken = float(shot.get("speech_duration_s") or 0)
         action_beats = math.ceil(
-            len(actions) / profile.max_micro_actions_per_beat
-        ) if actions else 1
-        unit_beats = math.ceil(
-            len(set(map(str, units))) / profile.max_action_units_per_beat
-        ) if units else 1
+            generation_unit_count / profile.max_micro_actions_per_beat
+        ) if generation_unit_count else 1
         spoken_beats = math.ceil(spoken / profile.max_unique_beat_s) if spoken else 1
-        content_beats = max(1, action_beats, unit_beats, spoken_beats)
+        content_beats = max(1, action_beats, spoken_beats)
         if content_beats > MAX_CONTENT_BEATS_PER_PRIMARY_SHOT:
             raise ValueError(
                 f"a primary shot requires {content_beats} story-bearing clips for "
@@ -905,6 +966,7 @@ def _inherit_event_semantics(
             previous_state = end_state
 
     previous_sequence_ids: List[str] = []
+    generation_seen: set = set()
     for shot_index, shot in enumerate(shots):
         raw_ids = shot.get("source_events", [])
         source_ids = list(dict.fromkeys(raw_ids)) if isinstance(raw_ids, list) else []
@@ -954,6 +1016,36 @@ def _inherit_event_semantics(
             for event_id, event_slice in slices
         ]
         shot["micro_actions"] = micro_actions
+        generation_units: List[Dict[str, Any]] = []
+        generation_categories: List[str] = []
+        ledger_offset = 0
+        for event_id, event_slice in slices:
+            slice_actions = list(event_slice["micro_actions"])
+            normalized = normalize_action_units(slice_actions, seen=generation_seen)
+            generation_categories.extend(normalized["categories"])
+            for unit in normalized["generation_action_units"]:
+                serialized = dict(unit)
+                serialized["unit_id"] = f"GAU{len(generation_units) + 1:03d}"
+                serialized["ledger_indexes"] = [
+                    ledger_offset + int(index)
+                    for index in unit.get("ledger_indexes", [])
+                ]
+                serialized["source_event_id"] = event_id
+                source_action_unit_id = str(
+                    event_by_id[event_id].get("action_unit_id") or ""
+                ).strip()
+                if source_action_unit_id:
+                    serialized["source_action_unit_id"] = source_action_unit_id
+                generation_units.append(serialized)
+            ledger_offset += len(slice_actions)
+        if not slices and micro_actions:
+            normalized = normalize_action_units(micro_actions, seen=generation_seen)
+            generation_categories = list(normalized["categories"])
+            generation_units = [
+                dict(unit) for unit in normalized["generation_action_units"]
+            ]
+        shot["generation_action_units"] = generation_units
+        shot["generation_action_categories"] = generation_categories
         generation_actions = select_generation_actions(
             micro_actions,
             duration_seconds=shot.get("suggested_duration") or shot.get("duration"),
@@ -962,6 +1054,7 @@ def _inherit_event_semantics(
         shot["generation_load"] = {
             "source_action_units": len(set(shot["source_action_unit_ids"])),
             "source_micro_actions": len(micro_actions),
+            "generation_action_units": len(generation_units),
             "prompted_actions": len(generation_actions),
             "compression": "representative" if len(generation_actions) < len(micro_actions) else "full",
         }
@@ -1093,6 +1186,7 @@ def _validate_beat_action_capacity(
     """Allow inner Pxx expansion while rejecting unrelated narrative merges."""
     profile = capabilities or get_video_capabilities()
     event_by_id = {i: event for i, event in enumerate(events, 1)}
+    occurrence_requirements = _event_primary_occurrence_requirements(events, profile)
     for beat in beats:
         if beat.get("action") == "drop":
             continue
@@ -1132,14 +1226,15 @@ def _validate_beat_action_capacity(
             for beat in beats
             if beat.get("action") != "drop"
         )
-        required = _event_primary_occurrence_requirement(event, profile)
+        required = occurrence_requirements[event_id]
         if required > 1 and observed < required:
             actions = event.get("micro_actions") or []
             if isinstance(actions, str):
                 actions = [actions]
             raise ValueError(
                 f"event {event_id} requires at least {required} primary beats to carry "
-                f"all {len(actions)} micro-actions; observed {observed}"
+                f"its normalized generation action units while preserving all "
+                f"{len(actions)} micro-actions; observed {observed}"
             )
 
 
@@ -1164,36 +1259,24 @@ def _beat_content_loads(
                 )
             positions.setdefault(event_id, []).append(beat_index)
 
-    actions_by_beat: List[List[str]] = [[] for _ in beats]
-    units_by_beat: List[set[str]] = [set() for _ in beats]
+    generation_units_by_beat: List[int] = [0 for _ in beats]
+    generation_unit_counts = _event_generation_action_unit_counts(events)
     for event_id, occurrence_positions in positions.items():
-        event = event_by_id[event_id]
-        actions = [
-            str(action).strip()
-            for action in (event.get("micro_actions") or [])
-            if str(action).strip()
-        ]
-        base, remainder = divmod(len(actions), len(occurrence_positions))
-        cursor = 0
+        generation_unit_count = generation_unit_counts[event_id]
+        base, remainder = divmod(generation_unit_count, len(occurrence_positions))
         for occurrence, beat_index in enumerate(occurrence_positions):
             size = base + (1 if occurrence < remainder else 0)
-            actions_by_beat[beat_index].extend(actions[cursor : cursor + size])
-            cursor += size
-            unit = str(event.get("action_unit_id") or "").strip()
-            if unit:
-                units_by_beat[beat_index].add(unit)
+            generation_units_by_beat[beat_index] += size
 
     loads = []
-    for actions, units in zip(actions_by_beat, units_by_beat, strict=True):
+    for generation_unit_count in generation_units_by_beat:
         action_beats = (
-            math.ceil(len(actions) / capabilities.max_micro_actions_per_beat)
-            if actions else 1
+            math.ceil(
+                generation_unit_count / capabilities.max_micro_actions_per_beat
+            )
+            if generation_unit_count else 1
         )
-        unit_beats = (
-            math.ceil(len(units) / capabilities.max_action_units_per_beat)
-            if units else 1
-        )
-        loads.append(max(1, action_beats, unit_beats))
+        loads.append(max(1, action_beats))
     return loads
 
 
@@ -1217,6 +1300,7 @@ def _repair_beat_action_capacity(
         beat["source_events"] = list(dict.fromkeys(raw_ids))
 
     event_by_id = {index: event for index, event in enumerate(events, 1)}
+    occurrence_requirements = _event_primary_occurrence_requirements(events, profile)
 
     def is_turning(event: Dict[str, Any]) -> bool:
         return bool(
@@ -1247,7 +1331,7 @@ def _repair_beat_action_capacity(
         return True
 
     for event_id, event in event_by_id.items():
-        required = _event_primary_occurrence_requirement(event, profile)
+        required = occurrence_requirements[event_id]
         if required <= 1:
             continue
         while True:
@@ -1363,12 +1447,13 @@ def _build_beat_skeleton(
         shot_duration,
         profile,
     )
+    occurrence_requirements = _event_primary_occurrence_requirements(events, profile)
     prompt_events = []
-    for event in events:
+    for event_id, event in enumerate(events, 1):
         prompt_event = dict(event)
-        prompt_event["minimum_primary_beat_occurrences"] = (
-            _event_primary_occurrence_requirement(event, profile)
-        )
+        prompt_event["minimum_primary_beat_occurrences"] = occurrence_requirements[
+            event_id
+        ]
         prompt_events.append(prompt_event)
     prompt = BEAT_SKELETON_PROMPT.format(
         target_duration=target_duration,
@@ -1688,12 +1773,15 @@ def adapt_events(
     )
 
     # ── 构建 prompt ───────────────────────────────────────────────────────
+    occurrence_requirements = _event_primary_occurrence_requirements(
+        events, capability_profile
+    )
     prompt_events = []
-    for event in events:
+    for event_id, event in enumerate(events, 1):
         prompt_event = dict(event)
-        prompt_event["minimum_primary_beat_occurrences"] = (
-            _event_primary_occurrence_requirement(event, capability_profile)
-        )
+        prompt_event["minimum_primary_beat_occurrences"] = occurrence_requirements[
+            event_id
+        ]
         prompt_events.append(prompt_event)
     events_json = _build_events_json(prompt_events)
     characters_summary = _build_characters_summary(characters)
