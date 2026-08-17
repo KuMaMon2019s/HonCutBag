@@ -68,6 +68,43 @@ from utils.video_capabilities import (
 
 # ─── LLM 配置 ───────────────────────────────────────────────────────────────
 
+_SHOT_SIZE_VALUES = (
+    "extreme_wide", "wide", "medium_wide", "medium", "medium_close",
+    "close_up", "extreme_close_up", "over_shoulder", "insert", "establishing",
+)
+_CAMERA_MOVEMENT_VALUES = (
+    "static", "pan_left", "pan_right", "tilt_up", "tilt_down",
+    "dolly_in", "dolly_out", "tracking_left", "tracking_right",
+    "crane_up", "crane_down", "handheld", "steadicam", "orbital",
+    "zoom_in", "zoom_out", "rack_focus",
+)
+_LIGHTING_KEY_VALUES = (
+    "high_key", "low_key", "natural", "golden_hour", "blue_hour",
+    "tungsten_warm", "neon", "silhouette", "rim_lit", "volumetric",
+    "overcast_soft",
+)
+_SHOT_INTENT_VALUES = (
+    "establishing", "reveal", "reaction", "dialogue", "action",
+    "transition", "atmosphere", "detail",
+)
+_VALID_SHOT_SIZES = frozenset(_SHOT_SIZE_VALUES)
+_VALID_CAMERA_MOVEMENTS = frozenset(_CAMERA_MOVEMENT_VALUES)
+_VALID_LIGHTING_KEYS = frozenset(_LIGHTING_KEY_VALUES)
+_VALID_SHOT_INTENTS = frozenset(_SHOT_INTENT_VALUES)
+
+_SHOT_LANGUAGE_ENUM_CONTRACT = (
+    "  - shot_size: 字符串，景别（" + "/".join(_SHOT_SIZE_VALUES) + "）\n"
+    "  - camera_movement: 字符串，摄影机运动（"
+    + "/".join(_CAMERA_MOVEMENT_VALUES)
+    + "）\n"
+    "  - lighting_key: 字符串，光影基调（"
+    + "/".join(_LIGHTING_KEY_VALUES)
+    + "）\n"
+    "  - shot_intent: 字符串，镜头叙事意图（"
+    + "/".join(_SHOT_INTENT_VALUES)
+    + "）\n"
+)
+
 SYSTEM_PROMPT = (
     "你是影视导演兼剪辑师。将故事事件改编为视频分镜。"
     "考虑：节奏感、情感弧线、视觉变化、时长限制。"
@@ -97,11 +134,8 @@ USER_PROMPT_TEMPLATE = (
     "  - continuity_subject: 字符串，continuous 时需要跨镜跟踪的主要人物或物体\n"
     "  - transition_to_next: 字符串，转场方式 cut/dissolve/fade\n"
     "  - associate_assets: 字符串数组，该镜头涉及的资产ID（格式 'char:角色id' 或 'scene:场景名'）\n"
-    "  - shot_size: 字符串，景别（extreme_wide/wide/medium_wide/medium/medium_close/close_up/extreme_close_up/over_shoulder/insert/establishing）\n"
-    "  - camera_movement: 字符串，摄影机运动（static/pan_left/pan_right/tilt_up/tilt_down/dolly_in/dolly_out/tracking_left/tracking_right/crane_up/crane_down/handheld/steadicam/orbital/zoom_in/zoom_out）\n"
-    "  - lighting_key: 字符串，光影基调（high_key/low_key/natural/golden_hour/blue_hour/tungsten_warm/neon/silhouette/rim_lit/volumetric/overcast_soft）\n"
-    "  - shot_intent: 字符串，镜头叙事意图（establishing/reveal/reaction/dialogue/action/transition/atmosphere/detail）\n"
-    "  - hero_moment: 布尔值，是否为全片视觉峰值；4 镜以上至少且通常恰好一个为 true\n"
+    + _SHOT_LANGUAGE_ENUM_CONTRACT
+    + "  - hero_moment: 布尔值，是否为全片视觉峰值；4 镜以上至少且通常恰好一个为 true\n"
     "  - texture_keywords: 2–4 个具体环境材质/光影纹理关键词组成的字符串数组\n\n"
     "  - dialogue: 对象或 null；有角色在本镜头说话时为 {{\"speaker\": \"角色名\", \"line\": \"剧本台词原文\"}}，无对白时必须为 null\n"
     "  - gen_strategy: 字符串，视频生成策略（flf2v/phantom/i2v）；最终值会由确定性规则校正\n\n"
@@ -895,25 +929,6 @@ def _call_llm_with_timeout_retry(user_prompt: str, max_tokens: int = 32000) -> s
     raise RuntimeError("LLM 调用失败: 意外退出重试循环")  # 不可达，满足类型检查
 
 
-_VALID_SHOT_SIZES = {
-    "extreme_wide", "wide", "medium_wide", "medium", "medium_close",
-    "close_up", "extreme_close_up", "over_shoulder", "insert", "establishing",
-}
-_VALID_CAMERA_MOVEMENTS = {
-    "static", "pan_left", "pan_right", "tilt_up", "tilt_down",
-    "dolly_in", "dolly_out", "tracking_left", "tracking_right",
-    "crane_up", "crane_down", "handheld", "steadicam", "orbital",
-    "zoom_in", "zoom_out", "rack_focus",
-}
-_VALID_LIGHTING_KEYS = {
-    "high_key", "low_key", "natural", "golden_hour", "blue_hour",
-    "tungsten_warm", "neon", "silhouette", "rim_lit", "volumetric",
-    "overcast_soft",
-}
-_VALID_SHOT_INTENTS = {
-    "establishing", "reveal", "reaction", "dialogue", "action",
-    "transition", "atmosphere", "detail",
-}
 _SHOT_LANGUAGE_FIELDS = (
     "shot_size",
     "camera_movement",
@@ -934,20 +949,24 @@ def _validate_authored_shot_language(
             raise ValueError(f"第 {index} 个 {label} 缺少镜头语言字段: {missing}")
         if shot["shot_size"] not in _VALID_SHOT_SIZES:
             raise ValueError(
-                f"第 {index} 个 {label} shot_size 无效: {shot['shot_size']}"
+                f"第 {index} 个 {label} shot_size 无效: {shot['shot_size']}; "
+                f"合法值: {', '.join(_SHOT_SIZE_VALUES)}"
             )
         if shot["camera_movement"] not in _VALID_CAMERA_MOVEMENTS:
             raise ValueError(
                 f"第 {index} 个 {label} camera_movement 无效: "
-                f"{shot['camera_movement']}"
+                f"{shot['camera_movement']}; 合法值: "
+                f"{', '.join(_CAMERA_MOVEMENT_VALUES)}"
             )
         if shot["lighting_key"] not in _VALID_LIGHTING_KEYS:
             raise ValueError(
-                f"第 {index} 个 {label} lighting_key 无效: {shot['lighting_key']}"
+                f"第 {index} 个 {label} lighting_key 无效: {shot['lighting_key']}; "
+                f"合法值: {', '.join(_LIGHTING_KEY_VALUES)}"
             )
         if shot["shot_intent"] not in _VALID_SHOT_INTENTS:
             raise ValueError(
-                f"第 {index} 个 {label} shot_intent 无效: {shot['shot_intent']}"
+                f"第 {index} 个 {label} shot_intent 无效: {shot['shot_intent']}; "
+                f"合法值: {', '.join(_SHOT_INTENT_VALUES)}"
             )
         if not isinstance(shot["hero_moment"], bool):
             raise ValueError(f"第 {index} 个 {label} hero_moment 必须是布尔值")
@@ -1410,7 +1429,10 @@ BEAT_SKELETON_PROMPT = (
     '"shot_size":"medium_wide","camera_movement":"dolly_in",'
     '"lighting_key":"natural","shot_intent":"establishing",'
     '"hero_moment":false,"texture_keywords":["场景中的具体材质","场景中的具体光影"]}}]}}。\n'
-    "【全局铁律】\n"
+    + "【镜头语言合法词表】以下四个枚举字段只能逐字选用所列值，禁止发明组合值或方向后缀：\n"
+    + _SHOT_LANGUAGE_ENUM_CONTRACT
+    + "hero_moment 必须为 JSON 布尔值；texture_keywords 必须为 2–4 个非空字符串。\n"
+    + "【全局铁律】\n"
     "1. beats 数量必须恰好等于 {beat_count}，总建议时长应接近 {target_duration} 秒（±10%）；"
     "每个 beat 的 generation_action_unit_count 合计不得超过 "
     "{max_generation_action_units_per_beat}。\n"

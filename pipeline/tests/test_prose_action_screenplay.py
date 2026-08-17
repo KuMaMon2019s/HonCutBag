@@ -13,6 +13,11 @@ from phases.phase1.adaptation_engine import (
     BATCH_EXPAND_PROMPT,
     BEAT_SKELETON_PROMPT,
     USER_PROMPT_TEMPLATE as ADAPTATION_PROMPT,
+    _CAMERA_MOVEMENT_VALUES,
+    _LIGHTING_KEY_VALUES,
+    _SHOT_INTENT_VALUES,
+    _SHOT_LANGUAGE_ENUM_CONTRACT,
+    _SHOT_SIZE_VALUES,
     _inherit_event_semantics,
     _parse_beat_skeleton,
 )
@@ -350,6 +355,21 @@ def test_beat_skeleton_requires_explicit_global_shot_language():
     ):
         assert field in BEAT_SKELETON_PROMPT
 
+    # Both planning paths and the validator are backed by these same ordered
+    # tuples. Exact contract reuse prevents their accepted vocabularies from
+    # drifting apart again.
+    assert _SHOT_LANGUAGE_ENUM_CONTRACT in ADAPTATION_PROMPT
+    assert _SHOT_LANGUAGE_ENUM_CONTRACT in BEAT_SKELETON_PROMPT
+    for values in (
+        _SHOT_SIZE_VALUES,
+        _CAMERA_MOVEMENT_VALUES,
+        _LIGHTING_KEY_VALUES,
+        _SHOT_INTENT_VALUES,
+    ):
+        for value in values:
+            assert value in ADAPTATION_PROMPT
+            assert value in BEAT_SKELETON_PROMPT
+
     response = json.dumps({
         "strategy": "旧格式",
         "beats": [{
@@ -365,4 +385,32 @@ def test_beat_skeleton_requires_explicit_global_shot_language():
     })
 
     with pytest.raises(ValueError, match="缺少字段"):
+        _parse_beat_skeleton(response, expected_count=1, event_count=1)
+
+
+def test_beat_skeleton_enum_error_returns_actionable_legal_values():
+    response = json.dumps({
+        "strategy": "手持跟拍",
+        "beats": [{
+            "beat_order": 1,
+            "source_events": [1],
+            "action": "keep",
+            "reason": "保留",
+            "who": [],
+            "where": "街头",
+            "what": "人物前进",
+            "suggested_duration": 15,
+            "shot_size": "medium_wide",
+            "camera_movement": "handheld_backward",
+            "lighting_key": "natural",
+            "shot_intent": "action",
+            "hero_moment": False,
+            "texture_keywords": ["湿润路面", "漫反射天光"],
+        }],
+    })
+
+    with pytest.raises(
+        ValueError,
+        match=r"handheld_backward; 合法值: .*handheld.*rack_focus",
+    ):
         _parse_beat_skeleton(response, expected_count=1, event_count=1)
