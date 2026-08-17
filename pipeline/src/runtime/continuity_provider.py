@@ -31,6 +31,7 @@ from runtime.execution_errors import ProviderPreparationError
 from runtime.generation_tasks import GenerationTaskStore
 from runtime.seedance_execution import execute_seedance_video_task
 from schemas.continuity import ContinuityPlan, GenerationChunk
+from utils.storyboard_motion_policy import apply_storyboard_motion_policy
 from utils.video_capabilities import SEEDANCE_2_CAPABILITIES
 from utils.video_geometry import resolve_video_geometry
 
@@ -443,7 +444,7 @@ def _chunk_prompt(
             f"Required end state: {request.chunk.end_state or 'complete that action'}. "
             "Do not execute another Pxx panel, skip ahead, or replay an earlier panel."
         )
-    return (
+    return apply_storyboard_motion_policy(
         f"{prompt}\n\n[continuity chunk {request.chunk.sequence}] {continuation}\n"
         f"{group_prompt}\n{request.memory_context}{beat_contract}{repair}"
     )
@@ -533,8 +534,9 @@ def _append_group_board_reference(
     image_number = sum(item.get("type") == "image_url" for item in content) + 1
     directive = (
         f"图片{image_number}是本连续组按时间从左到右、从上到下排列的总体分镜板，"
-        "仅用于确认当前镜头在故事中的位置和前后因果；不得复制整张拼图、不得同时演完其他格、"
-        "不得生成分格边框或板中文字。"
+        "仅用于确认当前镜头在故事中的位置和前后因果；必须按当前格中的主体动作箭头和摄影机箭头"
+        "执行相应的运动方向与轨迹，但箭头、轨迹线和提示文字都是不可见的制作标注；"
+        "不得复制整张拼图、不得同时演完其他格，不得在成片中生成箭头、辅助线、分格边框、编号或板中文字。"
     )
     text_item = next((item for item in content if item.get("type") == "text"), None)
     if text_item is None:
@@ -723,6 +725,8 @@ def _first_last_bridge_content(
     directive = (
         "图片1是上一二级分镜视频真实尾帧，必须作为新视频第一帧；"
         "图片2是下一一级分镜P01，必须作为新视频最后一帧。"
+        "图片2中的主体动作箭头和摄影机箭头只用于指示过渡的运动方向与轨迹，"
+        "箭头、轨迹线、文字、编号和分格标记不得出现在新视频任何一帧。"
         "只生成两帧之间的连续过渡并完成当前一级分镜的收束，"
         "不得提前执行图片2所属一级分镜的动作，不得新增剧情、角色或道具。\n"
     )

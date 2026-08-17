@@ -13,6 +13,8 @@ import zipfile
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
+from utils.storyboard_motion_policy import apply_storyboard_motion_policy
+
 
 def package_shot_assets(
     output_dir: Path,
@@ -453,7 +455,7 @@ def build_content_for_shot(
     content = []
 
     # 1. Text prompt (always first)
-    prompt_text = shot_meta.get("prompt", "")
+    prompt_text = apply_storyboard_motion_policy(shot_meta.get("prompt", ""))
     strategy = shot_meta.get("gen_strategy", "i2v")
     if strategy not in {"flf2v", "phantom", "i2v"}:
         strategy = "i2v"
@@ -503,7 +505,8 @@ def build_content_for_shot(
             "reference_description": (
                 f"{frame_label}，"
                 "用于锁定本生成片段的构图、角色站位、场景结构、"
-                "时间天气和光影"
+                "时间天气和光影；读取动作箭头和摄影机箭头的运动语义，"
+                "但不得在成片中复现任何箭头或标注"
             ),
         })
 

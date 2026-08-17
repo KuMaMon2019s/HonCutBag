@@ -26,6 +26,10 @@ from phases.phase6.video_generator import build_video_prompt
 from phases.phase4.scene_consistency import build_scene_reference_prompt
 from prompt.prompt_router import route_prompt
 from tools.asset_packager import build_content_for_shot, inject_reference_instruction
+from utils.storyboard_motion_policy import (
+    STORYBOARD_MOTION_POLICY_MARKER,
+    apply_storyboard_motion_policy,
+)
 from utils.visual_style_spec import VisualStyle
 
 
@@ -277,6 +281,16 @@ def test_action_phantom_references_are_motion_bounded(tmp_path, monkeypatch):
     assert "https://mock.invalid/R.png" in urls
     assert "https://mock.invalid/J.png" in urls
     assert "motion-priority" in prompt
+    assert "主体箭头控制主体的运动方向、路径和速度趋势" in prompt
+    assert "不得把它们转化成光效、道具、HUD、UI 或字幕" in prompt
+
+
+def test_storyboard_motion_policy_is_idempotent():
+    prompt = apply_storyboard_motion_policy("执行当前分镜动作")
+    reapplied = apply_storyboard_motion_policy(prompt)
+
+    assert reapplied == prompt
+    assert reapplied.count(STORYBOARD_MOTION_POLICY_MARKER) == 1
 
 
 def test_f5_placeholder_rendering_ignores_first_frame_numbering():

@@ -390,6 +390,9 @@ def test_video_prompt_keeps_requested_ratio_and_fast_action_semantics():
     assert "fast lateral" in prompt
     assert "smooth lateral" not in prompt
     assert "4K, 16:9" not in prompt
+    assert "[storyboard-motion-notation]" in prompt
+    assert "主体箭头控制主体的运动方向、路径和速度趋势" in prompt
+    assert "最终视频的任何一帧都不得出现或残留箭头" in prompt
 
 
 def test_shared_video_geometry_supports_portrait_and_explicit_dimensions():

@@ -13,18 +13,18 @@ Usage:
     url = client.image_to_image("same character, side view", ref_image="front.png", output_path="side.png")
 """
 
-import os
 import base64
 import io
+import os
 import threading
 import time
 from contextlib import contextmanager
+
 import requests
 from PIL import Image, ImageOps
-from typing import Optional
+
 from utils.config import ARK_BASE_URL
 from utils.ip_blacklist import sanitize_prompt
-
 
 # Agent Plan base URL (NOT /api/v3/ which is pay-as-you-go)
 BASE_URL = ARK_BASE_URL.rstrip("/")
@@ -138,10 +138,60 @@ class AgentPlanQuotaExceededError(RuntimeError):
     """Agent Plan repeatedly returned AccountQuotaExceeded after retries."""
 
 
+class SeedreamAPIError(requests.exceptions.HTTPError):
+    """Seedream rejected a request and returned structured provider context."""
+
+    def __init__(
+        self,
+        *,
+        status_code: int,
+        provider_code: str,
+        provider_message: str,
+        request_id: str | None,
+        response: requests.Response,
+    ):
+        details = f"Seedream API HTTP {status_code}"
+        if provider_code:
+            details += f" {provider_code}"
+        if provider_message:
+            details += f": {provider_message}"
+        if request_id:
+            details += f" (request_id={request_id})"
+        super().__init__(details, response=response, request=response.request)
+        self.status_code = status_code
+        self.provider_code = provider_code
+        self.provider_message = provider_message
+        self.request_id = request_id
+
+
+def _provider_error_details(
+    response: requests.Response,
+    diagnostic_headers: dict[str, str],
+) -> tuple[str, str, str | None]:
+    """Extract the stable error fields callers need for bounded recovery."""
+    provider_code = ""
+    provider_message = ""
+    try:
+        payload = response.json()
+    except (requests.exceptions.JSONDecodeError, ValueError):
+        payload = None
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            provider_code = str(error.get("code") or "").strip()
+            provider_message = str(error.get("message") or "").strip()
+    request_id = (
+        diagnostic_headers.get("x-request-id")
+        or diagnostic_headers.get("x-tt-logid")
+        or None
+    )
+    return provider_code, provider_message, request_id
+
+
 class SeedreamClient:
     """Seedream image generation client for Volcano Ark Agent Plan API."""
 
-    def __init__(self, api_key: Optional[str] = None, model: str = DEFAULT_MODEL):
+    def __init__(self, api_key: str | None = None, model: str = DEFAULT_MODEL):
         self.api_key = api_key or os.environ.get("ARK_AGENT_API_KEY", "")
         if not self.api_key:
             raise ValueError("ARK_AGENT_API_KEY not set. Export it or pass api_key=.")
@@ -166,7 +216,7 @@ class SeedreamClient:
         sanitized_prompt, filtered_terms = sanitize_prompt(prompt)
         if filtered_terms:
             print(f"  [seedream] IP filter: removed {filtered_terms}")
-        
+
         payload = {
             "model": self.model,
             "prompt": sanitized_prompt,
@@ -303,7 +353,13 @@ class SeedreamClient:
                         f"body={resp.text[:1000]!r} headers={diagnostic_headers}",
                         flush=True,
                     )
-                    if "AccountQuotaExceeded" in resp.text:
+                    provider_code, provider_message, request_id = (
+                        _provider_error_details(resp, diagnostic_headers)
+                    )
+                    if (
+                        provider_code == "AccountQuotaExceeded"
+                        or "AccountQuotaExceeded" in resp.text
+                    ):
                         if quota_retry < max_quota_retries:
                             print(
                                 f"  [seedream] ⚠ AccountQuotaExceeded (intermittent), "
@@ -314,9 +370,15 @@ class SeedreamClient:
                             continue
                         raise AgentPlanQuotaExceededError(
                             "HTTP 429 AccountQuotaExceeded persisted after 3 retries. "
-                            f"Request id: {diagnostic_headers.get('x-request-id', 'N/A')}"
+                            f"Request id: {request_id or 'N/A'}"
                         )
-                resp.raise_for_status()
+                    raise SeedreamAPIError(
+                        status_code=status_code,
+                        provider_code=provider_code,
+                        provider_message=provider_message,
+                        request_id=request_id,
+                        response=resp,
+                    )
                 data = resp.json()
                 break
 

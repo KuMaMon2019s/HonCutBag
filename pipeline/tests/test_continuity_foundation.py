@@ -17,7 +17,12 @@ from PIL import Image
 from pydantic import ValidationError
 
 from clients import seedance_client, tos_uploader
-from clients.seedream_client import IMAGE_ENDPOINT, _reference_data_url
+from clients.seedream_client import (
+    IMAGE_ENDPOINT,
+    SeedreamAPIError,
+    SeedreamClient,
+    _reference_data_url,
+)
 from phases import pipeline_core
 from phases.phase1.director_storyboard import (
     build_director_storyboard_prompt,
@@ -128,6 +133,44 @@ def test_seedream_compacts_large_reference_in_memory_without_touching_source(tmp
         assert header == "data:image/jpeg;base64"
         assert max(compacted.size) == 1600
     assert reference.read_bytes() == original
+
+
+def test_seedream_http_error_keeps_provider_code_and_request_id(monkeypatch, tmp_path):
+    error_payload = {
+        "error": {
+            "code": "InputImageSensitiveContentDetected",
+            "message": "The input image may contain sensitive information.",
+        }
+    }
+
+    class FakeResponse:
+        def __init__(self):
+            self.status_code = 400
+            self.headers = {"x-request-id": "request-sensitive-123"}
+            self.text = json.dumps(error_payload)
+            self.request = None
+
+        @staticmethod
+        def json():
+            return error_payload
+
+    monkeypatch.setenv("SEEDREAM_MIN_INTERVAL", "0")
+    monkeypatch.setattr(
+        "clients.seedream_client.requests.post",
+        lambda *_args, **_kwargs: FakeResponse(),
+    )
+    client = SeedreamClient(api_key="test-key")
+
+    with pytest.raises(SeedreamAPIError) as captured:
+        client.text_to_image(
+            "synthetic storyboard",
+            output_path=str(tmp_path / "unused.png"),
+        )
+
+    assert captured.value.status_code == 400
+    assert captured.value.provider_code == "InputImageSensitiveContentDetected"
+    assert captured.value.request_id == "request-sensitive-123"
+    assert "InputImageSensitiveContentDetected" in str(captured.value)
 
 
 def test_planner_keeps_short_editorial_shots_backward_compatible():
@@ -1016,6 +1059,163 @@ def test_storyboard_output_safety_rejection_gets_one_non_contact_retry(tmp_path)
     assert (tmp_path / panel["safety_retry"]["prompt"]).is_file()
 
 
+def test_storyboard_input_safety_rejection_keeps_known_identity_references(tmp_path):
+    face = tmp_path / "characters/CHAR_A/face_closeup.png"
+    body = tmp_path / "characters/CHAR_A/full_body.png"
+    face.parent.mkdir(parents=True)
+    Image.new("RGB", (128, 128), "orange").save(face)
+    Image.new("RGB", (128, 256), "navy").save(body)
+    storyboard = {
+        "shots": [{
+            "id": "S06",
+            "who": ["CHAR_A"],
+            "storyboard_beats": [
+                {
+                    "beat_id": "S06_P01",
+                    "duration_s": 5,
+                    "generation_mode": "multi_image",
+                    "action": "synthetic agent stabilizes in zero gravity",
+                },
+                {
+                    "beat_id": "S06_P02",
+                    "duration_s": 4,
+                    "generation_mode": "tail_video_extend",
+                    "action": "synthetic agent holds the final pose",
+                },
+            ],
+        }]
+    }
+
+    class SeedCacheClient:
+        model = "fake-seedream"
+
+        def image_to_image(self, prompt, ref_image, output_path, size):
+            Image.new("RGB", (1280, 720), "green").save(output_path)
+            return "https://image.invalid/seed-panel.png"
+
+        def text_to_image(self, **_kwargs):
+            pytest.fail("character shots must use image-to-image")
+
+    generate_shot_storyboards(
+        tmp_path,
+        storyboard,
+        [{"id": "CHAR_A", "name": "Character A"}],
+        client=SeedCacheClient(),
+        director_storyboard_path=tmp_path / "missing.png",
+    )
+    (tmp_path / "storyboard_beats/S06_P02.png").unlink()
+    (tmp_path / "storyboard_beats/S06_P02.json").unlink()
+    image_calls = []
+
+    class FakeImageClient:
+        model = "fake-seedream"
+
+        def image_to_image(self, prompt, ref_image, output_path, size):
+            references = [ref_image] if isinstance(ref_image, str) else list(ref_image)
+            image_calls.append(references)
+            previous_panel = str(tmp_path / "storyboard_beats/S06_P01.png")
+            if previous_panel in references:
+                raise SeedreamAPIError(
+                    status_code=400,
+                    provider_code="InputImageSensitiveContentDetected",
+                    provider_message="The input image may contain sensitive information.",
+                    request_id="request-panel-sensitive",
+                    response=SimpleNamespace(request=None),
+                )
+            Image.new("RGB", (1280, 720), "green").save(output_path)
+            return "https://image.invalid/reference-panel.png"
+
+        def text_to_image(self, **_kwargs):
+            pytest.fail("known accepted identity references should recover the request")
+
+    contract = generate_shot_storyboards(
+        tmp_path,
+        storyboard,
+        [{"id": "CHAR_A", "name": "Character A"}],
+        client=FakeImageClient(),
+        director_storyboard_path=tmp_path / "missing.png",
+    )
+
+    assert len(image_calls) == 2
+    assert image_calls[1] == [str(face), str(body)]
+    panel = contract["shots"][0]["panels"][1]
+    assert panel["mode"] == "image_to_image"
+    assert panel["used_reference_images"] == [
+        "characters/CHAR_A/face_closeup.png",
+        "characters/CHAR_A/full_body.png",
+    ]
+    assert panel["dropped_reference_images"] == [
+        "storyboard_beats/S06_P01.png"
+    ]
+    fallback = panel["input_safety_fallback"]
+    assert fallback["attempts"] == 1
+    assert fallback["policy"] == "role_preserving_reference_reduction_v1"
+    assert [item["status"] for item in fallback["trace"]] == [
+        "rejected",
+        "accepted",
+    ]
+    assert fallback["trace"][0]["request_id"] == "request-panel-sensitive"
+
+
+def test_storyboard_input_safety_rejection_has_bounded_text_fallback(tmp_path):
+    face = tmp_path / "characters/CHAR_A/face_closeup.png"
+    body = tmp_path / "characters/CHAR_A/full_body.png"
+    face.parent.mkdir(parents=True)
+    Image.new("RGB", (128, 128), "orange").save(face)
+    Image.new("RGB", (128, 256), "navy").save(body)
+    storyboard = {
+        "shots": [{
+            "id": "S01",
+            "who": ["CHAR_A"],
+            "storyboard_beats": [{
+                "beat_id": "S01_P01",
+                "duration_s": 5,
+                "generation_mode": "multi_image",
+                "action": "synthetic agent enters the corridor",
+            }],
+        }]
+    }
+    calls = []
+
+    class FakeImageClient:
+        model = "fake-seedream"
+
+        def image_to_image(self, prompt, ref_image, output_path, size):
+            references = [ref_image] if isinstance(ref_image, str) else list(ref_image)
+            calls.append(("image_to_image", references))
+            raise RuntimeError(
+                "InputImageSensitiveContentDetected: input image may contain sensitive information"
+            )
+
+        def text_to_image(self, prompt, output_path, size, timeout):
+            calls.append(("text_to_image", []))
+            Image.new("RGB", (1280, 720), "blue").save(output_path)
+            return "https://image.invalid/text-panel.png"
+
+    contract = generate_shot_storyboards(
+        tmp_path,
+        storyboard,
+        [{"id": "CHAR_A", "name": "Character A"}],
+        client=FakeImageClient(),
+        director_storyboard_path=tmp_path / "missing.png",
+    )
+
+    assert [mode for mode, _references in calls] == [
+        "image_to_image",
+        "image_to_image",
+        "text_to_image",
+    ]
+    panel = contract["shots"][0]["panels"][0]
+    assert panel["mode"] == "text_to_image"
+    assert panel["used_reference_images"] == []
+    assert panel["dropped_reference_images"] == [
+        "characters/CHAR_A/face_closeup.png",
+        "characters/CHAR_A/full_body.png",
+    ]
+    assert panel["input_safety_fallback"]["attempts"] == 2
+    assert panel["input_safety_fallback"]["final_mode"] == "text_to_image"
+
+
 def test_storyboard_reference_transport_failure_retries_same_request_twice(tmp_path):
     from requests.exceptions import ConnectionError as RequestsConnectionError
 
@@ -1247,6 +1447,8 @@ def test_provider_uses_each_chunk_storyboard_panel_and_action(monkeypatch, tmp_p
     assert observed["gen_strategy"] == "i2v"
     assert observed["generation_actions"] == ["烬抬起机械臂格挡"]
     assert "Execute only this visible action: 烬抬起机械臂格挡" in content[0]["text"]
+    assert "摄影机箭头控制机位的移动方向和轨迹" in content[0]["text"]
+    assert "最终视频的任何一帧都不得出现或残留箭头" in content[0]["text"]
 
 
 def test_secondary_first_beat_uses_multi_image_generation(monkeypatch, tmp_path):
@@ -1363,6 +1565,9 @@ def test_secondary_third_beat_uses_previous_tail_and_next_primary_p01(
     assert content[2]["image_url"]["url"].endswith("frame-2.jpg")
     assert "图片1是上一二级分镜视频真实尾帧" in content[0]["text"]
     assert "不得提前执行图片2所属一级分镜的动作" in content[0]["text"]
+    assert "图片2中的主体动作箭头和摄影机箭头只用于指示" in content[0]["text"]
+    assert "不得出现在新视频任何一帧" in content[0]["text"]
+    assert content[0]["text"].count("[storyboard-motion-notation]") == 1
 
 
 def test_seedance_duration_separates_provider_request_from_effective_story_time(
@@ -2517,6 +2722,9 @@ def test_extension_provider_content_keeps_images_as_anchors_and_adds_video(monke
     assert "Do not skip forward in time" in content[0]["text"]
     assert "storyboard group CG001; step 1/1" in content[0]["text"]
     assert "图片5是本连续组" in content[0]["text"]
+    assert "必须按当前格中的主体动作箭头和摄影机箭头" in content[0]["text"]
+    assert "不得在成片中生成箭头、辅助线" in content[0]["text"]
+    assert content[0]["text"].count("[storyboard-motion-notation]") == 1
     assert content[1]["image_url"]["url"] == "https://image.test/frame.png"
     assert [item["image_url"]["url"] for item in content[2:5]] == [
         f"https://image.test/{path.name}"

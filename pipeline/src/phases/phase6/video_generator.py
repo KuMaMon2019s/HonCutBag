@@ -11,9 +11,9 @@ from typing import Any
 
 from clients.video_client import VideoClient
 from prompt.eight_layer_summary import build_subject_summary
+from utils.storyboard_motion_policy import apply_storyboard_motion_policy
 from utils.style_slices import get_slice
 from utils.video_geometry import resolve_video_geometry
-
 
 BASE_NEGATIVE_PROMPT = (
     "变形扭曲(warping), 形态渐变(morphing), 面部扭曲(distorted faces), "
@@ -172,7 +172,7 @@ def build_video_prompt(
         negatives.append(time_negative)
     negatives.extend(str(char.get("negative_guardrails", "")).strip() for char in selected)
     negative_prompt = ", ".join(dict.fromkeys(item for item in negatives if item))
-    prompt = "。".join(parts)
+    prompt = apply_storyboard_motion_policy("。".join(parts))
     if explicit_scenery:
         scenery_lock = (
             "纯环境镜头硬约束：画面中保持零人物、零人形主体、零服装与零角色道具，"

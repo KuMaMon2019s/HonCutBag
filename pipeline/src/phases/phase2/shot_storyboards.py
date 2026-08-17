@@ -376,14 +376,77 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
 
 
 def _is_output_image_safety_rejection(error: BaseException) -> bool:
+    provider_code = str(getattr(error, "provider_code", "")).casefold()
     message = str(error).casefold()
     return any(
-        marker.casefold() in message
+        marker.casefold() in provider_code or marker.casefold() in message
         for marker in (
             "OutputImageSensitiveContentDetected",
             "output image may contain sensitive information",
         )
     )
+
+
+def _is_input_image_safety_rejection(error: BaseException) -> bool:
+    provider_code = str(getattr(error, "provider_code", "")).casefold()
+    message = str(error).casefold()
+    return any(
+        marker.casefold() in provider_code or marker.casefold() in message
+        for marker in (
+            "InputImageSensitiveContentDetected",
+            "input image may contain sensitive information",
+        )
+    )
+
+
+def _reference_reduction_candidates(
+    reference_paths: list[Path],
+    *,
+    character_references: list[Path],
+    previous_panel: Path | None,
+    director_panel: Path | None,
+    accepted_reference_hashes: set[str],
+) -> list[list[Path]]:
+    """Return at most three role-aware, progressively safer retry inputs."""
+    original = tuple(reference_paths)
+    seen = {original}
+    nonempty: list[list[Path]] = []
+
+    def add(paths: list[Path]) -> None:
+        ordered: list[Path] = []
+        for path in reference_paths:
+            if path in paths and path not in ordered:
+                ordered.append(path)
+        candidate = tuple(ordered)
+        if not candidate or candidate in seen:
+            return
+        seen.add(candidate)
+        nonempty.append(list(candidate))
+
+    if director_panel is not None:
+        add([path for path in reference_paths if path != director_panel])
+
+    known_accepted = [
+        path
+        for path in reference_paths
+        if hashlib.sha256(path.read_bytes()).hexdigest() in accepted_reference_hashes
+    ]
+    add(known_accepted)
+
+    body_identity = [
+        path
+        for path in character_references
+        if path.stem.casefold() in {"full_body", "front", "side", "back"}
+    ]
+    add(body_identity)
+    if previous_panel is not None:
+        add([previous_panel])
+    if director_panel is not None:
+        add([director_panel])
+
+    # Keep retries bounded: two reference-preserving attempts, then a final
+    # text-only generation whose identity contract remains in the prompt.
+    return [*nonempty[:2], []]
 
 
 def _is_transient_image_transport_error(error: BaseException) -> bool:
@@ -682,6 +745,7 @@ def generate_shot_storyboards(
     )
 
     previous_storyboard_panel: Path | None = None
+    accepted_reference_hashes: set[str] = set()
     try:
         for index, shot in enumerate(storyboard.get("shots", []), 1):
             if not isinstance(shot, dict):
@@ -820,7 +884,7 @@ def generate_shot_storyboards(
                     for path in reference_paths
                 ]
                 panel_sha = hashlib.sha256(
-                    f"{panel_prompt}\nreferences={','.join(reference_hashes)}".encode("utf-8")
+                    f"{panel_prompt}\nreferences={','.join(reference_hashes)}".encode()
                 ).hexdigest()
                 panel_record = {
                     "beat_id": beat_id,
@@ -863,34 +927,59 @@ def generate_shot_storyboards(
                     except (OSError, ValueError, json.JSONDecodeError):
                         cached = False
                 if not cached:
-                    def generate_panel(generation_prompt: str):
-                        if reference_paths and hasattr(client, "image_to_image"):
+                    def reference_value(path: Path) -> str:
+                        return (
+                            str(path.relative_to(output_dir))
+                            if path.is_relative_to(output_dir)
+                            else str(path)
+                        )
+
+                    def reference_hash(path: Path) -> str:
+                        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+                    def generate_panel(
+                        generation_prompt: str,
+                        selected_references: list[Path],
+                        *,
+                        _panel_record: dict[str, Any] = panel_record,
+                        _panel_path: Path = panel_path,
+                    ):
+                        if selected_references and hasattr(client, "image_to_image"):
+                            _panel_record["mode"] = "image_to_image"
                             return client.image_to_image(
                                 prompt=generation_prompt,
                                 ref_image=(
-                                    str(reference_paths[0])
-                                    if len(reference_paths) == 1
-                                    else [str(path) for path in reference_paths]
+                                    str(selected_references[0])
+                                    if len(selected_references) == 1
+                                    else [str(path) for path in selected_references]
                                 ),
-                                output_path=str(panel_path),
+                                output_path=str(_panel_path),
                                 size=size,
                             )
-                        panel_record["mode"] = "text_to_image"
+                        _panel_record["mode"] = "text_to_image"
                         return client.text_to_image(
                             prompt=generation_prompt,
-                            output_path=str(panel_path),
+                            output_path=str(_panel_path),
                             size=size,
                             timeout=180,
                         )
 
                     transport_retries = 0
 
-                    def generate_with_transport_retry(generation_prompt: str):
+                    def generate_with_transport_retry(
+                        generation_prompt: str,
+                        selected_references: list[Path],
+                        *,
+                        _beat_id: str = beat_id,
+                    ):
                         nonlocal transport_retries
                         max_transport_retries = 2
                         for attempt in range(max_transport_retries + 1):
                             try:
-                                return generate_panel(generation_prompt)
+                                return generate_panel(
+                                    generation_prompt,
+                                    selected_references,
+                                )
                             except Exception as exc:
                                 if (
                                     not _is_transient_image_transport_error(exc)
@@ -899,13 +988,115 @@ def generate_shot_storyboards(
                                     raise
                                 transport_retries += 1
                                 print(
-                                    f"  [seedream] {beat_id} 参考图传输中断；"
+                                    f"  [seedream] {_beat_id} 参考图传输中断；"
                                     f"同请求限次重试 {attempt + 1}/{max_transport_retries}",
                                     flush=True,
                                 )
 
+                    input_safety_trace: list[dict[str, Any]] = []
+                    provider_accepted_references = list(reference_paths)
+
+                    def generate_with_input_safety_fallback(
+                        generation_prompt: str,
+                        starting_references: list[Path],
+                        *,
+                        _character_references: tuple[Path, ...] = tuple(
+                            character_references
+                        ),
+                        _previous_panel: Path | None = previous_panel,
+                        _director_panel: Path | None = director_panel,
+                        _trace: list[dict[str, Any]] = input_safety_trace,
+                        _beat_id: str = beat_id,
+                    ) -> tuple[str, list[Path]]:
+                        nonlocal provider_accepted_references
+                        fallback_references = _reference_reduction_candidates(
+                            starting_references,
+                            character_references=list(_character_references),
+                            previous_panel=_previous_panel,
+                            director_panel=_director_panel,
+                            accepted_reference_hashes=accepted_reference_hashes,
+                        )
+                        candidates = [starting_references, *fallback_references]
+                        last_input_error: BaseException | None = None
+                        for attempt, selected_references in enumerate(candidates, 1):
+                            try:
+                                result = generate_with_transport_retry(
+                                    generation_prompt,
+                                    selected_references,
+                                )
+                            except Exception as exc:
+                                if not _is_input_image_safety_rejection(exc):
+                                    if _is_output_image_safety_rejection(exc):
+                                        provider_accepted_references = list(
+                                            selected_references
+                                        )
+                                        accepted_reference_hashes.update(
+                                            reference_hash(path)
+                                            for path in selected_references
+                                        )
+                                    raise
+                                last_input_error = exc
+                                _trace.append({
+                                    "attempt": attempt,
+                                    "status": "rejected",
+                                    "mode": (
+                                        "image_to_image"
+                                        if selected_references
+                                        else "text_to_image"
+                                    ),
+                                    "reference_images": [
+                                        reference_value(path)
+                                        for path in selected_references
+                                    ],
+                                    "provider_code": str(
+                                        getattr(exc, "provider_code", "")
+                                        or "InputImageSensitiveContentDetected"
+                                    ),
+                                    "request_id": (
+                                        str(getattr(exc, "request_id", "") or "")
+                                        or None
+                                    ),
+                                })
+                                if attempt < len(candidates):
+                                    print(
+                                        f"  [seedream] {_beat_id} 输入参考图被服务商拒绝；"
+                                        f"按身份与连续性优先级缩减参考图 "
+                                        f"{attempt}/{len(candidates) - 1}",
+                                        flush=True,
+                                    )
+                                continue
+                            provider_accepted_references = list(selected_references)
+                            accepted_reference_hashes.update(
+                                reference_hash(path) for path in selected_references
+                            )
+                            if _trace:
+                                _trace.append({
+                                    "attempt": attempt,
+                                    "status": "accepted",
+                                    "mode": (
+                                        "image_to_image"
+                                        if selected_references
+                                        else "text_to_image"
+                                    ),
+                                    "reference_images": [
+                                        reference_value(path)
+                                        for path in selected_references
+                                    ],
+                                })
+                            return result, list(selected_references)
+                        if last_input_error is not None:
+                            raise last_input_error
+                        raise RuntimeError(
+                            f"{_beat_id} exhausted storyboard reference fallbacks"
+                        )
+
                     try:
-                        result_url = generate_with_transport_retry(panel_prompt)
+                        result_url, used_reference_paths = (
+                            generate_with_input_safety_fallback(
+                                panel_prompt,
+                                list(reference_paths),
+                            )
+                        )
                     except Exception as exc:
                         if not _is_output_image_safety_rejection(exc):
                             raise
@@ -916,7 +1107,12 @@ def generate_shot_storyboards(
                             f"  [seedream] {beat_id} 输出安全拒绝；改为非接触机械特技预演，限次重试 1 次",
                             flush=True,
                         )
-                        result_url = generate_with_transport_retry(safety_prompt)
+                        result_url, used_reference_paths = (
+                            generate_with_input_safety_fallback(
+                                safety_prompt,
+                                provider_accepted_references,
+                            )
+                        )
                         panel_record["safety_retry"] = {
                             "reason": "output_image_sensitive_content",
                             "attempts": 1,
@@ -926,6 +1122,29 @@ def generate_shot_storyboards(
                                 safety_prompt.encode("utf-8")
                             ).hexdigest(),
                         }
+                    used_reference_hashes = [
+                        reference_hash(path) for path in used_reference_paths
+                    ]
+                    used_reference_values = [
+                        reference_value(path) for path in used_reference_paths
+                    ]
+                    if input_safety_trace:
+                        panel_record["input_safety_fallback"] = {
+                            "reason": "input_image_sensitive_content",
+                            "attempts": sum(
+                                item.get("status") == "rejected"
+                                for item in input_safety_trace
+                            ),
+                            "policy": "role_preserving_reference_reduction_v1",
+                            "trace": input_safety_trace,
+                            "final_mode": panel_record["mode"],
+                        }
+                    panel_record["used_reference_images"] = used_reference_values
+                    panel_record["dropped_reference_images"] = [
+                        reference_value(path)
+                        for path in reference_paths
+                        if path not in used_reference_paths
+                    ]
                     if transport_retries:
                         panel_record["transport_retry"] = {
                             "attempts": transport_retries,
@@ -938,8 +1157,14 @@ def generate_shot_storyboards(
                     panel_record.update({
                         "status": "done",
                         "result_url": result_url,
-                        "reference_image_sha256": reference_hashes,
+                        "requested_reference_image_sha256": reference_hashes,
+                        "reference_image_sha256": used_reference_hashes,
                     })
+                accepted_reference_hashes.update(
+                    str(value)
+                    for value in (panel_record.get("reference_image_sha256") or [])
+                    if str(value)
+                )
                 _write_json(panel_sidecar, panel_record)
                 beat["storyboard_image"] = panel_record["image"]
                 panel_records.append(panel_record)
