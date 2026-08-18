@@ -1514,26 +1514,23 @@ def test_adult_lead_body_contracts_are_exact_and_scoped():
 
     male_contract = male["appearance"]["body_contract"]
     assert male["appearance"]["height"] == "182cm"
-    assert male_contract == {
-        "profile": "adult_male_lead",
-        "height_cm": 182,
-        "head_to_body_ratio": 7.8,
-        "build": "lean athletic",
-        "shoulders": "moderately broad shoulders",
-        "leg_proportion": "slightly long legs",
-        "body_fat": "low-to-normal body fat",
-        "posture": "upright, confident",
-        "forbidden": [
-            "oversized head",
-            "extremely narrow waist",
-            "bodybuilder physique",
-        ],
-        "schema_version": 1,
-    }
+    assert male_contract["profile"] == "adult_male_lead"
+    assert male_contract["height_cm"] == 182
+    assert male_contract["head_to_body_ratio"] == 7.8
+    assert male_contract["build"] == "lean athletic"
+    assert male_contract["shoulders"] == "moderately broad shoulders"
+    assert male_contract["leg_proportion"] == "slightly long legs"
+    assert male_contract["body_fat"] == "low-to-normal body fat"
+    assert male_contract["posture"] == "upright, confident"
+    assert male_contract["schema_version"] == 2
+    human_contract = male_contract["human_proportion_constraints"]
+    assert human_contract["head_to_body_ratio_range"] == [7.6, 8.0]
+    assert human_contract["max_head_width_to_shoulder_width"] == 0.43
+    assert human_contract["extremity_scale"] == "hands and feet proportionate to height"
 
     female_contract = female["appearance"]["body_contract"]
     assert female["appearance"]["height"] == "166cm"
-    assert female_contract["head_to_body_ratio"] == 7.5
+    assert female_contract["head_to_body_ratio"] == 7.6
     assert female_contract["build"] == "slender balanced"
     assert female_contract["shoulders_and_hips"] == "natural proportional shoulders and hips"
     assert female_contract["waistline"] == "naturally defined waist"
@@ -1571,9 +1568,10 @@ def test_character_discovery_body_contract_is_prompted_and_normalized(monkeypatc
     discovered = result["characters"][0]
     assert discovered["appearance"]["body_contract"]["height_cm"] == 182
     assert "head_to_body_ratio=7.8" in captured["prompt"]
-    assert "head_to_body_ratio=7.5" in captured["prompt"]
+    assert "head_to_body_ratio=7.6" in captured["prompt"]
+    assert "头宽不得超过肩宽的 43%" in captured["prompt"]
     assert ADULT_LEAD_DISCOVERY_INSTRUCTIONS in character_discoverer.SYSTEM_PROMPT
-    assert character_discoverer.CHARACTER_CONTEXT_SCHEMA_VERSION == 5
+    assert character_discoverer.CHARACTER_CONTEXT_SCHEMA_VERSION == 6
     assert "bodybuilder physique" in discovered["negative_guardrails"]
     assert "Body-proportion lock" in discovered["prompt_definition"]
 
@@ -1587,7 +1585,12 @@ def test_body_contract_reaches_character_storyboard_and_video_prompts():
     assert "height exactly 182 cm" in description
     assert "exactly 7.8 heads tall" in description
     assert "moderately broad shoulders" in description
+    assert "adult head-to-body ratio stays within 7.6–8.0" in description
+    assert "head width never exceeds 43% of shoulder width" in description
+    assert "hands and feet proportionate to height" in description
+    assert "same head size and body proportions" in description
     assert "Do not depict: oversized head" in description
+    assert "childlike body proportions" in description
     assert "has priority over any conflicting body wording" in description
 
     reference_prompts = character_factory.build_model_reference_prompts(description)
@@ -1616,6 +1619,10 @@ def test_body_contract_reaches_character_storyboard_and_video_prompts():
     assert "角色身体比例逐镜硬合同" in video_prompt
     assert "height exactly 182 cm" in video_prompt
     assert "bodybuilder physique" in video_prompt
+    assert "运镜物理硬合同" in video_prompt
+    assert "lens: 50mm equivalent" in video_prompt
+    assert "50–85mm equivalent cinematic lens" in video_prompt
+    assert "wide-angle distortion" in video_prompt
 
 
 def test_phase4_preserves_authored_continuous_boundary_with_legacy_fresh_p01():
@@ -1923,6 +1930,9 @@ def test_storyboard_prompts_use_generic_role_and_prop_fidelity_contracts():
     assert "严格保留本格声明的道具类型、持有者和使用方式" in prompt
     assert "角色职责与道具合同" in director_prompt
     assert "每个具名角色只执行逐格内容合同明确分配给自己的动作" in director_prompt
+    assert "摄影物理合同" in director_prompt
+    assert "摄影禁止项" in director_prompt
+    assert "random camera movement" in director_prompt
     assert "摄影师是持机记录者，不是舞者" not in prompt
     assert "Groove" not in prompt
     assert "手机HDR高光" not in director_prompt

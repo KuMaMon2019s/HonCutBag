@@ -13,6 +13,10 @@ from typing import Any, Protocol
 import requests
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from utils.character_body_contracts import character_visual_description
+from utils.camera_motion_contracts import (
+    camera_motion_negative_prompt,
+    camera_motion_prompt,
+)
 
 SHOT_STORYBOARD_SIZE = "2560x1440"
 
@@ -80,7 +84,7 @@ def _character_contract(
         if description:
             lines.append(
                 f"- {character.get('name') or character.get('id')}："
-                f"{_compact(description, 600)}"
+                f"{_compact(description, 1400)}"
             )
     contract = "\n".join(lines) or "- 严格使用 STORYBOARD.json 声明的角色设定，不自行增加人物。"
     from utils.privacy_visual_policy import (
@@ -118,13 +122,15 @@ def build_shot_storyboard_prompt(
             "tail_video_extend": "TAIL_VIDEO_EXTEND",
             "first_last_frame_bridge": "FIRST_LAST_FRAME_BRIDGE",
         }.get(generation_mode, "FRESH" if position == 1 else "EXTEND")
+        beat_camera_contract = camera_motion_prompt({**shot, **beat})
         beat_lines.append(
             f"故事格{position}【{beat_id} · {mode} · {float(beat.get('duration_s') or 5):g}秒】："
             f"起始状态={_compact(beat.get('start_state'))}；"
             f"本格只表现={_compact(beat.get('action'))}；"
             f"结束状态={_compact(beat.get('end_state'))}；"
             f"景别={beat.get('shot_size') or shot.get('shot_size') or 'medium'}；"
-            f"运镜={beat.get('camera_movement') or shot.get('camera_movement') or 'steadicam'}。"
+            f"运镜={beat.get('camera_movement') or shot.get('camera_movement') or 'steadicam'}；"
+            f"物理合同={beat_camera_contract}。"
         )
     prompt = f"""为导演级镜头 {shot_id} 绘制一张内部动作故事板。
 
@@ -154,6 +160,9 @@ def build_shot_storyboard_prompt(
 角色职责与道具合同：
 - 每个角色只执行逐格合同明确分配给自己的动作；不得把其他角色或群体的动作复制给旁观者、记录者、驾驶者、守卫或任何未被指定的角色。
 - 保留源文本中的道具类型、持有者和使用方式；不得替换设备、交换道具或让角色无故放下道具。
+
+摄影与人体透视禁止项：
+- {camera_motion_negative_prompt(shot)}。
 
 逐格合同：
 {chr(10).join(beat_lines)}
@@ -289,6 +298,7 @@ Phase 5 定向纠偏合同：
 场景：{_compact(shot.get('where') or shot.get('visual'), 260)}
 景别：{beat.get('shot_size') or shot.get('shot_size') or 'medium'}
 运镜意图：{beat.get('camera_movement') or shot.get('camera_movement') or 'steadicam'}
+运镜物理硬合同：{camera_motion_prompt({**shot, **beat})}
 
 角色：
 {_character_contract(characters, who)}
@@ -301,6 +311,7 @@ Phase 5 定向纠偏合同：
 - 严格保留本格声明的道具类型、持有者和使用方式；不得替换设备、交换道具或让角色无故放下道具。
 - 静态故事格只能画一个时间点，不得把多个时间点或动作过程拼贴在一起；但若本格给主体分配了肢体或位移动作，必须选择达到结束状态时仍具动力学信息的瞬间，以关节弯曲、肢体伸展、重心偏移、接触关系和动作方向清楚表现该动作。不得把“终态”误画成人物中性站立；只有源合同明确要求静止、停止或定格时才画静止姿态。
 - 主动作角色必须是画面的主要运动来源。不得只让背景人群、车辆、光影、粒子、衣物、头发或摄影机产生动感，而让被分配动作的主体保持参考图原姿势；背景与运镜只能辅助，不能替代主体动作。
+- 人物构图必须遵守运镜合同中的 50–85mm 自然透视与稳定人物尺度；禁止：{camera_motion_negative_prompt({**shot, **beat})}。
 {disarm_contract}{cast_contract}- 其他动作不得用相邻剧情或泛化搏斗代替。
 - {final_beat_contract}
 {correction_section}

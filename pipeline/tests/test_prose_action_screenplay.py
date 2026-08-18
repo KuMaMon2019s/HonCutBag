@@ -31,6 +31,13 @@ from prompt.event_extractor import (
 )
 from prompt.text_parser import SEGMENT_MAX_CHARS, parse_text
 from schemas.story import StoryboardShot
+from utils.camera_motion_contracts import (
+    CAMERA_MOTION_PLANNING_INSTRUCTIONS,
+    CAMERA_MOVEMENT_VALUES,
+    HUMAN_PERSPECTIVE_NEGATIVE,
+    apply_camera_motion_contract,
+    camera_motion_prompt,
+)
 
 
 PROSE_ACTION_SCRIPT = """
@@ -414,3 +421,95 @@ def test_beat_skeleton_enum_error_returns_actionable_legal_values():
         match=r"handheld_backward; 合法值: .*handheld.*rack_focus",
     ):
         _parse_beat_skeleton(response, expected_count=1, event_count=1)
+
+
+def test_camera_motion_module_is_the_single_prompt_and_enum_contract():
+    assert _CAMERA_MOVEMENT_VALUES == CAMERA_MOVEMENT_VALUES
+    for value in (
+        "tracking_front",
+        "tracking_rear",
+        "pedestal_up",
+        "orbit_semicircle",
+        "subtle_zoom_in",
+        "dialogue_push_in",
+        "dolly_in_subtle_zoom",
+        "crash_zoom_in",
+        "punch_in",
+        "dolly_zoom_out",
+        "whip_pan_left",
+        "foreground_occlusion",
+        "rack_focus",
+    ):
+        assert value in _CAMERA_MOVEMENT_VALUES
+    for prompt in (ADAPTATION_PROMPT, BATCH_EXPAND_PROMPT, BEAT_SKELETON_PROMPT):
+        assert CAMERA_MOTION_PLANNING_INSTRUCTIONS in prompt
+        assert "每镜运动必须有稳定起点" in prompt
+        assert "70% dolly + 30% zoom" in prompt
+
+
+def test_camera_motion_contract_persists_physics_lens_and_negatives():
+    shot = {
+        "who": ["林川"],
+        "shot_size": "full",
+        "camera_movement": "tracking_front",
+    }
+
+    apply_camera_motion_contract(shot)
+
+    contract = shot["camera_motion_contract"]
+    assert shot["lens_mm"] == 50
+    assert contract["primary_movement_count"] == 1
+    assert contract["start"].startswith("stable authored full framing")
+    assert "moves backward at the same natural pace" in contract["process"]
+    assert "decelerate and stop" in contract["end"]
+    assert "50–85mm equivalent cinematic lens" in contract["human_perspective"]
+    assert HUMAN_PERSPECTIVE_NEGATIVE in contract["negative"]
+    rendered = camera_motion_prompt(shot)
+    assert "one primary movement only" in rendered
+    assert "lens: 50mm equivalent" in rendered
+
+    scenery = {
+        "who": [],
+        "shot_size": "extreme_wide",
+        "camera_movement": "pan_left",
+    }
+    apply_camera_motion_contract(scenery)
+    assert "lens_mm" not in scenery
+    assert scenery["camera_motion_contract"]["human_perspective"] == ""
+
+    combined = {
+        "who": ["林川"],
+        "shot_size": "medium",
+        "camera_movement": "dolly_in_subtle_zoom",
+    }
+    apply_camera_motion_contract(combined)
+    assert "70% dolly and 30% zoom" in combined["camera_motion_contract"]["process"]
+
+
+def test_beat_skeleton_persists_camera_contract_before_expansion():
+    response = json.dumps({
+        "strategy": "前方跟拍",
+        "beats": [{
+            "beat_order": 1,
+            "source_events": [1],
+            "action": "keep",
+            "reason": "保留行走对白",
+            "who": ["林川"],
+            "where": "街道",
+            "what": "林川迎面走来",
+            "suggested_duration": 15,
+            "shot_size": "wide",
+            "camera_movement": "tracking_front",
+            "lighting_key": "natural",
+            "shot_intent": "dialogue",
+            "hero_moment": False,
+            "texture_keywords": ["湿润路面", "柔和天光"],
+        }],
+    })
+
+    parsed = _parse_beat_skeleton(response, expected_count=1, event_count=1)
+    beat = parsed["beats"][0]
+
+    assert beat["lens_mm"] == 50
+    assert beat["camera_motion_contract"]["movement"] == "tracking_front"
+    assert beat["camera_motion_contract"]["primary_movement_count"] == 1

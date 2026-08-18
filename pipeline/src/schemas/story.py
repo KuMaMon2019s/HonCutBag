@@ -44,6 +44,8 @@ class StoryboardShot(BaseModel):
     who: str | list[str] = Field(default_factory=list)
     shot_size: str = ""
     camera_movement: str = ""
+    lens_mm: int | None = Field(default=None, ge=50, le=85)
+    camera_motion_contract: dict[str, Any] = Field(default_factory=dict)
     lighting_key: str = ""
     shot_intent: str = ""
     hero_moment: bool = False

@@ -41,6 +41,13 @@ from utils.pipeline_config import load_config
 from utils.visual_style_spec import VisualStyle, parse_visual_style
 from utils.ark_llm import call_llm_stream, create_ark_client
 from utils.character_body_contracts import body_contract_prompt
+from utils.camera_motion_contracts import (
+    apply_camera_motion_contract,
+    camera_motion_negative_prompt,
+    camera_motion_prompt,
+    camera_movement_description,
+    canonical_camera_movement,
+)
 
 
 def _load_default_visual_style(
@@ -141,29 +148,22 @@ IDENTITY_LOCK_PHRASES = [
     "Do not alter clothing category or primary color",
 ]
 
-CAMERA_OPENERS = {
-    "establishing": "Wide establishing shot, slow cinematic push-in, authored lighting and rendering style.",
-    "close_up": "Medium close-up, subtle handheld motion, shallow depth of field in the authored rendering style.",
-    "action": "Dynamic tracking shot, authored lighting, crisp subject detail.",
-    "reaction": "One continuous shot, natural head movement, no cuts, no zoom.",
-    "transition": "Slow pan across scene, authored lighting and atmosphere.",
-    "atmosphere": "Wide aerial shot, slow drift, authored time-of-day lighting.",
-}
-
-CAMERA_NEGATIONS = {
-    "static": "no camera movement, locked tripod, no pan, no tilt, no zoom",
-    "slow_pan": "no zoom, no cuts, smooth slow pan only",
-    "tracking": "no zoom, no cuts, smooth tracking only",
-    "handheld": "no zoom, no cuts, natural handheld movement",
+INTENT_FRAMING_OPENERS = {
+    "establishing": "Authored establishing composition, cinematic depth and stable headroom.",
+    "close_up": "Authored close composition, shallow depth of field and natural facial perspective.",
+    "action": "Authored action composition, crisp subject detail and readable body mechanics.",
+    "reaction": "Authored reaction composition, readable eyes and natural head movement.",
+    "transition": "Authored transition composition with clear spatial continuity.",
+    "atmosphere": "Authored environmental composition with time-of-day lighting.",
 }
 
 INTENT_TO_CAMERA = {
-    "establishing": "slow_pan",
-    "transition": "slow_pan",
-    "reveal": "tracking",
+    "establishing": "pan_left",
+    "transition": "pan_left",
+    "reveal": "steadicam",
     "emotional": "static",
-    "action": "tracking",
-    "atmosphere": "slow_pan",
+    "action": "steadicam",
+    "atmosphere": "pan_left",
     "reaction": "handheld",
 }
 
@@ -178,28 +178,6 @@ SHOT_SIZE_MAP = {
     "medium_close": "Medium close-up",
     "close_up": "Close-up",
     "extreme_close_up": "Extreme close-up",
-}
-
-CAMERA_TERMS = {
-    "dolly_in": "推进(dolly in)",
-    "dolly_out": "拉出(dolly out)",
-    "pan_left": "左摇(pan left)",
-    "pan_right": "右摇(pan right)",
-    "slow_pan": "左摇(pan left)",
-    "tracking": "跟拍(tracking shot)",
-    "tracking_shot": "跟拍(tracking shot)",
-    "tracking_left": "向左跟拍(tracking left)",
-    "tracking_right": "向右跟拍(tracking right)",
-    "orbit": "环绕(orbit)",
-    "handheld": "手持(handheld)",
-    "static": "固定(fixed/locked)",
-    "fixed": "固定(fixed/locked)",
-    "crane_up": "上升(crane up)",
-    "crane_down": "下降(crane down)",
-    "push_in": "推入(push in)",
-    "whip_pan": "甩镜(whip-pan)",
-    "rack_focus": "焦点转移(rack focus)",
-    "steadicam": "稳定器跟拍(steadicam tracking)",
 }
 
 QUALITY_GUARDRAILS = (
@@ -399,25 +377,30 @@ def _build_shot_prompt_legacy(
 
     # Select deterministic camera language and persist it for STORYBOARD.json.
     intent = str(shot.get("shot_intent") or "establishing").lower()
-    camera = INTENT_TO_CAMERA.get(intent, "slow_pan")
+    camera = canonical_camera_movement(
+        shot.get("camera_movement") or INTENT_TO_CAMERA.get(intent, "pan_left")
+    )
     previous_camera = prev_shot.get("camera_movement") if prev_shot else None
     if previous_camera == camera:
         camera = next(
             alternative
-            for alternative in ("slow_pan", "tracking", "static")
+            for alternative in ("pan_left", "steadicam", "static")
             if alternative != camera
         )
     shot["camera_movement"] = camera
+    apply_camera_motion_contract(shot)
 
     shot_size = str(shot.get("shot_size") or "medium").lower()
     framing = SHOT_SIZE_MAP.get(shot_size, "Medium shot")
-    opener_key = intent if intent in CAMERA_OPENERS else "establishing"
+    opener_key = intent if intent in INTENT_FRAMING_OPENERS else "establishing"
     if shot_size in {"medium_close_up", "close_up", "extreme_close_up"} and intent not in {
         "action", "reaction"
     }:
         opener_key = "close_up"
-    camera_desc = CAMERA_OPENERS[opener_key]
-    camera_negation = CAMERA_NEGATIONS[camera]
+    camera_desc = (
+        f"{INTENT_FRAMING_OPENERS[opener_key]} {camera_motion_prompt(shot)}"
+    )
+    camera_negation = camera_motion_negative_prompt(shot)
 
     # Build one verbatim identity-lock block per on-screen character. Aliases
     # resolve to the canonical character record, but never use appearance.summary.
@@ -624,14 +607,15 @@ def _build_eight_layer_prompt(
     duration = float(shot.get("suggested_duration", shot.get("duration", 5)))
     aspect_ratio = str(shot.get("aspect_ratio") or "16:9")
     declared_camera = str(shot.get("camera_movement") or "").strip().lower()
-    camera_key = declared_camera or INTENT_TO_CAMERA.get(intent, "slow_pan")
+    camera_key = declared_camera or INTENT_TO_CAMERA.get(intent, "pan_left")
     if declared_camera in {"", "unspecified"}:
         if generation_actions or intent == "action":
             camera_key = "steadicam"
         elif duration >= 4:
             camera_key = "dolly_in"
     shot["camera_movement"] = camera_key
-    camera = CAMERA_TERMS.get(camera_key, "固定(fixed/locked)")
+    apply_camera_motion_contract(shot)
+    camera = camera_movement_description(shot["camera_movement"])
     framing = SHOT_SIZE_MAP.get(str(shot.get("shot_size") or "medium").lower(), "Medium shot")
     subject = _concrete_subject_description(shot, characters)
     emotion = str(shot.get("emotion") or "")
@@ -688,6 +672,7 @@ def _build_eight_layer_prompt(
     layers.extend([
         f"镜头{shot_number}：",
         f"主体总结：{subject_summary}",
+        f"运镜物理硬合同：{camera_motion_prompt(shot)}",
         f"动作：{action}",
         f"运动契约：{motion_contract}",
     ])
@@ -697,7 +682,8 @@ def _build_eight_layer_prompt(
         )
     layers.extend([
         f"音效：{audio}",
-        f"全局收尾：{style_anchor}；约束词：{QUALITY_GUARDRAILS}；4K，{aspect_ratio}，{duration}秒",
+        f"全局收尾：{style_anchor}；约束词：{QUALITY_GUARDRAILS}，"
+        f"{camera_motion_negative_prompt(shot)}；4K，{aspect_ratio}，{duration}秒",
     ])
     blueprint = "\n".join(layers)
     blueprint = _remove_fast_motion_words(blueprint)
@@ -832,6 +818,7 @@ def _generate_single_shot(
             result[field] = value
     for field in (
         "shot_size", "camera_movement", "lighting_key", "shot_intent",
+        "lens_mm", "camera_motion_contract",
         "hero_moment", "texture_keywords",
         "gen_strategy", "where", "audio", "sound", "emotion",
         "transition_to_next", "boundary_before", "continuity_reason",

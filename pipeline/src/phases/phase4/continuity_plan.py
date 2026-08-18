@@ -61,6 +61,8 @@ def _storyboard_group_contract(
                 "storyboard_image": f"storyboard_images/{planned.shot_id}.png",
                 "storyboard_board": source.get("storyboard_board"),
                 "storyboard_beats": source.get("storyboard_beats") or [],
+                "lens_mm": source.get("lens_mm"),
+                "camera_motion_contract": source.get("camera_motion_contract") or {},
                 "start_state": compact(
                     source.get("start_state")
                     or source.get("prev_shot_context")

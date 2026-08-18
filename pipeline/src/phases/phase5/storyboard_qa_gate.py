@@ -27,6 +27,7 @@ from phases.phase1.storyboard_beats import (
 from utils.action_units import normalize_action_units
 from utils.video_capabilities import capabilities_for
 from utils.character_body_contracts import character_visual_description
+from utils.camera_motion_contracts import apply_camera_motion_contract
 
 DEFAULT_SIMILARITY_THRESHOLD = 0.85
 DEFAULT_MAX_CORRECTION_ATTEMPTS = 2
@@ -81,6 +82,9 @@ def run_l1_checks(storyboard: dict, visual_style: str) -> tuple[list[dict], dict
     for index, shot in enumerate(shots):
         if not isinstance(shot, dict):
             continue
+        # Free metadata normalization at the last pre-video QA boundary keeps
+        # legacy storyboards inside the same physical camera/lens contract.
+        apply_camera_motion_contract(shot)
         sid = _shot_id(shot, index)
         per_shot[sid] = {"issues": [], "characters": []}
         character_assets = [

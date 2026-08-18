@@ -33,6 +33,10 @@ _PROMPTS_DIR = Path(__file__).resolve().parents[3] / "prompts"
 sys.path.insert(0, str(_PROMPTS_DIR))
 from prompt.prompt_validator import validate_prompt
 from utils.character_body_contracts import character_visual_description
+from utils.camera_motion_contracts import (
+    HUMAN_PERSPECTIVE_CONTRACT,
+    HUMAN_PERSPECTIVE_NEGATIVE,
+)
 
 
 # =============================================================================
@@ -265,7 +269,8 @@ REFERENCE_WEIGHT_NOTE = (
 
 SOURCE_IMAGE_RULES = (
     "avoid strong shadows, front-facing or three-quarter view, "
-    "solid-color or simple fabric background, face occupies at least 60 percent"
+    "solid-color or simple fabric background, face occupies at least 60 percent, "
+    f"{HUMAN_PERSPECTIVE_CONTRACT}"
 )
 
 FULL_BODY_IMAGE_RULES = (
@@ -273,7 +278,8 @@ FULL_BODY_IMAGE_RULES = (
     "entire body visible from the top of the hair to the soles of both shoes, both feet fully "
     "inside the frame, generous empty margin above the hair and below the shoes, character "
     "occupies no more than 75 percent of canvas height, plain neutral background, no scenery, "
-    "no props, no crop, no close-up, no medium shot, no knees or feet outside frame"
+    "no props, no crop, no close-up, no medium shot, no knees or feet outside frame, "
+    f"{HUMAN_PERSPECTIVE_CONTRACT}"
 )
 
 FULL_BODY_REFERENCE_SIZE = "1440x2560"
@@ -316,7 +322,10 @@ def build_model_reference_prompts(
         "with no real-person likeness"
     )
     rendering = _reference_rendering_clause(style)
-    identity = f"{fictional_decl}. {character_desc}{suffix}. {rendering}, neutral expression"
+    identity = (
+        f"{fictional_decl}. {character_desc}{suffix}. {rendering}, neutral expression. "
+        f"Avoid: {HUMAN_PERSPECTIVE_NEGATIVE}"
+    )
     if "kling" in target_model.lower():
         return {
             "front": f"{identity}, {SOURCE_IMAGE_RULES}, front portrait, identity reference",

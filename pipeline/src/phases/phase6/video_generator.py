@@ -18,6 +18,12 @@ from utils.character_body_contracts import (
     body_contract_forbidden,
     body_contract_prompt,
 )
+from utils.camera_motion_contracts import (
+    apply_camera_motion_contract,
+    camera_motion_negative_prompt,
+    camera_motion_prompt,
+    camera_movement_description,
+)
 
 BASE_NEGATIVE_PROMPT = (
     "变形扭曲(warping), 形态渐变(morphing), 面部扭曲(distorted faces), "
@@ -44,20 +50,6 @@ def _time_continuity_contract(*values: object) -> tuple[str, str]:
             "深夜(deep night), 月光(moonlight), 纯夜景(night scene)",
         )
     return "", ""
-
-CAMERA_MOVEMENTS = {
-    "dolly_in": "推进(dolly in)", "dolly_out": "拉出(dolly out)",
-    "pan_left": "左摇(pan left)", "pan_right": "右摇(pan right)",
-    "slow_pan": "左摇(pan left)", "tracking": "跟拍(tracking shot)",
-    "tracking_shot": "跟拍(tracking shot)", "orbit": "环绕(orbit)",
-    "tracking_left": "向左跟拍(tracking left)",
-    "tracking_right": "向右跟拍(tracking right)",
-    "handheld": "手持(handheld)", "static": "固定(fixed/locked)",
-    "fixed": "固定(fixed/locked)", "crane_up": "上升(crane up)",
-    "crane_down": "下降(crane down)", "push_in": "推入(push in)",
-    "whip_pan": "甩镜(whip-pan)", "rack_focus": "焦点转移(rack focus)",
-}
-
 
 def _characters_list(characters: Any) -> list[dict[str, Any]]:
     if isinstance(characters, dict):
@@ -86,6 +78,7 @@ def build_video_prompt(
     model: str,
 ) -> str | dict[str, str]:
     """Assemble the eight layers and apply Seedance/Kling guardrail routing."""
+    apply_camera_motion_contract(shot_meta)
     number = _shot_number(shot_meta)
     scene = scene_consistency.get("shots", {}).get(f"S{number:02d}", {})
     requested_declared = "who" in shot_meta or "characters" in shot_meta
@@ -138,8 +131,7 @@ def build_video_prompt(
         or shot_meta.get("what")
         or "保持自然姿态"
     )
-    camera_key = str(shot_meta.get("camera_movement") or "fixed").lower()
-    camera = CAMERA_MOVEMENTS.get(camera_key, str(shot_meta.get("camera_movement") or "固定(fixed/locked)"))
+    camera = camera_movement_description(shot_meta.get("camera_movement"))
     layout = scene.get("spatial_layout", {})
     setting = scene.get("scene_description") or shot_meta.get("where") or "当前场景"
     lighting = scene.get("lighting_description") or scene.get("lighting_note") or scene_consistency.get("global_lighting") or "与全片美术风格一致的自然光照，明暗关系真实克制"
@@ -151,6 +143,7 @@ def build_video_prompt(
         ("场景与光影：", scene_and_lighting),
     ])
     parts.append(f"主体总结：{subject_summary}")
+    parts.append(f"运镜物理硬合同：{camera_motion_prompt(shot_meta)}")
     if generation_actions:
         # The bounded eight-layer summary is deliberately short. Keep the full
         # authored action ledger outside that limiter so legacy Phase 6 routing
@@ -188,7 +181,7 @@ def build_video_prompt(
     # Layer 8 is appended after the bounded summary and is never truncated.
     parts.append(f"全局收尾：{style}；{quality}")
 
-    negatives = [BASE_NEGATIVE_PROMPT, str(scene.get("negative_prompt", "")).strip()]
+    negatives = [str(scene.get("negative_prompt", "")).strip()]
     if explicit_scenery:
         negatives.append(
             "人物(people), 人形主体(humanoid figures), 角色(characters), "
@@ -202,19 +195,33 @@ def build_video_prompt(
         for char in selected
         if body_contract_forbidden(char)
     )
-    negative_prompt = ", ".join(dict.fromkeys(item for item in negatives if item))
+    negatives.append(camera_motion_negative_prompt(shot_meta))
+    # Keep the long-standing base guardrail at the tail for downstream tools
+    # that verify the prompt suffix while still carrying the richer contracts.
+    negatives.append(BASE_NEGATIVE_PROMPT)
+    normalized_negatives = list(dict.fromkeys(item for item in negatives if item))
+    normalized_negatives = [
+        item for item in normalized_negatives if item != BASE_NEGATIVE_PROMPT
+    ]
+    normalized_negatives.append(BASE_NEGATIVE_PROMPT)
+    negative_prompt = ", ".join(normalized_negatives)
+    additional_negative_prompt = ", ".join(normalized_negatives[:-1])
+    negative_suffix = (
+        (f"附加约束条件：{additional_negative_prompt}。" if additional_negative_prompt else "")
+        + f"约束条件：{BASE_NEGATIVE_PROMPT}"
+    )
     prompt = apply_storyboard_motion_policy("。".join(parts))
     if explicit_scenery:
         scenery_lock = (
             "纯环境镜头硬约束：画面中保持零人物、零人形主体、零服装与零角色道具，"
             "只呈现本镜头主体总结和动作中明确列出的环境元素"
         )
-        return f"{prompt}。{scenery_lock}。约束条件：{negative_prompt}"
+        return f"{prompt}。{scenery_lock}。{negative_suffix}"
     fictional_decl = "虚拟形象声明：片中角色均为 AI 生成的虚构角色，非真实人物"
     if "kling" in model.lower():
         return {"prompt": f"{fictional_decl}。{prompt}", "negative_prompt": negative_prompt}
     identity_lock = "identity-lock：保持参考图中的面部骨骼、发型、服装类别与主色不变"
-    return f"{prompt}。{fictional_decl}。{identity_lock}。约束条件：{negative_prompt}"
+    return f"{prompt}。{fictional_decl}。{identity_lock}。{negative_suffix}"
 
 
 def _load_json(path: Path, fallback: Any) -> Any:

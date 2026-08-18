@@ -57,6 +57,11 @@ from utils.character_identity import (
     normalize_character_reference,
     resolve_character_name,
 )
+from utils.camera_motion_contracts import (
+    CAMERA_MOTION_PLANNING_INSTRUCTIONS,
+    CAMERA_MOVEMENT_VALUES,
+    apply_camera_motion_contract,
+)
 from utils.video_capabilities import (
     MAX_CONTENT_BEATS_PER_PRIMARY_SHOT,
     VideoModelCapabilities,
@@ -72,12 +77,7 @@ _SHOT_SIZE_VALUES = (
     "extreme_wide", "wide", "medium_wide", "medium", "medium_close",
     "close_up", "extreme_close_up", "over_shoulder", "insert", "establishing",
 )
-_CAMERA_MOVEMENT_VALUES = (
-    "static", "pan_left", "pan_right", "tilt_up", "tilt_down",
-    "dolly_in", "dolly_out", "tracking_left", "tracking_right",
-    "crane_up", "crane_down", "handheld", "steadicam", "orbital",
-    "zoom_in", "zoom_out", "rack_focus",
-)
+_CAMERA_MOVEMENT_VALUES = CAMERA_MOVEMENT_VALUES
 _LIGHTING_KEY_VALUES = (
     "high_key", "low_key", "natural", "golden_hour", "blue_hour",
     "tungsten_warm", "neon", "silhouette", "rim_lit", "volumetric",
@@ -135,6 +135,8 @@ USER_PROMPT_TEMPLATE = (
     "  - transition_to_next: 字符串，转场方式 cut/dissolve/fade\n"
     "  - associate_assets: 字符串数组，该镜头涉及的资产ID（格式 'char:角色id' 或 'scene:场景名'）\n"
     + _SHOT_LANGUAGE_ENUM_CONTRACT
+    + CAMERA_MOTION_PLANNING_INSTRUCTIONS
+    + "\n"
     + "  - hero_moment: 布尔值，是否为全片视觉峰值；4 镜以上至少且通常恰好一个为 true\n"
     "  - texture_keywords: 2–4 个具体环境材质/光影纹理关键词组成的字符串数组\n\n"
     "  - dialogue: 对象或 null；有角色在本镜头说话时为 {{\"speaker\": \"角色名\", \"line\": \"剧本台词原文\"}}，无对白时必须为 null\n"
@@ -267,6 +269,8 @@ BATCH_EXPAND_PROMPT = (
     "【镜头语言继承】本批每个 shot 的 shot_size、camera_movement、lighting_key、shot_intent、"
     "hero_moment、texture_keywords 必须逐字复制对应 beat 的全局镜头语言合同，不得重新规划或"
     "退回 wide/static/natural 默认组合。\n\n"
+    + CAMERA_MOTION_PLANNING_INSTRUCTIONS
+    + "\n\n"
     "【HonCut Identity Anchor】身份只通过 who 与 associate_assets 结构化绑定；visual 不重复外貌。"
     "who=[] 时不得写角色或绑定 char: 资产。\n\n"
     "【HonCut 资产绑定（associateAssetsIds）】每镜 associate_assets 必须列出可见角色"
@@ -1055,6 +1059,7 @@ def _validate_shots(shots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         ):
             shot["dialogue"] = None
         shot["gen_strategy"] = determine_gen_strategy(shot)
+        apply_camera_motion_contract(shot)
     return shots
 
 
@@ -1431,6 +1436,8 @@ BEAT_SKELETON_PROMPT = (
     '"hero_moment":false,"texture_keywords":["场景中的具体材质","场景中的具体光影"]}}]}}。\n'
     + "【镜头语言合法词表】以下四个枚举字段只能逐字选用所列值，禁止发明组合值或方向后缀：\n"
     + _SHOT_LANGUAGE_ENUM_CONTRACT
+    + CAMERA_MOTION_PLANNING_INSTRUCTIONS
+    + "\n"
     + "hero_moment 必须为 JSON 布尔值；texture_keywords 必须为 2–4 个非空字符串。\n"
     + "【全局铁律】\n"
     "1. beats 数量必须恰好等于 {beat_count}，总建议时长应接近 {target_duration} 秒（±10%）；"
@@ -1499,6 +1506,8 @@ def _parse_beat_skeleton(response: str, expected_count: int, event_count: int) -
     if missing_events:
         raise ValueError(f"beat 未覆盖事件编号: {sorted(missing_events)}")
     _validate_authored_shot_language(beats, label="beat")
+    for beat in beats:
+        apply_camera_motion_contract(beat)
     parsed.setdefault("strategy", "")
     return parsed
 
@@ -1935,6 +1944,7 @@ def _expand_beats_to_shots(
                     for field in _SHOT_LANGUAGE_FIELDS:
                         value = beat[field]
                         shot[field] = list(value) if isinstance(value, list) else value
+                    apply_camera_motion_contract(shot)
                     missing = expanded_fields - set(shot)
                     if missing:
                         raise ValueError(f"本批第 {index} 镜缺少完整字段: {missing}")
@@ -1996,7 +2006,7 @@ def _atomic_write_json(path: Path, value: Any) -> None:
     os.replace(temporary, path)
 
 
-LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v4"
+LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v5"
 
 
 def _layered_input_fingerprint(
@@ -2208,6 +2218,8 @@ def adapt_events(
             shot["shot_order"] = i
 
         _inherit_event_semantics(shots, events, characters)
+        for shot in shots:
+            apply_camera_motion_contract(shot)
         from quality.shot_continuity import annotate_boundaries
 
         annotate_boundaries(shots)
@@ -2319,6 +2331,8 @@ def adapt_events(
         shot["shot_order"] = i
 
     _inherit_event_semantics(shots, events, characters)
+    for shot in shots:
+        apply_camera_motion_contract(shot)
     from quality.shot_continuity import annotate_boundaries
 
     annotate_boundaries(shots)

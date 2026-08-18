@@ -11,7 +11,31 @@ import copy
 import re
 from typing import Any
 
-BODY_CONTRACT_SCHEMA_VERSION = 1
+BODY_CONTRACT_SCHEMA_VERSION = 2
+
+COMMON_ADULT_HUMAN_PROPORTION_CONTRACT: dict[str, Any] = {
+    "anatomy": "realistic adult human proportions",
+    "head_scale": "slightly small and natural head size",
+    "head_to_body_ratio_range": [7.6, 8.0],
+    "max_head_width_to_shoulder_width": 0.43,
+    "shoulder_head_relation": "shoulders visibly wider than the head",
+    "neck": "natural neck length",
+    "clavicle_and_shoulder_line": "clear clavicle and shoulder line",
+    "torso_pelvis_legs": "realistic torso, pelvis, and leg proportions",
+    "leg_length": "long legs without exaggeration",
+    "extremity_scale": "hands and feet proportionate to height",
+    "cross_shot_consistency": (
+        "same head size and body proportions for the same character in every shot"
+    ),
+    "forbidden": [
+        "large head on small body",
+        "childlike body proportions",
+        "bobblehead proportions",
+        "large face",
+        "short neck",
+        "narrow shoulders",
+    ],
+}
 
 ADULT_LEAD_BODY_CONTRACTS: dict[str, dict[str, Any]] = {
     "male": {
@@ -32,7 +56,7 @@ ADULT_LEAD_BODY_CONTRACTS: dict[str, dict[str, Any]] = {
     "female": {
         "profile": "adult_female_lead",
         "height_cm": 166,
-        "head_to_body_ratio": 7.5,
+        "head_to_body_ratio": 7.6,
         "build": "slender balanced",
         "shoulders_and_hips": "natural proportional shoulders and hips",
         "leg_proportion": "slightly long legs",
@@ -53,12 +77,18 @@ ADULT_LEAD_DISCOVERY_INSTRUCTIONS = """
   shoulders=moderately broad shoulders；leg_proportion=slightly long legs；
   body_fat=low-to-normal body fat；posture=upright, confident；
   禁止 oversized head、extremely narrow waist、bodybuilder physique。
-- 成年女主：height=166cm；head_to_body_ratio=7.5；build=slender balanced；
+- 成年女主：height=166cm；head_to_body_ratio=7.6；build=slender balanced；
   shoulders_and_hips=natural proportional shoulders and hips；
   leg_proportion=slightly long legs；waistline=naturally defined waist；
   body_fat=healthy slim；
   禁止 oversized head、extremely tiny waist、exaggerated curves。
 - appearance.summary 不得写入与上述合同冲突的身高、头身比、体型、肩胯、腰线或体脂描述。
+- 所有成年主角共同遵守：成年真人比例；头部尺寸偏小且自然；头身比必须在 7.6–8.0；
+  头宽不得超过肩宽的 43%，肩部必须明显宽于头部；颈长自然，锁骨与肩线清晰；
+  躯干、骨盆、腿部比例真实，腿长但不夸张，手掌和脚掌与身高匹配；同一角色所有镜头
+  保持相同头部尺寸和身体比例。
+- 共同禁止：大头身小、幼态头身比例、large face、short neck、narrow shoulders、
+  childlike body proportions、bobblehead proportions。
 - appearance 中增加 body_contract 对象，逐字段使用上述英文值和 forbidden 数组；不要自行改写数值或同义替换。
 """.strip()
 
@@ -134,6 +164,9 @@ def apply_adult_lead_body_contracts(
             continue
 
         contract = copy.deepcopy(ADULT_LEAD_BODY_CONTRACTS[gender])
+        contract["human_proportion_constraints"] = copy.deepcopy(
+            COMMON_ADULT_HUMAN_PROPORTION_CONTRACT
+        )
         contract["schema_version"] = BODY_CONTRACT_SCHEMA_VERSION
         appearance["body_contract"] = contract
         # Keep legacy consumers that only read appearance.height/build aligned
@@ -169,6 +202,33 @@ def body_contract_prompt(character: dict[str, Any]) -> str:
         value = str(contract.get(key) or "").strip()
         if value:
             details.append(value)
+    common = contract.get("human_proportion_constraints")
+    if isinstance(common, dict):
+        ratio = common.get("head_to_body_ratio_range") or []
+        ratio_text = (
+            f"adult head-to-body ratio stays within {ratio[0]}–{ratio[1]}"
+            if isinstance(ratio, list) and len(ratio) == 2
+            else ""
+        )
+        max_width = common.get("max_head_width_to_shoulder_width")
+        common_details = [
+            common.get("anatomy"),
+            common.get("head_scale"),
+            ratio_text,
+            (
+                f"head width never exceeds {float(max_width) * 100:g}% of shoulder width"
+                if isinstance(max_width, (int, float))
+                else ""
+            ),
+            common.get("shoulder_head_relation"),
+            common.get("neck"),
+            common.get("clavicle_and_shoulder_line"),
+            common.get("torso_pelvis_legs"),
+            common.get("leg_length"),
+            common.get("extremity_scale"),
+            common.get("cross_shot_consistency"),
+        ]
+        details.extend(str(value).strip() for value in common_details if value)
     forbidden = body_contract_forbidden(character)
     negative_clause = f" Do not depict: {', '.join(forbidden)}." if forbidden else ""
     return (
@@ -186,9 +246,15 @@ def body_contract_forbidden(character: dict[str, Any]) -> list[str]:
     if not isinstance(contract, dict):
         return []
     forbidden = contract.get("forbidden")
-    if not isinstance(forbidden, list):
-        return []
-    return list(dict.fromkeys(str(value).strip() for value in forbidden if str(value).strip()))
+    forbidden = forbidden if isinstance(forbidden, list) else []
+    common = contract.get("human_proportion_constraints")
+    common_forbidden = common.get("forbidden") if isinstance(common, dict) else []
+    common_forbidden = common_forbidden if isinstance(common_forbidden, list) else []
+    return list(
+        dict.fromkeys(
+            str(value).strip() for value in [*forbidden, *common_forbidden] if str(value).strip()
+        )
+    )
 
 
 def character_visual_description(
