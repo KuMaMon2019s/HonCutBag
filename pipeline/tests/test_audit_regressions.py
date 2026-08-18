@@ -127,6 +127,8 @@ def test_secondary_v6_enforces_strategy_ranges_and_primary_assembly_budget(
 def test_secondary_v6_keeps_bridge_time_outside_primary_content_capacity():
     storyboard = {
         "video_provider": "seedance",
+        "delivery_target_duration": 30,
+        "pre_edit_duration_ratio_limit": 1.3,
         "shots": [
             {
                 "id": "S01",
@@ -160,6 +162,34 @@ def test_secondary_v6_keeps_bridge_time_outside_primary_content_capacity():
     assert storyboard["primary_shot_bridges"][0]["generation_phase"] == (
         "post_primary_shots"
     )
+    bridge = storyboard["primary_shot_bridges"][0]
+    assert bridge["generation_duration_s"] == 3
+    assert bridge["visible_duration_s"] == 3
+    assert bridge["source_handle_s"] == 1.5
+    assert bridge["target_handle_s"] == 1.5
+    assert bridge["timeline_insertion_policy"] == "replace_boundary_handles"
+    assert first["storyboard_beats"][-1]["outgoing_bridge_handle_s"] == 1.5
+    assert storyboard["shots"][1]["storyboard_beats"][0][
+        "incoming_bridge_handle_s"
+    ] == 1.5
+    assert storyboard["material_budget"] == {
+        "schema": "honcut.material-budget.v1",
+        "policy": "primary_ratio_cap_plus_explicit_bridge_overhead",
+        "timeline_policy": "replace_boundary_handles",
+        "delivery_target_duration_s": 30.0,
+        "pre_edit_duration_ratio_limit": 1.3,
+        "primary_material_duration_s": 30.0,
+        "primary_material_limit_s": 39.0,
+        "primary_material_within_limit": True,
+        "bridge_count": 1,
+        "bridge_generation_duration_s": 3.0,
+        "bridge_visible_duration_s": 3.0,
+        "bridge_replaced_handle_duration_s": 3.0,
+        "total_generated_duration_s": 33.0,
+        "projected_pre_edit_timeline_duration_s": 30.0,
+        "bridge_overhead_is_additive": True,
+        "primary_secondary_double_count_forbidden": True,
+    }
 
 
 def test_secondary_v4_rejects_false_continuity_and_fractional_seedance_duration():

@@ -154,6 +154,66 @@ def detect_black_frames(
     return {"trim_start": round(trim_start, 2), "trim_end": round(trim_end, 2)}
 
 
+def _replace_boundary_handles(
+    source_cut: dict[str, Any],
+    target_cut: dict[str, Any],
+    bridge: dict[str, Any],
+) -> dict[str, Any]:
+    """Replace stable primary edge handles with one visible bridge interval."""
+    source_handle = float(bridge.get("source_handle_s") or 0)
+    target_handle = float(bridge.get("target_handle_s") or 0)
+    visible = float(
+        bridge.get("visible_duration_s")
+        or bridge.get("target_duration_s")
+        or 0
+    )
+    if source_handle <= 0 or target_handle <= 0:
+        raise RuntimeError("bridge replacement requires positive handles on both sides")
+    if abs(source_handle + target_handle - visible) > 1e-6:
+        raise RuntimeError(
+            "bridge replacement handles do not match its visible duration: "
+            f"{source_handle:g}+{target_handle:g}!={visible:g}"
+        )
+
+    source_before = float(source_cut["out_seconds"])
+    target_before = float(target_cut["in_seconds"])
+    source_boundary = float(source_cut["original_duration"]) - source_handle
+    target_boundary = target_handle
+    source_cut["out_seconds"] = round(
+        min(source_before, source_boundary), 6
+    )
+    target_cut["in_seconds"] = round(max(target_before, target_boundary), 6)
+    if float(source_cut["in_seconds"]) >= float(source_cut["out_seconds"]):
+        raise RuntimeError(
+            f"bridge source handle consumes all of {source_cut['shot_id']}"
+        )
+    if float(target_cut["in_seconds"]) >= float(target_cut["out_seconds"]):
+        raise RuntimeError(
+            f"bridge target handle consumes all of {target_cut['shot_id']}"
+        )
+    source_cut["trimmed"] = True
+    target_cut["trimmed"] = True
+    receipt = {
+        "boundary_id": str(
+            bridge.get("bridge_id")
+            or f"{source_cut['shot_id']}__{target_cut['shot_id']}"
+        ),
+        "source_shot_id": str(source_cut["shot_id"]),
+        "target_shot_id": str(target_cut["shot_id"]),
+        "source_handle_s": source_handle,
+        "target_handle_s": target_handle,
+        "visible_bridge_duration_s": visible,
+        "source_out_before_s": source_before,
+        "source_out_after_s": float(source_cut["out_seconds"]),
+        "target_in_before_s": target_before,
+        "target_in_after_s": float(target_cut["in_seconds"]),
+        "timeline_insertion_policy": "replace_boundary_handles",
+    }
+    source_cut.setdefault("bridge_handle_replacements", []).append(receipt)
+    target_cut.setdefault("bridge_handle_replacements", []).append(receipt)
+    return receipt
+
+
 # ─── Build Edit Decisions ────────────────────────────────────────────────────
 
 
@@ -371,8 +431,14 @@ def build_edit_decisions(
         for shot in (continuity_plan or {}).get("shots", [])
         if shot.get("boundary_before") == "continuous"
     } if not (continuity_plan or {}).get("bridges") else set()
+    planned_bridge_records = {
+        (str(bridge.get("source_shot_id")), str(bridge.get("target_shot_id"))): bridge
+        for bridge in (continuity_plan or {}).get("bridges", [])
+        if isinstance(bridge, dict)
+    }
     assembled_cuts: list[dict[str, Any]] = []
     inserted_bridges: list[dict[str, Any]] = []
+    bridge_handle_replacements: list[dict[str, Any]] = []
     inserted_bridge_pairs: set[tuple[str, str]] = set()
     for index, cut in enumerate(primary_cuts):
         assembled_cuts.append(cut)
@@ -393,6 +459,29 @@ def build_edit_decisions(
             bridge_info = probe_video(str(bridge_path))
             if bridge_info["duration"] <= 0:
                 raise RuntimeError(f"bridge has no decodable duration: {bridge_path}")
+            planned_bridge = planned_bridge_records.get(pair) or {}
+            insertion_policy = str(
+                planned_bridge.get("timeline_insertion_policy") or "append"
+            )
+            replacement = None
+            if insertion_policy == "replace_boundary_handles":
+                visible_duration = float(
+                    planned_bridge.get("visible_duration_s")
+                    or planned_bridge.get("target_duration_s")
+                    or 0
+                )
+                if abs(float(bridge_info["duration"]) - visible_duration) > (1 / 30):
+                    raise RuntimeError(
+                        f"bridge {pair[0]}__{pair[1]} measured "
+                        f"{float(bridge_info['duration']):g}s but its visible budget is "
+                        f"{visible_duration:g}s"
+                    )
+                replacement = _replace_boundary_handles(
+                    cut,
+                    primary_cuts[index + 1],
+                    planned_bridge,
+                )
+                bridge_handle_replacements.append(replacement)
             bridge_id = f"BRIDGE_{pair[0]}__{pair[1]}"
             assembled_cuts.append(
                 {
@@ -414,6 +503,14 @@ def build_edit_decisions(
                     "boundary_id": f"{pair[0]}__{pair[1]}",
                     "shot_id": bridge_id,
                     "path": str(bridge_path),
+                    "generation_duration_s": float(
+                        planned_bridge.get("generation_duration_s")
+                        or planned_bridge.get("target_duration_s")
+                        or bridge_info["duration"]
+                    ),
+                    "visible_duration_s": float(bridge_info["duration"]),
+                    "timeline_insertion_policy": insertion_policy,
+                    "handle_replacement": replacement,
                 }
             )
             inserted_bridge_pairs.add(pair)
@@ -490,21 +587,83 @@ def build_edit_decisions(
                 )
             transitions.append(transition_entry)
 
-    # Crossfades overlap neighboring clips. Compensate with one bounded speed
-    # factor so the assembled timeline stays close to the requested duration.
+    # Quality review removes obvious dead edges first.  Then use one bounded
+    # pacing factor across primary clips and bridges so every authored frame is
+    # retained and the editor never solves a material surplus by chopping off
+    # the end of the film.  Because primary material is capped at 1.3x, the
+    # required acceleration is likewise bounded by that declared ratio.
+    pacing_normalization = None
     if target_duration and cuts:
         source_duration = sum(cut["out_seconds"] - cut["in_seconds"] for cut in cuts)
         overlap = sum(
             0.0 if item["type"] == "cut" else float(item["duration"]) for item in transitions
         )
         projected = source_duration - overlap
-        if projected < float(target_duration):
-            speed = source_duration / (float(target_duration) + overlap)
-            if 0.85 <= speed < 1.0:
+        speed = source_duration / (float(target_duration) + overlap)
+        ratio_limit = float(
+            ((continuity_plan or {}).get("material_budget") or {}).get(
+                "pre_edit_duration_ratio_limit",
+                1.3,
+            )
+        )
+        if abs(projected - float(target_duration)) > (1 / 30):
+            if 0.85 <= speed <= ratio_limit + 1e-6:
                 for cut in cuts:
                     cut["speed"] = round(speed, 6)
+                pacing_normalization = {
+                    "method": "bounded_all_frame_pacing_normalization",
+                    "source_duration_s": round(source_duration, 6),
+                    "transition_overlap_s": round(overlap, 6),
+                    "projected_before_s": round(projected, 6),
+                    "target_duration_s": float(target_duration),
+                    "speed": round(speed, 6),
+                    "minimum_speed": 0.85,
+                    "maximum_speed": ratio_limit,
+                    "preserves_all_reviewed_frames": True,
+                }
+            elif projected > float(target_duration):
+                raise RuntimeError(
+                    "reviewed timeline cannot reach delivery duration without unsafe "
+                    f"tail deletion: requires {speed:g}x pacing outside the "
+                    f"0.85-{ratio_limit:g}x budget"
+                )
 
     timeline = _build_timeline(cuts, transitions, target_fps=30)
+    if (
+        target_duration
+        and pacing_normalization
+        and pacing_normalization["speed"] > 1.0
+        and timeline
+    ):
+        target_frames = round(float(target_duration) * 30)
+        projected_frames = timeline[-1]["output_end_frame"]
+        residual_frames = target_frames - projected_frames
+        if residual_frames:
+            # Per-cut integer rounding can miss the otherwise exact global
+            # pacing solution by a frame or two.  Close that residual on the
+            # longest reviewed cut with an imperceptible speed adjustment.
+            candidate = max(
+                cuts,
+                key=lambda item: float(item["out_seconds"])
+                - float(item["in_seconds"]),
+            )
+            duration_s = float(candidate["out_seconds"]) - float(
+                candidate["in_seconds"]
+            )
+            current_frames = round(duration_s / float(candidate["speed"]) * 30)
+            desired_frames = current_frames + residual_frames
+            if desired_frames <= 0:
+                raise RuntimeError("timeline frame closure would consume an entire cut")
+            adjusted_speed = duration_s * 30 / desired_frames
+            candidate["speed"] = round(adjusted_speed, 9)
+            pacing_normalization["frame_closure"] = {
+                "shot_id": candidate["shot_id"],
+                "residual_frames": residual_frames,
+                "adjusted_speed": candidate["speed"],
+            }
+            timeline = _build_timeline(cuts, transitions, target_fps=30)
+            if timeline[-1]["output_end_frame"] != target_frames:
+                raise RuntimeError("bounded pacing could not close the delivery frame budget")
     projected_frames = timeline[-1]["output_end_frame"] if timeline else 0
     return {
         "cuts": cuts,
@@ -527,6 +686,8 @@ def build_edit_decisions(
             "continuity_trims": continuity_trim_receipts,
             "phase8_duration_trims": phase8_duration_trims,
             "inserted_primary_bridges": inserted_bridges,
+            "bridge_handle_replacements": bridge_handle_replacements,
+            "pacing_normalization": pacing_normalization,
             "audio_transition_policy": {
                 "visual_cut": "equal_power_edge_fade",
                 "visual_dissolve": "equal_power_crossfade",

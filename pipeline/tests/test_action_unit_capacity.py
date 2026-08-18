@@ -441,6 +441,63 @@ def test_storyboard_material_may_exceed_delivery_only_within_1_3x():
     }
 
 
+def test_phase5_checks_additive_bridge_ledger_and_handle_replacement():
+    storyboard = {
+        "continuity_mode": "one_take",
+        "video_provider": "seedance",
+        "delivery_target_duration": 30,
+        "pre_edit_duration_ratio_limit": 1.3,
+        "shots": [
+            {"id": "S01", "duration": 15, "micro_actions": ["前进"]},
+            {"id": "S02", "duration": 15, "micro_actions": ["继续前进"]},
+        ],
+    }
+    plan_storyboard_beats(storyboard)
+
+    issues, _ = run_l1_checks(storyboard, "")
+    assert not {
+        "bridge_handle_budget_mismatch",
+        "material_budget_ledger_stale",
+        "material_budget_ledger_missing",
+    } & {issue["code"] for issue in issues}
+    assert storyboard["material_budget"]["primary_material_duration_s"] == 30
+    assert storyboard["material_budget"]["bridge_generation_duration_s"] == 3
+    assert storyboard["material_budget"]["total_generated_duration_s"] == 33
+    assert storyboard["material_budget"][
+        "projected_pre_edit_timeline_duration_s"
+    ] == 30
+
+    tampered = json.loads(json.dumps(storyboard))
+    tampered["primary_shot_bridges"][0]["source_handle_s"] = 0.5
+    issues, _ = run_l1_checks(tampered, "")
+    codes = {issue["code"] for issue in issues}
+    assert "bridge_handle_budget_mismatch" in codes
+    assert "material_budget_ledger_stale" in codes
+
+
+def test_one_take_budget_counts_only_adjacent_continuous_boundaries():
+    storyboard = {
+        "continuity_mode": "one_take",
+        "video_provider": "seedance",
+        "delivery_target_duration": 60,
+        "pre_edit_duration_ratio_limit": 1.3,
+        "shots": [
+            {"id": f"S{index:02d}", "duration": 15, "micro_actions": ["连续动作"]}
+            for index in range(1, 5)
+        ],
+    }
+
+    plan_storyboard_beats(storyboard)
+
+    budget = storyboard["material_budget"]
+    assert budget["primary_material_duration_s"] == 60
+    assert budget["primary_material_limit_s"] == 78
+    assert budget["bridge_count"] == 3
+    assert budget["bridge_generation_duration_s"] == 9
+    assert budget["total_generated_duration_s"] == 69
+    assert budget["projected_pre_edit_timeline_duration_s"] == 60
+
+
 def test_composite_motion_keeps_full_ledger_through_pxx_and_qa():
     actions = [
         "摄影师以朋友视角持iPhone跟拍女主",

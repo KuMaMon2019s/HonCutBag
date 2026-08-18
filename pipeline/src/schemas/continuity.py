@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -173,6 +173,14 @@ class PrimaryShotBridge(BaseModel):
     target_shot_id: str = Field(min_length=1)
     target_duration_s: float = Field(ge=3, le=6)
     requested_frames: int = Field(gt=0)
+    generation_duration_s: float | None = Field(default=None, ge=3, le=6)
+    visible_duration_s: float | None = Field(default=None, ge=3, le=6)
+    source_handle_s: float = Field(default=0, ge=0)
+    target_handle_s: float = Field(default=0, ge=0)
+    timeline_insertion_policy: Literal[
+        "append",
+        "replace_boundary_handles",
+    ] = "append"
     execution_strategy: Literal["first_last_frame_bridge"] = (
         "first_last_frame_bridge"
     )
@@ -198,6 +206,21 @@ class PrimaryShotBridge(BaseModel):
         "target_primary_video_first_frame"
     )
 
+    @model_validator(mode="after")
+    def replacement_handles_match_visible_duration(self) -> PrimaryShotBridge:
+        if self.timeline_insertion_policy != "replace_boundary_handles":
+            return self
+        visible = self.visible_duration_s or self.target_duration_s
+        if not math.isclose(
+            self.source_handle_s + self.target_handle_s,
+            visible,
+            abs_tol=1e-6,
+        ):
+            raise ValueError(
+                "bridge replacement handles must add up to visible bridge duration"
+            )
+        return self
+
 
 class ContinuityPlan(BaseModel):
     """Phase 4 artifact consumed by the future continuity-aware Phase 6 runner."""
@@ -209,6 +232,7 @@ class ContinuityPlan(BaseModel):
     timeline_fps: int = Field(default=24, gt=0)
     shots: list[ContinuityShot] = Field(default_factory=list)
     bridges: list[PrimaryShotBridge] = Field(default_factory=list)
+    material_budget: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def resource_ids_are_globally_unique(self) -> ContinuityPlan:

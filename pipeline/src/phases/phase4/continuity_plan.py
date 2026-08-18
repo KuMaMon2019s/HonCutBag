@@ -298,6 +298,25 @@ def _secondary_strategy(beat: Mapping[str, Any], sequence: int) -> str:
     return "legacy"
 
 
+def _beat_action_prompt(beat: Mapping[str, Any]) -> str:
+    """Render story action plus stable edge handles used by bridge replacement."""
+    clauses: list[str] = []
+    incoming = float(beat.get("incoming_bridge_handle_s") or 0)
+    outgoing = float(beat.get("outgoing_bridge_handle_s") or 0)
+    if incoming > 0:
+        clauses.append(
+            f"开头前{incoming:g}秒保持 start_state 的同一构图、姿态与运动趋势，"
+            "只允许自然微动，不执行本格新的剧情动作；随后再开始本格动作"
+        )
+    clauses.append(str(beat.get("action") or ""))
+    if outgoing > 0:
+        clauses.append(
+            f"必须在结尾前{outgoing:g}秒完成本格剧情动作；最后{outgoing:g}秒"
+            "稳定保持 end_state，只允许自然微动，不新增动作、台词或剧情结果"
+        )
+    return "。".join(value for value in clauses if value)
+
+
 def _validate_secondary_strategy_sequence(
     shot_id: str,
     strategies: list[str],
@@ -509,7 +528,7 @@ def build_continuity_plan(
                     bridge_target_storyboard_image=(
                         str(beat.get("bridge_target_storyboard_image") or "") or None
                     ),
-                    action_prompt=str(beat.get("action") or ""),
+                    action_prompt=_beat_action_prompt(beat),
                     start_state=str(beat.get("start_state") or ""),
                     end_state=str(beat.get("end_state") or ""),
                 ))
@@ -596,6 +615,17 @@ def build_continuity_plan(
                 target_shot_id=target_shot_id,
                 target_duration_s=duration_s,
                 requested_frames=round(duration_s * timeline_fps),
+                generation_duration_s=float(
+                    spec.get("generation_duration_s") or duration_s
+                ),
+                visible_duration_s=float(
+                    spec.get("visible_duration_s") or duration_s
+                ),
+                source_handle_s=float(spec.get("source_handle_s") or 0),
+                target_handle_s=float(spec.get("target_handle_s") or 0),
+                timeline_insertion_policy=str(
+                    spec.get("timeline_insertion_policy") or "append"
+                ),
                 continuity_reason=str(spec.get("boundary_reason") or ""),
                 action_prompt=str(spec.get("action_prompt") or ""),
                 start_state=str(spec.get("start_state") or ""),
@@ -616,6 +646,7 @@ def build_continuity_plan(
         timeline_fps=timeline_fps,
         shots=planned_shots,
         bridges=planned_bridges,
+        material_budget=dict(storyboard.get("material_budget") or {}),
     )
 
 

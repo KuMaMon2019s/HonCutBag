@@ -14,16 +14,25 @@ def trim_excess_to_target(
     target_duration: float | None,
     *,
     timeline_fps: int = 30,
+    rounding_tolerance_frames: int = 2,
 ) -> dict | None:
-    """Trim an overlong assembly to the exact delivery frame budget."""
+    """Close codec rounding only; never delete a material surplus from the tail."""
     if target_duration is None:
         return None
     video = Path(output_dir) / "raw_assembly.mp4"
     actual = probe_duration(video)
     target = float(target_duration)
     target_frames = round(target * timeline_fps)
-    if round(actual * timeline_fps) <= target_frames:
+    actual_frames = round(actual * timeline_fps)
+    excess_frames = actual_frames - target_frames
+    if excess_frames <= 0:
         return None
+    if excess_frames > rounding_tolerance_frames:
+        raise RuntimeError(
+            "refusing destructive tail trim: reviewed edit is "
+            f"{excess_frames} frames over target, above the "
+            f"{rounding_tolerance_frames}-frame codec-rounding allowance"
+        )
     temporary = video.with_name("raw_assembly.duration_trim.mp4")
     completed = subprocess.run(
         [
@@ -60,6 +69,8 @@ def trim_excess_to_target(
         "target_frames": target_frames,
         "trimmed_frames": round(trimmed * timeline_fps),
         "method": "frame_exact_reencode",
+        "reason": "codec_rounding_only",
+        "discarded_rounding_frames": excess_frames,
     }
     (Path(output_dir) / "duration_trim.json").write_text(
         json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf-8"

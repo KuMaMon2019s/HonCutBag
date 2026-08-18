@@ -28,6 +28,7 @@ from utils.action_units import normalize_action_units
 from utils.video_capabilities import capabilities_for
 from utils.character_body_contracts import character_visual_description
 from utils.camera_motion_contracts import apply_camera_motion_contract
+from utils.material_budget import material_budget_contract_errors
 
 DEFAULT_SIMILARITY_THRESHOLD = 0.85
 DEFAULT_MAX_CORRECTION_ATTEMPTS = 2
@@ -170,6 +171,20 @@ def run_l1_checks(storyboard: dict, visual_style: str) -> tuple[list[dict], dict
                         "ratio_limit": float(ratio_limit),
                     },
                 ))
+    for budget_error in material_budget_contract_errors(storyboard):
+        # The long-standing primary ratio issue above retains its public code;
+        # this pass adds the new bridge/ledger invariants without duplicating it.
+        if budget_error["code"] == "primary_material_ratio_exceeded":
+            continue
+        issues.append(
+            _issue(
+                "L1",
+                "severe",
+                budget_error["code"],
+                budget_error["message"],
+                **(budget_error.get("details") or {}),
+            )
+        )
     return issues, per_shot
 
 

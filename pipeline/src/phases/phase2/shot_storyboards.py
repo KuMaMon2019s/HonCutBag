@@ -64,6 +64,21 @@ def _shot_who(shot: dict[str, Any]) -> list[Any] | None:
     return [raw] if raw else []
 
 
+def _edge_handle_contract(beat: dict[str, Any]) -> str:
+    incoming = float(beat.get("incoming_bridge_handle_s") or 0)
+    outgoing = float(beat.get("outgoing_bridge_handle_s") or 0)
+    clauses = []
+    if incoming > 0:
+        clauses.append(
+            f"开头{incoming:g}秒保持起始状态，仅自然微动，之后才开始新动作"
+        )
+    if outgoing > 0:
+        clauses.append(
+            f"结尾前完成全部剧情动作，最后{outgoing:g}秒稳定保持结束状态"
+        )
+    return "；".join(clauses) or "无跨一级分镜边界把手"
+
+
 def _character_contract(
     characters: list[dict[str, Any]],
     who: list[Any] | None,
@@ -130,6 +145,7 @@ def build_shot_storyboard_prompt(
             f"结束状态={_compact(beat.get('end_state'))}；"
             f"景别={beat.get('shot_size') or shot.get('shot_size') or 'medium'}；"
             f"运镜={beat.get('camera_movement') or shot.get('camera_movement') or 'steadicam'}；"
+            f"边界把手={_edge_handle_contract(beat)}；"
             f"物理合同={beat_camera_contract}。"
         )
     prompt = f"""为导演级镜头 {shot_id} 绘制一张内部动作故事板。
@@ -299,6 +315,7 @@ Phase 5 定向纠偏合同：
 景别：{beat.get('shot_size') or shot.get('shot_size') or 'medium'}
 运镜意图：{beat.get('camera_movement') or shot.get('camera_movement') or 'steadicam'}
 运镜物理硬合同：{camera_motion_prompt({**shot, **beat})}
+边界把手合同：{_edge_handle_contract(beat)}
 
 角色：
 {_character_contract(characters, who)}

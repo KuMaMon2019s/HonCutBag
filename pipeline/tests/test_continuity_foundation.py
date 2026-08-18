@@ -4918,6 +4918,7 @@ def test_phase8_inserts_post_primary_bridge_and_skips_transition_effects(
         str(shots_dir),
         transition_decisions=[{"decision": "dissolve"}],
         continuity_plan=plan.model_dump(mode="json"),
+        target_duration=30,
     )
 
     assert [cut["shot_id"] for cut in decisions["cuts"]] == [
@@ -4925,6 +4926,86 @@ def test_phase8_inserts_post_primary_bridge_and_skips_transition_effects(
     ]
     assert [item["type"] for item in decisions["transitions"]] == ["cut", "cut"]
     assert len(decisions["metadata"]["inserted_primary_bridges"]) == 1
+    assert decisions["cuts"][0]["out_seconds"] == 13.5
+    assert decisions["cuts"][2]["in_seconds"] == 1.5
+    replacement = decisions["metadata"]["bridge_handle_replacements"][0]
+    assert replacement["source_handle_s"] == 1.5
+    assert replacement["target_handle_s"] == 1.5
+    assert decisions["metadata"]["projected_frames"] == 30 * 30
+    assert decisions["metadata"]["pacing_normalization"] is None
+
+
+def test_phase8_bridge_handles_and_bounded_pacing_hit_delivery_without_tail_loss(
+    monkeypatch, tmp_path
+):
+    shots_dir = tmp_path / "shots"
+    for shot_id in ("S01", "S02"):
+        shot_dir = shots_dir / shot_id
+        shot_dir.mkdir(parents=True)
+        (shot_dir / "output.mp4").write_bytes(b"primary-video")
+    bridge_path = tmp_path / "shot_bridges/S01__S02.mp4"
+    bridge_path.parent.mkdir(parents=True)
+    bridge_path.write_bytes(b"bridge-video")
+    (tmp_path / "PRIMARY_SHOT_BRIDGES.json").write_text(
+        json.dumps(
+            {
+                "kind": "honcut.primary_shot_bridges.v2",
+                "status": "done",
+                "count": 1,
+                "bridges": [
+                    {
+                        "source_shot_id": "S01",
+                        "target_shot_id": "S02",
+                        "path": "shot_bridges/S01__S02.mp4",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    storyboard = {
+        "continuity_mode": "one_take",
+        "video_provider": "seedance",
+        "delivery_target_duration": 50,
+        "pre_edit_duration_ratio_limit": 1.3,
+        "shots": [
+            {"id": "S01", "duration": 30, "micro_actions": ["前进"]},
+            {"id": "S02", "duration": 30, "micro_actions": ["继续前进"]},
+        ],
+    }
+    plan_storyboard_beats(storyboard)
+    plan = build_continuity_plan(storyboard)
+    monkeypatch.setattr(
+        edit_decision_module,
+        "probe_video",
+        lambda path: {
+            "duration": 3.0 if "shot_bridges" in str(path) else 30.0,
+            "has_audio": False,
+        },
+    )
+    monkeypatch.setattr(
+        edit_decision_module,
+        "detect_black_frames",
+        lambda *_args, **_kwargs: {"trim_start": 0.0, "trim_end": 0.0},
+    )
+
+    decisions = edit_decision_module.build_edit_decisions(
+        str(shots_dir),
+        transition_decisions=[{"decision": "dissolve"}],
+        continuity_plan=plan.model_dump(mode="json"),
+        target_duration=50,
+    )
+
+    assert all(
+        cut["speed"] == pytest.approx(1.2, abs=0.002)
+        for cut in decisions["cuts"]
+    )
+    normalization = decisions["metadata"]["pacing_normalization"]
+    assert normalization["method"] == "bounded_all_frame_pacing_normalization"
+    assert normalization["speed"] == 1.2
+    assert normalization["preserves_all_reviewed_frames"] is True
+    assert normalization["frame_closure"]["residual_frames"] == 1
+    assert decisions["metadata"]["projected_frames"] == 50 * 30
 
 
 def test_phase8_trims_cross_shot_extension_prefix_and_keeps_scene_cuts_for_transitions(

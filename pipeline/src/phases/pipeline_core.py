@@ -1297,6 +1297,17 @@ def run_phase1_screenwriter(
         from phases.phase1.storyboard_beats import plan_storyboard_beats
 
         plan_storyboard_beats(storyboard)
+        material_budget = storyboard.get("material_budget") or {}
+        print(
+            "  ✓ 素材双账本: 主素材 "
+            f"{float(material_budget.get('primary_material_duration_s') or 0):g}s "
+            "+ 桥接生成 "
+            f"{float(material_budget.get('bridge_generation_duration_s') or 0):g}s "
+            "= 总生成 "
+            f"{float(material_budget.get('total_generated_duration_s') or 0):g}s；"
+            "桥接在时间线替换等长边界把手",
+            flush=True,
+        )
         _integrate_storyboard_prompts(storyboard, characters_list)
         annotate_shot_pacing(storyboard.get("shots", []))
         print("  → Seedream: 生成单张手绘导演故事板总览...")

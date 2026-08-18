@@ -7,6 +7,11 @@ import re
 from typing import Any
 
 from utils.action_units import normalize_action_units
+from utils.material_budget import (
+    BRIDGE_TIMELINE_POLICY,
+    attach_material_budget,
+    material_budget_contract_errors,
+)
 from utils.video_capabilities import (
     MAX_CONTENT_BEATS_PER_PRIMARY_SHOT,
     VideoModelCapabilities,
@@ -15,8 +20,8 @@ from utils.video_capabilities import (
     min_primary_story_duration,
 )
 
-SECONDARY_STORYBOARD_VERSION = "honcut.secondary-storyboard.v7"
-SECONDARY_EXECUTION = "content_capacity_post_primary_bridge_v7"
+SECONDARY_STORYBOARD_VERSION = "honcut.secondary-storyboard.v8"
+SECONDARY_EXECUTION = "content_capacity_post_primary_bridge_v8"
 SECONDARY_GENERATION_MODES = frozenset({
     "multi_image",
     "tail_video_extend",
@@ -380,8 +385,9 @@ def secondary_storyboard_requirements(
             "first_last_frame_bridge",
             resource_id=f"{sid}_bridge",
         )
-    # A cross-primary bridge is a post-generation assembly asset. It must not
-    # consume the story-time budget of either primary shot.
+    # A cross-primary bridge is a separately paid post-generation asset.  It
+    # does not expand either primary shot's authored duration; Phase 8 replaces
+    # stable edge handles with its visible interval on the edit timeline.
     content_duration = round(duration, 6)
     source_actions = _source_actions(shot)
     generation_action_units = _generation_action_units(shot, source_actions)
@@ -663,10 +669,18 @@ def secondary_storyboard_contract_errors(
                     != "source_primary_video_tail_frame"
                     or bridge.get("last_frame_source")
                     != "target_primary_video_first_frame"
+                    or bridge.get("timeline_insertion_policy")
+                    != BRIDGE_TIMELINE_POLICY
                     or str(bridge.get("start_state") or "") != expected_current_end
                     or str(bridge.get("end_state") or "") != expected_next_start
                     or not math.isclose(
                         float(bridge.get("duration_s") or 0),
+                        float(requirement["bridge_duration"]),
+                        abs_tol=1e-6,
+                    )
+                    or not math.isclose(
+                        float(bridge.get("source_handle_s") or 0)
+                        + float(bridge.get("target_handle_s") or 0),
                         float(requirement["bridge_duration"]),
                         abs_tol=1e-6,
                     )
@@ -747,6 +761,20 @@ def plan_storyboard_beats(
             "bridge_required": requirement["bridge_required"],
             "bridge_reason": requirement["bridge_reason"],
             "bridge_duration_s": requirement["bridge_duration"],
+            "bridge_source_handle_s": (
+                requirement["bridge_duration"] / 2
+                if requirement["bridge_required"]
+                else 0.0
+            ),
+            "bridge_target_handle_s": (
+                requirement["bridge_duration"]
+                - requirement["bridge_duration"] / 2
+                if requirement["bridge_required"]
+                else 0.0
+            ),
+            "bridge_timeline_policy": (
+                BRIDGE_TIMELINE_POLICY if requirement["bridge_required"] else None
+            ),
             "provider_capacity": provider_capacity,
             "duration_quantum_s": profile.duration_quantum_s,
             "primary_duration_range_s": [
@@ -760,6 +788,21 @@ def plan_storyboard_beats(
             "selected_count": total_count,
         }
         planned.append((shot, requirement))
+
+    # Reserve symmetric stable edge handles before authoring Pxx prompts.  A
+    # generated bridge replaces these handles in Phase 8, so it is additive in
+    # the provider-cost ledger without lengthening the edit timeline.
+    for shot in shots:
+        shot.pop("incoming_bridge_handle_s", None)
+        shot.pop("outgoing_bridge_handle_s", None)
+    for index, (shot, requirement) in enumerate(planned[:-1]):
+        if not requirement["bridge_required"]:
+            continue
+        duration = float(requirement["bridge_duration"])
+        source_handle = round(duration / 2, 6)
+        target_handle = round(duration - source_handle, 6)
+        shot["outgoing_bridge_handle_s"] = source_handle
+        planned[index + 1][0]["incoming_bridge_handle_s"] = target_handle
 
     primary_bridges: list[dict[str, Any]] = []
     for index, (shot, requirement) in enumerate(planned):
@@ -840,17 +883,46 @@ def plan_storyboard_beats(
                 "shot_intent": shot.get("shot_intent"),
                 "hero_moment": bool(shot.get("hero_moment")),
                 "texture_keywords": list(shot.get("texture_keywords") or []),
+                "incoming_bridge_handle_s": (
+                    float(shot.get("incoming_bridge_handle_s") or 0)
+                    if position == 1
+                    else 0.0
+                ),
+                "outgoing_bridge_handle_s": (
+                    float(shot.get("outgoing_bridge_handle_s") or 0)
+                    if position == content_count
+                    else 0.0
+                ),
+                "edge_handle_contract": (
+                    "hold the authored boundary state with only natural micro-motion; "
+                    "do not place unique plot action inside a reserved bridge handle"
+                    if (
+                        (position == 1 and shot.get("incoming_bridge_handle_s"))
+                        or (
+                            position == content_count
+                            and shot.get("outgoing_bridge_handle_s")
+                        )
+                    )
+                    else ""
+                ),
             }
             beats.append(normalized)
         if bridge_required:
             next_shot, next_requirement = planned[index + 1]
             next_sid = next_requirement["shot_id"]
             next_start_state = _start_state(next_shot)
+            source_handle = float(shot.get("outgoing_bridge_handle_s") or 0)
+            target_handle = float(next_shot.get("incoming_bridge_handle_s") or 0)
             bridge = {
                 "bridge_id": f"{sid}__{next_sid}",
                 "source_shot_id": sid,
                 "target_shot_id": next_sid,
                 "duration_s": requirement["bridge_duration"],
+                "generation_duration_s": requirement["bridge_duration"],
+                "visible_duration_s": requirement["bridge_duration"],
+                "source_handle_s": source_handle,
+                "target_handle_s": target_handle,
+                "timeline_insertion_policy": BRIDGE_TIMELINE_POLICY,
                 "execution_strategy": "first_last_frame_bridge",
                 "planner_version": SECONDARY_STORYBOARD_VERSION,
                 "plot_fidelity_contract": "primary_shot_source_only_no_invention",
@@ -895,6 +967,7 @@ def plan_storyboard_beats(
     storyboard["primary_shot_bridges"] = primary_bridges
     storyboard["storyboard_execution"] = SECONDARY_EXECUTION
     storyboard["secondary_storyboard_version"] = SECONDARY_STORYBOARD_VERSION
+    attach_material_budget(storyboard)
     contract_errors = [
         error
         for index in range(len(shots))
@@ -907,4 +980,8 @@ def plan_storyboard_beats(
     if contract_errors:
         summary = "; ".join(error["message"] for error in contract_errors[:5])
         raise AssertionError(f"secondary storyboard planner emitted an invalid contract: {summary}")
+    budget_errors = material_budget_contract_errors(storyboard)
+    if budget_errors:
+        summary = "; ".join(error["message"] for error in budget_errors[:5])
+        raise AssertionError(f"material budget planner emitted an invalid contract: {summary}")
     return storyboard

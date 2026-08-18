@@ -1084,6 +1084,15 @@ def execute_continuity_plan(
                         "target_shot_id": bridge.target_shot_id,
                         "chunk_id": chunk_id,
                         "duration_s": bridge.target_duration_s,
+                        "generation_duration_s": (
+                            bridge.generation_duration_s or bridge.target_duration_s
+                        ),
+                        "visible_duration_s": (
+                            bridge.visible_duration_s or bridge.target_duration_s
+                        ),
+                        "source_handle_s": bridge.source_handle_s,
+                        "target_handle_s": bridge.target_handle_s,
+                        "timeline_insertion_policy": bridge.timeline_insertion_policy,
                         "path": _portable_path(bridge_path, root),
                         "generated_after_primary_shots": True,
                         "storyboard_transition_image": (
