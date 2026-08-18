@@ -1,0 +1,217 @@
+"""Deterministic body-proportion contracts for adult lead characters.
+
+The contract is stored as structured data in ``CHARACTERS.json`` and rendered
+through the helpers in this module.  Image, storyboard, QA, and video prompts
+must not maintain private copies of these values.
+"""
+
+from __future__ import annotations
+
+import copy
+import re
+from typing import Any
+
+BODY_CONTRACT_SCHEMA_VERSION = 1
+
+ADULT_LEAD_BODY_CONTRACTS: dict[str, dict[str, Any]] = {
+    "male": {
+        "profile": "adult_male_lead",
+        "height_cm": 182,
+        "head_to_body_ratio": 7.8,
+        "build": "lean athletic",
+        "shoulders": "moderately broad shoulders",
+        "leg_proportion": "slightly long legs",
+        "body_fat": "low-to-normal body fat",
+        "posture": "upright, confident",
+        "forbidden": [
+            "oversized head",
+            "extremely narrow waist",
+            "bodybuilder physique",
+        ],
+    },
+    "female": {
+        "profile": "adult_female_lead",
+        "height_cm": 166,
+        "head_to_body_ratio": 7.5,
+        "build": "slender balanced",
+        "shoulders_and_hips": "natural proportional shoulders and hips",
+        "leg_proportion": "slightly long legs",
+        "waistline": "naturally defined waist",
+        "body_fat": "healthy slim",
+        "forbidden": [
+            "oversized head",
+            "extremely tiny waist",
+            "exaggerated curves",
+        ],
+    },
+}
+
+ADULT_LEAD_DISCOVERY_INSTRUCTIONS = """
+【成年主角身体比例硬合同】
+- 只对已明确为成年人且 role=protagonist 的男主、女主应用；未成年人、配角和性别/年龄不明者不得套用。
+- 成年男主：height=182cm；head_to_body_ratio=7.8；build=lean athletic；
+  shoulders=moderately broad shoulders；leg_proportion=slightly long legs；
+  body_fat=low-to-normal body fat；posture=upright, confident；
+  禁止 oversized head、extremely narrow waist、bodybuilder physique。
+- 成年女主：height=166cm；head_to_body_ratio=7.5；build=slender balanced；
+  shoulders_and_hips=natural proportional shoulders and hips；
+  leg_proportion=slightly long legs；waistline=naturally defined waist；
+  body_fat=healthy slim；
+  禁止 oversized head、extremely tiny waist、exaggerated curves。
+- appearance.summary 不得写入与上述合同冲突的身高、头身比、体型、肩胯、腰线或体脂描述。
+- appearance 中增加 body_contract 对象，逐字段使用上述英文值和 forbidden 数组；不要自行改写数值或同义替换。
+""".strip()
+
+_LEAD_LABELS = {"男主", "女主", "male lead", "female lead"}
+_NON_ADULT_MARKERS = (
+    "未成年",
+    "儿童",
+    "小孩",
+    "孩子",
+    "男孩",
+    "女孩",
+    "少年",
+    "少女",
+    "child",
+    "kid",
+    "teen",
+    "minor",
+    "boy",
+    "girl",
+)
+_ADULT_MARKERS = ("成年人", "成年", "adult", "grown-up", "grown up")
+
+
+def _normalized_gender(value: object) -> str | None:
+    normalized = str(value or "").strip().casefold()
+    if normalized in {"male", "man", "男", "男性"}:
+        return "male"
+    if normalized in {"female", "woman", "女", "女性"}:
+        return "female"
+    return None
+
+
+def _is_adult(appearance: dict[str, Any]) -> bool:
+    age_text = str(appearance.get("age_range") or "").strip().casefold()
+    if any(marker in age_text for marker in _NON_ADULT_MARKERS):
+        return False
+    if any(marker in age_text for marker in _ADULT_MARKERS):
+        return True
+    ages = [int(value) for value in re.findall(r"(?<!\d)(\d{1,3})(?!\d)", age_text)]
+    # A range is adult only when its youngest possible age is adult.  Unknown
+    # or ambiguous ages fail closed instead of assigning an adult body preset.
+    return bool(ages) and min(ages) >= 18
+
+
+def _is_lead(character: dict[str, Any]) -> bool:
+    if str(character.get("role") or "").strip().casefold() == "protagonist":
+        return True
+    labels = {
+        str(character.get("name") or "").strip().casefold(),
+        *(str(value).strip().casefold() for value in character.get("aliases", [])),
+    }
+    return bool(labels.intersection(_LEAD_LABELS))
+
+
+def apply_adult_lead_body_contracts(
+    characters: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Attach one deterministic contract to the primary adult lead per gender.
+
+    ``characters`` is expected to be sorted by narrative prominence.  Applying
+    at most one preset per gender prevents a cast of adult supporting characters
+    from being homogenized into copies of the leads.
+    """
+    assigned: set[str] = set()
+    for character in characters:
+        if not isinstance(character, dict) or not _is_lead(character):
+            continue
+        appearance = character.get("appearance")
+        if not isinstance(appearance, dict) or not _is_adult(appearance):
+            continue
+        gender = _normalized_gender(appearance.get("gender"))
+        if not gender or gender in assigned:
+            continue
+
+        contract = copy.deepcopy(ADULT_LEAD_BODY_CONTRACTS[gender])
+        contract["schema_version"] = BODY_CONTRACT_SCHEMA_VERSION
+        appearance["body_contract"] = contract
+        # Keep legacy consumers that only read appearance.height/build aligned
+        # with the structured contract.
+        appearance["height"] = f"{contract['height_cm']}cm"
+        appearance["build"] = contract["build"]
+        assigned.add(gender)
+    return characters
+
+
+def body_contract_prompt(character: dict[str, Any]) -> str:
+    """Render a complete positive body lock without dropping optional fields."""
+    appearance = character.get("appearance")
+    if not isinstance(appearance, dict):
+        return ""
+    contract = appearance.get("body_contract")
+    if not isinstance(contract, dict):
+        return ""
+
+    details = [
+        f"height exactly {contract.get('height_cm')} cm",
+        f"exactly {contract.get('head_to_body_ratio')} heads tall",
+        f"{contract.get('build')} build",
+    ]
+    for key in (
+        "shoulders",
+        "shoulders_and_hips",
+        "leg_proportion",
+        "waistline",
+        "body_fat",
+        "posture",
+    ):
+        value = str(contract.get(key) or "").strip()
+        if value:
+            details.append(value)
+    forbidden = body_contract_forbidden(character)
+    negative_clause = f" Do not depict: {', '.join(forbidden)}." if forbidden else ""
+    return (
+        "Body-proportion lock: "
+        + "; ".join(details)
+        + ". Preserve this apparent height, silhouette, head scale, and limb proportions "
+        "in full-body, side, and back views and across every shot." + negative_clause
+    )
+
+
+def body_contract_forbidden(character: dict[str, Any]) -> list[str]:
+    """Return normalized negative traits from a structured body contract."""
+    appearance = character.get("appearance")
+    contract = appearance.get("body_contract") if isinstance(appearance, dict) else None
+    if not isinstance(contract, dict):
+        return []
+    forbidden = contract.get("forbidden")
+    if not isinstance(forbidden, list):
+        return []
+    return list(dict.fromkeys(str(value).strip() for value in forbidden if str(value).strip()))
+
+
+def character_visual_description(
+    character: dict[str, Any],
+    fallback: str = "",
+) -> str:
+    """Combine the authored appearance summary with its deterministic body lock."""
+    appearance = character.get("appearance")
+    if isinstance(appearance, dict):
+        summary = str(
+            appearance.get("summary")
+            or appearance.get("description")
+            or fallback
+            or character.get("description")
+            or character.get("visual_description")
+            or ""
+        ).strip()
+    else:
+        summary = str(appearance or fallback or character.get("description") or "").strip()
+    contract = body_contract_prompt(character)
+    if contract and summary:
+        return (
+            f"{contract} Authored face, hair, and costume details: {summary}. "
+            "The body-proportion lock has priority over any conflicting body wording."
+        )
+    return contract or summary

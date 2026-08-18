@@ -26,6 +26,7 @@ from phases.phase1.storyboard_beats import (
 )
 from utils.action_units import normalize_action_units
 from utils.video_capabilities import capabilities_for
+from utils.character_body_contracts import character_visual_description
 
 DEFAULT_SIMILARITY_THRESHOLD = 0.85
 DEFAULT_MAX_CORRECTION_ATTEMPTS = 2
@@ -1040,14 +1041,8 @@ def run_l3_review(
         if not isinstance(character, dict):
             continue
         character_id = str(character.get("id") or "").strip()
-        appearance = character.get("appearance") or {}
-        if character_id and isinstance(appearance, dict):
-            canonical_contracts[character_id] = str(
-                appearance.get("summary")
-                or appearance.get("clothing")
-                or character.get("description")
-                or ""
-            ).strip()
+        if character_id:
+            canonical_contracts[character_id] = character_visual_description(character)
     ordered_character_ids = [
         str(character.get("id") or "")
         for character in characters_data.get("characters", [])

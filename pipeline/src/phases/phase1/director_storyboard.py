@@ -12,6 +12,7 @@ from typing import Any, Protocol
 
 import numpy as np
 from PIL import Image
+from utils.character_body_contracts import character_visual_description
 
 DIRECTOR_STORYBOARD_SIZE = "2560x1440"
 DIRECTOR_STORYBOARD_MAX_ATTEMPTS = 2
@@ -85,18 +86,9 @@ def _character_lines(characters: list[dict[str, Any]]) -> list[str]:
     lines: list[str] = []
     for character in characters:
         name = str(character.get("name") or character.get("id") or "角色").strip()
-        appearance = character.get("appearance") or {}
-        if isinstance(appearance, dict):
-            description = appearance.get("summary") or appearance.get("description")
-        else:
-            description = appearance
-        description = (
-            description
-            or character.get("description")
-            or character.get("visual_description")
-        )
+        description = character_visual_description(character)
         if description:
-            lines.append(f"- {name}：{_compact(description, 180)}")
+            lines.append(f"- {name}：{_compact(description, 600)}")
     return lines
 
 

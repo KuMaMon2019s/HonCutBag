@@ -14,6 +14,10 @@ from prompt.eight_layer_summary import build_subject_summary
 from utils.storyboard_motion_policy import apply_storyboard_motion_policy
 from utils.style_slices import get_slice
 from utils.video_geometry import resolve_video_geometry
+from utils.character_body_contracts import (
+    body_contract_forbidden,
+    body_contract_prompt,
+)
 
 BASE_NEGATIVE_PROMPT = (
     "变形扭曲(warping), 形态渐变(morphing), 面部扭曲(distorted faces), "
@@ -106,6 +110,12 @@ def build_video_prompt(
     definitions = [definition for definition in definitions if definition]
     if definitions:
         parts.append("元素参考声明：" + "；".join(definitions))
+    body_locks = [body_contract_prompt(char) for char in selected]
+    body_locks = [contract for contract in body_locks if contract]
+    if body_locks:
+        # Keep body geometry outside the bounded eight-layer summary so height,
+        # head scale, and silhouette cannot be truncated in action-heavy shots.
+        parts.append("角色身体比例逐镜硬合同：" + "；".join(body_locks))
     parts.append(f"镜头{number}：")
     shot_type = shot_meta.get("shot_type") or shot_meta.get("shot_size") or "中景"
     subject = shot_meta.get("subject_description")
@@ -187,6 +197,11 @@ def build_video_prompt(
     if time_negative:
         negatives.append(time_negative)
     negatives.extend(str(char.get("negative_guardrails", "")).strip() for char in selected)
+    negatives.extend(
+        ", ".join(body_contract_forbidden(char))
+        for char in selected
+        if body_contract_forbidden(char)
+    )
     negative_prompt = ", ".join(dict.fromkeys(item for item in negatives if item))
     prompt = apply_storyboard_motion_policy("。".join(parts))
     if explicit_scenery:

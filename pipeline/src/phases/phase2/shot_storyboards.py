@@ -12,6 +12,7 @@ from typing import Any, Protocol
 
 import requests
 from PIL import Image, ImageDraw, ImageFont, ImageOps
+from utils.character_body_contracts import character_visual_description
 
 SHOT_STORYBOARD_SIZE = "2560x1440"
 
@@ -75,24 +76,11 @@ def _character_contract(
         }
         if requested and requested.isdisjoint(names):
             continue
-        appearance = character.get("appearance") or {}
-        if isinstance(appearance, dict):
-            description = (
-                appearance.get("summary")
-                or appearance.get("description")
-                or json.dumps(appearance, ensure_ascii=False)
-            )
-        else:
-            description = appearance
-        description = (
-            description
-            or character.get("description")
-            or character.get("visual_description")
-        )
+        description = character_visual_description(character)
         if description:
             lines.append(
                 f"- {character.get('name') or character.get('id')}："
-                f"{_compact(description, 220)}"
+                f"{_compact(description, 600)}"
             )
     contract = "\n".join(lines) or "- 严格使用 STORYBOARD.json 声明的角色设定，不自行增加人物。"
     from utils.privacy_visual_policy import (

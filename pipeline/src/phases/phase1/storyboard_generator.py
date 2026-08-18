@@ -40,6 +40,7 @@ from utils.config import ToolPaths
 from utils.pipeline_config import load_config
 from utils.visual_style_spec import VisualStyle, parse_visual_style
 from utils.ark_llm import call_llm_stream, create_ark_client
+from utils.character_body_contracts import body_contract_prompt
 
 
 def _load_default_visual_style(
@@ -455,7 +456,8 @@ def _build_shot_prompt_legacy(
             "[identity_lock]\n"
             f"{canonical_name}: {IDENTITY_LOCK_PHRASES[0]} — {', '.join(features)} — "
             f"{IDENTITY_LOCK_PHRASES[1]}; {IDENTITY_LOCK_PHRASES[2]}; "
-            f"{IDENTITY_LOCK_PHRASES[3]}. {IDENTITY_LOCK_PHRASES[4]}."
+            f"{IDENTITY_LOCK_PHRASES[3]}. {IDENTITY_LOCK_PHRASES[4]}. "
+            f"{body_contract_prompt(character)}"
         )
     identity_block = "\n".join(identity_blocks)
 

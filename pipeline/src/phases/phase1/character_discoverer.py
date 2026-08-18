@@ -40,6 +40,12 @@ from utils.ark_llm import (
     create_ark_client,
 )
 from utils.character_identity import resolve_character_name
+from utils.character_body_contracts import (
+    ADULT_LEAD_DISCOVERY_INSTRUCTIONS,
+    apply_adult_lead_body_contracts,
+    body_contract_forbidden,
+    body_contract_prompt,
+)
 
 
 # ─── LLM 配置 ───────────────────────────────────────────────────────────────
@@ -65,6 +71,7 @@ SYSTEM_PROMPT = (
     "- 事件原文已明确的服装颜色、层次、材质、发型和配饰属于硬约束，必须原样保留，禁止改色、换装或替换材质\n"
     "- 根据角色的身份/职业/场景推导合理的具体服装（白领→衬衫+西装裤，学生→校服，店主→围裙）"
 )
+SYSTEM_PROMPT = f"{SYSTEM_PROMPT}\n\n{ADULT_LEAD_DISCOVERY_INSTRUCTIONS}"
 
 USER_PROMPT_TEMPLATE = (
     "以下是故事中的角色列表和出现的事件：\n\n"
@@ -110,6 +117,7 @@ USER_PROMPT_TEMPLATE = (
     "- 只提取「稳定、可复用、资产级」的状态变化，瞬时表情/局部特写不算\n"
     "- 常见状态：淋湿、换装、受伤、变身、卸妆、戴帽/摘帽\n"
     "- 如果没有明显状态变化，variants 可以为空数组 []\n"
+    "\n{adult_lead_body_contract}\n"
 )
 
 LLM_TIMEOUT = 600
@@ -125,7 +133,7 @@ ENTITY_SUFFIXES = (
 )
 MAX_ENTITY_NAME_CHINESE_CHARS = 12
 GENERIC_CHARACTER_NAMES = {"主角", "主人公", "男主", "女主", "人物", "他", "她", "它"}
-CHARACTER_CONTEXT_SCHEMA_VERSION = 4
+CHARACTER_CONTEXT_SCHEMA_VERSION = 5
 
 GENERIC_BACKGROUND_CHARACTER_NAMES = {
     "路人", "行人", "游客", "观众", "听众", "读者",
@@ -707,18 +715,30 @@ def _add_reference_contract(character: Dict[str, Any]) -> None:
     if len("、".join(traits)) > 80:
         traits = traits[:2]
     subject_traits = "、".join(traits) or str(appearance.get("summary") or character.get("name", "角色"))
-    character.setdefault("distinguishing_features", traits or [subject_traits])
+    body_lock = body_contract_prompt(character)
+    distinguishing_features = list(traits or [subject_traits])
+    if body_lock:
+        distinguishing_features.append(body_lock)
+    character.setdefault("distinguishing_features", distinguishing_features)
     character.setdefault("face_reference", "face_closeup.png")
     character.setdefault("body_reference", "full_body.png")
     character.setdefault(
         "prompt_definition",
         # [LEGACY-KEEP 2026-08-09] 旧值写死为：将图片1中的[...]定义为<主体1>
-        _ReferencePromptTemplate(f"将{{图片N}}中的[{subject_traits}]定义为{{主体N}}"),
+        _ReferencePromptTemplate(
+            f"将{{图片N}}中的[{subject_traits}]定义为{{主体N}}"
+            + (f"；{body_lock}" if body_lock else "")
+        ),
     )
     base_guardrails = "去龄化, 特征变形, 更换服装, 颜色偏移, 多余肢体, 关节扭曲"
+    body_guardrails = ", ".join(body_contract_forbidden(character))
     character.setdefault(
         "negative_guardrails",
-        ", ".join(filter(None, (base_guardrails, str(character.get("negative", "")).strip()))),
+        ", ".join(filter(None, (
+            base_guardrails,
+            body_guardrails,
+            str(character.get("negative", "")).strip(),
+        ))),
     )
 
 
@@ -831,7 +851,10 @@ def discover_characters(events: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     # 2. 构建 LLM prompt
     character_context = _build_character_context(stats)
-    prompt = USER_PROMPT_TEMPLATE.format(character_context=character_context)
+    prompt = USER_PROMPT_TEMPLATE.format(
+        character_context=character_context,
+        adult_lead_body_contract=ADULT_LEAD_DISCOVERY_INSTRUCTIONS,
+    )
 
     # 3. 调用 LLM（带重试）
     characters = []
@@ -875,6 +898,11 @@ def discover_characters(events: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     # 5. 按出场次数排序（主角在前）
     characters.sort(key=lambda c: (-c.get("appearance_count", 0), c.get("first_appearance", 0)))
+
+    # 5.5 Apply deterministic adult-lead proportions after narrative ranking.
+    # The LLM is instructed to emit this schema, but the normalization below is
+    # the actual contract boundary and prevents creative paraphrase or drift.
+    apply_adult_lead_body_contracts(characters)
 
     # 6. 生成 asset_path
     for char in characters:

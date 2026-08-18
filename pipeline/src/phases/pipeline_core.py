@@ -43,6 +43,7 @@ from quality.composition_validator import validate_composition
 from tools.vendor_adapter import VendorAdapter, VendorModel
 from utils.style_slices import get_slice
 from utils.ark_llm import call_llm_stream, configure_heartbeat_callback
+from utils.character_body_contracts import character_visual_description
 
 
 STYLE_SUMMARY_WALL_TIMEOUT = 180.0
@@ -509,9 +510,13 @@ if LANGGRAPH_AVAILABLE:
             char_dict = {
                 "id": char.get("id", f"char_{len(sends)}"),
                 "name": char.get("name", f"角色{len(sends)}"),
-                "description": char.get("appearance", {}).get("summary", char.get("description", "")),
+                "description": character_visual_description(char),
                 "appearance": char.get("appearance", {}),  # 传递完整 appearance dict
                 "style": char.get("style", ""),
+                "negative": ", ".join(filter(None, (
+                    str(char.get("negative", "")).strip(),
+                    str(char.get("negative_guardrails", "")).strip(),
+                ))),
             }
             sends.append(Send("generate_character", {"char_dict": char_dict, "chars_dir": chars_dir, "skip_images": skip_images}))
         
@@ -1491,8 +1496,7 @@ def fill_storyboard_template(template: str, storyboard_data: dict, characters_da
     char_lines = []
     for c in characters:
         name = c.get("name", "未知角色")
-        appearance = c.get("appearance", {})
-        summary = appearance.get("summary", c.get("description", ""))
+        summary = character_visual_description(c)
         if summary:
             char_lines.append(f"- {name}: {summary}")
     character_reference = "\n".join(char_lines) if char_lines else "无角色描述"
@@ -2865,12 +2869,15 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
             char_dicts.append({
                 "id": c.get("id", f"char_{i}"),
                 "name": c.get("name", f"角色{i}"),
-                "description": c.get("appearance", {}).get("summary", c.get("description", "")),
+                "description": character_visual_description(c),
                 "appearance": c.get("appearance", {}),  # 传递完整 appearance dict
                 "style": "\n\n".join(
                     part for part in (c.get("style", ""), character_style) if part
                 ),
-                "negative": c.get("negative", ""),
+                "negative": ", ".join(filter(None, (
+                    str(c.get("negative", "")).strip(),
+                    str(c.get("negative_guardrails", "")).strip(),
+                ))),
             })
 
         _p3_est = estimate_phase_duration("phase3", num_characters=len(char_dicts))
@@ -3521,7 +3528,7 @@ def _prompt_assets_for_shot(shot_meta: dict, characters_data: dict) -> list[dict
         if requested_keys.intersection(keys):
             selected.append({
                 "name": character.get("name", ""),
-                "description": character.get("appearance", {}).get("summary", ""),
+                "description": character_visual_description(character),
             })
     return selected
 

@@ -36,6 +36,7 @@ from phases.phase1 import (
     storyboard_generator,
 )
 from phases.phase1.director_storyboard import (
+    _character_lines,
     build_director_storyboard_prompt,
     materialize_director_panels,
 )
@@ -43,6 +44,7 @@ from phases.phase1.storyboard_beats import plan_storyboard_beats
 from phases.phase1.storyboard_generator import _build_shot_prompt_legacy
 from phases.phase2.shot_storyboards import (
     _build_panel_prompt,
+    _character_contract,
     _character_reference_paths,
     build_shot_storyboard_prompt,
     generate_shot_storyboards,
@@ -61,6 +63,11 @@ from runtime.run_manifest import prepare_run_manifest
 from utils.video_capabilities import get_video_capabilities
 from utils.video_geometry import resolve_video_geometry
 from utils.ark_llm import create_ark_client
+from utils.character_body_contracts import (
+    ADULT_LEAD_DISCOVERY_INSTRUCTIONS,
+    apply_adult_lead_body_contracts,
+    character_visual_description,
+)
 
 
 def test_seedance_limits_are_provider_capabilities_not_global_director_rules():
@@ -1477,6 +1484,138 @@ def test_phase3_seedance_contract_and_gate_require_four_views(tmp_path):
         write_reference(char_dir / f"{name}.png")
     complete = run_quality_check("phase3", tmp_path)
     assert complete.passed is True
+
+
+def _adult_lead_character(name, gender, age_range, role="protagonist"):
+    return {
+        "id": name.lower(),
+        "name": name,
+        "aliases": [],
+        "role": role,
+        "appearance": {
+            "gender": gender,
+            "age_range": age_range,
+            "hair": "black hair",
+            "face": "oval face",
+            "clothing": "dark jacket",
+            "summary": f"{name}, black hair, dark jacket",
+        },
+    }
+
+
+def test_adult_lead_body_contracts_are_exact_and_scoped():
+    male = _adult_lead_character("LIN", "male", "25-30")
+    female = _adult_lead_character("SU", "female", "22-28")
+    second_male = _adult_lead_character("ZHOU", "male", "30-35")
+    supporting = _adult_lead_character("ASSISTANT", "female", "25-30", "supporting")
+    child = _adult_lead_character("CHILD", "female", "12-15")
+
+    apply_adult_lead_body_contracts([male, female, second_male, supporting, child])
+
+    male_contract = male["appearance"]["body_contract"]
+    assert male["appearance"]["height"] == "182cm"
+    assert male_contract == {
+        "profile": "adult_male_lead",
+        "height_cm": 182,
+        "head_to_body_ratio": 7.8,
+        "build": "lean athletic",
+        "shoulders": "moderately broad shoulders",
+        "leg_proportion": "slightly long legs",
+        "body_fat": "low-to-normal body fat",
+        "posture": "upright, confident",
+        "forbidden": [
+            "oversized head",
+            "extremely narrow waist",
+            "bodybuilder physique",
+        ],
+        "schema_version": 1,
+    }
+
+    female_contract = female["appearance"]["body_contract"]
+    assert female["appearance"]["height"] == "166cm"
+    assert female_contract["head_to_body_ratio"] == 7.5
+    assert female_contract["build"] == "slender balanced"
+    assert female_contract["shoulders_and_hips"] == "natural proportional shoulders and hips"
+    assert female_contract["waistline"] == "naturally defined waist"
+    assert female_contract["body_fat"] == "healthy slim"
+    assert female_contract["forbidden"] == [
+        "oversized head",
+        "extremely tiny waist",
+        "exaggerated curves",
+    ]
+    assert "posture" not in female_contract
+    assert "body_contract" not in second_male["appearance"]
+    assert "body_contract" not in supporting["appearance"]
+    assert "body_contract" not in child["appearance"]
+
+
+def test_character_discovery_body_contract_is_prompted_and_normalized(monkeypatch):
+    response = json.dumps(
+        [_adult_lead_character("LIN", "male", "25-30")],
+        ensure_ascii=False,
+    )
+    captured = {}
+
+    def fake_call(prompt):
+        captured["prompt"] = prompt
+        return response
+
+    monkeypatch.setattr(character_discoverer, "_call_llm", fake_call)
+    result = character_discoverer.discover_characters([{
+        "id": 1,
+        "who": ["LIN"],
+        "what": "LIN walks into frame",
+        "visual": "full-body view",
+    }])
+
+    discovered = result["characters"][0]
+    assert discovered["appearance"]["body_contract"]["height_cm"] == 182
+    assert "head_to_body_ratio=7.8" in captured["prompt"]
+    assert "head_to_body_ratio=7.5" in captured["prompt"]
+    assert ADULT_LEAD_DISCOVERY_INSTRUCTIONS in character_discoverer.SYSTEM_PROMPT
+    assert character_discoverer.CHARACTER_CONTEXT_SCHEMA_VERSION == 5
+    assert "bodybuilder physique" in discovered["negative_guardrails"]
+    assert "Body-proportion lock" in discovered["prompt_definition"]
+
+
+def test_body_contract_reaches_character_storyboard_and_video_prompts():
+    male = _adult_lead_character("LIN", "male", "25-30")
+    apply_adult_lead_body_contracts([male])
+    description = character_visual_description(male)
+
+    assert description.startswith("Body-proportion lock:")
+    assert "height exactly 182 cm" in description
+    assert "exactly 7.8 heads tall" in description
+    assert "moderately broad shoulders" in description
+    assert "Do not depict: oversized head" in description
+    assert "has priority over any conflicting body wording" in description
+
+    reference_prompts = character_factory.build_model_reference_prompts(description)
+    assert all("height exactly 182 cm" in prompt for prompt in reference_prompts.values())
+    assert all("bodybuilder physique" in prompt for prompt in reference_prompts.values())
+    director_contract = _character_lines([male])[0]
+    assert "height exactly 182 cm" in director_contract
+    assert "bodybuilder physique" in director_contract
+    storyboard_contract = _character_contract([male], ["LIN"])
+    assert "exactly 7.8 heads tall" in storyboard_contract
+    assert "bodybuilder physique" in storyboard_contract
+
+    video_prompt = build_video_prompt(
+        {
+            "id": "S01",
+            "who": ["LIN"],
+            "shot_size": "full",
+            "what": "LIN strides across the room",
+            "duration": 5,
+        },
+        [male],
+        {"shots": {}},
+        "seedance-2.0",
+    )
+    assert isinstance(video_prompt, str)
+    assert "角色身体比例逐镜硬合同" in video_prompt
+    assert "height exactly 182 cm" in video_prompt
+    assert "bodybuilder physique" in video_prompt
 
 
 def test_phase4_preserves_authored_continuous_boundary_with_legacy_fresh_p01():

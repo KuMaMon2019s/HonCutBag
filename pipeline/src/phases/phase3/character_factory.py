@@ -24,12 +24,15 @@ from typing import Optional, Tuple, List
 
 # Import seedream client from same directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_SRC_DIR = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_SRC_DIR))
 from clients.seedream_client import SeedreamClient
 
 # Import prompt validator from prompts/ directory
 _PROMPTS_DIR = Path(__file__).resolve().parents[3] / "prompts"
 sys.path.insert(0, str(_PROMPTS_DIR))
 from prompt.prompt_validator import validate_prompt
+from utils.character_body_contracts import character_visual_description
 
 
 # =============================================================================
@@ -79,10 +82,7 @@ def fill_template(template: str, character: dict) -> str:
     prompt = template
     prompt = prompt.replace("{{CHARACTER_NAME}}", str(character.get("name", "角色")))
     # appearance 可能是 dict（含 summary）或 str
-    appearance = character.get("appearance", "")
-    if isinstance(appearance, dict):
-        appearance = appearance.get("summary", str(appearance))
-    prompt = prompt.replace("{{APPEARANCE}}", str(appearance))
+    prompt = prompt.replace("{{APPEARANCE}}", character_visual_description(character))
     prompt = prompt.replace("{{CLOTHING}}", str(character.get("clothing", "")))
     prompt = prompt.replace("{{FEATURES}}", str(character.get("features", "")))
     return prompt
