@@ -43,6 +43,22 @@ CONTINUITY_ANCHOR_FRAME_COUNT = SEEDANCE_2_CAPABILITIES.continuity_anchor_frame_
 SEEDANCE_MIN_IMAGE_ASPECT = 0.40
 SEEDANCE_MAX_IMAGE_ASPECT = 2.50
 SEEDANCE_IMAGE_ASPECT_MARGIN = 0.01
+MAX_COPYRIGHT_POLICY_REPAIRS = 2
+COPYRIGHT_POLICY_REPAIR_VERSION = "original_audio_frame_fallback_v1"
+_COPYRIGHT_SAFE_AUDIO_CONTRACT = (
+    "[copyright-safe audio contract] Generate original ambient location sounds only: "
+    "natural footsteps, clothing movement, crowd presence, and location ambience. "
+    "No music, soundtrack, song, melody, lyrics, or recognizable tune. No copyrighted "
+    "audio, sampled recording, or imitation of any existing artist. This instruction overrides "
+    "any earlier soundtrack, music, or rhythm-audio request; visual body-motion timing remains unchanged.\n"
+)
+_FRAME_ONLY_CONTINUITY_CONTRACT = (
+    "[copyright-safe frame-only continuity fallback] The rejected reference-video item "
+    "has been removed. Continue only from the remaining ordered reference images and the "
+    "authored storyboard start/action/end states. Preserve their visible subject identity, "
+    "position, direction, camera, and lighting without reconstructing or quoting any audio "
+    "from the rejected media.\n"
+)
 
 
 def probe_continuity_frames(path: Path, timeline_fps: int) -> dict[str, Any]:
@@ -946,6 +962,110 @@ def _without_content_indices(
     return [dict(item) for index, item in enumerate(content) if index not in rejected]
 
 
+def _copyright_policy_violation_kind(error: BaseException) -> str | None:
+    """Classify only the two copyright-policy failures with safe remediations."""
+    message = str(error).casefold()
+    if "policyviolation" not in message:
+        return None
+    if "outputaudiosensitivecontentdetected" in message:
+        return "output_audio"
+    if "inputvideosensitivecontentdetected" in message:
+        return "input_video"
+    return None
+
+
+def _copyright_rejected_video_indices(
+    content: Sequence[dict[str, Any]],
+    error: BaseException,
+) -> tuple[int, ...]:
+    """Resolve provider-addressed video items without dropping unrelated inputs."""
+    if _copyright_policy_violation_kind(error) != "input_video":
+        return ()
+    indices: list[int] = []
+    for raw_index in re.findall(r"content\[(\d+)\]", str(error)):
+        index = int(raw_index)
+        if (
+            0 <= index < len(content)
+            and content[index].get("type") == "video_url"
+            and index not in indices
+        ):
+            indices.append(index)
+    return tuple(indices)
+
+
+def _sanitize_music_language(value: str) -> str:
+    """Remove soundtrack requests while preserving the authored body action."""
+    substitutions = (
+        (
+            r"(?i)\b(?:soundtrack|music|song|melody|lyrics?|bpm|rhythm)\b",
+            "visual motion timing",
+        ),
+        (r"配乐|音乐|歌曲|旋律|歌词", "动作时序提示"),
+        (r"节奏", "动作时序"),
+    )
+    sanitized = value
+    for pattern, replacement in substitutions:
+        sanitized = re.sub(pattern, replacement, sanitized)
+    return sanitized
+
+
+def _copyright_repair_content(
+    content: Sequence[dict[str, Any]],
+    *,
+    audio_safe: bool,
+    rejected_video_indices: Sequence[int] = (),
+) -> list[dict[str, Any]]:
+    """Build a bounded compliant retry without reusing a rejected video item."""
+    corrected = _without_content_indices(content, rejected_video_indices)
+    if rejected_video_indices:
+        removed = [
+            content[index]
+            for index in rejected_video_indices
+            if 0 <= index < len(content)
+        ]
+        if not removed or any(item.get("type") != "video_url" for item in removed):
+            raise RuntimeError("copyright fallback did not resolve a rejected video item")
+    frame_only = bool(rejected_video_indices) or any(
+        _FRAME_ONLY_CONTINUITY_CONTRACT in str(item.get("text") or "")
+        for item in content
+        if item.get("type") == "text"
+    )
+    text_contract = (
+        (_FRAME_ONLY_CONTINUITY_CONTRACT if frame_only else "")
+        + (_COPYRIGHT_SAFE_AUDIO_CONTRACT if audio_safe else "")
+    )
+    for item in corrected:
+        if item.get("type") != "text":
+            continue
+        original = str(item.get("text") or "")
+        original = original.replace(_COPYRIGHT_SAFE_AUDIO_CONTRACT, "").replace(
+            _FRAME_ONLY_CONTINUITY_CONTRACT,
+            "",
+        )
+        item["text"] = text_contract + (
+            _sanitize_music_language(original) if audio_safe else original
+        )
+    if text_contract and not any(item.get("type") == "text" for item in corrected):
+        corrected.insert(0, {"type": "text", "text": text_contract})
+    return corrected
+
+
+def _copyright_repair_seed(
+    seed: int | None,
+    repairs: Sequence[dict[str, Any]],
+) -> int | None:
+    """Deterministically vary repaired output while keeping reruns reproducible."""
+    if seed is None or not repairs:
+        return seed
+    material = json.dumps(
+        {"seed": seed, "repairs": list(repairs)},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return int(hashlib.sha256(material.encode()).hexdigest()[:8], 16) % 2_147_483_647
+
+
 def _direct_seedance_executor(
     output_dir: Path,
     task_store: GenerationTaskStore,
@@ -969,49 +1089,10 @@ def _direct_seedance_executor(
         )
         payload = _task_payload(request, model=model, duration=duration, seed=seed)
         payload["ratio"] = ratio
-
-        def submit() -> str:
-            try:
-                content, _shot_meta, _seed, _duration = _provider_content(
-                    output_dir,
-                    request,
-                )
-            except Exception as exc:
-                raise ProviderPreparationError(
-                    f"cannot prepare provider content for {request.resource_id}: {exc}"
-                ) from exc
-            try:
-                return seedance_client.submit_content(
-                    content,
-                    api_key=api_key,
-                    model=model,
-                    duration=duration,
-                    ratio=ratio,
-                    seed=seed,
-                )
-            except Exception as exc:
-                rejected_indices = _privacy_rejected_image_indices(content, exc)
-                if not rejected_indices:
-                    raise
-                corrected_content = _without_content_indices(
-                    content,
-                    rejected_indices,
-                )
-                print(
-                    "  🛡 Seedance 隐私纠偏：移除服务商明确拒绝的参考图 "
-                    + ", ".join(f"content[{index}]" for index in rejected_indices)
-                    + "，限次重试 1 次",
-                    flush=True,
-                )
-                return seedance_client.submit_content(
-                    corrected_content,
-                    api_key=api_key,
-                    model=model,
-                    duration=duration,
-                    ratio=ratio,
-                    seed=seed,
-                )
-
+        run_id = str(output_dir.resolve())
+        repairs: list[dict[str, Any]] = []
+        content_override: list[dict[str, Any]] | None = None
+        execution = None
         with slots.reserve("seedance", "video", request.resource_id, capacity=capacity):
             with leases.reserve(
                 "seedance",
@@ -1019,21 +1100,185 @@ def _direct_seedance_executor(
                 request.resource_id,
                 capacity=capacity,
             ):
-                execution = execute_seedance_video_task(
-                    task_store,
-                    run_id=str(output_dir.resolve()),
-                    resource_id=request.resource_id,
-                    payload=payload,
-                    provider_endpoint=seedance_client.BASE_URL,
-                    output_path=request.output_path,
-                    submit=submit,
-                    poll=partial(seedance_client.poll, api_key=api_key),
-                    download=seedance_client.download,
-                    validate_output=is_valid_video,
-                )
+                for policy_attempt in range(MAX_COPYRIGHT_POLICY_REPAIRS + 1):
+                    try:
+                        if content_override is None:
+                            content, _shot_meta, _seed, _duration = _provider_content(
+                                output_dir,
+                                request,
+                            )
+                        else:
+                            content = [dict(item) for item in content_override]
+                    except Exception as exc:
+                        raise ProviderPreparationError(
+                            "cannot prepare provider content for "
+                            f"{request.resource_id}: {exc}"
+                        ) from exc
+
+                    attempt_seed = _copyright_repair_seed(seed, repairs)
+                    submitted_content: list[dict[str, Any]] = []
+                    attempt_payload = (
+                        payload
+                        if policy_attempt == 0
+                        else {
+                            **payload,
+                            "seed": attempt_seed,
+                            "copyright_policy_repair_version": (
+                                COPYRIGHT_POLICY_REPAIR_VERSION
+                            ),
+                            "copyright_policy_repair_attempt": policy_attempt,
+                            "copyright_policy_repairs": [
+                                dict(item) for item in repairs
+                            ],
+                        }
+                    )
+                    attempt_resource_id = (
+                        request.resource_id
+                        if policy_attempt == 0
+                        else f"{request.resource_id}_CP{policy_attempt:02d}"
+                    )
+
+                    def submit() -> str:
+                        def submit_selected(
+                            selected: Sequence[dict[str, Any]],
+                        ) -> str:
+                            submitted_content[:] = [dict(item) for item in selected]
+                            return seedance_client.submit_content(
+                                selected,
+                                api_key=api_key,
+                                model=model,
+                                duration=duration,
+                                ratio=ratio,
+                                seed=attempt_seed,
+                            )
+
+                        try:
+                            return submit_selected(content)
+                        except Exception as exc:
+                            rejected_indices = _privacy_rejected_image_indices(
+                                content,
+                                exc,
+                            )
+                            if not rejected_indices:
+                                raise
+                            corrected_content = _without_content_indices(
+                                content,
+                                rejected_indices,
+                            )
+                            print(
+                                "  🛡 Seedance 隐私纠偏：移除服务商明确拒绝的参考图 "
+                                + ", ".join(
+                                    f"content[{index}]"
+                                    for index in rejected_indices
+                                )
+                                + "，限次重试 1 次",
+                                flush=True,
+                            )
+                            return submit_selected(corrected_content)
+
+                    try:
+                        succeeded = task_store.find_succeeded(
+                            run_id=run_id,
+                            task_type="video.generate",
+                            resource_id=attempt_resource_id,
+                            payload=attempt_payload,
+                            provider_id="seedance",
+                        )
+                        failed = (
+                            None
+                            if succeeded is not None
+                            else task_store.find_failed(
+                                run_id=run_id,
+                                task_type="video.generate",
+                                resource_id=attempt_resource_id,
+                                payload=attempt_payload,
+                                provider_id="seedance",
+                            )
+                        )
+                        if failed is not None and _copyright_policy_violation_kind(
+                            RuntimeError(failed.error_message or "")
+                        ):
+                            raise RuntimeError(failed.error_message or "policy violation")
+                        execution = execute_seedance_video_task(
+                            task_store,
+                            run_id=run_id,
+                            resource_id=attempt_resource_id,
+                            payload=attempt_payload,
+                            provider_endpoint=seedance_client.BASE_URL,
+                            output_path=request.output_path,
+                            submit=submit,
+                            poll=partial(seedance_client.poll, api_key=api_key),
+                            download=seedance_client.download,
+                            validate_output=is_valid_video,
+                        )
+                        break
+                    except Exception as exc:
+                        violation_kind = _copyright_policy_violation_kind(exc)
+                        if (
+                            violation_kind is None
+                            or len(repairs) >= MAX_COPYRIGHT_POLICY_REPAIRS
+                        ):
+                            raise
+                        submitted = submitted_content or content
+                        if violation_kind == "output_audio":
+                            if any(
+                                item.get("reason_code")
+                                == "OutputAudioSensitiveContentDetected.PolicyViolation"
+                                for item in repairs
+                            ):
+                                raise
+                            content_override = _copyright_repair_content(
+                                submitted,
+                                audio_safe=True,
+                            )
+                            repair = {
+                                "attempt": len(repairs) + 1,
+                                "reason_code": (
+                                    "OutputAudioSensitiveContentDetected.PolicyViolation"
+                                ),
+                                "policy": "original_ambient_no_music_v1",
+                                "removed_content_indices": [],
+                            }
+                        else:
+                            rejected_video_indices = (
+                                _copyright_rejected_video_indices(submitted, exc)
+                            )
+                            if not rejected_video_indices:
+                                raise
+                            content_override = _copyright_repair_content(
+                                submitted,
+                                audio_safe=True,
+                                rejected_video_indices=rejected_video_indices,
+                            )
+                            repair = {
+                                "attempt": len(repairs) + 1,
+                                "reason_code": (
+                                    "InputVideoSensitiveContentDetected.PolicyViolation"
+                                ),
+                                "policy": "drop_rejected_video_keep_ordered_frames_v1",
+                                "removed_content_indices": list(
+                                    rejected_video_indices
+                                ),
+                                "retained_reference_images": sum(
+                                    item.get("type") == "image_url"
+                                    for item in content_override
+                                ),
+                            }
+                        repairs.append(repair)
+                        print(
+                            "  🛡 Seedance 版权审核合规重生成："
+                            f"{repair['reason_code']} → {repair['policy']} "
+                            f"({len(repairs)}/{MAX_COPYRIGHT_POLICY_REPAIRS})",
+                            flush=True,
+                        )
+                if execution is None:
+                    raise RuntimeError(
+                        f"{request.resource_id} copyright policy retry exited without result"
+                    )
         return ChunkExecutionResult(
             output_path=Path(execution.output_path),
             provider_task_id=execution.provider_job_id,
+            copyright_policy_repairs=tuple(dict(item) for item in repairs),
         )
 
     return execute

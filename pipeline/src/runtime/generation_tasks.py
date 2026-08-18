@@ -283,6 +283,35 @@ class GenerationTaskStore:
             ).fetchone()
         return GenerationTask.from_row(row) if row is not None else None
 
+    def find_failed(
+        self,
+        *,
+        run_id: str,
+        task_type: str,
+        resource_id: str,
+        payload: dict[str, Any],
+        provider_id: str,
+    ) -> GenerationTask | None:
+        """Return the newest terminal failure for the exact immutable input."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM generation_tasks
+                WHERE run_id = ? AND task_type = ? AND resource_id = ?
+                  AND provider_id = ? AND payload_json = ? AND status = 'failed'
+                ORDER BY finished_at DESC, queued_at DESC
+                LIMIT 1
+                """,
+                (
+                    run_id,
+                    task_type,
+                    resource_id,
+                    provider_id,
+                    _encode_json(payload),
+                ),
+            ).fetchone()
+        return GenerationTask.from_row(row) if row is not None else None
+
     def get(self, task_id: str) -> GenerationTask | None:
         with self._connect() as connection:
             row = connection.execute(

@@ -86,6 +86,7 @@ class ChunkExecutionResult:
 
     output_path: Path
     provider_task_id: str | None = None
+    copyright_policy_repairs: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -362,6 +363,7 @@ def execute_continuity_plan(
     timing_manifests = 0
     duration_topups = 0
     repair_attempts = 0
+    copyright_policy_repairs = 0
     primary_shot_bridges: list[dict[str, Any]] = []
     totals_lock = threading.Lock()
 
@@ -370,6 +372,7 @@ def execute_continuity_plan(
         predecessor: ShotExecutionContext | None = None,
     ) -> ShotExecutionContext:
         nonlocal executed_chunks, measured_seams, repair_attempts, skipped_chunks
+        nonlocal copyright_policy_repairs
         nonlocal timing_manifests, duration_topups
         chunk_paths: list[Path] = []
         executed_chunk_models: list[GenerationChunk] = []
@@ -402,7 +405,7 @@ def execute_continuity_plan(
             *,
             attempt: int,
         ) -> None:
-            nonlocal executed_chunks, repair_attempts
+            nonlocal executed_chunks, repair_attempts, copyright_policy_repairs
             resource_id = chunk.chunk_id if attempt == 0 else f"{chunk.chunk_id}_R{attempt:02d}"
             request = ChunkExecutionRequest(
                 resource_id=resource_id,
@@ -433,6 +436,7 @@ def execute_continuity_plan(
                         "resource_id": resource_id,
                         "input_fingerprint": fingerprint,
                         "repair_attempts": attempt,
+                        "copyright_policy_repairs": [],
                         "error": str(exc),
                         "updated_at": _utc_now(),
                     },
@@ -449,6 +453,12 @@ def execute_continuity_plan(
                     "output_sha256": _file_hash(chunk_path),
                     "provider_task_id": result.provider_task_id,
                     "repair_attempts": attempt,
+                    "copyright_policy_repair_attempts": len(
+                        result.copyright_policy_repairs
+                    ),
+                    "copyright_policy_repairs": [
+                        dict(item) for item in result.copyright_policy_repairs
+                    ],
                     "updated_at": _utc_now(),
                 },
             )
@@ -456,6 +466,7 @@ def execute_continuity_plan(
                 executed_chunks += 1
                 if attempt > 0:
                     repair_attempts += 1
+                copyright_policy_repairs += len(result.copyright_policy_repairs)
 
         def inspect_boundary(
             chunk: GenerationChunk,
@@ -1131,7 +1142,9 @@ def execute_continuity_plan(
         "prepared_seams": len(prepared_boundaries),
         "timing_manifests": timing_manifests,
         "duration_topups": duration_topups,
-        "repair_attempts": repair_attempts,
+        "repair_attempts": repair_attempts + copyright_policy_repairs,
+        "seam_repair_attempts": repair_attempts,
+        "copyright_policy_repair_attempts": copyright_policy_repairs,
         "skipped_chunks": skipped_chunks,
         "lineage_path": "CONTINUITY_LINEAGE.json",
         "primary_shot_bridges_path": "PRIMARY_SHOT_BRIDGES.json",

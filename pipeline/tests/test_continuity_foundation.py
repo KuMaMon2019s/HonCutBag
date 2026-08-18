@@ -95,6 +95,7 @@ from runtime.continuity_provider import (
     normalize_provider_minimum_padding,
     probe_continuity_frames,
 )
+from runtime.execution_errors import ProviderJobFailedError
 from runtime.generation_tasks import GenerationTaskStore
 from sam3_runtime.policy import (
     estimate_weight_bytes,
@@ -1980,7 +1981,16 @@ def test_chunk_runtime_serializes_dependencies_but_parallelizes_shots(tmp_path):
             assert request.previous_output_path is not None
             assert request.previous_output_path.is_file()
         request.output_path.write_bytes(request.resource_id.encode())
-        return ChunkExecutionResult(request.output_path, f"task-{request.resource_id}")
+        policy_repairs = (
+            ({"attempt": 1, "policy": "original_ambient_no_music_v1"},)
+            if request.resource_id == "S01_C01"
+            else ()
+        )
+        return ChunkExecutionResult(
+            request.output_path,
+            f"task-{request.resource_id}",
+            policy_repairs,
+        )
 
     report = execute_continuity_plan(
         plan,
@@ -1993,8 +2003,13 @@ def test_chunk_runtime_serializes_dependencies_but_parallelizes_shots(tmp_path):
 
     assert report["status"] == "done"
     assert report["executed_chunks"] == 4
+    assert report["repair_attempts"] == 1
+    assert report["seam_repair_attempts"] == 0
+    assert report["copyright_policy_repair_attempts"] == 1
     assert dict(sequences) == {"S01": [1, 2], "S02": [1, 2]}
     assert (tmp_path / "shots/S01/output.mp4").read_bytes() == b"S01_C01|S01_C02"
+    lineage = json.loads((tmp_path / "CONTINUITY_LINEAGE.json").read_text())
+    assert lineage["chunks"]["S01_C01"]["copyright_policy_repair_attempts"] == 1
 
 
 def test_chunk_runtime_archives_primary_shot_bridge_videos(tmp_path):
@@ -3156,6 +3171,163 @@ def test_direct_continuity_adapter_drops_provider_rejected_privacy_images_once(
         if item.get("type") == "image_url"
     ]
     assert retained_urls == ["safe-storyboard", "safe-group-board"]
+
+
+def test_direct_continuity_adapter_rewrites_output_audio_policy_once(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr("utils.video_validation.is_valid_video", lambda _path: True)
+    shot_dir = tmp_path / "shots/S01"
+    shot_dir.mkdir(parents=True)
+    (shot_dir / "SHOT_META.json").write_text(
+        json.dumps({"prompt": "dance to music and rhythm", "gen_strategy": "i2v"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ARK_AGENT_API_KEY", "test-key")
+    monkeypatch.setenv("HONCUT_CAPACITY_DB", str(tmp_path / "capacity.db"))
+    monkeypatch.setenv("VIDEO_GEN_CONCURRENCY", "1")
+    monkeypatch.setattr(
+        "tools.asset_packager.build_content_for_shot",
+        lambda **kwargs: [{"type": "text", "text": kwargs["shot_meta"]["prompt"]}],
+    )
+    submissions: list[list[dict]] = []
+    submitted_seeds: list[int | None] = []
+
+    def fake_submit(content, **kwargs):
+        submissions.append([dict(item) for item in content])
+        submitted_seeds.append(kwargs.get("seed"))
+        return f"seedance-job-{len(submissions)}"
+
+    def fake_poll(task_id, api_key):
+        assert api_key == "test-key"
+        if task_id == "seedance-job-1":
+            raise ProviderJobFailedError(
+                "OutputAudioSensitiveContentDetected.PolicyViolation"
+            )
+        return "https://video.test/output.mp4"
+
+    monkeypatch.setattr(seedance_client, "submit_content", fake_submit)
+    monkeypatch.setattr(seedance_client, "poll", fake_poll)
+    monkeypatch.setattr(
+        seedance_client,
+        "download",
+        lambda url, path: Path(path).write_bytes(b"video") or path,
+    )
+    request = _fresh_chunk_request(tmp_path)
+    request.output_path.parent.mkdir(parents=True, exist_ok=True)
+    execute = _direct_seedance_executor(
+        tmp_path,
+        GenerationTaskStore(tmp_path / "runtime.db"),
+    )
+
+    result = execute(request)
+    recovered = execute(request)
+
+    assert result.provider_task_id == "seedance-job-2"
+    assert recovered.provider_task_id == "seedance-job-2"
+    assert len(submissions) == 2
+    retry_prompt = submissions[1][0]["text"]
+    assert "original ambient location sounds only" in retry_prompt
+    assert "No music" in retry_prompt
+    assert "copyrighted audio" in retry_prompt.casefold()
+    assert "dance to music and rhythm" not in retry_prompt
+    assert submitted_seeds[0] != submitted_seeds[1]
+    assert result.copyright_policy_repairs == ({
+        "attempt": 1,
+        "reason_code": "OutputAudioSensitiveContentDetected.PolicyViolation",
+        "policy": "original_ambient_no_music_v1",
+        "removed_content_indices": [],
+    },)
+
+
+def test_direct_continuity_adapter_drops_rejected_video_but_keeps_anchor_frames(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr("utils.video_validation.is_valid_video", lambda _path: True)
+    shot_dir = tmp_path / "shots/S01"
+    shot_dir.mkdir(parents=True)
+    (shot_dir / "SHOT_META.json").write_text(
+        json.dumps({"prompt": "continue the authored movement", "gen_strategy": "i2v"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ARK_AGENT_API_KEY", "test-key")
+    monkeypatch.setenv("HONCUT_CAPACITY_DB", str(tmp_path / "capacity.db"))
+    monkeypatch.setenv("VIDEO_GEN_CONCURRENCY", "1")
+    provider_content = [
+        {"type": "text", "text": "continue from ordered anchors"},
+        {"type": "image_url", "image_url": {"url": "anchor-1"}},
+        {"type": "image_url", "image_url": {"url": "anchor-2"}},
+        {"type": "image_url", "image_url": {"url": "anchor-3"}},
+        {"type": "video_url", "video_url": {"url": "rejected-tail-video"}},
+    ]
+    monkeypatch.setattr(
+        "runtime.continuity_provider._provider_content",
+        lambda *_args, **_kwargs: (
+            [dict(item) for item in provider_content],
+            {},
+            None,
+            8,
+        ),
+    )
+    submissions: list[list[dict]] = []
+
+    def fake_submit(content, **_kwargs):
+        submissions.append([dict(item) for item in content])
+        if len(submissions) == 1:
+            raise RuntimeError(
+                "InputVideoSensitiveContentDetected.PolicyViolation: content[4]"
+            )
+        return "seedance-job-frame-only"
+
+    monkeypatch.setattr(seedance_client, "submit_content", fake_submit)
+    monkeypatch.setattr(
+        seedance_client,
+        "poll",
+        lambda task_id, api_key: "https://video.test/output.mp4",
+    )
+    monkeypatch.setattr(
+        seedance_client,
+        "download",
+        lambda url, path: Path(path).write_bytes(b"video") or path,
+    )
+    previous = tmp_path / "shots/S01/chunks/S01_C01.mp4"
+    previous.parent.mkdir(parents=True, exist_ok=True)
+    previous.write_bytes(b"previous")
+    request = ChunkExecutionRequest(
+        resource_id="S01_C02",
+        shot_id="S01",
+        chunk=GenerationChunk(
+            chunk_id="S01_C02",
+            sequence=2,
+            target_duration_s=8,
+            mode="native_extend",
+            depends_on="S01_C01",
+            execution_strategy="tail_video_extend",
+        ),
+        anchors={"scene": "street"},
+        output_path=tmp_path / "shots/S01/chunks/S01_C02.mp4",
+        previous_output_path=previous,
+        input_fingerprint="fingerprint",
+        memory_context="anchors",
+    )
+    execute = _direct_seedance_executor(
+        tmp_path,
+        GenerationTaskStore(tmp_path / "runtime.db"),
+    )
+
+    result = execute(request)
+
+    assert result.provider_task_id == "seedance-job-frame-only"
+    assert len(submissions) == 2
+    assert not any(item.get("type") == "video_url" for item in submissions[1])
+    assert [
+        item["image_url"]["url"]
+        for item in submissions[1]
+        if item.get("type") == "image_url"
+    ] == ["anchor-1", "anchor-2", "anchor-3"]
+    assert "frame-only continuity fallback" in submissions[1][0]["text"]
+    assert result.copyright_policy_repairs[0]["removed_content_indices"] == [4]
+    assert result.copyright_policy_repairs[0]["retained_reference_images"] == 3
 
 
 def test_bridge_continuity_adapter_reuses_succeeded_paid_task(monkeypatch, tmp_path):
