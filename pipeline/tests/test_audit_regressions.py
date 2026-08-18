@@ -40,7 +40,11 @@ from phases.phase1.director_storyboard import (
     build_director_storyboard_prompt,
     materialize_director_panels,
 )
-from phases.phase1.storyboard_beats import plan_storyboard_beats
+from phases.phase1.storyboard_beats import (
+    bridge_planning_duration_bounds,
+    plan_storyboard_beats,
+    secondary_storyboard_contract_errors,
+)
 from phases.phase1.storyboard_generator import _build_shot_prompt_legacy
 from phases.phase2.shot_storyboards import (
     _build_panel_prompt,
@@ -95,6 +99,26 @@ def test_seedance_limits_are_provider_capabilities_not_global_director_rules():
     assert generic_board["shots"][0]["generation_load"]["capability_profile"] == (
         "generic-video"
     )
+
+
+def test_flf2v_provider_capability_is_separate_from_honcut_bridge_policy():
+    seedance = get_video_capabilities(provider="seedance")
+
+    assert seedance.request_duration_bounds("first_last_frame_bridge") == (4, 15)
+    assert bridge_planning_duration_bounds(seedance) == (4, 6)
+    assert seedance.validate_chunk_durations(
+        15,
+        15,
+        "first_last_frame_bridge",
+        resource_id="provider_probe_upper_bound",
+    ) == (15, 15)
+    with pytest.raises(ValueError, match="outside seedance"):
+        seedance.validate_chunk_durations(
+            16,
+            16,
+            "first_last_frame_bridge",
+            resource_id="provider_probe_above_upper_bound",
+        )
 
 
 @pytest.mark.parametrize(
@@ -159,6 +183,15 @@ def test_secondary_v6_keeps_bridge_time_outside_primary_content_capacity():
     assert [beat["duration_s"] for beat in first["storyboard_beats"]] == [15]
     assert first["secondary_storyboard_planning"]["content_duration_s"] == 15
     assert first["secondary_storyboard_planning"]["bridge_duration_s"] == 4
+    assert first["secondary_storyboard_planning"][
+        "first_last_frame_bridge_duration_range_s"
+    ] == [4.0, 6.0]
+    assert first["secondary_storyboard_planning"][
+        "first_last_frame_bridge_policy_duration_range_s"
+    ] == [4.0, 6.0]
+    assert first["secondary_storyboard_planning"][
+        "first_last_frame_bridge_provider_duration_range_s"
+    ] == [4, 15]
     assert storyboard["primary_shot_bridges"][0]["generation_phase"] == (
         "post_primary_shots"
     )
@@ -190,6 +223,17 @@ def test_secondary_v6_keeps_bridge_time_outside_primary_content_capacity():
         "bridge_overhead_is_additive": True,
         "primary_secondary_double_count_forbidden": True,
     }
+
+    first["secondary_storyboard_planning"][
+        "first_last_frame_bridge_provider_duration_range_s"
+    ] = [4.0, 6.0]
+    errors = secondary_storyboard_contract_errors(storyboard, 0)
+    assert any(
+        issue["code"] == "secondary_storyboard_planning_metadata_invalid"
+        and issue["details"]["field"]
+        == "first_last_frame_bridge_provider_duration_range_s"
+        for issue in errors
+    )
 
 
 def test_secondary_v4_rejects_false_continuity_and_fractional_seedance_duration():

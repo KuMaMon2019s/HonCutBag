@@ -20,8 +20,8 @@ from utils.video_capabilities import (
     min_primary_story_duration,
 )
 
-SECONDARY_STORYBOARD_VERSION = "honcut.secondary-storyboard.v8"
-SECONDARY_EXECUTION = "content_capacity_post_primary_bridge_v8"
+SECONDARY_STORYBOARD_VERSION = "honcut.secondary-storyboard.v9"
+SECONDARY_EXECUTION = "content_capacity_post_primary_bridge_v9"
 SECONDARY_GENERATION_MODES = frozenset({
     "multi_image",
     "tail_video_extend",
@@ -30,6 +30,31 @@ SECONDARY_GENERATION_MODES = frozenset({
 MAX_CONTENT_BEATS = MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
 MAX_SECONDARY_BEATS = MAX_CONTENT_BEATS
 SPOKEN_CHARACTERS_PER_SECOND = 4.0
+
+# Editorial policy, deliberately separate from provider/model capabilities.
+# The provider may accept longer FLF2V clips, but a transition longer than six
+# seconds stops behaving like a bridge and should be authored as story content.
+HONCUT_BRIDGE_MIN_DURATION_S = 4.0
+HONCUT_BRIDGE_MAX_DURATION_S = 6.0
+
+
+def bridge_planning_duration_bounds(
+    capabilities: VideoModelCapabilities,
+) -> tuple[float, float]:
+    """Intersect HonCut's bridge policy with the selected provider's limits."""
+    provider_minimum, provider_maximum = capabilities.effective_duration_bounds(
+        "first_last_frame_bridge"
+    )
+    minimum = max(provider_minimum, HONCUT_BRIDGE_MIN_DURATION_S)
+    maximum = min(provider_maximum, HONCUT_BRIDGE_MAX_DURATION_S)
+    if minimum > maximum + 1e-6:
+        raise ValueError(
+            f"{capabilities.name} first/last-frame range "
+            f"{provider_minimum:g}-{provider_maximum:g}s has no overlap with "
+            f"HonCut's {HONCUT_BRIDGE_MIN_DURATION_S:g}-"
+            f"{HONCUT_BRIDGE_MAX_DURATION_S:g}s bridge policy"
+        )
+    return float(minimum), float(maximum)
 
 
 def _shot_id(shot: dict[str, Any], index: int) -> str:
@@ -374,9 +399,7 @@ def secondary_storyboard_requirements(
             f"{primary_minimum:g}-{primary_maximum:g}s range"
         )
     bridge_required, bridge_reason = _bridge_requirement(storyboard, shots, index)
-    bridge_minimum, _bridge_maximum = profile.effective_duration_bounds(
-        "first_last_frame_bridge"
-    )
+    bridge_minimum, _bridge_maximum = bridge_planning_duration_bounds(profile)
     bridge_duration = bridge_minimum if bridge_required else 0.0
     if bridge_required:
         profile.validate_chunk_durations(
@@ -637,10 +660,22 @@ def secondary_storyboard_contract_errors(
                 observed=shot.get("storyboard_beat_count"),
             )
         planning = shot.get("secondary_storyboard_planning") or {}
+        bridge_policy_bounds = bridge_planning_duration_bounds(requirement["profile"])
+        bridge_provider_bounds = requirement["profile"].effective_duration_bounds(
+            "first_last_frame_bridge"
+        )
         expected_planning = {
             "content_beat_count": requirement["content_count"],
             "extension_required": requirement["extension_required"],
             "bridge_required": requirement["bridge_required"],
+            "bridge_duration_s": requirement["bridge_duration"],
+            "first_last_frame_bridge_duration_range_s": list(bridge_policy_bounds),
+            "first_last_frame_bridge_policy_duration_range_s": list(
+                bridge_policy_bounds
+            ),
+            "first_last_frame_bridge_provider_duration_range_s": list(
+                bridge_provider_bounds
+            ),
             "selected_count": len(requirement["modes"]),
         }
         for key, expected in expected_planning.items():
@@ -749,7 +784,10 @@ def plan_storyboard_beats(
         provider_capacity = MAX_CONTENT_BEATS
         multi_bounds = profile.effective_duration_bounds("multi_image")
         tail_bounds = profile.effective_duration_bounds("tail_video_extend")
-        bridge_bounds = profile.effective_duration_bounds("first_last_frame_bridge")
+        bridge_provider_bounds = profile.effective_duration_bounds(
+            "first_last_frame_bridge"
+        )
+        bridge_policy_bounds = bridge_planning_duration_bounds(profile)
         shot["secondary_storyboard_planning"] = {
             "content_beat_count": requirement["content_count"],
             "generation_action_unit_count": len(
@@ -783,7 +821,13 @@ def plan_storyboard_beats(
             ],
             "multi_image_duration_range_s": list(multi_bounds),
             "tail_video_extend_duration_range_s": list(tail_bounds),
-            "first_last_frame_bridge_duration_range_s": list(bridge_bounds),
+            "first_last_frame_bridge_duration_range_s": list(bridge_policy_bounds),
+            "first_last_frame_bridge_policy_duration_range_s": list(
+                bridge_policy_bounds
+            ),
+            "first_last_frame_bridge_provider_duration_range_s": list(
+                bridge_provider_bounds
+            ),
             "bridge_generation_phase": "post_primary_shots",
             "selected_count": total_count,
         }
