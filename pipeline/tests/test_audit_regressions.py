@@ -61,6 +61,7 @@ from phases.pipeline_core import _write_project_visual_style
 from prompt import event_extractor
 from quality import video_qa
 from quality.character_reference_qa import (
+    build_character_reference_qa_prompt,
     build_character_reference_qa_receipt,
     parse_character_reference_qa,
 )
@@ -76,6 +77,10 @@ from utils.character_body_contracts import (
     apply_adult_lead_body_contracts,
     character_reference_identity_description,
     character_visual_description,
+)
+from utils.character_reference_contracts import (
+    STATIC_REFERENCE_ASSET_POLICY,
+    normalize_character_reference_assets,
 )
 
 
@@ -1631,6 +1636,7 @@ def test_phase3_reference_generation_uses_face_only_as_identity_anchor(
                 "view_match": True,
                 "framing_match": True,
                 "neutral_pose": True,
+                "hands_empty": True,
                 "plain_background": True,
                 "single_character": True,
                 "face_visible": True,
@@ -1738,6 +1744,7 @@ def test_phase3_existing_pack_retries_review_without_regenerating_images(
                 "view_match": True,
                 "framing_match": True,
                 "neutral_pose": True,
+                "hands_empty": True,
                 "plain_background": True,
                 "single_character": True,
                 "face_visible": True,
@@ -1876,12 +1883,73 @@ def test_phase3_identity_description_excludes_story_action_and_location():
     assert "moving camera" not in description
 
 
+def test_phase3_identity_separates_hand_interaction_props_without_object_allowlist():
+    character = {
+        "id": "subject",
+        "appearance": {
+            "gender": "unknown",
+            "age_range": "30-40",
+            "hair": "short dark hair",
+            "face": "angular face",
+            "clothing": (
+                "navy coat + wrist-fastened tracker + right hand gripping a field instrument"
+                "、佩戴丝巾、双手托着一件工具"
+            ),
+            "summary": "adult with short dark hair and a navy coat",
+        },
+    }
+
+    normalize_character_reference_assets(character)
+    appearance = character["appearance"]
+    description = character_reference_identity_description(character)
+
+    assert appearance["clothing"] == "navy coat + wrist-fastened tracker + 佩戴丝巾"
+    assert appearance["interaction_props"] == [
+        "right hand gripping a field instrument",
+        "双手托着一件工具",
+    ]
+    assert "field instrument" not in description
+    assert "一件工具" not in description
+    assert "wrist-fastened tracker" in description
+    assert "佩戴丝巾" in description
+    assert STATIC_REFERENCE_ASSET_POLICY in description
+    assert appearance["reference_asset_contract"]["hands"] == "empty_open_relaxed"
+
+    prompts = character_factory.build_model_reference_prompts(description)
+    assert all("interaction prop" in prompt for prompt in prompts.values())
+    assert all("hands empty" in prompt for prompt in prompts.values())
+    qa_prompt = build_character_reference_qa_prompt(description)
+    assert "Never penalize the absence of an interaction prop" in qa_prompt
+    assert "body-worn or fastened identity assets" in qa_prompt
+
+
+def test_reference_asset_normalization_rebuilds_fully_dynamic_summary():
+    character = {
+        "appearance": {
+            "hair": "cropped auburn hair",
+            "face": "square jaw",
+            "build": "average",
+            "clothing": "linen shirt + holding a generic instrument",
+            "summary": "holding a generic instrument",
+        }
+    }
+
+    normalize_character_reference_assets(character)
+
+    appearance = character["appearance"]
+    assert appearance["summary"] == (
+        "cropped auburn hair + square jaw + linen shirt + average"
+    )
+    assert appearance["interaction_props"] == ["holding a generic instrument"]
+
+
 def test_character_reference_qa_recomputes_wrong_view_verdict():
     passing_view = {
         "passed": True,
         "view_match": True,
         "framing_match": True,
         "neutral_pose": True,
+        "hands_empty": True,
         "plain_background": True,
         "single_character": True,
         "face_visible": True,
@@ -1914,6 +1982,47 @@ def test_character_reference_qa_recomputes_wrong_view_verdict():
     assert review["views"]["back"]["passed"] is False
 
 
+def test_character_reference_qa_requires_empty_hands_in_seedance_body_views():
+    passing_view = {
+        "passed": True,
+        "view_match": True,
+        "framing_match": True,
+        "neutral_pose": True,
+        "hands_empty": True,
+        "plain_background": True,
+        "single_character": True,
+        "face_visible": True,
+        "both_eyes_visible": True,
+        "issues": [],
+    }
+    payload = {
+        "views": {
+            "face_closeup": passing_view,
+            "full_body": {**passing_view, "hands_empty": False},
+            "side": {**passing_view, "both_eyes_visible": False},
+            "back": {
+                **passing_view,
+                "face_visible": False,
+                "both_eyes_visible": False,
+            },
+        },
+        "cross_view": {
+            "passed": True,
+            "identity_consistent": True,
+            "outfit_consistent": True,
+            "body_proportions_consistent": True,
+            "issues": [],
+        },
+        "failed_views": [],
+    }
+
+    review = parse_character_reference_qa(json.dumps(payload))
+
+    assert review["passed"] is False
+    assert review["failed_views"] == ["full_body"]
+    assert review["views"]["full_body"]["hands_empty"] is False
+
+
 def test_character_discovery_body_contract_is_prompted_and_normalized(monkeypatch):
     response = json.dumps(
         [_adult_lead_character("LIN", "male", "25-30")],
@@ -1939,7 +2048,8 @@ def test_character_discovery_body_contract_is_prompted_and_normalized(monkeypatc
     assert "head_to_body_ratio=7.6" in captured["prompt"]
     assert "头宽不得超过肩宽的 43%" in captured["prompt"]
     assert ADULT_LEAD_DISCOVERY_INSTRUCTIONS in character_discoverer.SYSTEM_PROMPT
-    assert character_discoverer.CHARACTER_CONTEXT_SCHEMA_VERSION == 6
+    assert character_discoverer.CHARACTER_CONTEXT_SCHEMA_VERSION == 7
+    assert "interaction_props" in captured["prompt"]
     assert "bodybuilder physique" in discovered["negative_guardrails"]
     assert "Body-proportion lock" in discovered["prompt_definition"]
 

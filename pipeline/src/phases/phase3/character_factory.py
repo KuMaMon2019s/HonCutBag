@@ -39,6 +39,7 @@ from quality.character_reference_qa import (
     build_character_reference_qa_receipt,
     review_character_reference_pack,
 )
+from utils.character_reference_contracts import STATIC_REFERENCE_ASSET_POLICY
 from utils.character_body_contracts import character_visual_description
 from utils.camera_motion_contracts import (
     HUMAN_PERSPECTIVE_CONTRACT,
@@ -282,7 +283,7 @@ SOURCE_IMAGE_RULES = (
     "the frame, centered neutral "
     "expression, plain neutral gray studio background, flat even reference lighting, "
     "no full body, no action, no performance, no scenery, no street, no shop, no crowd, "
-    "no text, no signage, no logo, "
+    "no text, no signage, no logo, no hand-supported or operated object in frame, "
     f"{HUMAN_PERSPECTIVE_CONTRACT}"
 )
 
@@ -291,7 +292,8 @@ FULL_BODY_IMAGE_RULES = (
     "entire body visible from the top of the hair to the soles of both shoes, both feet fully "
     "inside the frame, generous empty margin above the hair and below the shoes, character "
     "occupies no more than 75 percent of canvas height, plain neutral gray studio background, "
-    "upright anatomical reference stance, arms relaxed straight down, hands open, feet parallel "
+    "upright anatomical reference stance, arms relaxed straight down, hands open and empty, "
+    "no item held, gripped, carried by hand, raised, used or operated, feet parallel "
     "and hip-width, weight balanced evenly, no dance, no performance, no action gesture, no "
     "scenery, no street, no shop, no crowd, no extra person, no text, no signage, no logo, no "
     "undeclared prop, no crop, no close-up, no medium shot, no knees or feet outside frame, "
@@ -339,6 +341,7 @@ def build_model_reference_prompts(
     rendering = _reference_rendering_clause(style)
     identity = (
         f"{fictional_decl}. Static identity facts only: {character_desc}. "
+        f"Asset boundary: {STATIC_REFERENCE_ASSET_POLICY} "
         f"Rendering medium only: {rendering}. Neutral expression. The project style is not "
         "permission to add its story location, crowd, camera movement, pose or action. "
         f"Avoid: {HUMAN_PERSPECTIVE_NEGATIVE}"
@@ -408,6 +411,7 @@ def build_combined_sheet_prompt(
         "   - 左下：90度侧面全身站立像（纯侧面轮廓，从头顶到脚底完整）\n"
         "   - 右下：背面全身站立像（后脑/背部/发尾清晰，从头顶到脚底完整）\n"
         "4. 自然站立，双臂自然下垂，双脚平行微分；禁止舞蹈、表演和动作姿势。\n"
+        f"   静态资产边界：{STATIC_REFERENCE_ASSET_POLICY}\n"
         "5. 四视图身份、设计语言、线条和色块完全一致；面部与发型细节清晰，但不得改变既定画面媒介。\n"
         "6. 画面比例 1:1 正方形，2×2网格布局。图中不要有任何文字、街景、店铺、"
         "人群、道具或项目剧情元素；项目风格只决定媒介，不得带入场景与动作。\n"
@@ -938,7 +942,7 @@ def generate_character(
         else "seedance_four_views"
     )
     card["source_image_rules"] = SOURCE_IMAGE_RULES
-    card["reference_contract_version"] = 2
+    card["reference_contract_version"] = 3
     card["reference_qa_report"] = (
         f"characters/{char_id}/character_reference_qa.json"
         if qa_receipt is not None

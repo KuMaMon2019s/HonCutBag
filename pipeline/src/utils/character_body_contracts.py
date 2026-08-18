@@ -11,6 +11,11 @@ import copy
 import re
 from typing import Any
 
+from utils.character_reference_contracts import (
+    STATIC_REFERENCE_ASSET_POLICY,
+    static_reference_identity_text,
+)
+
 BODY_CONTRACT_SCHEMA_VERSION = 2
 
 COMMON_ADULT_HUMAN_PROPORTION_CONTRACT: dict[str, Any] = {
@@ -295,7 +300,10 @@ def character_reference_identity_description(
     """
     appearance = character.get("appearance")
     if not isinstance(appearance, dict):
-        return str(fallback or character.get("description") or "").strip()
+        identity = static_reference_identity_text(
+            fallback or character.get("description") or ""
+        )
+        return " ".join(part for part in (identity, STATIC_REFERENCE_ASSET_POLICY) if part)
 
     labels = {
         "age_range": "age",
@@ -306,17 +314,20 @@ def character_reference_identity_description(
         "face": "face",
         "clothing": "clothing and static accessories",
     }
-    static_details = [
-        f"{label}: {str(appearance.get(key)).strip()}"
-        for key, label in labels.items()
-        if str(appearance.get(key) or "").strip()
-    ]
+    static_details = []
+    for key, label in labels.items():
+        value = str(appearance.get(key) or "").strip()
+        if key == "clothing":
+            value = static_reference_identity_text(value)
+        if value:
+            static_details.append(f"{label}: {value}")
     contract = body_contract_prompt(character)
     parts = [
         contract,
         "Static authored identity: " + "; ".join(static_details)
         if static_details
         else "",
+        STATIC_REFERENCE_ASSET_POLICY,
     ]
     result = " ".join(part for part in parts if part).strip()
     return result or str(fallback or character.get("description") or "").strip()

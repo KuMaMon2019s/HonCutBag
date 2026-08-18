@@ -7,7 +7,9 @@ import json
 from pathlib import Path
 from typing import Any, Protocol
 
-CHARACTER_REFERENCE_QA_SCHEMA = "honcut.character-reference-qa.v1"
+from utils.character_reference_contracts import STATIC_REFERENCE_QA_POLICY
+
+CHARACTER_REFERENCE_QA_SCHEMA = "honcut.character-reference-qa.v2"
 SEEDANCE_REFERENCE_VIEWS = ("face_closeup", "full_body", "side", "back")
 
 
@@ -39,15 +41,17 @@ def build_character_reference_qa_prompt(
         ),
         "full_body": (
             "strict front full-body reference; hair top and both shoe soles visible; "
-            "upright neutral stance, arms relaxed down, feet parallel and hip-width"
+            "upright neutral stance, arms relaxed down, hands empty, feet parallel and hip-width"
         ),
         "side": (
             "strict 90-degree left side full-body profile; nose, torso, hips and toes all "
-            "point left; only one eye is visible; head does not turn toward camera"
+            "point left; only one eye is visible; head does not turn toward camera; no "
+            "hand-supported or operated object"
         ),
         "back": (
             "strict 180-degree rear full-body view; back of head, shoulders, spine, outfit "
-            "rear and heels visible; no eyes, nose, mouth, chest or front of torso visible"
+            "rear and heels visible; no eyes, nose, mouth, chest or front of torso visible; "
+            "no hand-supported or operated object"
         ),
         "front": "strict straight-on identity portrait matching its requested framing",
         "three_quarter": "clear three-quarter identity portrait, neither front nor profile",
@@ -63,14 +67,17 @@ The input images are ordered and labelled by filename. Judge geometry and semant
 Static identity contract:
 {character_description}
 
+Asset-boundary contract:
+{STATIC_REFERENCE_QA_POLICY}
+
 Per-view contracts:
 {ordered}
 
 All images must contain exactly one instance of the character on a plain neutral studio
-background. No street, shop, crowd, scenery, performance, dance pose, action pose, prop not
-declared in the identity, text, watermark or logo is allowed. Full-body views must use the same
-neutral anatomical reference stance. Face, hair, outfit, static accessories, apparent age,
-head scale and body proportions must remain the same across views.
+background. No street, shop, crowd, scenery, performance, dance pose, action pose, interaction
+prop, text, watermark or logo is allowed. Full-body views must use the same neutral anatomical
+reference stance. Body-worn or fastened wardrobe/accessories, face, hair, apparent age, head
+scale and body proportions must remain the same across views.
 
 Return one JSON object only:
 {{
@@ -80,6 +87,7 @@ Return one JSON object only:
       "view_match": true,
       "framing_match": true,
       "neutral_pose": true,
+      "hands_empty": true,
       "plain_background": true,
       "single_character": true,
       "face_visible": true,
@@ -98,8 +106,10 @@ Return one JSON object only:
   "summary": "short factual summary"
 }}
 
-Set passed=false for any uncertain or violated requirement. For back, face_visible and
-both_eyes_visible must both be false. For side, both_eyes_visible must be false. When a
+Set passed=false for any uncertain or violated requirement. hands_empty means that no held,
+hand-carried, raised, used or operated item is visible; it does not require hands to appear in
+the face close-up. For back, face_visible and both_eyes_visible must both be false. For side,
+both_eyes_visible must be false. When a
 cross-view mismatch is localized, list the suspect filenames in failed_views; otherwise list
 all supplied filenames. Do not excuse a wrong angle because identity is consistent."""
 
@@ -156,6 +166,7 @@ def parse_character_reference_qa(
 
     normalized_views: dict[str, dict[str, Any]] = {}
     failed: set[str] = set()
+    seedance_pack = set(SEEDANCE_REFERENCE_VIEWS).issubset(view_names)
     boolean_fields = (
         "view_match",
         "framing_match",
@@ -180,6 +191,8 @@ def parse_character_reference_qa(
             )
         if name == "side":
             passed = passed and evidence.get("both_eyes_visible") is False
+        if seedance_pack and name in {"full_body", "side", "back"}:
+            passed = passed and evidence.get("hands_empty") is True
         if not passed:
             failed.add(name)
         normalized_views[name] = {
@@ -187,6 +200,7 @@ def parse_character_reference_qa(
             **{field: evidence.get(field) is True for field in boolean_fields},
             "face_visible": evidence.get("face_visible") is True,
             "both_eyes_visible": evidence.get("both_eyes_visible") is True,
+            "hands_empty": evidence.get("hands_empty") is True,
             "issues": [str(item) for item in issues if str(item).strip()],
         }
 

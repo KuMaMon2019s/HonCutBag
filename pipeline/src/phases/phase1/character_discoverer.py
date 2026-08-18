@@ -46,6 +46,7 @@ from utils.character_body_contracts import (
     body_contract_forbidden,
     body_contract_prompt,
 )
+from utils.character_reference_contracts import normalize_character_reference_assets
 
 
 # ─── LLM 配置 ───────────────────────────────────────────────────────────────
@@ -67,6 +68,8 @@ SYSTEM_PROMPT = (
     "\n\n外貌描述具体化要求：\n"
     "- hair 必须写明发色+发长+发型（如'黑色长直发及肩'），不能只写'长发'\n"
     "- clothing 必须具体到单品（上装+下装+鞋+配饰），不能只写'通勤装'、'休闲服'\n"
+    "- clothing 只允许身体、服装、鞋和无需手部支撑的穿戴/固定配饰；凡需手握、手提、举起、使用或操作的物件必须移入 interaction_props，禁止混入静态身份\n"
+    "- summary 只写静态外貌，不得写手持物件、动作、姿势、运镜或场景\n"
     "- summary 必须包含发型+服装+体态三要素，让 AI 图片生成器能画出一致的角色\n"
     "- 事件原文已明确的服装颜色、层次、材质、发型和配饰属于硬约束，必须原样保留，禁止改色、换装或替换材质\n"
     "- 根据角色的身份/职业/场景推导合理的具体服装（白领→衬衫+西装裤，学生→校服，店主→围裙）"
@@ -97,7 +100,8 @@ USER_PROMPT_TEMPLATE = (
     "  - build: 体型，如 slim/athletic/heavy/petite\n"
     "  - hair: 发型发色（必须具体：发色+发长+发型，如'黑色长直发及肩'、'深棕色短发微卷'）\n"
     "  - face: 面部特征（必须具体：脸型+五官特点，如'鹅蛋脸、柳叶眉、杏眼、高鼻梁'）\n"
-    "  - clothing: 典型穿着（必须具体到单品：上装+下装+鞋子+配饰，如'白色修身衬衫+深蓝色高腰西装裤+黑色尖头平底鞋+银色细链手表'）\n"
+    "  - clothing: 静态穿着（必须具体到单品：上装+下装+鞋子+无需手支撑的穿戴/固定配饰；不得包含手握、手提、举起、使用或操作的物件）\n"
+    "  - interaction_props: 互动道具数组（可选；逐字保留需手握、手提、举起、使用或操作的物件及其关系，仅供剧情镜头使用，不属于静态身份）\n"
     "  - distinguishing: 显著标记（可选）\n"
     "  - summary: 一句话外貌总结（必须包含：发型+服装+体态，如'20多岁清秀纤细的都市女白领，黑色长直发及肩，皮肤白皙，穿白色修身衬衫搭配深蓝色高腰西装裤'）\n"
     "- personality: 性格对象（可选），包含：\n"
@@ -133,7 +137,7 @@ ENTITY_SUFFIXES = (
 )
 MAX_ENTITY_NAME_CHINESE_CHARS = 12
 GENERIC_CHARACTER_NAMES = {"主角", "主人公", "男主", "女主", "人物", "他", "她", "它"}
-CHARACTER_CONTEXT_SCHEMA_VERSION = 6
+CHARACTER_CONTEXT_SCHEMA_VERSION = 7
 
 GENERIC_BACKGROUND_CHARACTER_NAMES = {
     "路人", "行人", "游客", "观众", "听众", "读者",
@@ -903,6 +907,12 @@ def discover_characters(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     # The LLM is instructed to emit this schema, but the normalization below is
     # the actual contract boundary and prevents creative paraphrase or drift.
     apply_adult_lead_body_contracts(characters)
+
+    # Separate stable, body-supported identity assets from props that require
+    # an active hand relationship. This is semantic infrastructure, not a
+    # script-, role-, or object-name exception.
+    for character in characters:
+        normalize_character_reference_assets(character)
 
     # 6. 生成 asset_path
     for char in characters:
