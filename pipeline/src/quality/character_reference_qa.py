@@ -106,26 +106,39 @@ all supplied filenames. Do not excuse a wrong angle because identity is consiste
 
 def _json_object(raw: str) -> dict[str, Any]:
     text = str(raw or "").strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        text = "\n".join(lines).strip()
-    start = text.find("{")
-    end = text.rfind("}")
-    if start < 0 or end < start:
+    if "{" not in text:
         raise CharacterReferenceQAError("character reference QA returned no JSON object")
-    try:
-        payload = json.loads(text[start:end + 1])
-    except json.JSONDecodeError as exc:
-        raise CharacterReferenceQAError(
-            f"character reference QA returned invalid JSON: {exc}"
-        ) from exc
-    if not isinstance(payload, dict):
-        raise CharacterReferenceQAError("character reference QA payload must be an object")
-    return payload
+
+    # VLMs sometimes wrap the requested object in markdown or append a prose
+    # explanation (occasionally containing another JSON object).  ``json.loads``
+    # over first-"{" through last-"}" turns that valid response into Extra data.
+    # raw_decode consumes exactly one complete value and tells us where it ends;
+    # scan candidate object starts until the QA-shaped object is found.
+    decoder = json.JSONDecoder()
+    first_object: dict[str, Any] | None = None
+    last_error: json.JSONDecodeError | None = None
+    for start, character in enumerate(text):
+        if character != "{":
+            continue
+        try:
+            candidate, _end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            continue
+        if not isinstance(candidate, dict):
+            continue
+        first_object = first_object or candidate
+        if isinstance(candidate.get("views"), dict) and isinstance(
+            candidate.get("cross_view"), dict
+        ):
+            return candidate
+
+    if first_object is not None:
+        return first_object
+    detail = f": {last_error}" if last_error is not None else ""
+    raise CharacterReferenceQAError(
+        f"character reference QA returned invalid JSON{detail}"
+    )
 
 
 def parse_character_reference_qa(

@@ -1703,6 +1703,97 @@ def test_phase3_reference_generation_uses_face_only_as_identity_anchor(
     assert run_quality_check("phase3", tmp_path).passed is True
 
 
+def test_phase3_existing_pack_retries_review_without_regenerating_images(
+    monkeypatch, tmp_path
+):
+    from PIL import Image
+
+    char_dir = tmp_path / "characters/agent"
+    char_dir.mkdir(parents=True)
+    for index, name in enumerate(("face_closeup", "full_body", "side", "back"), 1):
+        Image.effect_noise((512, 512), 24 * index).convert("RGB").save(
+            char_dir / f"{name}.png"
+        )
+
+    class ImageClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def text_to_image(self, **_kwargs):
+            pytest.fail("a complete existing pack must be reviewed before regeneration")
+
+        def image_to_image(self, **_kwargs):
+            pytest.fail("a parse retry must not regenerate images")
+
+    class Reviewer:
+        def __init__(self):
+            self.calls = 0
+
+        def review(self, _paths, _prompt):
+            self.calls += 1
+            if self.calls == 1:
+                return "```json\n{\"views\": "
+            common = {
+                "passed": True,
+                "view_match": True,
+                "framing_match": True,
+                "neutral_pose": True,
+                "plain_background": True,
+                "single_character": True,
+                "face_visible": True,
+                "both_eyes_visible": True,
+                "issues": [],
+            }
+            payload = {
+                "views": {
+                    "face_closeup": common,
+                    "full_body": common,
+                    "side": {**common, "both_eyes_visible": False},
+                    "back": {
+                        **common,
+                        "face_visible": False,
+                        "both_eyes_visible": False,
+                    },
+                },
+                "cross_view": {
+                    "passed": True,
+                    "identity_consistent": True,
+                    "outfit_consistent": True,
+                    "body_proportions_consistent": True,
+                    "issues": [],
+                },
+                "failed_views": [],
+                "summary": "all contracts pass",
+            }
+            # Reproduce 17_12: a valid requested object followed by prose and
+            # another JSON object must not cause json.loads Extra data.
+            return json.dumps(payload) + '\n审核完成。 {"note":"trailing object"}'
+
+    monkeypatch.setattr(character_factory, "SeedreamClient", ImageClient)
+    reviewer = Reviewer()
+    result = character_factory.generate_character(
+        char_id="agent",
+        name="Agent",
+        description="adult woman; neutral identity reference",
+        output_dir=str(tmp_path),
+        review_client=reviewer,
+        view_qa_max_retries=0,
+        review_qa_max_retries=1,
+    )
+
+    assert reviewer.calls == 2
+    assert not (char_dir / "reference_qa_attempts").exists()
+    receipt = json.loads(
+        (char_dir / "character_reference_qa.json").read_text(encoding="utf-8")
+    )
+    assert receipt["status"] == "passed"
+    assert [item["attempt_kind"] for item in receipt["attempts"]] == [
+        "review_error",
+        "semantic_review",
+    ]
+    assert Path(result["card"]).is_file()
+
+
 def _adult_lead_character(name, gender, age_range, role="protagonist"):
     return {
         "id": name.lower(),

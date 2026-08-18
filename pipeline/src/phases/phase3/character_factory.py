@@ -672,42 +672,68 @@ def _quality_control_reference_views(
     review_client: Any,
     default_size: str,
     max_retries: int,
+    review_max_retries: int,
 ) -> dict[str, Any]:
     """Review all views together and regenerate only the implicated views."""
     if max_retries < 0 or max_retries > 2:
         raise ValueError("character reference QA retries must be between 0 and 2")
+    if review_max_retries < 0 or review_max_retries > 2:
+        raise ValueError("character reference review retries must be between 0 and 2")
     report_path = char_dir / "character_reference_qa.json"
     attempts: list[dict[str, Any]] = []
     ordered_names = tuple(view_paths)
     anchor_name = ordered_names[0]
 
     for attempt in range(1, max_retries + 2):
-        try:
-            result = review_character_reference_pack(
-                review_client,
-                view_paths,
-                character_description,
-            )
-        except Exception as exc:
-            failed = {
-                "passed": False,
-                "views": {},
-                "cross_view": {"passed": False, "issues": [str(exc)]},
-                "failed_views": list(ordered_names),
-                "summary": f"review failed: {exc}",
-            }
-            attempts.append({"attempt": attempt, **failed})
-            receipt = build_character_reference_qa_receipt(
-                char_id=char_id,
-                view_paths=view_paths,
-                attempts=attempts,
-            )
-            _write_json_atomic(report_path, receipt)
-            raise CharacterReferenceQAError(
-                f"{char_id} reference review could not produce valid evidence: {exc}"
-            ) from exc
+        result: dict[str, Any] | None = None
+        successful_review_attempt = 0
+        for review_attempt in range(1, review_max_retries + 2):
+            try:
+                result = review_character_reference_pack(
+                    review_client,
+                    view_paths,
+                    character_description,
+                )
+                successful_review_attempt = review_attempt
+                break
+            except Exception as exc:
+                failed = {
+                    "attempt": attempt,
+                    "review_attempt": review_attempt,
+                    "attempt_kind": "review_error",
+                    "passed": False,
+                    "views": {},
+                    "cross_view": {"passed": False, "issues": [str(exc)]},
+                    "failed_views": list(ordered_names),
+                    "summary": f"review failed: {exc}",
+                }
+                attempts.append(failed)
+                receipt = build_character_reference_qa_receipt(
+                    char_id=char_id,
+                    view_paths=view_paths,
+                    attempts=attempts,
+                )
+                _write_json_atomic(report_path, receipt)
+                if review_attempt <= review_max_retries:
+                    print(
+                        f"  [reference-qa] {char_id} review response invalid "
+                        f"({review_attempt}/{review_max_retries + 1}): {exc}; "
+                        "re-reviewing the same images"
+                    )
+                    continue
+                raise CharacterReferenceQAError(
+                    f"{char_id} reference review could not produce valid evidence after "
+                    f"{review_attempt} attempt(s): {exc}"
+                ) from exc
 
-        attempts.append({"attempt": attempt, **result})
+        if result is None:
+            raise AssertionError("character reference review retry loop returned no result")
+        attempts.append({
+            "attempt": attempt,
+            "review_attempt": successful_review_attempt,
+            "attempt_kind": "semantic_review",
+            **result,
+        })
         receipt = build_character_reference_qa_receipt(
             char_id=char_id,
             view_paths=view_paths,
@@ -763,6 +789,7 @@ def generate_character(
     variants: Optional[list] = None,
     review_client: Any | None = None,
     view_qa_max_retries: int = 2,
+    review_qa_max_retries: int = 2,
 ) -> dict:
     """Generate complete character asset set.
 
@@ -799,7 +826,24 @@ def generate_character(
         else "doubao-seedream-5.0-lite"
     )
     if not skip_images:
-        print(f"[Step 1/3] Generating separated {target_model} references...")
+        reference_prompts = build_model_reference_prompts(
+            description, style, target_model
+        )
+        expected_views = {
+            view_name: Path(char_dir) / f"{view_name}.png"
+            for view_name in reference_prompts
+        }
+        existing_pack_complete = all(
+            path.is_file() and path.stat().st_size > 10_240
+            for path in expected_views.values()
+        )
+        if existing_pack_complete:
+            print(
+                f"[Step 1/3] Re-reviewing existing {target_model} references; "
+                "no image regeneration before semantic QA..."
+            )
+        else:
+            print(f"[Step 1/3] Generating separated {target_model} references...")
         _write_json_atomic(
             Path(char_dir) / "character_reference_qa.json",
             {
@@ -811,35 +855,38 @@ def generate_character(
             },
         )
         client = SeedreamClient(model=seedream_model)
-        reference_prompts = build_model_reference_prompts(description, style, target_model)
-        views = {}
-        try:
-            identity_anchor = None
-            for view_name, reference_prompt in reference_prompts.items():
-                view_path = Path(char_dir) / f"{view_name}.png"
-                _generate_reference_view(
-                    client,
-                    view_name=view_name,
-                    prompt=reference_prompt,
-                    output_path=view_path,
-                    size=_reference_view_size(view_name, size),
-                    identity_anchor=identity_anchor,
+        views = {name: str(path) for name, path in expected_views.items()}
+        if not existing_pack_complete:
+            views = {}
+            try:
+                identity_anchor = None
+                for view_name, reference_prompt in reference_prompts.items():
+                    view_path = expected_views[view_name]
+                    _generate_reference_view(
+                        client,
+                        view_name=view_name,
+                        prompt=reference_prompt,
+                        output_path=view_path,
+                        size=_reference_view_size(view_name, size),
+                        identity_anchor=identity_anchor,
+                    )
+                    identity_anchor = identity_anchor or view_path
+                    views[view_name] = str(view_path)
+                    print(f"  [{view_name}] ✓ → {view_path}")
+            except Exception as exc:
+                if target_model != "seedance":
+                    raise
+                print(
+                    f"  ⚠ separated references failed ({exc}); "
+                    "using legacy combined sheet fallback"
                 )
-                identity_anchor = identity_anchor or view_path
-                views[view_name] = str(view_path)
-                print(f"  [{view_name}] ✓ → {view_path}")
-        except Exception as exc:
-            if target_model != "seedance":
-                raise
-            print(f"  ⚠ separated references failed ({exc}); using legacy combined sheet fallback")
-            sheet_path = os.path.join(char_dir, "character_sheet.png")
-            client.text_to_image(
-                prompt=build_combined_sheet_prompt(description, style),
-                output_path=sheet_path,
-                size="1920x1920",
-            )
-            legacy_views = crop_character_sheet(sheet_path, char_dir, num_views=4)
-            views = legacy_views
+                sheet_path = os.path.join(char_dir, "character_sheet.png")
+                client.text_to_image(
+                    prompt=build_combined_sheet_prompt(description, style),
+                    output_path=sheet_path,
+                    size="1920x1920",
+                )
+                views = crop_character_sheet(sheet_path, char_dir, num_views=4)
 
         if not all(isinstance(path, str) and Path(path).is_file() for path in views.values()):
             raise RuntimeError(f"{char_id} reference generation produced an incomplete pack")
@@ -857,6 +904,7 @@ def generate_character(
             review_client=review_client,
             default_size=size,
             max_retries=view_qa_max_retries,
+            review_max_retries=review_qa_max_retries,
         )
     else:
         print("[Step 1/3] Skipping image generation (--skip-images)")
@@ -1012,6 +1060,7 @@ def batch_generate(characters: list, output_dir: str, **kwargs) -> list:
                 variants=char.get("appearance", {}).get("variants", []),
                 review_client=kwargs.get("review_client"),
                 view_qa_max_retries=kwargs.get("view_qa_max_retries", 2),
+                review_qa_max_retries=kwargs.get("review_qa_max_retries", 2),
             )
             results.append(result)
         except Exception as e:
