@@ -88,6 +88,7 @@ from runtime.continuity_provider import (
     _direct_seedance_executor,
     _generation_seed,
     _provider_content,
+    _render_privacy_safe_handle_bridge,
     _seedance_reference_image_payload,
     execute_phase6_auto_continuity,
     finalize_continuity_shot,
@@ -2075,6 +2076,59 @@ def test_chunk_runtime_archives_primary_shot_bridge_videos(tmp_path):
     assert bridge_request.target_output_path == tmp_path / "shots/S02/output.mp4"
 
 
+def test_chunk_runtime_labels_local_privacy_bridge_fallback(tmp_path):
+    storyboard = {
+        "continuity_mode": "one_take",
+        "video_provider": "seedance",
+        "shots": [
+            {"id": "S01", "duration": 15, "where": "A", "micro_actions": ["move"]},
+            {"id": "S02", "duration": 15, "where": "B", "micro_actions": ["move"]},
+        ],
+    }
+    plan_storyboard_beats(storyboard)
+    plan = build_continuity_plan(storyboard)
+
+    def execute(request):
+        request.output_path.parent.mkdir(parents=True, exist_ok=True)
+        request.output_path.write_bytes(request.resource_id.encode())
+        if request.chunk.execution_strategy == "first_last_frame_bridge":
+            return ChunkExecutionResult(
+                request.output_path,
+                privacy_policy_repairs=({
+                    "attempt": 1,
+                    "policy": "required_endpoints_inseparable_local_handle_fallback_v1",
+                },),
+                provider_fallback={
+                    "policy": "local_boundary_handle_passthrough_v1",
+                    "provider_generation": False,
+                },
+            )
+        return ChunkExecutionResult(request.output_path)
+
+    report = execute_continuity_plan(
+        plan,
+        tmp_path,
+        execute_chunk=execute,
+        inspect_seam=_inspect_test_seam,
+        materialize_shot=_materialize_test_shot,
+        normalize_chunk=lambda path, _chunk, _fps: {"output_path": str(path)},
+    )
+
+    manifest = json.loads((tmp_path / "PRIMARY_SHOT_BRIDGES.json").read_text())
+    bridge = manifest["bridges"][0]
+    assert report["privacy_policy_repair_attempts"] == 1
+    assert report["repair_attempts"] == 1
+    assert bridge["provider_fallback"]["policy"] == (
+        "local_boundary_handle_passthrough_v1"
+    )
+    assert bridge["video_endpoint_policy"] == (
+        "local_actual_boundary_handle_passthrough"
+    )
+    assert bridge["phase8_transition_policy"] == (
+        "replace_boundary_handles_with_local_passthrough"
+    )
+
+
 def test_chunk_runtime_returns_a_top_level_failure_summary(tmp_path):
     plan = build_continuity_plan({"shots": [{"id": "S01", "duration": 15}]})
 
@@ -3171,6 +3225,315 @@ def test_direct_continuity_adapter_drops_provider_rejected_privacy_images_once(
         if item.get("type") == "image_url"
     ]
     assert retained_urls == ["safe-storyboard", "safe-group-board"]
+    assert len(result.privacy_policy_repairs) == 1
+    assert result.privacy_policy_repairs[0]["removed_content_indices"] == [2, 3, 4]
+
+
+def test_direct_continuity_adapter_handles_two_indexed_privacy_rounds(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr("utils.video_validation.is_valid_video", lambda _path: True)
+    shot_dir = tmp_path / "shots/S01"
+    shot_dir.mkdir(parents=True)
+    (shot_dir / "SHOT_META.json").write_text(
+        json.dumps({"prompt": "continue authored motion", "gen_strategy": "phantom"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ARK_AGENT_API_KEY", "test-key")
+    monkeypatch.setenv("HONCUT_CAPACITY_DB", str(tmp_path / "capacity.db"))
+    monkeypatch.setenv("VIDEO_GEN_CONCURRENCY", "1")
+    provider_content = [
+        {"type": "text", "text": "authored motion"},
+        {"type": "image_url", "image_url": {"url": "rejected-first"}},
+        {"type": "image_url", "image_url": {"url": "rejected-second"}},
+        {"type": "image_url", "image_url": {"url": "retained"}},
+    ]
+    monkeypatch.setattr(
+        "tools.asset_packager.build_content_for_shot",
+        lambda **_kwargs: [dict(item) for item in provider_content],
+    )
+    submissions = []
+
+    def fake_submit(content, **_kwargs):
+        submissions.append(content)
+        if len(submissions) <= 2:
+            raise RuntimeError(
+                "InputImageSensitiveContentDetected.PrivacyInformation: "
+                "content[1] may contain real person"
+            )
+        return "seedance-job-after-two-repairs"
+
+    monkeypatch.setattr(seedance_client, "submit_content", fake_submit)
+    monkeypatch.setattr(
+        seedance_client,
+        "poll",
+        lambda task_id, api_key: "https://video.test/output.mp4",
+    )
+    monkeypatch.setattr(
+        seedance_client,
+        "download",
+        lambda url, path: Path(path).write_bytes(b"video") or path,
+    )
+    request = _fresh_chunk_request(tmp_path)
+    request.output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    result = _direct_seedance_executor(
+        tmp_path,
+        GenerationTaskStore(tmp_path / "runtime.db"),
+    )(request)
+
+    assert result.provider_task_id == "seedance-job-after-two-repairs"
+    assert len(submissions) == 3
+    assert [
+        item.get("image_url", {}).get("url")
+        for item in submissions[-1]
+        if item.get("type") == "image_url"
+    ] == ["retained"]
+    assert [repair["attempt"] for repair in result.privacy_policy_repairs] == [1, 2]
+
+
+def test_native_extension_privacy_rejection_drops_video_but_keeps_ordered_frames(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr("utils.video_validation.is_valid_video", lambda _path: True)
+    shot_dir = tmp_path / "shots/S02"
+    shot_dir.mkdir(parents=True)
+    (shot_dir / "SHOT_META.json").write_text(
+        json.dumps({"prompt": "continue without reset", "gen_strategy": "phantom"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ARK_AGENT_API_KEY", "test-key")
+    monkeypatch.setenv("HONCUT_CAPACITY_DB", str(tmp_path / "capacity.db"))
+    monkeypatch.setenv("VIDEO_GEN_CONCURRENCY", "1")
+    internal_content = [
+        {"type": "text", "text": "向后延长视频1。"},
+        {
+            "type": "image_url",
+            "image_url": {"url": "tail-frame-1"},
+            "role": "reference_image",
+            "_continuity_role": "ordered_tail_frame",
+        },
+        {
+            "type": "image_url",
+            "image_url": {"url": "tail-frame-2"},
+            "role": "reference_image",
+            "_continuity_role": "ordered_tail_frame",
+        },
+        {
+            "type": "video_url",
+            "video_url": {"url": "rejected-tail-window"},
+            "role": "reference_video",
+            "_continuity_role": "tail_window_video",
+        },
+    ]
+    monkeypatch.setattr(
+        "runtime.continuity_provider._provider_content",
+        lambda _root, _request: ([dict(item) for item in internal_content], {}, None, 6),
+    )
+    submissions = []
+
+    def fake_submit(content, **_kwargs):
+        submissions.append(content)
+        if len(submissions) == 1:
+            raise RuntimeError(
+                "InputVideoSensitiveContentDetected.PrivacyInformation: "
+                "content[3] may contain real person"
+            )
+        return "seedance-frame-only-extension"
+
+    monkeypatch.setattr(seedance_client, "submit_content", fake_submit)
+    monkeypatch.setattr(
+        seedance_client,
+        "poll",
+        lambda task_id, api_key: "https://video.test/output.mp4",
+    )
+    monkeypatch.setattr(
+        seedance_client,
+        "download",
+        lambda url, path: Path(path).write_bytes(b"video") or path,
+    )
+    previous = tmp_path / "shots/S02/chunks/S02_C01.mp4"
+    previous.parent.mkdir(parents=True)
+    previous.write_bytes(b"previous")
+    request = ChunkExecutionRequest(
+        resource_id="S02_C02",
+        shot_id="S02",
+        chunk=GenerationChunk(
+            chunk_id="S02_C02",
+            sequence=2,
+            target_duration_s=6,
+            mode="native_extend",
+            depends_on="S02_C01",
+            execution_strategy="tail_video_extend",
+        ),
+        anchors={},
+        output_path=tmp_path / "shots/S02/chunks/S02_C02.mp4",
+        previous_output_path=previous,
+        input_fingerprint="privacy-video-fingerprint",
+        memory_context="",
+    )
+
+    result = _direct_seedance_executor(
+        tmp_path,
+        GenerationTaskStore(tmp_path / "runtime.db"),
+    )(request)
+
+    assert result.provider_task_id == "seedance-frame-only-extension"
+    assert len(submissions) == 2
+    assert not any(item.get("type") == "video_url" for item in submissions[1])
+    assert sum(item.get("type") == "image_url" for item in submissions[1]) == 2
+    assert "privacy-safe frame-only continuity fallback" in submissions[1][0]["text"]
+    assert not any(
+        any(str(key).startswith("_") for key in item)
+        for submission in submissions
+        for item in submission
+    )
+    assert result.privacy_policy_repairs[0]["policy"] == (
+        "drop_rejected_video_keep_ordered_tail_frames_v1"
+    )
+
+
+def test_flf2v_privacy_rejection_uses_local_handle_passthrough_without_dropping_endpoint(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr("utils.video_validation.is_valid_video", lambda _path: True)
+    shot_dir = tmp_path / "shots/S01"
+    shot_dir.mkdir(parents=True)
+    (shot_dir / "SHOT_META.json").write_text(
+        json.dumps({"prompt": "bridge adjacent primaries"}), encoding="utf-8"
+    )
+    (tmp_path / "CONTINUITY_PLAN.json").write_text(
+        json.dumps({
+            "timeline_fps": 24,
+            "bridges": [{
+                "source_shot_id": "S01",
+                "target_shot_id": "S02",
+                "source_handle_s": 2.0,
+                "target_handle_s": 2.0,
+                "visible_duration_s": 4.0,
+            }],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ARK_AGENT_API_KEY", "test-key")
+    monkeypatch.setenv("HONCUT_CAPACITY_DB", str(tmp_path / "capacity.db"))
+    monkeypatch.setenv("VIDEO_GEN_CONCURRENCY", "1")
+    endpoint_content = [
+        {"type": "text", "text": "bridge"},
+        {
+            "type": "image_url",
+            "image_url": {"url": "required-first"},
+            "role": "first_frame",
+            "_continuity_role": "required_first_frame",
+        },
+        {
+            "type": "image_url",
+            "image_url": {"url": "required-last"},
+            "role": "last_frame",
+            "_continuity_role": "required_last_frame",
+        },
+    ]
+    monkeypatch.setattr(
+        "runtime.continuity_provider._provider_content",
+        lambda _root, _request: ([dict(item) for item in endpoint_content], {}, None, 4),
+    )
+    submissions = []
+
+    def rejected_submit(content, **_kwargs):
+        submissions.append(content)
+        raise RuntimeError(
+            "InputImageSensitiveContentDetected.PrivacyInformation: "
+            "content[1] may contain real person"
+        )
+
+    monkeypatch.setattr(seedance_client, "submit_content", rejected_submit)
+    rendered = {}
+
+    def fake_render(source, target, output, **kwargs):
+        rendered.update(source=source, target=target, **kwargs)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"local-valid-video")
+        return {
+            "policy": "local_boundary_handle_passthrough_v1",
+            "provider_generation": False,
+        }
+
+    monkeypatch.setattr(
+        "runtime.continuity_provider._render_privacy_safe_handle_bridge",
+        fake_render,
+    )
+    source = tmp_path / "shots/S01/output.mp4"
+    target = tmp_path / "shots/S02/output.mp4"
+    source.write_bytes(b"source")
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"target")
+    request = ChunkExecutionRequest(
+        resource_id="S01__S02_B01",
+        shot_id="S01",
+        chunk=GenerationChunk(
+            chunk_id="S01__S02_B01",
+            sequence=1,
+            target_duration_s=4,
+            requested_frames=96,
+            expected_unique_frames=96,
+            mode="native_extend",
+            depends_on="S01_C01",
+            execution_strategy="first_last_frame_bridge",
+            bridge_target_shot_id="S02",
+        ),
+        anchors={},
+        output_path=tmp_path / "shot_bridges/S01__S02.mp4",
+        previous_output_path=source,
+        target_output_path=target,
+        input_fingerprint="bridge-privacy-fingerprint",
+        memory_context="",
+    )
+
+    result = _direct_seedance_executor(
+        tmp_path,
+        GenerationTaskStore(tmp_path / "runtime.db"),
+    )(request)
+
+    assert len(submissions) == 1
+    assert [item.get("role") for item in submissions[0][1:]] == [
+        "first_frame",
+        "last_frame",
+    ]
+    assert result.provider_task_id is None
+    assert result.provider_fallback["policy"] == "local_boundary_handle_passthrough_v1"
+    assert result.privacy_policy_repairs[0]["removed_content_indices"] == []
+    assert rendered["source_handle_s"] == 2.0
+    assert rendered["target_handle_s"] == 2.0
+
+
+def test_privacy_safe_handle_bridge_has_exact_frame_budget(tmp_path):
+    source = tmp_path / "source.mp4"
+    target = tmp_path / "target.mp4"
+    output = tmp_path / "bridge.mp4"
+    for path, color in ((source, "blue"), (target, "red")):
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                f"color=c={color}:s=160x90:r=24:d=3",
+                "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(path),
+            ],
+            check=True,
+        )
+
+    receipt = _render_privacy_safe_handle_bridge(
+        source,
+        target,
+        output,
+        source_handle_s=1.0,
+        target_handle_s=1.0,
+        timeline_fps=24,
+        width=160,
+        height=90,
+    )
+
+    assert probe_continuity_frames(output, 24)["frames"] == 48
+    assert receipt["frames"] == 48
+    assert receipt["transition_effect"] == "none_hard_cut_preserved"
 
 
 def test_direct_continuity_adapter_rewrites_output_audio_policy_once(

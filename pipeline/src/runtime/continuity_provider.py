@@ -45,6 +45,8 @@ SEEDANCE_MAX_IMAGE_ASPECT = 2.50
 SEEDANCE_IMAGE_ASPECT_MARGIN = 0.01
 MAX_COPYRIGHT_POLICY_REPAIRS = 2
 COPYRIGHT_POLICY_REPAIR_VERSION = "original_audio_frame_fallback_v1"
+MAX_PRIVACY_POLICY_REPAIRS = 2
+PRIVACY_POLICY_REPAIR_VERSION = "provider_indexed_media_fallback_v2"
 _COPYRIGHT_SAFE_AUDIO_CONTRACT = (
     "[copyright-safe audio contract] Generate original ambient location sounds only: "
     "natural footsteps, clothing movement, crowd presence, and location ambience. "
@@ -59,6 +61,24 @@ _FRAME_ONLY_CONTINUITY_CONTRACT = (
     "position, direction, camera, and lighting without reconstructing or quoting any audio "
     "from the rejected media.\n"
 )
+_PRIVACY_FRAME_ONLY_CONTINUITY_CONTRACT = (
+    "[privacy-safe frame-only continuity fallback] The provider-rejected tail-window "
+    "video has been removed. Continue from the remaining ordered tail-state frames. "
+    "They preserve the predecessor's final position, direction, speed, camera and "
+    "lighting. Earlier picture numbers may have changed after rejected media removal; "
+    "use the remaining continuity anchors in their current order and do not reset or "
+    "replay the action.\n"
+)
+_PRIVACY_VIDEO_ONLY_CONTINUITY_CONTRACT = (
+    "[privacy-safe tail-video continuity fallback] One or more provider-rejected still "
+    "references have been removed. Continue from the remaining tail-window video and "
+    "continuity anchors only. Earlier picture numbers may have changed; never infer or "
+    "recreate a removed reference.\n"
+)
+
+
+class RequiredContinuityEndpointPrivacyError(RuntimeError):
+    """A provider rejected an inseparable first/last-frame bridge endpoint."""
 
 
 def probe_continuity_frames(path: Path, timeline_fps: int) -> dict[str, Any]:
@@ -702,6 +722,7 @@ def _extension_content(
             "type": "image_url",
             "image_url": {"url": url},
             "role": "reference_image",
+            "_continuity_role": "ordered_tail_frame",
         }
         for url in frame_urls
     )
@@ -710,6 +731,7 @@ def _extension_content(
             "type": "video_url",
             "video_url": {"url": video_url},
             "role": "reference_video",
+            "_continuity_role": "tail_window_video",
         }
     )
     return normalized
@@ -775,12 +797,14 @@ def _first_last_bridge_content(
             "image_url": {"url": first_url},
             "role": "first_frame",
             "priority": "high",
+            "_continuity_role": "required_first_frame",
         },
         {
             "type": "image_url",
             "image_url": {"url": last_url},
             "role": "last_frame",
             "priority": "high",
+            "_continuity_role": "required_last_frame",
         },
     ]
 
@@ -867,7 +891,7 @@ def _task_payload(
         "provider_minimum_padding_duration_s": round(padding_duration, 6),
         "seed": seed,
         "repair_attempt": request.repair_attempt,
-        "privacy_fallback": "drop_provider_rejected_images_once_v1",
+        "privacy_fallback": PRIVACY_POLICY_REPAIR_VERSION,
     }
 
 
@@ -929,17 +953,13 @@ def _provider_input_context(
     }
 
 
-def _privacy_rejected_image_indices(
+def _privacy_rejected_media_indices(
     content: Sequence[dict[str, Any]],
     error: BaseException,
 ) -> tuple[int, ...]:
-    """Resolve only provider-addressed image items from a privacy rejection."""
+    """Resolve provider-addressed image/video items from a privacy rejection."""
     message = str(error)
-    privacy_markers = (
-        "PrivacyInformation",
-        "InputImageSensitiveContentDetected",
-        "real person",
-    )
+    privacy_markers = ("PrivacyInformation", "real person")
     if not any(marker.casefold() in message.casefold() for marker in privacy_markers):
         return ()
     indices = []
@@ -947,11 +967,23 @@ def _privacy_rejected_image_indices(
         index = int(raw_index)
         if (
             0 <= index < len(content)
-            and content[index].get("type") == "image_url"
+            and content[index].get("type") in {"image_url", "video_url"}
             and index not in indices
         ):
             indices.append(index)
     return tuple(indices)
+
+
+def _privacy_rejected_image_indices(
+    content: Sequence[dict[str, Any]],
+    error: BaseException,
+) -> tuple[int, ...]:
+    """Compatibility wrapper returning only provider-addressed image items."""
+    return tuple(
+        index
+        for index in _privacy_rejected_media_indices(content, error)
+        if content[index].get("type") == "image_url"
+    )
 
 
 def _without_content_indices(
@@ -960,6 +992,84 @@ def _without_content_indices(
 ) -> list[dict[str, Any]]:
     rejected = set(rejected_indices)
     return [dict(item) for index, item in enumerate(content) if index not in rejected]
+
+
+def _provider_ready_content(
+    content: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Strip local continuity annotations without changing provider indices."""
+    return [
+        {key: value for key, value in item.items() if not str(key).startswith("_")}
+        for item in content
+    ]
+
+
+def _privacy_repair_content(
+    content: Sequence[dict[str, Any]],
+    rejected_indices: Sequence[int],
+    *,
+    request: ChunkExecutionRequest,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Remove only rejected optional media while preserving continuity structure."""
+    rejected = tuple(dict.fromkeys(int(index) for index in rejected_indices))
+    removed = [content[index] for index in rejected if 0 <= index < len(content)]
+    if not removed or len(removed) != len(rejected):
+        raise RuntimeError("privacy fallback could not resolve every rejected media item")
+
+    required_endpoints = [
+        index
+        for index in rejected
+        if str(content[index].get("_continuity_role") or "").startswith("required_")
+    ]
+    if required_endpoints:
+        raise RequiredContinuityEndpointPrivacyError(
+            "provider privacy review rejected required first/last bridge endpoint(s): "
+            + ", ".join(f"content[{index}]" for index in required_endpoints)
+        )
+
+    corrected = _without_content_indices(content, rejected)
+    native_extend = request.chunk.mode == "native_extend"
+    if native_extend:
+        remaining_continuity = [
+            item for item in corrected if item.get("_continuity_role")
+        ]
+        if not remaining_continuity:
+            raise RuntimeError(
+                "privacy fallback would remove every tail continuity anchor"
+            )
+
+    removed_types = sorted({str(item.get("type") or "unknown") for item in removed})
+    removed_video = any(item.get("type") == "video_url" for item in removed)
+    contract = (
+        _PRIVACY_FRAME_ONLY_CONTINUITY_CONTRACT
+        if native_extend and removed_video
+        else _PRIVACY_VIDEO_ONLY_CONTINUITY_CONTRACT
+        if native_extend
+        else ""
+    )
+    if contract:
+        text_item = next(
+            (item for item in corrected if item.get("type") == "text"),
+            None,
+        )
+        if text_item is None:
+            corrected.insert(0, {"type": "text", "text": contract})
+        elif contract not in str(text_item.get("text") or ""):
+            text_item["text"] = contract + str(text_item.get("text") or "")
+
+    return corrected, {
+        "reason_code": "InputMediaSensitiveContentDetected.PrivacyInformation",
+        "policy": (
+            "drop_rejected_video_keep_ordered_tail_frames_v1"
+            if removed_video
+            else "drop_provider_rejected_optional_images_v2"
+        ),
+        "removed_content_indices": list(rejected),
+        "removed_media_types": removed_types,
+        "remaining_continuity_anchors": sum(
+            bool(item.get("_continuity_role")) for item in corrected
+        ),
+    }
 
 
 def _copyright_policy_violation_kind(error: BaseException) -> str | None:
@@ -1066,6 +1176,143 @@ def _copyright_repair_seed(
     return int(hashlib.sha256(material.encode()).hexdigest()[:8], 16) % 2_147_483_647
 
 
+def _bridge_handle_contract(
+    output_dir: Path,
+    request: ChunkExecutionRequest,
+) -> tuple[float, float, int]:
+    """Load the exact additive-handle budget for one post-primary bridge."""
+    plan_path = output_dir / "CONTINUITY_PLAN.json"
+    document = json.loads(plan_path.read_text(encoding="utf-8"))
+    target_shot_id = str(request.chunk.bridge_target_shot_id or "").strip()
+    bridge = next(
+        (
+            item
+            for item in document.get("bridges", [])
+            if isinstance(item, dict)
+            and item.get("source_shot_id") == request.shot_id
+            and item.get("target_shot_id") == target_shot_id
+        ),
+        None,
+    )
+    if bridge is None:
+        raise RuntimeError(
+            f"cannot resolve handle contract for {request.shot_id}__{target_shot_id}"
+        )
+    source_handle_s = float(bridge.get("source_handle_s") or 0.0)
+    target_handle_s = float(bridge.get("target_handle_s") or 0.0)
+    duration_s = float(bridge.get("visible_duration_s") or request.chunk.target_duration_s)
+    if source_handle_s <= 0 or target_handle_s <= 0:
+        raise RuntimeError("privacy bridge fallback requires two positive handle durations")
+    if not math.isclose(source_handle_s + target_handle_s, duration_s, abs_tol=1e-6):
+        raise RuntimeError(
+            "privacy bridge fallback requires source_handle + target_handle "
+            "to equal visible bridge duration"
+        )
+    timeline_fps = int(document.get("timeline_fps") or 24)
+    if timeline_fps <= 0:
+        raise RuntimeError("privacy bridge fallback requires a positive timeline fps")
+    return source_handle_s, target_handle_s, timeline_fps
+
+
+def _render_privacy_safe_handle_bridge(
+    source_video: Path,
+    target_video: Path,
+    output_path: Path,
+    *,
+    source_handle_s: float,
+    target_handle_s: float,
+    timeline_fps: int,
+    width: int,
+    height: int,
+) -> dict[str, Any]:
+    """Emit an honest local bridge by preserving the two budgeted handles.
+
+    Phase 8 removes these same handles from the adjacent primaries. Re-emitting
+    them here therefore preserves timing and every real source frame without
+    inventing faces, duplicating story time, or pretending a hard cut is a
+    provider-generated transition.
+    """
+    for label, path in (("source", source_video), ("target", target_video)):
+        if not path.is_file() or path.stat().st_size == 0:
+            raise FileNotFoundError(f"privacy fallback {label} video missing: {path}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_path.with_name(
+        f"{output_path.stem}.privacy_handle_fallback{output_path.suffix}"
+    )
+    total_frames = round((source_handle_s + target_handle_s) * timeline_fps)
+    common = (
+        f"fps={timeline_fps},"
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p"
+    )
+    filter_graph = (
+        f"[0:v]trim=duration={source_handle_s:.6f},setpts=PTS-STARTPTS,{common}[src];"
+        f"[1:v]trim=duration={target_handle_s:.6f},setpts=PTS-STARTPTS,{common}[dst];"
+        f"[src][dst]concat=n=2:v=1:a=0,trim=end_frame={total_frames},"
+        "setpts=PTS-STARTPTS[outv]"
+    )
+    completed = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-sseof",
+            f"-{source_handle_s:.6f}",
+            "-i",
+            str(source_video),
+            "-i",
+            str(target_video),
+            "-filter_complex",
+            filter_graph,
+            "-map",
+            "[outv]",
+            "-frames:v",
+            str(total_frames),
+            "-an",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(temporary),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    if completed.returncode != 0 or not temporary.is_file() or temporary.stat().st_size == 0:
+        temporary.unlink(missing_ok=True)
+        detail = completed.stderr.strip().splitlines()
+        raise RuntimeError(
+            "cannot render privacy-safe handle bridge: "
+            f"{detail[-1] if detail else 'unknown ffmpeg error'}"
+        )
+    observed = probe_continuity_frames(temporary, timeline_fps)
+    if int(observed["frames"]) != total_frames:
+        temporary.unlink(missing_ok=True)
+        raise RuntimeError(
+            "privacy-safe handle bridge frame mismatch: "
+            f"expected {total_frames}, got {observed['frames']}"
+        )
+    os.replace(temporary, output_path)
+    return {
+        "policy": "local_boundary_handle_passthrough_v1",
+        "reason": "provider privacy review rejected an inseparable FLF2V endpoint",
+        "provider_generation": False,
+        "transition_effect": "none_hard_cut_preserved",
+        "source_handle_s": source_handle_s,
+        "target_handle_s": target_handle_s,
+        "timeline_fps": timeline_fps,
+        "frames": total_frames,
+        "phase8_contract": "replace_the_same_boundary_handles",
+    }
+
+
 def _direct_seedance_executor(
     output_dir: Path,
     task_store: GenerationTaskStore,
@@ -1091,6 +1338,7 @@ def _direct_seedance_executor(
         payload["ratio"] = ratio
         run_id = str(output_dir.resolve())
         repairs: list[dict[str, Any]] = []
+        privacy_repairs: list[dict[str, Any]] = []
         content_override: list[dict[str, Any]] | None = None
         execution = None
         with slots.reserve("seedance", "video", request.resource_id, capacity=capacity):
@@ -1138,43 +1386,79 @@ def _direct_seedance_executor(
                         else f"{request.resource_id}_CP{policy_attempt:02d}"
                     )
 
-                    def submit() -> str:
+                    def submit(
+                        current_content: Sequence[dict[str, Any]] = content,
+                        current_seed: int | None = attempt_seed,
+                        submitted: list[dict[str, Any]] = submitted_content,
+                    ) -> str:
                         def submit_selected(
                             selected: Sequence[dict[str, Any]],
                         ) -> str:
-                            submitted_content[:] = [dict(item) for item in selected]
+                            submitted[:] = [dict(item) for item in selected]
                             return seedance_client.submit_content(
-                                selected,
+                                _provider_ready_content(selected),
                                 api_key=api_key,
                                 model=model,
                                 duration=duration,
                                 ratio=ratio,
-                                seed=attempt_seed,
+                                seed=current_seed,
                             )
 
-                        try:
-                            return submit_selected(content)
-                        except Exception as exc:
-                            rejected_indices = _privacy_rejected_image_indices(
-                                content,
-                                exc,
-                            )
-                            if not rejected_indices:
-                                raise
-                            corrected_content = _without_content_indices(
-                                content,
-                                rejected_indices,
-                            )
-                            print(
-                                "  🛡 Seedance 隐私纠偏：移除服务商明确拒绝的参考图 "
-                                + ", ".join(
-                                    f"content[{index}]"
-                                    for index in rejected_indices
+                        selected = [dict(item) for item in current_content]
+                        while True:
+                            try:
+                                return submit_selected(selected)
+                            except Exception as exc:
+                                rejected_indices = _privacy_rejected_media_indices(
+                                    selected,
+                                    exc,
                                 )
-                                + "，限次重试 1 次",
-                                flush=True,
-                            )
-                            return submit_selected(corrected_content)
+                                if (
+                                    not rejected_indices
+                                    or len(privacy_repairs)
+                                    >= MAX_PRIVACY_POLICY_REPAIRS
+                                ):
+                                    raise
+                                try:
+                                    corrected_content, repair = _privacy_repair_content(
+                                        selected,
+                                        rejected_indices,
+                                        request=request,
+                                    )
+                                except RequiredContinuityEndpointPrivacyError as endpoint_exc:
+                                    privacy_repairs.append({
+                                        "attempt": len(privacy_repairs) + 1,
+                                        "reason_code": (
+                                            "InputImageSensitiveContentDetected."
+                                            "PrivacyInformation"
+                                        ),
+                                        "policy": (
+                                            "required_endpoints_inseparable_"
+                                            "local_handle_fallback_v1"
+                                        ),
+                                        "removed_content_indices": [],
+                                        "rejected_content_indices": list(
+                                            rejected_indices
+                                        ),
+                                    })
+                                    raise endpoint_exc from exc
+                                repair = {
+                                    "attempt": len(privacy_repairs) + 1,
+                                    **repair,
+                                }
+                                privacy_repairs.append(repair)
+                                selected = corrected_content
+                                print(
+                                    "  🛡 Seedance 隐私合规降级："
+                                    f"{repair['policy']}，移除 "
+                                    + ", ".join(
+                                        f"content[{index}]"
+                                        for index in rejected_indices
+                                    )
+                                    + f" ({len(privacy_repairs)}/"
+                                    f"{MAX_PRIVACY_POLICY_REPAIRS})",
+                                    flush=True,
+                                )
 
                     try:
                         succeeded = task_store.find_succeeded(
@@ -1213,6 +1497,44 @@ def _direct_seedance_executor(
                         )
                         break
                     except Exception as exc:
+                        if isinstance(
+                            exc,
+                            RequiredContinuityEndpointPrivacyError,
+                        ):
+                            if (
+                                request.previous_output_path is None
+                                or request.target_output_path is None
+                            ):
+                                raise RuntimeError(
+                                    "privacy-safe bridge fallback requires completed "
+                                    "source and target primary videos"
+                                ) from exc
+                            source_handle_s, target_handle_s, timeline_fps = (
+                                _bridge_handle_contract(output_dir, request)
+                            )
+                            fallback = _render_privacy_safe_handle_bridge(
+                                request.previous_output_path,
+                                request.target_output_path,
+                                request.output_path,
+                                source_handle_s=source_handle_s,
+                                target_handle_s=target_handle_s,
+                                timeline_fps=timeline_fps,
+                                width=_width,
+                                height=_height,
+                            )
+                            print(
+                                "  🛡 FLF2V 必需端点被隐私审核拒绝：改用本地等长把手"
+                                "透传，Phase 8 仍按原合同替换边界把手",
+                                flush=True,
+                            )
+                            return ChunkExecutionResult(
+                                output_path=request.output_path,
+                                provider_task_id=None,
+                                privacy_policy_repairs=tuple(
+                                    dict(item) for item in privacy_repairs
+                                ),
+                                provider_fallback=fallback,
+                            )
                         violation_kind = _copyright_policy_violation_kind(exc)
                         if (
                             violation_kind is None
@@ -1279,6 +1601,9 @@ def _direct_seedance_executor(
             output_path=Path(execution.output_path),
             provider_task_id=execution.provider_job_id,
             copyright_policy_repairs=tuple(dict(item) for item in repairs),
+            privacy_policy_repairs=tuple(
+                dict(item) for item in privacy_repairs
+            ),
         )
 
     return execute
@@ -1318,7 +1643,7 @@ def _bridge_seedance_executor(
                 width=width,
                 height=height,
                 fps=24,
-                content=content,
+                content=_provider_ready_content(content),
                 batch_id=output_dir.name,
                 model=model,
                 **runtime_kwargs,
