@@ -281,3 +281,42 @@ def character_visual_description(
             "The body-proportion lock has priority over any conflicting body wording."
         )
     return contract or summary
+
+
+def character_reference_identity_description(
+    character: dict[str, Any],
+    fallback: str = "",
+) -> str:
+    """Render static identity facts for neutral Phase 3 reference images.
+
+    Story summaries and ``distinguishing`` often contain actions, poses, camera
+    interaction, or locations.  Those facts belong in shot prompts, not in the
+    canonical character pack where they would contaminate every view.
+    """
+    appearance = character.get("appearance")
+    if not isinstance(appearance, dict):
+        return str(fallback or character.get("description") or "").strip()
+
+    labels = {
+        "age_range": "age",
+        "gender": "gender",
+        "height": "apparent height",
+        "build": "build",
+        "hair": "hair",
+        "face": "face",
+        "clothing": "clothing and static accessories",
+    }
+    static_details = [
+        f"{label}: {str(appearance.get(key)).strip()}"
+        for key, label in labels.items()
+        if str(appearance.get(key) or "").strip()
+    ]
+    contract = body_contract_prompt(character)
+    parts = [
+        contract,
+        "Static authored identity: " + "; ".join(static_details)
+        if static_details
+        else "",
+    ]
+    result = " ".join(part for part in parts if part).strip()
+    return result or str(fallback or character.get("description") or "").strip()

@@ -60,7 +60,7 @@ def test_phase3_character_builder_receives_sliced_style(tmp_path, monkeypatch):
     (tmp_path / "visual-style.md").write_text(STYLE, encoding="utf-8")
     captured = []
 
-    def fake_batch(characters, output_dir, skip_images=False):
+    def fake_batch(characters, output_dir, skip_images=False, **_kwargs):
         captured.append(characters[0]["style"])
         return ["characters/lead/"]
 
@@ -88,7 +88,7 @@ def test_phase3_persists_and_generates_from_no_real_person_contract(tmp_path, mo
     captured = []
     monkeypatch.setenv("HONCUT_NO_REAL_PERSON", "1")
 
-    def fake_batch(characters, output_dir, skip_images=False):
+    def fake_batch(characters, output_dir, skip_images=False, **_kwargs):
         captured.extend(characters)
         return ["characters/agent/"]
 

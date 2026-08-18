@@ -60,6 +60,10 @@ from phases.phase6.video_generator import build_video_prompt
 from phases.pipeline_core import _write_project_visual_style
 from prompt import event_extractor
 from quality import video_qa
+from quality.character_reference_qa import (
+    build_character_reference_qa_receipt,
+    parse_character_reference_qa,
+)
 from quality.quality_gate import run_quality_check
 from quality.shot_continuity import annotate_boundaries, classify_boundary
 from quality.variation_checker import check_scene_variation
@@ -70,6 +74,7 @@ from utils.ark_llm import create_ark_client
 from utils.character_body_contracts import (
     ADULT_LEAD_DISCOVERY_INSTRUCTIONS,
     apply_adult_lead_body_contracts,
+    character_reference_identity_description,
     character_visual_description,
 )
 
@@ -1556,8 +1561,146 @@ def test_phase3_seedance_contract_and_gate_require_four_views(tmp_path):
 
     for name in ("full_body", "side", "back"):
         write_reference(char_dir / f"{name}.png")
+    missing_semantic_qa = run_quality_check("phase3", tmp_path)
+    assert missing_semantic_qa.passed is False
+    assert any(
+        issue.rule == "character_reference_qa_passed"
+        for issue in missing_semantic_qa.issues
+    )
+
+    view_paths = {name: char_dir / f"{name}.png" for name in prompts}
+    receipt = build_character_reference_qa_receipt(
+        char_id="agent",
+        view_paths=view_paths,
+        attempts=[{"attempt": 1, "passed": True, "failed_views": []}],
+    )
+    qa_path = char_dir / "character_reference_qa.json"
+    qa_path.write_text(json.dumps(receipt), encoding="utf-8")
+    card["reference_qa_report"] = "characters/agent/character_reference_qa.json"
+    (char_dir / "character_card.json").write_text(
+        json.dumps(card), encoding="utf-8"
+    )
+
     complete = run_quality_check("phase3", tmp_path)
     assert complete.passed is True
+
+    Image.effect_noise((512, 512), 24).convert("RGB").save(char_dir / "back.png")
+    stale_receipt = run_quality_check("phase3", tmp_path)
+    assert stale_receipt.passed is False
+    assert any(
+        issue.rule == "character_reference_qa_passed"
+        for issue in stale_receipt.issues
+    )
+
+
+def test_phase3_reference_generation_uses_face_only_as_identity_anchor(
+    monkeypatch, tmp_path
+):
+    from PIL import Image
+
+    calls = []
+
+    class ImageClient:
+        def __init__(self, model):
+            self.model = model
+
+        @staticmethod
+        def _write(path):
+            Image.effect_noise((512, 512), 96).convert("RGB").save(path)
+
+        def text_to_image(self, *, prompt, output_path, size):
+            calls.append(("text", prompt, None, Path(output_path).name, size))
+            self._write(output_path)
+
+        def image_to_image(self, *, prompt, ref_image, output_path, size):
+            calls.append(("image", prompt, ref_image, Path(output_path).name, size))
+            self._write(output_path)
+
+    class Reviewer:
+        def __init__(self):
+            self.paths = []
+            self.prompt = ""
+            self.calls = 0
+
+        def review(self, paths, prompt):
+            self.calls += 1
+            self.paths = list(paths)
+            self.prompt = prompt
+            common = {
+                "passed": True,
+                "view_match": True,
+                "framing_match": True,
+                "neutral_pose": True,
+                "plain_background": True,
+                "single_character": True,
+                "face_visible": True,
+                "both_eyes_visible": True,
+                "issues": [],
+            }
+            back = {
+                **common,
+                "face_visible": self.calls == 1,
+                "both_eyes_visible": False,
+                "passed": self.calls > 1,
+                "view_match": self.calls > 1,
+                "issues": (
+                    ["front-facing face is visible; back view is absent"]
+                    if self.calls == 1
+                    else []
+                ),
+            }
+            return json.dumps({
+                "views": {
+                    "face_closeup": common,
+                    "full_body": common,
+                    "side": {**common, "both_eyes_visible": False},
+                    "back": back,
+                },
+                "cross_view": {
+                    "passed": True,
+                    "identity_consistent": True,
+                    "outfit_consistent": True,
+                    "body_proportions_consistent": True,
+                    "issues": [],
+                },
+                "failed_views": ["back"] if self.calls == 1 else [],
+                "summary": (
+                    "back is front-facing" if self.calls == 1 else "all contracts pass"
+                ),
+            })
+
+    monkeypatch.setattr(character_factory, "SeedreamClient", ImageClient)
+    reviewer = Reviewer()
+    result = character_factory.generate_character(
+        char_id="agent",
+        name="Agent",
+        description="adult woman; black ponytail; white shirt; gray trousers",
+        output_dir=str(tmp_path),
+        style="7-Eleven street dance, moving handheld camera, cheering crowd",
+        review_client=reviewer,
+        view_qa_max_retries=1,
+    )
+
+    assert [path.name for path in reviewer.paths] == [
+        "face_closeup.png",
+        "full_body.png",
+        "side.png",
+        "back.png",
+    ]
+    assert calls[0][0] == "text"
+    assert reviewer.calls == 2
+    assert len(calls) == 5
+    assert all(call[0] == "image" for call in calls[1:])
+    assert all(str(call[2]).endswith("face_closeup.png") for call in calls[1:])
+    assert all("7-Eleven" not in call[1] for call in calls)
+    assert all("cheering crowd" not in call[1] for call in calls)
+    assert "strict 90-degree left side" in calls[2][1].lower()
+    assert "face, eyes, nose, mouth" in calls[3][1].lower()
+    assert "previous back failed blocking view qa" in calls[4][1].lower()
+    assert "front-facing face is visible" in calls[4][1].lower()
+    assert (tmp_path / "characters/agent/reference_qa_attempts/attempt_01/back.png").is_file()
+    assert Path(result["card"]).is_file()
+    assert run_quality_check("phase3", tmp_path).passed is True
 
 
 def _adult_lead_character(name, gender, age_range, role="protagonist"):
@@ -1618,6 +1761,66 @@ def test_adult_lead_body_contracts_are_exact_and_scoped():
     assert "body_contract" not in second_male["appearance"]
     assert "body_contract" not in supporting["appearance"]
     assert "body_contract" not in child["appearance"]
+
+
+def test_phase3_identity_description_excludes_story_action_and_location():
+    character = _adult_lead_character("SU", "female", "22-28")
+    character["appearance"].update({
+        "hair": "black high ponytail",
+        "face": "oval face and almond eyes",
+        "clothing": "white crop top, black jacket, gray trousers",
+        "summary": "street dancer performs a powerful routine outside a convenience store",
+        "distinguishing": "keeps dancing and making eye contact with the moving camera",
+    })
+    apply_adult_lead_body_contracts([character])
+
+    description = character_reference_identity_description(character)
+
+    assert "black high ponytail" in description
+    assert "white crop top" in description
+    assert "height exactly 166 cm" in description
+    assert "dancer" not in description
+    assert "dancing" not in description
+    assert "convenience store" not in description
+    assert "moving camera" not in description
+
+
+def test_character_reference_qa_recomputes_wrong_view_verdict():
+    passing_view = {
+        "passed": True,
+        "view_match": True,
+        "framing_match": True,
+        "neutral_pose": True,
+        "plain_background": True,
+        "single_character": True,
+        "face_visible": True,
+        "both_eyes_visible": False,
+        "issues": [],
+    }
+    payload = {
+        "views": {
+            "face_closeup": {**passing_view, "both_eyes_visible": True},
+            "full_body": {**passing_view, "both_eyes_visible": True},
+            "side": passing_view,
+            # A model-level passed=true cannot override visible face evidence.
+            "back": {**passing_view, "face_visible": True},
+        },
+        "cross_view": {
+            "passed": True,
+            "identity_consistent": True,
+            "outfit_consistent": True,
+            "body_proportions_consistent": True,
+            "issues": [],
+        },
+        "failed_views": [],
+        "summary": "back is actually front-facing",
+    }
+
+    review = parse_character_reference_qa(json.dumps(payload))
+
+    assert review["passed"] is False
+    assert review["failed_views"] == ["back"]
+    assert review["views"]["back"]["passed"] is False
 
 
 def test_character_discovery_body_contract_is_prompted_and_normalized(monkeypatch):

@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 import json
 import re
 
+from quality.character_reference_qa import validate_character_reference_qa_receipt
 from utils.character_identity import is_declared_character_reference
 from utils.video_capabilities import (
     capabilities_for,
@@ -86,6 +87,10 @@ QUALITY_RULES: Dict[str, Dict[str, Any]] = {
         "red_lines": [
             ("character_images_exist", "每个角色声明的四张身份参考图均存在且 > 10KB"),
             ("character_card_exists", "每个角色有 character_card.json"),
+            (
+                "character_reference_qa_passed",
+                "每个角色四视图通过视角、构图、中性姿态、背景及跨视图一致性审核",
+            ),
         ],
         "dimensions": [],
     },
@@ -315,6 +320,38 @@ def _check_red_line(rule_id: str, output_dir: Path,
                 return False
         return True
 
+    if rule_id == "character_reference_qa_passed":
+        chars_dir = _find_chars_dir(output_dir)
+        if chars_dir is None:
+            return False
+        character_count = 0
+        for cd in chars_dir.iterdir():
+            if not cd.is_dir():
+                continue
+            character_count += 1
+            try:
+                card = json.loads(
+                    (cd / "character_card.json").read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                return False
+            declared = card.get("reference_images")
+            if not isinstance(declared, dict) or len(declared) < 4:
+                return False
+            view_paths: dict[str, Path] = {}
+            for name, value in declared.items():
+                path = Path(str(value))
+                view_paths[str(name)] = path if path.is_absolute() else output_dir / path
+            report_value = card.get("reference_qa_report")
+            if not report_value:
+                return False
+            report_path = Path(str(report_value))
+            if not report_path.is_absolute():
+                report_path = output_dir / report_path
+            if not validate_character_reference_qa_receipt(report_path, view_paths):
+                return False
+        return character_count > 0
+
     if rule_id == "videos_exist":
         shots = output_dir / "shots"
         if not shots.exists():
@@ -381,6 +418,8 @@ def _get_suggestion(rule_id: str) -> str:
     return {
         "character_images_exist":
             "检查 Seedream API 尺寸与引用链，确认角色四视图生成成功",
+        "character_reference_qa_passed":
+            "检查 character_reference_qa.json，按失败视角重生成后再进入分镜与视频阶段",
         "videos_exist":
             "检查 Seedance API key 和 prompt，确认视频生成成功",
         "assembly_has_video":

@@ -2,7 +2,7 @@
 
 Generates:
   1. character_card.json — character metadata + generation params
-  2. Three-view images (front/side/back.png) via Seedream
+  2. Four-view identity images (face/front/side/back) via Seedream
   3. angle_map.json — camera angle → best reference image mapping
 
 Usage:
@@ -17,10 +17,11 @@ import os
 import sys
 import json
 import argparse
+import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Any, Optional, Tuple, List
 
 # Import seedream client from same directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -32,6 +33,12 @@ from clients.seedream_client import SeedreamClient
 _PROMPTS_DIR = Path(__file__).resolve().parents[3] / "prompts"
 sys.path.insert(0, str(_PROMPTS_DIR))
 from prompt.prompt_validator import validate_prompt
+from quality.character_reference_qa import (
+    CHARACTER_REFERENCE_QA_SCHEMA,
+    CharacterReferenceQAError,
+    build_character_reference_qa_receipt,
+    review_character_reference_pack,
+)
 from utils.character_body_contracts import character_visual_description
 from utils.camera_motion_contracts import (
     HUMAN_PERSPECTIVE_CONTRACT,
@@ -259,17 +266,23 @@ STYLE_MODIFIERS = {
 # --- IPAdapter → Seedream Reference Image Strategy ---
 # ComfyUI uses IPAdapter FaceID (weight 0.9) for identity consistency.
 # In Seedream API, this maps to image_to_image() with the reference image.
-# Strategy: Generate front view first (text-to-image), then use it as
-# reference for side and back views (image-to-image) to maintain identity.
+# Strategy: Generate a neutral face close-up first (text-to-image), then use
+# only that pose-free identity anchor for each body view (image-to-image).
 
 REFERENCE_WEIGHT_NOTE = (
-    "Maintain exact same character identity, face, body proportions, "
-    "outfit details, and color palette as the reference image"
+    "Use the supplied image only for the same fictional identity, face design, hair, "
+    "body proportions, outfit details and color palette. Discard and do not copy its "
+    "pose, gesture, camera angle, framing, background, scenery, text, logos, props or "
+    "other people. The requested view contract below has absolute priority"
 )
 
 SOURCE_IMAGE_RULES = (
-    "avoid strong shadows, front-facing or three-quarter view, "
-    "solid-color or simple fabric background, face occupies at least 60 percent, "
+    "one character only, strict straight-on camera, head and shoulders only from crown "
+    "through clavicles, face occupies at least 60 percent and no more than 75 percent of "
+    "the frame, centered neutral "
+    "expression, plain neutral gray studio background, flat even reference lighting, "
+    "no full body, no action, no performance, no scenery, no street, no shop, no crowd, "
+    "no text, no signage, no logo, "
     f"{HUMAN_PERSPECTIVE_CONTRACT}"
 )
 
@@ -277,8 +290,11 @@ FULL_BODY_IMAGE_RULES = (
     "vertical 9:16 character reference, camera pulled far back, straight-on standing pose, "
     "entire body visible from the top of the hair to the soles of both shoes, both feet fully "
     "inside the frame, generous empty margin above the hair and below the shoes, character "
-    "occupies no more than 75 percent of canvas height, plain neutral background, no scenery, "
-    "no props, no crop, no close-up, no medium shot, no knees or feet outside frame, "
+    "occupies no more than 75 percent of canvas height, plain neutral gray studio background, "
+    "upright anatomical reference stance, arms relaxed straight down, hands open, feet parallel "
+    "and hip-width, weight balanced evenly, no dance, no performance, no action gesture, no "
+    "scenery, no street, no shop, no crowd, no extra person, no text, no signage, no logo, no "
+    "undeclared prop, no crop, no close-up, no medium shot, no knees or feet outside frame, "
     f"{HUMAN_PERSPECTIVE_CONTRACT}"
 )
 
@@ -315,7 +331,6 @@ def build_model_reference_prompts(
     character_desc: str, style: str = "", target_model: str = "seedance"
 ) -> dict:
     """Build separated reference prompts for Seedance or Kling."""
-    suffix = f", {style}" if style else ""
     fictional_decl = (
         "This is a fully fictional AI-generated character (virtual avatar), "
         "not a real person; the entire visual identity is a designed digital creation "
@@ -323,7 +338,9 @@ def build_model_reference_prompts(
     )
     rendering = _reference_rendering_clause(style)
     identity = (
-        f"{fictional_decl}. {character_desc}{suffix}. {rendering}, neutral expression. "
+        f"{fictional_decl}. Static identity facts only: {character_desc}. "
+        f"Rendering medium only: {rendering}. Neutral expression. The project style is not "
+        "permission to add its story location, crowd, camera movement, pose or action. "
         f"Avoid: {HUMAN_PERSPECTIVE_NEGATIVE}"
     )
     if "kling" in target_model.lower():
@@ -334,18 +351,28 @@ def build_model_reference_prompts(
             "detail": f"{identity}, {SOURCE_IMAGE_RULES}, facial detail close-up, face occupies 70 percent",
         }
     return {
-        "face_closeup": f"{identity}, {SOURCE_IMAGE_RULES}, head-and-shoulders close-up, face occupies 70 percent",
+        "face_closeup": (
+            f"{identity}. VIEW CONTRACT — FACE CLOSE-UP: {SOURCE_IMAGE_RULES}. "
+            "This must be a true identity mugshot-style close-up, never a scene still"
+        ),
         "full_body": (
-            f"{identity}, {FULL_BODY_IMAGE_RULES}, separate full-body standing reference, complete outfit and footwear visible, "
-            "same identity and clothing as the face reference"
+            f"{identity}. VIEW CONTRACT — FRONT FULL BODY: {FULL_BODY_IMAGE_RULES}. "
+            "Face, chest, knees and toes point directly toward camera; complete outfit and "
+            "footwear visible; same identity and clothing as the supplied face reference"
         ),
         "side": (
-            f"{identity}, {FULL_BODY_IMAGE_RULES}, strict 90-degree side-profile full-body standing reference, "
-            "complete outfit and footwear visible, same identity, proportions, clothing and accessories as the supplied face and body references"
+            f"{identity}. VIEW CONTRACT — STRICT 90-DEGREE LEFT SIDE: {FULL_BODY_IMAGE_RULES}. "
+            "Nose, chin, shoulders, torso, hips, knees and both toes point left; only one eye "
+            "is visible; no head turn and no eye contact with camera. Complete outfit and "
+            "footwear visible; same identity, proportions, clothing and accessories as the "
+            "supplied face reference"
         ),
         "back": (
-            f"{identity}, {FULL_BODY_IMAGE_RULES}, strict back-view full-body standing reference, "
-            "complete rear hair, outfit and footwear visible, same identity, proportions, clothing and accessories as the supplied face and body references"
+            f"{identity}. VIEW CONTRACT — STRICT 180-DEGREE BACK: {FULL_BODY_IMAGE_RULES}. "
+            "Camera sees only the back of the head, rear hair, both shoulder blades, spine, "
+            "rear outfit, backs of legs and heels. Face, eyes, nose, mouth, chest and front of "
+            "torso must be completely invisible; do not turn the head. Same identity, "
+            "proportions, clothing and accessories as the supplied face reference"
         ),
     }
 
@@ -366,9 +393,6 @@ def build_combined_sheet_prompt(
     Returns:
         Single prompt string for combined character sheet generation
     """
-    style_suffix = f"，{style}" if style else ""
-    full_desc = f"{character_desc}{style_suffix}"
-    
     rendering = _reference_rendering_clause(style)
     prompt = (
         "【宏观描述】所有角色均为 AI 生成的虚拟形象，非真实人物。"
@@ -376,16 +400,17 @@ def build_combined_sheet_prompt(
         "根据以下角色描述，生成一张纯白背景的角色四视图设定表。"
         "要求服装、发型、配饰等所有细节在四个视角中完全一致。\n"
         "【微观描述】\n"
-        f"1. 角色描述：{full_desc}\n"
+        f"1. 静态角色身份描述：{character_desc}\n"
         "2. 画面要求：纯净中性灰背景 #E8E8E8，无阴影，均匀柔光。\n"
         "3. 同一画面按2×2网格展示四个视图：\n"
         "   - 左上：人像特写（头顶至锁骨，面部占60%+，五官清晰）\n"
         "   - 右上：正面全身站立像（面对镜头，从头顶到脚底完整）\n"
         "   - 左下：90度侧面全身站立像（纯侧面轮廓，从头顶到脚底完整）\n"
         "   - 右下：背面全身站立像（后脑/背部/发尾清晰，从头顶到脚底完整）\n"
-        "4. 自然站立，双臂自然下垂，双脚平行微分。\n"
+        "4. 自然站立，双臂自然下垂，双脚平行微分；禁止舞蹈、表演和动作姿势。\n"
         "5. 四视图身份、设计语言、线条和色块完全一致；面部与发型细节清晰，但不得改变既定画面媒介。\n"
-        "6. 画面比例 1:1 正方形，2×2网格布局。图中不要有任何文字。\n"
+        "6. 画面比例 1:1 正方形，2×2网格布局。图中不要有任何文字、街景、店铺、"
+        "人群、道具或项目剧情元素；项目风格只决定媒介，不得带入场景与动作。\n"
         "质感十足，高质量，震撼的视觉效果。"
     )
     return prompt
@@ -398,7 +423,7 @@ def crop_character_sheet(
 ) -> dict:
     """Crop a combined character sheet (2×2 grid) into individual view images.
     
-    Layout: 左上=closeup, 右上=front, 左下=side, 右下=back
+    Layout: 左上=face_closeup, 右上=full_body, 左下=side, 右下=back
     
     Args:
         sheet_path: Path to the combined character sheet image (square, e.g. 1920x1920)
@@ -410,8 +435,8 @@ def crop_character_sheet(
     """
     # 2×2 grid positions: (col, row) — col 0=left, 1=right; row 0=top, 1=bottom
     view_layout = [
-        ("closeup", 0, 0),  # 左上
-        ("front",   1, 0),  # 右上
+        ("face_closeup", 0, 0),  # 左上
+        ("full_body", 1, 0),  # 右上
         ("side",    0, 1),  # 左下
         ("back",    1, 1),  # 右下
     ][:num_views]
@@ -444,8 +469,8 @@ def build_three_view_prompts(
 ) -> dict:
     """Build professional three-view prompts from ComfyUI workflow templates.
     
-    DEPRECATED: This function is kept for backward compatibility but is no longer used.
-    The new approach uses build_combined_sheet_prompt() to generate all views in one image.
+    DEPRECATED: kept for backward compatibility. Production generates four
+    separated references and uses the combined sheet only as a provider-error fallback.
 
     Args:
         character_desc: Character description (e.g. "7岁中国男孩，深色发髻...")
@@ -552,6 +577,179 @@ def create_angle_map(
     }
 
 
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def _reference_view_size(view_name: str, default_size: str) -> str:
+    return (
+        FULL_BODY_REFERENCE_SIZE
+        if view_name in {"full_body", "side", "back"}
+        else default_size
+    )
+
+
+def _generate_reference_view(
+    client: Any,
+    *,
+    view_name: str,
+    prompt: str,
+    output_path: Path,
+    size: str,
+    identity_anchor: Path | None,
+    correction: str = "",
+) -> None:
+    """Generate one view atomically without letting an anchor dictate its pose."""
+    final_prompt = prompt
+    if correction:
+        final_prompt = (
+            f"CORRECTION — the previous {view_name} failed blocking view QA: "
+            f"{correction}. Regenerate from scratch and obey the view contract exactly. "
+            f"{prompt}"
+        )
+    temporary = output_path.with_name(f".{output_path.stem}.generating{output_path.suffix}")
+    try:
+        if identity_anchor is not None and hasattr(client, "image_to_image"):
+            client.image_to_image(
+                prompt=f"{REFERENCE_WEIGHT_NOTE}. {final_prompt}",
+                ref_image=str(identity_anchor),
+                output_path=str(temporary),
+                size=size,
+            )
+        else:
+            client.text_to_image(
+                prompt=final_prompt,
+                output_path=str(temporary),
+                size=size,
+            )
+        if not temporary.is_file():
+            raise RuntimeError(f"reference generator did not write {view_name}")
+        os.replace(temporary, output_path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _archive_reference_attempt(
+    char_dir: Path,
+    view_paths: dict[str, Path],
+    attempt: int,
+) -> None:
+    archive = char_dir / "reference_qa_attempts" / f"attempt_{attempt:02d}"
+    archive.mkdir(parents=True, exist_ok=True)
+    for name, path in view_paths.items():
+        if path.is_file():
+            shutil.copy2(path, archive / f"{name}.png")
+
+
+def _view_correction(review: dict[str, Any], view_name: str) -> str:
+    view = review.get("views", {}).get(view_name, {})
+    issues = [str(item) for item in view.get("issues", []) if str(item).strip()]
+    cross = review.get("cross_view", {})
+    issues.extend(
+        str(item) for item in cross.get("issues", []) if str(item).strip()
+    )
+    if not issues:
+        issues.append(
+            "wrong view angle, framing, neutral stance, studio background, or cross-view identity"
+        )
+    return "; ".join(dict.fromkeys(issues))
+
+
+def _quality_control_reference_views(
+    *,
+    char_id: str,
+    character_description: str,
+    char_dir: Path,
+    prompts: dict[str, str],
+    view_paths: dict[str, Path],
+    image_client: Any,
+    review_client: Any,
+    default_size: str,
+    max_retries: int,
+) -> dict[str, Any]:
+    """Review all views together and regenerate only the implicated views."""
+    if max_retries < 0 or max_retries > 2:
+        raise ValueError("character reference QA retries must be between 0 and 2")
+    report_path = char_dir / "character_reference_qa.json"
+    attempts: list[dict[str, Any]] = []
+    ordered_names = tuple(view_paths)
+    anchor_name = ordered_names[0]
+
+    for attempt in range(1, max_retries + 2):
+        try:
+            result = review_character_reference_pack(
+                review_client,
+                view_paths,
+                character_description,
+            )
+        except Exception as exc:
+            failed = {
+                "passed": False,
+                "views": {},
+                "cross_view": {"passed": False, "issues": [str(exc)]},
+                "failed_views": list(ordered_names),
+                "summary": f"review failed: {exc}",
+            }
+            attempts.append({"attempt": attempt, **failed})
+            receipt = build_character_reference_qa_receipt(
+                char_id=char_id,
+                view_paths=view_paths,
+                attempts=attempts,
+            )
+            _write_json_atomic(report_path, receipt)
+            raise CharacterReferenceQAError(
+                f"{char_id} reference review could not produce valid evidence: {exc}"
+            ) from exc
+
+        attempts.append({"attempt": attempt, **result})
+        receipt = build_character_reference_qa_receipt(
+            char_id=char_id,
+            view_paths=view_paths,
+            attempts=attempts,
+        )
+        _write_json_atomic(report_path, receipt)
+        if result["passed"]:
+            print(f"  [reference-qa] {char_id} ✓ attempt {attempt}")
+            return receipt
+        if attempt > max_retries:
+            raise CharacterReferenceQAError(
+                f"{char_id} reference views failed after {attempt} QA attempt(s): "
+                f"{result['failed_views']} — {result.get('summary') or 'view contract violation'}"
+            )
+
+        _archive_reference_attempt(char_dir, view_paths, attempt)
+        failed_views = set(result.get("failed_views") or ordered_names)
+        # If the identity anchor itself changes, every dependent view must be
+        # regenerated from the new anchor to avoid a mixed-identity pack.
+        if anchor_name in failed_views:
+            failed_views.update(ordered_names)
+        print(
+            f"  [reference-qa] attempt {attempt} rejected; regenerating "
+            f"{', '.join(name for name in ordered_names if name in failed_views)}"
+        )
+        for name in ordered_names:
+            if name not in failed_views:
+                continue
+            identity_anchor = None if name == anchor_name else view_paths[anchor_name]
+            _generate_reference_view(
+                image_client,
+                view_name=name,
+                prompt=prompts[name],
+                output_path=view_paths[name],
+                size=_reference_view_size(name, default_size),
+                identity_anchor=identity_anchor,
+                correction=_view_correction(result, name),
+            )
+
+    raise AssertionError("unreachable character reference QA state")
+
+
 def generate_character(
     char_id: str,
     name: str,
@@ -563,6 +761,8 @@ def generate_character(
     model: Optional[str] = None,
     skip_images: bool = False,
     variants: Optional[list] = None,
+    review_client: Any | None = None,
+    view_qa_max_retries: int = 2,
 ) -> dict:
     """Generate complete character asset set.
 
@@ -600,38 +800,37 @@ def generate_character(
     )
     if not skip_images:
         print(f"[Step 1/3] Generating separated {target_model} references...")
+        _write_json_atomic(
+            Path(char_dir) / "character_reference_qa.json",
+            {
+                "schema": CHARACTER_REFERENCE_QA_SCHEMA,
+                "character_id": char_id,
+                "status": "pending",
+                "inputs": {},
+                "attempts": [],
+            },
+        )
         client = SeedreamClient(model=seedream_model)
         reference_prompts = build_model_reference_prompts(description, style, target_model)
         views = {}
         try:
-            first_path = None
-            for index, (view_name, reference_prompt) in enumerate(reference_prompts.items()):
-                view_path = os.path.join(char_dir, f"{view_name}.png")
-                view_size = (
-                    FULL_BODY_REFERENCE_SIZE
-                    if view_name in {"full_body", "side", "back"}
-                    else size
+            identity_anchor = None
+            for view_name, reference_prompt in reference_prompts.items():
+                view_path = Path(char_dir) / f"{view_name}.png"
+                _generate_reference_view(
+                    client,
+                    view_name=view_name,
+                    prompt=reference_prompt,
+                    output_path=view_path,
+                    size=_reference_view_size(view_name, size),
+                    identity_anchor=identity_anchor,
                 )
-                if index and first_path and hasattr(client, "image_to_image"):
-                    reference_paths = [first_path]
-                    if target_model == "seedance" and views.get("full_body"):
-                        reference_paths.append(views["full_body"])
-                    client.image_to_image(
-                        prompt=f"{REFERENCE_WEIGHT_NOTE}. {reference_prompt}",
-                        ref_image=(
-                            reference_paths[0]
-                            if len(reference_paths) == 1
-                            else reference_paths
-                        ),
-                        output_path=view_path,
-                        size=view_size,
-                    )
-                else:
-                    client.text_to_image(prompt=reference_prompt, output_path=view_path, size=view_size)
-                first_path = first_path or view_path
-                views[view_name] = view_path
+                identity_anchor = identity_anchor or view_path
+                views[view_name] = str(view_path)
                 print(f"  [{view_name}] ✓ → {view_path}")
         except Exception as exc:
+            if target_model != "seedance":
+                raise
             print(f"  ⚠ separated references failed ({exc}); using legacy combined sheet fallback")
             sheet_path = os.path.join(char_dir, "character_sheet.png")
             client.text_to_image(
@@ -641,9 +840,28 @@ def generate_character(
             )
             legacy_views = crop_character_sheet(sheet_path, char_dir, num_views=4)
             views = legacy_views
+
+        if not all(isinstance(path, str) and Path(path).is_file() for path in views.values()):
+            raise RuntimeError(f"{char_id} reference generation produced an incomplete pack")
+        if review_client is None:
+            from clients.ark_multimodal_client import ArkMultimodalClient
+
+            review_client = ArkMultimodalClient()
+        qa_receipt = _quality_control_reference_views(
+            char_id=char_id,
+            character_description=description,
+            char_dir=Path(char_dir),
+            prompts=reference_prompts,
+            view_paths={name: Path(path) for name, path in views.items()},
+            image_client=client,
+            review_client=review_client,
+            default_size=size,
+            max_retries=view_qa_max_retries,
+        )
     else:
         print("[Step 1/3] Skipping image generation (--skip-images)")
         views = {name: None for name in build_model_reference_prompts(description, style, target_model)}
+        qa_receipt = None
 
     # Step 2: Create character_card.json
     print("[Step 2/3] Creating character_card.json...")
@@ -656,7 +874,13 @@ def generate_character(
         seedream_model=seedream_model,
         reference_images={name: f"characters/{char_id}/{name}.png" for name in views},
     )
-    face_view = "face_closeup" if "face_closeup" in views else "closeup"
+    face_view = (
+        "face_closeup"
+        if "face_closeup" in views
+        else "detail"
+        if "detail" in views
+        else "front"
+    )
     body_view = "full_body" if "full_body" in views else "front"
     card["face_reference"] = f"characters/{char_id}/{face_view}.png"
     card["body_reference"] = f"characters/{char_id}/{body_view}.png"
@@ -666,6 +890,12 @@ def generate_character(
         else "seedance_four_views"
     )
     card["source_image_rules"] = SOURCE_IMAGE_RULES
+    card["reference_contract_version"] = 2
+    card["reference_qa_report"] = (
+        f"characters/{char_id}/character_reference_qa.json"
+        if qa_receipt is not None
+        else None
+    )
     card_path = os.path.join(char_dir, "character_card.json")
     with open(card_path, "w", encoding="utf-8") as f:
         json.dump(card, f, ensure_ascii=False, indent=2)
@@ -780,10 +1010,14 @@ def batch_generate(characters: list, output_dir: str, **kwargs) -> list:
                 model=char.get("model"),
                 skip_images=kwargs.get("skip_images", False),
                 variants=char.get("appearance", {}).get("variants", []),
+                review_client=kwargs.get("review_client"),
+                view_qa_max_retries=kwargs.get("view_qa_max_retries", 2),
             )
             results.append(result)
         except Exception as e:
             print(f"\n  ✗ Failed to generate '{char.get('name', '?')}': {e}")
+            if kwargs.get("raise_on_error", False):
+                raise
             results.append({"char_id": char.get("id"), "error": str(e)})
     return results
 

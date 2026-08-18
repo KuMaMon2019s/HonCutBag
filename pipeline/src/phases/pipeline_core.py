@@ -365,7 +365,14 @@ def _read_checkpoint(output_dir: Path) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 # --- Retry helper (works outside StateGraph context) ---
-def _retry_with_policy(func, max_attempts=3, backoff_factor=2.0, *args, **kwargs):
+def _retry_with_policy(
+    func,
+    max_attempts=3,
+    backoff_factor=2.0,
+    *args,
+    non_retryable_exceptions=(),
+    **kwargs,
+):
     """Execute func with retry logic matching LangGraph's RetryPolicy semantics.
     
     This is a standalone retry helper that works outside StateGraph context.
@@ -377,6 +384,8 @@ def _retry_with_policy(func, max_attempts=3, backoff_factor=2.0, *args, **kwargs
         try:
             return func(*args, **kwargs)
         except Exception as e:
+            if isinstance(e, non_retryable_exceptions):
+                raise
             last_error = e
             error_text = str(e)
             if attempt < max_attempts:
@@ -2835,6 +2844,7 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
 
     try:
         from phases.phase3.character_factory import batch_generate
+        from quality.character_reference_qa import CharacterReferenceQAError
 
         chars_dir = _ensure_dir(output_dir / "characters")
         from utils.privacy_visual_policy import (
@@ -2874,13 +2884,18 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
             character_style = get_slice(
                 visual_style_path.read_text(encoding="utf-8"), "character"
             )
-        # 为每个角色准备 id/name/description
+        # 为每个角色准备静态身份描述。剧情动作、姿势、镜头互动和场景风格
+        # 不得进入四视图，否则会把所有 canonical references 污染成剧照。
+        from utils.character_body_contracts import (
+            character_reference_identity_description,
+        )
+
         char_dicts = []
         for i, c in enumerate(characters_list):
             char_dicts.append({
                 "id": c.get("id", f"char_{i}"),
                 "name": c.get("name", f"角色{i}"),
-                "description": character_visual_description(c),
+                "description": character_reference_identity_description(c),
                 "appearance": c.get("appearance", {}),  # 传递完整 appearance dict
                 "style": "\n\n".join(
                     part for part in (c.get("style", ""), character_style) if part
@@ -2909,10 +2924,20 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
             
             def _gen_char():
                 # Pass output_dir (not chars_dir) — generate_character appends /characters/ internally
-                return batch_generate([char_dict], str(output_dir), skip_images=dry_run)
+                return batch_generate(
+                    [char_dict],
+                    str(output_dir),
+                    skip_images=dry_run,
+                    raise_on_error=True,
+                )
             
             try:
-                result = _retry_with_policy(_gen_char, max_attempts=3, backoff_factor=2.0)
+                result = _retry_with_policy(
+                    _gen_char,
+                    max_attempts=3,
+                    backoff_factor=2.0,
+                    non_retryable_exceptions=(CharacterReferenceQAError,),
+                )
                 results.extend(result or [])
             except Exception as e:
                 print(f"    ✗ {char_name} 生成失败: {e}")
@@ -2940,7 +2965,15 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
         # Quality gate: Phase 3 (CRITICAL — blocks pipeline if character images missing)
         qg_report = run_quality_check("phase3", output_dir)
         if not qg_report.passed:
-            return {"status": "error", "error": f"Phase 3 质检未通过: {qg_report.grade} — 角色图片缺失，不能继续", "quality_report": qg_report, "duration_s": _elapsed(start)}
+            return {
+                "status": "error",
+                "error": (
+                    f"Phase 3 质检未通过: {qg_report.grade} — 角色四视图缺失、"
+                    "语义视角错误或审核凭证已过期，不能继续"
+                ),
+                "quality_report": qg_report,
+                "duration_s": _elapsed(start),
+            }
 
         # Phase 3 owns the first point at which character reference packs are
         # guaranteed to exist. Regenerate the canonical Pxx chain here so the
@@ -7439,9 +7472,25 @@ def run_pipeline(
             _record_stage_checkpoint(output_path, "phase2", p2_5)
 
     # ---- Phase 3: 角色工厂 ----
+    # Checkpoints created before the semantic four-view contract may contain
+    # four existing files but no valid angle/background/identity evidence.
+    # Never let resume bypass the current blocking gate.
+    phase3_resume_quality = None
+    if 3 not in skip_phase and resume and "phase3" in completed_phases:
+        phase3_resume_quality = run_quality_check("phase3", output_path)
+        if not phase3_resume_quality.passed:
+            print(
+                "  ⚠ Phase 3 checkpoint 四视图审核凭证缺失、失败或已过期；"
+                "本次恢复将重新执行 Phase 3"
+            )
     if 3 in skip_phase:
         report["phases"]["phase3"] = {"status": "skipped", "reason": "user-specified"}
-    elif resume and "phase3" in completed_phases:
+    elif (
+        resume
+        and "phase3" in completed_phases
+        and phase3_resume_quality is not None
+        and phase3_resume_quality.passed
+    ):
         cp = _read_checkpoint(output_path)
         p3 = dict(cp["results"].get("phase3", {"status": "done"}))
         p3.setdefault("status", "done")
