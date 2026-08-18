@@ -1555,9 +1555,9 @@ def test_post_primary_bridge_uses_actual_source_tail_and_target_head(
         chunk=GenerationChunk(
             chunk_id="S01_C03",
             sequence=3,
-            target_duration_s=3,
-            requested_frames=72,
-            expected_unique_frames=72,
+            target_duration_s=4,
+            requested_frames=96,
+            expected_unique_frames=96,
             mode="native_extend",
             depends_on="S01_C02",
             execution_strategy="first_last_frame_bridge",
@@ -1578,7 +1578,7 @@ def test_post_primary_bridge_uses_actual_source_tail_and_target_head(
 
     content, _meta, _seed, duration = _provider_content(tmp_path, request)
 
-    assert duration == 3
+    assert duration == 4
     assert [item.get("role") for item in content] == [
         None,
         "first_frame",
@@ -1624,7 +1624,7 @@ def test_seedance_duration_separates_provider_request_from_effective_story_time(
         chunk=GenerationChunk(
             chunk_id="S03_C03",
             sequence=3,
-            target_duration_s=3,
+            target_duration_s=4,
             mode="native_extend",
             depends_on="S03_C02",
             execution_strategy="first_last_frame_bridge",
@@ -1639,7 +1639,7 @@ def test_seedance_duration_separates_provider_request_from_effective_story_time(
         memory_context="",
     )
 
-    assert _chunk_duration(valid_bridge) == 3
+    assert _chunk_duration(valid_bridge) == 4
 
 
 def test_provider_prepends_no_real_person_visual_contract(monkeypatch, tmp_path):
@@ -3780,7 +3780,7 @@ def test_phase6_auto_accepts_zero_overlap_first_last_bridge(monkeypatch, tmp_pat
     plan = build_continuity_plan(storyboard)
     assert plan.shots[0].chunks[-1].execution_strategy == "multi_image"
     assert plan.bridges[0].execution_strategy == "first_last_frame_bridge"
-    assert plan.bridges[0].target_duration_s == 3
+    assert plan.bridges[0].target_duration_s == 4
 
     monkeypatch.setenv("VIDEO_PROVIDER", "seedance")
     monkeypatch.setenv("HONCUT_CONTINUITY_BRIDGE", "auto")
@@ -4904,7 +4904,7 @@ def test_phase8_inserts_post_primary_bridge_and_skips_transition_effects(
         edit_decision_module,
         "probe_video",
         lambda path: {
-            "duration": 3.0 if "shot_bridges" in str(path) else 15.0,
+            "duration": 4.0 if "shot_bridges" in str(path) else 15.0,
             "has_audio": False,
         },
     )
@@ -4926,11 +4926,11 @@ def test_phase8_inserts_post_primary_bridge_and_skips_transition_effects(
     ]
     assert [item["type"] for item in decisions["transitions"]] == ["cut", "cut"]
     assert len(decisions["metadata"]["inserted_primary_bridges"]) == 1
-    assert decisions["cuts"][0]["out_seconds"] == 13.5
-    assert decisions["cuts"][2]["in_seconds"] == 1.5
+    assert decisions["cuts"][0]["out_seconds"] == 13.0
+    assert decisions["cuts"][2]["in_seconds"] == 2.0
     replacement = decisions["metadata"]["bridge_handle_replacements"][0]
-    assert replacement["source_handle_s"] == 1.5
-    assert replacement["target_handle_s"] == 1.5
+    assert replacement["source_handle_s"] == 2.0
+    assert replacement["target_handle_s"] == 2.0
     assert decisions["metadata"]["projected_frames"] == 30 * 30
     assert decisions["metadata"]["pacing_normalization"] is None
 
@@ -4979,7 +4979,7 @@ def test_phase8_bridge_handles_and_bounded_pacing_hit_delivery_without_tail_loss
         edit_decision_module,
         "probe_video",
         lambda path: {
-            "duration": 3.0 if "shot_bridges" in str(path) else 30.0,
+            "duration": 4.0 if "shot_bridges" in str(path) else 30.0,
             "has_audio": False,
         },
     )
@@ -5004,7 +5004,9 @@ def test_phase8_bridge_handles_and_bounded_pacing_hit_delivery_without_tail_loss
     assert normalization["method"] == "bounded_all_frame_pacing_normalization"
     assert normalization["speed"] == 1.2
     assert normalization["preserves_all_reviewed_frames"] is True
-    assert normalization["frame_closure"]["residual_frames"] == 1
+    # With 4s bridges and 2s handles the 30+30s material closes the 50s frame
+    # budget exactly at uniform speed — no per-cut residual correction needed.
+    assert normalization.get("frame_closure") is None
     assert decisions["metadata"]["projected_frames"] == 50 * 30
 
 

@@ -461,8 +461,8 @@ def test_phase5_checks_additive_bridge_ledger_and_handle_replacement():
         "material_budget_ledger_missing",
     } & {issue["code"] for issue in issues}
     assert storyboard["material_budget"]["primary_material_duration_s"] == 30
-    assert storyboard["material_budget"]["bridge_generation_duration_s"] == 3
-    assert storyboard["material_budget"]["total_generated_duration_s"] == 33
+    assert storyboard["material_budget"]["bridge_generation_duration_s"] == 4
+    assert storyboard["material_budget"]["total_generated_duration_s"] == 34
     assert storyboard["material_budget"][
         "projected_pre_edit_timeline_duration_s"
     ] == 30
@@ -493,8 +493,8 @@ def test_one_take_budget_counts_only_adjacent_continuous_boundaries():
     assert budget["primary_material_duration_s"] == 60
     assert budget["primary_material_limit_s"] == 78
     assert budget["bridge_count"] == 3
-    assert budget["bridge_generation_duration_s"] == 9
-    assert budget["total_generated_duration_s"] == 69
+    assert budget["bridge_generation_duration_s"] == 12
+    assert budget["total_generated_duration_s"] == 72
     assert budget["projected_pre_edit_timeline_duration_s"] == 60
 
 
