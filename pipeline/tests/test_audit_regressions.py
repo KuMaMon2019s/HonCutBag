@@ -1358,6 +1358,80 @@ def test_phase1_source_identity_evidence_aggregates_aliases_and_events():
         "Mira Chen",
         "头戴护目镜的Mira Chen",
     ]
+    assert characters[0]["source_identity_evidence"] == {
+        "event_ids": [1, 2, 3],
+        "source_mentions": ["Mira Chen", "头戴护目镜的Mira Chen", "米拉"],
+        "inferred_aliases": [],
+    }
+
+
+def test_phase1_recovers_generic_alias_from_unique_non_cooccurring_identity():
+    characters = [
+        {
+            "id": "chief_researcher",
+            "name": "首席研究员",
+            "aliases": [],
+            "role": "supporting",
+        },
+        {
+            "id": "documentarian",
+            "name": "记录员",
+            "aliases": [],
+            "role": "supporting",
+        },
+    ]
+    stats = {
+        "首席研究员": {"events": [1], "contexts": []},
+        "女主": {"events": [2, 3], "contexts": []},
+        "记录员": {"events": [3], "contexts": []},
+    }
+
+    character_discoverer._attach_source_identity_evidence(characters, stats)
+
+    researcher = characters[0]
+    documentarian = characters[1]
+    assert "女主" in researcher["aliases"]
+    assert researcher["appearance_count"] == 3
+    assert researcher["source_identity_evidence"]["inferred_aliases"] == ["女主"]
+    assert "女主" not in documentarian["aliases"]
+    assert documentarian["appearance_count"] == 1
+
+
+def test_phase1_rejects_ambiguous_generic_alias_instead_of_guessing():
+    characters = [
+        {"id": "one", "name": "研究员甲", "aliases": []},
+        {"id": "two", "name": "研究员乙", "aliases": []},
+    ]
+    stats = {
+        "研究员甲": {"events": [1], "contexts": []},
+        "研究员乙": {"events": [2], "contexts": []},
+        "主角": {"events": [3], "contexts": []},
+    }
+
+    with pytest.raises(ValueError, match="主角: 未解析"):
+        character_discoverer._attach_source_identity_evidence(characters, stats)
+
+
+def test_phase1_rejects_unanchored_concrete_source_label():
+    characters = [{"id": "one", "name": "研究员甲", "aliases": []}]
+    stats = {
+        "研究员甲": {"events": [1], "contexts": []},
+        "神秘旅人": {"events": [2], "contexts": []},
+    }
+
+    with pytest.raises(ValueError, match="神秘旅人: 未解析"):
+        character_discoverer._attach_source_identity_evidence(characters, stats)
+
+
+def test_phase1_post_filter_drops_llm_invented_background_placeholder():
+    characters = [{
+        "id": "passerby",
+        "name": "路人",
+        "aliases": [],
+        "role": "extra",
+    }]
+
+    assert character_discoverer._post_filter_characters(characters) == []
 
 
 def test_character_identity_resolution_is_token_safe_and_unambiguous():
@@ -2048,7 +2122,7 @@ def test_character_discovery_body_contract_is_prompted_and_normalized(monkeypatc
     assert "head_to_body_ratio=7.6" in captured["prompt"]
     assert "头宽不得超过肩宽的 43%" in captured["prompt"]
     assert ADULT_LEAD_DISCOVERY_INSTRUCTIONS in character_discoverer.SYSTEM_PROMPT
-    assert character_discoverer.CHARACTER_CONTEXT_SCHEMA_VERSION == 7
+    assert character_discoverer.CHARACTER_CONTEXT_SCHEMA_VERSION == 8
     assert "interaction_props" in captured["prompt"]
     assert "bodybuilder physique" in discovered["negative_guardrails"]
     assert "Body-proportion lock" in discovered["prompt_definition"]

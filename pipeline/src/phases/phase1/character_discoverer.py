@@ -137,7 +137,7 @@ ENTITY_SUFFIXES = (
 )
 MAX_ENTITY_NAME_CHINESE_CHARS = 12
 GENERIC_CHARACTER_NAMES = {"主角", "主人公", "男主", "女主", "人物", "他", "她", "它"}
-CHARACTER_CONTEXT_SCHEMA_VERSION = 7
+CHARACTER_CONTEXT_SCHEMA_VERSION = 8
 
 GENERIC_BACKGROUND_CHARACTER_NAMES = {
     "路人", "行人", "游客", "观众", "听众", "读者",
@@ -685,8 +685,15 @@ def _post_filter_characters(characters: List[Dict[str, Any]]) -> List[Dict[str, 
             alias for alias in combined_aliases if alias and alias != target.get("name")
         ]
 
-    # 无法归并的通用指代不能单独成为角色资产。
-    filtered = [char for char in merged if char.get("name") not in GENERIC_CHARACTER_NAMES]
+    # 无法归并的通用指代和背景占位词不能单独成为角色资产。来源统计在
+    # LLM 调用前已经执行同一规则；这里必须对模型输出再次执行，避免模型
+    # 凭事件 prose 补出一个没有来源身份锚点、且每次运行可能不同的角色。
+    filtered = [
+        char
+        for char in merged
+        if char.get("name") not in GENERIC_CHARACTER_NAMES
+        and char.get("name") not in GENERIC_BACKGROUND_CHARACTER_NAMES
+    ]
 
     # 限制最多 5 个角色
     if len(filtered) > 5:
@@ -750,19 +757,35 @@ def _attach_source_identity_evidence(
     characters: List[Dict[str, Any]],
     stats: Dict[str, Dict[str, Any]],
 ) -> None:
-    """Attach source aliases and aggregate appearance evidence deterministically."""
+    """Reconcile every retained source label with one canonical character.
+
+    The LLM is asked to preserve all source aliases, but that instruction is not
+    a contract boundary: a valid JSON response may still omit one.  Directly
+    resolvable source labels therefore establish deterministic identity anchors.
+    A still-unresolved generic label (for example a lead/pronoun reference) may
+    be attached only when exactly one anchored character remains after excluding
+    characters that co-occur with it.  Co-occurrence is negative identity
+    evidence: two labels in the same event normally describe two participants.
+
+    Any remaining ambiguity is rejected here, before storyboard review or paid
+    generation.  Silently skipping an unresolved label would recreate the alias
+    drift this function is intended to prevent.
+    """
     characters_by_name = {
         str(character.get("name") or "").strip(): character
         for character in characters
         if str(character.get("name") or "").strip()
     }
+    if stats and not characters_by_name:
+        raise ValueError("角色身份回验失败：来源称呼存在，但规范角色列表为空")
+
     evidence: Dict[str, Dict[str, Any]] = {
-        name: {"events": set(), "aliases": []}
+        name: {"events": set(), "aliases": [], "inferred_aliases": []}
         for name in characters_by_name
     }
 
-    for stat_name, stat_info in stats.items():
-        source_mentions = list(dict.fromkeys([
+    def source_mentions(stat_name: str, stat_info: Dict[str, Any]) -> List[str]:
+        return list(dict.fromkeys([
             str(stat_name).strip(),
             *(
                 str(alias).strip()
@@ -770,18 +793,106 @@ def _attach_source_identity_evidence(
                 if str(alias).strip()
             ),
         ]))
+
+    # First pass: only accept mappings already supported by the LLM's canonical
+    # name/id/aliases.  One resolved mention is sufficient to anchor its sibling
+    # qualified source aliases, but conflicting resolutions are never merged.
+    unresolved_stats: List[tuple[str, Dict[str, Any], List[str]]] = []
+    for stat_name, stat_info in stats.items():
+        mentions = source_mentions(stat_name, stat_info)
         resolved = {
             canonical
-            for mention in source_mentions
+            for mention in mentions
             if (canonical := resolve_character_name(mention, characters))
         }
+        if len(resolved) > 1:
+            raise ValueError(
+                "角色身份回验失败：同一来源身份映射到多个角色："
+                f"{stat_name} -> {sorted(resolved)}"
+            )
+        if not resolved:
+            unresolved_stats.append((stat_name, stat_info, mentions))
+            continue
+
+        canonical = next(iter(resolved))
+        character = characters_by_name[canonical]
+        character["aliases"] = list(dict.fromkeys([
+            *(character.get("aliases") or []),
+            *(mention for mention in mentions if mention and mention != canonical),
+        ]))
+        evidence[canonical]["events"].update(stat_info.get("events") or [])
+        evidence[canonical]["aliases"].extend(mentions)
+
+    # A generic source reference can be recovered without guessing when its
+    # events rule out every anchored character except one.  Importantly, this
+    # does not use script vocabulary, descriptions, LLM ordering, or a
+    # "most-overlap" score; all of those can silently join distinct people.
+    anchored_names = {
+        canonical
+        for canonical, identity_evidence in evidence.items()
+        if identity_evidence["events"]
+    }
+    for stat_name, stat_info, mentions in unresolved_stats:
+        if stat_name not in GENERIC_CHARACTER_NAMES:
+            continue
+        source_events = set(stat_info.get("events") or [])
+        candidates = sorted(
+            canonical
+            for canonical in anchored_names
+            if not (source_events & evidence[canonical]["events"])
+        )
+        if len(candidates) != 1:
+            continue
+
+        canonical = candidates[0]
+        character = characters_by_name[canonical]
+        character["aliases"] = list(dict.fromkeys([
+            *(character.get("aliases") or []),
+            *(mention for mention in mentions if mention and mention != canonical),
+        ]))
+        evidence[canonical]["inferred_aliases"].extend(mentions)
+
+    # Final pass: recompute from the repaired roster and enforce the actual
+    # postcondition.  Every retained source mention must now resolve, and all
+    # mentions grouped under one source statistic must resolve to the same name.
+    evidence = {
+        name: {
+            "events": set(),
+            "aliases": [],
+            "inferred_aliases": list(identity_evidence["inferred_aliases"]),
+        }
+        for name, identity_evidence in evidence.items()
+    }
+    failures: List[str] = []
+
+    for stat_name, stat_info in stats.items():
+        mentions = source_mentions(stat_name, stat_info)
+        resolved_by_mention = {
+            mention: resolve_character_name(mention, characters)
+            for mention in mentions
+        }
+        unresolved = [
+            mention for mention, canonical in resolved_by_mention.items() if canonical is None
+        ]
+        if unresolved:
+            failures.append(f"{stat_name}: 未解析 {unresolved}")
+            continue
+        resolved = set(resolved_by_mention.values())
         if len(resolved) != 1:
+            failures.append(f"{stat_name}: 映射冲突 {resolved_by_mention}")
             continue
         canonical = next(iter(resolved))
         if canonical not in evidence:
+            failures.append(f"{stat_name}: 规范角色不存在 {canonical}")
             continue
         evidence[canonical]["events"].update(stat_info.get("events") or [])
-        evidence[canonical]["aliases"].extend(source_mentions)
+        evidence[canonical]["aliases"].extend(mentions)
+
+    if failures:
+        raise ValueError(
+            "角色身份回验失败：所有过滤后来源称呼必须唯一映射到规范角色；"
+            + "；".join(failures)
+        )
 
     for canonical, character in characters_by_name.items():
         event_ids = sorted(evidence[canonical]["events"])
@@ -796,6 +907,13 @@ def _attach_source_identity_evidence(
             for alias in aliases
             if alias and alias != canonical
         ]
+        character["source_identity_evidence"] = {
+            "event_ids": event_ids,
+            "source_mentions": list(dict.fromkeys(evidence[canonical]["aliases"])),
+            "inferred_aliases": list(dict.fromkeys(
+                evidence[canonical]["inferred_aliases"]
+            )),
+        }
 
 
 def discover_characters(events: List[Dict[str, Any]]) -> Dict[str, Any]:
