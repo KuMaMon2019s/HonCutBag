@@ -1738,6 +1738,26 @@ def test_manifest_records_effective_route_and_phase6_requires_phase5(
     assert "no passing Phase 5 checkpoint" in selected["error"]
 
 
+@pytest.mark.parametrize("initial_value", [None, "0", "1"])
+def test_run_pipeline_restores_no_real_person_environment(
+    tmp_path, monkeypatch, initial_value
+):
+    if initial_value is None:
+        monkeypatch.delenv("HONCUT_NO_REAL_PERSON", raising=False)
+    else:
+        monkeypatch.setenv("HONCUT_NO_REAL_PERSON", initial_value)
+
+    pipeline_core.run_pipeline(
+        text="a clean-room test script",
+        output_dir=str(tmp_path),
+        dry_run=True,
+        no_real_person=True,
+        skip_phase=[1, 2, 3, 4, 5, 6, 7, 8, 9, 9.5],
+    )
+
+    assert os.environ.get("HONCUT_NO_REAL_PERSON") == initial_value
+
+
 def test_phase7_hands_pixel_quality_to_phase8(tmp_path):
     (tmp_path / "storyboard_qa_report.json").write_text(
         json.dumps(

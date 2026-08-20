@@ -7092,6 +7092,54 @@ def run_pipeline(
     resume_from: str = None,
     accept_code_change_from: str = None,
 ) -> dict:
+    """Run the pipeline without leaking its privacy mode into later runs."""
+    previous_no_real_person = os.environ.get("HONCUT_NO_REAL_PERSON")
+    try:
+        return _run_pipeline(
+            text=text,
+            input_file=input_file,
+            duration=duration,
+            shot_duration=shot_duration,
+            chain_mode=chain_mode,
+            dry_run=dry_run,
+            skip_phase=skip_phase,
+            output_dir=output_dir,
+            transition=transition,
+            transition_duration=transition_duration,
+            media_profile=media_profile,
+            enable_reshoot=enable_reshoot,
+            no_real_person=no_real_person,
+            resume=resume,
+            auto_approve=auto_approve,
+            resume_from=resume_from,
+            accept_code_change_from=accept_code_change_from,
+        )
+    finally:
+        if previous_no_real_person is None:
+            os.environ.pop("HONCUT_NO_REAL_PERSON", None)
+        else:
+            os.environ["HONCUT_NO_REAL_PERSON"] = previous_no_real_person
+
+
+def _run_pipeline(
+    text: str = None,
+    input_file: str = None,
+    duration: int = 60,
+    shot_duration: int = AVG_SHOT_DURATION,
+    chain_mode: bool = False,
+    dry_run: bool = False,
+    skip_phase: list = None,
+    output_dir: str = ".",
+    transition: str = "crossfade",
+    transition_duration: float = 0.5,
+    media_profile: str = "1080p",
+    enable_reshoot: bool = True,
+    no_real_person: bool = False,
+    resume: bool = False,
+    auto_approve: bool = True,
+    resume_from: str = None,
+    accept_code_change_from: str = None,
+) -> dict:
     """
     主入口：端到端管线
 
