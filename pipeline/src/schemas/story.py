@@ -66,6 +66,8 @@ class StoryboardShot(BaseModel):
     micro_actions: list[str] = Field(default_factory=list)
     generation_action_categories: list[str] = Field(default_factory=list)
     generation_action_units: list[dict[str, Any]] = Field(default_factory=list)
+    body_action_choreography: list[dict[str, Any]] = Field(default_factory=list)
+    body_action_contract: dict[str, Any] = Field(default_factory=dict)
     speaker_attribution: list[dict[str, Any]] = Field(default_factory=list)
 
 

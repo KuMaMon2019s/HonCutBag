@@ -13,6 +13,7 @@ from typing import Any, Protocol
 import numpy as np
 from PIL import Image
 from utils.character_body_contracts import character_visual_description
+from utils.body_action_contracts import body_action_prompt
 from utils.camera_motion_contracts import (
     camera_motion_negative_prompt,
     camera_motion_prompt,
@@ -147,6 +148,7 @@ def build_director_storyboard_prompt(
         )
         physical_camera = camera_motion_prompt(shot)
         camera_negative = camera_motion_negative_prompt(shot)
+        choreography = body_action_prompt(shot)
         storyboard_beats = shot.get("storyboard_beats") or []
         beat_count = (
             max(1, len(storyboard_beats))
@@ -161,6 +163,7 @@ def build_director_storyboard_prompt(
             f"人物={who_text or '环境'}；故事摘要={action or '环境建立'}；运镜={camera}；"
             f"摄影物理合同={physical_camera}；"
             f"摄影禁止项={camera_negative}；"
+            f"逐拍肢体动作谱={_compact(choreography, 1200) or '无专项舞蹈/格斗动作'}；"
             f"后续 Phase 2 为本镜绘制 {beat_count} 个连续故事格。"
         )
         panels.append({
@@ -174,6 +177,7 @@ def build_director_storyboard_prompt(
             "setting": setting,
             "characters": who_text,
             "summary": action,
+            "body_action_contract": shot.get("body_action_contract") or {},
             "storyboard_beat_count": beat_count,
         })
 

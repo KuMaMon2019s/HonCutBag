@@ -69,6 +69,8 @@ def _storyboard_group_contract(
                     or source.get("what")
                 ),
                 "generation_actions": [str(action) for action in actions if str(action).strip()],
+                "body_action_choreography": source.get("body_action_choreography") or [],
+                "body_action_contract": source.get("body_action_contract") or {},
                 "end_state": compact(source.get("end_state") or source.get("what")),
                 "causal_link": compact(source.get("causal_link") or planned.continuity_reason),
                 "continuity_reason": planned.continuity_reason,

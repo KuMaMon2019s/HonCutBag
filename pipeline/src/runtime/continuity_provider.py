@@ -485,11 +485,28 @@ def _chunk_prompt(
         )
     beat_contract = ""
     if request.chunk.storyboard_beat_id:
+        from utils.body_action_contracts import body_action_prompt
+
+        chunk_action = str(request.chunk.action_prompt or "").strip()
+        chunk_meta = dict(shot_meta)
+        chunk_meta["micro_actions"] = [chunk_action] if chunk_action else []
+        chunk_meta["generation_actions"] = [chunk_action] if chunk_action else []
+        chunk_meta["body_action_choreography"] = [
+            dict(beat)
+            for beat in (shot_meta.get("body_action_choreography") or [])
+            if isinstance(beat, dict)
+            and (
+                not str(beat.get("micro_action") or "").strip()
+                or str(beat.get("micro_action") or "").strip() == chunk_action
+            )
+        ]
+        choreography = body_action_prompt(chunk_meta)
         beat_contract = (
             f"\n[authoritative storyboard beat {request.chunk.storyboard_beat_id}] "
             f"Start state: {request.chunk.start_state or 'continue the supplied state'}. "
             f"Execute only this visible action: {request.chunk.action_prompt or 'natural scene progression'}. "
             f"Required end state: {request.chunk.end_state or 'complete that action'}. "
+            f"{choreography} "
             "Do not execute another Pxx panel, skip ahead, or replay an earlier panel."
         )
     prompt = apply_storyboard_motion_policy(

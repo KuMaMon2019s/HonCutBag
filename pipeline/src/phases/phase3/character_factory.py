@@ -330,7 +330,8 @@ def _reference_rendering_clause(style: str) -> str:
         return (
             "High-end stylized CGI character design in the exact declared project medium, "
             "deliberately synthetic materials and designed digital geometry, consistent "
-            "silhouette and color blocks, no photoreal skin, no visible human face, "
+            "silhouette, declared veil/makeup/tattoo/mechanical texture anchors and color blocks, "
+            "no photoreal skin or untreated natural human face, "
             "no live-action person and no likeness of a real person"
         )
     return "Photorealistic, natural skin texture"

@@ -31,7 +31,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from utils.privacy_visual_policy import synthetic_character_review_evidence
+from utils.privacy_visual_policy import (
+    SYNTHETIC_QA_CONTRACT,
+    synthetic_character_review_evidence,
+)
+from utils.body_action_contracts import body_action_qa_instruction
 from utils.temporal_visual_contracts import apply_temporal_visual_contract
 
 # ---------------------------------------------------------------------------
@@ -865,7 +869,7 @@ def _vlm_semantic_check(
     review_evidence = synthetic_character_review_evidence(output_dir)
     synthetic_review = bool(review_evidence["enabled"])
     qa_contract = (
-        "synthetic_character_structural_consistency_v1"
+        SYNTHETIC_QA_CONTRACT
         if synthetic_review
         else "human_visual_anatomy_v1"
     )
@@ -880,7 +884,7 @@ def _vlm_semantic_check(
             "reason": "synthetic character identity evidence is incomplete",
             "issues": [
                 "Synthetic QA requires every character to have an ID, synthetic policy/gender, "
-                "canonical helmet/face, and at least one clothing or identity marker"
+                "canonical face styling, clothing/identity marker, non-human material, and at least two visible styling anchors"
             ],
             "qa_contract": qa_contract,
             "qa_contract_evidence": review_evidence,
@@ -890,10 +894,11 @@ def _vlm_semantic_check(
     identity_contract = (
         (
             "Canonical synthetic identities (treat every ID as a distinct character and enforce "
-            "the listed helmet/face, clothing, colors, silhouette, and markers exactly): "
+            "the listed veil/mask or face styling, makeup/tattoos, mechanical or other non-human "
+            "materials, designed hair/head silhouette, clothing, colors, and markers exactly): "
             f"{json.dumps(review_evidence['characters'], ensure_ascii=False)}. "
-            "Shared helmet families do not permit identity merging: use clothing and distinguishing "
-            "markers to keep same-helmet characters separate. "
+            "Shared styling families do not permit identity merging: use each role's complete anchor "
+            "combination, clothing and distinguishing markers to keep nearby designs separate. "
         )
         if synthetic_review and review_evidence["characters"]
         else (
@@ -907,14 +912,17 @@ def _vlm_semantic_check(
     )
     structure_contract = (
         (
-            "All characters in this project are intentionally fully synthetic CGI androids or robots. "
-            "Opaque enclosed mechanical helmets, reflective visors, designed mechanical heads, neck "
-            "connectors, joints, armor seams, and non-human materials are required identity features, "
-            "not human-anatomy defects. Never judge them against human anatomy or flag a mechanical "
-            "neck/head merely for being non-human. Judge structural consistency instead: require visible "
+            "All characters in this project are intentionally synthetic stylized CGI characters. "
+            "Declared veils/masks, graphic makeup, facial tattoos, mechanical seams, porcelain/crystalline "
+            "surfaces, designed hair/head silhouettes, joints and other non-human materials are required "
+            "identity styling, not human-anatomy defects. Helmets are optional and one generic helmet must "
+            "not replace the cast's distinct styling. Never flag a declared non-human head/neck/material "
+            "merely for not matching a natural human. Judge structural and styling consistency instead: "
+            "each visible character must preserve at least two declared styling anchors; an untreated "
+            "natural human face is a failure. Require visible "
             "positive evidence of an unintended break, detachment, merge, extra/missing component, "
             "impossible self-intersection, or reference-inconsistent deformation. Continue to detect "
-            "helmet/visor color drift, identity-marker drift, action discontinuity, and wrong spatial order. "
+            "face-styling/material color drift, identity-marker drift, action discontinuity, and wrong spatial order. "
         )
         if synthetic_review
         else (
@@ -934,6 +942,7 @@ def _vlm_semantic_check(
                     key: shot_by_id[shot_id].get(key)
                     for key in (
                         "shot_id", "id", "visual", "action", "generation_actions",
+                        "body_action_choreography", "body_action_contract",
                         "who", "where", "time", "time_of_day", "time_window",
                         "temporal_visual_contract", "lighting", "lighting_description",
                         "gen_strategy",
@@ -944,6 +953,13 @@ def _vlm_semantic_check(
                 if shot_id in shot_by_id
             ]
         }
+        body_action_qa = " ".join(
+            instruction
+            for shot_id in batch_shot_ids
+            if shot_id in shot_by_id
+            for instruction in [body_action_qa_instruction(shot_by_id[shot_id])]
+            if instruction
+        )
         prompt = (
             f"QA contract: {qa_contract}. "
             "Review these chronologically sampled frames from the final edited film against the storyboard. "
@@ -957,6 +973,7 @@ def _vlm_semantic_check(
             '{"verdict":"pass|revise|fail","issues":["..."],"confidence":0.0}. '
             f"{structure_contract}"
             f"{identity_contract}"
+            f"{body_action_qa} "
             f"Storyboard: {json.dumps(storyboard, ensure_ascii=False)}"
         )
         raw = vlm_client.review([Path(item.path) for item in sample_frames], prompt)

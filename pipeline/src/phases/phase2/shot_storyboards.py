@@ -13,6 +13,7 @@ from typing import Any, Protocol
 import requests
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from utils.character_body_contracts import character_visual_description
+from utils.body_action_contracts import body_action_prompt
 from utils.character_reference_contracts import (
     character_identity_detail_items,
     identity_detail_prompt_items,
@@ -120,10 +121,15 @@ def _character_contract(
     contract = "\n".join(lines) or "- 严格使用 STORYBOARD.json 声明的角色设定，不自行增加人物。"
     from utils.privacy_visual_policy import (
         is_no_real_person_enabled,
+        is_synthetic_visual_identity_policy,
         no_real_person_prompt_contract,
     )
 
-    if is_no_real_person_enabled():
+    if is_no_real_person_enabled() or any(
+        is_synthetic_visual_identity_policy(character.get("visual_identity_policy"))
+        for character in characters
+        if isinstance(character, dict)
+    ):
         contract = f"- {no_real_person_prompt_contract()}\n{contract}"
     return contract
 
@@ -162,6 +168,7 @@ def build_shot_storyboard_prompt(
             "first_last_frame_bridge": "FIRST_LAST_FRAME_BRIDGE",
         }.get(generation_mode, "FRESH" if position == 1 else "EXTEND")
         beat_camera_contract = camera_motion_prompt({**shot, **beat})
+        beat_choreography = body_action_prompt({**shot, **beat})
         beat_lines.append(
             f"故事格{position}【{beat_id} · {mode} · {float(beat.get('duration_s') or 5):g}秒】："
             f"起始状态={_compact(beat.get('start_state'))}；"
@@ -170,7 +177,8 @@ def build_shot_storyboard_prompt(
             f"景别={beat.get('shot_size') or shot.get('shot_size') or 'medium'}；"
             f"运镜={beat.get('camera_movement') or shot.get('camera_movement') or 'steadicam'}；"
             f"边界把手={_edge_handle_contract(beat)}；"
-            f"物理合同={beat_camera_contract}。"
+            f"物理合同={beat_camera_contract}；"
+            f"逐拍肢体动作谱={_compact(beat_choreography, 1200) or '无专项舞蹈/格斗动作'}。"
         )
     prompt = f"""为导演级镜头 {shot_id} 绘制一张内部动作故事板。
 
@@ -201,6 +209,7 @@ def build_shot_storyboard_prompt(
 角色职责与道具合同：
 - 每个角色只执行逐格合同明确分配给自己的动作；不得把其他角色或群体的动作复制给旁观者、记录者、驾驶者、守卫或任何未被指定的角色。
 - 保留源文本中的道具类型、持有者和使用方式；不得替换设备、交换道具或让角色无故放下道具。
+- 舞蹈、格斗、功夫和武术格必须画清左右侧、执行肢体、步法、躯干旋转、重心转移、方向、接触点和终态；不得用“复杂动作”“跳舞”“激烈格斗”或动作箭头代替身体姿态。
 
 摄影与人体透视禁止项：
 - {camera_motion_negative_prompt(shot)}。
@@ -233,6 +242,7 @@ def _build_panel_prompt(
     )
     who = _shot_who(shot)
     beat_id = str(beat.get("beat_id") or f"P{position:02d}")
+    choreography_section = body_action_prompt({**shot, **beat})
     generation_mode = str(beat.get("generation_mode") or "").strip().lower()
     is_bridge = generation_mode == "first_last_frame_bridge"
     if is_last_content_beat is None:
@@ -342,6 +352,7 @@ Phase 5 定向纠偏合同：
 {bridge_contract}
 本格起始状态：{_compact(beat.get('start_state'))}
 本格唯一可见动作：{_compact(beat.get('action'))}
+本格逐拍肢体动作谱：{_compact(choreography_section, 1600) or '无专项舞蹈/格斗动作'}
 本格必须到达的结束状态：{_compact(beat.get('end_state'))}
 场景：{_compact(shot.get('where') or shot.get('visual'), 260)}
 {temporal_section}景别：{beat.get('shot_size') or shot.get('shot_size') or 'medium'}
@@ -353,9 +364,10 @@ Phase 5 定向纠偏合同：
 {_character_contract(characters, who)}
 
 角色与动作硬约束：
-- 若角色合同启用“非真人视觉硬约束”，角色在每一格都必须保持全封闭不透明面甲，禁止露出人脸、皮肤、头发或真人肖像特征；旧剧情中的男性、脸、头发、真人写实描述不得覆盖该约束。
+- 若角色合同启用“非真人视觉硬约束”，每个角色必须逐格保持自己声明的面纱/遮罩、图形化妆、面部纹样、机械纹理、非人材质或其他合成妆造锚点；禁止退化为无妆造的自然真人，也禁止擅自给所有人套用同一种头盔。
 - 逐字遵守角色合同中的发型、服装基础色、制服类型、体型和装备；警示灯、阴影和炭笔风格只能改变受光，不得把服装基础色改成另一角色的颜色。
 - 每个动作的执行者、承受者、左右位置、朝向以及武器持有者必须与“本格唯一可见动作”一致；禁止交换人物、攻守关系或武器归属。
+- 舞蹈/格斗/功夫/武术动作必须逐拍执行上述肢体动作谱，明确左挡、右闪、支撑侧、摆动侧、躯干旋转、重心转移、接触点和终态；原文点名的托马斯、铁山靠等招式不得泛化、镜像或换招。
 - 每个角色只执行本格明确分配给自己的动作；不得把其他角色或群体的动作复制给旁观者、记录者、驾驶者、守卫或任何未被指定的角色。
 - 严格保留本格声明的道具类型、持有者和使用方式；不得替换设备、交换道具或让角色无故放下道具。
 - 静态故事格只能画一个时间点，不得把多个时间点或动作过程拼贴在一起；但若本格给主体分配了肢体或位移动作，必须选择达到结束状态时仍具动力学信息的瞬间，以关节弯曲、肢体伸展、重心偏移、接触关系和动作方向清楚表现该动作。不得把“终态”误画成人物中性站立；只有源合同明确要求静止、停止或定格时才画静止姿态。
@@ -721,8 +733,8 @@ def _is_transient_image_transport_error(error: BaseException) -> bool:
 def _storyboard_safety_retry_prompt(prompt: str) -> str:
     """Preserve blocking/action semantics while removing graphic implications."""
     return f"""【自动安全重生成合同｜最高优先级】
-- 这是完全虚构的非真人机械合成人特技预演图，不是真人打斗或现实暴力。
-- 所有角色必须保持全封闭不透明机械面甲；禁止人脸、皮肤、头发或生物伤口。
+- 这是完全虚构的风格化 CGI 数字角色特技预演图，不是真人打斗或现实暴力。
+- 每个角色必须保持自己声明的至少两个非真人妆造锚点（面纱/遮罩、图形化妆、面部纹样、机械纹理、非人材质等）；禁止未经妆造的自然真人脸、照片级人类皮肤或生物伤口，也禁止给全体套同款头盔。
 - 用错开的预接触姿态、格挡姿态和红色动作箭头表达动作方向；不要画拳、肘、膝或武器真正击中身体的瞬间。
 - 无血液、无伤口、无痛苦表情、无骨折、无身体损伤、无处决、无武器开火。
 - 必须保留原合同的角色身份、攻守关系、空间轴线和结束状态，但把接触表现为安全的机械训练编排。

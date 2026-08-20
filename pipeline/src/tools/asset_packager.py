@@ -533,6 +533,11 @@ def build_content_for_shot(
             "Move the subjects through the ordered action contract with clear body displacement; "
             "do not hold or gently animate the input pose."
         ).strip()
+    from utils.body_action_contracts import body_action_prompt
+
+    choreography_prompt = body_action_prompt(shot_meta)
+    if choreography_prompt and choreography_prompt not in prompt_text:
+        prompt_text = f"{prompt_text}\n{choreography_prompt}".strip()
     try:
         characters_data = json.loads(
             (output_dir / "CHARACTERS.json").read_text(encoding="utf-8")

@@ -645,7 +645,9 @@ def test_synthetic_seedance_router_does_not_reintroduce_human_skin_or_hair(
         assets=[{"name": "摄影师", "description": "全封闭机械头盔"}],
     )
 
-    assert "mechanical helmet and opaque visor geometry" in prompt
+    assert "declared veil/mask or face styling" in prompt
+    assert "no untreated natural human face" in prompt
+    assert "one generic helmet copied to all roles" in prompt
     assert "High-end stylized 3D CGI" in prompt
     assert "Photorealistic cinematography" not in prompt
     assert "delicate skin texture" not in prompt
@@ -1495,13 +1497,13 @@ def test_final_vlm_uses_persisted_synthetic_contract_after_env_is_gone(
         output_dir=tmp_path,
     )
 
-    assert result["qa_contract"] == "synthetic_character_structural_consistency_v1"
+    assert result["qa_contract"] == "synthetic_character_styling_consistency_v2"
     assert "not human-anatomy defects" in prompts[0]
-    assert "Never judge them against human anatomy" in prompts[0]
-    assert "helmet/visor color drift" in prompts[0]
+    assert "untreated natural human face is a failure" in prompts[0]
+    assert "face-styling/material color drift" in prompts[0]
     assert "藏蓝 #1B2A41" in prompts[0]
     assert "深红面甲" in prompts[0]
-    assert "Shared helmet families do not permit identity merging" in prompts[0]
+    assert "Shared styling families do not permit identity merging" in prompts[0]
     evidence = result["qa_contract_evidence"]
     assert evidence["identity_contract_complete"] is True
     assert "artifact:all_character_genders" in evidence["sources"]
@@ -1525,7 +1527,7 @@ def test_final_vlm_uses_live_synthetic_policy_without_character_artifact(
 
     result = video_qa._vlm_semantic_check(FakeClient(), frames, None)
 
-    assert result["qa_contract"] == "synthetic_character_structural_consistency_v1"
+    assert result["qa_contract"] == "synthetic_character_styling_consistency_v2"
 
 
 def test_final_vlm_blocks_incomplete_synthetic_identity_evidence(
@@ -1973,10 +1975,11 @@ def test_phase8_vlm_switches_to_synthetic_structure_contract_from_artifacts(
 
     result = reviewer([frame], {"shot_id": "S01", "who": ["摄影师"]})
 
-    assert result["qa_contract"] == "synthetic_character_structural_consistency_v1"
-    assert "Opaque enclosed mechanical helmets" in captured["prompt"]
+    assert result["qa_contract"] == "synthetic_character_styling_consistency_v2"
+    assert "Declared veils/masks, graphic makeup, facial tattoos" in captured["prompt"]
+    assert "must never be copied onto every role" in captured["prompt"]
     assert "not human-anatomy defects" in captured["prompt"]
-    assert "Judge synthetic-character structural consistency" in captured["prompt"]
+    assert "Judge synthetic-character consistency" in captured["prompt"]
     assert "Detect broken anatomy" not in captured["prompt"]
     assert "background extras must not duplicate a canonical identity" in captured["prompt"]
 

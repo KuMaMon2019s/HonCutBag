@@ -1667,8 +1667,8 @@ def test_provider_prepends_no_real_person_visual_contract(monkeypatch, tmp_path)
     )
 
     assert content[0]["text"].startswith("【非真人视觉硬约束】")
-    assert "全封闭机械头盔" in content[0]["text"]
-    assert "旧描述，一律忽略" in content[0]["text"]
+    assert "面纱/遮罩、图形化妆、面部纹样、机械拼接纹理" in content[0]["text"]
+    assert "不得把不同角色统一改成同款头盔" in content[0]["text"]
 
 
 def test_storyboard_beat_planner_discards_quote_only_fragments():
@@ -3214,7 +3214,7 @@ def test_generation_contract_locks_spatial_order_canonical_colors_and_lookalikes
     assert "藏蓝 / navy = #1F2A44" in prompt
     assert "深红 / dark red = #7A1F2B" in prompt
     assert "[lookalike-cast-disambiguation]" in prompt
-    assert "shared face/helmet: 摄影师 | 男路人" in prompt
+    assert "shared face/styling/headgear: 摄影师 | 男路人" in prompt
     assert "[spatial-motion-lock]" in prompt
     assert "男路人始终跟在女主身后2米" in prompt
     assert "never become side-by-side, move ahead, overtake" in prompt

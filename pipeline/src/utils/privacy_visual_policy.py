@@ -3,25 +3,38 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
 from typing import Any
 
 NO_REAL_PERSON_ENV = "HONCUT_NO_REAL_PERSON"
-NO_REAL_PERSON_POLICY = "synthetic_faceless_android_v1"
+NO_REAL_PERSON_POLICY = "synthetic_stylized_character_v2"
+LEGACY_NO_REAL_PERSON_POLICIES = frozenset({"synthetic_faceless_android_v1"})
+SUPPORTED_NO_REAL_PERSON_POLICIES = frozenset(
+    {NO_REAL_PERSON_POLICY, *LEGACY_NO_REAL_PERSON_POLICIES}
+)
+SYNTHETIC_QA_CONTRACT = "synthetic_character_styling_consistency_v2"
 
 SYNTHETIC_STYLE_CONTRACT = (
-    "高成本风格化三维 CGI 科幻动画，所有角色都是完全虚构的合成人或安保机器人；"
-    "角色始终佩戴不透明全封闭机械头盔和反光面甲，不露出脸、皮肤、头发、眼睛或任何真人生物特征；"
-    "材质和轮廓明确属于设计化数字角色，不是真人实拍，不模仿任何现实人物"
+    "高成本风格化三维 CGI 动画，所有角色都是完全虚构的数字角色；"
+    "每个角色必须拥有独立且逐镜持久的非真人妆造组合，例如面纱/遮罩、图形化妆、面部纹样、"
+    "机械拼接纹理、瓷质或晶体合成皮肤、非人眼部设计与设计化发丝；"
+    "每人至少保留两个可见妆造锚点和一种明确非人材质，不要求也禁止默认给所有角色套同一种头盔；"
+    "材质、轮廓与面部设计明确属于数字角色，不是真人实拍，不模仿任何现实人物"
 )
 
 SYNTHETIC_NEGATIVE_CONTRACT = (
-    "真人，真人实拍，写真人脸，照片级人类皮肤，可见面孔，可见眼睛，可见头发，"
-    "裸露皮肤，名人，现实人物，身份证照片，肖像摄影，换脸，live-action，"
-    "photorealistic human，real person，natural human skin"
+    "真人，真人实拍，写真人脸，未经妆造的自然人脸，照片级人类皮肤，自然人类眼睛，"
+    "自然裸露皮肤，普通真人发丝，名人，现实人物，身份证照片，肖像摄影，换脸，live-action，"
+    "photorealistic human，real person，natural human skin，所有角色同款头盔，统一面甲"
 )
+
+
+def is_synthetic_visual_identity_policy(value: Any) -> bool:
+    """Accept the current diverse styling policy and durable legacy artifacts."""
+    return str(value or "").strip() in SUPPORTED_NO_REAL_PERSON_POLICIES
 
 
 def is_no_real_person_enabled() -> bool:
@@ -84,6 +97,8 @@ def synthetic_character_review_evidence(
             "visual_identity_policy": str(
                 character.get("visual_identity_policy") or ""
             ).strip(),
+            "face_styling": str(appearance.get("face") or "").strip(),
+            # Compatibility alias for older report consumers.
             "helmet_or_face": str(appearance.get("face") or "").strip(),
             "clothing": str(appearance.get("clothing") or "").strip(),
             "distinguishing": str(appearance.get("distinguishing") or "").strip(),
@@ -96,32 +111,56 @@ def synthetic_character_review_evidence(
                 if isinstance(appearance.get("identity_props"), list)
                 else []
             ),
+            "synthetic_styling": (
+                appearance.get("synthetic_styling")
+                if isinstance(appearance.get("synthetic_styling"), dict)
+                else {}
+            ),
         })
 
     evidence["artifact_valid"] = True
     evidence["characters"] = characters
-    top_level_match = payload.get("visual_identity_policy") == NO_REAL_PERSON_POLICY
+    top_level_match = is_synthetic_visual_identity_policy(
+        payload.get("visual_identity_policy")
+    )
     all_policy_tagged = bool(characters) and all(
-        character["visual_identity_policy"] == NO_REAL_PERSON_POLICY
+        is_synthetic_visual_identity_policy(character["visual_identity_policy"])
         for character in characters
     )
     all_gender_synthetic = bool(characters) and all(
         character["gender"].casefold() == "synthetic"
         for character in characters
     )
+    def complete_identity(character: dict[str, Any]) -> bool:
+        base = bool(
+            character["id"]
+            and (
+                is_synthetic_visual_identity_policy(character["visual_identity_policy"])
+                or character["gender"].casefold() == "synthetic"
+            )
+            and character["face_styling"]
+            and (
+                character["clothing"]
+                or character["distinguishing"]
+                or character["distinguishing_features"]
+            )
+        )
+        if not base:
+            return False
+        if character["visual_identity_policy"] != NO_REAL_PERSON_POLICY:
+            return True
+        styling = character.get("synthetic_styling") or {}
+        anchors = styling.get("visible_anchors") or []
+        return bool(
+            styling.get("schema") == "honcut.synthetic-styling.v2"
+            and styling.get("mode")
+            and styling.get("non_human_material")
+            and isinstance(anchors, list)
+            and len([anchor for anchor in anchors if str(anchor).strip()]) >= 2
+        )
+
     identity_complete = bool(characters) and all(
-        character["id"]
-        and (
-            character["visual_identity_policy"] == NO_REAL_PERSON_POLICY
-            or character["gender"].casefold() == "synthetic"
-        )
-        and character["helmet_or_face"]
-        and (
-            character["clothing"]
-            or character["distinguishing"]
-            or character["distinguishing_features"]
-        )
-        for character in characters
+        complete_identity(character) for character in characters
     )
     evidence.update({
         "top_level_policy_match": top_level_match,
@@ -152,63 +191,159 @@ def no_real_person_prompt_contract() -> str:
         "【非真人视觉硬约束】"
         f"{SYNTHETIC_STYLE_CONTRACT}。"
         f"负面约束：{SYNTHETIC_NEGATIVE_CONTRACT}。"
-        "如果剧情文字含有男性、女性、脸、头发或真人写实等旧描述，一律忽略这些旧描述，"
-        "以本非真人视觉硬约束为最高优先级。"
+        "男性/女性等词只表示服装与表演呈现，不得恢复自然真人生物特征；剧情中的脸、头发描述"
+        "必须经过该角色已声明的非真人妆造合同重解释。以角色自己的妆造锚点为最高优先级，"
+        "不得把不同角色统一改成同款头盔、面甲或机器人。"
     )
 
 
-def _synthetic_identity(character: dict[str, Any]) -> dict[str, str]:
-    role = str(character.get("role") or "").strip().lower()
-    char_id = str(character.get("id") or "").strip().lower()
-    protagonist = role == "protagonist" or char_id == "agent"
-    if protagonist:
-        return {
-            "kind": "完全虚构的深灰色战术合成人",
-            "helmet": "哑光深灰色全封闭机械头盔，单片式不透明黑色反光面甲，无可见面孔或皮肤",
-            "mark": "面甲右眉位置有一条细窄琥珀色识别灯带，胸甲有三角形冷白编号灯",
-        }
-    return {
-        "kind": "完全虚构的藏蓝色安保机器人",
-        "helmet": "哑光藏蓝色全封闭安保头盔，横向不透明深红色机械面甲，无可见面孔或皮肤",
-        "mark": "左前臂是发光安保编号板，肩部保留银色安保识别章",
-    }
+def _synthetic_identity(character: dict[str, Any], index: int) -> dict[str, Any]:
+    """Choose a deterministic, visibly non-human styling route per character."""
+    appearance = character.get("appearance")
+    appearance = appearance if isinstance(appearance, dict) else {}
+    source_gender = str(
+        appearance.get("gender") or character.get("gender") or ""
+    ).casefold()
+    stable_key = str(
+        character.get("id") or character.get("name") or f"character-{index}"
+    )
+    digest = hashlib.sha256(stable_key.encode("utf-8")).digest()
+    palette = (
+        ("钴蓝", "荧光洋红", "冷银"),
+        ("孔雀绿", "熔岩橙", "石墨黑"),
+        ("群青", "酸性黄", "乳白瓷"),
+        ("深紫", "冰青", "暗金"),
+        ("朱红", "电光蓝", "钛灰"),
+    )[digest[0] % 5]
+    primary, accent, material_color = palette
+
+    female_presenting = any(
+        token in source_gender
+        for token in ("female", "woman", "girl", "女")
+    )
+    mode_index = index % 4
+    if female_presenting:
+        mode_index = 0
+    modes: tuple[dict[str, Any], ...] = (
+        {
+            "mode": "veiled_graphic_couture",
+            "kind": "完全虚构的面纱图形妆数字角色",
+            "hair": f"{material_color}设计化纤维发束，边缘呈规则切面高光，不是自然真人发丝",
+            "face": (
+                f"{primary}不透明薄纱面纱固定遮住鼻梁以下，额头与眼周覆盖{accent}非对称几何彩妆和"
+                f"发光面部纹样；可见区域是{material_color}哑光瓷质合成表面，不是人类皮肤"
+            ),
+            "anchors": [f"{primary}不透明面纱", f"{accent}发光眼周纹样", f"{material_color}瓷质表面"],
+            "material": f"{material_color}哑光瓷质合成表面",
+        },
+        {
+            "mode": "biomechanical_face_seams",
+            "kind": "完全虚构的生物机械妆数字角色",
+            "hair": f"{primary}硬质纤维束发型，发梢带{accent}导光丝，不是自然头发",
+            "face": (
+                f"脸颊和太阳穴嵌入{material_color}机械拼接板与可见接缝，眉骨下是{accent}图形光带，"
+                "表面为设计化合成材质，无照片级人类皮肤"
+            ),
+            "anchors": [f"{material_color}脸颊机械拼接板", f"{accent}眉骨光带", f"{primary}导光纤维发束"],
+            "material": f"{material_color}机械陶瓷与导光纤维",
+        },
+        {
+            "mode": "tattoo_editorial_makeup",
+            "kind": "完全虚构的纹样特效妆数字角色",
+            "hair": f"{material_color}雕塑感整块发型，带{primary}印刷网点纹理，不是自然发丝",
+            "face": (
+                f"整张脸覆盖{primary}/{accent}高对比编辑彩妆与跨越鼻梁的电路式面部纹身，"
+                f"底层是{material_color}丝绒合成皮肤并带规则微网格，不是自然人类皮肤"
+            ),
+            "anchors": [f"{primary}/{accent}跨鼻梁电路纹身", f"{material_color}微网格合成皮肤", "雕塑感印刷发型"],
+            "material": f"{material_color}丝绒微网格合成皮肤",
+        },
+        {
+            "mode": "crystalline_facial_texture",
+            "kind": "完全虚构的晶体纹理数字角色",
+            "hair": f"{primary}半透明片状头饰与短纤维冠，边缘发出{accent}冷光",
+            "face": (
+                f"面部由{material_color}半透明晶体纹理与{primary}放射状裂纹构成，颧骨有{accent}金属箔妆，"
+                "眼部为抽象图形光孔，不是自然眼睛或皮肤"
+            ),
+            "anchors": [f"{primary}放射晶体裂纹", f"{accent}颧骨金属箔妆", "抽象图形光孔"],
+            "material": f"{material_color}半透明晶体合成材质",
+        },
+    )
+    identity = dict(modes[mode_index])
+    identity["mark"] = (
+        f"锁骨位置保留{accent}短横识别灯，服装左侧有仅属于该角色的"
+        f"{digest[1]:02X}{digest[2]:02X}几何编号章"
+    )
+    return identity
 
 
 def apply_no_real_person_character_policy(
     characters_data: dict[str, Any],
 ) -> dict[str, Any]:
-    """Rewrite human identity fields into stable, faceless synthetic designs.
+    """Rewrite human identity fields into stable, visibly synthetic styling.
 
     The transform intentionally preserves names, roles, relationships, costume
-    colors, and story semantics while removing every facial/biometric cue that
-    could steer image or video providers toward a real-person likeness.
+    colors, and story semantics while replacing natural biometric cues with
+    persistent veil/makeup/tattoo/mechanical/material anchors that cannot be
+    mistaken for an untreated real-person likeness.
     """
     rewritten = copy.deepcopy(characters_data)
     characters = rewritten.get("characters")
     if not isinstance(characters, list):
         return rewritten
+    if (
+        rewritten.get("visual_identity_policy") == NO_REAL_PERSON_POLICY
+        and characters
+        and all(
+            isinstance(character, dict)
+            and character.get("visual_identity_policy") == NO_REAL_PERSON_POLICY
+            and isinstance(
+                (character.get("appearance") or {}).get("synthetic_styling"),
+                dict,
+            )
+            and (character.get("appearance") or {})
+            .get("synthetic_styling", {})
+            .get("schema")
+            == "honcut.synthetic-styling.v2"
+            for character in characters
+        )
+    ):
+        return rewritten
 
-    for character in characters:
+    for index, character in enumerate(characters):
         if not isinstance(character, dict):
             continue
         appearance = character.get("appearance")
         if not isinstance(appearance, dict):
             appearance = {}
             character["appearance"] = appearance
-        identity = _synthetic_identity(character)
+        identity = _synthetic_identity(character, index)
         clothing = str(appearance.get("clothing") or "").strip()
         clothing = clothing or "全身密闭式科幻战术装甲和防滑太空作战靴"
         appearance.update(
             {
                 "gender": "synthetic",
                 "age_range": "not applicable",
-                "hair": "无可见头发；全部隐藏在不可开启的全封闭机械头盔内",
-                "face": identity["helmet"],
+                "hair": identity["hair"],
+                "face": identity["face"],
                 "clothing": clothing,
                 "distinguishing": identity["mark"],
+                "synthetic_styling": {
+                    "schema": "honcut.synthetic-styling.v2",
+                    "mode": identity["mode"],
+                    "non_human_material": identity["material"],
+                    "visible_anchors": list(identity["anchors"]),
+                    "minimum_visible_anchors_per_shot": 2,
+                    "visibility_contract": (
+                        "every character-bearing shot must visibly preserve at least two listed anchors; "
+                        "occlusion may hide one anchor but may not restore an untreated natural human face"
+                    ),
+                },
                 "summary": (
-                    f"{identity['kind']}，{identity['helmet']}；{clothing}；"
-                    f"{identity['mark']}。全身无裸露皮肤，明确为风格化 CGI 数字角色而非真人"
+                    f"{identity['kind']}，{identity['face']}；{identity['hair']}；{clothing}；"
+                    f"{identity['mark']}。妆造锚点：{'、'.join(identity['anchors'])}。"
+                    "明确为风格化 CGI 数字角色而非真人"
                 ),
             }
         )
@@ -220,12 +355,14 @@ def apply_no_real_person_character_policy(
         character["visual_identity_policy"] = NO_REAL_PERSON_POLICY
         character["distinguishing_features"] = [
             clothing,
-            identity["helmet"],
+            identity["face"],
             identity["mark"],
+            *identity["anchors"],
         ]
         character["prompt_definition"] = (
-            f"将{{图片N}}中的[{identity['kind']}、{identity['helmet']}、{clothing}、"
-            f"{identity['mark']}]定义为{{主体N}}；主体是虚构合成人，不得生成人脸或皮肤"
+            f"将{{图片N}}中的[{identity['kind']}、{identity['face']}、{identity['hair']}、{clothing}、"
+            f"{identity['mark']}]定义为{{主体N}}；主体是虚构数字角色，至少两个妆造锚点逐镜可见，"
+            "不得恢复未经妆造的自然真人脸，也不得替换成通用头盔"
         )
         existing_guardrails = str(character.get("negative_guardrails") or "").strip()
         character["negative_guardrails"] = "，".join(
@@ -234,4 +371,10 @@ def apply_no_real_person_character_policy(
             if part
         )
     rewritten["visual_identity_policy"] = NO_REAL_PERSON_POLICY
+    rewritten["synthetic_styling_policy"] = {
+        "schema": "honcut.synthetic-styling-policy.v2",
+        "minimum_visible_anchors_per_character": 2,
+        "same_headgear_for_every_character_forbidden": True,
+        "natural_human_face_without_declared_styling_forbidden": True,
+    }
     return rewritten

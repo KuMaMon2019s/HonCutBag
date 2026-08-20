@@ -16,6 +16,8 @@ from utils.temporal_visual_contracts import (
     apply_temporal_visual_contract,
     temporal_visual_qa_instruction,
 )
+from utils.body_action_contracts import body_action_qa_instruction
+from utils.privacy_visual_policy import SYNTHETIC_QA_CONTRACT
 
 
 SemanticReviewer = Callable[[list[Path], dict[str, Any]], dict[str, Any]]
@@ -454,7 +456,7 @@ def _automatic_semantic_reviewer(
 
     synthetic_review = _uses_synthetic_character_review(output_dir)
     qa_contract = (
-        "synthetic_character_structural_consistency_v1"
+        SYNTHETIC_QA_CONTRACT
         if synthetic_review
         else "human_visual_anatomy_v1"
     )
@@ -466,6 +468,7 @@ def _automatic_semantic_reviewer(
             key: shot_meta.get(key)
             for key in (
                 "shot_id", "visual", "action", "action_description", "generation_actions",
+                "body_action_choreography", "body_action_contract",
                 "who", "where",
                 "characters", "time", "time_of_day", "lighting", "lighting_key",
                 "time_window", "temporal_visual_contract", "lighting_description",
@@ -478,13 +481,16 @@ def _automatic_semantic_reviewer(
         review_paths = [path for _character_id, path in character_references] + frame_paths
         structure_contract = (
             (
-                "This project intentionally uses fully synthetic CGI androids. Opaque enclosed mechanical "
-                "helmets, reflective visors, designed mechanical heads, neck connectors, joints, armor seams, "
-                "and non-human materials are required identity features, not human-anatomy defects. Do not "
-                "reject a shot merely because a character is helmeted, robotic, faceless, or unlike a normal "
-                "human. Judge synthetic-character structural consistency against the canonical references: "
-                "part count, attachment continuity, silhouette, helmet/visor geometry, costume/armor, color "
-                "blocks, and identity markers must remain stable. Reject only visible positive evidence of an "
+                "This project intentionally uses fully synthetic stylized CGI characters. Declared veils/masks, "
+                "graphic makeup, facial tattoos, mechanical seams, porcelain/crystalline synthetic surfaces, "
+                "designed hair/head silhouettes and other non-human materials are required identity styling, "
+                "not human-anatomy defects. A helmet is optional and must never be copied onto every role. Do not "
+                "reject a shot merely because a character is veiled, masked, robotic, graphically made up, "
+                "faceless, or unlike a normal human. Judge synthetic-character consistency against the canonical "
+                "references: part count, attachment continuity, silhouette, styling-anchor geometry, costume, "
+                "color blocks, non-human material and identity markers must remain stable, with at least two "
+                "declared styling anchors visibly preserved per character whenever framing permits. Reject an "
+                "untreated natural human face or visible positive evidence of an "
                 "unintended break, detachment, merge, extra/missing part, impossible self-intersection, or "
                 "reference-inconsistent deformation. "
             )
@@ -496,6 +502,7 @@ def _automatic_semantic_reviewer(
             )
         )
         temporal_qa = temporal_visual_qa_instruction(temporal_contract)
+        body_action_qa = body_action_qa_instruction(shot_meta)
         prompt = (
             f"QA contract: {qa_contract}. "
             f"The first {len(character_references)} supplied image(s) are canonical character references "
@@ -508,9 +515,9 @@ def _automatic_semantic_reviewer(
             "contradicts the shot or changes materially between the first and last supplied frame. Natural acting "
             "micro-movements (small gaze/head/hand changes) are allowed unless they reverse the narrative action or "
             "create a true continuity jump. "
-            f"{structure_contract}{temporal_qa} "
+            f"{structure_contract}{temporal_qa} {body_action_qa} "
             "Each canonical named identity may appear only once unless the metadata explicitly requests clones; "
-            "background extras must not duplicate a canonical identity, costume, helmet, or signature marker. "
+            "background extras must not duplicate a canonical identity, costume, styling-anchor combination, or signature marker. "
             "Verify that generation_actions occur in their listed order with visible subject "
             "displacement and a recognizable result; hair, rain, smoke, blinking, or camera drift alone do not "
             "count as completion of body action. Judge shot-size drift only against explicit camera movement: a dolly-in must not become "

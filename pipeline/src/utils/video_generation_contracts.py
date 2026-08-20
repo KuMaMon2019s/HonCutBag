@@ -8,7 +8,7 @@ from typing import Any
 
 from utils.camera_motion_contracts import camera_motion_execution_prompt
 from utils.character_reference_contracts import normalize_identity_props
-from utils.privacy_visual_policy import NO_REAL_PERSON_POLICY
+from utils.privacy_visual_policy import is_synthetic_visual_identity_policy
 
 VIDEO_GENERATION_CONTRACT_MARKER = "[honcut-video-generation-contract-v2]"
 
@@ -18,14 +18,15 @@ DUPLICATE_IDENTITY_NEGATIVE = (
 )
 
 SPATIAL_IDENTITY_NEGATIVE = (
-    "canonical identity color drift, recolored helmet or costume, swapped named-character styling, "
+    "canonical identity color drift, recolored face styling, headwear or costume, swapped named-character styling, "
     "swapped foreground roles, unintended side-by-side blocking, follower overtaking the lead, "
     "reversed authored depth order, unprompted stop, turn, or travel-direction reversal"
 )
 
 _CANONICAL_APPEARANCE_FIELDS = (
     ("hair", "hair/head"),
-    ("face", "face/helmet"),
+    ("face", "face/styling/headgear"),
+    ("synthetic_styling", "synthetic styling anchors"),
     ("clothing", "clothing"),
     ("build", "body build"),
     ("distinguishing", "signature marker"),
@@ -33,7 +34,7 @@ _CANONICAL_APPEARANCE_FIELDS = (
 
 # These are base-material color targets, not lighting instructions. The hex
 # hint keeps providers from treating neighboring dark neutrals as equivalent
-# when two identity-bound characters share a helmet or visor silhouette.
+# when two identity-bound characters share nearby styling or color families.
 _CANONICAL_COLOR_HEX = (
     ("藏蓝", "navy", "#1F2A44"),
     ("深红", "dark red", "#7A1F2B"),
@@ -57,11 +58,15 @@ def has_synthetic_identity_policy(characters: Any) -> bool:
     """Return whether persisted character data declares the synthetic policy."""
     if (
         isinstance(characters, Mapping)
-        and characters.get("visual_identity_policy") == NO_REAL_PERSON_POLICY
+        and is_synthetic_visual_identity_policy(
+            characters.get("visual_identity_policy")
+        )
     ):
         return True
     return any(
-        character.get("visual_identity_policy") == NO_REAL_PERSON_POLICY
+        is_synthetic_visual_identity_policy(
+            character.get("visual_identity_policy")
+        )
         for character in _character_list(characters)
     )
 
@@ -187,7 +192,7 @@ def _canonical_appearance_contract(selected: list[dict[str, Any]]) -> str:
             (
                 "Every listed trait is immutable in every frame. Hex values describe the canonical "
                 "base material/albedo under neutral light: scene lighting may change brightness, but "
-                "must not change the hue family, recolor a helmet/visor/costume, or transfer one "
+                "must not change the hue family, recolor declared face styling/headgear/costume, or transfer one "
                 "character's styling to another."
             ),
         )
@@ -219,7 +224,7 @@ def _lookalike_disambiguation_contract(selected: list[dict[str, Any]]) -> str:
             "[lookalike-cast-disambiguation]",
             *shared,
             (
-                "Shared helmet, visor, hair, build, or costume traits are not identity keys. Bind "
+                "Shared headgear, veil, face styling, hair, build, or costume traits are not identity keys. Bind "
                 "each named role to its own reference subject for the whole take; use that role's "
                 "non-shared canonical traits (especially clothing), assigned action, and authored "
                 "spatial position as the disambiguators. Never swap reference subjects, costumes, "
@@ -438,7 +443,7 @@ def render_video_generation_contract(
                     "required_exactly_once=" + " | ".join(cast_names),
                     (
                         "Each named identity-bound character appears as exactly one physical instance. "
-                        "Never clone, mirror, duplicate, split, or reuse that identity, costume, helmet, "
+                        "Never clone, mirror, duplicate, split, or reuse that identity, costume, face styling, headgear, "
                         "or signature marker on a background extra. Authored background crowds may exist, "
                         "but every extra must remain visually distinct from the named cast."
                     ),

@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from utils.action_units import normalize_action_units
+from utils.body_action_contracts import apply_body_action_contract
 from utils.material_budget import (
     BRIDGE_TIMELINE_POLICY,
     attach_material_budget,
@@ -950,6 +951,19 @@ def plan_storyboard_beats(
                     else ""
                 ),
             }
+            source_choreography = [
+                dict(beat)
+                for beat in (shot.get("body_action_choreography") or [])
+                if isinstance(beat, dict)
+                and (
+                    not str(beat.get("micro_action") or "").strip()
+                    or str(beat.get("micro_action") or "").strip()
+                    in set(action_buckets[position - 1])
+                )
+            ]
+            if source_choreography:
+                normalized["body_action_choreography"] = source_choreography
+            apply_body_action_contract(normalized)
             beats.append(normalized)
         if bridge_required:
             next_shot, next_requirement = planned[index + 1]

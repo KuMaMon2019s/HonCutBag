@@ -17,6 +17,7 @@ from utils.camera_motion_contracts import (
     camera_motion_prompt,
     camera_movement_description,
 )
+from utils.body_action_contracts import body_action_prompt
 from utils.character_body_contracts import (
     body_contract_forbidden,
     body_contract_prompt,
@@ -171,6 +172,10 @@ def build_video_prompt(
         # authored action ledger outside that limiter so legacy Phase 6 routing
         # cannot silently drop later body actions and animate only the scenery.
         parts.append("主体动作逐项硬合同：" + " → ".join(generation_actions))
+    choreography_prompt = body_action_prompt(shot_meta)
+    if choreography_prompt:
+        # This contract is never placed inside the bounded subject summary.
+        parts.append(choreography_prompt)
     audio = shot_meta.get("audio") or shot_meta.get("sound")
     if audio:
         parts.append(f"音效：{audio}")
@@ -255,8 +260,9 @@ def build_video_prompt(
     if "kling" in model.lower():
         return {"prompt": f"{fictional_decl}。{prompt}", "negative_prompt": negative_prompt}
     identity_lock = (
-        "synthetic-identity-lock：保持参考图中的机械头盔、面甲、数字角色轮廓、"
-        "装甲/服装类别、材质与主色不变；不得生成人脸、皮肤或头发"
+        "synthetic-identity-lock/synthetic-styling-lock：保持参考图中每个角色各自的面纱/遮罩、图形化妆、面部纹样、"
+        "机械纹理、非人材质、设计化头发/头饰、服装类别与主色不变；每人至少两个妆造锚点可见；"
+        "不得恢复未经妆造的自然真人脸，也不得把所有角色替换成同款头盔或面甲"
         if synthetic_identity
         else "identity-lock：保持参考图中的面部骨骼、发型、服装类别与主色不变"
     )

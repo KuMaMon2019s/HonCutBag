@@ -1318,6 +1318,13 @@ def run_phase1_screenwriter(
                 mock_storyboard["shots"].append(shot)
             mock_storyboard["total_duration"] = requested_duration
             from phases.phase1.storyboard_beats import plan_storyboard_beats
+            from utils.privacy_visual_policy import (
+                apply_no_real_person_character_policy,
+                is_no_real_person_enabled,
+            )
+
+            if is_no_real_person_enabled():
+                mock_characters = apply_no_real_person_character_policy(mock_characters)
 
             plan_storyboard_beats(mock_storyboard)
             _integrate_storyboard_prompts(mock_storyboard, mock_characters["characters"])
@@ -1428,10 +1435,20 @@ def run_phase1_screenwriter(
         if reporter:
             reporter.step("phase1", "发现角色", progress_pct=50)
         characters_checkpoint = output_dir / "phase1_characters.json"
+        from utils.privacy_visual_policy import (
+            NO_REAL_PERSON_POLICY,
+            apply_no_real_person_character_policy,
+            is_no_real_person_enabled,
+        )
+
         characters_input_hash = _phase1_input_hash([
             {
                 "character_context_schema": CHARACTER_CONTEXT_SCHEMA_VERSION,
                 "events": events,
+                "no_real_person": is_no_real_person_enabled(),
+                "no_real_person_policy": (
+                    NO_REAL_PERSON_POLICY if is_no_real_person_enabled() else None
+                ),
             }
         ])
         characters_result = _load_phase1_checkpoint(
@@ -1457,6 +1474,24 @@ def run_phase1_screenwriter(
             print("    ↻ 复用 phase1_characters.json，跳过角色发现")
         else:
             characters_result = dict(discover_characters(events))
+            characters_result["source_text_hash"] = characters_input_hash
+            characters_result.setdefault(
+                "total_characters", len(characters_result.get("characters", []))
+            )
+            _atomic_write_phase1_json(
+                characters_checkpoint,
+                characters_result,
+                collection_key="characters",
+                input_hash=characters_input_hash,
+            )
+        if (
+            is_no_real_person_enabled()
+            and characters_result.get("visual_identity_policy")
+            != NO_REAL_PERSON_POLICY
+        ):
+            characters_result = apply_no_real_person_character_policy(
+                characters_result
+            )
             characters_result["source_text_hash"] = characters_input_hash
             characters_result.setdefault(
                 "total_characters", len(characters_result.get("characters", []))
@@ -3066,11 +3101,16 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
 
         chars_dir = _ensure_dir(output_dir / "characters")
         from utils.privacy_visual_policy import (
+            NO_REAL_PERSON_POLICY,
             apply_no_real_person_character_policy,
             is_no_real_person_enabled,
         )
 
-        if is_no_real_person_enabled():
+        if (
+            is_no_real_person_enabled()
+            and characters_data.get("visual_identity_policy")
+            != NO_REAL_PERSON_POLICY
+        ):
             characters_data = apply_no_real_person_character_policy(characters_data)
             characters_path = output_dir / "CHARACTERS.json"
             characters_temporary = characters_path.with_suffix(".json.tmp")
@@ -3079,7 +3119,7 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
                 encoding="utf-8",
             )
             os.replace(characters_temporary, characters_path)
-            print("  🛡 非真人模式：角色身份已锁定为全封闭面甲的虚构合成人")
+            print("  🛡 非真人模式：角色身份已锁定为多样化非真人妆造（每人至少两个可见锚点）")
 
         characters_list = characters_data.get("characters", [])
 
@@ -3860,6 +3900,8 @@ def _generation_input_fingerprint(
         "associate_assets",
         "gen_strategy",
         "generation_actions",
+        "body_action_choreography",
+        "body_action_contract",
         "generation_load",
         "source_action_unit_ids",
         "start_state",
@@ -7337,7 +7379,7 @@ def _run_pipeline(
         transition_duration: Phase 8 转场时长（秒），默认 0.5
         media_profile: 编码配置名称，从 MEDIA_PROFILES 中选择（默认 "1080p"）
         enable_reshoot: 视觉缺陷或时长不足时是否允许调用 Phase 6 补录（默认 True，最多两轮）
-        no_real_person: 将所有角色锁定为无可见人脸/皮肤的虚构合成人 CGI 设计
+        no_real_person: 将所有角色锁定为带多样化可见妆造锚点的虚构 CGI 设计
         resume: 从检查点恢复，跳过已完成的 Phase
         accept_code_change_from: 显式接受代码变更并从指定 Phase 继续；其他身份变化仍拒绝
 
@@ -8206,7 +8248,7 @@ def main():
     parser.add_argument(
         "--no-real-person",
         action="store_true",
-        help="只生成无可见人脸/皮肤的虚构合成人 CGI 角色",
+        help="只生成带多样化、可见非真人妆造锚点的虚构 CGI 角色",
     )
     parser.add_argument("--media-profile", type=str, default="1080p",
                         choices=AVAILABLE_PROFILES,

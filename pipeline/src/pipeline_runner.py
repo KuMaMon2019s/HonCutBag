@@ -157,7 +157,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-real-person",
         dest="no_real_person",
         action="store_true",
-        help="只生成无可见人脸/皮肤的虚构合成人 CGI 角色",
+        help="只生成带多样化、可见非真人妆造锚点的虚构 CGI 角色",
     )
     person_group.add_argument(
         "--allow-real-person",

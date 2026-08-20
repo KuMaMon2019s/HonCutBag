@@ -62,6 +62,7 @@ from utils.camera_motion_contracts import (
     CAMERA_MOVEMENT_VALUES,
     apply_camera_motion_contract,
 )
+from utils.body_action_contracts import apply_body_action_contract
 from utils.temporal_visual_contracts import apply_temporal_visual_contract
 from utils.video_capabilities import (
     MAX_CONTENT_BEATS_PER_PRIMARY_SHOT,
@@ -1357,6 +1358,21 @@ def _inherit_event_semantics(
             duration_seconds=shot.get("suggested_duration") or shot.get("duration"),
         )
         shot["generation_actions"] = generation_actions
+        included_actions = {str(action).strip() for action in micro_actions if str(action).strip()}
+        choreography: List[Dict[str, Any]] = []
+        for event in details:
+            for raw_beat in event.get("body_action_choreography") or []:
+                if not isinstance(raw_beat, dict):
+                    continue
+                beat_action = str(raw_beat.get("micro_action") or "").strip()
+                if beat_action and beat_action not in included_actions:
+                    continue
+                serialized_beat = dict(raw_beat)
+                serialized_beat["beat"] = len(choreography) + 1
+                choreography.append(serialized_beat)
+        if choreography:
+            shot["body_action_choreography"] = choreography
+        apply_body_action_contract(shot)
         shot["generation_load"] = {
             "source_action_units": len(set(shot["source_action_unit_ids"])),
             "source_micro_actions": len(micro_actions),

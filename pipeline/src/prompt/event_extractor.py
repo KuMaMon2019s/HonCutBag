@@ -30,6 +30,10 @@ from typing import List, Dict, Any
 
 from openai import OpenAI
 from utils.action_units import annotate_event_motion_modes
+from utils.body_action_contracts import (
+    apply_body_action_contract,
+    normalize_body_action_choreography,
+)
 from utils.ark_llm import (
     LLMConnectTimeout,
     LLMIdleTimeout,
@@ -53,8 +57,10 @@ GENERAL_SYSTEM_PROMPT = (
 ACTION_SYSTEM_PROMPT = (
     "你是动作影视编剧与连续性编辑。从动作型文本中提取可拍摄的因果动作单元。"
     "事件不是镜头：不要把每句话或每个招式机械拆成一个事件，镜头划分由下游导演完成。"
-    "micro_actions 是按时间先后生成的动作阶段，不是同时发生的姿态、部位或动作词汇清单；"
+    "micro_actions 是按时间先后生成的可执行动作阶段，不是‘复杂动作’‘跳舞’‘连续格斗’等抽象标签；"
     "同一时刻并行完成的复合动作必须合成一条。"
+    "舞蹈、格斗、功夫或武术段落必须进一步输出逐拍 body_action_choreography，明确左右侧、"
+    "执行肢体、步法、躯干、重心、方向、接触点和终态。"
     "你必须保留动作的起始状态、结束状态、因果关系和无署名对白的可靠归属。输出严格 JSON 数组。"
     "不要输出任何解释文字，只输出 JSON。"
 )
@@ -81,6 +87,9 @@ USER_PROMPT_TEMPLATE = (
     "- event_role: 字符串，只能是 scene_setup/character_state/dialogue/action_chain/reaction/consequence/turning_point/transition\n"
     "- source_excerpt: 字符串，逐字摘录 <target> 中支撑本事件的连续原文\n"
     "- micro_actions: 字符串数组，按发生顺序列出本动作单元中的可见动作；非动作事件为 []\n"
+    "- body_action_choreography: 数组；仅舞蹈/格斗/功夫/武术段落必填，每项必须包含 "
+    "micro_action_index、performer、technique、side、limbs（数组）、footwork、torso、"
+    "weight_shift、direction、contact、end_pose；非此类事件为 []\n"
     "- generation_motion_mode: 字符串，只能是 none/atomic/composite；micro_actions=[] 时为 none；"
     "需按先后执行的动作阶段为 atomic；原文明确说明同一时刻并行完成、"
     "融为一个整体且不是逐个执行时才为 composite\n"
@@ -116,7 +125,8 @@ ACTION_SCREENPLAY_CONTRACT = (
     "【动作型叙事规则】\n"
     "1. 场景建立、人物当前状态、对白、动作链、反应、后果和叙事转折是不同 event_role。\n"
     "2. micro_actions 只表示视频模型需要按时间先后完成的可见动作阶段，"
-    "不是姿态、对象部件或动作词汇清单。原文明确说明多个贡献在同一时刻并行完成、"
+    "不得写‘复杂动作’‘复合动作’‘跳舞’‘激烈格斗’‘连续攻击’等不可执行占位词。"
+    "原文明确说明多个贡献在同一时刻并行完成、"
     "融为一个整体且并非逐个执行时，必须合成一条复合 micro_action 并设为 composite；"
     "‘连贯衔接’或‘一气呵成’本身不代表同时发生；原文明示先、随后、逐渐、最终等状态变化时仍须拆成多条。\n"
     "3. 动作造成的人物、物体、空间、朝向、速度或受力状态变化必须写入 end_state。\n"
@@ -126,7 +136,12 @@ ACTION_SCREENPLAY_CONTRACT = (
     "6. who 只放可作为角色资产的具名个体；群体与背景参与者写入 visual，不得写入 who。\n"
     "7. who 的每个值必须是稳定身份标签，不得包含服装、年龄、伤势、动作、站位或地点修饰；"
     "同一人物必须沿用 target/上下文中已有的最短无歧义标签。\n"
-    "8. 风格说明、摄影约束、负面约束和对前文剧情的总结不是新的时间线动作；"
+    "8. 舞蹈、格斗、功夫、武术或搏击段落必须逐拍填写 body_action_choreography："
+    "每拍明确执行者、左右侧、肢体路径、步法、躯干旋转、重心转移、运动方向、接触点和终态。"
+    "原文点名的招式（例如街舞托马斯、铁山靠）必须逐字保留；原文只写泛化表演或交手时，"
+    "允许在不改变人物、道具、伤亡、胜负、地点和剧情结果的边界内补足可拍摄编舞，例如左挡、"
+    "右闪、换步、支撑腿、摆动腿和受力终态。禁止只写动作难度、速度、情绪或镜头效果。\n"
+    "9. 风格说明、摄影约束、负面约束和对前文剧情的总结不是新的时间线动作；"
     "可以保留为 scene_setup/character_state，但 micro_actions 必须为 []，不得把已发生的剧情再提取一遍。"
 )
 
@@ -193,7 +208,7 @@ _NARRATIVE_JUMP_CUES = (
     "与此同时", "另一边", "次日", "翌日", "后来", "数小时后", "多年后", "回忆",
     "梦境", "转场", "来到", "抵达", "离开当前", "meanwhile", "later", "next day",
 )
-EVENT_FLOW_SCHEMA_VERSION = "6.0"
+EVENT_FLOW_SCHEMA_VERSION = "7.0"
 
 
 def _normalize_event(event: Dict[str, Any], source_content: str = "") -> Dict[str, Any]:
@@ -223,6 +238,11 @@ def _normalize_event(event: Dict[str, Any], source_content: str = "") -> Dict[st
     if isinstance(micro_actions, str):
         micro_actions = [micro_actions] if micro_actions.strip() else []
     event["micro_actions"] = [str(item).strip() for item in micro_actions if str(item).strip()] if isinstance(micro_actions, list) else []
+    event["body_action_choreography"] = normalize_body_action_choreography(
+        event.get("body_action_choreography") or event.get("action_choreography"),
+        micro_actions=event["micro_actions"],
+    )
+    apply_body_action_contract(event)
     motion_mode = str(event.get("generation_motion_mode") or "").strip().lower()
     if not event["micro_actions"]:
         event["generation_motion_mode"] = "none"

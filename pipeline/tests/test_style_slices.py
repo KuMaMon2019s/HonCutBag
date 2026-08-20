@@ -119,8 +119,11 @@ def test_phase3_persists_and_generates_from_no_real_person_contract(tmp_path, mo
 
     persisted = json.loads((tmp_path / "CHARACTERS.json").read_text(encoding="utf-8"))
     assert result["status"] == "done"
-    assert persisted["visual_identity_policy"] == "synthetic_faceless_android_v1"
-    assert "全封闭机械头盔" in captured[0]["description"]
+    assert persisted["visual_identity_policy"] == "synthetic_stylized_character_v2"
+    styling = persisted["characters"][0]["appearance"]["synthetic_styling"]
+    assert styling["schema"] == "honcut.synthetic-styling.v2"
+    assert len(styling["visible_anchors"]) >= 2
+    assert "全封闭机械头盔" not in captured[0]["description"]
     assert "风格化三维 CGI" in captured[0]["style"]
     assert "photorealistic human" in captured[0]["negative"]
 
@@ -131,7 +134,7 @@ def test_cgi_character_style_never_falls_back_to_photoreal_skin():
         "高成本风格化三维 CGI 科幻动画",
     )
 
-    assert all("no visible human face" in prompt for prompt in prompts.values())
+    assert all("untreated natural human face" in prompt for prompt in prompts.values())
     assert all(
         "Photorealistic, natural skin texture" not in prompt
         for prompt in prompts.values()

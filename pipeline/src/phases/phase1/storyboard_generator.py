@@ -41,6 +41,7 @@ from utils.pipeline_config import load_config
 from utils.visual_style_spec import VisualStyle, parse_visual_style
 from utils.ark_llm import call_llm_stream, create_ark_client
 from utils.character_body_contracts import body_contract_prompt
+from utils.body_action_contracts import body_action_prompt
 from utils.camera_motion_contracts import (
     apply_camera_motion_contract,
     camera_motion_negative_prompt,
@@ -698,6 +699,9 @@ def _build_eight_layer_prompt(
         f"动作：{action}",
         f"运动契约：{motion_contract}",
     ])
+    choreography_prompt = body_action_prompt(shot)
+    if choreography_prompt:
+        layers.append(choreography_prompt)
     if temporal_contract:
         layers.append(f"时间段视觉硬合同：{temporal_visual_prompt(temporal_contract)}")
         layers.append(
@@ -856,6 +860,7 @@ def _generate_single_shot(
         "source_events", "source_event_slices", "source_event_roles",
         "micro_actions", "generation_actions", "generation_action_units",
         "generation_action_categories",
+        "body_action_choreography", "body_action_contract",
         "generation_load", "start_state", "end_state", "causal_link",
         "speaker_attribution",
         "aspect_ratio", "width", "height",

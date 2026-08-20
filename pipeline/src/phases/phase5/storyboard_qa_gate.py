@@ -25,6 +25,7 @@ from phases.phase1.storyboard_beats import (
     secondary_storyboard_requirements,
 )
 from utils.action_units import normalize_action_units
+from utils.body_action_contracts import body_action_contract_errors
 from utils.video_capabilities import capabilities_for
 from utils.character_body_contracts import character_visual_description
 from utils.camera_motion_contracts import apply_camera_motion_contract
@@ -243,6 +244,16 @@ def run_generation_capacity_checks(
             if isinstance(beat, dict)
         ]
 
+        for contract_error in body_action_contract_errors(shot):
+            issues.append(_issue(
+                "L1",
+                "severe",
+                str(contract_error.get("code") or "body_choreography_invalid"),
+                f"{sid} {contract_error.get('message') or 'has an invalid body choreography contract'}",
+                [sid],
+                actions=contract_error.get("actions") or [],
+            ))
+
         if uses_strict_secondary_contract:
             for contract_error in secondary_storyboard_contract_errors(
                 storyboard,
@@ -340,6 +351,16 @@ def run_generation_capacity_checks(
                         "L1", "severe", "storyboard_beat_action_missing",
                         f"{beat_id} has no executable action contract",
                         [sid], beat_id=beat_id,
+                    ))
+                for contract_error in body_action_contract_errors({**shot, **beat}):
+                    issues.append(_issue(
+                        "L1",
+                        "severe",
+                        str(contract_error.get("code") or "body_choreography_invalid"),
+                        f"{beat_id} {contract_error.get('message') or 'has an invalid body choreography contract'}",
+                        [sid],
+                        beat_id=beat_id,
+                        actions=contract_error.get("actions") or [],
                     ))
                 beat_units = beat.get("source_action_unit_ids") or []
                 if isinstance(beat_units, str):
