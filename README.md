@@ -137,24 +137,33 @@ honcut/
 ├── scripts/            # Utility scripts
 ├── Makefile            # Common commands
 ├── pyproject.toml      # Python project config
-└── environment.yml     # Conda environment
+├── uv.lock             # Locked Python dependency graph
+├── .python-version     # Project interpreter pin
+└── environment.yml     # Legacy Conda runtime compatibility
 ```
 
 ## Quick Start
 
 ```bash
-# Create conda environment
-conda env create -f environment.yml
-conda activate honcut
+# Install uv and FFmpeg once (macOS example)
+brew install uv ffmpeg
+
+# Create .venv with the pinned interpreter and locked dependencies
+make install
+make doctor
 
 # Run the full pipeline from a script
-python pipeline/scripts/phase_orchestrator.py \
+uv run --locked --managed-python python pipeline/scripts/phase_orchestrator.py \
   --config config.json --auto-approve
 
 # Resume from a checkpoint (e.g. after a single shot failure)
-python pipeline/scripts/phase_orchestrator.py \
+uv run --locked --managed-python python pipeline/scripts/phase_orchestrator.py \
   --config config.json --resume-from phase5
 ```
+
+`uv.lock` and `.python-version` are authoritative. Project commands must use
+`make` or `uv run --locked ...`; bare `python`, `pip`, and `pytest` may resolve
+to an unrelated Conda or system interpreter.
 
 ## Development
 
@@ -163,22 +172,19 @@ python pipeline/scripts/phase_orchestrator.py \
 The project uses **Black** for formatting and **Ruff** for linting:
 
 ```bash
-pip install -e ".[dev]"
-black pipeline/src/ pipeline/tests/
-ruff check pipeline/src/ pipeline/tests/
+make lint
+uv run --locked --managed-python python -m black --check pipeline/src/ pipeline/tests/
 ```
 
 ### Testing
 
 ```bash
 make test
-# or
-pytest pipeline/tests/ -v --cov=pipeline/src
 ```
 
 ## Dependencies
 
-- Python 3.11+
+- Python 3.12.13 (pinned by `.python-version`)
 - LangGraph + langgraph-checkpoint-sqlite (workflow graph & state checkpointing)
 - Docker & Docker Compose
 - FFmpeg

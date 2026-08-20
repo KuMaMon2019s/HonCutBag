@@ -1,5 +1,6 @@
-# HonCut — Python dependencies
-# Install: conda activate honcut && pip install -r requirements.txt
+# HonCut — legacy Conda/runtime compatibility dependencies
+# The authoritative development environment is pyproject.toml + uv.lock.
+# Install and test with `make install` / `make test`; do not invoke bare pip or pytest.
 # Generated: 2026-07-31 (from actual import scan of pipeline/src + vendor/)
 
 # --- Core (hard requirements) ---

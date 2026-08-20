@@ -1,5 +1,9 @@
 name: HonCut Pipeline CI
 
+env:
+  PYTHON_VERSION: '3.12.13'
+  UV_VERSION: '0.11.26'
+
 on:
   push:
     branches: [ main, develop ]
@@ -9,17 +13,17 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ['3.11']
 
     steps:
     - uses: actions/checkout@v4
 
-    - name: Set up Python ${{ matrix.python-version }}
+    - name: Set up bootstrap Python
       uses: actions/setup-python@v5
       with:
-        python-version: ${{ matrix.python-version }}
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Install locked uv version
+      run: python -m pip install "uv==${UV_VERSION}"
 
     - name: Install FFmpeg
       run: |
@@ -27,13 +31,16 @@ jobs:
         sudo apt-get install -y ffmpeg
 
     - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -e ".[dev]"
+      run: uv sync --locked --managed-python
+
+    - name: Verify project interpreter
+      run: uv run --locked --managed-python python scripts/check_python_environment.py
 
     - name: Run tests
       run: |
-        PYTHONPATH=.:pipeline/src pytest pipeline/tests/ pipeline/test_story_order_multimodal.py -v --cov=pipeline/src --cov-report=xml
+        uv run --locked --managed-python python -m pytest \
+          pipeline/tests/ pipeline/test_story_order_multimodal.py \
+          -v --cov=pipeline/src --cov-report=xml
 
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v4
@@ -50,15 +57,16 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.11'
+        python-version: ${{ env.PYTHON_VERSION }}
 
-    - name: Install linters
-      run: |
-        pip install -e ".[dev]"
+    - name: Install locked uv version
+      run: python -m pip install "uv==${UV_VERSION}"
+
+    - name: Install dependencies
+      run: uv sync --locked --managed-python
 
     - name: Run Ruff critical checks
-      run: |
-        ruff check pipeline/src pipeline/tests --select E9,F63,F7,F82
+      run: uv run --locked --managed-python python -m ruff check pipeline/src pipeline/tests --select E9,F63,F7,F82
 
   build:
     runs-on: ubuntu-latest
@@ -70,15 +78,16 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.11'
+        python-version: ${{ env.PYTHON_VERSION }}
 
-    - name: Install build tools
-      run: |
-        pip install build
+    - name: Install locked uv version
+      run: python -m pip install "uv==${UV_VERSION}"
+
+    - name: Install dependencies
+      run: uv sync --locked --managed-python
 
     - name: Build package
-      run: |
-        python -m build
+      run: uv run --locked --managed-python python -m build
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4

@@ -7,7 +7,7 @@ name = "honcut-pipeline"
 version = "0.1.0"
 description = "HonCut AI Video Generation Pipeline"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12.13,<3.13"
 license = "MIT"
 authors = [
     {name = "Doraemon", email = "soda804507080@gmail.com"}
@@ -31,13 +31,16 @@ dependencies = [
     "arq>=0.28.0",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
+    "build>=1.2.2",
     "pytest>=7.4.0",
     "pytest-cov>=4.1.0",
     "black>=23.0.0",
     "ruff>=0.0.280",
 ]
+
+[project.optional-dependencies]
 sam3 = [
     "torch>=2.5",
     "torchvision>=0.20",
@@ -60,6 +63,9 @@ sam3 = [
 
 [project.scripts]
 honcut = "honcut.pipeline_runner:main"
+
+[tool.uv]
+default-groups = ["dev"]
 
 [tool.setuptools.packages.find]
 where = ["pipeline/src"]

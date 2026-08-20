@@ -7,6 +7,7 @@ import os
 import subprocess
 from pathlib import Path
 import sys
+import tomllib
 from types import SimpleNamespace
 
 import pytest
@@ -1075,6 +1076,33 @@ def test_ci_fails_when_codecov_upload_fails():
 
     assert "fail_ci_if_error: true" in workflow
     assert "fail_ci_if_error: false" not in workflow
+
+
+def test_python_entrypoints_are_locked_to_project_uv_environment():
+    pinned_python = (ROOT / ".python-version").read_text(encoding="utf-8").strip()
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    lockfile = (ROOT / "uv.lock").read_text(encoding="utf-8")
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+
+    assert pinned_python == "3.12.13"
+    assert pyproject["project"]["requires-python"] == ">=3.12.13,<3.13"
+    assert pyproject["tool"]["uv"]["default-groups"] == ["dev"]
+    assert 'requires-python = ">=3.12.13, <3.13"' in lockfile
+    assert "UV_RUN = $(UV) run --locked --managed-python" in makefile
+    assert "$(UV_RUN) python -m pytest" in makefile
+    assert "uv sync --locked --managed-python" in workflow
+    assert "python -m pytest" in workflow
+
+    result = subprocess.run(
+        [sys.executable, ROOT / "scripts/check_python_environment.py"],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert f"Python: {pinned_python}" in result.stdout
 
 
 def test_ark_llm_client_does_not_require_ambient_socks_proxy(monkeypatch):
