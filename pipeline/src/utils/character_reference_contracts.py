@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-CHARACTER_REFERENCE_ASSET_CONTRACT_VERSION = 1
+CHARACTER_REFERENCE_ASSET_CONTRACT_VERSION = 2
 
 STATIC_REFERENCE_ASSET_POLICY = (
     "Canonical neutral references contain only the character's body, garments, "
@@ -28,6 +28,15 @@ STATIC_REFERENCE_QA_POLICY = (
     "prop, even if residual story text assigns one to the character. The empty-hands "
     "rule overrides residual held-object wording; it does not permit removal of "
     "body-worn or fastened identity assets."
+)
+
+IDENTITY_DETAIL_ASSET_POLICY = (
+    "A supplemental identity-detail board is derived from the approved neutral four-view pack. "
+    "It may show close crops of body-worn identity markers and isolated turnarounds of declared "
+    "signature props. Handheld equipment must be displayed by itself, never held or operated by "
+    "the character, so it cannot contaminate neutral pose references. Preserve exact geometry, "
+    "color, material, markings, handedness notes, and attachment points; do not invent story props, "
+    "a location, an action pose, or another character."
 )
 
 # Split only at list-like boundaries commonly used in generated wardrobe fields.
@@ -69,6 +78,67 @@ def static_reference_identity_text(value: object) -> str:
     """Return identity text with hand-interaction clauses removed."""
     static, _interaction = partition_reference_asset_clauses(value)
     return static
+
+
+def normalize_identity_props(value: object) -> list[dict[str, Any]]:
+    """Normalize flexible authored identity-prop values into an auditable list."""
+    raw_items = value if isinstance(value, list) else ([value] if value else [])
+    normalized: list[dict[str, Any]] = []
+    for index, item in enumerate(raw_items, 1):
+        if isinstance(item, dict):
+            name = str(item.get("name") or item.get("id") or "").strip()
+            description = str(item.get("description") or name).strip()
+            attachment_mode = str(
+                item.get("attachment_mode") or item.get("attachment") or "isolated_handheld"
+            ).strip().lower()
+            persistence = str(item.get("persistence") or "role_active").strip().lower()
+            reference_required = item.get("reference_required", True) is not False
+            identity_id = str(item.get("id") or f"identity_prop_{index:02d}").strip()
+        else:
+            name = str(item or "").strip()
+            description = name
+            attachment_mode = "isolated_handheld"
+            persistence = "role_active"
+            reference_required = True
+            identity_id = f"identity_prop_{index:02d}"
+        if not name or not description:
+            continue
+        if attachment_mode not in {"body_attached", "isolated_handheld"}:
+            attachment_mode = "isolated_handheld"
+        if persistence not in {"always", "role_active"}:
+            persistence = "role_active"
+        normalized.append({
+            "id": identity_id,
+            "name": name,
+            "description": description,
+            "attachment_mode": attachment_mode,
+            "persistence": persistence,
+            "reference_required": reference_required,
+        })
+    return normalized
+
+
+def character_identity_detail_items(character: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return only declared props that require a visual consistency reference."""
+    appearance = character.get("appearance")
+    if not isinstance(appearance, dict):
+        appearance = character
+    return [
+        item
+        for item in normalize_identity_props(
+            appearance.get("identity_props") or appearance.get("signature_props")
+        )
+        if item["reference_required"]
+    ]
+
+
+def identity_detail_prompt_items(items: list[dict[str, Any]]) -> str:
+    """Render exact item contracts for Phase 3 generation and QA."""
+    return "；".join(
+        f"{item['id']}={item['name']}：{item['description']}"
+        f"（展示方式={item['attachment_mode']}，持续性={item['persistence']}）"
+        for item in items
+    )
 
 
 def normalize_character_reference_assets(character: dict[str, Any]) -> None:
@@ -114,9 +184,17 @@ def normalize_character_reference_assets(character: dict[str, Any]) -> None:
     if combined:
         appearance["interaction_props"] = combined
 
+    identity_props = normalize_identity_props(
+        appearance.get("identity_props") or appearance.get("signature_props")
+    )
+    if identity_props:
+        appearance["identity_props"] = identity_props
+    appearance.pop("signature_props", None)
+
     appearance["reference_asset_contract"] = {
         "version": CHARACTER_REFERENCE_ASSET_CONTRACT_VERSION,
         "static_identity": "body_and_body_supported_assets",
         "interaction_props": "excluded_from_neutral_references",
+        "identity_detail_assets": "derived_board_body_attached_or_isolated",
         "hands": "empty_open_relaxed",
     }

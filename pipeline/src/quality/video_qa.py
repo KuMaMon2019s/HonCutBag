@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from utils.privacy_visual_policy import synthetic_character_review_evidence
+from utils.temporal_visual_contracts import apply_temporal_visual_contract
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -775,6 +776,7 @@ def _vlm_semantic_check(
     ]
     shot_by_id: dict[str, dict] = {}
     for index, shot in enumerate(shots, 1):
+        apply_temporal_visual_contract(shot)
         shot_id = str(shot.get("shot_id") or shot.get("id") or f"S{index:02d}")
         if shot_id.isdigit():
             shot_id = f"S{int(shot_id):02d}"
@@ -894,7 +896,14 @@ def _vlm_semantic_check(
             "markers to keep same-helmet characters separate. "
         )
         if synthetic_review and review_evidence["characters"]
-        else ""
+        else (
+            "Canonical character identities and recurring identity props (preserve every listed "
+            "color, material, geometry, marker, attachment mode and owner; role-active items need "
+            "not appear unless the shot uses them, but may never be substituted or transferred): "
+            f"{json.dumps(review_evidence['characters'], ensure_ascii=False)}. "
+            if review_evidence["characters"]
+            else ""
+        )
     )
     structure_contract = (
         (
@@ -925,7 +934,9 @@ def _vlm_semantic_check(
                     key: shot_by_id[shot_id].get(key)
                     for key in (
                         "shot_id", "id", "visual", "action", "generation_actions",
-                        "who", "where", "time", "lighting", "gen_strategy",
+                        "who", "where", "time", "time_of_day", "time_window",
+                        "temporal_visual_contract", "lighting", "lighting_description",
+                        "gen_strategy",
                     )
                     if shot_by_id[shot_id].get(key) not in (None, "", [])
                 }
@@ -939,7 +950,10 @@ def _vlm_semantic_check(
             f"This is semantic review batch {len(batch_results) + 1}; frame labels in order are "
             f"{json.dumps([item.label for item in sample_frames], ensure_ascii=False)}. "
             "Detect wrong subjects or locations, missing key actions, identity drift, structural defects, "
-            "modern/watermark/text artifacts, and material continuity errors. Return JSON only with "
+            "modern/watermark/text artifacts, material continuity errors, and any time-of-day mismatch. "
+            "For every temporal_visual_contract, enforce its local_clock_window using the listed visible-light "
+            "requirements and forbidden cues; rain, neon, cold color grading, or dramatic mood never excuses a "
+            "day/night mismatch. A mismatch or first-to-last temporal drift requires revise or fail. Return JSON only with "
             '{"verdict":"pass|revise|fail","issues":["..."],"confidence":0.0}. '
             f"{structure_contract}"
             f"{identity_contract}"

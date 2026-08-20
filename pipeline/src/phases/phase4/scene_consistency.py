@@ -7,6 +7,11 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from utils.visual_style_spec import VisualStyle, parse_visual_style
+from utils.temporal_visual_contracts import (
+    apply_temporal_visual_contract,
+    temporal_visual_negative_prompt,
+    temporal_visual_prompt,
+)
 
 
 BASE_NEGATIVE_PROMPTS = [
@@ -44,17 +49,22 @@ def _shot_key(shot: Mapping[str, Any], index: int) -> str:
 
 
 def _lighting_for(shot: Mapping[str, Any], visual_style: VisualStyle) -> str:
+    normalized_shot = dict(shot)
+    temporal_contract = apply_temporal_visual_contract(normalized_shot)
+    period = str((temporal_contract or {}).get("period") or "")
+    daylight_period = period in {"day", "morning", "midday", "afternoon"}
     explicit = str(shot.get("lighting_description") or shot.get("lighting_key") or "").strip()
-    if explicit and any(token in explicit for token in ("左", "右", "上", "下", "逆光", "侧光")):
+    contradictory_explicit = daylight_period and any(
+        token in explicit.casefold() for token in ("夜", "night", "moon", "月光")
+    )
+    if not contradictory_explicit and explicit and any(token in explicit for token in ("左", "右", "上", "下", "逆光", "侧光")):
         lighting = explicit if any(token in explicit.upper() for token in ("K", "暖", "冷")) else f"{explicit}，色温4800K"
         if not any(token in lighting for token in ("气氛", "氛围", "雾", "雨", "尘", "颗粒", "潮湿")):
             lighting += "，空气颗粒轻微可见，气氛与剧情情绪一致"
+        if daylight_period:
+            lighting += "，日光主导环境曝光，天空与窗外保持明亮日间亮度"
         return lighting
     place = str(shot.get("where") or shot.get("scene_description") or shot.get("visual") or "")
-    if any(token in place for token in ("夜", "月", "暗", "工厂")):
-        return "冷蓝月光从镜头右上方射入，色温5600K，左侧暖橙实景灯补亮人物轮廓，空气颗粒清晰"
-    if any(token in place for token in ("室内", "房", "店", "办公室")):
-        return "暖白LED面板从镜头左上方照射，色温4200K，右后方冷色窗光勾勒轮廓，明暗层次稳定"
 
     style_text = " ".join(filter(None, (
         visual_style.style_prompt_short,
@@ -64,6 +74,20 @@ def _lighting_for(shot: Mapping[str, Any], visual_style: VisualStyle) -> str:
     ))).lower()
     has_rain = any(token in style_text for token in ("雨", "rain", "storm", "暴风"))
     has_night = any(token in style_text for token in ("夜", "night", "moon", "月"))
+    if daylight_period:
+        if any(token in place for token in ("室内", "房", "店", "办公室")):
+            return "日间自然窗光从镜头右后方主导环境曝光，暖白室内实景灯只作辅光，窗外为明亮日间天空"
+        if has_rain or any(token in style_text for token in ("阴", "overcast", "cloudy")):
+            return "日间阴雨漫射光从明亮灰白天空均匀落下，日光主导曝光，低饱和但绝非夜景"
+        return "日间太阳光从镜头左上方照射，天空明亮，环境曝光由自然日光主导"
+    if period == "night" or (not period and any(token in place for token in ("夜", "月"))):
+        if has_rain:
+            return "冷蓝雨夜光从镜头右上方漫射照入，色温5600K，湿润表面反射微光，低饱和度，天空不得出现日光"
+        return "冷蓝夜间环境光从镜头右上方射入，色温5600K，左侧暖橙实景灯补亮轮廓，天空不得出现日光"
+    if period in {"dawn", "golden_hour", "dusk"}:
+        return f"{(temporal_contract or {}).get('label', '低角度时段')}低角度自然光从镜头左上方侧逆光照射，天空保留对应时段的可见渐变"
+    if any(token in place for token in ("室内", "房", "店", "办公室")):
+        return "暖白LED面板从镜头左上方照射，色温4200K，右后方冷色窗光勾勒轮廓，明暗层次稳定"
     if has_rain and has_night:
         return "冷蓝雨夜光从镜头右上方漫射照入，湿润表面反射微光，低饱和度，气氛湿冷压抑"
     if has_night:
@@ -101,15 +125,28 @@ def build_scene_reference_prompt(
 ) -> str:
     """Build an empty-scene reference prompt with the same time/light contract."""
     related = [shot for shot in shots if str(shot.get("where") or "").strip() == where]
+    reference_shot = dict(related[0]) if related else {"where": where}
+    temporal_contract = apply_temporal_visual_contract(reference_shot)
+    style = visual_style.style_prompt_full or visual_style.style_prompt_short or "电影叙事风格"
+    lighting = _lighting_for(reference_shot, visual_style)
     evidence = " ".join(
         str(shot.get(key) or "")
         for shot in related
-        for key in ("time_of_day", "time", "visual", "lighting_description", "lighting_key")
+        for key in ("time", "time_of_day", "visual", "lighting_description", "lighting_key")
+    ).casefold()
+    legacy_night_lock = (
+        "深夜雨天，不得出现白天、日光、晴空或灰白日间天空。"
+        if temporal_contract
+        and temporal_contract.get("period") == "night"
+        and any(token in f"{evidence} {style}".casefold() for token in ("雨", "rain", "storm"))
+        else ""
     )
-    style = visual_style.style_prompt_full or visual_style.style_prompt_short or "电影叙事风格"
-    lighting = _lighting_for(related[0] if related else {"where": where}, visual_style)
-    is_night = any(token in f"{evidence} {style}".lower() for token in ("夜", "night", "moon"))
-    time_lock = "深夜雨天，不得出现白天、日光、晴空或灰白日间天空。" if is_night else ""
+    time_lock = (
+        f"{legacy_night_lock}Time contract: {temporal_visual_prompt(temporal_contract)}. "
+        f"Forbidden: {temporal_visual_negative_prompt(temporal_contract)}. "
+        if temporal_contract
+        else ""
+    )
     return (
         f"Scene: {where}. {time_lock}Lighting: {lighting}. Style: {style}. "
         "Photorealistic environment, cinematic quality, no people, establishing shot."
@@ -153,8 +190,10 @@ def generate_scene_consistency(
     }
     for index, shot in enumerate(shots, 1):
         key = _shot_key(shot, index)
+        normalized_shot = dict(shot)
+        temporal_contract = apply_temporal_visual_contract(normalized_shot)
         duration = shot.get("duration", 5)
-        lighting = _lighting_for(shot, style)
+        lighting = _lighting_for(normalized_shot, style)
         style_anchor = style.style_prompt_short or global_style
         constraints = _appearance_constraints(characters, shot)
         constraints.extend([
@@ -162,6 +201,8 @@ def generate_scene_consistency(
             f"画面比例{aspect_ratio}",
             "固定场景元素的位置和颜色跨镜头一致",
         ])
+        if temporal_contract:
+            constraints.append(temporal_visual_prompt(temporal_contract))
         subject_names = shot.get("who", [])
         subject_names = subject_names if isinstance(subject_names, list) else [subject_names]
         subject = "、".join(map(str, filter(None, subject_names))) or "场景主体"
@@ -177,6 +218,7 @@ def generate_scene_consistency(
             },
             "lighting_description": lighting,
             "lighting_note": lighting,
+            "temporal_visual_contract": temporal_contract,
             "style_anchor": style_anchor,
             "style_suffix": f"保持{style_anchor}",
             "negative_prompt": negative,

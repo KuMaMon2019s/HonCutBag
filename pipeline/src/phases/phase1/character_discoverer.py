@@ -46,7 +46,11 @@ from utils.character_body_contracts import (
     body_contract_forbidden,
     body_contract_prompt,
 )
-from utils.character_reference_contracts import normalize_character_reference_assets
+from utils.character_reference_contracts import (
+    character_identity_detail_items,
+    identity_detail_prompt_items,
+    normalize_character_reference_assets,
+)
 
 
 # ─── LLM 配置 ───────────────────────────────────────────────────────────────
@@ -69,6 +73,7 @@ SYSTEM_PROMPT = (
     "- hair 必须写明发色+发长+发型（如'黑色长直发及肩'），不能只写'长发'\n"
     "- clothing 必须具体到单品（上装+下装+鞋+配饰），不能只写'通勤装'、'休闲服'\n"
     "- clothing 只允许身体、服装、鞋和无需手部支撑的穿戴/固定配饰；凡需手握、手提、举起、使用或操作的物件必须移入 interaction_props，禁止混入静态身份\n"
+    "- 对跨镜头反复出现、能区分人物身份且需要锁定颜色/材质/几何的职业或签名道具，同时写入 identity_props；普通一次性拿取物只写 interaction_props\n"
     "- summary 只写静态外貌，不得写手持物件、动作、姿势、运镜或场景\n"
     "- summary 必须包含发型+服装+体态三要素，让 AI 图片生成器能画出一致的角色\n"
     "- 事件原文已明确的服装颜色、层次、材质、发型和配饰属于硬约束，必须原样保留，禁止改色、换装或替换材质\n"
@@ -102,6 +107,7 @@ USER_PROMPT_TEMPLATE = (
     "  - face: 面部特征（必须具体：脸型+五官特点，如'鹅蛋脸、柳叶眉、杏眼、高鼻梁'）\n"
     "  - clothing: 静态穿着（必须具体到单品：上装+下装+鞋子+无需手支撑的穿戴/固定配饰；不得包含手握、手提、举起、使用或操作的物件）\n"
     "  - interaction_props: 互动道具数组（可选；逐字保留需手握、手提、举起、使用或操作的物件及其关系，仅供剧情镜头使用，不属于静态身份）\n"
+    "  - identity_props: 身份一致性道具数组（可选；只收录跨镜头反复出现、能区分角色且必须生成细节参考图的装备；每项含 id、name、description、attachment_mode=body_attached/isolated_handheld、persistence=always/role_active、reference_required=true；相机、专属工具等手持装备必须用 isolated_handheld，仍不得进入中性四视图的手中）\n"
     "  - distinguishing: 显著标记（可选）\n"
     "  - summary: 一句话外貌总结（必须包含：发型+服装+体态，如'20多岁清秀纤细的都市女白领，黑色长直发及肩，皮肤白皙，穿白色修身衬衫搭配深蓝色高腰西装裤'）\n"
     "- personality: 性格对象（可选），包含：\n"
@@ -727,7 +733,13 @@ def _add_reference_contract(character: Dict[str, Any]) -> None:
         traits = traits[:2]
     subject_traits = "、".join(traits) or str(appearance.get("summary") or character.get("name", "角色"))
     body_lock = body_contract_prompt(character)
+    identity_items = character_identity_detail_items(character)
+    identity_detail_contract = identity_detail_prompt_items(identity_items)
     distinguishing_features = list(traits or [subject_traits])
+    if identity_detail_contract:
+        distinguishing_features.append(
+            "身份道具细节锁：" + identity_detail_contract
+        )
     if body_lock:
         distinguishing_features.append(body_lock)
     character.setdefault("distinguishing_features", distinguishing_features)
@@ -738,6 +750,11 @@ def _add_reference_contract(character: Dict[str, Any]) -> None:
         # [LEGACY-KEEP 2026-08-09] 旧值写死为：将图片1中的[...]定义为<主体1>
         _ReferencePromptTemplate(
             f"将{{图片N}}中的[{subject_traits}]定义为{{主体N}}"
+            + (
+                f"；身份道具必须匹配独立细节参考板：{identity_detail_contract}"
+                if identity_detail_contract
+                else ""
+            )
             + (f"；{body_lock}" if body_lock else "")
         ),
     )

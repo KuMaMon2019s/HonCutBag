@@ -7,6 +7,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 from utils.camera_motion_contracts import camera_motion_execution_prompt
+from utils.character_reference_contracts import normalize_identity_props
 from utils.privacy_visual_policy import NO_REAL_PERSON_POLICY
 
 VIDEO_GENERATION_CONTRACT_MARKER = "[honcut-video-generation-contract-v2]"
@@ -352,6 +353,51 @@ def _interaction_prop_contract(
     return "\n".join(("[interaction-prop-fidelity]", *anchors))
 
 
+def _identity_prop_reference_contract(
+    shot_meta: Mapping[str, Any],
+    selected: list[dict[str, Any]],
+) -> str:
+    """Bind recurring identity equipment to its supplemental detail board."""
+    action_text = _shot_action_text(shot_meta)
+    anchors: list[str] = []
+    for character in selected:
+        owner = str(character.get("name") or character.get("id") or "character")
+        appearance = character.get("appearance") or {}
+        if not isinstance(appearance, Mapping):
+            continue
+        for item in normalize_identity_props(appearance.get("identity_props")):
+            exact = (
+                f"{owner}/{item['id']} {item['name']}: {item['description']}; "
+                f"attachment_mode={item['attachment_mode']}; persistence={item['persistence']}"
+            )
+            active = _interaction_prop_is_active(
+                owner,
+                f"{item['name']} {item['description']}",
+                action_text,
+            )
+            if item["attachment_mode"] == "body_attached" or item["persistence"] == "always":
+                anchors.append(
+                    exact
+                    + "; must remain visible at the authored attachment point with identical geometry, "
+                    "colors, material and markings in every relevant frame"
+                )
+            elif active:
+                anchors.append(
+                    exact
+                    + "; this shot activates the item, so show exactly one matching instance owned by "
+                    f"{owner}; do not substitute, recolor, resize, duplicate, or transfer it"
+                )
+            else:
+                anchors.append(
+                    exact
+                    + "; do not invent it into the action, but if it is visible it must match the "
+                    "identity-detail reference exactly and remain owned by the declared character"
+                )
+    if not anchors:
+        return ""
+    return "\n".join(("[identity-prop-reference-lock]", *dict.fromkeys(anchors)))
+
+
 def _reshoot_feedback_contract(shot_meta: Mapping[str, Any]) -> str:
     feedback = shot_meta.get("phase8_reshoot")
     if not isinstance(feedback, Mapping):
@@ -411,6 +457,9 @@ def render_video_generation_contract(
     prop_contract = _interaction_prop_contract(shot_meta, selected)
     if prop_contract:
         sections.append(prop_contract)
+    identity_prop_contract = _identity_prop_reference_contract(shot_meta, selected)
+    if identity_prop_contract:
+        sections.append(identity_prop_contract)
     sections.append(camera_motion_execution_prompt(shot_meta))
     feedback_contract = _reshoot_feedback_contract(shot_meta)
     if feedback_contract:

@@ -48,6 +48,11 @@ from utils.camera_motion_contracts import (
     camera_movement_description,
     canonical_camera_movement,
 )
+from utils.temporal_visual_contracts import (
+    apply_temporal_visual_contract,
+    temporal_visual_negative_prompt,
+    temporal_visual_prompt,
+)
 
 
 def _load_default_visual_style(
@@ -540,16 +545,20 @@ def _concrete_subject_description(
 def _specific_lighting(
     shot: Dict[str, Any], where: str, visual_style: VisualStyle
 ) -> str:
+    temporal_contract = apply_temporal_visual_contract(shot)
+    period = str((temporal_contract or {}).get("period") or "")
+    daylight_period = period in {"day", "morning", "midday", "afternoon"}
     lighting = str(shot.get("lighting_description") or shot.get("lighting_key") or "").strip()
-    if lighting and any(token in lighting for token in ("左", "右", "上", "下", "逆光", "侧光")):
+    contradictory_explicit = daylight_period and any(
+        token in lighting.casefold() for token in ("夜", "night", "moon", "月光")
+    )
+    if not contradictory_explicit and lighting and any(token in lighting for token in ("左", "右", "上", "下", "逆光", "侧光")):
         if any(token in lighting.upper() for token in ("K", "暖", "冷")):
             if not any(token in lighting for token in ("气氛", "氛围", "雾", "雨", "尘", "颗粒", "潮湿")):
                 lighting += "，空气颗粒轻微可见，气氛与剧情情绪一致"
+            if daylight_period:
+                lighting += "，日光主导环境曝光，天空与窗外保持明亮日间亮度"
             return lighting
-    if any(token in where for token in ("夜", "月")):
-        return "冷蓝月光从镜头右上方射入，色温5600K，暖橙环境光轻微补亮轮廓，气氛克制"
-    if any(token in where for token in ("室内", "房", "店", "办公室")):
-        return "暖白LED主光从镜头左上方照射，色温4200K，右侧冷色窗光勾勒轮廓，气氛沉静"
 
     style_text = " ".join(filter(None, (
         visual_style.style_prompt_short,
@@ -559,6 +568,18 @@ def _specific_lighting(
     ))).lower()
     has_rain = any(token in style_text for token in ("雨", "rain", "storm", "暴风"))
     has_night = any(token in style_text for token in ("夜", "night", "moon", "月"))
+    if daylight_period:
+        if any(token in where for token in ("室内", "房", "店", "办公室")):
+            return "日间自然窗光从镜头右侧主导环境曝光，室内暖白实景灯仅作辅光，窗外保持明亮日间天空"
+        if has_rain or any(token in style_text for token in ("阴", "overcast", "cloudy")):
+            return "日间阴雨漫射光从明亮灰白天空均匀落下，日光主导曝光，低饱和但绝非夜景"
+        return "日间太阳光从镜头左上方照射，天空明亮，环境由自然日光主导曝光"
+    if period == "night" or (not period and any(token in where for token in ("夜", "月"))):
+        return "冷蓝夜间环境光从镜头右上方射入，暖橙实景灯轻微补亮轮廓，天空不得出现日光"
+    if period in {"dawn", "golden_hour", "dusk"}:
+        return f"{(temporal_contract or {}).get('label', '低角度时段')}低角度自然光从镜头左上方侧逆光照射，天空保留对应时段的可见渐变"
+    if any(token in where for token in ("室内", "房", "店", "办公室")):
+        return "暖白LED主光从镜头左上方照射，色温4200K，右侧冷色窗光勾勒轮廓，气氛沉静"
     if has_rain and has_night:
         return "冷蓝雨夜光从镜头右上方漫射照入，湿润表面反射微光，低饱和度，气氛湿冷压抑"
     if has_night:
@@ -580,6 +601,7 @@ def _build_eight_layer_prompt(
     visual_style_path: Optional[str] = None,
 ) -> str:
     """Build the deterministic eight-layer blueprint consumed by the LLM."""
+    temporal_contract = apply_temporal_visual_contract(shot)
     shot_number = shot.get("shot_number") or shot.get("shot_order") or shot.get("id") or 1
     try:
         shot_number = int(str(shot_number).lstrip("Ss"))
@@ -676,6 +698,11 @@ def _build_eight_layer_prompt(
         f"动作：{action}",
         f"运动契约：{motion_contract}",
     ])
+    if temporal_contract:
+        layers.append(f"时间段视觉硬合同：{temporal_visual_prompt(temporal_contract)}")
+        layers.append(
+            f"时间段负面约束：{temporal_visual_negative_prompt(temporal_contract)}"
+        )
     if shot.get("hero_moment"):
         layers.append(
             "视觉峰值：这是全片 hero moment，构图、动作结果与环境层次必须形成清晰视觉峰值。"
@@ -818,6 +845,8 @@ def _generate_single_shot(
             result[field] = value
     for field in (
         "shot_size", "camera_movement", "lighting_key", "shot_intent",
+        "time", "time_of_day", "time_window", "source_time_values",
+        "temporal_visual_contract",
         "lens_mm", "camera_motion_contract",
         "hero_moment", "texture_keywords",
         "gen_strategy", "where", "audio", "sound", "emotion",

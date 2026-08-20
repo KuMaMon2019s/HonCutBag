@@ -91,6 +91,11 @@ def synthetic_character_review_evidence(
             "distinguishing_features": [
                 str(value).strip() for value in features if str(value).strip()
             ],
+            "identity_props": (
+                appearance.get("identity_props", [])
+                if isinstance(appearance.get("identity_props"), list)
+                else []
+            ),
         })
 
     evidence["artifact_valid"] = True

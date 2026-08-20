@@ -20,7 +20,10 @@ from typing import Any, Dict, List, Optional
 import json
 import re
 
-from quality.character_reference_qa import validate_character_reference_qa_receipt
+from quality.character_reference_qa import (
+    file_sha256,
+    validate_character_reference_qa_receipt,
+)
 from utils.character_identity import is_declared_character_reference
 from utils.video_capabilities import (
     capabilities_for,
@@ -350,6 +353,45 @@ def _check_red_line(rule_id: str, output_dir: Path,
                 report_path = output_dir / report_path
             if not validate_character_reference_qa_receipt(report_path, view_paths):
                 return False
+            identity_props = card.get("identity_props")
+            if isinstance(identity_props, list) and identity_props:
+                detail_value = card.get("identity_detail_reference")
+                detail_report_value = card.get("identity_detail_qa_report")
+                if not detail_value or not detail_report_value:
+                    return False
+                detail_path = Path(str(detail_value))
+                if not detail_path.is_absolute():
+                    detail_path = output_dir / detail_path
+                detail_report_path = Path(str(detail_report_value))
+                if not detail_report_path.is_absolute():
+                    detail_report_path = output_dir / detail_report_path
+                try:
+                    detail_report = json.loads(
+                        detail_report_path.read_text(encoding="utf-8")
+                    )
+                    detail_input = detail_report["inputs"]["identity_detail"]
+                    canonical_inputs = detail_report["inputs"]["canonical_references"]
+                except (OSError, json.JSONDecodeError, KeyError, TypeError):
+                    return False
+                if (
+                    detail_report.get("schema") != "honcut.identity-detail-qa.v1"
+                    or detail_report.get("status") != "passed"
+                    or not detail_path.is_file()
+                    or detail_input.get("path") != detail_path.name
+                    or detail_input.get("sha256") != file_sha256(detail_path)
+                ):
+                    return False
+                if not isinstance(canonical_inputs, list) or not canonical_inputs:
+                    return False
+                for canonical_input in canonical_inputs:
+                    if not isinstance(canonical_input, dict):
+                        return False
+                    canonical_path = cd / str(canonical_input.get("path") or "")
+                    if (
+                        not canonical_path.is_file()
+                        or canonical_input.get("sha256") != file_sha256(canonical_path)
+                    ):
+                        return False
         return character_count > 0
 
     if rule_id == "videos_exist":

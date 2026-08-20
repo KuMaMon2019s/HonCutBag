@@ -23,6 +23,13 @@ from utils.character_body_contracts import (
 )
 from utils.storyboard_motion_policy import apply_storyboard_motion_policy
 from utils.style_slices import get_slice
+from utils.temporal_visual_contracts import (
+    apply_temporal_visual_contract,
+    build_temporal_visual_contract,
+    normalized_temporal_visual_contract,
+    temporal_visual_negative_prompt,
+    temporal_visual_prompt,
+)
 from utils.video_generation_contracts import (
     DUPLICATE_IDENTITY_NEGATIVE,
     SPATIAL_IDENTITY_NEGATIVE,
@@ -39,23 +46,13 @@ BASE_NEGATIVE_PROMPT = (
 
 
 def _time_continuity_contract(*values: object) -> tuple[str, str]:
-    """Return a positive continuity lock and its contradictory visual guardrails."""
-    text = " ".join(str(value) for value in values if value).lower()
-    is_night = any(token in text for token in ("夜", "night", "moon", "月光"))
-    is_day = any(token in text for token in ("白天", "daytime", "daylight", "midday", "正午"))
-    if is_night and not is_day:
-        return (
-            "整个镜头从第一帧到最后一帧始终保持深夜，不得渐变为白天或黎明，"
-            "天空和环境不得出现日光",
-            "白天(daytime), 日光(daylight), 晴空(clear sky), 明亮天空(bright sky), "
-            "灰白日间天空(overcast daylight), 清晨(dawn), 日出(sunrise)",
-        )
-    if is_day and not is_night:
-        return (
-            "整个镜头从第一帧到最后一帧始终保持日间光照，不得渐变为夜景",
-            "深夜(deep night), 月光(moonlight), 纯夜景(night scene)",
-        )
-    return "", ""
+    """Backward-compatible wrapper around the structured temporal contract."""
+    contract = build_temporal_visual_contract(
+        time_of_day=values[0] if values else "",
+        source_time=values[1] if len(values) > 1 else "",
+        visual_context=" ".join(str(value) for value in values[2:] if value),
+    )
+    return temporal_visual_prompt(contract), temporal_visual_negative_prompt(contract)
 
 def _characters_list(characters: Any) -> list[dict[str, Any]]:
     if isinstance(characters, dict):
@@ -87,6 +84,13 @@ def build_video_prompt(
     apply_camera_motion_contract(shot_meta)
     number = _shot_number(shot_meta)
     scene = scene_consistency.get("shots", {}).get(f"S{number:02d}", {})
+    temporal_contract = normalized_temporal_visual_contract(
+        shot_meta.get("temporal_visual_contract")
+    ) or normalized_temporal_visual_contract(scene.get("temporal_visual_contract"))
+    if temporal_contract is None:
+        temporal_contract = apply_temporal_visual_contract(shot_meta)
+    elif shot_meta.get("temporal_visual_contract") != temporal_contract:
+        shot_meta["temporal_visual_contract"] = temporal_contract
     requested_declared = "who" in shot_meta or "characters" in shot_meta
     requested = shot_meta.get("who") or shot_meta.get("characters") or []
     requested = requested if isinstance(requested, list) else [requested]
@@ -141,6 +145,18 @@ def build_video_prompt(
     layout = scene.get("spatial_layout", {})
     setting = scene.get("scene_description") or shot_meta.get("where") or "当前场景"
     lighting = scene.get("lighting_description") or scene.get("lighting_note") or scene_consistency.get("global_lighting") or "与全片美术风格一致的自然光照，明暗关系真实克制"
+    if temporal_contract is None:
+        temporal_contract = build_temporal_visual_contract(
+            visual_context=" ".join(
+                str(value or "")
+                for value in (
+                    lighting,
+                    scene_consistency.get("global_style_lock"),
+                )
+            )
+        )
+        if temporal_contract is not None:
+            shot_meta["temporal_visual_contract"] = temporal_contract
     scene_and_lighting = f"{setting}，{layout.get('subject', '')}，{lighting}".replace("，，", "，")
     subject_summary = build_subject_summary([
         ("景别与主体：", f"{shot_type}，{subject}"),
@@ -174,13 +190,8 @@ def build_video_prompt(
         or f"4K, {ratio}, {shot_meta.get('duration', 5)}秒"
     )
     quality = re.sub(r"(?<!\d)\d+(?:\.\d+)?:\d+(?:\.\d+)?(?!\d)", ratio, quality)
-    time_lock, time_negative = _time_continuity_contract(
-        shot_meta.get("time_of_day"),
-        shot_meta.get("time"),
-        lighting,
-        style,
-        scene_consistency.get("global_style_lock"),
-    )
+    time_lock = temporal_visual_prompt(temporal_contract)
+    time_negative = temporal_visual_negative_prompt(temporal_contract)
     if time_lock:
         # This is intentionally outside build_subject_summary's character budget.
         parts.append(f"时空连续性硬约束：{time_lock}")

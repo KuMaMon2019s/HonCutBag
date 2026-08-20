@@ -62,6 +62,7 @@ from utils.camera_motion_contracts import (
     CAMERA_MOVEMENT_VALUES,
     apply_camera_motion_contract,
 )
+from utils.temporal_visual_contracts import apply_temporal_visual_contract
 from utils.video_capabilities import (
     MAX_CONTENT_BEATS_PER_PRIMARY_SHOT,
     VideoModelCapabilities,
@@ -1368,6 +1369,10 @@ def _inherit_event_semantics(
             shot["gen_strategy"] = determine_gen_strategy(shot)
 
         first_source = details[0] if details else {}
+        apply_temporal_visual_contract(
+            shot,
+            source_times=(event.get("time") for event in details),
+        )
         if slices and slices[0][1].get("start_state"):
             shot["start_state"] = str(slices[0][1]["start_state"])
         if slices and slices[-1][1].get("end_state"):

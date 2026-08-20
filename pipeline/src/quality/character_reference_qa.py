@@ -7,7 +7,11 @@ import json
 from pathlib import Path
 from typing import Any, Protocol
 
-from utils.character_reference_contracts import STATIC_REFERENCE_QA_POLICY
+from utils.character_reference_contracts import (
+    IDENTITY_DETAIL_ASSET_POLICY,
+    STATIC_REFERENCE_QA_POLICY,
+    identity_detail_prompt_items,
+)
 
 CHARACTER_REFERENCE_QA_SCHEMA = "honcut.character-reference-qa.v2"
 SEEDANCE_REFERENCE_VIEWS = ("face_closeup", "full_body", "side", "back")
@@ -114,6 +118,30 @@ cross-view mismatch is localized, list the suspect filenames in failed_views; ot
 all supplied filenames. Do not excuse a wrong angle because identity is consistent."""
 
 
+def build_identity_detail_qa_prompt(items: list[dict[str, Any]]) -> str:
+    """Build the blocking review contract for a four-view-derived detail board."""
+    return f"""You are the blocking Phase 3 identity-detail inspector.
+Images 1 and 2 are the approved canonical face and full-body references. Image 3 is the
+supplemental identity-detail board derived from them.
+
+Declared identity-detail items:
+{identity_detail_prompt_items(items)}
+
+Detail-board policy:
+{IDENTITY_DETAIL_ASSET_POLICY}
+
+Verify that the character identity, outfit base colors, and body-worn markers match images 1-2;
+every declared item is visible with its exact authored geometry, colors, materials, markings and
+attachment mode; isolated_handheld items are shown detached and are not held or operated; and no
+undeclared prop, location, action pose, second character, text, watermark or logo was introduced.
+
+Return one JSON object only:
+{{"passed":true,"character_identity_consistent":true,"declared_items_present":true,
+"item_geometry_consistent":true,"colors_materials_consistent":true,
+"attachment_modes_correct":true,"undeclared_items_absent":true,"issues":[]}}
+Set passed=false whenever any required item or consistency fact is uncertain."""
+
+
 def _json_object(raw: str) -> dict[str, Any]:
     text = str(raw or "").strip()
     if "{" not in text:
@@ -149,6 +177,41 @@ def _json_object(raw: str) -> dict[str, Any]:
     raise CharacterReferenceQAError(
         f"character reference QA returned invalid JSON{detail}"
     )
+
+
+def parse_identity_detail_qa(raw: str) -> dict[str, Any]:
+    """Parse and recompute the identity-detail verdict from explicit evidence."""
+    payload = _json_object(raw)
+    fields = (
+        "character_identity_consistent",
+        "declared_items_present",
+        "item_geometry_consistent",
+        "colors_materials_consistent",
+        "attachment_modes_correct",
+        "undeclared_items_absent",
+    )
+    evidence = {field: payload.get(field) is True for field in fields}
+    issues = payload.get("issues")
+    issues = issues if isinstance(issues, list) else [str(issues or "")]
+    return {
+        "passed": payload.get("passed") is True and all(evidence.values()),
+        **evidence,
+        "issues": [str(item) for item in issues if str(item).strip()],
+    }
+
+
+def review_identity_detail_reference(
+    reviewer: CharacterReferenceReviewer,
+    canonical_paths: list[Path],
+    detail_path: Path,
+    items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Review one detail board against the approved neutral identity references."""
+    raw = reviewer.review(
+        [*canonical_paths, detail_path],
+        build_identity_detail_qa_prompt(items),
+    )
+    return parse_identity_detail_qa(raw)
 
 
 def parse_character_reference_qa(

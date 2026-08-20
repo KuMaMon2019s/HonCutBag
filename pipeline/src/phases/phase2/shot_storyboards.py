@@ -13,9 +13,18 @@ from typing import Any, Protocol
 import requests
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from utils.character_body_contracts import character_visual_description
+from utils.character_reference_contracts import (
+    character_identity_detail_items,
+    identity_detail_prompt_items,
+)
 from utils.camera_motion_contracts import (
     camera_motion_negative_prompt,
     camera_motion_prompt,
+)
+from utils.temporal_visual_contracts import (
+    apply_temporal_visual_contract,
+    temporal_visual_negative_prompt,
+    temporal_visual_prompt,
 )
 
 SHOT_STORYBOARD_SIZE = "2560x1440"
@@ -101,6 +110,13 @@ def _character_contract(
                 f"- {character.get('name') or character.get('id')}："
                 f"{_compact(description, 1400)}"
             )
+        identity_items = character_identity_detail_items(character)
+        if identity_items:
+            lines.append(
+                f"  身份道具细节参考：{identity_detail_prompt_items(identity_items)}。"
+                "body_attached 项保持在固定佩挂点；isolated_handheld 项只有本格动作明确调用时才出现，"
+                "出现时几何、颜色、材质和标记必须与独立细节板一致。"
+            )
     contract = "\n".join(lines) or "- 严格使用 STORYBOARD.json 声明的角色设定，不自行增加人物。"
     from utils.privacy_visual_policy import (
         is_no_real_person_enabled,
@@ -118,6 +134,14 @@ def build_shot_storyboard_prompt(
     characters: list[dict[str, Any]],
     aspect_ratio: str = "16:9",
 ) -> tuple[str, list[dict[str, Any]]]:
+    temporal_contract = apply_temporal_visual_contract(shot)
+    temporal_section = (
+        "\n时间段视觉硬合同：\n"
+        f"- {temporal_visual_prompt(temporal_contract)}。\n"
+        f"- 禁止：{temporal_visual_negative_prompt(temporal_contract)}。\n"
+        if temporal_contract
+        else ""
+    )
     beats = [
         dict(beat)
         for beat in (shot.get("storyboard_beats") or [])
@@ -170,6 +194,7 @@ def build_shot_storyboard_prompt(
 - 每格只能细分当前 Sxx 已写明的动作与状态，不得新增角色、道具、冲突、伤亡或剧情结果。
 
 场景：{_compact(shot.get('where') or shot.get('visual'), 260)}
+{temporal_section}
 角色：
 {_character_contract(characters, who)}
 
@@ -199,6 +224,13 @@ def _build_panel_prompt(
     correction_contract: str = "",
     is_last_content_beat: bool | None = None,
 ) -> str:
+    temporal_contract = apply_temporal_visual_contract(shot)
+    temporal_section = (
+        f"时间段视觉硬合同：{temporal_visual_prompt(temporal_contract)}\n"
+        f"时间段禁止项：{temporal_visual_negative_prompt(temporal_contract)}\n"
+        if temporal_contract
+        else ""
+    )
     who = _shot_who(shot)
     beat_id = str(beat.get("beat_id") or f"P{position:02d}")
     generation_mode = str(beat.get("generation_mode") or "").strip().lower()
@@ -312,7 +344,7 @@ Phase 5 定向纠偏合同：
 本格唯一可见动作：{_compact(beat.get('action'))}
 本格必须到达的结束状态：{_compact(beat.get('end_state'))}
 场景：{_compact(shot.get('where') or shot.get('visual'), 260)}
-景别：{beat.get('shot_size') or shot.get('shot_size') or 'medium'}
+{temporal_section}景别：{beat.get('shot_size') or shot.get('shot_size') or 'medium'}
 运镜意图：{beat.get('camera_movement') or shot.get('camera_movement') or 'steadicam'}
 运镜物理硬合同：{camera_motion_prompt({**shot, **beat})}
 边界把手合同：{_edge_handle_contract(beat)}

@@ -37,9 +37,16 @@ from quality.character_reference_qa import (
     CHARACTER_REFERENCE_QA_SCHEMA,
     CharacterReferenceQAError,
     build_character_reference_qa_receipt,
+    file_sha256,
     review_character_reference_pack,
+    review_identity_detail_reference,
 )
-from utils.character_reference_contracts import STATIC_REFERENCE_ASSET_POLICY
+from utils.character_reference_contracts import (
+    IDENTITY_DETAIL_ASSET_POLICY,
+    STATIC_REFERENCE_ASSET_POLICY,
+    identity_detail_prompt_items,
+    normalize_identity_props,
+)
 from utils.character_body_contracts import character_visual_description
 from utils.camera_motion_contracts import (
     HUMAN_PERSPECTIVE_CONTRACT,
@@ -380,6 +387,35 @@ def build_model_reference_prompts(
     }
 
 
+def build_identity_detail_prompt(
+    character_desc: str,
+    identity_props: list[dict[str, Any]],
+    style: str = "",
+    correction: str = "",
+) -> str:
+    """Build a four-view-derived detail board without polluting neutral poses."""
+    rendering = _reference_rendering_clause(style)
+    correction_clause = (
+        f"CORRECTION — the previous detail board failed: {correction}. "
+        if correction
+        else ""
+    )
+    return (
+        f"{correction_clause}Create one professional identity-detail reference board for the exact "
+        "same fictional character shown in the supplied approved face and full-body references. "
+        f"Static identity: {character_desc}. Rendering medium: {rendering}. "
+        f"Declared identity items: {identity_detail_prompt_items(identity_props)}. "
+        f"Policy: {IDENTITY_DETAIL_ASSET_POLICY} "
+        "Use a clean 2x2 detail-board layout on neutral gray #E8E8E8 with even studio light. "
+        "For body_attached items, show a close crop on the same attachment point plus one isolated "
+        "material/color detail. For isolated_handheld items, show the item alone from front, side, "
+        "and three-quarter angles at a stable scale; no hand touches it and the character does not "
+        "operate it. Preserve exact authored primary/secondary colors, material finish, geometry, "
+        "markings, straps and left/right orientation. Do not add a scene, action pose, another person, "
+        "an undeclared object, captions, labels, watermark, border text or logo."
+    )
+
+
 def build_combined_sheet_prompt(
     character_desc: str,
     style: str = "",
@@ -639,6 +675,114 @@ def _generate_reference_view(
             temporary.unlink()
 
 
+def _generate_identity_detail(
+    client: Any,
+    *,
+    character_description: str,
+    identity_props: list[dict[str, Any]],
+    style: str,
+    canonical_paths: list[Path],
+    output_path: Path,
+    correction: str = "",
+) -> None:
+    """Generate one detail board from approved canonical identity references."""
+    temporary = output_path.with_name(
+        f".{output_path.stem}.generating{output_path.suffix}"
+    )
+    try:
+        client.image_to_image(
+            prompt=build_identity_detail_prompt(
+                character_description,
+                identity_props,
+                style,
+                correction,
+            ),
+            ref_image=[str(path) for path in canonical_paths],
+            output_path=str(temporary),
+            size="1920x1920",
+        )
+        if not temporary.is_file():
+            raise RuntimeError("identity-detail generator did not write its output")
+        os.replace(temporary, output_path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _quality_control_identity_detail(
+    *,
+    char_id: str,
+    character_description: str,
+    identity_props: list[dict[str, Any]],
+    style: str,
+    char_dir: Path,
+    canonical_paths: list[Path],
+    detail_path: Path,
+    image_client: Any,
+    review_client: Any,
+    max_retries: int,
+) -> dict[str, Any]:
+    """Block Phase 3 until the supplemental item board matches the four views."""
+    report_path = char_dir / "identity_detail_qa.json"
+    attempts: list[dict[str, Any]] = []
+    if not detail_path.is_file() or detail_path.stat().st_size <= 10_240:
+        _generate_identity_detail(
+            image_client,
+            character_description=character_description,
+            identity_props=identity_props,
+            style=style,
+            canonical_paths=canonical_paths,
+            output_path=detail_path,
+        )
+    for attempt in range(1, max_retries + 2):
+        result = review_identity_detail_reference(
+            review_client,
+            canonical_paths,
+            detail_path,
+            identity_props,
+        )
+        attempts.append({"attempt": attempt, **result})
+        receipt = {
+            "schema": "honcut.identity-detail-qa.v1",
+            "character_id": char_id,
+            "status": "passed" if result["passed"] else "failed",
+            "identity_props": identity_props,
+            "inputs": {
+                "canonical_references": [
+                    {"path": path.name, "sha256": file_sha256(path)}
+                    for path in canonical_paths
+                ],
+                "identity_detail": {
+                    "path": detail_path.name,
+                    "sha256": file_sha256(detail_path),
+                },
+            },
+            "attempts": attempts,
+        }
+        _write_json_atomic(report_path, receipt)
+        if result["passed"]:
+            print(f"  [identity-detail-qa] {char_id} ✓ attempt {attempt}")
+            return receipt
+        if attempt > max_retries:
+            raise CharacterReferenceQAError(
+                f"{char_id} identity detail failed after {attempt} QA attempt(s): "
+                + "; ".join(result.get("issues") or ["detail contract violation"])
+            )
+        archive = char_dir / "identity_detail_qa_attempts" / f"attempt_{attempt:02d}"
+        archive.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(detail_path, archive / detail_path.name)
+        _generate_identity_detail(
+            image_client,
+            character_description=character_description,
+            identity_props=identity_props,
+            style=style,
+            canonical_paths=canonical_paths,
+            output_path=detail_path,
+            correction="; ".join(result.get("issues") or ["item or identity mismatch"]),
+        )
+    raise AssertionError("unreachable identity-detail QA state")
+
+
 def _archive_reference_attempt(
     char_dir: Path,
     view_paths: dict[str, Path],
@@ -791,6 +935,7 @@ def generate_character(
     model: Optional[str] = None,
     skip_images: bool = False,
     variants: Optional[list] = None,
+    identity_props: Optional[list] = None,
     review_client: Any | None = None,
     view_qa_max_retries: int = 2,
     review_qa_max_retries: int = 2,
@@ -813,6 +958,9 @@ def generate_character(
     """
     char_dir = os.path.join(output_dir, "characters", char_id)
     os.makedirs(char_dir, exist_ok=True)
+    normalized_identity_props = normalize_identity_props(identity_props or [])
+    identity_detail_path: Path | None = None
+    identity_detail_receipt: dict[str, Any] | None = None
 
     print(f"\n{'='*60}")
     print(f"  Character Factory: {name} ({char_id})")
@@ -910,6 +1058,32 @@ def generate_character(
             max_retries=view_qa_max_retries,
             review_max_retries=review_qa_max_retries,
         )
+        if normalized_identity_props:
+            identity_detail_path = Path(char_dir) / "identity_detail.png"
+            detail_face_view = (
+                "face_closeup"
+                if "face_closeup" in views
+                else "detail"
+                if "detail" in views
+                else "front"
+            )
+            detail_body_view = "full_body" if "full_body" in views else "front"
+            canonical_paths = [
+                Path(views[detail_face_view]),
+                Path(views[detail_body_view]),
+            ]
+            identity_detail_receipt = _quality_control_identity_detail(
+                char_id=char_id,
+                character_description=description,
+                identity_props=normalized_identity_props,
+                style=style,
+                char_dir=Path(char_dir),
+                canonical_paths=canonical_paths,
+                detail_path=identity_detail_path,
+                image_client=client,
+                review_client=review_client,
+                max_retries=view_qa_max_retries,
+            )
     else:
         print("[Step 1/3] Skipping image generation (--skip-images)")
         views = {name: None for name in build_model_reference_prompts(description, style, target_model)}
@@ -917,6 +1091,9 @@ def generate_character(
 
     # Step 2: Create character_card.json
     print("[Step 2/3] Creating character_card.json...")
+    reference_images = {
+        name: f"characters/{char_id}/{name}.png" for name in views
+    }
     card = create_character_card(
         char_id=char_id,
         name=name,
@@ -924,7 +1101,7 @@ def generate_character(
         style=style,
         negative=negative,
         seedream_model=seedream_model,
-        reference_images={name: f"characters/{char_id}/{name}.png" for name in views},
+        reference_images=reference_images,
     )
     face_view = (
         "face_closeup"
@@ -942,7 +1119,18 @@ def generate_character(
         else "seedance_four_views"
     )
     card["source_image_rules"] = SOURCE_IMAGE_RULES
-    card["reference_contract_version"] = 3
+    card["reference_contract_version"] = 4
+    card["identity_props"] = normalized_identity_props
+    card["identity_detail_reference"] = (
+        f"characters/{char_id}/identity_detail.png"
+        if normalized_identity_props
+        else None
+    )
+    card["identity_detail_qa_report"] = (
+        f"characters/{char_id}/identity_detail_qa.json"
+        if identity_detail_receipt is not None
+        else None
+    )
     card["reference_qa_report"] = (
         f"characters/{char_id}/character_reference_qa.json"
         if qa_receipt is not None
@@ -964,6 +1152,11 @@ def generate_character(
             "侧面/行走/奔跑": "side.png",
             "背面/远去/离开": "back.png",
             "面部/情绪/泪水": f"{face_view}.png",
+            **(
+                {"身份道具/材质/标记细节": "identity_detail.png"}
+                if normalized_identity_props
+                else {}
+            ),
         },
     )
     angle_path = os.path.join(char_dir, "angle_map.json")
@@ -1005,8 +1198,13 @@ def generate_character(
                 )
                 
                 print(f"  [variant] Generating {variant_filename}...")
-                url = client.text_to_image(
+                canonical_variant_references = [
+                    str(Path(char_dir) / f"{face_view}.png"),
+                    str(Path(char_dir) / f"{body_view}.png"),
+                ]
+                url = client.image_to_image(
                     prompt=variant_prompt,
+                    ref_image=canonical_variant_references,
                     output_path=variant_path,
                     size=size,
                 )
@@ -1030,6 +1228,7 @@ def generate_character(
         "card": card_path,
         "angle_map": angle_path,
         "views": views,
+        "identity_detail": str(identity_detail_path) if identity_detail_path else None,
         "variants": variant_paths,
     }
     print(f"\n  ✓ Character '{name}' complete!")
@@ -1062,6 +1261,7 @@ def batch_generate(characters: list, output_dir: str, **kwargs) -> list:
                 model=char.get("model"),
                 skip_images=kwargs.get("skip_images", False),
                 variants=char.get("appearance", {}).get("variants", []),
+                identity_props=char.get("appearance", {}).get("identity_props", []),
                 review_client=kwargs.get("review_client"),
                 view_qa_max_retries=kwargs.get("view_qa_max_retries", 2),
                 review_qa_max_retries=kwargs.get("review_qa_max_retries", 2),

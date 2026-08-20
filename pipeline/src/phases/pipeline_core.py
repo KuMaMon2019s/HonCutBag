@@ -3869,6 +3869,10 @@ def _generation_input_fingerprint(
         "camera_movement",
         "shot_size",
         "where",
+        "time",
+        "time_of_day",
+        "time_window",
+        "temporal_visual_contract",
         "lighting_description",
         "style_anchor",
     )
@@ -4155,6 +4159,10 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                     or scene_contract.get("style_suffix")
                     or scene_consistency_data.get("global_style_lock")
                     or meta.get("style_anchor")
+                )
+                meta["temporal_visual_contract"] = (
+                    scene_contract.get("temporal_visual_contract")
+                    or meta.get("temporal_visual_contract")
                 )
 
             routed_prompt = build_video_prompt(

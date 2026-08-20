@@ -12,6 +12,11 @@ from typing import Any, Callable
 
 import numpy as np
 
+from utils.temporal_visual_contracts import (
+    apply_temporal_visual_contract,
+    temporal_visual_qa_instruction,
+)
+
 
 SemanticReviewer = Callable[[list[Path], dict[str, Any]], dict[str, Any]]
 
@@ -418,6 +423,11 @@ def _character_reference_paths(
             )
             if reference is not None:
                 references.append((character_id, reference))
+                identity_detail = character_dir / "identity_detail.png"
+                if identity_detail.is_file() and identity_detail.stat().st_size > 0:
+                    references.append(
+                        (f"{character_id}:identity_detail", identity_detail)
+                    )
                 break
     return references
 
@@ -450,6 +460,7 @@ def _automatic_semantic_reviewer(
     )
 
     def review(frame_paths: list[Path], shot_meta: dict[str, Any]) -> dict[str, Any]:
+        temporal_contract = apply_temporal_visual_contract(shot_meta)
         character_references = _character_reference_paths(output_dir, shot_meta)
         expected = {
             key: shot_meta.get(key)
@@ -457,7 +468,8 @@ def _automatic_semantic_reviewer(
                 "shot_id", "visual", "action", "action_description", "generation_actions",
                 "who", "where",
                 "characters", "time", "time_of_day", "lighting", "lighting_key",
-                "lighting_description", "style_anchor", "camera_movement",
+                "time_window", "temporal_visual_contract", "lighting_description",
+                "style_anchor", "camera_movement",
                 "camera_motion_contract", "interaction_props", "phase8_reshoot",
             )
             if shot_meta.get(key) not in (None, "", [])
@@ -483,6 +495,7 @@ def _automatic_semantic_reviewer(
                 "require visible positive evidence of malformation. "
             )
         )
+        temporal_qa = temporal_visual_qa_instruction(temporal_contract)
         prompt = (
             f"QA contract: {qa_contract}. "
             f"The first {len(character_references)} supplied image(s) are canonical character references "
@@ -495,7 +508,7 @@ def _automatic_semantic_reviewer(
             "contradicts the shot or changes materially between the first and last supplied frame. Natural acting "
             "micro-movements (small gaze/head/hand changes) are allowed unless they reverse the narrative action or "
             "create a true continuity jump. "
-            f"{structure_contract}"
+            f"{structure_contract}{temporal_qa} "
             "Each canonical named identity may appear only once unless the metadata explicitly requests clones; "
             "background extras must not duplicate a canonical identity, costume, helmet, or signature marker. "
             "Verify that generation_actions occur in their listed order with visible subject "

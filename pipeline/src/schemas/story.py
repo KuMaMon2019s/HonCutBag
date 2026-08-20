@@ -47,6 +47,11 @@ class StoryboardShot(BaseModel):
     lens_mm: int | None = Field(default=None, ge=50, le=85)
     camera_motion_contract: dict[str, Any] = Field(default_factory=dict)
     lighting_key: str = ""
+    time: str = ""
+    time_of_day: str = ""
+    time_window: str = ""
+    source_time_values: list[str] = Field(default_factory=list)
+    temporal_visual_contract: dict[str, Any] = Field(default_factory=dict)
     shot_intent: str = ""
     hero_moment: bool = False
     texture_keywords: list[str] = Field(default_factory=list)

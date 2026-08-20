@@ -6,6 +6,12 @@ prompt_router.py — M4: HonCut 模型路由（4 种提示词模式）
 
 from typing import Optional
 
+from utils.temporal_visual_contracts import (
+    apply_temporal_visual_contract,
+    temporal_visual_negative_prompt,
+    temporal_visual_prompt,
+)
+
 
 def route_prompt(model_name: str, mode: str, shot_data: dict, assets: list = None) -> str:
     """
@@ -102,6 +108,7 @@ def _build_seedance2_single(shot_data: dict, assets: list) -> str:
         or shot_data.get("lighting_key")
         or ""
     )
+    temporal_contract = apply_temporal_visual_contract(shot_data)
     
     # 构建英文 prompt
     parts = []
@@ -112,6 +119,12 @@ def _build_seedance2_single(shot_data: dict, assets: list) -> str:
         parts.append(f"Time and weather: {time_desc}.")
     if lighting:
         parts.append(f"Lighting continuity: {lighting}.")
+    if temporal_contract:
+        parts.append(
+            "Temporal visual hard contract: "
+            f"{temporal_visual_prompt(temporal_contract)}. "
+            f"Forbidden cues: {temporal_visual_negative_prompt(temporal_contract)}."
+        )
     if emotion:
         parts.append(f"Mood: {emotion}.")
     # ``source_prompt`` is the complete Phase 6 contract and already carries a

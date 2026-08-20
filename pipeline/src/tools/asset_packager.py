@@ -38,7 +38,7 @@ def package_shot_assets(
     Zip structure:
         assets.zip
         ├─ meta.json
-        ├─ character_refs/      (face_closeup/full_body/variant_*.png)
+        ├─ character_refs/      (face_closeup/full_body/identity_detail/variant_*.png)
         ├─ shot_frames/         (storyboard_images/{shot_id}.png)
         └─ storyboard/          (storyboard.png)
     
@@ -73,6 +73,7 @@ def package_shot_assets(
                     reference_paths = [
                         char_dir / "face_closeup.png",
                         char_dir / "full_body.png",
+                        char_dir / "identity_detail.png",
                         *sorted(char_dir.glob("variant_*.png")),
                     ]
                     for reference_path in reference_paths:
@@ -272,18 +273,51 @@ def collect_character_reference_assets(
             for character in characters_data.get("characters", [])
             if character.get("id")
         }
+        character_identity_props = {
+            character.get("id"): (
+                character.get("appearance", {}).get("identity_props", [])
+                if isinstance(character.get("appearance"), dict)
+                else []
+            )
+            for character in characters_data.get("characters", [])
+            if character.get("id")
+        }
     else:
         character_definitions = {}
+        character_identity_props = {}
 
     references = []
+    action_text = " ".join(
+        str(shot_meta.get(key) or "")
+        for key in ("visual", "what", "action_description", "generation_actions", "prompt")
+    ).casefold()
     for char_id in _detect_shot_characters(output_dir, shot_meta):
         character_name = character_names.get(char_id, char_id)
+        identity_props = character_identity_props.get(char_id, [])
+        identity_detail_active = any(
+            isinstance(item, dict)
+            and (
+                item.get("persistence") == "always"
+                or item.get("attachment_mode") == "body_attached"
+                or bool(str(item.get("name") or "").strip())
+                and str(item.get("name") or "").casefold() in action_text
+                or (
+                    str(character_name).casefold() in action_text
+                    and any(
+                        marker in action_text
+                        for marker in ("拍摄", "跟拍", "手持", "使用", "操作", "记录")
+                    )
+                )
+            )
+            for item in identity_props
+        )
         char_dir = output_dir / "characters" / char_id
         if not char_dir.exists():
             char_dir = output_dir / "characters" / "characters" / char_id
         reference_paths = [
             char_dir / "face_closeup.png",
             char_dir / "full_body.png",
+            char_dir / "identity_detail.png",
             *sorted(char_dir.glob("variant_*.png")),
         ]
         for reference_path in reference_paths:
@@ -295,11 +329,28 @@ def collect_character_reference_assets(
                     "prompt_definition": character_definitions.get(char_id, ""),
                     "role": "reference_image",
                     "priority": "high",
+                    "reference_kind": (
+                        "identity_detail"
+                        if reference_path.name == "identity_detail.png"
+                        else "character_identity"
+                    ),
+                    "bind_subject": reference_path.name != "identity_detail.png",
+                    "identity_props": identity_props,
+                    "identity_detail_active": (
+                        identity_detail_active
+                        if reference_path.name == "identity_detail.png"
+                        else False
+                    ),
                     "reference_description": (
                         f"{character_name}的面部特写"
                         if reference_path.name == "face_closeup.png"
                         else f"{character_name}的全身照"
                         if reference_path.name == "full_body.png"
+                        else (
+                            f"{character_name}的身份道具与材质细节板；仅锁定声明道具的几何、"
+                            "颜色、材质、标记和佩挂关系，不把板上孤立道具当成新主体"
+                        )
+                        if reference_path.name == "identity_detail.png"
                         else f"{character_name}的变体图（{reference_path.stem}）"
                     ),
                 })
@@ -565,7 +616,7 @@ def build_content_for_shot(
         if expected_characters and not character_assets:
             raise FileNotFoundError(
                 "Phantom character references missing for shot "
-                f"{shot_id}; expected face_closeup.png, full_body.png, or variant_*.png"
+                f"{shot_id}; expected face_closeup.png, full_body.png, identity_detail.png, or variant_*.png"
             )
         if not character_assets and not storyboard_assets:
             raise FileNotFoundError(
@@ -585,8 +636,17 @@ def build_content_for_shot(
         # Dense identity packs over-constrain motion. For action, retain one
         # identity image per character plus the composition frame; native
         # continuation adds its ordered tail anchors outside this budget.
-        motion_budget = len(_detect_shot_characters(output_dir, shot_meta)) + 1
-        motion_budget = max(2, min(3, motion_budget))
+        active_detail_count = sum(
+            asset.get("reference_kind") == "identity_detail"
+            and asset.get("identity_detail_active") is True
+            for asset in image_assets
+        )
+        motion_budget = (
+            len(_detect_shot_characters(output_dir, shot_meta))
+            + 1
+            + min(active_detail_count, 1)
+        )
+        motion_budget = max(2, min(4, motion_budget))
         max_reference_images = (
             motion_budget
             if max_reference_images is None
@@ -597,7 +657,7 @@ def build_content_for_shot(
         if len(image_assets) > max_reference_images:
             # Continuation reserves three provider image slots for ordered tail
             # anchors. Keep the composition frame and distribute the remaining
-            # identity budget across characters in rounds (face, body, variant)
+            # identity budget across characters in rounds (face, body, detail, variant)
             # so one character cannot consume every slot.
             composition_assets = [
                 asset
@@ -622,11 +682,13 @@ def build_content_for_shot(
                     name = Path(asset.get("path", "")).name
                     if name == "full_body.png":
                         return 0
-                    if name.startswith("variant_"):
+                    if name == "identity_detail.png":
                         return 1
-                    if name == "face_closeup.png":
+                    if name.startswith("variant_"):
                         return 2
-                    return 3
+                    if name == "face_closeup.png":
+                        return 3
+                    return 4
 
                 for assets in grouped.values():
                     assets.sort(key=action_reference_rank)
