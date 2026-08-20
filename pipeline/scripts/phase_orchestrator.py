@@ -431,6 +431,8 @@ def run_phase(phase: str, config: dict) -> dict:
         cmd.append("--no-real-person")
     if config.get("_resume"):
         cmd.append("--resume")
+    if config.get("_resume_from"):
+        cmd.extend(["--resume-from", str(config["_resume_from"])])
     if config.get("_accept_code_change"):
         cmd.append("--accept-code-change")
     cmd.append(
@@ -523,6 +525,10 @@ def main() -> None:
         # Admit the transition exactly once. Later children resume normally so
         # a source edit during the monitored run cannot be silently accepted.
         config["_accept_code_change"] = phase == code_change_acceptance_phase
+        # Every child must invalidate its own completed checkpoint before it
+        # runs. Passing only --resume would make a completed child report a
+        # synthetic success without executing any phase code.
+        config["_resume_from"] = phase if args.resume_from else None
         print(f"\n{'=' * 60}\n  Running {phase}...\n{'=' * 60}\n", flush=True)
         _write_progress(
             progress_file,

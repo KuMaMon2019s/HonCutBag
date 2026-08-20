@@ -57,6 +57,11 @@ from phases.phase3 import character_factory
 from phases.phase4.continuity_plan import build_continuity_plan
 from phases.phase5 import storyboard_qa_gate
 from phases.phase6.video_generator import build_video_prompt
+from phases.phase8 import duration_gate
+from phases.phase8.edit_decisions import execute_edit_decisions
+from phases.phase8.inventory import Phase8InventoryError, load_phase8_inventory
+from phases.phase8.reshoot_transaction import durable_attempt_count
+from phases.phase8.story_order_reviewer import InvalidStoryOrderReview, reorder_shots
 from phases.pipeline_core import _write_project_visual_style
 from prompt import event_extractor
 from quality import video_qa
@@ -69,6 +74,10 @@ from quality.quality_gate import run_quality_check
 from quality.shot_continuity import annotate_boundaries, classify_boundary
 from quality.variation_checker import check_scene_variation
 from runtime.run_manifest import prepare_run_manifest
+from tools.checkpoint import invalidate_checkpoint_from, write_checkpoint
+from tools.smart_transition import decide_all_transitions
+from utils.artifact_chain import get_resumable_phase, invalidate_checkpoints_from
+from utils.shot_embedder import compute_transition_similarity
 from utils.video_capabilities import get_video_capabilities
 from utils.video_geometry import resolve_video_geometry
 from utils.ark_llm import create_ark_client
@@ -677,12 +686,14 @@ def test_phase_orchestrator_marks_resumed_children(monkeypatch, tmp_path):
             "transition_duration": 0.5,
             "enable_reshoot": True,
             "_resume": True,
+            "_resume_from": "phase5",
             "_accept_code_change": True,
         },
     )
 
     assert result["exit_code"] == 0
     assert "--resume" in captured["cmd"]
+    assert captured["cmd"][captured["cmd"].index("--resume-from") + 1] == "phase5"
     assert "--accept-code-change" in captured["cmd"]
 
 
@@ -701,10 +712,16 @@ def test_phase_orchestrator_admits_code_change_only_for_first_resumed_child(
         ),
         encoding="utf-8",
     )
-    observed: list[tuple[str, bool]] = []
+    observed: list[tuple[str, bool, str | None]] = []
 
     def fake_run_phase(phase, config):
-        observed.append((phase, config.get("_accept_code_change", False)))
+        observed.append(
+            (
+                phase,
+                config.get("_accept_code_change", False),
+                config.get("_resume_from"),
+            )
+        )
         return {
             "phase": phase,
             "exit_code": 0,
@@ -730,10 +747,223 @@ def test_phase_orchestrator_admits_code_change_only_for_first_resumed_child(
     phase_orchestrator.main()
 
     assert observed == [
-        ("phase8", True),
-        ("phase9", False),
-        ("phase9_5", False),
+        ("phase8", True, "phase8"),
+        ("phase9", False, "phase9"),
+        ("phase9_5", False, "phase9_5"),
     ]
+
+
+def _write_phase8_storyboard(output_dir: Path, shot_ids: list[str]) -> None:
+    (output_dir / "STORYBOARD.json").write_text(
+        json.dumps({"shots": [{"id": shot_id} for shot_id in shot_ids]}),
+        encoding="utf-8",
+    )
+
+
+def _write_phase8_shot(
+    output_dir: Path,
+    shot_id: str,
+    *,
+    video: bool = True,
+    metadata: bool = True,
+) -> None:
+    shot_dir = output_dir / "shots" / shot_id
+    shot_dir.mkdir(parents=True, exist_ok=True)
+    if video:
+        (shot_dir / "output.mp4").write_bytes(b"video")
+    if metadata:
+        (shot_dir / "SHOT_META.json").write_text(
+            json.dumps({"shot_id": shot_id, "duration": 5}),
+            encoding="utf-8",
+        )
+
+
+def test_phase8_rejects_missing_expected_clip(tmp_path):
+    _write_phase8_storyboard(tmp_path, ["S01", "S02"])
+    _write_phase8_shot(tmp_path, "S01")
+    _write_phase8_shot(tmp_path, "S02", video=False)
+
+    with pytest.raises(Phase8InventoryError, match="missing_videos"):
+        load_phase8_inventory(tmp_path)
+
+
+def test_phase8_rejects_unexpected_stale_clip(tmp_path):
+    _write_phase8_storyboard(tmp_path, ["S01", "S02"])
+    _write_phase8_shot(tmp_path, "S01")
+    _write_phase8_shot(tmp_path, "S02")
+    _write_phase8_shot(tmp_path, "S03")
+
+    with pytest.raises(Phase8InventoryError, match="unexpected_videos"):
+        load_phase8_inventory(tmp_path)
+
+
+def test_story_reorder_rejects_incomplete_order():
+    clips = ["/run/shots/S01/output.mp4", "/run/shots/S02/output.mp4"]
+
+    with pytest.raises(InvalidStoryOrderReview, match="every available shot"):
+        reorder_shots(clips, [{"shot_id": "S01"}, {"shot_id": "S02"}], ["S01"])
+
+
+def test_edit_normalization_failure_is_fatal(monkeypatch, tmp_path):
+    source = tmp_path / "shots" / "S01" / "output.mp4"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"untrimmed source")
+    output = tmp_path / "raw_assembly.mp4"
+
+    def fail_ffmpeg(*_args, **_kwargs):
+        raise subprocess.CalledProcessError(1, "ffmpeg", stderr=b"filter failed")
+
+    monkeypatch.setattr(subprocess, "run", fail_ffmpeg)
+    execution = execute_edit_decisions(
+        {
+            "cuts": [
+                {
+                    "source": str(source),
+                    "shot_id": "S01",
+                    "in_seconds": 2.4,
+                    "out_seconds": 8.7,
+                    "speed": 1.0,
+                    "has_audio": True,
+                }
+            ],
+            "transitions": [],
+            "metadata": {
+                "compose_target": {"width": 1280, "height": 720, "fit": "cover"},
+                "target_fps": 30,
+            },
+        },
+        str(output),
+    )
+
+    assert execution["success"] is False
+    assert "normalization failed" in execution["error"]
+    assert not output.exists()
+    assert source.read_bytes() == b"untrimmed source"
+
+
+def test_resume_from_reexecutes_completed_target_and_downstream(tmp_path):
+    checkpoint = tmp_path / "checkpoint.json"
+    phases = ["phase1", "phase2", "phase3", "phase4"]
+    for phase in phases:
+        write_checkpoint(checkpoint, phase, {"status": "done"})
+
+    invalidated = invalidate_checkpoint_from(checkpoint, "phase2", phases)
+    persisted = json.loads(checkpoint.read_text(encoding="utf-8"))
+
+    assert invalidated == ["phase2", "phase3", "phase4"]
+    assert persisted["completed"] == ["phase1"]
+    assert set(persisted["results"]) == {"phase1"}
+    assert persisted["invalidations"][-1]["resume_from"] == "phase2"
+
+
+def test_resume_from_marks_artifact_receipts_stale(tmp_path):
+    for phase in ("phase1", "phase2", "phase3"):
+        (tmp_path / f"checkpoint_{phase}.json").write_text(
+            json.dumps({"phase": phase, "status": "done"}),
+            encoding="utf-8",
+        )
+    (tmp_path / "STORYBOARD.json").write_text('{"shots": []}', encoding="utf-8")
+
+    invalidated = invalidate_checkpoints_from("phase2", tmp_path)
+
+    assert invalidated == ["phase2", "phase3"]
+    assert json.loads((tmp_path / "checkpoint_phase1.json").read_text())["status"] == "done"
+    assert json.loads((tmp_path / "checkpoint_phase2.json").read_text())["status"] == "stale"
+    assert get_resumable_phase(tmp_path) == "phase2"
+
+
+def test_resume_from_preserves_single_phase_child_selection():
+    all_but_phase6 = [1.0, 2.0, 3.0, 4.0, 5.0, 7.0, 8.0, 9.0, 9.5]
+
+    assert pipeline_core._resume_skip_phases(all_but_phase6, "phase6") == all_but_phase6
+    assert pipeline_core._resume_skip_phases([], "phase6") == [1.0, 2.0, 3.0, 4.0, 5.0]
+
+
+def test_reordered_shots_use_real_transition_pair_ids():
+    embeddings = {
+        "S01": {"first": [1.0, 0.0], "last": [1.0, 0.0]},
+        "S02": {"first": [0.0, 1.0], "last": [0.0, 1.0]},
+        "S03": {"first": [1.0, 0.0], "last": [1.0, 0.0]},
+    }
+    order = ["S02", "S01", "S03"]
+    similarities = compute_transition_similarity(embeddings, order)
+    decisions = decide_all_transitions(
+        [
+            {"shot_id": "S02", "where": "b"},
+            {"shot_id": "S01", "where": "a"},
+            {"shot_id": "S03", "where": "c"},
+        ],
+        similarities,
+        shot_ids=order,
+    )
+
+    assert list(similarities) == ["S02->S01", "S01->S03"]
+    assert [decision["pair"] for decision in decisions] == [
+        "S02->S01",
+        "S01->S03",
+    ]
+
+
+def test_overlong_duration_never_creates_reshoot_plan(monkeypatch, tmp_path):
+    monkeypatch.setattr(duration_gate, "probe_duration", lambda _path: 61.0)
+    (tmp_path / "reshoot_list.json").write_text(
+        '{"shots": [{"shot_id": "S01"}]}', encoding="utf-8"
+    )
+
+    gate, reshoot_plan = duration_gate.evaluate_duration_gate(tmp_path, 60.0)
+
+    assert gate["status"] == "OVERLONG"
+    assert gate["passed"] is False
+    assert gate["gap_s"] == 0.0
+    assert gate["excess_s"] == 1.0
+    assert reshoot_plan is None
+    assert not (tmp_path / "reshoot_list.json").exists()
+
+
+def test_phase8_overlong_gate_requires_reedit_without_reshoot(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        duration_gate,
+        "evaluate_duration_gate",
+        lambda *_args, **_kwargs: (
+            {
+                "status": "OVERLONG",
+                "passed": False,
+                "actual_s": 61.0,
+                "target_s": 60.0,
+                "gap_s": 0.0,
+                "excess_s": 1.0,
+            },
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        duration_gate,
+        "trim_excess_to_target",
+        lambda *_args, **_kwargs: pytest.fail("overlong assembly must not be tail-trimmed"),
+    )
+
+    finished = pipeline_core._finish_phase8(
+        {"status": "done", "outputs": ["raw_assembly.mp4"]},
+        tmp_path,
+        60.0,
+        True,
+        "crossfade",
+        0.5,
+        "720p",
+        0,
+        [],
+        False,
+    )
+
+    assert finished["status"] == "error"
+    assert "requires re-edit" in finished["error"]
+
+
+def test_corrupt_reshoot_state_fails_closed(tmp_path):
+    (tmp_path / "reshoot_state.json").write_text("{broken", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="refusing to reset"):
+        durable_attempt_count(tmp_path)
 
 
 def test_repository_tests_do_not_reference_a_user_home_fixture():

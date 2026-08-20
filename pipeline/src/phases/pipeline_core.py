@@ -30,7 +30,10 @@ from utils.timing_estimator import estimate_phase_duration, estimate_total, esti
 from quality.delivery_promise import classify_from_brief
 from prompt.speech_pacing import annotate_shot_pacing
 from tools.base_tool import BaseTool, ToolResult, ToolRuntime
-from tools.checkpoint import write_checkpoint as write_stage_checkpoint
+from tools.checkpoint import (
+    invalidate_checkpoint_from as invalidate_stage_checkpoint,
+    write_checkpoint as write_stage_checkpoint,
+)
 from tools.provider_scoring import rank_providers
 from tools.video_composer import lock_runtime
 from prompt.shot_prompt_builder import build_batch_prompts
@@ -291,6 +294,13 @@ def _ensure_dir(p: Path) -> Path:
 
 # Phase 顺序定义（用于 resume 时判断哪些已完成）
 PHASE_ORDER = ["phase1", "phase2", "phase3", "phase4", "phase5", "phase6", "phase7", "phase8", "phase9", "phase9_5"]
+
+
+def _resume_skip_phases(existing_skip: list[float], resume_from: str) -> list[float]:
+    """Preserve an explicit phase/range selection while adding the resume boundary."""
+    from utils.artifact_chain import phase_numbers_before
+
+    return sorted(set(existing_skip).union(phase_numbers_before(resume_from)))
 
 
 def _checkpoint_path(output_dir: Path) -> Path:
@@ -4819,22 +4829,29 @@ def _finish_phase8(
     phase_result["outputs"] = outputs
 
     try:
-        duration_trim = trim_excess_to_target(output_dir, target_duration)
-        if duration_trim:
-            phase_result["duration_trim"] = duration_trim
-            if "duration_trim.json" not in phase_result["outputs"]:
-                phase_result["outputs"].append("duration_trim.json")
-            print(
-                "  ✂ [8.3] 组装时长归一化: "
-                f"{duration_trim['original_s']:.2f}s → {duration_trim['trimmed_s']:.2f}s",
-                flush=True,
-            )
         gate, reshoot_plan = evaluate_duration_gate(
             output_dir,
             target_duration,
             round_number=reshoot_round,
             reshoots=reshoot_history,
         )
+        if gate.get("status") != "OVERLONG":
+            duration_trim = trim_excess_to_target(output_dir, target_duration)
+            if duration_trim:
+                phase_result["duration_trim"] = duration_trim
+                if "duration_trim.json" not in phase_result["outputs"]:
+                    phase_result["outputs"].append("duration_trim.json")
+                print(
+                    "  ✂ [8.3] 组装时长归一化: "
+                    f"{duration_trim['original_s']:.2f}s → {duration_trim['trimmed_s']:.2f}s",
+                    flush=True,
+                )
+                gate, reshoot_plan = evaluate_duration_gate(
+                    output_dir,
+                    target_duration,
+                    round_number=reshoot_round,
+                    reshoots=reshoot_history,
+                )
     except Exception as exc:
         print(f"  ⚠⚠ [8.3] 时长闸门执行失败: {exc}；阻止交付", flush=True)
         phase_result["duration_gate_error"] = str(exc)
@@ -4853,6 +4870,20 @@ def _finish_phase8(
             flush=True,
         )
         mark_cycle_completed(output_dir)
+        return phase_result
+
+    if gate.get("status") == "OVERLONG":
+        print(
+            f"  ⚠⚠ [8.3] 成片过长: 实际 {gate['actual_s']:.2f}s，"
+            f"目标 {gate['target_s']:.2f}s，超出 {gate['excess_s']:.2f}s；"
+            "必须重新剪辑，禁止生成补拍计划",
+            flush=True,
+        )
+        phase_result["status"] = "error"
+        phase_result["error"] = (
+            "Phase 8 duration gate requires re-edit for overlong assembly: "
+            f"excess {gate['excess_s']:.2f}s"
+        )
         return phase_result
 
     print(
@@ -4961,9 +4992,6 @@ def run_phase8(output_dir: Path, dry_run: bool,
     print(f"  ⏱ Phase 8 开始 (预估 ~{int(phase8_estimate)}s)")
     output_dir = Path(output_dir)
     reshoot_history = list(_reshoot_history or [])
-    from phases.phase8.reshoot_transaction import durable_attempt_count
-
-    _reshoot_round = max(_reshoot_round, durable_attempt_count(output_dir))
     exhausted_reshoot_policy = os.environ.get(
         "HONCUT_PHASE8_EXHAUSTED_RESHOOT_POLICY", "fail"
     ).strip().lower()
@@ -4977,26 +5005,23 @@ def run_phase8(output_dir: Path, dry_run: bool,
         print("  ⊘ dry-run 模式，跳过视频组装")
         return {"status": "skipped", "reason": "dry-run", "duration_s": _elapsed(start)}
 
-    # 收集视频片段和对应的 SHOT_META
-    shots_dir = output_dir / "shots"
-    clip_paths = []
-    shot_metas = []
-    if shots_dir.exists():
-        for shot_d in sorted(shots_dir.iterdir()):
-            if shot_d.is_dir() and shot_d.name.startswith("S"):
-                video = shot_d / "output.mp4"
-                if video.exists():
-                    clip_paths.append(str(video))
-                    # Load SHOT_META.json for this shot
-                    meta_path = shot_d / "SHOT_META.json"
-                    if meta_path.exists():
-                        with open(meta_path, 'r', encoding='utf-8') as f:
-                            shot_metas.append(json.load(f))
-                    else:
-                        shot_metas.append({})  # Empty meta if file doesn't exist
+    # Prove the complete storyboard/video/metadata identity before any pixel
+    # analysis or paid reshoot can begin. Resume and manual artifact repair can
+    # bypass Phase 4, so Phase 8 owns this invariant too.
+    from phases.phase8.inventory import Phase8InventoryError, load_phase8_inventory
+    from phases.phase8.reshoot_transaction import durable_attempt_count
 
-    if not clip_paths:
-        return {"status": "error", "error": "No video clips found", "duration_s": _elapsed(start)}
+    try:
+        clip_paths, shot_metas = load_phase8_inventory(output_dir)
+        _reshoot_round = max(_reshoot_round, durable_attempt_count(output_dir))
+    except (Phase8InventoryError, RuntimeError) as exc:
+        return {
+            "status": "error",
+            "error": str(exc),
+            "duration_s": _elapsed(start),
+        }
+
+    shots_dir = output_dir / "shots"
 
     # Step 8.1: compare storyboard narrative order with the current clip order.
     from phases.phase8.story_order_reviewer import reorder_shots, review_story_order
@@ -5305,8 +5330,12 @@ def run_phase8(output_dir: Path, dry_run: bool,
         print("  → 智能转场: 抽帧 + 向量化 + 三层决策...")
         embeddings = embed_all_shots(str(shots_dir), run_id=str(output_dir.name))
         if embeddings:
-            similarities = compute_transition_similarity(embeddings)
-            smart_decisions = decide_all_transitions(shot_metas, similarities)
+            similarities = compute_transition_similarity(embeddings, reviewed_order)
+            smart_decisions = decide_all_transitions(
+                shot_metas,
+                similarities,
+                shot_ids=reviewed_order,
+            )
             
             # Log decisions
             for d in smart_decisions:
@@ -5327,7 +5356,7 @@ def run_phase8(output_dir: Path, dry_run: bool,
         else:
             sel_transition = _select_transition(shot_meta, default_transition=transition)
         selected_transitions.append(sel_transition)
-        shot_name = f"S{i+1:03d}"
+        shot_name = reviewed_order[i]
         emotion = shot_meta.get("emotion", "N/A")
         source = "智能" if (smart_decisions and i < len(smart_decisions)) else "情绪"
         print(f"    • {shot_name} → {sel_transition} ({source}, emotion: {emotion})")
@@ -5383,6 +5412,7 @@ def run_phase8(output_dir: Path, dry_run: bool,
         for shot in (continuity_plan_for_edit or {}).get("shots", [])
     )
     reviewed_edit_error = "reviewed edit path did not complete"
+    reviewed_edit_execution_started = False
     try:
         from phases.phase8.edit_decisions import build_edit_decisions, execute_edit_decisions
 
@@ -5404,6 +5434,7 @@ def run_phase8(output_dir: Path, dry_run: bool,
             ),
         )
         print(f"  → 执行 reviewed edit_decisions（{len(edit_decisions['cuts'])} 个片段）...")
+        reviewed_edit_execution_started = True
         reviewed_edit = execute_edit_decisions(
             edit_decisions,
             output_path=str(output_dir / "raw_assembly.mp4"),
@@ -5450,15 +5481,23 @@ def run_phase8(output_dir: Path, dry_run: bool,
             }, output_dir, target_duration, enable_reshoot, transition,
                transition_duration, media_profile, _reshoot_round, reshoot_history,
                chain_mode)
-        print(
-            f"  ⚠ reviewed edit_decisions 失败: {reviewed_edit.get('error', 'unknown error')}；"
-            "降级为 VideoEdit",
-            flush=True,
-        )
         reviewed_edit_error = str(reviewed_edit.get("error", "unknown error"))
+        return {
+            "status": "error",
+            "error": f"Phase 8 reviewed edit execution failed: {reviewed_edit_error}",
+            "duration_s": _elapsed(start),
+            "frame_analysis": frame_report.get("summary", {}),
+        }
     except Exception as exc:
-        print(f"  ⚠ reviewed edit_decisions 异常: {exc}；降级为 VideoEdit", flush=True)
         reviewed_edit_error = str(exc)
+        if reviewed_edit_execution_started:
+            return {
+                "status": "error",
+                "error": f"Phase 8 reviewed edit execution failed: {reviewed_edit_error}",
+                "duration_s": _elapsed(start),
+                "frame_analysis": frame_report.get("summary", {}),
+            }
+        print(f"  ⚠ reviewed edit_decisions 构建异常: {exc}；降级为 VideoEdit", flush=True)
 
     if frame_report.get("summary", {}).get("trim"):
         return {
@@ -7069,7 +7108,11 @@ def run_pipeline(
     os.environ["HONCUT_NO_REAL_PERSON"] = "1" if no_real_person else "0"
 
     if accept_code_change_from is not None:
-        from utils.artifact_chain import PHASE_SEQUENCE, can_resume_from
+        from utils.artifact_chain import (
+            PHASE_SEQUENCE,
+            can_resume_from,
+            invalidate_checkpoints_from,
+        )
 
         if not resume:
             raise ValueError("code change acceptance requires resume mode")
@@ -7142,7 +7185,7 @@ def run_pipeline(
 
     # --- M6: --resume-from 支持 ---
     if resume_from:
-        from utils.artifact_chain import PHASE_SEQUENCE, can_resume_from, phase_numbers_before
+        from utils.artifact_chain import PHASE_SEQUENCE, can_resume_from
 
         if resume_from not in PHASE_SEQUENCE:
             raise ValueError(f"未知 Phase: {resume_from}")
@@ -7150,8 +7193,23 @@ def run_pipeline(
             raise RuntimeError(
                 f"Resume-from {resume_from} refused: prerequisite artifacts are incomplete"
             )
-        skip_phase = phase_numbers_before(resume_from)
+        invalidated = invalidate_stage_checkpoint(
+            _checkpoint_path(output_path),
+            resume_from,
+            PHASE_SEQUENCE,
+        )
+        invalidated_artifact_receipts = invalidate_checkpoints_from(
+            resume_from,
+            output_path,
+        )
+        skip_phase = _resume_skip_phases(skip_phase, resume_from)
         print(f"  🔄 [M6] Resume-from {resume_from}: 跳过 {skip_phase}")
+        stale_phases = list(dict.fromkeys([*invalidated, *invalidated_artifact_receipts]))
+        if stale_phases:
+            print(
+                "  ♻ [M6] 已将目标阶段及下游 checkpoint 标记为 stale: "
+                + ", ".join(stale_phases)
+            )
 
     # ---- 进度报告系统初始化 ----
     # 编排器为每个 Phase 子进程设置 HONCUT_APPEND_EVENTS=1，跨阶段 events 历史保留。
@@ -7163,7 +7221,7 @@ def run_pipeline(
 
     # --- M6: 产物链（增量）---
     try:
-        from utils.artifact_chain import save_checkpoint as save_artifact_checkpoint, can_resume_from, get_resumable_phase
+        from utils.artifact_chain import save_checkpoint as save_artifact_checkpoint, can_resume_from
         M6_AVAILABLE = True
     except ImportError:
         M6_AVAILABLE = False
@@ -7173,7 +7231,7 @@ def run_pipeline(
     if resume:
         # Try JSON checkpoint first, then fall back to SQLite checkpoint
         completed_phases = set(_get_completed_stages(output_path))
-        if not completed_phases:
+        if not completed_phases and not resume_from:
             # Fallback: try to read completed phases from SQLite checkpoint
             sqlite_state = load_state_from_sqlite(output_path, thread_id="pipeline_run")
             if sqlite_state and sqlite_state.get("run_fingerprint") != run_manifest.get(
@@ -7822,6 +7880,9 @@ def run_pipeline(
         try:
             from utils.artifact_chain import verify_artifacts, save_checkpoint as save_artifact_checkpoint
             for phase_name in PHASE_ORDER:
+                phase_report = report.get("phases", {}).get(phase_name, {})
+                if phase_report.get("status") != "done":
+                    continue
                 va = verify_artifacts(phase_name, output_path)
                 if va["exists"]:
                     save_artifact_checkpoint(phase_name, output_path, va)

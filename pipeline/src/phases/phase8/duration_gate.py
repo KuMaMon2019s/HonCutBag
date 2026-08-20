@@ -79,6 +79,8 @@ def trim_excess_to_target(
 
 
 def build_reshoot_list(shots_dir: Path, required_gap_s: float, round_number: int) -> dict:
+    if required_gap_s <= 0:
+        return {"shots": [], "round": round_number}
     deficits: list[dict] = []
     for shot_dir in sorted(Path(shots_dir).iterdir()) if Path(shots_dir).is_dir() else []:
         video = shot_dir / "output.mp4"
@@ -121,29 +123,37 @@ def evaluate_duration_gate(
     tolerance_frames: int = 2,
 ) -> tuple[dict, dict | None]:
     output_dir = Path(output_dir)
+    reshoot_path = output_dir / "reshoot_list.json"
     actual = probe_duration(output_dir / "raw_assembly.mp4")
     history = list(reshoots or [])
     if target_duration is None:
         gate = {
+            "status": "SKIPPED",
             "target_s": None,
             "actual_s": round(actual, 3),
             "gap_s": None,
+            "excess_s": None,
             "passed": True,
             "reshoots": history,
             "skipped_reason": "target_duration is None",
         }
         reshoot_plan = None
+        reshoot_path.unlink(missing_ok=True)
     else:
         target = float(target_duration)
         target_frames = round(target * timeline_fps)
         actual_frames = round(actual * timeline_fps)
         delta_frames = actual_frames - target_frames
         gap = max(0.0, -delta_frames / timeline_fps)
+        excess = max(0.0, delta_frames / timeline_fps)
         passed = abs(delta_frames) <= tolerance_frames
+        status = "PASS" if passed else ("SHORTFALL" if delta_frames < 0 else "OVERLONG")
         gate = {
+            "status": status,
             "target_s": round(target, 3),
             "actual_s": round(actual, 3),
             "gap_s": round(gap, 3),
+            "excess_s": round(excess, 3),
             "passed": passed,
             "timeline_fps": timeline_fps,
             "target_frames": target_frames,
@@ -152,11 +162,17 @@ def evaluate_duration_gate(
             "tolerance_frames": tolerance_frames,
             "reshoots": history,
         }
-        reshoot_plan = None if passed else build_reshoot_list(output_dir / "shots", gap, round_number + 1)
+        reshoot_plan = (
+            build_reshoot_list(output_dir / "shots", gap, round_number + 1)
+            if status == "SHORTFALL"
+            else None
+        )
         if reshoot_plan is not None:
-            (output_dir / "reshoot_list.json").write_text(
+            reshoot_path.write_text(
                 json.dumps(reshoot_plan, ensure_ascii=False, indent=2), encoding="utf-8"
             )
+        else:
+            reshoot_path.unlink(missing_ok=True)
     (output_dir / "duration_gate.json").write_text(
         json.dumps(gate, ensure_ascii=False, indent=2), encoding="utf-8"
     )

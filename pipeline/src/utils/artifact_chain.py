@@ -41,6 +41,36 @@ def phase_numbers_before(phase: str) -> list[float]:
     return numbers
 
 
+def invalidate_checkpoints_from(phase: str, output_dir: Path) -> list[str]:
+    """Mark target/downstream artifact receipts stale without deleting proof."""
+    if phase not in PHASE_SEQUENCE:
+        raise ValueError(f"unknown phase: {phase}")
+    output_dir = Path(output_dir)
+    invalidated: list[str] = []
+    for phase_name in PHASE_SEQUENCE[PHASE_SEQUENCE.index(phase) :]:
+        checkpoint_path = output_dir / f"checkpoint_{phase_name}.json"
+        if not checkpoint_path.is_file():
+            continue
+        try:
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            checkpoint = {"phase": phase_name}
+        if not isinstance(checkpoint, dict):
+            checkpoint = {"phase": phase_name}
+        checkpoint.update(
+            status="stale",
+            invalidated_at=datetime.now().isoformat(),
+            invalidated_by_resume_from=phase,
+        )
+        temporary = checkpoint_path.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(checkpoint, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        temporary.replace(checkpoint_path)
+        invalidated.append(phase_name)
+    return invalidated
+
+
 def save_checkpoint(phase: str, output_dir: Path, artifacts: dict = None) -> Path:
     """每阶段完成后写 checkpoint。
     
@@ -153,7 +183,13 @@ def get_resumable_phase(output_dir: Path) -> Optional[str]:
     
     for phase in PHASE_SEQUENCE:
         checkpoint = output_dir / f"checkpoint_{phase}.json"
-        if not checkpoint.exists():
+        try:
+            checkpoint_status = json.loads(
+                checkpoint.read_text(encoding="utf-8")
+            ).get("status")
+        except (OSError, AttributeError, json.JSONDecodeError):
+            checkpoint_status = None
+        if checkpoint_status != "done":
             # 检查是否可以从此阶段恢复
             if can_resume_from(phase, output_dir):
                 return phase

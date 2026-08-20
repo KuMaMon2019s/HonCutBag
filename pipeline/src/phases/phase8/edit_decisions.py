@@ -241,8 +241,20 @@ def build_edit_decisions(
         for directory in shots_dir.iterdir()
         if directory.is_dir() and directory.name.startswith("S")
     }
+    if shot_order:
+        missing_ordered = [name for name in shot_order if name not in available]
+        unexpected_ordered = sorted(set(available).difference(shot_order))
+        duplicate_ordered = sorted(
+            {name for name in shot_order if shot_order.count(name) > 1}
+        )
+        if missing_ordered or unexpected_ordered or duplicate_ordered:
+            raise ValueError(
+                "reviewed shot order does not exactly resolve to shot directories: "
+                f"missing={missing_ordered}, unexpected={unexpected_ordered}, "
+                f"duplicates={duplicate_ordered}"
+            )
     shot_dirs = (
-        [available[name] for name in shot_order or [] if name in available]
+        [available[name] for name in shot_order or []]
         if shot_order
         else [available[name] for name in sorted(available)]
     )
@@ -253,12 +265,12 @@ def build_edit_decisions(
     phase8_duration_trims: list[dict[str, Any]] = []
     for shot_dir in shot_dirs:
         video_path = shot_dir / "output.mp4"
-        if not video_path.exists():
-            continue
+        if not video_path.is_file():
+            raise FileNotFoundError(f"{shot_dir.name} output.mp4 is missing")
 
         info = probe_video(str(video_path))
         if info["duration"] <= 0:
-            continue
+            raise ValueError(f"{shot_dir.name} output.mp4 has non-positive duration")
 
         quality = quality_shots.get(shot_dir.name, {})
         if quality.get("action") == "reshoot":
@@ -711,11 +723,15 @@ def execute_edit_decisions(edit_decisions: dict, output_path: str) -> dict:
     tw = target.get("width", 1920)
     th = target.get("height", 1080)
     tfps = meta.get("target_fps", 30)
+    output_path = Path(output_path)
 
     if not cuts:
+        try:
+            output_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         return {"success": False, "error": "No cuts"}
 
-    output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temp_dir = output_path.parent / ".edit_tmp"
     temp_dir.mkdir(parents=True, exist_ok=True)
@@ -727,8 +743,7 @@ def execute_edit_decisions(edit_decisions: dict, output_path: str) -> dict:
         for i, cut in enumerate(cuts):
             src = Path(cut["source"])
             if not src.exists():
-                print(f"  ⚠ Segment not found: {src}")
-                continue
+                raise FileNotFoundError(f"reviewed edit source is missing: {src}")
 
             seg = temp_dir / f"seg_{i:04d}.mp4"
             in_s = cut["in_seconds"]
@@ -849,10 +864,10 @@ def execute_edit_decisions(edit_decisions: dict, output_path: str) -> dict:
                 segments.append(str(seg))
                 temp_files.append(seg)
             except subprocess.CalledProcessError as e:
-                print(f"  ⚠ Segment {i} failed: {str(e.stderr)[:200] if e.stderr else e}")
-                shutil.copy2(str(src), str(seg))
-                segments.append(str(seg))
-                temp_files.append(seg)
+                detail = str(e.stderr)[:500] if e.stderr else str(e)
+                raise RuntimeError(
+                    f"reviewed segment {i} normalization failed for {src}: {detail}"
+                ) from e
 
         if not segments:
             return {"success": False, "error": "No segments produced"}
@@ -891,6 +906,10 @@ def execute_edit_decisions(edit_decisions: dict, output_path: str) -> dict:
         }
 
     except Exception as e:
+        try:
+            output_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         return {"success": False, "error": str(e)}
 
     finally:

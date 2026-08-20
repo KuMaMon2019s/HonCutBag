@@ -122,26 +122,44 @@ def decide_transition(
 def decide_all_transitions(
     shot_metas: list,
     similarities: Optional[dict] = None,
+    *,
+    shot_ids: Optional[list[str]] = None,
 ) -> list:
     """Decide transitions for all adjacent shot pairs.
 
     Args:
         shot_metas: List of shot metadata dicts (emotion, duration, where)
         similarities: {"S01->S02": cosine, ...} from compute_transition_similarity()
+        shot_ids: Canonical identities in the reviewed timeline order. When
+            omitted, identities are read from each metadata object.
 
     Returns:
         List of transition decisions, one per adjacent pair
     """
     if similarities is None:
         similarities = {}
+    if shot_ids is None:
+        shot_ids = []
+        for index, meta in enumerate(shot_metas):
+            raw_id = meta.get("shot_id") or meta.get("id")
+            if raw_id is None or isinstance(raw_id, bool):
+                raise ValueError(f"shot metadata at index {index} has no canonical ID")
+            text = str(raw_id).strip().upper()
+            if text.startswith("S"):
+                text = text[1:]
+            shot_ids.append(f"S{int(text):02d}" if text.isdigit() else str(raw_id))
+    if len(shot_ids) != len(shot_metas):
+        raise ValueError("shot_ids must align one-to-one with shot_metas")
+    if len(shot_ids) != len(set(shot_ids)):
+        raise ValueError("shot_ids contains duplicate identities")
 
     decisions = []
     for i in range(len(shot_metas) - 1):
         curr = shot_metas[i]
         next_shot = shot_metas[i + 1]
 
-        curr_id = f"S{i+1:02d}"
-        next_id = f"S{i+2:02d}"
+        curr_id = shot_ids[i]
+        next_id = shot_ids[i + 1]
         pair_key = f"{curr_id}->{next_id}"
 
         emotion = curr.get("emotion", "")

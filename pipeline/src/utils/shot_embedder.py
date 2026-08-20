@@ -204,19 +204,26 @@ def embed_all_shots(shots_dir: str, run_id: str = "") -> dict:
     return embeddings
 
 
-def compute_transition_similarity(embeddings: dict) -> dict:
+def compute_transition_similarity(
+    embeddings: dict,
+    shot_order: list[str] | None = None,
+) -> dict:
     """Compute visual similarity between adjacent shots (last frame N vs first frame N+1).
 
     Returns: {"S01->S02": cosine_similarity, ...}
     """
     import numpy as np
 
-    shot_ids = sorted(embeddings.keys())
+    shot_ids = list(shot_order) if shot_order is not None else list(embeddings)
+    if len(shot_ids) != len(set(shot_ids)):
+        raise ValueError("transition shot order contains duplicate IDs")
     similarities = {}
 
     for i in range(len(shot_ids) - 1):
-        curr_last = embeddings[shot_ids[i]].get("last")
-        next_first = embeddings[shot_ids[i + 1]].get("first")
+        current = embeddings.get(shot_ids[i], {})
+        following = embeddings.get(shot_ids[i + 1], {})
+        curr_last = current.get("last")
+        next_first = following.get("first")
 
         if curr_last and next_first:
             a = np.array(curr_last, dtype=np.float32)

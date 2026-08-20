@@ -42,16 +42,28 @@ def read_state(output_dir: Path) -> dict[str, Any]:
     return value if isinstance(value, dict) else {"status": "invalid", "attempts": []}
 
 
+def _require_valid_state(output_dir: Path) -> dict[str, Any]:
+    state = read_state(output_dir)
+    valid_statuses = {"idle", "in_progress", "failed", "completed"}
+    if state.get("status") not in valid_statuses or not isinstance(
+        state.get("attempts"), list
+    ):
+        raise RuntimeError(
+            "reshoot_state.json is invalid; refusing to reset the paid reshoot budget"
+        )
+    return state
+
+
 def durable_attempt_count(output_dir: Path) -> int:
     """Return attempts from an unfinished reshoot cycle only."""
-    state = read_state(output_dir)
+    state = _require_valid_state(output_dir)
     if state.get("status") == "completed":
         return 0
     return len(state.get("attempts", []))
 
 
 def mark_cycle_completed(output_dir: Path) -> None:
-    state = read_state(output_dir)
+    state = _require_valid_state(output_dir)
     state.update(status="completed", completed_at=_now())
     _write_json(_state_path(output_dir), state)
 
@@ -73,8 +85,9 @@ class ReshootTransaction:
         kind: str,
         shot_ids: list[str],
         track_budget: bool = True,
-    ) -> "ReshootTransaction":
+    ) -> ReshootTransaction:
         output_dir = Path(output_dir)
+        state = _require_valid_state(output_dir) if track_budget else None
         transaction_id = f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex[:8]}"
         root = output_dir / TRANSACTION_DIR / transaction_id
         root.mkdir(parents=True, exist_ok=False)
@@ -110,7 +123,7 @@ class ReshootTransaction:
         }
         _write_json(root / "receipt.json", receipt)
         if track_budget:
-            state = read_state(output_dir)
+            assert state is not None
             if state.get("status") == "completed":
                 state = {"status": "in_progress", "attempts": []}
             state.setdefault("attempts", []).append(receipt)
@@ -136,7 +149,7 @@ class ReshootTransaction:
                     shutil.copy2(backup, live_dir / filename)
         self._set_status("rolled_back", error=reason)
         if self.track_budget:
-            state = read_state(self.output_dir)
+            state = _require_valid_state(self.output_dir)
             state.update(status="failed", last_error=reason, updated_at=_now())
             self._update_attempt(state, "rolled_back", reason)
             _write_json(_state_path(self.output_dir), state)
@@ -154,7 +167,7 @@ class ReshootTransaction:
         # rename, so a caller can still roll back any earlier commit failure.
         self._set_status("committed")
         if self.track_budget:
-            state = read_state(self.output_dir)
+            state = _require_valid_state(self.output_dir)
             state.update(status="in_progress", updated_at=_now())
             self._update_attempt(state, "committed")
             _write_json(_state_path(self.output_dir), state)

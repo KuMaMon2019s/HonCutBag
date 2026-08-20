@@ -85,13 +85,21 @@ def storyboard_shot_ids(storyboard: dict) -> list[str]:
 def reorder_shots(
     clip_paths: list[str], shot_metas: list[dict], suggested_order: list[str]
 ) -> tuple[list[str], list[dict], bool]:
-    """Reorder aligned clips/metas, preserving unmentioned clips at the end."""
-    aligned = list(zip(clip_paths, shot_metas))
+    """Reorder one exact clip/meta set; reject omissions and invented IDs."""
+    aligned = list(zip(clip_paths, shot_metas, strict=True))
     by_id = {Path(path).parent.name.upper(): (path, meta) for path, meta in aligned}
     normalized = [_shot_id(value) for value in suggested_order]
-    ordered = [by_id[shot_id] for shot_id in normalized if shot_id in by_id]
-    used = {Path(path).parent.name.upper() for path, _ in ordered}
-    ordered.extend(pair for pair in aligned if Path(pair[0]).parent.name.upper() not in used)
+    if (
+        len(by_id) != len(aligned)
+        or any(shot_id is None for shot_id in normalized)
+        or len(normalized) != len(by_id)
+        or len(set(normalized)) != len(normalized)
+        or set(normalized) != set(by_id)
+    ):
+        raise InvalidStoryOrderReview(
+            "suggested shot order must contain every available shot exactly once"
+        )
+    ordered = [by_id[shot_id] for shot_id in normalized]
     new_paths = [path for path, _ in ordered]
     return new_paths, [meta for _, meta in ordered], new_paths != clip_paths
 
