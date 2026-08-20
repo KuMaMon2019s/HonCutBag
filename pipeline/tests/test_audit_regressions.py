@@ -637,6 +637,27 @@ def test_detached_launcher_forwards_resume_phase(tmp_path):
     assert command[-2:] == ["--resume-from", "phase5"]
 
 
+def test_detached_launcher_forwards_explicit_code_change_acceptance(tmp_path):
+    config = tmp_path / "pipeline.json"
+    config.write_text("{}", encoding="utf-8")
+
+    command = detached_pipeline_launch.build_launch_command(
+        config,
+        project_root=tmp_path,
+        python_executable="/opt/honcut/python",
+        resume_from="phase6",
+        accept_code_change=True,
+    )
+
+    assert command[-3:] == ["--resume-from", "phase6", "--accept-code-change"]
+    with pytest.raises(ValueError, match="requires resume_from"):
+        detached_pipeline_launch.build_launch_command(
+            config,
+            project_root=tmp_path,
+            accept_code_change=True,
+        )
+
+
 def test_phase_orchestrator_marks_resumed_children(monkeypatch, tmp_path):
     captured: dict[str, list[str]] = {}
 
@@ -656,11 +677,63 @@ def test_phase_orchestrator_marks_resumed_children(monkeypatch, tmp_path):
             "transition_duration": 0.5,
             "enable_reshoot": True,
             "_resume": True,
+            "_accept_code_change": True,
         },
     )
 
     assert result["exit_code"] == 0
     assert "--resume" in captured["cmd"]
+    assert "--accept-code-change" in captured["cmd"]
+
+
+def test_phase_orchestrator_admits_code_change_only_for_first_resumed_child(
+    monkeypatch,
+    tmp_path,
+):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "input": str(tmp_path / "story.txt"),
+                "duration": 60,
+                "output_dir": str(tmp_path / "run"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    observed: list[tuple[str, bool]] = []
+
+    def fake_run_phase(phase, config):
+        observed.append((phase, config.get("_accept_code_change", False)))
+        return {
+            "phase": phase,
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "timestamp": "2026-08-20T00:00:00",
+        }
+
+    monkeypatch.setattr(phase_orchestrator, "run_phase", fake_run_phase)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "phase_orchestrator.py",
+            "--config",
+            str(config_path),
+            "--resume-from",
+            "phase8",
+            "--accept-code-change",
+        ],
+    )
+
+    phase_orchestrator.main()
+
+    assert observed == [
+        ("phase8", True),
+        ("phase9", False),
+        ("phase9_5", False),
+    ]
 
 
 def test_repository_tests_do_not_reference_a_user_home_fixture():
@@ -740,6 +813,181 @@ def test_new_run_refuses_a_different_run_in_the_same_workspace(tmp_path):
             resolved_config=config,
             repo_root=ROOT,
             resume=False,
+        )
+
+
+def test_explicit_code_change_acceptance_preserves_run_identity_and_audits_transition(
+    tmp_path,
+):
+    repo_root = tmp_path / "repo"
+    source_path = repo_root / "pipeline/src/example.py"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text("VERSION = 1\n", encoding="utf-8")
+    output_dir = tmp_path / "run"
+    config = {
+        "duration": 30,
+        "shot_duration": 5,
+        "video_provider": "seedance",
+        "video_model": "doubao-seedance-2.0-mini",
+        "project_video_spec": pipeline_core._project_video_spec("1080p"),
+    }
+
+    initial = prepare_run_manifest(
+        output_dir,
+        source_text="first script",
+        resolved_config=config,
+        repo_root=repo_root,
+        resume=False,
+    )
+    checkpoint_path = output_dir / "checkpoint.json"
+    checkpoint_path.write_text(
+        json.dumps(
+            {
+                "completed": ["phase1", "phase2", "phase3", "phase4", "phase5"],
+                "results": {},
+                "run_fingerprint": initial["run_fingerprint"],
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    checkpoint_before = checkpoint_path.read_bytes()
+
+    source_path.write_text("VERSION = 2\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="immutable run identity changed"):
+        prepare_run_manifest(
+            output_dir,
+            source_text="first script",
+            resolved_config=config,
+            repo_root=repo_root,
+            resume=True,
+        )
+
+    migrated = prepare_run_manifest(
+        output_dir,
+        source_text="first script",
+        resolved_config=config,
+        repo_root=repo_root,
+        resume=True,
+        accepted_code_change_from="phase6",
+    )
+
+    assert migrated["run_fingerprint"] == initial["run_fingerprint"]
+    assert migrated["origin_code_version"] == initial["code_version"]
+    assert migrated["code_version"] != initial["code_version"]
+    assert checkpoint_path.read_bytes() == checkpoint_before
+    assert migrated["code_change_history"] == [
+        {
+            "schema_version": "honcut.code-change-acceptance.v1",
+            "accepted_at": migrated["code_change_history"][0]["accepted_at"],
+            "acceptance": "explicit_cli_flag",
+            "from_code_version": initial["code_version"],
+            "to_code_version": migrated["code_version"],
+            "resume_from": "phase6",
+            "run_fingerprint": initial["run_fingerprint"],
+        }
+    ]
+
+    manifest_before_repeat = (output_dir / "RUN_MANIFEST.json").read_bytes()
+    repeated = prepare_run_manifest(
+        output_dir,
+        source_text="first script",
+        resolved_config=config,
+        repo_root=repo_root,
+        resume=True,
+        accepted_code_change_from="phase6",
+    )
+    assert repeated == migrated
+    assert (output_dir / "RUN_MANIFEST.json").read_bytes() == manifest_before_repeat
+
+
+def test_code_change_acceptance_cannot_override_other_identity_changes(tmp_path):
+    repo_root = tmp_path / "repo"
+    source_path = repo_root / "pipeline/src/example.py"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text("VERSION = 1\n", encoding="utf-8")
+    output_dir = tmp_path / "run"
+    config = {
+        "duration": 30,
+        "shot_duration": 5,
+        "video_provider": "seedance",
+        "video_model": "doubao-seedance-2.0-mini",
+        "project_video_spec": pipeline_core._project_video_spec("1080p"),
+    }
+    prepare_run_manifest(
+        output_dir,
+        source_text="first script",
+        resolved_config=config,
+        repo_root=repo_root,
+        resume=False,
+    )
+
+    source_path.write_text("VERSION = 2\n", encoding="utf-8")
+    changed_config = {**config, "video_model": "different-model"}
+    with pytest.raises(RuntimeError, match="immutable run identity changed") as error:
+        prepare_run_manifest(
+            output_dir,
+            source_text="first script",
+            resolved_config=changed_config,
+            repo_root=repo_root,
+            resume=True,
+            accepted_code_change_from="phase6",
+        )
+    assert "config_sha256" in str(error.value)
+    assert "model" in str(error.value)
+
+
+def test_code_change_acceptance_requires_resume(tmp_path):
+    with pytest.raises(RuntimeError, match="requires resume"):
+        prepare_run_manifest(
+            tmp_path,
+            source_text="script",
+            resolved_config={
+                "duration": 30,
+                "shot_duration": 5,
+                "video_provider": "seedance",
+                "video_model": "doubao-seedance-2.0-mini",
+                "project_video_spec": pipeline_core._project_video_spec("1080p"),
+            },
+            repo_root=tmp_path,
+            resume=False,
+            accepted_code_change_from="phase6",
+        )
+
+
+def test_resume_rejects_a_tampered_code_acceptance_history(tmp_path):
+    repo_root = tmp_path / "repo"
+    source_path = repo_root / "pipeline/src/example.py"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text("VERSION = 1\n", encoding="utf-8")
+    output_dir = tmp_path / "run"
+    config = {
+        "duration": 30,
+        "shot_duration": 5,
+        "video_provider": "seedance",
+        "video_model": "doubao-seedance-2.0-mini",
+        "project_video_spec": pipeline_core._project_video_spec("1080p"),
+    }
+    prepare_run_manifest(
+        output_dir,
+        source_text="first script",
+        resolved_config=config,
+        repo_root=repo_root,
+        resume=False,
+    )
+    manifest_path = output_dir / "RUN_MANIFEST.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["code_version"] = "manually-edited"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="not backed by its acceptance history"):
+        prepare_run_manifest(
+            output_dir,
+            source_text="first script",
+            resolved_config=config,
+            repo_root=repo_root,
+            resume=True,
+            accepted_code_change_from="phase6",
         )
 
 
@@ -1065,6 +1313,39 @@ def test_semantic_media_ratios_and_cli_resume_defaults(tmp_path):
         "cinematic"
     )
     assert pipeline_runner_cli._resolved_run_arguments(args)["no_real_person"] is True
+
+    accepted_args = parser.parse_args(
+        ["--resume", "--phase", "phase6", "--accept-code-change"]
+    )
+    assert pipeline_runner_cli._accepted_code_change_from(
+        accepted_args,
+        parser,
+    ) == "phase6"
+
+    missing_boundary = parser.parse_args(["--resume", "--accept-code-change"])
+    with pytest.raises(SystemExit, match="2"):
+        pipeline_runner_cli._accepted_code_change_from(missing_boundary, parser)
+
+    missing_resume = parser.parse_args(
+        ["--input", "story.txt", "--phase", "phase6", "--accept-code-change"]
+    )
+    with pytest.raises(SystemExit, match="2"):
+        pipeline_runner_cli._accepted_code_change_from(missing_resume, parser)
+
+
+def test_code_change_acceptance_checks_phase_prerequisites_before_manifest_write(
+    tmp_path,
+):
+    with pytest.raises(RuntimeError, match="prerequisite artifacts are incomplete"):
+        pipeline_core.run_pipeline(
+            text="a clean-room test script",
+            output_dir=str(tmp_path),
+            dry_run=True,
+            resume=True,
+            accept_code_change_from="phase6",
+        )
+
+    assert not (tmp_path / "RUN_MANIFEST.json").exists()
 
 
 def test_director_failure_removes_a_stale_plan(tmp_path, monkeypatch):

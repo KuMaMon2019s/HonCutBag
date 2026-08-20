@@ -431,6 +431,8 @@ def run_phase(phase: str, config: dict) -> dict:
         cmd.append("--no-real-person")
     if config.get("_resume"):
         cmd.append("--resume")
+    if config.get("_accept_code_change"):
+        cmd.append("--accept-code-change")
     cmd.append(
         "--enable-reshoot"
         if config.get("enable_reshoot", True)
@@ -474,7 +476,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path, help="JSON config file")
     parser.add_argument("--resume-from", choices=PHASES, help="Resume from specific phase")
+    parser.add_argument(
+        "--accept-code-change",
+        action="store_true",
+        help="Explicitly admit a code-only identity change at --resume-from",
+    )
     args = parser.parse_args()
+
+    if args.accept_code_change and not args.resume_from:
+        parser.error("--accept-code-change requires --resume-from")
 
     with args.config.open(encoding="utf-8") as config_file:
         config = json.load(config_file)
@@ -502,6 +512,7 @@ def main() -> None:
 
     progress_file = Path(config["output_dir"]) / "phase_progress.json"
     phases = PHASES[PHASES.index(args.resume_from) :] if args.resume_from else PHASES
+    code_change_acceptance_phase = phases[0] if args.accept_code_change else None
     results = _resume_results(Path(config["output_dir"]), progress_file, args.resume_from) if args.resume_from else []
     _write_progress(
         progress_file,
@@ -509,6 +520,9 @@ def main() -> None:
     )
 
     for phase in phases:
+        # Admit the transition exactly once. Later children resume normally so
+        # a source edit during the monitored run cannot be silently accepted.
+        config["_accept_code_change"] = phase == code_change_acceptance_phase
         print(f"\n{'=' * 60}\n  Running {phase}...\n{'=' * 60}\n", flush=True)
         _write_progress(
             progress_file,

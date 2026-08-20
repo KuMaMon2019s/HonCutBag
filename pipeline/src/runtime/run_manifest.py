@@ -6,10 +6,21 @@ import hashlib
 import json
 import os
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 RUN_MANIFEST_SCHEMA = "honcut.run-manifest.v1"
+CODE_CHANGE_ACCEPTANCE_SCHEMA = "honcut.code-change-acceptance.v1"
+
+_SEMANTIC_IDENTITY_KEYS = (
+    "schema_version",
+    "input_sha256",
+    "config_sha256",
+    "provider",
+    "model",
+    "project_video_spec",
+)
 
 _RUN_OWNED_MARKERS = (
     "STORYBOARD.json",
@@ -88,6 +99,82 @@ def _code_version(repo_root: Path) -> str:
     return f"{commit}:{digest.hexdigest()}"
 
 
+def _identity_with_code(manifest: dict[str, Any], code_version: str) -> dict[str, Any]:
+    return {
+        **{key: manifest.get(key) for key in _SEMANTIC_IDENTITY_KEYS},
+        "code_version": code_version,
+    }
+
+
+def _validated_code_history(
+    manifest: dict[str, Any],
+) -> tuple[str, list[dict[str, Any]]]:
+    """Verify the stable run fingerprint and every admitted code transition."""
+    origin_code_version = manifest.get(
+        "origin_code_version",
+        manifest.get("code_version"),
+    )
+    if not isinstance(origin_code_version, str) or not origin_code_version:
+        raise RuntimeError(
+            "resume refused: stored RUN_MANIFEST.json origin code version is invalid"
+        )
+    expected_fingerprint = _sha256_json(
+        _identity_with_code(manifest, origin_code_version)
+    )
+    run_fingerprint = manifest.get("run_fingerprint")
+    if run_fingerprint != expected_fingerprint:
+        raise RuntimeError(
+            "resume refused: stored RUN_MANIFEST.json fingerprint is invalid"
+        )
+
+    history = manifest.get("code_change_history", [])
+    if not isinstance(history, list):
+        raise RuntimeError(
+            "resume refused: stored RUN_MANIFEST.json code change history is invalid"
+        )
+    admitted_code_version = origin_code_version
+    for index, entry in enumerate(history, start=1):
+        if not isinstance(entry, dict):
+            raise RuntimeError(
+                "resume refused: stored RUN_MANIFEST.json code change history "
+                f"entry {index} is invalid"
+            )
+        valid_entry = (
+            entry.get("schema_version") == CODE_CHANGE_ACCEPTANCE_SCHEMA
+            and entry.get("acceptance") == "explicit_cli_flag"
+            and entry.get("from_code_version") == admitted_code_version
+            and isinstance(entry.get("to_code_version"), str)
+            and bool(entry.get("to_code_version"))
+            and isinstance(entry.get("resume_from"), str)
+            and bool(entry.get("resume_from"))
+            and entry.get("run_fingerprint") == run_fingerprint
+            and isinstance(entry.get("accepted_at"), str)
+            and bool(entry.get("accepted_at"))
+        )
+        if not valid_entry:
+            raise RuntimeError(
+                "resume refused: stored RUN_MANIFEST.json code change history "
+                f"entry {index} is invalid"
+            )
+        admitted_code_version = entry["to_code_version"]
+    if admitted_code_version != manifest.get("code_version"):
+        raise RuntimeError(
+            "resume refused: stored RUN_MANIFEST.json code version is not backed "
+            "by its acceptance history"
+        )
+    return origin_code_version, history
+
+
+def _write_manifest(path: Path, manifest: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
 def prepare_run_manifest(
     output_dir: str | Path,
     *,
@@ -95,8 +182,18 @@ def prepare_run_manifest(
     resolved_config: dict[str, Any],
     repo_root: str | Path,
     resume: bool,
+    accepted_code_change_from: str | None = None,
 ) -> dict[str, Any]:
     """Create a run identity or reject a resume whose immutable inputs changed."""
+    if accepted_code_change_from is not None:
+        if not resume:
+            raise RuntimeError("code change acceptance requires resume mode")
+        if not isinstance(accepted_code_change_from, str) or not (
+            accepted_code_change_from.strip()
+        ):
+            raise RuntimeError("code change acceptance requires an explicit resume phase")
+        accepted_code_change_from = accepted_code_change_from.strip()
+
     root = Path(output_dir)
     path = root / "RUN_MANIFEST.json"
     existing = None
@@ -154,33 +251,54 @@ def prepare_run_manifest(
                 )
 
     if resume:
-        mismatches = {
+        _origin_code_version, history = _validated_code_history(existing)
+        semantic_mismatches = {
             key: {"stored": existing.get(key), "current": identity.get(key)}
-            for key in (
-                "schema_version",
-                "input_sha256",
-                "config_sha256",
-                "provider",
-                "model",
-                "project_video_spec",
-                "code_version",
-                "run_fingerprint",
-            )
+            for key in _SEMANTIC_IDENTITY_KEYS
             if existing.get(key) != identity.get(key)
         }
-        if mismatches:
+        code_changed = existing.get("code_version") != identity["code_version"]
+        mismatches = dict(semantic_mismatches)
+        if code_changed:
+            mismatches["code_version"] = {
+                "stored": existing.get("code_version"),
+                "current": identity["code_version"],
+            }
+        if mismatches and existing.get("run_fingerprint") != identity["run_fingerprint"]:
+            mismatches["run_fingerprint"] = {
+                "stored": existing.get("run_fingerprint"),
+                "current": identity["run_fingerprint"],
+            }
+        if semantic_mismatches or (code_changed and accepted_code_change_from is None):
             raise RuntimeError(
                 "resume refused: immutable run identity changed: "
                 + json.dumps(mismatches, ensure_ascii=False, sort_keys=True)
             )
+        if code_changed:
+            transition = {
+                "schema_version": CODE_CHANGE_ACCEPTANCE_SCHEMA,
+                "accepted_at": datetime.now(UTC).isoformat(),
+                "acceptance": "explicit_cli_flag",
+                "from_code_version": existing["code_version"],
+                "to_code_version": identity["code_version"],
+                "resume_from": accepted_code_change_from,
+                "run_fingerprint": existing["run_fingerprint"],
+            }
+            migrated = {
+                **existing,
+                "origin_code_version": _origin_code_version,
+                "code_version": identity["code_version"],
+                "code_change_history": [*history, transition],
+            }
+            _write_manifest(path, migrated)
+            return migrated
         return existing
 
-    manifest = {**identity, "resolved_config": normalized_config}
-    root.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
+    manifest = {
+        **identity,
+        "origin_code_version": identity["code_version"],
+        "code_change_history": [],
+        "resolved_config": normalized_config,
+    }
+    _write_manifest(path, manifest)
     return manifest

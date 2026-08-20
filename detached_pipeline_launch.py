@@ -22,8 +22,12 @@ def build_launch_command(
     project_root: str | Path = PROJECT_ROOT,
     python_executable: str | None = None,
     resume_from: str | None = None,
+    accept_code_change: bool = False,
 ) -> list[str]:
     """Build a portable command without assuming conda or a machine path."""
+
+    if accept_code_change and not resume_from:
+        raise ValueError("accept_code_change requires resume_from")
 
     root = Path(project_root).resolve()
     config = Path(config_path).expanduser().resolve()
@@ -37,6 +41,8 @@ def build_launch_command(
     ]
     if resume_from:
         command.extend(["--resume-from", resume_from])
+    if accept_code_change:
+        command.append("--accept-code-change")
     return command
 
 
@@ -56,7 +62,11 @@ def _read_daemon_pid(fd: int) -> int:
 
 
 def launch(
-    config_path: str | Path, tag: str, *, resume_from: str | None = None
+    config_path: str | Path,
+    tag: str,
+    *,
+    resume_from: str | None = None,
+    accept_code_change: bool = False,
 ) -> int:
     """Double-fork and return the actual long-running daemon PID."""
 
@@ -69,7 +79,11 @@ def launch(
 
     log_path = Path("/tmp") / f"honcut_{tag}.log"
     pid_path = Path("/tmp") / f"honcut_{tag}.pid"
-    command = build_launch_command(config, resume_from=resume_from)
+    command = build_launch_command(
+        config,
+        resume_from=resume_from,
+        accept_code_change=accept_code_change,
+    )
     read_fd, write_fd = os.pipe()
 
     first_pid = os.fork()
@@ -127,9 +141,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("config_path")
     parser.add_argument("tag")
     parser.add_argument("--resume-from")
+    parser.add_argument("--accept-code-change", action="store_true")
     args = parser.parse_args(argv)
     try:
-        launch(args.config_path, args.tag, resume_from=args.resume_from)
+        launch(
+            args.config_path,
+            args.tag,
+            resume_from=args.resume_from,
+            accept_code_change=args.accept_code_change,
+        )
     except (FileNotFoundError, RuntimeError, ValueError) as exc:
         parser.error(str(exc))
     return 0

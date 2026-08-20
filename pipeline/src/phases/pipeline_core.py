@@ -7038,6 +7038,7 @@ def run_pipeline(
     resume: bool = False,
     auto_approve: bool = True,
     resume_from: str = None,
+    accept_code_change_from: str = None,
 ) -> dict:
     """
     主入口：端到端管线
@@ -7057,6 +7058,7 @@ def run_pipeline(
         enable_reshoot: 视觉缺陷或时长不足时是否允许调用 Phase 6 补录（默认 True，最多两轮）
         no_real_person: 将所有角色锁定为无可见人脸/皮肤的虚构合成人 CGI 设计
         resume: 从检查点恢复，跳过已完成的 Phase
+        accept_code_change_from: 显式接受代码变更并从指定 Phase 继续；其他身份变化仍拒绝
 
     Returns:
         pipeline_report dict
@@ -7065,6 +7067,25 @@ def run_pipeline(
     output_path = Path(output_dir).resolve()
     _ensure_dir(output_path)
     os.environ["HONCUT_NO_REAL_PERSON"] = "1" if no_real_person else "0"
+
+    if accept_code_change_from is not None:
+        from utils.artifact_chain import PHASE_SEQUENCE, can_resume_from
+
+        if not resume:
+            raise ValueError("code change acceptance requires resume mode")
+        if accept_code_change_from not in PHASE_SEQUENCE:
+            raise ValueError(
+                f"code change acceptance has unknown Phase: {accept_code_change_from}"
+            )
+        if resume_from and accept_code_change_from != resume_from:
+            raise ValueError(
+                "code change acceptance Phase must match --resume-from"
+            )
+        if not can_resume_from(accept_code_change_from, output_path):
+            raise RuntimeError(
+                "code change acceptance refused: prerequisite artifacts are "
+                f"incomplete for {accept_code_change_from}"
+            )
 
     # Resolve source and run identity before consulting any checkpoint. This
     # prevents an old "all phases complete" record from short-circuiting a new
@@ -7109,6 +7130,7 @@ def run_pipeline(
         },
         repo_root=SCRIPT_DIR.parent.parent,
         resume=resume,
+        accepted_code_change_from=accept_code_change_from,
     )
     spec_path = output_path / "PROJECT_VIDEO_SPEC.json"
     spec_temporary = spec_path.with_suffix(".json.tmp")
@@ -7896,8 +7918,18 @@ def main():
     )
     parser.add_argument("--resume-from", type=str, default=None,
                         help="从指定阶段恢复（如 phase5），跳过之前的阶段")
+    parser.add_argument(
+        "--accept-code-change",
+        action="store_true",
+        help="显式接受代码变更后续跑；必须与 --resume-from 同用",
+    )
 
     args = parser.parse_args()
+
+    if args.accept_code_change and not args.resume:
+        parser.error("--accept-code-change requires --resume")
+    if args.accept_code_change and not args.resume_from:
+        parser.error("--accept-code-change requires --resume-from")
 
     report = run_pipeline(
         text=args.text,
@@ -7914,6 +7946,9 @@ def main():
         resume=args.resume,
         auto_approve=args.auto_approve,
         resume_from=args.resume_from,
+        accept_code_change_from=(
+            args.resume_from if args.accept_code_change else None
+        ),
     )
 
     sys.exit(0 if report["status"] == "completed" else 1)

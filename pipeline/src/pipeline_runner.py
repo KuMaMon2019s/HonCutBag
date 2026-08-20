@@ -178,6 +178,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--resume-from", help="从指定阶段恢复（如 phase5）")
     parser.add_argument(
+        "--accept-code-change",
+        action="store_true",
+        help="显式接受代码变更后续跑；必须与 --resume 及明确的起始 Phase 同用",
+    )
+    parser.add_argument(
         "--phase", choices=PHASES, help="Execute single phase only (e.g., 'phase1', 'phase6')"
     )
     parser.add_argument(
@@ -246,11 +251,29 @@ def _resolved_run_arguments(args: argparse.Namespace) -> dict:
     }
 
 
+def _accepted_code_change_from(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+) -> str | None:
+    """Return the explicit resume boundary authorized for a code transition."""
+    if not args.accept_code_change:
+        return None
+    if not args.resume:
+        parser.error("--accept-code-change requires --resume")
+    boundary = args.resume_from or args.phase or args.start_phase
+    if not boundary:
+        parser.error(
+            "--accept-code-change requires --resume-from, --phase, or --start-phase"
+        )
+    return boundary
+
+
 def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
     if not (args.text or args.input or args.resume):
         parser.error("one of --text/--input is required unless --resume is used")
+    accepted_code_change_from = _accepted_code_change_from(args, parser)
     resolved = _resolved_run_arguments(args)
     report = _core.run_pipeline(
         text=args.text,
@@ -269,6 +292,7 @@ def main() -> None:
         resume=args.resume,
         auto_approve=args.auto_approve,
         resume_from=args.resume_from,
+        accept_code_change_from=accepted_code_change_from,
     )
     _record_report_checkpoints(report, args.output_dir)
     try:
