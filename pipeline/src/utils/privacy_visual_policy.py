@@ -34,35 +34,111 @@ def is_no_real_person_enabled() -> bool:
     }
 
 
-def uses_synthetic_character_review(output_dir: str | Path | None = None) -> bool:
-    """Resolve synthetic QA mode from live policy or persisted character data.
-
-    Final QA often runs in a fresh/resumed process where the original privacy
-    environment variable is no longer present.  ``CHARACTERS.json`` is the
-    durable second source of truth, so reviewers must consult both sources.
-    """
-    if is_no_real_person_enabled():
-        return True
+def synthetic_character_review_evidence(
+    output_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Return auditable runtime/artifact evidence for synthetic-character QA."""
+    env_enabled = is_no_real_person_enabled()
+    evidence: dict[str, Any] = {
+        "enabled": env_enabled,
+        "sources": ([f"environment:{NO_REAL_PERSON_ENV}"] if env_enabled else []),
+        "policy": NO_REAL_PERSON_POLICY,
+        "artifact": "CHARACTERS.json",
+        "artifact_present": False,
+        "artifact_valid": False,
+        "top_level_policy_match": False,
+        "all_characters_policy_tagged": False,
+        "all_characters_gender_synthetic": False,
+        "identity_contract_complete": False,
+        "characters": [],
+    }
     if output_dir is None:
-        return False
+        return evidence
+    artifact_path = Path(output_dir) / "CHARACTERS.json"
+    evidence["artifact_present"] = artifact_path.is_file()
     try:
-        payload = json.loads(
-            (Path(output_dir) / "CHARACTERS.json").read_text(encoding="utf-8")
-        )
+        payload = json.loads(artifact_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return False
+        return evidence
     if not isinstance(payload, dict):
-        return False
-    if payload.get("visual_identity_policy") == NO_REAL_PERSON_POLICY:
-        return True
-    characters = payload.get("characters")
-    if not isinstance(characters, list):
-        return False
-    return any(
-        isinstance(character, dict)
-        and character.get("visual_identity_policy") == NO_REAL_PERSON_POLICY
+        return evidence
+    raw_characters = payload.get("characters")
+    if not isinstance(raw_characters, list):
+        return evidence
+
+    characters: list[dict[str, Any]] = []
+    for character in raw_characters:
+        if not isinstance(character, dict):
+            continue
+        appearance = character.get("appearance")
+        if not isinstance(appearance, dict):
+            appearance = {}
+        gender = str(appearance.get("gender") or character.get("gender") or "").strip()
+        features = character.get("distinguishing_features")
+        if not isinstance(features, list):
+            features = []
+        characters.append({
+            "id": str(character.get("id") or "").strip(),
+            "name": str(character.get("name") or "").strip(),
+            "gender": gender,
+            "visual_identity_policy": str(
+                character.get("visual_identity_policy") or ""
+            ).strip(),
+            "helmet_or_face": str(appearance.get("face") or "").strip(),
+            "clothing": str(appearance.get("clothing") or "").strip(),
+            "distinguishing": str(appearance.get("distinguishing") or "").strip(),
+            "summary": str(appearance.get("summary") or "").strip(),
+            "distinguishing_features": [
+                str(value).strip() for value in features if str(value).strip()
+            ],
+        })
+
+    evidence["artifact_valid"] = True
+    evidence["characters"] = characters
+    top_level_match = payload.get("visual_identity_policy") == NO_REAL_PERSON_POLICY
+    all_policy_tagged = bool(characters) and all(
+        character["visual_identity_policy"] == NO_REAL_PERSON_POLICY
         for character in characters
     )
+    all_gender_synthetic = bool(characters) and all(
+        character["gender"].casefold() == "synthetic"
+        for character in characters
+    )
+    identity_complete = bool(characters) and all(
+        character["id"]
+        and (
+            character["visual_identity_policy"] == NO_REAL_PERSON_POLICY
+            or character["gender"].casefold() == "synthetic"
+        )
+        and character["helmet_or_face"]
+        and (
+            character["clothing"]
+            or character["distinguishing"]
+            or character["distinguishing_features"]
+        )
+        for character in characters
+    )
+    evidence.update({
+        "top_level_policy_match": top_level_match,
+        "all_characters_policy_tagged": all_policy_tagged,
+        "all_characters_gender_synthetic": all_gender_synthetic,
+        "identity_contract_complete": identity_complete,
+    })
+    if top_level_match:
+        evidence["sources"].append("artifact:top_level_policy")
+    if all_policy_tagged:
+        evidence["sources"].append("artifact:all_character_policies")
+    if all_gender_synthetic:
+        evidence["sources"].append("artifact:all_character_genders")
+    evidence["enabled"] = bool(
+        env_enabled or top_level_match or all_policy_tagged or all_gender_synthetic
+    )
+    return evidence
+
+
+def uses_synthetic_character_review(output_dir: str | Path | None = None) -> bool:
+    """Resolve synthetic QA mode from runtime and durable artifact evidence."""
+    return bool(synthetic_character_review_evidence(output_dir)["enabled"])
 
 
 def no_real_person_prompt_contract() -> str:

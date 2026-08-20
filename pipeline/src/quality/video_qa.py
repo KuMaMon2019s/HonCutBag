@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from utils.privacy_visual_policy import uses_synthetic_character_review
+from utils.privacy_visual_policy import synthetic_character_review_evidence
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -860,11 +860,41 @@ def _vlm_semantic_check(
     verdict = "pass"
     confidence_values: list[float] = []
     verdict_rank = {"pass": 0, "revise": 1, "fail": 2}
-    synthetic_review = uses_synthetic_character_review(output_dir)
+    review_evidence = synthetic_character_review_evidence(output_dir)
+    synthetic_review = bool(review_evidence["enabled"])
     qa_contract = (
         "synthetic_character_structural_consistency_v1"
         if synthetic_review
         else "human_visual_anatomy_v1"
+    )
+    if (
+        synthetic_review
+        and output_dir is not None
+        and not review_evidence["identity_contract_complete"]
+    ):
+        return {
+            "status": "error",
+            "verdict": "revise",
+            "reason": "synthetic character identity evidence is incomplete",
+            "issues": [
+                "Synthetic QA requires every character to have an ID, synthetic policy/gender, "
+                "canonical helmet/face, and at least one clothing or identity marker"
+            ],
+            "qa_contract": qa_contract,
+            "qa_contract_evidence": review_evidence,
+            "sampled_frames": [item.label for item in selected],
+            "review_batches": 0,
+        }
+    identity_contract = (
+        (
+            "Canonical synthetic identities (treat every ID as a distinct character and enforce "
+            "the listed helmet/face, clothing, colors, silhouette, and markers exactly): "
+            f"{json.dumps(review_evidence['characters'], ensure_ascii=False)}. "
+            "Shared helmet families do not permit identity merging: use clothing and distinguishing "
+            "markers to keep same-helmet characters separate. "
+        )
+        if synthetic_review and review_evidence["characters"]
+        else ""
     )
     structure_contract = (
         (
@@ -912,6 +942,7 @@ def _vlm_semantic_check(
             "modern/watermark/text artifacts, and material continuity errors. Return JSON only with "
             '{"verdict":"pass|revise|fail","issues":["..."],"confidence":0.0}. '
             f"{structure_contract}"
+            f"{identity_contract}"
             f"Storyboard: {json.dumps(storyboard, ensure_ascii=False)}"
         )
         raw = vlm_client.review([Path(item.path) for item in sample_frames], prompt)
@@ -922,6 +953,7 @@ def _vlm_semantic_check(
                 "status": "error",
                 "reason": "invalid semantic review response",
                 "qa_contract": qa_contract,
+                "qa_contract_evidence": review_evidence,
                 "sampled_frames": [item.label for item in selected],
                 "review_batches": len(batch_results) + 1,
             }
@@ -939,6 +971,7 @@ def _vlm_semantic_check(
         "verdict": verdict,
         "issues": issues,
         "qa_contract": qa_contract,
+        "qa_contract_evidence": review_evidence,
         "confidence": min(confidence_values) if confidence_values else None,
         "sampled_frames": [item.label for item in selected],
         "covered_shots": list(frames_by_shot),

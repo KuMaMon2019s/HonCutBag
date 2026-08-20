@@ -14,6 +14,7 @@ rhythm_editor.py — Phase 9 后处理节奏模块
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -21,6 +22,16 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Optional
+
+DELIVERY_TIMELINE_SCHEMA = "honcut.delivery-timeline.v2"
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 # ---------------------------------------------------------------------------
 # 第三方兼容工具可选导入（graceful fallback 到 ffmpeg）
@@ -225,18 +236,28 @@ def _write_delivery_timeline(
         item["output_duration_s"] = round(output_duration, 9)
         delivery_shots.append(item)
 
+    artifact_path = Path(output_path)
+    if not artifact_path.is_file():
+        return None
+    source_sha256 = _sha256_file(artifact_path)
     delivery = {
-        "version": 1,
-        "artifact": Path(output_path).name,
+        "schema": DELIVERY_TIMELINE_SCHEMA,
+        "version": 2,
+        "artifact": artifact_path.name,
+        "source_sha256": source_sha256,
+        "source_size_bytes": artifact_path.stat().st_size,
         "basis": "Phase 8 edit timeline warped by Phase 9 rhythm speeds",
         "duration_s": round(cursor, 9),
         "shots": delivery_shots,
         "transitions": edit_timeline.get("transitions", []),
     }
-    delivery_path = str(Path(output_path).with_name("delivery_timeline.json"))
-    Path(delivery_path).write_text(
+    delivery_file = artifact_path.with_name("delivery_timeline.json")
+    temporary = delivery_file.with_suffix(".json.tmp")
+    temporary.write_text(
         json.dumps(delivery, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    temporary.replace(delivery_file)
+    delivery_path = str(delivery_file)
     print(f"  [timeline] wrote {delivery_path}")
     return delivery_path
 

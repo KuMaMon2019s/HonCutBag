@@ -6046,9 +6046,20 @@ def test_phase9_duration_gate_accepts_frame_decimal_rounding():
 
 
 def test_phase9_final_encode_preserves_reviewed_timeline_when_plan_target_differs():
+    delivery_contract = {
+        "schema": "honcut.delivery-timeline.v2",
+        "artifact": "polished.mp4",
+        "source_sha256": "a" * 64,
+        "source_size_bytes": 123,
+        "duration_s": 82.633333,
+        "shot_count": 4,
+        "timing_contiguous": True,
+        "input_duration_delta_s": 0.0,
+    }
     receipt = pipeline_core._final_encode_duration_gate(
         {"video": 82.633333, "audio": 82.624},
         {"video": 82.633333, "audio": 82.645333},
+        delivery_contract=delivery_contract,
         requested_duration=80.0,
         fps=30,
     )
@@ -6058,6 +6069,8 @@ def test_phase9_final_encode_preserves_reviewed_timeline_when_plan_target_differ
     assert receipt["requested_duration_within_tolerance"] is False
     assert receipt["requested_duration_enforced_by_final_encode"] is False
     assert receipt["expected"]["video"] == pytest.approx(82.633333)
+    assert receipt["reviewed_timeline"] == delivery_contract
+    assert receipt["authoritative_duration_source"] == "delivery_timeline.json"
 
     video_filters, audio_filters = pipeline_core._final_encode_filters({
         "width": 1280,
@@ -6071,6 +6084,7 @@ def test_phase9_final_encode_preserves_reviewed_timeline_when_plan_target_differ
 
 def test_delivery_timeline_tracks_warped_shot_boundaries(tmp_path):
     output = tmp_path / "polished.mp4"
+    output.write_bytes(b"reviewed rhythm edit")
     timeline = {
         "shots": [
             {"shot_id": "S01", "speed": 1.0},
@@ -6084,12 +6098,104 @@ def test_delivery_timeline_tracks_warped_shot_boundaries(tmp_path):
     written = _write_delivery_timeline(str(output), timeline, boundaries, speeds)
     delivery = json.loads(Path(written).read_text())
 
+    assert delivery["schema"] == "honcut.delivery-timeline.v2"
+    assert delivery["source_sha256"] == pipeline_core._file_sha256(output)
+    assert delivery["source_size_bytes"] == output.stat().st_size
     assert delivery["duration_s"] == pytest.approx(10.0)
     assert delivery["shots"][0]["output_end_s"] == pytest.approx(4.0 / speeds[0])
     assert delivery["shots"][1]["output_start_s"] == pytest.approx(
         delivery["shots"][0]["output_end_s"]
     )
     assert delivery["shots"][1]["output_end_s"] == pytest.approx(10.0)
+
+    contract = pipeline_core._validated_reviewed_delivery_contract(
+        tmp_path,
+        output,
+        {"video": 10.0, "audio": 10.0},
+        fps=30,
+    )
+    assert contract["timing_contiguous"] is True
+    assert contract["shot_count"] == 2
+
+    noncontiguous = dict(delivery)
+    noncontiguous["shots"] = [dict(item) for item in delivery["shots"]]
+    noncontiguous["shots"][1]["output_start_s"] += 0.5
+    Path(written).write_text(json.dumps(noncontiguous), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="not contiguous"):
+        pipeline_core._validated_reviewed_delivery_contract(
+            tmp_path,
+            output,
+            {"video": 10.0, "audio": 10.0},
+            fps=30,
+        )
+
+    Path(written).write_text(json.dumps(delivery), encoding="utf-8")
+    output.write_bytes(b"unreviewed replacement")
+    with pytest.raises(RuntimeError, match="SHA-256"):
+        pipeline_core._validated_reviewed_delivery_contract(
+            tmp_path,
+            output,
+            {"video": 10.0, "audio": 10.0},
+            fps=30,
+        )
+
+
+def test_phase9_final_encode_contract_with_real_av_artifact(tmp_path):
+    source = tmp_path / "polished.mp4"
+    candidate = tmp_path / "polished_final.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=2",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=2",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-shortest", str(source),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    before = pipeline_core._probe_av_durations(source)
+    timeline = {"shots": [{"shot_id": "S01", "speed": 1.0}], "transitions": []}
+    _write_delivery_timeline(
+        str(source),
+        timeline,
+        [0.0, float(before["video"])],
+        {0: 1.0},
+    )
+    delivery_contract = pipeline_core._validated_reviewed_delivery_contract(
+        tmp_path,
+        source,
+        before,
+        fps=24,
+    )
+    video_filters, audio_filters = pipeline_core._final_encode_filters({
+        "width": 320,
+        "height": 180,
+        "fps": 24,
+    })
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", str(source),
+            "-vf", video_filters, "-af", audio_filters,
+            "-c:v", "libx264", "-crf", "23", "-preset", "medium",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+            "-pix_fmt", "yuv420p", str(candidate),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    after = pipeline_core._probe_av_durations(candidate)
+    receipt = pipeline_core._final_encode_duration_gate(
+        before,
+        after,
+        delivery_contract=delivery_contract,
+        requested_duration=1.5,
+        fps=24,
+    )
+
+    assert receipt["passed"] is True
+    assert receipt["requested_duration_within_tolerance"] is False
+    assert after["video"] == pytest.approx(before["video"], abs=2 / 24)
 
 
 def test_final_qa_samples_delivery_timeline_before_edit_timeline(tmp_path, monkeypatch):

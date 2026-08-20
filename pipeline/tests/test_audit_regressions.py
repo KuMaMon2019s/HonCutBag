@@ -1463,7 +1463,13 @@ def test_final_vlm_uses_persisted_synthetic_contract_after_env_is_gone(
         json.dumps({
             "characters": [{
                 "id": "photographer",
-                "visual_identity_policy": "synthetic_faceless_android_v1",
+                "appearance": {
+                    "gender": "synthetic",
+                    "face": "哑光藏蓝 #1B2A41 全封闭机械头盔，深红面甲",
+                    "clothing": "黑色摄影背心，银色肩章",
+                    "distinguishing": "胸前冷白相机编号灯",
+                },
+                "distinguishing_features": ["摄影背心", "冷白相机编号灯"],
             }],
         }),
         encoding="utf-8",
@@ -1493,6 +1499,12 @@ def test_final_vlm_uses_persisted_synthetic_contract_after_env_is_gone(
     assert "not human-anatomy defects" in prompts[0]
     assert "Never judge them against human anatomy" in prompts[0]
     assert "helmet/visor color drift" in prompts[0]
+    assert "藏蓝 #1B2A41" in prompts[0]
+    assert "深红面甲" in prompts[0]
+    assert "Shared helmet families do not permit identity merging" in prompts[0]
+    evidence = result["qa_contract_evidence"]
+    assert evidence["identity_contract_complete"] is True
+    assert "artifact:all_character_genders" in evidence["sources"]
 
 
 def test_final_vlm_uses_live_synthetic_policy_without_character_artifact(
@@ -1514,6 +1526,46 @@ def test_final_vlm_uses_live_synthetic_policy_without_character_artifact(
     result = video_qa._vlm_semantic_check(FakeClient(), frames, None)
 
     assert result["qa_contract"] == "synthetic_character_structural_consistency_v1"
+
+
+def test_final_vlm_blocks_incomplete_synthetic_identity_evidence(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.delenv("HONCUT_NO_REAL_PERSON", raising=False)
+    (tmp_path / "CHARACTERS.json").write_text(
+        json.dumps({
+            "visual_identity_policy": "synthetic_faceless_android_v1",
+            "characters": [{
+                "id": "photographer",
+                "visual_identity_policy": "synthetic_faceless_android_v1",
+            }],
+        }),
+        encoding="utf-8",
+    )
+    frames = [video_qa.FrameSample(
+        path="/tmp/S01_mid.jpg",
+        timestamp=1.0,
+        label="S01_mid",
+    )]
+    calls = []
+
+    class FakeClient:
+        def review(self, _paths, _prompt):
+            calls.append(True)
+            return '{"verdict":"pass","issues":[],"confidence":0.99}'
+
+    result = video_qa._vlm_semantic_check(
+        FakeClient(),
+        frames,
+        {"shots": [{"shot_id": "S01", "who": ["photographer"]}]},
+        output_dir=tmp_path,
+    )
+
+    assert result["verdict"] == "revise"
+    assert result["review_batches"] == 0
+    assert result["qa_contract_evidence"]["identity_contract_complete"] is False
+    assert calls == []
 
 
 def test_layered_checkpoints_are_bound_to_the_full_semantic_input(tmp_path):
