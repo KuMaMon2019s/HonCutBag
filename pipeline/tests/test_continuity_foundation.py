@@ -3501,6 +3501,117 @@ def test_native_extension_poll_privacy_rejection_retries_without_rejected_video(
     )
 
 
+def test_native_extension_privacy_ladder_reaches_video_after_two_image_repairs(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr("utils.video_validation.is_valid_video", lambda _path: True)
+    shot_dir = tmp_path / "shots/S03"
+    shot_dir.mkdir(parents=True)
+    (shot_dir / "SHOT_META.json").write_text(
+        json.dumps({"prompt": "continue without reset", "gen_strategy": "phantom"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ARK_AGENT_API_KEY", "test-key")
+    monkeypatch.setenv("HONCUT_CAPACITY_DB", str(tmp_path / "capacity.db"))
+    monkeypatch.setenv("VIDEO_GEN_CONCURRENCY", "1")
+    internal_content = [
+        {"type": "text", "text": "向后延长视频1。"},
+        {
+            "type": "image_url",
+            "image_url": {"url": "tail-frame-1"},
+            "role": "reference_image",
+            "_continuity_role": "ordered_tail_frame",
+        },
+        {
+            "type": "image_url",
+            "image_url": {"url": "tail-frame-2"},
+            "role": "reference_image",
+            "_continuity_role": "ordered_tail_frame",
+        },
+        {"type": "image_url", "image_url": {"url": "optional-face"}},
+        {"type": "image_url", "image_url": {"url": "rejected-image-1"}},
+        {"type": "image_url", "image_url": {"url": "rejected-image-2"}},
+        {
+            "type": "video_url",
+            "video_url": {"url": "rejected-tail-window"},
+            "role": "reference_video",
+            "_continuity_role": "tail_window_video",
+        },
+    ]
+    monkeypatch.setattr(
+        "runtime.continuity_provider._provider_content",
+        lambda _root, _request: ([dict(item) for item in internal_content], {}, None, 6),
+    )
+    submissions = []
+
+    def fake_submit(content, **_kwargs):
+        submissions.append([dict(item) for item in content])
+        if len(submissions) == 2:
+            raise RuntimeError(
+                "InputImageSensitiveContentDetected.PrivacyInformation: "
+                "content[4] may contain real person"
+            )
+        if len(submissions) == 3:
+            raise RuntimeError(
+                "InputVideoSensitiveContentDetected.PrivacyInformation: "
+                "content[4] may contain real person"
+            )
+        return f"seedance-job-{len(submissions)}"
+
+    def fake_poll(task_id, api_key):
+        assert api_key == "test-key"
+        if task_id == "seedance-job-1":
+            raise ProviderJobFailedError(
+                "Seedance API 400: InputImageSensitiveContentDetected."
+                "PrivacyInformation: content[4] may contain real person"
+            )
+        return "https://video.test/output.mp4"
+
+    monkeypatch.setattr(seedance_client, "submit_content", fake_submit)
+    monkeypatch.setattr(seedance_client, "poll", fake_poll)
+    monkeypatch.setattr(
+        seedance_client,
+        "download",
+        lambda url, path: Path(path).write_bytes(b"video") or path,
+    )
+    previous = tmp_path / "shots/S03/chunks/S03_C01.mp4"
+    previous.parent.mkdir(parents=True)
+    previous.write_bytes(b"previous")
+    request = ChunkExecutionRequest(
+        resource_id="S03_C02",
+        shot_id="S03",
+        chunk=GenerationChunk(
+            chunk_id="S03_C02",
+            sequence=2,
+            target_duration_s=6,
+            mode="native_extend",
+            depends_on="S03_C01",
+            execution_strategy="tail_video_extend",
+        ),
+        anchors={},
+        output_path=tmp_path / "shots/S03/chunks/S03_C02.mp4",
+        previous_output_path=previous,
+        input_fingerprint="three-step-privacy-ladder-fingerprint",
+        memory_context="",
+    )
+
+    result = _direct_seedance_executor(
+        tmp_path,
+        GenerationTaskStore(tmp_path / "runtime.db"),
+    )(request)
+
+    assert result.provider_task_id == "seedance-job-4"
+    assert len(submissions) == 4
+    assert not any(item.get("type") == "video_url" for item in submissions[-1])
+    assert [repair["attempt"] for repair in result.privacy_policy_repairs] == [1, 2, 3]
+    assert [repair["policy"] for repair in result.privacy_policy_repairs] == [
+        "drop_provider_rejected_optional_images_v2",
+        "drop_provider_rejected_optional_images_v2",
+        "drop_rejected_video_keep_ordered_tail_frames_v1",
+    ]
+    assert "privacy-safe frame-only continuity fallback" in submissions[-1][0]["text"]
+
+
 def test_flf2v_privacy_rejection_uses_local_handle_passthrough_without_dropping_endpoint(
     monkeypatch, tmp_path
 ):

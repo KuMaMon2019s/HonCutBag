@@ -45,7 +45,7 @@ SEEDANCE_MAX_IMAGE_ASPECT = 2.50
 SEEDANCE_IMAGE_ASPECT_MARGIN = 0.01
 MAX_COPYRIGHT_POLICY_REPAIRS = 2
 COPYRIGHT_POLICY_REPAIR_VERSION = "original_audio_frame_fallback_v1"
-MAX_PRIVACY_POLICY_REPAIRS = 2
+MAX_PRIVACY_POLICY_REPAIRS = SEEDANCE_MAX_REFERENCE_IMAGES + 1
 PRIVACY_POLICY_REPAIR_VERSION = "provider_indexed_media_fallback_v2"
 _COPYRIGHT_SAFE_AUDIO_CONTRACT = (
     "[copyright-safe audio contract] Generate original ambient location sounds only: "
@@ -1004,6 +1004,14 @@ def _provider_ready_content(
     ]
 
 
+def _privacy_policy_repair_budget(content: Sequence[dict[str, Any]]) -> int:
+    """Bound progressive privacy repairs by the original addressable media set."""
+    media_items = sum(
+        item.get("type") in {"image_url", "video_url"} for item in content
+    )
+    return min(media_items, MAX_PRIVACY_POLICY_REPAIRS)
+
+
 def _privacy_repair_content(
     content: Sequence[dict[str, Any]],
     rejected_indices: Sequence[int],
@@ -1340,6 +1348,7 @@ def _direct_seedance_executor(
         repairs: list[dict[str, Any]] = []
         privacy_repairs: list[dict[str, Any]] = []
         privacy_resubmission_attempt = 0
+        privacy_repair_budget: int | None = None
         content_override: list[dict[str, Any]] | None = None
         execution = None
         with slots.reserve("seedance", "video", request.resource_id, capacity=capacity):
@@ -1367,6 +1376,9 @@ def _direct_seedance_executor(
                             "cannot prepare provider content for "
                             f"{request.resource_id}: {exc}"
                         ) from exc
+                    if privacy_repair_budget is None:
+                        privacy_repair_budget = _privacy_policy_repair_budget(content)
+                    assert privacy_repair_budget is not None
 
                     attempt_seed = _copyright_repair_seed(seed, repairs)
                     policy_attempt = len(repairs)
@@ -1414,6 +1426,7 @@ def _direct_seedance_executor(
                         current_content: Sequence[dict[str, Any]] = content,
                         current_seed: int | None = attempt_seed,
                         submitted: list[dict[str, Any]] = submitted_content,
+                        current_privacy_budget: int = privacy_repair_budget,
                     ) -> str:
                         def submit_selected(
                             selected: Sequence[dict[str, Any]],
@@ -1432,15 +1445,15 @@ def _direct_seedance_executor(
                         while True:
                             try:
                                 return submit_selected(selected)
-                            except Exception as exc:
+                            except Exception as submit_exc:
                                 rejected_indices = _privacy_rejected_media_indices(
                                     selected,
-                                    exc,
+                                    submit_exc,
                                 )
                                 if (
                                     not rejected_indices
                                     or len(privacy_repairs)
-                                    >= MAX_PRIVACY_POLICY_REPAIRS
+                                    >= current_privacy_budget
                                 ):
                                     raise
                                 try:
@@ -1465,7 +1478,7 @@ def _direct_seedance_executor(
                                             rejected_indices
                                         ),
                                     })
-                                    raise endpoint_exc from exc
+                                    raise endpoint_exc from submit_exc
                                 repair = {
                                     "attempt": len(privacy_repairs) + 1,
                                     **repair,
@@ -1480,7 +1493,7 @@ def _direct_seedance_executor(
                                         for index in rejected_indices
                                     )
                                     + f" ({len(privacy_repairs)}/"
-                                    f"{MAX_PRIVACY_POLICY_REPAIRS})",
+                                    f"{current_privacy_budget})",
                                     flush=True,
                                 )
 
@@ -1533,7 +1546,7 @@ def _direct_seedance_executor(
                             exc,
                         )
                         if rejected_indices:
-                            if len(privacy_repairs) >= MAX_PRIVACY_POLICY_REPAIRS:
+                            if len(privacy_repairs) >= privacy_repair_budget:
                                 raise
                             try:
                                 corrected_content, repair = _privacy_repair_content(
@@ -1576,7 +1589,7 @@ def _direct_seedance_executor(
                                         for index in rejected_indices
                                     )
                                     + f" ({len(privacy_repairs)}/"
-                                    f"{MAX_PRIVACY_POLICY_REPAIRS})",
+                                    f"{privacy_repair_budget})",
                                     flush=True,
                                 )
                                 continue
