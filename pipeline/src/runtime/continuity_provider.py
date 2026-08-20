@@ -1339,6 +1339,7 @@ def _direct_seedance_executor(
         run_id = str(output_dir.resolve())
         repairs: list[dict[str, Any]] = []
         privacy_repairs: list[dict[str, Any]] = []
+        privacy_resubmission_attempt = 0
         content_override: list[dict[str, Any]] | None = None
         execution = None
         with slots.reserve("seedance", "video", request.resource_id, capacity=capacity):
@@ -1348,7 +1349,11 @@ def _direct_seedance_executor(
                 request.resource_id,
                 capacity=capacity,
             ):
-                for policy_attempt in range(MAX_COPYRIGHT_POLICY_REPAIRS + 1):
+                # Terminal provider failures require a new durable task. Privacy and
+                # copyright repairs keep independent bounded budgets below.
+                for _provider_attempt in range(
+                    MAX_COPYRIGHT_POLICY_REPAIRS + MAX_PRIVACY_POLICY_REPAIRS + 1
+                ):
                     try:
                         if content_override is None:
                             content, _shot_meta, _seed, _duration = _provider_content(
@@ -1364,27 +1369,46 @@ def _direct_seedance_executor(
                         ) from exc
 
                     attempt_seed = _copyright_repair_seed(seed, repairs)
+                    policy_attempt = len(repairs)
                     submitted_content: list[dict[str, Any]] = []
-                    attempt_payload = (
-                        payload
-                        if policy_attempt == 0
-                        else {
-                            **payload,
-                            "seed": attempt_seed,
-                            "copyright_policy_repair_version": (
-                                COPYRIGHT_POLICY_REPAIR_VERSION
-                            ),
-                            "copyright_policy_repair_attempt": policy_attempt,
-                            "copyright_policy_repairs": [
-                                dict(item) for item in repairs
-                            ],
-                        }
-                    )
-                    attempt_resource_id = (
-                        request.resource_id
-                        if policy_attempt == 0
-                        else f"{request.resource_id}_CP{policy_attempt:02d}"
-                    )
+                    attempt_payload = dict(payload)
+                    if repairs:
+                        attempt_payload.update(
+                            {
+                                "seed": attempt_seed,
+                                "copyright_policy_repair_version": (
+                                    COPYRIGHT_POLICY_REPAIR_VERSION
+                                ),
+                                "copyright_policy_repair_attempt": policy_attempt,
+                                "copyright_policy_repairs": [
+                                    dict(item) for item in repairs
+                                ],
+                            }
+                        )
+                    if privacy_resubmission_attempt:
+                        attempt_payload.update(
+                            {
+                                "privacy_policy_repair_version": (
+                                    PRIVACY_POLICY_REPAIR_VERSION
+                                ),
+                                "privacy_policy_repair_attempt": (
+                                    privacy_resubmission_attempt
+                                ),
+                                "privacy_policy_repairs": [
+                                    dict(item) for item in privacy_repairs
+                                ],
+                            }
+                        )
+                    attempt_suffixes: list[str] = []
+                    if policy_attempt:
+                        attempt_suffixes.append(f"CP{policy_attempt:02d}")
+                    if privacy_resubmission_attempt:
+                        attempt_suffixes.append(
+                            f"PP{privacy_resubmission_attempt:02d}"
+                        )
+                    attempt_resource_id = request.resource_id
+                    if attempt_suffixes:
+                        attempt_resource_id += "_" + "_".join(attempt_suffixes)
 
                     def submit(
                         current_content: Sequence[dict[str, Any]] = content,
@@ -1479,10 +1503,16 @@ def _direct_seedance_executor(
                                 provider_id="seedance",
                             )
                         )
-                        if failed is not None and _copyright_policy_violation_kind(
-                            RuntimeError(failed.error_message or "")
-                        ):
-                            raise RuntimeError(failed.error_message or "policy violation")
+                        if failed is not None:
+                            failed_error = RuntimeError(failed.error_message or "")
+                            if (
+                                _copyright_policy_violation_kind(failed_error)
+                                or _privacy_rejected_media_indices(
+                                    content,
+                                    failed_error,
+                                )
+                            ):
+                                raise failed_error
                         execution = execute_seedance_video_task(
                             task_store,
                             run_id=run_id,
@@ -1497,6 +1527,59 @@ def _direct_seedance_executor(
                         )
                         break
                     except Exception as exc:
+                        submitted = submitted_content or content
+                        rejected_indices = _privacy_rejected_media_indices(
+                            submitted,
+                            exc,
+                        )
+                        if rejected_indices:
+                            if len(privacy_repairs) >= MAX_PRIVACY_POLICY_REPAIRS:
+                                raise
+                            try:
+                                corrected_content, repair = _privacy_repair_content(
+                                    submitted,
+                                    rejected_indices,
+                                    request=request,
+                                )
+                            except RequiredContinuityEndpointPrivacyError as endpoint_exc:
+                                privacy_repairs.append(
+                                    {
+                                        "attempt": len(privacy_repairs) + 1,
+                                        "reason_code": (
+                                            "InputImageSensitiveContentDetected."
+                                            "PrivacyInformation"
+                                        ),
+                                        "policy": (
+                                            "required_endpoints_inseparable_"
+                                            "local_handle_fallback_v1"
+                                        ),
+                                        "removed_content_indices": [],
+                                        "rejected_content_indices": list(
+                                            rejected_indices
+                                        ),
+                                    }
+                                )
+                                exc = endpoint_exc
+                            else:
+                                repair = {
+                                    "attempt": len(privacy_repairs) + 1,
+                                    **repair,
+                                }
+                                privacy_repairs.append(repair)
+                                content_override = corrected_content
+                                privacy_resubmission_attempt += 1
+                                print(
+                                    "  🛡 Seedance 异步隐私审核合规重生成："
+                                    f"{repair['policy']}，移除 "
+                                    + ", ".join(
+                                        f"content[{index}]"
+                                        for index in rejected_indices
+                                    )
+                                    + f" ({len(privacy_repairs)}/"
+                                    f"{MAX_PRIVACY_POLICY_REPAIRS})",
+                                    flush=True,
+                                )
+                                continue
                         if isinstance(
                             exc,
                             RequiredContinuityEndpointPrivacyError,
@@ -1541,7 +1624,6 @@ def _direct_seedance_executor(
                             or len(repairs) >= MAX_COPYRIGHT_POLICY_REPAIRS
                         ):
                             raise
-                        submitted = submitted_content or content
                         if violation_kind == "output_audio":
                             if any(
                                 item.get("reason_code")
@@ -1595,7 +1677,7 @@ def _direct_seedance_executor(
                         )
                 if execution is None:
                     raise RuntimeError(
-                        f"{request.resource_id} copyright policy retry exited without result"
+                        f"{request.resource_id} provider policy retry exited without result"
                     )
         return ChunkExecutionResult(
             output_path=Path(execution.output_path),
