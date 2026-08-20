@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import copy
+import json
 import os
+from pathlib import Path
 from typing import Any
-
 
 NO_REAL_PERSON_ENV = "HONCUT_NO_REAL_PERSON"
 NO_REAL_PERSON_POLICY = "synthetic_faceless_android_v1"
@@ -31,6 +32,37 @@ def is_no_real_person_enabled() -> bool:
         "yes",
         "on",
     }
+
+
+def uses_synthetic_character_review(output_dir: str | Path | None = None) -> bool:
+    """Resolve synthetic QA mode from live policy or persisted character data.
+
+    Final QA often runs in a fresh/resumed process where the original privacy
+    environment variable is no longer present.  ``CHARACTERS.json`` is the
+    durable second source of truth, so reviewers must consult both sources.
+    """
+    if is_no_real_person_enabled():
+        return True
+    if output_dir is None:
+        return False
+    try:
+        payload = json.loads(
+            (Path(output_dir) / "CHARACTERS.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("visual_identity_policy") == NO_REAL_PERSON_POLICY:
+        return True
+    characters = payload.get("characters")
+    if not isinstance(characters, list):
+        return False
+    return any(
+        isinstance(character, dict)
+        and character.get("visual_identity_policy") == NO_REAL_PERSON_POLICY
+        for character in characters
+    )
 
 
 def no_real_person_prompt_contract() -> str:

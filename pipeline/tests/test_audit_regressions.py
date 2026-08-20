@@ -1454,6 +1454,68 @@ def test_final_vlm_reviews_every_shot_without_a_global_twelve_frame_cap():
     assert all(len(paths) <= 12 for paths, _prompt in calls)
 
 
+def test_final_vlm_uses_persisted_synthetic_contract_after_env_is_gone(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.delenv("HONCUT_NO_REAL_PERSON", raising=False)
+    (tmp_path / "CHARACTERS.json").write_text(
+        json.dumps({
+            "characters": [{
+                "id": "photographer",
+                "visual_identity_policy": "synthetic_faceless_android_v1",
+            }],
+        }),
+        encoding="utf-8",
+    )
+    frames = [
+        video_qa.FrameSample(
+            path="/tmp/S01_mid.jpg",
+            timestamp=1.0,
+            label="S01_mid",
+        )
+    ]
+    prompts = []
+
+    class FakeClient:
+        def review(self, _paths, prompt):
+            prompts.append(prompt)
+            return '{"verdict":"pass","issues":[],"confidence":0.99}'
+
+    result = video_qa._vlm_semantic_check(
+        FakeClient(),
+        frames,
+        {"shots": [{"shot_id": "S01", "who": ["photographer"]}]},
+        output_dir=tmp_path,
+    )
+
+    assert result["qa_contract"] == "synthetic_character_structural_consistency_v1"
+    assert "not human-anatomy defects" in prompts[0]
+    assert "Never judge them against human anatomy" in prompts[0]
+    assert "helmet/visor color drift" in prompts[0]
+
+
+def test_final_vlm_uses_live_synthetic_policy_without_character_artifact(
+    monkeypatch,
+):
+    monkeypatch.setenv("HONCUT_NO_REAL_PERSON", "1")
+    frames = [
+        video_qa.FrameSample(
+            path="/tmp/S01_mid.jpg",
+            timestamp=1.0,
+            label="S01_mid",
+        )
+    ]
+
+    class FakeClient:
+        def review(self, _paths, _prompt):
+            return '{"verdict":"pass","issues":[],"confidence":0.99}'
+
+    result = video_qa._vlm_semantic_check(FakeClient(), frames, None)
+
+    assert result["qa_contract"] == "synthetic_character_structural_consistency_v1"
+
+
 def test_layered_checkpoints_are_bound_to_the_full_semantic_input(tmp_path):
     old_events = [{"what": "old event", "sequence_id": "Q1"}]
     new_events = [{"what": "new event", "sequence_id": "Q1"}]

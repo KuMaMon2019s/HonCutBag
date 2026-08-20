@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from utils.privacy_visual_policy import uses_synthetic_character_review
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -168,7 +169,12 @@ def run_video_qa(
     if vlm_client is not None:
         report.vlm_check_available = True
         try:
-            report.vlm_result = _vlm_semantic_check(vlm_client, frames, storyboard_data)
+            report.vlm_result = _vlm_semantic_check(
+                vlm_client,
+                frames,
+                storyboard_data,
+                output_dir=output_dir,
+            )
         except Exception as e:
             report.vlm_result = {"error": str(e)}
     else:
@@ -742,6 +748,8 @@ def _vlm_semantic_check(
     vlm_client: Any,
     frames: List[FrameSample],
     storyboard_data: Optional[dict],
+    *,
+    output_dir: Path | None = None,
 ) -> dict:
     """Run VLM-based semantic quality check on extracted frames.
 
@@ -852,6 +860,29 @@ def _vlm_semantic_check(
     verdict = "pass"
     confidence_values: list[float] = []
     verdict_rank = {"pass": 0, "revise": 1, "fail": 2}
+    synthetic_review = uses_synthetic_character_review(output_dir)
+    qa_contract = (
+        "synthetic_character_structural_consistency_v1"
+        if synthetic_review
+        else "human_visual_anatomy_v1"
+    )
+    structure_contract = (
+        (
+            "All characters in this project are intentionally fully synthetic CGI androids or robots. "
+            "Opaque enclosed mechanical helmets, reflective visors, designed mechanical heads, neck "
+            "connectors, joints, armor seams, and non-human materials are required identity features, "
+            "not human-anatomy defects. Never judge them against human anatomy or flag a mechanical "
+            "neck/head merely for being non-human. Judge structural consistency instead: require visible "
+            "positive evidence of an unintended break, detachment, merge, extra/missing component, "
+            "impossible self-intersection, or reference-inconsistent deformation. Continue to detect "
+            "helmet/visor color drift, identity-marker drift, action discontinuity, and wrong spatial order. "
+        )
+        if synthetic_review
+        else (
+            "Detect broken human anatomy as well as impossible geometry, but require visible positive "
+            "evidence rather than treating occlusion, costume, or camera angle as a defect. "
+        )
+    )
 
     for batch_index in range(0, len(selected), review_batch_size):
         sample_frames = selected[batch_index : batch_index + review_batch_size]
@@ -873,12 +904,14 @@ def _vlm_semantic_check(
             ]
         }
         prompt = (
+            f"QA contract: {qa_contract}. "
             "Review these chronologically sampled frames from the final edited film against the storyboard. "
             f"This is semantic review batch {len(batch_results) + 1}; frame labels in order are "
             f"{json.dumps([item.label for item in sample_frames], ensure_ascii=False)}. "
-            "Detect wrong subjects or locations, missing key actions, identity drift, broken anatomy or geometry, "
+            "Detect wrong subjects or locations, missing key actions, identity drift, structural defects, "
             "modern/watermark/text artifacts, and material continuity errors. Return JSON only with "
             '{"verdict":"pass|revise|fail","issues":["..."],"confidence":0.0}. '
+            f"{structure_contract}"
             f"Storyboard: {json.dumps(storyboard, ensure_ascii=False)}"
         )
         raw = vlm_client.review([Path(item.path) for item in sample_frames], prompt)
@@ -888,6 +921,7 @@ def _vlm_semantic_check(
             return {
                 "status": "error",
                 "reason": "invalid semantic review response",
+                "qa_contract": qa_contract,
                 "sampled_frames": [item.label for item in selected],
                 "review_batches": len(batch_results) + 1,
             }
@@ -904,6 +938,7 @@ def _vlm_semantic_check(
         "status": "completed",
         "verdict": verdict,
         "issues": issues,
+        "qa_contract": qa_contract,
         "confidence": min(confidence_values) if confidence_values else None,
         "sampled_frames": [item.label for item in selected],
         "covered_shots": list(frames_by_shot),

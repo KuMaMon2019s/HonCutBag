@@ -424,30 +424,9 @@ def _character_reference_paths(
 
 def _uses_synthetic_character_review(output_dir: Path | None) -> bool:
     """Resolve privacy-safe review mode from runtime state or persisted artifacts."""
-    from utils.privacy_visual_policy import (
-        NO_REAL_PERSON_POLICY,
-        is_no_real_person_enabled,
-    )
+    from utils.privacy_visual_policy import uses_synthetic_character_review
 
-    if is_no_real_person_enabled():
-        return True
-    if output_dir is None:
-        return False
-    try:
-        payload = json.loads(
-            (Path(output_dir) / "CHARACTERS.json").read_text(encoding="utf-8")
-        )
-    except (OSError, json.JSONDecodeError):
-        return False
-    if not isinstance(payload, dict):
-        return False
-    if payload.get("visual_identity_policy") == NO_REAL_PERSON_POLICY:
-        return True
-    return any(
-        isinstance(character, dict)
-        and character.get("visual_identity_policy") == NO_REAL_PERSON_POLICY
-        for character in payload.get("characters", [])
-    )
+    return uses_synthetic_character_review(output_dir)
 
 
 def _automatic_semantic_reviewer(

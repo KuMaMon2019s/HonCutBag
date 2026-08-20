@@ -258,6 +258,97 @@ def _assert_duration_conserved(
             )
 
 
+def _final_encode_duration_gate(
+    encode_input_durations: dict[str, float | None],
+    encoded_durations: dict[str, float | None],
+    *,
+    requested_duration: float | None,
+    fps: float,
+) -> dict[str, Any]:
+    """Build the non-contradictory Phase 9 final-encode duration receipt.
+
+    Phase 8 and the rhythm editor own the reviewed edit timeline. Phase 9's
+    encoder must preserve that input rather than silently re-trimming it to the
+    earlier planning target. The requested duration remains useful diagnostic
+    context, but it is not a second, conflicting encode invariant.
+    """
+    duration_tolerance_s = 2 / float(fps)
+    audio_duration_tolerance_s = max(duration_tolerance_s, 0.05)
+    comparison_epsilon_s = 1e-6
+    duration_deltas = {
+        kind: (
+            None
+            if encode_input_durations[kind] is None or encoded_durations[kind] is None
+            else round(
+                abs(encoded_durations[kind] - encode_input_durations[kind]),
+                6,
+            )
+        )
+        for kind in ("video", "audio")
+    }
+    encode_conserved = all(
+        encode_input_durations[kind] is None
+        or (
+            encoded_durations[kind] is not None
+            and duration_deltas[kind]
+            <= (
+                audio_duration_tolerance_s
+                if kind == "audio"
+                else duration_tolerance_s
+            )
+            + comparison_epsilon_s
+        )
+        for kind in ("video", "audio")
+    )
+    requested_duration_delta = (
+        None
+        if requested_duration is None or encoded_durations["video"] is None
+        else round(
+            abs(encoded_durations["video"] - float(requested_duration)),
+            6,
+        )
+    )
+    requested_duration_within_tolerance = (
+        None
+        if requested_duration_delta is None
+        else requested_duration_delta
+        <= duration_tolerance_s + comparison_epsilon_s
+    )
+    return {
+        "passed": encode_conserved,
+        "artifact": "polished.mp4",
+        "expected": encode_input_durations,
+        "actual": encoded_durations,
+        "absolute_delta_s": duration_deltas,
+        "requested_duration_s": requested_duration,
+        "requested_duration_delta_s": requested_duration_delta,
+        "requested_duration_within_tolerance": requested_duration_within_tolerance,
+        "requested_duration_enforced_by_final_encode": False,
+        "tolerance_s": {
+            "video": duration_tolerance_s,
+            "audio": audio_duration_tolerance_s,
+        },
+        "tolerance_frames": 2,
+        "basis": (
+            "Phase 9 encode input is the reviewed delivery timeline; the earlier "
+            "requested duration is diagnostic only"
+        ),
+    }
+
+
+def _final_encode_filters(profile: dict[str, Any]) -> tuple[str, str]:
+    """Return delivery filters that normalize format without changing runtime."""
+    video_filters = (
+        "setpts=PTS-STARTPTS,"
+        f"scale={profile['width']}:{profile['height']}:"
+        "force_original_aspect_ratio=increase,"
+        f"crop={profile['width']}:{profile['height']},setsar=1,"
+        f"fps={profile['fps']}"
+    )
+    audio_filters = "asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0"
+    return video_filters, audio_filters
+
+
 # ---------------------------------------------------------------------------
 # 工具函数
 # ---------------------------------------------------------------------------
@@ -6647,26 +6738,7 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
         profile = _get_profile_dict(media_profile)
         encode_input_durations = _probe_av_durations(Path(final_out))
 
-        video_filters = (
-            "setpts=PTS-STARTPTS,"
-            f"scale={profile['width']}:{profile['height']}:"
-            "force_original_aspect_ratio=increase,"
-            f"crop={profile['width']}:{profile['height']},setsar=1,"
-            f"fps={profile['fps']}"
-        )
-        audio_filters = "asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0"
-        if target_duration is not None:
-            # Close on the delivery frame grid after FPS conversion.  Trimming
-            # before ``fps`` can leave one or two duplicated tail frames due to
-            # timestamp rounding (for example 60.066667s at 30 fps).
-            target_frames = round(float(target_duration) * float(profile["fps"]))
-            video_filters += (
-                f",trim=end_frame={target_frames},setpts=PTS-STARTPTS"
-            )
-            audio_filters += (
-                f",apad,atrim=duration={float(target_duration):.9f},"
-                "asetpts=PTS-STARTPTS"
-            )
+        video_filters, audio_filters = _final_encode_filters(profile)
 
         cmd = [
             "ffmpeg", "-y",
@@ -6690,8 +6762,14 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             raise RuntimeError(f"Final encoding failed: {result.stderr[-1000:]}")
 
         encoded_durations = _probe_av_durations(Path(final_encoded))
-        duration_tolerance_s = 2 / float(profile["fps"])
-        audio_duration_tolerance_s = max(duration_tolerance_s, 0.05)
+        final_duration_gate = _final_encode_duration_gate(
+            encode_input_durations,
+            encoded_durations,
+            requested_duration=target_duration,
+            fps=float(profile["fps"]),
+        )
+        duration_tolerance_s = final_duration_gate["tolerance_s"]["video"]
+        audio_duration_tolerance_s = final_duration_gate["tolerance_s"]["audio"]
         _assert_duration_conserved(
             encode_input_durations,
             encoded_durations,
@@ -6704,50 +6782,12 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
         import shutil
         shutil.move(final_encoded, final_out)
         polished_durations = _probe_av_durations(Path(final_out))
-        duration_deltas = {
-            kind: (None if encode_input_durations[kind] is None or polished_durations[kind] is None
-                   else round(abs(polished_durations[kind] - encode_input_durations[kind]), 6))
-            for kind in ("video", "audio")
-        }
-        comparison_epsilon_s = 1e-6
-        duration_gate_passed = all(
-            encode_input_durations[kind] is None
-            or (
-                polished_durations[kind] is not None
-                and duration_deltas[kind]
-                <= (
-                    audio_duration_tolerance_s
-                    if kind == "audio"
-                    else duration_tolerance_s
-                ) + comparison_epsilon_s
-            )
-            for kind in ("video", "audio")
+        final_duration_gate = _final_encode_duration_gate(
+            encode_input_durations,
+            polished_durations,
+            requested_duration=target_duration,
+            fps=float(profile["fps"]),
         )
-        requested_duration_delta = (
-            None if target_duration is None or polished_durations["video"] is None
-            else round(abs(polished_durations["video"] - float(target_duration)), 6)
-        )
-        if requested_duration_delta is not None:
-            duration_gate_passed = (
-                duration_gate_passed
-                and requested_duration_delta
-                <= duration_tolerance_s + comparison_epsilon_s
-            )
-        final_duration_gate = {
-            "passed": duration_gate_passed,
-            "artifact": "polished.mp4",
-            "expected": encode_input_durations,
-            "actual": polished_durations,
-            "absolute_delta_s": duration_deltas,
-            "requested_duration_s": target_duration,
-            "requested_duration_delta_s": requested_duration_delta,
-            "tolerance_s": {
-                "video": duration_tolerance_s,
-                "audio": audio_duration_tolerance_s,
-            },
-            "tolerance_frames": 2,
-            "basis": "Phase 9 encode input plus the requested delivery duration",
-        }
         (output_dir / "final_duration_gate.json").write_text(
             json.dumps(final_duration_gate, ensure_ascii=False, indent=2), encoding="utf-8"
         )
@@ -6757,9 +6797,10 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             tolerance_s=duration_tolerance_s,
             audio_tolerance_s=audio_duration_tolerance_s,
         )
-        if not duration_gate_passed:
+        if not final_duration_gate["passed"]:
             raise RuntimeError(
-                f"Final duration gate failed: target={target_duration}, actual={polished_durations}"
+                "Final duration gate failed to conserve the reviewed encode input: "
+                f"expected={encode_input_durations}, actual={polished_durations}"
             )
         outputs.extend([
             f"polished.mp4 (encoded with {media_profile})",

@@ -6045,6 +6045,30 @@ def test_phase9_duration_gate_accepts_frame_decimal_rounding():
     )
 
 
+def test_phase9_final_encode_preserves_reviewed_timeline_when_plan_target_differs():
+    receipt = pipeline_core._final_encode_duration_gate(
+        {"video": 82.633333, "audio": 82.624},
+        {"video": 82.633333, "audio": 82.645333},
+        requested_duration=80.0,
+        fps=30,
+    )
+
+    assert receipt["passed"] is True
+    assert receipt["requested_duration_delta_s"] == pytest.approx(2.633333)
+    assert receipt["requested_duration_within_tolerance"] is False
+    assert receipt["requested_duration_enforced_by_final_encode"] is False
+    assert receipt["expected"]["video"] == pytest.approx(82.633333)
+
+    video_filters, audio_filters = pipeline_core._final_encode_filters({
+        "width": 1280,
+        "height": 720,
+        "fps": 30,
+    })
+    assert "trim" not in video_filters
+    assert "trim" not in audio_filters
+    assert "fps=30" in video_filters
+
+
 def test_delivery_timeline_tracks_warped_shot_boundaries(tmp_path):
     output = tmp_path / "polished.mp4"
     timeline = {
