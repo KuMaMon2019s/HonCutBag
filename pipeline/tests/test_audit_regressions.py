@@ -625,7 +625,9 @@ def test_video_prompt_locks_named_cast_iphone_prop_and_observable_camera_path():
     assert "禁止替换成单反相机、微单相机、摄像机" in prompt
     assert "movement=dolly_out" in prompt
     assert "observable_success=the subject becomes gradually smaller" in prompt
-    assert prompt.count("[honcut-video-generation-contract-v1]") == 1
+    assert "[spatial-motion-lock]" in prompt
+    assert "unintended side-by-side blocking" in prompt
+    assert prompt.count("[honcut-video-generation-contract-v2]") == 1
     assert "synthetic-identity-lock" in prompt
     assert "面部骨骼、发型" not in prompt
 

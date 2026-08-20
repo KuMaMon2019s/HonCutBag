@@ -319,6 +319,7 @@ def inject_reference_instruction(prompt_text: str, descriptions: List[Any]) -> s
         for index, item in enumerate(normalized, start=1)
     )
     subject_bindings = []
+    named_subject_bindings = []
     subject_numbers = {}
     for image_number, item in enumerate(normalized, start=1):
         if item.get("bind_subject", True) is False:
@@ -328,6 +329,11 @@ def inject_reference_instruction(prompt_text: str, descriptions: List[Any]) -> s
             continue
         subject_number = len(subject_numbers) + 1
         subject_numbers[char_id] = (image_number, subject_number)
+        character_name = str(item.get("character_name") or char_id).strip()
+        if character_name:
+            named_subject_bindings.append(
+                f"{character_name}=<主体{subject_number}>（图片{image_number}）"
+            )
         definition = item.get("prompt_definition") or (
             f"将{{图片N}}中的[{item.get('reference_description', char_id)}]定义为{{主体N}}"
         )
@@ -356,6 +362,12 @@ def inject_reference_instruction(prompt_text: str, descriptions: List[Any]) -> s
     instruction = references + "。"
     if binding_text:
         instruction += f"{binding_text}。生成时严格保持参考图中角色的外观一致。"
+    if named_subject_bindings:
+        instruction += (
+            "角色名与主体编号硬绑定（全镜不得互换身份、造型、服装、颜色、动作或空间角色）："
+            + "；".join(named_subject_bindings)
+            + "。"
+        )
     if "元素参考" in prompt_text:
         return re.sub(
             r"元素参考(?:声明)?\s*[：:]?\s*",

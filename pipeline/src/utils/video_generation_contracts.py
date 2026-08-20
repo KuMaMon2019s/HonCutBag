@@ -9,11 +9,38 @@ from typing import Any
 from utils.camera_motion_contracts import camera_motion_execution_prompt
 from utils.privacy_visual_policy import NO_REAL_PERSON_POLICY
 
-VIDEO_GENERATION_CONTRACT_MARKER = "[honcut-video-generation-contract-v1]"
+VIDEO_GENERATION_CONTRACT_MARKER = "[honcut-video-generation-contract-v2]"
 
 DUPLICATE_IDENTITY_NEGATIVE = (
     "cloned named character, duplicated identity, twin copy of a reference character, "
     "mirrored character duplicate, repeated canonical costume or identity marker on background extras"
+)
+
+SPATIAL_IDENTITY_NEGATIVE = (
+    "canonical identity color drift, recolored helmet or costume, swapped named-character styling, "
+    "swapped foreground roles, unintended side-by-side blocking, follower overtaking the lead, "
+    "reversed authored depth order, unprompted stop, turn, or travel-direction reversal"
+)
+
+_CANONICAL_APPEARANCE_FIELDS = (
+    ("hair", "hair/head"),
+    ("face", "face/helmet"),
+    ("clothing", "clothing"),
+    ("build", "body build"),
+    ("distinguishing", "signature marker"),
+)
+
+# These are base-material color targets, not lighting instructions. The hex
+# hint keeps providers from treating neighboring dark neutrals as equivalent
+# when two identity-bound characters share a helmet or visor silhouette.
+_CANONICAL_COLOR_HEX = (
+    ("藏蓝", "navy", "#1F2A44"),
+    ("深红", "dark red", "#7A1F2B"),
+    ("深灰", "dark gray", "#3A3F46"),
+    ("冷白", "cool white", "#E8F4FF"),
+    ("银色", "silver", "#C0C0C0"),
+    ("琥珀", "amber", "#FFBF00"),
+    ("冷蓝", "cool blue", "#4A6FA5"),
 )
 
 
@@ -99,6 +126,164 @@ def _flatten_strings(value: Any) -> list[str]:
             flattened.extend(_flatten_strings(item))
         return flattened
     return []
+
+
+def _bounded_contract_text(value: Any, limit: int = 1200) -> str:
+    text = " | ".join(_flatten_strings(value))
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "…"
+
+
+def _character_name(character: Mapping[str, Any]) -> str:
+    return str(character.get("name") or character.get("id") or "character").strip()
+
+
+def _appearance_values(character: Mapping[str, Any]) -> dict[str, str]:
+    appearance = character.get("appearance") or {}
+    if not isinstance(appearance, Mapping):
+        return {}
+    values = {}
+    for field, _label in _CANONICAL_APPEARANCE_FIELDS:
+        value = _bounded_contract_text(appearance.get(field), 600)
+        if value:
+            values[field] = value
+    return values
+
+
+def _canonical_color_targets(text: str) -> list[str]:
+    return [
+        f"{token} / {english} = {hex_value}"
+        for token, english, hex_value in _CANONICAL_COLOR_HEX
+        if token in text
+    ]
+
+
+def _canonical_appearance_contract(selected: list[dict[str, Any]]) -> str:
+    lines = []
+    for character in selected:
+        values = _appearance_values(character)
+        if not values:
+            continue
+        traits = "; ".join(
+            f"{label}={values[field]}"
+            for field, label in _CANONICAL_APPEARANCE_FIELDS
+            if field in values
+        )
+        colors = _canonical_color_targets(" ".join(values.values()))
+        color_suffix = f"; canonical base colors: {' | '.join(colors)}" if colors else ""
+        lines.append(
+            f"{_character_name(character)} [reference_id={character.get('id') or 'unassigned'}]: "
+            f"{traits}{color_suffix}"
+        )
+    if not lines:
+        return ""
+    return "\n".join(
+        (
+            "[canonical-identity-appearance-lock]",
+            *lines,
+            (
+                "Every listed trait is immutable in every frame. Hex values describe the canonical "
+                "base material/albedo under neutral light: scene lighting may change brightness, but "
+                "must not change the hue family, recolor a helmet/visor/costume, or transfer one "
+                "character's styling to another."
+            ),
+        )
+    )
+
+
+def _lookalike_disambiguation_contract(selected: list[dict[str, Any]]) -> str:
+    shared: list[str] = []
+    for field, label in _CANONICAL_APPEARANCE_FIELDS:
+        owners_by_value: dict[str, list[str]] = {}
+        original_by_value: dict[str, str] = {}
+        for character in selected:
+            value = _appearance_values(character).get(field)
+            if not value:
+                continue
+            normalized = re.sub(r"\s+", "", value).casefold()
+            owners_by_value.setdefault(normalized, []).append(_character_name(character))
+            original_by_value[normalized] = value
+        for normalized, owners in owners_by_value.items():
+            if len(owners) < 2:
+                continue
+            shared.append(
+                f"shared {label}: {' | '.join(owners)} -> {original_by_value[normalized]}"
+            )
+    if not shared:
+        return ""
+    return "\n".join(
+        (
+            "[lookalike-cast-disambiguation]",
+            *shared,
+            (
+                "Shared helmet, visor, hair, build, or costume traits are not identity keys. Bind "
+                "each named role to its own reference subject for the whole take; use that role's "
+                "non-shared canonical traits (especially clothing), assigned action, and authored "
+                "spatial position as the disambiguators. Never swap reference subjects, costumes, "
+                "colors, actions, or spatial roles between lookalike characters, and never merge them "
+                "into one identity."
+            ),
+        )
+    )
+
+
+def _spatial_motion_contract(shot_meta: Mapping[str, Any]) -> str:
+    explicit_layout = _bounded_contract_text(
+        {
+            key: shot_meta.get(key)
+            for key in (
+                "spatial_relations",
+                "spatial_layout",
+                "blocking",
+                "position_constraints",
+                "motion_constraints",
+            )
+            if shot_meta.get(key)
+        }
+    )
+    visual = _bounded_contract_text(shot_meta.get("visual"))
+    start_state = _bounded_contract_text(shot_meta.get("start_state"))
+    ordered_motion = _bounded_contract_text(
+        shot_meta.get("generation_actions")
+        or shot_meta.get("action_description")
+        or shot_meta.get("what")
+        or shot_meta.get("action")
+    )
+    end_state = _bounded_contract_text(shot_meta.get("end_state"))
+    evidence = [
+        ("explicit_layout", explicit_layout),
+        ("authored_visual_blocking", visual),
+        ("start_state", start_state),
+        ("ordered_motion", ordered_motion),
+        ("required_end_state", end_state),
+    ]
+    evidence_lines = [f"{label}={value}" for label, value in evidence if value]
+    if not evidence_lines:
+        return ""
+    return "\n".join(
+        (
+            "[spatial-motion-lock]",
+            *evidence_lines,
+            (
+                "Treat authored front/behind, left/right, depth order, distance, facing, and screen "
+                "direction as persistent state variables, not suggestions. Preserve any exact authored "
+                "distance throughout the action unless the contract explicitly changes it."
+            ),
+            (
+                "If one role follows or stays behind another, the follower must remain behind along the "
+                "authored travel/spatial axis and keep the authored gap: never become side-by-side, move "
+                "ahead, overtake, cross through, or exchange depth order with the lead."
+            ),
+            (
+                "If motion is authored as continuous forward travel, maintain that travel from the first "
+                "relevant frame through the required end state. Do not pause, pivot toward another role, "
+                "reverse, teleport, or let camera motion substitute for the subject's movement unless "
+                "that change is explicitly authored."
+            ),
+        )
+    )
 
 
 def _shot_action_text(shot_meta: Mapping[str, Any]) -> str:
@@ -214,6 +399,15 @@ def render_video_generation_contract(
                 )
             )
         )
+    appearance_contract = _canonical_appearance_contract(selected)
+    if appearance_contract:
+        sections.append(appearance_contract)
+    lookalike_contract = _lookalike_disambiguation_contract(selected)
+    if lookalike_contract:
+        sections.append(lookalike_contract)
+    spatial_contract = _spatial_motion_contract(shot_meta)
+    if spatial_contract:
+        sections.append(spatial_contract)
     prop_contract = _interaction_prop_contract(shot_meta, selected)
     if prop_contract:
         sections.append(prop_contract)

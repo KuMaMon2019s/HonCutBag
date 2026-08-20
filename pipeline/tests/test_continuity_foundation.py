@@ -104,6 +104,7 @@ from sam3_runtime.policy import (
     resolve_runtime_policy,
 )
 from schemas.continuity import ContinuityPlan, GenerationChunk
+from tools.asset_packager import inject_reference_instruction
 from utils.artifact_chain import can_resume_from
 
 
@@ -3156,7 +3157,92 @@ def test_continuity_chunk_injects_shared_cast_prop_camera_and_reshoot_contracts(
     assert "observable_success=the camera visibly retreats" in prompt
     assert "[phase8-reshoot-correction]" in prompt
     assert "上一轮错误使用单反相机" in prompt
-    assert prompt.count("[honcut-video-generation-contract-v1]") == 1
+    assert prompt.count("[honcut-video-generation-contract-v2]") == 1
+
+
+def test_generation_contract_locks_spatial_order_canonical_colors_and_lookalikes(tmp_path):
+    shared_helmet = "哑光藏蓝色全封闭安保头盔，横向不透明深红色机械面甲"
+    (tmp_path / "CHARACTERS.json").write_text(
+        json.dumps(
+            {
+                "characters": [
+                    {
+                        "id": "lead",
+                        "name": "女主",
+                        "appearance": {
+                            "face": "哑光深灰色机械头盔",
+                            "clothing": "银灰色长外套",
+                            "distinguishing": "胸前琥珀色三角灯",
+                        },
+                    },
+                    {
+                        "id": "photographer",
+                        "name": "摄影师",
+                        "appearance": {
+                            "face": shared_helmet,
+                            "clothing": "黑色短夹克",
+                            "distinguishing": "左臂冷白色摄影编号灯",
+                        },
+                    },
+                    {
+                        "id": "male_passerby",
+                        "name": "男路人",
+                        "appearance": {
+                            "face": shared_helmet,
+                            "clothing": "藏蓝色长风衣",
+                            "distinguishing": "右肩银色路人识别章",
+                        },
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    shot_meta = {
+        "prompt": "三名角色沿街道前进\n[honcut-video-generation-contract-v1]\nlegacy contract",
+        "who": ["女主", "摄影师", "男路人"],
+        "visual": "女主持续向前移动；男路人始终跟在女主身后2米",
+        "start_state": "女主在前，男路人在她正后方2米，摄影师位于左后侧",
+        "generation_actions": ["女主持续向前移动", "男路人保持身后2米跟随"],
+        "end_state": "女主仍在前进，男路人仍在正后方2米且没有超前",
+    }
+
+    prompt = _base_content(tmp_path, _fresh_chunk_request(tmp_path), shot_meta)[0]["text"]
+
+    assert "[canonical-identity-appearance-lock]" in prompt
+    assert "男路人 [reference_id=male_passerby]" in prompt
+    assert "藏蓝 / navy = #1F2A44" in prompt
+    assert "深红 / dark red = #7A1F2B" in prompt
+    assert "[lookalike-cast-disambiguation]" in prompt
+    assert "shared face/helmet: 摄影师 | 男路人" in prompt
+    assert "[spatial-motion-lock]" in prompt
+    assert "男路人始终跟在女主身后2米" in prompt
+    assert "never become side-by-side, move ahead, overtake" in prompt
+    assert "Do not pause, pivot toward another role" in prompt
+    assert "[honcut-video-generation-contract-v1]" in prompt
+    assert prompt.count("[honcut-video-generation-contract-v2]") == 1
+
+
+def test_reference_instruction_hard_binds_names_to_distinct_subject_slots():
+    prompt = inject_reference_instruction(
+        "两名同盔角色沿街道移动",
+        [
+            {
+                "char_id": "photographer",
+                "character_name": "摄影师",
+                "reference_description": "摄影师全身照",
+            },
+            {
+                "char_id": "male_passerby",
+                "character_name": "男路人",
+                "reference_description": "男路人全身照",
+            },
+        ],
+    )
+
+    assert "摄影师=<主体1>（图片1）" in prompt
+    assert "男路人=<主体2>（图片2）" in prompt
+    assert "全镜不得互换身份、造型、服装、颜色、动作或空间角色" in prompt
 
 
 def test_direct_continuity_adapter_reuses_succeeded_paid_task(monkeypatch, tmp_path):

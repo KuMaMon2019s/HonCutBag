@@ -11,24 +11,25 @@ from typing import Any
 
 from clients.video_client import VideoClient
 from prompt.eight_layer_summary import build_subject_summary
-from utils.storyboard_motion_policy import apply_storyboard_motion_policy
-from utils.style_slices import get_slice
-from utils.video_geometry import resolve_video_geometry
-from utils.character_body_contracts import (
-    body_contract_forbidden,
-    body_contract_prompt,
-)
 from utils.camera_motion_contracts import (
     apply_camera_motion_contract,
     camera_motion_negative_prompt,
     camera_motion_prompt,
     camera_movement_description,
 )
+from utils.character_body_contracts import (
+    body_contract_forbidden,
+    body_contract_prompt,
+)
+from utils.storyboard_motion_policy import apply_storyboard_motion_policy
+from utils.style_slices import get_slice
 from utils.video_generation_contracts import (
     DUPLICATE_IDENTITY_NEGATIVE,
+    SPATIAL_IDENTITY_NEGATIVE,
     ensure_video_generation_contract,
     has_synthetic_identity_policy,
 )
+from utils.video_geometry import resolve_video_geometry
 
 BASE_NEGATIVE_PROMPT = (
     "变形扭曲(warping), 形态渐变(morphing), 面部扭曲(distorted faces), "
@@ -202,6 +203,7 @@ def build_video_prompt(
     )
     if selected:
         negatives.append(DUPLICATE_IDENTITY_NEGATIVE)
+        negatives.append(SPATIAL_IDENTITY_NEGATIVE)
     negatives.append(camera_motion_negative_prompt(shot_meta))
     # Keep the long-standing base guardrail at the tail for downstream tools
     # that verify the prompt suffix while still carrying the richer contracts.
