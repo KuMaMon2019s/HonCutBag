@@ -120,25 +120,46 @@ def _build_seedance2_single(shot_data: dict, assets: list) -> str:
     # scenery-only shot after the safe prompt has already been assembled.
     parts.append(source_prompt)
     
+    from utils.privacy_visual_policy import is_no_real_person_enabled
+
+    synthetic_identity = bool(
+        is_no_real_person_enabled()
+        or shot_data.get("visual_identity_policy") == "synthetic_faceless_android_v1"
+    )
+
     # 角色参考绑定
     if assets:
         names = [a.get("name", "") for a in assets]
-        parts.append(f"Based on the reference image of {', '.join(names)}, "
-                     "maintain consistent: face features, hairstyle, costume details.")
+        identity_traits = (
+            "mechanical helmet and opaque visor geometry, synthetic silhouette, costume/armor materials, color blocks, and identity markers"
+            if synthetic_identity
+            else "face features, hairstyle, costume details"
+        )
+        parts.append(
+            f"Based on the reference image of {', '.join(names)}, "
+            f"maintain consistent: {identity_traits}."
+        )
     
     # 风格锚定：纯环境镜不得携带 skin/hair 等人物诱导词。
     character_requested = bool(
         assets or shot_data.get("who") or shot_data.get("characters")
     )
-    detail_contract = (
-        "delicate skin texture, strand-by-strand hair detail"
-        if character_requested
-        else "realistic volumetric atmosphere, fine environmental material detail"
-    )
-    parts.append(
-        "Photorealistic cinematography, cinematic quality, ultra-fine detail, "
-        f"{detail_contract}. Ultra-sharp 4K, no subtitles, no watermark."
-    )
+    if synthetic_identity and character_requested:
+        parts.append(
+            "High-end stylized 3D CGI cinematography with deliberately synthetic materials "
+            "and designed digital geometry, no visible human face, skin, eyes, or hair, "
+            "cinematic quality, ultra-fine material detail, ultra-sharp 4K, no subtitles, no watermark."
+        )
+    else:
+        detail_contract = (
+            "delicate skin texture, strand-by-strand hair detail"
+            if character_requested
+            else "realistic volumetric atmosphere, fine environmental material detail"
+        )
+        parts.append(
+            "Photorealistic cinematography, cinematic quality, ultra-fine detail, "
+            f"{detail_contract}. Ultra-sharp 4K, no subtitles, no watermark."
+        )
     
     return " ".join(parts)
 

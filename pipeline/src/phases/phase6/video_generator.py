@@ -24,6 +24,11 @@ from utils.camera_motion_contracts import (
     camera_motion_prompt,
     camera_movement_description,
 )
+from utils.video_generation_contracts import (
+    DUPLICATE_IDENTITY_NEGATIVE,
+    ensure_video_generation_contract,
+    has_synthetic_identity_policy,
+)
 
 BASE_NEGATIVE_PROMPT = (
     "变形扭曲(warping), 形态渐变(morphing), 面部扭曲(distorted faces), "
@@ -195,6 +200,8 @@ def build_video_prompt(
         for char in selected
         if body_contract_forbidden(char)
     )
+    if selected:
+        negatives.append(DUPLICATE_IDENTITY_NEGATIVE)
     negatives.append(camera_motion_negative_prompt(shot_meta))
     # Keep the long-standing base guardrail at the tail for downstream tools
     # that verify the prompt suffix while still carrying the richer contracts.
@@ -211,6 +218,20 @@ def build_video_prompt(
         + f"约束条件：{BASE_NEGATIVE_PROMPT}"
     )
     prompt = apply_storyboard_motion_policy("。".join(parts))
+    from utils.privacy_visual_policy import (
+        NO_REAL_PERSON_POLICY,
+        is_no_real_person_enabled,
+    )
+
+    synthetic_identity = bool(selected) and (
+        has_synthetic_identity_policy(characters) or is_no_real_person_enabled()
+    )
+    if synthetic_identity:
+        from utils.privacy_visual_policy import no_real_person_prompt_contract
+
+        shot_meta["visual_identity_policy"] = NO_REAL_PERSON_POLICY
+        prompt = f"{no_real_person_prompt_contract()}\n{prompt}"
+    prompt = ensure_video_generation_contract(prompt, shot_meta, characters)
     if explicit_scenery:
         scenery_lock = (
             "纯环境镜头硬约束：画面中保持零人物、零人形主体、零服装与零角色道具，"
@@ -220,7 +241,12 @@ def build_video_prompt(
     fictional_decl = "虚拟形象声明：片中角色均为 AI 生成的虚构角色，非真实人物"
     if "kling" in model.lower():
         return {"prompt": f"{fictional_decl}。{prompt}", "negative_prompt": negative_prompt}
-    identity_lock = "identity-lock：保持参考图中的面部骨骼、发型、服装类别与主色不变"
+    identity_lock = (
+        "synthetic-identity-lock：保持参考图中的机械头盔、面甲、数字角色轮廓、"
+        "装甲/服装类别、材质与主色不变；不得生成人脸、皮肤或头发"
+        if synthetic_identity
+        else "identity-lock：保持参考图中的面部骨骼、发型、服装类别与主色不变"
+    )
     return f"{prompt}。{fictional_decl}。{identity_lock}。{negative_suffix}"
 
 

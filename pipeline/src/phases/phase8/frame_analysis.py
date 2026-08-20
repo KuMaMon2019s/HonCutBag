@@ -422,6 +422,34 @@ def _character_reference_paths(
     return references
 
 
+def _uses_synthetic_character_review(output_dir: Path | None) -> bool:
+    """Resolve privacy-safe review mode from runtime state or persisted artifacts."""
+    from utils.privacy_visual_policy import (
+        NO_REAL_PERSON_POLICY,
+        is_no_real_person_enabled,
+    )
+
+    if is_no_real_person_enabled():
+        return True
+    if output_dir is None:
+        return False
+    try:
+        payload = json.loads(
+            (Path(output_dir) / "CHARACTERS.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("visual_identity_policy") == NO_REAL_PERSON_POLICY:
+        return True
+    return any(
+        isinstance(character, dict)
+        and character.get("visual_identity_policy") == NO_REAL_PERSON_POLICY
+        for character in payload.get("characters", [])
+    )
+
+
 def _automatic_semantic_reviewer(
     output_dir: Path | None = None,
 ) -> SemanticReviewer | None:
@@ -435,6 +463,13 @@ def _automatic_semantic_reviewer(
     except Exception:
         return None
 
+    synthetic_review = _uses_synthetic_character_review(output_dir)
+    qa_contract = (
+        "synthetic_character_structural_consistency_v1"
+        if synthetic_review
+        else "human_visual_anatomy_v1"
+    )
+
     def review(frame_paths: list[Path], shot_meta: dict[str, Any]) -> dict[str, Any]:
         character_references = _character_reference_paths(output_dir, shot_meta)
         expected = {
@@ -443,25 +478,48 @@ def _automatic_semantic_reviewer(
                 "shot_id", "visual", "action", "action_description", "generation_actions",
                 "who", "where",
                 "characters", "time", "time_of_day", "lighting", "lighting_key",
-                "lighting_description", "style_anchor",
+                "lighting_description", "style_anchor", "camera_movement",
+                "camera_motion_contract", "interaction_props", "phase8_reshoot",
             )
             if shot_meta.get(key) not in (None, "", [])
         }
         reference_labels = [character_id for character_id, _path in character_references]
         review_paths = [path for _character_id, path in character_references] + frame_paths
+        structure_contract = (
+            (
+                "This project intentionally uses fully synthetic CGI androids. Opaque enclosed mechanical "
+                "helmets, reflective visors, designed mechanical heads, neck connectors, joints, armor seams, "
+                "and non-human materials are required identity features, not human-anatomy defects. Do not "
+                "reject a shot merely because a character is helmeted, robotic, faceless, or unlike a normal "
+                "human. Judge synthetic-character structural consistency against the canonical references: "
+                "part count, attachment continuity, silhouette, helmet/visor geometry, costume/armor, color "
+                "blocks, and identity markers must remain stable. Reject only visible positive evidence of an "
+                "unintended break, detachment, merge, extra/missing part, impossible self-intersection, or "
+                "reference-inconsistent deformation. "
+            )
+            if synthetic_review
+            else (
+                "Detect broken anatomy and extra or missing limbs. Do not call a hand or limb anatomically "
+                "broken merely because it is partly hidden by a sleeve, prop, railing, crop, or camera angle; "
+                "require visible positive evidence of malformation. "
+            )
+        )
         prompt = (
+            f"QA contract: {qa_contract}. "
             f"The first {len(character_references)} supplied image(s) are canonical character references "
             f"in this exact order: {json.dumps(reference_labels, ensure_ascii=False)}. All remaining images "
             "are ordered frames from one generated video shot. Compare the video frames with those references "
             "and with the expected "
             f"shot metadata: {json.dumps(expected, ensure_ascii=False)}. Detect character identity drift, "
-            "extra or missing limbs/objects, broken anatomy, impossible geometry, continuity jumps, text or "
+            "extra or missing limbs/objects, impossible geometry, continuity jumps, text or "
             "watermark artifacts, wrong time of day, daylight/night drift, weather drift, and lighting that "
             "contradicts the shot or changes materially between the first and last supplied frame. Natural acting "
             "micro-movements (small gaze/head/hand changes) are allowed unless they reverse the narrative action or "
-            "create a true continuity jump. Do not call a hand or limb anatomically broken merely because it is "
-            "partly hidden by a sleeve, prop, railing, crop, or camera angle; require visible positive evidence of "
-            "malformation. Verify that generation_actions occur in their listed order with visible subject "
+            "create a true continuity jump. "
+            f"{structure_contract}"
+            "Each canonical named identity may appear only once unless the metadata explicitly requests clones; "
+            "background extras must not duplicate a canonical identity, costume, helmet, or signature marker. "
+            "Verify that generation_actions occur in their listed order with visible subject "
             "displacement and a recognizable result; hair, rain, smoke, blinking, or camera drift alone do not "
             "count as completion of body action. Judge shot-size drift only against explicit camera movement: a dolly-in must not become "
             "a sustained pull-back, while a fixed shot may contain minor stabilization drift. Return JSON only: "
@@ -470,7 +528,14 @@ def _automatic_semantic_reviewer(
         raw = client.review(review_paths, prompt).strip()
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE)
         parsed = json.loads(raw)
-        return parsed if isinstance(parsed, dict) else {"verdict": "reshoot", "issues": ["invalid semantic review"]}
+        if not isinstance(parsed, dict):
+            return {
+                "verdict": "reshoot",
+                "issues": ["invalid semantic review"],
+                "qa_contract": qa_contract,
+            }
+        parsed["qa_contract"] = qa_contract
+        return parsed
 
     return review
 

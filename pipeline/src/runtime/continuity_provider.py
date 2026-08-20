@@ -32,6 +32,7 @@ from runtime.generation_tasks import GenerationTaskStore
 from runtime.seedance_execution import execute_seedance_video_task
 from schemas.continuity import ContinuityPlan, GenerationChunk
 from utils.storyboard_motion_policy import apply_storyboard_motion_policy
+from utils.video_generation_contracts import ensure_video_generation_contract
 from utils.video_capabilities import SEEDANCE_2_CAPABILITIES
 from utils.video_geometry import resolve_video_geometry
 
@@ -446,6 +447,7 @@ def _chunk_prompt(
     request: ChunkExecutionRequest,
     shot_meta: dict[str, Any],
     group_prompt: str = "",
+    characters: Any = None,
 ) -> str:
     prompt = str(shot_meta.get("prompt") or "").strip()
     if not prompt:
@@ -490,10 +492,11 @@ def _chunk_prompt(
             f"Required end state: {request.chunk.end_state or 'complete that action'}. "
             "Do not execute another Pxx panel, skip ahead, or replay an earlier panel."
         )
-    return apply_storyboard_motion_policy(
+    prompt = apply_storyboard_motion_policy(
         f"{prompt}\n\n[continuity chunk {request.chunk.sequence}] {continuation}\n"
         f"{group_prompt}\n{request.memory_context}{beat_contract}{repair}"
     )
+    return ensure_video_generation_contract(prompt, shot_meta, characters or {})
 
 
 def _seedance_reference_image_payload(board_path: Path) -> tuple[bytes, str]:
@@ -612,10 +615,17 @@ def _base_content(
 
     content_meta = dict(shot_meta)
     group, board_path = _storyboard_group_for_shot(output_dir, request.shot_id)
+    try:
+        characters_data = json.loads(
+            (output_dir / "CHARACTERS.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        characters_data = {}
     content_meta["prompt"] = _chunk_prompt(
         request,
         shot_meta,
         _storyboard_group_prompt(group, request.shot_id),
+        characters_data,
     )
     from utils.privacy_visual_policy import (
         is_no_real_person_enabled,

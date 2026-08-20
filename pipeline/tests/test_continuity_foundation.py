@@ -3115,6 +3115,50 @@ def _fresh_chunk_request(tmp_path):
     )
 
 
+def test_continuity_chunk_injects_shared_cast_prop_camera_and_reshoot_contracts(
+    tmp_path,
+):
+    (tmp_path / "CHARACTERS.json").write_text(
+        json.dumps(
+            {
+                "characters": [
+                    {
+                        "id": "photographer",
+                        "name": "摄影师",
+                        "appearance": {
+                            "interaction_props": [
+                                "手持拍摄设备（iPhone手机，配备手机广角镜头）进行拍摄"
+                            ]
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    shot_meta = {
+        "prompt": "摄影师持 iPhone 向后退步跟拍",
+        "who": ["摄影师"],
+        "camera_movement": "tracking_front",
+        "generation_actions": ["摄影师持 iPhone 向后退步跟拍"],
+        "phase8_reshoot": {
+            "round": 1,
+            "issues": ["上一轮错误使用单反相机，且未执行倒退跟拍"],
+        },
+    }
+
+    content = _base_content(tmp_path, _fresh_chunk_request(tmp_path), shot_meta)
+    prompt = content[0]["text"]
+
+    assert "identity_bound_cast_count=1" in prompt
+    assert "exactly one silver iPhone smartphone / 银色 iPhone 手机" in prompt
+    assert "movement=tracking_front" in prompt
+    assert "observable_success=the camera visibly retreats" in prompt
+    assert "[phase8-reshoot-correction]" in prompt
+    assert "上一轮错误使用单反相机" in prompt
+    assert prompt.count("[honcut-video-generation-contract-v1]") == 1
+
+
 def test_direct_continuity_adapter_reuses_succeeded_paid_task(monkeypatch, tmp_path):
     monkeypatch.setattr("utils.video_validation.is_valid_video", lambda _path: True)
     shot_dir = tmp_path / "shots/S01"

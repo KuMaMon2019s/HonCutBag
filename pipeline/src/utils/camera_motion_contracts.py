@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping, MutableMapping
 from typing import Any
 
-CAMERA_MOTION_SCHEMA_VERSION = 1
+CAMERA_MOTION_SCHEMA_VERSION = 2
 
 # Keep ``rack_focus`` last: parser diagnostics and contract tests historically
 # use it as the visible end of the legal vocabulary.
@@ -313,6 +313,63 @@ def camera_motion_prompt(shot: Mapping[str, Any]) -> str:
     if contract.get("human_perspective"):
         parts.append(str(contract["human_perspective"]))
     return "; ".join(parts)
+
+
+_OBSERVABLE_CAMERA_EVIDENCE = {
+    "static": "subject scale, framing, and horizon remain visibly unchanged",
+    "dolly_in": (
+        "the subject becomes gradually larger while foreground/background parallax proves "
+        "that the camera physically moved forward"
+    ),
+    "dolly_out": (
+        "the subject becomes gradually smaller and more surrounding environment enters the "
+        "frame while the authored subject remains composed"
+    ),
+    "tracking_front": (
+        "the camera visibly retreats in front of the approaching subject; subject scale and "
+        "frontal composition remain stable while the environment translates behind them"
+    ),
+    "tracking_rear": (
+        "the camera visibly advances behind the moving subject at a stable following distance"
+    ),
+    "tracking_left": (
+        "lateral background parallax moves right while subject distance and body scale stay stable"
+    ),
+    "tracking_right": (
+        "lateral background parallax moves left while subject distance and body scale stay stable"
+    ),
+    "pan_left": "the fixed camera rotates left and reveals authored content on the left",
+    "pan_right": "the fixed camera rotates right and reveals authored content on the right",
+    "zoom_in": "framing tightens without translation parallax because camera position is fixed",
+    "zoom_out": "framing widens without translation parallax because camera position is fixed",
+}
+
+
+def camera_motion_execution_prompt(shot: Mapping[str, Any]) -> str:
+    """Render a machine-readable execution block with observable success evidence."""
+    contract = shot.get("camera_motion_contract")
+    if not isinstance(contract, Mapping):
+        contract = build_camera_motion_contract(shot)
+    movement = str(contract.get("movement") or "static")
+    observable = _OBSERVABLE_CAMERA_EVIDENCE.get(
+        movement,
+        "the declared physical camera path creates a continuous, visible framing change",
+    )
+    return "\n".join(
+        (
+            "[camera-motion-execution-v2]",
+            f"movement={movement}",
+            f"start_frame={contract.get('start')}",
+            f"physical_path={contract.get('process')}",
+            f"end_frame={contract.get('end')}",
+            f"observable_success={observable}",
+            (
+                "forbidden_substitution=camera drift, subject-only movement, background-only "
+                "animation, optical zoom, or a diegetic character moving cannot substitute for "
+                "the declared physical viewer-camera path"
+            ),
+        )
+    )
 
 
 def camera_motion_negative_prompt(shot: Mapping[str, Any]) -> str:

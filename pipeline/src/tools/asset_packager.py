@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
 from utils.storyboard_motion_policy import apply_storyboard_motion_policy
+from utils.video_generation_contracts import ensure_video_generation_contract
 
 
 def package_shot_assets(
@@ -469,6 +470,17 @@ def build_content_for_shot(
             "Move the subjects through the ordered action contract with clear body displacement; "
             "do not hold or gently animate the input pose."
         ).strip()
+    try:
+        characters_data = json.loads(
+            (output_dir / "CHARACTERS.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        characters_data = {}
+    prompt_text = ensure_video_generation_contract(
+        prompt_text,
+        shot_meta,
+        characters_data,
+    )
     if prompt_text:
         content.append({"type": "text", "text": prompt_text})
 

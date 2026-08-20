@@ -5232,20 +5232,33 @@ def run_phase8(output_dir: Path, dry_run: bool,
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 meta = {}
+            review_entry = frame_report.get("shots", {}).get(shot_id, {})
+            semantic_review = review_entry.get("semantic_review") or {}
+            reasons = review_entry.get("reasons") or semantic_review.get("issues") or []
+            if not isinstance(reasons, list):
+                reasons = [str(reasons)]
+            meta["phase8_reshoot"] = {
+                "round": _reshoot_round + 1,
+                "qa_contract": semantic_review.get("qa_contract"),
+                "issues": [str(reason) for reason in reasons if str(reason).strip()],
+            }
+            from utils.camera_motion_contracts import apply_camera_motion_contract
+
+            apply_camera_motion_contract(meta)
             if meta.get("gen_strategy") == "flf2v":
                 meta["gen_strategy"] = "phantom"
                 meta["phase8_reshoot_route_reason"] = (
                     "FLF2V visual QA failure; avoid reusing a possibly "
                     "inconsistent generated endpoint"
                 )
-                meta_path.write_text(
-                    json.dumps(meta, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
                 print(
                     f"  ↪ [8.2] {shot_id}: FLF2V 补录改用 Phantom 角色参考路由",
                     flush=True,
                 )
+            meta_path.write_text(
+                json.dumps(meta, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
         transaction.remove_sources()
 
         print(

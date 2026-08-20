@@ -579,6 +579,76 @@ def test_video_prompt_preserves_full_subject_action_ledger_and_rejects_backgroun
     assert "action_description" not in prompt
 
 
+def test_video_prompt_locks_named_cast_iphone_prop_and_observable_camera_path():
+    characters = {
+        "visual_identity_policy": "synthetic_faceless_android_v1",
+        "characters": [
+            {
+                "id": "lead",
+                "name": "女主",
+                "visual_identity_policy": "synthetic_faceless_android_v1",
+                "appearance": {},
+            },
+            {
+                "id": "photographer",
+                "name": "摄影师",
+                "visual_identity_policy": "synthetic_faceless_android_v1",
+                "appearance": {
+                    "interaction_props": [
+                        "手持拍摄设备（iPhone手机，配备手机广角镜头）进行拍摄"
+                    ]
+                },
+            },
+        ],
+    }
+
+    prompt = build_video_prompt(
+        {
+            "id": 3,
+            "who": ["女主", "摄影师"],
+            "where": "城市街头",
+            "camera_movement": "dolly_out",
+            "generation_actions": [
+                "摄影师持 iPhone 向后退步拍摄，画面逐渐变宽"
+            ],
+        },
+        characters,
+        {},
+        "seedance",
+    )
+
+    assert "identity_bound_cast_count=2" in prompt
+    assert "required_exactly_once=女主 | 摄影师" in prompt
+    assert "Never clone, mirror, duplicate" in prompt
+    assert "exactly one silver iPhone smartphone / 银色 iPhone 手机" in prompt
+    assert "禁止替换成单反相机、微单相机、摄像机" in prompt
+    assert "movement=dolly_out" in prompt
+    assert "observable_success=the subject becomes gradually smaller" in prompt
+    assert prompt.count("[honcut-video-generation-contract-v1]") == 1
+    assert "synthetic-identity-lock" in prompt
+    assert "面部骨骼、发型" not in prompt
+
+
+def test_synthetic_seedance_router_does_not_reintroduce_human_skin_or_hair(
+    monkeypatch,
+):
+    from prompt.prompt_router import route_prompt
+
+    monkeypatch.setenv("HONCUT_NO_REAL_PERSON", "1")
+    prompt = route_prompt(
+        "doubao-seedance-2.0-mini",
+        "single_shot",
+        {"prompt": "合成人向前移动", "who": ["摄影师"]},
+        assets=[{"name": "摄影师", "description": "全封闭机械头盔"}],
+    )
+
+    assert "mechanical helmet and opaque visor geometry" in prompt
+    assert "High-end stylized 3D CGI" in prompt
+    assert "Photorealistic cinematography" not in prompt
+    assert "delicate skin texture" not in prompt
+    assert "face features, hairstyle" not in prompt
+
+
 def test_shared_video_geometry_supports_portrait_and_explicit_dimensions():
     assert resolve_video_geometry({"aspect_ratio": "9:16"}) == ("9:16", 720, 1280)
     assert resolve_video_geometry({"width": 1080, "height": 1920}) == (
@@ -1685,6 +1755,7 @@ def test_phase8_vlm_compares_video_frames_with_character_reference(
             captured["prompt"] = prompt
             return '{"verdict":"pass","issues":[],"confidence":1.0}'
 
+    monkeypatch.setenv("HONCUT_NO_REAL_PERSON", "0")
     monkeypatch.setattr(ark_multimodal_client, "ArkMultimodalClient", FakeClient)
     reviewer = frame_analysis._automatic_semantic_reviewer(tmp_path)
 
@@ -1694,8 +1765,140 @@ def test_phase8_vlm_compares_video_frames_with_character_reference(
     )
 
     assert result["verdict"] == "pass"
+    assert result["qa_contract"] == "human_visual_anatomy_v1"
     assert captured["paths"] == [character_reference, frame]
     assert "canonical character references" in captured["prompt"]
+    assert "Detect broken anatomy" in captured["prompt"]
+
+
+def test_phase8_vlm_switches_to_synthetic_structure_contract_from_artifacts(
+    tmp_path, monkeypatch
+):
+    from PIL import Image
+    from phases.phase8 import frame_analysis
+    from clients import ark_multimodal_client
+
+    frame = tmp_path / "shots/S01/frames/frame_000.jpg"
+    frame.parent.mkdir(parents=True)
+    Image.new("RGB", (32, 32), "blue").save(frame)
+    (tmp_path / "CHARACTERS.json").write_text(
+        json.dumps(
+            {
+                "visual_identity_policy": "synthetic_faceless_android_v1",
+                "characters": [
+                    {
+                        "id": "photographer",
+                        "name": "摄影师",
+                        "visual_identity_policy": "synthetic_faceless_android_v1",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured = {}
+
+    class FakeClient:
+        def review(self, paths, prompt):
+            captured["prompt"] = prompt
+            return '{"verdict":"pass","issues":[],"confidence":1.0}'
+
+    monkeypatch.delenv("HONCUT_NO_REAL_PERSON", raising=False)
+    monkeypatch.setattr(ark_multimodal_client, "ArkMultimodalClient", FakeClient)
+    reviewer = frame_analysis._automatic_semantic_reviewer(tmp_path)
+
+    result = reviewer([frame], {"shot_id": "S01", "who": ["摄影师"]})
+
+    assert result["qa_contract"] == "synthetic_character_structural_consistency_v1"
+    assert "Opaque enclosed mechanical helmets" in captured["prompt"]
+    assert "not human-anatomy defects" in captured["prompt"]
+    assert "Judge synthetic-character structural consistency" in captured["prompt"]
+    assert "Detect broken anatomy" not in captured["prompt"]
+    assert "background extras must not duplicate a canonical identity" in captured["prompt"]
+
+
+def test_phase8_writes_qa_feedback_into_metadata_before_paid_reshoot(
+    tmp_path, monkeypatch
+):
+    from contextlib import nullcontext
+    from phases.phase8 import continuity_adjudication, frame_analysis, story_order_reviewer
+    from quality import sam3_sidecar
+
+    shot_dir = tmp_path / "shots/S01"
+    shot_dir.mkdir(parents=True)
+    (shot_dir / "output.mp4").write_bytes(b"previous-paid-video")
+    (shot_dir / "SHOT_META.json").write_text(
+        json.dumps(
+            {
+                "shot_id": "S01",
+                "prompt": "摄影师持 iPhone 倒退跟拍",
+                "who": ["摄影师"],
+                "camera_movement": "tracking_front",
+                "gen_strategy": "phantom",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps({"shots": [{"shot_id": "S01"}]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        story_order_reviewer,
+        "review_story_order",
+        lambda *_args: {
+            "matches_current_order": True,
+            "narrative_consistent": True,
+            "suggested_order": ["S01"],
+            "issues": [],
+        },
+    )
+    monkeypatch.setattr(sam3_sidecar, "phase8_sam3_endpoint", lambda *_args: nullcontext(None))
+    monkeypatch.setattr(
+        continuity_adjudication,
+        "adjudicate_continuity_seams",
+        lambda *_args, **_kwargs: {
+            "requires_human_review": False,
+            "requires_phase6": False,
+            "shots": [],
+        },
+    )
+    issue = "摄影师错误使用单反相机，且没有向后退步"
+    monkeypatch.setattr(
+        frame_analysis,
+        "analyze_shot_frames",
+        lambda *_args, **_kwargs: {
+            "summary": {"keep": [], "trim": [], "reshoot": ["S01"]},
+            "shots": {
+                "S01": {
+                    "reasons": [issue],
+                    "semantic_review": {
+                        "verdict": "reshoot",
+                        "issues": [issue],
+                        "qa_contract": "synthetic_character_structural_consistency_v1",
+                    },
+                }
+            },
+        },
+    )
+    captured = {}
+
+    def fail_after_capturing_feedback(*_args, **_kwargs):
+        metadata = json.loads((shot_dir / "SHOT_META.json").read_text(encoding="utf-8"))
+        captured.update(metadata)
+        return {"status": "error", "error": "stop after contract capture"}
+
+    monkeypatch.setattr(pipeline_core, "run_phase6", fail_after_capturing_feedback)
+
+    result = pipeline_core.run_phase8(tmp_path, False)
+
+    assert result["status"] == "error"
+    assert captured["phase8_reshoot"] == {
+        "round": 1,
+        "qa_contract": "synthetic_character_structural_consistency_v1",
+        "issues": [issue],
+    }
+    assert captured["camera_motion_contract"]["movement"] == "tracking_front"
 
 
 def test_phase5_l3_orders_beat_images_without_shot_image_keys(tmp_path):
