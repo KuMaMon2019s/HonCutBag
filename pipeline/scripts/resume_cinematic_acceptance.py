@@ -7,8 +7,11 @@ import argparse
 import hashlib
 import json
 import os
+import sqlite3
 import sys
+from datetime import datetime, timezone
 from functools import partial
+from math import ceil
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +20,7 @@ from dotenv import dotenv_values
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PIPELINE_SRC = REPO_ROOT / "pipeline" / "src"
+DEFAULT_PROVIDER_COOLDOWN_SECONDS = 15 * 60
 for import_root in (REPO_ROOT, PIPELINE_SRC):
     if str(import_root) not in sys.path:
         sys.path.insert(0, str(import_root))
@@ -131,6 +135,51 @@ def _queue_totals(api_key: str) -> dict[str, int]:
     }
 
 
+def _provider_cooldown_state(
+    database_path: Path,
+    resource_id: str,
+    *,
+    cooldown_seconds: int,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    """Return a no-network cooldown receipt for the newest pre-job quota failure."""
+    if cooldown_seconds <= 0 or not database_path.is_file():
+        return None
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT finished_at, error_message
+            FROM generation_tasks
+            WHERE resource_id = ?
+              AND provider_id = 'seedance'
+              AND provider_job_id IS NULL
+              AND status = 'failed'
+              AND error_message LIKE '%429%QuotaExceeded%'
+            ORDER BY finished_at DESC, queued_at DESC
+            LIMIT 1
+            """,
+            (resource_id,),
+        ).fetchone()
+    if not row or not row[0]:
+        return None
+    finished_at = datetime.fromisoformat(str(row[0]))
+    if finished_at.tzinfo is None:
+        finished_at = finished_at.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    remaining = cooldown_seconds - (current - finished_at).total_seconds()
+    if remaining <= 0:
+        return None
+    return {
+        "status": "provider_cooldown",
+        "last_failed_at": finished_at.isoformat(),
+        "retry_after_seconds": ceil(remaining),
+        "provider_request_sent": False,
+        "reason": "recent Seedance 429 QuotaExceeded before provider job creation",
+    }
+
+
 def _update_acceptance_receipt(
     output_dir: Path,
     *,
@@ -159,6 +208,8 @@ def run(
     duration: int,
     seed: int,
     submit: bool,
+    force_submit: bool = False,
+    cooldown_seconds: int = DEFAULT_PROVIDER_COOLDOWN_SECONDS,
 ) -> dict[str, Any]:
     _assert_project_api_key(REPO_ROOT)
 
@@ -237,6 +288,19 @@ def run(
             "route_applied": route_applied,
         }
     else:
+        if not force_submit:
+            cooldown = _provider_cooldown_state(
+                output_dir / "runtime.db",
+                beat_id,
+                cooldown_seconds=cooldown_seconds,
+            )
+            if cooldown:
+                return {
+                    **cooldown,
+                    "shot_id": beat_id,
+                    "model": SEEDANCE_MODEL,
+                    "first_frame_sha256": _sha256(frame),
+                }
         queue = _queue_totals(api_key)
         if queue["queued"] or queue["running"]:
             raise RuntimeError(f"Seedance queue is not empty: {queue}")
@@ -310,6 +374,7 @@ def run(
                     "last_error": str(exc),
                     "queued_tasks_observed": queue["queued"],
                     "running_tasks_observed": queue["running"],
+                    "last_provider_attempt_at": datetime.now(timezone.utc).isoformat(),
                 },
             )
             raise
@@ -372,6 +437,20 @@ def main() -> int:
         action="store_true",
         help="authorize the paid Seedance submission; without it only preflight runs",
     )
+    parser.add_argument(
+        "--force-submit",
+        action="store_true",
+        help=(
+            "bypass the persisted provider cooldown only after an observed external "
+            "state change; still requires --submit"
+        ),
+    )
+    parser.add_argument(
+        "--cooldown-seconds",
+        type=int,
+        default=DEFAULT_PROVIDER_COOLDOWN_SECONDS,
+        help="minimum delay after a pre-job Seedance quota failure (default: 900)",
+    )
     args = parser.parse_args()
     result = run(
         args.output_dir,
@@ -380,6 +459,8 @@ def main() -> int:
         duration=args.duration,
         seed=args.seed,
         submit=args.submit,
+        force_submit=args.force_submit,
+        cooldown_seconds=args.cooldown_seconds,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
