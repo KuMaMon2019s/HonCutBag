@@ -426,8 +426,8 @@ def _storyboard_group_prompt(
             (
                 f"[storyboard group {group.get('group_id')}; step {position + 1}/{len(beats)}]",
                 (
-                    "The group board is a chronological narrative map. Render only the "
-                    "authoritative current Pxx beat below, never another panel."
+                    "The text-only group contract is a chronological narrative map. "
+                    "Render only the authoritative current Pxx beat below, never another panel."
                 ),
                 f"Current beat starting state: {chunk.start_state or 'continue the supplied state'}",
                 "The authoritative Pxx contract below defines the only action to execute now.",
@@ -438,7 +438,7 @@ def _storyboard_group_prompt(
     actions = " -> ".join(str(value) for value in current.get("generation_actions", []))
     lines = [
         f"[storyboard group {group.get('group_id')}; step {position + 1}/{len(beats)}]",
-        "The group board is a chronological narrative map, not a request to perform every panel now.",
+        "The text-only group contract is a chronological narrative map, not a request to perform every panel now.",
         (
             f"Previous shot final state: {previous.get('end_state', '')}"
             if previous
@@ -761,47 +761,13 @@ def _append_group_board_reference(
     content: list[dict[str, Any]],
     board_path: Path | None,
 ) -> list[dict[str, Any]]:
-    if board_path is None:
-        return content
-    frame_roles = {
-        item.get("role")
-        for item in content
-        if item.get("type") == "image_url"
-    }
-    if frame_roles & {"first_frame", "last_frame"}:
-        # Seedance rejects first/last-frame control mixed with reference media.
-        # The same group contract is already embedded in the text prompt, so the
-        # board remains a media reference only for reference-only requests.
-        return content
-    from clients.tos_uploader import upload_image
+    """Retain the legacy seam as an enforced no-op.
 
-    board_payload, content_type = _seedance_reference_image_payload(board_path)
-    board_url = upload_image(board_payload, content_type)
-    if not board_url:
-        raise RuntimeError(f"failed to upload storyboard group board {board_path}")
-    image_number = sum(item.get("type") == "image_url" for item in content) + 1
-    directive = (
-        f"图片{image_number}是本连续组按时间从左到右、从上到下排列的总体分镜板，"
-        "仅用于确认当前镜头在故事中的位置和前后因果；必须按当前格中的主体动作箭头和摄影机箭头"
-        "执行相应的运动方向与轨迹，但箭头、轨迹线和提示文字都是不可见的制作标注；"
-        "不得复制整张拼图、不得同时演完其他格，不得在成片中生成箭头、辅助线、分格边框、编号或板中文字。"
-    )
-    text_item = next((item for item in content if item.get("type") == "text"), None)
-    if text_item is None:
-        content.insert(0, {"type": "text", "text": directive})
-    else:
-        text_item["text"] = f"{directive}\n{text_item.get('text', '')}"
-    board_item = {
-        "type": "image_url",
-        "image_url": {"url": board_url},
-        "role": "reference_image",
-        "priority": "low",
-    }
-    video_index = next(
-        (index for index, item in enumerate(content) if item.get("type") == "video_url"),
-        len(content),
-    )
-    content.insert(video_index, board_item)
+    Storyboard boards are allowed in text/LLM review only. Keeping this helper
+    as a no-op prevents an old call site from silently reintroducing grid pixels
+    into provider requests.
+    """
+    _ = board_path
     return content
 
 
@@ -814,7 +780,7 @@ def _base_content(
     from tools.asset_packager import build_content_for_shot
 
     content_meta = _chunk_scoped_shot_meta(request, shot_meta)
-    group, board_path = _storyboard_group_for_shot(output_dir, request.shot_id)
+    group, _ = _storyboard_group_for_shot(output_dir, request.shot_id)
     try:
         characters_data = json.loads(
             (output_dir / "CHARACTERS.json").read_text(encoding="utf-8")
@@ -867,6 +833,7 @@ def _base_content(
         return [{"type": "text", "text": content_meta["prompt"]}]
     if request.chunk.storyboard_image:
         content_meta["_storyboard_frame_path"] = request.chunk.storyboard_image
+        content_meta["_storyboard_frame_kind"] = request.chunk.storyboard_image_kind
         content_meta["_storyboard_beat_id"] = request.chunk.storyboard_beat_id
         content_meta["generation_actions"] = [request.chunk.action_prompt]
         content_meta["gen_strategy"] = (
@@ -874,16 +841,12 @@ def _base_content(
             if strategy in {"multi_image", "tail_video_extend"}
             else "i2v"
         )
-    reserved_group_board = 1 if board_path is not None else 0
+    # Storyboard/group boards are director and LLM evidence only. Their grids,
+    # labels, and motion notation never consume provider image slots.
     if request.chunk.mode == "native_extend":
         content_meta["_max_reference_images"] = (
             SEEDANCE_MAX_REFERENCE_IMAGES
             - CONTINUITY_ANCHOR_FRAME_COUNT
-            - reserved_group_board
-        )
-    elif reserved_group_board:
-        content_meta["_max_reference_images"] = (
-            SEEDANCE_MAX_REFERENCE_IMAGES - reserved_group_board
         )
     content = build_content_for_shot(
         output_dir=output_dir,
@@ -1064,9 +1027,9 @@ def _provider_content(
         if request.previous_output_path is None:
             raise RuntimeError(f"{request.resource_id} has no predecessor video")
         content = _extension_content(content, request.previous_output_path)
-    if strategy != "first_last_frame_bridge":
-        _, board_path = _storyboard_group_for_shot(output_dir, request.shot_id)
-        content = _append_group_board_reference(content, board_path)
+    # Keep the group narrative in the text prompt, but never attach its pixels.
+    # The only composition pixels accepted by the video route are Phase 4
+    # cinematic first frames with provenance receipts.
     return content, shot_meta, _generation_seed(request), _chunk_duration(request)
 
 

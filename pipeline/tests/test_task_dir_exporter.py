@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -18,7 +19,17 @@ def _image(path: Path, marker: bytes) -> None:
 
 
 def _multi_character_project(tmp_path: Path) -> dict:
-    _image(tmp_path / "storyboard_images" / "S02.png", b"s")
+    frame = tmp_path / "video_first_frames" / "S02_P01.png"
+    _image(frame, b"s")
+    frame.with_suffix(".json").write_text(
+        json.dumps({
+            "kind": "honcut.cinematic-first-frame.v1",
+            "status": "done",
+            "image_sha256": hashlib.sha256(frame.read_bytes()).hexdigest(),
+            "previs_reference_images": [],
+        }),
+        encoding="utf-8",
+    )
     for char_id, marker in (("black_merc", b"b"), ("silver_tech", b"t")):
         char_dir = tmp_path / "characters" / char_id
         _image(char_dir / "face_closeup.png", marker)
@@ -37,6 +48,8 @@ def _multi_character_project(tmp_path: Path) -> dict:
         "prompt": "两名角色在机库交谈。",
         "gen_strategy": "phantom",
         "_char_ids": ["black_merc", "silver_tech"],
+        "_storyboard_frame_path": "video_first_frames/S02_P01.png",
+        "_storyboard_frame_kind": "honcut.cinematic-first-frame.v1",
         "duration": 12,
         "width": 1280,
         "height": 720,
@@ -44,7 +57,7 @@ def _multi_character_project(tmp_path: Path) -> dict:
     }
 
 
-def test_manifest_reference_order_matches_asset_packager_numbering(tmp_path, monkeypatch):
+def test_task_dir_and_content_promote_phantom_to_strict_first_frame(tmp_path, monkeypatch):
     shot_meta = _multi_character_project(tmp_path)
     monkeypatch.setattr(
         tos_uploader,
@@ -57,24 +70,16 @@ def test_manifest_reference_order_matches_asset_packager_numbering(tmp_path, mon
     prompt = (task_dir / "S02" / "提示词" / "提示词.txt").read_text(encoding="utf-8")
 
     content_prompt = next(item["text"] for item in content if item["type"] == "text")
-    assert [reference["label"] for reference in manifest["references"]] == [
-        f"图片{index}" for index in range(1, 7)
+    assert [item.get("role") for item in content if item["type"] == "image_url"] == [
+        "first_frame"
     ]
-    assert [reference["path"] for reference in manifest["references"]] == [
-        "black_merc/大头照.png",
-        "black_merc/全身照.png",
-        "black_merc/变体_1.png",
-        "black_merc/变体_2.png",
-        "silver_tech/大头照.png",
-        "silver_tech/全身照.png",
-    ]
-    for reference in manifest["references"]:
-        numbered = f"{reference['label']}为{reference['desc']}"
-        assert numbered in prompt
-        assert numbered in content_prompt
-    assert "分镜/分镜图.png是S02分镜首帧" in prompt
-    assert "构图、角色站位、场景结构、时间天气和光影" in prompt
-    assert "图片7为S02分镜首帧" in content_prompt
+    assert manifest["strategy"] == "i2v"
+    assert manifest["references"] == []
+    assert "分镜/分镜图.png是S02成片质感首帧" in prompt
+    assert "构图、角色站位、场景结构、项目美术风格、时间天气和光影" in prompt
+    assert "图片1为S02成片质感第一帧" in content_prompt
+    assert not (task_dir / "S02" / "black_merc").exists()
+    assert not (task_dir / "S02" / "silver_tech").exists()
 
 
 def test_task_directory_matches_contract_structure(tmp_path):
@@ -83,9 +88,6 @@ def test_task_directory_matches_contract_structure(tmp_path):
     required = [
         "task_manifest.json",
         "S02/manifest.json",
-        "S02/black_merc/大头照.png",
-        "S02/black_merc/全身照.png",
-        "S02/silver_tech/大头照.png",
         "S02/分镜/分镜图.png",
         "S02/提示词/提示词.txt",
     ]
@@ -93,7 +95,7 @@ def test_task_directory_matches_contract_structure(tmp_path):
     manifest = json.loads((task_dir / "S02" / "manifest.json").read_text(encoding="utf-8"))
     assert manifest == {
         "shot_id": "S02",
-        "strategy": "phantom",
+        "strategy": "i2v",
         "first_frame": "分镜/分镜图.png",
         "last_frame": None,
         "references": manifest["references"],
@@ -120,7 +122,8 @@ def test_upload_preserves_utf8_object_keys_without_network(tmp_path, monkeypatch
     assert task_id == task_dir.name
     keys = [key for key, _ in uploads]
     assert f"tasks/{task_id}/S02/提示词/提示词.txt" in keys
-    assert f"tasks/{task_id}/S02/black_merc/大头照.png" in keys
+    assert f"tasks/{task_id}/S02/分镜/分镜图.png" in keys
+    assert not any("大头照" in key or "全身照" in key for key in keys)
     assert all("%" not in key for key in keys)
 
 

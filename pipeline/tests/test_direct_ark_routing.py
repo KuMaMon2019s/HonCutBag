@@ -1,5 +1,6 @@
 # ruff: noqa: E402
 
+import hashlib
 import importlib.util
 import json
 import multiprocessing
@@ -277,11 +278,24 @@ def _stub_tos_upload(monkeypatch):
     )
 
 
-def test_phantom_content_uses_reference_images_only(tmp_path, monkeypatch):
+def _write_cinematic_frame(path: Path, marker: bytes = b"s") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(marker * 1025)
+    path.with_suffix(".json").write_text(
+        json.dumps({
+            "kind": "honcut.cinematic-first-frame.v1",
+            "status": "done",
+            "image_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "previs_reference_images": [],
+        }),
+        encoding="utf-8",
+    )
+
+
+def test_phantom_with_cinematic_frame_uses_strict_first_frame_only(tmp_path, monkeypatch):
     _stub_tos_upload(monkeypatch)
     storyboard_dir = tmp_path / "storyboard_images"
-    storyboard_dir.mkdir()
-    (storyboard_dir / "S01.png").write_bytes(b"s" * 1025)
+    _write_cinematic_frame(storyboard_dir / "S01.png")
     char_dir = tmp_path / "characters" / "lin"
     char_dir.mkdir(parents=True)
     (char_dir / "face_closeup.png").write_bytes(b"f" * 1025)
@@ -294,17 +308,15 @@ def test_phantom_content_uses_reference_images_only(tmp_path, monkeypatch):
     )
 
     roles = [item.get("role", item["type"]) for item in content]
-    assert "first_frame" not in roles
+    assert roles == ["text", "first_frame"]
     assert "last_frame" not in roles
-    assert roles.count("reference_image") >= 2
-    assert roles[0] == "text"
+    assert "reference_image" not in roles
 
 
 def test_flf2v_content_keeps_first_and_last_frames(tmp_path, monkeypatch):
     _stub_tos_upload(monkeypatch)
     storyboard_dir = tmp_path / "storyboard_images"
-    storyboard_dir.mkdir()
-    (storyboard_dir / "S01.png").write_bytes(b"s" * 1025)
+    _write_cinematic_frame(storyboard_dir / "S01.png")
     (storyboard_dir / "S01_end.png").write_bytes(b"e" * 1025)
 
     content = asset_packager.build_content_for_shot(
@@ -323,8 +335,7 @@ def test_flf2v_content_keeps_first_and_last_frames(tmp_path, monkeypatch):
 def test_flf2v_injects_text_identity_lock_and_rejects_drifted_relay(tmp_path, monkeypatch):
     _stub_tos_upload(monkeypatch)
     storyboard_dir = tmp_path / "storyboard_images"
-    storyboard_dir.mkdir()
-    (storyboard_dir / "S03.png").write_bytes(b"s" * 1025)
+    _write_cinematic_frame(storyboard_dir / "S03.png")
     (storyboard_dir / "S03_end.png").write_bytes(b"e" * 1025)
     (tmp_path / "CHARACTERS.json").write_text(
         json.dumps({"characters": [{
@@ -567,6 +578,7 @@ def test_phase4_never_lets_legacy_orchestrator_submit_video(monkeypatch, tmp_pat
     assert {item["id"] for item in review["checks"]} == {
         "storyboard_artifacts_complete",
         "scene_and_continuity_contracts_written",
+        "cinematic_first_frames_previs_isolated",
         "legacy_orchestrator_metadata_only",
         "shot_meta_ids_exact",
     }

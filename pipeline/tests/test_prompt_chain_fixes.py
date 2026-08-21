@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -11,6 +12,7 @@ from clients import tos_uploader
 from phases.phase1.character_discoverer import _add_reference_contract
 from phases.pipeline_core import (
     _extract_visual_style_text,
+    _prepare_phase6_prompt,
     _storyboard_keyframe_description,
     _write_project_visual_style,
 )
@@ -80,6 +82,20 @@ def _write_character_assets(root: Path, char_id: str, byte: bytes):
     char_dir.mkdir(parents=True)
     (char_dir / "face_closeup.png").write_bytes(byte * 2048)
     (char_dir / "full_body.png").write_bytes(byte.upper() * 2048)
+
+
+def _write_cinematic_frame(path: Path, marker: bytes = b"s") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(marker * 2048)
+    path.with_suffix(".json").write_text(
+        json.dumps({
+            "kind": "honcut.cinematic-first-frame.v1",
+            "status": "done",
+            "image_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "previs_reference_images": [],
+        }),
+        encoding="utf-8",
+    )
 
 
 def test_f3_two_characters_bind_distinct_actual_reference_numbers(tmp_path, monkeypatch):
@@ -248,7 +264,9 @@ def test_phase5_uses_stricter_action_budget_for_four_second_clip():
     assert overload["details"]["action_limit"] == 1
 
 
-def test_action_phantom_references_are_motion_bounded(tmp_path, monkeypatch):
+def test_action_phantom_with_cinematic_frame_keeps_only_strict_first_frame(
+    tmp_path, monkeypatch
+):
     characters = [
         {"id": "rin", "name": "凛", "aliases": []},
         {"id": "jin", "name": "烬", "aliases": []},
@@ -259,8 +277,7 @@ def test_action_phantom_references_are_motion_bounded(tmp_path, monkeypatch):
     for character in characters:
         _write_character_assets(tmp_path, character["id"], character["id"][0].encode())
     storyboard_dir = tmp_path / "storyboard_images"
-    storyboard_dir.mkdir()
-    (storyboard_dir / "S01.png").write_bytes(b"s" * 2048)
+    _write_cinematic_frame(storyboard_dir / "S01.png")
     monkeypatch.setattr(
         tos_uploader,
         "upload_image",
@@ -276,10 +293,8 @@ def test_action_phantom_references_are_motion_bounded(tmp_path, monkeypatch):
 
     images = [item for item in content if item["type"] == "image_url"]
     prompt = next(item["text"] for item in content if item["type"] == "text")
-    assert len(images) == 3
-    urls = [item["image_url"]["url"] for item in images]
-    assert "https://mock.invalid/R.png" in urls
-    assert "https://mock.invalid/J.png" in urls
+    assert [item["role"] for item in images] == ["first_frame"]
+    assert images[0]["image_url"]["url"] == "https://mock.invalid/s.png"
     assert "motion-priority" in prompt
     assert "主体箭头控制主体的运动方向、路径和速度趋势" in prompt
     assert "不得把它们转化成光效、道具、HUD、UI 或字幕" in prompt
@@ -384,6 +399,55 @@ def test_video_prompt_uses_neutral_lighting_for_empty_scene_consistency():
 
     assert "与全片美术风格一致的自然光照，明暗关系真实克制" in prompt
     assert "色温4800K" not in prompt
+
+
+def test_phase6_prompt_keeps_style_authoritative_and_removes_visible_ids():
+    shot = {
+        "id": 2,
+        "who": ["操纵者"],
+        "where": "中式皮影戏台幕布",
+        "visual": "操纵者在幕布后牵引皮影",
+        "subject_description": (
+            "冷银瓷质操纵者，服装左侧有3C91几何编号章；"
+            "朱红面纱舞者，衣服袖口有A857编号"
+        ),
+        "generation_actions": ["皮影缓慢扭腰甩袖"],
+        "camera_movement": "subtle_zoom_in",
+    }
+    characters = {
+        "characters": [{
+            "id": "puppeteer",
+            "name": "操纵者",
+            "appearance": {
+                "face": "冷银瓷质面部与钴蓝面纱",
+                "clothing": "暗色中式短衫，服装左侧有3C91几何编号章",
+                "distinguishing": "洋红识别灯，衣服袖口有A857编号",
+            },
+        }],
+    }
+    scene = {
+        "shots": {"S02": {
+            "lighting_description": "阴雨天冷光，低饱和度，覆盖全片调色",
+            "style_anchor": "靛蓝与炽橙中式皮影戏台美学",
+        }},
+    }
+
+    prompt, routed = _prepare_phase6_prompt(
+        "S02",
+        shot,
+        characters,
+        scene,
+        video_model="doubao-seedance-2.0-fast",
+        route_model="doubao-seedance-2.0-fast",
+    )
+
+    assert routed is True
+    assert "3C91" not in prompt
+    assert "A857" not in prompt
+    assert "阴雨天冷光" not in prompt
+    assert "低饱和度" not in prompt
+    assert "严格服从项目美术风格和 Phase 4 成片首帧" in prompt
+    assert "内部编号、序列号、铭文或字母数字标识只作为机器元数据" in prompt
 
 
 def test_seedance_single_route_preserves_complete_rainy_night_prompt():

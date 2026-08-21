@@ -18,6 +18,7 @@ from pydantic import ValidationError
 
 from clients import seedance_client, tos_uploader
 from clients.seedream_client import (
+    AgentPlanQuotaExceededError,
     IMAGE_ENDPOINT,
     SeedreamAPIError,
     SeedreamClient,
@@ -174,6 +175,52 @@ def test_seedream_http_error_keeps_provider_code_and_request_id(monkeypatch, tmp
     assert captured.value.provider_code == "InputImageSensitiveContentDetected"
     assert captured.value.request_id == "request-sensitive-123"
     assert "InputImageSensitiveContentDetected" in str(captured.value)
+
+
+def test_seedream_monthly_quota_exhaustion_fails_without_retry(monkeypatch, tmp_path):
+    error_payload = {
+        "error": {
+            "code": "AccountQuotaExceeded",
+            "message": (
+                "You have exceeded the monthly usage quota. "
+                "It will reset at 2026-09-02 23:59:59 +0800 CST."
+            ),
+        }
+    }
+    calls = 0
+
+    class FakeResponse:
+        status_code = 429
+        headers = {"x-request-id": "request-monthly-quota-123"}
+        text = json.dumps(error_payload)
+        request = None
+
+        @staticmethod
+        def json():
+            return error_payload
+
+    def fake_post(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return FakeResponse()
+
+    monkeypatch.setenv("SEEDREAM_MIN_INTERVAL", "0")
+    monkeypatch.setattr("clients.seedream_client.requests.post", fake_post)
+    monkeypatch.setattr(
+        "clients.seedream_client.time.sleep",
+        lambda _seconds: pytest.fail("fixed-window quota exhaustion must not sleep"),
+    )
+    client = SeedreamClient(api_key="test-key")
+
+    with pytest.raises(AgentPlanQuotaExceededError) as captured:
+        client.text_to_image(
+            "synthetic storyboard",
+            output_path=str(tmp_path / "unused.png"),
+        )
+
+    assert calls == 1
+    assert "2026-09-02 23:59:59 +0800 CST" in str(captured.value)
+    assert "request-monthly-quota-123" in str(captured.value)
 
 
 def test_planner_keeps_short_editorial_shots_backward_compatible():
@@ -569,8 +616,10 @@ def test_director_storyboard_calls_image_model_with_one_overview_contract(tmp_pa
     assert "16–24 像素纯白留白槽" in calls[0]["prompt"]
     assert "禁止在行间额外重复任何 Sxx 标题" in calls[0]["prompt"]
     assert "银白长发，暗银轻甲" in calls[0]["prompt"]
-    assert "S01 · 4s · WIDE · 内部1格" in calls[0]["prompt"]
-    assert "S02 · 4s · MEDIUM · 内部1格" in calls[0]["prompt"]
+    assert "S01 · 4s · WIDE · 内部1格" not in calls[0]["prompt"]
+    assert "S02 · 4s · MEDIUM · 内部1格" not in calls[0]["prompt"]
+    assert "时长、景别、内部故事格数量、动作方向和运镜信息只存在于机器可读 JSON" in calls[0]["prompt"]
+    assert persisted["panels"][0]["motion_annotations"]["render_in_pixels"] is False
     with Image.open(tmp_path / "director_storyboard.png") as image:
         assert image.size == tuple(manifest["size_actual"])
 
@@ -860,7 +909,12 @@ def test_complex_shot_maps_to_three_secondary_generation_strategies(tmp_path):
     assert contract["total_panels"] == 3
     assert contract["total_transition_panels"] == 1
     assert [call[0] for call in calls] == [
-        "text_to_image", "image_to_image", "image_to_image", "image_to_image",
+        "text_to_image",
+        "image_to_image",
+        "text_to_image",
+        "image_to_image",
+        "text_to_image",
+        "image_to_image",
     ]
     assert "S01_P01（第 1/2 格）" in calls[0][1]
     assert "S01_P02（第 2/2 格）" in calls[1][1]
@@ -891,6 +945,24 @@ def test_complex_shot_maps_to_three_secondary_generation_strategies(tmp_path):
     assert (tmp_path / "storyboard_bridges/S01__S02.png").is_file()
     assert validate_shot_storyboard_artifacts(tmp_path, storyboard) == []
     assert (tmp_path / "shot_storyboards/S01.png").is_file()
+    shot_record = json.loads(
+        (tmp_path / "shot_storyboards/S01.json").read_text(encoding="utf-8")
+    )
+    assert shot_record["grid_contract"]["columns"] == 3
+    assert shot_record["grid_contract"]["rows"] == 3
+    assert shot_record["grid_contract"]["cell_count"] == 9
+    assert len(shot_record["narrative_grid"]) == 9
+    assert shot_record["usage"] == "director_llm_review_only_not_video_reference"
+    manifest_path = tmp_path / "SHOT_STORYBOARDS.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["shots"][0]["grid_contract"]["cell_count"] = 8
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    assert any(
+        "S01 has an invalid 3x3 narrative grid contract" in error
+        for error in validate_shot_storyboard_artifacts(tmp_path, storyboard)
+    )
+    manifest["shots"][0]["grid_contract"]["cell_count"] = 9
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     assert (tmp_path / "storyboard_beats/S01_P01.png").is_file()
     assert (tmp_path / "storyboard_beats/S01_P02.png").is_file()
     assert (tmp_path / "storyboard_images/S01.png").is_file()
@@ -1075,9 +1147,10 @@ def test_storyboard_output_safety_rejection_gets_one_non_contact_retry(tmp_path)
         director_storyboard_path=tmp_path / "missing.png",
     )
 
-    assert len(prompts) == 2
+    assert len(prompts) == 3
     assert prompts[1].startswith("【自动安全重生成合同｜最高优先级】")
     assert "不要画拳、肘、膝或武器真正击中身体的瞬间" in prompts[1]
+    assert "严格使用 3 列 × 3 行九宫格" in prompts[2]
     panel = contract["shots"][0]["panels"][0]
     assert panel["safety_retry"]["policy"] == "synthetic_non_contact_stunt_v1"
     assert (tmp_path / panel["safety_retry"]["prompt"]).is_file()
@@ -1117,8 +1190,9 @@ def test_storyboard_input_safety_rejection_keeps_known_identity_references(tmp_p
             Image.new("RGB", (1280, 720), "green").save(output_path)
             return "https://image.invalid/seed-panel.png"
 
-        def text_to_image(self, **_kwargs):
-            pytest.fail("character shots must use image-to-image")
+        def text_to_image(self, output_path, **_kwargs):
+            Image.new("RGB", (1280, 720), "white").save(output_path)
+            return "https://image.invalid/nine-grid.png"
 
     generate_shot_storyboards(
         tmp_path,
@@ -1149,8 +1223,9 @@ def test_storyboard_input_safety_rejection_keeps_known_identity_references(tmp_p
             Image.new("RGB", (1280, 720), "green").save(output_path)
             return "https://image.invalid/reference-panel.png"
 
-        def text_to_image(self, **_kwargs):
-            pytest.fail("known accepted identity references should recover the request")
+        def text_to_image(self, output_path, **_kwargs):
+            Image.new("RGB", (1280, 720), "white").save(output_path)
+            return "https://image.invalid/nine-grid.png"
 
     contract = generate_shot_storyboards(
         tmp_path,
@@ -1228,6 +1303,7 @@ def test_storyboard_input_safety_rejection_has_bounded_text_fallback(tmp_path):
         "image_to_image",
         "image_to_image",
         "text_to_image",
+        "text_to_image",
     ]
     panel = contract["shots"][0]["panels"][0]
     assert panel["mode"] == "text_to_image"
@@ -1282,8 +1358,9 @@ def test_storyboard_reference_transport_failure_retries_same_request_twice(tmp_p
         director_storyboard_path=tmp_path / "missing.png",
     )
 
-    assert len(prompts) == 3
-    assert len(set(prompts)) == 1
+    assert len(prompts) == 4
+    assert len(set(prompts[:3])) == 1
+    assert "严格使用 3 列 × 3 行九宫格" in prompts[3]
     retry = contract["shots"][0]["panels"][0]["transport_retry"]
     assert retry == {
         "attempts": 2,
@@ -1324,12 +1401,15 @@ def test_phase2_uses_director_board_as_visual_reference_for_every_shot(tmp_path)
     }
     plan_storyboard_beats(storyboard)
     calls = []
+    board_calls = []
 
     class FakeImageClient:
         model = "fake-seedream"
 
-        def text_to_image(self, **kwargs):
-            pytest.fail("P01 must inherit the director overview through i2i")
+        def text_to_image(self, prompt, output_path, size, timeout):
+            board_calls.append((prompt, size))
+            Image.new("RGB", (1440, 2560), "white").save(output_path)
+            return "https://image.invalid/nine-grid.png"
 
         def image_to_image(self, prompt, ref_image, output_path, size):
             calls.append((prompt, ref_image, size))
@@ -1347,6 +1427,8 @@ def test_phase2_uses_director_board_as_visual_reference_for_every_shot(tmp_path)
     )
 
     assert len(calls) == 2
+    assert len(board_calls) == 2
+    assert all("严格使用 3 列 × 3 行九宫格" in call[0] for call in board_calls)
     assert calls[0][1] == str(tmp_path / "director_panels/S07.png")
     assert calls[1][1] == str(tmp_path / "director_panels/S08.png")
     assert all(str(director) not in str(call[1]) for call in calls)
@@ -2816,7 +2898,6 @@ def test_extension_provider_content_keeps_images_as_anchors_and_adds_video(monke
         "reference_image",
         "reference_image",
         "reference_image",
-        "reference_image",
         "reference_video",
     ]
     assert "向后延长视频1" in content[0]["text"]
@@ -2826,16 +2907,14 @@ def test_extension_provider_content_keeps_images_as_anchors_and_adds_video(monke
     assert "without a reset or cut" in content[0]["text"]
     assert "Do not skip forward in time" in content[0]["text"]
     assert "storyboard group CG001; step 1/1" in content[0]["text"]
-    assert "图片5是本连续组" in content[0]["text"]
-    assert "必须按当前格中的主体动作箭头和摄影机箭头" in content[0]["text"]
-    assert "不得在成片中生成箭头、辅助线" in content[0]["text"]
+    assert "图片5是本连续组" not in content[0]["text"]
+    assert "主体动作箭头和摄影机箭头" not in content[0]["text"]
     assert content[0]["text"].count("[storyboard-motion-notation]") == 1
     assert content[1]["image_url"]["url"] == "https://image.test/frame.png"
     assert [item["image_url"]["url"] for item in content[2:5]] == [
         f"https://image.test/{path.name}"
         for path in sorted((tmp_path / "continuity_anchors").glob("*_frame_*.jpg"))
     ]
-    assert content[5]["image_url"]["url"] == "https://image.test/CG001.jpg"
     assert content[-1]["video_url"]["url"] == "https://video.test/tail-window.mp4"
 
 
@@ -2941,7 +3020,7 @@ def test_fresh_provider_does_not_mix_first_frame_with_group_board(monkeypatch, t
     assert "storyboard group CG001; step 1/1" in content[0]["text"]
 
 
-def test_fresh_provider_content_uses_current_frame_and_group_storyboard(monkeypatch, tmp_path):
+def test_fresh_provider_content_uses_current_frame_but_not_group_board_pixels(monkeypatch, tmp_path):
     shot_dir = tmp_path / "shots/S01"
     shot_dir.mkdir(parents=True)
     (shot_dir / "SHOT_META.json").write_text(
@@ -2990,15 +3069,14 @@ def test_fresh_provider_content_uses_current_frame_and_group_storyboard(monkeypa
 
     content, *_ = _provider_content(tmp_path, request)
 
-    assert observed["max_images"] == 8
+    assert observed["max_images"] is None
     assert [item.get("image_url", {}).get("url") for item in content[1:]] == [
         "https://image.test/S01.png",
-        "https://image.test/CG001.jpg",
     ]
     assert "storyboard group CG001; step 1/2" in content[0]["text"]
     assert "Execute only this current shot action contract: 凛踩水冲出" in content[0]["text"]
-    assert "图片2是本连续组" in content[0]["text"]
-    assert "不得同时演完其他格" in content[0]["text"]
+    assert "图片2是本连续组" not in content[0]["text"]
+    assert "不得同时演完其他格" not in content[0]["text"]
 
 
 def test_extension_provider_content_never_exceeds_seedance_image_budget(monkeypatch, tmp_path):

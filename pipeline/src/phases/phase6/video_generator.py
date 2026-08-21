@@ -22,6 +22,10 @@ from utils.character_body_contracts import (
     body_contract_forbidden,
     body_contract_prompt,
 )
+from utils.pixel_text_policy import (
+    PIXEL_TEXT_METADATA_CONTRACT,
+    strip_pixel_text_identity_markers,
+)
 from utils.storyboard_motion_policy import apply_storyboard_motion_policy
 from utils.style_slices import get_slice
 from utils.temporal_visual_contracts import (
@@ -73,6 +77,25 @@ def _shot_number(shot_meta: dict[str, Any]) -> int:
         return int(str(raw).lstrip("Ss"))
     except (TypeError, ValueError):
         return 1
+
+
+def resolve_video_lighting(
+    scene: dict[str, Any],
+    global_lighting: object = "",
+) -> str:
+    """Keep continuity lighting subordinate to an authored visual-style anchor."""
+    if scene.get("style_anchor") or scene.get("style_suffix"):
+        return (
+            "光影、调色、饱和度、舞台介质与主辅光颜色严格服从项目美术风格"
+            "和 Phase 4 成片首帧；场景连续性只维持同一风格内的光位与明暗关系，"
+            "任何冲突的天气、色温或饱和度描述均忽略"
+        )
+    return str(
+        scene.get("lighting_description")
+        or scene.get("lighting_note")
+        or global_lighting
+        or "与全片美术风格一致的自然光照，明暗关系真实克制"
+    )
 
 
 def build_video_prompt(
@@ -127,9 +150,14 @@ def build_video_prompt(
         traits = []
         for character in selected:
             appearance = character.get("appearance", {})
-            stable = [str(appearance.get(key, "")).strip() for key in ("hair", "face", "clothing") if appearance.get(key)][:3]
+            stable = [
+                strip_pixel_text_identity_markers(appearance.get(key))
+                for key in ("hair", "face", "clothing")
+                if appearance.get(key)
+            ][:3]
             traits.append(f"{character.get('name')}—{'，'.join(stable)}")
         subject = "；".join(traits) or shot_meta.get("visual") or "场景主体"
+    subject = strip_pixel_text_identity_markers(subject)
     generation_actions = shot_meta.get("generation_actions") or []
     if isinstance(generation_actions, str):
         generation_actions = [generation_actions]
@@ -145,7 +173,10 @@ def build_video_prompt(
     camera = camera_movement_description(shot_meta.get("camera_movement"))
     layout = scene.get("spatial_layout", {})
     setting = scene.get("scene_description") or shot_meta.get("where") or "当前场景"
-    lighting = scene.get("lighting_description") or scene.get("lighting_note") or scene_consistency.get("global_lighting") or "与全片美术风格一致的自然光照，明暗关系真实克制"
+    lighting = resolve_video_lighting(
+        scene,
+        scene_consistency.get("global_lighting"),
+    )
     if temporal_contract is None:
         temporal_contract = build_temporal_visual_contract(
             visual_context=" ".join(
@@ -202,6 +233,7 @@ def build_video_prompt(
         parts.append(f"时空连续性硬约束：{time_lock}")
     # Layer 8 is appended after the bounded summary and is never truncated.
     parts.append(f"全局收尾：{style}；{quality}")
+    parts.append(PIXEL_TEXT_METADATA_CONTRACT)
 
     negatives = [str(scene.get("negative_prompt", "")).strip()]
     if explicit_scenery:

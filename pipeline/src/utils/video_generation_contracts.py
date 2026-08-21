@@ -9,6 +9,7 @@ from typing import Any
 from utils.camera_motion_contracts import camera_motion_execution_prompt
 from utils.character_reference_contracts import normalize_identity_props
 from utils.privacy_visual_policy import is_synthetic_visual_identity_policy
+from utils.pixel_text_policy import strip_pixel_text_identity_markers
 
 VIDEO_GENERATION_CONTRACT_MARKER = "[honcut-video-generation-contract-v2]"
 
@@ -152,7 +153,10 @@ def _appearance_values(character: Mapping[str, Any]) -> dict[str, str]:
         return {}
     values = {}
     for field, _label in _CANONICAL_APPEARANCE_FIELDS:
-        value = _bounded_contract_text(appearance.get(field), 600)
+        value = _bounded_contract_text(
+            strip_pixel_text_identity_markers(appearance.get(field)),
+            600,
+        )
         if value:
             values[field] = value
     return values

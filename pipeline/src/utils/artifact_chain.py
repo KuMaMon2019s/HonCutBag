@@ -13,9 +13,9 @@ from typing import Optional
 # HonCut 产物链定义
 ARTIFACT_CHAIN = {
     "phase1":   {"produces": "director_plan.json + events.json + CHARACTERS.json + STORYBOARD.json", "requires": []},
-    "phase2":   {"produces": "SHOT_STORYBOARDS.json + storyboard_beats/ + shot_storyboards/ + storyboard_images/", "requires": ["STORYBOARD.json"]},
+    "phase2":   {"produces": "SHOT_STORYBOARDS.json + PREVIS storyboard_beats/ + LLM-only 3x3 shot_storyboards/", "requires": ["STORYBOARD.json"]},
     "phase3":   {"produces": "characters/",                           "requires": ["CHARACTERS.json"]},
-    "phase4":   {"produces": "shots/",                                "requires": ["STORYBOARD.json"]},
+    "phase4":   {"produces": "CINEMATIC_FIRST_FRAMES.json + video_first_frames/ + shots/", "requires": ["STORYBOARD.json"]},
     "phase5":   {"produces": "storyboard_qa_report.json",             "requires": ["STORYBOARD.json", "shots/"]},
     "phase6":   {"produces": "shots/*/output.mp4",                   "requires": ["shots/", "storyboard_qa_report.json"]},
     "phase7":   {"produces": "quality_report.json",                   "requires": ["shots/"]},

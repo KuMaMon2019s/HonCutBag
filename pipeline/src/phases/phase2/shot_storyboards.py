@@ -29,6 +29,11 @@ from utils.temporal_visual_contracts import (
 )
 
 SHOT_STORYBOARD_SIZE = "2560x1440"
+SHOT_STORYBOARD_GRID_COLUMNS = 3
+SHOT_STORYBOARD_GRID_ROWS = 3
+SHOT_STORYBOARD_GRID_CELLS = (
+    SHOT_STORYBOARD_GRID_COLUMNS * SHOT_STORYBOARD_GRID_ROWS
+)
 
 
 class ImageGenerationClient(Protocol):
@@ -87,6 +92,60 @@ def _edge_handle_contract(beat: dict[str, Any]) -> str:
             f"结尾前完成全部剧情动作，最后{outgoing:g}秒稳定保持结束状态"
         )
     return "；".join(clauses) or "无跨一级分镜边界把手"
+
+
+def _narrative_grid_contract(
+    shot: dict[str, Any],
+    shot_id: str,
+    beats: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Expand one primary Sxx plus its ordered Pxx beats into nine review cells.
+
+    The grid is a director/LLM narrative artifact, not a provider frame ledger.
+    Cells subdivide only already-authored start/action/end facts and therefore do
+    not create new plot events when one Pxx needs more than three review cells.
+    """
+    base, remainder = divmod(SHOT_STORYBOARD_GRID_CELLS, len(beats))
+    cells: list[dict[str, Any]] = []
+    for beat_index, beat in enumerate(beats):
+        cell_count = base + (1 if beat_index < remainder else 0)
+        beat_id = str(beat.get("beat_id") or f"{shot_id}_P{beat_index + 1:02d}")
+        start_state = _compact(beat.get("start_state"), 320)
+        action = _compact(beat.get("action"), 520)
+        end_state = _compact(beat.get("end_state"), 320)
+        for local_index in range(cell_count):
+            if local_index == 0:
+                stage = "start"
+                visible_fact = start_state or action
+            elif local_index == cell_count - 1:
+                stage = "end"
+                visible_fact = end_state or action
+            else:
+                stage = "action_progress"
+                progress = round(local_index / max(cell_count - 1, 1), 3)
+                visible_fact = (
+                    f"仅演绎本格既有动作的 {progress:.0%} 进度：{action}；"
+                    "不得增加新事件、角色、道具或结果"
+                )
+            cells.append({
+                "cell": len(cells) + 1,
+                "label": f"{shot_id}_G{len(cells) + 1:02d}",
+                "primary_shot_id": shot_id,
+                "secondary_beat_id": beat_id,
+                "secondary_beat_position": beat_index + 1,
+                "stage": stage,
+                "visible_fact": visible_fact,
+                "camera_movement": beat.get("camera_movement")
+                or shot.get("camera_movement")
+                or "steadicam",
+                "rendered_annotations": ["cell_label"],
+            })
+    if len(cells) != SHOT_STORYBOARD_GRID_CELLS:
+        raise RuntimeError(
+            f"{shot_id} narrative grid produced {len(cells)} cells, expected "
+            f"{SHOT_STORYBOARD_GRID_CELLS}"
+        )
+    return cells
 
 
 def _character_contract(
@@ -155,6 +214,7 @@ def build_shot_storyboard_prompt(
     ]
     if not beats:
         raise ValueError(f"{shot_id} has no storyboard_beats")
+    narrative_grid = _narrative_grid_contract(shot, shot_id, beats)
     who = _shot_who(shot)
     beat_lines = []
     for position, beat in enumerate(beats, 1):
@@ -180,11 +240,20 @@ def build_shot_storyboard_prompt(
             f"物理合同={beat_camera_contract}；"
             f"逐拍肢体动作谱={_compact(beat_choreography, 1200) or '无专项舞蹈/格斗动作'}。"
         )
-    prompt = f"""为导演级镜头 {shot_id} 绘制一张内部动作故事板。
+    grid_lines = [
+        (
+            f"格{cell['cell']}【{cell['label']}｜一级={shot_id}｜"
+            f"二级={cell['secondary_beat_id']}｜阶段={cell['stage']}】："
+            f"{cell['visible_fact']}；运镜={cell['camera_movement']}。"
+        )
+        for cell in narrative_grid
+    ]
+    prompt = f"""为导演级镜头 {shot_id} 绘制一张九宫格剧情演绎故事板。
 
 版式合同：
-- 单张 {aspect_ratio} 故事板纸，严格按时间顺序排列 {len(beats)} 格，恰好对应 P01 到 P{len(beats):02d}。
-- 每格顶部只写 {shot_id}_P01、{shot_id}_P02 这样的编号；不得增加、合并、重复或交换格子。
+- 单张 {aspect_ratio} 故事板纸，严格使用 3 列 × 3 行九宫格，恰好 9 格；格子等宽等高，阅读顺序从左到右、从上到下。
+- 每格顶部只写 {shot_id}_G01 到 {shot_id}_G09；不得增加、合并、重复、交换、跨格或省略格子。
+- 九宫格按一级镜头 {shot_id} 的剧情顺序，完整演绎二级 P01 到 P{len(beats):02d}；同一 Pxx 占多格时只能细分既有动作进度，不得发明新剧情。
 - 这是 {shot_id} 自己的故事板，不要画其他 Sxx 的内容。
 
 绘画风格：
@@ -214,10 +283,13 @@ def build_shot_storyboard_prompt(
 摄影与人体透视禁止项：
 - {camera_motion_negative_prompt(shot)}。
 
-逐格合同：
+二级 Pxx 执行合同：
 {chr(10).join(beat_lines)}
 
-最终检查：恰好 {len(beats)} 格，严格服从每格标记的执行模式；全部当前 Sxx 动作只能由 MULTI_IMAGE/TAIL_VIDEO_EXTEND 格按原顺序覆盖，不得绘制跨一级分镜桥接格。"""
+九宫格演绎合同：
+{chr(10).join(grid_lines)}
+
+最终检查：画面必须是完整 3×3、恰好 9 格，G01 至 G09 连续且各出现一次；严格服从每个格子绑定的 Pxx 和阶段。全部当前 Sxx 动作只能按原顺序覆盖，不得绘制跨一级分镜桥接格，也不得把九宫格误作视频首帧或成片质感参考。"""
     return prompt, beats
 
 
@@ -432,6 +504,78 @@ def _compose_board(
             width=3,
         )
     board.save(board_path, format="PNG", optimize=True)
+
+
+def _normalize_nine_grid_board(board_path: Path, shot_id: str) -> dict[str, Any]:
+    """Overlay an exact 3x3 machine-readable boundary on model-drawn board art."""
+    with Image.open(board_path) as source:
+        board = source.convert("RGB")
+    width, height = board.size
+    if width < 300 or height < 180:
+        raise RuntimeError(
+            f"{shot_id} nine-grid storyboard is too small: {width}x{height}"
+        )
+    draw = ImageDraw.Draw(board)
+    gutter = max(8, round(min(width / 3, height / 3) * 0.025))
+    border = max(3, gutter // 3)
+    label_font = _font(max(18, round(height / 42)))
+    cells: list[dict[str, Any]] = []
+    for index in range(SHOT_STORYBOARD_GRID_CELLS):
+        row, column = divmod(index, SHOT_STORYBOARD_GRID_COLUMNS)
+        left = round(column * width / SHOT_STORYBOARD_GRID_COLUMNS)
+        right = round((column + 1) * width / SHOT_STORYBOARD_GRID_COLUMNS)
+        top = round(row * height / SHOT_STORYBOARD_GRID_ROWS)
+        bottom = round((row + 1) * height / SHOT_STORYBOARD_GRID_ROWS)
+        if column:
+            draw.rectangle(
+                (left - gutter // 2, 0, left + math.ceil(gutter / 2), height),
+                fill="white",
+            )
+        if row:
+            draw.rectangle(
+                (0, top - gutter // 2, width, top + math.ceil(gutter / 2)),
+                fill="white",
+            )
+        cells.append({
+            "cell": index + 1,
+            "label": f"{shot_id}_G{index + 1:02d}",
+            "grid_row": row,
+            "grid_column": column,
+            "bbox_px": [left, top, right, bottom],
+        })
+    for cell in cells:
+        left, top, right, bottom = cell["bbox_px"]
+        inset = max(2, gutter // 2)
+        draw.rectangle(
+            (left + inset, top + inset, right - inset, bottom - inset),
+            outline=(20, 20, 20),
+            width=border,
+        )
+        text_x = left + inset + border + 6
+        text_y = top + inset + border + 4
+        text_bbox = draw.textbbox((text_x, text_y), cell["label"], font=label_font)
+        padding = max(4, border)
+        draw.rectangle(
+            (
+                text_bbox[0] - padding,
+                text_bbox[1] - padding,
+                text_bbox[2] + padding,
+                text_bbox[3] + padding,
+            ),
+            fill="white",
+        )
+        draw.text((text_x, text_y), cell["label"], fill="black", font=label_font)
+    temporary = board_path.with_suffix(".png.tmp")
+    board.save(temporary, format="PNG", optimize=True)
+    temporary.replace(board_path)
+    return {
+        "schema": "honcut.shot-storyboard-grid.v1",
+        "columns": SHOT_STORYBOARD_GRID_COLUMNS,
+        "rows": SHOT_STORYBOARD_GRID_ROWS,
+        "cell_count": SHOT_STORYBOARD_GRID_CELLS,
+        "reading_order": "left_to_right_top_to_bottom",
+        "cells": cells,
+    }
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:
@@ -915,6 +1059,8 @@ def validate_shot_storyboard_artifacts(
         manifest = output_dir / "SHOT_STORYBOARDS.json"
         try:
             document = json.loads(manifest.read_text(encoding="utf-8"))
+            if document.get("kind") != "honcut.shot_storyboards.v2":
+                errors.append("SHOT_STORYBOARDS.json is not the nine-grid v2 contract")
             if document.get("status") != "done":
                 errors.append("SHOT_STORYBOARDS.json is not complete")
             if int(document.get("total_panels") or 0) != authored_count:
@@ -939,6 +1085,48 @@ def validate_shot_storyboard_artifacts(
                 errors.append(
                     "SHOT_STORYBOARDS.json has incomplete post-primary transitions"
                 )
+            manifest_shots = {
+                str(record.get("shot_id") or ""): record
+                for record in (document.get("shots") or [])
+                if isinstance(record, dict) and record.get("shot_id")
+            }
+            for shot_index, shot in enumerate(storyboard.get("shots", []), 1):
+                if not isinstance(shot, dict):
+                    continue
+                shot_id = _shot_id(shot, shot_index)
+                record = manifest_shots.get(shot_id)
+                if not record or record.get("status") != "done":
+                    errors.append(f"{shot_id} has no completed nine-grid storyboard")
+                    continue
+                grid = record.get("grid_contract") or {}
+                narrative = record.get("narrative_grid") or []
+                if (
+                    grid.get("columns") != SHOT_STORYBOARD_GRID_COLUMNS
+                    or grid.get("rows") != SHOT_STORYBOARD_GRID_ROWS
+                    or grid.get("cell_count") != SHOT_STORYBOARD_GRID_CELLS
+                    or len(grid.get("cells") or []) != SHOT_STORYBOARD_GRID_CELLS
+                    or len(narrative) != SHOT_STORYBOARD_GRID_CELLS
+                ):
+                    errors.append(f"{shot_id} has an invalid 3x3 narrative grid contract")
+                if record.get("usage") != "director_llm_review_only_not_video_reference":
+                    errors.append(f"{shot_id} nine-grid board has unsafe usage metadata")
+                board_value = str(record.get("board") or "").strip()
+                if not board_value:
+                    errors.append(f"{shot_id} nine-grid board path is missing")
+                    continue
+                board_path = _artifact_path(output_dir, board_value)
+                try:
+                    if not board_path.is_file() or board_path.stat().st_size <= 1024:
+                        raise OSError("file missing or too small")
+                    with Image.open(board_path) as board_image:
+                        board_image.verify()
+                    observed_sha = hashlib.sha256(board_path.read_bytes()).hexdigest()
+                    if observed_sha != str(record.get("board_sha256") or ""):
+                        raise ValueError("board hash mismatch")
+                except (OSError, ValueError) as exc:
+                    errors.append(
+                        f"{shot_id} invalid nine-grid storyboard {board_value}: {exc}"
+                    )
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             errors.append(f"SHOT_STORYBOARDS.json unreadable: {exc}")
     return errors
@@ -989,8 +1177,8 @@ def generate_shot_storyboards(
         if shot_id not in normalized_targets
     ]
     contract: dict[str, Any] = {
-        "kind": "honcut.shot_storyboards.v1",
-        "version": 1,
+        "kind": "honcut.shot_storyboards.v2",
+        "version": 2,
         "status": "running",
         "provider": "seedream",
         "model": model,
@@ -1090,6 +1278,7 @@ def generate_shot_storyboards(
             board_path = boards_dir / f"{shot_id}.png"
             prompt_path.write_text(prompt, encoding="utf-8")
             prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+            narrative_grid = _narrative_grid_contract(shot, shot_id, beats)
             director_panel = director_panels.get(shot_id)
             correction_issues = correction_context_by_shot.get(shot_id, [])
             record = {
@@ -1098,6 +1287,10 @@ def generate_shot_storyboards(
                 "prompt": str(prompt_path.relative_to(output_dir)),
                 "prompt_sha256": prompt_sha,
                 "panel_count": len(beats),
+                "narrative_grid": narrative_grid,
+                "grid_columns": SHOT_STORYBOARD_GRID_COLUMNS,
+                "grid_rows": SHOT_STORYBOARD_GRID_ROWS,
+                "grid_cell_count": SHOT_STORYBOARD_GRID_CELLS,
                 "director_panel": (
                     str(director_panel.relative_to(output_dir))
                     if director_panel is not None and director_panel.is_relative_to(output_dir)
@@ -1478,16 +1671,48 @@ def generate_shot_storyboards(
                 panel_records.append(panel_record)
                 panel_paths.append(panel_path)
                 previous_panel = panel_path
-            _compose_board(
-                panel_paths,
-                [str(beat.get("beat_id")) for beat in beats],
-                board_path,
+            # The Sxx board is a director/LLM-only nine-grid narrative artifact.
+            # It is generated independently from the per-Pxx images and is never
+            # eligible as video-model media. Exact grid boundaries and cell IDs
+            # are then overlaid deterministically so layout cannot silently
+            # collapse into a linear strip.
+            board_result_url = client.text_to_image(
+                prompt=prompt,
+                output_path=str(board_path),
+                size=size,
+                timeout=180,
             )
-            shutil.copy2(panel_paths[0], image_dir / f"{shot_id}.png")
+            if not board_path.is_file() or board_path.stat().st_size == 0:
+                raise RuntimeError(f"Seedream returned without {board_path.name}")
+            with Image.open(board_path) as board_image:
+                board_image.verify()
+            raw_board_sha256 = hashlib.sha256(board_path.read_bytes()).hexdigest()
+            grid_contract = _normalize_nine_grid_board(board_path, shot_id)
+            legacy_preview_path = image_dir / f"{shot_id}.png"
+            shutil.copy2(panel_paths[0], legacy_preview_path)
+            _write_json(
+                image_dir / f"{shot_id}.json",
+                {
+                    "kind": "honcut.previs-placeholder.v1",
+                    "status": "previs_only",
+                    "usage": "phase2_review_placeholder_never_video_reference",
+                    "image": str(legacy_preview_path.relative_to(output_dir)),
+                    "image_sha256": hashlib.sha256(
+                        legacy_preview_path.read_bytes()
+                    ).hexdigest(),
+                    "source": str(panel_paths[0].relative_to(output_dir)),
+                    "replaced_by_phase": "phase4_cinematic_first_frames",
+                },
+            )
             record.update({
                 "status": "done",
                 "model": contract["model"],
                 "panels": panel_records,
+                "usage": "director_llm_review_only_not_video_reference",
+                "result_url": board_result_url,
+                "raw_board_sha256": raw_board_sha256,
+                "board_sha256": hashlib.sha256(board_path.read_bytes()).hexdigest(),
+                "grid_contract": grid_contract,
             })
             shot["storyboard_board"] = record["board"]
             shot["storyboard_beats"] = beats

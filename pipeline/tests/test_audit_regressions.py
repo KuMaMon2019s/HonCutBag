@@ -56,6 +56,11 @@ from phases.phase2.shot_storyboards import (
 )
 from phases.phase3 import character_factory
 from phases.phase4.continuity_plan import build_continuity_plan
+from phases.phase4.cinematic_first_frames import (
+    CINEMATIC_FIRST_FRAME_SCHEMA,
+    generate_cinematic_first_frames,
+    validate_cinematic_first_frame_artifacts,
+)
 from phases.phase5 import storyboard_qa_gate
 from phases.phase6.video_generator import build_video_prompt
 from phases.phase8 import duration_gate
@@ -76,6 +81,7 @@ from quality.shot_continuity import annotate_boundaries, classify_boundary
 from quality.variation_checker import check_scene_variation
 from runtime.run_manifest import prepare_run_manifest
 from tools.checkpoint import invalidate_checkpoint_from, write_checkpoint
+from tools.asset_packager import _assert_video_frame_provenance
 from tools.smart_transition import decide_all_transitions
 from utils.artifact_chain import get_resumable_phase, invalidate_checkpoints_from
 from utils.shot_embedder import compute_transition_similarity
@@ -1695,8 +1701,9 @@ def test_character_references_refresh_the_canonical_pxx_chain(tmp_path):
             Image.new("RGB", (64, 64), "blue").save(output_path)
             return "https://image.invalid/result.png"
 
-        def text_to_image(self, **_kwargs):
-            raise AssertionError("character shot must use image-to-image")
+        def text_to_image(self, output_path, **_kwargs):
+            Image.new("RGB", (1280, 720), "white").save(output_path)
+            return "https://image.invalid/nine-grid.png"
 
     storyboard = {
         "shots": [
@@ -3558,6 +3565,38 @@ def test_phase5_global_issue_prevents_wasted_visual_redraw(tmp_path):
     assert result["issues"] == [variation_issue, camera_issue]
 
 
+def test_phase5_l4_issue_restarts_phase4_without_redrawing_previs(tmp_path):
+    l4_issue = storyboard_qa_gate._issue(
+        "L4",
+        "severe",
+        "first_frame_style_mismatch",
+        "S02_P01 is pencil PREVIS instead of the authored indigo/orange stage",
+        ["S02"],
+        frame_ids=["S02_P01"],
+        expected="indigo/orange shadow-puppet stage",
+        observed="white-paper pencil line art",
+    )
+
+    result = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        max_correction_attempts=2,
+        qa_runner=lambda _output_dir: {
+            "status": "error",
+            "grade": "D",
+            "gate_passed": False,
+            "issues": [l4_issue],
+            "failed_shot_ids": ["S02"],
+        },
+        redraw_runner=lambda *_args: pytest.fail(
+            "L4 must regenerate Phase 4 cinematic pixels, not redraw PREVIS"
+        ),
+    )
+
+    assert result["correction"]["status"] == "requires_replanning"
+    assert result["correction"]["recommended_restart_phase"] == "phase4"
+    assert result["correction"]["attempts_used"] == 0
+
+
 @pytest.mark.parametrize("shot_count", [3, 5, 8])
 def test_variation_check_is_pure_for_different_storyboard_shapes(shot_count):
     scenes = [
@@ -3778,10 +3817,11 @@ def test_phase5_real_redraw_reuses_generator_and_archives_failed_shot(tmp_path):
         image_client=client,
     )
 
-    assert len(generated_prompts) == 3
-    assert "Phase 5 定向纠偏合同" in generated_prompts[-1]
-    assert "观察窗保持完整，Agent 稳定定格" in generated_prompts[-1]
-    assert "保安撞破观察窗飞入太空" in generated_prompts[-1]
+    assert len(generated_prompts) == 6
+    correction_prompt = generated_prompts[-2]
+    assert "Phase 5 定向纠偏合同" in correction_prompt
+    assert "观察窗保持完整，Agent 稳定定格" in correction_prompt
+    assert "保安撞破观察窗飞入太空" in correction_prompt
     archive = tmp_path / receipt["archive"]["archive_dir"] / "before"
     assert (archive / "storyboard_beats/S02_P01.png").is_file()
     assert (archive / "storyboard_qa_report.json").is_file()
@@ -3847,6 +3887,264 @@ def test_phase5_l3_supplies_canonical_character_images(tmp_path):
     assert "panel_evidence" in client.prompt
     assert "A mutual weapon-disarm action is not satisfied" in client.prompt
     assert "stable/stopped/freeze-frame" in client.prompt
+
+
+def test_director_board_keeps_motion_metadata_out_of_pixels():
+    storyboard = {
+        "shots": [{
+            "id": "S02",
+            "duration": 8,
+            "camera_movement": "subtle zoom in",
+            "storyboard_beats": [{"beat_id": "S02_P01"}, {"beat_id": "S02_P02"}],
+            "generation_actions": ["银色傀儡转身"],
+        }],
+    }
+
+    prompt, panels, _layout = build_director_storyboard_prompt(storyboard)
+
+    assert "×N格" not in prompt
+    assert "动作方向用红色手绘箭头" not in prompt
+    assert "摄像机运动用蓝色手绘箭头" not in prompt
+    assert "禁止字幕、拍数、Pxx 编号、动作箭头、运镜箭头" in prompt
+    assert panels[0]["storyboard_beat_count"] == 2
+    assert panels[0]["motion_annotations"] == {
+        "action": "银色傀儡转身",
+        "camera_movement": "subtle zoom in",
+        "camera_motion_contract": panels[0]["motion_annotations"][
+            "camera_motion_contract"
+        ],
+        "camera_motion_negative": panels[0]["motion_annotations"][
+            "camera_motion_negative"
+        ],
+        "body_action_contract": panels[0]["motion_annotations"][
+            "body_action_contract"
+        ],
+        "render_in_pixels": False,
+    }
+
+
+def test_phase4_cinematic_frames_inject_style_and_exclude_previs(tmp_path):
+    from PIL import Image
+
+    _write_project_visual_style(tmp_path, "皮影戏台，靛蓝幕布，炽橙轮廓光，平面剪影材质")
+    character_dir = tmp_path / "characters" / "puppet"
+    character_dir.mkdir(parents=True)
+    for name in ("face_closeup.png", "full_body.png"):
+        Image.effect_noise((320, 180), 70).convert("RGB").save(character_dir / name)
+    previs_dir = tmp_path / "storyboard_beats"
+    previs_dir.mkdir()
+    previs_path = previs_dir / "S02_P01.png"
+    Image.effect_noise((320, 180), 90).convert("RGB").save(previs_path)
+    director_dir = tmp_path / "director_panels"
+    director_dir.mkdir()
+    director_panel = director_dir / "S02.png"
+    Image.effect_noise((320, 180), 40).convert("RGB").save(director_panel)
+    storyboard = {
+        "aspect_ratio": "16:9",
+        "shots": [{
+            "id": "S02",
+            "who": ["puppet"],
+            "where": "靛蓝幕布皮影戏台",
+            "storyboard_beats": [{
+                "beat_id": "S02_P01",
+                "start_state": "银色傀儡投影贴合于幕布中央",
+                "action": "银色傀儡抬手",
+                "end_state": "傀儡手臂抬起",
+                "storyboard_image": "storyboard_beats/S02_P01.png",
+            }],
+        }],
+    }
+    calls = []
+
+    class FakeClient:
+        model = "fake-seedream"
+
+        def image_to_image(self, prompt, ref_image, output_path, size):
+            calls.append((prompt, ref_image, size))
+            Image.effect_noise((640, 360), 50).convert("RGB").save(output_path)
+            return "https://image.invalid/cinematic.png"
+
+        def text_to_image(self, **_kwargs):
+            raise AssertionError("character-locked frame must use image_to_image")
+
+    manifest = generate_cinematic_first_frames(
+        tmp_path,
+        storyboard,
+        [{
+            "id": "puppet",
+            "name": "银色傀儡",
+            "appearance": {
+                "summary": (
+                    "银色皮影剪影；锁骨保留洋红识别灯，"
+                    "服装左侧有3C91几何编号章"
+                )
+            },
+        }],
+        {"shots": {"S02": {
+            "lighting_description": "阴雨天冷光，低饱和度，覆盖全片调色",
+        }}},
+        client=FakeClient(),
+    )
+
+    assert manifest["status"] == "done"
+    assert manifest["frame_count"] == 1
+    assert calls[0][0].startswith("【美术风格｜最高优先级｜成片质感】")
+    assert "皮影戏台" in calls[0][0]
+    assert "靛蓝" in calls[0][0]
+    assert "禁止任何红色/蓝色/彩色动作箭头" in calls[0][0]
+    assert "导演故事板单格" in calls[0][0]
+    assert "绝不继承其线稿媒介" in calls[0][0]
+    assert "3C91几何编号章" not in calls[0][0]
+    assert "阴雨天冷光" not in calls[0][0]
+    assert "低饱和度" not in calls[0][0]
+    assert "内部编号、序列号、铭文或字母数字标识只作为机器元数据" in calls[0][0]
+    assert "美术风格光影与色彩合同为唯一权威" in calls[0][0]
+    assert "首帧舞台介质硬合同｜零例外" in calls[0][0]
+    assert "画面中幕前实体角色数量必须为零" in calls[0][0]
+    references = calls[0][1] if isinstance(calls[0][1], list) else [calls[0][1]]
+    assert references[0] == str(director_panel)
+    assert all("storyboard_beats" not in value for value in references)
+    beat = storyboard["shots"][0]["storyboard_beats"][0]
+    assert beat["video_first_frame_kind"] == CINEMATIC_FIRST_FRAME_SCHEMA
+    frame_path = tmp_path / beat["video_first_frame"]
+    assert frame_path.read_bytes() != previs_path.read_bytes()
+    assert validate_cinematic_first_frame_artifacts(tmp_path, storyboard) == []
+    receipt = json.loads(
+        (tmp_path / beat["video_first_frame_receipt"]).read_text(encoding="utf-8")
+    )
+    assert receipt["reference_roles"][0] == "director_single_panel_composition_only"
+    assert receipt["upstream_director_panel"] == "director_panels/S02.png"
+    assert receipt["upstream_director_panel_usage"].endswith("never_video_reference")
+    assert receipt["previs_reference_images"] == []
+    assert receipt["character_identity_reference_mode"] == (
+        "text_contract_only_for_flat_shadow_material"
+    )
+    plan = build_continuity_plan(storyboard)
+    assert plan.shots[0].chunks[0].storyboard_image == beat["video_first_frame"]
+    assert (
+        plan.shots[0].chunks[0].storyboard_image_kind
+        == CINEMATIC_FIRST_FRAME_SCHEMA
+    )
+
+
+def test_phase4_l4_rejection_invalidates_rejected_frame_cache_once(tmp_path):
+    from PIL import Image
+
+    _write_project_visual_style(
+        tmp_path,
+        "皮影剪影、靛蓝幕布、炽橙轮廓光",
+    )
+    storyboard = {
+        "shots": [{
+            "id": "S02",
+            "where": "皮影戏台",
+            "storyboard_beats": [
+                {"beat_id": "S02_P01", "action": "傀儡抬手"},
+                {"beat_id": "S02_P02", "action": "幕布落下"},
+            ],
+        }]
+    }
+    calls = []
+    prompts = []
+
+    class FakeClient:
+        model = "fake-seedream"
+
+        def text_to_image(self, prompt, output_path, size, timeout):
+            calls.append(Path(output_path).stem)
+            prompts.append(prompt)
+            Image.new("RGB", (1280, 720), "navy").save(output_path)
+            return "https://image.invalid/frame.png"
+
+    client = FakeClient()
+    generate_cinematic_first_frames(tmp_path, storyboard, [], client=client)
+    assert calls == ["S02_P01", "S02_P02"]
+
+    (tmp_path / "storyboard_qa_report.json").write_text(
+        json.dumps({
+            "gate_passed": False,
+            "issues": [{
+                "layer": "L4",
+                "severity": "severe",
+                "code": "first_frame_style_mismatch",
+                "message": "实体人偶不符合皮影媒介",
+                "details": {
+                    "frame_ids": ["S02_P01"],
+                    "expected": "幕布平面上的镂空皮影",
+                    "observed": "幕前实体三维人偶",
+                },
+            }],
+        }),
+        encoding="utf-8",
+    )
+    generate_cinematic_first_frames(tmp_path, storyboard, [], client=client)
+    assert calls == ["S02_P01", "S02_P02", "S02_P01"]
+    assert "L4 定向纠偏合同" in prompts[-1]
+    assert "本轮必须呈现：幕布平面上的镂空皮影" in prompts[-1]
+    assert "严禁再次呈现：幕前实体三维人偶" in prompts[-1]
+    generate_cinematic_first_frames(tmp_path, storyboard, [], client=client)
+    assert calls == ["S02_P01", "S02_P02", "S02_P01"]
+
+
+def test_video_transport_rejects_previs_frame_even_when_it_exists(tmp_path):
+    from PIL import Image
+
+    path = tmp_path / "storyboard_beats" / "S02_P01.png"
+    path.parent.mkdir()
+    Image.effect_noise((320, 180), 80).convert("RGB").save(path)
+
+    with pytest.raises(ValueError, match="PREVIS/director board"):
+        _assert_video_frame_provenance(path)
+
+
+def test_phase5_first_frame_review_blocks_style_and_annotation_pollution(tmp_path):
+    from PIL import Image
+
+    frame = tmp_path / "S02_P01.png"
+    Image.effect_noise((320, 180), 80).convert("RGB").save(frame)
+    storyboard = {
+        "shots": [{
+            "id": "S02",
+            "storyboard_beats": [{
+                "beat_id": "S02_P01",
+                "video_first_frame_kind": CINEMATIC_FIRST_FRAME_SCHEMA,
+            }],
+        }],
+    }
+
+    class ReviewClient:
+        def review(self, paths, prompt):
+            assert paths == [frame]
+            assert "ANNOTATION_CONTAMINATION" in prompt
+            assert "STYLE_MISMATCH" in prompt
+            return json.dumps({
+                "issues": [{
+                    "code": "ANNOTATION_CONTAMINATION",
+                    "severity": "severe",
+                    "frame_ids": ["S02_P01"],
+                    "message": "visible red and blue arrows plus P01 label",
+                    "expected": "clean shadow-puppet cinematic frame",
+                    "observed": "red/blue arrows and P01 text",
+                    "confidence": 0.99,
+                    "frame_evidence": [{
+                        "frame_id": "S02_P01",
+                        "observed": "two colored arrows and P01 label",
+                    }],
+                }]
+            })
+
+    issues, layer = storyboard_qa_gate.run_l4_first_frame_review(
+        storyboard,
+        "皮影戏台，靛蓝幕布，炽橙轮廓光",
+        {"S02_P01": frame},
+        tmp_path,
+        ReviewClient(),
+    )
+
+    assert layer["status"] == "completed"
+    assert issues[0]["code"] == "first_frame_annotation_contamination"
+    assert issues[0]["severity"] == "severe"
+    assert storyboard_qa_gate.is_blocking_issue(issues[0]) is True
 
 
 def test_phase5_unverified_systemic_clothing_claim_is_non_blocking(tmp_path):

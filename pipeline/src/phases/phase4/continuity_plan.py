@@ -520,7 +520,19 @@ def build_continuity_plan(
                     storyboard_beat_id=str(
                         beat.get("beat_id") or f"{shot_id}_P{sequence:02d}"
                     ),
-                    storyboard_image=str(beat.get("storyboard_image") or "") or None,
+                    storyboard_image=str(
+                        beat.get("video_first_frame")
+                        or beat.get("storyboard_image")
+                        or ""
+                    ) or None,
+                    storyboard_image_kind=str(
+                        beat.get("video_first_frame_kind")
+                        or (
+                            "legacy_storyboard_image"
+                            if beat.get("storyboard_image")
+                            else ""
+                        )
+                    ) or None,
                     bridge_target_shot_id=(
                         str(beat.get("bridge_target_shot_id") or "") or None
                     ),

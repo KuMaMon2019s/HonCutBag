@@ -7,6 +7,7 @@ for upload to Bridge API. Falls back to base64 list if zip upload fails.
 """
 
 import base64
+import hashlib
 import json
 import re
 import zipfile
@@ -15,6 +16,60 @@ from typing import Any, List, Optional, Tuple
 
 from utils.storyboard_motion_policy import apply_storyboard_motion_policy
 from utils.video_generation_contracts import ensure_video_generation_contract
+
+CINEMATIC_FIRST_FRAME_SCHEMA = "honcut.cinematic-first-frame.v1"
+PREVIS_FRAME_PATH_PARTS = frozenset({
+    "director_panels",
+    "storyboard_beats",
+    "shot_storyboards",
+    "storyboard_groups",
+    "storyboard_bridges",
+    "phase5_reference_boards",
+})
+
+
+def _frame_receipt(path: Path) -> dict[str, Any] | None:
+    receipt_path = path.with_suffix(".json")
+    try:
+        value = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _assert_video_frame_provenance(path: Path, declared_kind: Any = None) -> None:
+    """Reject director/PREVIS pixels at the final video transport boundary."""
+    lowered_parts = {part.casefold() for part in path.parts}
+    if lowered_parts & PREVIS_FRAME_PATH_PARTS or path.name.casefold() in {
+        "director_storyboard.png",
+        "storyboard.png",
+    }:
+        raise ValueError(
+            f"PREVIS/director board cannot be used as a video frame: {path}"
+        )
+    kind = str(declared_kind or "").strip()
+    if kind and kind != CINEMATIC_FIRST_FRAME_SCHEMA:
+        raise ValueError(
+            f"video frame has non-cinematic provenance kind {kind}: {path}"
+        )
+    receipt = _frame_receipt(path)
+    # A path named ``storyboard_images/Sxx.png`` is not trustworthy by itself:
+    # Phase 2 deliberately writes a PREVIS compatibility placeholder there and
+    # Phase 4 replaces it.  Require the Phase 4 receipt at every video transport
+    # boundary so a missing/mutated sidecar fails closed instead of silently
+    # reviving the historical contamination route.
+    if not receipt or receipt.get("status") != "done":
+        raise ValueError(f"cinematic video frame has no completed receipt: {path}")
+    if receipt.get("kind") != CINEMATIC_FIRST_FRAME_SCHEMA:
+        raise ValueError(
+            f"video frame receipt marks the asset as non-cinematic: {path}"
+        )
+    expected = str(receipt.get("image_sha256") or "")
+    observed = hashlib.sha256(path.read_bytes()).hexdigest()
+    if expected != observed:
+        raise ValueError(f"cinematic video frame receipt hash mismatch: {path}")
+    if receipt.get("previs_reference_images") != []:
+        raise ValueError(f"cinematic video frame contains PREVIS lineage: {path}")
 
 
 def package_shot_assets(
@@ -39,8 +94,7 @@ def package_shot_assets(
         assets.zip
         ├─ meta.json
         ├─ character_refs/      (face_closeup/full_body/identity_detail/variant_*.png)
-        ├─ shot_frames/         (storyboard_images/{shot_id}.png)
-        └─ storyboard/          (storyboard.png)
+        └─ shot_frames/         (Phase 4 cinematic storyboard_images/{shot_id}.png)
     
     meta.json structure:
         {
@@ -88,21 +142,12 @@ def package_shot_assets(
     # 2. Shot frame from storyboard_images (priority 1, role=composition)
     shot_frame_path = output_dir / "storyboard_images" / f"{shot_id}.png"
     if shot_frame_path.exists():
+        _assert_video_frame_provenance(shot_frame_path)
         assets.append({
             "src_path": shot_frame_path,
             "zip_path": f"shot_frames/{shot_id}.png",
             "role": "composition",
             "priority": 1,
-        })
-    
-    # 3. Storyboard.png (priority 2, role=style)
-    storyboard_path = output_dir / "storyboard.png"
-    if storyboard_path.exists():
-        assets.append({
-            "src_path": storyboard_path,
-            "zip_path": "storyboard/storyboard.png",
-            "role": "style",
-            "priority": 2,
         })
     
     if not assets:
@@ -139,7 +184,7 @@ def package_shot_assets(
             zf.write(asset["src_path"], asset["zip_path"])
     
     # Build base64 fallback list (sorted by priority, then by role, max 9)
-    # Priority order: identity (character) > composition (shot frame) > style (storyboard)
+    # Priority order: identity (character) > cinematic composition frame.
     sorted_assets = sorted(assets, key=lambda a: (a["priority"], a["role"]))
     base64_list = []
     
@@ -435,6 +480,8 @@ def inject_flf2v_identity_lock(
     prompt_text: str,
 ) -> str:
     """Add canonical character traits to FLF2V prompts without reference media."""
+    from utils.pixel_text_policy import strip_pixel_text_identity_markers
+
     char_ids = _detect_shot_characters(output_dir, shot_meta)
     if not char_ids:
         return prompt_text
@@ -466,11 +513,13 @@ def inject_flf2v_identity_lock(
         appearance = character.get("appearance") or {}
         if not isinstance(appearance, dict):
             continue
-        traits = [
-            f"{label}: {str(appearance[field]).strip()}"
-            for field, label in trait_labels
-            if appearance.get(field)
-        ]
+        traits = []
+        for field, label in trait_labels:
+            if not appearance.get(field):
+                continue
+            sanitized = strip_pixel_text_identity_markers(appearance[field])
+            if sanitized:
+                traits.append(f"{label}: {sanitized}")
         if traits:
             name = character.get("name") or char_id
             identity_lines.append(f"{name} — " + "; ".join(traits))
@@ -507,8 +556,10 @@ def build_content_for_shot(
             {"type": "image_url", "image_url": {"url": "https://..."}, "role": "first_frame", "priority": "high"}
         ]
 
-    i2v uses one first frame; Phantom adds the shot characters' face, body, and
-    optional variant references; FLF2V uses an explicit first and last frame.
+    i2v uses one first frame; FLF2V uses an explicit first and last frame.
+    A legacy Phantom request is upgraded to strict i2v transport whenever a
+    Phase 4 cinematic frame exists.  Phantom's separate character references
+    remain only as a compatibility fallback for projects without that frame.
 
     Legacy paths (zip/base64) are preserved for backward compatibility but not
     used in the primary content[] workflow.
@@ -520,9 +571,10 @@ def build_content_for_shot(
 
     # 1. Text prompt (always first)
     prompt_text = apply_storyboard_motion_policy(shot_meta.get("prompt", ""))
-    strategy = shot_meta.get("gen_strategy", "i2v")
-    if strategy not in {"flf2v", "phantom", "i2v"}:
-        strategy = "i2v"
+    requested_strategy = shot_meta.get("gen_strategy", "i2v")
+    if requested_strategy not in {"flf2v", "phantom", "i2v"}:
+        requested_strategy = "i2v"
+    strategy = requested_strategy
     if strategy == "flf2v":
         prompt_text = inject_flf2v_identity_lock(output_dir, shot_meta, prompt_text)
     generation_actions = shot_meta.get("generation_actions") or []
@@ -552,14 +604,17 @@ def build_content_for_shot(
     if prompt_text:
         content.append({"type": "text", "text": prompt_text})
 
-    # Every route uses the per-shot storyboard image. Frame-based routes use it
-    # as a strict frame; Phantom uses it as a composition/environment reference
-    # alongside character identity references.
+    # Every route uses the Phase 4 cinematic frame as a strict frame.  In
+    # particular, a legacy Phantom request must not downgrade it to a generic
+    # reference_image or mix in separate character media: either behavior lets
+    # the provider redraw the approved start state and can reintroduce solid
+    # actors into a flat shadow-puppet shot. Director/PREVIS pixels are rejected
+    # at this boundary even when an old continuity plan points at them.
     storyboard_images_dir = output_dir / "storyboard_images"
     if not storyboard_images_dir.exists():
         print(
             f"  [assets] ⚠ storyboard_images directory missing: {storyboard_images_dir}; "
-            "run Phase 2 to generate per-shot first frames"
+            "run Phase 4 to generate cinematic first frames"
         )
     frame_override = shot_meta.get("_storyboard_frame_path")
     shot_frame_path = (
@@ -571,11 +626,15 @@ def build_content_for_shot(
     )
     image_assets = []
     if shot_frame_path.exists() and shot_frame_path.stat().st_size > 1024:
+        _assert_video_frame_provenance(
+            shot_frame_path,
+            shot_meta.get("_storyboard_frame_kind"),
+        )
         beat_label = shot_meta.get("_storyboard_beat_id")
         frame_label = (
-            f"{beat_label}手绘故事格"
+            f"{beat_label}成片质感第一帧"
             if beat_label
-            else f"{shot_id}分镜首帧"
+            else f"{shot_id}成片质感第一帧"
         )
         image_assets.append({
             "path": shot_frame_path,
@@ -583,10 +642,9 @@ def build_content_for_shot(
             "priority": "high",
             "bind_subject": False,
             "reference_description": (
-                f"{frame_label}，"
-                "用于锁定本生成片段的构图、角色站位、场景结构、"
-                "时间天气和光影；读取动作箭头和摄影机箭头的运动语义，"
-                "但不得在成片中复现任何箭头或标注"
+                f"{frame_label}，用于锁定本生成片段的构图、角色站位、"
+                "场景结构、项目美术风格、时间天气和光影；该资产已经过"
+                "无文字、无箭头、无分格的像素洁净检查"
             ),
         })
 
@@ -607,15 +665,6 @@ def build_content_for_shot(
                 f"FLF2V end frame missing or too small: {end_frame_path}"
             )
     elif strategy == "phantom":
-        storyboard_assets = [
-            {
-                **asset,
-                "role": "reference_image",
-                "reference_kind": "storyboard_composition",
-            }
-            for asset in image_assets
-            if asset["role"] == "first_frame"
-        ]
         character_assets = collect_character_reference_assets(output_dir, shot_meta)
         expected_characters = _detect_shot_characters(output_dir, shot_meta)
         if expected_characters and not character_assets:
@@ -623,18 +672,34 @@ def build_content_for_shot(
                 "Phantom character references missing for shot "
                 f"{shot_id}; expected face_closeup.png, full_body.png, identity_detail.png, or variant_*.png"
             )
-        if not character_assets and not storyboard_assets:
+        if image_assets:
+            # The approved Phase 4 render already resolves identity, costume,
+            # medium, composition, and continuity. Seedance cannot legally mix
+            # first_frame with reference_image, and doing so would weaken the
+            # exact-start-frame contract, so keep identity text-only here.
+            strategy = "i2v"
+            text_item = next(
+                (item for item in content if item.get("type") == "text"), None
+            )
+            if text_item is not None:
+                text_item["text"] = inject_flf2v_identity_lock(
+                    output_dir,
+                    shot_meta,
+                    text_item["text"],
+                )
+            print(
+                "  [assets] phantom -> i2v: Phase 4 cinematic frame promoted "
+                "to strict first_frame; character references kept text-only"
+            )
+        elif not character_assets:
             raise FileNotFoundError(
                 "Phantom references missing for shot "
-                f"{shot_id}; expected a storyboard frame or character reference"
+                f"{shot_id}; expected a cinematic first frame or character reference"
             )
-        image_assets = character_assets
-        image_assets.extend(storyboard_assets)
-        if storyboard_assets:
-            print(
-                "  [assets] phantom: storyboard frame retained as a "
-                "composition/environment reference"
-            )
+        else:
+            # Compatibility only: legacy projects that have not generated a
+            # Phase 4 cinematic frame still use Phantom identity references.
+            image_assets = character_assets
 
     max_reference_images = shot_meta.get("_max_reference_images")
     if strategy == "phantom" and generation_actions:
@@ -667,12 +732,12 @@ def build_content_for_shot(
             composition_assets = [
                 asset
                 for asset in image_assets
-                if asset.get("reference_kind") == "storyboard_composition"
+                if asset.get("reference_kind") == "cinematic_composition"
             ][:1]
             character_assets = [
                 asset
                 for asset in image_assets
-                if asset.get("reference_kind") != "storyboard_composition"
+                if asset.get("reference_kind") != "cinematic_composition"
             ]
             character_budget = max(0, max_reference_images - len(composition_assets))
             grouped: dict[str, list[dict]] = {}
@@ -716,7 +781,12 @@ def build_content_for_shot(
                 f"trimmed to {len(image_assets)}/{max_reference_images} images"
             )
 
-    print(f"  [assets] {strategy}: images_used={len(image_assets)}")
+    route_label = (
+        f"{requested_strategy}->{strategy}"
+        if requested_strategy != strategy
+        else strategy
+    )
+    print(f"  [assets] {route_label}: images_used={len(image_assets)}")
     
     # Upload each image to TOS and add to content
     uploaded_count = 0
@@ -786,7 +856,7 @@ def build_content_for_shot(
                 f"图片{index}为{asset['reference_description']}"
                 for index, asset in enumerate(frame_descriptions, start=1)
             )
-            text_item["text"] = f"分镜参考说明：{frame_contract}。{text_item['text']}"
+            text_item["text"] = f"成片首帧参考说明：{frame_contract}。{text_item['text']}"
 
     print(f"  [assets] 上传 {uploaded_count} 张参考图到 TOS")
     return content

@@ -155,9 +155,11 @@ def build_director_storyboard_prompt(
             if isinstance(storyboard_beats, list)
             else 1
         )
-        label = (
-            f"{shot_id} · {duration:g}s · {size} · 内部{beat_count}格"
-        )
+        # Only the stable Sxx identity may be rendered into the overview pixels.
+        # Duration, beat count, action direction, and camera movement remain
+        # machine-readable metadata so a downstream image model never inherits
+        # production annotations from the director work board.
+        label = shot_id
         panel_lines.append(
             f"面板{index}【{label}】：地点={setting or '延续前镜'}；"
             f"人物={who_text or '环境'}；故事摘要={action or '环境建立'}；运镜={camera}；"
@@ -179,6 +181,14 @@ def build_director_storyboard_prompt(
             "summary": action,
             "body_action_contract": shot.get("body_action_contract") or {},
             "storyboard_beat_count": beat_count,
+            "motion_annotations": {
+                "action": action,
+                "camera_movement": camera,
+                "camera_motion_contract": physical_camera,
+                "camera_motion_negative": camera_negative,
+                "body_action_contract": choreography,
+                "render_in_pixels": False,
+            },
         })
 
     character_lines = _character_lines(characters or [])
@@ -188,18 +198,18 @@ def build_director_storyboard_prompt(
 画布与版式：
 - 单张 {aspect_ratio} 故事板纸，严格使用 {columns} 列 × {rows} 行，共 {len(shots)} 个面板。
 - 阅读顺序必须从左到右、从上到下；不得合并、遗漏、重复或打乱面板。
-- 每个面板顶部仅写清晰的大号编号 S01、S02……；底部可写不超过 8 个汉字的动作速记。
-- 每个 Sxx 是导演级叙事镜头；在编号旁清楚标注“×N格”，N 来自逐格合同中的内部故事格数量。
+- 每个面板顶部仅写清晰的大号编号 S01、S02……；除此之外画面中禁止任何文字、数字或符号。
+- 每个 Sxx 是导演级叙事镜头；时长、景别、内部故事格数量、动作方向和运镜信息只存在于机器可读 JSON，不得渲染进像素。
 - 这是必须可被机器切分的固定网格合同，版式准确性优先于绘画装饰和构图自由。
 - 所有列必须等宽，所有行必须等高；列边界从画布顶端贯通到底端，行边界从画布左端贯通到右端，不得错位或中断。
 - 相邻面板之间保留 16–24 像素纯白留白槽，并沿每个面板四周绘制清晰、连续、深黑色矩形边框；留白槽内禁止出现人物、道具、箭头或文字。
 - S01 至 S{len(shots):02d} 每个编号只能出现一次，并且必须位于对应面板内部；禁止在行间额外重复任何 Sxx 标题，禁止增加横幅、表头或第二组编号。
-- 面板不得跨格、合并、重叠或越过留白槽；任何动作、字幕与运镜箭头都必须完整留在所属面板内。
+- 面板不得跨格、合并、重叠或越过留白槽；禁止字幕、拍数、Pxx 编号、动作箭头、运镜箭头、轨迹线、色块图例和手写注释。
 
 绘画风格：
 - 真正的导演手绘分镜草图，不是成片剧照，不是彩色概念设计，不是漫画成稿。
 - 白纸、黑色粗铅笔和炭笔线条，松弛快速的 gesture drawing，少量灰色阴影。
-- 人物姿势和空间关系必须清楚，动作方向用红色手绘箭头，摄像机运动用蓝色手绘箭头。
+- 人物姿势、重心、视线和空间关系本身必须清楚表达动作与运镜意图；不得依赖或绘制任何箭头、轨迹线或文字说明。
 - 保持粗糙、动态、未完成的工作稿质感；人物身份遵守项目角色合同，拒绝海报排版和装饰性大标题。
 
 跨面板连续性：
@@ -217,7 +227,7 @@ def build_director_storyboard_prompt(
 逐格内容合同：
 {chr(10).join(panel_lines)}
 
-最终版式自检：输出前逐项确认画面恰好为 {columns}×{rows} 等分网格、恰好 {len(shots)} 格，S01 至 S{len(shots):02d} 连续且各出现一次，只有一组编号，所有贯通边界和纯白留白槽清晰可见；任一条件不满足时必须先重新排版再输出。构图和动作按上述合同逐格对应。"""
+最终版式自检：输出前逐项确认画面恰好为 {columns}×{rows} 等分网格、恰好 {len(shots)} 格，S01 至 S{len(shots):02d} 连续且各出现一次，只有一组编号，所有贯通边界和纯白留白槽清晰可见，并且没有拍数、Pxx、动作/运镜箭头、轨迹线或其他制作标注；任一条件不满足时必须先重新排版再输出。构图和动作按上述合同逐格对应。"""
     return prompt, panels, (columns, rows)
 
 

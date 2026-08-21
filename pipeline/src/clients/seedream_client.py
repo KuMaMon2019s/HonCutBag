@@ -135,7 +135,20 @@ _SEEDREAM_RATE_LIMITER = _SeedreamRateLimiter()
 
 
 class AgentPlanQuotaExceededError(RuntimeError):
-    """Agent Plan repeatedly returned AccountQuotaExceeded after retries."""
+    """Agent Plan returned an exhausted or repeatedly unavailable quota."""
+
+
+def _is_fixed_window_quota_exhaustion(provider_message: str) -> bool:
+    """Return whether retrying cannot help before a declared quota reset."""
+    normalized = provider_message.casefold()
+    return any(
+        marker in normalized
+        for marker in (
+            "monthly usage quota",
+            "will reset at",
+            "waiting for the reset",
+        )
+    )
 
 
 class SeedreamAPIError(requests.exceptions.HTTPError):
@@ -360,6 +373,12 @@ class SeedreamClient:
                         provider_code == "AccountQuotaExceeded"
                         or "AccountQuotaExceeded" in resp.text
                     ):
+                        if _is_fixed_window_quota_exhaustion(provider_message):
+                            raise AgentPlanQuotaExceededError(
+                                "HTTP 429 AccountQuotaExceeded: "
+                                f"{provider_message or 'fixed-window quota exhausted'} "
+                                f"(request_id={request_id or 'N/A'})"
+                            )
                         if quota_retry < max_quota_retries:
                             print(
                                 f"  [seedream] ⚠ AccountQuotaExceeded (intermittent), "

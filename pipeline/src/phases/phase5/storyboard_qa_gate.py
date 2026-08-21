@@ -586,6 +586,195 @@ def find_storyboard_beat_images(output_dir: Path, storyboard: dict) -> dict[str,
     return result
 
 
+def find_cinematic_first_frame_images(
+    output_dir: Path,
+    storyboard: dict,
+) -> dict[str, Path]:
+    """Resolve only Phase 4 frames explicitly declared as cinematic assets."""
+    from phases.phase4.cinematic_first_frames import CINEMATIC_FIRST_FRAME_SCHEMA
+
+    result: dict[str, Path] = {}
+    for shot_index, shot in enumerate(storyboard.get("shots", [])):
+        if not isinstance(shot, dict):
+            continue
+        shot_id = _shot_id(shot, shot_index)
+        for position, beat in enumerate(shot.get("storyboard_beats") or [], 1):
+            if not isinstance(beat, dict):
+                continue
+            if beat.get("video_first_frame_kind") != CINEMATIC_FIRST_FRAME_SCHEMA:
+                continue
+            beat_id = str(beat.get("beat_id") or f"{shot_id}_P{position:02d}")
+            value = str(beat.get("video_first_frame") or "").strip()
+            if not value:
+                continue
+            path = Path(value)
+            if not path.is_absolute():
+                path = output_dir / path
+            if path.is_file() and path.stat().st_size > 0:
+                result[beat_id] = path
+    return result
+
+
+def run_l4_first_frame_review(
+    storyboard: dict,
+    visual_style: str,
+    images: dict[str, Path],
+    output_dir: Path,
+    client: ArkMultimodalClient | None = None,
+) -> tuple[list[dict], dict[str, Any]]:
+    """Fail closed on annotations or style drift in video-bound first frames."""
+    declared_ids = [
+        str(beat.get("beat_id") or f"{_shot_id(shot, shot_index)}_P{position:02d}")
+        for shot_index, shot in enumerate(storyboard.get("shots", []))
+        if isinstance(shot, dict)
+        for position, beat in enumerate(shot.get("storyboard_beats") or [], 1)
+        if isinstance(beat, dict) and beat.get("video_first_frame_kind")
+    ]
+    if not declared_ids:
+        return [], {
+            "status": "skipped",
+            "skipped_reason": "legacy storyboard declares no Phase 4 cinematic first frames",
+        }
+    ordered_ids = [frame_id for frame_id in declared_ids if frame_id in images]
+    if not ordered_ids:
+        return [], {
+            "status": "skipped",
+            "skipped_reason": "no declared cinematic first-frame pixels are available",
+        }
+    records = [
+        {
+            "input_index": index,
+            "kind": "cinematic_video_first_frame",
+            "frame_id": frame_id,
+            "path": str(images[frame_id]),
+            "sha256": _sha256_file(images[frame_id]),
+        }
+        for index, frame_id in enumerate(ordered_ids, 1)
+    ]
+    input_manifest = output_dir / "first_frame_qa_inputs.json"
+    _write_l3_input_manifest(input_manifest, records)
+    if client is None and not (
+        os.environ.get("ARK_AGENT_API_KEY") or os.environ.get("ARK_API_KEY")
+    ):
+        shot_ids = sorted({_parent_shot_id(frame_id) for frame_id in ordered_ids})
+        return [
+            _issue(
+                "L4",
+                "severe",
+                "first_frame_style_review_unavailable",
+                "Cinematic first-frame annotation/style review is unavailable; paid video generation is blocked",
+                shot_ids,
+                frame_ids=ordered_ids,
+            )
+        ], {
+            "status": "error",
+            "input_manifest_path": str(input_manifest),
+            "input_count": len(records),
+            "skipped_reason": "ARK multimodal API key missing",
+        }
+    prompt = f"""Review every supplied image as a video-bound cinematic first frame. Each image is attached in ascending input_index order and mapped to an exact frame_id below.
+
+Two fail-closed checks apply independently:
+1. ANNOTATION_CONTAMINATION: report any visible action/camera arrow, trajectory or helper line, Sxx/Pxx/Gxx label, letter, number, subtitle, watermark, UI, panel border, split-screen, contact sheet, storyboard grid, handwritten note, or other production annotation.
+2. STYLE_MISMATCH: compare the visible palette, materials, rendering medium, stage/environment structure, lighting, and finish against VISUAL STYLE. Report a mismatch when the frame is visibly PREVIS, pencil/charcoal/line-art, generic CGI/photography that contradicts the authored medium, or omits a defining environment such as a stage/curtain explicitly required by the style. Do not report minor composition differences.
+
+Inspect each frame independently. Never copy one observation across multiple IDs. Every issue needs concrete visible evidence, expected, observed, and confidence >= 0.75. Annotation contamination and material style mismatch are severe because these pixels are about to enter paid video generation.
+
+Return JSON only: {{"issues":[{{"code":"ANNOTATION_CONTAMINATION|STYLE_MISMATCH","severity":"severe|moderate|minor","frame_ids":["S01_P01"],"message":"...","expected":"...","observed":"...","confidence":0.95,"frame_evidence":[{{"frame_id":"S01_P01","observed":"specific visible evidence"}}]}}]}}.
+Use only these frame IDs: {json.dumps(ordered_ids, ensure_ascii=False)}.
+INPUTS:
+{json.dumps(records, ensure_ascii=False)}
+VISUAL STYLE:
+{visual_style}"""
+    input_paths = [images[frame_id] for frame_id in ordered_ids]
+    try:
+        raw = (client or ArkMultimodalClient()).review(input_paths, prompt)
+        raw = re.sub(
+            r"^```(?:json)?\s*|\s*```$",
+            "",
+            raw.strip(),
+            flags=re.IGNORECASE,
+        )
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("issues"), list):
+            raise ValueError("response must contain an issues array")
+        valid_ids = set(ordered_ids)
+        issues: list[dict[str, Any]] = []
+        for value in parsed["issues"]:
+            if not isinstance(value, dict):
+                continue
+            code = str(value.get("code") or "").upper()
+            if code not in {"ANNOTATION_CONTAMINATION", "STYLE_MISMATCH"}:
+                continue
+            frame_ids = [
+                frame_id
+                for frame_id in (value.get("frame_ids") or [])
+                if frame_id in valid_ids
+            ]
+            try:
+                confidence = float(value.get("confidence"))
+            except (TypeError, ValueError):
+                confidence = 0.0
+            expected = str(value.get("expected") or "").strip()
+            observed = str(value.get("observed") or "").strip()
+            evidence = value.get("frame_evidence") or []
+            evidence_ids = {
+                str(item.get("frame_id") or "")
+                for item in evidence
+                if isinstance(item, dict) and str(item.get("observed") or "").strip()
+            }
+            evidence_valid = bool(
+                frame_ids
+                and expected
+                and observed
+                and confidence >= 0.75
+                and set(frame_ids).issubset(evidence_ids)
+            )
+            severity = (
+                "severe"
+                if evidence_valid
+                else "minor"
+            )
+            issues.append(
+                _issue(
+                    "L4",
+                    severity,
+                    f"first_frame_{code.casefold()}",
+                    str(value.get("message") or f"First-frame {code} issue"),
+                    sorted({_parent_shot_id(frame_id) for frame_id in frame_ids}),
+                    frame_ids=frame_ids,
+                    expected=expected,
+                    observed=observed,
+                    confidence=confidence,
+                    frame_evidence=evidence,
+                    evidence_status="validated" if evidence_valid else "unverified",
+                )
+            )
+        return issues, {
+            "status": "completed",
+            "input_manifest_path": str(input_manifest),
+            "input_count": len(records),
+            "raw_issue_count": len(parsed["issues"]),
+        }
+    except Exception as exc:
+        shot_ids = sorted({_parent_shot_id(frame_id) for frame_id in ordered_ids})
+        return [
+            _issue(
+                "L4",
+                "severe",
+                "first_frame_style_review_unavailable",
+                f"Cinematic first-frame review failed: {exc}",
+                shot_ids,
+                frame_ids=ordered_ids,
+            )
+        ], {
+            "status": "error",
+            "input_manifest_path": str(input_manifest),
+            "input_count": len(records),
+            "skipped_reason": f"multimodal review unavailable: {exc}",
+        }
+
+
 def _parent_shot_id(image_id: str) -> str:
     match = re.match(r"^(.*)_P\d+$", image_id, flags=re.IGNORECASE)
     return match.group(1) if match else image_id
@@ -1342,6 +1531,7 @@ def run_storyboard_qa_gate(output_dir: Path, similarity_threshold: float | None 
         return result
 
     beat_images = find_storyboard_beat_images(output_dir, storyboard)
+    cinematic_images = find_cinematic_first_frame_images(output_dir, storyboard)
     expected_beats = [
         str(beat.get("beat_id") or f"{_shot_id(shot, shot_index)}_P{position:02d}")
         for shot_index, shot in enumerate(storyboard.get("shots", []))
@@ -1406,6 +1596,13 @@ def run_storyboard_qa_gate(output_dir: Path, similarity_threshold: float | None 
         multimodal_client,
         character_reference_images=character_reference_images,
     )
+    l4_issues, l4 = run_l4_first_frame_review(
+        storyboard,
+        visual_style,
+        cinematic_images,
+        output_dir,
+        multimodal_client,
+    )
     capacity_issues = run_generation_capacity_checks(storyboard, events_data)
     artifact_issues = [
         _issue(
@@ -1416,7 +1613,53 @@ def run_storyboard_qa_gate(output_dir: Path, similarity_threshold: float | None 
         for beat_id in expected_beats
         if beat_id not in beat_images
     ]
-    issues = l1_issues + structural_issues + artifact_issues + capacity_issues + l2_issues + l3_issues
+    declared_cinematic_ids = [
+        str(beat.get("beat_id") or f"{_shot_id(shot, shot_index)}_P{position:02d}")
+        for shot_index, shot in enumerate(storyboard.get("shots", []))
+        if isinstance(shot, dict)
+        for position, beat in enumerate(shot.get("storyboard_beats") or [], 1)
+        if isinstance(beat, dict) and beat.get("video_first_frame_kind")
+    ]
+    cinematic_artifact_issues = [
+        _issue(
+            "L4",
+            "severe",
+            "cinematic_first_frame_missing",
+            f"{frame_id} has no valid Phase 4 cinematic first frame",
+            [_parent_shot_id(frame_id)],
+            frame_id=frame_id,
+        )
+        for frame_id in declared_cinematic_ids
+        if frame_id not in cinematic_images
+    ]
+    if declared_cinematic_ids:
+        from phases.phase4.cinematic_first_frames import (
+            validate_cinematic_first_frame_artifacts,
+        )
+
+        for error in validate_cinematic_first_frame_artifacts(output_dir, storyboard):
+            matched = re.match(r"^(S[^ ]+)", error)
+            resource_id = matched.group(1) if matched else ""
+            cinematic_artifact_issues.append(
+                _issue(
+                    "L4",
+                    "severe",
+                    "cinematic_first_frame_provenance_invalid",
+                    error,
+                    [_parent_shot_id(resource_id)] if resource_id else [],
+                    resource_id=resource_id or None,
+                )
+            )
+    issues = (
+        l1_issues
+        + structural_issues
+        + artifact_issues
+        + cinematic_artifact_issues
+        + capacity_issues
+        + l2_issues
+        + l3_issues
+        + l4_issues
+    )
     for index, shot in enumerate(storyboard.get("shots", [])):
         sid = _shot_id(shot, index)
         detail = per_shot.setdefault(sid, {"issues": []})
@@ -1428,6 +1671,11 @@ def run_storyboard_qa_gate(output_dir: Path, similarity_threshold: float | None 
         }
         detail["image_path"] = str(images[sid]) if sid in images else None
         detail["storyboard_beat_images"] = shot_beat_images
+        detail["cinematic_first_frames"] = {
+            image_id: str(path)
+            for image_id, path in cinematic_images.items()
+            if _parent_shot_id(image_id) == sid
+        }
         detail["issues"] = [issue for issue in issues if sid in issue.get("shot_ids", [])]
     grade = grade_issues(issues)
     failed_shots = sorted({
@@ -1435,9 +1683,11 @@ def run_storyboard_qa_gate(output_dir: Path, similarity_threshold: float | None 
         for issue in blocking_issues(issues)
         for sid in issue.get("shot_ids", [])
     })
-    report = {"status": "done" if grade in {"A", "B"} else "error", "grade": grade, "gate_passed": grade in {"A", "B"}, "issues": issues, "issue_counts": {severity: sum(item.get("severity") == severity for item in issues) for severity in ("severe", "moderate", "minor")}, "failed_shot_ids": failed_shots, "shots": per_shot, "variation_score": variation_quality, "slideshow_risk": slideshow_risk, "layers": {"L1": {"status": "completed"}, "L2": l2, "L3": l3}, "outputs": ["storyboard_qa_report.json", "variation_report.json", "slideshow_risk_report.json", *( ["storyboard_qa_grid.jpg"] if grid_path_exists(output_dir) else []), *( ["storyboard_qa_inputs.json"] if (output_dir / "storyboard_qa_inputs.json").is_file() else [])]}
+    report = {"status": "done" if grade in {"A", "B"} else "error", "grade": grade, "gate_passed": grade in {"A", "B"}, "issues": issues, "issue_counts": {severity: sum(item.get("severity") == severity for item in issues) for severity in ("severe", "moderate", "minor")}, "failed_shot_ids": failed_shots, "shots": per_shot, "variation_score": variation_quality, "slideshow_risk": slideshow_risk, "layers": {"L1": {"status": "completed"}, "L2": l2, "L3": l3, "L4": l4}, "outputs": ["storyboard_qa_report.json", "variation_report.json", "slideshow_risk_report.json", *( ["storyboard_qa_grid.jpg"] if grid_path_exists(output_dir) else []), *( ["storyboard_qa_inputs.json"] if (output_dir / "storyboard_qa_inputs.json").is_file() else []), *( ["first_frame_qa_inputs.json"] if (output_dir / "first_frame_qa_inputs.json").is_file() else [])]}
     if not report["gate_passed"]:
         report["error"] = f"Storyboard QA grade {grade} blocks Phase 6; redraw only failed_shot_ids"
+        if any(issue.get("layer") == "L4" for issue in blocking_issues(issues)):
+            report["recommended_restart_phase"] = "phase4"
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return report
 
@@ -1493,7 +1743,11 @@ def _global_uncorrectable_issues(
     return [
         issue
         for issue in blocking_issues(report.get("issues") or [])
+        # L4 reviews video-bound Phase 4 pixels. Even when the affected shot is
+        # known, redrawing Phase 2 PREVIS cannot repair it and would spend the
+        # wrong quota. Route the whole correction back to Phase 4 regeneration.
         if not issue.get("shot_ids")
+        or str(issue.get("layer") or "").upper() == "L4"
     ]
 
 
@@ -1659,7 +1913,9 @@ def run_storyboard_qa_with_correction(
             "slideshow_risk_high",
         }
         restart_phase = (
-            "phase1"
+            "phase4"
+            if any(str(issue.get("layer") or "").upper() == "L4" for issue in global_issues)
+            else "phase1"
             if any(code.casefold() in structural_codes for code in issue_codes)
             else "phase2"
         )

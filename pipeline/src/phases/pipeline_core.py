@@ -3373,6 +3373,58 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
         )
         outputs.append("SCENE_CONSISTENCY.json")
         print("  ✓ 场景一致性契约: SCENE_CONSISTENCY.json")
+        cinematic_errors: list[str] = []
+        if not dry_run:
+            from phases.phase4.cinematic_first_frames import (
+                generate_cinematic_first_frames,
+                validate_cinematic_first_frame_artifacts,
+            )
+
+            video_width, video_height, cinematic_aspect_ratio = _storyboard_canvas(
+                storyboard_for_consistency
+            )
+            cinematic_frames = generate_cinematic_first_frames(
+                output_dir,
+                storyboard_for_consistency,
+                characters_for_consistency.get("characters", []),
+                scene_consistency,
+                size=_storyboard_image_size(
+                    video_width=video_width,
+                    video_height=video_height,
+                ),
+                visual_style_path=visual_style_path,
+                aspect_ratio=cinematic_aspect_ratio,
+            )
+            cinematic_errors = validate_cinematic_first_frame_artifacts(
+                output_dir,
+                storyboard_for_consistency,
+            )
+            if cinematic_errors:
+                return {
+                    "status": "error",
+                    "error": "Phase 4 cinematic first-frame validation failed",
+                    "artifact_errors": cinematic_errors,
+                    "duration_s": _elapsed(start),
+                }
+            storyboard_path.write_text(
+                json.dumps(
+                    storyboard_for_consistency,
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            outputs.extend(
+                [
+                    "CINEMATIC_FIRST_FRAMES.json",
+                    "video_first_frames/",
+                    "storyboard_images/",
+                ]
+            )
+            print(
+                "  ✓ 成片质感首帧: "
+                f"{cinematic_frames.get('frame_count', 0)} 个（零 PREVIS 像素参考）"
+            )
         continuity_plan = write_continuity_plan(
             output_dir / "CONTINUITY_PLAN.json",
             storyboard_for_consistency,
@@ -3529,6 +3581,14 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
                 "id": "scene_and_continuity_contracts_written",
                 "status": "passed",
                 "detail": "scene, continuity, group, and memory contracts were materialized",
+            },
+            {
+                "id": "cinematic_first_frames_previs_isolated",
+                "status": "passed" if dry_run or not cinematic_errors else "failed",
+                "detail": (
+                    "every video first frame has a style-injection receipt and zero "
+                    "PREVIS pixel references"
+                ),
             },
             {
                 "id": "legacy_orchestrator_metadata_only",
@@ -3816,6 +3876,8 @@ def _prompt_assets_for_shot(shot_meta: dict, characters_data: dict) -> list[dict
         if isinstance(asset_id, str) and asset_id.startswith("char:"):
             requested_keys.add(asset_id[5:].split(":", 1)[0].casefold())
 
+    from utils.pixel_text_policy import strip_pixel_text_identity_markers
+
     selected = []
     for character in characters_data.get("characters", []):
         keys = {
@@ -3830,7 +3892,9 @@ def _prompt_assets_for_shot(shot_meta: dict, characters_data: dict) -> list[dict
         if requested_keys.intersection(keys):
             selected.append({
                 "name": character.get("name", ""),
-                "description": character_visual_description(character),
+                "description": strip_pixel_text_identity_markers(
+                    character_visual_description(character)
+                ),
             })
     return selected
 
@@ -3845,14 +3909,19 @@ def _prepare_phase6_prompt(
     route_model: str,
 ) -> tuple[str, bool]:
     """Return the final transport prompt while retaining a reroutable base prompt."""
-    from phases.phase6.video_generator import build_video_prompt
+    from phases.phase6.video_generator import build_video_prompt, resolve_video_lighting
+    from utils.pixel_text_policy import strip_pixel_text_identity_markers
+
+    for field in ("subject_description", "character_visual_description"):
+        if shot_meta.get(field):
+            shot_meta[field] = strip_pixel_text_identity_markers(shot_meta[field])
 
     scene_contract = scene_consistency_data.get("shots", {}).get(shot_id, {})
     if scene_contract:
-        shot_meta["lighting_description"] = (
-            scene_contract.get("lighting_description")
-            or scene_contract.get("lighting_note")
-            or shot_meta.get("lighting_description")
+        shot_meta["lighting_description"] = resolve_video_lighting(
+            scene_contract,
+            scene_consistency_data.get("global_lighting")
+            or shot_meta.get("lighting_description"),
         )
         shot_meta["style_anchor"] = (
             scene_contract.get("style_anchor")
@@ -3878,6 +3947,7 @@ def _prepare_phase6_prompt(
             shot_meta["negative_prompt"] = rendered.get("negative_prompt") or ""
         else:
             prompt = str(rendered or "")
+    prompt = strip_pixel_text_identity_markers(prompt)
     shot_meta["prompt"] = prompt
 
     route_applied = False
@@ -3893,7 +3963,9 @@ def _prepare_phase6_prompt(
             assets=_prompt_assets_for_shot(shot_meta, characters_data),
         )
         if routed_prompt:
-            prompt = str(routed_prompt)
+            # The router may restate shot-level identity fields, so enforce the
+            # pixel-text boundary once more on the final transport prompt.
+            prompt = strip_pixel_text_identity_markers(routed_prompt)
             route_applied = True
     except Exception:
         # The complete Phase 6 prompt remains the compatibility fallback when

@@ -7,7 +7,11 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from tools.asset_packager import (
+    CINEMATIC_FIRST_FRAME_SCHEMA,
+    _assert_video_frame_provenance,
+    _detect_shot_characters,
     collect_character_reference_assets,
+    inject_flf2v_identity_lock,
     inject_reference_instruction,
 )
 from utils.prompt_budget import enforce_prompt_budget
@@ -67,17 +71,37 @@ def build_task_dir(output_dir, shot_ids: Sequence[str], meta: Mapping) -> Path:
 
     for shot_id in shot_ids:
         current = _shot_meta(meta, shot_id)
-        strategy = current.get("gen_strategy", current.get("strategy", "i2v"))
-        if strategy not in {"i2v", "flf2v", "phantom"}:
-            strategy = "i2v"
+        requested_strategy = current.get(
+            "gen_strategy", current.get("strategy", "i2v")
+        )
+        if requested_strategy not in {"i2v", "flf2v", "phantom"}:
+            requested_strategy = "i2v"
+        strategy = requested_strategy
         shot_dir = task_dir / shot_id
         shot_dir.mkdir()
 
-        first_source = output_dir / "storyboard_images" / f"{shot_id}.png"
+        frame_override = current.get("_storyboard_frame_path")
+        first_source = (
+            Path(str(frame_override))
+            if frame_override and Path(str(frame_override)).is_absolute()
+            else output_dir / str(frame_override)
+            if frame_override
+            else output_dir / "storyboard_images" / f"{shot_id}.png"
+        )
         first_frame = None
         if first_source.exists():
+            _assert_video_frame_provenance(
+                first_source,
+                current.get("_storyboard_frame_kind")
+                or CINEMATIC_FIRST_FRAME_SCHEMA,
+            )
             first_destination = _copy_image(first_source, shot_dir / "分镜" / "分镜图.png")
             first_frame = first_destination.relative_to(shot_dir).as_posix()
+        if requested_strategy == "phantom" and first_frame:
+            # Keep task-dir transport equivalent to content[] transport: the
+            # clean Phase 4 render is an exact first frame, never a generic
+            # Phantom reference mixed with separate character images.
+            strategy = "i2v"
         last_frame = None
         if strategy == "flf2v":
             end_source = output_dir / "storyboard_images" / f"{shot_id}_end.png"
@@ -85,7 +109,23 @@ def build_task_dir(output_dir, shot_ids: Sequence[str], meta: Mapping) -> Path:
             last_frame = end_destination.relative_to(shot_dir).as_posix()
 
         references = []
-        assets = collect_character_reference_assets(output_dir, current) if strategy == "phantom" else []
+        phantom_identity_assets = (
+            collect_character_reference_assets(output_dir, current)
+            if requested_strategy == "phantom"
+            else []
+        )
+        expected_characters = (
+            _detect_shot_characters(output_dir, current)
+            if requested_strategy == "phantom"
+            else []
+        )
+        if expected_characters and not phantom_identity_assets:
+            raise FileNotFoundError(
+                "Phantom character references missing for shot "
+                f"{shot_id}; expected face_closeup.png, full_body.png, "
+                "identity_detail.png, or variant_*.png"
+            )
+        assets = phantom_identity_assets if strategy == "phantom" else []
         variant_totals = {}
         for asset in assets:
             if asset["path"].name.startswith("variant_"):
@@ -112,6 +152,8 @@ def build_task_dir(output_dir, shot_ids: Sequence[str], meta: Mapping) -> Path:
         prompt_dir = shot_dir / "提示词"
         prompt_dir.mkdir(parents=True, exist_ok=True)
         prompt = current.get("prompt", "")
+        if requested_strategy == "phantom" and strategy == "i2v":
+            prompt = inject_flf2v_identity_lock(output_dir, current, prompt)
         if references:
             # Preserve character ids so face/full-body/variant images of one
             # person bind to one subject, matching the ordinary content[] path.
@@ -119,8 +161,8 @@ def build_task_dir(output_dir, shot_ids: Sequence[str], meta: Mapping) -> Path:
         frame_instructions = []
         if first_frame:
             frame_instructions.append(
-                f"{first_frame}是{shot_id}分镜首帧，用于锁定构图、角色站位、"
-                "场景结构、时间天气和光影"
+                f"{first_frame}是{shot_id}成片质感首帧，用于锁定构图、角色站位、"
+                "场景结构、项目美术风格、时间天气和光影；不得使用 PREVIS 工作板"
             )
         if last_frame:
             frame_instructions.append(
@@ -128,7 +170,7 @@ def build_task_dir(output_dir, shot_ids: Sequence[str], meta: Mapping) -> Path:
                 "动作、构图和光影"
             )
         if frame_instructions:
-            prompt = f"分镜参考说明：{'；'.join(frame_instructions)}。{prompt}"
+            prompt = f"成片首帧参考说明：{'；'.join(frame_instructions)}。{prompt}"
         enforce_prompt_budget(
             prompt,
             provider="bridge",

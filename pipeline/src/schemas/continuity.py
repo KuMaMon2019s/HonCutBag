@@ -57,6 +57,9 @@ class GenerationChunk(BaseModel):
     storyboard_image: str | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
+    storyboard_image_kind: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     bridge_target_shot_id: str | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
