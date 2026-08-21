@@ -749,6 +749,66 @@ def _crossref_storyboard(
 # 6. VLM semantic check (optional interface)
 # ---------------------------------------------------------------------------
 
+def _batch_character_evidence(
+    batch_shot_ids: list[str],
+    shot_by_id: dict[str, dict],
+    characters: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Select only identities declared by shots in the current VLM batch."""
+    requested: set[str] = set()
+    for shot_id in batch_shot_ids:
+        shot = shot_by_id.get(shot_id, {})
+        raw_cast = shot.get("who") or shot.get("characters") or []
+        if isinstance(raw_cast, str):
+            raw_cast = [raw_cast]
+        requested.update(str(value).strip().casefold() for value in raw_cast if value)
+        requested.update(
+            str(asset)[5:].split(":", 1)[0].strip().casefold()
+            for asset in (shot.get("associate_assets") or [])
+            if isinstance(asset, str) and asset.startswith("char:")
+        )
+    if not requested:
+        return []
+    selected = []
+    for character in characters:
+        keys = {
+            str(character.get("id") or "").strip().casefold(),
+            str(character.get("name") or "").strip().casefold(),
+            *(
+                str(alias).strip().casefold()
+                for alias in (character.get("aliases") or [])
+                if alias
+            ),
+        }
+        if not requested.isdisjoint(keys):
+            selected.append(character)
+    return selected
+
+
+def _batch_prop_evidence(
+    batch_shot_ids: list[str],
+    shot_by_id: dict[str, dict],
+    characters: list[dict[str, Any]],
+) -> list[Any]:
+    """Collect shot-active props plus persistent identity props for selected cast."""
+    props: list[Any] = []
+    for shot_id in batch_shot_ids:
+        shot = shot_by_id.get(shot_id, {})
+        for field_name in ("interaction_props", "props"):
+            value = shot.get(field_name) or []
+            if isinstance(value, (str, dict)):
+                value = [value]
+            props.extend(value if isinstance(value, list) else [])
+    for character in characters:
+        props.extend(character.get("identity_props") or [])
+    unique: dict[str, Any] = {}
+    for prop in props:
+        key = json.dumps(prop, ensure_ascii=False, sort_keys=True) if isinstance(prop, dict) else str(prop)
+        if key.strip():
+            unique.setdefault(key, prop)
+    return list(unique.values())
+
+
 def _vlm_semantic_check(
     vlm_client: Any,
     frames: List[FrameSample],
@@ -891,25 +951,6 @@ def _vlm_semantic_check(
             "sampled_frames": [item.label for item in selected],
             "review_batches": 0,
         }
-    identity_contract = (
-        (
-            "Canonical synthetic identities (treat every ID as a distinct character and enforce "
-            "the listed veil/mask or face styling, makeup/tattoos, mechanical or other non-human "
-            "materials, designed hair/head silhouette, clothing, colors, and markers exactly): "
-            f"{json.dumps(review_evidence['characters'], ensure_ascii=False)}. "
-            "Shared styling families do not permit identity merging: use each role's complete anchor "
-            "combination, clothing and distinguishing markers to keep nearby designs separate. "
-        )
-        if synthetic_review and review_evidence["characters"]
-        else (
-            "Canonical character identities and recurring identity props (preserve every listed "
-            "color, material, geometry, marker, attachment mode and owner; role-active items need "
-            "not appear unless the shot uses them, but may never be substituted or transferred): "
-            f"{json.dumps(review_evidence['characters'], ensure_ascii=False)}. "
-            if review_evidence["characters"]
-            else ""
-        )
-    )
     structure_contract = (
         (
             "All characters in this project are intentionally synthetic stylized CGI characters. "
@@ -936,16 +977,46 @@ def _vlm_semantic_check(
         batch_shot_ids = list(
             dict.fromkeys(filter(None, map(frame_shot_id, sample_frames)))
         )
+        batch_characters = _batch_character_evidence(
+            batch_shot_ids,
+            shot_by_id,
+            review_evidence["characters"],
+        )
+        batch_props = _batch_prop_evidence(
+            batch_shot_ids,
+            shot_by_id,
+            batch_characters,
+        )
+        identity_contract = ""
+        if batch_characters:
+            identity_label = (
+                "Canonical synthetic identities"
+                if synthetic_review
+                else "Canonical character identities"
+            )
+            identity_contract = (
+                f"{identity_label} for this batch only (treat every ID as distinct and preserve "
+                "the listed face styling, materials, clothing, colors and markers exactly): "
+                f"{json.dumps(batch_characters, ensure_ascii=False)}. "
+                "Shared styling families do not permit identity merging: keep each role's complete "
+                "anchor combination separate and never transfer styling or identity props. "
+            )
+        if batch_props:
+            identity_contract += (
+                "Props involved in this batch only (preserve owner, count, color, material, geometry, "
+                "markings and attachment mode; never substitute or transfer): "
+                f"{json.dumps(batch_props, ensure_ascii=False)}. "
+            )
         storyboard = {
             "shots": [
                 {
                     key: shot_by_id[shot_id].get(key)
                     for key in (
                         "shot_id", "id", "visual", "action", "generation_actions",
-                        "body_action_choreography", "body_action_contract",
+                        "body_action_choreography",
                         "who", "where", "time", "time_of_day", "time_window",
                         "temporal_visual_contract", "lighting", "lighting_description",
-                        "gen_strategy",
+                        "interaction_props", "props", "associate_assets", "gen_strategy",
                     )
                     if shot_by_id[shot_id].get(key) not in (None, "", [])
                 }

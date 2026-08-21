@@ -90,9 +90,16 @@ def synthetic_character_review_evidence(
         features = character.get("distinguishing_features")
         if not isinstance(features, list):
             features = []
+        aliases = character.get("aliases")
+        aliases = aliases if isinstance(aliases, list) else []
         characters.append({
             "id": str(character.get("id") or "").strip(),
             "name": str(character.get("name") or "").strip(),
+            "aliases": [
+                str(value).strip()
+                for value in aliases
+                if str(value).strip()
+            ],
             "gender": gender,
             "visual_identity_policy": str(
                 character.get("visual_identity_policy") or ""

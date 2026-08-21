@@ -14,6 +14,7 @@ from typing import Any
 from openai import OpenAI
 
 from utils.config import ARK_BASE_URL, DEFAULT_MULTIMODAL_MODEL, get_api_key
+from utils.prompt_budget import enforce_prompt_budget
 
 
 class ArkMultimodalClient:
@@ -90,6 +91,12 @@ class ArkMultimodalClient:
         """Return the model's textual review for the complete ordered image set."""
         if not image_paths:
             raise ValueError("at least one storyboard image is required")
+        enforce_prompt_budget(
+            prompt,
+            provider="ark",
+            model=self.model,
+            purpose="multimodal_review",
+        )
 
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         for position, path in enumerate(image_paths, start=1):

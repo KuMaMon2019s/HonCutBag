@@ -1667,6 +1667,7 @@ def test_provider_prepends_no_real_person_visual_contract(monkeypatch, tmp_path)
     )
 
     assert content[0]["text"].startswith("【非真人视觉硬约束】")
+    assert content[0]["text"].count("【非真人视觉硬约束】") == 1
     assert "面纱/遮罩、图形化妆、面部纹样、机械拼接纹理" in content[0]["text"]
     assert "不得把不同角色统一改成同款头盔" in content[0]["text"]
 

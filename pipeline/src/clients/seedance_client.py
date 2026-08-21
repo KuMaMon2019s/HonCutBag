@@ -5,14 +5,17 @@ Never nest in "parameters". watermark=false MUST be included.
 """
 
 import os
-import time
 import tempfile
-import requests
+import time
 from typing import Optional
+
+import requests
+
 from clients.video_client import VideoClient
+from runtime.execution_errors import ProviderJobFailedError
 from utils.config import ARK_BASE_URL
 from utils.ip_blacklist import sanitize_prompt
-from runtime.execution_errors import ProviderJobFailedError
+from utils.prompt_budget import enforce_prompt_budget
 
 
 BASE_URL = ARK_BASE_URL.rstrip("/")
@@ -139,6 +142,12 @@ def _submit_direct(
     sanitized_prompt, filtered_terms = sanitize_prompt(prompt)
     if filtered_terms:
         print(f"  [seedance] IP filter: removed {filtered_terms}")
+    enforce_prompt_budget(
+        sanitized_prompt,
+        provider="seedance",
+        model=model,
+        purpose="video_generation",
+    )
     
     headers = _authorization_headers(api_key)
 
@@ -232,6 +241,17 @@ def submit_content(
 ) -> str:
     """Submit a preassembled ARK Agent Plan content array. Returns task_id."""
     _validate_content_media_roles(content)
+    prompt = "\n".join(
+        str(item.get("text") or "")
+        for item in content
+        if isinstance(item, dict) and item.get("type") == "text"
+    )
+    enforce_prompt_budget(
+        prompt,
+        provider="seedance",
+        model=model,
+        purpose="video_generation",
+    )
     headers = _authorization_headers(api_key)
     payload = {
         "model": model,

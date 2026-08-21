@@ -14,11 +14,15 @@ if str(ROOT) not in sys.path:
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from phases.phase1.adaptation_engine import _build_events_json, _event_llm_view
 from phases.phase2.shot_storyboards import build_shot_storyboard_prompt
 from phases.phase5.storyboard_qa_gate import run_generation_capacity_checks
 from phases.phase6.video_generator import build_video_prompt
 from quality import video_qa
 from prompt.event_extractor import ACTION_SCREENPLAY_CONTRACT, USER_PROMPT_TEMPLATE, _normalize_event
+from runtime.continuity_chunks import ChunkExecutionRequest
+from runtime.continuity_provider import _chunk_prompt, _chunk_scoped_shot_meta
+from schemas.continuity import GenerationChunk
 from utils.body_action_contracts import (
     apply_body_action_contract,
     body_action_contract_errors,
@@ -31,6 +35,7 @@ from utils.privacy_visual_policy import (
     no_real_person_prompt_contract,
     synthetic_character_review_evidence,
 )
+from utils.prompt_budget import enforce_prompt_budget
 
 
 def _choreography_shot() -> dict:
@@ -192,6 +197,108 @@ def test_storyboard_and_video_prompts_keep_full_unabstracted_choreography():
     assert "铁山靠" in video_prompt
 
 
+def test_chunk_prompt_renders_only_current_beat_and_keeps_audit_ledger_intact(tmp_path):
+    shot = _choreography_shot()
+    shot["storyboard_beats"] = []
+    for position, (action, choreography) in enumerate(
+        zip(
+            shot["generation_actions"],
+            shot["body_action_choreography"],
+            strict=True,
+        ),
+        1,
+    ):
+        beat = {
+            "beat_id": f"S01_P{position:02d}",
+            "action": action,
+            "visual": action,
+            "start_state": f"第{position}拍起始",
+            "end_state": f"第{position}拍终态",
+            "micro_actions": [action],
+            "generation_actions": [action],
+            "body_action_choreography": [choreography],
+        }
+        apply_body_action_contract(beat)
+        shot["storyboard_beats"].append(beat)
+    scene = {"shots": {"S01": {"scene_description": "训练场"}}}
+    full_prompt = build_video_prompt(shot, {"characters": []}, scene, "seedance")
+    shot["prompt"] = full_prompt
+    chunk = GenerationChunk(
+        chunk_id="S01_C01",
+        sequence=1,
+        target_duration_s=5,
+        mode="fresh",
+        execution_strategy="multi_image",
+        storyboard_beat_id="S01_P01",
+        action_prompt=shot["generation_actions"][0],
+        start_state="第1拍起始",
+        end_state="第1拍终态",
+    )
+    request = ChunkExecutionRequest(
+        resource_id="S01_C01",
+        shot_id="S01",
+        chunk=chunk,
+        anchors={},
+        output_path=tmp_path / "S01.mp4",
+        previous_output_path=None,
+        input_fingerprint="fixture",
+        memory_context="",
+    )
+
+    scoped = _chunk_scoped_shot_meta(request, shot)
+    scoped["prompt"] = build_video_prompt(
+        scoped, {"characters": []}, scene, "seedance"
+    )
+    prompt = _chunk_prompt(request, scoped)
+    budget = enforce_prompt_budget(
+        prompt,
+        provider="seedance",
+        model="doubao-seedance-2.0-mini",
+        purpose="video_generation",
+    )
+
+    assert prompt.count("[逐拍肢体动作谱｜不可摘要]") == 1
+    assert prompt.count("[honcut-video-generation-contract-v2]") == 1
+    assert "街舞托马斯全旋" in prompt
+    assert "左挡右闪" not in prompt
+    assert "铁山靠" not in prompt
+    assert budget.total_chars < budget.budget.soft_chars
+    assert len(scoped["body_action_choreography"]) == 1
+    assert len(shot["body_action_contract"]["beats"]) == 3
+    assert "左挡右闪" in full_prompt and "铁山靠" in full_prompt
+
+
+def test_phase1_event_llm_view_excludes_derived_duplicate_contract_fields():
+    event = _choreography_shot()
+    event.update({
+        "sequence_id": "SEQ001",
+        "action_unit_id": "AU001",
+        "source_excerpt": "审计原文不得重复进入 adapter prompt",
+        "generation_action_units": [{"prompt": "派生动作"}],
+        "prompt": "顶层派生 prompt",
+        "errors": ["派生错误"],
+        "forbidden": ["派生禁项"],
+        "minimum_primary_beat_occurrences": 2,
+        "generation_action_unit_count": 3,
+    })
+
+    view = _event_llm_view(event)
+    encoded = _build_events_json([event])
+
+    assert "body_action_choreography" in view
+    assert view["minimum_primary_beat_occurrences"] == 2
+    for duplicate in (
+        "body_action_contract",
+        "source_excerpt",
+        "generation_action_units",
+        "prompt",
+        "errors",
+        "forbidden",
+    ):
+        assert duplicate not in view
+        assert f'"{duplicate}"' not in encoded
+
+
 def test_final_video_qa_checks_every_choreography_beat_in_order():
     shot = _choreography_shot()
     captured: list[str] = []
@@ -211,6 +318,73 @@ def test_final_video_qa_checks_every_choreography_beat_in_order():
     assert "QA must verify every beat in order" in captured[0]
     assert "街舞托马斯全旋" in captured[0]
     assert "mirrored side" in captured[0]
+
+
+def test_final_video_qa_only_sends_current_batch_characters_and_props(tmp_path):
+    def character(char_id, name, prop):
+        return {
+            "id": char_id,
+            "name": name,
+            "aliases": [f"{name}别名"],
+            "visual_identity_policy": NO_REAL_PERSON_POLICY,
+            "appearance": {
+                "gender": "synthetic",
+                "face": f"{name}专属面部纹样",
+                "clothing": f"{name}专属服装",
+                "identity_props": [{"id": prop, "name": prop, "owner": char_id}],
+                "synthetic_styling": {
+                    "schema": "honcut.synthetic-styling.v2",
+                    "mode": "mechanical_makeup",
+                    "non_human_material": "porcelain composite",
+                    "visible_anchors": ["face tattoo", "mechanical seam"],
+                },
+            },
+        }
+
+    (tmp_path / "CHARACTERS.json").write_text(
+        json.dumps({
+            "visual_identity_policy": NO_REAL_PERSON_POLICY,
+            "characters": [
+                character("lead", "女主", "银色发簪"),
+                character("guard", "未出镜守卫", "黑曜石长枪"),
+            ],
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    captured: list[str] = []
+
+    class FakeClient:
+        def review(self, _paths, prompt):
+            captured.append(prompt)
+            return '{"verdict":"pass","issues":[],"confidence":0.99}'
+
+    frames = [
+        video_qa.FrameSample(
+            path=str(tmp_path / f"S01_{label}.jpg"),
+            timestamp=float(index),
+            label=f"S01_{label}",
+        )
+        for index, label in enumerate(("first", "mid", "last"))
+    ]
+    result = video_qa._vlm_semantic_check(
+        FakeClient(),
+        frames,
+        {"shots": [{
+            "shot_id": "S01",
+            "who": ["女主"],
+            "visual": "女主持银色手机向前移动",
+            "interaction_props": ["银色手机"],
+            "associate_assets": ["char:lead"],
+        }]},
+        output_dir=tmp_path,
+    )
+
+    assert result["verdict"] == "pass"
+    assert "女主" in captured[0]
+    assert "银色发簪" in captured[0]
+    assert "银色手机" in captured[0]
+    assert "未出镜守卫" not in captured[0]
+    assert "黑曜石长枪" not in captured[0]
 
 
 def test_no_real_person_policy_assigns_diverse_persistent_styling_not_uniform_helmets(tmp_path):

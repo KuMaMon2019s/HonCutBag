@@ -13,6 +13,7 @@ import httpx
 from openai import APIConnectionError, APIStatusError, APITimeoutError, DefaultHttpxClient, OpenAI
 
 from utils.config import ARK_BASE_URL, DEFAULT_TEXT_MODEL
+from utils.prompt_budget import enforce_prompt_budget
 
 _default_heartbeat_callback: Optional[Callable[[], None]] = None
 
@@ -166,6 +167,23 @@ def _attempt_llm_stream(
         raise ValueError("idle_timeout must be positive")
     if heartbeat_interval < 0:
         raise ValueError("heartbeat_interval must be non-negative")
+    prompt_texts: list[str] = []
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else ""
+        if isinstance(content, str):
+            prompt_texts.append(content)
+        elif isinstance(content, list):
+            prompt_texts.extend(
+                str(item.get("text") or "")
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+    enforce_prompt_budget(
+        "\n".join(prompt_texts),
+        provider="ark",
+        model=model,
+        purpose="text_llm",
+    )
     client = _client or create_ark_client(connect_timeout, read_timeout)
     heartbeat_callback = heartbeat_callback or _default_heartbeat_callback
     deadline = time.monotonic() + wall_timeout

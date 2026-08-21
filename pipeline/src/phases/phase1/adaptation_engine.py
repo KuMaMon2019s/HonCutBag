@@ -28,6 +28,7 @@
 """
 
 import argparse
+import copy
 import hashlib
 import json
 import math
@@ -1141,6 +1142,49 @@ def _build_characters_summary(characters: Optional[List[Dict[str, Any]]]) -> str
     return "\n".join(lines)
 
 
+_EVENT_LLM_FIELDS = (
+    "who",
+    "background_groups",
+    "where",
+    "what",
+    "emotion",
+    "visual",
+    "time",
+    "action_type",
+    "event_role",
+    "micro_actions",
+    "body_action_choreography",
+    "generation_motion_mode",
+    "action_phase",
+    "start_state",
+    "end_state",
+    "causal_link",
+    "continuity_before",
+    "continuity_subject",
+    "dramatic_turn",
+    "lines",
+    "sequence_id",
+    "action_unit_id",
+    "minimum_primary_beat_occurrences",
+    "generation_action_unit_count",
+)
+
+
+def _event_llm_view(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep only authoritative event fields needed by the Phase 1 adapter LLM.
+
+    Derived contracts such as ``body_action_contract`` duplicate choreography
+    and add prompt/errors/forbidden payloads. Source excerpts and normalized
+    generation units remain in the audit event but are reconstructed or read
+    from that source after adaptation, so they are intentionally omitted here.
+    """
+    return {
+        field: copy.deepcopy(event[field])
+        for field in _EVENT_LLM_FIELDS
+        if field in event
+    }
+
+
 def _build_events_json(events: List[Dict[str, Any]]) -> str:
     """
     将事件列表格式化为 LLM 可读的 JSON 字符串
@@ -1156,7 +1200,7 @@ def _build_events_json(events: List[Dict[str, Any]]) -> str:
     # 为每个事件添加编号
     numbered_events = []
     for i, event in enumerate(events, 1):
-        event_copy = dict(event)
+        event_copy = _event_llm_view(event)
         event_copy["event_id"] = i
         numbered_events.append(event_copy)
 

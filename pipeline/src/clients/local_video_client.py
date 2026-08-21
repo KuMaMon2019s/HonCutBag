@@ -20,6 +20,8 @@ from pathlib import Path
 
 import requests
 
+from utils.prompt_budget import enforce_prompt_budget
+
 # Default local API URL (can be overridden via config or env)
 DEFAULT_API_URL = "http://127.0.0.1:9100"
 
@@ -188,6 +190,17 @@ def submit(
     Raises:
         RuntimeError: If the API is unreachable or returns an error
     """
+    submitted_prompt = "\n".join(
+        str(item.get("text") or "")
+        for item in (content or [])
+        if isinstance(item, dict) and item.get("type") == "text"
+    ) or prompt
+    enforce_prompt_budget(
+        submitted_prompt,
+        provider="bridge",
+        model=model or "wan22",
+        purpose="video_generation",
+    )
     if model == "seedance":
         _get_ark_api_key()
 

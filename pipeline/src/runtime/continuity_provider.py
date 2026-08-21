@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -32,8 +33,8 @@ from runtime.generation_tasks import GenerationTaskStore
 from runtime.seedance_execution import execute_seedance_video_task
 from schemas.continuity import ContinuityPlan, GenerationChunk
 from utils.storyboard_motion_policy import apply_storyboard_motion_policy
-from utils.video_generation_contracts import ensure_video_generation_contract
 from utils.video_capabilities import SEEDANCE_2_CAPABILITIES
+from utils.video_generation_contracts import ensure_video_generation_contract
 from utils.video_geometry import resolve_video_geometry
 
 CONTINUITY_BRIDGE_ENV = "HONCUT_CONTINUITY_BRIDGE"
@@ -443,6 +444,88 @@ def _storyboard_group_prompt(group: dict[str, Any] | None, shot_id: str) -> str:
     return "\n".join(line for line in lines if not line.endswith(": "))
 
 
+def _chunk_scoped_shot_meta(
+    request: ChunkExecutionRequest,
+    shot_meta: dict[str, Any],
+) -> dict[str, Any]:
+    """Return a provider-only view containing the current beat, never the full ledger."""
+    from utils.body_action_contracts import apply_body_action_contract
+
+    scoped = copy.deepcopy(shot_meta)
+    beat_id = str(request.chunk.storyboard_beat_id or "").strip()
+    action = str(request.chunk.action_prompt or "").strip()
+    if (
+        request.chunk.execution_strategy != "first_last_frame_bridge"
+        and not beat_id
+        and not action
+    ):
+        return scoped
+    scoped.pop("prompt", None)
+    scoped.pop("storyboard_beats", None)
+    scoped.pop("body_action_contract", None)
+
+    if request.chunk.execution_strategy == "first_last_frame_bridge":
+        bridge_action = str(request.chunk.action_prompt or "").strip()
+        scoped["generation_actions"] = []
+        scoped["micro_actions"] = []
+        scoped["body_action_choreography"] = []
+        scoped["action"] = bridge_action
+        scoped["action_description"] = bridge_action
+        scoped["what"] = bridge_action or "仅生成两个已完成主镜头之间的连续过渡"
+        scoped["visual"] = scoped["what"]
+        scoped["start_state"] = request.chunk.start_state
+        scoped["end_state"] = request.chunk.end_state
+        return scoped
+
+    source_beats = [
+        beat
+        for beat in (shot_meta.get("storyboard_beats") or [])
+        if isinstance(beat, dict)
+    ]
+    matched = next(
+        (beat for beat in source_beats if str(beat.get("beat_id") or "") == beat_id),
+        {},
+    )
+    action = action or str(
+        matched.get("action")
+        or matched.get("action_prompt")
+        or matched.get("visual")
+        or ""
+    ).strip()
+    choreography = copy.deepcopy(matched.get("body_action_choreography") or [])
+    if not choreography and action:
+        choreography = [
+            copy.deepcopy(beat)
+            for beat in (shot_meta.get("body_action_choreography") or [])
+            if isinstance(beat, dict)
+            and str(beat.get("micro_action") or beat.get("description") or "").strip()
+            == action
+        ]
+    if not choreography and beat_id:
+        match = re.search(r"_P(\d+)$", beat_id, re.IGNORECASE)
+        if match:
+            position = int(match.group(1))
+            choreography = [
+                copy.deepcopy(beat)
+                for beat in (shot_meta.get("body_action_choreography") or [])
+                if isinstance(beat, dict)
+                and int(beat.get("micro_action_index") or beat.get("beat") or 0)
+                == position
+            ]
+
+    scoped["generation_actions"] = [action] if action else []
+    scoped["micro_actions"] = [action] if action else []
+    scoped["body_action_choreography"] = choreography
+    scoped["action"] = action
+    scoped["action_description"] = action
+    scoped["what"] = action or "自然延续当前分镜拍"
+    scoped["visual"] = str(matched.get("visual") or action or scoped["what"])
+    scoped["start_state"] = request.chunk.start_state or matched.get("start_state") or ""
+    scoped["end_state"] = request.chunk.end_state or matched.get("end_state") or ""
+    apply_body_action_contract(scoped)
+    return scoped
+
+
 def _chunk_prompt(
     request: ChunkExecutionRequest,
     shot_meta: dict[str, Any],
@@ -485,35 +568,29 @@ def _chunk_prompt(
         )
     beat_contract = ""
     if request.chunk.storyboard_beat_id:
-        from utils.body_action_contracts import body_action_prompt
-
-        chunk_action = str(request.chunk.action_prompt or "").strip()
-        chunk_meta = dict(shot_meta)
-        chunk_meta["micro_actions"] = [chunk_action] if chunk_action else []
-        chunk_meta["generation_actions"] = [chunk_action] if chunk_action else []
-        chunk_meta["body_action_choreography"] = [
-            dict(beat)
-            for beat in (shot_meta.get("body_action_choreography") or [])
-            if isinstance(beat, dict)
-            and (
-                not str(beat.get("micro_action") or "").strip()
-                or str(beat.get("micro_action") or "").strip() == chunk_action
-            )
-        ]
-        choreography = body_action_prompt(chunk_meta)
         beat_contract = (
             f"\n[authoritative storyboard beat {request.chunk.storyboard_beat_id}] "
             f"Start state: {request.chunk.start_state or 'continue the supplied state'}. "
             f"Execute only this visible action: {request.chunk.action_prompt or 'natural scene progression'}. "
             f"Required end state: {request.chunk.end_state or 'complete that action'}. "
-            f"{choreography} "
             "Do not execute another Pxx panel, skip ahead, or replay an earlier panel."
         )
     prompt = apply_storyboard_motion_policy(
         f"{prompt}\n\n[continuity chunk {request.chunk.sequence}] {continuation}\n"
         f"{group_prompt}\n{request.memory_context}{beat_contract}{repair}"
     )
-    return ensure_video_generation_contract(prompt, shot_meta, characters or {})
+    prompt = ensure_video_generation_contract(prompt, shot_meta, characters or {})
+    from utils.body_action_contracts import body_action_prompt
+
+    choreography = body_action_prompt(shot_meta)
+    marker_count = prompt.count("[逐拍肢体动作谱｜不可摘要]")
+    expected_count = 1 if choreography else 0
+    if marker_count != expected_count:
+        raise ValueError(
+            f"{request.resource_id} choreography marker count is {marker_count}, "
+            f"expected {expected_count} for the current beat"
+        )
+    return prompt
 
 
 def _seedance_reference_image_payload(board_path: Path) -> tuple[bytes, str]:
@@ -628,9 +705,10 @@ def _base_content(
     request: ChunkExecutionRequest,
     shot_meta: dict[str, Any],
 ) -> list[dict[str, Any]]:
+    from phases.phase6.video_generator import build_video_prompt
     from tools.asset_packager import build_content_for_shot
 
-    content_meta = dict(shot_meta)
+    content_meta = _chunk_scoped_shot_meta(request, shot_meta)
     group, board_path = _storyboard_group_for_shot(output_dir, request.shot_id)
     try:
         characters_data = json.loads(
@@ -638,9 +716,31 @@ def _base_content(
         )
     except (OSError, json.JSONDecodeError):
         characters_data = {}
+    try:
+        scene_consistency = json.loads(
+            (output_dir / "SCENE_CONSISTENCY.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        scene_consistency = {}
+    model = os.environ.get("VIDEO_MODEL") or os.environ.get("SEEDANCE_MODEL") or "seedance"
+    should_render_current_beat = bool(
+        request.chunk.storyboard_beat_id
+        or request.chunk.action_prompt
+        or request.chunk.execution_strategy == "first_last_frame_bridge"
+    )
+    if should_render_current_beat:
+        rendered = build_video_prompt(
+            content_meta,
+            characters_data,
+            scene_consistency,
+            model,
+        )
+        if isinstance(rendered, dict):
+            rendered = rendered.get("prompt") or ""
+        content_meta["prompt"] = str(rendered)
     content_meta["prompt"] = _chunk_prompt(
         request,
-        shot_meta,
+        content_meta,
         _storyboard_group_prompt(group, request.shot_id),
         characters_data,
     )
@@ -650,9 +750,11 @@ def _base_content(
     )
 
     if is_no_real_person_enabled():
-        content_meta["prompt"] = (
-            f"{no_real_person_prompt_contract()}\n{content_meta['prompt']}"
-        )
+        privacy_contract = no_real_person_prompt_contract()
+        if privacy_contract not in content_meta["prompt"]:
+            content_meta["prompt"] = (
+                f"{privacy_contract}\n{content_meta['prompt']}"
+            )
     strategy = request.chunk.execution_strategy
     if strategy == "first_last_frame_bridge":
         # Frame roles cannot be mixed with reference media in Seedance.  The

@@ -11,6 +11,7 @@ from typing import Any
 import requests
 
 from utils.config import get_bridge_api_url, get_video_route
+from utils.prompt_budget import enforce_prompt_budget
 
 
 DirectGenerator = Callable[..., Any]
@@ -67,6 +68,12 @@ class VideoClient:
         self.session = session or _AsyncRequestsSession()
 
     def generate(self, prompt: str, **kwargs: Any) -> VideoResult:
+        enforce_prompt_budget(
+            prompt,
+            provider=self.provider,
+            model=str(kwargs.get("model") or self._bridge_model()),
+            purpose="video_generation",
+        )
         if self.mode == "bridge":
             return self._generate_via_bridge(prompt, **kwargs)
         return self._generate_direct(prompt, **kwargs)
@@ -87,6 +94,12 @@ class VideoClient:
         fps: int = 24,
     ) -> VideoResult:
         """Submit an asset-driven generation task to Bridge v3.2."""
+        enforce_prompt_budget(
+            prompt,
+            provider="bridge",
+            model=model,
+            purpose="video_generation",
+        )
         payload = {
             "asset_id": asset_id,
             "asset_type": asset_type,
