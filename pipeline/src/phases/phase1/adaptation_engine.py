@@ -1207,6 +1207,22 @@ def _build_events_json(events: List[Dict[str, Any]]) -> str:
     return json.dumps(numbered_events, ensure_ascii=False, indent=2)
 
 
+def _build_event_details_json(events: List[Dict[str, Any]]) -> str:
+    """Render batched event details through the same compact provider view.
+
+    Stage 2 receives the globally assigned event ids from Stage 1, so unlike
+    ``_build_events_json`` this helper preserves those ids rather than
+    renumbering the current batch from one.
+    """
+    compact_events = []
+    for event in events:
+        event_copy = _event_llm_view(event)
+        if event.get("event_id") is not None:
+            event_copy["event_id"] = event["event_id"]
+        compact_events.append(event_copy)
+    return json.dumps(compact_events, ensure_ascii=False, indent=2)
+
+
 def _normalize_character_reference(value: Any) -> str:
     """Backward-compatible wrapper around the shared identity normalizer."""
     return normalize_character_reference(value)
@@ -1944,7 +1960,7 @@ def _batch_prompt(
         batch_target=batch_target,
         shot_duration=shot_duration,
         max_shots=len(batch),
-        events_json=json.dumps(event_details, ensure_ascii=False, indent=2),
+        events_json=_build_event_details_json(event_details),
         characters_summary=characters_summary,
     )
     if relay is None:

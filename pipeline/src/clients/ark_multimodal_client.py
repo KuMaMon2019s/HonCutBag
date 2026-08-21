@@ -91,15 +91,19 @@ class ArkMultimodalClient:
         """Return the model's textual review for the complete ordered image set."""
         if not image_paths:
             raise ValueError("at least one storyboard image is required")
+        image_labels = [
+            f"Input image {position}: {path.stem}"
+            for position, path in enumerate(image_paths, start=1)
+        ]
         enforce_prompt_budget(
-            prompt,
+            "\n".join((prompt, *image_labels)),
             provider="ark",
             model=self.model,
             purpose="multimodal_review",
         )
 
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
-        for position, path in enumerate(image_paths, start=1):
+        for path, label in zip(image_paths, image_labels, strict=True):
             content.extend(
                 [
                     {
@@ -108,7 +112,7 @@ class ArkMultimodalClient:
                         # others are storyboard evidence boards. Calling all
                         # of them "Storyboard image" caused the model to swap
                         # the reference and observed sides of comparisons.
-                        "text": f"Input image {position}: {path.stem}",
+                        "text": label,
                     },
                     {
                         "type": "image_url",

@@ -14,6 +14,9 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from clients.video_client import VideoClient
+from clients.ark_multimodal_client import ArkMultimodalClient
+from phases.pipeline_core import _prepare_phase6_prompt
+from tools.task_dir_exporter import build_task_dir
 from utils.prompt_budget import (
     DuplicatePromptContractError,
     PromptBudgetExceededError,
@@ -112,3 +115,69 @@ def test_video_transport_budget_blocks_before_direct_generator(monkeypatch):
         client.generate("x" * 30, model="kling-v3")
 
     assert called is False
+
+
+def test_multimodal_budget_counts_image_labels_before_reading_media(monkeypatch, tmp_path):
+    monkeypatch.setenv("HONCUT_ARK_MULTIMODAL_PROMPT_SOFT_CHARS", "35")
+    monkeypatch.setenv("HONCUT_ARK_MULTIMODAL_PROMPT_HARD_CHARS", "40")
+    client = ArkMultimodalClient(
+        client=object(),
+        model="doubao-seed-vision",
+    )
+    missing_image = tmp_path / "this_is_long_evidence_name.png"
+
+    with pytest.raises(PromptBudgetExceededError):
+        client.review([missing_image], "x" * 25)
+
+
+def test_task_directory_checks_the_exact_written_prompt(monkeypatch, tmp_path):
+    monkeypatch.setenv("HONCUT_SEEDANCE_PROMPT_SOFT_CHARS", "50")
+    monkeypatch.setenv("HONCUT_SEEDANCE_PROMPT_HARD_CHARS", "60")
+
+    with pytest.raises(PromptBudgetExceededError):
+        build_task_dir(
+            tmp_path,
+            ["S01"],
+            {
+                "model": "doubao-seedance-2.0-mini",
+                "shots": {"S01": {"prompt": "x" * 60, "gen_strategy": "i2v"}},
+            },
+        )
+
+
+def test_phase6_task_and_direct_routes_share_one_final_prompt_preparation():
+    shot = {
+        "shot_id": "S01",
+        "duration": 5,
+        "where": "露天训练场",
+        "time": "日间",
+        "who": [],
+        "visual": "空场旗帜轻摆",
+        "generation_actions": ["旗帜随风轻摆"],
+    }
+
+    prompt, route_applied = _prepare_phase6_prompt(
+        "S01",
+        shot,
+        {"characters": []},
+        {"shots": {"S01": {"scene_description": "露天训练场"}}},
+        video_model="seedance",
+        route_model="doubao-seedance-2.0-mini",
+    )
+
+    assert route_applied is True
+    base_prompt = shot["prompt"]
+    assert base_prompt in prompt
+    rerouted, reroute_applied = _prepare_phase6_prompt(
+        "S01",
+        shot,
+        {"characters": []},
+        {"shots": {"S01": {"scene_description": "露天训练场"}}},
+        video_model="seedance",
+        route_model="doubao-seedance-2.0-mini",
+    )
+    assert reroute_applied is True
+    assert rerouted == prompt
+    assert shot["prompt"] == base_prompt
+    assert prompt.count("[honcut-video-generation-contract-v2]") == 1
+    assert "Time and weather: day" in prompt

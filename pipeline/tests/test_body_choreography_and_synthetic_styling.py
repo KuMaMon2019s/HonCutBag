@@ -14,14 +14,23 @@ if str(ROOT) not in sys.path:
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from phases.phase1.adaptation_engine import _build_events_json, _event_llm_view
+from phases.phase1.adaptation_engine import (
+    _batch_prompt,
+    _build_event_details_json,
+    _build_events_json,
+    _event_llm_view,
+)
 from phases.phase2.shot_storyboards import build_shot_storyboard_prompt
 from phases.phase5.storyboard_qa_gate import run_generation_capacity_checks
 from phases.phase6.video_generator import build_video_prompt
 from quality import video_qa
 from prompt.event_extractor import ACTION_SCREENPLAY_CONTRACT, USER_PROMPT_TEMPLATE, _normalize_event
 from runtime.continuity_chunks import ChunkExecutionRequest
-from runtime.continuity_provider import _chunk_prompt, _chunk_scoped_shot_meta
+from runtime.continuity_provider import (
+    _chunk_prompt,
+    _chunk_scoped_shot_meta,
+    _storyboard_group_prompt,
+)
 from schemas.continuity import GenerationChunk
 from utils.body_action_contracts import (
     apply_body_action_contract,
@@ -268,6 +277,104 @@ def test_chunk_prompt_renders_only_current_beat_and_keeps_audit_ledger_intact(tm
     assert "左挡右闪" in full_prompt and "铁山靠" in full_prompt
 
 
+def test_chunk_resolves_authoritative_beat_fields_without_leaking_hidden_ledger(tmp_path):
+    shot = _choreography_shot()
+    shot["subject_description"] = "舞者外观；稍后搭档执行铁山靠"
+    shot["generation_action_units"] = [
+        {"prompt": "街舞托马斯全旋"},
+        {"prompt": "左挡右闪"},
+        {"prompt": "铁山靠"},
+    ]
+    shot["storyboard_beats"] = []
+    for position, (action, choreography) in enumerate(
+        zip(
+            shot["generation_actions"],
+            shot["body_action_choreography"],
+            strict=True,
+        ),
+        1,
+    ):
+        beat = {
+            "beat_id": f"S01_P{position:02d}",
+            "action": action,
+            "visual": action,
+            "start_state": f"第{position}拍起始",
+            "end_state": f"第{position}拍终态",
+            "generation_actions": [action],
+            "body_action_choreography": [choreography],
+        }
+        apply_body_action_contract(beat)
+        shot["storyboard_beats"].append(beat)
+    shot["phase8_reshoot"] = {
+        "round": 1,
+        "issues": ["铁山靠落点错误", "当前头盔颜色漂移"],
+    }
+    chunk = GenerationChunk(
+        chunk_id="S01_C01",
+        sequence=1,
+        target_duration_s=5,
+        mode="fresh",
+        execution_strategy="multi_image",
+        storyboard_beat_id="S01_P01",
+    )
+    request = ChunkExecutionRequest(
+        resource_id="S01_C01",
+        shot_id="S01",
+        chunk=chunk,
+        anchors={},
+        output_path=tmp_path / "S01.mp4",
+        previous_output_path=None,
+        input_fingerprint="fixture",
+        memory_context="",
+    )
+
+    scoped = _chunk_scoped_shot_meta(request, shot)
+    scoped["prompt"] = build_video_prompt(
+        scoped,
+        {"characters": []},
+        {"shots": {"S01": {"scene_description": "训练场"}}},
+        "seedance",
+    )
+    prompt = _chunk_prompt(request, scoped)
+
+    assert "natural scene progression" not in prompt
+    assert "第1拍起始" in prompt and "第1拍终态" in prompt
+    assert "街舞托马斯全旋" in prompt
+    assert "左挡右闪" not in prompt
+    assert "铁山靠" not in prompt
+    assert "generation_action_units" not in scoped
+    assert scoped["phase8_reshoot"]["issues"] == ["当前头盔颜色漂移"]
+
+
+def test_inner_beat_group_context_omits_primary_shot_end_and_later_action():
+    group = {
+        "group_id": "CG001",
+        "beats": [{
+            "shot_id": "S01",
+            "start_state": "整镜起点",
+            "end_state": "铁山靠收势",
+            "generation_actions": ["街舞托马斯全旋", "铁山靠"],
+            "storyboard_beats": [{"beat_id": "S01_P01"}, {"beat_id": "S01_P02"}],
+        }],
+    }
+    chunk = GenerationChunk(
+        chunk_id="S01_C01",
+        sequence=1,
+        target_duration_s=5,
+        mode="fresh",
+        storyboard_beat_id="S01_P01",
+        start_state="左手准备撑地",
+        end_state="右腿扫过正前方",
+    )
+
+    prompt = _storyboard_group_prompt(group, "S01", chunk)
+
+    assert "左手准备撑地" in prompt
+    assert "右腿扫过正前方" in prompt
+    assert "铁山靠" not in prompt
+    assert "整镜起点" not in prompt
+
+
 def test_phase1_event_llm_view_excludes_derived_duplicate_contract_fields():
     event = _choreography_shot()
     event.update({
@@ -297,6 +404,39 @@ def test_phase1_event_llm_view_excludes_derived_duplicate_contract_fields():
     ):
         assert duplicate not in view
         assert f'"{duplicate}"' not in encoded
+
+
+def test_phase1_batch_expansion_reuses_compact_event_view():
+    event = _choreography_shot()
+    event.update({
+        "event_id": 7,
+        "source_excerpt": "审计原文",
+        "generation_action_units": [{"prompt": "派生动作"}],
+        "prompt": "派生 prompt",
+        "errors": ["派生错误"],
+        "forbidden": ["派生禁项"],
+    })
+    batch = [{
+        "beat_order": 1,
+        "source_events": [7],
+        "action": "keep",
+        "suggested_duration": 5,
+        "_source_event_details": [event],
+    }]
+
+    compact = _build_event_details_json([event])
+    prompt = _batch_prompt(batch, "无角色", 5, 5, 0, None)
+
+    assert '"event_id": 7' in compact
+    assert '"event_id": 7' in prompt
+    for duplicate in (
+        "source_excerpt",
+        "generation_action_units",
+        '"prompt"',
+        '"errors"',
+        '"forbidden"',
+    ):
+        assert duplicate not in prompt
 
 
 def test_final_video_qa_checks_every_choreography_beat_in_order():
@@ -346,6 +486,7 @@ def test_final_video_qa_only_sends_current_batch_characters_and_props(tmp_path):
             "visual_identity_policy": NO_REAL_PERSON_POLICY,
             "characters": [
                 character("lead", "女主", "银色发簪"),
+                character("support", "支援者", "蓝色护符"),
                 character("guard", "未出镜守卫", "黑曜石长枪"),
             ],
         }, ensure_ascii=False),
@@ -372,6 +513,7 @@ def test_final_video_qa_only_sends_current_batch_characters_and_props(tmp_path):
         {"shots": [{
             "shot_id": "S01",
             "who": ["女主"],
+            "characters": ["support"],
             "visual": "女主持银色手机向前移动",
             "interaction_props": ["银色手机"],
             "associate_assets": ["char:lead"],
@@ -382,6 +524,8 @@ def test_final_video_qa_only_sends_current_batch_characters_and_props(tmp_path):
     assert result["verdict"] == "pass"
     assert "女主" in captured[0]
     assert "银色发簪" in captured[0]
+    assert "支援者" in captured[0]
+    assert "蓝色护符" in captured[0]
     assert "银色手机" in captured[0]
     assert "未出镜守卫" not in captured[0]
     assert "黑曜石长枪" not in captured[0]

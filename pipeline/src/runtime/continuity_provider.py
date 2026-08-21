@@ -405,7 +405,11 @@ def _storyboard_group_for_shot(
     return group, board if board is not None and board.is_file() else None
 
 
-def _storyboard_group_prompt(group: dict[str, Any] | None, shot_id: str) -> str:
+def _storyboard_group_prompt(
+    group: dict[str, Any] | None,
+    shot_id: str,
+    chunk: GenerationChunk | None = None,
+) -> str:
     if not group:
         return ""
     beats = [beat for beat in group.get("beats", []) if isinstance(beat, dict)]
@@ -417,6 +421,20 @@ def _storyboard_group_prompt(group: dict[str, Any] | None, shot_id: str) -> str:
     following = beats[position + 1] if position + 1 < len(beats) else None
     handoff = group.get("handoff_from_previous") or {}
     has_inner_beats = bool(current.get("storyboard_beats"))
+    if has_inner_beats and chunk is not None and chunk.storyboard_beat_id:
+        return "\n".join(
+            (
+                f"[storyboard group {group.get('group_id')}; step {position + 1}/{len(beats)}]",
+                (
+                    "The group board is a chronological narrative map. Render only the "
+                    "authoritative current Pxx beat below, never another panel."
+                ),
+                f"Current beat starting state: {chunk.start_state or 'continue the supplied state'}",
+                "The authoritative Pxx contract below defines the only action to execute now.",
+                f"Current beat required result: {chunk.end_state or 'complete the current beat action'}",
+                "Do not jump to a later panel, combine later actions, replay an earlier panel, or render a collage.",
+            )
+        )
     actions = " -> ".join(str(value) for value in current.get("generation_actions", []))
     lines = [
         f"[storyboard group {group.get('group_id')}; step {position + 1}/{len(beats)}]",
@@ -463,9 +481,18 @@ def _chunk_scoped_shot_meta(
     scoped.pop("prompt", None)
     scoped.pop("storyboard_beats", None)
     scoped.pop("body_action_contract", None)
+    for ledger_field in (
+        "generation_action_units",
+        "generation_action_categories",
+        "source_action_unit_ids",
+        "source_event_slices",
+        "subject_description",
+    ):
+        scoped.pop(ledger_field, None)
 
     if request.chunk.execution_strategy == "first_last_frame_bridge":
         bridge_action = str(request.chunk.action_prompt or "").strip()
+        scoped.pop("phase8_reshoot", None)
         scoped["generation_actions"] = []
         scoped["micro_actions"] = []
         scoped["body_action_choreography"] = []
@@ -486,6 +513,38 @@ def _chunk_scoped_shot_meta(
         (beat for beat in source_beats if str(beat.get("beat_id") or "") == beat_id),
         {},
     )
+
+    def _action_terms(beat: dict[str, Any]) -> set[str]:
+        terms: set[str] = set()
+        for field_name in ("action", "action_prompt", "micro_actions", "generation_actions"):
+            values = beat.get(field_name) or []
+            if isinstance(values, str):
+                values = [values]
+            if isinstance(values, list):
+                terms.update(
+                    str(value).strip()
+                    for value in values
+                    if len(str(value).strip()) >= 3
+                )
+        for body_beat in beat.get("body_action_choreography") or []:
+            if not isinstance(body_beat, dict):
+                continue
+            for field_name in ("technique", "micro_action", "description"):
+                value = str(body_beat.get(field_name) or "").strip()
+                if len(value) >= 3:
+                    terms.add(value)
+        return terms
+
+    current_terms = _action_terms(matched)
+    if action:
+        current_terms.add(action)
+    offbeat_terms: set[str] = set()
+    for source_beat in source_beats:
+        if source_beat is not matched:
+            offbeat_terms.update(_action_terms(source_beat))
+    offbeat_terms.difference_update(current_terms)
+    scoped["_forbidden_offbeat_action_terms"] = sorted(offbeat_terms)
+
     action = action or str(
         matched.get("action")
         or matched.get("action_prompt")
@@ -522,6 +581,23 @@ def _chunk_scoped_shot_meta(
     scoped["visual"] = str(matched.get("visual") or action or scoped["what"])
     scoped["start_state"] = request.chunk.start_state or matched.get("start_state") or ""
     scoped["end_state"] = request.chunk.end_state or matched.get("end_state") or ""
+    if matched.get("subject_description"):
+        scoped["subject_description"] = matched["subject_description"]
+    feedback = scoped.get("phase8_reshoot")
+    if isinstance(feedback, dict) and offbeat_terms:
+        issues = feedback.get("issues") or []
+        if isinstance(issues, str):
+            issues = [issues]
+        feedback["issues"] = [
+            issue
+            for issue in issues
+            if not any(
+                term.casefold() in str(issue).casefold()
+                for term in offbeat_terms
+            )
+        ]
+        if not feedback["issues"]:
+            scoped.pop("phase8_reshoot", None)
     apply_body_action_contract(scoped)
     return scoped
 
@@ -568,11 +644,30 @@ def _chunk_prompt(
         )
     beat_contract = ""
     if request.chunk.storyboard_beat_id:
+        scoped_actions = shot_meta.get("generation_actions") or []
+        if isinstance(scoped_actions, str):
+            scoped_actions = [scoped_actions]
+        current_action = str(
+            request.chunk.action_prompt
+            or next((value for value in scoped_actions if str(value).strip()), "")
+            or shot_meta.get("action")
+            or "natural scene progression"
+        ).strip()
+        current_start = str(
+            request.chunk.start_state
+            or shot_meta.get("start_state")
+            or "continue the supplied state"
+        ).strip()
+        current_end = str(
+            request.chunk.end_state
+            or shot_meta.get("end_state")
+            or "complete that action"
+        ).strip()
         beat_contract = (
             f"\n[authoritative storyboard beat {request.chunk.storyboard_beat_id}] "
-            f"Start state: {request.chunk.start_state or 'continue the supplied state'}. "
-            f"Execute only this visible action: {request.chunk.action_prompt or 'natural scene progression'}. "
-            f"Required end state: {request.chunk.end_state or 'complete that action'}. "
+            f"Start state: {current_start}. "
+            f"Execute only this visible action: {current_action}. "
+            f"Required end state: {current_end}. "
             "Do not execute another Pxx panel, skip ahead, or replay an earlier panel."
         )
     prompt = apply_storyboard_motion_policy(
@@ -589,6 +684,16 @@ def _chunk_prompt(
         raise ValueError(
             f"{request.resource_id} choreography marker count is {marker_count}, "
             f"expected {expected_count} for the current beat"
+        )
+    leaked_terms = [
+        term
+        for term in shot_meta.get("_forbidden_offbeat_action_terms", [])
+        if str(term).casefold() in prompt.casefold()
+    ]
+    if leaked_terms:
+        raise ValueError(
+            f"{request.resource_id} prompt leaked non-current beat action terms: "
+            + ", ".join(leaked_terms[:5])
         )
     return prompt
 
@@ -741,7 +846,7 @@ def _base_content(
     content_meta["prompt"] = _chunk_prompt(
         request,
         content_meta,
-        _storyboard_group_prompt(group, request.shot_id),
+        _storyboard_group_prompt(group, request.shot_id, request.chunk),
         characters_data,
     )
     from utils.privacy_visual_policy import (

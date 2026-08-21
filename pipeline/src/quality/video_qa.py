@@ -758,10 +758,13 @@ def _batch_character_evidence(
     requested: set[str] = set()
     for shot_id in batch_shot_ids:
         shot = shot_by_id.get(shot_id, {})
-        raw_cast = shot.get("who") or shot.get("characters") or []
-        if isinstance(raw_cast, str):
-            raw_cast = [raw_cast]
-        requested.update(str(value).strip().casefold() for value in raw_cast if value)
+        for field_name in ("who", "characters"):
+            raw_cast = shot.get(field_name) or []
+            if isinstance(raw_cast, str):
+                raw_cast = [raw_cast]
+            requested.update(
+                str(value).strip().casefold() for value in raw_cast if value
+            )
         requested.update(
             str(asset)[5:].split(":", 1)[0].strip().casefold()
             for asset in (shot.get("associate_assets") or [])

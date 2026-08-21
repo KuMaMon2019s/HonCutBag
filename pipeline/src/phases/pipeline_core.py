@@ -3835,6 +3835,73 @@ def _prompt_assets_for_shot(shot_meta: dict, characters_data: dict) -> list[dict
     return selected
 
 
+def _prepare_phase6_prompt(
+    shot_id: str,
+    shot_meta: dict,
+    characters_data: dict,
+    scene_consistency_data: dict,
+    *,
+    video_model: str,
+    route_model: str,
+) -> tuple[str, bool]:
+    """Return the final transport prompt while retaining a reroutable base prompt."""
+    from phases.phase6.video_generator import build_video_prompt
+
+    scene_contract = scene_consistency_data.get("shots", {}).get(shot_id, {})
+    if scene_contract:
+        shot_meta["lighting_description"] = (
+            scene_contract.get("lighting_description")
+            or scene_contract.get("lighting_note")
+            or shot_meta.get("lighting_description")
+        )
+        shot_meta["style_anchor"] = (
+            scene_contract.get("style_anchor")
+            or scene_contract.get("style_suffix")
+            or scene_consistency_data.get("global_style_lock")
+            or shot_meta.get("style_anchor")
+        )
+        shot_meta["temporal_visual_contract"] = (
+            scene_contract.get("temporal_visual_contract")
+            or shot_meta.get("temporal_visual_contract")
+        )
+
+    prompt = str(shot_meta.get("prompt") or "")
+    if scene_consistency_data:
+        rendered = build_video_prompt(
+            shot_meta,
+            characters_data,
+            scene_consistency_data,
+            video_model,
+        )
+        if isinstance(rendered, dict):
+            prompt = str(rendered.get("prompt") or "")
+            shot_meta["negative_prompt"] = rendered.get("negative_prompt") or ""
+        else:
+            prompt = str(rendered or "")
+    shot_meta["prompt"] = prompt
+
+    route_applied = False
+    try:
+        from prompt.prompt_router import route_prompt
+
+        route_data = dict(shot_meta)
+        route_data["prompt"] = prompt
+        routed_prompt = route_prompt(
+            model_name=route_model,
+            mode="single_shot",
+            shot_data=route_data,
+            assets=_prompt_assets_for_shot(shot_meta, characters_data),
+        )
+        if routed_prompt:
+            prompt = str(routed_prompt)
+            route_applied = True
+    except Exception:
+        # The complete Phase 6 prompt remains the compatibility fallback when
+        # an optional model-specific formatter is unavailable.
+        pass
+    return prompt, route_applied
+
+
 def _rejected_privacy_image_url(content: list[dict] | None, error: object) -> str | None:
     """Return the stable URL key for the provider-rejected content[N] image."""
     import re
@@ -4139,6 +4206,16 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
     # by an exact succeeded ledger entry plus hash and ffprobe validation.
     pending_shot_dirs = list(shot_dirs)
 
+    try:
+        from utils.config import SEEDANCE_MODEL
+
+        route_model_name = SEEDANCE_MODEL
+    except ImportError:
+        route_model_name = os.environ.get(
+            "SEEDANCE_MODEL", "doubao-seedance-2.0-mini"
+        )
+    video_prompt_model = os.environ.get("VIDEO_MODEL", "seedance")
+
     task_dir_id = None
     if use_local and os.environ.get("HONCUT_TASK_DIR_MODE") == "1" and pending_shot_dirs:
         from tools import task_dir_exporter
@@ -4154,6 +4231,15 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                 for asset_id in pending_meta.get("associate_assets", [])
                 if isinstance(asset_id, str) and asset_id.startswith("char:")
             })
+            export_prompt, _route_applied = _prepare_phase6_prompt(
+                pending_dir.name,
+                pending_meta,
+                chars_data,
+                scene_consistency_data,
+                video_model=video_prompt_model,
+                route_model=route_model_name,
+            )
+            pending_meta["prompt"] = export_prompt
             export_shots[pending_dir.name] = pending_meta
         local_task_dir = task_dir_exporter.build_task_dir(
             output_dir,
@@ -4182,44 +4268,17 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
         active_source = chain_source if chain_mode and chain_allowed else None
         meta["chain_source"] = active_source[0] if active_source else None
         meta["chain_active"] = bool(active_source)
-        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-        prompt = meta.get("prompt", "")
-        if scene_consistency_data:
-            from phases.phase6.video_generator import build_video_prompt
-
-            scene_contract = scene_consistency_data.get("shots", {}).get(
-                shot_dir.name, {}
-            )
-            if scene_contract:
-                meta["lighting_description"] = (
-                    scene_contract.get("lighting_description")
-                    or scene_contract.get("lighting_note")
-                    or meta.get("lighting_description")
-                )
-                meta["style_anchor"] = (
-                    scene_contract.get("style_anchor")
-                    or scene_contract.get("style_suffix")
-                    or scene_consistency_data.get("global_style_lock")
-                    or meta.get("style_anchor")
-                )
-                meta["temporal_visual_contract"] = (
-                    scene_contract.get("temporal_visual_contract")
-                    or meta.get("temporal_visual_contract")
-                )
-
-            routed_prompt = build_video_prompt(
-                meta,
-                chars_data,
-                scene_consistency_data,
-                os.environ.get("VIDEO_MODEL", "seedance"),
-            )
-            if isinstance(routed_prompt, dict):
-                prompt = routed_prompt["prompt"]
-                meta["negative_prompt"] = routed_prompt["negative_prompt"]
-            else:
-                prompt = routed_prompt
-            meta["prompt"] = prompt
-            meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        prompt, route_applied = _prepare_phase6_prompt(
+            shot_dir.name,
+            meta,
+            chars_data,
+            scene_consistency_data,
+            video_model=video_prompt_model,
+            route_model=route_model_name,
+        )
+        meta_path.write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
         gen_strategy = meta.get("gen_strategy", "i2v")
         if gen_strategy not in {"flf2v", "phantom", "i2v"}:
             gen_strategy = "i2v"
@@ -4250,25 +4309,8 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                 flush=True,
             )
             return None
-        # --- M4: 模型路由（增量，失败用原始 prompt）---
-        try:
-            from prompt.prompt_router import route_prompt
-            try:
-                from utils.config import SEEDANCE_MODEL
-                model_name = SEEDANCE_MODEL
-            except ImportError:
-                model_name = os.environ.get("SEEDANCE_MODEL", "doubao-seedance-2.0-mini")
-            routed_prompt = route_prompt(
-                model_name=model_name,
-                mode="single_shot",
-                shot_data=meta,
-                assets=_prompt_assets_for_shot(meta, chars_data),
-            )
-            if routed_prompt:
-                prompt = routed_prompt
-                print(f"    [M4] 提示词路由: {model_name} → single_shot")
-        except Exception as e:
-            pass  # 降级用原始 prompt
+        if route_applied:
+            print(f"    [M4] 提示词路由: {route_model_name} → single_shot")
         duration = meta.get("duration")  # 从 SHOT_META 读取；缺失时由模型 profile 选中间档
         if not prompt:
             return None

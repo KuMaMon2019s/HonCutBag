@@ -10,6 +10,7 @@ from tools.asset_packager import (
     collect_character_reference_assets,
     inject_reference_instruction,
 )
+from utils.prompt_budget import enforce_prompt_budget
 
 
 def _shot_meta(meta: Mapping, shot_id: str) -> dict:
@@ -128,6 +129,12 @@ def build_task_dir(output_dir, shot_ids: Sequence[str], meta: Mapping) -> Path:
             )
         if frame_instructions:
             prompt = f"分镜参考说明：{'；'.join(frame_instructions)}。{prompt}"
+        enforce_prompt_budget(
+            prompt,
+            provider="bridge",
+            model=str(meta.get("model") or "unknown"),
+            purpose="video_generation",
+        )
         (prompt_dir / "提示词.txt").write_text(prompt, encoding="utf-8")
         manifest = {
             "shot_id": shot_id,
