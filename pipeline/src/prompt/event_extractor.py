@@ -208,6 +208,12 @@ _NARRATIVE_JUMP_CUES = (
     "与此同时", "另一边", "次日", "翌日", "后来", "数小时后", "多年后", "回忆",
     "梦境", "转场", "来到", "抵达", "离开当前", "meanwhile", "later", "next day",
 )
+# Cache-invalidation contract: this version is mixed into every segment_hash
+# (see below), and cached files are keyed by that hash. Bumping this value
+# therefore invalidates ALL existing phase1_event_segments/ caches — including
+# caches carried over from earlier run directories — and forces every Phase 1
+# event extraction to re-run (a paid LLM pass). Never bump casually, and never
+# reuse cross-run segment caches from a run produced under a different value.
 EVENT_FLOW_SCHEMA_VERSION = "7.0"
 
 
