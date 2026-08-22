@@ -20,6 +20,8 @@ from pathlib import Path
 
 import requests
 
+from runtime.provider_responses import parse_video_submission
+
 from utils.prompt_budget import enforce_prompt_budget
 
 # Default local API URL (can be overridden via config or env)
@@ -218,9 +220,10 @@ def submit(
             resp = session.post(f"{api_url}/generate", json=payload, timeout=timeout)
             if resp.status_code == 200:
                 response_data = resp.json()
-                task_id = response_data.get("task_id") or response_data.get("id")
-                if task_id:
-                    return task_id
+                return parse_video_submission(
+                    response_data,
+                    provider_id="bridge",
+                ).task_id
             raise RuntimeError(
                 f"Bridge task_dir submission failed: HTTP {resp.status_code} — {resp.text[:200]}"
             )
@@ -255,7 +258,10 @@ def submit(
             )
             if resp.status_code == 200:
                 data = resp.json()
-                task_id = data.get("task_id") or data.get("id")
+                task_id = parse_video_submission(
+                    data,
+                    provider_id="bridge",
+                ).task_id
                 images_used = data.get("images_used", 0)
                 warnings = data.get("warnings", [])
                 if task_id:
@@ -291,9 +297,10 @@ def submit(
                 )
             if resp.status_code == 200:
                 data = resp.json()
-                task_id = data.get("task_id") or data.get("id")
-                if task_id:
-                    return task_id
+                return parse_video_submission(
+                    data,
+                    provider_id="bridge",
+                ).task_id
             elif resp.status_code == 404:
                 print(f"  [submit] Bridge does not support /generate_zip (404), falling back to base64")
                 return None
@@ -347,11 +354,7 @@ def submit(
         raise RuntimeError(f"Local video API error {resp.status_code}: {resp.text[:500]}")
     
     data = resp.json()
-    task_id = data.get("task_id") or data.get("id")
-    if not task_id:
-        raise RuntimeError(f"No task_id in local API response: {data}")
-    
-    return task_id
+    return parse_video_submission(data, provider_id="bridge").task_id
 
 
 def poll(

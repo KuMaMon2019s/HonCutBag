@@ -14,6 +14,7 @@ from runtime.execution_errors import (
     SubmissionUncertainError,
 )
 from runtime.generation_tasks import GenerationTaskStore
+from runtime.security_boundaries import CorrelationContext, emit_runtime_event
 
 
 @dataclass(frozen=True)
@@ -143,6 +144,19 @@ def execute_bridge_video_task(
         raise SubmissionUncertainError(
             f"Bridge submission for {resource_id} may be in flight; refusing to resubmit"
         )
+
+    emit_runtime_event(
+        "provider_task_active",
+        CorrelationContext(
+            project_id=(artifact_store.project_id if artifact_store else "local"),
+            run_id=run_id,
+            node_id="phase6.video_generation",
+            task_id=task.task_id,
+        ),
+        provider_id="bridge",
+        status=task.status,
+        resource_id=resource_id,
+    )
 
     provider_job_id = task.provider_job_id
     if provider_job_id and task.provider_endpoint != provider_endpoint:

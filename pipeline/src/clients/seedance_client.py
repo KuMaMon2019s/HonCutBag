@@ -13,6 +13,8 @@ import requests
 
 from clients.video_client import VideoClient
 from runtime.execution_errors import ProviderJobFailedError
+from runtime.provider_responses import parse_seedance_task, parse_video_submission
+from runtime.security_boundaries import redact_text
 from utils.config import ARK_BASE_URL
 from utils.ip_blacklist import sanitize_prompt
 from utils.prompt_budget import enforce_prompt_budget
@@ -33,7 +35,8 @@ def _authorization_headers(api_key: str) -> dict[str, str]:
 def _response_json(response: requests.Response, operation: str) -> dict:
     if response.status_code != 200:
         raise RuntimeError(
-            f"Seedance {operation} API {response.status_code}: {response.text[:500]}"
+            f"Seedance {operation} API {response.status_code}: "
+            f"{redact_text(response.text[:500])}"
         )
     payload = response.json()
     if not isinstance(payload, dict):
@@ -224,10 +227,7 @@ def _submit_direct(
     if resp.status_code != 200:
         raise RuntimeError(f"Seedance API {resp.status_code}: {resp.text[:500]}")
     data = resp.json()
-    task_id = data.get("id")
-    if not task_id:
-        raise RuntimeError(f"No task_id in response: {data}")
-    return task_id
+    return parse_video_submission(data, provider_id="seedance").task_id
 
 
 def submit_content(
@@ -274,10 +274,7 @@ def submit_content(
     if resp.status_code != 200:
         raise RuntimeError(f"Seedance API {resp.status_code}: {resp.text[:500]}")
     data = resp.json()
-    task_id = data.get("id")
-    if not task_id:
-        raise RuntimeError(f"No task_id in response: {data}")
-    return task_id
+    return parse_video_submission(data, provider_id="seedance").task_id
 
 
 def build_video_extension_content(
@@ -384,12 +381,13 @@ def poll(
     for attempt in range(1, max_attempts + 1):
         time.sleep(interval)
         data = get_task(task_id, api_key=api_key, timeout=request_timeout)
-        status = data.get("status", "")
+        task = parse_seedance_task(data)
+        status = task.status
 
         if status == "succeeded":
             video_url = (
-                data.get("content", {}).get("video_url")
-                or data.get("output", {}).get("video_url")
+                task.content.get("video_url")
+                or task.output.get("video_url")
             )
             if not video_url:
                 raise RuntimeError(f"Succeeded but no video_url: {data}")

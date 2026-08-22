@@ -37,6 +37,7 @@ from runtime.generation_fingerprint import (
 )
 from runtime.generation_tasks import GenerationTaskStore
 from runtime.provider_policy import ProviderExecutionPolicy
+from runtime.security_boundaries import validate_subprocess_args
 from runtime.seedance_execution import execute_seedance_video_task
 from schemas.continuity import ContinuityPlan, GenerationChunk
 from utils.storyboard_motion_policy import apply_storyboard_motion_policy
@@ -2082,7 +2083,7 @@ def materialize_continuity_shot(
         ]
     )
     completed = subprocess.run(
-        command,
+        validate_subprocess_args(command),
         check=False,
         capture_output=True,
         text=True,

@@ -23,6 +23,7 @@ from runtime.generation_fingerprint import (
 )
 from runtime.phase_timing import _banner, _elapsed, _now
 from runtime.provider_policy import ProviderExecutionPolicy
+from runtime.security_boundaries import safe_error_message
 from tools.base_tool import BaseTool, ToolResult, ToolRuntime
 from tools.vendor_adapter import VendorAdapter, VendorModel
 from utils.character_body_contracts import character_visual_description
@@ -943,7 +944,10 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                         generation_result["relative_output"] = f"shots/{shot_dir.name}/output.mp4"
                         return generation_result
                     except Exception as local_err:
-                        print(f"    ✗ {shot_dir.name}: 本地 API 失败 — {local_err}")
+                        print(
+                            f"    ✗ {shot_dir.name}: 本地 API 失败 — "
+                            f"{safe_error_message(local_err)}"
+                        )
                         print("    ⚠ 不降级到 ARK（零成本测试模式），跳过此镜头")
                         return None
 
@@ -1115,7 +1119,7 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                     "relative_output": f"shots/{shot_dir.name}/output.mp4",
                 }
             except Exception as e:
-                err_str = str(e)
+                err_str = safe_error_message(e)
                 # Transport quota retries are exhausted inside Runtime policy.
                 if "QuotaExceeded" in err_str or "429" in err_str:
                     print(

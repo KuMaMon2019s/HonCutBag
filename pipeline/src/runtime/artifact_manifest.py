@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Iterable
 
 from runtime.artifact_migrations import migrate_artifact_manifest
+from runtime.security_boundaries import resolve_within_workspace
 from schemas.artifact import ArtifactManifest, ArtifactRef
 
 
@@ -115,11 +116,12 @@ class ArtifactManifestStore:
         expected_sha256: str | None = None,
         semantic_fingerprint: str | None = None,
     ) -> ArtifactRef:
-        source = Path(path).resolve(strict=True)
-        try:
-            relative_path = source.relative_to(self.run_directory).as_posix()
-        except ValueError as error:
-            raise ValueError("artifact path escapes its run directory") from error
+        source = resolve_within_workspace(
+            self.run_directory,
+            path,
+            must_exist=True,
+        )
+        relative_path = source.relative_to(self.run_directory).as_posix()
         if not source.is_file():
             raise ValueError("only regular artifact files can be registered")
         content_sha256 = file_sha256(source)
@@ -182,9 +184,11 @@ class ArtifactManifestStore:
         if artifact is None:
             raise KeyError(f"unknown artifact ID: {artifact_id}")
         if verify_content:
-            path = (self.run_directory / artifact.relative_path).resolve()
             try:
-                path.relative_to(self.run_directory)
+                path = resolve_within_workspace(
+                    self.run_directory,
+                    artifact.relative_path,
+                )
             except ValueError as error:
                 raise RuntimeError("artifact path escapes its run directory") from error
             if not path.is_file():
