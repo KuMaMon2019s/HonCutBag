@@ -313,6 +313,48 @@ def test_group_participants_are_not_promoted_to_character_assets():
     assert parsed[0]["background_groups"] == ["数十机械单位"]
 
 
+@pytest.mark.parametrize(
+    ("event_role", "dramatic_turn"),
+    [("action_chain", True), ("turning_point", False)],
+)
+def test_event_parser_rejects_role_and_dramatic_turn_conflicts(
+    event_role,
+    dramatic_turn,
+):
+    payload = [_event(event_role=event_role, dramatic_turn=dramatic_turn)]
+
+    with pytest.raises(ValueError, match="event_role.*dramatic_turn"):
+        _parse_events(json.dumps(payload, ensure_ascii=False))
+
+
+def test_event_extractor_retries_role_and_dramatic_turn_conflict(monkeypatch):
+    calls = []
+    invalid = _event(event_role="action_chain", dramatic_turn=True)
+    corrected = _event(event_role="action_chain", dramatic_turn=False)
+
+    def fake_call(prompt, **_kwargs):
+        calls.append(prompt)
+        payload = invalid if len(calls) == 1 else corrected
+        return json.dumps([payload], ensure_ascii=False)
+
+    monkeypatch.setattr("prompt.event_extractor._call_llm", fake_call)
+    monkeypatch.setattr("prompt.event_extractor.time.sleep", lambda _seconds: None)
+
+    from prompt import event_extractor
+
+    events = event_extractor._extract_events_from_segment(
+        {
+            "id": 1,
+            "content": invalid["source_excerpt"],
+            "format_hint": "prose_action_screenplay",
+        }
+    )
+
+    assert len(calls) == 2
+    assert "event_role 与 dramatic_turn" in calls[1]
+    assert events[0]["dramatic_turn"] is False
+
+
 def test_adaptation_inherits_source_evidence_and_repairs_dialogue_speaker():
     events = [_event(
         continuity_before="cut",

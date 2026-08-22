@@ -99,7 +99,7 @@ USER_PROMPT_TEMPLATE = (
     "- causal_link: 字符串，说明本单元由上一事件的什么动作或决定引发；无则为空字符串\n"
     "- continuity_before: 字符串，cut/continuous；只有同一时空且状态直接承接才为 continuous\n"
     "- continuity_subject: 字符串，continuous 时跨单元跟踪的主要人物或物体，否则为空字符串\n"
-    "- dramatic_turn: 布尔值，立场、目标、关系或战局是否在这里发生转折\n"
+    "- dramatic_turn: 布尔值，只允许 turning_point 为 true；其他 event_role 必须为 false\n"
     "- lines: 数组，本事件中角色说出的台词原文，每条为 "
     "{{\"speaker\": \"角色名或未知\", \"line\": \"逐字台词\", "
     "\"confidence\": 0到1, \"evidence\": \"归属依据\"}}；无台词时为空数组 []\n"
@@ -114,7 +114,8 @@ GENERAL_PROSE_CONTRACT = (
     "1. 场景建立、人物状态、对白、行为、反应、后果与关系变化按叙事功能划分 event_role。\n"
     "2. 只在原文明确描述可见行为时填写 micro_actions；氛围、说明与内心信息不得虚构肢体动作。\n"
     "3. 对人物、物体或空间造成的持久变化必须进入 end_state，供后续事件承接。\n"
-    "4. 目标、关系、认知或处境发生转折时单列 turning_point，并设置 dramatic_turn=true。\n"
+    "4. 目标、关系、认知或处境发生转折时单列 turning_point，并设置 dramatic_turn=true；"
+    "所有非 turning_point 事件必须设置 dramatic_turn=false。\n"
     "5. 同一时空的状态直接承接才使用 continuous；换场、跳时或独立叙事段落使用 cut。\n"
     "6. who 只放可作为角色资产的具名个体；群体与背景参与者写入 visual，不得写入 who。\n"
     "7. who 的每个值必须是稳定身份标签，不得包含服装、年龄、伤势、动作、站位或地点修饰；"
@@ -130,7 +131,8 @@ ACTION_SCREENPLAY_CONTRACT = (
     "融为一个整体且并非逐个执行时，必须合成一条复合 micro_action 并设为 composite；"
     "‘连贯衔接’或‘一气呵成’本身不代表同时发生；原文明示先、随后、逐渐、最终等状态变化时仍须拆成多条。\n"
     "3. 动作造成的人物、物体、空间、朝向、速度或受力状态变化必须写入 end_state。\n"
-    "4. 目标、立场、关系或局势发生变化时单列 turning_point，并设置 dramatic_turn=true。\n"
+    "4. 目标、立场、关系或局势发生变化时单列 turning_point，并设置 dramatic_turn=true；"
+    "所有非 turning_point 事件必须设置 dramatic_turn=false。\n"
     "5. 相邻事件的位置、朝向、速度和受力状态直接延续时使用 continuous；"
     "换场、跳时或独立叙事段落使用 cut。\n"
     "6. who 只放可作为角色资产的具名个体；群体与背景参与者写入 visual，不得写入 who。\n"
@@ -214,7 +216,7 @@ _NARRATIVE_JUMP_CUES = (
 # caches carried over from earlier run directories — and forces every Phase 1
 # event extraction to re-run (a paid LLM pass). Never bump casually, and never
 # reuse cross-run segment caches from a run produced under a different value.
-EVENT_FLOW_SCHEMA_VERSION = "7.0"
+EVENT_FLOW_SCHEMA_VERSION = "8.0"
 
 
 def _normalize_event(event: Dict[str, Any], source_content: str = "") -> Dict[str, Any]:
@@ -262,7 +264,15 @@ def _normalize_event(event: Dict[str, Any], source_content: str = "") -> Dict[st
         event[field] = str(event.get(field) or "").strip()
     boundary = str(event.get("continuity_before") or "cut").strip().lower()
     event["continuity_before"] = boundary if boundary in {"cut", "continuous"} else "cut"
-    event["dramatic_turn"] = bool(event.get("dramatic_turn", role == "turning_point"))
+    dramatic_turn = event.get("dramatic_turn", role == "turning_point")
+    if not isinstance(dramatic_turn, bool):
+        raise ValueError("dramatic_turn 必须是 JSON 布尔值")
+    expected_turn = role == "turning_point"
+    if dramatic_turn is not expected_turn:
+        raise ValueError(
+            "event_role 与 dramatic_turn 冲突：只有 turning_point 可以为 true"
+        )
+    event["dramatic_turn"] = dramatic_turn
 
     lines = event.get("lines", [])
     normalized_lines = []
@@ -372,7 +382,14 @@ def _extract_events_from_segment(segment: Dict[str, Any]) -> List[Dict[str, Any]
     last_error = None
     for attempt in range(1 + MAX_RETRIES):
         try:
-            response = _call_llm(prompt, system_prompt=system_prompt)
+            attempt_prompt = prompt
+            if attempt and last_error:
+                attempt_prompt += (
+                    "\n\n【重试纠错】上次响应未通过 canonical event schema："
+                    f"{last_error}。event_role 与 dramatic_turn 必须严格对应："
+                    "turning_point=true，其他 event_role=false。"
+                )
+            response = _call_llm(attempt_prompt, system_prompt=system_prompt)
             events = _parse_events(response, content)
             return events
         except (json.JSONDecodeError, ValueError) as e:
