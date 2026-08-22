@@ -7,7 +7,6 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from graph.composition import build_pipeline_graph as build_composed_graph
 from graph.routing import quality_gate_router, route_phase5
 from graph.state import HonCutState
 from phases.phase1 import phase1_pipeline as _phase1_pipeline_owner
@@ -52,7 +51,6 @@ from phases.phase6.direct_generation import (
     _run_phase6_fallback as _owned_phase6_fallback,
     _without_rejected_privacy_images,
 )
-from phases.phase6.legacy_vendor_generation import _run_phase6_om_seedance
 from phases.phase7 import phase7_consistency as _phase7_consistency_owner
 from phases.phase8 import phase8_assembly as _phase8_assembly_owner
 from phases.phase9 import phase9_post as _phase9_post_owner
@@ -79,18 +77,11 @@ from prompt.shot_prompt_builder import build_batch_prompts
 from prompt.speech_pacing import annotate_shot_pacing
 from quality.quality_gate import run_quality_check
 from runtime import pipeline_execution as _pipeline_execution
-from runtime.phase_timing import _banner, _elapsed, _ensure_dir, _now
+from runtime.phase_timing import _banner, _elapsed, _now
 from runtime.pipeline_checkpoints import (
     PHASE_ORDER,
-    _checkpoint_path,
-    _get_completed_stages,
-    _get_next_stage,
-    _read_checkpoint,
-    _record_stage_checkpoint,
     _resume_skip_phases,
-    get_sqlite_checkpointer,
     load_state_from_sqlite,
-    save_state_to_sqlite,
 )
 from runtime.pipeline_reports import _write_report
 from runtime.retry_execution import _retry_with_policy
@@ -98,11 +89,7 @@ from utils.ark_llm import call_llm_stream
 from utils.config import get_api_key
 from utils.file_integrity import _file_sha256
 from utils.media_probe import _assert_duration_conserved, _probe_av_durations
-from utils.media_profiles import (
-    AVAILABLE_PROFILES,
-    _get_profile_dict,
-    _project_video_spec,
-)
+from utils.media_profiles import _project_video_spec
 from utils.progress_reporter import ProgressReporter
 from utils.source_paths import PIPELINE_SRC_DIR, PROJECT_ROOT
 

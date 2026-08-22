@@ -1,10 +1,8 @@
 """Production composition root for the canonical HonCut workflow.
 
-This module injects the current Phase owners into the pure topology in
-``graph.workflow``. During the strangler migration those owners still live in
-``phases.pipeline_core``; the optional ``phase_owner`` argument keeps that
-dependency explicit and lets the compatibility facade preserve call-time
-monkeypatch behavior.
+This module injects the current runtime Phase owners into the pure topology in
+``graph.workflow``. The optional ``phase_owner`` argument exists only for
+explicit compatibility tests and alternate compositions.
 """
 
 from __future__ import annotations
@@ -19,7 +17,11 @@ from graph.state import HonCutState
 
 
 def _resolve_phase_owner(phase_owner: ModuleType | Any | None) -> Any:
-    return phase_owner if phase_owner is not None else import_module("phases.pipeline_core")
+    return (
+        phase_owner
+        if phase_owner is not None
+        else import_module("runtime.pipeline_execution")
+    )
 
 
 def _invoke(

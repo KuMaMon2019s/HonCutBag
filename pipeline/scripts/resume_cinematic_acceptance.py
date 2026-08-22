@@ -188,7 +188,7 @@ def run(
     # the project .env only when no matching process value is already present.
     from clients import seedance_client
     from phases.phase8.frame_analysis import analyze_shot_frames
-    from phases.pipeline_core import _prepare_phase6_prompt
+    from phases.phase6.direct_generation import _prepare_phase6_prompt
     from runtime.generation_tasks import GenerationTaskStore
     from runtime.seedance_execution import execute_seedance_video_task
     from tools.asset_packager import _detect_shot_characters, build_content_for_shot

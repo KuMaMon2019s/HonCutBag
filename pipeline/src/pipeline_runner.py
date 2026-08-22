@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""HonCut pipeline CLI and backward-compatible orchestration facade.
-
-Phase entry points live in :mod:`phases`; the implementation core is kept as
-one module so the existing LangGraph nodes and monkeypatch-based integrations
-continue to share a single module namespace.
-"""
+"""HonCut command-line entry point."""
 
 import argparse
 import json
@@ -23,7 +18,9 @@ from utils.deps import check_dependencies
 
 check_dependencies()
 
-from phases import pipeline_core as _core
+from phases.phase1.adaptation_engine import AVG_SHOT_DURATION
+from runtime import pipeline_execution as _core
+from utils.media_profiles import AVAILABLE_PROFILES
 from utils.pipeline_config import DEFAULT_CONFIG, load_config
 from utils.run_memory import RunMemory
 
@@ -132,7 +129,7 @@ def _build_parser() -> argparse.ArgumentParser:
     input_group.add_argument("--input", type=str, help="故事文本文件路径")
     parser.add_argument("--duration", type=int, default=None, help="目标视频时长（秒），默认 60")
     parser.add_argument("--shot-duration", type=int, default=None,
-                        help=f"每镜平均时长（秒），默认 {_core.AVG_SHOT_DURATION}")
+                        help=f"每镜平均时长（秒），默认 {AVG_SHOT_DURATION}")
     parser.add_argument("--chain-mode", action="store_true", default=None,
                         help="Seedance 尾帧接力模式（镜头串行生成）")
     parser.add_argument("--dry-run", action="store_true", default=None, help="dry-run 模式")
@@ -173,7 +170,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.set_defaults(no_real_person=None)
     parser.add_argument(
-        "--media-profile", choices=_core.AVAILABLE_PROFILES, default=None, help="编码配置（默认 1080p）"
+        "--media-profile", choices=AVAILABLE_PROFILES, default=None, help="编码配置（默认 1080p）"
     )
     parser.add_argument("--resume", action="store_true", help="从检查点恢复")
     parser.add_argument(
@@ -246,7 +243,7 @@ def _resolved_run_arguments(args: argparse.Namespace) -> dict:
 
     return {
         "duration": choose("duration", 60),
-        "shot_duration": choose("shot_duration", _core.AVG_SHOT_DURATION),
+        "shot_duration": choose("shot_duration", AVG_SHOT_DURATION),
         "chain_mode": choose("chain_mode", False),
         "dry_run": choose("dry_run", False),
         "transition": choose("transition", "crossfade"),
@@ -319,11 +316,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-def __getattr__(name: str):
-    """Forward legacy helpers without replacing this module's public CLI."""
-    try:
-        return getattr(_core, name)
-    except AttributeError as exc:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
