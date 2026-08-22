@@ -130,6 +130,33 @@ def test_production_composition_uses_canonical_state_and_core_is_only_a_facade()
     assert "nodes={" not in core_facade
 
 
+def test_cross_cutting_runtime_owners_do_not_import_pipeline_core():
+    from runtime import (
+        phase_timing,
+        pipeline_checkpoints,
+        pipeline_reports,
+        retry_execution,
+    )
+    from utils import file_integrity, media_probe, source_paths
+
+    owners = (
+        phase_timing,
+        pipeline_checkpoints,
+        pipeline_reports,
+        retry_execution,
+        file_integrity,
+        media_probe,
+        source_paths,
+    )
+    assert all("pipeline_core" not in inspect.getsource(module) for module in owners)
+    assert pipeline_core._now is phase_timing._now
+    assert pipeline_core._retry_with_policy is retry_execution._retry_with_policy
+    assert pipeline_core._write_report is pipeline_reports._write_report
+    assert pipeline_core._file_sha256 is file_integrity._file_sha256
+    assert pipeline_core._probe_av_durations is media_probe._probe_av_durations
+    assert pipeline_core.PROJECT_ROOT == source_paths.PROJECT_ROOT
+
+
 def test_cli_dispatch_preserves_public_arguments_and_exit_contract(monkeypatch, tmp_path):
     captured: dict[str, Any] = {}
     report = {
@@ -340,17 +367,23 @@ def test_resume_resolver_rejects_future_and_cross_project_state(tmp_path):
 def test_sqlite_checkpointer_initialization_fails_open_to_uncheckpointed_graph(
     monkeypatch, tmp_path
 ):
-    if not pipeline_core.LANGGRAPH_AVAILABLE:
+    from runtime import pipeline_checkpoints
+
+    if not pipeline_checkpoints.LANGGRAPH_CHECKPOINTS_AVAILABLE:
         pytest.skip("LangGraph is not installed")
 
-    monkeypatch.setattr(pipeline_core, "_sqlite_saver_instance", None)
-    monkeypatch.setattr(pipeline_core, "_sqlite_saver_path", None)
+    monkeypatch.setattr(pipeline_checkpoints, "_sqlite_saver_instance", None)
+    monkeypatch.setattr(pipeline_checkpoints, "_sqlite_saver_path", None)
 
     def fail_to_open(_path):
         raise OSError("database unavailable")
 
-    monkeypatch.setattr(pipeline_core.SqliteSaver, "from_conn_string", fail_to_open)
-    assert pipeline_core.get_sqlite_checkpointer(tmp_path) is None
+    monkeypatch.setattr(
+        pipeline_checkpoints.SqliteSaver,
+        "from_conn_string",
+        fail_to_open,
+    )
+    assert pipeline_checkpoints.get_sqlite_checkpointer(tmp_path) is None
 
 
 def test_generation_task_dedupe_is_payload_exact_and_provider_scoped(tmp_path):

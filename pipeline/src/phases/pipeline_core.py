@@ -14,7 +14,6 @@ import hashlib
 import json
 import math
 import os
-import random
 import subprocess
 import sys
 import time
@@ -32,7 +31,6 @@ from prompt.speech_pacing import annotate_shot_pacing
 from tools.base_tool import BaseTool, ToolResult, ToolRuntime
 from tools.checkpoint import (
     invalidate_checkpoint_from as invalidate_stage_checkpoint,
-    write_checkpoint as write_stage_checkpoint,
 )
 from tools.provider_scoring import rank_providers
 from tools.video_composer import lock_runtime
@@ -47,6 +45,30 @@ from tools.vendor_adapter import VendorAdapter, VendorModel
 from utils.style_slices import get_slice
 from utils.ark_llm import call_llm_stream, configure_heartbeat_callback
 from utils.character_body_contracts import character_visual_description
+from runtime.phase_timing import _banner, _elapsed, _ensure_dir, _now
+from runtime.pipeline_checkpoints import (
+    PHASE_ORDER,
+    SqliteSaver,
+    _checkpoint_path,
+    _get_completed_stages,
+    _get_next_stage,
+    _read_checkpoint,
+    _record_stage_checkpoint,
+    _resume_skip_phases,
+    get_sqlite_checkpointer,
+    load_state_from_sqlite,
+    save_state_to_sqlite,
+)
+from runtime.pipeline_reports import _write_report
+from runtime.retry_execution import _retry_with_policy
+from utils.file_integrity import _file_sha256
+from utils.media_probe import _assert_duration_conserved, _probe_av_durations
+from utils.source_paths import (
+    LEGACY_TOOLS_DIR,
+    OM_TOOLS_DIR,
+    PIPELINE_SRC_DIR,
+    PROJECT_ROOT,
+)
 
 
 STYLE_SUMMARY_WALL_TIMEOUT = 180.0
@@ -79,8 +101,6 @@ if hasattr(sys.stderr, "reconfigure"):
 try:
     from langgraph.func import task
     from langgraph.types import RetryPolicy, Send, Command
-    from langgraph.checkpoint.sqlite import SqliteSaver
-    from langgraph.checkpoint.base import empty_checkpoint
     from langgraph.errors import GraphInterrupt
     LANGGRAPH_AVAILABLE = True
 except ImportError as e:
@@ -107,10 +127,7 @@ except ImportError as e:
 # ---------------------------------------------------------------------------
 # Path setup — 让本脚本能 import 同目录及 2026-07-27_05/scripts 下的模块
 # ---------------------------------------------------------------------------
-SCRIPT_DIR = Path(__file__).resolve().parent.parent
-PIPELINE_SRC_DIR = SCRIPT_DIR
-LEGACY_TOOLS_DIR = SCRIPT_DIR.parent.parent / "vendor" / "legacy"
-OM_TOOLS_DIR = SCRIPT_DIR.parent.parent / "vendor" / "video_tools"
+SCRIPT_DIR = PIPELINE_SRC_DIR
 
 # 优先加载当前源码目录，然后是兼容工具目录。insert(0) 必须反序执行。
 for d in reversed((PIPELINE_SRC_DIR, LEGACY_TOOLS_DIR, str(OM_TOOLS_DIR))):
@@ -210,52 +227,6 @@ def _project_video_spec(media_profile: str) -> dict[str, Any]:
         "fps": float(profile.get("fps") or 30),
         "delivery_profile": media_profile,
     }
-
-
-def _probe_av_durations(path: Path) -> dict[str, float | None]:
-    """Return independent video/audio stream durations; probing failures block delivery."""
-    completed = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,duration",
-         "-of", "json", str(path)],
-        capture_output=True, text=True, timeout=30, check=True,
-    )
-    streams = json.loads(completed.stdout).get("streams", [])
-    durations: dict[str, float | None] = {"video": None, "audio": None}
-    for stream in streams:
-        kind = stream.get("codec_type")
-        if kind in durations and durations[kind] is None and stream.get("duration") not in (None, "N/A"):
-            durations[kind] = float(stream["duration"])
-    if durations["video"] is None:
-        raise RuntimeError(f"No measurable video stream duration: {path}")
-    return durations
-
-
-def _assert_duration_conserved(
-    before: dict[str, float | None],
-    after: dict[str, float | None],
-    tolerance_s: float = 1.0,
-    *,
-    audio_tolerance_s: float | None = None,
-) -> None:
-    """Assert final encoding conserved video and audio durations independently."""
-    comparison_epsilon_s = 1e-6
-    for kind in ("video", "audio"):
-        expected, actual = before.get(kind), after.get(kind)
-        tolerance = (
-            audio_tolerance_s
-            if kind == "audio" and audio_tolerance_s is not None
-            else tolerance_s
-        )
-        if expected is None:
-            continue
-        if (
-            actual is None
-            or abs(actual - expected) > tolerance + comparison_epsilon_s
-        ):
-            raise RuntimeError(
-                f"Final {kind} duration changed from {expected:.3f}s to "
-                f"{actual if actual is not None else 'missing'} (tolerance ±{tolerance:.3f}s)"
-            )
 
 
 def _final_encode_duration_gate(
@@ -467,178 +438,6 @@ def _validated_reviewed_delivery_contract(
 
 
 # ---------------------------------------------------------------------------
-# 工具函数
-# ---------------------------------------------------------------------------
-
-def _now() -> float:
-    return time.time()
-
-
-def _elapsed(start: float) -> float:
-    return round(_now() - start, 2)
-
-
-def _banner(phase_num, total: int, name: str, dry_run: bool = False):
-    tag = " [DRY-RUN]" if dry_run else ""
-    print(f"\n{'='*60}")
-    print(f"  [Phase {phase_num}/{total}] {name}{tag}")
-    print(f"{'='*60}")
-
-
-def _ensure_dir(p: Path) -> Path:
-    p.mkdir(parents=True, exist_ok=True)
-    return p
-
-
-# ---------------------------------------------------------------------------
-# Checkpoint — HonCut 断点续跑
-# ---------------------------------------------------------------------------
-# 格式: {
-#   "completed": ["phase1", "phase2", ...],
-#   "results": {"phase1": {...}, ...},
-#   "timestamp": "2026-07-28T..."
-# }
-# ---------------------------------------------------------------------------
-
-# Phase 顺序定义（用于 resume 时判断哪些已完成）
-PHASE_ORDER = ["phase1", "phase2", "phase3", "phase4", "phase5", "phase6", "phase7", "phase8", "phase9", "phase9_5"]
-
-
-def _resume_skip_phases(existing_skip: list[float], resume_from: str) -> list[float]:
-    """Preserve an explicit phase/range selection while adding the resume boundary."""
-    from utils.artifact_chain import phase_numbers_before
-
-    return sorted(set(existing_skip).union(phase_numbers_before(resume_from)))
-
-
-def _checkpoint_path(output_dir: Path) -> Path:
-    """返回 checkpoint.json 路径"""
-    return Path(output_dir) / "checkpoint.json"
-
-
-def _record_stage_checkpoint(output_dir: Path, phase_name: str, result: dict) -> Path:
-    """Persist a successful phase through the shared checkpoint module."""
-    cp_path = _checkpoint_path(output_dir)
-    status = result.get("status", "")
-    if status != "done":
-        return cp_path
-    safe_result = {}
-    for k, v in result.items():
-        if k.startswith("_"):
-            continue
-        try:
-            json.dumps(v, default=str)
-            safe_result[k] = v
-        except (TypeError, ValueError):
-            safe_result[k] = str(v)
-    run_fingerprint = None
-    project_id = "local"
-    manifest_path = Path(output_dir) / "RUN_MANIFEST.json"
-    if manifest_path.is_file():
-        try:
-            manifest = json.loads(
-                manifest_path.read_text(encoding="utf-8")
-            )
-            run_fingerprint = manifest.get("run_fingerprint")
-            project_id = manifest.get("resolved_config", {}).get(
-                "project_id",
-                "local",
-            )
-        except (OSError, json.JSONDecodeError):
-            pass
-    checkpoint = write_stage_checkpoint(
-        cp_path,
-        phase_name,
-        safe_result,
-        run_fingerprint=run_fingerprint,
-        project_id=project_id,
-    )
-
-    if LANGGRAPH_AVAILABLE:
-        try:
-            save_state_to_sqlite(checkpoint, output_dir, thread_id="pipeline_run")
-        except Exception as e:
-            print(f"  ⚠ SQLite checkpoint 写入失败: {e}")
-
-    return cp_path
-
-
-def _read_checkpoint(output_dir: Path) -> Optional[dict]:
-    """读取检查点。返回 None 如果不存在或损坏。"""
-    cp_path = _checkpoint_path(output_dir)
-    cp_path = Path(cp_path)
-    if not cp_path.exists():
-        return None
-    try:
-        with open(cp_path, encoding="utf-8") as f:
-            checkpoint = json.load(f)
-        # 基本校验
-        if not isinstance(checkpoint.get("completed"), list):
-            return None
-        manifest_path = Path(output_dir) / "RUN_MANIFEST.json"
-        if manifest_path.is_file():
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if checkpoint.get("run_fingerprint") != manifest.get("run_fingerprint"):
-                return None
-        return checkpoint
-    except (json.JSONDecodeError, OSError, TypeError):
-        return None
-
-
-# ---------------------------------------------------------------------------
-# LangGraph Phase 1 Integration: @task + RetryPolicy, Send fan-out, SqliteSaver
-# ---------------------------------------------------------------------------
-
-# --- Retry helper (works outside StateGraph context) ---
-def _retry_with_policy(
-    func,
-    max_attempts=3,
-    backoff_factor=2.0,
-    *args,
-    non_retryable_exceptions=(),
-    **kwargs,
-):
-    """Execute func with retry logic matching LangGraph's RetryPolicy semantics.
-    
-    This is a standalone retry helper that works outside StateGraph context.
-    When running inside a StateGraph, the @task decorator provides equivalent
-    retry behavior automatically.
-    """
-    last_error = None
-    for attempt in range(1, max_attempts + 1):
-        try:
-            return func(*args, **kwargs)
-        except Exception as e:
-            if isinstance(e, non_retryable_exceptions):
-                raise
-            last_error = e
-            error_text = str(e)
-            if attempt < max_attempts:
-                is_429 = (
-                    "429" in error_text
-                    or "Too Many Requests" in error_text
-                    or "QuotaExceeded" in error_text
-                    or getattr(getattr(e, "response", None), "status_code", None) == 429
-                )
-                if is_429:
-                    base_wait = [120, 240, 480][attempt - 1]
-                    wait_time = base_wait + random.uniform(0, 30)
-                else:
-                    wait_time = backoff_factor ** (attempt - 1)
-                print(
-                    f"    ⚠ Attempt {attempt}/{max_attempts} failed: {e}. "
-                    f"Retrying in {wait_time:.1f}s...",
-                    flush=True,
-                )
-                time.sleep(wait_time)
-            else:
-                print(
-                    f"    ✗ All {max_attempts} attempts failed. Last error: {e}",
-                    flush=True,
-                )
-    raise last_error
-
-
 if LANGGRAPH_AVAILABLE:
     # Define state for LangGraph-based execution (Phase 1 StateGraph migration)
     class PipelineState(TypedDict):
@@ -778,105 +577,6 @@ if LANGGRAPH_AVAILABLE:
         
         return sends
 
-    # SqliteSaver checkpoint integration
-    _sqlite_saver_instance = None
-    _sqlite_saver_path = None
-
-    def get_sqlite_checkpointer(output_dir: Path):
-        """Create SqliteSaver checkpointer for the pipeline (module-level singleton).
-        
-        Returns the SqliteSaver context manager itself. Use it as:
-            saver = get_sqlite_checkpointer(output_dir)
-            with saver as checkpointer:
-                checkpointer.setup()
-                # use checkpointer...
-        """
-        global _sqlite_saver_instance, _sqlite_saver_path
-        db_path = Path(output_dir) / "checkpoint.db"
-        db_path_str = str(db_path)
-        if _sqlite_saver_instance is not None and _sqlite_saver_path == db_path_str:
-            return _sqlite_saver_instance
-        try:
-            db_path.parent.mkdir(parents=True, exist_ok=True)
-            _sqlite_saver_instance = SqliteSaver.from_conn_string(db_path_str)
-            _sqlite_saver_path = db_path_str
-            return _sqlite_saver_instance
-        except Exception as e:
-            print(f"⚠ SqliteSaver initialization failed: {e}")
-            return None
-
-    def save_state_to_sqlite(state: dict, output_dir: Path, thread_id: str = "default") -> bool:
-        """Save the stage checkpoint as LangGraph channel values in SQLite."""
-        try:
-            db_path = Path(output_dir) / "checkpoint.db"
-            db_path.parent.mkdir(parents=True, exist_ok=True)
-            checkpoint = empty_checkpoint()
-            checkpoint["channel_values"] = state
-            config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
-            with SqliteSaver.from_conn_string(str(db_path)) as checkpointer:
-                checkpointer.put(
-                    config,
-                    checkpoint,
-                    {"source": "update", "step": len(state.get("completed", [])), "writes": state},
-                    {},
-                )
-            return True
-        except Exception as e:
-            print(f"⚠ Failed to save state to SQLite: {e}")
-            return False
-
-    def load_state_from_sqlite(output_dir: Path, thread_id: str = "default") -> Optional[dict]:
-        """Load pipeline state from SQLite checkpoint."""
-        try:
-            db_path = Path(output_dir) / "checkpoint.db"
-            if not db_path.exists():
-                return None
-            with SqliteSaver.from_conn_string(str(db_path)) as checkpointer:
-                config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
-                checkpoint = checkpointer.get_tuple(config)
-            
-                if checkpoint and checkpoint.checkpoint:
-                    return checkpoint.checkpoint.get("channel_values", {})
-            return None
-        except Exception as e:
-            print(f"⚠ Failed to load state from SQLite: {e}")
-            return None
-
-else:
-    # Fallback when LangGraph is not available
-    def get_sqlite_checkpointer(output_dir: Path):
-        return None
-    
-    def save_state_to_sqlite(state: dict, output_dir: Path, thread_id: str = "default") -> bool:
-        return False
-    
-    def load_state_from_sqlite(output_dir: Path, thread_id: str = "default") -> Optional[dict]:
-        return None
-
-
-def _get_completed_stages(output_dir: Path) -> list:
-    """获取已完成的阶段列表。"""
-    cp = _read_checkpoint(output_dir)
-    if cp is None:
-        return []
-    return cp.get("completed", [])
-
-
-def _get_next_stage(output_dir: Path, all_phases: list = None) -> Optional[str]:
-    """获取下一个要执行的阶段。
-
-    返回第一个不在 completed 列表中的 phase，或 None（全部完成）。
-    """
-    if all_phases is None:
-        all_phases = PHASE_ORDER
-    completed = set(_get_completed_stages(output_dir))
-    for phase in all_phases:
-        if phase not in completed:
-            return phase
-    return None
-
-
-# ---------------------------------------------------------------------------
 # Phase 1: 导演规划 (M1 增量模块)
 # ---------------------------------------------------------------------------
 
@@ -2256,16 +1956,6 @@ def _read_end_frame_sidecar(end_frame_path: Path) -> Optional[dict]:
         return json.loads(sidecar.read_text())
     except Exception:
         return None
-
-
-def _file_sha256(path: Path) -> str:
-    """Compute SHA-256 hex digest of a file."""
-    import hashlib
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 def _phase6_output_failure(
@@ -7478,7 +7168,7 @@ def _run_pipeline(
             ),
             "project_video_spec": project_video_spec,
         },
-        repo_root=SCRIPT_DIR.parent.parent,
+        repo_root=PROJECT_ROOT,
         resume=resume,
         accepted_code_change_from=accept_code_change_from,
     )
@@ -8220,18 +7910,6 @@ def _run_pipeline(
     print(f"{'#'*60}\n")
 
     return report
-
-
-def _write_report(report: dict, output_dir: Path):
-    """写出 pipeline_report.json"""
-    output_dir = Path(output_dir)
-    report_path = output_dir / "pipeline_report.json"
-    # 深拷贝，确保可序列化
-    clean = json.loads(json.dumps(report, default=str))
-    if clean.get("status") == "completed":
-        clean.pop("error", None)
-    report_path.write_text(json.dumps(clean, ensure_ascii=False, indent=2))
-    print(f"\n  📄 报告已写入: {report_path}")
 
 
 # ---------------------------------------------------------------------------
