@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import sqlite3
 
 import pytest
 
 from runtime.execution_errors import SubmissionUncertainError
+from runtime.generation_tasks import (
+    GENERATION_TASK_SCHEMA_VERSION,
+    GenerationTaskStore,
+)
 from runtime.video_provider import (
     ProviderErrorKind,
     VideoGenerationRequest,
@@ -91,3 +97,107 @@ def test_status_contract_fails_closed_for_missing_terminal_details():
         VideoJobStatus(VideoJobState.SUCCEEDED)
     with pytest.raises(ValueError, match="error_message"):
         VideoJobStatus(VideoJobState.FAILED)
+
+
+def test_generation_task_store_migrates_legacy_rows_without_loss(tmp_path):
+    database = tmp_path / "runtime.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            CREATE TABLE generation_tasks (
+                task_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                task_type TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                resource_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                outcome_json TEXT,
+                error_message TEXT,
+                provider_id TEXT,
+                provider_job_id TEXT,
+                provider_endpoint TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                queued_at TEXT NOT NULL,
+                started_at TEXT,
+                updated_at TEXT NOT NULL,
+                finished_at TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO generation_tasks (
+                task_id, run_id, task_type, media_type, resource_id, status,
+                payload_json, outcome_json, provider_id, provider_job_id,
+                provider_endpoint, queued_at, updated_at, finished_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-task",
+                "run-1",
+                "video.generate",
+                "video",
+                "S01",
+                "succeeded",
+                json.dumps({"input_fingerprint": "legacy-fingerprint", "prompt": "x"}),
+                json.dumps({"output_artifact_id": "artifact-1"}),
+                "seedance",
+                "job-1",
+                "https://provider.example/jobs",
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:01:00+00:00",
+            ),
+        )
+
+    store = GenerationTaskStore(database)
+    migrated = store.get("legacy-task")
+    assert migrated is not None
+    assert migrated.payload["prompt"] == "x"
+    assert migrated.input_fingerprint == "legacy-fingerprint"
+    assert migrated.output_artifact_id == "artifact-1"
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == (
+            GENERATION_TASK_SCHEMA_VERSION
+        )
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(generation_tasks)")
+        }
+    assert {"input_fingerprint", "output_artifact_id"} <= columns
+
+
+def test_generation_task_store_persists_fingerprint_and_output_artifact(tmp_path):
+    store = GenerationTaskStore(tmp_path / "runtime.db")
+    enqueued = store.enqueue(
+        run_id="run-1",
+        task_type="video.generate",
+        media_type="video",
+        resource_id="S01",
+        provider_id="seedance",
+        payload={"prompt": "canonical"},
+    )
+    assert len(enqueued.task.input_fingerprint) == 64
+    claimed = store.claim(enqueued.task.task_id)
+    assert claimed is not None
+    store.persist_provider_job(
+        claimed.task_id,
+        provider_job_id="job-1",
+        provider_endpoint="https://provider.example/jobs",
+    )
+    succeeded = store.mark_succeeded(
+        claimed.task_id,
+        {"output_artifact_id": "artifact-1", "output_path": "S01.mp4"},
+    )
+    assert succeeded.output_artifact_id == "artifact-1"
+
+
+def test_generation_task_store_rejects_unknown_future_schema(tmp_path):
+    database = tmp_path / "runtime.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            f"PRAGMA user_version={GENERATION_TASK_SCHEMA_VERSION + 1}"
+        )
+    with pytest.raises(RuntimeError, match="newer than this runtime"):
+        GenerationTaskStore(database)

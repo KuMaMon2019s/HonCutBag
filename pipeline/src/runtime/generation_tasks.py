@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 ACTIVE_STATUSES = ("queued", "running", "submission_uncertain")
+GENERATION_TASK_SCHEMA_VERSION = 2
 
 
 def _utc_now() -> str:
@@ -30,6 +32,15 @@ def _decode_json(value: str | None) -> dict[str, Any]:
     return decoded
 
 
+def _payload_fingerprint(
+    payload: dict[str, Any], explicit: str | None = None
+) -> str:
+    candidate = explicit or payload.get("input_fingerprint")
+    if candidate is not None and str(candidate).strip():
+        return str(candidate).strip()
+    return hashlib.sha256(_encode_json(payload).encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True)
 class GenerationTask:
     task_id: str
@@ -44,6 +55,8 @@ class GenerationTask:
     provider_id: str | None
     provider_job_id: str | None
     provider_endpoint: str | None
+    input_fingerprint: str
+    output_artifact_id: str | None
     attempt_count: int
     queued_at: str
     started_at: str | None
@@ -65,6 +78,8 @@ class GenerationTask:
             provider_id=row["provider_id"],
             provider_job_id=row["provider_job_id"],
             provider_endpoint=row["provider_endpoint"],
+            input_fingerprint=row["input_fingerprint"],
+            output_artifact_id=row["output_artifact_id"],
             attempt_count=int(row["attempt_count"]),
             queued_at=row["queued_at"],
             started_at=row["started_at"],
@@ -96,6 +111,12 @@ class GenerationTaskStore:
     def _initialize(self) -> None:
         with self._connect() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version > GENERATION_TASK_SCHEMA_VERSION:
+                raise RuntimeError(
+                    "generation task database schema is newer than this runtime: "
+                    f"{version} > {GENERATION_TASK_SCHEMA_VERSION}"
+                )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS generation_tasks (
@@ -114,6 +135,8 @@ class GenerationTaskStore:
                     provider_id TEXT,
                     provider_job_id TEXT,
                     provider_endpoint TEXT,
+                    input_fingerprint TEXT,
+                    output_artifact_id TEXT,
                     attempt_count INTEGER NOT NULL DEFAULT 0,
                     queued_at TEXT NOT NULL,
                     started_at TEXT,
@@ -122,10 +145,55 @@ class GenerationTaskStore:
                 )
                 """
             )
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(generation_tasks)"
+                ).fetchall()
+            }
+            if "input_fingerprint" not in columns:
+                connection.execute(
+                    "ALTER TABLE generation_tasks ADD COLUMN input_fingerprint TEXT"
+                )
+            if "output_artifact_id" not in columns:
+                connection.execute(
+                    "ALTER TABLE generation_tasks ADD COLUMN output_artifact_id TEXT"
+                )
+            rows = connection.execute(
+                """
+                SELECT task_id, payload_json, outcome_json, input_fingerprint,
+                       output_artifact_id
+                FROM generation_tasks
+                WHERE input_fingerprint IS NULL OR input_fingerprint = ''
+                   OR output_artifact_id IS NULL
+                """
+            ).fetchall()
+            for row in rows:
+                payload = _decode_json(row["payload_json"])
+                outcome = _decode_json(row["outcome_json"])
+                connection.execute(
+                    """
+                    UPDATE generation_tasks
+                    SET input_fingerprint = ?,
+                        output_artifact_id = COALESCE(output_artifact_id, ?)
+                    WHERE task_id = ?
+                    """,
+                    (
+                        _payload_fingerprint(payload, row["input_fingerprint"]),
+                        outcome.get("output_artifact_id"),
+                        row["task_id"],
+                    ),
+                )
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_generation_tasks_status_queued
                 ON generation_tasks(status, queued_at)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_generation_tasks_input_fingerprint
+                ON generation_tasks(provider_id, input_fingerprint)
                 """
             )
             # The original index omitted provider_id, so a failed Bridge task
@@ -143,6 +211,9 @@ class GenerationTaskStore:
                 )
                 """
             )
+            connection.execute(
+                f"PRAGMA user_version={GENERATION_TASK_SCHEMA_VERSION}"
+            )
 
     def enqueue(
         self,
@@ -153,9 +224,11 @@ class GenerationTaskStore:
         resource_id: str,
         payload: dict[str, Any],
         provider_id: str | None = None,
+        input_fingerprint: str | None = None,
     ) -> EnqueuedTask:
         """Insert one active task or return the matching active task."""
         now = _utc_now()
+        resolved_fingerprint = _payload_fingerprint(payload, input_fingerprint)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             existing = self._find_active(
@@ -179,8 +252,9 @@ class GenerationTaskStore:
                 """
                 INSERT INTO generation_tasks (
                     task_id, run_id, task_type, media_type, resource_id, status,
-                    payload_json, provider_id, queued_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
+                    payload_json, provider_id, input_fingerprint,
+                    queued_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -190,6 +264,7 @@ class GenerationTaskStore:
                     resource_id,
                     _encode_json(payload),
                     provider_id,
+                    resolved_fingerprint,
                     now,
                     now,
                 ),
@@ -264,12 +339,14 @@ class GenerationTaskStore:
         provider_id: str,
     ) -> GenerationTask | None:
         """Return the newest successful task for exactly the same immutable input."""
+        input_fingerprint = _payload_fingerprint(payload)
         with self._connect() as connection:
             row = connection.execute(
                 """
                 SELECT * FROM generation_tasks
                 WHERE run_id = ? AND task_type = ? AND resource_id = ?
                   AND provider_id = ? AND payload_json = ? AND status = 'succeeded'
+                  AND input_fingerprint = ?
                 ORDER BY finished_at DESC, queued_at DESC
                 LIMIT 1
                 """,
@@ -279,6 +356,7 @@ class GenerationTaskStore:
                     resource_id,
                     provider_id,
                     _encode_json(payload),
+                    input_fingerprint,
                 ),
             ).fetchone()
         return GenerationTask.from_row(row) if row is not None else None
@@ -293,12 +371,14 @@ class GenerationTaskStore:
         provider_id: str,
     ) -> GenerationTask | None:
         """Return the newest terminal failure for the exact immutable input."""
+        input_fingerprint = _payload_fingerprint(payload)
         with self._connect() as connection:
             row = connection.execute(
                 """
                 SELECT * FROM generation_tasks
                 WHERE run_id = ? AND task_type = ? AND resource_id = ?
                   AND provider_id = ? AND payload_json = ? AND status = 'failed'
+                  AND input_fingerprint = ?
                 ORDER BY finished_at DESC, queued_at DESC
                 LIMIT 1
                 """,
@@ -308,6 +388,7 @@ class GenerationTaskStore:
                     resource_id,
                     provider_id,
                     _encode_json(payload),
+                    input_fingerprint,
                 ),
             ).fetchone()
         return GenerationTask.from_row(row) if row is not None else None
@@ -379,10 +460,11 @@ class GenerationTaskStore:
         return self._update_running(
             task_id,
             """
-            status = 'succeeded', outcome_json = ?, error_message = NULL,
+            status = 'succeeded', outcome_json = ?, output_artifact_id = ?,
+            error_message = NULL,
             updated_at = ?, finished_at = ?
             """,
-            (_encode_json(outcome), now, now),
+            (_encode_json(outcome), outcome.get("output_artifact_id"), now, now),
         )
 
     def mark_failed(
