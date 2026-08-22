@@ -1840,25 +1840,28 @@ def _sequence_beat_plan(
             ordered_sequences.append(sequence)
     if not ordered_sequences:
         raise ValueError("cannot plan beat sequences without source events")
-    if len(ordered_sequences) > beat_count:
-        raise ValueError(
-            f"{len(ordered_sequences)} isolated sequences cannot fit {beat_count} beats"
-        )
-
     generation_units = _event_generation_action_unit_counts(events)
     total_units = {sequence: 0 for sequence in ordered_sequences}
     mandatory_units = {sequence: 0 for sequence in ordered_sequences}
+    mandatory_sequences: set[str] = set()
     for event_id, event in enumerate(events, 1):
         sequence = str(event.get("sequence_id") or "").strip() or "__unspecified__"
         units = generation_units[event_id]
         total_units[sequence] += units
         if _event_is_mandatory_for_adaptation(event):
+            mandatory_sequences.add(sequence)
             mandatory_units[sequence] += units
 
     allocations = {
-        sequence: max(
-            1,
-            math.ceil(mandatory_units[sequence] / max_generation_units_per_beat),
+        sequence: (
+            max(
+                1,
+                math.ceil(
+                    mandatory_units[sequence] / max_generation_units_per_beat
+                ),
+            )
+            if sequence in mandatory_sequences
+            else 0
         )
         for sequence in ordered_sequences
     }
@@ -1882,6 +1885,7 @@ def _sequence_beat_plan(
         sequence
         for sequence in ordered_sequences
         for _ in range(allocations[sequence])
+        if allocations[sequence] > 0
     ]
 
 
@@ -1961,6 +1965,7 @@ def _repair_beat_action_capacity(
         for beat in repaired
         for event_id in beat["source_events"]
         if event_id in event_by_id
+        and event_sequences[event_id] in sequence_slots
     }
     mandatory_ids = {
         event_id
@@ -2099,8 +2104,22 @@ def _repair_beat_action_capacity(
             sources_by_beat[beat_index].append(event_id)
     dropped_ids = set(event_by_id) - set(placements)
     dropped_by_beat: List[List[int]] = [[] for _ in repaired]
+    ordered_event_sequences = list(dict.fromkeys(event_sequences.values()))
+
+    def dropped_audit_slot(sequence: str) -> int:
+        if sequence in sequence_slots:
+            return sequence_slots[sequence][0]
+        sequence_index = ordered_event_sequences.index(sequence)
+        for adjacent in ordered_event_sequences[sequence_index + 1:]:
+            if adjacent in sequence_slots:
+                return sequence_slots[adjacent][0]
+        for adjacent in reversed(ordered_event_sequences[:sequence_index]):
+            if adjacent in sequence_slots:
+                return sequence_slots[adjacent][-1]
+        raise ValueError(f"dropped sequence {sequence} has no auditable beat slot")
+
     for event_id in sorted(dropped_ids):
-        dropped_by_beat[sequence_slots[event_sequences[event_id]][0]].append(event_id)
+        dropped_by_beat[dropped_audit_slot(event_sequences[event_id])].append(event_id)
 
     for index, beat in enumerate(repaired):
         source_events = sorted(sources_by_beat[index])

@@ -492,6 +492,80 @@ def test_capacity_repair_separates_sequences_and_rebalances_dense_station_fight(
     assert max(engine._beat_content_loads(repaired, events, profile)) <= 3
 
 
+def test_optional_transition_sequence_does_not_steal_mandatory_story_capacity():
+    events = [
+        {
+            "sequence_id": "SEQ001",
+            "event_role": "turning_point",
+            "dramatic_turn": True,
+            "what": f"必保转折 {event_id}",
+            "micro_actions": [
+                f"男子依次完成转折动作{event_id}-{action_id}"
+                for action_id in range(1, unit_count + 1)
+            ],
+        }
+        for event_id, unit_count in enumerate((3, 7, 1), 1)
+    ]
+    events.extend([
+        {
+            "sequence_id": "SEQ002",
+            "event_role": "transition",
+            "dramatic_turn": False,
+            "what": "可删的过场",
+            "micro_actions": [],
+        },
+        {
+            "sequence_id": "SEQ003",
+            "event_role": "scene_setup",
+            "dramatic_turn": False,
+            "what": "结尾新场景建立",
+            "micro_actions": [],
+        },
+    ])
+    beats = [
+        {
+            "beat_order": index,
+            "source_events": source_events,
+            "dropped_source_events": [],
+            "action": "merge" if len(source_events) > 1 else "keep",
+            "reason": "模型初始分配",
+            "who": [],
+            "where": "未来列车",
+            "what": f"段落 {index}",
+        }
+        for index, source_events in enumerate(([1], [2], [3], [4, 5]), 1)
+    ]
+    profile = engine.get_video_capabilities()
+    story_capacity = engine._generation_unit_capacity_for_story_duration(
+        15,
+        profile,
+    )
+
+    repaired = engine._repair_beat_action_capacity(
+        beats,
+        events,
+        profile,
+        max_generation_units_per_beat=story_capacity,
+    )
+
+    assert [beat["sequence_id"] for beat in repaired] == [
+        "SEQ001",
+        "SEQ001",
+        "SEQ001",
+        "SEQ003",
+    ]
+    assert 4 not in {
+        event_id for beat in repaired for event_id in beat["source_events"]
+    }
+    assert [
+        event_id
+        for beat in repaired
+        for event_id in beat["dropped_source_events"]
+    ] == [4]
+    assert 5 in repaired[-1]["source_events"]
+    assert max(engine._beat_generation_unit_loads(repaired, events)) <= story_capacity
+
+
 def test_flashmob_one_take_has_a_feasible_four_beat_skeleton(monkeypatch):
     events = _load_capacity_fixture(FIXTURE, LEGACY_COMPOSITE_EVENTS)
     _annotate_global_event_flow(events, continuity_mode="one_take")
