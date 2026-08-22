@@ -19,9 +19,13 @@ A 44-second cyberpunk short film generated fully automatically from a text scrip
 
 ## Architecture
 
+The normative post-refactor architecture, ownership rules, recovery precedence,
+and repair checklist live in [docs/HONCUT_ARCHITECTURE.md](docs/HONCUT_ARCHITECTURE.md).
+Historical roadmap and redesign documents are non-normative.
+
 HonCut runs on a split-role deployment: a Mac orchestration layer drives a nine-phase pipeline, a Windows GPU machine hosts the ComfyUI Bridge for local synthesis fallback, and Volcano Ark provides online LLM scripting, Seedance video, Seedream image, Seed-TTS, and SeedASR services. All LLM scripting calls flow through a unified streaming client (`ark_llm`) with hard wall-clock timeouts, per-phase heartbeats, and sub-phase checkpoints so no phase can hang silently.
 
-The production pipeline is a **LangGraph state graph** defined in `graph/workflow.py`, composed with concrete Phase owners by `graph/composition.py`, and executed by `runtime/pipeline_execution.py`. The QA gate selects one of three video-generation strategies (text-to-video / image-to-video / reference-driven), the consistency guard can loop failed shots back for regeneration, and the assembly engine can trigger a bounded reshoot cycle. Versioned Graph state persists through a SQLite checkpointer, so a run can be interrupted and resumed mid-pipeline.
+The production pipeline is a **LangGraph state graph** defined in `graph/workflow.py`, composed with concrete Phase owners by `graph/composition.py`, and executed by `runtime/pipeline_execution.py`. The QA gate selects one of three video-generation strategies (text-to-video / image-to-video / reference-driven), Phase 7 either hands validated evidence to Phase 8 or blocks, and the assembly engine owns the bounded reshoot cycle. Versioned Graph state persists through a SQLite checkpointer, so a run can be interrupted and resumed mid-pipeline.
 
 Video generation runs behind a dedicated **runtime layer** (`runtime/`). A versioned SQLite task ledger persists Provider job IDs before polling and refuses blind resubmission when submission status is uncertain. One Runtime policy owns request deadlines, retry/backoff, cooldown, and capacity. Every paid request receives a secret-free semantic fingerprint; project/run/input lineage namespaces its cache identity; successful files are registered as strict `ArtifactRef` records in an atomically written per-run manifest. Known old State, task-ledger, and Artifact schemas migrate through explicit registries, while unknown future versions fail closed.
 
@@ -38,7 +42,7 @@ flowchart TB
         P6A --> P7[Phase 7<br/>Consistency Guard]
         P6B --> P7
         P6C --> P7
-        P7 -- retry --> P6A
+        P7 -- block --> STOP[Run failed]
         P7 --> P8[Phase 8<br/>Assembly + Narrative Review]
         P8 --> P9[Phase 9<br/>Post-Production]
         P9 --> P95[Phase 9.5<br/>Final QA]
@@ -92,7 +96,7 @@ Phases use contiguous integer IDs (`phase1`–`phase9`); every phase writes a ch
 | Phase 4 | Scene Consistency | Shot directory layout, timeline planning, scene consistency contracts, and continuity groups: a group starts from image references and later shots depend on the preceding video |
 | Phase 5 | QA Gate + Supervision | L1/L2/L3 structural quality gate plus an LLM supervision agent (continuity / character / style / pacing / dialogue). Blocking visual failures trigger a bounded failed-shot redraw and full recheck (default 2 rounds, max 3); unresolved C/D grades still block video generation. On pass, a graph router picks the Phase 6 strategy (txt2vid / img2vid / reference) |
 | Phase 6 | Video Generation | Continuity groups execute serially through Seedance while independent groups remain concurrent: group heads use multi-image generation and later shots use predecessor-video extension on the crash-safe runtime |
-| Phase 7 | Consistency Guard | Cross-shot consistency checks, scene-change detection, and slideshow-risk scoring; failed shots are routed back to Phase 6 for bounded regeneration |
+| Phase 7 | Consistency Handoff | Cross-shot consistency checks, scene-change detection, and slideshow-risk scoring; passing evidence moves to Phase 8 while blocking evidence ends the Graph before more paid work |
 | Phase 8 | Assembly Engine | Temporal/SAM3 seam adjudication removes extension replay prefixes without interpolation; continuous boundaries use hard cuts while scene boundaries retain smart transitions, followed by narrative review and duration closure |
 | Phase 9 | Post-Production | Real SeedASR transcription → subtitle burn-in, three-track audio mixing (original bed + TTS dialogue + ducking), color grading, rhythm editing, final encode |
 | Phase 9.5 | Final QA | Delivery gate that validates the finished film before hand-off |
