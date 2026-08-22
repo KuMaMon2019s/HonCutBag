@@ -9,6 +9,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from phases import pipeline_core
+from phases.phase1 import phase1_screenwriter
 from quality.quality_gate import run_storyboard_review
 
 
@@ -96,7 +97,7 @@ def test_storyboard_review_rejects_partial_latin_alias_collision():
 
 
 def test_phase1_screenwriter_m5_fallback_returns_result():
-    tree = ast.parse(inspect.getsource(pipeline_core.run_phase1_screenwriter))
+    tree = ast.parse(inspect.getsource(phase1_screenwriter.run_phase1_screenwriter))
 
     fallback_has_return = any(
         isinstance(node, ast.Assign)
