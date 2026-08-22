@@ -14,6 +14,12 @@ from typing import Any, Callable, Optional
 from phases.phase2.storyboard_assets import _shot_storyboard_reference
 from prompt.shot_prompt_builder import build_batch_prompts
 from quality.quality_gate import run_quality_check
+from runtime.generation_fingerprint import (
+    PHASE6_VIDEO_PROMPT_TEMPLATE_ID,
+    PHASE6_VIDEO_PROMPT_TEMPLATE_VERSION,
+    GenerationFingerprint,
+    build_generation_fingerprint,
+)
 from runtime.phase_timing import _banner, _elapsed, _now
 from runtime.provider_policy import ProviderExecutionPolicy
 from tools.base_tool import BaseTool, ToolResult, ToolRuntime
@@ -243,7 +249,7 @@ def _privacy_fallback_strategy(gen_strategy: str) -> str:
     return "phantom" if gen_strategy == "flf2v" else gen_strategy
 
 
-def _generation_input_fingerprint(
+def _generation_fingerprint(
     *,
     output_dir: Path,
     shot_id: str,
@@ -252,7 +258,12 @@ def _generation_input_fingerprint(
     first_frame_b64: str | None,
     content: list[dict] | None,
     chain_source: tuple[str, Path] | None,
-) -> str:
+    provider_id: str,
+    provider_version: str,
+    model_id: str,
+    model_version: str,
+    generation_parameters: dict[str, Any],
+) -> GenerationFingerprint:
     """Hash the immutable semantic and local-media inputs to one paid clip."""
     semantic_fields = (
         "who",
@@ -326,10 +337,8 @@ def _generation_input_fingerprint(
             )
         except (OSError, json.JSONDecodeError):
             pass
-    contract = {
-        "schema": "honcut.phase6-input.v1",
+    parameters = {
         "shot_id": shot_id,
-        "prompt": prompt,
         "meta": {field: meta.get(field) for field in semantic_fields},
         "first_frame_sha256": (
             hashlib.sha256(first_frame_b64.encode("ascii")).hexdigest()
@@ -337,11 +346,49 @@ def _generation_input_fingerprint(
             else None
         ),
         "content": stable_content,
-        "local_assets": sorted(local_assets, key=lambda item: item["path"]),
         "run_fingerprint": run_fingerprint,
+        **generation_parameters,
     }
-    serialized = json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return build_generation_fingerprint(
+        prompt_text=prompt,
+        prompt_template_id=PHASE6_VIDEO_PROMPT_TEMPLATE_ID,
+        prompt_template_version=PHASE6_VIDEO_PROMPT_TEMPLATE_VERSION,
+        provider_id=provider_id,
+        provider_version=provider_version,
+        model_id=model_id,
+        model_version=model_version,
+        parameters=parameters,
+        input_artifact_hashes={
+            item["path"]: item["sha256"] for item in local_assets
+        },
+    )
+
+
+def _generation_input_fingerprint(
+    *,
+    output_dir: Path,
+    shot_id: str,
+    meta: dict,
+    prompt: str,
+    first_frame_b64: str | None,
+    content: list[dict] | None,
+    chain_source: tuple[str, Path] | None,
+) -> str:
+    """Compatibility wrapper for callers that only need the digest."""
+    return _generation_fingerprint(
+        output_dir=output_dir,
+        shot_id=shot_id,
+        meta=meta,
+        prompt=prompt,
+        first_frame_b64=first_frame_b64,
+        content=content,
+        chain_source=chain_source,
+        provider_id="compatibility",
+        provider_version="1",
+        model_id="unspecified",
+        model_version="unspecified",
+        generation_parameters={},
+    ).value
 
 
 def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
@@ -798,7 +845,7 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                         from utils.video_validation import is_valid_video
 
                         aspect_ratio, video_width, video_height = resolve_video_geometry(meta)
-                        input_fingerprint = _generation_input_fingerprint(
+                        generation_fingerprint = _generation_fingerprint(
                             output_dir=output_dir,
                             shot_id=shot_id,
                             meta=content_meta,
@@ -806,6 +853,18 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                             first_frame_b64=first_frame_b64,
                             content=content_list,
                             chain_source=active_source,
+                            provider_id="bridge",
+                            provider_version="bridge-api-v1",
+                            model_id=bridge_model,
+                            model_version=bridge_model,
+                            generation_parameters={
+                                "duration": duration,
+                                "seed": shot_seed if shot_seed is not None else -1,
+                                "ratio": aspect_ratio,
+                                "width": video_width,
+                                "height": video_height,
+                                "task_dir": task_dir_id,
+                            },
                         )
                         bridge_generate = partial(
                             generate,
@@ -844,7 +903,7 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                                 "ratio": aspect_ratio,
                                 "width": video_width,
                                 "height": video_height,
-                                "input_fingerprint": input_fingerprint,
+                                **generation_fingerprint.task_metadata(),
                             },
                             provider_endpoint=local_video_client.get_api_url(),
                             output_path=out_path,
@@ -865,7 +924,9 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                                 "actual_model": bridge_model,
                             }
                         generation_result["generation_task_id"] = execution.task_id
-                        generation_result["input_fingerprint"] = input_fingerprint
+                        generation_result["input_fingerprint"] = (
+                            generation_fingerprint.value
+                        )
                         generation_result["relative_output"] = f"shots/{shot_dir.name}/output.mp4"
                         return generation_result
                     except Exception as local_err:
@@ -913,7 +974,7 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                 from utils.video_validation import is_valid_video
 
                 aspect_ratio, video_width, video_height = resolve_video_geometry(meta)
-                input_fingerprint = _generation_input_fingerprint(
+                generation_fingerprint = _generation_fingerprint(
                     output_dir=output_dir,
                     shot_id=shot_id,
                     meta=content_meta,
@@ -921,6 +982,17 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                     first_frame_b64=first_frame_b64,
                     content=content_list,
                     chain_source=active_source,
+                    provider_id="seedance",
+                    provider_version="ark-agent-plan-v3",
+                    model_id=direct_model,
+                    model_version=direct_model,
+                    generation_parameters={
+                        "duration": duration or 12,
+                        "seed": shot_seed,
+                        "ratio": aspect_ratio,
+                        "width": video_width,
+                        "height": video_height,
+                    },
                 )
                 execution = execute_seedance_video_task(
                     generation_tasks,
@@ -935,7 +1007,7 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                         "ratio": aspect_ratio,
                         "width": video_width,
                         "height": video_height,
-                        "input_fingerprint": input_fingerprint,
+                        **generation_fingerprint.task_metadata(),
                     },
                     provider_endpoint=seedance_client.BASE_URL,
                     output_path=out_path,
@@ -1020,7 +1092,7 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                     ),
                     "actual_model": direct_model,
                     "generation_task_id": execution.task_id,
-                    "input_fingerprint": input_fingerprint,
+                    "input_fingerprint": generation_fingerprint.value,
                     "relative_output": f"shots/{shot_dir.name}/output.mp4",
                 }
             except Exception as e:

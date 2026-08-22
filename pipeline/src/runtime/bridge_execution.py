@@ -95,6 +95,7 @@ def execute_bridge_video_task(
                     artifact_type="video",
                     producer_node="phase6.video_generation",
                     producer_task_id=succeeded.task_id,
+                    semantic_fingerprint=succeeded.input_fingerprint,
                 )
                 task_store.mark_succeeded(
                     succeeded.task_id,
@@ -219,6 +220,7 @@ def execute_bridge_video_task(
             producer_node="phase6.video_generation",
             producer_task_id=task.task_id,
             expected_sha256=outcome["output_sha256"],
+            semantic_fingerprint=task.input_fingerprint,
         )
         outcome["output_artifact_id"] = artifact.artifact_id
     task_store.mark_succeeded(task.task_id, outcome)

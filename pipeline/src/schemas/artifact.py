@@ -29,6 +29,10 @@ class ArtifactRef(BaseModel):
     project_id: str = Field(min_length=1)
     artifact_type: str = Field(alias="type", min_length=1)
     content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    semantic_fingerprint: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     relative_path: str = Field(min_length=1)
     producer_node: str = Field(min_length=1)
     producer_task_id: str | None = Field(default=None, min_length=1)

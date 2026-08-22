@@ -28,15 +28,19 @@ def _artifact_id(
     artifact_type: str,
     relative_path: str,
     content_sha256: str,
+    semantic_fingerprint: str | None,
 ) -> str:
+    identity = {
+        "project_id": project_id,
+        "run_id": run_id,
+        "type": artifact_type,
+        "relative_path": relative_path,
+        "content_sha256": content_sha256,
+    }
+    if semantic_fingerprint is not None:
+        identity["semantic_fingerprint"] = semantic_fingerprint
     semantic_identity = json.dumps(
-        {
-            "project_id": project_id,
-            "run_id": run_id,
-            "type": artifact_type,
-            "relative_path": relative_path,
-            "content_sha256": content_sha256,
-        },
+        identity,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -106,6 +110,7 @@ class ArtifactManifestStore:
         producer_task_id: str | None = None,
         parent_artifact_ids: Iterable[str] = (),
         expected_sha256: str | None = None,
+        semantic_fingerprint: str | None = None,
     ) -> ArtifactRef:
         source = Path(path).resolve(strict=True)
         try:
@@ -132,6 +137,7 @@ class ArtifactManifestStore:
             artifact_type=artifact_type,
             relative_path=relative_path,
             content_sha256=content_sha256,
+            semantic_fingerprint=semantic_fingerprint,
         )
         existing = known.get(artifact_id)
         if existing is not None:
@@ -139,6 +145,7 @@ class ArtifactManifestStore:
                 existing.producer_node != producer_node
                 or existing.producer_task_id != producer_task_id
                 or existing.parent_artifact_ids != parents
+                or existing.semantic_fingerprint != semantic_fingerprint
             ):
                 raise RuntimeError("artifact ID collides with different provenance")
             return self.resolve(existing.artifact_id)
@@ -148,6 +155,7 @@ class ArtifactManifestStore:
             project_id=self.project_id,
             type=artifact_type,
             content_sha256=content_sha256,
+            semantic_fingerprint=semantic_fingerprint,
             relative_path=relative_path,
             producer_node=producer_node,
             producer_task_id=producer_task_id,

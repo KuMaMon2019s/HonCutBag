@@ -151,4 +151,5 @@ def test_seedance_success_binds_task_to_registered_output(tmp_path):
     assert task.output_artifact_id is not None
     artifact = artifacts.resolve(task.output_artifact_id)
     assert artifact.producer_task_id == task.task_id
+    assert artifact.semantic_fingerprint == task.input_fingerprint
     assert artifact.relative_path == "shots/S01/output.mp4"

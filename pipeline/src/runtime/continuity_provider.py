@@ -29,6 +29,11 @@ from runtime.continuity_chunks import (
     execute_continuity_plan,
 )
 from runtime.execution_errors import ProviderPreparationError
+from runtime.generation_fingerprint import (
+    PHASE6_VIDEO_PROMPT_TEMPLATE_ID,
+    PHASE6_VIDEO_PROMPT_TEMPLATE_VERSION,
+    build_generation_fingerprint,
+)
 from runtime.generation_tasks import GenerationTaskStore
 from runtime.provider_policy import ProviderExecutionPolicy
 from runtime.seedance_execution import execute_seedance_video_task
@@ -1038,6 +1043,8 @@ def _task_payload(
     request: ChunkExecutionRequest,
     *,
     model: str,
+    provider_id: str,
+    provider_version: str,
     duration: int,
     seed: int | None,
 ) -> dict[str, Any]:
@@ -1053,11 +1060,10 @@ def _task_payload(
         if requested_frames
         else 0.0
     )
-    return {
+    payload = {
         "shot_id": request.shot_id,
         "chunk_id": request.chunk.chunk_id,
         "resource_id": request.resource_id,
-        "input_fingerprint": request.input_fingerprint,
         "output_path": str(request.output_path),
         "model": model,
         "mode": request.chunk.mode,
@@ -1091,6 +1097,28 @@ def _task_payload(
         "repair_attempt": request.repair_attempt,
         "privacy_fallback": PRIVACY_POLICY_REPAIR_VERSION,
     }
+    upstream_fingerprint = str(request.input_fingerprint)
+    if not re.fullmatch(r"[0-9a-f]{64}", upstream_fingerprint):
+        upstream_fingerprint = hashlib.sha256(
+            upstream_fingerprint.encode("utf-8")
+        ).hexdigest()
+    fingerprint = build_generation_fingerprint(
+        prompt_text=(
+            str(request.chunk.action_prompt or "").strip()
+            or request.memory_context
+        ),
+        prompt_template_id=PHASE6_VIDEO_PROMPT_TEMPLATE_ID,
+        prompt_template_version=PHASE6_VIDEO_PROMPT_TEMPLATE_VERSION,
+        provider_id=provider_id,
+        provider_version=provider_version,
+        model_id=model,
+        model_version=model,
+        parameters={
+            key: value for key, value in payload.items() if key != "output_path"
+        },
+        input_artifact_hashes={"continuity_input": upstream_fingerprint},
+    )
+    return {**payload, **fingerprint.task_metadata()}
 
 
 def _provider_input_context(
@@ -1545,7 +1573,14 @@ def _direct_seedance_executor(
         ratio, _width, _height = _video_geometry(
             _read_shot_meta(output_dir, request.shot_id)
         )
-        payload = _task_payload(request, model=model, duration=duration, seed=seed)
+        payload = _task_payload(
+            request,
+            model=model,
+            provider_id="seedance",
+            provider_version="ark-agent-plan-v3",
+            duration=duration,
+            seed=seed,
+        )
         payload["ratio"] = ratio
         run_id = str(output_dir.resolve())
         repairs: list[dict[str, Any]] = []
@@ -1940,7 +1975,14 @@ def _bridge_seedance_executor(
         ratio, width, height = _video_geometry(
             _read_shot_meta(output_dir, request.shot_id)
         )
-        payload = _task_payload(request, model=model, duration=duration, seed=seed)
+        payload = _task_payload(
+            request,
+            model=model,
+            provider_id="bridge",
+            provider_version="bridge-api-v1",
+            duration=duration,
+            seed=seed,
+        )
         payload.update({"ratio": ratio, "width": width, "height": height})
 
         def generate(**runtime_kwargs: Any) -> str | dict[str, Any]:
