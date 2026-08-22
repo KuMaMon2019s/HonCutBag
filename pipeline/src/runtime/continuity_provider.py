@@ -18,7 +18,6 @@ from typing import Any
 from quality.seam_calibration import SeamCalibration
 from runtime.bridge_execution import execute_bridge_video_task
 from runtime.capacity import (
-    CapacityTable,
     CrossProcessSlotTable,
     SlotTable,
     default_capacity_lease_path,
@@ -30,6 +29,7 @@ from runtime.continuity_chunks import (
 )
 from runtime.execution_errors import ProviderPreparationError
 from runtime.generation_tasks import GenerationTaskStore
+from runtime.provider_policy import ProviderExecutionPolicy
 from runtime.seedance_execution import execute_seedance_video_task
 from schemas.continuity import ContinuityPlan, GenerationChunk
 from utils.storyboard_motion_policy import apply_storyboard_motion_policy
@@ -1528,8 +1528,9 @@ def _direct_seedance_executor(
 
     api_key = get_api_key_or_raise("ARK_AGENT")
     model = SEEDANCE_MODEL
+    provider_policy = ProviderExecutionPolicy.from_environment("seedance")
     fallback_workers = max(1, int(os.environ.get("VIDEO_GEN_CONCURRENCY", "1")))
-    capacity = CapacityTable.for_seedance_video(fallback_workers).get("seedance", "video")
+    capacity = provider_policy.capacity(fallback_workers)
     slots = SlotTable()
     leases = CrossProcessSlotTable(default_capacity_lease_path())
 
@@ -1629,13 +1630,19 @@ def _direct_seedance_executor(
                             selected: Sequence[dict[str, Any]],
                         ) -> str:
                             submitted[:] = [dict(item) for item in selected]
-                            return seedance_client.submit_content(
-                                _provider_ready_content(selected),
-                                api_key=api_key,
-                                model=model,
-                                duration=duration,
-                                ratio=ratio,
-                                seed=current_seed,
+                            return provider_policy.execute_rate_limited(
+                                partial(
+                                    seedance_client.submit_content,
+                                    _provider_ready_content(selected),
+                                    api_key=api_key,
+                                    model=model,
+                                    duration=duration,
+                                    ratio=ratio,
+                                    seed=current_seed,
+                                    timeout=(
+                                        provider_policy.submit_timeout_seconds
+                                    ),
+                                )
                             )
 
                         selected = [dict(item) for item in current_content]
@@ -1731,7 +1738,11 @@ def _direct_seedance_executor(
                             provider_endpoint=seedance_client.BASE_URL,
                             output_path=request.output_path,
                             submit=submit,
-                            poll=partial(seedance_client.poll, api_key=api_key),
+                            poll=provider_policy.bind_poll(
+                                seedance_client.poll,
+                                interval_seconds=15,
+                                api_key=api_key,
+                            ),
                             download=seedance_client.download,
                             validate_output=is_valid_video,
                         )
@@ -1908,6 +1919,7 @@ def _bridge_seedance_executor(
     from clients import local_video_client
     from utils.video_validation import is_valid_video
 
+    provider_policy = ProviderExecutionPolicy.from_environment("bridge")
     capacity = max(1, int(os.environ.get("VIDEO_GEN_CONCURRENCY", "1")))
     slots = SlotTable()
 
@@ -1938,6 +1950,9 @@ def _bridge_seedance_executor(
                 content=_provider_ready_content(content),
                 batch_id=output_dir.name,
                 model=model,
+                submit_timeout=int(provider_policy.submit_timeout_seconds),
+                status_timeout=provider_policy.status_timeout_seconds,
+                poll_deadline=provider_policy.poll_deadline_seconds,
                 **runtime_kwargs,
             )
 

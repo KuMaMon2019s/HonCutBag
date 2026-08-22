@@ -62,7 +62,7 @@ def _validate_content_media_roles(content: list[dict]) -> None:
         )
 
 
-def get_task(task_id: str, *, api_key: str, timeout: int = 30) -> dict:
+def get_task(task_id: str, *, api_key: str, timeout: float = 30) -> dict:
     """Query one video task through the Agent Plan task endpoint."""
     if not task_id.strip():
         raise ValueError("task_id must not be empty")
@@ -238,6 +238,7 @@ def submit_content(
     ratio: str = "16:9",
     seed: int = None,
     generate_audio: Optional[str] = None,
+    timeout: float = 30,
 ) -> str:
     """Submit a preassembled ARK Agent Plan content array. Returns task_id."""
     _validate_content_media_roles(content)
@@ -264,7 +265,12 @@ def submit_content(
     if seed is not None:
         payload["seed"] = seed
 
-    resp = requests.post(SUBMIT_ENDPOINT, json=payload, headers=headers, timeout=30)
+    resp = requests.post(
+        SUBMIT_ENDPOINT,
+        json=payload,
+        headers=headers,
+        timeout=timeout,
+    )
     if resp.status_code != 200:
         raise RuntimeError(f"Seedance API {resp.status_code}: {resp.text[:500]}")
     data = resp.json()
@@ -372,11 +378,12 @@ def poll(
     api_key: str,
     max_attempts: int = 40,
     interval: int = 15,
+    request_timeout: float = 30,
 ) -> str:
     """Poll task until done. Returns video_url or raises."""
     for attempt in range(1, max_attempts + 1):
         time.sleep(interval)
-        data = get_task(task_id, api_key=api_key)
+        data = get_task(task_id, api_key=api_key, timeout=request_timeout)
         status = data.get("status", "")
 
         if status == "succeeded":

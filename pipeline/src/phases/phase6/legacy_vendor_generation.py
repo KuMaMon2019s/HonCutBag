@@ -15,7 +15,6 @@ from phases.phase2.storyboard_assets import _shot_storyboard_reference
 from prompt.shot_prompt_builder import build_batch_prompts
 from quality.quality_gate import run_quality_check
 from runtime.phase_timing import _banner, _elapsed, _now
-from runtime.retry_execution import _retry_with_policy
 from tools.base_tool import BaseTool, ToolResult, ToolRuntime
 from tools.vendor_adapter import VendorAdapter, VendorModel
 from utils.character_body_contracts import character_visual_description
@@ -88,8 +87,9 @@ def _run_phase6_om_seedance(storyboard_data: dict, output_dir: Path, characters_
     if storyboard_data.get("style"):
         style_context = {"mood": storyboard_data["style"]}
 
-    # Sequential generation with retry policy per shot
-    print(f"  → 生成 {len(shots)} 个镜头 (retry=3, backoff=2.0)...")
+    # Legacy compatibility route performs one transport attempt. Runtime owns
+    # all retry/backoff policy for production providers.
+    print(f"  → 生成 {len(shots)} 个镜头 (legacy single-attempt route)...")
 
     for shot in shots:
         shot_id = shot.get("id", "?")
@@ -115,7 +115,7 @@ def _run_phase6_om_seedance(storyboard_data: dict, output_dir: Path, characters_
         video_path = shot_dir / "output.mp4"
 
         def _generate_shot():
-            """Inner function for retry logic."""
+            """Perform the legacy route's single provider attempt."""
             # 优先使用角色参考图
             character_ref = None
             if character_ref_images:
@@ -174,7 +174,7 @@ def _run_phase6_om_seedance(storyboard_data: dict, output_dir: Path, characters_
             _p5_est_val = int(_timing_ctx["estimate"]) if _timing_ctx else 0
             print(f"  → S{shot_id}: 生成视频...")
             _shot_t0 = _now()
-            result = _retry_with_policy(_generate_shot, max_attempts=3, backoff_factor=2.0)
+            result = _generate_shot()
             _shot_elapsed = round(_now() - _shot_t0, 1)
             _p5_cumulative = round(_now() - (_timing_ctx["start"] if _timing_ctx else _now()), 1)
 

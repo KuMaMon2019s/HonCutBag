@@ -11,6 +11,7 @@ from runtime.generation_tasks import (
     GENERATION_TASK_SCHEMA_VERSION,
     GenerationTaskStore,
 )
+from runtime.provider_policy import ProviderExecutionPolicy
 from runtime.video_provider import (
     ProviderErrorKind,
     VideoGenerationRequest,
@@ -201,3 +202,73 @@ def test_generation_task_store_rejects_unknown_future_schema(tmp_path):
         )
     with pytest.raises(RuntimeError, match="newer than this runtime"):
         GenerationTaskStore(database)
+
+
+def test_runtime_policy_owns_rate_limit_backoff_and_call_count():
+    policy = ProviderExecutionPolicy(
+        provider_id="seedance",
+        max_rate_limit_retries=2,
+        initial_backoff_seconds=3,
+        max_backoff_seconds=5,
+    )
+    attempts = 0
+    waits = []
+
+    def operation():
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise RuntimeError("Seedance API 429: too many requests")
+        return "job-1"
+
+    assert policy.execute_rate_limited(operation, sleeper=waits.append) == "job-1"
+    assert attempts == 3
+    assert waits == [3, 5]
+
+
+def test_runtime_policy_never_retries_uncertain_submission():
+    policy = ProviderExecutionPolicy(provider_id="seedance")
+    attempts = 0
+
+    def operation():
+        nonlocal attempts
+        attempts += 1
+        raise SubmissionUncertainError("provider may have accepted request")
+
+    with pytest.raises(SubmissionUncertainError):
+        policy.execute_rate_limited(operation, sleeper=lambda _seconds: None)
+    assert attempts == 1
+
+
+def test_runtime_policy_owns_seedance_capacity(monkeypatch):
+    monkeypatch.setenv("HONCUT_SEEDANCE_VIDEO_CONCURRENCY", "2")
+    policy = ProviderExecutionPolicy(provider_id="seedance")
+    assert policy.capacity(5) == 2
+    assert ProviderExecutionPolicy(provider_id="bridge").capacity(5) == 5
+
+
+def test_runtime_policy_binds_poll_deadline_and_request_timeout():
+    calls = []
+
+    def poll(
+        task_id,
+        *,
+        api_key,
+        max_attempts,
+        interval,
+        request_timeout,
+    ):
+        calls.append(
+            (task_id, api_key, max_attempts, interval, request_timeout)
+        )
+        return "https://video.test/output.mp4"
+
+    policy = ProviderExecutionPolicy(
+        provider_id="seedance",
+        status_timeout_seconds=7,
+        poll_deadline_seconds=90,
+    )
+    bound = policy.bind_poll(poll, interval_seconds=15, api_key="secret")
+
+    assert bound("job-1") == "https://video.test/output.mp4"
+    assert calls == [("job-1", "secret", 6, 15, 7)]

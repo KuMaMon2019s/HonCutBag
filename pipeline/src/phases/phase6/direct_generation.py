@@ -15,7 +15,7 @@ from phases.phase2.storyboard_assets import _shot_storyboard_reference
 from prompt.shot_prompt_builder import build_batch_prompts
 from quality.quality_gate import run_quality_check
 from runtime.phase_timing import _banner, _elapsed, _now
-from runtime.retry_execution import _retry_with_policy
+from runtime.provider_policy import ProviderExecutionPolicy
 from tools.base_tool import BaseTool, ToolResult, ToolRuntime
 from tools.vendor_adapter import VendorAdapter, VendorModel
 from utils.character_body_contracts import character_visual_description
@@ -462,11 +462,13 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
     except ImportError:
         concurrency = int(os.environ.get("VIDEO_GEN_CONCURRENCY", "1"))
     provider_capacity = max(1, concurrency)
+    provider_policy = ProviderExecutionPolicy.from_environment(
+        "bridge" if use_local else "seedance"
+    )
     provider_slots = None
     provider_leases = None
     if not use_local:
         from runtime.capacity import (
-            CapacityTable,
             CrossProcessSlotTable,
             SlotTable,
             default_capacity_lease_path,
@@ -475,8 +477,7 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
         provider_slots = SlotTable()
         provider_leases = CrossProcessSlotTable(default_capacity_lease_path())
         if not chain_mode:
-            capacities = CapacityTable.for_seedance_video(provider_capacity)
-            provider_capacity = capacities.get("seedance", "video")
+            provider_capacity = provider_policy.capacity(provider_capacity)
     if chain_mode:
         concurrency = 1
         provider_capacity = 1
@@ -729,8 +730,7 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                         flush=True,
                     )
 
-        max_retries = 3
-        quota_retries = 0
+        max_policy_repairs = 3
         privacy_retries = 0
         policy_retries = 0
         privacy_rejected_urls: set[str] = set()
@@ -817,6 +817,11 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                             content=content_list,
                             batch_id=output_dir.name,
                             model=bridge_model,
+                            submit_timeout=int(
+                                provider_policy.submit_timeout_seconds
+                            ),
+                            status_timeout=provider_policy.status_timeout_seconds,
+                            poll_deadline=provider_policy.poll_deadline_seconds,
                             return_last_frame=chain_mode and chain_allowed,
                             task_dir=task_dir_id,
                         )
@@ -929,15 +934,23 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                     provider_endpoint=seedance_client.BASE_URL,
                     output_path=out_path,
                     submit=partial(
-                        seedance_client.submit_content,
-                        content_list,
-                        api_key=api_key,
-                        model=direct_model,
-                        duration=duration or 12,
-                        ratio=aspect_ratio,
-                        seed=shot_seed,
+                        provider_policy.execute_rate_limited,
+                        partial(
+                            seedance_client.submit_content,
+                            content_list,
+                            api_key=api_key,
+                            model=direct_model,
+                            duration=duration or 12,
+                            ratio=aspect_ratio,
+                            seed=shot_seed,
+                            timeout=provider_policy.submit_timeout_seconds,
+                        ),
                     ),
-                    poll=partial(seedance_client.poll, api_key=api_key),
+                    poll=provider_policy.bind_poll(
+                        seedance_client.poll,
+                        interval_seconds=15,
+                        api_key=api_key,
+                    ),
                     download=seedance_client.download,
                     validate_output=is_valid_video,
                 )
@@ -1005,18 +1018,12 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                 }
             except Exception as e:
                 err_str = str(e)
-                # 429 QuotaExceeded — exponential backoff retry
+                # Transport quota retries are exhausted inside Runtime policy.
                 if "QuotaExceeded" in err_str or "429" in err_str:
-                    wait_sec = min(30 * (2 ** quota_retries), 120)
-                    if quota_retries < max_retries:
-                        quota_retries += 1
-                        print(f"    ⚠ {shot_dir.name}: 配额超限(429)，等待 {wait_sec}s 后重试 ({quota_retries}/{max_retries})...")
-                        import time as _time
-                        _time.sleep(wait_sec)
-                        continue
-                    else:
-                        print(f"    ✗ {shot_dir.name}: 配额超限，已重试 {max_retries} 次，跳过")
-                        return None
+                    print(
+                        f"    ✗ {shot_dir.name}: 配额超限，Runtime 策略已耗尽，跳过"
+                    )
+                    return None
                 # Check auth only after classifying quota errors. Provider
                 # request ids are arbitrary hexadecimal-ish strings and can
                 # contain the substring "401" or "403" inside a genuine 429.
@@ -1024,7 +1031,7 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                     raise RuntimeError(
                         f"{err_str}；检查 ARK_AGENT_API_KEY 或 Agent Plan 权限"
                     ) from e
-                if "PrivacyInformation" in err_str and privacy_retries < max_retries:
+                if "PrivacyInformation" in err_str and privacy_retries < max_policy_repairs:
                     privacy_retries += 1
                     fallback_strategy = _privacy_fallback_strategy(
                         privacy_retry_strategy
@@ -1049,9 +1056,9 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                         f"    ⚠ {shot_dir.name}: 无法定位被拒参考图，"
                         "停止自动重提以避免重复无效请求"
                     )
-                if "PolicyViolation" in err_str and policy_retries < max_retries:
+                if "PolicyViolation" in err_str and policy_retries < max_policy_repairs:
                     policy_retries += 1
-                    print(f"    ⚠ {shot_dir.name}: 版权误报，重试 ({policy_retries}/{max_retries})...")
+                    print(f"    ⚠ {shot_dir.name}: 版权误报，重试 ({policy_retries}/{max_policy_repairs})...")
                     prompt = prompt.replace("Cinematic", "Original fictional")
                     prompt += ", original character design, non-copyrighted"
                     first_frame_b64 = None

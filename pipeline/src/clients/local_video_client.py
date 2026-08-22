@@ -358,6 +358,8 @@ def poll(
     task_id: str,
     max_attempts: int | None = None,
     interval: int = 10,
+    request_timeout: float = 15,
+    deadline_seconds: float | None = None,
 ) -> dict:
     """Poll task until done, with progress-based timeout.
 
@@ -403,7 +405,13 @@ def poll(
     total_polls: int = 0          # 总轮询次数（仅用于日志）
     last_progress_change_poll: int = 0  # 上次 progress 变化时的 total_polls 序号
     queue_started_at = time.monotonic()
-    queue_timeout = int(os.environ.get("LOCAL_VIDEO_QUEUE_TIMEOUT", "7200"))
+    queue_timeout = (
+        float(deadline_seconds)
+        if deadline_seconds is not None
+        else float(os.environ.get("LOCAL_VIDEO_QUEUE_TIMEOUT", "7200"))
+    )
+    if queue_timeout <= 0 or request_timeout <= 0:
+        raise ValueError("poll deadline and request timeout must be positive")
     stall_polls = (
         max_attempts
         if max_attempts is not None
@@ -429,9 +437,14 @@ def poll(
     probe_started_at: float | None = None  # monotonic time of first probe in current run
 
     while True:
+        if time.monotonic() - queue_started_at >= queue_timeout:
+            raise TimeoutError(
+                f"Local video task {task_id} exceeded runtime deadline "
+                f"of {queue_timeout:g}s"
+            )
         total_polls += 1
         try:
-            resp = session.get(url, timeout=15)
+            resp = session.get(url, timeout=request_timeout)
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
@@ -862,6 +875,8 @@ def generate_video(
     batch_id: str | None = None,
     model: str | None = None,
     submit_timeout: int | None = None,
+    status_timeout: float = 15,
+    poll_deadline: float | None = None,
     return_last_frame: bool = False,
     task_dir: str | None = None,
     resume_task_id: str | None = None,
@@ -994,7 +1009,12 @@ def generate_video(
     print(f"  [local_video] task_id={task_id}")
 
     # Poll
-    result = poll(task_id)
+    poll_kwargs = {}
+    if status_timeout != 15:
+        poll_kwargs["request_timeout"] = status_timeout
+    if poll_deadline is not None:
+        poll_kwargs["deadline_seconds"] = poll_deadline
+    result = poll(task_id, **poll_kwargs)
     print("  [local_video] completed!")
 
     # Download (with cross-task leakage verification)
@@ -1073,7 +1093,8 @@ def generate_video_with_fallback(**kwargs) -> str | dict:
     """
     output_path = str(kwargs["output_path"])
     shot_id = Path(output_path).parent.name
-    seedance_kwargs = dict(kwargs, model="seedance", submit_timeout=60)
+    seedance_kwargs = dict(kwargs, model="seedance")
+    seedance_kwargs.setdefault("submit_timeout", 60)
     try:
         return generate_video(**seedance_kwargs)
     except TimeoutError:

@@ -7,11 +7,9 @@ import argparse
 import hashlib
 import json
 import os
-import sqlite3
 import sys
 from datetime import datetime, timezone
 from functools import partial
-from math import ceil
 from pathlib import Path
 from typing import Any
 
@@ -142,42 +140,15 @@ def _provider_cooldown_state(
     cooldown_seconds: int,
     now: datetime | None = None,
 ) -> dict[str, Any] | None:
-    """Return a no-network cooldown receipt for the newest pre-job quota failure."""
-    if cooldown_seconds <= 0 or not database_path.is_file():
-        return None
-    with sqlite3.connect(database_path) as connection:
-        row = connection.execute(
-            """
-            SELECT finished_at, error_message
-            FROM generation_tasks
-            WHERE resource_id = ?
-              AND provider_id = 'seedance'
-              AND provider_job_id IS NULL
-              AND status = 'failed'
-              AND error_message LIKE '%429%QuotaExceeded%'
-            ORDER BY finished_at DESC, queued_at DESC
-            LIMIT 1
-            """,
-            (resource_id,),
-        ).fetchone()
-    if not row or not row[0]:
-        return None
-    finished_at = datetime.fromisoformat(str(row[0]))
-    if finished_at.tzinfo is None:
-        finished_at = finished_at.replace(tzinfo=timezone.utc)
-    current = now or datetime.now(timezone.utc)
-    if current.tzinfo is None:
-        current = current.replace(tzinfo=timezone.utc)
-    remaining = cooldown_seconds - (current - finished_at).total_seconds()
-    if remaining <= 0:
-        return None
-    return {
-        "status": "provider_cooldown",
-        "last_failed_at": finished_at.isoformat(),
-        "retry_after_seconds": ceil(remaining),
-        "provider_request_sent": False,
-        "reason": "recent Seedance 429 QuotaExceeded before provider job creation",
-    }
+    from runtime.provider_policy import provider_cooldown_state
+
+    return provider_cooldown_state(
+        database_path,
+        resource_id,
+        provider_id="seedance",
+        cooldown_seconds=cooldown_seconds,
+        now=now,
+    )
 
 
 def _update_acceptance_receipt(
