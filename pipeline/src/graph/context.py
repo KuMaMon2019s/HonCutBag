@@ -16,6 +16,7 @@ def initial_state_from_config(config: GraphRunConfig) -> HonCutState:
 
     return HonCutState(
         run_id=config.run_id,
+        run_fingerprint=config.run_id,
         input_text=config.input_text,
         output_dir=config.output_dir,
         target_duration_s=config.target_duration_s,
@@ -26,6 +27,7 @@ def initial_state_from_config(config: GraphRunConfig) -> HonCutState:
         transition=config.transition,
         transition_duration_s=config.transition_duration_s,
         media_profile=config.media_profile,
+        project_video_spec=dict(config.project_video_spec),
         enable_reshoot=config.enable_reshoot,
         resume=config.resume,
         resume_from=config.resume_from,

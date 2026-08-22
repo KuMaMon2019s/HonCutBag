@@ -14,6 +14,7 @@ class HonCutState(TypedDict, total=False):
 
     # Run identity and validated configuration.
     run_id: str
+    run_fingerprint: str
     input_text: str
     output_dir: str
     target_duration_s: int

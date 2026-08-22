@@ -7719,36 +7719,29 @@ def _run_pipeline(
             else:
                 app = graph.compile()
             
-            # Prepare initial state
-            initial_state = {
-                "text": text,
-                "events": [],
-                "characters": [],
-                "storyboard": {},
-                "storyboard_image": "",
-                "shots": [],
-                "videos": [],
-                "quality_report": {},
-                "final_video": "",
-                "status": "running",
-                "output_dir": str(output_path),
-                "duration": duration,
-                "shot_duration": shot_duration,
-                "chain_mode": chain_mode,
-                "dry_run": dry_run,
-                "transition": transition,
-                "transition_duration": transition_duration,
-                "media_profile": media_profile,
-                "project_video_spec": project_video_spec,
-                "run_fingerprint": run_manifest["run_fingerprint"],
-                "enable_reshoot": enable_reshoot,
-                "skip_phase": skip_phase or [],
-                "resume": resume,
-                "auto_approve": auto_approve,
-                "phase_results": {},
-                "retry_count": 0,
-                "completed_phases": [],
-            }
+            # Seed the live graph through the validated, checkpoint-safe contract.
+            from graph.context import initial_state_from_config
+            from schemas.workflow import GraphRunConfig
+
+            run_config = GraphRunConfig(
+                run_id=run_manifest["run_fingerprint"],
+                input_text=text,
+                output_dir=str(output_path),
+                target_duration_s=duration,
+                shot_duration_s=shot_duration,
+                dry_run=dry_run,
+                chain_mode=chain_mode,
+                auto_approve=auto_approve,
+                transition=transition,
+                transition_duration_s=transition_duration,
+                media_profile=media_profile,
+                project_video_spec=project_video_spec,
+                enable_reshoot=enable_reshoot,
+                resume=resume,
+                resume_from=resume_from,
+                skip_phase=skip_phase,
+            )
+            initial_state = initial_state_from_config(run_config)
             
             # Config for threading
             config = {

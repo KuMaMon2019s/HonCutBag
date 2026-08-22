@@ -11,10 +11,12 @@ import pytest
 from langgraph.graph import END, START
 
 import pipeline_runner
+from graph.context import initial_state_from_config
 from graph.state import HonCutState
 from graph.workflow import PHASE_NODE_IDS, build_workflow
 from phases import pipeline_core
 from runtime.generation_tasks import GenerationTaskStore
+from schemas.workflow import GraphRunConfig
 from utils.artifact_chain import (
     can_resume_from,
     invalidate_checkpoints_from,
@@ -24,6 +26,29 @@ from utils.artifact_chain import (
 
 def _identity_node(state: HonCutState) -> dict[str, Any]:
     return dict(state)
+
+
+def test_live_graph_config_seeds_complete_json_safe_compatibility_state():
+    config = GraphRunConfig(
+        run_id="fingerprint-1",
+        input_text="story",
+        output_dir="/tmp/honcut-characterization",
+        target_duration_s=12,
+        shot_duration_s=4,
+        transition_duration_s=0.25,
+        project_video_spec={"width": 1920, "height": 1080},
+        resume_from="phase5",
+    )
+
+    state = initial_state_from_config(config)
+
+    assert state["run_id"] == state["run_fingerprint"] == "fingerprint-1"
+    assert state["input_text"] == state["text"] == "story"
+    assert state["target_duration_s"] == state["duration"] == 12
+    assert state["shot_duration_s"] == state["shot_duration"] == 4
+    assert state["project_video_spec"] == {"width": 1920, "height": 1080}
+    assert state["resume_from"] == "phase5"
+    assert json.loads(json.dumps(state))["phase_results"] == {}
 
 
 def test_cli_dispatch_preserves_public_arguments_and_exit_contract(monkeypatch, tmp_path):
