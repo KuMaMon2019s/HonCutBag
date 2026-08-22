@@ -387,9 +387,14 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
             }
         print("  → 路由: Seedance 直连 ARK Agent Plan", flush=True)
 
+    from runtime.artifact_manifest import ArtifactManifestStore
     from runtime.generation_tasks import GenerationTaskStore
 
     generation_tasks = GenerationTaskStore(output_dir / "runtime.db")
+    artifact_store = ArtifactManifestStore.from_run_directory(
+        output_dir,
+        required=False,
+    )
 
     # Load character reference images for consistency
     import base64 as _b64
@@ -845,6 +850,7 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                             output_path=out_path,
                             generate=bridge_generate,
                             validate_output=is_valid_video,
+                            artifact_store=artifact_store,
                         )
                         generation_result = execution.generation_result
 
@@ -953,6 +959,7 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                     ),
                     download=seedance_client.download,
                     validate_output=is_valid_video,
+                    artifact_store=artifact_store,
                 )
                 task_id = execution.provider_job_id
 

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from quality.seam_calibration import SeamCalibration
+from runtime.artifact_manifest import ArtifactManifestStore
 from runtime.bridge_execution import execute_bridge_video_task
 from runtime.capacity import (
     CrossProcessSlotTable,
@@ -1529,6 +1530,10 @@ def _direct_seedance_executor(
     api_key = get_api_key_or_raise("ARK_AGENT")
     model = SEEDANCE_MODEL
     provider_policy = ProviderExecutionPolicy.from_environment("seedance")
+    artifact_store = ArtifactManifestStore.from_run_directory(
+        output_dir,
+        required=False,
+    )
     fallback_workers = max(1, int(os.environ.get("VIDEO_GEN_CONCURRENCY", "1")))
     capacity = provider_policy.capacity(fallback_workers)
     slots = SlotTable()
@@ -1745,6 +1750,7 @@ def _direct_seedance_executor(
                             ),
                             download=seedance_client.download,
                             validate_output=is_valid_video,
+                            artifact_store=artifact_store,
                         )
                         break
                     except Exception as exc:
@@ -1920,6 +1926,10 @@ def _bridge_seedance_executor(
     from utils.video_validation import is_valid_video
 
     provider_policy = ProviderExecutionPolicy.from_environment("bridge")
+    artifact_store = ArtifactManifestStore.from_run_directory(
+        output_dir,
+        required=False,
+    )
     capacity = max(1, int(os.environ.get("VIDEO_GEN_CONCURRENCY", "1")))
     slots = SlotTable()
 
@@ -1966,6 +1976,7 @@ def _bridge_seedance_executor(
                     output_path=request.output_path,
                     generate=generate,
                     validate_output=is_valid_video,
+                    artifact_store=artifact_store,
                 )
         return ChunkExecutionResult(
             output_path=Path(execution.output_path),

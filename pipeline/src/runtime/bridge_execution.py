@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from runtime.artifact_manifest import ArtifactManifestStore
 from runtime.execution_errors import (
     ProviderEndpointChangedError,
     SubmissionUncertainError,
@@ -50,6 +51,7 @@ def execute_bridge_video_task(
     output_path: str | Path,
     generate: Callable[..., str | dict[str, Any]],
     validate_output: Callable[[Path], bool] | None = None,
+    artifact_store: ArtifactManifestStore | None = None,
 ) -> BridgeExecution:
     """Persist a Bridge job ID before polling and resume it after interruption."""
 
@@ -83,6 +85,21 @@ def execute_bridge_video_task(
             validate_output is not None and not validate_output(destination)
         ):
             raise RuntimeError(f"recovered Bridge output is invalid for {resource_id}")
+        if artifact_store is not None:
+            artifact_id = succeeded.output_artifact_id
+            if artifact_id:
+                artifact_store.resolve(artifact_id)
+            else:
+                artifact = artifact_store.register_file(
+                    destination,
+                    artifact_type="video",
+                    producer_node="phase6.video_generation",
+                    producer_task_id=succeeded.task_id,
+                )
+                task_store.mark_succeeded(
+                    succeeded.task_id,
+                    {**succeeded.outcome, "output_artifact_id": artifact.artifact_id},
+                )
         return BridgeExecution(
             task_id=succeeded.task_id,
             provider_job_id=provider_job_id,
@@ -195,6 +212,15 @@ def execute_bridge_video_task(
                 if key in generation_result
             }
         )
+    if artifact_store is not None:
+        artifact = artifact_store.register_file(
+            destination,
+            artifact_type="video",
+            producer_node="phase6.video_generation",
+            producer_task_id=task.task_id,
+            expected_sha256=outcome["output_sha256"],
+        )
+        outcome["output_artifact_id"] = artifact.artifact_id
     task_store.mark_succeeded(task.task_id, outcome)
     return BridgeExecution(
         task_id=task.task_id,

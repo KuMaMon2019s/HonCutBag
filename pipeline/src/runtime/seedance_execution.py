@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from runtime.artifact_manifest import ArtifactManifestStore
 from runtime.execution_errors import (
     ProviderEndpointChangedError,
     ProviderJobFailedError,
@@ -71,6 +72,7 @@ def execute_seedance_video_task(
     poll: Callable[[str], str],
     download: Callable[[str, str], str],
     validate_output: Callable[[Path], bool] | None = None,
+    artifact_store: ArtifactManifestStore | None = None,
 ) -> SeedanceExecution:
     """Submit once, persist the job id, then resume polling after failures."""
     destination = Path(output_path)
@@ -99,6 +101,21 @@ def execute_seedance_video_task(
             validate_output is not None and not validate_output(destination)
         ):
             raise RuntimeError(f"recovered Seedance output is invalid for {resource_id}")
+        if artifact_store is not None:
+            artifact_id = succeeded.output_artifact_id
+            if artifact_id:
+                artifact_store.resolve(artifact_id)
+            else:
+                artifact = artifact_store.register_file(
+                    destination,
+                    artifact_type="video",
+                    producer_node="phase6.video_generation",
+                    producer_task_id=succeeded.task_id,
+                )
+                task_store.mark_succeeded(
+                    succeeded.task_id,
+                    {**succeeded.outcome, "output_artifact_id": artifact.artifact_id},
+                )
         return SeedanceExecution(
             task_id=succeeded.task_id,
             provider_job_id=provider_job_id,
@@ -187,15 +204,22 @@ def execute_seedance_video_task(
         task_store.note_resumable_error(task.task_id, message)
         raise RuntimeError(message)
 
-    task_store.mark_succeeded(
-        task.task_id,
-        {
-            "provider_job_id": provider_job_id,
-            "video_url": video_url,
-            "output_path": destination_text,
-            "output_sha256": _file_hash(destination),
-        },
-    )
+    outcome = {
+        "provider_job_id": provider_job_id,
+        "video_url": video_url,
+        "output_path": destination_text,
+        "output_sha256": _file_hash(destination),
+    }
+    if artifact_store is not None:
+        artifact = artifact_store.register_file(
+            destination,
+            artifact_type="video",
+            producer_node="phase6.video_generation",
+            producer_task_id=task.task_id,
+            expected_sha256=outcome["output_sha256"],
+        )
+        outcome["output_artifact_id"] = artifact.artifact_id
+    task_store.mark_succeeded(task.task_id, outcome)
     return SeedanceExecution(
         task_id=task.task_id,
         provider_job_id=provider_job_id,

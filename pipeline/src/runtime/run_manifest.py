@@ -39,6 +39,7 @@ _RUN_OWNED_MARKERS = (
     "checkpoint.json",
     "checkpoint.db",
     "runtime.db",
+    "ARTIFACT_MANIFEST.json",
     "shots",
     "director_panels",
     "shot_storyboards",
