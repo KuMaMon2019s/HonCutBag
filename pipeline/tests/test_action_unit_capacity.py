@@ -384,6 +384,114 @@ def test_mandatory_turning_point_cannot_be_dropped_from_story_clock():
         engine._validate_beat_action_capacity(beats, events)
 
 
+def test_capacity_repair_separates_sequences_and_rebalances_dense_station_fight():
+    unit_counts = [0, 3, 0, 3, 9, 4, 6, 3, 4, 5, 2, 1, 0]
+    roles = [
+        "scene_setup",
+        "transition",
+        "character_state",
+        "action_chain",
+        "action_chain",
+        "action_chain",
+        "action_chain",
+        "action_chain",
+        "action_chain",
+        "turning_point",
+        "character_state",
+        "turning_point",
+        "scene_setup",
+    ]
+    events = [
+        {
+            "sequence_id": "SEQ001" if event_id < 13 else "SEQ002",
+            "event_role": roles[event_id - 1],
+            "dramatic_turn": event_id == 7,
+            "who": ["男子"],
+            "where": "未来列车",
+            "what": f"事件 {event_id}",
+            "micro_actions": [
+                f"男子依次挥拳动作{event_id}-{action_id}"
+                for action_id in range(1, unit_counts[event_id - 1] + 1)
+            ],
+        }
+        for event_id in range(1, 14)
+    ]
+    source_groups = [[1, 2, 3, 4], [5, 6], [5, 7, 8, 9, 10, 11, 12], [12, 13]]
+    shot_sizes = ["medium_wide", "medium", "wide", "medium_close"]
+    camera_movements = ["dolly_in", "handheld", "tracking_front", "static"]
+    beats = [
+        {
+            "beat_order": index,
+            "source_events": source_events,
+            "dropped_source_events": [],
+            "action": "merge",
+            "reason": "模型首轮密集装箱",
+            "who": ["男子"],
+            "where": "未来列车",
+            "what": f"战斗段落 {index}",
+            "suggested_duration": 15,
+            "shot_size": shot_sizes[index - 1],
+            "camera_movement": camera_movements[index - 1],
+            "lighting_key": "neon",
+            "shot_intent": "reveal" if index == 4 else "action",
+            "hero_moment": index == 3,
+            "texture_keywords": ["湿润金属", f"蓝色电弧{index}"],
+        }
+        for index, source_events in enumerate(source_groups, 1)
+    ]
+    parsed = engine._parse_beat_skeleton(
+        json.dumps({"strategy": "压缩列车战斗", "beats": beats}, ensure_ascii=False),
+        4,
+        len(events),
+    )
+    profile = engine.get_video_capabilities()
+    story_capacity = engine._generation_unit_capacity_for_story_duration(
+        15,
+        profile,
+    )
+
+    repaired = engine._repair_beat_action_capacity(
+        parsed["beats"],
+        events,
+        profile,
+        max_generation_units_per_beat=story_capacity,
+    )
+
+    engine._validate_beat_action_capacity(repaired, events, profile)
+    assert [beat["sequence_id"] for beat in repaired] == [
+        "SEQ001",
+        "SEQ001",
+        "SEQ001",
+        "SEQ002",
+    ]
+    assert [
+        {
+            events[event_id - 1]["sequence_id"]
+            for event_id in beat["source_events"]
+        }
+        for beat in repaired
+    ] == [{"SEQ001"}, {"SEQ001"}, {"SEQ001"}, {"SEQ002"}]
+    mandatory_ids = {
+        event_id
+        for event_id, event in enumerate(events, 1)
+        if engine._event_is_mandatory_for_adaptation(event)
+    }
+    kept_ids = {
+        event_id for beat in repaired for event_id in beat["source_events"]
+    }
+    dropped_ids = {
+        event_id
+        for beat in repaired
+        for event_id in beat["dropped_source_events"]
+    }
+    assert mandatory_ids <= kept_ids
+    assert kept_ids.isdisjoint(dropped_ids)
+    assert kept_ids | dropped_ids == set(range(1, 14))
+    assert dropped_ids
+    assert max(engine._beat_generation_unit_loads(repaired, events)) <= story_capacity
+    assert max(engine._beat_content_loads(repaired, events, profile)) <= 3
+
+
 def test_flashmob_one_take_has_a_feasible_four_beat_skeleton(monkeypatch):
     events = _load_capacity_fixture(FIXTURE, LEGACY_COMPOSITE_EVENTS)
     _annotate_global_event_flow(events, continuity_mode="one_take")

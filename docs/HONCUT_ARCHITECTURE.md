@@ -120,6 +120,8 @@ Phase 1 的时长合同采用双账本：一级 `Sxx` 与其二级 `Pxx` 共用�
 
 当完整事件账本超过交付故事时钟的可执行容量时，Phase 1 只能通过 `dropped_source_events` 显式记录被删减的非关键事件；这些事件不得进入 `source_events`、Pxx、Prompt 或媒体生成。`scene_setup`、`turning_point`、`dramatic_turn` 与 `consequence` 必须保留。Phase 5 必须 fail closed 校验故事时钟上限、Sxx/Pxx 等时、bridge 区间/把手以及持久化 material ledger；未知或旧 material-budget schema 不得解释为成功。
 
+Phase 1 的骨架账本按 screenplay `sequence_id` 预先分配连续且互不合并的 beat 槽位。模型返回跨 sequence、遗漏必保事件或超过故事时钟动作容量时，Phase owner 必须按固定槽位确定性重建 `source_events` / `dropped_source_events`：必保事件不得删除，删减只能显式进入 dropped 账本，重建后仍不满足容量则 fail closed。
+
 Phase 间调用原则上通过 Graph/Lifecycle。唯一允许的业务闭环是已建模且有限的修复路径，例如 Phase 8 调用注入的 Phase 6 生成 callable；该依赖必须可测试注入，并在所有递归轮次中保持一致。
 
 ## 4. State、身份与恢复

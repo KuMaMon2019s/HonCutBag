@@ -30,6 +30,7 @@
 import argparse
 import copy
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -1547,6 +1548,7 @@ def _inherit_event_semantics(
 BEAT_SKELETON_PROMPT = (
     "目标时长：{target_duration}秒，每镜约{shot_duration}秒。请把全部事件压缩为恰好{beat_count}个 beat。\n\n"
     "事件列表：\n{events_json}\n\n角色列表：\n{characters_summary}\n\n"
+    "固定 beat/sequence 槽位：\n{sequence_beat_plan}\n\n"
     "只做全局改编与镜头语言规划，不要展开 visual 或人物外貌。输出严格 JSON 对象："
     '{{"strategy":"一句话改编策略","beats":[{{"beat_order":1,"source_events":[1],'
     '"dropped_source_events":[],"action":"keep/merge","reason":"一句话理由","who":["角色主名"],'
@@ -1573,8 +1575,8 @@ BEAT_SKELETON_PROMPT = (
     "换场/跳时不得错误合并。turning_point 可与同 sequence 中紧邻的因果动作共用 beat，但必须明确"
     "保留转折。被保留事件在 beats 中的引用次数不得少于输入中的 "
     "minimum_kept_primary_beat_occurrences；同一事件的后续引用只承载尚未表现的动作，不得重放。\n"
-    "6. sequence_id 与 continuity_before 是生成连续性依据。同一 sequence 的连续单元尽量落在相邻 beat，"
-    "换场/跳时/关系转折不得为了省镜头而错误连拍。\n"
+    "6. sequence_id 与 continuity_before 是生成连续性依据。每个 beat 只能引用固定槽位指定 sequence 的事件；"
+    "同一 sequence 的连续单元落在相邻 beat，换场/跳时/关系转折不得为了省镜头而错误连拍。\n"
     "7. shot_size、camera_movement、lighting_key、shot_intent、hero_moment、texture_keywords "
     "是骨架的全局结构字段，全部必填。相邻 beat 景别必须形成差异，动作 beat 不得全部 static；"
     "4 个及以上 beat 必须至少一个 hero_moment=true，每个 beat 给出 2–4 个具体纹理关键词。"
@@ -1696,6 +1698,11 @@ def _validate_beat_action_capacity(
     invalid_dropped = dropped_event_ids - set(event_by_id)
     if invalid_dropped:
         raise ValueError(f"dropped events are invalid: {sorted(invalid_dropped)}")
+    missing_event_ids = set(event_by_id) - kept_event_ids - dropped_event_ids
+    if missing_event_ids:
+        raise ValueError(
+            f"events must be explicitly kept or dropped: {sorted(missing_event_ids)}"
+        )
     for beat in beats:
         if beat.get("action") == "drop":
             continue
@@ -1768,12 +1775,11 @@ def _validate_beat_material_duration(
         )
 
 
-def _beat_content_loads(
+def _beat_generation_unit_loads(
     beats: List[Dict[str, Any]],
     events: List[Dict[str, Any]],
-    capabilities: VideoModelCapabilities,
 ) -> List[int]:
-    """Calculate the eventual per-shot action load after event occurrence slicing."""
+    """Distribute each kept event's normalized units across its beat occurrences."""
     event_by_id = {index: event for index, event in enumerate(events, 1)}
     positions: Dict[int, List[int]] = {}
     for beat_index, beat in enumerate(beats):
@@ -1798,8 +1804,17 @@ def _beat_content_loads(
             size = base + (1 if occurrence < remainder else 0)
             generation_units_by_beat[beat_index] += size
 
+    return generation_units_by_beat
+
+
+def _beat_content_loads(
+    beats: List[Dict[str, Any]],
+    events: List[Dict[str, Any]],
+    capabilities: VideoModelCapabilities,
+) -> List[int]:
+    """Calculate the eventual per-shot clip load after event occurrence slicing."""
     loads = []
-    for generation_unit_count in generation_units_by_beat:
+    for generation_unit_count in _beat_generation_unit_loads(beats, events):
         action_beats = (
             math.ceil(
                 generation_unit_count / capabilities.max_micro_actions_per_beat
@@ -1810,18 +1825,87 @@ def _beat_content_loads(
     return loads
 
 
+def _sequence_beat_plan(
+    events: List[Dict[str, Any]],
+    beat_count: int,
+    max_generation_units_per_beat: int,
+) -> List[str]:
+    """Allocate contiguous primary-beat slots to non-mergeable sequences."""
+    if beat_count < 1 or max_generation_units_per_beat < 1:
+        raise ValueError("beat count and per-beat generation capacity must be positive")
+    ordered_sequences: List[str] = []
+    for event in events:
+        sequence = str(event.get("sequence_id") or "").strip() or "__unspecified__"
+        if sequence not in ordered_sequences:
+            ordered_sequences.append(sequence)
+    if not ordered_sequences:
+        raise ValueError("cannot plan beat sequences without source events")
+    if len(ordered_sequences) > beat_count:
+        raise ValueError(
+            f"{len(ordered_sequences)} isolated sequences cannot fit {beat_count} beats"
+        )
+
+    generation_units = _event_generation_action_unit_counts(events)
+    total_units = {sequence: 0 for sequence in ordered_sequences}
+    mandatory_units = {sequence: 0 for sequence in ordered_sequences}
+    for event_id, event in enumerate(events, 1):
+        sequence = str(event.get("sequence_id") or "").strip() or "__unspecified__"
+        units = generation_units[event_id]
+        total_units[sequence] += units
+        if _event_is_mandatory_for_adaptation(event):
+            mandatory_units[sequence] += units
+
+    allocations = {
+        sequence: max(
+            1,
+            math.ceil(mandatory_units[sequence] / max_generation_units_per_beat),
+        )
+        for sequence in ordered_sequences
+    }
+    required = sum(allocations.values())
+    if required > beat_count:
+        raise ValueError(
+            f"mandatory sequence content needs {required} beats; only {beat_count} available"
+        )
+    while sum(allocations.values()) < beat_count:
+        sequence = max(
+            ordered_sequences,
+            key=lambda value: (
+                total_units[value]
+                - allocations[value] * max_generation_units_per_beat,
+                total_units[value],
+                -ordered_sequences.index(value),
+            ),
+        )
+        allocations[sequence] += 1
+    return [
+        sequence
+        for sequence in ordered_sequences
+        for _ in range(allocations[sequence])
+    ]
+
+
 def _repair_beat_action_capacity(
     beats: List[Dict[str, Any]],
     events: List[Dict[str, Any]],
     capabilities: VideoModelCapabilities | None = None,
+    *,
+    max_generation_units_per_beat: int | None = None,
 ) -> List[Dict[str, Any]]:
-    """Deterministically add missing dense-event occurrences to adjacent beats.
+    """Repair the source ledger without crossing sequences or story capacity.
 
-    The LLM still chooses editorial framing. This repair owns the non-negotiable
-    source ledger: event order, sequence boundaries, turning points, and the
-    provider's per-primary-shot content capacity.
+    The model still owns shot language and editorial intent.  Code owns the
+    auditable source ledger: contiguous sequence slots, mandatory-event
+    retention, explicit non-key drops, and deterministic action-unit slicing.
     """
     profile = capabilities or get_video_capabilities()
+    hard_capacity = (
+        profile.max_micro_actions_per_beat * MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
+    )
+    unit_capacity = min(
+        hard_capacity,
+        max_generation_units_per_beat or hard_capacity,
+    )
     repaired = [dict(beat) for beat in beats]
     for beat in repaired:
         raw_ids = beat.get("source_events") or []
@@ -1835,103 +1919,208 @@ def _repair_beat_action_capacity(
         beat["source_events"] = list(dict.fromkeys(raw_ids))
         beat["dropped_source_events"] = list(dict.fromkeys(raw_dropped_ids))
 
+    try:
+        _validate_beat_action_capacity(repaired, events, profile)
+        if max(_beat_generation_unit_loads(repaired, events), default=0) <= unit_capacity:
+            for beat in repaired:
+                sequences = {
+                    str(events[event_id - 1].get("sequence_id") or "").strip()
+                    or "__unspecified__"
+                    for event_id in beat["source_events"]
+                }
+                if len(sequences) == 1:
+                    beat["sequence_id"] = next(iter(sequences))
+            return repaired
+    except ValueError:
+        pass
+
+    sequence_plan = _sequence_beat_plan(events, len(repaired), unit_capacity)
     event_by_id = {index: event for index, event in enumerate(events, 1)}
+    event_sequences = {
+        event_id: str(event.get("sequence_id") or "").strip() or "__unspecified__"
+        for event_id, event in event_by_id.items()
+    }
+    sequence_slots = {
+        sequence: [
+            index for index, planned in enumerate(sequence_plan) if planned == sequence
+        ]
+        for sequence in dict.fromkeys(sequence_plan)
+    }
+    sequence_event_ids = {
+        sequence: [
+            event_id
+            for event_id, event_sequence in event_sequences.items()
+            if event_sequence == sequence
+        ]
+        for sequence in sequence_slots
+    }
+    generation_units = _event_generation_action_unit_counts(events)
     occurrence_requirements = _event_primary_occurrence_requirements(events, profile)
-    dropped_event_ids = _dropped_source_event_ids(repaired)
+    model_kept = {
+        event_id
+        for beat in repaired
+        for event_id in beat["source_events"]
+        if event_id in event_by_id
+    }
+    mandatory_ids = {
+        event_id
+        for event_id, event in event_by_id.items()
+        if _event_is_mandatory_for_adaptation(event)
+    }
+    requested_kept = model_kept | mandatory_ids
+    placements: Dict[int, tuple[int, ...]] = {}
 
-    def legal_merge(event_id: int, beat: Dict[str, Any]) -> bool:
-        if beat.get("action") == "drop":
-            return False
-        other_ids = [
-            value for value in beat.get("source_events", []) if value != event_id
+    def generation_loads(candidate: Dict[int, tuple[int, ...]]) -> List[int]:
+        loads = [0 for _ in repaired]
+        for event_id, positions in candidate.items():
+            base, remainder = divmod(generation_units[event_id], len(positions))
+            for occurrence, beat_index in enumerate(positions):
+                loads[beat_index] += base + (1 if occurrence < remainder else 0)
+        return loads
+
+    def preferred_slot(event_id: int) -> int:
+        sequence = event_sequences[event_id]
+        slots = sequence_slots[sequence]
+        source_ids = sequence_event_ids[sequence]
+        position = source_ids.index(event_id)
+        if len(slots) == 1 or len(source_ids) == 1:
+            return slots[0]
+        relative = position * (len(slots) - 1) / (len(source_ids) - 1)
+        return slots[round(relative)]
+
+    def placement_options(event_id: int) -> List[tuple[int, ...]]:
+        slots = sequence_slots[event_sequences[event_id]]
+        minimum = occurrence_requirements[event_id]
+        if minimum > len(slots):
+            return []
+        maximum = len(slots) if generation_units[event_id] else minimum
+        preferred = preferred_slot(event_id)
+        options = [
+            option
+            for count in range(minimum, maximum + 1)
+            for option in itertools.combinations(slots, count)
         ]
-        if not other_ids:
+        return sorted(
+            options,
+            key=lambda option: (
+                len(option) - minimum,
+                sum(abs(slot - preferred) for slot in option),
+                option,
+            ),
+        )
+
+    mandatory_order = sorted(
+        mandatory_ids,
+        key=lambda event_id: (-generation_units[event_id], event_id),
+    )
+
+    def place_mandatory(position: int) -> bool:
+        if position >= len(mandatory_order):
             return True
-        event = event_by_id[event_id]
-        details = [event_by_id[value] for value in other_ids if value in event_by_id]
-        sequence = str(event.get("sequence_id") or "").strip()
-        other_sequences = {
-            str(detail.get("sequence_id") or "").strip()
-            for detail in details
-            if str(detail.get("sequence_id") or "").strip()
-        }
-        if sequence and other_sequences and other_sequences != {sequence}:
-            return False
-        return True
+        event_id = mandatory_order[position]
+        for option in placement_options(event_id):
+            placements[event_id] = option
+            if max(generation_loads(placements), default=0) <= unit_capacity:
+                if place_mandatory(position + 1):
+                    return True
+            placements.pop(event_id, None)
+        return False
 
-    for event_id, event in event_by_id.items():
-        current = [
-            index for index, beat in enumerate(repaired)
-            if beat.get("action") != "drop"
-            and event_id in beat.get("source_events", [])
-        ]
-        if not current and event_id in dropped_event_ids:
-            continue
-        required = occurrence_requirements[event_id]
-        if required <= 1:
-            continue
-        while True:
-            current = [
-                index for index, beat in enumerate(repaired)
-                if beat.get("action") != "drop"
-                and event_id in beat.get("source_events", [])
-            ]
-            if len(current) >= required:
-                break
-            lower = max(
-                (
-                    index for index, beat in enumerate(repaired)
-                    if any(value < event_id for value in beat.get("source_events", []))
-                ),
-                default=0,
-            )
-            upper = min(
-                (
-                    index for index, beat in enumerate(repaired)
-                    if any(value > event_id for value in beat.get("source_events", []))
-                ),
-                default=len(repaired) - 1,
-            )
-            candidates = []
-            for candidate in range(lower, upper + 1):
-                if candidate in current or not legal_merge(event_id, repaired[candidate]):
-                    continue
-                trial = [dict(beat) for beat in repaired]
-                trial[candidate]["source_events"] = sorted(
-                    [*trial[candidate].get("source_events", []), event_id]
-                )
-                loads = _beat_content_loads(trial, events, profile)
-                if max(loads, default=1) > MAX_CONTENT_BEATS_PER_PRIMARY_SHOT:
-                    continue
-                distance = min((abs(candidate - value) for value in current), default=0)
-                candidates.append(
-                    (loads[candidate], distance, len(trial[candidate]["source_events"]), candidate)
-                )
-            if not candidates:
-                raise ValueError(
-                    f"event {event_id} needs {required} primary beats, but no adjacent "
-                    "beat can accept another occurrence without crossing a sequence "
-                    "or exceeding provider capacity"
-                )
-            candidate = min(candidates)[-1]
-            repaired[candidate]["source_events"] = sorted(
-                [*repaired[candidate].get("source_events", []), event_id]
-            )
-            repaired[candidate]["capacity_repair"] = {
-                "reason": "dense_event_occurrence_added",
-                "event_id": event_id,
-                "minimum_occurrences": required,
+    if not place_mandatory(0):
+        raise ValueError(
+            "mandatory events cannot fit the sequence-isolated story-beat capacity"
+        )
+
+    for event_id in sorted(requested_kept - mandatory_ids):
+        candidates = []
+        for option in placement_options(event_id):
+            trial = dict(placements)
+            trial[event_id] = option
+            loads = generation_loads(trial)
+            if max(loads, default=0) > unit_capacity:
+                continue
+            occupied = {
+                beat_index
+                for positions in placements.values()
+                for beat_index in positions
             }
+            candidates.append((
+                sum(abs(slot - preferred_slot(event_id)) for slot in option),
+                -sum(slot not in occupied for slot in option),
+                sum(load * load for load in loads),
+                option,
+            ))
+        if candidates:
+            placements[event_id] = min(candidates)[-1]
 
-    for beat in repaired:
-        details = [
-            event_by_id[event_id]
-            for event_id in beat.get("source_events", [])
-            if event_id in event_by_id
-        ]
-        if not details or "capacity_repair" not in beat:
+    for sequence, slots in sequence_slots.items():
+        if any(
+            event_sequences[event_id] == sequence for event_id in placements
+        ):
             continue
+        fallback_event = sequence_event_ids[sequence][0]
+        placements[fallback_event] = (slots[0],)
+        if max(generation_loads(placements), default=0) > unit_capacity:
+            raise ValueError(f"sequence {sequence} has no event that fits its beat slots")
+
+    while True:
+        occupied = {
+            beat_index
+            for positions in placements.values()
+            for beat_index in positions
+        }
+        empty_slots = [index for index in range(len(repaired)) if index not in occupied]
+        if not empty_slots:
+            break
+        empty = empty_slots[0]
+        sequence = sequence_plan[empty]
+        candidates = []
+        for event_id, positions in placements.items():
+            if event_sequences[event_id] != sequence or empty in positions:
+                continue
+            trial = dict(placements)
+            trial[event_id] = tuple(sorted((*positions, empty)))
+            loads = generation_loads(trial)
+            if max(loads, default=0) <= unit_capacity:
+                candidates.append((
+                    min(abs(empty - position) for position in positions),
+                    -generation_units[event_id],
+                    event_id,
+                    trial[event_id],
+                ))
+        if not candidates:
+            raise ValueError(f"sequence {sequence} cannot populate beat {empty + 1}")
+        _distance, _negative_units, event_id, positions = min(candidates)
+        placements[event_id] = positions
+
+    sources_by_beat: List[List[int]] = [[] for _ in repaired]
+    for event_id, positions in placements.items():
+        for beat_index in positions:
+            sources_by_beat[beat_index].append(event_id)
+    dropped_ids = set(event_by_id) - set(placements)
+    dropped_by_beat: List[List[int]] = [[] for _ in repaired]
+    for event_id in sorted(dropped_ids):
+        dropped_by_beat[sequence_slots[event_sequences[event_id]][0]].append(event_id)
+
+    for index, beat in enumerate(repaired):
+        source_events = sorted(sources_by_beat[index])
+        dropped_events = sorted(dropped_by_beat[index])
+        changed = (
+            source_events != sorted(beat.get("source_events") or [])
+            or dropped_events != sorted(beat.get("dropped_source_events") or [])
+        )
+        beat["source_events"] = source_events
+        beat["dropped_source_events"] = dropped_events
+        beat["sequence_id"] = sequence_plan[index]
+        details = [event_by_id[event_id] for event_id in source_events]
         beat["action"] = "merge" if len(details) > 1 else "keep"
+        if not changed:
+            continue
+        beat["capacity_repair"] = {
+            "reason": "sequence_and_story_capacity_rebalanced",
+            "sequence_id": sequence_plan[index],
+            "max_generation_units": unit_capacity,
+        }
         beat["who"] = list(dict.fromkeys(
             str(name)
             for detail in details
@@ -1943,29 +2132,24 @@ def _repair_beat_action_capacity(
             for detail in details
             if str(detail.get("where") or "").strip()
         ))
-        if len(locations) == 1:
-            beat["where"] = locations[0]
+        if locations:
+            beat["where"] = locations[0] if len(locations) == 1 else " / ".join(locations)
         descriptions = [
             str(detail.get("what") or "").strip()
             for detail in details
             if str(detail.get("what") or "").strip()
         ]
-        visuals = [
-            str(detail.get("visual") or "").strip()
-            for detail in details
-            if str(detail.get("visual") or "").strip()
-        ]
         if descriptions:
             beat["what"] = "；随后".join(descriptions)
-        if visuals:
-            beat["visual"] = "按来源剧情顺序：" + "；随后".join(visuals)
         existing_reason = str(beat.get("reason") or "").strip()
         beat["reason"] = "；".join(filter(None, [
             existing_reason,
-            "代码按视频容量补齐稠密事件的相邻一级分镜出现次数",
+            "代码按 sequence 与故事时钟容量重建可审计事件账本",
         ]))
 
     _validate_beat_action_capacity(repaired, events, profile)
+    if max(_beat_generation_unit_loads(repaired, events), default=0) > unit_capacity:
+        raise ValueError("repaired beat ledger still exceeds story capacity")
     return repaired
 
 
@@ -1989,6 +2173,17 @@ def _build_beat_skeleton(
         shot_duration,
         profile,
     )
+    sequence_beat_plan = [
+        {"beat_order": index, "sequence_id": sequence}
+        for index, sequence in enumerate(
+            _sequence_beat_plan(
+                events,
+                beat_count,
+                per_beat_generation_unit_capacity,
+            ),
+            1,
+        )
+    ]
     prompt_events = []
     for event_id, event in enumerate(events, 1):
         prompt_event = dict(event)
@@ -2004,6 +2199,7 @@ def _build_beat_skeleton(
         max_generation_action_units_per_beat=per_beat_generation_unit_capacity,
         events_json=_build_events_json(prompt_events),
         characters_summary=characters_summary,
+        sequence_beat_plan=json.dumps(sequence_beat_plan, ensure_ascii=False),
     )
     last_validation_error = ""
     for attempt in range(1 + MAX_RETRIES):
@@ -2028,7 +2224,10 @@ def _build_beat_skeleton(
             response = _call_llm_with_timeout_retry(attempt_prompt, max_tokens=8000)
             skeleton = _parse_beat_skeleton(response, beat_count, len(events))
             skeleton["beats"] = _repair_beat_action_capacity(
-                skeleton["beats"], events, profile
+                skeleton["beats"],
+                events,
+                profile,
+                max_generation_units_per_beat=per_beat_generation_unit_capacity,
             )
             skeleton["shot_language_plan"] = _validate_shot_language_variation(
                 skeleton["beats"]
@@ -2204,7 +2403,7 @@ def _atomic_write_json(path: Path, value: Any) -> None:
     os.replace(temporary, path)
 
 
-LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v6"
+LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v7"
 
 
 def _layered_input_fingerprint(
@@ -2497,7 +2696,15 @@ def adapt_events(
                     f"必须输出 {max_shots} 个镜头，实际为 {len(parsed['shots'])}"
                 )
             parsed["shots"] = _repair_beat_action_capacity(
-                parsed["shots"], events, capability_profile
+                parsed["shots"],
+                events,
+                capability_profile,
+                max_generation_units_per_beat=(
+                    _generation_unit_capacity_for_story_duration(
+                        effective_shot_duration,
+                        capability_profile,
+                    )
+                ),
             )
             _validate_beat_action_capacity(
                 parsed["shots"],
