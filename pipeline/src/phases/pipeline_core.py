@@ -7204,6 +7204,7 @@ if LANGGRAPH_AVAILABLE:
             auto_approve=auto_approve,
             reporter=reporter,
             phase_owner=sys.modules[__name__],
+            legacy_compat=True,
         )
 
     # --- Node functions (wrappers around existing run_phase* functions) ---
@@ -7324,6 +7325,7 @@ def run_pipeline(
     auto_approve: bool = True,
     resume_from: str = None,
     accept_code_change_from: str = None,
+    project_id: str = "local",
 ) -> dict:
     """Run the pipeline without leaking its privacy mode into later runs."""
     previous_no_real_person = os.environ.get("HONCUT_NO_REAL_PERSON")
@@ -7337,6 +7339,7 @@ def run_pipeline(
             dry_run=dry_run,
             skip_phase=skip_phase,
             output_dir=output_dir,
+            project_id=project_id,
             transition=transition,
             transition_duration=transition_duration,
             media_profile=media_profile,
@@ -7372,6 +7375,7 @@ def _run_pipeline(
     auto_approve: bool = True,
     resume_from: str = None,
     accept_code_change_from: str = None,
+    project_id: str = "local",
 ) -> dict:
     """
     主入口：端到端管线
@@ -7385,6 +7389,7 @@ def _run_pipeline(
         dry_run: dry-run 模式（Phase 1 实际调 LLM，Phase 3 skip-images，Phase 4 dry-run，Phase 6-8 跳过）
         skip_phase: 跳过指定 phase 列表，如 [3, 8]
         output_dir: 输出目录
+        project_id: 项目隔离标识；默认 `local`
         transition: Phase 8 转场模式 ("crossfade" | "fade" | "cut")
         transition_duration: Phase 8 转场时长（秒），默认 0.5
         media_profile: 编码配置名称，从 MEDIA_PROFILES 中选择（默认 "1080p"）
@@ -7448,6 +7453,7 @@ def _run_pipeline(
         output_path,
         source_text=text,
         resolved_config={
+            "project_id": project_id,
             "duration": duration,
             "shot_duration": shot_duration,
             "chain_mode": chain_mode,
@@ -7623,10 +7629,12 @@ def _run_pipeline(
             
             # Seed the live graph through the validated, checkpoint-safe contract.
             from graph.context import initial_state_from_config
+            from graph.migrations import latest_error_message, migrate_state
             from schemas.workflow import GraphRunConfig
 
             run_config = GraphRunConfig(
                 run_id=run_manifest["run_fingerprint"],
+                project_id=project_id,
                 input_text=text,
                 output_dir=str(output_path),
                 target_duration_s=duration,
@@ -7643,12 +7651,15 @@ def _run_pipeline(
                 resume_from=resume_from,
                 skip_phase=skip_phase,
             )
-            initial_state = initial_state_from_config(run_config)
+            initial_state = initial_state_from_config(
+                run_config,
+                include_legacy_aliases=False,
+            )
             
             # Config for threading
             config = {
                 "configurable": {
-                    "thread_id": run_manifest["run_fingerprint"],
+                    "thread_id": f"{project_id}:{run_manifest['run_fingerprint']}",
                 }
             }
             
@@ -7661,13 +7672,18 @@ def _run_pipeline(
                         state_values = getattr(existing_state, 'values', None)
                         if state_values and isinstance(state_values, dict):
                             print(f"  🔄 Resuming from LangGraph checkpoint")
+                            migrated_state = migrate_state(state_values)
                             # Merge existing state with initial state
-                            for key, value in state_values.items():
+                            for key, value in migrated_state.items():
                                 if key not in (
-                                    "text", "duration", "dry_run", "output_dir",
-                                    "shot_duration", "chain_mode", "transition",
-                                    "transition_duration", "media_profile",
-                                    "enable_reshoot", "auto_approve",
+                                    "state_schema_version", "run_id",
+                                    "run_fingerprint", "project_id", "input_text",
+                                    "target_duration_s", "dry_run", "output_dir",
+                                    "shot_duration_s", "chain_mode", "transition",
+                                    "transition_duration_s", "media_profile",
+                                    "project_video_spec", "enable_reshoot",
+                                    "auto_approve", "resume", "resume_from",
+                                    "skip_phase",
                                 ):  # Explicit CLI configuration remains authoritative.
                                     initial_state[key] = value
                 except Exception as e:
@@ -7705,7 +7721,8 @@ def _run_pipeline(
                     reporter.mark_completed()
                 else:
                     reporter.mark_failed(
-                        final_state.get("error") or f"Pipeline ended with status: {report['status']}"
+                        latest_error_message(final_state)
+                        or f"Pipeline ended with status: {report['status']}"
                     )
                 
                 # Write report

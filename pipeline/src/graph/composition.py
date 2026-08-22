@@ -11,14 +11,32 @@ from __future__ import annotations
 
 from importlib import import_module
 from types import ModuleType
-from typing import Any
+from typing import Any, Callable
 
+from graph.migrations import canonicalize_node_result
 from graph.routing import quality_gate_router, route_phase5
 from graph.state import HonCutState
 
 
 def _resolve_phase_owner(phase_owner: ModuleType | Any | None) -> Any:
     return phase_owner if phase_owner is not None else import_module("phases.pipeline_core")
+
+
+def _invoke(
+    state: HonCutState,
+    node: Callable[[], Any],
+    *,
+    legacy_compat: bool,
+    quality_target: str = "consistency",
+):
+    result = node()
+    if legacy_compat:
+        return result
+    return canonicalize_node_result(
+        result,
+        state,
+        quality_target=quality_target,
+    )
 
 
 def node_phase1(
@@ -152,6 +170,7 @@ def build_pipeline_graph(
     auto_approve: bool = True,
     reporter: Any | None = None,
     phase_owner: ModuleType | Any | None = None,
+    legacy_compat: bool = False,
 ):
     """Build the one production topology with concrete Phase dependencies."""
 
@@ -161,26 +180,67 @@ def build_pipeline_graph(
     return workflow.build_workflow(
         state_schema=HonCutState,
         nodes={
-            "phase1": lambda state: node_phase1(
-                state, reporter=reporter, phase_owner=owner
+            "phase1": lambda state: _invoke(
+                state,
+                lambda: node_phase1(state, reporter=reporter, phase_owner=owner),
+                legacy_compat=legacy_compat,
             ),
-            "phase2": lambda state: node_phase2(state, phase_owner=owner),
-            "phase3": lambda state: node_phase3(state, phase_owner=owner),
-            "phase4": lambda state: node_phase4(state, phase_owner=owner),
-            "phase5": lambda state: node_phase5_quality(state, phase_owner=owner),
-            "phase6_txt2vid": lambda state: node_phase6_txt2vid(
-                state, phase_owner=owner
+            "phase2": lambda state: _invoke(
+                state,
+                lambda: node_phase2(state, phase_owner=owner),
+                legacy_compat=legacy_compat,
             ),
-            "phase6_img2vid": lambda state: node_phase6_img2vid(
-                state, phase_owner=owner
+            "phase3": lambda state: _invoke(
+                state,
+                lambda: node_phase3(state, phase_owner=owner),
+                legacy_compat=legacy_compat,
             ),
-            "phase6_reference": lambda state: node_phase6_reference(
-                state, phase_owner=owner
+            "phase4": lambda state: _invoke(
+                state,
+                lambda: node_phase4(state, phase_owner=owner),
+                legacy_compat=legacy_compat,
             ),
-            "phase7": lambda state: node_phase7(state, phase_owner=owner),
-            "phase8": lambda state: node_phase8(state, phase_owner=owner),
-            "phase9": lambda state: node_phase9(state, phase_owner=owner),
-            "phase9_5": node_phase9_5,
+            "phase5": lambda state: _invoke(
+                state,
+                lambda: node_phase5_quality(state, phase_owner=owner),
+                legacy_compat=legacy_compat,
+            ),
+            "phase6_txt2vid": lambda state: _invoke(
+                state,
+                lambda: node_phase6_txt2vid(state, phase_owner=owner),
+                legacy_compat=legacy_compat,
+            ),
+            "phase6_img2vid": lambda state: _invoke(
+                state,
+                lambda: node_phase6_img2vid(state, phase_owner=owner),
+                legacy_compat=legacy_compat,
+            ),
+            "phase6_reference": lambda state: _invoke(
+                state,
+                lambda: node_phase6_reference(state, phase_owner=owner),
+                legacy_compat=legacy_compat,
+            ),
+            "phase7": lambda state: _invoke(
+                state,
+                lambda: node_phase7(state, phase_owner=owner),
+                legacy_compat=legacy_compat,
+            ),
+            "phase8": lambda state: _invoke(
+                state,
+                lambda: node_phase8(state, phase_owner=owner),
+                legacy_compat=legacy_compat,
+            ),
+            "phase9": lambda state: _invoke(
+                state,
+                lambda: node_phase9(state, phase_owner=owner),
+                legacy_compat=legacy_compat,
+            ),
+            "phase9_5": lambda state: _invoke(
+                state,
+                lambda: node_phase9_5(state),
+                legacy_compat=legacy_compat,
+                quality_target="final_qa",
+            ),
         },
         route_phase5=route_phase5,
         quality_gate_router=quality_gate_router,

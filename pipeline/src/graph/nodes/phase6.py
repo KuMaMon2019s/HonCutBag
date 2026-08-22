@@ -46,7 +46,10 @@ def _phase6_node(
         shot_ids = sorted(
             {
                 str(shot_id)
-                for shot_id in state.get("quality_report", {}).get("failed_shots", [])
+                for shot_id in state.get(
+                    "consistency",
+                    state.get("quality_report", {}),
+                ).get("failed_shots", [])
                 if str(shot_id).startswith("S")
             }
         )

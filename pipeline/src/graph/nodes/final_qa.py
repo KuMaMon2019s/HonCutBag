@@ -65,7 +65,7 @@ def final_qa_node(
         except (ImportError, ValueError):
             fallbacks = {"480p": (854, 480), "720p": (1280, 720), "1080p": (1920, 1080)}
             width, height = fallbacks.get(profile_name, (None, None))
-        target_duration = state.get("duration")
+        target_duration = state.get("target_duration_s", state.get("duration"))
         qa_report = runner(
             Path(state["output_dir"]),
             storyboard_data=state.get("storyboard"),

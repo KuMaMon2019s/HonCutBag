@@ -7,16 +7,23 @@ separately verified slices.
 
 from __future__ import annotations
 
+from graph.migrations import CURRENT_STATE_SCHEMA_VERSION
 from graph.state import HonCutState
 from schemas.workflow import GraphRunConfig, RunStatus
 
 
-def initial_state_from_config(config: GraphRunConfig) -> HonCutState:
+def initial_state_from_config(
+    config: GraphRunConfig,
+    *,
+    include_legacy_aliases: bool = True,
+) -> HonCutState:
     """Create a fresh checkpoint-safe State without touching external systems."""
 
-    return HonCutState(
+    state = HonCutState(
+        state_schema_version=CURRENT_STATE_SCHEMA_VERSION,
         run_id=config.run_id,
         run_fingerprint=config.run_id,
+        project_id=config.project_id,
         input_text=config.input_text,
         output_dir=config.output_dir,
         target_duration_s=config.target_duration_s,
@@ -47,14 +54,17 @@ def initial_state_from_config(config: GraphRunConfig) -> HonCutState:
         errors=[],
         quality_attempts=0,
         reshoot_attempts=0,
-        # Live graph aliases retained during compatibility migration.
-        text=config.input_text,
-        duration=config.target_duration_s,
-        shot_duration=config.shot_duration_s,
-        transition_duration=config.transition_duration_s,
-        events=[],
-        shots=[],
-        videos=[],
-        quality_report={},
         retry_count=0,
     )
+    if include_legacy_aliases:
+        state.update(
+            text=config.input_text,
+            duration=config.target_duration_s,
+            shot_duration=config.shot_duration_s,
+            transition_duration=config.transition_duration_s,
+            events=[],
+            shots=[],
+            videos=[],
+            quality_report={},
+        )
+    return state

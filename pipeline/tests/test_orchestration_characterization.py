@@ -6,6 +6,7 @@ import json
 import inspect
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -14,6 +15,12 @@ from langgraph.graph import END, START
 import pipeline_runner
 from graph.composition import build_pipeline_graph as build_composed_graph
 from graph.context import initial_state_from_config
+from graph.migrations import (
+    CURRENT_STATE_SCHEMA_VERSION,
+    LEGACY_STATE_ALIASES,
+    StateMigrationError,
+    migrate_state,
+)
 from graph.state import HonCutState
 from graph.workflow import PHASE_NODE_IDS, build_workflow
 from phases import pipeline_core
@@ -33,6 +40,7 @@ def _identity_node(state: HonCutState) -> dict[str, Any]:
 def test_live_graph_config_seeds_complete_json_safe_compatibility_state():
     config = GraphRunConfig(
         run_id="fingerprint-1",
+        project_id="studio-a",
         input_text="story",
         output_dir="/tmp/honcut-characterization",
         target_duration_s=12,
@@ -45,12 +53,68 @@ def test_live_graph_config_seeds_complete_json_safe_compatibility_state():
     state = initial_state_from_config(config)
 
     assert state["run_id"] == state["run_fingerprint"] == "fingerprint-1"
+    assert state["project_id"] == "studio-a"
+    assert state["state_schema_version"] == CURRENT_STATE_SCHEMA_VERSION
     assert state["input_text"] == state["text"] == "story"
     assert state["target_duration_s"] == state["duration"] == 12
     assert state["shot_duration_s"] == state["shot_duration"] == 4
     assert state["project_video_spec"] == {"width": 1920, "height": 1080}
     assert state["resume_from"] == "phase5"
     assert json.loads(json.dumps(state))["phase_results"] == {}
+
+    canonical = initial_state_from_config(config, include_legacy_aliases=False)
+    assert LEGACY_STATE_ALIASES.isdisjoint(canonical)
+
+
+def test_legacy_state_migrates_deterministically_and_future_versions_fail():
+    migrated = migrate_state(
+        {
+            "text": "legacy story",
+            "duration": 30,
+            "shot_duration": 5,
+            "transition_duration": 0.5,
+            "shots": [{"shot_id": "S01"}],
+            "videos": ["shots/S01/output.mp4"],
+            "quality_report": {"failed_shots": []},
+            "error": "legacy failure",
+            "run_fingerprint": "run-old",
+        }
+    )
+
+    assert migrated["state_schema_version"] == CURRENT_STATE_SCHEMA_VERSION
+    assert migrated["project_id"] == "local"
+    assert migrated["run_id"] == "run-old"
+    assert migrated["input_text"] == "legacy story"
+    assert migrated["target_duration_s"] == 30
+    assert migrated["shot_ids"] == ["S01"]
+    assert migrated["generated_shots"] == ["shots/S01/output.mp4"]
+    assert migrated["errors"][-1]["message"] == "legacy failure"
+    assert LEGACY_STATE_ALIASES.isdisjoint(migrated)
+
+    with pytest.raises(StateMigrationError, match="newer than supported"):
+        migrate_state({"state_schema_version": CURRENT_STATE_SCHEMA_VERSION + 1})
+
+
+def test_production_composition_strips_legacy_node_patch_aliases(tmp_path):
+    owner = SimpleNamespace(
+        AVG_SHOT_DURATION=5,
+        run_phase1=lambda **_kwargs: {
+            "status": "error",
+            "error": "screenwriter failed",
+        },
+    )
+    graph = build_composed_graph(phase_owner=owner)
+    state = initial_state_from_config(
+        GraphRunConfig(input_text="story", output_dir=str(tmp_path)),
+        include_legacy_aliases=False,
+    )
+
+    result = graph.nodes["phase1"].runnable.invoke(state)
+
+    assert "error" not in result.update
+    assert result.update["errors"][-1]["message"] == (
+        "Phase 1 failed: screenwriter failed"
+    )
 
 
 def test_production_composition_uses_canonical_state_and_core_is_only_a_facade():
@@ -84,6 +148,8 @@ def test_cli_dispatch_preserves_public_arguments_and_exit_contract(monkeypatch, 
             "story",
             "--output-dir",
             str(tmp_path),
+            "--project-id",
+            "studio-a",
             "--duration",
             "12",
             "--phase",
@@ -100,6 +166,7 @@ def test_cli_dispatch_preserves_public_arguments_and_exit_contract(monkeypatch, 
     assert captured["duration"] == 12
     assert captured["dry_run"] is True
     assert captured["output_dir"] == str(tmp_path)
+    assert captured["project_id"] == "studio-a"
     assert captured["skip_phase"] == [2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 9.5]
 
 

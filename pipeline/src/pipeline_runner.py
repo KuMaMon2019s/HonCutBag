@@ -137,6 +137,12 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Seedance 尾帧接力模式（镜头串行生成）")
     parser.add_argument("--dry-run", action="store_true", default=None, help="dry-run 模式")
     parser.add_argument("--output-dir", type=str, default=".", help="输出目录，默认当前目录")
+    parser.add_argument(
+        "--project-id",
+        type=str,
+        default="local",
+        help="项目隔离标识，默认 local",
+    )
     parser.add_argument("--skip-phase", type=float, nargs="+", default=[], help="跳过指定 Phase")
     parser.add_argument(
         "--transition", choices=["crossfade", "fade", "cut"], default=None, help="Phase 8 转场模式"
@@ -284,6 +290,7 @@ def main() -> None:
         dry_run=resolved["dry_run"],
         skip_phase=_phase_skip_list(args, parser),
         output_dir=args.output_dir,
+        project_id=args.project_id,
         transition=resolved["transition"],
         transition_duration=resolved["transition_duration"],
         media_profile=resolved["media_profile"],

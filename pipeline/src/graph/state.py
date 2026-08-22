@@ -13,8 +13,10 @@ class HonCutState(TypedDict, total=False):
     """Target State shape plus temporary aliases used by the live graph."""
 
     # Run identity and validated configuration.
+    state_schema_version: int
     run_id: str
     run_fingerprint: str
+    project_id: str
     input_text: str
     output_dir: str
     target_duration_s: int
@@ -60,8 +62,8 @@ class HonCutState(TypedDict, total=False):
     quality_attempts: int
     reshoot_attempts: int
 
-    # Compatibility aliases used by the current pipeline_core graph. Remove
-    # only after checkpoint/resume migration is proven end to end.
+    # Deprecated compatibility aliases exposed only by legacy adapters. The
+    # production composition root strips these before checkpointing.
     text: str
     duration: int
     shot_duration: int

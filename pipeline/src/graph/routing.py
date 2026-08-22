@@ -47,7 +47,7 @@ def route_phase5(state: Mapping[str, Any]) -> VideoGenerationMode:
 def quality_gate_router(state: Mapping[str, Any]) -> Literal["pass", "block"]:
     """Block structural storyboard failures; Phase 8 owns pixel reshoots."""
 
-    quality = state.get("quality_report", {})
+    quality = state.get("consistency", state.get("quality_report", {}))
     if not isinstance(quality, Mapping):
         quality = {}
     slideshow_risk = float(quality.get("slideshow_risk", 0.0))

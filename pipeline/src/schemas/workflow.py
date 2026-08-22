@@ -71,6 +71,7 @@ class GraphRunConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     run_id: str = Field(default="pipeline_run", min_length=1)
+    project_id: str = Field(default="local", min_length=1)
     input_text: str = Field(
         default="",
         validation_alias=AliasChoices("input_text", "text"),

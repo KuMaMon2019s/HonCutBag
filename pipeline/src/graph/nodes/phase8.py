@@ -47,9 +47,12 @@ def phase8_node(
         output_dir=Path(state["output_dir"]),
         dry_run=state["dry_run"],
         transition=state.get("transition", "crossfade"),
-        transition_duration=state.get("transition_duration", 0.5),
+        transition_duration=state.get(
+            "transition_duration_s",
+            state.get("transition_duration", 0.5),
+        ),
         media_profile=state.get("media_profile", "1080p"),
-        target_duration=state.get("duration"),
+        target_duration=state.get("target_duration_s", state.get("duration")),
         enable_reshoot=state.get("enable_reshoot", True),
         chain_mode=state.get("chain_mode", False),
     )

@@ -43,7 +43,7 @@ def phase9_node(
         output_dir=Path(state["output_dir"]),
         dry_run=state["dry_run"],
         media_profile=state.get("media_profile", "1080p"),
-        target_duration=state.get("duration"),
+        target_duration=state.get("target_duration_s", state.get("duration")),
     )
     outputs = phase_receipt.get("outputs", [])
     final_video = ""

@@ -36,12 +36,19 @@ def phase1_node(
     """Call Phase 1 and return its existing compatibility State patch."""
 
     phase_receipt = runner(
-        text=state["text"],
+        text=(state["input_text"] if "input_text" in state else state["text"]),
         output_dir=Path(state["output_dir"]),
-        duration=state["duration"],
+        duration=(
+            state["target_duration_s"]
+            if "target_duration_s" in state
+            else state["duration"]
+        ),
         dry_run=state["dry_run"],
         reporter=reporter,
-        shot_duration=state.get("shot_duration", default_shot_duration),
+        shot_duration=state.get(
+            "shot_duration_s",
+            state.get("shot_duration", default_shot_duration),
+        ),
         project_video_spec=state.get("project_video_spec"),
     )
 
