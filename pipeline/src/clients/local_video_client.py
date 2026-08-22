@@ -122,9 +122,9 @@ def _request_session() -> requests.Session:
 
 def _get_ark_api_key() -> str:
     """Return the ARK credential used by Bridge-backed Seedance routes."""
-    api_key = os.environ.get("ARK_AGENT_API_KEY") or os.environ.get("ARK_API_KEY")
+    api_key = os.environ.get("ARK_AGENT_API_KEY")
     if not api_key:
-        raise ValueError("ARK_AGENT_API_KEY or ARK_API_KEY not set")
+        raise ValueError("ARK_AGENT_API_KEY not set")
     return api_key
 
 

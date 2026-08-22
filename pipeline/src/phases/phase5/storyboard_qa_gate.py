@@ -623,9 +623,7 @@ def run_l4_first_frame_review(
     ]
     input_manifest = output_dir / "first_frame_qa_inputs.json"
     _write_l3_input_manifest(input_manifest, records)
-    if client is None and not (
-        os.environ.get("ARK_AGENT_API_KEY") or os.environ.get("ARK_API_KEY")
-    ):
+    if client is None and not os.environ.get("ARK_AGENT_API_KEY"):
         shot_ids = sorted({_parent_shot_id(frame_id) for frame_id in ordered_ids})
         return [
             _issue(
@@ -1307,7 +1305,7 @@ def run_l3_review(
         grid_path.parent / "storyboard_qa_inputs.json",
         input_records,
     )
-    if client is None and not (os.environ.get("ARK_AGENT_API_KEY") or os.environ.get("ARK_API_KEY")):
+    if client is None and not os.environ.get("ARK_AGENT_API_KEY"):
         return [], {
             "status": "skipped",
             "grid_path": str(grid_path),

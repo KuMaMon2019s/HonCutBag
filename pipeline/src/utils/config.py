@@ -14,7 +14,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, ClassVar, Dict, Optional
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -84,9 +84,36 @@ class VideoModel(str, Enum):
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 ENV_FILE = PROJECT_ROOT / ".env"
 
+
+def configure_ark_agent_environment(env_file: Path = ENV_FILE) -> str:
+    """Pin HonCut to the project Agent Plan key and discard the Coding key.
+
+    A long-lived launcher can retain an obsolete ``ARK_AGENT_API_KEY`` even
+    after the project ``.env`` changes.  The project value therefore wins for
+    this one credential.  Deployments without a project value may still supply
+    ``ARK_AGENT_API_KEY`` directly.  ``ARK_API_KEY`` is never a HonCut runtime
+    fallback.
+
+    The return value is a safe source label and never contains credential data.
+    """
+    project_values = dotenv_values(env_file) if env_file.is_file() else {}
+    project_agent_key = project_values.get("ARK_AGENT_API_KEY")
+    if isinstance(project_agent_key, str) and project_agent_key.strip():
+        os.environ["ARK_AGENT_API_KEY"] = project_agent_key.strip()
+        source = "project_env"
+    elif os.environ.get("ARK_AGENT_API_KEY"):
+        source = "process_env"
+    else:
+        source = "missing"
+    os.environ.pop("ARK_API_KEY", None)
+    return source
+
+
 # Load before pipeline_runner starts child processes so they inherit the same
-# repository-level configuration. Explicitly exported variables keep priority.
+# repository-level configuration.  Other explicitly exported variables retain
+# priority; the Ark credential follows the narrower policy above.
 load_dotenv(ENV_FILE, override=False)
+ARK_AGENT_CREDENTIAL_SOURCE = configure_ark_agent_environment()
 
 # 火山系服务（ARK/TOS/TTS/ASR）是国内服务，走本地代理会多一跳且不稳：
 # 2026-08-09 R5/R7 实测 http_proxy=127.0.0.1:7897 时事件提取 8/19 段超时、
@@ -138,7 +165,8 @@ class APIKeys:
     
     # 火山方舟 (Volcano Ark)
     ARK_AGENT: str = "ARK_AGENT_API_KEY"  # Agent Plan (主要)
-    ARK_CODING: str = "ARK_API_KEY"       # Coding Plan (Hermes 用)
+    # External-tool compatibility only; HonCut strips this variable at runtime.
+    ARK_CODING: str = "ARK_API_KEY"
     
     # OpenAI 兼容
     OPENAI: str = "OPENAI_API_KEY"        # 备选
@@ -296,6 +324,7 @@ def get_api_key(service: str, fallback: Optional[str] = None) -> Optional[str]:
         API key 值
     """
     load_dotenv(ENV_FILE, override=False)
+    os.environ.pop("ARK_API_KEY", None)
     return APIKeys.get(service, fallback)
 
 

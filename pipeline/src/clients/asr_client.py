@@ -236,9 +236,9 @@ def transcribe_audio(audio_path: str) -> dict:
     if os.getenv("HONCUT_ASR_MOCK") == "1":
         return _mock_transcription(path)
 
-    api_key = os.getenv("ARK_AGENT_API_KEY") or os.getenv("ARK_API_KEY")
+    api_key = os.getenv("ARK_AGENT_API_KEY")
     if not api_key:
-        raise RuntimeError("SeedASR requires ARK_AGENT_API_KEY or ARK_API_KEY")
+        raise RuntimeError("SeedASR requires ARK_AGENT_API_KEY")
     timeout_s = float(os.getenv("HONCUT_ASR_TIMEOUT_S", "300"))
     try:
         asyncio.get_running_loop()
