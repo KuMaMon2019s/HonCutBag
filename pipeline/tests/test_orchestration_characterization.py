@@ -157,6 +157,19 @@ def test_cross_cutting_runtime_owners_do_not_import_pipeline_core():
     assert pipeline_core.PROJECT_ROOT == source_paths.PROJECT_ROOT
 
 
+def test_phase1_business_owners_are_independent_from_core():
+    from phases.phase1 import phase1_director, phase1_pipeline, phase1_screenwriter
+
+    owners = (phase1_director, phase1_pipeline, phase1_screenwriter)
+    assert all("pipeline_core" not in inspect.getsource(owner) for owner in owners)
+    assert "_phase1_pipeline_owner.run_phase1" in inspect.getsource(
+        pipeline_core.run_phase1
+    )
+    assert "_phase1_screenwriter_owner.run_phase1_screenwriter" in inspect.getsource(
+        pipeline_core.run_phase1_screenwriter
+    )
+
+
 def test_cli_dispatch_preserves_public_arguments_and_exit_contract(monkeypatch, tmp_path):
     captured: dict[str, Any] = {}
     report = {
