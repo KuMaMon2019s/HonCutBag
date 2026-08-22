@@ -532,12 +532,18 @@ def _record_stage_checkpoint(output_dir: Path, phase_name: str, result: dict) ->
         except (TypeError, ValueError):
             safe_result[k] = str(v)
     run_fingerprint = None
+    project_id = "local"
     manifest_path = Path(output_dir) / "RUN_MANIFEST.json"
     if manifest_path.is_file():
         try:
-            run_fingerprint = json.loads(
+            manifest = json.loads(
                 manifest_path.read_text(encoding="utf-8")
-            ).get("run_fingerprint")
+            )
+            run_fingerprint = manifest.get("run_fingerprint")
+            project_id = manifest.get("resolved_config", {}).get(
+                "project_id",
+                "local",
+            )
         except (OSError, json.JSONDecodeError):
             pass
     checkpoint = write_stage_checkpoint(
@@ -545,6 +551,7 @@ def _record_stage_checkpoint(output_dir: Path, phase_name: str, result: dict) ->
         phase_name,
         safe_result,
         run_fingerprint=run_fingerprint,
+        project_id=project_id,
     )
 
     if LANGGRAPH_AVAILABLE:
@@ -7528,48 +7535,53 @@ def _run_pipeline(
 
     # ---- Resume: 读取检查点 ----
     completed_phases = set()
+    resume_snapshot = None
+    resume_uses_graph = False
     if resume:
-        # Try JSON checkpoint first, then fall back to SQLite checkpoint
-        completed_phases = set(_get_completed_stages(output_path))
-        if not completed_phases and not resume_from:
-            # Fallback: try to read completed phases from SQLite checkpoint
-            sqlite_state = load_state_from_sqlite(output_path, thread_id="pipeline_run")
-            if sqlite_state and sqlite_state.get("run_fingerprint") != run_manifest.get(
-                "run_fingerprint"
-            ):
-                print("\n  ⚠ SQLite checkpoint run fingerprint mismatch; ignoring stale state")
-                sqlite_state = None
-            if sqlite_state and isinstance(sqlite_state, dict):
-                sqlite_completed = sqlite_state.get("completed_phases", [])
-                if sqlite_completed:
-                    completed_phases = set(sqlite_completed)
-                    print(f"\n  🔄 Resume 模式: 从 SQLite checkpoint 恢复已完成的 Phase: {sorted(completed_phases)}")
-                    # Also write a JSON checkpoint so future resume calls can read it
-                    # Reconstruct a minimal checkpoint.json from SQLite state
-                    phase_results = sqlite_state.get("phase_results", {})
-                    for phase_name in completed_phases:
-                        phase_result = phase_results.get(phase_name, {"status": "done"})
-                        _record_stage_checkpoint(output_path, phase_name, phase_result)
-                else:
-                    print(f"\n  🔄 Resume 模式: 无检查点，从头开始")
-            else:
-                print(f"\n  🔄 Resume 模式: 无检查点，从头开始")
-        else:
-            print(f"\n  🔄 Resume 模式: 跳过已完成的 Phase: {sorted(completed_phases)}")
-        
+        from runtime.checkpoint_resolution import resolve_resume_snapshot
+
+        graph_states = []
+        if not resume_from:
+            graph_states = [
+                (
+                    "graph",
+                    load_state_from_sqlite(
+                        output_path,
+                        thread_id=run_manifest["run_fingerprint"],
+                    ),
+                ),
+                (
+                    "sqlite-stage",
+                    load_state_from_sqlite(output_path, thread_id="pipeline_run"),
+                ),
+            ]
+        resume_snapshot = resolve_resume_snapshot(
+            output_path,
+            run_fingerprint=run_manifest["run_fingerprint"],
+            project_id=project_id,
+            graph_states=graph_states,
+        )
+        completed_phases = set(resume_snapshot.completed_phases)
+        resume_uses_graph = resume_snapshot.source == "graph"
         if completed_phases:
-            next_stage = _get_next_stage(output_path)
-            if next_stage is None:
-                print(f"  ✓ 所有 Phase 已完成，无需重新运行")
-                cp = _read_checkpoint(output_path)
-                reporter.mark_completed()
-                return {
-                    "status": "completed",
-                    "resumed": True,
-                    "completed_phases": sorted(completed_phases),
-                    "output_dir": str(output_dir),
-                    "timestamp": cp.get("timestamp", "") if cp else "",
-                }
+            print(
+                f"\n  🔄 Resume 模式 ({resume_snapshot.source}): "
+                f"跳过已完成的 Phase: {sorted(completed_phases)}"
+            )
+        else:
+            print("\n  🔄 Resume 模式: 无可信检查点，从头开始")
+
+        if len(completed_phases) == len(PHASE_ORDER):
+            print("  ✓ 所有 Phase 已完成，无需重新运行")
+            cp = _read_checkpoint(output_path)
+            reporter.mark_completed()
+            return {
+                "status": "completed",
+                "resumed": True,
+                "completed_phases": sorted(completed_phases),
+                "output_dir": str(output_dir),
+                "timestamp": cp.get("timestamp", "") if cp else "",
+            }
 
     total_start = _now()
     report = {
@@ -7598,7 +7610,9 @@ def _run_pipeline(
     print(f"{'#'*60}")
 
     # --- LangGraph StateGraph execution path ---
-    if LANGGRAPH_AVAILABLE and not skip_phase:
+    if LANGGRAPH_AVAILABLE and not skip_phase and (
+        not resume or not completed_phases or resume_uses_graph
+    ):
         print(f"\n  🚀 Using LangGraph StateGraph for pipeline execution")
         try:
             # Build the graph through the production composition root.
@@ -7659,12 +7673,13 @@ def _run_pipeline(
             # Config for threading
             config = {
                 "configurable": {
-                    "thread_id": f"{project_id}:{run_manifest['run_fingerprint']}",
+                    "thread_id": run_manifest["run_fingerprint"],
                 }
             }
             
             # Handle resume: if resuming, try to get existing state
-            if resume and checkpointer:
+            invocation_input = initial_state
+            if resume and checkpointer and resume_uses_graph:
                 try:
                     existing_state = app.get_state(config)
                     if existing_state:
@@ -7672,26 +7687,16 @@ def _run_pipeline(
                         state_values = getattr(existing_state, 'values', None)
                         if state_values and isinstance(state_values, dict):
                             print(f"  🔄 Resuming from LangGraph checkpoint")
-                            migrated_state = migrate_state(state_values)
-                            # Merge existing state with initial state
-                            for key, value in migrated_state.items():
-                                if key not in (
-                                    "state_schema_version", "run_id",
-                                    "run_fingerprint", "project_id", "input_text",
-                                    "target_duration_s", "dry_run", "output_dir",
-                                    "shot_duration_s", "chain_mode", "transition",
-                                    "transition_duration_s", "media_profile",
-                                    "project_video_spec", "enable_reshoot",
-                                    "auto_approve", "resume", "resume_from",
-                                    "skip_phase",
-                                ):  # Explicit CLI configuration remains authoritative.
-                                    initial_state[key] = value
+                            migrate_state(state_values)
+                            invocation_input = None
                 except Exception as e:
-                    print(f"  ⚠ Failed to load checkpoint state: {e}")
+                    raise RuntimeError(
+                        f"failed to load trusted graph checkpoint: {e}"
+                    ) from e
             
             # Execute the graph
             try:
-                final_state = app.invoke(initial_state, config=config)
+                final_state = app.invoke(invocation_input, config=config)
 
                 pending_interrupts = final_state.get("__interrupt__", ())
                 if pending_interrupts:
@@ -7758,7 +7763,9 @@ def _run_pipeline(
             return report
     
     # --- Sequential execution (fallback or when skip_phase is used) ---
-    if LANGGRAPH_AVAILABLE and not skip_phase:
+    if LANGGRAPH_AVAILABLE and not skip_phase and (
+        not resume or not completed_phases or resume_uses_graph
+    ):
         pass  # Already tried above
     else:
         print(f"\n  📋 Using sequential execution mode")

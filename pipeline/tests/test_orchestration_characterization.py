@@ -25,6 +25,11 @@ from graph.state import HonCutState
 from graph.workflow import PHASE_NODE_IDS, build_workflow
 from phases import pipeline_core
 from runtime.generation_tasks import GenerationTaskStore
+from runtime.checkpoint_resolution import (
+    ResumeResolutionError,
+    STAGE_CHECKPOINT_SCHEMA_VERSION,
+    resolve_resume_snapshot,
+)
 from schemas.workflow import GraphRunConfig
 from utils.artifact_chain import (
     can_resume_from,
@@ -250,6 +255,86 @@ def test_resume_prerequisites_and_downstream_receipt_invalidation(tmp_path):
     assert phase1["status"] == "done"
     assert phase2["status"] == phase3["status"] == "stale"
     assert phase2["invalidated_by_resume_from"] == "phase2"
+
+
+def test_resume_resolver_prefers_graph_and_honors_stale_artifact_boundary(tmp_path):
+    (tmp_path / "checkpoint.json").write_text(
+        json.dumps(
+            {
+                "checkpoint_schema_version": STAGE_CHECKPOINT_SCHEMA_VERSION,
+                "run_fingerprint": "run-1",
+                "completed": ["phase1", "phase2", "phase3"],
+                "results": {
+                    "phase1": {"status": "done"},
+                    "phase2": {"status": "done"},
+                    "phase3": {"status": "done"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "checkpoint_phase2.json").write_text(
+        json.dumps({"phase": "phase2", "status": "stale"}),
+        encoding="utf-8",
+    )
+    graph_state = {
+        "text": "legacy",
+        "duration": 30,
+        "run_fingerprint": "run-1",
+        "completed_phases": ["phase1", "phase2"],
+        "phase_results": {
+            "phase1": {"status": "done"},
+            "phase2": {"status": "done"},
+        },
+    }
+
+    snapshot = resolve_resume_snapshot(
+        tmp_path,
+        run_fingerprint="run-1",
+        project_id="local",
+        graph_states=[("graph", graph_state)],
+    )
+
+    assert snapshot.source == "graph"
+    assert snapshot.completed_phases == ("phase1",)
+    assert snapshot.state["input_text"] == "legacy"
+    assert snapshot.state["state_schema_version"] == CURRENT_STATE_SCHEMA_VERSION
+
+
+def test_resume_resolver_rejects_future_and_cross_project_state(tmp_path):
+    with pytest.raises(ResumeResolutionError, match="newer than supported"):
+        resolve_resume_snapshot(
+            tmp_path,
+            run_fingerprint="run-1",
+            project_id="local",
+            graph_states=[
+                (
+                    "graph",
+                    {
+                        "state_schema_version": CURRENT_STATE_SCHEMA_VERSION + 1,
+                        "run_fingerprint": "run-1",
+                    },
+                )
+            ],
+        )
+
+    with pytest.raises(ResumeResolutionError, match="project_id"):
+        resolve_resume_snapshot(
+            tmp_path,
+            run_fingerprint="run-1",
+            project_id="project-b",
+            graph_states=[
+                (
+                    "graph",
+                    {
+                        "state_schema_version": CURRENT_STATE_SCHEMA_VERSION,
+                        "run_id": "run-1",
+                        "run_fingerprint": "run-1",
+                        "project_id": "project-a",
+                    },
+                )
+            ],
+        )
 
 
 def test_sqlite_checkpointer_initialization_fails_open_to_uncheckpointed_graph(

@@ -6,12 +6,22 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+STAGE_CHECKPOINT_SCHEMA_VERSION = 1
+
 
 class CheckpointValidationError(ValueError):
     pass
 
 
 def validate_checkpoint(value: dict[str, Any]) -> None:
+    version = value.get("checkpoint_schema_version", 0)
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise CheckpointValidationError("checkpoint_schema_version must be an integer")
+    if version > STAGE_CHECKPOINT_SCHEMA_VERSION:
+        raise CheckpointValidationError(
+            f"checkpoint schema version {version} is newer than supported "
+            f"version {STAGE_CHECKPOINT_SCHEMA_VERSION}"
+        )
     if not isinstance(value.get("completed"), list):
         raise CheckpointValidationError("completed must be a list")
     if not isinstance(value.get("results"), dict):
@@ -28,11 +38,17 @@ def read_checkpoint(path: str | Path) -> dict[str, Any] | None:
 
 
 def write_checkpoint(
-    path: str | Path, stage: str, result: dict[str, Any], *, run_fingerprint: str | None = None
+    path: str | Path,
+    stage: str,
+    result: dict[str, Any],
+    *,
+    run_fingerprint: str | None = None,
+    project_id: str | None = None,
 ) -> dict[str, Any]:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     value = read_checkpoint(target) or {"completed": [], "results": {}, "timestamp": ""}
+    value["checkpoint_schema_version"] = STAGE_CHECKPOINT_SCHEMA_VERSION
     if run_fingerprint is not None and value.get("run_fingerprint") not in (None, run_fingerprint):
         value = {
             "completed": [],
@@ -46,6 +62,8 @@ def write_checkpoint(
     value["timestamp"] = datetime.now(UTC).isoformat()
     if run_fingerprint is not None:
         value["run_fingerprint"] = run_fingerprint
+    if project_id is not None:
+        value["project_id"] = project_id
     temporary = target.with_suffix(target.suffix + ".tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(temporary, target)
