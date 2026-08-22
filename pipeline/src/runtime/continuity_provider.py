@@ -2383,19 +2383,30 @@ def execute_phase6_auto_continuity(
     output_dir: str | Path,
     plan: ContinuityPlan,
     calibration: SeamCalibration | None,
+    *,
+    _test_executor_factory: Callable[
+        [Path, GenerationTaskStore],
+        Callable[[ChunkExecutionRequest], ChunkExecutionResult],
+    ]
+    | None = None,
 ) -> dict[str, Any]:
     """Run continuity groups through exactly one configured provider."""
     root = Path(output_dir)
-    provider = os.environ.get("VIDEO_PROVIDER", "seedance").strip().lower()
-    if provider == "seedance":
-        executor_factory = _direct_seedance_executor
-    elif provider == "bridge":
-        executor_factory = _bridge_seedance_executor
+    test_only = _test_executor_factory is not None
+    if test_only:
+        provider = "offline_fixture"
+        executor_factory = _test_executor_factory
     else:
-        raise RuntimeError(
-            "continuity auto requires VIDEO_PROVIDER=seedance or bridge; "
-            f"{provider!r} has no verified native video-extension contract"
-        )
+        provider = os.environ.get("VIDEO_PROVIDER", "seedance").strip().lower()
+        if provider == "seedance":
+            executor_factory = _direct_seedance_executor
+        elif provider == "bridge":
+            executor_factory = _bridge_seedance_executor
+        else:
+            raise RuntimeError(
+                "continuity auto requires VIDEO_PROVIDER=seedance or bridge; "
+                f"{provider!r} has no verified native video-extension contract"
+            )
 
     _validate_seedance_continuity_plan(plan)
 
@@ -2405,7 +2416,7 @@ def execute_phase6_auto_continuity(
         for shot in plan.shots
         for chunk in shot.chunks
     )
-    if requires_video_upload:
+    if requires_video_upload and not test_only:
         from clients.tos_uploader import is_media_upload_configured
 
         if not is_media_upload_configured():
@@ -2477,6 +2488,7 @@ def execute_phase6_auto_continuity(
         {
             "provider": provider,
             "mode": "continuity_auto",
+            "test_only": test_only,
             "continuity_bridge": os.environ.get(CONTINUITY_BRIDGE_ENV, "off").strip().lower(),
             "calibration_fingerprint": (
                 calibration.dataset_fingerprint if calibration is not None else None

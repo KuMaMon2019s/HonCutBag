@@ -6033,6 +6033,111 @@ def test_phase6_auto_routes_only_through_continuity_runtime(monkeypatch, tmp_pat
     }
 
 
+def test_phase6_auto_accepts_only_explicit_test_executor_override(
+    monkeypatch,
+    tmp_path,
+):
+    plan = write_continuity_plan(
+        tmp_path / "CONTINUITY_PLAN.json",
+        {"shots": [{"id": "S01", "duration": 16}]},
+    )
+    observed = {"factory_calls": 0, "tos_checks": 0}
+
+    def test_factory(output_dir, task_store):
+        observed["factory_calls"] += 1
+        observed["output_dir"] = output_dir
+        observed["database_path"] = task_store.database_path
+        return lambda _request: pytest.fail("stub plan must not execute a chunk")
+
+    def unexpected_tos_check():
+        observed["tos_checks"] += 1
+        raise AssertionError("offline fixture must not inspect paid upload credentials")
+
+    monkeypatch.setenv("VIDEO_PROVIDER", "unsupported-provider")
+    monkeypatch.setattr(tos_uploader, "is_media_upload_configured", unexpected_tos_check)
+    monkeypatch.setattr(
+        "runtime.continuity_provider.execute_continuity_plan",
+        lambda *_args, **_kwargs: {"status": "done", "outputs": [], "errors": []},
+    )
+
+    receipt = execute_phase6_auto_continuity(
+        tmp_path,
+        plan,
+        None,
+        _test_executor_factory=test_factory,
+    )
+
+    assert receipt["status"] == "done"
+    assert receipt["provider"] == "offline_fixture"
+    assert receipt["test_only"] is True
+    assert observed == {
+        "factory_calls": 1,
+        "tos_checks": 0,
+        "output_dir": tmp_path,
+        "database_path": tmp_path / "runtime.db",
+    }
+
+
+def test_phase6_auto_default_route_rejects_unknown_provider(monkeypatch, tmp_path):
+    plan = write_continuity_plan(
+        tmp_path / "CONTINUITY_PLAN.json",
+        {"shots": [{"id": "S01", "duration": 16}]},
+    )
+    monkeypatch.setenv("VIDEO_PROVIDER", "offline_fixture")
+
+    with pytest.raises(RuntimeError, match="no verified native video-extension"):
+        execute_phase6_auto_continuity(tmp_path, plan, None)
+
+
+def test_phase6_owner_forwards_test_continuity_executor(monkeypatch, tmp_path):
+    from phases.phase6.phase6_video_gen import run_phase6 as run_phase6_owner
+
+    write_continuity_plan(
+        tmp_path / "CONTINUITY_PLAN.json",
+        {"shots": [{"id": "S01", "duration": 16}]},
+    )
+    observed = {}
+
+    def test_factory(_output_dir, _task_store):
+        return lambda _request: pytest.fail("capturing owner must not execute chunks")
+
+    def fake_auto(output_dir, plan, calibration, **kwargs):
+        observed.update(
+            output_dir=output_dir,
+            chunk_count=sum(len(shot.chunks) for shot in plan.shots),
+            calibration=calibration,
+            executor_factory=kwargs.get("_test_executor_factory"),
+        )
+        return {
+            "status": "done",
+            "outputs": ["shots/S01/output.mp4"],
+            "errors": [],
+            "provider": "offline_fixture",
+        }
+
+    monkeypatch.setenv("HONCUT_CONTINUITY_MODE", "auto")
+    monkeypatch.setattr(
+        "runtime.continuity_provider.execute_phase6_auto_continuity",
+        fake_auto,
+    )
+
+    receipt = run_phase6_owner(
+        {"shots": []},
+        tmp_path,
+        dry_run=False,
+        _test_continuity_executor_factory=test_factory,
+        _quality_runner=lambda *_args: SimpleNamespace(passed=True),
+    )
+
+    assert receipt["status"] == "done"
+    assert observed == {
+        "output_dir": tmp_path,
+        "chunk_count": 2,
+        "calibration": None,
+        "executor_factory": test_factory,
+    }
+
+
 def test_phase6_auto_normalizes_resumed_string_output_dir(monkeypatch, tmp_path):
     write_continuity_plan(
         tmp_path / "CONTINUITY_PLAN.json",

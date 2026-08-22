@@ -49,6 +49,7 @@ def run_phase6(
     *,
     _adapter_cls=None,
     _quality_runner=None,
+    _test_continuity_executor_factory=None,
 ) -> dict:
     """Phase 6: video generation through the configured provider route."""
     # The phase orchestrator persists paths as strings when resuming.  Normalize
@@ -100,6 +101,11 @@ def run_phase6(
                 "  [continuity] auto: grouped generation; Phase 8 owns final seam trim",
                 flush=True,
             )
+            execution_kwargs = {}
+            if _test_continuity_executor_factory is not None:
+                execution_kwargs["_test_executor_factory"] = (
+                    _test_continuity_executor_factory
+                )
             result = execute_phase6_auto_continuity(
                 output_dir,
                 load_continuity_plan(output_dir / "CONTINUITY_PLAN.json"),
@@ -108,6 +114,7 @@ def run_phase6(
                     if (output_dir / "CONTINUITY_CALIBRATION.json").is_file()
                     else None
                 ),
+                **execution_kwargs,
             )
             result["duration_s"] = _elapsed(start)
             result["continuity_runtime"] = continuity_runtime
