@@ -20,6 +20,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_BRIDGE_API_URL = "http://127.0.0.1:9100"
 VIDEO_ROUTE_VALUES = {"bridge", "direct", "local"}
+_PROVIDER_DEFAULT_VIDEO_ROUTES = {
+    "BRIDGE": "bridge",
+    "LOCAL": "local",
+    "WAN": "bridge",
+    "WAN22": "bridge",
+}
 
 
 class PathConfig(BaseSettings):
@@ -99,15 +105,18 @@ for _np_key in ("NO_PROXY", "no_proxy"):
 def get_video_route(provider: str) -> str:
     """Return the configured video route for *provider*.
 
-    Provider-specific configuration wins over the global setting.  ``bridge``
-    is deliberately the default so video work stays on the Windows backend.
+    Provider-specific configuration wins over the global setting.  ``direct``
+    is the production default so an unconfigured run uses the online provider;
+    Bridge and local execution remain explicit opt-in routes.
     """
     provider_name = provider.strip().upper()
     if not provider_name:
         raise ValueError("video provider must not be empty")
     route = os.environ.get(f"VIDEO_PROVIDER_{provider_name}") or os.environ.get(
-        "VIDEO_GENERATION_MODE", "bridge"
+        "VIDEO_GENERATION_MODE"
     )
+    if route is None:
+        route = _PROVIDER_DEFAULT_VIDEO_ROUTES.get(provider_name, "direct")
     route = route.strip().lower()
     if route not in VIDEO_ROUTE_VALUES:
         raise ValueError(

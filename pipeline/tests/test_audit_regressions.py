@@ -100,6 +100,27 @@ from utils.character_reference_contracts import (
     STATIC_REFERENCE_ASSET_POLICY,
     normalize_character_reference_assets,
 )
+from utils.config import get_video_route
+
+
+def test_seedance_defaults_to_direct_online_route(monkeypatch):
+    monkeypatch.delenv("VIDEO_PROVIDER_SEEDANCE", raising=False)
+    monkeypatch.delenv("VIDEO_GENERATION_MODE", raising=False)
+
+    assert get_video_route("seedance") == "direct"
+
+
+@pytest.mark.parametrize(
+    ("provider", "expected_route"),
+    [("bridge", "bridge"), ("local", "local"), ("wan", "bridge")],
+)
+def test_explicit_local_provider_aliases_remain_opt_in(
+    monkeypatch, provider, expected_route
+):
+    monkeypatch.delenv(f"VIDEO_PROVIDER_{provider.upper()}", raising=False)
+    monkeypatch.delenv("VIDEO_GENERATION_MODE", raising=False)
+
+    assert get_video_route(provider) == expected_route
 
 
 def test_seedance_limits_are_provider_capabilities_not_global_director_rules():
