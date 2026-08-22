@@ -18,6 +18,7 @@ from typing import Any
 from quality.seam_calibration import SeamCalibration
 from runtime.artifact_manifest import ArtifactManifestStore
 from runtime.bridge_execution import execute_bridge_video_task
+from runtime.cache_lineage import generation_cache_key
 from runtime.capacity import (
     CrossProcessSlotTable,
     SlotTable,
@@ -1045,8 +1046,11 @@ def _task_payload(
     model: str,
     provider_id: str,
     provider_version: str,
+    project_id: str,
+    run_id: str,
     duration: int,
     seed: int | None,
+    generation_parameters: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     unique_duration = _chunk_unique_duration(request.chunk)
     requested_frames = request.chunk.requested_frames
@@ -1096,6 +1100,7 @@ def _task_payload(
         "seed": seed,
         "repair_attempt": request.repair_attempt,
         "privacy_fallback": PRIVACY_POLICY_REPAIR_VERSION,
+        **(generation_parameters or {}),
     }
     upstream_fingerprint = str(request.input_fingerprint)
     if not re.fullmatch(r"[0-9a-f]{64}", upstream_fingerprint):
@@ -1118,7 +1123,16 @@ def _task_payload(
         },
         input_artifact_hashes={"continuity_input": upstream_fingerprint},
     )
-    return {**payload, **fingerprint.task_metadata()}
+    cache_key = generation_cache_key(
+        project_id=project_id,
+        run_id=run_id,
+        fingerprint=fingerprint,
+    )
+    return {
+        **payload,
+        **fingerprint.task_metadata(),
+        **cache_key.task_metadata(),
+    }
 
 
 def _provider_input_context(
@@ -1562,6 +1576,8 @@ def _direct_seedance_executor(
         output_dir,
         required=False,
     )
+    run_id = artifact_store.run_id if artifact_store else str(output_dir.resolve())
+    project_id = artifact_store.project_id if artifact_store else "local"
     fallback_workers = max(1, int(os.environ.get("VIDEO_GEN_CONCURRENCY", "1")))
     capacity = provider_policy.capacity(fallback_workers)
     slots = SlotTable()
@@ -1578,11 +1594,12 @@ def _direct_seedance_executor(
             model=model,
             provider_id="seedance",
             provider_version="ark-agent-plan-v3",
+            project_id=project_id,
+            run_id=run_id,
             duration=duration,
             seed=seed,
+            generation_parameters={"ratio": ratio},
         )
-        payload["ratio"] = ratio
-        run_id = str(output_dir.resolve())
         repairs: list[dict[str, Any]] = []
         privacy_repairs: list[dict[str, Any]] = []
         privacy_resubmission_attempt = 0
@@ -1965,6 +1982,8 @@ def _bridge_seedance_executor(
         output_dir,
         required=False,
     )
+    run_id = artifact_store.run_id if artifact_store else str(output_dir.resolve())
+    project_id = artifact_store.project_id if artifact_store else "local"
     capacity = max(1, int(os.environ.get("VIDEO_GEN_CONCURRENCY", "1")))
     slots = SlotTable()
 
@@ -1980,10 +1999,16 @@ def _bridge_seedance_executor(
             model=model,
             provider_id="bridge",
             provider_version="bridge-api-v1",
+            project_id=project_id,
+            run_id=run_id,
             duration=duration,
             seed=seed,
+            generation_parameters={
+                "ratio": ratio,
+                "width": width,
+                "height": height,
+            },
         )
-        payload.update({"ratio": ratio, "width": width, "height": height})
 
         def generate(**runtime_kwargs: Any) -> str | dict[str, Any]:
             content, _shot_meta, _seed, _duration = _provider_content(output_dir, request)
@@ -2011,7 +2036,7 @@ def _bridge_seedance_executor(
         with slots.reserve("bridge", "video", request.resource_id, capacity=capacity):
                 execution = execute_bridge_video_task(
                 task_store,
-                run_id=str(output_dir.resolve()),
+                    run_id=run_id,
                 resource_id=request.resource_id,
                 payload=payload,
                 provider_endpoint=local_video_client.get_api_url(),

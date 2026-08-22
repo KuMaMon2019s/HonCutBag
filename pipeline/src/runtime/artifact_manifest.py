@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Iterable
 
+from runtime.artifact_migrations import migrate_artifact_manifest
 from schemas.artifact import ArtifactManifest, ArtifactRef
 
 
@@ -92,10 +93,12 @@ class ArtifactManifestStore:
         if not self.path.is_file():
             return ArtifactManifest(run_id=self.run_id, project_id=self.project_id)
         try:
+            raw_manifest = json.loads(self.path.read_text(encoding="utf-8"))
+            migrated = migrate_artifact_manifest(raw_manifest)
             manifest = ArtifactManifest.model_validate_json(
-                self.path.read_text(encoding="utf-8")
+                json.dumps(migrated, ensure_ascii=False)
             )
-        except (OSError, ValueError) as error:
+        except (OSError, TypeError, ValueError) as error:
             raise RuntimeError(f"invalid artifact manifest: {error}") from error
         if manifest.run_id != self.run_id or manifest.project_id != self.project_id:
             raise RuntimeError("artifact manifest belongs to a different project or run")

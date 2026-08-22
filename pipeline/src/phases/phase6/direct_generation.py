@@ -14,6 +14,7 @@ from typing import Any, Callable, Optional
 from phases.phase2.storyboard_assets import _shot_storyboard_reference
 from prompt.shot_prompt_builder import build_batch_prompts
 from quality.quality_gate import run_quality_check
+from runtime.cache_lineage import generation_cache_key
 from runtime.generation_fingerprint import (
     PHASE6_VIDEO_PROMPT_TEMPLATE_ID,
     PHASE6_VIDEO_PROMPT_TEMPLATE_VERSION,
@@ -442,6 +443,12 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
         output_dir,
         required=False,
     )
+    generation_run_id = (
+        artifact_store.run_id if artifact_store is not None else str(output_dir.resolve())
+    )
+    generation_project_id = (
+        artifact_store.project_id if artifact_store is not None else "local"
+    )
 
     # Load character reference images for consistency
     import base64 as _b64
@@ -866,6 +873,11 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                                 "task_dir": task_dir_id,
                             },
                         )
+                        cache_key = generation_cache_key(
+                            project_id=generation_project_id,
+                            run_id=generation_run_id,
+                            fingerprint=generation_fingerprint,
+                        )
                         bridge_generate = partial(
                             generate,
                             prompt=prompt,
@@ -891,7 +903,7 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                         )
                         execution = execute_bridge_video_task(
                             generation_tasks,
-                            run_id=str(output_dir.resolve()),
+                            run_id=generation_run_id,
                             resource_id=shot_id,
                             payload={
                                 "shot_id": shot_id,
@@ -904,6 +916,7 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                                 "width": video_width,
                                 "height": video_height,
                                 **generation_fingerprint.task_metadata(),
+                                **cache_key.task_metadata(),
                             },
                             provider_endpoint=local_video_client.get_api_url(),
                             output_path=out_path,
@@ -994,9 +1007,14 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                         "height": video_height,
                     },
                 )
+                cache_key = generation_cache_key(
+                    project_id=generation_project_id,
+                    run_id=generation_run_id,
+                    fingerprint=generation_fingerprint,
+                )
                 execution = execute_seedance_video_task(
                     generation_tasks,
-                    run_id=str(output_dir.resolve()),
+                    run_id=generation_run_id,
                     resource_id=shot_id,
                     payload={
                         "shot_id": shot_id,
@@ -1008,6 +1026,7 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                         "width": video_width,
                         "height": video_height,
                         **generation_fingerprint.task_metadata(),
+                        **cache_key.task_metadata(),
                     },
                     provider_endpoint=seedance_client.BASE_URL,
                     output_path=out_path,

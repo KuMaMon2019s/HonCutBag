@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from copy import deepcopy
 from typing import Any
 
 from langgraph.types import Command
+from runtime.migration_registry import apply_migration_registry
 
 CURRENT_STATE_SCHEMA_VERSION = 1
 LEGACY_STATE_ALIASES = frozenset(
@@ -60,14 +60,7 @@ def _shot_ids(value: Any) -> list[str]:
     return identifiers
 
 
-def migrate_state(raw_state: Mapping[str, Any]) -> dict[str, Any]:
-    """Return canonical v1 state or reject an unsupported future checkpoint."""
-
-    if not isinstance(raw_state, Mapping):
-        raise StateMigrationError("checkpoint state must be an object")
-    state = deepcopy(dict(raw_state))
-    _version_of(state)
-
+def _canonicalize_v1_state(state: dict[str, Any]) -> dict[str, Any]:
     alias_values = {
         "input_text": state.get("text", ""),
         "target_duration_s": state.get("duration", 60),
@@ -94,6 +87,32 @@ def migrate_state(raw_state: Mapping[str, Any]) -> dict[str, Any]:
     for alias in LEGACY_STATE_ALIASES:
         state.pop(alias, None)
     return state
+
+
+def _migrate_state_v0_to_v1(state: dict[str, Any]) -> dict[str, Any]:
+    return _canonicalize_v1_state(state)
+
+
+STATE_MIGRATIONS = {0: _migrate_state_v0_to_v1}
+
+
+def migrate_state(raw_state: Mapping[str, Any]) -> dict[str, Any]:
+    """Return canonical v1 state through the explicit migration registry."""
+
+    if not isinstance(raw_state, Mapping):
+        raise StateMigrationError("checkpoint state must be an object")
+    _version_of(raw_state)
+    try:
+        state = apply_migration_registry(
+            raw_state,
+            current_version=CURRENT_STATE_SCHEMA_VERSION,
+            migrations=STATE_MIGRATIONS,
+            document_name="checkpoint state schema",
+            version_field="state_schema_version",
+        )
+    except ValueError as error:
+        raise StateMigrationError(str(error)) from error
+    return _canonicalize_v1_state(state)
 
 
 def _canonical_patch(
@@ -165,6 +184,7 @@ def latest_error_message(state: Mapping[str, Any]) -> str | None:
 __all__ = [
     "CURRENT_STATE_SCHEMA_VERSION",
     "LEGACY_STATE_ALIASES",
+    "STATE_MIGRATIONS",
     "StateMigrationError",
     "canonicalize_node_result",
     "latest_error_message",
