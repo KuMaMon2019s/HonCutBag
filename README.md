@@ -21,7 +21,9 @@ A 44-second cyberpunk short film generated fully automatically from a text scrip
 
 HonCut runs on a split-role deployment: a Mac orchestration layer drives a nine-phase pipeline, a Windows GPU machine hosts the ComfyUI Bridge for local synthesis fallback, and Volcano Ark provides online LLM scripting, Seedance video, Seedream image, Seed-TTS, and SeedASR services. All LLM scripting calls flow through a unified streaming client (`ark_llm`) with hard wall-clock timeouts, per-phase heartbeats, and sub-phase checkpoints so no phase can hang silently.
 
-The pipeline core is a **LangGraph state graph** (`graph/workflow.py`): phases are graph nodes wired with conditional routing — the QA gate selects one of three video-generation strategies (text-to-video / image-to-video / reference-driven), the consistency guard can loop failed shots back for regeneration, and the assembly engine can trigger a bounded reshoot cycle. Graph state persists through a SQLite checkpointer, so a run can be interrupted and resumed mid-pipeline. Video generation itself runs on a dedicated **runtime layer** (`runtime/`): a SQLite task store persists provider job IDs across process crashes, cross-process capacity leases limit concurrent provider calls, and crash-safe executors resume in-flight tasks instead of resubmitting them.
+The production pipeline is a **LangGraph state graph** defined in `graph/workflow.py`, composed with concrete Phase owners by `graph/composition.py`, and executed by `runtime/pipeline_execution.py`. The QA gate selects one of three video-generation strategies (text-to-video / image-to-video / reference-driven), the consistency guard can loop failed shots back for regeneration, and the assembly engine can trigger a bounded reshoot cycle. Versioned Graph state persists through a SQLite checkpointer, so a run can be interrupted and resumed mid-pipeline.
+
+Video generation runs behind a dedicated **runtime layer** (`runtime/`). A versioned SQLite task ledger persists Provider job IDs before polling and refuses blind resubmission when submission status is uncertain. One Runtime policy owns request deadlines, retry/backoff, cooldown, and capacity. Every paid request receives a secret-free semantic fingerprint; project/run/input lineage namespaces its cache identity; successful files are registered as strict `ArtifactRef` records in an atomically written per-run manifest. Known old State, task-ledger, and Artifact schemas migrate through explicit registries, while unknown future versions fail closed.
 
 ```mermaid
 flowchart TB
@@ -111,6 +113,8 @@ Phases use contiguous integer IDs (`phase1`–`phase9`); every phase writes a ch
 - **Fictional-character declaration** — reference-image and video prompts declare AI-generated fictional characters to reduce real-person content moderation friction.
 - **Checkpoint & resume** — per-phase checkpoint files with `--resume-from` recovery restart from any phase without re-running completed work; the LangGraph state persists through a SQLite checkpointer so an interrupted run resumes mid-pipeline.
 - **Crash-safe generation runtime** — video tasks persist their provider job IDs in a SQLite task store; cross-process capacity leases limit concurrent provider calls, and after a crash the pipeline resumes polling in-flight jobs instead of resubmitting and double-paying.
+- **Typed artifact and cache lineage** — local artifacts carry project/run identity, content hashes, producer task IDs, parent assets, and semantic fingerprints. Cache reuse requires an exact project + run + input-lineage + generation-fingerprint match.
+- **Fail-closed operational boundaries** — workspace paths are symlink-safe, Provider responses are schema-validated, subprocesses use argument arrays, and correlated Runtime logs redact credentials and full Prompts.
 - **Quality supervision** — four red-line checks (asset validity, script fidelity, concreteness, parent-child assets) with A/B/C/D grading gate before assembly.
 
 ## Project Structure
@@ -120,8 +124,8 @@ honcut/
 ├── pipeline/           # Python video pipeline
 │   ├── src/
 │   │   ├── graph/      # LangGraph workflow (state, nodes, routing)
-│   │   ├── runtime/    # Generation runtime (task store, capacity leases, executors)
-│   │   ├── phases/     # Phase modules (phase1/ … phase9/) + pipeline_core
+│   │   ├── runtime/    # Lifecycle, task ledger, policy, lineage, artifacts, security
+│   │   ├── phases/     # Business owners (phase1/ … phase9/); test-only core facade
 │   │   ├── prompt/     # Prompt engineering modules
 │   │   ├── schemas/    # Typed schemas (story, quality, workflow, …)
 │   │   ├── clients/    # Provider clients (Seedance, Seedream, ASR, InvokeAI, TOS, …)
@@ -155,6 +159,10 @@ make doctor
 # Run the full pipeline from a script
 uv run --locked --managed-python python pipeline/scripts/phase_orchestrator.py \
   --config config.json --auto-approve
+
+# Or invoke the stable CLI directly with an explicit cache/project namespace
+uv run --locked --managed-python python pipeline/src/pipeline_runner.py \
+  --input story.txt --output-dir workspaces/example/output --project-id studio-a
 
 # Resume from a checkpoint (e.g. after a single shot failure)
 uv run --locked --managed-python python pipeline/scripts/phase_orchestrator.py \
