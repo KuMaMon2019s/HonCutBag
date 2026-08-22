@@ -1,10 +1,7 @@
-"""LangGraph orchestration foundation for HonCut.
+"""LangGraph orchestration contracts and production composition for HonCut."""
 
-The existing workflow remains in ``phases.pipeline_core`` until each migration
-slice has passed compatibility tests.
-"""
-
+from .composition import build_pipeline_graph
 from .context import initial_state_from_config
 from .state import HonCutState
 
-__all__ = ["HonCutState", "initial_state_from_config"]
+__all__ = ["HonCutState", "build_pipeline_graph", "initial_state_from_config"]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import sys
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ import pytest
 from langgraph.graph import END, START
 
 import pipeline_runner
+from graph.composition import build_pipeline_graph as build_composed_graph
 from graph.context import initial_state_from_config
 from graph.state import HonCutState
 from graph.workflow import PHASE_NODE_IDS, build_workflow
@@ -49,6 +51,14 @@ def test_live_graph_config_seeds_complete_json_safe_compatibility_state():
     assert state["project_video_spec"] == {"width": 1920, "height": 1080}
     assert state["resume_from"] == "phase5"
     assert json.loads(json.dumps(state))["phase_results"] == {}
+
+
+def test_production_composition_uses_canonical_state_and_core_is_only_a_facade():
+    assert pipeline_core.HonCutState is HonCutState
+    assert "StateGraph(" not in inspect.getsource(build_composed_graph)
+    core_facade = inspect.getsource(pipeline_core.build_pipeline_graph)
+    assert "graph.composition" in core_facade
+    assert "nodes={" not in core_facade
 
 
 def test_cli_dispatch_preserves_public_arguments_and_exit_contract(monkeypatch, tmp_path):

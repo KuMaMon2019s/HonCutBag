@@ -32,6 +32,36 @@ def select_video_generation_mode(
     return "txt2vid"
 
 
+def route_phase5(state: Mapping[str, Any]) -> VideoGenerationMode:
+    """Select the concrete Phase 6 node from checkpoint-safe graph state."""
+
+    storyboard = state.get("storyboard", {})
+    if not isinstance(storyboard, Mapping):
+        storyboard = {}
+    return select_video_generation_mode(
+        storyboard,
+        str(state.get("storyboard_image") or ""),
+    )
+
+
+def quality_gate_router(state: Mapping[str, Any]) -> Literal["pass", "block"]:
+    """Block structural storyboard failures; Phase 8 owns pixel reshoots."""
+
+    quality = state.get("quality_report", {})
+    if not isinstance(quality, Mapping):
+        quality = {}
+    slideshow_risk = float(quality.get("slideshow_risk", 0.0))
+    variation_score = float(quality.get("variation_score", 5.0))
+    if slideshow_risk > 0.7 or variation_score < 3.0:
+        print(
+            "\n  ✗ 故事板质检不通过 "
+            f"(slideshow_risk={slideshow_risk}, variation={variation_score})，"
+            "阻断视频重拍"
+        )
+        return "block"
+    return "pass"
+
+
 def route_after_qa(
     qa_result: QAResult,
     supervision: SupervisionResult | None,

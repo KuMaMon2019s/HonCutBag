@@ -7194,211 +7194,107 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
 # ---------------------------------------------------------------------------
 
 if LANGGRAPH_AVAILABLE:
-    class HonCutState(TypedDict):
-        """State schema for LangGraph StateGraph pipeline."""
-        text: str
-        events: list
-        characters: list
-        storyboard: dict
-        storyboard_image: str
-        shots: list
-        videos: list
-        quality_report: dict
-        final_video: str
-        status: str
-        error: str
-        # Internal fields (not in original plan but needed for compatibility)
-        output_dir: str
-        duration: int
-        shot_duration: int
-        chain_mode: bool
-        dry_run: bool
-        transition: str
-        transition_duration: float
-        enable_reshoot: bool
-        media_profile: str
-        project_video_spec: dict
-        run_fingerprint: str
-        skip_phase: list
-        resume: bool
-        auto_approve: bool
-        # Tracking fields
-        phase_results: dict
-        retry_count: int
-        completed_phases: list
+    from graph.state import HonCutState
 
     def build_pipeline_graph(auto_approve: bool = True, reporter: Optional[ProgressReporter] = None):
-        """Compatibility facade for the migrated uncompiled workflow builder."""
-        from graph.nodes.phase8 import route_after_phase8
-        from graph.nodes.phase9 import route_after_phase9
-        from graph.workflow import build_workflow
+        """Deprecated facade for :func:`graph.composition.build_pipeline_graph`."""
+        from graph.composition import build_pipeline_graph as build_composed_graph
 
-        return build_workflow(
-            state_schema=HonCutState,
-            nodes={
-                "phase1": lambda state: node_phase1(state, reporter=reporter),
-                "phase2": node_phase2,
-                "phase3": node_phase3,
-                "phase4": node_phase4,
-                "phase5": node_phase5_quality,
-                "phase6_txt2vid": node_phase6_txt2vid,
-                "phase6_img2vid": node_phase6_img2vid,
-                "phase6_reference": node_phase6_reference,
-                "phase7": node_phase7,
-                "phase8": node_phase8,
-                "phase9": node_phase9,
-                "phase9_5": node_phase9_5,
-            },
-            route_phase5=route_phase5,
-            quality_gate_router=quality_gate_router,
-            route_after_phase8=route_after_phase8,
-            route_after_phase9=route_after_phase9,
+        return build_composed_graph(
             auto_approve=auto_approve,
+            reporter=reporter,
+            phase_owner=sys.modules[__name__],
         )
 
     # --- Node functions (wrappers around existing run_phase* functions) ---
     
     def node_phase1(state: HonCutState, reporter: Optional[ProgressReporter] = None) -> dict:
         """Compatibility facade for the migrated Phase 1 graph node."""
-        from graph.nodes.phase1 import phase1_node
+        from graph.composition import node_phase1 as composed_node
 
-        # Resolve the module global at call time so existing monkeypatches of
-        # pipeline_core.run_phase1 keep working during the migration.
-        return phase1_node(
+        return composed_node(
             state,
-            runner=run_phase1,
             reporter=reporter,
-            default_shot_duration=AVG_SHOT_DURATION,
+            phase_owner=sys.modules[__name__],
         )
 
     def node_phase2(state: HonCutState) -> dict:
         """Compatibility facade for the migrated Phase 2 graph node."""
-        from graph.nodes.phase2 import phase2_node
+        from graph.composition import node_phase2 as composed_node
 
-        # Resolve the module global at call time so existing monkeypatches of
-        # pipeline_core.run_phase2 keep working during the migration.
-        return phase2_node(state, runner=run_phase2)
+        return composed_node(state, phase_owner=sys.modules[__name__])
 
     def node_phase3(state: HonCutState) -> dict:
         """Compatibility facade for the migrated Phase 3 graph node."""
-        from graph.nodes.phase3 import phase3_node
+        from graph.composition import node_phase3 as composed_node
 
-        # Resolve the module global at call time so existing monkeypatches of
-        # pipeline_core.run_phase3 keep working during the migration.
-        return phase3_node(state, runner=run_phase3)
+        return composed_node(state, phase_owner=sys.modules[__name__])
 
     def node_phase4(state: HonCutState) -> dict:
         """Compatibility facade for the migrated Phase 4 graph node."""
-        from graph.nodes.phase4 import phase4_node
+        from graph.composition import node_phase4 as composed_node
 
-        # Resolve the module global at call time so existing monkeypatches of
-        # pipeline_core.run_phase4 keep working during the migration.
-        return phase4_node(state, runner=run_phase4)
+        return composed_node(state, phase_owner=sys.modules[__name__])
 
     def route_phase5(state: HonCutState) -> str:
-        """根据镜头属性路由到不同的 Phase 6 生成器"""
-        storyboard = state.get("storyboard", {})
-        shots = storyboard.get("shots", [])
+        """Deprecated facade for the canonical Phase 5 router."""
+        from graph.routing import route_phase5 as route
 
-        # 统计镜头类型
-        has_reference = any(s.get("ref_type") == "reference" for s in shots)
-        has_storyboard_image = bool(state.get("storyboard_image"))
-
-        if has_reference:
-            return "reference"
-        elif has_storyboard_image:
-            return "img2vid"
-        else:
-            return "txt2vid"
+        return route(state)
 
     def node_phase5_quality(state: HonCutState) -> dict:
         """Compatibility facade for the migrated Phase 5 graph node."""
-        from graph.nodes.phase5 import phase5_node
-        from phases.phase5 import storyboard_qa_gate
-        from quality.supervision_agent import SupervisionBlockedError
+        from graph.composition import node_phase5_quality as composed_node
 
-        # Resolve all existing callables at invocation time so monkeypatches
-        # remain effective even when the graph was built earlier.
-        return phase5_node(
-            state,
-            qa_runner=lambda output_dir: (
-                storyboard_qa_gate.run_storyboard_qa_with_correction(
-                    output_dir,
-                    qa_runner=storyboard_qa_gate.run_storyboard_qa_gate,
-                )
-            ),
-            supervision_runner=_run_storyboard_supervision,
-            supervision_blocked_error=SupervisionBlockedError,
-        )
+        return composed_node(state, phase_owner=sys.modules[__name__])
 
     def node_phase6_txt2vid(state: HonCutState) -> dict:
         """Compatibility facade for the migrated txt2vid node."""
-        from graph.nodes.phase6 import phase6_txt2vid_node
+        from graph.composition import node_phase6_txt2vid as composed_node
 
-        return phase6_txt2vid_node(state, runner=run_phase6)
+        return composed_node(state, phase_owner=sys.modules[__name__])
 
     def node_phase6_img2vid(state: HonCutState) -> dict:
         """Compatibility facade for the migrated img2vid node."""
-        from graph.nodes.phase6 import phase6_img2vid_node
+        from graph.composition import node_phase6_img2vid as composed_node
 
-        return phase6_img2vid_node(state, runner=run_phase6)
+        return composed_node(state, phase_owner=sys.modules[__name__])
 
     def node_phase6_reference(state: HonCutState) -> dict:
         """Compatibility facade for the migrated reference node."""
-        from graph.nodes.phase6 import phase6_reference_node
+        from graph.composition import node_phase6_reference as composed_node
 
-        return phase6_reference_node(state, runner=run_phase6)
+        return composed_node(state, phase_owner=sys.modules[__name__])
 
     def node_phase7(state: HonCutState) -> dict:
         """Compatibility facade for the migrated Phase 7 graph node."""
-        from graph.nodes.phase7 import phase7_node
+        from graph.composition import node_phase7 as composed_node
 
-        return phase7_node(state, runner=run_phase7)
+        return composed_node(state, phase_owner=sys.modules[__name__])
 
     def quality_gate_router(state: HonCutState) -> str:
-        """Block stale structural failures; Phase 8 owns video reshoots."""
-        quality = state.get("quality_report", {})
+        """Deprecated facade for the canonical structural quality router."""
+        from graph.routing import quality_gate_router as route
 
-        slideshow_risk = quality.get("slideshow_risk", 0.0)
-        variation_score = quality.get("variation_score", 5.0)
-        # These two scores are computed from the immutable storyboard, not the
-        # generated pixels. Re-submitting identical paid video inputs cannot
-        # improve them, so all execution modes block and request storyboard
-        # repair instead of burning another provider attempt.
-        if slideshow_risk > 0.7 or variation_score < 3.0:
-            print(
-                f"\n  ✗ 故事板质检不通过 "
-                f"(slideshow_risk={slideshow_risk}, variation={variation_score})，"
-                "阻断视频重拍"
-            )
-            return "block"
-        
-        # Phase 8 is the only pixel-level decision owner and performs its own
-        # recoverable per-shot reshoot transaction. Phase 7 never fabricates a
-        # selective retry from prompt-only evidence.
-        return "pass"
+        return route(state)
 
     def node_phase8(state: HonCutState) -> dict:
         """Compatibility facade for the migrated Phase 8 graph node."""
-        from graph.nodes.phase8 import phase8_node
+        from graph.composition import node_phase8 as composed_node
 
-        return phase8_node(state, runner=run_phase8)
+        return composed_node(state, phase_owner=sys.modules[__name__])
 
     def node_phase9(state: HonCutState) -> dict:
         """Compatibility facade for the migrated Phase 9 graph node."""
-        from graph.nodes.phase9 import phase9_node
+        from graph.composition import node_phase9 as composed_node
 
-        return phase9_node(state, runner=run_phase9)
+        return composed_node(state, phase_owner=sys.modules[__name__])
 
     def node_phase9_5(state: HonCutState) -> dict:
         """Compatibility facade for the migrated Phase 9.5 graph node."""
-        from graph.nodes.final_qa import final_qa_node
-        try:
-            from quality.video_qa import run_video_qa
-        except ImportError:
-            run_video_qa = None
+        from graph.composition import node_phase9_5 as composed_node
 
-        return final_qa_node(state, runner=run_video_qa)
+        return composed_node(state)
 
 else:
     # Fallback when LangGraph is not available
@@ -7699,8 +7595,14 @@ def _run_pipeline(
     if LANGGRAPH_AVAILABLE and not skip_phase:
         print(f"\n  🚀 Using LangGraph StateGraph for pipeline execution")
         try:
-            # Build the graph
-            graph = build_pipeline_graph(auto_approve=auto_approve, reporter=reporter)
+            # Build the graph through the production composition root.
+            from graph.composition import build_pipeline_graph as build_composed_graph
+
+            graph = build_composed_graph(
+                auto_approve=auto_approve,
+                reporter=reporter,
+                phase_owner=sys.modules[__name__],
+            )
             
             if graph is None:
                 raise RuntimeError("Failed to build pipeline graph")
