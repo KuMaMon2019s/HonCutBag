@@ -42,6 +42,7 @@ from phases.phase1.director_storyboard import (
     build_director_storyboard_prompt,
     materialize_director_panels,
 )
+from phases.phase1.phase1_director import run_phase1_director
 from phases.phase1.storyboard_beats import (
     bridge_planning_duration_bounds,
     plan_storyboard_beats,
@@ -1844,9 +1845,9 @@ def test_director_failure_removes_a_stale_plan(tmp_path, monkeypatch):
         lambda *_args, **_kwargs: {"status": "error", "error": "provider down"},
     )
 
-    result = pipeline_core.run_phase1_director("new script", tmp_path, False)
+    with pytest.raises(RuntimeError, match="director planning returned error"):
+        run_phase1_director("new script", tmp_path, False)
 
-    assert result["status"] == "error"
     assert not stale.exists()
 
 

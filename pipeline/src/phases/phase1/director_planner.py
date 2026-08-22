@@ -93,12 +93,11 @@ def plan_director(script_text: str, output_dir: Path, dry_run: bool = False) -> 
         print("  ⊘ dry-run 模式，跳过导演规划")
         return {"status": "skipped", "reason": "dry-run"}
 
-    # 调用 LLM
+    # 调用 LLM。生产导演规划是 Phase 1 的必需证据，失败必须向上冒泡。
     try:
         api_key = get_api_key("ARK_AGENT_API_KEY")
         if not api_key:
-            print("  ⚠ [M1] ARK_AGENT_API_KEY 未设置，降级跳过导演规划")
-            return {"status": "skipped", "reason": "no_api_key"}
+            raise RuntimeError("director planning requires ARK_AGENT_API_KEY")
 
         client = create_ark_client(read_timeout=LLM_IDLE_TIMEOUT)
         user_prompt = USER_PROMPT_TEMPLATE.format(script_text=script_text[:8000])
@@ -138,6 +137,6 @@ def plan_director(script_text: str, output_dir: Path, dry_run: bool = False) -> 
 
         return {"status": "done", "plan": plan, "output": str(plan_path)}
 
-    except Exception as e:
-        print(f"  ⚠ [M1] 导演规划失败（降级跳过）: {e}")
-        return {"status": "error", "error": str(e)}
+    except Exception as exc:
+        plan_path.unlink(missing_ok=True)
+        raise RuntimeError(f"director planning failed: {exc}") from exc

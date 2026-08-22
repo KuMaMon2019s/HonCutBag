@@ -18,10 +18,10 @@ def run_phase1_director(text: str, output_dir: Path, dry_run: bool) -> dict:
     try:
         from phases.phase1.director_planner import plan_director
         result = plan_director(text, output_dir, dry_run)
-        if result.get("status") != "done":
-            # A fail-open director step must not leave an earlier plan visible
-            # to Phase 4 as if it belonged to the current attempt.
-            plan_path.unlink(missing_ok=True)
+        status = result.get("status")
+        if status != "done" and not (dry_run and status == "skipped"):
+            detail = result.get("error") or result.get("reason") or "missing success evidence"
+            raise RuntimeError(f"director planning returned {status}: {detail}")
         # Lock the intended production medium before providers can downgrade it.
         delivery_promise = classify_from_brief("cinematic", {}).to_dict()
         result.setdefault("delivery_promise", delivery_promise)
@@ -48,7 +48,6 @@ def run_phase1_director(text: str, output_dir: Path, dry_run: bool) -> dict:
             result_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
         result["duration_s"] = _elapsed(start)
         return result
-    except Exception as e:
+    except Exception:
         plan_path.unlink(missing_ok=True)
-        print(f"  ⚠ [M1] Phase 1 降级跳过: {e}")
-        return {"status": "skipped", "reason": str(e), "duration_s": _elapsed(start)}
+        raise

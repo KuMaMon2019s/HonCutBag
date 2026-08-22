@@ -49,6 +49,18 @@ def run_phase1(
     screenwriter_runner = _screenwriter_runner or run_phase1_screenwriter
     try:
         director = director_runner(text, Path(output_dir), dry_run)
+        director_status = director.get("status")
+        if director_status != "done" and not (
+            dry_run and director_status == "skipped"
+        ):
+            detail = (
+                director.get("error")
+                or director.get("reason")
+                or "missing success evidence"
+            )
+            raise RuntimeError(
+                f"director planning returned {director_status}: {detail}"
+            )
         screenwriter = screenwriter_runner(
             text,
             output_dir,

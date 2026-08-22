@@ -14,6 +14,7 @@ if str(SRC) not in sys.path:
 import phases.phase1.director_planner as director_planner
 import phases.phase1.storyboard_generator as storyboard_generator
 from phases import pipeline_core
+from phases.phase1.phase1_pipeline import run_phase1
 from prompt import event_extractor, text_parser
 from utils import ark_llm
 from utils.config import DEFAULT_TEXT_MODEL
@@ -298,6 +299,21 @@ def test_director_planner_uses_shared_streaming_client(monkeypatch, tmp_path):
     assert json.loads((tmp_path / "director_plan.json").read_text())["scenes"] == []
 
 
+def test_director_planner_propagates_provider_failure(monkeypatch, tmp_path):
+    monkeypatch.setattr(director_planner, "get_api_key", lambda _name: "test-key")
+    monkeypatch.setattr(director_planner, "create_ark_client", lambda **_kwargs: object())
+
+    def provider_timeout(**_kwargs):
+        raise TimeoutError("provider wall timeout")
+
+    monkeypatch.setattr(director_planner, "call_llm_stream", provider_timeout)
+
+    with pytest.raises(RuntimeError, match="director planning failed: provider wall timeout"):
+        director_planner.plan_director("云海中的仙宫", tmp_path)
+
+    assert not (tmp_path / "director_plan.json").exists()
+
+
 def test_storyboard_long_stream_timeout_budget_is_consistent(monkeypatch):
     client = object()
     observed = {}
@@ -514,6 +530,30 @@ def test_combined_phase1_starts_progress_before_director(monkeypatch, tmp_path):
     assert result["status"] == "done"
     assert calls.index(("heartbeat_start", "phase1")) < calls.index(("director",))
     assert calls[-1] == ("heartbeat_stop",)
+
+
+def test_combined_phase1_fails_closed_before_screenwriter_when_director_fails(tmp_path):
+    screenwriter_called = False
+
+    def failed_director(*_args, **_kwargs):
+        return {"status": "error", "error": "director timeout"}
+
+    def unexpected_screenwriter(*_args, **_kwargs):
+        nonlocal screenwriter_called
+        screenwriter_called = True
+        return {"status": "done"}
+
+    with pytest.raises(RuntimeError, match="director planning returned error"):
+        run_phase1(
+            "synthetic",
+            tmp_path,
+            30,
+            False,
+            _director_runner=failed_director,
+            _screenwriter_runner=unexpected_screenwriter,
+        )
+
+    assert screenwriter_called is False
 
 
 def test_storyboard_default_path_runs_three_shots_concurrently(monkeypatch):
