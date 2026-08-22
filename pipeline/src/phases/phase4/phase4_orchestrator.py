@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import traceback
+from copy import deepcopy
 from pathlib import Path
 
 from phases.phase2.storyboard_assets import _normalize_shot_id
@@ -14,8 +15,100 @@ from runtime.phase_timing import _banner, _elapsed, _now
 from tools.provider_scoring import rank_providers
 from tools.video_composer import lock_runtime
 from utils.source_paths import LEGACY_TOOLS_DIR, PIPELINE_SRC_DIR
+from utils.file_integrity import file_sha256
 from utils.storyboard_geometry import _storyboard_canvas, _storyboard_image_size
 from utils.timing_estimator import estimate_phase_duration
+
+
+PHASE4_LEGACY_STORYBOARD_SCHEMA = "honcut.phase4-legacy-storyboard.v1"
+PHASE4_LEGACY_STORYBOARD_NAME = "phase4_legacy_storyboard.json"
+
+
+def _first_compatibility_text(shot: dict, fields: tuple[str, ...]) -> str | None:
+    """Return the first authored, non-empty string accepted by legacy Phase 4."""
+    for field in fields:
+        value = shot.get(field)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _write_legacy_storyboard_adapter(
+    output_dir: Path,
+    storyboard_path: Path,
+    storyboard: dict,
+) -> Path:
+    """Write the narrow legacy input without changing the canonical storyboard."""
+    adapted = deepcopy(storyboard)
+    shots = adapted.get("shots")
+    if not isinstance(shots, list):
+        raise ValueError("Phase 4 storyboard must contain a shots array")
+
+    for index, shot in enumerate(shots):
+        if not isinstance(shot, dict):
+            raise ValueError(f"Phase 4 shot at index {index} must be an object")
+        normalized_id = _normalize_shot_id(shot)
+        if normalized_id is None:
+            raise ValueError(f"Phase 4 shot at index {index} has no usable shot ID")
+        try:
+            numeric_id = int(normalized_id[1:])
+        except ValueError as exc:
+            raise ValueError(
+                f"Phase 4 shot at index {index} has a non-numeric shot ID: "
+                f"{normalized_id}"
+            ) from exc
+        if numeric_id <= 0:
+            raise ValueError(
+                f"Phase 4 shot at index {index} has an invalid shot ID: "
+                f"{normalized_id}"
+            )
+
+        name = _first_compatibility_text(shot, ("name",))
+        if name is None:
+            name = _first_compatibility_text(
+                shot,
+                (
+                    "shot_intent",
+                    "caption",
+                    "action",
+                    "what",
+                    "visual",
+                    "prompt",
+                ),
+            ) or normalized_id
+        prompt = _first_compatibility_text(shot, ("prompt",))
+        if prompt is None:
+            prompt = _first_compatibility_text(
+                shot,
+                ("visual", "action", "what"),
+            )
+        if prompt is None:
+            raise ValueError(
+                f"Phase 4 shot {normalized_id} has no prompt-compatible visual, "
+                "action, or what field"
+            )
+
+        shot["id"] = numeric_id
+        shot["shot_id"] = normalized_id
+        shot["name"] = name
+        shot["prompt"] = prompt
+
+    adapted["_compatibility"] = {
+        "schema": PHASE4_LEGACY_STORYBOARD_SCHEMA,
+        "source_path": storyboard_path.relative_to(output_dir).as_posix(),
+        "source_sha256": file_sha256(storyboard_path),
+    }
+    adapter_path = output_dir / PHASE4_LEGACY_STORYBOARD_NAME
+    temporary = adapter_path.with_suffix(adapter_path.suffix + ".tmp")
+    try:
+        temporary.write_text(
+            json.dumps(adapted, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, adapter_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return adapter_path
 
 
 def run_phase4(output_dir: Path, dry_run: bool) -> dict:
@@ -162,10 +255,17 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
         if not orchestrator_script.exists():
             return {"status": "error", "error": f"orchestrator.py not found at {orchestrator_script}", "duration_s": _elapsed(start)}
 
+        legacy_storyboard_path = _write_legacy_storyboard_adapter(
+            output_dir,
+            storyboard_path,
+            storyboard_for_consistency,
+        )
+        outputs.append(PHASE4_LEGACY_STORYBOARD_NAME)
+
         shots_dir = output_dir / "shots"
         cmd = [
             sys.executable, str(orchestrator_script),
-            "--storyboard", str(storyboard_path.resolve()),
+            "--storyboard", str(legacy_storyboard_path.resolve()),
             "--skip-assembly",
             "--shots-dir", str(shots_dir.resolve()),
             # Phase 4 owns routing and SHOT_META creation only.  The legacy
