@@ -1,5 +1,306 @@
-"""Phase 3: character asset generation."""
+"""Phase 3 character asset generation and QA."""
 
-from ..pipeline_core import run_phase3
+from __future__ import annotations
 
-__all__ = ["run_phase3"]
+import json
+import os
+import time
+import traceback
+from pathlib import Path
+
+from phases.phase2.storyboard_assets import _validate_storyboard_image_composition
+from quality.quality_gate import run_quality_check
+from runtime.phase_timing import _banner, _elapsed, _ensure_dir, _now
+from runtime.retry_execution import _retry_with_policy
+from utils.storyboard_geometry import _storyboard_canvas, _storyboard_image_size
+from utils.style_slices import get_slice
+from utils.timing_estimator import estimate_phase_duration
+
+
+def detect_derive_assets(characters_data: dict) -> list:
+    """按 HonCut 规范检测衍生资产。
+
+    读取 CHARACTERS.json，检测角色是否有变身/换装描述，
+    返回衍生资产列表。
+
+    规则（精简版）:
+    - 角色: 仅变身状态（服装/变身特效/变形）
+    - 场景: 仅时间变体（日景→夜景）
+    - 道具: 不衍生
+
+    Returns:
+        list of dict: [{"parent_id": "char_001", "name": "战斗服", "desc": "...", "type": "role"}, ...]
+    """
+    derive_assets = []
+    # 兼容 dict（含 "characters" key）和直接 list 两种输入
+    if isinstance(characters_data, list):
+        characters_list = characters_data
+    else:
+        characters_list = characters_data.get("characters", [])
+
+    # 变身/换装关键词（中文 + 英文）
+    transformation_keywords = [
+        "变身", "换装", "战斗服", "礼服", "盔甲", "兽化", "巨大化", "变形",
+        "能量", "光效", "transform", "costume", "armor", "beast", "giant",
+        "battle", "ceremony", "formal", "magic", "power"
+    ]
+
+    for char in characters_list:
+        char_id = char.get("id", "")
+        char_name = char.get("name", "")
+        description = char.get("description", "")
+        appearance = char.get("appearance", {})
+        summary = appearance.get("summary", "")
+        clothing = appearance.get("clothing", "")
+
+        # 合并所有文本字段进行检测
+        all_text = f"{description} {summary} {clothing}".lower()
+
+        # 检测是否包含变身/换装关键词
+        detected_keywords = [kw for kw in transformation_keywords if kw.lower() in all_text]
+
+        if detected_keywords:
+            # 为每个检测到的变身状态创建衍生资产
+            for keyword in detected_keywords[:3]:  # 限制每个角色最多3个衍生
+                # 生成衍生资产名称（2-6字）
+                derive_name = keyword if len(keyword) <= 6 else keyword[:6]
+
+                # 生成描述
+                derive_desc = f"{char_name}的{keyword}形态 · 与默认态有明显视觉差异"
+
+                derive_assets.append({
+                    "parent_id": char_id,
+                    "parent_name": char_name,
+                    "name": derive_name,
+                    "desc": derive_desc,
+                    "type": "role",
+                    "keyword": keyword,
+                })
+
+    return derive_assets
+
+
+def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
+    """Phase 3: character_factory — 生成角色四视图 + 衍生资产检测"""
+    _banner(3, 9, "角色工厂 (Character Factory + Derive Assets)", dry_run)
+    start = _now()
+    outputs = []
+    output_dir = Path(output_dir)
+
+    try:
+        from phases.phase3.character_factory import batch_generate
+        from quality.character_reference_qa import CharacterReferenceQAError
+
+        chars_dir = _ensure_dir(output_dir / "characters")
+        from utils.privacy_visual_policy import (
+            NO_REAL_PERSON_POLICY,
+            apply_no_real_person_character_policy,
+            is_no_real_person_enabled,
+        )
+
+        if (
+            is_no_real_person_enabled()
+            and characters_data.get("visual_identity_policy")
+            != NO_REAL_PERSON_POLICY
+        ):
+            characters_data = apply_no_real_person_character_policy(characters_data)
+            characters_path = output_dir / "CHARACTERS.json"
+            characters_temporary = characters_path.with_suffix(".json.tmp")
+            characters_temporary.write_text(
+                json.dumps(characters_data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(characters_temporary, characters_path)
+            print("  🛡 非真人模式：角色身份已锁定为多样化非真人妆造（每人至少两个可见锚点）")
+
+        characters_list = characters_data.get("characters", [])
+
+        if not characters_list:
+            print("  ⊘ 无角色数据，跳过")
+            return {"status": "skipped", "reason": "no characters", "duration_s": _elapsed(start)}
+
+        # Step 3.1: HonCut 衍生资产检测
+        print("  → 检测衍生资产（变身/换装状态）...")
+        derive_assets = detect_derive_assets(characters_data)
+        if derive_assets:
+            print(f"    ✓ 检测到 {len(derive_assets)} 个衍生资产:")
+            for da in derive_assets:
+                print(f"      - {da['parent_name']}·{da['name']}: {da['desc']}")
+
+        # Step 3.2: 生成基础角色四视图
+        visual_style_path = output_dir / "visual-style.md"
+        character_style = ""
+        if visual_style_path.is_file():
+            character_style = get_slice(
+                visual_style_path.read_text(encoding="utf-8"), "character"
+            )
+        # 为每个角色准备静态身份描述。剧情动作、姿势、镜头互动和场景风格
+        # 不得进入四视图，否则会把所有 canonical references 污染成剧照。
+        from utils.character_body_contracts import (
+            character_reference_identity_description,
+        )
+
+        char_dicts = []
+        for i, c in enumerate(characters_list):
+            char_dicts.append({
+                "id": c.get("id", f"char_{i}"),
+                "name": c.get("name", f"角色{i}"),
+                "description": character_reference_identity_description(c),
+                "appearance": c.get("appearance", {}),  # 传递完整 appearance dict
+                "style": "\n\n".join(
+                    part for part in (c.get("style", ""), character_style) if part
+                ),
+                "negative": ", ".join(filter(None, (
+                    str(c.get("negative", "")).strip(),
+                    str(c.get("negative_guardrails", "")).strip(),
+                ))),
+            })
+
+        _p3_est = estimate_phase_duration("phase3", num_characters=len(char_dicts))
+        print(f"  ⏱ Phase 3 开始 (预估 ~{int(_p3_est)}s)")
+        print(f"  → batch_generate: {len(char_dicts)} 个角色, skip_images={dry_run}")
+
+        if not dry_run:
+            print("[cooldown] 等待 120s 让 Agent Plan 限流窗口重置...", flush=True)
+            time.sleep(120)
+
+        # Use retry policy for each character generation
+        results = []
+        _p3_char_start = _now()
+        for i, char_dict in enumerate(char_dicts):
+            char_name = char_dict.get("name", f"角色{i}")
+            print(f"    → [{i+1}/{len(char_dicts)}] {char_name}...")
+            _char_t0 = _now()
+
+            def _gen_char():
+                # Pass output_dir (not chars_dir) — generate_character appends /characters/ internally
+                return batch_generate(
+                    [char_dict],
+                    str(output_dir),
+                    skip_images=dry_run,
+                    raise_on_error=True,
+                )
+
+            try:
+                result = _retry_with_policy(
+                    _gen_char,
+                    max_attempts=3,
+                    backoff_factor=2.0,
+                    non_retryable_exceptions=(CharacterReferenceQAError,),
+                )
+                results.extend(result or [])
+            except Exception as e:
+                print(f"    ✗ {char_name} 生成失败: {e}")
+                results.append(None)
+            _char_elapsed = round(_now() - _char_t0, 1)
+            _char_cumulative = round(_now() - _p3_char_start, 1)
+            print(f"  ⏱ {char_name} 完成 (耗时 {_char_elapsed}s, 累计 {_char_cumulative}s / 预估 {int(_p3_est)}s)")
+
+        # 统计输出
+        for r in (results or []):
+            if isinstance(r, dict):
+                name = r.get("name", r.get("id", "unknown"))
+                outputs.append(f"characters/{name}/")
+            elif isinstance(r, str):
+                outputs.append(r)
+
+        if not outputs:
+            # fallback: 扫描目录
+            for d in chars_dir.iterdir():
+                if d.is_dir():
+                    outputs.append(f"characters/{d.name}/")
+
+        print(f"  ✓ Phase 3 完成: {len(outputs)} 角色卡 + {len(derive_assets)} 衍生资产")
+
+        # Quality gate: Phase 3 (CRITICAL — blocks pipeline if character images missing)
+        qg_report = run_quality_check("phase3", output_dir)
+        if not qg_report.passed:
+            return {
+                "status": "error",
+                "error": (
+                    f"Phase 3 质检未通过: {qg_report.grade} — 角色四视图缺失、"
+                    "语义视角错误或审核凭证已过期，不能继续"
+                ),
+                "quality_report": qg_report,
+                "duration_s": _elapsed(start),
+            }
+
+        # Phase 3 owns the first point at which character reference packs are
+        # guaranteed to exist. Regenerate the canonical Pxx chain here so the
+        # continuity runtime and ordinary Sxx path consume the same identity-
+        # locked visual truth.
+        storyboard_path = output_dir / "STORYBOARD.json"
+        if storyboard_path.is_file():
+            storyboard = json.loads(storyboard_path.read_text(encoding="utf-8"))
+            expected_shots = len(storyboard.get("shots", []))
+            from phases.phase2.shot_storyboards import (
+                generate_shot_storyboards,
+                validate_shot_storyboard_artifacts,
+            )
+
+            video_width, video_height, aspect_ratio = _storyboard_canvas(storyboard)
+            director_reference = storyboard.get("director_storyboard") or {}
+            refreshed = generate_shot_storyboards(
+                output_dir,
+                storyboard,
+                characters_list,
+                size=_storyboard_image_size(
+                    video_width=video_width,
+                    video_height=video_height,
+                ),
+                director_storyboard_path=(
+                    director_reference.get("image")
+                    if isinstance(director_reference, dict)
+                    else None
+                ),
+                aspect_ratio=aspect_ratio,
+            )
+            if refreshed.get("total_boards") != expected_shots:
+                return {
+                    "status": "error",
+                    "error": (
+                        "Phase 3 could not refresh all character-locked Pxx boards: "
+                        f"{refreshed.get('total_boards', 0)}/{expected_shots}"
+                    ),
+                    "duration_s": _elapsed(start),
+                }
+            artifact_errors = validate_shot_storyboard_artifacts(
+                output_dir,
+                storyboard,
+            )
+            if artifact_errors:
+                return {
+                    "status": "error",
+                    "error": "Phase 3 character-locked Pxx validation failed",
+                    "artifact_errors": artifact_errors,
+                    "duration_s": _elapsed(start),
+                }
+            storyboard_path.write_text(
+                json.dumps(storyboard, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            composition_report = _validate_storyboard_image_composition(
+                output_dir, storyboard
+            )
+            if not composition_report["valid"]:
+                return {
+                    "status": "error",
+                    "error": "Storyboard composition validation failed after Phase 3",
+                    "composition_report": composition_report,
+                    "duration_s": _elapsed(start),
+                }
+
+        return {
+            "status": "done",
+            "duration_s": _elapsed(start),
+            "outputs": outputs or ["characters/"],
+            "derive_assets_count": len(derive_assets),
+            "derive_assets": derive_assets,
+        }
+
+    except ImportError as e:
+        print(f"  ⚠ Phase 3 import 失败: {e}")
+        return {"status": "error", "error": str(e), "duration_s": _elapsed(start)}
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "error": str(e), "duration_s": _elapsed(start)}
