@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -80,6 +81,7 @@ from quality.quality_gate import run_quality_check
 from quality.shot_continuity import annotate_boundaries, classify_boundary
 from quality.variation_checker import check_scene_variation
 from runtime.run_manifest import prepare_run_manifest
+from runtime import pipeline_execution
 from tools.checkpoint import invalidate_checkpoint_from, write_checkpoint
 from tools.asset_packager import _assert_video_frame_provenance
 from tools.smart_transition import decide_all_transitions
@@ -3463,6 +3465,279 @@ def test_phase1_rejects_real_17_06_default_shot_language_before_paid_work():
 
     with pytest.raises(ValueError, match=r"variation quality 1\.4/5"):
         adaptation_engine._validate_shot_language_variation(storyboard["shots"])
+
+
+def _phase5_dry_run_storyboard() -> dict:
+    return {
+        "target_duration": 8,
+        "shots": [
+            {
+                "id": 1,
+                "duration": 4,
+                "shot_intent": "establish the empty platform",
+                "visual": "rain on the glass station roof",
+                "shot_size": "wide",
+                "camera_movement": "crane_down",
+                "texture_keywords": ["rain", "glass"],
+                "hero_moment": True,
+                "storyboard_beats": [{
+                    "beat_id": "S01_P01",
+                    "duration_s": 4,
+                    "generation_mode": "fresh",
+                    "action": "the camera descends toward the platform",
+                }],
+            },
+            {
+                "id": 2,
+                "duration": 4,
+                "shot_intent": "reveal the waiting passenger",
+                "visual": "a passenger turns a glowing chip in his hand",
+                "shot_size": "close_up",
+                "camera_movement": "orbit_right",
+                "texture_keywords": ["skin", "blue light"],
+                "storyboard_beats": [{
+                    "beat_id": "S02_P01",
+                    "duration_s": 4,
+                    "generation_mode": "fresh",
+                    "action": "the passenger studies the glowing chip",
+                }],
+            },
+        ],
+    }
+
+
+def _write_phase5_dry_run_inputs(
+    output_dir: Path,
+    storyboard: dict | None = None,
+) -> bytes:
+    storyboard_path = output_dir / "STORYBOARD.json"
+    storyboard_path.write_text(
+        json.dumps(
+            _phase5_dry_run_storyboard() if storyboard is None else storyboard,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (output_dir / "CHARACTERS.json").write_text(
+        json.dumps({"characters": []}),
+        encoding="utf-8",
+    )
+    (output_dir / "visual-style.md").write_text(
+        "cold blue cinematic rain",
+        encoding="utf-8",
+    )
+    return storyboard_path.read_bytes()
+
+
+def _unexpected_phase5_dry_run_owner(*_args, **_kwargs):
+    raise AssertionError("dry-run touched a production image or model owner")
+
+
+def test_phase5_dry_run_writes_atomic_structural_receipts_without_pixel_qa(
+    monkeypatch, tmp_path
+):
+    canonical_before = _write_phase5_dry_run_inputs(tmp_path)
+    monkeypatch.setattr(
+        storyboard_qa_gate,
+        "run_l2_checks",
+        _unexpected_phase5_dry_run_owner,
+    )
+    monkeypatch.setattr(
+        storyboard_qa_gate,
+        "run_l3_review",
+        _unexpected_phase5_dry_run_owner,
+    )
+    monkeypatch.setattr(
+        storyboard_qa_gate,
+        "run_l4_first_frame_review",
+        _unexpected_phase5_dry_run_owner,
+    )
+    monkeypatch.setattr(
+        storyboard_qa_gate,
+        "_redraw_failed_storyboards",
+        _unexpected_phase5_dry_run_owner,
+    )
+
+    result = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        dry_run=True,
+        qa_runner=_unexpected_phase5_dry_run_owner,
+        redraw_runner=_unexpected_phase5_dry_run_owner,
+        image_client=object(),
+    )
+
+    assert result["status"] == "done"
+    assert result["gate_passed"] is True
+    assert result["dry_run_receipt"] == "phase5_dry_run_receipt.json"
+    assert result["layers"]["L1"]["status"] == "completed"
+    assert all(
+        result["layers"][layer]["status"] == "skipped"
+        for layer in ("L2", "L3", "L4")
+    )
+    assert set(result["skipped_operations"]) == {
+        "storyboard_pixel_artifact_validation",
+        "embedding_review",
+        "multimodal_storyboard_review",
+        "cinematic_first_frame_review",
+        "automatic_image_correction",
+        "independent_llm_supervision",
+    }
+    receipt = json.loads(
+        (tmp_path / "phase5_dry_run_receipt.json").read_text(encoding="utf-8")
+    )
+    compatibility_report = json.loads(
+        (tmp_path / "storyboard_qa_report.json").read_text(encoding="utf-8")
+    )
+    assert receipt["schema"] == "honcut.phase5-dry-run-receipt.v1"
+    assert receipt["status"] == "completed"
+    assert compatibility_report == result
+    assert receipt["input_artifacts"][0] == {
+        "path": "STORYBOARD.json",
+        "sha256": hashlib.sha256(canonical_before).hexdigest(),
+    }
+    assert (tmp_path / "STORYBOARD.json").read_bytes() == canonical_before
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_phase5_dry_run_still_blocks_structural_grade_c_without_redraw(tmp_path):
+    _write_phase5_dry_run_inputs(tmp_path, {"target_duration": 8, "shots": []})
+
+    result = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        dry_run=True,
+        redraw_runner=_unexpected_phase5_dry_run_owner,
+        image_client=object(),
+    )
+
+    assert result["status"] == "error"
+    assert result["grade"] in {"C", "D"}
+    assert {issue["code"] for issue in result["issues"]} == {
+        "scene_variation_insufficient",
+        "slideshow_risk_high",
+    }
+    receipt = json.loads(
+        (tmp_path / "phase5_dry_run_receipt.json").read_text(encoding="utf-8")
+    )
+    assert receipt["status"] == "blocked"
+    assert not (tmp_path / "phase5_corrections").exists()
+
+
+def test_phase5_production_keeps_missing_pixel_artifacts_blocking(
+    monkeypatch, tmp_path
+):
+    _write_phase5_dry_run_inputs(tmp_path)
+    monkeypatch.setattr(
+        storyboard_qa_gate,
+        "run_l2_checks",
+        lambda *_args, **_kwargs: ([], {"status": "skipped"}),
+    )
+    monkeypatch.setattr(
+        storyboard_qa_gate,
+        "run_l3_review",
+        lambda *_args, **_kwargs: ([], {"status": "skipped"}),
+    )
+    monkeypatch.setattr(
+        storyboard_qa_gate,
+        "run_l4_first_frame_review",
+        lambda *_args, **_kwargs: ([], {"status": "skipped"}),
+    )
+
+    result = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        dry_run=False,
+        max_correction_attempts=0,
+    )
+
+    assert result["status"] == "error"
+    assert result["gate_passed"] is False
+    assert {issue["code"] for issue in result["issues"]} >= {
+        "storyboard_beat_image_missing"
+    }
+    assert not (tmp_path / "phase5_dry_run_receipt.json").exists()
+
+
+def test_graph_phase5_threads_dry_run_and_skips_independent_supervision(
+    monkeypatch, tmp_path
+):
+    graph = pipeline_core.build_pipeline_graph(auto_approve=True)
+    observed = {}
+
+    def patched_wrapper(output_dir, **kwargs):
+        observed["output_dir"] = output_dir
+        observed.update(kwargs)
+        return {"status": "done", "grade": "A", "dry_run": True}
+
+    monkeypatch.setattr(
+        storyboard_qa_gate,
+        "run_storyboard_qa_with_correction",
+        patched_wrapper,
+    )
+    monkeypatch.setattr(
+        pipeline_core,
+        "_run_storyboard_supervision",
+        _unexpected_phase5_dry_run_owner,
+    )
+    state = {
+        "input_text": "future station fixture",
+        "output_dir": str(tmp_path),
+        "target_duration_s": 8,
+        "dry_run": True,
+        "storyboard": _phase5_dry_run_storyboard(),
+        "phase_results": {},
+        "completed_phases": ["phase1", "phase2", "phase3", "phase4"],
+        "skip_phase": [],
+    }
+
+    update = graph.nodes["phase5"].runnable.invoke(state)
+
+    assert observed["output_dir"] == tmp_path
+    assert observed["dry_run"] is True
+    assert update["phase_results"]["phase5"]["supervision"] == {
+        "status": "skipped",
+        "reason": "dry-run",
+    }
+
+
+def test_sequential_phase5_dry_run_skips_independent_supervision(tmp_path):
+    storyboard = _phase5_dry_run_storyboard()
+    characters = {"characters": []}
+
+    def run_phase1(_text, output_dir, *_args, **_kwargs):
+        _write_phase5_dry_run_inputs(output_dir, storyboard)
+        return {
+            "status": "done",
+            "_storyboard": storyboard,
+            "_characters": characters,
+        }
+
+    owner = SimpleNamespace(
+        run_phase1=run_phase1,
+        run_phase2=lambda *_args, **_kwargs: {"status": "done"},
+        run_phase3=lambda *_args, **_kwargs: {"status": "done"},
+        run_phase4=lambda *_args, **_kwargs: {"status": "done"},
+        run_phase6=_unexpected_phase5_dry_run_owner,
+        run_phase7=_unexpected_phase5_dry_run_owner,
+        run_phase8=_unexpected_phase5_dry_run_owner,
+        run_phase9=_unexpected_phase5_dry_run_owner,
+        _run_storyboard_supervision=_unexpected_phase5_dry_run_owner,
+    )
+
+    result = pipeline_execution.run_pipeline(
+        text="future station fixture",
+        duration=8,
+        dry_run=True,
+        skip_phase=[6, 7, 8, 9, 9.5],
+        output_dir=str(tmp_path),
+        _phase_owner=owner,
+    )
+
+    assert result["status"] == "completed"
+    assert result["phases"]["phase5"]["status"] == "done"
+    assert result["phases"]["phase5"]["supervision"] == {
+        "status": "skipped",
+        "reason": "dry-run",
+    }
+    assert not (tmp_path / "runtime.db").exists()
 
 
 def test_phase5_global_variation_requires_replanning_without_mutation(tmp_path):

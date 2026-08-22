@@ -35,6 +35,16 @@ DEFAULT_SIMILARITY_THRESHOLD = 0.85
 DEFAULT_MAX_CORRECTION_ATTEMPTS = 2
 MAX_CORRECTION_ATTEMPTS = 3
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
+PHASE5_DRY_RUN_RECEIPT_SCHEMA = "honcut.phase5-dry-run-receipt.v1"
+PHASE5_DRY_RUN_RECEIPT_NAME = "phase5_dry_run_receipt.json"
+PHASE5_DRY_RUN_SKIPPED_OPERATIONS = (
+    "storyboard_pixel_artifact_validation",
+    "embedding_review",
+    "multimodal_storyboard_review",
+    "cinematic_first_frame_review",
+    "automatic_image_correction",
+    "independent_llm_supervision",
+)
 
 _LIGHT_PERIODS = {
     "night": ("night", "midnight", "moonlight", "夜", "午夜", "月光", "星空"),
@@ -1694,11 +1704,205 @@ def run_storyboard_qa_gate(output_dir: Path, similarity_threshold: float | None 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _phase5_input_artifacts(output_dir: Path) -> list[dict[str, str]]:
+    """Hash only run-local Phase 5 inputs; never embed prompts or credentials."""
+    artifacts = []
+    for name in (
+        "STORYBOARD.json",
+        "CHARACTERS.json",
+        "visual-style.md",
+        "phase1_events.json",
+    ):
+        path = output_dir / name
+        if path.is_file():
+            artifacts.append({"path": name, "sha256": _sha256_file(path)})
+    return artifacts
+
+
+def _dry_run_layer_receipt(layer: str) -> dict[str, str]:
+    return {
+        "status": "skipped",
+        "skipped_reason": (
+            f"{layer} requires production image or model evidence and is disabled "
+            "during dry-run"
+        ),
+    }
+
+
+def _run_storyboard_qa_dry_run(output_dir: Path) -> dict[str, Any]:
+    """Run deterministic metadata checks without touching image/model owners."""
+    output_dir = Path(output_dir)
+    input_artifacts = _phase5_input_artifacts(output_dir)
+    try:
+        storyboard = json.loads(
+            (output_dir / "STORYBOARD.json").read_text(encoding="utf-8")
+        )
+        characters_path = output_dir / "CHARACTERS.json"
+        characters = (
+            json.loads(characters_path.read_text(encoding="utf-8"))
+            if characters_path.is_file()
+            else {"characters": []}
+        )
+        style_path = output_dir / "visual-style.md"
+        visual_style = (
+            style_path.read_text(encoding="utf-8") if style_path.is_file() else ""
+        )
+        events_path = output_dir / "phase1_events.json"
+        events_data = (
+            json.loads(events_path.read_text(encoding="utf-8"))
+            if events_path.is_file()
+            else None
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        issue = _issue(
+            "L1",
+            "severe",
+            "artifact_unreadable",
+            f"required artifact unreadable: {exc}",
+        )
+        variation = {"status": "skipped", "reason": "required artifact unreadable"}
+        slideshow = {"status": "skipped", "reason": "required artifact unreadable"}
+        issues = [issue]
+        per_shot: dict[str, dict[str, Any]] = {}
+        variation_quality = 0.0
+        slideshow_risk = 1.0
+    else:
+        l1_issues, per_shot = run_l1_checks(storyboard, visual_style)
+        capacity_issues = run_generation_capacity_checks(storyboard, events_data)
+
+        from quality.slideshow_risk import score_slideshow_risk
+        from quality.variation_checker import check_scene_variation
+
+        scenes = [
+            shot for shot in storyboard.get("shots", []) if isinstance(shot, dict)
+        ]
+        variation = check_scene_variation(scenes)
+        slideshow = score_slideshow_risk(scenes)
+        variation_quality = round(5.0 - float(variation.get("score", 5.0)), 2)
+        slideshow_risk = round(float(slideshow.get("average", 5.0)) / 5.0, 3)
+        structural_issues = []
+        if variation_quality < 3.0:
+            structural_issues.append(
+                _issue(
+                    "L1",
+                    "severe",
+                    "scene_variation_insufficient",
+                    "Storyboard variation quality "
+                    f"{variation_quality:g}/5 requires revision",
+                    details={"violations": variation.get("violations", [])},
+                )
+            )
+        if slideshow_risk > 0.7:
+            structural_issues.append(
+                _issue(
+                    "L1",
+                    "severe",
+                    "slideshow_risk_high",
+                    f"Storyboard slideshow risk {slideshow_risk:.3f} exceeds 0.7",
+                    details={"dimensions": slideshow.get("dimensions", {})},
+                )
+            )
+        issues = l1_issues + structural_issues + capacity_issues
+        character_list = characters.get("characters", [])
+        for index, shot in enumerate(storyboard.get("shots", [])):
+            if not isinstance(shot, dict):
+                continue
+            shot_id = _shot_id(shot, index)
+            detail = per_shot.setdefault(shot_id, {})
+            detail["characters"] = _characters_in_shot(shot, character_list)
+            detail["image_path"] = None
+            detail["storyboard_beat_images"] = {}
+            detail["cinematic_first_frames"] = {}
+            detail["issues"] = [
+                issue for issue in issues if shot_id in issue.get("shot_ids", [])
+            ]
+
+    _atomic_json(output_dir / "variation_report.json", variation)
+    _atomic_json(output_dir / "slideshow_risk_report.json", slideshow)
+    grade = grade_issues(issues)
+    gate_passed = grade in {"A", "B"}
+    failed_shots = sorted(
+        {
+            shot_id
+            for issue in blocking_issues(issues)
+            for shot_id in issue.get("shot_ids", [])
+        }
     )
-    temporary.replace(path)
+    issue_counts = {
+        severity: sum(item.get("severity") == severity for item in issues)
+        for severity in ("severe", "moderate", "minor")
+    }
+    outputs = [
+        "storyboard_qa_report.json",
+        "variation_report.json",
+        "slideshow_risk_report.json",
+        PHASE5_DRY_RUN_RECEIPT_NAME,
+    ]
+    layers = {
+        "L1": {
+            "status": "completed",
+            "checks": [
+                "metadata",
+                "generation_capacity",
+                "scene_variation",
+                "slideshow_risk",
+            ],
+        },
+        "L2": _dry_run_layer_receipt("L2 embedding review"),
+        "L3": _dry_run_layer_receipt("L3 multimodal review"),
+        "L4": _dry_run_layer_receipt("L4 cinematic first-frame review"),
+    }
+    receipt = {
+        "schema": PHASE5_DRY_RUN_RECEIPT_SCHEMA,
+        "status": "completed" if gate_passed else "blocked",
+        "dry_run": True,
+        "input_artifacts": input_artifacts,
+        "grade": grade,
+        "gate_passed": gate_passed,
+        "issues": issues,
+        "issue_counts": issue_counts,
+        "failed_shot_ids": failed_shots,
+        "variation_score": variation_quality,
+        "slideshow_risk": slideshow_risk,
+        "layers": layers,
+        "skipped_operations": list(PHASE5_DRY_RUN_SKIPPED_OPERATIONS),
+        "outputs": outputs,
+    }
+    _atomic_json(output_dir / PHASE5_DRY_RUN_RECEIPT_NAME, receipt)
+    report = {
+        "schema": "honcut.storyboard-qa-report.v1",
+        "status": "done" if gate_passed else "error",
+        "grade": grade,
+        "gate_passed": gate_passed,
+        "dry_run": True,
+        "dry_run_receipt": PHASE5_DRY_RUN_RECEIPT_NAME,
+        "input_artifacts": input_artifacts,
+        "issues": issues,
+        "issue_counts": issue_counts,
+        "failed_shot_ids": failed_shots,
+        "shots": per_shot,
+        "variation_score": variation_quality,
+        "slideshow_risk": slideshow_risk,
+        "layers": layers,
+        "skipped_operations": list(PHASE5_DRY_RUN_SKIPPED_OPERATIONS),
+        "outputs": outputs,
+    }
+    if not gate_passed:
+        report["error"] = (
+            f"Storyboard dry-run structural QA grade {grade} blocks Phase 6"
+        )
+    _atomic_json(output_dir / "storyboard_qa_report.json", report)
+    return report
 
 
 def _resolved_correction_attempts(value: int | None) -> int:
@@ -1895,9 +2099,12 @@ def run_storyboard_qa_with_correction(
     qa_runner: Callable[[Path], dict[str, Any]] | None = None,
     redraw_runner: Callable[[Path, list[str], list[dict[str, Any]], int], dict[str, Any]] | None = None,
     image_client: Any = None,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Run Phase 5 with a bounded failed-shot redraw and recheck loop."""
     output_dir = Path(output_dir)
+    if dry_run:
+        return _run_storyboard_qa_dry_run(output_dir)
     attempts_allowed = _resolved_correction_attempts(max_correction_attempts)
     qa = qa_runner or run_storyboard_qa_gate
     result = qa(output_dir)

@@ -96,6 +96,7 @@ def node_phase5_quality(
             storyboard_qa_gate.run_storyboard_qa_with_correction(
                 output_dir,
                 qa_runner=storyboard_qa_gate.run_storyboard_qa_gate,
+                dry_run=bool(state.get("dry_run")),
             )
         ),
         supervision_runner=owner._run_storyboard_supervision,

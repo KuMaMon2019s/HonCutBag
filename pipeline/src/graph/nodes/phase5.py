@@ -54,6 +54,13 @@ def phase5_node(
         )
         return Command(goto=END, update=update)
 
+    if state.get("dry_run"):
+        update["phase_results"]["phase5"] = {
+            **phase_receipt,
+            "supervision": {"status": "skipped", "reason": "dry-run"},
+        }
+        return update
+
     try:
         supervision = supervision_runner(
             state.get("storyboard", {}),

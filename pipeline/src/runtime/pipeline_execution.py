@@ -750,6 +750,7 @@ def _run_pipeline(
         p4_5 = storyboard_qa_gate.run_storyboard_qa_with_correction(
             output_path,
             qa_runner=storyboard_qa_gate.run_storyboard_qa_gate,
+            dry_run=dry_run,
         )
         report["phases"]["phase5"] = p4_5
         reporter.phase_done("phase5", f"分镜质检 {p4_5.get('grade', '?')} 级", duration_s=p4_5.get("duration_s"))
@@ -760,17 +761,23 @@ def _run_pipeline(
             report["total_duration_s"] = _elapsed(total_start)
             _write_report(report, output_dir)
             return report
-        from quality.supervision_agent import SupervisionBlockedError
-        try:
-            supervision = supervision_runner(storyboard_data, output_path)
-            report["phases"]["phase5"]["supervision"] = supervision
-        except SupervisionBlockedError as exc:
-            reporter.mark_failed(str(exc))
-            report["status"] = "failed"
-            report["error"] = str(exc)
-            report["total_duration_s"] = _elapsed(total_start)
-            _write_report(report, output_dir)
-            return report
+        if dry_run:
+            report["phases"]["phase5"]["supervision"] = {
+                "status": "skipped",
+                "reason": "dry-run",
+            }
+        else:
+            from quality.supervision_agent import SupervisionBlockedError
+            try:
+                supervision = supervision_runner(storyboard_data, output_path)
+                report["phases"]["phase5"]["supervision"] = supervision
+            except SupervisionBlockedError as exc:
+                reporter.mark_failed(str(exc))
+                report["status"] = "failed"
+                report["error"] = str(exc)
+                report["total_duration_s"] = _elapsed(total_start)
+                _write_report(report, output_dir)
+                return report
         _record_stage_checkpoint(output_path, "phase5", p4_5)
 
     # ---- Phase 6: 视频生成 ----
