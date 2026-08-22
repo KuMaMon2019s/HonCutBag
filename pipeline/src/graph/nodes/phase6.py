@@ -20,6 +20,7 @@ class Phase6Runner(Protocol):
         output_dir: Path,
         dry_run: bool,
         chain_mode: bool = False,
+        media_profile: str = "480p",
     ) -> dict[str, Any]: ...
 
 
@@ -74,11 +75,16 @@ def _phase6_node(
             replacement.remove_sources()
 
     try:
+        runner_kwargs = {
+            "storyboard_data": state.get("storyboard"),
+            "output_dir": output_dir,
+            "dry_run": state["dry_run"],
+            "chain_mode": state.get("chain_mode", False),
+        }
+        if "media_profile" in state:
+            runner_kwargs["media_profile"] = state["media_profile"]
         raw_receipt = runner(
-            storyboard_data=state.get("storyboard"),
-            output_dir=output_dir,
-            dry_run=state["dry_run"],
-            chain_mode=state.get("chain_mode", False),
+            **runner_kwargs,
         )
     except Exception as exc:
         if replacement:

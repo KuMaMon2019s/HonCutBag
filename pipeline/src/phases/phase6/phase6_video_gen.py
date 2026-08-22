@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import traceback
 from pathlib import Path
 from typing import Any
@@ -19,7 +20,7 @@ class _PipelineVideoTool(BaseTool):
     name = "pipeline_video_generation"
     runtime = ToolRuntime.API
     capabilities = ["i2v", "flf2v"]
-    input_schema = {"output_dir": "path"}
+    input_schema = {"output_dir": "path", "media_profile": "string"}
 
     def execute(self, inputs: dict[str, Any]) -> ToolResult:
         started = _now()
@@ -27,6 +28,7 @@ class _PipelineVideoTool(BaseTool):
             data = _run_phase6_fallback(
                 Path(inputs["output_dir"]),
                 chain_mode=bool(inputs.get("chain_mode", False)),
+                media_profile=str(inputs.get("media_profile") or "480p"),
             )
             return ToolResult(data.get("status") == "done", data=data, error=data.get("error"), duration_seconds=_elapsed(started))
         except Exception as exc:
@@ -46,6 +48,7 @@ def run_phase6(
     output_dir: str | Path,
     dry_run: bool,
     chain_mode: bool = False,
+    media_profile: str = "480p",
     *,
     _adapter_cls=None,
     _quality_runner=None,
@@ -106,6 +109,15 @@ def run_phase6(
                 execution_kwargs["_test_executor_factory"] = (
                     _test_continuity_executor_factory
                 )
+            auto_kwargs = dict(execution_kwargs)
+            auto_parameters = inspect.signature(
+                execute_phase6_auto_continuity
+            ).parameters
+            if "media_profile" in auto_parameters or any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in auto_parameters.values()
+            ):
+                auto_kwargs["media_profile"] = media_profile
             result = execute_phase6_auto_continuity(
                 output_dir,
                 load_continuity_plan(output_dir / "CONTINUITY_PLAN.json"),
@@ -114,7 +126,7 @@ def run_phase6(
                     if (output_dir / "CONTINUITY_CALIBRATION.json").is_file()
                     else None
                 ),
-                **execution_kwargs,
+                **auto_kwargs,
             )
             result["duration_s"] = _elapsed(start)
             result["continuity_runtime"] = continuity_runtime
@@ -144,7 +156,11 @@ def run_phase6(
         ])
         tool_result = adapter.request(
             "local-video-bridge",
-            {"output_dir": str(output_dir), "chain_mode": chain_mode},
+            {
+                "output_dir": str(output_dir),
+                "chain_mode": chain_mode,
+                "media_profile": media_profile,
+            },
         )
         result = tool_result.data or {"status": "error", "error": tool_result.error}
         result["duration_s"] = _elapsed(start)

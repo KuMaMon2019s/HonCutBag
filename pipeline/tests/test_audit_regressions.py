@@ -1774,6 +1774,11 @@ def test_character_references_refresh_the_canonical_pxx_chain(tmp_path):
 def test_semantic_media_ratios_and_cli_resume_defaults(tmp_path):
     assert pipeline_core._project_video_spec("cinematic")["aspect_ratio"] == "21:9"
     assert pipeline_core._project_video_spec("480p")["aspect_ratio"] == "16:9"
+    parser = pipeline_runner_cli._build_parser()
+    fresh_args = parser.parse_args(["--input", "story.txt"])
+    assert pipeline_runner_cli._resolved_run_arguments(fresh_args)[
+        "media_profile"
+    ] == "480p"
     (tmp_path / "RUN_MANIFEST.json").write_text(
         json.dumps(
             {
@@ -1792,7 +1797,6 @@ def test_semantic_media_ratios_and_cli_resume_defaults(tmp_path):
         ),
         encoding="utf-8",
     )
-    parser = pipeline_runner_cli._build_parser()
     args = parser.parse_args(["--resume", "--output-dir", str(tmp_path)])
 
     assert args.text is None and args.input is None

@@ -206,13 +206,20 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
     return _phase4_orchestrator_owner.run_phase4(output_dir, dry_run)
 
 
-def run_phase6(storyboard_data: dict, output_dir: str | Path, dry_run: bool, chain_mode: bool = False) -> dict:
+def run_phase6(
+    storyboard_data: dict,
+    output_dir: str | Path,
+    dry_run: bool,
+    chain_mode: bool = False,
+    media_profile: str = "480p",
+) -> dict:
     _phase6_video_owner._run_phase6_fallback = _run_phase6_fallback
     return _phase6_video_owner.run_phase6(
         storyboard_data,
         output_dir,
         dry_run,
         chain_mode,
+        media_profile,
         _adapter_cls=_LocalVideoVendorAdapter,
         _quality_runner=run_quality_check,
     )
@@ -346,7 +353,7 @@ def run_pipeline(
     output_dir: str = ".",
     transition: str = "crossfade",
     transition_duration: float = 0.5,
-    media_profile: str = "1080p",
+    media_profile: str = "480p",
     enable_reshoot: bool = True,
     no_real_person: bool = False,
     resume: bool = False,

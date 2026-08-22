@@ -126,6 +126,8 @@ Phase 1 的骨架账本按 screenplay `sequence_id` 预先分配连续且互不�
 
 Phase 间调用原则上通过 Graph/Lifecycle。唯一允许的业务闭环是已建模且有限的修复路径，例如 Phase 8 调用注入的 Phase 6 生成 callable；该依赖必须可测试注入，并在所有递归轮次中保持一致。
 
+新运行的 canonical 媒体默认值是 `media_profile=480p`。Graph 与顺序执行器必须把该字段显式传给共同的 Phase 6 owner；Phase 6 再把它解析成 Agent Plan 顶层 `resolution`，同时写入 generation fingerprint 与 `GenerationTaskStore` payload。当前 Agent Plan 默认视频模型 ID 固定为精确字符串 `doubao-seedance-2-0-fast`，不得使用旧的点号别名；模型或分辨率变化必须形成不同任务身份，Fast/Mini 请求超出 480p/720p 时在提交前 fail closed。
+
 ## 4. State、身份与恢复
 
 ### 4.1 Canonical State

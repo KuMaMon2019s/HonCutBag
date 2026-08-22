@@ -232,7 +232,7 @@ def get_video_capabilities(
         os.environ.get("VIDEO_PROVIDER") or "seedance"
     ).lower()
     selected_model = explicit_model or str(
-        os.environ.get("SEEDANCE_MODEL") or "doubao-seedance-2.0-mini"
+        os.environ.get("SEEDANCE_MODEL") or "doubao-seedance-2-0-fast"
     ).lower()
     identity = f"{selected_provider} {selected_model}"
     if "seedance" in identity:

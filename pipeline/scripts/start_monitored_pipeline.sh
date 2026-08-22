@@ -11,7 +11,7 @@ fi
 INPUT="$1"
 DURATION="$2"
 OUTPUT_DIR="$3"
-MEDIA_PROFILE="${4:-720p}"
+MEDIA_PROFILE="${4:-480p}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PIPELINE_DIR="$(dirname "$SCRIPT_DIR")"
 CONFIG_FILE="$(mktemp "${TMPDIR:-/tmp}/honcut_config.XXXXXX.json")"

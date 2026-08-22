@@ -26,6 +26,38 @@ TASK_ENDPOINT = f"{TASKS_ENDPOINT}/{{task_id}}"
 # Compatibility names retained for existing submit/resume call sites.
 SUBMIT_ENDPOINT = TASKS_ENDPOINT
 POLL_ENDPOINT = TASK_ENDPOINT
+SEEDANCE_RESOLUTIONS = {"480p", "720p", "1080p", "4k"}
+SEEDANCE_FAST_RESOLUTIONS = {"480p", "720p"}
+
+
+def resolution_for_media_profile(media_profile: str, model: str) -> str:
+    """Map the project delivery profile to Seedance's named resolution field."""
+    from utils.media_profiles import project_video_spec
+
+    profile_name = str(media_profile or "").strip()
+    if profile_name in SEEDANCE_RESOLUTIONS:
+        resolution = profile_name
+    else:
+        spec = project_video_spec(profile_name)
+        short_edge = min(int(spec["width"]), int(spec["height"]))
+        resolution = {
+            480: "480p",
+            720: "720p",
+            1080: "1080p",
+            2160: "4k",
+        }.get(short_edge, "")
+    if not resolution:
+        raise ValueError(
+            f"media profile {profile_name!r} has no exact Seedance resolution"
+        )
+    normalized_model = str(model or "").strip().lower()
+    if any(tier in normalized_model for tier in ("-fast", "-mini")):
+        if resolution not in SEEDANCE_FAST_RESOLUTIONS:
+            raise ValueError(
+                f"Seedance Fast/Mini does not support resolution={resolution}; "
+                "expected 480p or 720p"
+            )
+    return resolution
 
 
 def _authorization_headers(api_key: str) -> dict[str, str]:
@@ -126,6 +158,7 @@ def _submit_direct(
     model: str = None,
     duration: int = 7,
     ratio: str = "16:9",
+    resolution: str = "480p",
     first_frame_base64: Optional[str] = None,
     reference_image_base64: Optional[str] = None,
     generate_audio: Optional[str] = None,  # P0-D: Agent Plan 不支持此参数，仅按量计费可用
@@ -139,7 +172,8 @@ def _submit_direct(
             from utils.config import SEEDANCE_MODEL
             model = SEEDANCE_MODEL
         except ImportError:
-            model = "doubao-seedance-2.0-mini"
+            model = "doubao-seedance-2-0-fast"
+    resolution = resolution_for_media_profile(resolution, model)
     
     # Sanitize prompt to remove IP risks
     sanitized_prompt, filtered_terms = sanitize_prompt(prompt)
@@ -217,6 +251,7 @@ def _submit_direct(
         **({"generate_audio": generate_audio} if generate_audio is not None else {}),
         "ratio": ratio,
         "duration": duration,
+        "resolution": resolution,
         "watermark": False,  # MUST be included at top level
     }
     # P1-C: Seed Locking（Agent Plan API 参数必须在顶层）
@@ -236,11 +271,13 @@ def submit_content(
     model: str,
     duration: int,
     ratio: str = "16:9",
+    resolution: str = "480p",
     seed: int = None,
     generate_audio: Optional[str] = None,
     timeout: float = 30,
 ) -> str:
     """Submit a preassembled ARK Agent Plan content array. Returns task_id."""
+    resolution = resolution_for_media_profile(resolution, model)
     _validate_content_media_roles(content)
     prompt = "\n".join(
         str(item.get("text") or "")
@@ -260,6 +297,7 @@ def submit_content(
         **({"generate_audio": generate_audio} if generate_audio is not None else {}),
         "ratio": ratio,
         "duration": duration,
+        "resolution": resolution,
         "watermark": False,
     }
     if seed is not None:
@@ -315,6 +353,7 @@ def submit_video_extension(
     model: str,
     duration: int,
     ratio: str = "16:9",
+    resolution: str = "480p",
     reference_image_urls: list[str] | None = None,
     seed: int | None = None,
     generate_audio: str | None = None,
@@ -336,6 +375,7 @@ def submit_video_extension(
         model=model,
         duration=duration,
         ratio=ratio,
+        resolution=resolution,
         seed=seed,
         generate_audio=generate_audio,
     )
@@ -347,6 +387,7 @@ def submit(
     model: str = None,
     duration: int = 7,
     ratio: str = "16:9",
+    resolution: str = "480p",
     first_frame_base64: Optional[str] = None,
     reference_image_base64: Optional[str] = None,
     generate_audio: Optional[str] = None,
@@ -361,6 +402,7 @@ def submit(
         model=model,
         duration=duration,
         ratio=ratio,
+        resolution=resolution,
         first_frame_base64=first_frame_base64,
         reference_image_base64=reference_image_base64,
         generate_audio=generate_audio,

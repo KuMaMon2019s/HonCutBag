@@ -182,7 +182,13 @@ def _finish_phase8(
     storyboard_path = output_dir / "STORYBOARD.json"
     try:
         storyboard = json.loads(storyboard_path.read_text(encoding="utf-8"))
-        generation = run_phase6(storyboard, output_dir, dry_run=False, chain_mode=chain_mode)
+        generation = run_phase6(
+            storyboard,
+            output_dir,
+            dry_run=False,
+            chain_mode=chain_mode,
+            media_profile=media_profile,
+        )
     except Exception as exc:
         transaction.rollback(str(exc))
         print(f"  ⚠⚠ [8.3] 补录调用 Phase 6 失败: {exc}；阻止交付", flush=True)
@@ -370,6 +376,7 @@ def run_phase8(output_dir: Path, dry_run: bool,
                 output_dir,
                 dry_run=False,
                 chain_mode=chain_mode,
+                media_profile=media_profile,
             )
         except Exception as exc:
             return {
@@ -522,7 +529,11 @@ def run_phase8(output_dir: Path, dry_run: bool,
         try:
             storyboard = json.loads(storyboard_path.read_text(encoding="utf-8"))
             generation = run_phase6(
-                storyboard, output_dir, dry_run=False, chain_mode=chain_mode
+                storyboard,
+                output_dir,
+                dry_run=False,
+                chain_mode=chain_mode,
+                media_profile=media_profile,
             )
         except Exception as exc:
             transaction.rollback(str(exc))

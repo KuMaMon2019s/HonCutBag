@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -1565,6 +1566,8 @@ def _render_privacy_safe_handle_bridge(
 def _direct_seedance_executor(
     output_dir: Path,
     task_store: GenerationTaskStore,
+    *,
+    media_profile: str = "480p",
 ) -> Callable[[ChunkExecutionRequest], ChunkExecutionResult]:
     from clients import seedance_client
     from utils.config import SEEDANCE_MODEL, get_api_key_or_raise
@@ -1572,6 +1575,7 @@ def _direct_seedance_executor(
 
     api_key = get_api_key_or_raise("ARK_AGENT")
     model = SEEDANCE_MODEL
+    resolution = seedance_client.resolution_for_media_profile(media_profile, model)
     provider_policy = ProviderExecutionPolicy.from_environment("seedance")
     artifact_store = ArtifactManifestStore.from_run_directory(
         output_dir,
@@ -1599,7 +1603,7 @@ def _direct_seedance_executor(
             run_id=run_id,
             duration=duration,
             seed=seed,
-            generation_parameters={"ratio": ratio},
+            generation_parameters={"ratio": ratio, "resolution": resolution},
         )
         repairs: list[dict[str, Any]] = []
         privacy_repairs: list[dict[str, Any]] = []
@@ -1696,6 +1700,7 @@ def _direct_seedance_executor(
                                     model=model,
                                     duration=duration,
                                     ratio=ratio,
+                                    resolution=resolution,
                                     seed=current_seed,
                                     timeout=(
                                         provider_policy.submit_timeout_seconds
@@ -2384,6 +2389,7 @@ def execute_phase6_auto_continuity(
     plan: ContinuityPlan,
     calibration: SeamCalibration | None,
     *,
+    media_profile: str = "480p",
     _test_executor_factory: Callable[
         [Path, GenerationTaskStore],
         Callable[[ChunkExecutionRequest], ChunkExecutionResult],
@@ -2396,12 +2402,24 @@ def execute_phase6_auto_continuity(
     if test_only:
         provider = "offline_fixture"
         executor_factory = _test_executor_factory
+        executor_factory_kwargs: dict[str, Any] = {}
     else:
         provider = os.environ.get("VIDEO_PROVIDER", "seedance").strip().lower()
         if provider == "seedance":
             executor_factory = _direct_seedance_executor
+            parameters = inspect.signature(executor_factory).parameters
+            executor_factory_kwargs = (
+                {"media_profile": media_profile}
+                if "media_profile" in parameters
+                or any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters.values()
+                )
+                else {}
+            )
         elif provider == "bridge":
             executor_factory = _bridge_seedance_executor
+            executor_factory_kwargs = {}
         else:
             raise RuntimeError(
                 "continuity auto requires VIDEO_PROVIDER=seedance or bridge; "
@@ -2456,7 +2474,7 @@ def execute_phase6_auto_continuity(
             + ", ".join(missing_replay_overlap[:6])
         )
     task_store = GenerationTaskStore(root / "runtime.db")
-    execute_chunk = executor_factory(root, task_store)
+    execute_chunk = executor_factory(root, task_store, **executor_factory_kwargs)
 
     max_repairs = int(os.environ.get("HONCUT_CONTINUITY_MAX_REPAIRS", "1"))
     if not 0 <= max_repairs <= 3:

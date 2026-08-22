@@ -29,6 +29,7 @@ from clients.seedream_client import SeedreamClient
 from phases import pipeline_core
 from phases.phase4 import phase4_orchestrator
 from phases.phase5.storyboard_qa_gate import _calibrate_l3_severity
+from graph.nodes.phase6 import phase6_txt2vid_node
 from phases.phase8.edit_decisions import _build_timeline, build_edit_decisions
 from phases.phase8.reshoot_transaction import ReshootTransaction, durable_attempt_count
 from phases.phase8.story_order_reviewer import _shot_id, storyboard_shot_ids
@@ -49,6 +50,7 @@ from runtime.seedance_execution import (
 )
 from tools import asset_packager
 from utils import shot_embedder
+from utils.config import Models, SEEDANCE_MODEL
 from vendor.video_tools.tools.video.remotion_caption_burn import RemotionCaptionBurn
 
 _runner_spec = importlib.util.spec_from_file_location(
@@ -735,6 +737,7 @@ def test_submit_content_sends_top_level_agent_plan_payload(monkeypatch):
         api_key="test-key",
         model="doubao-seedance-2.0-mini",
         duration=12,
+        resolution="480p",
         seed=42,
         generate_audio="enabled",
     )
@@ -747,11 +750,47 @@ def test_submit_content_sends_top_level_agent_plan_payload(monkeypatch):
         "generate_audio": "enabled",
         "ratio": "16:9",
         "duration": 12,
+        "resolution": "480p",
         "watermark": False,
         "seed": 42,
     }
     assert posted["json"]["content"] is content
     assert "parameters" not in posted["json"]
+
+
+def test_agent_plan_default_model_id_is_the_exact_seedance_fast_id():
+    assert Models.ARK_VIDEO == "doubao-seedance-2-0-fast"
+    assert SEEDANCE_MODEL == "doubao-seedance-2-0-fast"
+
+
+def test_seedance_fast_rejects_unsupported_media_profile_before_submission():
+    with pytest.raises(ValueError, match="expected 480p or 720p"):
+        seedance_client.resolution_for_media_profile(
+            "1080p",
+            "doubao-seedance-2-0-fast",
+        )
+
+
+def test_phase6_graph_node_forwards_media_profile_to_phase_owner(tmp_path):
+    calls = []
+    state = {
+        "output_dir": str(tmp_path),
+        "dry_run": True,
+        "chain_mode": False,
+        "media_profile": "480p",
+        "storyboard": {"shots": []},
+        "phase_results": {},
+        "completed_phases": [],
+        "retry_count": 0,
+        "skip_phase": [],
+    }
+
+    phase6_txt2vid_node(
+        state,
+        runner=lambda **kwargs: calls.append(kwargs) or {"status": "done"},
+    )
+
+    assert calls[0]["media_profile"] == "480p"
 
 
 def test_submit_content_rejects_frame_control_mixed_with_reference_media(monkeypatch):
@@ -873,6 +912,8 @@ def test_direct_providers_bypass_bridge(tmp_path, monkeypatch, provider):
     assert result["status"] == "done"
     assert len(direct_calls) == 1
     assert direct_calls[0][1]["duration"] == 12
+    assert direct_calls[0][1]["model"] == "doubao-seedance-2-0-fast"
+    assert direct_calls[0][1]["resolution"] == "480p"
     assert (shot_dir / "output.mp4").exists()
 
 

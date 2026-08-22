@@ -20,6 +20,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_BRIDGE_API_URL = "http://127.0.0.1:9100"
 VIDEO_ROUTE_VALUES = {"bridge", "direct", "local"}
+DEFAULT_SEEDANCE_MODEL_ID = "doubao-seedance-2-0-fast"
 _PROVIDER_DEFAULT_VIDEO_ROUTES = {
     "BRIDGE": "bridge",
     "LOCAL": "local",
@@ -109,11 +110,25 @@ def configure_ark_agent_environment(env_file: Path = ENV_FILE) -> str:
     return source
 
 
+def configure_seedance_model_environment(env_file: Path = ENV_FILE) -> str:
+    """Prefer the repository model ID over a stale launcher environment."""
+    project_values = dotenv_values(env_file) if env_file.is_file() else {}
+    project_model = project_values.get("SEEDANCE_MODEL")
+    if isinstance(project_model, str) and project_model.strip():
+        os.environ["SEEDANCE_MODEL"] = project_model.strip()
+        return "project_env"
+    if os.environ.get("SEEDANCE_MODEL"):
+        return "process_env"
+    os.environ["SEEDANCE_MODEL"] = DEFAULT_SEEDANCE_MODEL_ID
+    return "default"
+
+
 # Load before pipeline_runner starts child processes so they inherit the same
 # repository-level configuration.  Other explicitly exported variables retain
 # priority; the Ark credential follows the narrower policy above.
 load_dotenv(ENV_FILE, override=False)
 ARK_AGENT_CREDENTIAL_SOURCE = configure_ark_agent_environment()
+SEEDANCE_MODEL_SOURCE = configure_seedance_model_environment()
 
 # 火山系服务（ARK/TOS/TTS/ASR）是国内服务，走本地代理会多一跳且不稳：
 # 2026-08-09 R5/R7 实测 http_proxy=127.0.0.1:7897 时事件提取 8/19 段超时、
@@ -267,7 +282,7 @@ class Models:
     ARK_IMAGE: str = "doubao-seedream-5.0-lite"
     
     # 火山方舟 - 视频生成
-    ARK_VIDEO: str = "doubao-seedance-2.0-mini"
+    ARK_VIDEO: str = DEFAULT_SEEDANCE_MODEL_ID
     
     # 火山方舟 - 语音合成 (TTS 2.0)
     ARK_TTS: str = "seed-tts-2.0"
@@ -480,8 +495,9 @@ AUDIO_CONFIG = {
 }
 
 # Seedance 模型 ID（Agent Plan 支持的模型）
-# 可选: doubao-seedance-2.0, doubao-seedance-2.0-fast, doubao-seedance-2.0-mini
-SEEDANCE_MODEL = os.environ.get("SEEDANCE_MODEL", "doubao-seedance-2.0-mini")
+# Agent Plan 模型 ID 使用连字符，不是旧的点号别名。
+# 可选: doubao-seedance-2-0, doubao-seedance-2-0-fast, doubao-seedance-2-0-mini
+SEEDANCE_MODEL = os.environ.get("SEEDANCE_MODEL", DEFAULT_SEEDANCE_MODEL_ID)
 
 # Video provider comparison matrix (from ai-video-gen skill)
 VIDEO_PROVIDER_MATRIX = {

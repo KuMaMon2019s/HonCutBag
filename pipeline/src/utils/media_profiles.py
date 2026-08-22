@@ -13,6 +13,9 @@ from enum import Enum
 from typing import Any, Optional
 
 
+DEFAULT_MEDIA_PROFILE = "480p"
+
+
 class AspectRatio(str, Enum):
     LANDSCAPE_16_9 = "16:9"
     PORTRAIT_9_16 = "9:16"

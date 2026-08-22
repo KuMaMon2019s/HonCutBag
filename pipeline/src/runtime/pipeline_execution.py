@@ -38,7 +38,11 @@ from runtime.pipeline_checkpoints import (
 )
 from runtime.pipeline_reports import _write_report
 from tools.checkpoint import invalidate_checkpoint_from as invalidate_stage_checkpoint
-from utils.media_profiles import _get_profile_dict, _project_video_spec
+from utils.media_profiles import (
+    DEFAULT_MEDIA_PROFILE,
+    _get_profile_dict,
+    _project_video_spec,
+)
 from utils.progress_reporter import ProgressReporter
 from utils.source_paths import PROJECT_ROOT
 from utils.timing_estimator import estimate_total
@@ -55,7 +59,7 @@ def run_pipeline(
     output_dir: str = ".",
     transition: str = "crossfade",
     transition_duration: float = 0.5,
-    media_profile: str = "1080p",
+    media_profile: str = DEFAULT_MEDIA_PROFILE,
     enable_reshoot: bool = True,
     no_real_person: bool = False,
     resume: bool = False,
@@ -108,7 +112,7 @@ def _run_pipeline(
     output_dir: str = ".",
     transition: str = "crossfade",
     transition_duration: float = 0.5,
-    media_profile: str = "1080p",
+    media_profile: str = DEFAULT_MEDIA_PROFILE,
     enable_reshoot: bool = True,
     no_real_person: bool = False,
     resume: bool = False,
@@ -134,7 +138,7 @@ def _run_pipeline(
         project_id: 项目隔离标识；默认 `local`
         transition: Phase 8 转场模式 ("crossfade" | "fade" | "cut")
         transition_duration: Phase 8 转场时长（秒），默认 0.5
-        media_profile: 编码配置名称，从 MEDIA_PROFILES 中选择（默认 "1080p"）
+        media_profile: 编码配置名称，从 MEDIA_PROFILES 中选择（默认 "480p"）
         enable_reshoot: 视觉缺陷或时长不足时是否允许调用 Phase 6 补录（默认 True，最多两轮）
         no_real_person: 将所有角色锁定为带多样化可见妆造锚点的虚构 CGI 设计
         resume: 从检查点恢复，跳过已完成的 Phase
@@ -224,7 +228,7 @@ def _run_pipeline(
             "video_generation_mode": effective_video_route,
             "video_model": os.environ.get(
                 "SEEDANCE_MODEL",
-                os.environ.get("VIDEO_MODEL", "doubao-seedance-2.0-mini"),
+                os.environ.get("VIDEO_MODEL", "doubao-seedance-2-0-fast"),
             ),
             "project_video_spec": project_video_spec,
         },
@@ -792,7 +796,13 @@ def _run_pipeline(
     elif storyboard_data is None:
         report["phases"]["phase6"] = {"status": "skipped", "reason": "no storyboard data"}
     else:
-        p5 = run_phase6(storyboard_data, output_dir, dry_run, chain_mode=chain_mode)
+        p5 = run_phase6(
+            storyboard_data,
+            output_dir,
+            dry_run,
+            chain_mode=chain_mode,
+            media_profile=media_profile,
+        )
         report["phases"]["phase6"] = p5
         if p5["status"] == "error":
             report["status"] = "failed"

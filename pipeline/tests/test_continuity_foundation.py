@@ -3343,7 +3343,8 @@ def test_direct_continuity_adapter_reuses_succeeded_paid_task(monkeypatch, tmp_p
     monkeypatch.setattr(
         seedance_client,
         "submit_content",
-        lambda content, **kwargs: submissions.append(content) or "seedance-job-1",
+        lambda content, **kwargs: submissions.append((content, kwargs))
+        or "seedance-job-1",
     )
     monkeypatch.setattr(
         seedance_client,
@@ -3368,6 +3369,8 @@ def test_direct_continuity_adapter_reuses_succeeded_paid_task(monkeypatch, tmp_p
     assert first.provider_task_id == "seedance-job-1"
     assert recovered.provider_task_id == "seedance-job-1"
     assert len(submissions) == 1
+    assert submissions[0][1]["model"] == "doubao-seedance-2-0-fast"
+    assert submissions[0][1]["resolution"] == "480p"
 
 
 def test_direct_continuity_adapter_drops_provider_rejected_privacy_images_once(

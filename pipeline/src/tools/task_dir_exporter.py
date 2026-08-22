@@ -199,8 +199,8 @@ def build_task_dir(output_dir, shot_ids: Sequence[str], meta: Mapping) -> Path:
         "task_id": task_id,
         "created_at": now.isoformat(timespec="seconds"),
         "shots": shot_ids,
-        "model": meta.get("model", "doubao-seedance-2.0-mini"),
-        "resolution": meta.get("resolution", "720p"),
+        "model": meta.get("model", "doubao-seedance-2-0-fast"),
+        "resolution": meta.get("resolution", "480p"),
         "chain_mode": bool(meta.get("chain_mode", False)),
         "tos_prefix": f"tasks/{task_id}",
     }

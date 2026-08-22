@@ -20,7 +20,7 @@ check_dependencies()
 
 from phases.phase1.adaptation_engine import AVG_SHOT_DURATION
 from runtime import pipeline_execution as _core
-from utils.media_profiles import AVAILABLE_PROFILES
+from utils.media_profiles import AVAILABLE_PROFILES, DEFAULT_MEDIA_PROFILE
 from utils.pipeline_config import DEFAULT_CONFIG, load_config
 from utils.run_memory import RunMemory
 
@@ -170,7 +170,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.set_defaults(no_real_person=None)
     parser.add_argument(
-        "--media-profile", choices=AVAILABLE_PROFILES, default=None, help="编码配置（默认 1080p）"
+        "--media-profile",
+        choices=AVAILABLE_PROFILES,
+        default=None,
+        help=f"编码配置（默认 {DEFAULT_MEDIA_PROFILE}）",
     )
     parser.add_argument("--resume", action="store_true", help="从检查点恢复")
     parser.add_argument(
@@ -248,7 +251,7 @@ def _resolved_run_arguments(args: argparse.Namespace) -> dict:
         "dry_run": choose("dry_run", False),
         "transition": choose("transition", "crossfade"),
         "transition_duration": choose("transition_duration", 0.5),
-        "media_profile": choose("media_profile", "1080p"),
+        "media_profile": choose("media_profile", DEFAULT_MEDIA_PROFILE),
         "enable_reshoot": choose("enable_reshoot", True),
         "no_real_person": choose("no_real_person", False),
     }

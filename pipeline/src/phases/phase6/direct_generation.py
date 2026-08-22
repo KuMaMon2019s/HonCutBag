@@ -27,7 +27,7 @@ from runtime.security_boundaries import safe_error_message
 from tools.base_tool import BaseTool, ToolResult, ToolRuntime
 from tools.vendor_adapter import VendorAdapter, VendorModel
 from utils.character_body_contracts import character_visual_description
-from utils.config import get_api_key
+from utils.config import DEFAULT_SEEDANCE_MODEL_ID, get_api_key
 from utils.file_integrity import _file_sha256
 from utils.timing_estimator import estimate_phase_duration
 
@@ -393,7 +393,11 @@ def _generation_input_fingerprint(
     ).value
 
 
-def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
+def _run_phase6_fallback(
+    output_dir: Path,
+    chain_mode: bool = False,
+    media_profile: str = "480p",
+) -> dict:
     """Generate Phase 6 video through direct ARK or the explicit local Bridge."""
     output_dir = Path(output_dir)
 
@@ -565,8 +569,14 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
         route_model_name = SEEDANCE_MODEL
     except ImportError:
         route_model_name = os.environ.get(
-            "SEEDANCE_MODEL", "doubao-seedance-2.0-mini"
+            "SEEDANCE_MODEL", DEFAULT_SEEDANCE_MODEL_ID
         )
+    from clients.seedance_client import resolution_for_media_profile
+
+    provider_resolution = resolution_for_media_profile(
+        media_profile,
+        route_model_name,
+    )
     video_prompt_model = os.environ.get("VIDEO_MODEL", "seedance")
 
     task_dir_id = None
@@ -600,8 +610,8 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
             {
                 "shots": export_shots,
                 "chain_mode": chain_mode,
-                "model": os.environ.get("SEEDANCE_MODEL", "doubao-seedance-2.0-mini"),
-                "resolution": "720p",
+                "model": route_model_name,
+                "resolution": provider_resolution,
             },
         )
         task_dir_id = task_dir_exporter.upload_task_dir(local_task_dir, "tasks")
@@ -981,7 +991,7 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                     direct_model = SEEDANCE_MODEL
                 except ImportError:
                     direct_model = os.environ.get(
-                        "SEEDANCE_MODEL", "doubao-seedance-2.0-mini"
+                        "SEEDANCE_MODEL", DEFAULT_SEEDANCE_MODEL_ID
                     )
                 from functools import partial
 
@@ -1007,6 +1017,7 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                         "duration": duration or 12,
                         "seed": shot_seed,
                         "ratio": aspect_ratio,
+                        "resolution": provider_resolution,
                         "width": video_width,
                         "height": video_height,
                     },
@@ -1027,6 +1038,7 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                         "duration": duration or 12,
                         "seed": shot_seed,
                         "ratio": aspect_ratio,
+                        "resolution": provider_resolution,
                         "width": video_width,
                         "height": video_height,
                         **generation_fingerprint.task_metadata(),
@@ -1043,6 +1055,7 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                             model=direct_model,
                             duration=duration or 12,
                             ratio=aspect_ratio,
+                            resolution=provider_resolution,
                             seed=shot_seed,
                             timeout=provider_policy.submit_timeout_seconds,
                         ),
@@ -1100,6 +1113,7 @@ def _run_phase6_fallback(output_dir: Path, chain_mode: bool = False) -> dict:
                     "actual_model": direct_model,
                     "actual_duration": actual_duration,
                     "ratio": aspect_ratio,
+                    "resolution": provider_resolution,
                     "width": video_width,
                     "height": video_height,
                 })

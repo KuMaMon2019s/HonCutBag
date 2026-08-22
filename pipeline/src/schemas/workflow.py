@@ -99,7 +99,7 @@ class GraphRunConfig(BaseModel):
         ge=0,
         validation_alias=AliasChoices("transition_duration_s", "transition_duration"),
     )
-    media_profile: str = Field(default="1080p", min_length=1)
+    media_profile: str = Field(default="480p", min_length=1)
     project_video_spec: dict[str, Any] = Field(default_factory=dict)
     enable_reshoot: bool = True
     resume: bool = False

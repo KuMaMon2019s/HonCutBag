@@ -415,7 +415,7 @@ def run_phase(phase: str, config: dict) -> dict:
         "--phase",
         phase,
         "--media-profile",
-        config.get("media_profile", "720p"),
+        config.get("media_profile", "480p"),
         "--transition-duration",
         str(config.get("transition_duration", 0.5)),
     ]

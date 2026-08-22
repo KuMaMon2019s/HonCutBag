@@ -45,6 +45,20 @@ def test_exported_agent_key_is_kept_when_project_env_has_no_agent_key(
     assert "ARK_API_KEY" not in config.os.environ
 
 
+def test_project_seedance_model_overrides_stale_launcher_model(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "SEEDANCE_MODEL=doubao-seedance-2-0-fast\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SEEDANCE_MODEL", "doubao-seedance-2.0-fast")
+
+    source = config.configure_seedance_model_environment(env_file)
+
+    assert source == "project_env"
+    assert config.os.environ["SEEDANCE_MODEL"] == "doubao-seedance-2-0-fast"
+
+
 def test_bridge_seedance_credentials_never_fall_back_to_ark_api_key(monkeypatch):
     monkeypatch.delenv("ARK_AGENT_API_KEY", raising=False)
     monkeypatch.setenv("ARK_API_KEY", "coding-key-must-not-be-used")
