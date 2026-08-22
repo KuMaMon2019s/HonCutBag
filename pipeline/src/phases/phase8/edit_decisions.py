@@ -599,11 +599,10 @@ def build_edit_decisions(
                 )
             transitions.append(transition_entry)
 
-    # Quality review removes obvious dead edges first.  Then use one bounded
-    # pacing factor across primary clips and bridges so every authored frame is
-    # retained and the editor never solves a material surplus by chopping off
-    # the end of the film.  Because primary material is capped at 1.3x, the
-    # required acceleration is likewise bounded by that declared ratio.
+    # Quality review removes obvious dead edges first. Then use one bounded
+    # pacing factor across primary clips and bridges so every reviewed frame is
+    # retained. Pacing has its own explicit safety range and is not derived
+    # from provider-cost overhead or the historical 1.3 material reference.
     pacing_normalization = None
     if target_duration and cuts:
         source_duration = sum(cut["out_seconds"] - cut["in_seconds"] for cut in cuts)
@@ -612,14 +611,27 @@ def build_edit_decisions(
         )
         projected = source_duration - overlap
         speed = source_duration / (float(target_duration) + overlap)
-        ratio_limit = float(
-            ((continuity_plan or {}).get("material_budget") or {}).get(
-                "pre_edit_duration_ratio_limit",
-                1.3,
-            )
+        material_budget = (
+            ((continuity_plan or {}).get("material_budget") or {})
+            if isinstance(continuity_plan, dict)
+            else {}
         )
+        pacing_range = material_budget.get("delivery_pacing_speed_range")
+        if (
+            isinstance(pacing_range, list)
+            and len(pacing_range) == 2
+            and all(
+                isinstance(value, (int, float)) and not isinstance(value, bool)
+                for value in pacing_range
+            )
+            and 0 < float(pacing_range[0]) <= float(pacing_range[1])
+        ):
+            pacing_minimum = float(pacing_range[0])
+            pacing_maximum = float(pacing_range[1])
+        else:
+            pacing_minimum, pacing_maximum = 0.85, 1.25
         if abs(projected - float(target_duration)) > (1 / 30):
-            if 0.85 <= speed <= ratio_limit + 1e-6:
+            if pacing_minimum <= speed <= pacing_maximum + 1e-6:
                 for cut in cuts:
                     cut["speed"] = round(speed, 6)
                 pacing_normalization = {
@@ -629,15 +641,15 @@ def build_edit_decisions(
                     "projected_before_s": round(projected, 6),
                     "target_duration_s": float(target_duration),
                     "speed": round(speed, 6),
-                    "minimum_speed": 0.85,
-                    "maximum_speed": ratio_limit,
+                    "minimum_speed": pacing_minimum,
+                    "maximum_speed": pacing_maximum,
                     "preserves_all_reviewed_frames": True,
                 }
             elif projected > float(target_duration):
                 raise RuntimeError(
                     "reviewed timeline cannot reach delivery duration without unsafe "
                     f"tail deletion: requires {speed:g}x pacing outside the "
-                    f"0.85-{ratio_limit:g}x budget"
+                    f"{pacing_minimum:g}-{pacing_maximum:g}x budget"
                 )
 
     timeline = _build_timeline(cuts, transitions, target_fps=30)

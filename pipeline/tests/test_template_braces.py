@@ -17,6 +17,7 @@ def test_user_prompt_template_formats_literal_dialogue_json():
         target_duration=60,
         shot_duration=12,
         max_shots=5,
+        max_generation_action_units_per_shot=4,
         events_json="[]",
         characters_summary="test",
     )

@@ -21,6 +21,7 @@ def _beat(i):
     return {
         "beat_order": i,
         "source_events": [i],
+        "dropped_source_events": [],
         "action": "keep",
         "reason": "保留因果",
         "who": ["凛"],
@@ -245,7 +246,7 @@ def test_stage1_uses_timeout_retry_wrapper(monkeypatch):
     assert calls == [8000]
 
 
-def test_action_dense_script_fails_when_full_detail_cannot_fit_target_runtime():
+def test_action_dense_script_reports_compression_without_expanding_target_runtime():
     action_events = [
             {
                 "event_role": "action_chain",
@@ -264,8 +265,12 @@ def test_action_dense_script_fails_when_full_detail_cannot_fit_target_runtime():
         {"event_role": "scene_setup"},
     ]
 
-    with pytest.raises(ValueError, match="cannot carry the authored action detail"):
-        engine.estimate_action_aware_shot_count(events, 60, 10)
+    plan = engine._estimate_action_capacity_plan(events, 60, 10)
+
+    assert plan["material_duration"] == 60
+    assert plan["primary_shots"] == 4
+    assert plan["minimum_material_duration"] == 320
+    assert plan["action_capacity_status"] == "screenplay_compression_required"
 
 
 def test_event_semantics_bounds_generation_actions_but_keeps_full_ledger():

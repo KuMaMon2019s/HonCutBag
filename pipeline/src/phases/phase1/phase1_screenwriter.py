@@ -660,8 +660,10 @@ def run_phase1_screenwriter(
         )
         if adapted.get("capacity_plan"):
             storyboard["capacity_plan"] = adapted["capacity_plan"]
-            storyboard["pre_edit_duration_ratio_limit"] = adapted["capacity_plan"].get(
-                "pre_edit_duration_ratio_limit"
+            storyboard["generated_duration_ratio_reference"] = adapted[
+                "capacity_plan"
+            ].get(
+                "generated_duration_ratio_reference"
             )
         if continuity_mode:
             storyboard["continuity_mode"] = continuity_mode
@@ -670,8 +672,8 @@ def run_phase1_screenwriter(
         plan_storyboard_beats(storyboard)
         material_budget = storyboard.get("material_budget") or {}
         print(
-            "  ✓ 素材双账本: 主素材 "
-            f"{float(material_budget.get('primary_material_duration_s') or 0):g}s "
+            "  ✓ 素材双账本: 故事时钟 "
+            f"{float(material_budget.get('story_clock_duration_s') or 0):g}s "
             "+ 桥接生成 "
             f"{float(material_budget.get('bridge_generation_duration_s') or 0):g}s "
             "= 总生成 "

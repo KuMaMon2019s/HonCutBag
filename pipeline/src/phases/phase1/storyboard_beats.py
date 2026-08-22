@@ -977,6 +977,9 @@ def plan_storyboard_beats(
                 "target_shot_id": next_sid,
                 "duration_s": requirement["bridge_duration"],
                 "generation_duration_s": requirement["bridge_duration"],
+                "generation_duration_range_s": list(
+                    bridge_planning_duration_bounds(requirement["profile"])
+                ),
                 "visible_duration_s": requirement["bridge_duration"],
                 "source_handle_s": source_handle,
                 "target_handle_s": target_handle,

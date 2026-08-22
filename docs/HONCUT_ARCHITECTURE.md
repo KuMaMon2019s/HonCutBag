@@ -116,6 +116,10 @@ Graph node 必须只完成三件事：读取 State、调用一个窄 owner、返
 | 9 | ASR、音频/TTS/ducking、字幕、视觉后期、节奏编辑和最终编码 | 最终时长/编码失败即停止；可选 QA 必须在 receipt 中明确标记 |
 | 9.5 | 成片交付 QA | 不通过则顶层 run failed，不交付伪成功 |
 
+Phase 1 的时长合同采用双账本：一级 `Sxx` 与其二级 `Pxx` 共用同一个故事时钟，二者不得相加，且新规划的故事时钟不得超过交付时长；跨一级镜头的 bridge 是独立 Provider 生成开销，只加入生成账本。`honcut.material-budget.v2` 必须同时记录故事时钟、Pxx 分区校验、bridge 实际/规划时长区间、总生成时长及其实际/区间比率。历史 `1.3` 只可作为成本参考值，不是容量硬上限；Phase 8 的安全变速区间是独立编辑合同，不得从生成开销比率反推。
+
+当完整事件账本超过交付故事时钟的可执行容量时，Phase 1 只能通过 `dropped_source_events` 显式记录被删减的非关键事件；这些事件不得进入 `source_events`、Pxx、Prompt 或媒体生成。`scene_setup`、`turning_point`、`dramatic_turn` 与 `consequence` 必须保留。Phase 5 必须 fail closed 校验故事时钟上限、Sxx/Pxx 等时、bridge 区间/把手以及持久化 material ledger；未知或旧 material-budget schema 不得解释为成功。
+
 Phase 间调用原则上通过 Graph/Lifecycle。唯一允许的业务闭环是已建模且有限的修复路径，例如 Phase 8 调用注入的 Phase 6 生成 callable；该依赖必须可测试注入，并在所有递归轮次中保持一致。
 
 ## 4. State、身份与恢复

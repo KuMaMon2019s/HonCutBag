@@ -5758,10 +5758,10 @@ def test_phase8_bridge_handles_and_bounded_pacing_hit_delivery_without_tail_loss
         "continuity_mode": "one_take",
         "video_provider": "seedance",
         "delivery_target_duration": 50,
-        "pre_edit_duration_ratio_limit": 1.3,
+        "generated_duration_ratio_reference": 1.3,
         "shots": [
-            {"id": "S01", "duration": 30, "micro_actions": ["前进"]},
-            {"id": "S02", "duration": 30, "micro_actions": ["继续前进"]},
+            {"id": "S01", "duration": 25, "micro_actions": ["前进"]},
+            {"id": "S02", "duration": 25, "micro_actions": ["继续前进"]},
         ],
     }
     plan_storyboard_beats(storyboard)
@@ -5793,6 +5793,7 @@ def test_phase8_bridge_handles_and_bounded_pacing_hit_delivery_without_tail_loss
     )
     normalization = decisions["metadata"]["pacing_normalization"]
     assert normalization["method"] == "bounded_all_frame_pacing_normalization"
+    assert normalization["maximum_speed"] == pytest.approx(1.25)
     assert normalization["speed"] == 1.2
     assert normalization["preserves_all_reviewed_frames"] is True
     # With 4s bridges and 2s handles the 30+30s material closes the 50s frame

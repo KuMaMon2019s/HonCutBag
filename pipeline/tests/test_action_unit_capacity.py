@@ -277,8 +277,10 @@ def test_flashmob_60s_script_passes_capacity_gate():
     assert plan["generation_action_units"] == 22
     assert plan["primary_shots"] == 4
     assert plan["minimum_material_duration"] == 75
-    assert plan["material_duration"] == 78
-    assert plan["maximum_material_duration"] == 78
+    assert plan["material_duration"] == 60
+    assert plan["storyboard_duration_limit"] == 60
+    assert plan["action_capacity_status"] == "screenplay_compression_required"
+    assert plan["generated_duration_ratio_reference"] == 1.3
     shots = engine.estimate_action_aware_shot_count(events, 60, 12)
     assert shots == 4
 
@@ -296,29 +298,108 @@ def test_evolving_model_flashmob_artifact_has_stable_capacity():
     assert plan["generation_action_units"] == 22
     assert plan["primary_shots"] == 4
     assert plan["minimum_material_duration"] == 75
-    assert plan["material_duration"] == 78
-    assert plan["maximum_material_duration"] == 78
+    assert plan["material_duration"] == 60
+    assert plan["storyboard_duration_limit"] == 60
+    assert plan["action_capacity_status"] == "screenplay_compression_required"
 
 
-def test_sequence_fragmentation_is_rejected_before_skeleton_llm():
+def test_sequence_fragmentation_is_reported_without_expanding_story_clock():
     events = _load_capacity_fixture(FIXTURE, LEGACY_COMPOSITE_EVENTS)
 
-    with pytest.raises(
-        ValueError,
-        match=r"sequence-isolated primary shots.*packing: SEQ001=1u",
-    ):
-        engine.estimate_action_aware_shot_count(events, 60, 12)
+    plan = engine._estimate_action_capacity_plan(events, 60, 12)
+
+    assert plan["primary_shots"] == 4
+    assert plan["structural_shots"] > plan["primary_shots"]
+    assert plan["material_duration"] == 60
+    assert plan["action_capacity_status"] == "screenplay_compression_required"
+
+
+def test_explicitly_dropped_events_are_audited_without_consuming_shot_capacity():
+    events = [
+        {"event_role": "scene_setup", "sequence_id": "SEQ001"},
+        {
+            "event_role": "action_chain",
+            "sequence_id": "SEQ001",
+            "micro_actions": [f"可删动作{index}" for index in range(12)],
+        },
+        {
+            "event_role": "turning_point",
+            "sequence_id": "SEQ001",
+            "micro_actions": ["护盾爆发", "敌人失衡"],
+        },
+    ]
+    beat = {
+        "beat_order": 1,
+        "source_events": [1, 3],
+        "dropped_source_events": [2],
+        "action": "merge",
+        "reason": "保留建立与转折，显式删减重复交锋",
+        "who": [],
+        "where": "车厢",
+        "what": "护盾改变战局",
+        "suggested_duration": 15,
+        "shot_size": "medium_wide",
+        "camera_movement": "dolly_in",
+        "lighting_key": "neon",
+        "shot_intent": "reveal",
+        "hero_moment": True,
+        "texture_keywords": ["蓝色电弧", "湿润金属"],
+    }
+
+    parsed = engine._parse_beat_skeleton(
+        json.dumps({"strategy": "压缩重复动作", "beats": [beat]}, ensure_ascii=False),
+        1,
+        len(events),
+    )
+    repaired = engine._repair_beat_action_capacity(parsed["beats"], events)
+    engine._validate_beat_action_capacity(repaired, events)
+
+    assert repaired[0]["source_events"] == [1, 3]
+    assert repaired[0]["dropped_source_events"] == [2]
+    shots = [{**repaired[0], "shot_order": 1, "visual": "护盾爆发"}]
+    engine._inherit_event_semantics(shots, events)
+    assert shots[0]["dropped_source_events"] == [2]
+    assert shots[0]["micro_actions"] == ["护盾爆发", "敌人失衡"]
+
+
+def test_mandatory_turning_point_cannot_be_dropped_from_story_clock():
+    events = [
+        {"event_role": "scene_setup", "sequence_id": "SEQ001"},
+        {
+            "event_role": "turning_point",
+            "sequence_id": "SEQ001",
+            "micro_actions": ["护盾爆发"],
+        },
+    ]
+    beats = [
+        {
+            "beat_order": 1,
+            "source_events": [1],
+            "dropped_source_events": [2],
+            "action": "keep",
+        }
+    ]
+
+    with pytest.raises(ValueError, match="mandatory event 2 cannot be dropped"):
+        engine._validate_beat_action_capacity(beats, events)
 
 
 def test_flashmob_one_take_has_a_feasible_four_beat_skeleton(monkeypatch):
     events = _load_capacity_fixture(FIXTURE, LEGACY_COMPOSITE_EVENTS)
     _annotate_global_event_flow(events, continuity_mode="one_take")
-    source_groups = [range(1, 6), range(6, 8), range(8, 19), range(19, 27)]
+    dropped_groups = [[5], [], [10, 13], [19]]
+    source_groups = [
+        [event_id for event_id in range(1, 6) if event_id not in dropped_groups[0]],
+        list(range(6, 8)),
+        [event_id for event_id in range(8, 19) if event_id not in dropped_groups[2]],
+        [event_id for event_id in range(19, 27) if event_id not in dropped_groups[3]],
+    ]
     shot_sizes = ["medium_wide", "medium", "wide", "medium_close"]
     beats = [
         {
             "beat_order": index,
             "source_events": list(source_group),
+            "dropped_source_events": dropped_groups[index - 1],
             "action": "merge",
             "reason": "按连续动作容量装箱",
             "who": [],
@@ -333,7 +414,7 @@ def test_flashmob_one_take_has_a_feasible_four_beat_skeleton(monkeypatch):
             "texture_keywords": ["城市路面", f"街头层次{index}"],
         }
         for index, (source_group, duration) in enumerate(
-            zip(source_groups, [20, 20, 18, 17], strict=True),
+            zip(source_groups, [15, 15, 15, 15], strict=True),
             1,
         )
     ]
@@ -347,9 +428,14 @@ def test_flashmob_one_take_has_a_feasible_four_beat_skeleton(monkeypatch):
     )
     profile = engine.get_video_capabilities()
 
-    skeleton = engine._build_beat_skeleton(events, "", 75, 19, 4)
+    skeleton = engine._build_beat_skeleton(events, "", 60, 15, 4)
 
-    assert engine._beat_content_loads(skeleton["beats"], events, profile) == [3, 2, 3, 3]
+    assert engine._beat_content_loads(skeleton["beats"], events, profile) == [1, 2, 2, 2]
+    assert [
+        event_id
+        for beat in skeleton["beats"]
+        for event_id in beat["dropped_source_events"]
+    ] == [5, 10, 13, 19]
 
 
 def test_layered_expansion_preserves_skeleton_shot_language(monkeypatch):
@@ -415,29 +501,30 @@ def test_layered_expansion_preserves_skeleton_shot_language(monkeypatch):
     }
 
 
-def test_storyboard_material_may_exceed_delivery_only_within_1_3x():
-    valid = {
-        "target_duration": 75,
+def test_storyboard_story_clock_is_capped_but_generated_ratio_is_advisory():
+    too_long = {
+        "target_duration": 79,
         "delivery_target_duration": 60,
-        "pre_edit_duration_ratio_limit": 1.3,
-        "shots": [{"id": "S01", "duration": 75}],
+        "generated_duration_ratio_reference": 1.3,
+        "shots": [{"id": "S01", "duration": 79}],
     }
-    issues, _ = run_l1_checks(valid, "")
+    issues, _ = run_l1_checks(too_long, "")
+    assert "storyboard_duration_exceeds_delivery_target" in {
+        issue["code"] for issue in issues
+    }
+
+    within_story_clock = {
+        "target_duration": 60,
+        "delivery_target_duration": 60,
+        "generated_duration_ratio_reference": 1.3,
+        "shots": [{"id": "S01", "duration": 60}],
+    }
+    issues, _ = run_l1_checks(within_story_clock, "")
     assert not {
         issue["code"] for issue in issues
     } & {
-        "pre_edit_material_below_delivery_target",
+        "storyboard_duration_exceeds_delivery_target",
         "pre_edit_material_ratio_exceeded",
-    }
-
-    too_long = {**valid, "target_duration": 79, "shots": [{"id": "S01", "duration": 79}]}
-    issues, _ = run_l1_checks(too_long, "")
-    assert "pre_edit_material_ratio_exceeded" in {issue["code"] for issue in issues}
-
-    too_short = {**valid, "target_duration": 59, "shots": [{"id": "S01", "duration": 59}]}
-    issues, _ = run_l1_checks(too_short, "")
-    assert "pre_edit_material_below_delivery_target" in {
-        issue["code"] for issue in issues
     }
 
 
@@ -446,7 +533,7 @@ def test_phase5_checks_additive_bridge_ledger_and_handle_replacement():
         "continuity_mode": "one_take",
         "video_provider": "seedance",
         "delivery_target_duration": 30,
-        "pre_edit_duration_ratio_limit": 1.3,
+        "generated_duration_ratio_reference": 1.3,
         "shots": [
             {"id": "S01", "duration": 15, "micro_actions": ["前进"]},
             {"id": "S02", "duration": 15, "micro_actions": ["继续前进"]},
@@ -460,7 +547,7 @@ def test_phase5_checks_additive_bridge_ledger_and_handle_replacement():
         "material_budget_ledger_stale",
         "material_budget_ledger_missing",
     } & {issue["code"] for issue in issues}
-    assert storyboard["material_budget"]["primary_material_duration_s"] == 30
+    assert storyboard["material_budget"]["story_clock_duration_s"] == 30
     assert storyboard["material_budget"]["bridge_generation_duration_s"] == 4
     assert storyboard["material_budget"]["total_generated_duration_s"] == 34
     assert storyboard["material_budget"][
@@ -480,7 +567,7 @@ def test_one_take_budget_counts_only_adjacent_continuous_boundaries():
         "continuity_mode": "one_take",
         "video_provider": "seedance",
         "delivery_target_duration": 60,
-        "pre_edit_duration_ratio_limit": 1.3,
+        "generated_duration_ratio_reference": 1.3,
         "shots": [
             {"id": f"S{index:02d}", "duration": 15, "micro_actions": ["连续动作"]}
             for index in range(1, 5)
@@ -490,12 +577,53 @@ def test_one_take_budget_counts_only_adjacent_continuous_boundaries():
     plan_storyboard_beats(storyboard)
 
     budget = storyboard["material_budget"]
-    assert budget["primary_material_duration_s"] == 60
-    assert budget["primary_material_limit_s"] == 78
+    assert budget["story_clock_duration_s"] == 60
+    assert budget["storyboard_duration_limit_s"] == 60
     assert budget["bridge_count"] == 3
     assert budget["bridge_generation_duration_s"] == 12
     assert budget["total_generated_duration_s"] == 72
+    assert budget["total_generated_duration_ratio"] == 1.2
+    assert budget["generated_duration_ratio_reference"] == 1.3
+    assert budget["generated_duration_ratio_is_hard_limit"] is False
     assert budget["projected_pre_edit_timeline_duration_s"] == 60
+
+
+def test_bridge_overhead_may_fluctuate_above_1_3_without_growing_story_clock():
+    storyboard = {
+        "target_duration": 60,
+        "delivery_target_duration": 60,
+        "generated_duration_ratio_reference": 1.3,
+        "shots": [
+            {"id": f"S{index:02d}", "duration": 7.5}
+            for index in range(1, 9)
+        ],
+        "primary_shot_bridges": [
+            {
+                "bridge_id": f"S{index:02d}__S{index + 1:02d}",
+                "generation_duration_s": 4,
+                "generation_duration_range_s": [4, 6],
+                "visible_duration_s": 4,
+                "source_handle_s": 2,
+                "target_handle_s": 2,
+                "timeline_insertion_policy": "replace_boundary_handles",
+            }
+            for index in range(1, 8)
+        ],
+    }
+
+    issues, _ = run_l1_checks(storyboard, "")
+    codes = {issue["code"] for issue in issues}
+    assert "storyboard_duration_exceeds_delivery_target" not in codes
+    assert "pre_edit_material_ratio_exceeded" not in codes
+
+    from utils.material_budget import build_material_budget
+
+    ledger = build_material_budget(storyboard)
+    assert ledger["story_clock_duration_s"] == 60
+    assert ledger["total_generated_duration_s"] == 88
+    assert ledger["total_generated_duration_ratio"] == 1.466667
+    assert ledger["total_generated_duration_ratio_range"] == [1.466667, 1.7]
+    assert ledger["generated_duration_ratio_is_hard_limit"] is False
 
 
 def test_composite_motion_keeps_full_ledger_through_pxx_and_qa():
@@ -544,10 +672,10 @@ def test_composite_motion_keeps_full_ledger_through_pxx_and_qa():
     assert run_generation_capacity_checks(storyboard) == []
 
 
-# ── guard: genuinely dense sequential chains must still fail ────────────────
+# ── guard: genuinely dense sequential chains remain explicit pressure ──────
 
 
-def test_dense_sequential_combat_chain_still_fails_when_budget_too_small():
+def test_dense_sequential_combat_chain_reports_compression_pressure():
     events = [{
         "event_role": "action_chain",
         "micro_actions": [
@@ -556,11 +684,17 @@ def test_dense_sequential_combat_chain_still_fails_when_budget_too_small():
             "翻滚压制", "降服拍地",
         ],
     }]
-    with pytest.raises(ValueError, match="delivery allows at most"):
-        engine.estimate_action_aware_shot_count(events, 30, 12)
+    plan = engine._estimate_action_capacity_plan(events, 30, 12)
+
+    assert plan["generation_action_units"] == 12
+    assert plan["structural_shots"] == 2
+    assert plan["primary_shots"] == 2
+    assert plan["minimum_material_duration"] == 40
+    assert plan["material_duration"] == 30
+    assert plan["action_capacity_status"] == "screenplay_compression_required"
 
 
-def test_generic_dense_actions_still_fail():
+def test_generic_dense_actions_report_screenplay_compression_pressure():
     generic = [
         {
             "event_role": "action_chain",
@@ -578,5 +712,11 @@ def test_generic_dense_actions_still_fail():
         *generic[8:],
         {"event_role": "scene_setup"},
     ]
-    with pytest.raises(ValueError, match="delivery allows at most"):
-        engine.estimate_action_aware_shot_count(events, 60, 10)
+    plan = engine._estimate_action_capacity_plan(events, 60, 10)
+
+    assert plan["generation_action_units"] == 96
+    assert plan["structural_shots"] == 16
+    assert plan["primary_shots"] == 4
+    assert plan["minimum_material_duration"] == 320
+    assert plan["material_duration"] == 60
+    assert plan["action_capacity_status"] == "screenplay_compression_required"

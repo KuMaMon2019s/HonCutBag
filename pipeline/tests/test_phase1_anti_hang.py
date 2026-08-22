@@ -560,15 +560,26 @@ def test_phase1_checkpoints_are_written_and_reused(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(character_discoverer, "discover_characters", lambda _events: (calls.__setitem__("characters", calls["characters"] + 1) or characters_payload))
     monkeypatch.setattr(adaptation_engine, "adapt_events", lambda *_args, **_kwargs: {"shots": [{}]})
-    monkeypatch.setattr(storyboard_generator, "generate_storyboard", lambda *_args, **_kwargs: {"shots": []})
+    monkeypatch.setattr(
+        storyboard_generator,
+        "generate_storyboard",
+        lambda *_args, **_kwargs: {
+            "shots": [{"id": "S01", "duration": 15, "micro_actions": ["站立"]}]
+        },
+    )
     monkeypatch.setattr(pipeline_core, "_integrate_storyboard_prompts", lambda value, _characters: value)
     monkeypatch.setattr(pipeline_core, "annotate_shot_pacing", lambda _shots: None)
     monkeypatch.setattr(pipeline_core, "_summarize_visual_style_with_llm", lambda _text: None)
+    monkeypatch.setattr(
+        pipeline_core,
+        "_attach_director_storyboard",
+        lambda *_args, **_kwargs: {"panels": []},
+    )
     monkeypatch.setattr(pipeline_core, "run_quality_check", lambda *_args: SimpleNamespace(passed=True, grade="A"))
     monkeypatch.setattr("quality.quality_gate.run_storyboard_review", lambda **_kwargs: {"grade": "A"})
 
-    first = pipeline_core.run_phase1_screenwriter("synthetic input", tmp_path, 10, False)
-    second = pipeline_core.run_phase1_screenwriter("synthetic input", tmp_path, 10, False)
+    first = pipeline_core.run_phase1_screenwriter("synthetic input", tmp_path, 15, False)
+    second = pipeline_core.run_phase1_screenwriter("synthetic input", tmp_path, 15, False)
 
     assert first["status"] == second["status"] == "done"
     assert calls == {"events": 1, "characters": 1}
@@ -605,14 +616,25 @@ def test_phase1_legacy_checkpoint_is_regenerated(monkeypatch, tmp_path):
         lambda _events: {"characters": [], "total_characters": 0},
     )
     monkeypatch.setattr(adaptation_engine, "adapt_events", lambda *_args, **_kwargs: {"shots": [{}]})
-    monkeypatch.setattr(storyboard_generator, "generate_storyboard", lambda *_args, **_kwargs: {"shots": []})
+    monkeypatch.setattr(
+        storyboard_generator,
+        "generate_storyboard",
+        lambda *_args, **_kwargs: {
+            "shots": [{"id": "S01", "duration": 15, "micro_actions": ["站立"]}]
+        },
+    )
     monkeypatch.setattr(pipeline_core, "_integrate_storyboard_prompts", lambda value, _characters: value)
     monkeypatch.setattr(pipeline_core, "annotate_shot_pacing", lambda _shots: None)
     monkeypatch.setattr(pipeline_core, "_summarize_visual_style_with_llm", lambda _text: None)
+    monkeypatch.setattr(
+        pipeline_core,
+        "_attach_director_storyboard",
+        lambda *_args, **_kwargs: {"panels": []},
+    )
     monkeypatch.setattr(pipeline_core, "run_quality_check", lambda *_args: SimpleNamespace(passed=True, grade="A"))
     monkeypatch.setattr("quality.quality_gate.run_storyboard_review", lambda **_kwargs: {"grade": "A"})
 
-    result = pipeline_core.run_phase1_screenwriter("凛出现", tmp_path, 10, False)
+    result = pipeline_core.run_phase1_screenwriter("凛出现", tmp_path, 15, False)
 
     assert result["status"] == "done"
     assert calls["events"] == 1

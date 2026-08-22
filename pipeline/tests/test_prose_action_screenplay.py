@@ -382,6 +382,7 @@ def test_beat_skeleton_requires_explicit_global_shot_language():
         "beats": [{
             "beat_order": 1,
             "source_events": [1],
+            "dropped_source_events": [],
             "action": "keep",
             "reason": "保留",
             "who": [],
@@ -401,6 +402,7 @@ def test_beat_skeleton_enum_error_returns_actionable_legal_values():
         "beats": [{
             "beat_order": 1,
             "source_events": [1],
+            "dropped_source_events": [],
             "action": "keep",
             "reason": "保留",
             "who": [],
@@ -492,6 +494,7 @@ def test_beat_skeleton_persists_camera_contract_before_expansion():
         "beats": [{
             "beat_order": 1,
             "source_events": [1],
+            "dropped_source_events": [],
             "action": "keep",
             "reason": "保留行走对白",
             "who": ["林川"],

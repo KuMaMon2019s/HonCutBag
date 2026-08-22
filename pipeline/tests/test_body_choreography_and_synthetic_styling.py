@@ -385,7 +385,7 @@ def test_phase1_event_llm_view_excludes_derived_duplicate_contract_fields():
         "prompt": "顶层派生 prompt",
         "errors": ["派生错误"],
         "forbidden": ["派生禁项"],
-        "minimum_primary_beat_occurrences": 2,
+        "minimum_kept_primary_beat_occurrences": 2,
         "generation_action_unit_count": 3,
     })
 
@@ -393,7 +393,7 @@ def test_phase1_event_llm_view_excludes_derived_duplicate_contract_fields():
     encoded = _build_events_json([event])
 
     assert "body_action_choreography" in view
-    assert view["minimum_primary_beat_occurrences"] == 2
+    assert view["minimum_kept_primary_beat_occurrences"] == 2
     for duplicate in (
         "body_action_contract",
         "source_excerpt",

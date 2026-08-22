@@ -201,7 +201,7 @@ def test_secondary_v6_keeps_bridge_time_outside_primary_content_capacity():
     storyboard = {
         "video_provider": "seedance",
         "delivery_target_duration": 30,
-        "pre_edit_duration_ratio_limit": 1.3,
+        "generated_duration_ratio_reference": 1.3,
         "shots": [
             {
                 "id": "S01",
@@ -246,6 +246,7 @@ def test_secondary_v6_keeps_bridge_time_outside_primary_content_capacity():
     )
     bridge = storyboard["primary_shot_bridges"][0]
     assert bridge["generation_duration_s"] == 4
+    assert bridge["generation_duration_range_s"] == [4.0, 6.0]
     assert bridge["visible_duration_s"] == 4
     assert bridge["source_handle_s"] == 2.0
     assert bridge["target_handle_s"] == 2.0
@@ -255,19 +256,29 @@ def test_secondary_v6_keeps_bridge_time_outside_primary_content_capacity():
         "incoming_bridge_handle_s"
     ] == 2.0
     assert storyboard["material_budget"] == {
-        "schema": "honcut.material-budget.v1",
-        "policy": "primary_ratio_cap_plus_explicit_bridge_overhead",
+        "schema": "honcut.material-budget.v2",
+        "policy": "story_clock_cap_plus_explicit_bridge_overhead",
         "timeline_policy": "replace_boundary_handles",
         "delivery_target_duration_s": 30.0,
-        "pre_edit_duration_ratio_limit": 1.3,
-        "primary_material_duration_s": 30.0,
-        "primary_material_limit_s": 39.0,
-        "primary_material_within_limit": True,
+        "storyboard_duration_limit_s": 30.0,
+        "primary_story_duration_s": 30.0,
+        "secondary_story_duration_s": 30.0,
+        "primary_secondary_duration_match": True,
+        "story_clock_duration_s": 30.0,
+        "story_clock_within_delivery_target": True,
         "bridge_count": 1,
         "bridge_generation_duration_s": 4.0,
+        "bridge_generation_duration_range_s": [4.0, 6.0],
         "bridge_visible_duration_s": 4.0,
         "bridge_replaced_handle_duration_s": 4.0,
         "total_generated_duration_s": 34.0,
+        "total_generated_duration_range_s": [34.0, 36.0],
+        "total_generated_duration_ratio": 1.133333,
+        "total_generated_duration_ratio_range": [1.133333, 1.2],
+        "generated_duration_ratio_reference": 1.3,
+        "generated_duration_ratio_is_hard_limit": False,
+        "delivery_pacing_speed_range": [0.85, 1.25],
+        "total_generated_covers_delivery_target": True,
         "projected_pre_edit_timeline_duration_s": 30.0,
         "bridge_overhead_is_additive": True,
         "primary_secondary_double_count_forbidden": True,
