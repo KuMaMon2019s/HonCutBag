@@ -7,7 +7,7 @@ import os
 import subprocess
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from phases.phase6.phase6_video_gen import run_phase6
 from quality.quality_gate import run_quality_check
@@ -15,6 +15,9 @@ from runtime.phase_timing import _banner, _elapsed, _now
 from tools.video_stitcher import build_stitch_plan
 from utils.media_profiles import _get_profile_dict
 from utils.timing_estimator import estimate_phase_duration
+
+
+TransitionEmbeddingRunner = Callable[..., dict]
 
 
 def _select_transition(shot_meta: dict, default_transition: str = "dissolve") -> str:
@@ -54,6 +57,7 @@ def _finish_phase8(
     reshoot_round: int,
     reshoot_history: list[dict],
     chain_mode: bool,
+    transition_embedding_runner: Optional[TransitionEmbeddingRunner] = None,
 ) -> dict:
     """Apply the duration gate and fail closed when required footage is missing."""
     from phases.phase8.duration_gate import evaluate_duration_gate, trim_excess_to_target
@@ -216,6 +220,7 @@ def _finish_phase8(
         _reshoot_round=reshoot_round + 1,
         _reshoot_history=history,
         chain_mode=chain_mode,
+        _transition_embedding_runner=transition_embedding_runner,
     )
 
 
@@ -228,7 +233,10 @@ def run_phase8(output_dir: Path, dry_run: bool,
                chain_mode: bool = False,
                _reshoot_round: int = 0,
                _reshoot_history: Optional[list[dict]] = None,
-               _continuity_round: int = 0) -> dict:
+               _continuity_round: int = 0,
+               _transition_embedding_runner: Optional[
+                   TransitionEmbeddingRunner
+               ] = None) -> dict:
     """Phase 8: 逐镜质检、裁切/补录闭环与受审组装。"""
     _banner(8, 9, f"组装引擎 (Assembly) — {transition}", dry_run)
     start = _now()
@@ -401,6 +409,7 @@ def run_phase8(output_dir: Path, dry_run: bool,
             _reshoot_round=_reshoot_round,
             _reshoot_history=history,
             _continuity_round=_continuity_round + 1,
+            _transition_embedding_runner=_transition_embedding_runner,
         )
 
     # Step 8.2: dense per-shot review with actionable keep/trim/reshoot decisions.
@@ -571,6 +580,7 @@ def run_phase8(output_dir: Path, dry_run: bool,
             chain_mode=chain_mode,
             _reshoot_round=_reshoot_round + 1,
             _reshoot_history=history,
+            _transition_embedding_runner=_transition_embedding_runner,
         )
 
     reviewed_order = [Path(path).parent.name for path in clip_paths]
@@ -585,7 +595,12 @@ def run_phase8(output_dir: Path, dry_run: bool,
         from tools.smart_transition import decide_all_transitions
 
         print("  → 智能转场: 抽帧 + 向量化 + 三层决策...")
-        embeddings = embed_all_shots(str(shots_dir), run_id=str(output_dir.name))
+        embedding_runner = (
+            _transition_embedding_runner
+            if _transition_embedding_runner is not None
+            else embed_all_shots
+        )
+        embeddings = embedding_runner(str(shots_dir), run_id=str(output_dir.name))
         if embeddings:
             similarities = compute_transition_similarity(embeddings, reviewed_order)
             smart_decisions = decide_all_transitions(
@@ -737,7 +752,7 @@ def run_phase8(output_dir: Path, dry_run: bool,
                 "audio_layer": audio_receipt,
             }, output_dir, target_duration, enable_reshoot, transition,
                transition_duration, media_profile, _reshoot_round, reshoot_history,
-               chain_mode)
+               chain_mode, _transition_embedding_runner)
         reviewed_edit_error = str(reviewed_edit.get("error", "unknown error"))
         return {
             "status": "error",
@@ -864,7 +879,7 @@ def run_phase8(output_dir: Path, dry_run: bool,
             "audio_layer": audio_receipt,
         }, output_dir, target_duration, enable_reshoot, transition,
            transition_duration, media_profile, _reshoot_round, reshoot_history,
-           chain_mode)
+           chain_mode, _transition_embedding_runner)
     except Exception as e:
         try:
             (output_dir / ".video_edit_concat.mp4").unlink(missing_ok=True)
@@ -911,7 +926,7 @@ def run_phase8(output_dir: Path, dry_run: bool,
                 "audio_layer": audio_receipt,
             }, output_dir, target_duration, enable_reshoot, transition,
                transition_duration, media_profile, _reshoot_round, reshoot_history,
-               chain_mode)
+               chain_mode, _transition_embedding_runner)
         else:
             return {"status": "error", "error": result.error, "duration_s": _elapsed(start)}
 

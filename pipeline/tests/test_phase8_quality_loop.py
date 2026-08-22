@@ -10,7 +10,12 @@ from types import SimpleNamespace
 import pytest
 
 from phases import pipeline_core
-from phases.phase8 import edit_decisions, frame_analysis, story_order_reviewer
+from phases.phase8 import (
+    edit_decisions,
+    frame_analysis,
+    phase8_assembly,
+    story_order_reviewer,
+)
 from phases.phase8.frame_analysis import decide_shot_action
 from utils import shot_embedder
 from tools.audio_pipeline import is_silent_audio
@@ -44,6 +49,48 @@ def _write_color_video(path: Path, color: str, duration: float = 2.0) -> None:
         ],
         capture_output=True,
         check=True,
+    )
+
+
+def _write_transition_fixture(output_dir: Path) -> None:
+    shots = output_dir / "shots"
+    storyboard = {"shots": []}
+    for shot_id, emotion in (("S01", "紧张"), ("S02", "平静")):
+        directory = shots / shot_id
+        directory.mkdir(parents=True)
+        (directory / "output.mp4").write_bytes(b"video")
+        metadata = {"shot_id": shot_id, "emotion": emotion, "duration": 1.0}
+        (directory / "SHOT_META.json").write_text(
+            json.dumps(metadata), encoding="utf-8"
+        )
+        storyboard["shots"].append(metadata)
+    (output_dir / "STORYBOARD.json").write_text(
+        json.dumps(storyboard), encoding="utf-8"
+    )
+
+
+def _patch_transition_fixture_qa(monkeypatch) -> None:
+    monkeypatch.setattr(
+        story_order_reviewer,
+        "review_story_order",
+        lambda *_args: {
+            "matches_current_order": True,
+            "narrative_consistent": True,
+            "issues": [],
+            "suggested_order": ["S01", "S02"],
+        },
+    )
+    monkeypatch.setattr(
+        frame_analysis,
+        "analyze_shot_frames",
+        lambda *_args, **_kwargs: {
+            "shots": {
+                shot_id: {"action": "keep", "reasons": []}
+                for shot_id in ("S01", "S02")
+            },
+            "summary": {"keep": ["S01", "S02"], "trim": [], "reshoot": []},
+            "has_issues": False,
+        },
     )
 
 
@@ -398,6 +445,75 @@ def test_edit_decisions_apply_quality_trim_and_story_order(monkeypatch, tmp_path
     assert decisions["metadata"]["quality_reviewed"] is True
 
 
+def test_phase8_explicit_embedding_runner_uses_emotion_fallback(
+    monkeypatch, tmp_path
+):
+    _write_transition_fixture(tmp_path)
+    _patch_transition_fixture_qa(monkeypatch)
+    default_calls: list[tuple] = []
+    injected_calls: list[tuple] = []
+    captured: dict = {}
+
+    def default_runner(*args, **kwargs):
+        default_calls.append((args, kwargs))
+        return {}
+
+    def injected_runner(*args, **kwargs):
+        injected_calls.append((args, kwargs))
+        return {}
+
+    def build_decisions(*_args, **kwargs):
+        captured["transitions"] = kwargs["transition_decisions"]
+        return {"cuts": [{}]}
+
+    monkeypatch.setattr(shot_embedder, "embed_all_shots", default_runner)
+    monkeypatch.setattr(edit_decisions, "build_edit_decisions", build_decisions)
+    monkeypatch.setattr(
+        edit_decisions,
+        "execute_edit_decisions",
+        lambda *_args, **_kwargs: {"success": False, "error": "stop after decision"},
+    )
+
+    result = pipeline_core.run_phase8(
+        tmp_path,
+        dry_run=False,
+        enable_reshoot=False,
+        _transition_embedding_runner=injected_runner,
+    )
+
+    assert result["status"] == "error"
+    assert default_calls == []
+    assert len(injected_calls) == 1
+    assert captured["transitions"] == [{"decision": "cut"}]
+
+
+def test_phase8_default_embedding_runner_remains_enabled(monkeypatch, tmp_path):
+    _write_transition_fixture(tmp_path)
+    _patch_transition_fixture_qa(monkeypatch)
+    default_calls: list[tuple] = []
+
+    def default_runner(*args, **kwargs):
+        default_calls.append((args, kwargs))
+        return {}
+
+    monkeypatch.setattr(shot_embedder, "embed_all_shots", default_runner)
+    monkeypatch.setattr(
+        edit_decisions,
+        "build_edit_decisions",
+        lambda *_args, **_kwargs: {"cuts": [{}]},
+    )
+    monkeypatch.setattr(
+        edit_decisions,
+        "execute_edit_decisions",
+        lambda *_args, **_kwargs: {"success": False, "error": "stop after decision"},
+    )
+
+    pipeline_core.run_phase8(tmp_path, dry_run=False, enable_reshoot=False)
+
+    assert len(default_calls) == 1
+    assert default_calls[0][1]["run_id"] == tmp_path.name
+
+
 def test_visual_reshoot_is_bounded_to_two_rounds(monkeypatch, tmp_path):
     shots = tmp_path / "shots"
     shot = shots / "S01"
@@ -441,6 +557,64 @@ def test_visual_reshoot_is_bounded_to_two_rounds(monkeypatch, tmp_path):
     assert result["status"] == "error"
     assert "after 2 reshoot rounds" in result["error"]
     assert calls == [True, True]
+
+
+def test_visual_reshoot_preserves_transition_embedding_runner(monkeypatch, tmp_path):
+    shot = tmp_path / "shots" / "S01"
+    shot.mkdir(parents=True)
+    (shot / "output.mp4").write_bytes(b"video")
+    (shot / "SHOT_META.json").write_text(
+        json.dumps({"shot_id": "S01"}), encoding="utf-8"
+    )
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps({"shots": [{"shot_id": "S01"}]}), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        story_order_reviewer,
+        "review_story_order",
+        lambda *_args: {
+            "matches_current_order": True,
+            "narrative_consistent": True,
+            "issues": [],
+            "suggested_order": ["S01"],
+        },
+    )
+    monkeypatch.setattr(
+        frame_analysis,
+        "analyze_shot_frames",
+        lambda *_args, **_kwargs: {
+            "shots": {"S01": {"action": "reshoot", "reasons": ["identity drift"]}},
+            "summary": {"keep": [], "trim": [], "reshoot": ["S01"]},
+            "has_issues": True,
+        },
+    )
+
+    def regenerate(*_args, **_kwargs):
+        (shot / "output.mp4").write_bytes(b"regenerated")
+        return {"status": "done"}
+
+    def runner(*_args, **_kwargs):
+        return {}
+
+    recursive_kwargs: dict = {}
+    owner_run_phase8 = phase8_assembly.run_phase8
+
+    def capture_recursion(*_args, **kwargs):
+        recursive_kwargs.update(kwargs)
+        return {"status": "done"}
+
+    monkeypatch.setattr(phase8_assembly, "run_phase6", regenerate)
+    monkeypatch.setattr(phase8_assembly, "run_phase8", capture_recursion)
+
+    result = owner_run_phase8(
+        tmp_path,
+        dry_run=False,
+        enable_reshoot=True,
+        _transition_embedding_runner=runner,
+    )
+
+    assert result["status"] == "done"
+    assert recursive_kwargs["_transition_embedding_runner"] is runner
 
 
 def test_required_trim_never_falls_back_to_raw_concat(monkeypatch, tmp_path):

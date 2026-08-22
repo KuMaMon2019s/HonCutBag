@@ -365,6 +365,11 @@ def _phase_summary(receipt: dict[str, Any]) -> dict[str, Any]:
     return {key: receipt[key] for key in keys if key in receipt}
 
 
+def _offline_transition_embedding_runner(*_args: Any, **_kwargs: Any) -> dict:
+    """Disable remote smart-transition embeddings for this offline acceptance."""
+    return {}
+
+
 def _initial_receipt(output_dir: Path) -> dict[str, Any]:
     return {
         "schema": RECEIPT_SCHEMA,
@@ -381,6 +386,7 @@ def _initial_receipt(output_dir: Path) -> dict[str, Any]:
             "provider_media_upload",
             "story_order_multimodal_review",
             "per_shot_multimodal_review",
+            "smart_transition_remote_embeddings",
             "remote_asr",
             "sam3_object_tracking",
         ],
@@ -429,6 +435,31 @@ def _validate_resume_inputs(output_dir: Path, receipt: dict[str, Any]) -> None:
         raise RuntimeError("offline acceptance resume inputs missing: " + ", ".join(missing))
 
 
+def _validate_completed_media(
+    output_dir: Path, completed_invocation: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    recorded_media = completed_invocation.get("media", {})
+    names = ("raw_assembly.mp4", "polished.mp4")
+    missing_receipts = [name for name in names if name not in recorded_media]
+    if missing_receipts:
+        raise RuntimeError(
+            "completed acceptance is missing media lineage: "
+            + ", ".join(missing_receipts)
+        )
+    current_media = {name: _media_summary(output_dir / name) for name in names}
+    changed_media = [
+        name
+        for name, summary in current_media.items()
+        if recorded_media[name].get("sha256") != summary["sha256"]
+    ]
+    if changed_media:
+        raise RuntimeError(
+            "completed acceptance media no longer matches its lineage: "
+            + ", ".join(changed_media)
+        )
+    return current_media
+
+
 def run_acceptance(output_dir: Path, *, resume: bool = False) -> dict[str, Any]:
     if not FIXTURE_PATH.is_file() or _sha256(FIXTURE_PATH) != FIXTURE_SHA256:
         raise RuntimeError("Future Station fixture is missing or has the wrong SHA-256")
@@ -447,6 +478,19 @@ def run_acceptance(output_dir: Path, *, resume: bool = False) -> dict[str, Any]:
 
     stats = OfflineExecutionStats()
     tasks_before = _task_rows(output_dir / "runtime.db")
+    prior_completed = next(
+        (
+            item
+            for item in reversed(receipt.get("invocations", []))
+            if item.get("status") == "completed"
+        ),
+        None,
+    )
+    completed_media = (
+        _validate_completed_media(output_dir, prior_completed)
+        if resume and prior_completed is not None
+        else None
+    )
     invocation: dict[str, Any] = {
         "mode": "resume" if resume else "cold",
         "started_at": _utc_now(),
@@ -507,31 +551,54 @@ def run_acceptance(output_dir: Path, *, resume: bool = False) -> dict[str, Any]:
             if phase7.get("status") != "done":
                 raise RuntimeError(f"Phase 7 failed: {phase7.get('error') or phase7}")
 
-            phase8 = run_phase8(
-                output_dir,
-                dry_run=False,
-                transition="cut",
-                transition_duration=0.0,
-                media_profile=MEDIA_PROFILE,
-                target_duration=TARGET_DURATION_S,
-                enable_reshoot=False,
-                chain_mode=False,
-            )
-            invocation["phase_results"]["phase8"] = _phase_summary(phase8)
-            _atomic_write_json(receipt_path, receipt)
-            if phase8.get("status") != "done":
-                raise RuntimeError(f"Phase 8 failed: {phase8.get('error') or phase8}")
+            if completed_media is None:
+                phase8 = run_phase8(
+                    output_dir,
+                    dry_run=False,
+                    transition="cut",
+                    transition_duration=0.0,
+                    media_profile=MEDIA_PROFILE,
+                    target_duration=TARGET_DURATION_S,
+                    enable_reshoot=False,
+                    chain_mode=False,
+                    _transition_embedding_runner=(
+                        _offline_transition_embedding_runner
+                    ),
+                )
+                invocation["phase_results"]["phase8"] = _phase_summary(phase8)
+                _atomic_write_json(receipt_path, receipt)
+                if phase8.get("status") != "done":
+                    raise RuntimeError(
+                        f"Phase 8 failed: {phase8.get('error') or phase8}"
+                    )
 
-            phase9 = run_phase9(
-                output_dir,
-                dry_run=False,
-                media_profile=MEDIA_PROFILE,
-                target_duration=TARGET_DURATION_S,
-            )
-            invocation["phase_results"]["phase9"] = _phase_summary(phase9)
-            _atomic_write_json(receipt_path, receipt)
-            if phase9.get("status") != "done":
-                raise RuntimeError(f"Phase 9 failed: {phase9.get('error') or phase9}")
+                phase9 = run_phase9(
+                    output_dir,
+                    dry_run=False,
+                    media_profile=MEDIA_PROFILE,
+                    target_duration=TARGET_DURATION_S,
+                )
+                invocation["phase_results"]["phase9"] = _phase_summary(phase9)
+                _atomic_write_json(receipt_path, receipt)
+                if phase9.get("status") != "done":
+                    raise RuntimeError(
+                        f"Phase 9 failed: {phase9.get('error') or phase9}"
+                    )
+            else:
+                source_started_at = prior_completed.get("started_at")
+                invocation["phase_results"]["phase8"] = {
+                    "status": "done",
+                    "mode": "reused_completed_media",
+                    "outputs": ["raw_assembly.mp4"],
+                    "source_started_at": source_started_at,
+                }
+                invocation["phase_results"]["phase9"] = {
+                    "status": "done",
+                    "mode": "reused_completed_media",
+                    "outputs": ["polished.mp4"],
+                    "source_started_at": source_started_at,
+                }
+                _atomic_write_json(receipt_path, receipt)
 
         tasks_after = _task_rows(output_dir / "runtime.db")
         invalid_tasks = [
@@ -551,13 +618,30 @@ def run_acceptance(output_dir: Path, *, resume: bool = False) -> dict[str, Any]:
             raise RuntimeError(
                 f"offline acceptance attempted {stats.provider_requests} Provider requests"
             )
-        if resume and len(tasks_after) != len(tasks_before):
-            raise RuntimeError("resume created new generation tasks for unchanged inputs")
+        if resume:
+            task_ids_before = [task["task_id"] for task in tasks_before]
+            task_ids_after = [task["task_id"] for task in tasks_after]
+            if task_ids_after != task_ids_before:
+                raise RuntimeError(
+                    "resume changed generation task lineage for unchanged inputs"
+                )
 
         media = {
             name: _media_summary(output_dir / name)
             for name in ("raw_assembly.mp4", "polished.mp4")
         }
+        if resume and prior_completed is not None:
+            prior_media = prior_completed.get("media", {})
+            changed_media = [
+                name
+                for name, summary in media.items()
+                if prior_media.get(name, {}).get("sha256") != summary["sha256"]
+            ]
+            if changed_media:
+                raise RuntimeError(
+                    "resume changed final media hashes for unchanged inputs: "
+                    + ", ".join(changed_media)
+                )
         invocation.update(
             status="completed",
             finished_at=_utc_now(),
@@ -568,6 +652,11 @@ def run_acceptance(output_dir: Path, *, resume: bool = False) -> dict[str, Any]:
             task_ids=[task["task_id"] for task in tasks_after],
             media=media,
         )
+        if resume:
+            invocation["resume_lineage"] = {
+                "task_ids_preserved": True,
+                "media_hashes_preserved": prior_completed is not None,
+            }
         receipt.update(
             status="completed",
             completed_at=_utc_now(),
