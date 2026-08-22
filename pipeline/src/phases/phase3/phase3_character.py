@@ -17,6 +17,73 @@ from utils.style_slices import get_slice
 from utils.timing_estimator import estimate_phase_duration
 
 
+PHASE3_DRY_RUN_RECEIPT_SCHEMA = "honcut.phase3-dry-run-receipt.v1"
+PHASE3_DRY_RUN_RECEIPT_NAME = "phase3_dry_run_receipt.json"
+PHASE3_DRY_RUN_SKIPPED_OPERATIONS = (
+    "character_reference_image_generation",
+    "character_reference_semantic_qa",
+    "character_locked_storyboard_refresh",
+)
+
+
+def _hashed_artifact(root: Path, path: Path) -> dict | None:
+    """Describe one existing run-local artifact without embedding its content."""
+    if not path.is_file():
+        return None
+    from utils.file_integrity import file_sha256
+
+    return {
+        "path": path.relative_to(root).as_posix(),
+        "sha256": file_sha256(path),
+    }
+
+
+def _write_phase3_dry_run_receipt(
+    output_dir: Path,
+    characters: list[dict],
+    required_reference_views: tuple[str, ...],
+) -> Path:
+    """Atomically record what Phase 3 validated and intentionally did not run."""
+    source_artifacts = [
+        artifact
+        for name in ("CHARACTERS.json", "STORYBOARD.json", "visual-style.md")
+        if (artifact := _hashed_artifact(output_dir, output_dir / name)) is not None
+    ]
+    character_cards = []
+    character_ids = []
+    for index, character in enumerate(characters):
+        character_id = str(character.get("id") or f"char_{index}")
+        character_ids.append(character_id)
+        card = _hashed_artifact(
+            output_dir,
+            output_dir / "characters" / character_id / "character_card.json",
+        )
+        if card is not None:
+            character_cards.append({"character_id": character_id, **card})
+
+    payload = {
+        "schema": PHASE3_DRY_RUN_RECEIPT_SCHEMA,
+        "status": "completed",
+        "dry_run": True,
+        "character_ids": character_ids,
+        "required_reference_views": list(required_reference_views),
+        "source_artifacts": source_artifacts,
+        "character_cards": character_cards,
+        "skipped_operations": list(PHASE3_DRY_RUN_SKIPPED_OPERATIONS),
+    }
+    receipt_path = output_dir / PHASE3_DRY_RUN_RECEIPT_NAME
+    temporary = receipt_path.with_suffix(".json.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, receipt_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return receipt_path
+
+
 def detect_derive_assets(characters_data: dict) -> list:
     """按 HonCut 规范检测衍生资产。
 
@@ -89,7 +156,10 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
 
     try:
         from phases.phase3.character_factory import batch_generate
-        from quality.character_reference_qa import CharacterReferenceQAError
+        from quality.character_reference_qa import (
+            SEEDANCE_REFERENCE_VIEWS,
+            CharacterReferenceQAError,
+        )
 
         chars_dir = _ensure_dir(output_dir / "characters")
         from utils.privacy_visual_policy import (
@@ -211,6 +281,27 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
                     outputs.append(f"characters/{d.name}/")
 
         print(f"  ✓ Phase 3 完成: {len(outputs)} 角色卡 + {len(derive_assets)} 衍生资产")
+
+        if dry_run:
+            receipt_path = _write_phase3_dry_run_receipt(
+                output_dir,
+                characters_list,
+                SEEDANCE_REFERENCE_VIEWS,
+            )
+            outputs.append(receipt_path.name)
+            print(
+                "  ⊘ dry-run: 跳过生产四视图质检与角色锁定 Pxx 刷新；"
+                f"凭证写入 {receipt_path.name}"
+            )
+            return {
+                "status": "done",
+                "dry_run": True,
+                "dry_run_receipt": receipt_path.name,
+                "duration_s": _elapsed(start),
+                "outputs": outputs,
+                "derive_assets_count": len(derive_assets),
+                "derive_assets": derive_assets,
+            }
 
         # Quality gate: Phase 3 (CRITICAL — blocks pipeline if character images missing)
         qg_report = run_quality_check("phase3", output_dir)
