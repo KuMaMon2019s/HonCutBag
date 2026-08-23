@@ -195,6 +195,63 @@ def test_event_parser_excludes_global_visual_directives_from_story_clock():
     assert _parse_events(json.dumps(payload, ensure_ascii=False), directive) == []
 
 
+def test_event_parser_excludes_fragment_from_directive_only_segment():
+    directive = (
+        "全程保持同一台工业设备的材质与比例。照明必须稳定，"
+        "禁止标记、水印和颜色漂移。"
+    )
+    payload = [_event(
+        who=[],
+        where="未指定空间",
+        what="建立稳定照明与金属表面反射",
+        visual="稳定照明照亮金属表面反射",
+        action_type="setup",
+        event_role="scene_setup",
+        source_excerpt="稳定照明与金属表面反射",
+        micro_actions=[],
+        action_phase="none",
+        start_state="",
+        end_state="",
+        causal_link="",
+        continuity_before="cut",
+        continuity_subject="",
+    )]
+
+    assert _parse_events(json.dumps(payload, ensure_ascii=False), directive) == []
+
+
+def test_event_parser_keeps_story_action_in_mixed_directive_segment():
+    source = (
+        "机械臂进入工位。全程保持统一材质，禁止水印和颜色漂移。"
+    )
+    payload = [
+        _event(
+            who=["机械臂"],
+            what="机械臂进入工位",
+            visual="机械臂进入工位",
+            event_role="action_chain",
+            source_excerpt="机械臂进入工位",
+            micro_actions=["机械臂进入工位"],
+            generation_motion_mode="atomic",
+            action_phase="setup",
+        ),
+        _event(
+            who=[],
+            what="保持统一材质",
+            visual="统一材质",
+            event_role="scene_setup",
+            source_excerpt="统一材质",
+            micro_actions=[],
+            generation_motion_mode="none",
+            action_phase="none",
+        ),
+    ]
+
+    parsed = _parse_events(json.dumps(payload, ensure_ascii=False), source)
+
+    assert any(event["micro_actions"] == ["机械臂进入工位"] for event in parsed)
+
+
 def test_event_parser_keeps_real_scene_setup_without_visible_motion():
     setup = "深夜地下车站空无一人，冷蓝霓虹映在湿润地面。"
     payload = [_event(

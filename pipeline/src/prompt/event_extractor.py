@@ -230,7 +230,7 @@ _NARRATIVE_JUMP_CUES = (
 # caches carried over from earlier run directories — and forces every Phase 1
 # event extraction to re-run (a paid LLM pass). Never bump casually, and never
 # reuse cross-run segment caches from a run produced under a different value.
-EVENT_FLOW_SCHEMA_VERSION = "11.0"
+EVENT_FLOW_SCHEMA_VERSION = "12.0"
 
 
 def is_global_production_directive_text(evidence: str) -> bool:
@@ -242,11 +242,18 @@ def is_global_production_directive_text(evidence: str) -> bool:
     )
 
 
-def _is_global_production_directive(event: Dict[str, Any]) -> bool:
-    """Return true for project-wide visual rules that have no story-clock beat."""
+def _is_non_narrative_directive_candidate(event: Dict[str, Any]) -> bool:
+    """Whether an extracted record has no action/dialogue story-clock evidence."""
     if event.get("micro_actions") or event.get("lines"):
         return False
-    if event.get("event_role") not in {"scene_setup", "character_state", "transition"}:
+    return event.get("event_role") in {
+        "scene_setup", "character_state", "transition"
+    }
+
+
+def _is_global_production_directive(event: Dict[str, Any]) -> bool:
+    """Return true for project-wide visual rules that have no story-clock beat."""
+    if not _is_non_narrative_directive_candidate(event):
         return False
     evidence = str(event.get("source_excerpt") or "")
     return is_global_production_directive_text(evidence)
@@ -377,6 +384,18 @@ def _parse_events(response: str, source_content: str = "") -> List[Dict[str, Any
             raise ValueError(f"第 {i+1} 个事件缺少字段: {missing}")
         _normalize_event(event, source_content)
 
+    # A model may quote only a small visual fragment from a paragraph that is
+    # wholly a project-wide production directive.  The fragment then loses the
+    # scope/imperative tokens required by the local classifier.  Drop the whole
+    # response only when the complete source paragraph is a directive and every
+    # extracted record is action/dialogue-free; a mixed narrative paragraph is
+    # preserved instead of being guessed away.
+    if (
+        parsed
+        and is_global_production_directive_text(source_content)
+        and all(_is_non_narrative_directive_candidate(event) for event in parsed)
+    ):
+        return []
     return [event for event in parsed if not _is_global_production_directive(event)]
 
 
