@@ -65,7 +65,10 @@ _COMPOSITE_MOTION_CUE = re.compile(
     r"(?:不是|并非|而非).{0,30}(?:逐个|依次|顺序|分离|清单)"
 )
 _TEMPORAL_PROGRESSION_CUE = re.compile(
-    r"一开始|随后|然后|接着|逐步|逐渐|最终|最后|先.{0,30}再"
+    r"一开始|随后|然后|接着|逐步|逐渐|最终|"
+    r"最后(?!\s*(?:一|1)?\s*(?:名|位|只|辆|台|艘|架|支|队|组|批|部|"
+    r"座|间|枚|把|套|双|对|排|列|头|匹))|"
+    r"先.{0,30}再"
 )
 
 # A: sequential signals — ordered plot steps that cannot run in parallel

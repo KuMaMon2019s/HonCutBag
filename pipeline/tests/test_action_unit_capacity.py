@@ -205,6 +205,28 @@ def test_explicit_source_composite_overrides_conflicting_model_atomic_label():
     assert normalized["units"] == 1
 
 
+def test_composite_source_does_not_treat_last_entity_as_temporal_progression():
+    event = {
+        "what": "平台转向时完成并发控制动作",
+        "source_excerpt": (
+            "同一瞬间复合动作：平台转向，操作员贴身控制最后一名检修员的"
+            "手臂，借惯性将其推向隔离门。"
+        ),
+        "micro_actions": [
+            "平台转向",
+            "贴身控制最后一名检修员的手臂",
+            "借惯性将其推向隔离门",
+        ],
+        "generation_motion_mode": "atomic",
+    }
+
+    normalized = normalize_event_action_units(event)
+
+    assert event_uses_composite_motion(event) is True
+    assert normalized["motion_mode"] == "composite"
+    assert normalized["units"] == 1
+
+
 def test_sequential_fight_is_not_collapsed_without_dance_evidence():
     event = {
         "what": "两人在舞台上完成一气呵成的连续交锋",

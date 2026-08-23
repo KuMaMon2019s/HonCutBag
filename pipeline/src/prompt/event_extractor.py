@@ -230,7 +230,7 @@ _NARRATIVE_JUMP_CUES = (
 # caches carried over from earlier run directories — and forces every Phase 1
 # event extraction to re-run (a paid LLM pass). Never bump casually, and never
 # reuse cross-run segment caches from a run produced under a different value.
-EVENT_FLOW_SCHEMA_VERSION = "10.0"
+EVENT_FLOW_SCHEMA_VERSION = "11.0"
 
 
 def is_global_production_directive_text(evidence: str) -> bool:
