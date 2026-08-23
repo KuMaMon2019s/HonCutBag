@@ -2699,6 +2699,11 @@ def test_phase3_reference_generation_uses_face_only_as_identity_anchor(
     assert len(calls) == 5
     assert all(call[0] == "image" for call in calls[1:])
     assert all(str(call[2]).endswith("face_closeup.png") for call in calls[1:])
+    assert all(
+        call[1].startswith("[honcut-seedream-reference-contract-v1]")
+        for call in calls[1:]
+    )
+    assert all("Image 1: character identity only" in call[1] for call in calls[1:])
     assert all("7-Eleven" not in call[1] for call in calls)
     assert all("cheering crowd" not in call[1] for call in calls)
     assert "strict 90-degree left side" in calls[2][1].lower()
@@ -4300,7 +4305,11 @@ def test_phase4_cinematic_frames_inject_style_and_exclude_previs(tmp_path):
 
     assert manifest["status"] == "done"
     assert manifest["frame_count"] == 1
-    assert calls[0][0].startswith("【美术风格｜最高优先级｜成片质感】")
+    assert calls[0][0].startswith("[honcut-seedream-reference-contract-v1]")
+    assert "Image 1: director single panel" in calls[0][0]
+    assert calls[0][0].index("Image 1") < calls[0][0].index(
+        "【美术风格｜最高优先级｜成片质感】"
+    )
     assert "皮影戏台" in calls[0][0]
     assert "靛蓝" in calls[0][0]
     assert "禁止任何红色/蓝色/彩色动作箭头" in calls[0][0]
@@ -4325,6 +4334,11 @@ def test_phase4_cinematic_frames_inject_style_and_exclude_previs(tmp_path):
         (tmp_path / beat["video_first_frame_receipt"]).read_text(encoding="utf-8")
     )
     assert receipt["reference_roles"][0] == "director_single_panel_composition_only"
+    assert receipt["reference_contract_template_id"] == (
+        "honcut.seedream.reference-contract"
+    )
+    assert receipt["reference_contract_template_version"] == "1"
+    assert receipt["prompt_guidance"]["sha256"] == receipt["prompt_sha256"]
     assert receipt["upstream_director_panel"] == "director_panels/S02.png"
     assert receipt["upstream_director_panel_usage"].endswith("never_video_reference")
     assert receipt["previs_reference_images"] == []

@@ -610,7 +610,7 @@ def test_director_storyboard_calls_image_model_with_one_overview_contract(tmp_pa
     assert persisted["panels"][4]["grid_column"] == 1
     assert (tmp_path / "director_panels/S01.png").is_file()
     assert (tmp_path / "director_panels/S05.png").is_file()
-    assert calls[0]["size"] == "2560x1440"
+    assert calls[0]["size"] == "2K"
     assert "严格使用 3 列 × 2 行，共 5 个面板" in calls[0]["prompt"]
     assert "必须可被机器切分的固定网格合同" in calls[0]["prompt"]
     assert "16–24 像素纯白留白槽" in calls[0]["prompt"]
@@ -1432,7 +1432,19 @@ def test_phase2_uses_director_board_as_visual_reference_for_every_shot(tmp_path)
     assert calls[0][1] == str(tmp_path / "director_panels/S07.png")
     assert calls[1][1] == str(tmp_path / "director_panels/S08.png")
     assert all(str(director) not in str(call[1]) for call in calls)
+    assert calls[0][0].startswith("[honcut-seedream-reference-contract-v1]")
+    assert "Image 1: director single panel" in calls[0][0]
     assert "9:16" in calls[0][0]
+    first_panel_receipt = json.loads(
+        (tmp_path / "storyboard_beats/S07_P01.json").read_text(encoding="utf-8")
+    )
+    assert first_panel_receipt["reference_contract_template_id"] == (
+        "honcut.seedream.reference-contract"
+    )
+    assert first_panel_receipt["reference_contract_template_version"] == "1"
+    assert first_panel_receipt["provider_prompt_guidance"]["sha256"] == (
+        first_panel_receipt["provider_prompt_sha256"]
+    )
     assert contract["director_storyboard"] == "director_storyboard.png"
     assert contract["director_panel_schema"] == "honcut.director-panels.v1"
     with Image.open(tmp_path / "shot_storyboards/S07.png") as board:

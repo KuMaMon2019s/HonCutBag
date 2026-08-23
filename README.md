@@ -177,6 +177,11 @@ uv run --locked --managed-python python pipeline/scripts/phase_orchestrator.py \
 `make` or `uv run --locked ...`; bare `python`, `pip`, and `pytest` may resolve
 to an unrelated Conda or system interpreter.
 
+Online visual generation uses the Volcano Ark Agent Plan only. Configure
+`ARK_AGENT_API_KEY`; HonCut does not read `ARK_API_KEY`, which remains reserved
+for the Honcho Coding Plan memory integration. Seedream image generation uses
+the Agent Plan model `doubao-seedream-5.0-lite` with a default `2K` PNG output.
+
 ## Development
 
 ### Code Quality

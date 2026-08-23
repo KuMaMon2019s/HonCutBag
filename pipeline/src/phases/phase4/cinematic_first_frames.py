@@ -12,6 +12,15 @@ from typing import Any, Protocol
 from PIL import Image
 
 from phases.phase2.shot_storyboards import _character_reference_paths, _shot_who
+from prompt.seedream_image_prompt import (
+    IMAGE_REQUEST_CONTRACT_ID,
+    IMAGE_REQUEST_CONTRACT_VERSION,
+    REFERENCE_CONTRACT_TEMPLATE_ID,
+    REFERENCE_CONTRACT_TEMPLATE_VERSION,
+    bind_reference_roles,
+    image_request_fingerprint,
+    prompt_guidance_metrics,
+)
 from utils.body_action_contracts import body_action_prompt
 from utils.camera_motion_contracts import camera_motion_negative_prompt, camera_motion_prompt
 from utils.character_body_contracts import character_visual_description
@@ -360,7 +369,7 @@ def generate_cinematic_first_frames(
     scene_consistency: dict[str, Any] | None = None,
     *,
     client: ImageGenerationClient | None = None,
-    size: str = "2560x1440",
+    size: str = "2K",
     visual_style_path: Path | None = None,
     aspect_ratio: str | None = None,
 ) -> dict[str, Any]:
@@ -426,7 +435,6 @@ def generate_cinematic_first_frames(
                 prompt_path = frame_dir / f"{beat_id}_prompt.txt"
                 image_path = frame_dir / f"{beat_id}.png"
                 receipt_path = frame_dir / f"{beat_id}.json"
-                prompt_path.write_text(prompt, encoding="utf-8")
                 identity_references = _character_reference_paths(
                     output_dir,
                     characters,
@@ -458,13 +466,27 @@ def generate_cinematic_first_frames(
                         f"{beat_id} cinematic generation rejected PREVIS references: "
                         + ", ".join(str(path) for path in forbidden)
                     )
+                reference_roles = [
+                    "director_single_panel_composition_only"
+                    if path == director_composition
+                    else "prior_cinematic_state"
+                    if path == previous_cinematic
+                    else "character_identity_only"
+                    for path in reference_paths
+                ]
+                prompt = bind_reference_roles(prompt, reference_roles)
+                prompt_metrics = prompt_guidance_metrics(prompt)
+                prompt_path.write_text(prompt, encoding="utf-8")
                 reference_hashes = [
                     hashlib.sha256(path.read_bytes()).hexdigest()
                     for path in reference_paths
                 ]
-                input_sha = hashlib.sha256(
-                    f"{prompt}\nreferences={','.join(reference_hashes)}".encode()
-                ).hexdigest()
+                input_sha = image_request_fingerprint(
+                    prompt=prompt,
+                    model=model,
+                    size=size,
+                    reference_image_sha256=reference_hashes,
+                )
                 record: dict[str, Any] = {
                     "kind": CINEMATIC_FIRST_FRAME_SCHEMA,
                     "version": 1,
@@ -473,9 +495,17 @@ def generate_cinematic_first_frames(
                     "beat_id": beat_id,
                     "image": _portable_path(output_dir, image_path),
                     "prompt": _portable_path(output_dir, prompt_path),
-                    "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                    "prompt_sha256": prompt_metrics["sha256"],
+                    "prompt_guidance": prompt_metrics,
+                    "reference_contract_template_id": REFERENCE_CONTRACT_TEMPLATE_ID,
+                    "reference_contract_template_version": (
+                        REFERENCE_CONTRACT_TEMPLATE_VERSION
+                    ),
                     "input_sha256": input_sha,
                     "model": model,
+                    "size_requested": size,
+                    "request_contract_id": IMAGE_REQUEST_CONTRACT_ID,
+                    "request_contract_version": IMAGE_REQUEST_CONTRACT_VERSION,
                     "style_source": style["source"],
                     "style_source_sha256": style["source_sha256"],
                     "style_prompt_sha256": style["prompt_sha256"],
@@ -483,14 +513,7 @@ def generate_cinematic_first_frames(
                         _portable_path(output_dir, path) for path in reference_paths
                     ],
                     "reference_image_sha256": reference_hashes,
-                    "reference_roles": [
-                        "director_single_panel_composition_only"
-                        if path == director_composition
-                        else "prior_cinematic_state"
-                        if path == previous_cinematic
-                        else "character_identity_only"
-                        for path in reference_paths
-                    ],
+                    "reference_roles": reference_roles,
                     "upstream_director_panel": (
                         _portable_path(output_dir, director_composition)
                         if director_composition is not None
@@ -534,6 +557,7 @@ def generate_cinematic_first_frames(
                             and previous.get("status") == "done"
                             and previous.get("input_sha256") == input_sha
                             and previous.get("model") == model
+                            and previous.get("size_requested") == size
                             and (
                                 beat_id not in rejected_frame_ids
                                 or previous.get(

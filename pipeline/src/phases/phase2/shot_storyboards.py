@@ -12,6 +12,15 @@ from typing import Any, Protocol
 
 import requests
 from PIL import Image, ImageDraw, ImageFont, ImageOps
+from prompt.seedream_image_prompt import (
+    IMAGE_REQUEST_CONTRACT_ID,
+    IMAGE_REQUEST_CONTRACT_VERSION,
+    REFERENCE_CONTRACT_TEMPLATE_ID,
+    REFERENCE_CONTRACT_TEMPLATE_VERSION,
+    bind_reference_roles,
+    image_request_fingerprint,
+    prompt_guidance_metrics,
+)
 from utils.character_body_contracts import character_visual_description
 from utils.body_action_contracts import body_action_prompt
 from utils.character_reference_contracts import (
@@ -28,7 +37,7 @@ from utils.temporal_visual_contracts import (
     temporal_visual_prompt,
 )
 
-SHOT_STORYBOARD_SIZE = "2560x1440"
+SHOT_STORYBOARD_SIZE = "2K"
 SHOT_STORYBOARD_GRID_COLUMNS = 3
 SHOT_STORYBOARD_GRID_ROWS = 3
 SHOT_STORYBOARD_GRID_CELLS = (
@@ -697,12 +706,17 @@ def _generate_primary_bridge_storyboards(
             if not path.is_file() or path.stat().st_size == 0:
                 raise RuntimeError(f"{bridge_id} {label} is missing: {path}")
 
-        prompt = _build_primary_bridge_storyboard_prompt(
+        contract_prompt = _build_primary_bridge_storyboard_prompt(
             bridge,
             source_beat,
             target_beat,
             aspect_ratio=aspect_ratio,
         )
+        prompt = bind_reference_roles(
+            contract_prompt,
+            ["bridge_source_final_state", "bridge_target_opening_state"],
+        )
+        prompt_metrics = prompt_guidance_metrics(prompt)
         image_path = bridge_dir / f"{bridge_id}.png"
         prompt_path = bridge_dir / f"{bridge_id}_prompt.txt"
         sidecar_path = bridge_dir / f"{bridge_id}.json"
@@ -712,9 +726,12 @@ def _generate_primary_bridge_storyboards(
             hashlib.sha256(path.read_bytes()).hexdigest()
             for path in reference_paths
         ]
-        prompt_sha = hashlib.sha256(
-            f"{prompt}\nreferences={','.join(reference_hashes)}".encode()
-        ).hexdigest()
+        prompt_sha = image_request_fingerprint(
+            prompt=prompt,
+            model=model,
+            size=size,
+            reference_image_sha256=reference_hashes,
+        )
         record: dict[str, Any] = {
             "bridge_id": bridge_id,
             "source_shot_id": str(bridge.get("source_shot_id") or ""),
@@ -722,7 +739,20 @@ def _generate_primary_bridge_storyboards(
             "image": _portable_path(output_dir, image_path),
             "prompt": _portable_path(output_dir, prompt_path),
             "prompt_sha256": prompt_sha,
+            "provider_prompt_sha256": prompt_metrics["sha256"],
+            "provider_prompt_guidance": prompt_metrics,
             "model": model,
+            "size_requested": size,
+            "request_contract_id": IMAGE_REQUEST_CONTRACT_ID,
+            "request_contract_version": IMAGE_REQUEST_CONTRACT_VERSION,
+            "reference_contract_template_id": REFERENCE_CONTRACT_TEMPLATE_ID,
+            "reference_contract_template_version": (
+                REFERENCE_CONTRACT_TEMPLATE_VERSION
+            ),
+            "reference_roles": [
+                "bridge_source_final_state",
+                "bridge_target_opening_state",
+            ],
             "reference_images": [
                 _portable_path(output_dir, path) for path in reference_paths
             ],
@@ -739,6 +769,7 @@ def _generate_primary_bridge_storyboards(
                     previous.get("status") == "done"
                     and previous.get("prompt_sha256") == prompt_sha
                     and previous.get("model") == model
+                    and previous.get("size_requested") == size
                 ):
                     with Image.open(image_path) as image:
                         image.verify()
@@ -1201,6 +1232,8 @@ def generate_shot_storyboards(
             aspect_ratio = "16:9"
     contract["aspect_ratio"] = aspect_ratio
     contract["size_requested"] = size
+    contract["request_contract_id"] = IMAGE_REQUEST_CONTRACT_ID
+    contract["request_contract_version"] = IMAGE_REQUEST_CONTRACT_VERSION
     _write_json(manifest_path, contract)
     if client is None:
         from clients.seedream_client import SeedreamClient
@@ -1373,7 +1406,6 @@ def generate_shot_storyboards(
                 panel_prompt_path = beats_dir / f"{beat_id}_prompt.txt"
                 panel_path = beats_dir / f"{beat_id}.png"
                 panel_sidecar = beats_dir / f"{beat_id}.json"
-                panel_prompt_path.write_text(panel_prompt, encoding="utf-8")
                 reference_paths: list[Path] = []
                 reference_paths.extend(character_references)
                 if previous_panel is not None:
@@ -1384,9 +1416,35 @@ def generate_shot_storyboards(
                     hashlib.sha256(path.read_bytes()).hexdigest()
                     for path in reference_paths
                 ]
-                panel_sha = hashlib.sha256(
-                    f"{panel_prompt}\nreferences={','.join(reference_hashes)}".encode()
-                ).hexdigest()
+                requested_reference_roles = []
+                for reference_path in reference_paths:
+                    if reference_path in character_references:
+                        requested_reference_roles.append("character_identity_only")
+                    elif reference_path == previous_panel:
+                        requested_reference_roles.append("prior_storyboard_state")
+                    elif reference_path == director_panel:
+                        requested_reference_roles.append(
+                            "director_single_panel_composition_only"
+                        )
+                    else:
+                        raise RuntimeError(
+                            "unowned Seedream storyboard reference: "
+                            f"{reference_path}"
+                        )
+                provider_contract_prompt = bind_reference_roles(
+                    panel_prompt,
+                    requested_reference_roles,
+                )
+                provider_contract_metrics = prompt_guidance_metrics(
+                    provider_contract_prompt
+                )
+                panel_prompt_path.write_text(provider_contract_prompt, encoding="utf-8")
+                panel_sha = image_request_fingerprint(
+                    prompt=provider_contract_prompt,
+                    model=str(contract["model"]),
+                    size=size,
+                    reference_image_sha256=reference_hashes,
+                )
                 panel_record = {
                     "beat_id": beat_id,
                     "position": position,
@@ -1394,7 +1452,19 @@ def generate_shot_storyboards(
                     "image": str(panel_path.relative_to(output_dir)),
                     "prompt": str(panel_prompt_path.relative_to(output_dir)),
                     "prompt_sha256": panel_sha,
+                    "provider_prompt_sha256": provider_contract_metrics["sha256"],
+                    "provider_prompt_guidance": provider_contract_metrics,
                     "model": contract["model"],
+                    "size_requested": size,
+                    "request_contract_id": IMAGE_REQUEST_CONTRACT_ID,
+                    "request_contract_version": IMAGE_REQUEST_CONTRACT_VERSION,
+                    "reference_contract_template_id": (
+                        REFERENCE_CONTRACT_TEMPLATE_ID
+                    ),
+                    "reference_contract_template_version": (
+                        REFERENCE_CONTRACT_TEMPLATE_VERSION
+                    ),
+                    "reference_roles": requested_reference_roles,
                     "character_references": [
                         str(path.relative_to(output_dir))
                         if path.is_relative_to(output_dir)
@@ -1419,6 +1489,7 @@ def generate_shot_storyboards(
                             previous_record.get("status") == "done"
                             and previous_record.get("prompt_sha256") == panel_sha
                             and previous_record.get("model") == contract["model"]
+                            and previous_record.get("size_requested") == size
                         ):
                             with Image.open(panel_path) as image:
                                 image.verify()
@@ -1445,10 +1516,40 @@ def generate_shot_storyboards(
                         _panel_record: dict[str, Any] = panel_record,
                         _panel_path: Path = panel_path,
                     ):
+                        reference_roles = []
+                        for reference_path in selected_references:
+                            if reference_path in character_references:
+                                reference_roles.append("character_identity_only")
+                            elif reference_path == previous_panel:
+                                reference_roles.append("prior_storyboard_state")
+                            elif reference_path == director_panel:
+                                reference_roles.append(
+                                    "director_single_panel_composition_only"
+                                )
+                            else:
+                                raise RuntimeError(
+                                    "unowned Seedream storyboard reference: "
+                                    f"{reference_path}"
+                                )
+                        provider_prompt = bind_reference_roles(
+                            generation_prompt,
+                            reference_roles,
+                        )
+                        provider_metrics = prompt_guidance_metrics(provider_prompt)
+                        _panel_record["provider_prompt_sha256"] = provider_metrics[
+                            "sha256"
+                        ]
+                        _panel_record["provider_prompt_guidance"] = provider_metrics
+                        _panel_record["reference_contract_template_id"] = (
+                            REFERENCE_CONTRACT_TEMPLATE_ID
+                        )
+                        _panel_record["reference_contract_template_version"] = (
+                            REFERENCE_CONTRACT_TEMPLATE_VERSION
+                        )
                         if selected_references and hasattr(client, "image_to_image"):
                             _panel_record["mode"] = "image_to_image"
                             return client.image_to_image(
-                                prompt=generation_prompt,
+                                prompt=provider_prompt,
                                 ref_image=(
                                     str(selected_references[0])
                                     if len(selected_references) == 1
@@ -1459,7 +1560,7 @@ def generate_shot_storyboards(
                             )
                         _panel_record["mode"] = "text_to_image"
                         return client.text_to_image(
-                            prompt=generation_prompt,
+                            prompt=provider_prompt,
                             output_path=str(_panel_path),
                             size=size,
                             timeout=180,

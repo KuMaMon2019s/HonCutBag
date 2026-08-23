@@ -325,7 +325,7 @@ def run_phase1_screenwriter(
                         },
                         "style": "写实风格, 35mm film, 自然光",
                         "negative": "卡通, 3D渲染, 过度饱和",
-                        "size": "1920x1920",
+                        "size": "2K",
                         "first_appearance": 1,
                         "appearance_count": 3
                     },
@@ -352,7 +352,7 @@ def run_phase1_screenwriter(
                         },
                         "style": "写实风格, 35mm film, 自然光",
                         "negative": "卡通, 3D渲染, 过度饱和",
-                        "size": "1920x1920",
+                        "size": "2K",
                         "first_appearance": 2,
                         "appearance_count": 1
                     }

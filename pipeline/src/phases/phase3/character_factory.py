@@ -33,6 +33,7 @@ from clients.seedream_client import SeedreamClient
 _PROMPTS_DIR = Path(__file__).resolve().parents[3] / "prompts"
 sys.path.insert(0, str(_PROMPTS_DIR))
 from prompt.prompt_validator import validate_prompt
+from prompt.seedream_image_prompt import bind_reference_roles
 from quality.character_reference_qa import (
     CHARACTER_REFERENCE_QA_SCHEMA,
     CharacterReferenceQAError,
@@ -307,7 +308,7 @@ FULL_BODY_IMAGE_RULES = (
     f"{HUMAN_PERSPECTIVE_CONTRACT}"
 )
 
-FULL_BODY_REFERENCE_SIZE = "1440x2560"
+FULL_BODY_REFERENCE_SIZE = "2K"
 
 
 def _reference_rendering_clause(style: str) -> str:
@@ -657,7 +658,10 @@ def _generate_reference_view(
     try:
         if identity_anchor is not None and hasattr(client, "image_to_image"):
             client.image_to_image(
-                prompt=f"{REFERENCE_WEIGHT_NOTE}. {final_prompt}",
+                prompt=bind_reference_roles(
+                    f"{REFERENCE_WEIGHT_NOTE}. {final_prompt}",
+                    ["character_identity_only"],
+                ),
                 ref_image=str(identity_anchor),
                 output_path=str(temporary),
                 size=size,
@@ -692,15 +696,18 @@ def _generate_identity_detail(
     )
     try:
         client.image_to_image(
-            prompt=build_identity_detail_prompt(
-                character_description,
-                identity_props,
-                style,
-                correction,
+            prompt=bind_reference_roles(
+                build_identity_detail_prompt(
+                    character_description,
+                    identity_props,
+                    style,
+                    correction,
+                ),
+                ["character_face_identity_only", "character_body_identity_only"],
             ),
             ref_image=[str(path) for path in canonical_paths],
             output_path=str(temporary),
-            size="1920x1920",
+            size="2K",
         )
         if not temporary.is_file():
             raise RuntimeError("identity-detail generator did not write its output")
@@ -932,7 +939,7 @@ def generate_character(
     output_dir: str,
     style: str = "",
     negative: str = "",
-    size: str = "1920x1920",
+    size: str = "2K",
     model: Optional[str] = None,
     skip_images: bool = False,
     variants: Optional[list] = None,
@@ -1037,7 +1044,7 @@ def generate_character(
                 client.text_to_image(
                     prompt=build_combined_sheet_prompt(description, style),
                     output_path=sheet_path,
-                    size="1920x1920",
+                    size="2K",
                 )
                 views = crop_character_sheet(sheet_path, char_dir, num_views=4)
 
@@ -1204,7 +1211,13 @@ def generate_character(
                     str(Path(char_dir) / f"{body_view}.png"),
                 ]
                 url = client.image_to_image(
-                    prompt=variant_prompt,
+                    prompt=bind_reference_roles(
+                        variant_prompt,
+                        [
+                            "character_face_identity_only",
+                            "character_body_identity_only",
+                        ],
+                    ),
                     ref_image=canonical_variant_references,
                     output_path=variant_path,
                     size=size,
@@ -1258,7 +1271,7 @@ def batch_generate(characters: list, output_dir: str, **kwargs) -> list:
                 output_dir=output_dir,
                 style=char.get("style", ""),
                 negative=char.get("negative", ""),
-                size=char.get("size", "1920x1920"),
+                size=char.get("size", "2K"),
                 model=char.get("model"),
                 skip_images=kwargs.get("skip_images", False),
                 variants=char.get("appearance", {}).get("variants", []),
@@ -1284,7 +1297,7 @@ if __name__ == "__main__":
     parser.add_argument("--style", default="", help="Art style")
     parser.add_argument("--negative", default="", help="Negative prompt")
     parser.add_argument("--output-dir", default=".", help="Base output directory")
-    parser.add_argument("--size", default="1920x1920", help="Image size WxH")
+    parser.add_argument("--size", default="2K", help="Seedream size tier or WxH")
     parser.add_argument("--model", default=None, help="Override Seedream model")
     parser.add_argument("--batch", help="Path to batch JSON file")
     parser.add_argument("--skip-images", action="store_true", help="Only create JSON, skip image gen")

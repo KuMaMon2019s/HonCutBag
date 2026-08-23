@@ -12,6 +12,11 @@ from typing import Any, Protocol
 
 import numpy as np
 from PIL import Image
+from prompt.seedream_image_prompt import (
+    IMAGE_REQUEST_CONTRACT_ID,
+    IMAGE_REQUEST_CONTRACT_VERSION,
+    image_request_fingerprint,
+)
 from utils.character_body_contracts import character_visual_description
 from utils.body_action_contracts import body_action_prompt
 from utils.camera_motion_contracts import (
@@ -19,7 +24,7 @@ from utils.camera_motion_contracts import (
     camera_motion_prompt,
 )
 
-DIRECTOR_STORYBOARD_SIZE = "2560x1440"
+DIRECTOR_STORYBOARD_SIZE = "2K"
 DIRECTOR_STORYBOARD_MAX_ATTEMPTS = 2
 GROUP_MAX_SHOTS = 3
 DIRECTOR_PANEL_SCHEMA = "honcut.director-panels.v1"
@@ -454,6 +459,11 @@ def generate_director_storyboard(
     requested_model = (
         getattr(client, "model", None) or "doubao-seedream-5.0-lite"
     )
+    input_sha256 = image_request_fingerprint(
+        prompt=prompt,
+        model=requested_model,
+        size=size,
+    )
     manifest: dict[str, Any] = {
         "kind": "honcut.director_storyboard.v3",
         "version": 3,
@@ -464,6 +474,9 @@ def generate_director_storyboard(
         "prompt": prompt_path.name,
         "prompt_sha256": prompt_sha256,
         "contract_prompt_sha256": prompt_sha256,
+        "input_sha256": input_sha256,
+        "request_contract_id": IMAGE_REQUEST_CONTRACT_ID,
+        "request_contract_version": IMAGE_REQUEST_CONTRACT_VERSION,
         "size_requested": size,
         "aspect_ratio": aspect_ratio,
         "columns": layout[0],
@@ -495,7 +508,9 @@ def generate_director_storyboard(
                     "contract_prompt_sha256",
                     previous.get("prompt_sha256"),
                 ) == prompt_sha256
+                and previous.get("input_sha256") == input_sha256
                 and previous.get("model") == requested_model
+                and previous.get("size_requested") == size
             ):
                 with Image.open(image_path) as generated:
                     generated.verify()

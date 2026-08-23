@@ -116,7 +116,7 @@ USER_PROMPT_TEMPLATE = (
     "  - motivation: 动机\n"
     "- style: 推荐画风（如 '张艺谋式写实, 35mm film, 自然光'）\n"
     "- negative: 负面提示词（如 '卡通, 3D渲染, 过度饱和'）\n"
-    "- size: 推荐生成尺寸（如 '1920x1920'）\n"
+    "- size: 推荐生成尺寸，默认使用 Seedream 5.0 lite 的 '2K' 档位\n"
     "- first_appearance: 首次出场的事件 ID（整数）\n"
     "- appearance_count: 出场次数（整数）\n"
     "- relationships: 与其他角色的关系数组（可选），每项含 target_id, type, description\n\n"
@@ -1093,7 +1093,7 @@ def _fallback_characters(stats: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any
             },
             "style": "写实风格, 自然光",
             "negative": "卡通, 3D渲染",
-            "size": "1920x1920",
+            "size": "2K",
             "first_appearance": min(info["events"]) if info["events"] else 0,
             "appearance_count": len(info["events"]),
             "asset_path": f"characters/{char_id}/",

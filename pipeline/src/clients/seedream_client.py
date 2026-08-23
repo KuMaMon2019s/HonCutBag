@@ -14,15 +14,24 @@ Usage:
 """
 
 import base64
+import binascii
+import hashlib
 import io
 import os
+import re
 import threading
 import time
 from contextlib import contextmanager
+from pathlib import Path
 
 import requests
 from PIL import Image, ImageOps
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from prompt.seedream_image_prompt import (
+    prompt_guidance_metrics,
+    single_image_request_parameters,
+)
 from utils.config import ARK_BASE_URL
 from utils.ip_blacklist import sanitize_prompt
 
@@ -32,9 +41,96 @@ IMAGE_ENDPOINT = f"{BASE_URL}/images/generations"
 
 # Agent Plan model (NOT doubao-seedream-3-0 which doesn't exist)
 DEFAULT_MODEL = "doubao-seedream-5.0-lite"
-DEFAULT_IMAGE_SIZE = "1920x1920"
+DEFAULT_IMAGE_SIZE = "2K"
+AGENT_PLAN_IMAGE_MODELS = frozenset({DEFAULT_MODEL})
+SEEDREAM_5_LITE_SIZE_TIERS = frozenset({"2K", "3K", "4K"})
+SEEDREAM_5_LITE_MIN_PIXELS = 2560 * 1440
+SEEDREAM_5_LITE_MAX_PIXELS = 4096 * 4096
+SEEDREAM_5_LITE_MAX_REFERENCE_IMAGES = 14
 REFERENCE_UPLOAD_MAX_EDGE = 1600
 REFERENCE_UPLOAD_MAX_BYTES = 1_500_000
+
+
+class _SeedreamImageItem(BaseModel):
+    """Validated subset of one non-streaming image response item."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    url: str | None = None
+    b64_json: str | None = None
+    size: str | None = None
+    output_format: str | None = None
+
+    @model_validator(mode="after")
+    def require_exactly_one_image_source(self):
+        if bool(self.url) == bool(self.b64_json):
+            raise ValueError("image item must contain exactly one of url or b64_json")
+        return self
+
+
+class _SeedreamImagesResponse(BaseModel):
+    """Fail-closed envelope for the synchronous Agent Plan response."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    data: list[_SeedreamImageItem] = Field(min_length=1)
+
+
+def _validate_image_size(size: str) -> str:
+    """Validate the Agent Plan Seedream 5.0 lite size contract locally."""
+    normalized = str(size).strip()
+    tier = normalized.upper()
+    if tier in SEEDREAM_5_LITE_SIZE_TIERS:
+        return tier
+    match = re.fullmatch(r"(\d+)[xX](\d+)", normalized)
+    if match is None:
+        raise ValueError(
+            "Seedream 5.0 lite size must be 2K, 3K, 4K, or WIDTHxHEIGHT"
+        )
+    width, height = (int(value) for value in match.groups())
+    pixels = width * height
+    aspect_ratio = width / height if height else 0
+    if not (
+        SEEDREAM_5_LITE_MIN_PIXELS <= pixels <= SEEDREAM_5_LITE_MAX_PIXELS
+        and 1 / 16 <= aspect_ratio <= 16
+    ):
+        raise ValueError(
+            "Seedream 5.0 lite size must contain 3,686,400-16,777,216 pixels "
+            "with an aspect ratio between 1:16 and 16:1"
+        )
+    return f"{width}x{height}"
+
+
+def _prepare_prompt(prompt: str) -> str:
+    """Apply the existing IP policy and emit only privacy-safe diagnostics."""
+    sanitized_prompt, filtered_terms = sanitize_prompt(str(prompt))
+    if not sanitized_prompt.strip():
+        raise ValueError("Seedream prompt must not be empty after sanitization")
+    if filtered_terms:
+        print(
+            f"  [seedream] IP filter removed {len(filtered_terms)} term(s)",
+            flush=True,
+        )
+    metrics = prompt_guidance_metrics(sanitized_prompt)
+    if metrics["over_recommended_length"]:
+        print(
+            "  [seedream] prompt exceeds official length guidance: "
+            f"characters={metrics['characters']} "
+            f"cjk={metrics['cjk_characters']} "
+            f"english_words={metrics['english_words']} "
+            f"sha256={metrics['sha256']}",
+            flush=True,
+        )
+    return sanitized_prompt
+
+
+def _single_image_payload(*, model: str, prompt: str, size: str) -> dict:
+    """Build the documented non-streaming, single-image quality contract."""
+    return {
+        "model": model,
+        "prompt": _prepare_prompt(prompt),
+        **single_image_request_parameters(_validate_image_size(size)),
+    }
 
 
 def _reference_data_url(reference_path: str) -> str:
@@ -208,6 +304,11 @@ class SeedreamClient:
         self.api_key = api_key or os.environ.get("ARK_AGENT_API_KEY", "")
         if not self.api_key:
             raise ValueError("ARK_AGENT_API_KEY not set. Export it or pass api_key=.")
+        if model not in AGENT_PLAN_IMAGE_MODELS:
+            raise ValueError(
+                "Agent Plan image generation only supports "
+                f"{DEFAULT_MODEL!r}; received {model!r}"
+            )
         self.model = model
         self.headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -225,19 +326,11 @@ class SeedreamClient:
 
         Agent Plan API is synchronous — no polling needed.
         """
-        # Sanitize prompt to remove IP risks
-        sanitized_prompt, filtered_terms = sanitize_prompt(prompt)
-        if filtered_terms:
-            print(f"  [seedream] IP filter: removed {filtered_terms}")
-
-        payload = {
-            "model": self.model,
-            "prompt": sanitized_prompt,
-            "size": size,
-            "response_format": "url",
-            "watermark": False,
-            "sequential_image_generation": "disabled",
-        }
+        payload = _single_image_payload(
+            model=self.model,
+            prompt=prompt,
+            size=size,
+        )
 
         return self._call_and_save(payload, output_path, timeout=timeout)
 
@@ -259,24 +352,25 @@ class SeedreamClient:
         reference_paths = [ref_image] if isinstance(ref_image, str) else list(ref_image)
         if not reference_paths:
             raise ValueError("image_to_image requires at least one reference image")
+        if len(reference_paths) > SEEDREAM_5_LITE_MAX_REFERENCE_IMAGES:
+            raise ValueError(
+                "Seedream 5.0 lite accepts at most 14 reference images when "
+                "generating one output image"
+            )
+        payload = _single_image_payload(
+            model=self.model,
+            prompt=prompt,
+            size=size,
+        )
         encoded_references = []
         for reference_path in reference_paths:
             encoded_references.append(_reference_data_url(reference_path))
 
-        # Agent Plan i2i: use image_url in content array
-        payload = {
-            "model": self.model,
-            "prompt": prompt,
-            "image": (
-                encoded_references[0]
-                if len(encoded_references) == 1
-                else encoded_references
-            ),
-            "size": size,
-            "n": 1,
-            "output_format": "png",
-            "watermark": False,
-        }
+        payload["image"] = (
+            encoded_references[0]
+            if len(encoded_references) == 1
+            else encoded_references
+        )
 
         return self._call_and_save(payload, output_path)
 
@@ -295,7 +389,7 @@ class SeedreamClient:
             style: Art style (e.g. "张艺谋式写实, 35mm film, 自然光")
             negative: Negative prompt (appended to each view)
             output_dir: Directory to save front.png, side.png, back.png
-            size: Image dimensions (min 1920x1920 for Agent Plan)
+            size: Seedream resolution tier or valid WxH dimensions
 
         Returns:
             dict with keys "front", "side", "back" mapping to file paths
@@ -361,9 +455,15 @@ class SeedreamClient:
                             for marker in ("rate", "limit", "retry")
                         )
                     }
+                    response_bytes = getattr(resp, "content", None)
+                    if not isinstance(response_bytes, bytes):
+                        response_bytes = str(getattr(resp, "text", "")).encode(
+                            "utf-8", errors="replace"
+                        )
                     print(
                         f"  [seedream] ✗ HTTP {status_code} "
-                        f"body={resp.text[:1000]!r} headers={diagnostic_headers}",
+                        f"body_sha256={hashlib.sha256(response_bytes).hexdigest()} "
+                        f"headers={diagnostic_headers}",
                         flush=True,
                     )
                     provider_code, provider_message, request_id = (
@@ -398,42 +498,73 @@ class SeedreamClient:
                         request_id=request_id,
                         response=resp,
                     )
-                data = resp.json()
+                try:
+                    data = _SeedreamImagesResponse.model_validate(resp.json())
+                except (
+                    requests.exceptions.JSONDecodeError,
+                    ValueError,
+                    ValidationError,
+                ) as exc:
+                    raise RuntimeError(
+                        "Seedream returned an invalid non-streaming image envelope"
+                    ) from exc
                 break
 
-        # Agent Plan returns data[] array with url or b64_json
-        if "data" not in data or len(data["data"]) == 0:
-            raise RuntimeError(f"No image data in response: {data}")
-
-        item = data["data"][0]
-        image_url = item.get("url")
-        b64_json = item.get("b64_json")
+        # Agent Plan returns a validated data[] array with url or b64_json.
+        item = data.data[0]
+        image_url = item.url
+        b64_json = item.b64_json
 
         if image_url:
             # Download from URL
             self._download(image_url, output_path)
             return image_url
         elif b64_json:
-            # Decode base64
-            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-            decoded = base64.b64decode(b64_json)
-            with open(output_path, "wb") as f:
-                f.write(decoded)
-            print(f"  [download] saved {output_path} ({len(decoded)} bytes)")
+            try:
+                decoded = base64.b64decode(b64_json, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise RuntimeError("Seedream returned invalid base64 image data") from exc
+            self._save_validated_image(decoded, output_path)
             return f"b64://{output_path}"
-        else:
-            raise RuntimeError(f"No url or b64_json in response: {data}")
+        raise RuntimeError("Seedream response lost its validated image source")
+
+    @staticmethod
+    def _save_validated_image(image_bytes: bytes, output_path: str) -> str:
+        """Atomically persist provider bytes only after they decode as an image."""
+        destination = Path(output_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_suffix(destination.suffix + ".part")
+        try:
+            temporary.write_bytes(image_bytes)
+            with Image.open(temporary) as image:
+                image.verify()
+            os.replace(temporary, destination)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
+        print(f"  [download] saved {destination} ({len(image_bytes)} bytes)")
+        return str(destination)
 
     def _download(self, url: str, output_path: str) -> str:
         """Download image to output_path."""
-        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
         resp = requests.get(url, stream=True, timeout=120)
         resp.raise_for_status()
-        with open(output_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                f.write(chunk)
-        print(f"  [download] saved {output_path} ({os.path.getsize(output_path)} bytes)")
-        return output_path
+        destination = Path(output_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_suffix(destination.suffix + ".part")
+        try:
+            with temporary.open("wb") as output_file:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        output_file.write(chunk)
+            with Image.open(temporary) as image:
+                image.verify()
+            os.replace(temporary, destination)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
+        print(f"  [download] saved {destination} ({destination.stat().st_size} bytes)")
+        return str(destination)
 
 
 # --- Convenience functions ---
