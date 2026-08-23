@@ -109,6 +109,14 @@ from tools.asset_packager import inject_reference_instruction
 from utils.artifact_chain import can_resume_from
 
 
+def _signed_tos_url(monkeypatch, object_key):
+    monkeypatch.setenv("TOS_ACCESS_KEY", "test-ak")
+    monkeypatch.setenv("TOS_SECRET_KEY", "test-sk")
+    monkeypatch.setenv("TOS_BUCKET", "honcut-fixtures")
+    monkeypatch.setenv("TOS_ENDPOINT", "tos-cn-beijing.volces.com")
+    return tos_uploader.get_signed_url(object_key)
+
+
 def _write_grid_image(
     path: Path,
     *,
@@ -1635,10 +1643,12 @@ def test_post_primary_bridge_uses_actual_source_tail_and_target_head(
         fake_extract,
     )
     uploaded = []
+    first_url = _signed_tos_url(monkeypatch, "fixture/frame-1.jpg")
+    second_url = _signed_tos_url(monkeypatch, "fixture/frame-2.jpg")
 
     def fake_upload(_data, _content_type):
         uploaded.append(len(uploaded) + 1)
-        return f"https://image.test/frame-{uploaded[-1]}.jpg"
+        return (first_url, second_url)[uploaded[-1] - 1]
 
     monkeypatch.setattr("clients.tos_uploader.upload_image", fake_upload)
     monkeypatch.setattr(
@@ -1680,8 +1690,8 @@ def test_post_primary_bridge_uses_actual_source_tail_and_target_head(
         "first_frame",
         "last_frame",
     ]
-    assert content[1]["image_url"]["url"].endswith("frame-1.jpg")
-    assert content[2]["image_url"]["url"].endswith("frame-2.jpg")
+    assert content[1]["image_url"]["url"] == first_url
+    assert content[2]["image_url"]["url"] == second_url
     assert "上一一级分镜视频真实尾帧" in content[0]["text"]
     assert "下一一级分镜视频真实首帧" in content[0]["text"]
     assert "不得新增剧情" in content[0]["text"]
@@ -1918,11 +1928,172 @@ def test_upload_media_file_preserves_video_bytes_and_mime(monkeypatch, tmp_path)
         return "https://tos.test/reference.mp4"
 
     monkeypatch.setattr(tos_uploader, "upload_file", fake_upload)
+    monkeypatch.setattr(tos_uploader, "_validate_seedance_video", lambda _path: None)
 
     assert tos_uploader.upload_media_file(video) == "https://tos.test/reference.mp4"
     assert observed["data"] == video.read_bytes()
     assert observed["object_key"].endswith(".mp4")
     assert observed["content_type"] == "video/mp4"
+
+
+def test_tos_url_contract_requires_configured_signed_origin(monkeypatch):
+    monkeypatch.setenv("TOS_ACCESS_KEY", "test-ak")
+    monkeypatch.setenv("TOS_SECRET_KEY", "test-sk")
+    monkeypatch.setenv("TOS_BUCKET", "honcut-fixtures")
+    monkeypatch.setenv("TOS_ENDPOINT", "tos-cn-beijing.volces.com")
+
+    signed_url = tos_uploader.get_signed_url("volcengine/image/frame.png")
+
+    assert tos_uploader.require_tos_url(signed_url, label="frame") == signed_url
+    with pytest.raises(RuntimeError, match="invalid TOS signature"):
+        tos_uploader.require_tos_url(
+            signed_url.replace("volcengine/image/frame.png", "volcengine/image/other.png"),
+            label="frame",
+        )
+    with pytest.raises(RuntimeError, match="configured TOS origin"):
+        tos_uploader.require_tos_url(
+            "https://untrusted.example/frame.png?X-Tos-Signature=fake",
+            label="frame",
+        )
+    with pytest.raises(RuntimeError, match="configured TOS origin"):
+        tos_uploader.require_tos_url(
+            signed_url.replace(
+                "honcut-fixtures.tos-cn-beijing.volces.com",
+                "honcut-fixtures.tos-cn-beijing.volces.com:8443",
+            ),
+            label="frame",
+        )
+    with pytest.raises(RuntimeError, match="signed TOS URL"):
+        tos_uploader.require_tos_url(
+            "https://honcut-fixtures.tos-cn-beijing.volces.com/frame.png",
+            label="frame",
+        )
+
+
+def test_seedance_image_compression_does_not_target_legacy_300kb():
+    random_pixels = np.random.default_rng(7).integers(
+        0,
+        256,
+        size=(1200, 1200, 3),
+        dtype=np.uint8,
+    )
+    buffer = io.BytesIO()
+    Image.fromarray(random_pixels, "RGB").save(buffer, format="JPEG", quality=95)
+    original = buffer.getvalue()
+    assert len(original) > 300 * 1024
+    assert len(original) < 30 * 1024 * 1024
+
+    compressed = tos_uploader.compress_image_bytes(original)
+
+    assert compressed == original
+
+
+def test_seedance_upload_preserves_webp_transport_metadata(monkeypatch):
+    image_buffer = io.BytesIO()
+    Image.new("RGB", (640, 480), "navy").save(image_buffer, format="WEBP")
+    observed = {}
+    monkeypatch.setattr(
+        tos_uploader,
+        "_get_tos_config",
+        lambda: {
+            "ak": "test-ak",
+            "sk": "test-sk",
+            "bucket": "honcut-fixtures",
+            "endpoint": "tos-cn-beijing.volces.com",
+            "region": "cn-beijing",
+        },
+    )
+
+    def fake_put(url, data, headers, timeout):
+        observed.update(url=url, data=data, headers=headers, timeout=timeout)
+        return SimpleNamespace(status_code=200, text="")
+
+    monkeypatch.setattr(tos_uploader.requests, "put", fake_put)
+
+    tos_uploader.upload_image(image_buffer.getvalue(), "image/png")
+
+    assert observed["url"].split("?", 1)[0].endswith(".webp")
+    assert observed["headers"]["Content-Type"] == "image/webp"
+    assert observed["data"] == image_buffer.getvalue()
+
+
+def test_seedance_video_preflight_fails_before_tos_upload(monkeypatch, tmp_path):
+    invalid_video = tmp_path / "reference.mp4"
+    invalid_video.write_bytes(b"not-a-decodable-video")
+    monkeypatch.setattr(
+        tos_uploader,
+        "upload_file",
+        lambda *_args, **_kwargs: pytest.fail("invalid media must not upload"),
+    )
+
+    with pytest.raises(ValueError, match="ffprobe"):
+        tos_uploader.upload_media_file_required(
+            invalid_video,
+            label="reference video",
+        )
+
+
+def test_seedance_media_preflight_enforces_image_dimensions_and_video_fps(
+    monkeypatch,
+    tmp_path,
+):
+    image_buffer = io.BytesIO()
+    Image.new("RGB", (299, 300), "navy").save(image_buffer, format="PNG")
+    with pytest.raises(ValueError, match="300..6000"):
+        tos_uploader._validate_seedance_image(image_buffer.getvalue())
+
+    video = tmp_path / "too-fast.mp4"
+    video.write_bytes(b"fixture")
+    monkeypatch.setattr(
+        tos_uploader,
+        "_probe_av",
+        lambda _path: {
+            "streams": [
+                {
+                    "codec_type": "video",
+                    "codec_name": "h264",
+                    "width": 1280,
+                    "height": 720,
+                    "avg_frame_rate": "120/1",
+                }
+            ],
+            "format": {"duration": "4.0", "format_name": "mov,mp4"},
+        },
+    )
+    with pytest.raises(ValueError, match="24..60 fps"):
+        tos_uploader._validate_seedance_video(video)
+
+
+def test_multimodal_media_preflight_accepts_official_url_input_types(
+    monkeypatch,
+    tmp_path,
+):
+    image = tmp_path / "frame.png"
+    Image.new("RGB", (640, 480), "black").save(image)
+    document = tmp_path / "notes.pdf"
+    document.write_bytes(b"%PDF-1.7\nfixture")
+    video = tmp_path / "motion.mp4"
+    video.write_bytes(b"fixture-video")
+    audio = tmp_path / "dialogue.mp3"
+    audio.write_bytes(b"fixture-audio")
+
+    def fake_probe(path):
+        if path.suffix == ".mp4":
+            return {
+                "streams": [{"codec_type": "video", "codec_name": "h264"}],
+                "format": {"duration": "4.0"},
+            }
+        return {
+            "streams": [{"codec_type": "audio", "codec_name": "mp3"}],
+            "format": {"duration": "12.0"},
+        }
+
+    monkeypatch.setattr(tos_uploader, "_probe_av", fake_probe)
+
+    assert tos_uploader.validate_multimodal_media_file(image) == "image"
+    assert tos_uploader.validate_multimodal_media_file(video) == "video"
+    assert tos_uploader.validate_multimodal_media_file(document) == "document"
+    assert tos_uploader.validate_multimodal_media_file(audio) == "audio"
 
 
 def test_base64_video_upload_bypasses_image_compression(monkeypatch):
@@ -1934,6 +2105,7 @@ def test_base64_video_upload_bypasses_image_compression(monkeypatch):
         return "https://tos.test/reference.mp4"
 
     monkeypatch.setattr(tos_uploader, "upload_file", fake_upload)
+    monkeypatch.setattr(tos_uploader, "_validate_seedance_video", lambda _path: None)
     payload = "data:video/mp4;base64," + base64.b64encode(video_data).decode()
 
     assert tos_uploader.base64_video_to_signed_url(payload) == "https://tos.test/reference.mp4"
@@ -1946,11 +2118,13 @@ def test_video_extension_uses_reference_video_with_persistent_image_anchors(monk
     video = tmp_path / "S03_C01.mp4"
     video.write_bytes(b"video")
     observed = {}
+    chunk_url = _signed_tos_url(monkeypatch, "fixture/chunk.mp4")
+    character_url = _signed_tos_url(monkeypatch, "fixture/character.png")
 
     monkeypatch.setattr(
         tos_uploader,
         "upload_media_file",
-        lambda path, prefix: "https://tos.test/chunk.mp4",
+        lambda path, prefix: chunk_url,
     )
 
     def fake_submit(content, **kwargs):
@@ -1966,7 +2140,7 @@ def test_video_extension_uses_reference_video_with_persistent_image_anchors(monk
         api_key="test-key",
         model="doubao-seedance-2.0-mini",
         duration=8,
-        reference_image_urls=["https://tos.test/character.png"],
+        reference_image_urls=[character_url],
         seed=7,
     )
 
@@ -1976,7 +2150,7 @@ def test_video_extension_uses_reference_video_with_persistent_image_anchors(monk
         "reference_image",
         "reference_video",
     ]
-    assert observed["content"][-1]["video_url"]["url"].endswith("chunk.mp4")
+    assert observed["content"][-1]["video_url"]["url"] == chunk_url
     assert observed["kwargs"]["duration"] == 8
     assert observed["kwargs"]["seed"] == 7
 
@@ -2842,6 +3016,19 @@ def test_extension_provider_content_keeps_images_as_anchors_and_adds_video(monke
     }), encoding="utf-8")
     previous = tmp_path / "previous.mp4"
     previous.write_bytes(b"video")
+    tail_url = _signed_tos_url(monkeypatch, "fixture/tail-window.mp4")
+    uploaded_media_urls = {}
+
+    def fake_media_upload(path, prefix):
+        if prefix == "volcengine/video":
+            return tail_url
+        name = Path(path).name
+        if name not in uploaded_media_urls:
+            uploaded_media_urls[name] = _signed_tos_url(
+                monkeypatch, f"fixture/{name}"
+            )
+        return uploaded_media_urls[name]
+
     monkeypatch.setattr(
         "tools.asset_packager.build_content_for_shot",
         lambda **kwargs: [
@@ -2856,11 +3043,7 @@ def test_extension_provider_content_keeps_images_as_anchors_and_adds_video(monke
     )
     monkeypatch.setattr(
         "clients.tos_uploader.upload_media_file",
-        lambda path, prefix: (
-            "https://video.test/tail-window.mp4"
-            if prefix == "volcengine/video"
-            else f"https://image.test/{Path(path).name}"
-        ),
+        fake_media_upload,
     )
     monkeypatch.setattr(
         "clients.tos_uploader.upload_image",
@@ -2924,10 +3107,10 @@ def test_extension_provider_content_keeps_images_as_anchors_and_adds_video(monke
     assert content[0]["text"].count("[storyboard-motion-notation]") == 1
     assert content[1]["image_url"]["url"] == "https://image.test/frame.png"
     assert [item["image_url"]["url"] for item in content[2:5]] == [
-        f"https://image.test/{path.name}"
+        uploaded_media_urls[path.name]
         for path in sorted((tmp_path / "continuity_anchors").glob("*_frame_*.jpg"))
     ]
-    assert content[-1]["video_url"]["url"] == "https://video.test/tail-window.mp4"
+    assert content[-1]["video_url"]["url"] == tail_url
 
 
 @pytest.mark.parametrize(
@@ -3101,6 +3284,7 @@ def test_extension_provider_content_never_exceeds_seedance_image_budget(monkeypa
     previous = tmp_path / "previous.mp4"
     previous.write_bytes(b"video")
     observed = {}
+    _signed_tos_url(monkeypatch, "fixture/prepare-contract")
 
     def fake_build(**kwargs):
         observed["max_images"] = kwargs["shot_meta"].get("_max_reference_images")
@@ -3119,7 +3303,7 @@ def test_extension_provider_content_never_exceeds_seedance_image_budget(monkeypa
     monkeypatch.setattr("tools.asset_packager.build_content_for_shot", fake_build)
     monkeypatch.setattr(
         "clients.tos_uploader.upload_media_file",
-        lambda path, prefix: f"https://media.test/{Path(path).name}",
+        lambda path, prefix: _signed_tos_url(monkeypatch, f"fixture/{Path(path).name}"),
     )
     monkeypatch.setattr(
         "quality.continuity_seam.extract_video_tail_window",

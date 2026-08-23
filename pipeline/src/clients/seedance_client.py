@@ -8,7 +8,6 @@ import os
 import tempfile
 import time
 from typing import Optional
-from urllib.parse import urlparse
 
 import requests
 
@@ -102,12 +101,12 @@ def _validate_content_media_roles(content: list[dict]) -> None:
             continue
         container = item.get(media_type)
         url = container.get("url") if isinstance(container, dict) else None
-        parsed = urlparse(str(url or ""))
-        if parsed.scheme != "https" or not parsed.netloc:
-            raise ValueError(
-                "Seedance media must use an uploaded HTTPS URL; inline data, "
-                "local paths, and empty media URLs are forbidden"
-            )
+        from clients.tos_uploader import require_tos_url
+
+        require_tos_url(
+            str(url or ""),
+            label=f"Seedance {media_type} content",
+        )
 
 
 def get_task(task_id: str, *, api_key: str, timeout: float = 30) -> dict:

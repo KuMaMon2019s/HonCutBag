@@ -280,10 +280,24 @@ def test_collect_character_references_resolves_explicit_display_names(tmp_path):
 
 
 def _stub_tos_upload(monkeypatch):
+    monkeypatch.setenv("TOS_ACCESS_KEY", "test-ak")
+    monkeypatch.setenv("TOS_SECRET_KEY", "test-sk")
+    monkeypatch.setenv("TOS_BUCKET", "honcut-fixtures")
+    monkeypatch.setenv("TOS_ENDPOINT", "tos-cn-beijing.volces.com")
     monkeypatch.setattr(
         "clients.tos_uploader.upload_image",
-        lambda image_data, content_type: f"https://tos.test/{len(image_data)}.png",
+        lambda image_data, content_type: tos_uploader.get_signed_url(
+            f"fixture/{len(image_data)}.png"
+        ),
     )
+
+
+def _signed_tos_url(monkeypatch, object_key):
+    monkeypatch.setenv("TOS_ACCESS_KEY", "test-ak")
+    monkeypatch.setenv("TOS_SECRET_KEY", "test-sk")
+    monkeypatch.setenv("TOS_BUCKET", "honcut-fixtures")
+    monkeypatch.setenv("TOS_ENDPOINT", "tos-cn-beijing.volces.com")
+    return tos_uploader.get_signed_url(object_key)
 
 
 def _write_cinematic_frame(path: Path, marker: bytes = b"s") -> None:
@@ -348,11 +362,12 @@ def test_video_image_packaging_fails_closed_when_any_tos_upload_fails(
     _write_cinematic_frame(storyboard_dir / "S01.png")
     (storyboard_dir / "S01_end.png").write_bytes(b"e" * 1025)
     upload_count = 0
+    first_url = _signed_tos_url(monkeypatch, "fixture/first.png")
 
     def fail_second_upload(_image_data, _content_type):
         nonlocal upload_count
         upload_count += 1
-        return "https://tos.test/first.png" if upload_count == 1 else None
+        return first_url if upload_count == 1 else None
 
     monkeypatch.setattr(tos_uploader, "upload_image", fail_second_upload)
 
@@ -425,16 +440,17 @@ def test_chain_relay_skips_reference_only_content():
 def test_chain_relay_uploads_the_image_to_tos(monkeypatch):
     content = [{"type": "text", "text": "continue the shot"}]
     observed = []
+    relay_url = _signed_tos_url(monkeypatch, "fixture/relay.jpg")
     monkeypatch.setattr(
         tos_uploader,
         "base64_to_signed_url",
-        lambda value: observed.append(value) or "https://tos.test/relay.jpg",
+        lambda value: observed.append(value) or relay_url,
     )
 
     relayed = pipeline_core._apply_chain_relay(content, "relay-data", "S01")
 
     assert observed == ["relay-data"]
-    assert relayed[1]["image_url"]["url"] == "https://tos.test/relay.jpg"
+    assert relayed[1]["image_url"]["url"] == relay_url
     assert not relayed[1]["image_url"]["url"].startswith("data:")
 
 
@@ -767,11 +783,12 @@ def test_phase4_legacy_adapter_fails_before_subprocess_for_invalid_shots(
 
 
 def test_submit_content_sends_top_level_agent_plan_payload(monkeypatch):
+    frame_url = _signed_tos_url(monkeypatch, "fixture/frame.jpg")
     content = [
         {"type": "text", "text": "move slowly"},
         {
             "type": "image_url",
-            "image_url": {"url": "https://example.test/frame.jpg"},
+            "image_url": {"url": frame_url},
             "role": "first_frame",
         },
     ]
@@ -818,6 +835,7 @@ def test_submit_content_sends_top_level_agent_plan_payload(monkeypatch):
 
 def test_seedance_direct_first_frame_is_uploaded_to_tos_before_submit(monkeypatch):
     posted = {}
+    first_frame_url = _signed_tos_url(monkeypatch, "fixture/first-frame.png")
 
     class Response:
         status_code = 200
@@ -830,9 +848,7 @@ def test_seedance_direct_first_frame_is_uploaded_to_tos_before_submit(monkeypatc
     monkeypatch.setattr(
         tos_uploader,
         "base64_to_signed_url",
-        lambda value: (
-            "https://tos.test/first-frame.png" if value == "first-frame-b64" else None
-        ),
+        lambda value: first_frame_url if value == "first-frame-b64" else None,
     )
     monkeypatch.setattr(
         seedance_client.requests,
@@ -851,7 +867,7 @@ def test_seedance_direct_first_frame_is_uploaded_to_tos_before_submit(monkeypatc
     image_item = next(
         item for item in posted["json"]["content"] if item["type"] == "image_url"
     )
-    assert image_item["image_url"]["url"] == "https://tos.test/first-frame.png"
+    assert image_item["image_url"]["url"] == first_frame_url
     assert image_item["role"] == "first_frame"
 
 
@@ -908,7 +924,7 @@ def test_seedance_submit_content_rejects_inline_media_before_provider(monkeypatc
         ),
     )
 
-    with pytest.raises(ValueError, match="media must use an uploaded HTTPS URL"):
+    with pytest.raises(RuntimeError, match="configured TOS origin"):
         seedance_client.submit_content(
             [
                 {"type": "text", "text": "continue"},
@@ -2382,29 +2398,124 @@ def test_phase6_honors_seedance_provider_capacity(tmp_path, monkeypatch):
     assert succeeded == 4
 
 
-def test_multimodal_review_uses_vision_model_and_bounded_output(tmp_path):
+def test_multimodal_review_uses_responses_contract_and_bounded_output(tmp_path):
     observed = {}
 
-    class FakeCompletions:
+    class FakeResponses:
         @staticmethod
         def create(**kwargs):
             observed.update(kwargs)
             return SimpleNamespace(
-                choices=[SimpleNamespace(message=SimpleNamespace(content='{"ok": true}'))]
+                output=[
+                    SimpleNamespace(
+                        type="message",
+                        content=[SimpleNamespace(type="output_text", text='{"ok": true}')],
+                    )
+                ]
             )
 
     class FakeClient:
-        class chat:
-            completions = FakeCompletions()
+        responses = FakeResponses()
 
     image = tmp_path / "grid.jpg"
     image.write_bytes(b"image-bytes")
-    client = ark_multimodal_client.ArkMultimodalClient(client=FakeClient())
+    client = ark_multimodal_client.ArkMultimodalClient(
+        client=FakeClient(),
+        media_url_resolver=lambda _path: "https://tos.test/grid.jpg?signed=1",
+    )
 
     assert client.review([image], "review") == '{"ok": true}'
-    assert observed["model"] == "doubao-seed-2.0-lite"
-    assert observed["max_tokens"] == 4096
+    assert observed["model"] == "doubao-seed-2-0-lite-260428"
+    assert observed["max_output_tokens"] == 4096
     assert observed["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert observed["text"] == {"format": {"type": "json_object"}}
+    assert observed["input"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "review"},
+                {"type": "input_text", "text": "Input image 1: grid"},
+                {
+                    "type": "input_image",
+                    "image_url": "https://tos.test/grid.jpg?signed=1",
+                    "detail": "high",
+                },
+            ],
+        }
+    ]
+
+
+def test_multimodal_request_preserves_image_video_document_audio_order(tmp_path):
+    observed = {}
+
+    class FakeResponses:
+        @staticmethod
+        def create(**kwargs):
+            observed.update(kwargs)
+            return SimpleNamespace(output_text='{"ok": true}', output=[])
+
+    class FakeClient:
+        responses = FakeResponses()
+
+    paths = [
+        tmp_path / "frame.png",
+        tmp_path / "motion.mp4",
+        tmp_path / "notes.pdf",
+        tmp_path / "dialogue.mp3",
+    ]
+    for path in paths:
+        path.write_bytes(b"fixture")
+
+    client = ark_multimodal_client.ArkMultimodalClient(
+        client=FakeClient(),
+        media_url_resolver=lambda path: f"https://tos.test/{path.name}?signed=1",
+    )
+
+    assert client.review_media(paths, "audit") == '{"ok": true}'
+    content = observed["input"][0]["content"]
+    media_items = [item for item in content if item["type"] != "input_text"]
+    assert media_items == [
+        {
+            "type": "input_image",
+            "image_url": "https://tos.test/frame.png?signed=1",
+            "detail": "high",
+        },
+        {
+            "type": "input_video",
+            "video_url": "https://tos.test/motion.mp4?signed=1",
+            "fps": 1.0,
+        },
+        {
+            "type": "input_file",
+            "file_url": "https://tos.test/notes.pdf?signed=1",
+        },
+        {
+            "type": "input_audio",
+            "audio_url": "https://tos.test/dialogue.mp3?signed=1",
+        },
+    ]
+
+
+def test_multimodal_client_uses_standard_responses_url_with_agent_key(monkeypatch):
+    observed = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            observed.update(kwargs)
+
+    monkeypatch.setenv("ARK_AGENT_API_KEY", "agent-plan-key")
+    monkeypatch.setenv("ARK_API_KEY", "coding-plan-key")
+    monkeypatch.setenv(
+        "HONCUT_STORYBOARD_REVIEW_BASE_URL",
+        "https://ark.cn-beijing.volces.com/api/plan/v3",
+    )
+    monkeypatch.setattr(ark_multimodal_client, "OpenAI", FakeOpenAI)
+
+    ark_multimodal_client.ArkMultimodalClient()
+
+    assert observed["api_key"] == "agent-plan-key"
+    assert observed["base_url"] == "https://ark.cn-beijing.volces.com/api/v3"
+    assert observed["max_retries"] == 0
 
 
 def test_seedream_accepts_multiple_character_references(tmp_path, monkeypatch):

@@ -1,4 +1,3 @@
-import base64
 import json
 import sys
 from pathlib import Path
@@ -16,16 +15,14 @@ import phases.phase8.story_order_reviewer as story_order_reviewer
 from utils.config import DEFAULT_MULTIMODAL_MODEL
 
 
-class FakeCompletions:
+class FakeResponses:
     def __init__(self, content):
         self.content = content
         self.kwargs = None
 
     def create(self, **kwargs):
         self.kwargs = kwargs
-        return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=self.content))]
-        )
+        return SimpleNamespace(output_text=self.content, output=[])
 
 
 def test_ark_client_constructs_one_request_with_multiple_images(tmp_path):
@@ -33,20 +30,25 @@ def test_ark_client_constructs_one_request_with_multiple_images(tmp_path):
     second = tmp_path / "S02.jpg"
     first.write_bytes(b"first-image")
     second.write_bytes(b"second-image")
-    completions = FakeCompletions('{"ok": true}')
-    transport = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    responses = FakeResponses('{"ok": true}')
+    transport = SimpleNamespace(responses=responses)
 
-    client = ArkMultimodalClient(client=transport, model=DEFAULT_MULTIMODAL_MODEL)
+    client = ArkMultimodalClient(
+        client=transport,
+        model=DEFAULT_MULTIMODAL_MODEL,
+        media_url_resolver=lambda path: f"https://tos.test/{path.name}?signed=1",
+    )
     assert client.review([first, second], "review these") == '{"ok": true}'
 
-    request = completions.kwargs
+    request = responses.kwargs
     assert request["model"] == DEFAULT_MULTIMODAL_MODEL
-    assert request["response_format"] == {"type": "json_object"}
-    content = request["messages"][0]["content"]
-    urls = [part["image_url"]["url"] for part in content if part["type"] == "image_url"]
-    assert len(urls) == 2
-    assert base64.b64decode(urls[0].split(",", 1)[1]) == b"first-image"
-    assert urls[1].startswith("data:image/jpeg;base64,")
+    assert request["text"] == {"format": {"type": "json_object"}}
+    content = request["input"][0]["content"]
+    urls = [part["image_url"] for part in content if part["type"] == "input_image"]
+    assert urls == [
+        "https://tos.test/S01.png?signed=1",
+        "https://tos.test/S02.jpg?signed=1",
+    ]
 
 
 def test_review_parses_and_validates_ark_json(tmp_path):

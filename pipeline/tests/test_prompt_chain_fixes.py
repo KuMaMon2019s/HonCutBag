@@ -51,6 +51,15 @@ PLOT_ONLY_SCRIPT = """\
 """
 
 
+def _signed_tos_url(monkeypatch, object_key: str) -> str:
+    monkeypatch.setenv("TOS_ACCESS_KEY", "test-ak")
+    monkeypatch.setenv("TOS_SECRET_KEY", "test-sk")
+    monkeypatch.setenv("TOS_BUCKET", "honcut-fixtures")
+    monkeypatch.setenv("TOS_ENDPOINT", "tos-cn-beijing.volces.com")
+    monkeypatch.setenv("TOS_REGION", "cn-beijing")
+    return tos_uploader.get_signed_url(object_key)
+
+
 def test_f1_extracts_and_parses_v10_project_style(tmp_path):
     style_text = _extract_visual_style_text(STYLE_DECLARED_SCRIPT)
     assert style_text and "赛璐璐" in style_text
@@ -115,7 +124,9 @@ def test_f3_two_characters_bind_distinct_actual_reference_numbers(tmp_path, monk
     monkeypatch.setattr(
         tos_uploader,
         "upload_image",
-        lambda image_bytes, content_type: f"https://mock.invalid/{image_bytes[:1].decode()}.png",
+        lambda image_bytes, content_type: _signed_tos_url(
+            monkeypatch, f"fixture/{image_bytes[:1].decode()}.png"
+        ),
     )
 
     content = build_content_for_shot(
@@ -279,10 +290,11 @@ def test_action_phantom_with_cinematic_frame_keeps_only_strict_first_frame(
         _write_character_assets(tmp_path, character["id"], character["id"][0].encode())
     storyboard_dir = tmp_path / "storyboard_images"
     _write_cinematic_frame(storyboard_dir / "S01.png")
+    storyboard_url = _signed_tos_url(monkeypatch, "fixture/s.png")
     monkeypatch.setattr(
         tos_uploader,
         "upload_image",
-        lambda image_bytes, content_type: f"https://mock.invalid/{image_bytes[:1].decode()}.png",
+        lambda image_bytes, content_type: storyboard_url,
     )
 
     content = build_content_for_shot(tmp_path, "S01", {
@@ -295,7 +307,7 @@ def test_action_phantom_with_cinematic_frame_keeps_only_strict_first_frame(
     images = [item for item in content if item["type"] == "image_url"]
     prompt = next(item["text"] for item in content if item["type"] == "text")
     assert [item["role"] for item in images] == ["first_frame"]
-    assert images[0]["image_url"]["url"] == "https://mock.invalid/s.png"
+    assert images[0]["image_url"]["url"] == storyboard_url
     assert "motion-priority" in prompt
     assert "主体箭头控制主体的运动方向、路径和速度趋势" in prompt
     assert "不得把它们转化成光效、道具、HUD、UI 或字幕" in prompt

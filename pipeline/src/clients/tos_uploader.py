@@ -8,12 +8,31 @@ import os
 import hashlib
 import hmac
 import base64
+import json
 import mimetypes
 import requests
-from urllib.parse import quote
+import subprocess
+import tempfile
+from urllib.parse import parse_qs, quote, urlparse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+
+SEEDANCE_MAX_IMAGE_BYTES = 30 * 1024 * 1024
+SEEDANCE_MAX_VIDEO_BYTES = 200 * 1024 * 1024
+MULTIMODAL_MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MULTIMODAL_MAX_VIDEO_BYTES = 50 * 1024 * 1024
+MULTIMODAL_MAX_DOCUMENT_BYTES = 50 * 1024 * 1024
+MULTIMODAL_MAX_AUDIO_BYTES = 25 * 1024 * 1024
+IMAGE_TRANSPORT_METADATA = {
+    "JPEG": ("image/jpeg", ".jpg"),
+    "PNG": ("image/png", ".png"),
+    "WEBP": ("image/webp", ".webp"),
+    "BMP": ("image/bmp", ".bmp"),
+    "TIFF": ("image/tiff", ".tiff"),
+    "GIF": ("image/gif", ".gif"),
+}
 
 
 # ─── .env loading (same pattern as config.py) ────────────────────────────────
@@ -81,10 +100,80 @@ class TOSMediaUploadError(RuntimeError):
 
 
 def require_tos_url(url: str | None, *, label: str) -> str:
-    """Fail closed when a required TOS upload did not return a signed URL."""
+    """Require a current signed URL from HonCut's configured TOS bucket."""
     normalized = str(url or "").strip()
     if not normalized:
         raise TOSMediaUploadError(f"TOS upload failed for required {label}")
+    config = _get_tos_config()
+    endpoint = str(config["endpoint"] or "").strip().lower().rstrip("/")
+    if "://" in endpoint:
+        endpoint = urlparse(endpoint).netloc
+    expected_host = f"{config['bucket']}.{endpoint}".lower()
+    parsed = urlparse(normalized)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != expected_host
+        or parsed.netloc.lower() != expected_host
+        or parsed.username is not None
+        or parsed.password is not None
+        or not parsed.path.lstrip("/")
+        or parsed.fragment
+    ):
+        raise TOSMediaUploadError(f"required {label} did not use the configured TOS origin")
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    required_fields = {
+        "X-Tos-Algorithm",
+        "X-Tos-Credential",
+        "X-Tos-Date",
+        "X-Tos-Expires",
+        "X-Tos-SignedHeaders",
+        "X-Tos-Signature",
+    }
+    if set(query) != required_fields:
+        raise TOSMediaUploadError(f"required {label} was not a signed TOS URL")
+    if any(len(query[field]) != 1 for field in required_fields):
+        raise TOSMediaUploadError(f"required {label} had ambiguous TOS signature fields")
+    if query["X-Tos-Algorithm"] != ["TOS4-HMAC-SHA256"]:
+        raise TOSMediaUploadError(f"required {label} used an invalid TOS signature")
+    credential = query["X-Tos-Credential"][0]
+    try:
+        signed_at = datetime.strptime(query["X-Tos-Date"][0], "%Y%m%dT%H%M%SZ").replace(
+            tzinfo=timezone.utc
+        )
+        expires = int(query["X-Tos-Expires"][0])
+    except (ValueError, TypeError, IndexError) as exc:
+        raise TOSMediaUploadError(f"required {label} had invalid TOS expiry metadata") from exc
+    expected_scope = f"{signed_at:%Y%m%d}/{config['region']}/tos/request"
+    if (
+        not config["ak"]
+        or credential != f"{config['ak']}/{expected_scope}"
+        or query["X-Tos-SignedHeaders"] != ["host"]
+    ):
+        raise TOSMediaUploadError(f"required {label} did not use the configured TOS credential")
+    if not 1 <= expires <= 604800:
+        raise TOSMediaUploadError(f"required {label} had invalid TOS expiry")
+    if datetime.now(timezone.utc).timestamp() >= signed_at.timestamp() + expires:
+        raise TOSMediaUploadError(f"required {label} used an expired TOS URL")
+    signature = query["X-Tos-Signature"][0]
+    if len(signature) != 64 or any(char not in "0123456789abcdef" for char in signature):
+        raise TOSMediaUploadError(f"required {label} used an invalid TOS signature")
+    canonical_query = "&".join(
+        f"{_url_encode(key)}={_url_encode(values[0])}"
+        for key, values in sorted(query.items())
+        if key != "X-Tos-Signature"
+    )
+    canonical_request = (
+        f"GET\n{parsed.path}\n{canonical_query}\nhost:{expected_host}\n\nhost\nUNSIGNED-PAYLOAD"
+    )
+    request_hash = hashlib.sha256(canonical_request.encode()).hexdigest()
+    string_to_sign = f"TOS4-HMAC-SHA256\n{query['X-Tos-Date'][0]}\n{expected_scope}\n{request_hash}"
+    expected_signature = hmac.new(
+        _signing_key(config["sk"], f"{signed_at:%Y%m%d}", config["region"]),
+        string_to_sign.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    if not config["sk"] or not hmac.compare_digest(signature, expected_signature):
+        raise TOSMediaUploadError(f"required {label} used an invalid TOS signature")
     return normalized
 
 
@@ -204,57 +293,211 @@ def get_signed_url(object_key: str, expires: int = 7200) -> str:
 
 # ─── Image compression (P0-E, ref: HonCut spec zipImage) ────────────────────────
 
-def compress_image_base64(b64_data: str, max_bytes: int = 300 * 1024) -> str:
-    """压缩 base64 图片到目标大小以下（参考 HonCut 规范 zipImage）。
-    
-    策略：先降 quality，再降分辨率，循环直到 < max_bytes。
-    """
+def compress_image_base64(
+    b64_data: str,
+    max_bytes: int = SEEDANCE_MAX_IMAGE_BYTES,
+) -> str:
+    """Compress only when a provider limit requires it, preserving detail first."""
     import io
     try:
-        from PIL import Image
+        from PIL import Image, ImageOps
     except ImportError:
         return b64_data  # Pillow 未安装，跳过压缩
     
     raw = base64.b64decode(b64_data)
     if len(raw) <= max_bytes:
         return b64_data  # 已经够小
-    
-    img = Image.open(io.BytesIO(raw))
-    if img.mode == 'RGBA':
-        img = img.convert('RGB')
-    
-    # 策略1: 降 quality
-    for quality in [85, 70, 55, 40]:
+    with Image.open(io.BytesIO(raw)) as source:
+        img = ImageOps.exif_transpose(source).convert("RGB")
+
+    # Preserve the original pixel dimensions while reducing JPEG quality.
+    for quality in [92, 88, 84, 78, 72, 64, 56, 48, 40]:
         buf = io.BytesIO()
         img.save(buf, format='JPEG', quality=quality, optimize=True)
         if buf.tell() <= max_bytes:
             return base64.b64encode(buf.getvalue()).decode()
-    
-    # 策略2: 降分辨率 + 降 quality
-    for scale in [0.75, 0.5, 0.35]:
-        new_size = (int(img.width * scale), int(img.height * scale))
-        resized = img.resize(new_size, Image.Resampling.LANCZOS)
+    # Reduce dimensions gradually only after quality-only encodes are too large.
+    resized = img
+    while min(resized.size) > 300:
+        scale = max(300 / min(resized.size), 0.85)
+        new_size = (
+            max(300, int(resized.width * scale)),
+            max(300, int(resized.height * scale)),
+        )
+        if new_size == resized.size:
+            break
+        resized = resized.resize(new_size, Image.Resampling.LANCZOS)
         buf = io.BytesIO()
-        resized.save(buf, format='JPEG', quality=60, optimize=True)
+        resized.save(buf, format="JPEG", quality=78, optimize=True)
         if buf.tell() <= max_bytes:
             return base64.b64encode(buf.getvalue()).decode()
-    
-    # 兜底：返回最小版本
+
+    # Let the caller's media preflight fail closed if even the legal minimum
+    # cannot satisfy the provider limit.
     buf = io.BytesIO()
-    img.resize((int(img.width * 0.25), int(img.height * 0.25)), Image.Resampling.LANCZOS).save(
-        buf, format='JPEG', quality=40, optimize=True)
+    resized.save(buf, format="JPEG", quality=40, optimize=True)
     return base64.b64encode(buf.getvalue()).decode()
 
 
 # ─── Upload ───────────────────────────────────────────────────────────────────
 
-def compress_image_bytes(image_data: bytes, max_bytes: int = 300 * 1024) -> bytes:
+def compress_image_bytes(
+    image_data: bytes,
+    max_bytes: int = SEEDANCE_MAX_IMAGE_BYTES,
+) -> bytes:
     """压缩图片字节到目标大小以下。内部复用 compress_image_base64。"""
     if len(image_data) <= max_bytes:
         return image_data
     b64 = base64.b64encode(image_data).decode()
     compressed_b64 = compress_image_base64(b64, max_bytes=max_bytes)
     return base64.b64decode(compressed_b64)
+
+
+def _image_metadata(image_data: bytes) -> tuple[str, int, int]:
+    import io
+
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(image_data)) as image:
+            image.verify()
+        with Image.open(io.BytesIO(image_data)) as image:
+            return str(image.format or "").upper(), int(image.width), int(image.height)
+    except (ImportError, OSError, ValueError) as exc:
+        raise ValueError("media preflight could not decode image bytes") from exc
+
+
+def _probe_av(path: Path) -> dict:
+    try:
+        completed = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type,codec_name,width,height,avg_frame_rate:format=duration,format_name",
+                "-of",
+                "json",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(f"media preflight ffprobe failed for {path.name}") from exc
+    if completed.returncode != 0:
+        raise ValueError(f"media preflight ffprobe rejected {path.name}")
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"media preflight ffprobe returned invalid JSON for {path.name}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"media preflight ffprobe returned invalid data for {path.name}")
+    return payload
+
+
+def _fraction(value: str | None) -> float:
+    numerator, _, denominator = str(value or "0").partition("/")
+    try:
+        return float(numerator) / float(denominator or 1)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return 0.0
+
+
+def _validate_seedance_image(image_data: bytes) -> tuple[str, int, int]:
+    if len(image_data) >= SEEDANCE_MAX_IMAGE_BYTES:
+        raise ValueError("Seedance image must be smaller than 30 MB")
+    image_format, width, height = _image_metadata(image_data)
+    if image_format not in {"JPEG", "PNG", "WEBP", "BMP", "TIFF", "GIF"}:
+        raise ValueError(f"Seedance image format is unsupported: {image_format or 'unknown'}")
+    ratio = width / height if height else 0
+    if not (300 <= width <= 6000 and 300 <= height <= 6000):
+        raise ValueError("Seedance image dimensions must be within 300..6000 pixels")
+    if not 0.4 <= ratio <= 2.5:
+        raise ValueError("Seedance image aspect ratio must be within 0.4..2.5")
+    return image_format, width, height
+
+
+def _validate_seedance_video(path: Path) -> None:
+    if path.stat().st_size > SEEDANCE_MAX_VIDEO_BYTES:
+        raise ValueError("Seedance video exceeds the 200 MB input limit")
+    if path.suffix.lower() not in {".mp4", ".mov"}:
+        raise ValueError("Seedance video format must be mp4 or mov")
+    payload = _probe_av(path)
+    streams = payload.get("streams") or []
+    video = next((stream for stream in streams if stream.get("codec_type") == "video"), None)
+    if not isinstance(video, dict):
+        raise ValueError("media preflight ffprobe found no video stream")
+    codec = str(video.get("codec_name") or "").lower()
+    if codec not in {"h264", "hevc"}:
+        raise ValueError("Seedance video codec must be H.264 or H.265")
+    width, height = int(video.get("width") or 0), int(video.get("height") or 0)
+    area = width * height
+    if not (300 <= width <= 6000 and 300 <= height <= 6000):
+        raise ValueError("Seedance video dimensions must be within 300..6000 pixels")
+    if not 407696 <= area <= 8295044:
+        raise ValueError("Seedance video pixel area is outside the supported range")
+    fps = _fraction(video.get("avg_frame_rate"))
+    if not 24 <= fps <= 60:
+        raise ValueError("Seedance video frame rate must be within 24..60 fps")
+    try:
+        duration = float((payload.get("format") or {}).get("duration") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Seedance video duration is not measurable") from exc
+    if not 2 <= duration <= 15:
+        raise ValueError("Seedance reference video duration must be within 2..15 seconds")
+
+
+def validate_multimodal_media_file(path: str | Path) -> str:
+    """Validate one URL-backed Ark Responses input and return its media kind."""
+    source = Path(path)
+    if not source.is_file() or source.stat().st_size <= 0:
+        raise FileNotFoundError(f"multimodal input not found or empty: {source}")
+    mime_type = mimetypes.guess_type(source.name)[0] or ""
+    size = source.stat().st_size
+    if mime_type.startswith("image/"):
+        if size >= MULTIMODAL_MAX_IMAGE_BYTES:
+            raise ValueError("multimodal image must be smaller than 10 MB")
+        image_format, width, height = _image_metadata(source.read_bytes())
+        if image_format not in {"JPEG", "PNG", "WEBP", "BMP", "TIFF", "GIF", "ICO"}:
+            raise ValueError(f"multimodal image format is unsupported: {image_format}")
+        if width <= 14 or height <= 14 or not 196 <= width * height <= 36_000_000:
+            raise ValueError("multimodal image dimensions are outside the supported range")
+        if not 1 / 150 <= width / height <= 150:
+            raise ValueError("multimodal image aspect ratio is outside the supported range")
+        return "image"
+    if mime_type.startswith("video/"):
+        if size >= MULTIMODAL_MAX_VIDEO_BYTES:
+            raise ValueError("multimodal video must be smaller than 50 MB")
+        if source.suffix.lower() not in {".mp4", ".avi", ".mov"}:
+            raise ValueError("multimodal video format must be mp4, avi, or mov")
+        payload = _probe_av(source)
+        if not any(stream.get("codec_type") == "video" for stream in payload.get("streams") or []):
+            raise ValueError("media preflight ffprobe found no video stream")
+        return "video"
+    if mime_type.startswith("audio/"):
+        if size > MULTIMODAL_MAX_AUDIO_BYTES:
+            raise ValueError("multimodal audio exceeds the 25 MB input limit")
+        if source.suffix.lower() not in {".mp3", ".wav", ".aac", ".m4a"}:
+            raise ValueError("multimodal audio format must be mp3, wav, aac, or m4a")
+        payload = _probe_av(source)
+        if not any(stream.get("codec_type") == "audio" for stream in payload.get("streams") or []):
+            raise ValueError("media preflight ffprobe found no audio stream")
+        duration = float((payload.get("format") or {}).get("duration") or 0)
+        if duration <= 0 or duration > 7200:
+            raise ValueError("multimodal audio duration must be within 120 minutes")
+        return "audio"
+    if source.suffix.lower() == ".pdf":
+        if size >= MULTIMODAL_MAX_DOCUMENT_BYTES:
+            raise ValueError("multimodal PDF must be smaller than 50 MB")
+        with source.open("rb") as document:
+            signature = document.read(5)
+        if signature != b"%PDF-":
+            raise ValueError("multimodal document must be a valid PDF")
+        return "document"
+    raise ValueError(f"unsupported multimodal input format: {source.name}")
 
 
 def upload_image(image_data: bytes, content_type: str = "image/png") -> Optional[str]:
@@ -272,21 +515,15 @@ def upload_image(image_data: bytes, content_type: str = "image/png") -> Optional
         print("  [tos] TOS config incomplete (need TOS_ACCESS_KEY, TOS_SECRET_KEY, TOS_BUCKET), skipping upload")
         return None
 
-    # --- P0-E: 上传前压缩（参考 HonCut 规范 zipImage）---
+    # Seedance accepts images up to 30 MB. Preserve source bytes and detail
+    # unless that provider limit actually requires recompression.
     image_data = compress_image_bytes(image_data)
-
-    # Compression may transcode a large PNG to JPEG.  Keep the object suffix and
-    # HTTP Content-Type consistent with the bytes so downstream decoders do not
-    # have to guess (large full_body.png files routinely take this path).
-    if image_data.startswith(b"\xff\xd8\xff"):
-        content_type = "image/jpeg"
-    elif image_data.startswith(b"\x89PNG\r\n\x1a\n"):
-        content_type = "image/png"
+    image_format, _width, _height = _validate_seedance_image(image_data)
+    content_type, suffix = IMAGE_TRANSPORT_METADATA[image_format]
 
     # Object key with content hash for dedup
     content_hash = hashlib.sha256(image_data).hexdigest()
-    ext = "png" if content_type == "image/png" else "jpg"
-    object_key = f"volcengine/image/{content_hash}.{ext}"
+    object_key = f"volcengine/image/{content_hash}{suffix}"
 
     host = f"{config['bucket']}.{config['endpoint']}"
     now = datetime.now(timezone.utc)
@@ -374,13 +611,37 @@ def upload_file(
     return get_signed_url(object_key, expires=7200)
 
 
-def upload_media_file(path: str | Path, *, prefix: str = "volcengine/media") -> str | None:
-    """Upload a media file without applying image compression or transcoding."""
+def upload_media_file(
+    path: str | Path,
+    *,
+    prefix: str = "volcengine/media",
+    contract: str = "seedance",
+) -> str | None:
+    """Preflight and upload one local provider input."""
     source = Path(path)
     if not source.is_file():
         raise FileNotFoundError(f"media file not found: {source}")
-    media_data = source.read_bytes()
     content_type = mimetypes.guess_type(source.name)[0] or "application/octet-stream"
+    if contract == "seedance":
+        if content_type.startswith("image/"):
+            image_data = compress_image_bytes(source.read_bytes())
+            image_format, _width, _height = _validate_seedance_image(image_data)
+            content_type, suffix = IMAGE_TRANSPORT_METADATA[image_format]
+            content_hash = hashlib.sha256(image_data).hexdigest()
+            return upload_file(
+                image_data,
+                f"{prefix.rstrip('/')}/{content_hash}{suffix}",
+                content_type,
+            )
+        if content_type.startswith("video/"):
+            _validate_seedance_video(source)
+        else:
+            raise ValueError(f"unsupported Seedance media input: {source.name}")
+    elif contract == "multimodal":
+        validate_multimodal_media_file(source)
+    else:
+        raise ValueError(f"unknown media upload contract: {contract}")
+    media_data = source.read_bytes()
     content_hash = hashlib.sha256(media_data).hexdigest()
     suffix = source.suffix.lower() or ".bin"
     return upload_file(
@@ -399,6 +660,19 @@ def upload_media_file_required(
     """Upload a local image/video and require a TOS URL result."""
     return require_tos_url(
         upload_media_file(path, prefix=prefix),
+        label=label,
+    )
+
+
+def upload_multimodal_media_file_required(
+    path: str | Path,
+    *,
+    prefix: str = "volcengine/multimodal",
+    label: str = "multimodal input",
+) -> str:
+    """Preflight an Ark understanding input, upload it, and require provenance."""
+    return require_tos_url(
+        upload_media_file(path, prefix=prefix, contract="multimodal"),
         label=label,
     )
 
@@ -427,8 +701,12 @@ def base64_video_to_signed_url(
     if not video_data:
         print("  [tos] Video base64 decode error: empty payload")
         return None
-    content_hash = hashlib.sha256(video_data).hexdigest()
     normalized_suffix = suffix if suffix.startswith(".") else f".{suffix}"
+    with tempfile.NamedTemporaryFile(suffix=normalized_suffix) as temporary:
+        temporary.write(video_data)
+        temporary.flush()
+        _validate_seedance_video(Path(temporary.name))
+    content_hash = hashlib.sha256(video_data).hexdigest()
     return upload_file(
         video_data,
         f"volcengine/video/{content_hash}{normalized_suffix}",
@@ -454,11 +732,8 @@ def base64_to_signed_url(base64_data: str) -> Optional[str]:
     if "," in base64_data:
         base64_data = base64_data.split(",", 1)[1]
 
-    # --- P0-E: 上传前压缩（参考 HonCut 规范 zipImage）---
-    base64_data = compress_image_base64(base64_data)
-
     try:
-        image_bytes = base64.b64decode(base64_data)
+        image_bytes = base64.b64decode(base64_data, validate=True)
     except Exception as e:
         print(f"  [tos] Base64 decode error: {e}")
         return None

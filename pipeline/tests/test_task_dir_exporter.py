@@ -13,6 +13,15 @@ from clients import tos_uploader
 from tools import asset_packager, task_dir_exporter
 
 
+def _signed_tos_url(monkeypatch, object_key: str) -> str:
+    monkeypatch.setenv("TOS_ACCESS_KEY", "test-ak")
+    monkeypatch.setenv("TOS_SECRET_KEY", "test-sk")
+    monkeypatch.setenv("TOS_BUCKET", "honcut-fixtures")
+    monkeypatch.setenv("TOS_ENDPOINT", "tos-cn-beijing.volces.com")
+    monkeypatch.setenv("TOS_REGION", "cn-beijing")
+    return tos_uploader.get_signed_url(object_key)
+
+
 def _image(path: Path, marker: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(marker * 2048)
@@ -62,7 +71,9 @@ def test_task_dir_and_content_promote_phantom_to_strict_first_frame(tmp_path, mo
     monkeypatch.setattr(
         tos_uploader,
         "upload_image",
-        lambda image_data, content_type: f"https://example.test/{image_data[:1].hex()}",
+        lambda image_data, content_type: _signed_tos_url(
+            monkeypatch, f"fixture/{image_data[:1].hex()}.png"
+        ),
     )
     content = asset_packager.build_content_for_shot(tmp_path, "S02", shot_meta)
     task_dir = task_dir_exporter.build_task_dir(tmp_path, ["S02"], shot_meta)

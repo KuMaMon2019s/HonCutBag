@@ -256,7 +256,9 @@ class BaseURLs:
     
     # 火山方舟
     ARK_AGENT_PLAN: str = "https://ark.cn-beijing.volces.com/api/plan/v3"
-    ARK_PAY_AS_YOU_GO: str = "https://ark.cn-beijing.volces.com/api/v3"  # 不使用
+    # Responses-based multimodal understanding uses the standard Ark route.
+    # HonCut still reads only ARK_AGENT_API_KEY; ARK_API_KEY remains reserved.
+    ARK_RESPONSES: str = "https://ark.cn-beijing.volces.com/api/v3"
     
     # OpenAI
     OPENAI: str = "https://api.openai.com/v1"
@@ -278,7 +280,7 @@ class Models:
     ARK_TEXT_TURBO: str = "doubao-seed-evolving"     # 兼容旧快速路由名
 
     # 火山方舟 - 多模态理解。不要复用文本默认模型；Phase 5/8 会传图片。
-    ARK_MULTIMODAL: str = "doubao-seed-2.0-lite"
+    ARK_MULTIMODAL: str = "doubao-seed-2-0-lite-260428"
     
     # 火山方舟 - 图像生成
     ARK_IMAGE: str = "doubao-seedream-5.0-lite"
@@ -474,6 +476,7 @@ OPENAI_API_KEY_ENV = APIKeys.OPENAI
 
 # Base URLs
 ARK_BASE_URL = BaseURLs.ARK_AGENT_PLAN
+ARK_RESPONSES_BASE_URL = BaseURLs.ARK_RESPONSES
 
 # Models
 DEFAULT_TEXT_MODEL = Models.ARK_TEXT_LITE

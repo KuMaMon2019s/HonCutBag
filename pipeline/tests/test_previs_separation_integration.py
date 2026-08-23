@@ -32,6 +32,15 @@ from phases.phase5.storyboard_qa_gate import run_l4_first_frame_review
 from tools.asset_packager import build_content_for_shot
 
 
+def _signed_tos_url(monkeypatch, object_key: str) -> str:
+    monkeypatch.setenv("TOS_ACCESS_KEY", "test-ak")
+    monkeypatch.setenv("TOS_SECRET_KEY", "test-sk")
+    monkeypatch.setenv("TOS_BUCKET", "honcut-fixtures")
+    monkeypatch.setenv("TOS_ENDPOINT", "tos-cn-beijing.volces.com")
+    monkeypatch.setenv("TOS_REGION", "cn-beijing")
+    return tos_uploader.get_signed_url(object_key)
+
+
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -208,7 +217,7 @@ def test_previs_pixels_are_separated_end_to_end_before_video_transport(
     def _record_upload(image_data, content_type):
         digest = hashlib.sha256(image_data).hexdigest()
         uploaded_sha256.append(digest)
-        return f"offline://upload/{digest}"
+        return _signed_tos_url(monkeypatch, f"fixture/{digest}.png")
 
     monkeypatch.setattr(tos_uploader, "upload_image", _record_upload)
     content = build_content_for_shot(
