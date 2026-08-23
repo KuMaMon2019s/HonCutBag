@@ -24,7 +24,12 @@ if str(SCRIPTS) not in sys.path:
 
 import phase_orchestrator
 
-from clients import ark_multimodal_client, local_video_client, seedance_client
+from clients import (
+    ark_multimodal_client,
+    local_video_client,
+    seedance_client,
+    tos_uploader,
+)
 from clients.seedream_client import SeedreamClient
 from phases import pipeline_core
 from phases.phase4 import phase4_orchestrator
@@ -335,6 +340,32 @@ def test_flf2v_content_keeps_first_and_last_frames(tmp_path, monkeypatch):
     ]
 
 
+def test_video_image_packaging_fails_closed_when_any_tos_upload_fails(
+    tmp_path,
+    monkeypatch,
+):
+    storyboard_dir = tmp_path / "storyboard_images"
+    _write_cinematic_frame(storyboard_dir / "S01.png")
+    (storyboard_dir / "S01_end.png").write_bytes(b"e" * 1025)
+    upload_count = 0
+
+    def fail_second_upload(_image_data, _content_type):
+        nonlocal upload_count
+        upload_count += 1
+        return "https://tos.test/first.png" if upload_count == 1 else None
+
+    monkeypatch.setattr(tos_uploader, "upload_image", fail_second_upload)
+
+    with pytest.raises(RuntimeError, match="TOS upload failed.*last_frame"):
+        asset_packager.build_content_for_shot(
+            tmp_path,
+            "S01",
+            {"prompt": "frame shot", "gen_strategy": "flf2v"},
+        )
+
+    assert upload_count == 2
+
+
 def test_flf2v_injects_text_identity_lock_and_rejects_drifted_relay(tmp_path, monkeypatch):
     _stub_tos_upload(monkeypatch)
     storyboard_dir = tmp_path / "storyboard_images"
@@ -389,6 +420,33 @@ def test_chain_relay_skips_reference_only_content():
 
     assert relayed is content
     assert not any(item.get("role") == "first_frame" for item in relayed)
+
+
+def test_chain_relay_uploads_the_image_to_tos(monkeypatch):
+    content = [{"type": "text", "text": "continue the shot"}]
+    observed = []
+    monkeypatch.setattr(
+        tos_uploader,
+        "base64_to_signed_url",
+        lambda value: observed.append(value) or "https://tos.test/relay.jpg",
+    )
+
+    relayed = pipeline_core._apply_chain_relay(content, "relay-data", "S01")
+
+    assert observed == ["relay-data"]
+    assert relayed[1]["image_url"]["url"] == "https://tos.test/relay.jpg"
+    assert not relayed[1]["image_url"]["url"].startswith("data:")
+
+
+def test_chain_relay_fails_closed_when_tos_upload_fails(monkeypatch):
+    monkeypatch.setattr(tos_uploader, "base64_to_signed_url", lambda _value: None)
+
+    with pytest.raises(RuntimeError, match="TOS upload failed.*chain relay"):
+        pipeline_core._apply_chain_relay(
+            [{"type": "text", "text": "continue the shot"}],
+            "relay-data",
+            "S01",
+        )
 
 
 def test_phase_orchestrator_writes_full_streamed_log(monkeypatch, tmp_path):
@@ -756,6 +814,114 @@ def test_submit_content_sends_top_level_agent_plan_payload(monkeypatch):
     }
     assert posted["json"]["content"] is content
     assert "parameters" not in posted["json"]
+
+
+def test_seedance_direct_first_frame_is_uploaded_to_tos_before_submit(monkeypatch):
+    posted = {}
+
+    class Response:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json():
+            return {"id": "task-tos-first-frame"}
+
+    monkeypatch.setattr(
+        tos_uploader,
+        "base64_to_signed_url",
+        lambda value: (
+            "https://tos.test/first-frame.png" if value == "first-frame-b64" else None
+        ),
+    )
+    monkeypatch.setattr(
+        seedance_client.requests,
+        "post",
+        lambda url, **kwargs: posted.update(url=url, **kwargs) or Response(),
+    )
+
+    task_id = seedance_client._submit_direct(
+        "continue the visible action",
+        "test-key",
+        model="doubao-seedance-2.0-fast",
+        first_frame_base64="first-frame-b64",
+    )
+
+    assert task_id == "task-tos-first-frame"
+    image_item = next(
+        item for item in posted["json"]["content"] if item["type"] == "image_url"
+    )
+    assert image_item["image_url"]["url"] == "https://tos.test/first-frame.png"
+    assert image_item["role"] == "first_frame"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "uploader_name", "message"),
+    [
+        (
+            {"first_frame_base64": "first-frame"},
+            "base64_to_signed_url",
+            "first-frame image",
+        ),
+        (
+            {"reference_image_base64": "reference-image"},
+            "base64_to_signed_url",
+            "reference image",
+        ),
+        (
+            {"reference_video_base64": "reference-video"},
+            "base64_video_to_signed_url",
+            "reference video",
+        ),
+    ],
+)
+def test_seedance_direct_media_upload_failure_never_reaches_provider(
+    monkeypatch,
+    kwargs,
+    uploader_name,
+    message,
+):
+    monkeypatch.setattr(tos_uploader, uploader_name, lambda _value: None)
+    monkeypatch.setattr(
+        seedance_client.requests,
+        "post",
+        lambda *_args, **_kwargs: pytest.fail(
+            "provider submission must not run after TOS failure"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match=f"TOS upload failed.*{message}"):
+        seedance_client._submit_direct(
+            "test",
+            "test-key",
+            model="doubao-seedance-2.0-fast",
+            **kwargs,
+        )
+
+
+def test_seedance_submit_content_rejects_inline_media_before_provider(monkeypatch):
+    monkeypatch.setattr(
+        seedance_client.requests,
+        "post",
+        lambda *_args, **_kwargs: pytest.fail(
+            "inline media must be rejected before provider submission"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="media must use an uploaded HTTPS URL"):
+        seedance_client.submit_content(
+            [
+                {"type": "text", "text": "continue"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,AAAA"},
+                    "role": "first_frame",
+                },
+            ],
+            api_key="test-key",
+            model="doubao-seedance-2.0-fast",
+            duration=4,
+        )
 
 
 def test_submit_content_rejects_non_boolean_generate_audio_before_submission(monkeypatch):
@@ -1591,6 +1757,46 @@ def test_seedance_poll_failure_resumes_without_resubmitting(tmp_path):
     assert execution.provider_job_id == "provider-job-1"
     assert submissions == ["submitted"]
     assert store.get(execution.task_id).status == "succeeded"
+
+
+def test_seedance_generated_output_download_does_not_upload_to_tos(
+    tmp_path,
+    monkeypatch,
+):
+    store = GenerationTaskStore(tmp_path / "runtime.db")
+    output_path = tmp_path / "shots" / "S01" / "output.mp4"
+    downloaded = []
+    monkeypatch.setattr(
+        tos_uploader,
+        "upload_media_file",
+        lambda *_args, **_kwargs: pytest.fail(
+            "a generated output is not TOS input material until it is reused"
+        ),
+    )
+
+    def download(url, path):
+        downloaded.append((url, path))
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_bytes(b"video")
+        return path
+
+    execution = execute_seedance_video_task(
+        store,
+        run_id="run-output-download",
+        resource_id="S01",
+        payload={"shot_id": "S01"},
+        provider_endpoint="https://seedance.test",
+        output_path=output_path,
+        submit=lambda: "provider-job-output",
+        poll=lambda _provider_job_id: "https://provider.test/output.mp4",
+        download=download,
+    )
+
+    assert downloaded == [
+        ("https://provider.test/output.mp4", str(output_path)),
+    ]
+    assert output_path.read_bytes() == b"video"
+    assert execution.output_path == str(output_path)
 
 
 @pytest.mark.parametrize("status_code", [403, 429, 500])

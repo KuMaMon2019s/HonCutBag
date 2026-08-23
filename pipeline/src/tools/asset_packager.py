@@ -833,46 +833,45 @@ def build_content_for_shot(
     uploaded_reference_descriptions = []
     try:
         from clients import tos_uploader
-    except ImportError:
-        print(f"  [assets] ⚠ tos_uploader not available, skipping image upload")
-        return content
+    except ImportError as exc:
+        raise RuntimeError(
+            "TOS uploader is required for every Seedance image input"
+        ) from exc
     
     for asset in image_assets:
-        try:
-            # M5: fit first_frame/last_frame to video aspect ratio before upload (no stretching)
-            video_w = shot_meta.get("width", 1280)
-            video_h = shot_meta.get("height", 720)
+        # M5: fit first_frame/last_frame to video aspect ratio before upload (no stretching)
+        video_w = shot_meta.get("width", 1280)
+        video_h = shot_meta.get("height", 720)
 
-            if asset["role"] in {"first_frame", "last_frame"}:
-                try:
-                    import tempfile
-                    from pipeline_runner import fit_to_aspect
-                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                        tmp_path = Path(tmp.name)
-                    fit_to_aspect(asset["path"], video_w, video_h, tmp_path)
-                    img_data = tmp_path.read_bytes()
-                    tmp_path.unlink()
-                except Exception:
-                    # Fallback: use raw bytes if fit_to_aspect fails (e.g. non-image file)
-                    img_data = asset["path"].read_bytes()
-            else:
+        if asset["role"] in {"first_frame", "last_frame"}:
+            try:
+                import tempfile
+                from pipeline_runner import fit_to_aspect
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                    tmp_path = Path(tmp.name)
+                fit_to_aspect(asset["path"], video_w, video_h, tmp_path)
+                img_data = tmp_path.read_bytes()
+                tmp_path.unlink()
+            except Exception:
+                # Preserve the original validated image when deterministic fitting
+                # is unavailable; the upload itself must still succeed.
                 img_data = asset["path"].read_bytes()
+        else:
+            img_data = asset["path"].read_bytes()
 
-            tos_url = tos_uploader.upload_image(img_data, "image/png")
-            if tos_url:
-                content.append({
-                    "type": "image_url",
-                    "image_url": {"url": tos_url},
-                    "role": asset["role"],
-                    "priority": asset["priority"],
-                })
-                uploaded_count += 1
-                if asset["role"] == "reference_image":
-                    uploaded_reference_descriptions.append(asset)
-            else:
-                print(f"  [assets] ⚠ TOS upload failed for {asset['path'].name}, skipping")
-        except Exception as e:
-            print(f"  [assets] ⚠ Failed to upload {asset['path'].name}: {e}")
+        tos_url = tos_uploader.require_tos_url(
+            tos_uploader.upload_image(img_data, "image/png"),
+            label=f"{asset['role']} image {asset['path'].name}",
+        )
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": tos_url},
+            "role": asset["role"],
+            "priority": asset["priority"],
+        })
+        uploaded_count += 1
+        if asset["role"] == "reference_image":
+            uploaded_reference_descriptions.append(asset)
     
     if strategy == "phantom" and uploaded_reference_descriptions and content:
         text_item = next(

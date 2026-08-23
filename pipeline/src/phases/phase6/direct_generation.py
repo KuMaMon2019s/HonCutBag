@@ -85,9 +85,15 @@ def _apply_chain_relay(content_list, first_frame_b64, shot_id):
         item for item in (content_list or [])
         if item.get("role") != "first_frame"
     ]
+    from clients.tos_uploader import base64_image_to_signed_url_required
+
+    relay_url = base64_image_to_signed_url_required(
+        first_frame_b64,
+        label=f"chain relay image for {shot_id}",
+    )
     content_list.insert(1 if content_list else 0, {
         "type": "image_url",
-        "image_url": {"url": f"data:image/jpeg;base64,{first_frame_b64}"},
+        "image_url": {"url": relay_url},
         "role": "first_frame",
         "priority": "high",
     })

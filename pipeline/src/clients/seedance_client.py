@@ -8,6 +8,7 @@ import os
 import tempfile
 import time
 from typing import Optional
+from urllib.parse import urlparse
 
 import requests
 
@@ -95,6 +96,18 @@ def _validate_content_media_roles(content: list[dict]) -> None:
             f"media (frame_roles={sorted(frame_roles)}, "
             f"reference_roles={sorted(reference_roles)})"
         )
+    for item in content:
+        media_type = item.get("type")
+        if media_type not in {"image_url", "video_url"}:
+            continue
+        container = item.get(media_type)
+        url = container.get("url") if isinstance(container, dict) else None
+        parsed = urlparse(str(url or ""))
+        if parsed.scheme != "https" or not parsed.netloc:
+            raise ValueError(
+                "Seedance media must use an uploaded HTTPS URL; inline data, "
+                "local paths, and empty media URLs are forbidden"
+            )
 
 
 def get_task(task_id: str, *, api_key: str, timeout: float = 30) -> dict:
@@ -192,17 +205,12 @@ def _submit_direct(
 
     # Build content — always array format
     if reference_image_base64:
-        # Try TOS upload first (avoids PrivacyInformation detection)
-        image_url = None
-        try:
-            from clients.tos_uploader import base64_to_signed_url
-            image_url = base64_to_signed_url(reference_image_base64)
-        except Exception as e:
-            print(f"  [seedance] TOS upload failed: {e}")
-        
-        if image_url is None:
-            # Fallback to base64 data URL
-            image_url = f"data:image/png;base64,{reference_image_base64}"
+        from clients.tos_uploader import base64_image_to_signed_url_required
+
+        image_url = base64_image_to_signed_url_required(
+            reference_image_base64,
+            label="reference image",
+        )
         
         # Character identity anchor (no privacy detection, maintains consistency)
         content = [
@@ -214,11 +222,17 @@ def _submit_direct(
             },
         ]
     elif first_frame_base64:
-        # img2vid: video starts FROM this image (strict privacy detection)
+        from clients.tos_uploader import base64_image_to_signed_url_required
+
+        image_url = base64_image_to_signed_url_required(
+            first_frame_base64,
+            label="first-frame image",
+        )
+        # img2vid: video starts FROM this uploaded image.
         content = [
             {
                 "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{first_frame_base64}"},
+                "image_url": {"url": image_url},
                 "role": "first_frame",
             },
             {"type": "text", "text": sanitized_prompt},
@@ -229,19 +243,17 @@ def _submit_direct(
 
     # --- P1-D: 多模态组合参考 — 视频参考追加到 content ---
     if reference_video_base64:
-        video_url = None
-        try:
-            from clients.tos_uploader import base64_video_to_signed_url
+        from clients.tos_uploader import base64_video_to_signed_url_required
 
-            video_url = base64_video_to_signed_url(reference_video_base64)
-        except Exception as e:
-            print(f"  [seedance] Video TOS upload failed: {e}")
-        if video_url:
-            content.append({
-                "type": "video_url",
-                "video_url": {"url": video_url},
-                "role": "reference_video",
-            })
+        video_url = base64_video_to_signed_url_required(
+            reference_video_base64,
+            label="reference video",
+        )
+        content.append({
+            "type": "video_url",
+            "video_url": {"url": video_url},
+            "role": "reference_video",
+        })
 
     _validate_content_media_roles(content)
 
@@ -362,11 +374,13 @@ def submit_video_extension(
     generate_audio: bool | None = None,
 ) -> str:
     """Upload a prior chunk as video and submit an explicit Seedance extension task."""
-    from clients.tos_uploader import upload_media_file
+    from clients.tos_uploader import upload_media_file_required
 
-    video_url = upload_media_file(reference_video_path, prefix="volcengine/video")
-    if not video_url:
-        raise RuntimeError(f"failed to upload reference video: {reference_video_path}")
+    video_url = upload_media_file_required(
+        reference_video_path,
+        prefix="volcengine/video",
+        label="video extension source",
+    )
     content = build_video_extension_content(
         prompt,
         video_url,

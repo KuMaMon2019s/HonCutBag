@@ -871,7 +871,7 @@ def _extension_content(
     content: Sequence[dict[str, Any]],
     previous_output_path: Path,
 ) -> list[dict[str, Any]]:
-    from clients.tos_uploader import upload_media_file
+    from clients.tos_uploader import upload_media_file_required
     from quality.continuity_seam import (
         extract_ordered_video_frames,
         extract_video_tail_window,
@@ -888,15 +888,20 @@ def _extension_content(
     frame_paths = tuple(anchor_dir / f"{asset_stem}_frame_{index:02d}.jpg" for index in range(1, 4))
     if any(not path.is_file() or path.stat().st_size == 0 for path in frame_paths):
         extract_ordered_video_frames(tail_video_path, frame_paths)
-    video_url = upload_media_file(tail_video_path, prefix="volcengine/video")
-    if not video_url:
-        raise RuntimeError(f"failed to upload continuity tail window {tail_video_path}")
+    video_url = upload_media_file_required(
+        tail_video_path,
+        prefix="volcengine/video",
+        label="continuity tail video",
+    )
     frame_urls = []
-    for path in frame_paths:
-        url = upload_media_file(path, prefix="volcengine/image")
-        if not url:
-            raise RuntimeError(f"failed to upload ordered continuity anchor {path}")
-        frame_urls.append(url)
+    for index, path in enumerate(frame_paths, 1):
+        frame_urls.append(
+            upload_media_file_required(
+                path,
+                prefix="volcengine/image",
+                label=f"ordered continuity anchor image {index}",
+            )
+        )
 
     base_images = [dict(item) for item in content if item.get("type") == "image_url"]
     base_images = base_images[
@@ -949,7 +954,7 @@ def _first_last_bridge_content(
     target_output_path: Path,
 ) -> list[dict[str, Any]]:
     """Bind a transition to completed source-tail and target-head frames."""
-    from clients.tos_uploader import upload_image
+    from clients.tos_uploader import require_tos_url, upload_image
     from quality.continuity_seam import (
         extract_video_head_frame,
         extract_video_tail_frame,
@@ -980,12 +985,14 @@ def _first_last_bridge_content(
 
     first_payload, first_content_type = _seedance_reference_image_payload(tail_frame)
     last_payload, last_content_type = _seedance_reference_image_payload(head_frame)
-    first_url = upload_image(first_payload, first_content_type)
-    last_url = upload_image(last_payload, last_content_type)
-    if not first_url or not last_url:
-        raise RuntimeError(
-            "failed to upload first/last frames for secondary-storyboard bridge"
-        )
+    first_url = require_tos_url(
+        upload_image(first_payload, first_content_type),
+        label="secondary-storyboard first-frame image",
+    )
+    last_url = require_tos_url(
+        upload_image(last_payload, last_content_type),
+        label="secondary-storyboard last-frame image",
+    )
     directive = (
         "图片1来自已完成的上一一级分镜视频真实尾帧，必须作为新视频第一帧；"
         "图片2来自已完成的下一一级分镜视频真实首帧，必须作为新视频最后一帧。"
@@ -2428,20 +2435,21 @@ def execute_phase6_auto_continuity(
 
     _validate_seedance_continuity_plan(plan)
 
-    requires_video_upload = any(
+    requires_media_upload = any(
         chunk.mode == "native_extend"
-        and chunk.execution_strategy != "first_last_frame_bridge"
+        or chunk.execution_strategy == "first_last_frame_bridge"
+        or bool(chunk.storyboard_image)
         for shot in plan.shots
         for chunk in shot.chunks
     )
-    if requires_video_upload and not test_only:
+    if requires_media_upload and not test_only:
         from clients.tos_uploader import is_media_upload_configured
 
         if not is_media_upload_configured():
             raise RuntimeError(
                 "continuity auto preflight requires TOS_ACCESS_KEY, "
                 "TOS_SECRET_KEY, and TOS_BUCKET before any paid provider "
-                "submission for native_extend chunks"
+                "submission containing image or video media"
             )
 
     planned_overlap_seconds = max(

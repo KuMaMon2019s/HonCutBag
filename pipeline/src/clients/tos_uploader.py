@@ -76,6 +76,18 @@ def is_media_upload_configured() -> bool:
     return all((config["ak"], config["sk"], config["bucket"]))
 
 
+class TOSMediaUploadError(RuntimeError):
+    """A required Provider media input could not be persisted to TOS."""
+
+
+def require_tos_url(url: str | None, *, label: str) -> str:
+    """Fail closed when a required TOS upload did not return a signed URL."""
+    normalized = str(url or "").strip()
+    if not normalized:
+        raise TOSMediaUploadError(f"TOS upload failed for required {label}")
+    return normalized
+
+
 # ─── TOS4-HMAC-SHA256 signing ────────────────────────────────────────────────
 
 def _signing_key(sk: str, date: str, region: str) -> bytes:
@@ -378,6 +390,19 @@ def upload_media_file(path: str | Path, *, prefix: str = "volcengine/media") -> 
     )
 
 
+def upload_media_file_required(
+    path: str | Path,
+    *,
+    prefix: str = "volcengine/media",
+    label: str = "media",
+) -> str:
+    """Upload a local image/video and require a TOS URL result."""
+    return require_tos_url(
+        upload_media_file(path, prefix=prefix),
+        label=label,
+    )
+
+
 def base64_video_to_signed_url(
     base64_data: str,
     *,
@@ -439,3 +464,21 @@ def base64_to_signed_url(base64_data: str) -> Optional[str]:
         return None
 
     return upload_image(image_bytes)
+
+
+def base64_image_to_signed_url_required(
+    base64_data: str,
+    *,
+    label: str = "image",
+) -> str:
+    """Upload a Base64 image and require a TOS URL result."""
+    return require_tos_url(base64_to_signed_url(base64_data), label=label)
+
+
+def base64_video_to_signed_url_required(
+    base64_data: str,
+    *,
+    label: str = "video",
+) -> str:
+    """Upload a Base64 video and require a TOS URL result."""
+    return require_tos_url(base64_video_to_signed_url(base64_data), label=label)

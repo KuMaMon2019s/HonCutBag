@@ -181,6 +181,12 @@ Online visual generation uses the Volcano Ark Agent Plan only. Configure
 `ARK_AGENT_API_KEY`; HonCut does not read `ARK_API_KEY`, which remains reserved
 for the Honcho Coding Plan memory integration. Seedream image generation uses
 the Agent Plan model `doubao-seedream-5.0-lite` with a default `2K` PNG output.
+Seedance image/video inputs are always uploaded to TOS before submission, so
+online video generation also requires `TOS_ACCESS_KEY`, `TOS_SECRET_KEY`, and
+`TOS_BUCKET`; upload failure stops before the Provider call rather than
+silently degrading to text-only generation. Generated videos are downloaded
+directly from the Provider; they are uploaded to TOS only when reused as input
+material for extension, editing, or reference generation.
 
 ## Development
 
