@@ -419,6 +419,8 @@ def run_phase(phase: str, config: dict) -> dict:
         "--transition-duration",
         str(config.get("transition_duration", 0.5)),
     ]
+    if config.get("project_id"):
+        cmd.extend(["--project-id", str(config["project_id"])])
     if config.get("transition"):
         cmd.extend(["--transition", str(config["transition"])])
     if config.get("auto_approve"):
@@ -457,6 +459,10 @@ def run_phase(phase: str, config: dict) -> dict:
     # Child reporters append to the shared events.jsonl instead of clearing
     # it, preserving cross-phase history for monitors and post-mortems.
     child_env = {**os.environ, "HONCUT_APPEND_EVENTS": "1"}
+    if "video_provider" in config:
+        child_env["VIDEO_PROVIDER"] = str(config["video_provider"])
+    if "video_model" in config:
+        child_env["SEEDANCE_MODEL"] = str(config["video_model"])
     result = _stream_subprocess(cmd, log_path, RUNNER.parent, child_env, monitor=monitor)
     _merge_phase_report(report_path, existing_report, phase)
     phase_result = {

@@ -813,6 +813,44 @@ def test_phase_orchestrator_marks_resumed_children(monkeypatch, tmp_path):
     assert "--accept-code-change" in captured["cmd"]
 
 
+def test_phase_orchestrator_propagates_run_identity_and_provider_config(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+
+    def fake_stream(cmd, _log_path, _cwd, env, monitor=None):
+        captured["cmd"] = cmd
+        captured["env"] = env
+        return {"returncode": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setenv("VIDEO_PROVIDER", "stale-provider")
+    monkeypatch.setenv("SEEDANCE_MODEL", "stale-model")
+    monkeypatch.setattr(phase_orchestrator, "_stream_subprocess", fake_stream)
+
+    result = phase_orchestrator.run_phase(
+        "phase1",
+        {
+            "input": str(tmp_path / "input.txt"),
+            "duration": 32,
+            "shot_duration": 15,
+            "output_dir": str(tmp_path / "run"),
+            "project_id": "future-station-32s",
+            "video_provider": "seedance",
+            "video_model": "doubao-seedance-2.0-fast",
+            "media_profile": "480p",
+            "transition_duration": 0.0,
+            "enable_reshoot": False,
+        },
+    )
+
+    assert result["exit_code"] == 0
+    command = captured["cmd"]
+    assert command[command.index("--project-id") + 1] == "future-station-32s"
+    assert captured["env"]["VIDEO_PROVIDER"] == "seedance"
+    assert captured["env"]["SEEDANCE_MODEL"] == "doubao-seedance-2.0-fast"
+
+
 def test_phase_orchestrator_admits_code_change_only_for_first_resumed_child(
     monkeypatch,
     tmp_path,
