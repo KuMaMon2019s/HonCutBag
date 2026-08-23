@@ -39,15 +39,41 @@ def test_extracted_dialogue_lines_reach_adaptation_prompt(monkeypatch):
 
     def fake_adaptation_call(prompt, max_tokens=32000):
         prompts.append(prompt)
+        if "固定 beat/sequence 槽位" in prompt:
+            return json.dumps({"strategy": "保留对白", "beats": [{
+                "beat_order": 1,
+                "source_events": [1],
+                "dropped_source_events": [],
+                "action": "keep",
+                "reason": "保留原台词",
+                "who": ["凛"],
+                "where": "雨夜轨道",
+                "what": "凛质问烬",
+                "suggested_duration": 15,
+                "shot_size": "medium",
+                "camera_movement": "dolly_in",
+                "lighting_key": "low_key",
+                "shot_intent": "dialogue",
+                "hero_moment": False,
+                "texture_keywords": ["雨水反光", "轨道金属"],
+            }]}, ensure_ascii=False)
         return json.dumps({"strategy": "保留对白", "shots": [{
+            "beat_order": 1,
             "shot_order": 1,
             "source_events": [1],
             "action": "keep",
+            "reason": "保留原台词",
             "who": ["凛"],
             "where": "雨夜轨道",
             "what": "凛质问烬",
+            "emotion": "紧张",
             "visual": "两人隔着轨道对峙",
             "suggested_duration": 15,
+            "boundary_before": "cut",
+            "continuity_reason": "第一镜",
+            "continuity_subject": "",
+            "transition_to_next": "cut",
+            "associate_assets": ["char:凛", "scene:雨夜轨道"],
             "shot_size": "medium",
             "camera_movement": "dolly_in",
             "lighting_key": "low_key",
@@ -55,13 +81,15 @@ def test_extracted_dialogue_lines_reach_adaptation_prompt(monkeypatch):
             "hero_moment": False,
             "texture_keywords": ["雨水反光", "轨道金属"],
             "dialogue": expected_lines[0],
+            "gen_strategy": "phantom",
         }]}, ensure_ascii=False)
 
     monkeypatch.setattr(adaptation_engine, "_call_llm_with_timeout_retry", fake_adaptation_call)
     adaptation_engine.adapt_events(events, target_duration=15)
 
-    assert expected_lines[0]["line"] in prompts[0]
-    assert '"lines"' in prompts[0]
+    assert len(prompts) == 2
+    assert all(expected_lines[0]["line"] in prompt for prompt in prompts)
+    assert all('"lines"' in prompt for prompt in prompts)
 
 
 def test_event_without_dialogue_gets_empty_lines():

@@ -136,21 +136,30 @@ def test_skeleton_rejects_uncovered_source_event():
         engine._parse_beat_skeleton(json.dumps(payload, ensure_ascii=False), 1, 2)
 
 
-def test_single_mode_uses_legacy_path(monkeypatch):
-    calls = {"single": 0, "skeleton": 0}
-
-    def single(prompt, **kwargs):
-        calls["single"] += 1
-        return _batch_response(1, count=1)
-
+def test_single_mode_override_cannot_reenable_legacy_path(monkeypatch):
+    calls = {"skeleton": 0, "expand": 0}
     monkeypatch.setenv("HONCUT_ADAPT_MODE", "single")
-    monkeypatch.setattr(engine, "_call_llm_with_timeout_retry", single)
-    monkeypatch.setattr(engine, "_build_beat_skeleton", lambda *args: calls.__setitem__("skeleton", 1))
+    monkeypatch.setattr(
+        engine,
+        "_call_llm_with_timeout_retry",
+        lambda *args, **kwargs: pytest.fail("legacy single-call path was used"),
+    )
 
-    result = engine.adapt_events(_events(11), target_duration=15)
+    def build(*_args):
+        calls["skeleton"] += 1
+        return {"strategy": "layered", "beats": [_beat(1)]}
 
-    assert calls == {"single": 1, "skeleton": 0}
-    assert result["strategy"] == "批次"
+    def expand(*_args, **_kwargs):
+        calls["expand"] += 1
+        return [_shot(1)]
+
+    monkeypatch.setattr(engine, "_build_beat_skeleton", build)
+    monkeypatch.setattr(engine, "_expand_beats_to_shots", expand)
+
+    result = engine.adapt_events(_events(1), target_duration=15)
+
+    assert calls == {"skeleton": 1, "expand": 1}
+    assert result["strategy"] == "layered"
 
 
 def test_batch_parse_retry_only_retries_failing_batch(monkeypatch):
@@ -177,12 +186,26 @@ def test_batch_parse_retry_only_retries_failing_batch(monkeypatch):
     assert prompts[0] != prompts[1]
 
 
-def test_small_script_automatically_uses_single(monkeypatch):
+def test_small_script_automatically_uses_layered(monkeypatch):
     monkeypatch.delenv("HONCUT_ADAPT_MODE", raising=False)
-    monkeypatch.setattr(engine, "_call_llm_with_timeout_retry", lambda *args, **kwargs: _batch_response(1, count=1))
-    monkeypatch.setattr(engine, "_build_beat_skeleton", lambda *args: pytest.fail("small script used layered mode"))
+    calls = {"skeleton": 0}
 
-    assert engine.adapt_events(_events(10), target_duration=15)["estimated_shots"] == 1
+    def build(*_args):
+        calls["skeleton"] += 1
+        return {"strategy": "layered", "beats": [_beat(1)]}
+
+    monkeypatch.setattr(engine, "_build_beat_skeleton", build)
+    monkeypatch.setattr(engine, "_expand_beats_to_shots", lambda *args, **kwargs: [_shot(1)])
+    monkeypatch.setattr(
+        engine,
+        "_call_llm_with_timeout_retry",
+        lambda *args, **kwargs: pytest.fail("legacy single-call path was used"),
+    )
+
+    result = engine.adapt_events(_events(1), target_duration=15)
+
+    assert calls["skeleton"] == 1
+    assert result["estimated_shots"] == 1
 
 
 def test_beat_order_mismatch_retries_batch(monkeypatch):

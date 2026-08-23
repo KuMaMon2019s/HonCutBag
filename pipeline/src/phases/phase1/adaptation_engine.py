@@ -225,9 +225,9 @@ USER_PROMPT_TEMPLATE = (
 )
 
 
-# Stage 2 only: its duration budget is local to one beat batch.  Keep this
-# independent from USER_PROMPT_TEMPLATE, whose global contract is still used by
-# the LEGACY single-call path.
+# Stage 2 only: its duration budget is local to one beat batch. Keep this
+# independent from the compatibility-only USER_PROMPT_TEMPLATE; production
+# adaptation has no single-call route.
 BATCH_EXPAND_PROMPT = (
     "本批目标时长：{batch_target}秒，每镜约{shot_duration}秒，恰好输出{max_shots}个镜头。"
     "每镜只完成一个明确情节。\n\n"
@@ -2573,25 +2573,9 @@ def adapt_events(
         ),
     )
 
-    # ── 构建 prompt ───────────────────────────────────────────────────────
-    occurrence_requirements = _event_primary_occurrence_requirements(
-        events, capability_profile
-    )
-    generation_unit_counts = _event_generation_action_unit_counts(events)
-    prompt_events = []
-    for event_id, event in enumerate(events, 1):
-        prompt_event = dict(event)
-        prompt_event["minimum_kept_primary_beat_occurrences"] = (
-            occurrence_requirements[event_id]
-        )
-        prompt_event["generation_action_unit_count"] = generation_unit_counts[event_id]
-        prompt_events.append(prompt_event)
-    events_json = _build_events_json(prompt_events)
     characters_summary = _build_characters_summary(characters)
 
-    requested_mode = os.getenv("HONCUT_ADAPT_MODE", "layered").strip().lower()
-    use_layered = requested_mode != "single" and len(events) > 10
-    if use_layered:
+    def _run_layered_adaptation() -> Dict[str, Any]:
         checkpoint_dir = Path(output_dir) if output_dir is not None else None
         layered_fingerprint = _layered_input_fingerprint(
             events,
@@ -2677,129 +2661,7 @@ def adapt_events(
             "shots": shots,
         }
 
-    # [LEGACY-KEEP layered-adapt] 原单次调用路径；显式 single 或事件数 <= 10 时使用。
-    user_prompt = USER_PROMPT_TEMPLATE.format(
-        target_duration=material_duration,
-        shot_duration=effective_shot_duration,
-        max_shots=max_shots,
-        max_generation_action_units_per_shot=(
-            _generation_unit_capacity_for_story_duration(
-                effective_shot_duration,
-                capability_profile,
-            )
-        ),
-        events_json=events_json,
-        characters_summary=characters_summary,
-    )
-
-    # ── 调用 LLM（带重试）─────────────────────────────────────────────────
-    parsed = None
-    shot_language_plan: Optional[Dict[str, Any]] = None
-    for attempt in range(1 + MAX_RETRIES):
-        try:
-            attempt_prompt = user_prompt
-            if attempt:
-                attempt_prompt += (
-                    "\n\n【重试纠错】必须输出恰好"
-                    f"{max_shots}个镜头，并满足每个保留事件的 "
-                    "minimum_kept_primary_beat_occurrences；非关键重复事件可明确"
-                    "列入 dropped_source_events；重复引用同一事件时只推进"
-                    "尚未表现的后续动作，不得重放。"
-                )
-            response = _call_llm_with_timeout_retry(attempt_prompt)
-            parsed = _parse_response(
-                response, require_authored_shot_language=True
-            )
-            if len(parsed["shots"]) != max_shots:
-                raise ValueError(
-                    f"必须输出 {max_shots} 个镜头，实际为 {len(parsed['shots'])}"
-                )
-            parsed["shots"] = _repair_beat_action_capacity(
-                parsed["shots"],
-                events,
-                capability_profile,
-                max_generation_units_per_beat=(
-                    _generation_unit_capacity_for_story_duration(
-                        effective_shot_duration,
-                        capability_profile,
-                    )
-                ),
-            )
-            _validate_beat_action_capacity(
-                parsed["shots"],
-                events,
-                capability_profile,
-            )
-            _validate_beat_material_duration(
-                parsed["shots"],
-                events,
-                material_duration,
-                capability_profile,
-            )
-            shot_language_plan = _validate_shot_language_variation(parsed["shots"])
-            break
-        except (json.JSONDecodeError, ValueError) as e:
-            if attempt < MAX_RETRIES:
-                print(f"解析失败，重试中（{attempt + 1}/{MAX_RETRIES}）: {e}", file=sys.stderr)
-                time.sleep(1)
-            else:
-                raise RuntimeError(f"LLM 响应解析失败（已重试 {MAX_RETRIES} 次）: {e}") from e
-        except Exception as e:
-            raise RuntimeError(f"LLM 调用失败: {e}") from e
-    
-    if parsed is None:
-        raise RuntimeError("LLM 调用失败：未获得有效响应")
-
-    # ── 组装输出 ──────────────────────────────────────────────────────────
-    shots = parsed["shots"]
-
-    # 确保 shot_order 连续
-    for i, shot in enumerate(shots, 1):
-        shot["shot_order"] = i
-
-    _inherit_event_semantics(shots, events, characters)
-    for shot in shots:
-        apply_camera_motion_contract(shot)
-    from quality.shot_continuity import annotate_boundaries
-
-    annotate_boundaries(shots)
-    normalize_shot_durations(shots, material_duration, capability_profile)
-
-    # Add continuity context between shots (镜头连贯性)
-    for i, shot in enumerate(shots):
-        if i > 0:
-            prev = shots[i - 1]
-            prev_visual = prev.get("visual", "")
-            # Only add continuity if same scene (same 'where')
-            if shot.get("where") == prev.get("where"):
-                shot["prev_shot_context"] = (
-                    f"承接上镜：{prev_visual[-80:]}"
-                    if len(prev_visual) > 80
-                    else f"承接上镜：{prev_visual}"
-                )
-            else:
-                shot["prev_shot_context"] = ""  # Scene change, hard cut
-        else:
-            shot["prev_shot_context"] = ""  # First shot
-
-    # 计算总时长
-    total_duration = sum(shot.get("suggested_duration", 0) for shot in shots)
-
-    result = {
-        "target_duration": target_duration,
-        "delivery_target_duration": target_duration,
-        "material_duration": material_duration,
-        "capacity_plan": capacity_plan,
-        "estimated_shots": len(shots),
-        "requested_shot_duration": shot_duration,
-        "effective_shot_duration": effective_shot_duration,
-        "total_duration": total_duration,
-        "shot_language_plan": shot_language_plan,
-        "strategy": parsed.get("strategy", ""),
-        "shots": shots,
-    }
-
-    return result
+    return _run_layered_adaptation()
 
 
 # ─── CLI 入口 ────────────────────────────────────────────────────────────────
