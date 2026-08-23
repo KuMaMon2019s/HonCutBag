@@ -2330,6 +2330,49 @@ def test_phase1_source_identity_evidence_aggregates_aliases_and_events():
     }
 
 
+def test_phase1_post_filter_does_not_merge_cooccurring_source_identities():
+    characters = [
+        {
+            "id": "maintenance_engineer",
+            "name": "维修员",
+            "aliases": ["破坏者甲"],
+            "role": "protagonist",
+        },
+        {
+            "id": "saboteur_alpha",
+            "name": "破坏者甲",
+            "aliases": ["一号入侵者"],
+            "role": "antagonist",
+        },
+    ]
+    stats = {
+        "维修员": {"events": [1, 2], "contexts": []},
+        "破坏者甲": {"events": [2], "contexts": []},
+    }
+
+    filtered = character_discoverer._post_filter_characters(characters, stats)
+
+    assert [character["name"] for character in filtered] == ["维修员", "破坏者甲"]
+    assert "破坏者甲" not in filtered[0]["aliases"]
+    assert filtered[1]["aliases"] == ["一号入侵者"]
+
+
+def test_phase1_rejects_cooccurring_source_identities_collapsed_by_alias():
+    characters = [{
+        "id": "maintenance_engineer",
+        "name": "维修员",
+        "aliases": ["破坏者甲"],
+        "role": "protagonist",
+    }]
+    stats = {
+        "维修员": {"events": [1, 2], "contexts": []},
+        "破坏者甲": {"events": [2], "contexts": []},
+    }
+
+    with pytest.raises(ValueError, match="共现来源身份不得映射到同一角色"):
+        character_discoverer._attach_source_identity_evidence(characters, stats)
+
+
 def test_phase1_recovers_generic_alias_from_unique_non_cooccurring_identity():
     characters = [
         {

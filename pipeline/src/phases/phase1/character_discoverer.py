@@ -623,7 +623,23 @@ def _filter_descriptive_phrases(stats: Dict[str, Dict[str, Any]]) -> Dict[str, D
     return filtered
 
 
-def _post_filter_characters(characters: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _source_identities_cooccur(
+    left_name: str,
+    right_name: str,
+    stats: Dict[str, Dict[str, Any]] | None,
+) -> bool:
+    """Return whether two explicit source labels participate in one event."""
+    if not stats or left_name == right_name:
+        return False
+    left_events = set((stats.get(left_name) or {}).get("events") or [])
+    right_events = set((stats.get(right_name) or {}).get("events") or [])
+    return bool(left_events & right_events)
+
+
+def _post_filter_characters(
+    characters: List[Dict[str, Any]],
+    stats: Dict[str, Dict[str, Any]] | None = None,
+) -> List[Dict[str, Any]]:
     """
     后处理过滤：移除 LLM 可能错误包含的非人物角色
     
@@ -650,6 +666,23 @@ def _post_filter_characters(characters: List[Dict[str, Any]]) -> List[Dict[str, 
         target = None
         for existing in merged:
             existing_name = str(existing.get("name", "")).strip()
+            if _source_identities_cooccur(name, existing_name, stats):
+                # Source co-occurrence is stronger identity evidence than an
+                # LLM-generated alias.  Keep both canonical objects and remove
+                # only the contradictory cross-alias so downstream resolution
+                # remains unambiguous.
+                char["aliases"] = [
+                    alias
+                    for alias in char.get("aliases", [])
+                    if str(alias).strip() != existing_name
+                ]
+                existing["aliases"] = [
+                    alias
+                    for alias in existing.get("aliases", [])
+                    if str(alias).strip() != name
+                ]
+                aliases.discard(existing_name)
+                continue
             existing_aliases = {
                 str(alias).strip() for alias in existing.get("aliases", []) if str(alias).strip()
             }
@@ -833,6 +866,15 @@ def _attach_source_identity_evidence(
 
         canonical = next(iter(resolved))
         character = characters_by_name[canonical]
+        source_events = set(stat_info.get("events") or [])
+        overlapping_events = source_events & evidence[canonical]["events"]
+        if overlapping_events:
+            prior_mentions = list(dict.fromkeys(evidence[canonical]["aliases"]))
+            raise ValueError(
+                "角色身份回验失败：共现来源身份不得映射到同一角色："
+                f"{prior_mentions} + {mentions} -> {canonical}; "
+                f"events={sorted(overlapping_events, key=str)}"
+            )
         character["aliases"] = list(dict.fromkeys([
             *(character.get("aliases") or []),
             *(mention for mention in mentions if mention and mention != canonical),
@@ -1028,7 +1070,7 @@ def discover_characters(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         characters = _fallback_characters(stats)
 
     # 3.5 后处理过滤：移除 LLM 可能错误包含的非人物角色
-    characters = _post_filter_characters(characters)
+    characters = _post_filter_characters(characters, stats)
 
     # 4. Reconcile every source label against the canonical roster. This also
     # preserves qualified source mentions as aliases and aggregates repeated
