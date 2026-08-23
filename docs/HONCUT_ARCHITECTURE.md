@@ -236,6 +236,7 @@ Seedream 图片请求的唯一传输 owner 是 `clients/seedream_client.py`，Ph
 
 Dry-run receipt 只能证明“结构路径已执行且远程/像素步骤被跳过”，不能替代生产图片、语义 QA 或 Provider 成功凭证。
 
+- Phase 1 dry-run 必须从真实源文本生成 `phase1_dry_run_receipt.json` 与 source-derived 结构夹具，复用 adaptation 容量 owner 做零请求的源结构容量估算；估算要求 screenplay compression 时 fail closed，禁止用固定 mock 事件或固定故事板伪装通过。该估算不替代生产 Event Extractor 的语义账本，receipt 必须明确记录此限制。
 - Phase 3 dry-run 写角色卡与 `phase3_dry_run_receipt.json`，不生成占位图片、不进入四视图 QA、不刷新生产 Pxx。
 - Phase 4 直接从 canonical `STORYBOARD.json` 确定性物化 shot 目录与 `SHOT_META.json`；不写 legacy 适配副本、不启动子进程，也不调用 Provider。
 - Phase 5 dry-run 只运行结构、容量、variation 与 slideshow 检查；跳过像素、embedding、多模态修正和 supervision。

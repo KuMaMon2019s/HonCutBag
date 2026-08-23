@@ -233,6 +233,15 @@ _NARRATIVE_JUMP_CUES = (
 EVENT_FLOW_SCHEMA_VERSION = "9.0"
 
 
+def is_global_production_directive_text(evidence: str) -> bool:
+    """Classify project-wide visual rules without inventing a timeline event."""
+    return bool(
+        _GLOBAL_DIRECTIVE_SCOPE_RE.search(evidence)
+        and _GLOBAL_DIRECTIVE_IMPERATIVE_RE.search(evidence)
+        and _GLOBAL_DIRECTIVE_PRODUCTION_RE.search(evidence)
+    )
+
+
 def _is_global_production_directive(event: Dict[str, Any]) -> bool:
     """Return true for project-wide visual rules that have no story-clock beat."""
     if event.get("micro_actions") or event.get("lines"):
@@ -240,11 +249,7 @@ def _is_global_production_directive(event: Dict[str, Any]) -> bool:
     if event.get("event_role") not in {"scene_setup", "character_state", "transition"}:
         return False
     evidence = str(event.get("source_excerpt") or "")
-    return bool(
-        _GLOBAL_DIRECTIVE_SCOPE_RE.search(evidence)
-        and _GLOBAL_DIRECTIVE_IMPERATIVE_RE.search(evidence)
-        and _GLOBAL_DIRECTIVE_PRODUCTION_RE.search(evidence)
-    )
+    return is_global_production_directive_text(evidence)
 
 
 def _normalize_event(event: Dict[str, Any], source_content: str = "") -> Dict[str, Any]:

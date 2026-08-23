@@ -104,6 +104,7 @@ pipeline/tests/*
 !pipeline/tests/test_previs_separation_integration.py
 !pipeline/tests/test_action_unit_capacity.py
 !pipeline/tests/test_phase4_metadata_contract.py
+!pipeline/tests/test_reaudit_regressions.py
 !pipeline/tests/fixtures/
 pipeline/tests/fixtures/*
 !pipeline/tests/fixtures/prose_action_rainy_overpass_zh.txt

@@ -256,219 +256,209 @@ def run_phase1_screenwriter(
         if reporter:
             reporter.step("phase1", f"解析出 {len(segments)} 个段落", progress_pct=20)
 
-        # dry-run 模式：生成模拟数据，不调用 API
+        # dry-run derives its capacity receipt and structural fixtures from
+        # the actual source text. It never calls an LLM, image model, or Provider.
         if dry_run:
-            print("  ⊘ dry-run 模式，生成模拟数据（跳过 API 调用）...")
-            if reporter:
-                reporter.step("phase1", "dry-run: 生成模拟事件", progress_pct=30)
+            from phases.phase1.dry_run_capacity import (
+                build_dry_run_capacity_preflight,
+                write_dry_run_receipt,
+            )
 
-            # 模拟事件数据
-            mock_events = [
-                {
-                    "id": 1,
-                    "who": ["主角"],
-                    "where": "场景A",
-                    "what": "发现关键线索",
-                    "emotion": "紧张",
-                    "visual": "主角在昏暗的房间中发现了一张神秘的地图",
-                    "time": "夜晚",
-                    "action_type": "discovery"
-                },
-                {
-                    "id": 2,
-                    "who": ["主角", "配角"],
-                    "where": "场景B",
-                    "what": "展开行动",
-                    "emotion": "激动",
-                    "visual": "两人在阳光下讨论计划，充满希望",
-                    "time": "白天",
-                    "action_type": "action"
-                },
-                {
-                    "id": 3,
-                    "who": ["主角"],
-                    "where": "场景C",
-                    "what": "面临挑战",
-                    "emotion": "坚定",
-                    "visual": "主角独自站在山顶，眺望远方",
-                    "time": "黄昏",
-                    "action_type": "resolution"
+            print("  ⊘ dry-run 模式，执行真实源文本容量预检（零远程请求）...")
+            if reporter:
+                reporter.step("phase1", "dry-run: 源文本容量预检", progress_pct=30)
+            preflight = build_dry_run_capacity_preflight(
+                text,
+                segments,
+                duration=max(15, int(duration or 15)),
+                shot_duration=shot_duration,
+            )
+            receipt = preflight["receipt"]
+            receipt_path = output_dir / "phase1_dry_run_receipt.json"
+            write_dry_run_receipt(receipt_path, receipt)
+            outputs = ["phase1_dry_run_receipt.json"]
+            capacity_plan = receipt["capacity_plan"]
+            if receipt["status"] != "passed":
+                return {
+                    "status": "error",
+                    "error": (
+                        "dry-run source capacity preflight failed: "
+                        f"{capacity_plan['action_capacity_status']}"
+                    ),
+                    "duration_s": _elapsed(start),
+                    "outputs": outputs,
+                    "dry_run_receipt": receipt_path.name,
+                    "capacity_plan": capacity_plan,
                 }
-            ]
 
+            source_events = preflight["events"]
             if reporter:
-                reporter.step("phase1", f"dry-run: 提取 {len(mock_events)} 个事件", progress_pct=45)
-
-            # 模拟角色数据
-            mock_characters = {
-                "characters": [
-                    {
-                        "id": "protagonist",
-                        "name": "主角",
-                        "aliases": ["他", "主人公"],
-                        "role": "protagonist",
-                        "appearance": {
-                            "gender": "male",
-                            "age_range": "25-35",
-                            "height": "中等身高",
-                            "build": "athletic",
-                            "hair": "黑色短发",
-                            "face": "坚毅的面容",
-                            "clothing": "休闲装",
-                            "distinguishing": "无明显特征",
-                            "summary": "25-35岁男性，黑色短发，身材健壮，面容坚毅"
-                        },
-                        "personality": {
-                            "traits": ["勇敢", "坚定", "善良"],
-                            "speech_style": "简洁有力",
-                            "motivation": "寻找真相"
-                        },
-                        "style": "写实风格, 35mm film, 自然光",
-                        "negative": "卡通, 3D渲染, 过度饱和",
-                        "size": "2K",
-                        "first_appearance": 1,
-                        "appearance_count": 3
-                    },
-                    {
-                        "id": "supporting",
-                        "name": "配角",
-                        "aliases": ["朋友"],
-                        "role": "supporting",
-                        "appearance": {
-                            "gender": "female",
-                            "age_range": "20-30",
-                            "height": "中等身高",
-                            "build": "slim",
-                            "hair": "棕色长发",
-                            "face": "温和的面容",
-                            "clothing": "职业装",
-                            "distinguishing": "戴眼镜",
-                            "summary": "20-30岁女性，棕色长发，身材纤细，戴眼镜，面容温和"
-                        },
-                        "personality": {
-                            "traits": ["聪明", "细心", "支持"],
-                            "speech_style": "理性分析",
-                            "motivation": "帮助主角"
-                        },
-                        "style": "写实风格, 35mm film, 自然光",
-                        "negative": "卡通, 3D渲染, 过度饱和",
-                        "size": "2K",
-                        "first_appearance": 2,
-                        "appearance_count": 1
-                    }
-                ]
+                reporter.step(
+                    "phase1",
+                    f"dry-run: 源文本事件 {len(source_events)} 个",
+                    progress_pct=50,
+                )
+            characters = {
+                "characters": [],
+                "dry_run": True,
+                "source_derived": True,
             }
-
-            if reporter:
-                reporter.step("phase1", f"dry-run: 发现 {len(mock_characters['characters'])} 个角色", progress_pct=60)
-
-            # 模拟分镜数据
             resolved_video_spec = project_video_spec or _project_video_spec("1080p")
-            mock_storyboard = {
-                "shots": [
+            requested_duration = max(15, int(duration or 15))
+            shot_count = max(1, int(capacity_plan["primary_shots"]))
+            base_duration, remainder = divmod(requested_duration, shot_count)
+            shots = []
+            for index in range(shot_count):
+                event_start = math.floor(index * len(source_events) / shot_count)
+                event_end = math.floor((index + 1) * len(source_events) / shot_count)
+                assigned_events = source_events[event_start:event_end]
+                if not assigned_events and source_events:
+                    assigned_events = [
+                        source_events[min(event_start, len(source_events) - 1)]
+                    ]
+                source_slice = "；".join(
+                    str(event.get("what") or "").strip()
+                    for event in assigned_events
+                    if str(event.get("what") or "").strip()
+                ) or text.strip() or "source-derived dry-run scene"
+                micro_actions = [
+                    action
+                    for event in assigned_events
+                    for action in event.get("micro_actions", [])
+                ]
+                generation_action_units = [
                     {
-                        "id": 1,
-                        "prompt": "A young man discovers a mysterious map in a dimly lit room, cinematic lighting, 35mm film, natural light, tense atmosphere",
-                        "caption": "发现神秘地图",
-                        "duration": 5,
-                        "aspect_ratio": resolved_video_spec["aspect_ratio"],
-                        "width": resolved_video_spec["width"],
-                        "height": resolved_video_spec["height"],
-                        "scene": "昏暗的房间",
-                        "action": "发现地图",
-                        "camera": "中景",
-                        "emotion": "紧张"
-                    },
-                    {
-                        "id": 2,
-                        "prompt": "Two people discussing plans under bright sunlight, hopeful atmosphere, cinematic composition, natural lighting",
-                        "caption": "讨论计划",
-                        "duration": 5,
-                        "aspect_ratio": resolved_video_spec["aspect_ratio"],
-                        "width": resolved_video_spec["width"],
-                        "height": resolved_video_spec["height"],
-                        "scene": "阳光明媚的户外",
-                        "action": "讨论计划",
-                        "camera": "双人镜头",
-                        "emotion": "激动"
-                    },
-                    {
-                        "id": 3,
-                        "prompt": "A determined man standing alone on a mountain top at sunset, looking into the distance, epic cinematic shot, golden hour lighting",
-                        "caption": "眺望远方",
-                        "duration": 5,
-                        "aspect_ratio": resolved_video_spec["aspect_ratio"],
-                        "width": resolved_video_spec["width"],
-                        "height": resolved_video_spec["height"],
-                        "scene": "山顶",
-                        "action": "眺望",
-                        "camera": "远景",
-                        "emotion": "坚定"
+                        "unit_id": f"DRYRUN_GAU{unit_index:03d}",
+                        "kind": (
+                            "simultaneous"
+                            if event.get("generation_motion_mode") == "composite"
+                            else "sequential"
+                        ),
+                        "actions": list(event.get("micro_actions", [])),
+                        "ledger_indexes": [unit_index - 1],
                     }
-                ],
-                "total_duration": 15,
-                "style": "写实电影风格",
+                    for unit_index, event in enumerate(assigned_events, 1)
+                    if event.get("micro_actions")
+                ]
+                shot_id = index + 1
+                shots.append(
+                    {
+                        "id": shot_id,
+                        "name": f"source-derived dry-run shot {shot_id}",
+                        "prompt": source_slice,
+                        "caption": "",
+                        "duration": base_duration + (1 if index < remainder else 0),
+                        "suggested_duration": base_duration + (
+                            1 if index < remainder else 0
+                        ),
+                        "aspect_ratio": resolved_video_spec["aspect_ratio"],
+                        "width": resolved_video_spec["width"],
+                        "height": resolved_video_spec["height"],
+                        "scene": source_slice,
+                        "where": "dry-run source",
+                        "action": source_slice,
+                        "action_description": source_slice,
+                        "what": source_slice,
+                        "visual": source_slice,
+                        "camera": "source-derived structural preflight",
+                        "emotion": "",
+                        "who": [],
+                        "source_events": [
+                            event["event_id"] for event in assigned_events
+                        ],
+                        "source_action_unit_ids": [
+                            event["action_unit_id"] for event in assigned_events
+                        ],
+                        "micro_actions": micro_actions,
+                        "generation_actions": micro_actions,
+                        "generation_action_units": generation_action_units,
+                        "shot_size": ("wide" if index % 2 == 0 else "medium"),
+                        "camera_movement": (
+                            "static" if index % 2 == 0 else "dolly_in"
+                        ),
+                        "lighting_key": "natural",
+                        "shot_intent": (
+                            "establishing" if index == 0 else "action"
+                        ),
+                        "hero_moment": index == shot_count - 1,
+                        "texture_keywords": ["source-derived", "dry-run"],
+                        "dialogue": None,
+                        "gen_strategy": "t2v",
+                    }
+                )
+            storyboard = {
+                "shots": shots,
+                "events": source_events,
+                "target_duration": requested_duration,
+                "delivery_target_duration": requested_duration,
+                "material_duration": requested_duration,
+                "total_duration": requested_duration,
+                "capacity_plan": capacity_plan,
+                "style": "source-derived dry-run structural fixture",
                 "aspect_ratio": resolved_video_spec["aspect_ratio"],
                 "width": resolved_video_spec["width"],
                 "height": resolved_video_spec["height"],
+                "dry_run_receipt": receipt_path.name,
             }
-            # Dry-run artifacts must obey the same 15-30s primary contract as
-            # paid runs; otherwise later phases validate a fixture that can
-            # never exist in production.
-            requested_duration = max(15, int(duration or 15))
-            mock_shot_count = max(1, math.ceil(requested_duration / 30))
-            templates = list(mock_storyboard["shots"])
-            base_duration, remainder = divmod(requested_duration, mock_shot_count)
-            mock_storyboard["shots"] = []
-            for index in range(mock_shot_count):
-                shot = dict(templates[index % len(templates)])
-                shot["id"] = index + 1
-                shot["duration"] = base_duration + (1 if index < remainder else 0)
-                mock_storyboard["shots"].append(shot)
-            mock_storyboard["total_duration"] = requested_duration
             from phases.phase1.storyboard_beats import plan_storyboard_beats
-            from utils.privacy_visual_policy import (
-                apply_no_real_person_character_policy,
-                is_no_real_person_enabled,
-            )
 
-            if is_no_real_person_enabled():
-                mock_characters = apply_no_real_person_character_policy(mock_characters)
-
-            plan_storyboard_beats(mock_storyboard)
-            _integrate_storyboard_prompts(mock_storyboard, mock_characters["characters"])
+            plan_storyboard_beats(storyboard)
+            _integrate_storyboard_prompts(storyboard, characters["characters"])
             _attach_director_storyboard(
                 output_dir,
-                mock_storyboard,
-                mock_characters["characters"],
+                storyboard,
+                characters["characters"],
                 dry_run=True,
             )
 
             if reporter:
-                reporter.step("phase1", f"dry-run: 生成 {len(mock_storyboard['shots'])} 个分镜", progress_pct=80)
-
-            # 写出文件
+                reporter.step(
+                    "phase1",
+                    f"dry-run: 生成 {len(shots)} 个源文本结构分镜",
+                    progress_pct=80,
+                )
             storyboard_path = output_dir / "STORYBOARD.json"
             characters_path = output_dir / "CHARACTERS.json"
             events_path = output_dir / "events.json"
-
-            storyboard_path.write_text(json.dumps(mock_storyboard, ensure_ascii=False, indent=2))
-            characters_path.write_text(json.dumps(mock_characters, ensure_ascii=False, indent=2))
-            events_path.write_text(json.dumps({"events": mock_events}, ensure_ascii=False, indent=2))
-
-            outputs = [
-                "STORYBOARD.json", "CHARACTERS.json", "events.json",
-                "director_storyboard_prompt.txt", "director_storyboard.json",
-            ]
+            storyboard_path.write_text(
+                json.dumps(storyboard, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            characters_path.write_text(
+                json.dumps(characters, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            events_path.write_text(
+                json.dumps(
+                    {
+                        "events": source_events,
+                        "dry_run_receipt": receipt_path.name,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            outputs.extend(
+                [
+                    "STORYBOARD.json",
+                    "CHARACTERS.json",
+                    "events.json",
+                    "director_storyboard_prompt.txt",
+                    "director_storyboard.json",
+                ]
+            )
             print(f"  ✓ Phase 1 完成 (dry-run): {outputs}")
-
             return {
                 "status": "done",
                 "duration_s": _elapsed(start),
                 "outputs": outputs,
-                "_storyboard": mock_storyboard,
-                "_characters": mock_characters,
+                "dry_run_receipt": receipt_path.name,
+                "capacity_plan": capacity_plan,
+                "_storyboard": storyboard,
+                "_characters": characters,
             }
+
 
         # 正常模式：调用 API
         try:
