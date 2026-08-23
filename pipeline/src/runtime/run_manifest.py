@@ -89,9 +89,9 @@ def _code_version(repo_root: Path) -> str:
         pass
     digest = hashlib.sha256()
     source_paths = []
-    for source_root in (repo_root / "pipeline" / "src", repo_root / "vendor" / "legacy"):
-        if source_root.is_dir():
-            source_paths.extend(source_root.rglob("*.py"))
+    source_root = repo_root / "pipeline" / "src"
+    if source_root.is_dir():
+        source_paths.extend(source_root.rglob("*.py"))
     for extra in (repo_root / "pyproject.toml", repo_root / "pipeline" / "config.yaml"):
         if extra.is_file():
             source_paths.append(extra)

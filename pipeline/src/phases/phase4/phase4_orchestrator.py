@@ -4,113 +4,15 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
-import sys
 import traceback
-from copy import deepcopy
 from pathlib import Path
 
-from phases.phase2.storyboard_assets import _normalize_shot_id
+from phases.phase4.shot_setup import materialize_shot_directories, normalize_shots
 from runtime.phase_timing import _banner, _elapsed, _now
 from tools.provider_scoring import rank_providers
 from tools.video_composer import lock_runtime
-from utils.source_paths import LEGACY_TOOLS_DIR, PIPELINE_SRC_DIR
-from utils.file_integrity import file_sha256
 from utils.storyboard_geometry import _storyboard_canvas, _storyboard_image_size
 from utils.timing_estimator import estimate_phase_duration
-
-
-PHASE4_LEGACY_STORYBOARD_SCHEMA = "honcut.phase4-legacy-storyboard.v1"
-PHASE4_LEGACY_STORYBOARD_NAME = "phase4_legacy_storyboard.json"
-
-
-def _first_compatibility_text(shot: dict, fields: tuple[str, ...]) -> str | None:
-    """Return the first authored, non-empty string accepted by legacy Phase 4."""
-    for field in fields:
-        value = shot.get(field)
-        if isinstance(value, str) and value.strip():
-            return value
-    return None
-
-
-def _write_legacy_storyboard_adapter(
-    output_dir: Path,
-    storyboard_path: Path,
-    storyboard: dict,
-) -> Path:
-    """Write the narrow legacy input without changing the canonical storyboard."""
-    adapted = deepcopy(storyboard)
-    shots = adapted.get("shots")
-    if not isinstance(shots, list):
-        raise ValueError("Phase 4 storyboard must contain a shots array")
-
-    for index, shot in enumerate(shots):
-        if not isinstance(shot, dict):
-            raise ValueError(f"Phase 4 shot at index {index} must be an object")
-        normalized_id = _normalize_shot_id(shot)
-        if normalized_id is None:
-            raise ValueError(f"Phase 4 shot at index {index} has no usable shot ID")
-        try:
-            numeric_id = int(normalized_id[1:])
-        except ValueError as exc:
-            raise ValueError(
-                f"Phase 4 shot at index {index} has a non-numeric shot ID: "
-                f"{normalized_id}"
-            ) from exc
-        if numeric_id <= 0:
-            raise ValueError(
-                f"Phase 4 shot at index {index} has an invalid shot ID: "
-                f"{normalized_id}"
-            )
-
-        name = _first_compatibility_text(shot, ("name",))
-        if name is None:
-            name = _first_compatibility_text(
-                shot,
-                (
-                    "shot_intent",
-                    "caption",
-                    "action",
-                    "what",
-                    "visual",
-                    "prompt",
-                ),
-            ) or normalized_id
-        prompt = _first_compatibility_text(shot, ("prompt",))
-        if prompt is None:
-            prompt = _first_compatibility_text(
-                shot,
-                ("visual", "action", "what"),
-            )
-        if prompt is None:
-            raise ValueError(
-                f"Phase 4 shot {normalized_id} has no prompt-compatible visual, "
-                "action, or what field"
-            )
-
-        shot["id"] = numeric_id
-        shot["shot_id"] = normalized_id
-        shot["name"] = name
-        shot["prompt"] = prompt
-
-    adapted["_compatibility"] = {
-        "schema": PHASE4_LEGACY_STORYBOARD_SCHEMA,
-        "source_path": storyboard_path.relative_to(output_dir).as_posix(),
-        "source_sha256": file_sha256(storyboard_path),
-    }
-    adapter_path = output_dir / PHASE4_LEGACY_STORYBOARD_NAME
-    temporary = adapter_path.with_suffix(adapter_path.suffix + ".tmp")
-    try:
-        temporary.write_text(
-            json.dumps(adapted, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        os.replace(temporary, adapter_path)
-    finally:
-        temporary.unlink(missing_ok=True)
-    return adapter_path
-
-
 def run_phase4(output_dir: Path, dry_run: bool) -> dict:
     """Phase 4: deterministic orchestration and code-constraint review."""
     _banner(4, 9, "编排器 (Orchestrator)", dry_run)
@@ -251,74 +153,17 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
         outputs.append("CONTINUITY_MEMORY.json")
         print("  ✓ 不可变连续性锚点: CONTINUITY_MEMORY.json")
 
-        orchestrator_script = LEGACY_TOOLS_DIR / "orchestrator.py"
-        if not orchestrator_script.exists():
-            return {"status": "error", "error": f"orchestrator.py not found at {orchestrator_script}", "duration_s": _elapsed(start)}
-
-        legacy_storyboard_path = _write_legacy_storyboard_adapter(
-            output_dir,
-            storyboard_path,
+        shots_dir = output_dir / "shots"
+        normalized_shots = normalize_shots(
             storyboard_for_consistency,
+            storyboard_dir=storyboard_path.parent,
         )
-        outputs.append(PHASE4_LEGACY_STORYBOARD_NAME)
+        materialize_shot_directories(shots_dir, normalized_shots)
+        outputs.extend(f"shots/{shot['shot_id']}/" for shot in normalized_shots)
+        print(f"  ✓ 原生镜头元数据: {len(normalized_shots)} 个 SHOT_META.json")
 
-        shots_dir = output_dir / "shots"
-        cmd = [
-            sys.executable, str(orchestrator_script),
-            "--storyboard", str(legacy_storyboard_path.resolve()),
-            "--skip-assembly",
-            "--shots-dir", str(shots_dir.resolve()),
-            # Phase 4 owns routing and SHOT_META creation only.  The legacy
-            # orchestrator's live mode also submits video jobs, which belongs
-            # exclusively to Phase 6 and can otherwise double-submit work.
-            "--dry-run",
-        ]
-
-        print(f"  → orchestrator: {' '.join(cmd[-4:])}")
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=120,
-            cwd=str(LEGACY_TOOLS_DIR),
-            env={
-                **os.environ,
-                "PYTHONPATH": os.pathsep.join(
-                    filter(
-                        None,
-                        (str(PIPELINE_SRC_DIR), os.environ.get("PYTHONPATH", "")),
-                    )
-                ),
-            },
-        )
-
-        print(f"  → orchestrator return code: {result.returncode}")
-
-        if result.returncode != 0:
-            print(f"  ⚠ orchestrator stdout tail: {result.stdout[-1500:]}")
-            print(f"  ⚠ orchestrator stderr tail: {result.stderr[-1000:]}")
-            return {
-                "status": "error",
-                "error": f"orchestrator exited with code {result.returncode}",
-                "returncode": result.returncode,
-                "stdout_tail": result.stdout[-1500:],
-                "stderr_tail": result.stderr[-1000:],
-                "duration_s": _elapsed(start),
-            }
-
-        # 扫描输出
-        shots_dir = output_dir / "shots"
-        if shots_dir.exists():
-            for d in sorted(shots_dir.iterdir()):
-                if d.is_dir() and d.name.startswith("S"):
-                    outputs.append(f"shots/{d.name}/")
-
-        storyboard = json.loads(storyboard_path.read_text(encoding="utf-8"))
-        expected_shot_ids = {
-            shot_id
-            for shot in storyboard.get("shots", [])
-            if (shot_id := _normalize_shot_id(shot)) is not None
-        }
+        storyboard = storyboard_for_consistency
+        expected_shot_ids = {shot["shot_id"] for shot in normalized_shots}
         actual_shot_ids = {
             directory.name
             for directory in shots_dir.iterdir()
@@ -391,9 +236,9 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
                 ),
             },
             {
-                "id": "legacy_orchestrator_metadata_only",
+                "id": "native_shot_metadata_only",
                 "status": "passed",
-                "detail": "legacy orchestrator was forced to --dry-run --skip-assembly",
+                "detail": "Phase 4 materialized SHOT_META without a subprocess or Provider call",
             },
             {
                 "id": "shot_meta_ids_exact",
@@ -419,23 +264,11 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
                 "checks": constraint_checks,
             },
             **(
-                {"error": "orchestrator produced no shot directories"}
+                {"error": "native shot setup produced no shot directories"}
                 if status == "error"
                 else {}
             ),
         }
-
-    except subprocess.TimeoutExpired as e:
-        timeout_stdout = e.stdout or ""
-        timeout_stderr = e.stderr or ""
-        if isinstance(timeout_stdout, bytes):
-            timeout_stdout = timeout_stdout.decode(errors="replace")
-        if isinstance(timeout_stderr, bytes):
-            timeout_stderr = timeout_stderr.decode(errors="replace")
-        print("  ⚠ orchestrator timed out after 120s")
-        print(f"  ⚠ orchestrator stdout tail: {timeout_stdout[-1500:]}")
-        print(f"  ⚠ orchestrator stderr tail: {timeout_stderr[-1000:]}")
-        return {"status": "error", "error": "orchestrator timed out", "duration_s": _elapsed(start)}
     except Exception as e:
         traceback.print_exc()
         return {"status": "error", "error": str(e), "duration_s": _elapsed(start)}

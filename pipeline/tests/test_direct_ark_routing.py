@@ -33,6 +33,7 @@ from clients import (
 from clients.seedream_client import SeedreamClient
 from phases import pipeline_core
 from phases.phase4 import phase4_orchestrator
+from phases.phase4.shot_setup import normalize_shots
 from phases.phase5.storyboard_qa_gate import _calibrate_l3_severity
 from graph.nodes.phase6 import phase6_txt2vid_node
 from phases.phase8.edit_decisions import _build_timeline, build_edit_decisions
@@ -614,40 +615,21 @@ def test_pipeline_runner_reconnects_successful_report_checkpoints(monkeypatch, t
     assert sqlite_state["completed"] == ["phase2"]
 
 
-def test_phase4_timeout_prints_subprocess_output_tails(monkeypatch, tmp_path, capsys):
-    (tmp_path / "STORYBOARD.json").write_text(json.dumps({"shots": []}))
-    monkeypatch.setattr(
-        pipeline_core.subprocess,
-        "run",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            pipeline_core.subprocess.TimeoutExpired(
-                args[0], 120, output=b"inner stdout cause", stderr=b"inner stderr cause"
-            )
-        ),
+def _forbid_phase4_subprocess(*_args, **_kwargs):
+    pytest.fail("Phase 4 invoked a subprocess")
+
+
+def test_phase4_native_setup_does_not_invoke_subprocess(monkeypatch, tmp_path):
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps({"shots": [{"id": 1, "visual": "first shot"}]}),
+        encoding="utf-8",
     )
+    monkeypatch.setattr(pipeline_core.subprocess, "run", _forbid_phase4_subprocess)
 
-    result = pipeline_core.run_phase4(tmp_path, dry_run=False)
+    result = pipeline_core.run_phase4(tmp_path, dry_run=True)
 
-    output = capsys.readouterr().out
-    assert result["status"] == "error"
-    assert result["error"] == "orchestrator timed out"
-    assert "inner stdout cause" in output
-    assert "inner stderr cause" in output
-
-
-def test_phase4_never_lets_legacy_orchestrator_submit_video(monkeypatch, tmp_path):
-    (tmp_path / "STORYBOARD.json").write_text(json.dumps({"shots": []}))
-    observed = {}
-
-    def fake_run(cmd, **kwargs):
-        observed["cmd"] = cmd
-        return pipeline_core.subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(pipeline_core.subprocess, "run", fake_run)
-
-    result = pipeline_core.run_phase4(tmp_path, dry_run=False)
-
-    assert "--dry-run" in observed["cmd"]
+    assert result["status"] == "done"
+    assert (tmp_path / "shots" / "S01" / "SHOT_META.json").is_file()
     review = result["constraint_review"]
     assert review["mode"] == "deterministic_code"
     assert review["human_review_required"] is False
@@ -656,12 +638,12 @@ def test_phase4_never_lets_legacy_orchestrator_submit_video(monkeypatch, tmp_pat
         "storyboard_artifacts_complete",
         "scene_and_continuity_contracts_written",
         "cinematic_first_frames_previs_isolated",
-        "legacy_orchestrator_metadata_only",
+        "native_shot_metadata_only",
         "shot_meta_ids_exact",
     }
 
 
-def test_phase4_nonzero_exit_cannot_be_masked_by_partial_shot_dirs(
+def test_phase4_native_setup_completes_partial_expected_directories(
     monkeypatch, tmp_path
 ):
     (tmp_path / "STORYBOARD.json").write_text(
@@ -678,25 +660,41 @@ def test_phase4_nonzero_exit_cannot_be_masked_by_partial_shot_dirs(
     partial = tmp_path / "shots" / "S01"
     partial.mkdir(parents=True)
     (partial / "SHOT_META.json").write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(
-        pipeline_core.subprocess,
-        "run",
-        lambda cmd, **kwargs: pipeline_core.subprocess.CompletedProcess(
-            cmd,
-            9,
-            stdout="created S01 then crashed",
-            stderr="orchestrator failure",
-        ),
+    monkeypatch.setattr(pipeline_core.subprocess, "run", _forbid_phase4_subprocess)
+
+    result = pipeline_core.run_phase4(tmp_path, dry_run=True)
+
+    assert result["status"] == "done"
+    for shot_id in ("S01", "S02"):
+        metadata = json.loads(
+            (tmp_path / "shots" / shot_id / "SHOT_META.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert metadata["shot_id"] == shot_id
+        assert metadata["status"] == "pending"
+
+
+def test_phase4_native_setup_rejects_unexpected_stale_shot_directory(
+    monkeypatch, tmp_path
+):
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps({"shots": [{"id": 1, "visual": "first shot"}]}),
+        encoding="utf-8",
     )
+    stale = tmp_path / "shots" / "S99"
+    stale.mkdir(parents=True)
+    (stale / "SHOT_META.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(pipeline_core.subprocess, "run", _forbid_phase4_subprocess)
 
     result = pipeline_core.run_phase4(tmp_path, dry_run=True)
 
     assert result["status"] == "error"
-    assert result["returncode"] == 9
-    assert "exited with code 9" in result["error"]
+    assert result["error"] == "Phase 4 shot directory invariant failed"
+    assert result["unexpected_shot_ids"] == ["S99"]
 
 
-def test_phase4_adapts_canonical_dry_run_storyboard_for_legacy_parser(
+def test_phase4_materializes_canonical_storyboard_without_legacy_adapter(
     monkeypatch, tmp_path
 ):
     storyboard_path = tmp_path / "STORYBOARD.json"
@@ -721,41 +719,30 @@ def test_phase4_adapts_canonical_dry_run_storyboard_for_legacy_parser(
         encoding="utf-8",
     )
     canonical_before = storyboard_path.read_bytes()
-    observed = {}
-
-    def fake_run(cmd, **_kwargs):
-        adapter_path = Path(cmd[cmd.index("--storyboard") + 1])
-        observed["path"] = adapter_path
-        observed["payload"] = json.loads(adapter_path.read_text(encoding="utf-8"))
-        for shot in observed["payload"]["shots"]:
-            shot_dir = tmp_path / "shots" / shot["shot_id"]
-            shot_dir.mkdir(parents=True)
-            (shot_dir / "SHOT_META.json").write_text("{}", encoding="utf-8")
-        return pipeline_core.subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(pipeline_core.subprocess, "run", fake_run)
+    monkeypatch.setattr(pipeline_core.subprocess, "run", _forbid_phase4_subprocess)
 
     result = pipeline_core.run_phase4(tmp_path, dry_run=True)
 
     assert result["status"] == "done"
-    assert "phase4_legacy_storyboard.json" in result["outputs"]
-    assert observed["path"] == (tmp_path / "phase4_legacy_storyboard.json").resolve()
-    first, second = observed["payload"]["shots"]
-    assert first["id"] == 1
+    assert "phase4_legacy_storyboard.json" not in result["outputs"]
+    assert not (tmp_path / "phase4_legacy_storyboard.json").exists()
+    first = json.loads(
+        (tmp_path / "shots" / "S01" / "SHOT_META.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    second = json.loads(
+        (tmp_path / "shots" / "S02" / "SHOT_META.json").read_text(
+            encoding="utf-8"
+        )
+    )
     assert first["shot_id"] == "S01"
     assert first["name"] == "approach the platform"
     assert first["prompt"] == "a blue-lit tunnel"
-    assert second["id"] == 2
     assert second["shot_id"] == "S02"
     assert second["name"] == "authored name"
     assert second["prompt"] == "authored prompt"
-    assert observed["payload"]["_compatibility"] == {
-        "schema": "honcut.phase4-legacy-storyboard.v1",
-        "source_path": "STORYBOARD.json",
-        "source_sha256": hashlib.sha256(canonical_before).hexdigest(),
-    }
     assert storyboard_path.read_bytes() == canonical_before
-    assert not (tmp_path / "phase4_legacy_storyboard.json.tmp").exists()
 
 
 @pytest.mark.parametrize(
@@ -765,21 +752,10 @@ def test_phase4_adapts_canonical_dry_run_storyboard_for_legacy_parser(
         ({"id": 1, "name": "opening"}, "no prompt-compatible"),
     ],
 )
-def test_phase4_legacy_adapter_fails_before_subprocess_for_invalid_shots(
-    tmp_path, shot, message
-):
-    storyboard_path = tmp_path / "STORYBOARD.json"
-    storyboard = {"shots": [shot]}
-    storyboard_path.write_text(json.dumps(storyboard), encoding="utf-8")
-
+def test_phase4_native_normalization_rejects_invalid_shots(shot, message):
     with pytest.raises(ValueError, match=message):
-        phase4_orchestrator._write_legacy_storyboard_adapter(
-            tmp_path,
-            storyboard_path,
-            storyboard,
-        )
+        normalize_shots({"shots": [shot]}, storyboard_dir=None)
 
-    assert not (tmp_path / "phase4_legacy_storyboard.json").exists()
 
 
 def test_submit_content_sends_top_level_agent_plan_payload(monkeypatch):
