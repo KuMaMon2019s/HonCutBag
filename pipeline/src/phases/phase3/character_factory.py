@@ -575,7 +575,7 @@ def create_character_card(
     style: str = "",
     negative: str = "",
     seedream_model: str = "doubao-seedream-5.0-lite",
-    seedance_model: str = "doubao-seedance-2-0-fast",
+    seedance_model: str = "doubao-seedance-2.0-fast",
     reference_images: Optional[dict] = None,
 ) -> dict:
     """Create a character_card.json structure."""

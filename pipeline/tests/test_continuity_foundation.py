@@ -3369,7 +3369,7 @@ def test_direct_continuity_adapter_reuses_succeeded_paid_task(monkeypatch, tmp_p
     assert first.provider_task_id == "seedance-job-1"
     assert recovered.provider_task_id == "seedance-job-1"
     assert len(submissions) == 1
-    assert submissions[0][1]["model"] == "doubao-seedance-2-0-fast"
+    assert submissions[0][1]["model"] == "doubao-seedance-2.0-fast"
     assert submissions[0][1]["resolution"] == "480p"
 
 

@@ -20,7 +20,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_BRIDGE_API_URL = "http://127.0.0.1:9100"
 VIDEO_ROUTE_VALUES = {"bridge", "direct", "local"}
-DEFAULT_SEEDANCE_MODEL_ID = "doubao-seedance-2-0-fast"
+DEFAULT_SEEDANCE_MODEL_ID = "doubao-seedance-2.0-fast"
 _PROVIDER_DEFAULT_VIDEO_ROUTES = {
     "BRIDGE": "bridge",
     "LOCAL": "local",
@@ -87,13 +87,14 @@ ENV_FILE = PROJECT_ROOT / ".env"
 
 
 def configure_ark_agent_environment(env_file: Path = ENV_FILE) -> str:
-    """Pin HonCut to the project Agent Plan key and discard the Coding key.
+    """Pin HonCut to the project Agent Plan key without touching the Coding key.
 
     A long-lived launcher can retain an obsolete ``ARK_AGENT_API_KEY`` even
     after the project ``.env`` changes.  The project value therefore wins for
     this one credential.  Deployments without a project value may still supply
-    ``ARK_AGENT_API_KEY`` directly.  ``ARK_API_KEY`` is never a HonCut runtime
-    fallback.
+    ``ARK_AGENT_API_KEY`` directly.  ``ARK_API_KEY`` is reserved for the Honcho
+    Coding Plan memory integration: HonCut never reads it or treats it as a
+    fallback, but must preserve it in the shared process environment.
 
     The return value is a safe source label and never contains credential data.
     """
@@ -106,7 +107,6 @@ def configure_ark_agent_environment(env_file: Path = ENV_FILE) -> str:
         source = "process_env"
     else:
         source = "missing"
-    os.environ.pop("ARK_API_KEY", None)
     return source
 
 
@@ -180,8 +180,6 @@ class APIKeys:
     
     # 火山方舟 (Volcano Ark)
     ARK_AGENT: str = "ARK_AGENT_API_KEY"  # Agent Plan (主要)
-    # External-tool compatibility only; HonCut strips this variable at runtime.
-    ARK_CODING: str = "ARK_API_KEY"
     
     # OpenAI 兼容
     OPENAI: str = "OPENAI_API_KEY"        # 备选
@@ -205,6 +203,11 @@ class APIKeys:
         Returns:
             API key 值，如果不存在返回 None
         """
+        if key_name in {"ARK_CODING", "ARK_API_KEY"}:
+            return None
+        if fallback in {"ARK_CODING", "ARK_API_KEY"}:
+            fallback = None
+
         # 1. 尝试作为类属性名查找 (如 "ARK_AGENT" -> "ARK_AGENT_API_KEY")
         env_var = getattr(cls, key_name, None)
         if env_var and isinstance(env_var, str):
@@ -253,7 +256,6 @@ class BaseURLs:
     
     # 火山方舟
     ARK_AGENT_PLAN: str = "https://ark.cn-beijing.volces.com/api/plan/v3"
-    ARK_CODING_PLAN: str = "https://ark.cn-beijing.volces.com/api/coding/v3"
     ARK_PAY_AS_YOU_GO: str = "https://ark.cn-beijing.volces.com/api/v3"  # 不使用
     
     # OpenAI
@@ -339,7 +341,6 @@ def get_api_key(service: str, fallback: Optional[str] = None) -> Optional[str]:
         API key 值
     """
     load_dotenv(ENV_FILE, override=False)
-    os.environ.pop("ARK_API_KEY", None)
     return APIKeys.get(service, fallback)
 
 
@@ -356,6 +357,13 @@ def get_api_key_or_raise(service: str, fallback: Optional[str] = None) -> str:
     Raises:
         ValueError: 如果 API key 不存在
     """
+    if service in {"ARK_CODING", "ARK_API_KEY"}:
+        raise ValueError(
+            "ARK_API_KEY is reserved for Honcho Coding Plan memory and is not "
+            "available to HonCut providers"
+        )
+    if fallback in {"ARK_CODING", "ARK_API_KEY"}:
+        fallback = None
     return APIKeys.get_or_raise(service, fallback)
 
 
@@ -462,12 +470,10 @@ def print_config():
 
 # API Keys
 ARK_AGENT_API_KEY_ENV = APIKeys.ARK_AGENT
-ARK_API_KEY_ENV = APIKeys.ARK_CODING
 OPENAI_API_KEY_ENV = APIKeys.OPENAI
 
 # Base URLs
 ARK_BASE_URL = BaseURLs.ARK_AGENT_PLAN
-ARK_CODING_BASE_URL = BaseURLs.ARK_CODING_PLAN
 
 # Models
 DEFAULT_TEXT_MODEL = Models.ARK_TEXT_LITE
@@ -495,8 +501,8 @@ AUDIO_CONFIG = {
 }
 
 # Seedance 模型 ID（Agent Plan 支持的模型）
-# Agent Plan 模型 ID 使用连字符，不是旧的点号别名。
-# 可选: doubao-seedance-2-0, doubao-seedance-2-0-fast, doubao-seedance-2-0-mini
+# Agent Plan 使用套餐模型名，不使用按量 API 的日期版本后缀。
+# 可选: doubao-seedance-2.0, doubao-seedance-2.0-fast, doubao-seedance-2.0-mini
 SEEDANCE_MODEL = os.environ.get("SEEDANCE_MODEL", DEFAULT_SEEDANCE_MODEL_ID)
 
 # Video provider comparison matrix (from ai-video-gen skill)

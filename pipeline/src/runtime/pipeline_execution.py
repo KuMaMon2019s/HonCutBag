@@ -228,7 +228,7 @@ def _run_pipeline(
             "video_generation_mode": effective_video_route,
             "video_model": os.environ.get(
                 "SEEDANCE_MODEL",
-                os.environ.get("VIDEO_MODEL", "doubao-seedance-2-0-fast"),
+                os.environ.get("VIDEO_MODEL", "doubao-seedance-2.0-fast"),
             ),
             "project_video_spec": project_video_spec,
         },

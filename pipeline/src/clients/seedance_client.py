@@ -161,7 +161,7 @@ def _submit_direct(
     resolution: str = "480p",
     first_frame_base64: Optional[str] = None,
     reference_image_base64: Optional[str] = None,
-    generate_audio: Optional[str] = None,  # P0-D: Agent Plan 不支持此参数，仅按量计费可用
+    generate_audio: Optional[bool] = None,
     seed: int = None,  # P1-C: Seed Locking（同场景同 seed）
     reference_video_base64: Optional[str] = None,  # P1-D: 多模态组合参考
 ) -> str:
@@ -172,8 +172,10 @@ def _submit_direct(
             from utils.config import SEEDANCE_MODEL
             model = SEEDANCE_MODEL
         except ImportError:
-            model = "doubao-seedance-2-0-fast"
+            model = "doubao-seedance-2.0-fast"
     resolution = resolution_for_media_profile(resolution, model)
+    if generate_audio is not None and not isinstance(generate_audio, bool):
+        raise ValueError("Agent Plan generate_audio must be a boolean")
     
     # Sanitize prompt to remove IP risks
     sanitized_prompt, filtered_terms = sanitize_prompt(prompt)
@@ -247,7 +249,6 @@ def _submit_direct(
     payload = {
         "model": model,
         "content": content,
-        # generate_audio: Agent Plan 不支持，仅按量计费可用
         **({"generate_audio": generate_audio} if generate_audio is not None else {}),
         "ratio": ratio,
         "duration": duration,
@@ -273,11 +274,13 @@ def submit_content(
     ratio: str = "16:9",
     resolution: str = "480p",
     seed: int = None,
-    generate_audio: Optional[str] = None,
+    generate_audio: Optional[bool] = None,
     timeout: float = 30,
 ) -> str:
     """Submit a preassembled ARK Agent Plan content array. Returns task_id."""
     resolution = resolution_for_media_profile(resolution, model)
+    if generate_audio is not None and not isinstance(generate_audio, bool):
+        raise ValueError("Agent Plan generate_audio must be a boolean")
     _validate_content_media_roles(content)
     prompt = "\n".join(
         str(item.get("text") or "")
@@ -356,7 +359,7 @@ def submit_video_extension(
     resolution: str = "480p",
     reference_image_urls: list[str] | None = None,
     seed: int | None = None,
-    generate_audio: str | None = None,
+    generate_audio: bool | None = None,
 ) -> str:
     """Upload a prior chunk as video and submit an explicit Seedance extension task."""
     from clients.tos_uploader import upload_media_file
@@ -390,7 +393,7 @@ def submit(
     resolution: str = "480p",
     first_frame_base64: Optional[str] = None,
     reference_image_base64: Optional[str] = None,
-    generate_audio: Optional[str] = None,
+    generate_audio: Optional[bool] = None,
     seed: int = None,
     reference_video_base64: Optional[str] = None,
 ) -> str:

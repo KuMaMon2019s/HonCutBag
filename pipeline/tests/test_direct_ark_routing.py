@@ -739,7 +739,7 @@ def test_submit_content_sends_top_level_agent_plan_payload(monkeypatch):
         duration=12,
         resolution="480p",
         seed=42,
-        generate_audio="enabled",
+        generate_audio=True,
     )
 
     assert task_id == "task-direct-1"
@@ -747,7 +747,7 @@ def test_submit_content_sends_top_level_agent_plan_payload(monkeypatch):
     assert posted["json"] == {
         "model": "doubao-seedance-2.0-mini",
         "content": content,
-        "generate_audio": "enabled",
+        "generate_audio": True,
         "ratio": "16:9",
         "duration": 12,
         "resolution": "480p",
@@ -758,16 +758,34 @@ def test_submit_content_sends_top_level_agent_plan_payload(monkeypatch):
     assert "parameters" not in posted["json"]
 
 
+def test_submit_content_rejects_non_boolean_generate_audio_before_submission(monkeypatch):
+    monkeypatch.setattr(
+        seedance_client.requests,
+        "post",
+        lambda *args, **kwargs: pytest.fail("invalid payload must not be submitted"),
+    )
+
+    with pytest.raises(ValueError, match="generate_audio must be a boolean"):
+        seedance_client.submit_content(
+            [{"type": "text", "text": "a cinematic shot"}],
+            api_key="test-key",
+            model="doubao-seedance-2.0-fast",
+            duration=5,
+            resolution="480p",
+            generate_audio="true",
+        )
+
+
 def test_agent_plan_default_model_id_is_the_exact_seedance_fast_id():
-    assert Models.ARK_VIDEO == "doubao-seedance-2-0-fast"
-    assert SEEDANCE_MODEL == "doubao-seedance-2-0-fast"
+    assert Models.ARK_VIDEO == "doubao-seedance-2.0-fast"
+    assert SEEDANCE_MODEL == "doubao-seedance-2.0-fast"
 
 
 def test_seedance_fast_rejects_unsupported_media_profile_before_submission():
     with pytest.raises(ValueError, match="expected 480p or 720p"):
         seedance_client.resolution_for_media_profile(
             "1080p",
-            "doubao-seedance-2-0-fast",
+            "doubao-seedance-2.0-fast",
         )
 
 
@@ -912,7 +930,7 @@ def test_direct_providers_bypass_bridge(tmp_path, monkeypatch, provider):
     assert result["status"] == "done"
     assert len(direct_calls) == 1
     assert direct_calls[0][1]["duration"] == 12
-    assert direct_calls[0][1]["model"] == "doubao-seedance-2-0-fast"
+    assert direct_calls[0][1]["model"] == "doubao-seedance-2.0-fast"
     assert direct_calls[0][1]["resolution"] == "480p"
     assert (shot_dir / "output.mp4").exists()
 
