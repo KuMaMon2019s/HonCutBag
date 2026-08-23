@@ -136,10 +136,10 @@ def event_uses_composite_motion(event: dict[str, Any]) -> bool:
     while the event itself describes a real ordered progression.
     """
 
+    if _has_local_composite_motion(event):
+        return True
     declared_mode = str(event.get("generation_motion_mode") or "").strip().lower()
-    if declared_mode in {"composite", "atomic"}:
-        return declared_mode == "composite"
-    return _has_local_composite_motion(event)
+    return declared_mode == "composite"
 
 
 def annotate_event_motion_modes(events: list[dict[str, Any]]) -> bool:
@@ -155,28 +155,34 @@ def annotate_event_motion_modes(events: list[dict[str, Any]]) -> bool:
         actions = event.get("micro_actions") or []
         if not actions:
             continue
-        declared_mode = str(event.get("generation_motion_mode") or "").strip().lower()
-        if declared_mode in {"composite", "atomic"}:
-            event["generation_motion_mode"] = declared_mode
-            event["generation_motion_mode_reason"] = "event extraction contract"
-            has_composite_contract = (
-                has_composite_contract or declared_mode == "composite"
-            )
-            continue
         evidence = _event_motion_evidence(event)
         local_contract = _has_local_composite_motion(event)
         if local_contract:
             event["generation_motion_mode"] = "composite"
             event["generation_motion_mode_reason"] = (
-                "source explicitly defines this event as concurrent compound motion"
+                "source explicitly defines this event as concurrent compound motion; "
+                "source evidence overrides a conflicting model label"
             )
             has_composite_contract = True
         else:
-            event["generation_motion_mode"] = "atomic"
+            declared_mode = str(
+                event.get("generation_motion_mode") or ""
+            ).strip().lower()
+            event["generation_motion_mode"] = (
+                declared_mode if declared_mode in {"composite", "atomic"} else "atomic"
+            )
             event["generation_motion_mode_reason"] = (
-                "source contains ordered state progression"
-                if _TEMPORAL_PROGRESSION_CUE.search(evidence)
-                else "no compound-motion source contract"
+                "event extraction contract"
+                if declared_mode in {"composite", "atomic"}
+                else (
+                    "source contains ordered state progression"
+                    if _TEMPORAL_PROGRESSION_CUE.search(evidence)
+                    else "no compound-motion source contract"
+                )
+            )
+            has_composite_contract = (
+                has_composite_contract
+                or event["generation_motion_mode"] == "composite"
             )
     return has_composite_contract
 

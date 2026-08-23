@@ -187,6 +187,24 @@ def test_source_authored_compound_motion_is_one_generation_unit():
     assert normalized["ledger"] == event["micro_actions"]
 
 
+def test_explicit_source_composite_overrides_conflicting_model_atomic_label():
+    event = {
+        "what": "操作员完成复合锁定",
+        "source_excerpt": (
+            "同一瞬间复合动作：操作员对齐组件、压合接缝并锁紧夹具，"
+            "这些贡献并行完成，不是逐项动作清单。"
+        ),
+        "micro_actions": ["对齐组件", "压合接缝", "锁紧夹具"],
+        "generation_motion_mode": "atomic",
+    }
+
+    normalized = normalize_event_action_units(event)
+
+    assert event_uses_composite_motion(event) is True
+    assert normalized["motion_mode"] == "composite"
+    assert normalized["units"] == 1
+
+
 def test_sequential_fight_is_not_collapsed_without_dance_evidence():
     event = {
         "what": "两人在舞台上完成一气呵成的连续交锋",
