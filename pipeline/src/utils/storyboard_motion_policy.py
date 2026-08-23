@@ -26,3 +26,16 @@ def apply_storyboard_motion_policy(prompt: object) -> str:
     if STORYBOARD_MOTION_POLICY_MARKER in text:
         return text
     return f"{STORYBOARD_MOTION_POLICY}\n{text}".strip()
+
+
+def append_storyboard_motion_policy(prompt: object) -> str:
+    """Append notation after the provider's high-priority subject definition.
+
+    Seedance weights concise, early subject/reference bindings heavily.  Phase 6
+    therefore keeps the same singleton motion contract, but places it after the
+    shot's identity, action, scene, and camera instructions.
+    """
+    text = str(prompt or "").strip()
+    if STORYBOARD_MOTION_POLICY_MARKER in text:
+        return text
+    return f"{text}\n{STORYBOARD_MOTION_POLICY}".strip()

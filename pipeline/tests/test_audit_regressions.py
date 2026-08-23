@@ -588,11 +588,11 @@ def test_video_prompt_keeps_requested_ratio_and_fast_action_semantics():
         "seedance",
     )
 
-    assert "4K, 9:16, 5秒" in prompt
+    assert "高清细节, 9:16, 5秒" in prompt
     assert "快速冲过光带" in prompt
     assert "fast lateral" in prompt
     assert "smooth lateral" not in prompt
-    assert "4K, 16:9" not in prompt
+    assert "4K" not in prompt
     assert "[storyboard-motion-notation]" in prompt
     assert "主体箭头控制主体的运动方向、路径和速度趋势" in prompt
     assert "最终视频的任何一帧都不得出现或残留箭头" in prompt

@@ -180,4 +180,6 @@ def test_phase6_task_and_direct_routes_share_one_final_prompt_preparation():
     assert rerouted == prompt
     assert shot["prompt"] == base_prompt
     assert prompt.count("[honcut-video-generation-contract-v2]") == 1
-    assert "Time and weather: day" in prompt
+    assert prompt == base_prompt
+    assert "时空连续性硬约束" in prompt
+    assert "本地场景钟点锁定为 10:00–16:00（日间）" in prompt

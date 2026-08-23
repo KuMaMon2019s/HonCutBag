@@ -208,7 +208,7 @@ def generate_scene_consistency(
         subject = "、".join(map(str, filter(None, subject_names))) or "场景主体"
         scene_description = str(shot.get("where") or shot.get("visual") or shot.get("prompt") or "当前场景")
         negative = ", ".join(BASE_NEGATIVE_PROMPTS)
-        quality = f"4K, {aspect_ratio}, {duration}秒"
+        quality = f"高清细节, {aspect_ratio}, {duration}秒"
         contract["shots"][key] = {
             "scene_description": scene_description,
             "spatial_layout": {

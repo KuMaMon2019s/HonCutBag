@@ -11,6 +11,7 @@ from utils.temporal_visual_contracts import (
     temporal_visual_negative_prompt,
     temporal_visual_prompt,
 )
+from utils.video_generation_contracts import VIDEO_GENERATION_CONTRACT_MARKER
 
 
 def route_prompt(model_name: str, mode: str, shot_data: dict, assets: list = None) -> str:
@@ -44,47 +45,74 @@ def route_prompt(model_name: str, mode: str, shot_data: dict, assets: list = Non
 
 
 def _build_seedance2_multi(shot_data: dict, assets: list) -> str:
-    """Seedance 2.0 多分镜模式：中文结构化12维编码 + @图N 引用 + 毫秒时长"""
+    """Seedance 2.0 ordered shots without brittle per-shot timecodes."""
     style = shot_data.get("style", "真人写实, 电影风格, 都市暖调")
-    duration_ms = shot_data.get("duration", 6) * 1000
-    
-    parts = [f"画面风格和类型: {style}\n"]
-    
-    # 图片定义
+
+    parts = []
+
+    # Important reference bindings stay ahead of style and shot metadata.
     if assets:
-        parts.append("图片定义:")
+        parts.append("图片定义：")
         for i, asset in enumerate(assets, 1):
             name = asset.get("name", f"角色{i}")
             desc = asset.get("description", "")
-            parts.append(f"@图{i}: {name}，{desc}")
+            parts.append(f"@图片{i}：{name}，{desc}")
         parts.append("")
-    
-    # 分镜内容
+
     shots = shot_data.get("shots", [shot_data])
-    parts.append(f"生成一个由以下 {len(shots)} 个分镜组成的视频:\n")
-    
+    parts.append(f"按以下事件顺序生成 {len(shots)} 个连续镜头：\n")
+
     for i, shot in enumerate(shots, 1):
-        dur = shot.get("duration", shot.get("suggested_duration", 6))
-        time_desc = shot.get("time", "白天")
-        where = shot.get("where", "室内")
-        camera = shot.get("camera", "中景")
-        visual = shot.get("visual", shot.get("prompt", ""))
-        who = ", ".join(shot.get("who", []))
-        
-        parts.append(f"分镜{i} {dur}s: 时间：{time_desc}，场景：{where}，"
-                     f"镜头：{camera}，{who}，{visual}")
-        
-        # HonCut 12维编码补充
-        dims = []
-        if shot.get("action"): dims.append(f"动作：{shot['action']}")
-        if shot.get("expression"): dims.append(f"表情：{shot['expression']}")
-        if shot.get("lighting"): dims.append(f"光影：{shot['lighting']}")
-        if shot.get("color_tone"): dims.append(f"色彩：{shot['color_tone']}")
-        if shot.get("sound_effect"): dims.append(f"音效：{shot['sound_effect']}")
-        if shot.get("rhythm"): dims.append(f"节奏：{shot['rhythm']}")
-        if dims:
-            parts.append("  " + "，".join(dims))
-    
+        raw_who = shot.get("who") or shot.get("characters") or []
+        if isinstance(raw_who, str):
+            raw_who = [raw_who]
+        subject = "、".join(str(value) for value in raw_who if value)
+        subject = subject or str(shot.get("subject") or "场景主体")
+        visual = str(shot.get("visual") or shot.get("prompt") or "").strip()
+        action = str(shot.get("action") or visual or "保持自然连续运动").strip()
+        time_desc = str(shot.get("time") or shot.get("time_of_day") or "").strip()
+        where = str(shot.get("where") or "当前场景").strip()
+        setting = "，".join(value for value in (time_desc, where) if value)
+        lighting = str(shot.get("lighting") or "服从参考画面光影").strip()
+        color_tone = str(shot.get("color_tone") or "").strip()
+        if color_tone:
+            lighting = f"{lighting}，{color_tone}"
+        camera = str(shot.get("camera") or "固定机位").strip()
+
+        layers = [
+            f"精准主体：{subject}",
+            f"动作细节：{action}",
+        ]
+        if visual and visual != action:
+            layers.append(f"画面细节：{visual}")
+        expression = str(shot.get("expression") or "").strip()
+        if expression:
+            layers.append(f"可见表情与身体状态：{expression}")
+        layers.extend(
+            (
+                f"场景环境：{setting}",
+                f"光影色调：{lighting}",
+                f"主运镜：{camera}",
+            )
+        )
+        rhythm = str(shot.get("rhythm") or "").strip()
+        if rhythm:
+            layers.append(f"动作节奏：{rhythm}")
+        sound_effect = str(shot.get("sound_effect") or "").strip()
+        if sound_effect:
+            layers.append(f"音效：<{sound_effect}>")
+        dialogue = shot.get("dialogue")
+        if isinstance(dialogue, dict):
+            dialogue = dialogue.get("line")
+        if str(dialogue or "").strip():
+            layers.append(f"台词：{{{str(dialogue).strip()}}}")
+        music = str(shot.get("background_music") or shot.get("music") or "").strip()
+        if music:
+            layers.append(f"音乐：（{music}）")
+        parts.append(f"镜头{i}：" + "；".join(layers))
+
+    parts.append(f"画面风格和类型：{style}")
+    parts.append("输出约束：无字幕、无Logo、无水印；主体身份稳定，动作连续自然")
     return "\n".join(parts)
 
 
@@ -98,6 +126,8 @@ def _build_seedance2_single(shot_data: dict, assets: list) -> str:
     source_prompt = str(
         shot_data.get("prompt") or shot_data.get("visual") or ""
     ).strip()
+    if VIDEO_GENERATION_CONTRACT_MARKER in source_prompt:
+        return source_prompt
     emotion = shot_data.get("emotion", "")
     where = shot_data.get("where", "")
     camera = shot_data.get("camera") or shot_data.get("shot_size") or "medium shot"
@@ -111,7 +141,7 @@ def _build_seedance2_single(shot_data: dict, assets: list) -> str:
     temporal_contract = apply_temporal_visual_contract(shot_data)
     
     # 构建英文 prompt
-    parts = []
+    parts = [source_prompt]
     if where:
         parts.append(f"Scene: {where}.")
     parts.append(f"Shot: {camera}.")
@@ -131,8 +161,6 @@ def _build_seedance2_single(shot_data: dict, assets: list) -> str:
     # reference-frame style lock. Re-appending ``style_anchor`` here can leak
     # project-level plot nouns (future characters, architecture, props) into a
     # scenery-only shot after the safe prompt has already been assembled.
-    parts.append(source_prompt)
-    
     from utils.privacy_visual_policy import (
         is_no_real_person_enabled,
         is_synthetic_visual_identity_policy,
@@ -167,7 +195,8 @@ def _build_seedance2_single(shot_data: dict, assets: list) -> str:
             "High-end stylized 3D CGI cinematography with deliberately synthetic materials "
             "and designed digital geometry. Preserve each character's declared non-human styling anchors; "
             "no untreated natural human face, photoreal human skin/eyes/hair, or one generic helmet copied to all roles. "
-            "cinematic quality, ultra-fine material detail, ultra-sharp 4K, no subtitles, no watermark."
+            "cinematic quality, ultra-fine material detail, ultra-sharp detail, "
+            "no subtitles, no Logo, no watermark."
         )
     else:
         detail_contract = (
@@ -177,7 +206,7 @@ def _build_seedance2_single(shot_data: dict, assets: list) -> str:
         )
         parts.append(
             "Photorealistic cinematography, cinematic quality, ultra-fine detail, "
-            f"{detail_contract}. Ultra-sharp 4K, no subtitles, no watermark."
+            f"{detail_contract}. Ultra-sharp detail, no subtitles, no Logo, no watermark."
         )
     
     return " ".join(parts)

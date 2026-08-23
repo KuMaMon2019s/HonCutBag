@@ -26,7 +26,7 @@ from utils.pixel_text_policy import (
     PIXEL_TEXT_METADATA_CONTRACT,
     strip_pixel_text_identity_markers,
 )
-from utils.storyboard_motion_policy import apply_storyboard_motion_policy
+from utils.storyboard_motion_policy import append_storyboard_motion_policy
 from utils.style_slices import get_slice
 from utils.temporal_visual_contracts import (
     apply_temporal_visual_contract,
@@ -48,6 +48,63 @@ BASE_NEGATIVE_PROMPT = (
     "多余手指(extra fingers), 模糊纹理(blurry textures), "
     "抖动运动(jittery motion), 伪影(artifacts)"
 )
+
+SEEDANCE_OUTPUT_CONSTRAINTS = (
+    "保持无字幕，避免生成任何文字或字幕，不要生成Logo，不要生成水印；"
+    "人物和物体不得变形，不得出现多余肢体或手指，不得闪烁、漂浮、瞬移或颜色漂移"
+)
+
+_EMOTION_EXTERNALIZATION = (
+    (("悲伤", "难过", "伤心"), "轻微低头、肩膀微微收紧、眼眶渐渐泛红"),
+    (("喜悦", "开心", "欢喜"), "嘴角自然上扬、眉眼舒展、步伐变得轻快"),
+    (("紧张", "焦虑", "不安"), "呼吸略微急促、肩颈保持警觉、目光短促扫视当前威胁"),
+    (("愤怒", "生气", "怒"), "下颌线紧绷、胸口起伏加重、目光变得锐利"),
+    (("释然", "放松"), "缓慢呼出一口气、紧绷的肩膀自然放松、露出克制的微笑"),
+)
+
+
+def _seedance_emotion_prompt(shot_meta: dict[str, Any]) -> str:
+    emotion = str(shot_meta.get("emotion") or shot_meta.get("mood") or "").strip()
+    if not emotion:
+        return ""
+    for keywords, observable in _EMOTION_EXTERNALIZATION:
+        if any(keyword in emotion for keyword in keywords):
+            return (
+                "情绪外化（不新增剧情动作）："
+                f"{observable}；仅用可见的表情、呼吸、肩背与重心变化表达{emotion}，"
+                "不新增道具、不打断既定动作顺序"
+            )
+    return (
+        f"情绪外化（不新增剧情动作）：{emotion}必须通过已写明的"
+        "面部、呼吸、肩背、重心与动作节奏变化可见表达，不得只改变背景氛围"
+    )
+
+
+def _seedance_audio_prompts(shot_meta: dict[str, Any]) -> list[str]:
+    prompts: list[str] = []
+    dialogue = shot_meta.get("dialogue")
+    if isinstance(dialogue, dict):
+        speaker = str(dialogue.get("speaker") or "角色").strip()
+        line = str(dialogue.get("line") or "").strip()
+        language = str(dialogue.get("language") or "").strip()
+        if line:
+            speech = f"{speaker}{'用' + language if language else ''}说道{{{line}}}"
+            prompts.append(f"台词：{speech}")
+    elif str(dialogue or "").strip():
+        prompts.append(f"台词：{{{str(dialogue).strip()}}}")
+
+    sound_effect = str(shot_meta.get("sound_effect") or "").strip()
+    if sound_effect:
+        prompts.append(f"音效：<{sound_effect}>")
+    music = str(
+        shot_meta.get("background_music") or shot_meta.get("music") or ""
+    ).strip()
+    if music:
+        prompts.append(f"音乐：（{music}）")
+    generic_audio = str(shot_meta.get("audio") or shot_meta.get("sound") or "").strip()
+    if generic_audio and generic_audio not in {sound_effect, music}:
+        prompts.append(f"音效：<{generic_audio}>")
+    return prompts
 
 
 def _time_continuity_contract(*values: object) -> tuple[str, str]:
@@ -137,13 +194,23 @@ def build_video_prompt(
     definitions = [definition for definition in definitions if definition]
     if definitions:
         parts.append("元素参考声明：" + "；".join(definitions))
+    if selected:
+        subject_names = "、".join(
+            str(character.get("name") or character.get("id") or "角色")
+            for character in selected
+        )
+        parts.append(
+            "主体指代硬约束："
+            f"全镜只使用固定名称（{subject_names}）指代对应主体；"
+            "每次涉及主体都明确指名，不省略、不改名、不合并、不互换"
+        )
     body_locks = [body_contract_prompt(char) for char in selected]
     body_locks = [contract for contract in body_locks if contract]
     if body_locks:
         # Keep body geometry outside the bounded eight-layer summary so height,
         # head scale, and silhouette cannot be truncated in action-heavy shots.
         parts.append("角色身体比例逐镜硬合同：" + "；".join(body_locks))
-    parts.append(f"镜头{number}：")
+    parts.append(f"[镜头{number}｜按事件顺序]")
     shot_type = shot_meta.get("shot_type") or shot_meta.get("shot_size") or "中景"
     subject = shot_meta.get("subject_description")
     if not subject:
@@ -193,10 +260,21 @@ def build_video_prompt(
     subject_summary = build_subject_summary([
         ("景别与主体：", f"{shot_type}，{subject}"),
         ("动作：", action),
-        ("运镜：", camera),
         ("场景与光影：", scene_and_lighting),
+        ("运镜：", camera),
     ])
     parts.append(f"主体总结：{subject_summary}")
+    if generation_actions or action != "保持自然姿态":
+        parts.append(
+            "动作细节执行：只细化上述已写动作，明确对应执行肢体、"
+            "幅度、速度、力度、重心变化和前后惯性；动作自然承接，"
+            "不增加新动作，不改变已写的接触点、先后顺序与结果"
+        )
+    emotion_prompt = _seedance_emotion_prompt(shot_meta)
+    if emotion_prompt:
+        parts.append(emotion_prompt)
+    parts.append(f"场景与光影硬合同：{scene_and_lighting}")
+    parts.append("运镜规则：每个镜头只使用一种主运镜，其他取景词只描述构图结果")
     parts.append(f"运镜物理硬合同：{camera_motion_prompt(shot_meta)}")
     if generation_actions:
         # The bounded eight-layer summary is deliberately short. Keep the full
@@ -207,9 +285,7 @@ def build_video_prompt(
     if choreography_prompt:
         # This contract is never placed inside the bounded subject summary.
         parts.append(choreography_prompt)
-    audio = shot_meta.get("audio") or shot_meta.get("sound")
-    if audio:
-        parts.append(f"音效：{audio}")
+    parts.extend(_seedance_audio_prompts(shot_meta))
     # The per-shot storyboard frame already carries the project's visual style.
     # Project-level summaries often contain plot nouns (characters, palaces,
     # props, future locations). Repeating that prose in every prompt caused a
@@ -223,8 +299,11 @@ def build_video_prompt(
     ratio, _width, _height = resolve_video_geometry({**scene, **shot_meta})
     quality = str(
         scene.get("quality_suffix")
-        or f"4K, {ratio}, {shot_meta.get('duration', 5)}秒"
+        or f"高清细节, {ratio}, {shot_meta.get('duration', 5)}秒"
     )
+    # Resolution is a provider semantic parameter owned by ``media_profile``;
+    # keep legacy scene artifacts from asking the model to hallucinate "4K".
+    quality = re.sub(r"^\s*4[kK]\s*,?\s*", "高清细节, ", quality, count=1)
     quality = re.sub(r"(?<!\d)\d+(?:\.\d+)?:\d+(?:\.\d+)?(?!\d)", ratio, quality)
     time_lock = temporal_visual_prompt(temporal_contract)
     time_negative = temporal_visual_negative_prompt(temporal_contract)
@@ -232,7 +311,8 @@ def build_video_prompt(
         # This is intentionally outside build_subject_summary's character budget.
         parts.append(f"时空连续性硬约束：{time_lock}")
     # Layer 8 is appended after the bounded summary and is never truncated.
-    parts.append(f"全局收尾：{style}；{quality}")
+    parts.append(f"全局收尾：视觉风格与画质：{style}；{quality}")
+    parts.append(f"输出约束：{SEEDANCE_OUTPUT_CONSTRAINTS}")
     parts.append(PIXEL_TEXT_METADATA_CONTRACT)
 
     negatives = [str(scene.get("negative_prompt", "")).strip()]
@@ -267,7 +347,7 @@ def build_video_prompt(
         (f"附加约束条件：{additional_negative_prompt}。" if additional_negative_prompt else "")
         + f"约束条件：{BASE_NEGATIVE_PROMPT}"
     )
-    prompt = apply_storyboard_motion_policy("。".join(parts))
+    prompt = append_storyboard_motion_policy("。".join(parts))
     from utils.privacy_visual_policy import (
         NO_REAL_PERSON_POLICY,
         is_no_real_person_enabled,

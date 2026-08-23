@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -468,6 +469,178 @@ def test_seedance_single_route_preserves_complete_rainy_night_prompt():
     assert assembled in prompt
     assert "Time and weather: 夜间，雨天" in prompt
     assert "Lighting continuity: 冷蓝雨夜光" in prompt
+
+
+def test_seedance_official_prompt_contract_prioritizes_subject_and_orders_layers():
+    shot = {
+        "id": 4,
+        "who": ["林夏"],
+        "where": "深夜地下车站",
+        "shot_size": "medium",
+        "camera_movement": "dolly_in",
+        "generation_actions": [
+            "林夏右手握紧芯片",
+            "林夏借身体后仰的惯性顺势避开能量刃",
+        ],
+        "duration": 6,
+    }
+    characters = {
+        "characters": [{
+            "id": "lin_xia",
+            "name": "林夏",
+            "appearance": {
+                "hair": "黑色短发",
+                "face": "轮廓清晰",
+                "clothing": "黑色长风衣",
+            },
+            "prompt_definition": "将{图片N}中的[黑色长风衣、黑色短发]定义为{主体N}",
+        }],
+    }
+    scene = {
+        "shots": {"S04": {
+            "scene_description": "透明穹顶下的湿润站台",
+            "lighting_description": "冷蓝霓虹照亮地面倒影",
+        }},
+    }
+
+    prompt = build_video_prompt(shot, characters, scene, "seedance")
+
+    assert prompt.index("元素参考声明") < prompt.index(STORYBOARD_MOTION_POLICY_MARKER)
+    assert prompt.index("景别与主体：") < prompt.index("动作：")
+    assert prompt.index("动作：") < prompt.index("场景与光影：")
+    assert prompt.index("场景与光影：") < prompt.index("运镜：")
+    assert "动作细节执行" in prompt
+    assert "幅度、速度、力度、重心变化和前后惯性" in prompt
+    assert "每个镜头只使用一种主运镜" in prompt
+    assert "保持无字幕" in prompt
+    assert "不要生成Logo" in prompt
+    assert "不要生成水印" in prompt
+    assert not re.search(r"\d+\s*[-–—~]\s*\d+\s*秒", prompt)
+
+
+def test_seedance_official_prompt_contract_externalizes_emotion_and_marks_audio():
+    prompt = build_video_prompt(
+        {
+            "id": 1,
+            "who": ["林夏"],
+            "where": "列车门前",
+            "what": "林夏停在车门前查看芯片",
+            "emotion": "紧张",
+            "dialogue": {"speaker": "林夏", "line": "坐标已确认", "language": "中文"},
+            "sound_effect": "远处传来列车制动的低鸣",
+            "background_music": "克制的低频电子音乐",
+        },
+        {"characters": [{"id": "lin_xia", "name": "林夏"}]},
+        {},
+        "seedance",
+    )
+
+    assert "情绪外化（不新增剧情动作）" in prompt
+    assert "呼吸略微急促" in prompt
+    assert "台词：林夏用中文说道{坐标已确认}" in prompt
+    assert "音效：<远处传来列车制动的低鸣>" in prompt
+    assert "音乐：（克制的低频电子音乐）" in prompt
+
+
+def test_seedance_router_keeps_complete_contract_first_and_avoids_per_shot_timecodes():
+    assembled = "元素参考声明：将图片1中的林夏定义为<主体1>。[镜头1｜按事件顺序]林夏缓慢转身。"
+
+    single = route_prompt(
+        "doubao-seedance-2.0-fast",
+        "single_shot",
+        {
+            "prompt": assembled,
+            "where": "地下车站",
+            "shot_size": "medium",
+            "time_of_day": "深夜",
+        },
+    )
+    multi = route_prompt(
+        "doubao-seedance-2.0-fast",
+        "multi_shot",
+        {
+            "shots": [
+                {"duration": 5, "where": "站台", "visual": "男子走向车门"},
+                {"duration": 6, "where": "车厢", "visual": "男子举起芯片"},
+            ],
+        },
+    )
+
+    assert single.startswith(assembled)
+    assert "镜头1：" in multi and "镜头2：" in multi
+    assert "分镜1 5s" not in multi and "分镜2 6s" not in multi
+
+
+def test_seedance_router_does_not_duplicate_a_complete_phase6_contract():
+    assembled = (
+        "元素参考声明：林夏=<主体1>。主体总结：林夏打开车门。"
+        "[honcut-video-generation-contract-v2]"
+    )
+
+    prompt = route_prompt(
+        "doubao-seedance-2.0-fast",
+        "single_shot",
+        {
+            "prompt": assembled,
+            "where": "地下车站",
+            "shot_size": "medium",
+            "emotion": "紧张",
+        },
+        assets=[{"name": "林夏"}],
+    )
+
+    assert prompt == assembled
+
+
+def test_seedance_multi_router_frontloads_references_and_uses_official_layer_order():
+    prompt = route_prompt(
+        "doubao-seedance-2.0-fast",
+        "multi_shot",
+        {
+            "style": "真实电影质感",
+            "shots": [{
+                "who": ["林夏"],
+                "action": "右手握紧芯片后缓慢转身",
+                "where": "深夜地下车站",
+                "lighting": "冷蓝霓虹映在湿地面",
+                "camera": "缓慢推进",
+                "sound_effect": "列车制动低鸣",
+            }],
+        },
+        assets=[{"name": "林夏", "description": "黑色短发、黑色长风衣"}],
+    )
+
+    assert prompt.index("图片定义") < prompt.index("画面风格和类型")
+    assert "@图片1" in prompt
+    assert prompt.index("精准主体：林夏") < prompt.index("动作细节：")
+    assert prompt.index("动作细节：") < prompt.index("场景环境：")
+    assert prompt.index("场景环境：") < prompt.index("光影色调：")
+    assert prompt.index("光影色调：") < prompt.index("主运镜：")
+    assert "音效：<列车制动低鸣>" in prompt
+
+
+def test_reference_instruction_binds_face_and_full_body_to_one_subject():
+    prompt = inject_reference_instruction(
+        "元素参考声明：保持林夏身份一致。",
+        [
+            {
+                "char_id": "lin_xia",
+                "character_name": "林夏",
+                "reference_description": "林夏的面部特写",
+                "prompt_definition": "将{图片N}中的[黑色短发、轮廓清晰]定义为{主体N}",
+            },
+            {
+                "char_id": "lin_xia",
+                "character_name": "林夏",
+                "reference_description": "林夏的全身照",
+                "prompt_definition": "",
+            },
+        ],
+    )
+
+    assert "<主体1>的面部特征参考图片1（大头照）" in prompt
+    assert "<主体1>的妆造和身体比例参考图片2（全身照）" in prompt
+    assert prompt.count("定义为<主体1>") == 1
 
 
 def test_video_prompt_adds_hard_night_lock_and_daylight_negative():

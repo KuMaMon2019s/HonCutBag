@@ -417,10 +417,12 @@ def inject_reference_instruction(prompt_text: str, descriptions: List[Any]) -> s
     subject_bindings = []
     named_subject_bindings = []
     subject_numbers = {}
+    references_by_subject = {}
     for image_number, item in enumerate(normalized, start=1):
         if item.get("bind_subject", True) is False:
             continue
         char_id = item.get("char_id") or str(image_number)
+        references_by_subject.setdefault(char_id, []).append((image_number, item))
         if char_id in subject_numbers:
             continue
         subject_number = len(subject_numbers) + 1
@@ -436,6 +438,44 @@ def inject_reference_instruction(prompt_text: str, descriptions: List[Any]) -> s
         subject_bindings.append(
             definition.replace("{图片N}", f"图片{image_number}").replace("{主体N}", f"<主体{subject_number}>")
         )
+
+    reference_role_bindings = []
+    for char_id, (first_image_number, subject_number) in subject_numbers.items():
+        subject_references = references_by_subject.get(char_id, [])
+        face_number = next(
+            (
+                image_number
+                for image_number, item in subject_references
+                if any(
+                    token in str(item.get("reference_description") or "")
+                    for token in ("面部特写", "脸部特写", "大头照")
+                )
+                or "face_closeup" in str(item.get("path") or "")
+            ),
+            None,
+        )
+        body_number = next(
+            (
+                image_number
+                for image_number, item in subject_references
+                if any(
+                    token in str(item.get("reference_description") or "")
+                    for token in ("全身照", "全身参考")
+                )
+                or "full_body" in str(item.get("path") or "")
+            ),
+            None,
+        )
+        role_parts = []
+        if face_number is not None:
+            role_parts.append(f"<主体{subject_number}>的面部特征参考图片{face_number}（大头照）")
+        if body_number is not None:
+            role_parts.append(
+                f"<主体{subject_number}>的妆造和身体比例参考图片{body_number}（全身照）"
+            )
+        if not role_parts:
+            role_parts.append(f"<主体{subject_number}>参考图片{first_image_number}")
+        reference_role_bindings.append("，".join(role_parts))
 
     image_replacements = iter(subject_numbers.values())
     def replace_image_placeholder(match: re.Match) -> str:
@@ -454,7 +494,7 @@ def inject_reference_instruction(prompt_text: str, descriptions: List[Any]) -> s
             return match.group(0)
         return f"<主体{subject_number}>"
     prompt_text = re.sub(r"\{主体N\}", replace_subject_placeholder, prompt_text)
-    binding_text = "；".join(subject_bindings)
+    binding_text = "；".join([*reference_role_bindings, *subject_bindings])
     instruction = references + "。"
     if binding_text:
         instruction += f"{binding_text}。生成时严格保持参考图中角色的外观一致。"
