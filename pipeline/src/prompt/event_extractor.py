@@ -143,8 +143,8 @@ ACTION_SCREENPLAY_CONTRACT = (
     "原文点名的招式（例如街舞托马斯、铁山靠）必须逐字保留；原文只写泛化表演或交手时，"
     "允许在不改变人物、道具、伤亡、胜负、地点和剧情结果的边界内补足可拍摄编舞，例如左挡、"
     "右闪、换步、支撑腿、摆动腿和受力终态。禁止只写动作难度、速度、情绪或镜头效果。\n"
-    "9. 风格说明、摄影约束、负面约束和对前文剧情的总结不是新的时间线动作；"
-    "可以保留为 scene_setup/character_state，但 micro_actions 必须为 []，不得把已发生的剧情再提取一遍。"
+    "9. 风格说明、摄影约束、负面约束、角色一致性要求和对前文剧情的总结不是新的时间线动作或事件；"
+    "不得为它们输出 scene_setup/character_state/transition，也不得把已发生的剧情再提取一遍。"
 )
 
 LLM_TIMEOUT = 900  # 健康大段落长流可超过 300s；空闲停滞仍由 75s 独立阈值处理
@@ -206,6 +206,20 @@ _ACTION_PHASES = {"none", "setup", "attack", "counter", "impact", "recovery", "c
 _GROUP_PARTICIPANT_RE = re.compile(
     r"(?:数[十百千]|机械(?:单位|身影|部队|群)|群众|人群|群体|军队|部队|居民群|敌群)"
 )
+_GLOBAL_DIRECTIVE_SCOPE_RE = re.compile(
+    r"(?:全程|始终|所有镜头|每(?:个|一)镜头|throughout|every\s+shot)",
+    re.IGNORECASE,
+)
+_GLOBAL_DIRECTIVE_IMPERATIVE_RE = re.compile(
+    r"(?:只使用|保持|禁止|不得|必须|避免|不要|不允许|must|avoid|forbid|without|\bno\b)",
+    re.IGNORECASE,
+)
+_GLOBAL_DIRECTIVE_PRODUCTION_RE = re.compile(
+    r"(?:摄影机|运镜|镜头|画面|字幕|水印|logo|风格|质感|人物变形|脸部变化|"
+    r"手指|肢体错误|颜色漂移|同一张脸|同一发型|身材比例|character\s+consistency|"
+    r"camera|subtitle|watermark)",
+    re.IGNORECASE,
+)
 _NARRATIVE_JUMP_CUES = (
     "与此同时", "另一边", "次日", "翌日", "后来", "数小时后", "多年后", "回忆",
     "梦境", "转场", "来到", "抵达", "离开当前", "meanwhile", "later", "next day",
@@ -216,7 +230,21 @@ _NARRATIVE_JUMP_CUES = (
 # caches carried over from earlier run directories — and forces every Phase 1
 # event extraction to re-run (a paid LLM pass). Never bump casually, and never
 # reuse cross-run segment caches from a run produced under a different value.
-EVENT_FLOW_SCHEMA_VERSION = "8.0"
+EVENT_FLOW_SCHEMA_VERSION = "9.0"
+
+
+def _is_global_production_directive(event: Dict[str, Any]) -> bool:
+    """Return true for project-wide visual rules that have no story-clock beat."""
+    if event.get("micro_actions") or event.get("lines"):
+        return False
+    if event.get("event_role") not in {"scene_setup", "character_state", "transition"}:
+        return False
+    evidence = str(event.get("source_excerpt") or "")
+    return bool(
+        _GLOBAL_DIRECTIVE_SCOPE_RE.search(evidence)
+        and _GLOBAL_DIRECTIVE_IMPERATIVE_RE.search(evidence)
+        and _GLOBAL_DIRECTIVE_PRODUCTION_RE.search(evidence)
+    )
 
 
 def _normalize_event(event: Dict[str, Any], source_content: str = "") -> Dict[str, Any]:
@@ -344,7 +372,7 @@ def _parse_events(response: str, source_content: str = "") -> List[Dict[str, Any
             raise ValueError(f"第 {i+1} 个事件缺少字段: {missing}")
         _normalize_event(event, source_content)
 
-    return parsed
+    return [event for event in parsed if not _is_global_production_directive(event)]
 
 
 def _extract_events_from_segment(segment: Dict[str, Any]) -> List[Dict[str, Any]]:

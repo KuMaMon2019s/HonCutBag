@@ -170,6 +170,56 @@ def test_event_parser_rejects_invented_dialogue():
         _parse_events(json.dumps(payload, ensure_ascii=False), "凛沉默地举起刀。")
 
 
+def test_event_parser_excludes_global_visual_directives_from_story_clock():
+    directive = (
+        "全程只使用同一名虚构年轻男性：同一张脸、同一发型、同一身材比例、"
+        "同一套服装。摄影机保持缓慢推进，禁止人物变形、字幕、水印和 Logo。"
+    )
+    payload = [_event(
+        who=["年轻男性"],
+        where="未指定空间",
+        what="建立角色一致性与摄影规范",
+        visual="保持同一角色并禁止画面瑕疵",
+        action_type="transition",
+        event_role="scene_setup",
+        source_excerpt=directive,
+        micro_actions=[],
+        action_phase="none",
+        start_state="",
+        end_state="",
+        causal_link="",
+        continuity_before="cut",
+        continuity_subject="",
+    )]
+
+    assert _parse_events(json.dumps(payload, ensure_ascii=False), directive) == []
+
+
+def test_event_parser_keeps_real_scene_setup_without_visible_motion():
+    setup = "深夜地下车站空无一人，冷蓝霓虹映在湿润地面。"
+    payload = [_event(
+        who=[],
+        where="深夜地下车站",
+        what="建立暴雨夜的地下车站",
+        visual=setup,
+        action_type="discovery",
+        event_role="scene_setup",
+        source_excerpt=setup,
+        micro_actions=[],
+        action_phase="none",
+        start_state="",
+        end_state="地下车站与雨夜环境建立完成",
+        causal_link="",
+        continuity_before="cut",
+        continuity_subject="",
+    )]
+
+    parsed = _parse_events(json.dumps(payload, ensure_ascii=False), setup)
+
+    assert len(parsed) == 1
+    assert parsed[0]["event_role"] == "scene_setup"
+
+
 def test_global_flow_assigns_stable_sequence_action_and_dialogue_ids():
     events = [
         _event(continuity_before="cut", lines=[]),
