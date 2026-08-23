@@ -2462,6 +2462,7 @@ def test_phase1_canonical_storyboard_preserves_event_partition_audit(monkeypatch
         "what": "镜头继续推进",
         "visual": "空走廊",
         "source_events": [2],
+        "dropped_source_events": [3, 4],
         "source_event_slices": [
             {
                 "event_id": 2,
@@ -2475,6 +2476,7 @@ def test_phase1_canonical_storyboard_preserves_event_partition_audit(monkeypatch
     canonical = storyboard_generator._generate_single_shot(shot, 1, 1)
 
     assert canonical["source_events"] == [2]
+    assert canonical["dropped_source_events"] == [3, 4]
     assert canonical["source_event_slices"] == shot["source_event_slices"]
 
 
