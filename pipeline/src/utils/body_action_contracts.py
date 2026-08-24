@@ -40,16 +40,17 @@ _BODY_PART = re.compile(
     re.IGNORECASE,
 )
 _KINETIC_VERB = re.compile(
-    r"挡|格挡|闪|闪避|侧身|下潜|转|旋|撑|蹬|跨|滑|扫|踢|靠|撞|"
+    r"挡|格挡|闪|闪避|侧身|下潜|转|旋|撑|蹬|跨|滑|扫|踢|挥|砍|斩|刺|劈|靠|撞|"
     r"推|拉|抓|扣|锁|摔|跃|跳|落|收|撤|换步|移步|压低|抬高|"
-    r"block|parry|dodge|slip|duck|pivot|spin|plant|kick|strike|"
+    r"block|parry|dodge|slip|duck|pivot|spin|plant|kick|strike|swing|slash|stab|chop|"
     r"push|pull|grab|lock|throw|jump|land|shift|lean",
     re.IGNORECASE,
 )
 _UNAMBIGUOUS_BODY_EXECUTION = re.compile(
     r"挡|格挡|闪避|(?<!灯光)闪(?!烁)|侧身|下潜|转身|旋转|撑|蹬|跨步|滑步|扫腿|踢|"
+    r"挥动|挥砍|砍|斩|刺|劈|"
     r"抓|扣|锁|摔|跃|跳|落地|换步|移步|压低|抬腿|突袭|"
-    r"block|parry|dodge|slip|duck|pivot|spin|plant|kick|strike|"
+    r"block|parry|dodge|slip|duck|pivot|spin|plant|kick|strike|swing|slash|stab|chop|"
     r"grab|lock|throw|jump|land|shift|lean|lunge",
     re.IGNORECASE,
 )
@@ -112,10 +113,20 @@ def requires_explicit_body_choreography(record: dict[str, Any]) -> bool:
     if raw_choreography in (None, "", []):
         raw_choreography = record.get("action_choreography")
     if raw_choreography not in (None, "", []):
-        # Once a producer/model asserts a structured body score, every field
-        # is authoritative and must be validated even when the surrounding
-        # prose omits generic words such as "fight" or "dance".
-        return True
+        declared_beats = normalize_body_action_choreography(
+            raw_choreography,
+            micro_actions=_string_list(record.get("micro_actions")),
+        )
+        if any(
+            _action_requires_body_beat(
+                str(beat.get("micro_action") or beat.get("description") or "")
+            )
+            for beat in declared_beats
+        ):
+            # A declared performer-mechanics score is authoritative even when
+            # surrounding prose omits generic labels such as "fight".  Pure
+            # prop/environment result rows are not body choreography.
+            return True
     action_ledger = _string_list(record.get("micro_actions"))
     if not action_ledger:
         action_ledger = _string_list(record.get("generation_actions"))
@@ -317,6 +328,28 @@ def build_body_action_contract(record: dict[str, Any]) -> dict[str, Any] | None:
         raw = record.get("action_choreography")
     has_structured_choreography = raw not in (None, "", [])
     beats = normalize_body_action_choreography(raw, micro_actions=micro_actions)
+    if has_structured_choreography:
+        # Models sometimes mirror every micro action into the body DTO.  Keep
+        # canonical narrative actions in ``micro_actions`` while removing
+        # weapon, vehicle, lighting, particle and other non-body result rows
+        # from the performer-mechanics score.
+        beats = [
+            dict(beat, beat=body_index)
+            for body_index, beat in enumerate(
+                (
+                    beat
+                    for beat in beats
+                    if _action_requires_body_beat(
+                        str(
+                            beat.get("micro_action")
+                            or beat.get("description")
+                            or ""
+                        )
+                    )
+                ),
+                1,
+            )
+        ]
     if not beats:
         # Legacy explicit action strings remain usable and auditable. Vague
         # dance/fight summaries deliberately do not get upgraded by guessing.
@@ -353,7 +386,7 @@ def build_body_action_contract(record: dict[str, Any]) -> dict[str, Any] | None:
             action_requires_beat = _action_requires_body_beat(action)
             if required and action_requires_beat and not matches:
                 uncovered_actions.append(action)
-            if matches and not any(
+            if action_requires_beat and matches and not any(
                 not _missing_structured_mechanics(beat) for beat in matches
             ):
                 vague_actions.append(action)
@@ -430,6 +463,8 @@ def apply_body_action_contract(record: dict[str, Any]) -> dict[str, Any] | None:
     contract = build_body_action_contract(record)
     if contract is None:
         record.pop("body_action_contract", None)
+        record.pop("body_action_choreography", None)
+        record.pop("action_choreography", None)
         return None
     if has_declared_choreography:
         record["body_action_choreography"] = copy.deepcopy(contract["beats"])

@@ -267,6 +267,56 @@ def test_non_body_effect_does_not_need_a_duplicate_choreography_beat():
     assert body_action_contract_errors(record) == []
 
 
+def test_non_body_rows_are_removed_from_declared_body_choreography():
+    record = {
+        "micro_actions": [
+            "男子精准踢向敌人手腕",
+            "能量武器撞击车壁处产生蓝色电弧与火花",
+        ],
+        "body_action_choreography": [
+            {
+                "micro_action_index": 1,
+                "micro_action": "男子精准踢向敌人手腕",
+                "performer": "男子",
+                "technique": "右腿前踢",
+                "side": "右侧",
+                "limbs": ["右腿", "左腿"],
+                "footwork": "左脚支撑，右膝抬起后伸腿",
+                "torso": "躯干向左侧微倾保持平衡",
+                "weight_shift": "重心完全转移至左腿",
+                "direction": "右脚朝敌人持械手腕前伸",
+                "contact": "右脚脚背接触敌人持械手腕",
+                "end_pose": "右腿收回，左脚稳定支撑",
+            },
+            {
+                "micro_action_index": 2,
+                "micro_action": "能量武器撞击车壁处产生蓝色电弧与火花",
+                "performer": "能量武器",
+                "technique": "撞击车壁",
+                "side": "撞击侧",
+                "limbs": [],
+                "footwork": "不适用",
+                "torso": "不适用",
+                "weight_shift": "不适用",
+                "direction": "朝车壁",
+                "contact": "武器接触车壁",
+                "end_pose": "电弧与火花飞散",
+            },
+        ],
+    }
+
+    contract = apply_body_action_contract(record)
+
+    assert contract is not None
+    assert contract["valid"] is True
+    assert [beat["micro_action_index"] for beat in contract["beats"]] == [1]
+    assert record["micro_actions"] == [
+        "男子精准踢向敌人手腕",
+        "能量武器撞击车壁处产生蓝色电弧与火花",
+    ]
+    assert record["body_action_choreography"] == contract["beats"]
+
+
 def test_legacy_action_text_is_not_promoted_to_declared_structured_choreography():
     record = {"micro_actions": ["抓住扶手"]}
 
