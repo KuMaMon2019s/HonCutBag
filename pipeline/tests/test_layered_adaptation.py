@@ -291,7 +291,7 @@ def test_action_dense_script_reports_compression_without_expanding_target_runtim
     plan = engine._estimate_action_capacity_plan(events, 60, 10)
 
     assert plan["material_duration"] == 60
-    assert plan["primary_shots"] == 6
+    assert plan["primary_shots"] == 7
     assert plan["minimum_material_duration"] == 144
     assert plan["action_capacity_status"] == "screenplay_compression_required"
 

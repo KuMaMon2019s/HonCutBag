@@ -531,6 +531,29 @@ def _sequence_generation_unit_counts(
     return list(ordered.items())
 
 
+def _maximum_generation_units_for_story_clock(
+    primary_shots: int,
+    story_duration: int,
+    capabilities: VideoModelCapabilities,
+) -> int:
+    """Return the largest normalized action ledger executable in the clock."""
+    unit_capacity = (
+        capabilities.max_micro_actions_per_beat
+        * MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
+    )
+    for generation_units in range(primary_shots * unit_capacity, -1, -1):
+        if (
+            _sequence_material_cost(
+                generation_units,
+                primary_shots,
+                capabilities,
+            )
+            <= story_duration + 1e-6
+        ):
+            return generation_units
+    return 0
+
+
 def _material_duration_bound(
     sequence_units: list[tuple[str, int]],
     primary_shots: int,
@@ -609,7 +632,6 @@ def _estimate_action_capacity_plan(
             f"{minimum_primary_duration}s minimum primary story duration"
         )
     maximum_story_shots = max(1, int(delivery_duration) // minimum_primary_duration)
-    primary_shots = max(1, min(baseline, maximum_story_shots))
     minimum_material_duration = _material_duration_bound(
         sequence_units,
         structural_shots,
@@ -625,6 +647,35 @@ def _estimate_action_capacity_plan(
         structural_shots <= maximum_story_shots
         and minimum_material_duration <= delivery_duration + 1e-6
     )
+    # The requested average shot duration is an editorial preference, not a
+    # semantic-capacity ceiling.  Preserve every sequence slot when the full
+    # ledger fits.  Under unavoidable compression, grow only until another
+    # primary shot no longer increases executable action coverage; this avoids
+    # both artificial event deletion and needless rapid cutting.
+    if action_capacity_fits:
+        primary_shots = min(
+            max(baseline, structural_shots),
+            maximum_story_shots,
+        )
+    else:
+        search_end = max(
+            baseline,
+            min(structural_shots, maximum_story_shots),
+        )
+        capacities = {
+            shot_count: _maximum_generation_units_for_story_clock(
+                shot_count,
+                delivery_duration,
+                profile,
+            )
+            for shot_count in range(baseline, search_end + 1)
+        }
+        best_capacity = max(capacities.values())
+        primary_shots = min(
+            shot_count
+            for shot_count, capacity in capacities.items()
+            if capacity == best_capacity
+        )
     return {
         "primary_shots": primary_shots,
         "structural_shots": structural_shots,
@@ -1922,6 +1973,7 @@ def _repair_beat_action_capacity(
     capabilities: VideoModelCapabilities | None = None,
     *,
     max_generation_units_per_beat: int | None = None,
+    material_duration: int | None = None,
 ) -> List[Dict[str, Any]]:
     """Repair the source ledger without crossing sequences or story capacity.
 
@@ -1950,9 +2002,27 @@ def _repair_beat_action_capacity(
         beat["source_events"] = list(dict.fromkeys(raw_ids))
         beat["dropped_source_events"] = list(dict.fromkeys(raw_dropped_ids))
 
+    def material_fits(candidate: List[Dict[str, Any]]) -> bool:
+        if material_duration is None:
+            return True
+        try:
+            _validate_beat_material_duration(
+                candidate,
+                events,
+                material_duration,
+                profile,
+            )
+        except ValueError:
+            return False
+        return True
+
     try:
         _validate_beat_action_capacity(repaired, events, profile)
-        if max(_beat_generation_unit_loads(repaired, events), default=0) <= unit_capacity:
+        if (
+            max(_beat_generation_unit_loads(repaired, events), default=0)
+            <= unit_capacity
+            and material_fits(repaired)
+        ):
             for beat in repaired:
                 sequences = {
                     str(events[event_id - 1].get("sequence_id") or "").strip()
@@ -2010,6 +2080,18 @@ def _repair_beat_action_capacity(
                 loads[beat_index] += base + (1 if occurrence < remainder else 0)
         return loads
 
+    def placement_fits(candidate: Dict[int, tuple[int, ...]]) -> bool:
+        loads = generation_loads(candidate)
+        if max(loads, default=0) > unit_capacity:
+            return False
+        if material_duration is None:
+            return True
+        material_cost = sum(
+            _minimum_primary_duration_for_units(load, profile)
+            for load in loads
+        )
+        return material_cost <= material_duration + 1e-6
+
     def preferred_slot(event_id: int) -> int:
         sequence = event_sequences[event_id]
         slots = sequence_slots[sequence]
@@ -2052,7 +2134,7 @@ def _repair_beat_action_capacity(
         event_id = mandatory_order[position]
         for option in placement_options(event_id):
             placements[event_id] = option
-            if max(generation_loads(placements), default=0) <= unit_capacity:
+            if placement_fits(placements):
                 if place_mandatory(position + 1):
                     return True
             placements.pop(event_id, None)
@@ -2069,7 +2151,7 @@ def _repair_beat_action_capacity(
             trial = dict(placements)
             trial[event_id] = option
             loads = generation_loads(trial)
-            if max(loads, default=0) > unit_capacity:
+            if not placement_fits(trial):
                 continue
             occupied = {
                 beat_index
@@ -2077,6 +2159,10 @@ def _repair_beat_action_capacity(
                 for beat_index in positions
             }
             candidates.append((
+                sum(
+                    _minimum_primary_duration_for_units(load, profile)
+                    for load in loads
+                ),
                 sum(abs(slot - preferred_slot(event_id)) for slot in option),
                 -sum(slot not in occupied for slot in option),
                 sum(load * load for load in loads),
@@ -2092,7 +2178,7 @@ def _repair_beat_action_capacity(
             continue
         fallback_event = sequence_event_ids[sequence][0]
         placements[fallback_event] = (slots[0],)
-        if max(generation_loads(placements), default=0) > unit_capacity:
+        if not placement_fits(placements):
             raise ValueError(f"sequence {sequence} has no event that fits its beat slots")
 
     while True:
@@ -2113,8 +2199,12 @@ def _repair_beat_action_capacity(
             trial = dict(placements)
             trial[event_id] = tuple(sorted((*positions, empty)))
             loads = generation_loads(trial)
-            if max(loads, default=0) <= unit_capacity:
+            if placement_fits(trial):
                 candidates.append((
+                    sum(
+                        _minimum_primary_duration_for_units(load, profile)
+                        for load in loads
+                    ),
                     min(abs(empty - position) for position in positions),
                     -generation_units[event_id],
                     event_id,
@@ -2122,7 +2212,7 @@ def _repair_beat_action_capacity(
                 ))
         if not candidates:
             raise ValueError(f"sequence {sequence} cannot populate beat {empty + 1}")
-        _distance, _negative_units, event_id, positions = min(candidates)
+        _material_cost, _distance, _negative_units, event_id, positions = min(candidates)
         placements[event_id] = positions
 
     sources_by_beat: List[List[int]] = [[] for _ in repaired]
@@ -2196,6 +2286,100 @@ def _repair_beat_action_capacity(
     _validate_beat_action_capacity(repaired, events, profile)
     if max(_beat_generation_unit_loads(repaired, events), default=0) > unit_capacity:
         raise ValueError("repaired beat ledger still exceeds story capacity")
+    if material_duration is not None:
+        _validate_beat_material_duration(
+            repaired,
+            events,
+            material_duration,
+            profile,
+        )
+    return repaired
+
+
+def _restore_redundantly_dropped_events(
+    beats: List[Dict[str, Any]],
+    events: List[Dict[str, Any]],
+    *,
+    material_duration: int,
+    capabilities: VideoModelCapabilities | None = None,
+    max_generation_units_per_beat: int | None = None,
+) -> List[Dict[str, Any]]:
+    """Restore whole events that still fit the structured story clock.
+
+    The model may rank optional events, but it may not manufacture compression
+    pressure by leaving usable action capacity empty.  Starting from its kept
+    ledger, try dropped events in descending normalized action coverage and
+    accept only candidates that retain every previously kept event while
+    satisfying sequence, per-beat and material-duration contracts.
+    """
+    profile = capabilities or get_video_capabilities()
+    repaired = _repair_beat_action_capacity(
+        beats,
+        events,
+        profile,
+        max_generation_units_per_beat=max_generation_units_per_beat,
+        material_duration=material_duration,
+    )
+    generation_units = _event_generation_action_unit_counts(events)
+
+    def kept_ids(candidate: List[Dict[str, Any]]) -> set[int]:
+        return {
+            event_id
+            for beat in candidate
+            for event_id in (beat.get("source_events") or [])
+            if isinstance(event_id, int)
+        }
+
+    dropped_ids = {
+        event_id
+        for beat in repaired
+        for event_id in (beat.get("dropped_source_events") or [])
+        if isinstance(event_id, int)
+    }
+    restore_order = sorted(
+        dropped_ids,
+        key=lambda event_id: (-generation_units.get(event_id, 0), event_id),
+    )
+    for event_id in restore_order:
+        previous_kept = kept_ids(repaired)
+        event_sequence = (
+            str(events[event_id - 1].get("sequence_id") or "").strip()
+            or "__unspecified__"
+        )
+        candidate = [dict(beat) for beat in repaired]
+        for beat in candidate:
+            beat["source_events"] = list(beat.get("source_events") or [])
+            beat["dropped_source_events"] = [
+                dropped
+                for dropped in (beat.get("dropped_source_events") or [])
+                if dropped != event_id
+            ]
+        destination = next(
+            (
+                beat
+                for beat in candidate
+                if str(beat.get("sequence_id") or "").strip() == event_sequence
+            ),
+            None,
+        )
+        if destination is None:
+            continue
+        destination["source_events"] = list(dict.fromkeys(
+            [*destination["source_events"], event_id]
+        ))
+        try:
+            candidate = _repair_beat_action_capacity(
+                candidate,
+                events,
+                profile,
+                max_generation_units_per_beat=max_generation_units_per_beat,
+                material_duration=material_duration,
+            )
+        except ValueError:
+            continue
+        if not previous_kept | {event_id} <= kept_ids(candidate):
+            continue
+        repaired = candidate
     return repaired
 
 
@@ -2273,6 +2457,14 @@ def _build_beat_skeleton(
                 skeleton["beats"],
                 events,
                 profile,
+                max_generation_units_per_beat=per_beat_generation_unit_capacity,
+                material_duration=target_duration,
+            )
+            skeleton["beats"] = _restore_redundantly_dropped_events(
+                skeleton["beats"],
+                events,
+                material_duration=target_duration,
+                capabilities=profile,
                 max_generation_units_per_beat=per_beat_generation_unit_capacity,
             )
             skeleton["shot_language_plan"] = _validate_shot_language_variation(
@@ -2449,7 +2641,7 @@ def _atomic_write_json(path: Path, value: Any) -> None:
     os.replace(temporary, path)
 
 
-LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v7"
+LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v8"
 
 
 def _layered_input_fingerprint(

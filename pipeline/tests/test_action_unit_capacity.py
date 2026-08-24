@@ -348,10 +348,40 @@ def test_sequence_fragmentation_is_reported_without_expanding_story_clock():
 
     plan = engine._estimate_action_capacity_plan(events, 60, 12)
 
-    assert plan["primary_shots"] == 5
+    assert plan["primary_shots"] == 8
     assert plan["structural_shots"] == 8
     assert plan["material_duration"] == 60
     assert plan["action_capacity_status"] == "fits_story_clock"
+
+
+def test_dense_single_sequence_expands_structure_before_dropping_events():
+    unit_counts = [1, 3, 0, 3, 5, 5, 5, 0, 4, 2, 4, 5, 4, 0]
+    events = [
+        {
+            "sequence_id": "SEQ001",
+            "event_role": (
+                "scene_setup"
+                if event_id == 1
+                else "turning_point"
+                if event_id == 4
+                else "action_chain"
+            ),
+            "dramatic_turn": event_id == 4,
+            "micro_actions": [
+                f"事件{event_id}动作{action_id}"
+                for action_id in range(1, unit_count + 1)
+            ],
+        }
+        for event_id, unit_count in enumerate(unit_counts, 1)
+    ]
+
+    plan = engine._estimate_action_capacity_plan(events, 60, 12)
+
+    assert plan["generation_action_units"] == 41
+    assert plan["structural_shots"] == 7
+    assert plan["primary_shots"] == 7
+    assert plan["material_duration"] == 60
+    assert plan["action_capacity_status"] == "screenplay_compression_required"
 
 
 def test_explicitly_dropped_events_are_audited_without_consuming_shot_capacity():
@@ -422,6 +452,70 @@ def test_mandatory_turning_point_cannot_be_dropped_from_story_clock():
 
     with pytest.raises(ValueError, match="mandatory event 2 cannot be dropped"):
         engine._validate_beat_action_capacity(beats, events)
+
+
+def test_capacity_repair_restores_redundant_whole_event_drops():
+    unit_counts = [1, 3, 0, 3, 5, 5, 5, 0, 4, 2, 4, 5, 4, 0]
+    events = [
+        {
+            "sequence_id": "SEQ001",
+            "event_role": (
+                "scene_setup"
+                if event_id == 1
+                else "turning_point"
+                if event_id == 4
+                else "action_chain"
+            ),
+            "dramatic_turn": event_id == 4,
+            "who": ["角色"],
+            "where": "连续动作空间",
+            "what": f"事件 {event_id}",
+            "micro_actions": [
+                f"事件{event_id}动作{action_id}"
+                for action_id in range(1, unit_count + 1)
+            ],
+        }
+        for event_id, unit_count in enumerate(unit_counts, 1)
+    ]
+    source_groups = [[1, 2], [3, 4], [5], [5], [8, 11], [13], [14]]
+    beats = [
+        {
+            "beat_order": index,
+            "source_events": source_events,
+            "dropped_source_events": (
+                [6, 7, 9, 10, 12] if index == 3 else []
+            ),
+            "action": "merge" if len(source_events) > 1 else "keep",
+            "reason": "模型过度删减",
+            "who": ["角色"],
+            "where": "连续动作空间",
+            "what": f"段落 {index}",
+        }
+        for index, source_events in enumerate(source_groups, 1)
+    ]
+    profile = engine.get_video_capabilities()
+
+    repaired = engine._restore_redundantly_dropped_events(
+        beats,
+        events,
+        material_duration=60,
+        capabilities=profile,
+        max_generation_units_per_beat=6,
+    )
+
+    engine._validate_beat_action_capacity(repaired, events, profile)
+    engine._validate_beat_material_duration(repaired, events, 60, profile)
+    kept_ids = {
+        event_id for beat in repaired for event_id in beat["source_events"]
+    }
+    dropped_ids = {
+        event_id
+        for beat in repaired
+        for event_id in beat["dropped_source_events"]
+    }
+    assert kept_ids == set(range(1, 15)) - {10}
+    assert dropped_ids == {10}
+    assert any(beat.get("capacity_repair") for beat in repaired)
 
 
 def test_capacity_repair_separates_sequences_and_rebalances_dense_station_fight():
@@ -652,12 +746,12 @@ def test_flashmob_one_take_has_a_feasible_four_beat_skeleton(monkeypatch):
 
     skeleton = engine._build_beat_skeleton(events, "", 60, 15, 4)
 
-    assert engine._beat_content_loads(skeleton["beats"], events, profile) == [1, 2, 2, 2]
+    assert engine._beat_content_loads(skeleton["beats"], events, profile) == [3, 3, 3, 2]
     assert [
         event_id
         for beat in skeleton["beats"]
         for event_id in beat["dropped_source_events"]
-    ] == [5, 10, 13, 19]
+    ] == []
 
 
 def test_layered_expansion_preserves_skeleton_shot_language(monkeypatch):
@@ -987,7 +1081,7 @@ def test_generic_dense_actions_report_screenplay_compression_pressure():
 
     assert plan["generation_action_units"] == 96
     assert plan["structural_shots"] == 16
-    assert plan["primary_shots"] == 6
+    assert plan["primary_shots"] == 7
     assert plan["minimum_material_duration"] == 144
     assert plan["material_duration"] == 60
     assert plan["action_capacity_status"] == "screenplay_compression_required"
