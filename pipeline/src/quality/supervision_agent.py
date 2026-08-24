@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from openai import OpenAI
+from openai import DefaultHttpxClient, OpenAI
 
 from utils.config import ARK_BASE_URL, DEFAULT_TEXT_MODEL, get_api_key
 from utils.ark_llm import call_llm_stream
@@ -35,14 +35,16 @@ def _get_llm_client(config: dict[str, Any]) -> OpenAI:
     api_key = config.get("api_key") or get_api_key("ARK_AGENT_API_KEY")
     if not api_key:
         raise RuntimeError("ARK_AGENT_API_KEY is required for supervision")
+    timeout = float(
+        config.get("request_timeout")
+        or os.environ.get("HONCUT_SUPERVISION_REQUEST_TIMEOUT_S", "60")
+    )
     return OpenAI(
         api_key=api_key,
         base_url=config.get("base_url") or ARK_BASE_URL,
-        timeout=float(
-            config.get("request_timeout")
-            or os.environ.get("HONCUT_SUPERVISION_REQUEST_TIMEOUT_S", "60")
-        ),
+        timeout=timeout,
         max_retries=0,
+        http_client=DefaultHttpxClient(timeout=timeout, trust_env=False),
     )
 
 

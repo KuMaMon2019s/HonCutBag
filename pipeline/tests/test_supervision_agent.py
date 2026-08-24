@@ -75,6 +75,19 @@ def test_llm_call_uses_idle_and_wall_timeouts(monkeypatch):
     assert observed["_client"] is fake_client
 
 
+def test_client_ignores_ambient_socks_proxy(monkeypatch):
+    monkeypatch.setenv("ALL_PROXY", "socks5://127.0.0.1:9")
+
+    client = supervision_agent._get_llm_client({
+        "api_key": "test-key",
+        "base_url": "https://ark.invalid/api/v3",
+    })
+    try:
+        assert client._client._trust_env is False
+    finally:
+        client.close()
+
+
 def test_blocking_mode_aborts_and_lists_issues(tmp_path, monkeypatch):
     response = {
         "grade": "D",
