@@ -5,7 +5,14 @@ import json
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from runtime.llm_policy import LLMStreamPolicy
+from schemas.understanding import (
+    DirectorPlanUnderstanding,
+    native_chat_json_schema_format,
+    parse_structured_output,
+)
 from utils.ark_llm import call_llm_stream, create_ark_client
 from utils.config import DEFAULT_TEXT_MODEL, get_api_key
 
@@ -22,6 +29,7 @@ DIRECTOR_INTENT_FIELDS = (
     "spatial_intent",
     "transition_intent",
 )
+MAX_SCHEMA_CORRECTIONS = 1
 
 SYSTEM_PROMPT = (
     "你是资深影视导演。事件账本已经完成剧本理解与分段。"
@@ -74,31 +82,12 @@ def validate_director_plan(
     events: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Validate exact event-ledger coverage and the narrow intent contract."""
-    if not isinstance(plan, dict):
-        raise ValueError("director plan must be a JSON object")
-    if plan.get("schema") != DIRECTOR_PLAN_SCHEMA:
-        raise ValueError(
-            f"director plan schema must be {DIRECTOR_PLAN_SCHEMA}"
-        )
-    if set(plan) != {"schema", "sequences"}:
-        raise ValueError("director plan must contain only schema and sequences")
+    plan = DirectorPlanUnderstanding.model_validate(plan).model_dump(by_alias=True)
     sequences = plan.get("sequences")
-    if not isinstance(sequences, list):
-        raise ValueError("director plan sequences must be an array")
 
     expected_ids = _sequence_ids(events)
     actual_ids: list[str] = []
-    allowed_fields = {"sequence_id", *DIRECTOR_INTENT_FIELDS}
     for index, sequence in enumerate(sequences, 1):
-        if not isinstance(sequence, dict):
-            raise ValueError(f"director sequence {index} must be an object")
-        if set(sequence) != allowed_fields:
-            missing = sorted(allowed_fields - set(sequence))
-            extra = sorted(set(sequence) - allowed_fields)
-            raise ValueError(
-                f"director sequence {index} fields mismatch; "
-                f"missing={missing}, extra={extra}"
-            )
         sequence_id = str(sequence.get("sequence_id") or "").strip()
         if not sequence_id:
             raise ValueError(f"director sequence {index} has empty sequence_id")
@@ -159,28 +148,46 @@ def plan_director(
             events_json=json.dumps(events, ensure_ascii=False, indent=2)
         )
 
-        content = call_llm_stream(
-            messages=[
+        correction = ""
+        plan = None
+        for attempt in range(MAX_SCHEMA_CORRECTIONS + 1):
+            messages = [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            model=DEFAULT_TEXT_MODEL,
-            max_tokens=DIRECTOR_LLM_POLICY.max_tokens,
-            wall_timeout=DIRECTOR_LLM_POLICY.wall_timeout_seconds,
-            idle_timeout=DIRECTOR_LLM_POLICY.idle_timeout_seconds,
-            _client=client,
-        )
-
-        if not content:
-            raise ValueError("LLM 返回空内容")
-
-        # 解析 JSON（兼容 markdown 代码块包裹）
-        text = content.strip()
-        if text.startswith("```"):
-            lines = text.split("\n")
-            text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
-
-        plan = validate_director_plan(json.loads(text), events)
+                {
+                    "role": "user",
+                    "content": user_prompt + correction,
+                },
+            ]
+            content = call_llm_stream(
+                messages=messages,
+                model=DEFAULT_TEXT_MODEL,
+                max_tokens=DIRECTOR_LLM_POLICY.max_tokens,
+                wall_timeout=DIRECTOR_LLM_POLICY.wall_timeout_seconds,
+                idle_timeout=DIRECTOR_LLM_POLICY.idle_timeout_seconds,
+                response_format=native_chat_json_schema_format(
+                    DirectorPlanUnderstanding
+                ),
+                _client=client,
+            )
+            if not content:
+                raise ValueError("LLM 返回空内容")
+            try:
+                parsed = parse_structured_output(
+                    content,
+                    DirectorPlanUnderstanding,
+                ).model_dump(by_alias=True)
+                plan = validate_director_plan(parsed, events)
+                break
+            except (json.JSONDecodeError, ValidationError, ValueError) as exc:
+                if attempt >= MAX_SCHEMA_CORRECTIONS:
+                    raise
+                correction = (
+                    "\n\n上次输出未通过导演计划业务校验："
+                    f"{exc}。请重新输出完整 JSON，严格覆盖全部 sequence_id，"
+                    "保持原顺序且不要增加任何 shot 字段。"
+                )
+        if plan is None:
+            raise ValueError("director planning did not produce a validated plan")
 
         # 写入文件
         plan_path.write_text(json.dumps(plan, indent=2, ensure_ascii=False), encoding="utf-8")

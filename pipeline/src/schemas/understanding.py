@@ -85,6 +85,23 @@ class EventUnderstandingBatch(StrictUnderstandingModel):
     events: list[EventUnderstanding]
 
 
+class DirectorSequenceIntentUnderstanding(StrictUnderstandingModel):
+    sequence_id: str
+    scene_goal: str
+    emotion_arc: str
+    visual_focus: str
+    spatial_intent: str
+    transition_intent: str
+
+
+class DirectorPlanUnderstanding(StrictUnderstandingModel):
+    director_schema: Literal["honcut.director-plan.v1"] = Field(
+        alias="schema",
+        serialization_alias="schema",
+    )
+    sequences: list[DirectorSequenceIntentUnderstanding]
+
+
 class CharacterVariantUnderstanding(StrictUnderstandingModel):
     state_name: str
     description: str
@@ -334,6 +351,7 @@ def native_chat_json_schema_format(
 __all__ = [
     "CharacterUnderstandingBatch",
     "CharacterReferenceUnderstanding",
+    "DirectorPlanUnderstanding",
     "FirstFrameUnderstanding",
     "IdentityDetailUnderstanding",
     "EventUnderstandingBatch",

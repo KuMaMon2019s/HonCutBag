@@ -311,6 +311,8 @@ def test_director_planner_uses_shared_streaming_client(monkeypatch, tmp_path):
     assert observed["stream_args"]["wall_timeout"] == director_planner.LLM_WALL_TIMEOUT
     assert observed["stream_args"]["idle_timeout"] == director_planner.LLM_IDLE_TIMEOUT
     assert observed["stream_args"]["model"] == DEFAULT_TEXT_MODEL
+    assert observed["stream_args"]["response_format"]["type"] == "json_schema"
+    assert observed["stream_args"]["response_format"]["json_schema"]["strict"] is True
     assert observed["messages"][0]["role"] == "system"
     assert json.loads((tmp_path / "director_plan.json").read_text()) == plan
 

@@ -105,8 +105,9 @@ def test_director_planner_consumes_sequences_and_rejects_missing_coverage(
     monkeypatch.setattr(director_planner, "get_api_key", lambda _name: "test-key")
     monkeypatch.setattr(director_planner, "create_ark_client", lambda **_kwargs: object())
 
-    def fake_stream(*, messages, **_kwargs):
+    def fake_stream(*, messages, **kwargs):
         observed["messages"] = messages
+        observed["response_format"] = kwargs["response_format"]
         return json.dumps(_director_plan(), ensure_ascii=False)
 
     monkeypatch.setattr(director_planner, "call_llm_stream", fake_stream)
@@ -116,12 +117,53 @@ def test_director_planner_consumes_sequences_and_rejects_missing_coverage(
     prompt = observed["messages"][1]["content"]
     assert "SEQ001" in prompt and "SEQ002" in prompt
     assert "不要重新分场" in prompt
+    assert observed["response_format"]["type"] == "json_schema"
+    schema = observed["response_format"]["json_schema"]
+    assert schema["strict"] is True
+    assert schema["schema"]["additionalProperties"] is False
     assert result["plan"] == _director_plan()
 
     incomplete = _director_plan()
     incomplete["sequences"] = incomplete["sequences"][:1]
     with pytest.raises(ValueError, match="SEQ002"):
         director_planner.validate_director_plan(incomplete, _events())
+
+    with_extra_shot_field = _director_plan()
+    with_extra_shot_field["sequences"][0]["camera_angle"] = "low"
+    with pytest.raises(ValueError, match="extra"):
+        director_planner.validate_director_plan(
+            with_extra_shot_field,
+            _events(),
+        )
+
+
+def test_director_planner_retries_one_invalid_complete_response(
+    monkeypatch,
+    tmp_path,
+):
+    responses = [
+        json.dumps(_director_plan(), ensure_ascii=False) + " trailing prose",
+        json.dumps(_director_plan(), ensure_ascii=False),
+    ]
+    prompts: list[str] = []
+    monkeypatch.setattr(director_planner, "get_api_key", lambda _name: "test-key")
+    monkeypatch.setattr(
+        director_planner,
+        "create_ark_client",
+        lambda **_kwargs: object(),
+    )
+
+    def fake_stream(*, messages, **_kwargs):
+        prompts.append(messages[1]["content"])
+        return responses.pop(0)
+
+    monkeypatch.setattr(director_planner, "call_llm_stream", fake_stream)
+
+    result = director_planner.plan_director(_events(), tmp_path)
+
+    assert result["plan"] == _director_plan()
+    assert len(prompts) == 2
+    assert "上次输出未通过导演计划业务校验" in prompts[1]
 
 
 def test_director_intent_changes_layered_checkpoint_identity():
@@ -143,4 +185,3 @@ def test_director_intent_changes_layered_checkpoint_identity():
     )
 
     assert first != changed
-
