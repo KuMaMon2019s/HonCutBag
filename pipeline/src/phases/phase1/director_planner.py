@@ -8,11 +8,14 @@ director_planner.py — M1: HonCut 导演规划层
 import json
 from pathlib import Path
 
+from runtime.llm_policy import LLMStreamPolicy
 from utils.ark_llm import call_llm_stream, create_ark_client
 from utils.config import DEFAULT_TEXT_MODEL, get_api_key
 
-LLM_WALL_TIMEOUT = 240
-LLM_IDLE_TIMEOUT = 75
+DIRECTOR_LLM_POLICY = LLMStreamPolicy.long_structured_output(max_tokens=8000)
+# Compatibility aliases for integrations that inspect the Phase 1 limits.
+LLM_WALL_TIMEOUT = DIRECTOR_LLM_POLICY.wall_timeout_seconds
+LLM_IDLE_TIMEOUT = DIRECTOR_LLM_POLICY.idle_timeout_seconds
 
 SYSTEM_PROMPT = (
     "你是资深影视导演。对剧本做导演级规划分析。"
@@ -108,9 +111,9 @@ def plan_director(script_text: str, output_dir: Path, dry_run: bool = False) -> 
                 {"role": "user", "content": user_prompt},
             ],
             model=DEFAULT_TEXT_MODEL,
-            max_tokens=8000,
-            wall_timeout=LLM_WALL_TIMEOUT,
-            idle_timeout=LLM_IDLE_TIMEOUT,
+            max_tokens=DIRECTOR_LLM_POLICY.max_tokens,
+            wall_timeout=DIRECTOR_LLM_POLICY.wall_timeout_seconds,
+            idle_timeout=DIRECTOR_LLM_POLICY.idle_timeout_seconds,
             _client=client,
         )
 

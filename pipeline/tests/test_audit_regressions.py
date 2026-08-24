@@ -579,6 +579,18 @@ def test_event_extractor_allows_healthy_long_streams_but_keeps_idle_guard(
     assert captured["response_format"]["json_schema"]["strict"] is True
 
 
+def test_director_uses_runtime_long_structured_stream_policy():
+    from runtime.llm_policy import LLMStreamPolicy
+
+    expected = LLMStreamPolicy.long_structured_output(max_tokens=8000)
+
+    assert director_planner.DIRECTOR_LLM_POLICY == expected
+    assert director_planner.LLM_WALL_TIMEOUT == expected.wall_timeout_seconds
+    assert director_planner.LLM_IDLE_TIMEOUT == expected.idle_timeout_seconds
+    assert expected.wall_timeout_seconds >= 600
+    assert expected.wall_timeout_seconds > expected.idle_timeout_seconds
+
+
 def test_video_prompt_keeps_requested_ratio_and_fast_action_semantics():
     prompt = build_video_prompt(
         {

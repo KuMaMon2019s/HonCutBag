@@ -59,7 +59,7 @@ Schema、State 和纯工具是共享契约，但不得反向触发上层工作�
 | State 与迁移 | `graph/state.py`、`graph/migrations.py` | 生产写 canonical 字段；旧别名只在迁移适配器读取 |
 | 文本/视觉理解 DTO | `pipeline/src/schemas/understanding.py` | Provider 使用原生 JSON Schema；返回值经 Pydantic 业务 DTO 验证后才能驱动身份、顺序或 QA |
 | Phase 业务 | `pipeline/src/phases/phaseN/` | 文件、模型、媒体和领域规则归对应 Phase owner |
-| 超时、重试、冷却与容量 | `pipeline/src/runtime/provider_policy.py` | Provider、Graph 和 Phase 不得叠加重试 |
+| 超时、重试、冷却与容量 | `pipeline/src/runtime/provider_policy.py`、`pipeline/src/runtime/llm_policy.py` | Provider、Graph 和 Phase 不得叠加重试；健康 LLM 长流由 idle 与 wall 两个时钟区分 |
 | 长任务账本 | `pipeline/src/runtime/generation_tasks.py` | SQLite 幂等迁移、提交去重、恢复与终态证据 |
 | Artifact 血缘 | `schemas/artifact.py`、`runtime/artifact_manifest.py` | 严格 schema、内容哈希、父资产与原子 manifest |
 | Provider 传输 | `runtime/video_provider.py` 与现有 clients/adapters | submit/status/cancel、能力和错误分类；不决定全局策略 |
@@ -109,6 +109,8 @@ flowchart LR
 Phase 5 的路由优先级固定为：任一 shot 的 `ref_type=reference` → reference；否则存在 storyboard image → img2vid；否则 txt2vid。Phase 7 的 Graph 路由只做 pass/block，像素级修复和付费补拍由 Phase 8 的有限闭环拥有。每条 Phase 成功边都是显式条件边；节点写入 `status=failed/error/blocked` 后只能路由到 END，`Command(goto=END)` 不能与无条件静态成功边并存，防止失败 Phase 之后继续产生图片、视频或其他副作用。
 
 Graph node 必须只完成三件事：读取 State、调用一个窄 owner、返回 State patch。节点不得直接读写媒体、运行 subprocess、调用网络/模型或实现重试。
+
+流式 LLM 的 idle timeout 与 wall timeout 是两个不同合同：idle 只检测连续无 chunk 的停滞，wall 才是活动流的绝对安全上限。导演规划、事件提取和 adaptation 这类有界结构化长输出不得使用短于健康历史流的 Phase 本地硬墙；其限制由 Runtime LLM policy 提供，Phase 只选择工作负载 profile。超时后仍 fail closed，禁止在 Graph 或 Phase 外层盲目重提。
 
 ### 3.3 Phase 所有权
 
