@@ -75,6 +75,10 @@ _PLACEHOLDER_MECHANICS = re.compile(
     r"^(?:未明确|未指定|未指明|不明确|未知|无|不适用|unspecified|unknown|none|n/?a|-)$",
     re.IGNORECASE,
 )
+_PLACEHOLDER_MECHANICS_FRAGMENT = re.compile(
+    r"未明确|未指定|未指明|不明确|未知|\bunspecified\b|\bunknown\b",
+    re.IGNORECASE,
+)
 _STRUCTURED_MECHANICS_FIELDS = (
     "performer",
     "technique",
@@ -199,7 +203,9 @@ def _missing_structured_mechanics(beat: dict[str, Any]) -> list[str]:
         values = value if isinstance(value, list) else [value]
         normalized = [str(item or "").strip() for item in values]
         if not normalized or any(
-            not item or _PLACEHOLDER_MECHANICS.fullmatch(item)
+            not item
+            or _PLACEHOLDER_MECHANICS.fullmatch(item)
+            or _PLACEHOLDER_MECHANICS_FRAGMENT.search(item)
             for item in normalized
         ):
             missing.append(field)

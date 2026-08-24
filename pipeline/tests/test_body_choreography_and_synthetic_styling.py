@@ -199,6 +199,32 @@ def test_explicit_choreography_requires_complete_mechanics_without_domain_label(
     assert errors[1]["beats"][0]["missing_fields"] == ["side"]
 
 
+def test_enriched_placeholder_cannot_masquerade_as_executable_side():
+    errors = body_action_contract_errors({
+        "micro_actions": ["敌人挥动能量刃横向斩击"],
+        "body_action_choreography": [{
+            "micro_action_index": 1,
+            "micro_action": "敌人挥动能量刃横向斩击",
+            "performer": "敌人",
+            "technique": "横向挥砍",
+            "side": "持械手臂一侧（左右原文未明确）",
+            "limbs": ["持械手臂", "双腿"],
+            "footwork": "前脚落地形成弓步",
+            "torso": "躯干向挥砍方向转动",
+            "weight_shift": "重心从后腿转移至前腿",
+            "direction": "沿对手身前横向挥出",
+            "contact": "刀刃擦过衣物，未命中身体",
+            "end_pose": "持械手臂伸展，双脚稳定落地",
+        }],
+    })
+
+    assert [error["code"] for error in errors] == [
+        "body_choreography_vague_action",
+        "body_choreography_incomplete_beat",
+    ]
+    assert errors[1]["beats"][0]["missing_fields"] == ["side"]
+
+
 def test_body_contract_uses_current_action_ledger_not_fight_context():
     record = {
         "what": "近身格斗仍在持续，护盾抵御冲击波",
