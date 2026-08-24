@@ -2263,6 +2263,88 @@ def test_phase5_l3_recovers_one_rejected_native_structured_response(tmp_path):
     ] == ["schema_rejected", "succeeded"]
 
 
+def test_phase5_l3_partitions_structured_review_by_shot(tmp_path):
+    from PIL import Image
+
+    from phases.phase5 import storyboard_qa_gate
+
+    images = {}
+    shots = []
+    for index in range(1, 3):
+        shot_id = f"S{index:02d}"
+        beat_id = f"{shot_id}_P01"
+        path = tmp_path / f"{beat_id}.png"
+        Image.new("RGB", (160, 90), "white").save(path)
+        images[beat_id] = path
+        shots.append({
+            "id": shot_id,
+            "character_ids": [f"character_{index}"],
+            "storyboard_beats": [{"beat_id": beat_id}],
+        })
+
+    references = {}
+    for index in range(1, 3):
+        path = tmp_path / f"character_{index}.png"
+        Image.new("RGB", (90, 160), "gray").save(path)
+        references[f"character_{index}"] = [path]
+
+    class ReviewClient:
+        def __init__(self):
+            self.calls = []
+
+        def review(self, image_paths, prompt):
+            self.calls.append((list(image_paths), prompt))
+            return '{"issues":[]}'
+
+    client = ReviewClient()
+    issues, layer = storyboard_qa_gate.run_l3_review(
+        {"shots": shots},
+        {"characters": [
+            {"id": "character_1"},
+            {"id": "character_2"},
+        ]},
+        "cinematic",
+        images,
+        tmp_path / "storyboard_qa_grid.jpg",
+        client,
+        character_reference_images=references,
+    )
+
+    assert issues == []
+    assert layer["status"] == "completed"
+    assert layer["request_count"] == 2
+    assert layer["provider_request_count"] == 2
+    assert [batch["shot_id"] for batch in layer["structured_review_batches"]] == [
+        "S01",
+        "S02",
+    ]
+    assert len(client.calls) == 2
+    assert [path.name for path in client.calls[0][0]] == [
+        "character_1.png",
+        "storyboard_reference_S01.jpg",
+        "storyboard_qa_grid.jpg",
+    ]
+    assert [path.name for path in client.calls[1][0]] == [
+        "character_2.png",
+        "storyboard_reference_S02.jpg",
+        "storyboard_qa_grid.jpg",
+    ]
+    assert 'Use only these exact IDs: ["S01_P01"]' in client.calls[0][1]
+    assert 'Use only these exact IDs: ["S02_P01"]' in client.calls[1][1]
+    manifest = json.loads(
+        (tmp_path / "storyboard_qa_inputs.json").read_text(encoding="utf-8")
+    )
+    assert manifest["schema"] == "honcut.storyboard-qa-inputs.v2"
+    assert manifest["request_count"] == 2
+    assert [value["input_index"] for value in manifest["requests"][0]["inputs"]] == [
+        1,
+        2,
+        3,
+    ]
+    assert manifest["requests"][0]["inputs"][0]["character_id"] == "character_1"
+    assert manifest["requests"][1]["inputs"][0]["character_id"] == "character_2"
+
+
 def test_phase5_l3_skips_unmatched_image_ids_instead_of_crashing(tmp_path):
     from PIL import Image
 

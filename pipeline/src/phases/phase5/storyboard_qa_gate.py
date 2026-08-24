@@ -1096,6 +1096,31 @@ def _write_l3_input_manifest(path: Path, records: list[dict[str, Any]]) -> Path:
     return path
 
 
+def _write_l3_batched_input_manifest(
+    path: Path,
+    records: list[dict[str, Any]],
+    requests: list[dict[str, Any]],
+) -> Path:
+    """Persist unique evidence plus each exact shot-scoped Provider request."""
+    payload = {
+        "schema": "honcut.storyboard-qa-inputs.v2",
+        "input_count": len(records),
+        "provider_input_count": sum(
+            int(request.get("input_count") or 0) for request in requests
+        ),
+        "request_count": len(requests),
+        "inputs": records,
+        "requests": requests,
+    }
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+    return path
+
+
 def _ordered_storyboard_images(
     storyboard: dict, images: dict[str, Path]
 ) -> list[Path]:
@@ -1587,13 +1612,11 @@ def run_l3_review(
         for board in shot_boards
         for storyboard_id in board["storyboard_ids"]
     ]
-    input_paths = list(reference_inputs)
     storyboard_manifest: list[dict[str, Any]] = []
     for board in shot_boards:
         path = Path(board["path"])
-        input_paths.append(path)
         storyboard_manifest.append({
-            "input_index": len(input_paths),
+            "input_index": len(reference_manifest) + len(storyboard_manifest) + 1,
             "kind": "storyboard_shot_board",
             "shot_id": board["shot_id"],
             "storyboard_ids": board["storyboard_ids"],
@@ -1604,8 +1627,7 @@ def run_l3_review(
                 for source in board["source_paths"]
             ],
         })
-    input_paths.append(grid_path)
-    grid_input_index = len(input_paths)
+    grid_input_index = len(reference_manifest) + len(storyboard_manifest) + 1
     overview_manifest = {
         "input_index": grid_input_index,
         "kind": "storyboard_overview_grid",
@@ -1614,9 +1636,124 @@ def run_l3_review(
         "sha256": _sha256_file(grid_path),
     }
     input_records = [*reference_manifest, *storyboard_manifest, overview_manifest]
-    input_manifest_path = _write_l3_input_manifest(
+    shot_values = [
+        shot
+        for shot in (storyboard.get("shots") or [])
+        if isinstance(shot, dict)
+    ]
+    shot_index_by_id = {
+        _shot_id(shot, index): index for index, shot in enumerate(shot_values)
+    }
+    characters = [
+        value
+        for value in (characters_data.get("characters") or [])
+        if isinstance(value, dict)
+    ]
+    reference_ids = {
+        str(record.get("character_id") or "") for record in reference_manifest
+    }
+    requests: list[dict[str, Any]] = []
+    executions: list[dict[str, Any]] = []
+    for board, board_record in zip(shot_boards, storyboard_manifest):
+        shot_id = str(board["shot_id"])
+        shot_index = shot_index_by_id.get(shot_id)
+        if shot_index is None:
+            continue
+        shot = shot_values[shot_index]
+        explicit = shot.get("character_ids", shot.get("characters", []))
+        if isinstance(explicit, str):
+            explicit = [explicit]
+        explicit_ids = {
+            str(value.get("id") if isinstance(value, dict) else value)
+            for value in (explicit if isinstance(explicit, list) else [])
+            if value
+        }
+        relevant_character_ids = explicit_ids & reference_ids
+        if not relevant_character_ids:
+            inferred_ids = set(_characters_in_shot(shot, characters))
+            relevant_character_ids = inferred_ids & reference_ids
+        if not relevant_character_ids:
+            # Legacy storyboards may not carry canonical IDs.  Reviewing every
+            # available reference is safer than silently omitting identity QA.
+            relevant_character_ids = set(reference_ids)
+
+        local_records: list[dict[str, Any]] = []
+        local_paths: list[Path] = []
+        for record, path in zip(reference_manifest, reference_inputs):
+            if str(record.get("character_id") or "") not in relevant_character_ids:
+                continue
+            local_paths.append(path)
+            local_records.append({
+                **record,
+                "global_input_index": record["input_index"],
+                "input_index": len(local_records) + 1,
+            })
+        local_paths.append(Path(board["path"]))
+        local_board_record = {
+            **board_record,
+            "global_input_index": board_record["input_index"],
+            "input_index": len(local_records) + 1,
+        }
+        local_records.append(local_board_record)
+        local_paths.append(grid_path)
+        local_overview_record = {
+            **overview_manifest,
+            "global_input_index": overview_manifest["input_index"],
+            "input_index": len(local_records) + 1,
+        }
+        local_records.append(local_overview_record)
+
+        context_start = max(0, shot_index - 1)
+        context_end = min(len(shot_values), shot_index + 2)
+        context_storyboard = {"shots": shot_values[context_start:context_end]}
+        local_contracts = {
+            character_id: canonical_contracts.get(character_id, "")
+            for character_id in ordered_character_ids
+            if character_id in relevant_character_ids
+        }
+        prompt = _l3_review_prompt(
+            reference_inputs=[
+                record
+                for record in local_records
+                if record["kind"] == "canonical_character_reference"
+            ],
+            storyboard_inputs=[local_board_record],
+            overview_input=local_overview_record,
+            canonical_contracts=local_contracts,
+            storyboard=context_storyboard,
+            visual_style=visual_style,
+            valid_storyboard_ids=list(board["storyboard_ids"]),
+        )
+        request_id = f"l3-{shot_id.lower()}"
+        requests.append({
+            "request_id": request_id,
+            "shot_id": shot_id,
+            "context_shot_ids": [
+                _shot_id(value, context_start + offset)
+                for offset, value in enumerate(context_storyboard["shots"])
+            ],
+            "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            "input_count": len(local_records),
+            "inputs": local_records,
+        })
+        executions.append({
+            "request_id": request_id,
+            "shot_id": shot_id,
+            "storyboard_ids": list(board["storyboard_ids"]),
+            "prompt": prompt,
+            "input_paths": local_paths,
+            "reference_manifest": [
+                record
+                for record in local_records
+                if record["kind"] == "canonical_character_reference"
+            ],
+            "canonical_contracts": local_contracts,
+        })
+
+    input_manifest_path = _write_l3_batched_input_manifest(
         grid_path.parent / "storyboard_qa_inputs.json",
         input_records,
+        requests,
     )
     if client is None and not os.environ.get("ARK_AGENT_API_KEY"):
         shot_ids = sorted({_parent_shot_id(value) for value in valid_storyboard_ids})
@@ -1632,97 +1769,135 @@ def run_l3_review(
             "status": "error",
             "grid_path": str(grid_path),
             "input_manifest_path": str(input_manifest_path),
-            "input_count": len(input_paths),
+            "input_count": len(input_records),
+            "provider_input_count": sum(
+                int(request["input_count"]) for request in requests
+            ),
+            "request_count": len(requests),
+            "provider_request_count": 0,
             "skipped_reason": "ARK multimodal API key missing",
         }
-    prompt = _l3_review_prompt(
-        reference_inputs=reference_manifest,
-        storyboard_inputs=storyboard_manifest,
-        overview_input=overview_manifest,
-        canonical_contracts=canonical_contracts,
-        storyboard=storyboard,
-        visual_style=visual_style,
-        valid_storyboard_ids=valid_storyboard_ids,
-    )
-    try:
-        from clients.ark_multimodal_client import review_as
-        from schemas.understanding import StoryboardVisualUnderstanding
 
-        review_client = client or ArkMultimodalClient()
-        typed_review, review_execution = execute_structured_understanding(
-            lambda: review_as(
-                review_client,
-                input_paths,
-                prompt,
-                StoryboardVisualUnderstanding,
+    from clients.ark_multimodal_client import review_as
+    from schemas.understanding import StoryboardVisualUnderstanding
+
+    review_client = client or ArkMultimodalClient()
+    issues: list[dict[str, Any]] = []
+    batches: list[dict[str, Any]] = []
+    raw_issue_count = 0
+    failed_batches = 0
+    for execution in executions:
+        try:
+            typed_review, review_execution = execute_structured_understanding(
+                lambda execution=execution: review_as(
+                    review_client,
+                    execution["input_paths"],
+                    execution["prompt"],
+                    StoryboardVisualUnderstanding,
+                )
             )
-        )
-        parsed = typed_review.model_dump()
-        valid_ids = set(valid_storyboard_ids)
-        issues = []
-        for value in parsed["issues"]:
-            if not isinstance(value, dict):
-                continue
-            red_line = str(value.get("red_line", "semantic_review"))
-            message = str(value.get("message", "Multimodal review issue"))
-            requested_severity = value.get("severity") if value.get("severity") in {"severe", "moderate", "minor"} else "moderate"
-            severity = _calibrate_l3_severity(
-                red_line, requested_severity, message
-            )
-            storyboard_ids = [sid for sid in value.get("shot_ids", []) if sid in valid_ids]
-            evidence_valid, evidence_details = _r1_attribute_evidence(
-                value,
-                storyboard_ids,
-                {
-                    int(item["input_index"]): str(item["character_id"])
-                    for item in reference_manifest
-                },
-                canonical_contracts,
-            ) if red_line.upper() == "R1" else (True, {"evidence_status": "not_required"})
-            if not evidence_valid:
-                severity = "minor"
-            shot_ids = sorted({_parent_shot_id(sid) for sid in storyboard_ids})
-            correction_evidence = {
-                "storyboard_ids": storyboard_ids,
-                "mismatch_type": str(value.get("mismatch_type") or "other"),
-                "expected": str(value.get("expected") or "").strip(),
-                "observed": str(value.get("observed") or "").strip(),
-                "confidence": value.get("confidence"),
-                "panel_evidence": value.get("panel_evidence") or [],
+            parsed = typed_review.model_dump()
+            raw_issue_count += len(parsed["issues"])
+            batch = {
+                "request_id": execution["request_id"],
+                "shot_id": execution["shot_id"],
+                "status": "completed",
+                "input_count": len(execution["input_paths"]),
+                "raw_issue_count": len(parsed["issues"]),
+                "structured_review_execution": review_execution,
             }
-            correction_evidence.update(evidence_details)
+            batches.append(batch)
+            valid_ids = set(execution["storyboard_ids"])
+            for value in parsed["issues"]:
+                if not isinstance(value, dict):
+                    continue
+                red_line = str(value.get("red_line", "semantic_review"))
+                message = str(value.get("message", "Multimodal review issue"))
+                requested_severity = (
+                    value.get("severity")
+                    if value.get("severity") in {"severe", "moderate", "minor"}
+                    else "moderate"
+                )
+                severity = _calibrate_l3_severity(
+                    red_line, requested_severity, message
+                )
+                storyboard_ids = [
+                    sid for sid in value.get("shot_ids", []) if sid in valid_ids
+                ]
+                evidence_valid, evidence_details = (
+                    _r1_attribute_evidence(
+                        value,
+                        storyboard_ids,
+                        {
+                            int(item["input_index"]): str(item["character_id"])
+                            for item in execution["reference_manifest"]
+                        },
+                        execution["canonical_contracts"],
+                    )
+                    if red_line.upper() == "R1"
+                    else (True, {"evidence_status": "not_required"})
+                )
+                if not evidence_valid:
+                    severity = "minor"
+                shot_ids = sorted({
+                    _parent_shot_id(storyboard_id)
+                    for storyboard_id in storyboard_ids
+                })
+                correction_evidence = {
+                    "storyboard_ids": storyboard_ids,
+                    "mismatch_type": str(value.get("mismatch_type") or "other"),
+                    "expected": str(value.get("expected") or "").strip(),
+                    "observed": str(value.get("observed") or "").strip(),
+                    "confidence": value.get("confidence"),
+                    "panel_evidence": value.get("panel_evidence") or [],
+                }
+                correction_evidence.update(evidence_details)
+                issues.append(_issue(
+                    "L3", severity, red_line, message, shot_ids,
+                    **correction_evidence,
+                ))
+        except Exception as exc:
+            failed_batches += 1
+            batch = {
+                "request_id": execution["request_id"],
+                "shot_id": execution["shot_id"],
+                "status": "error",
+                "input_count": len(execution["input_paths"]),
+                "raw_issue_count": 0,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            if isinstance(exc, StructuredUnderstandingExhausted):
+                batch["structured_review_execution"] = exc.receipt
+            batches.append(batch)
             issues.append(_issue(
-                "L3", severity, red_line, message, shot_ids,
-                **correction_evidence,
-            ))
-        return issues, {
-            "status": "completed",
-            "grid_path": str(grid_path),
-            "input_manifest_path": str(input_manifest_path),
-            "input_count": len(input_paths),
-            "raw_issue_count": len(parsed["issues"]),
-            "structured_review_execution": review_execution,
-        }
-    except Exception as exc:
-        shot_ids = sorted({_parent_shot_id(value) for value in valid_storyboard_ids})
-        layer = {
-            "status": "error",
-            "grid_path": str(grid_path),
-            "input_manifest_path": str(input_manifest_path),
-            "input_count": len(input_paths),
-            "skipped_reason": f"multimodal review unavailable: {exc}",
-        }
-        if isinstance(exc, StructuredUnderstandingExhausted):
-            layer["structured_review_execution"] = exc.receipt
-        return [
-            _issue(
                 "L3",
                 "severe",
                 "storyboard_visual_review_unavailable",
                 f"Canonical storyboard visual review failed: {exc}",
-                shot_ids,
-            )
-        ], layer
+                [execution["shot_id"]],
+            ))
+
+    layer = {
+        "status": "error" if failed_batches else "completed",
+        "grid_path": str(grid_path),
+        "input_manifest_path": str(input_manifest_path),
+        "input_count": len(input_records),
+        "provider_input_count": sum(len(value["input_paths"]) for value in executions),
+        "request_count": len(executions),
+        "provider_request_count": len(batches),
+        "raw_issue_count": raw_issue_count,
+        "structured_review_batches": batches,
+    }
+    if len(batches) == 1 and "structured_review_execution" in batches[0]:
+        layer["structured_review_execution"] = batches[0][
+            "structured_review_execution"
+        ]
+    if failed_batches:
+        layer["skipped_reason"] = (
+            f"multimodal review unavailable for {failed_batches} "
+            "shot-scoped batch(es)"
+        )
+    return issues, layer
 
 
 def is_blocking_issue(issue: dict) -> bool:
