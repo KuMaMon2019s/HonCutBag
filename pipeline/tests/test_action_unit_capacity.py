@@ -1196,14 +1196,14 @@ def test_60s_scaled_screenplay_reconciles_source_pressure_into_executable_ledger
         source_events_hash="source-events-sha256",
     )
 
-    assert screenplay_plan["schema"] == "honcut.screenplay-plan.v2"
+    assert screenplay_plan["schema"] == "honcut.screenplay-plan.v3"
     assert screenplay_plan["source_ledger"]["capacity_status"] == (
         "screenplay_compression_required"
     )
     assert screenplay_plan["production_ledger"] == {
         "capacity_status": "fits_story_clock",
         "duration_scaling_status": "applied",
-        "event_action_scaling_schema": "honcut.duration-scaled-event-plan.v1",
+        "event_action_scaling_schema": "honcut.duration-scaled-event-plan.v2",
         "intra_event_scaling_applied": False,
         "intra_event_omitted_micro_action_count": 0,
         "event_count": 6,
@@ -1211,7 +1211,9 @@ def test_60s_scaled_screenplay_reconciles_source_pressure_into_executable_ledger
         "effective_story_duration_s": 60,
         "kept_source_event_ids": [1, 2, 3, 5, 6, 7],
         "omitted_source_event_ids": [4],
+        "base_mandatory_source_event_ids": [1, 7],
         "mandatory_source_event_ids": [1, 7],
+        "causal_predecessor_source_event_ids": [],
     }
     assert sum(beat["duration_s"] for beat in screenplay_plan["beats"]) == 60
     assert reconciled["source_action_capacity_status"] == (
@@ -1260,7 +1262,7 @@ def test_duration_scaled_event_plan_fits_dense_mandatory_actions_without_mutatin
     )
 
     assert events == source_snapshot
-    assert scaling_plan["schema"] == "honcut.duration-scaled-event-plan.v1"
+    assert scaling_plan["schema"] == "honcut.duration-scaled-event-plan.v2"
     assert scaling_plan["source_generation_action_units"] == 46
     assert scaling_plan["production_generation_action_units"] < 46
     assert scaling_plan["intra_event_scaling_applied"] is True
@@ -1288,6 +1290,119 @@ def test_duration_scaled_event_plan_fits_dense_mandatory_actions_without_mutatin
         production_events[event_id - 1]["what"] == events[event_id - 1]["what"]
         for event_id in mandatory_ids
     )
+
+
+def test_mandatory_event_protects_continuous_predecessors_until_cut_boundary():
+    """A kept outcome cannot survive after its same-sequence causes are omitted."""
+    events = [
+        {
+            "sequence_id": "SEQ000",
+            "event_role": "transition",
+            "continuity_before": "cut",
+            "what": "unrelated prologue",
+            "micro_actions": ["prologue action"],
+        },
+        {
+            "sequence_id": "SEQ001",
+            "event_role": "action_chain",
+            "continuity_before": "cut",
+            "what": "the attack begins",
+            "micro_actions": ["enemy attacks"],
+        },
+        {
+            "sequence_id": "SEQ001",
+            "event_role": "action_chain",
+            "continuity_before": "continuous",
+            "what": "the protagonist counters",
+            "micro_actions": ["protagonist counters"],
+        },
+        {
+            "sequence_id": "SEQ001",
+            "event_role": "turning_point",
+            "continuity_before": "continuous",
+            "what": "the counter changes the fight",
+            "micro_actions": ["enemy loses balance"],
+        },
+        {
+            "sequence_id": "SEQ002",
+            "event_role": "transition",
+            "continuity_before": "cut",
+            "what": "unrelated epilogue",
+            "micro_actions": ["epilogue action"],
+        },
+    ]
+
+    assert engine._mandatory_adaptation_event_ids(events) == {2, 3, 4}
+
+    production_events, scaling_plan = engine._build_duration_scaled_event_plan(
+        events,
+        target_duration=32,
+        beat_count=5,
+        effective_shot_duration=6,
+    )
+
+    assert len(production_events) == len(events)
+    assert scaling_plan["mandatory_source_event_ids"] == [2, 3, 4]
+    assert {
+        record["source_event_id"]
+        for record in scaling_plan["events"]
+        if record["mandatory"]
+    } == {2, 3, 4}
+
+
+def test_optional_kept_event_cannot_orphan_its_continuous_predecessor():
+    events = [
+        {
+            "sequence_id": "SEQ001",
+            "event_role": "action_chain",
+            "continuity_before": "cut",
+            "micro_actions": ["train arrives"],
+        },
+        {
+            "sequence_id": "SEQ001",
+            "event_role": "character_state",
+            "continuity_before": "continuous",
+            "micro_actions": ["protagonist waits at the open door"],
+        },
+    ]
+    beats = [{
+        "beat_order": 1,
+        "source_events": [2],
+        "dropped_source_events": [1],
+        "action": "keep",
+    }]
+
+    with pytest.raises(ValueError, match="omit continuous predecessors"):
+        engine._validate_beat_action_capacity(beats, events)
+
+
+def test_duration_scaling_dp_fits_long_continuous_chain_without_state_explosion():
+    events = [
+        {
+            "sequence_id": "SEQ001",
+            "event_role": "turning_point" if event_id == 12 else "action_chain",
+            "dramatic_turn": event_id == 12,
+            "continuity_before": "cut" if event_id == 1 else "continuous",
+            "what": f"causal action {event_id}",
+            "micro_actions": [
+                f"event {event_id} action {action_id}"
+                for action_id in range(1, 5)
+            ],
+        }
+        for event_id in range(1, 13)
+    ]
+
+    production_events, scaling_plan = engine._build_duration_scaled_event_plan(
+        events,
+        target_duration=32,
+        beat_count=5,
+        effective_shot_duration=6,
+    )
+
+    assert len(production_events) == 12
+    assert scaling_plan["mandatory_source_event_ids"] == list(range(1, 13))
+    assert scaling_plan["production_generation_action_units"] <= 20
+    assert scaling_plan["intra_event_scaling_applied"] is True
 
 
 def test_screenplay_plan_records_intra_event_action_lineage():
@@ -1330,9 +1445,9 @@ def test_screenplay_plan_records_intra_event_action_lineage():
         duration_scaled_event_plan=scaling_plan,
     )
 
-    assert screenplay_plan["schema"] == "honcut.screenplay-plan.v2"
+    assert screenplay_plan["schema"] == "honcut.screenplay-plan.v3"
     assert screenplay_plan["production_ledger"]["event_action_scaling_schema"] == (
-        "honcut.duration-scaled-event-plan.v1"
+        "honcut.duration-scaled-event-plan.v2"
     )
     assert screenplay_plan["beats"][0]["production_action_refs"] == [{
         "source_event_id": 1,
@@ -1361,15 +1476,29 @@ def test_phase5_capacity_uses_duration_scaled_production_event_ledger():
     }
     screenplay_plan = {
         "schema": engine.SCREENPLAY_PLAN_SCHEMA,
+        "production_ledger": {
+            "base_mandatory_source_event_ids": [],
+            "mandatory_source_event_ids": [],
+            "causal_predecessor_source_event_ids": [],
+        },
         "event_action_scaling": {
             "schema": engine.DURATION_SCALED_EVENT_PLAN_SCHEMA,
             "events": [
-                {"source_event_id": 1, "production_status": "kept"},
+                {
+                    "source_event_id": 1,
+                    "production_status": "kept",
+                    "mandatory": False,
+                },
                 {
                     "source_event_id": 2,
                     "production_status": "whole_event_omitted",
+                    "mandatory": False,
                 },
-                {"source_event_id": 3, "production_status": "kept"},
+                {
+                    "source_event_id": 3,
+                    "production_status": "kept",
+                    "mandatory": False,
+                },
             ],
         },
     }
@@ -1381,5 +1510,23 @@ def test_phase5_capacity_uses_duration_scaled_production_event_ledger():
     )
 
     assert "action_unit_coverage_missing" not in {
+        issue["code"] for issue in issues
+    }
+
+
+def test_phase5_rejects_pre_causal_screenplay_plan_schema():
+    issues = run_generation_capacity_checks(
+        {"shots": []},
+        {"events": []},
+        {
+            "schema": "honcut.screenplay-plan.v2",
+            "event_action_scaling": {
+                "schema": "honcut.duration-scaled-event-plan.v1",
+                "events": [],
+            },
+        },
+    )
+
+    assert "screenplay_plan_lineage_invalid" in {
         issue["code"] for issue in issues
     }

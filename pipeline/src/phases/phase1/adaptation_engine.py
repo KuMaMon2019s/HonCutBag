@@ -30,7 +30,6 @@
 import argparse
 import copy
 import functools
-import heapq
 import hashlib
 import itertools
 import json
@@ -707,10 +706,11 @@ def _estimate_action_capacity_plan(
         # temporal jump.  It does not enlarge the story clock or theoretical
         # action budget, and is bounded by the structural search range.
         primary_shots = min(first_capacity_maximizer + 1, search_end)
+    mandatory_event_ids = _mandatory_adaptation_event_ids(authored_events)
     mandatory_sequences = list(dict.fromkeys(
         str(event.get("sequence_id") or "").strip() or "__unspecified__"
-        for event in authored_events
-        if _event_is_mandatory_for_adaptation(event)
+        for event_id, event in enumerate(authored_events, 1)
+        if event_id in mandatory_event_ids
     ))
     if len(mandatory_sequences) > maximum_story_shots:
         raise ValueError(
@@ -1877,6 +1877,77 @@ def _event_is_mandatory_for_adaptation(event: Dict[str, Any]) -> bool:
     return role in _MANDATORY_ADAPTATION_EVENT_ROLES or bool(event.get("dramatic_turn"))
 
 
+def _base_mandatory_adaptation_event_ids(
+    events: List[Dict[str, Any]],
+) -> set[int]:
+    return {
+        event_id
+        for event_id, event in enumerate(events, 1)
+        if _event_is_mandatory_for_adaptation(event)
+    }
+
+
+def _continuous_predecessor_event_ids(
+    events: List[Dict[str, Any]],
+    seed_event_ids: set[int],
+) -> set[int]:
+    """Return seeds plus structured predecessors up to each cut boundary.
+
+    ``continuity_before=continuous`` is an authored temporal contract: keeping
+    the current event while deleting its previous same-sequence event would
+    create an unexplained state jump.
+    """
+    invalid_ids = seed_event_ids - set(range(1, len(events) + 1))
+    if invalid_ids:
+        raise ValueError(
+            f"continuous predecessor closure received unknown events: "
+            f"{sorted(invalid_ids)}"
+        )
+    required = set(seed_event_ids)
+    previous_in_sequence: Dict[int, int] = {}
+    last_event_by_sequence: Dict[str, int] = {}
+    for event_id, event in enumerate(events, 1):
+        sequence_id = (
+            str(event.get("sequence_id") or "").strip() or "__unspecified__"
+        )
+        previous_event_id = last_event_by_sequence.get(sequence_id)
+        if previous_event_id is not None:
+            previous_in_sequence[event_id] = previous_event_id
+        last_event_by_sequence[sequence_id] = event_id
+
+    pending = list(required)
+    while pending:
+        event_id = pending.pop()
+        event = events[event_id - 1]
+        boundary = str(event.get("continuity_before") or "").strip().lower()
+        if boundary != "continuous":
+            continue
+        previous_event_id = previous_in_sequence.get(event_id)
+        if previous_event_id is None:
+            sequence_id = (
+                str(event.get("sequence_id") or "").strip()
+                or "__unspecified__"
+            )
+            raise ValueError(
+                f"event {event_id} declares continuous entry for sequence "
+                f"{sequence_id!r} without a predecessor"
+            )
+        if previous_event_id not in required:
+            required.add(previous_event_id)
+            pending.append(previous_event_id)
+    return required
+
+
+def _mandatory_adaptation_event_ids(
+    events: List[Dict[str, Any]],
+) -> set[int]:
+    """Protect mandatory facts and their structured continuous causes."""
+    return _continuous_predecessor_event_ids(
+        events,
+        _base_mandatory_adaptation_event_ids(events),
+    )
+
+
 def _dropped_source_event_ids(beats: List[Dict[str, Any]]) -> set[int]:
     return {
         event_id
@@ -1963,6 +2034,16 @@ def _validate_beat_action_capacity(
         raise ValueError(
             f"events must be explicitly kept or dropped: {sorted(missing_event_ids)}"
         )
+    mandatory_event_ids = _mandatory_adaptation_event_ids(events)
+    missing_continuous_predecessors = (
+        _continuous_predecessor_event_ids(events, kept_event_ids)
+        - kept_event_ids
+    )
+    if missing_continuous_predecessors:
+        raise ValueError(
+            "kept events omit continuous predecessors: "
+            f"{sorted(missing_continuous_predecessors)}"
+        )
     _validate_beat_event_order(beats, events)
     for beat in beats:
         if beat.get("action") == "drop":
@@ -1996,7 +2077,7 @@ def _validate_beat_action_capacity(
             if beat.get("action") != "drop"
         )
         if observed == 0 and event_id in dropped_event_ids:
-            if _event_is_mandatory_for_adaptation(event):
+            if event_id in mandatory_event_ids:
                 raise ValueError(f"mandatory event {event_id} cannot be dropped")
             continue
         required = occurrence_requirements[event_id]
@@ -2106,11 +2187,12 @@ def _sequence_beat_plan(
     mandatory_units = {sequence: 0 for sequence in ordered_sequences}
     mandatory_event_units = {sequence: [] for sequence in ordered_sequences}
     mandatory_sequences: set[str] = set()
+    mandatory_event_ids = _mandatory_adaptation_event_ids(events)
     for event_id, event in enumerate(events, 1):
         sequence = str(event.get("sequence_id") or "").strip() or "__unspecified__"
         units = generation_units[event_id]
         total_units[sequence] += units
-        if _event_is_mandatory_for_adaptation(event):
+        if event_id in mandatory_event_ids:
             mandatory_sequences.add(sequence)
             mandatory_units[sequence] += units
             mandatory_event_units[sequence].append(units)
@@ -2177,7 +2259,7 @@ def _sequence_beat_plan(
     ]
 
 
-DURATION_SCALED_EVENT_PLAN_SCHEMA = "honcut.duration-scaled-event-plan.v1"
+DURATION_SCALED_EVENT_PLAN_SCHEMA = "honcut.duration-scaled-event-plan.v2"
 DURATION_SCALED_ACTION_SELECTION_SCHEMA = (
     "honcut.duration-scaled-action-selection.v1"
 )
@@ -2328,17 +2410,12 @@ def _build_duration_scaled_event_plan(
 
     source_contracts = _source_event_generation_contracts(events)
 
-    mandatory_event_ids = [
-        event_id
-        for event_id, event in enumerate(events, 1)
-        if _event_is_mandatory_for_adaptation(event)
-    ]
+    base_mandatory_event_ids = _base_mandatory_adaptation_event_ids(events)
+    mandatory_event_ids = sorted(_mandatory_adaptation_event_ids(events))
     source_counts = {
         contract["event_id"]: len(contract["generation_units"])
         for contract in source_contracts
     }
-    initial_targets = tuple(source_counts[event_id] for event_id in mandatory_event_ids)
-
     def build_candidate(
         mandatory_targets: tuple[int, ...],
     ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -2372,7 +2449,16 @@ def _build_duration_scaled_event_plan(
                     str(source_event.get("sequence_id") or "").strip()
                     or "__unspecified__"
                 ),
-                "mandatory": _event_is_mandatory_for_adaptation(source_event),
+                "mandatory": event_id in mandatory_event_ids,
+                "mandatory_reason": (
+                    "structural"
+                    if event_id in base_mandatory_event_ids
+                    else (
+                        "continuous_predecessor"
+                        if event_id in mandatory_event_ids
+                        else "optional"
+                    )
+                ),
                 "source_micro_action_count": len(contract["actions"]),
                 "source_generation_action_units": len(units),
                 "selected_source_generation_unit_indexes": [
@@ -2414,47 +2500,78 @@ def _build_duration_scaled_event_plan(
         "dramatic_turn": 8,
     }
 
-    def weighted_loss(targets: tuple[int, ...]) -> int:
-        return sum(
-            (source_counts[event_id] - target) * role_weights.get(
-                str(events[event_id - 1].get("event_role") or "").strip().lower(),
-                5,
-            )
-            for event_id, target in zip(
-                mandatory_event_ids,
-                targets,
-                strict=True,
-            )
+    # The old best-first search enumerated the Cartesian product of every
+    # event target.  A long continuous chain could exhaust 50,000 states before
+    # reaching a valid low-unit plan even though the final beat capacity was
+    # tiny.  Dynamic programming keeps only the best semantic-loss candidate
+    # for each observable packing state: occupied beats and trailing load.
+    # Its state space is bounded by ``beat_count * per_beat_capacity`` rather
+    # than by the number of action-count combinations.
+    ScoreAndTargets = tuple[int, int, int, tuple[int, ...]]
+    packing_states: dict[tuple[int, int], ScoreAndTargets] = {
+        (0, 0): (0, 0, 0, ())
+    }
+    previous_sequence: str | None = None
+    for event_id in mandatory_event_ids:
+        event = events[event_id - 1]
+        sequence = str(event.get("sequence_id") or "").strip() or "__unspecified__"
+        starts_sequence = sequence != previous_sequence
+        source_count = source_counts[event_id]
+        minimum_target = 1 if source_count > 0 else 0
+        role_weight = role_weights.get(
+            str(event.get("event_role") or "").strip().lower(),
+            5,
         )
+        next_states: dict[tuple[int, int], ScoreAndTargets] = {}
+        for (occupied_beats, trailing_load), state in packing_states.items():
+            removed_so_far, weighted_so_far, relative_so_far, targets_so_far = state
+            for target in range(source_count, minimum_target - 1, -1):
+                occurrence_count = max(1, math.ceil(target / per_beat_capacity))
+                base, remainder = divmod(target, occurrence_count)
+                chunks = [
+                    base + (1 if occurrence < remainder else 0)
+                    for occurrence in range(occurrence_count)
+                ]
+                candidate_beats = occupied_beats
+                candidate_trailing = trailing_load
+                first, *tail = chunks
+                if starts_sequence or candidate_beats == 0:
+                    candidate_beats += 1
+                    candidate_trailing = first
+                elif candidate_trailing + first <= per_beat_capacity:
+                    candidate_trailing += first
+                else:
+                    candidate_beats += 1
+                    candidate_trailing = first
+                for chunk in tail:
+                    candidate_beats += 1
+                    candidate_trailing = chunk
+                if candidate_beats > beat_count:
+                    continue
+                removed = source_count - target
+                candidate: ScoreAndTargets = (
+                    removed_so_far + removed,
+                    weighted_so_far + removed * role_weight,
+                    relative_so_far
+                    + round(10000 * removed / max(source_count, 1)),
+                    targets_so_far + (target,),
+                )
+                key = (candidate_beats, candidate_trailing)
+                incumbent = next_states.get(key)
+                if incumbent is None or candidate < incumbent:
+                    next_states[key] = candidate
+        packing_states = next_states
+        previous_sequence = sequence
+        if not packing_states:
+            break
 
-    def relative_loss(targets: tuple[int, ...]) -> int:
-        return sum(
-            round(
-                10000 * (source_counts[event_id] - target)
-                / max(source_counts[event_id], 1)
-            )
-            for event_id, target in zip(
-                mandatory_event_ids,
-                targets,
-                strict=True,
-            )
-        )
-
-    queue: list[tuple[int, int, int, tuple[int, ...]]] = [
-        (0, 0, 0, initial_targets)
-    ]
-    visited: set[tuple[int, ...]] = set()
     selected: tuple[
         List[Dict[str, Any]],
         List[Dict[str, Any]],
         List[str],
     ] | None = None
-    max_search_states = 50000
-    while queue and len(visited) < max_search_states:
-        removed, _semantic_loss, _relative_loss, targets = heapq.heappop(queue)
-        if targets in visited:
-            continue
-        visited.add(targets)
+    if packing_states:
+        _removed, _weighted, _relative, targets = min(packing_states.values())
         production_events, records = build_candidate(targets)
         try:
             sequence_plan = _sequence_beat_plan(
@@ -2466,27 +2583,6 @@ def _build_duration_scaled_event_plan(
             sequence_plan = []
         if sequence_plan:
             selected = production_events, records, sequence_plan
-            break
-        for index, target in enumerate(targets):
-            event_id = mandatory_event_ids[index]
-            minimum_visible_units = 1 if source_counts[event_id] > 0 else 0
-            if target <= minimum_visible_units:
-                continue
-            candidate = list(targets)
-            candidate[index] -= 1
-            serialized = tuple(candidate)
-            if serialized in visited:
-                continue
-            candidate_removed = sum(initial_targets) - sum(serialized)
-            heapq.heappush(
-                queue,
-                (
-                    candidate_removed,
-                    weighted_loss(serialized),
-                    relative_loss(serialized),
-                    serialized,
-                ),
-            )
 
     if selected is None:
         raise ValueError(
@@ -2508,7 +2604,11 @@ def _build_duration_scaled_event_plan(
         "intra_event_scaling_applied": any(
             record["scaling"] == "representative" for record in records
         ),
+        "base_mandatory_source_event_ids": sorted(base_mandatory_event_ids),
         "mandatory_source_event_ids": mandatory_event_ids,
+        "causal_predecessor_source_event_ids": sorted(
+            set(mandatory_event_ids) - base_mandatory_event_ids
+        ),
         "sequence_beat_plan": [
             {"beat_order": index, "sequence_id": sequence}
             for index, sequence in enumerate(sequence_plan, 1)
@@ -2807,11 +2907,7 @@ def _repair_bounded_single_sequence_order(
     generation_units = _event_generation_action_unit_counts(events)
     if max(generation_units.values(), default=0) > unit_capacity:
         return None
-    mandatory_ids = {
-        event_id
-        for event_id, event in enumerate(events, 1)
-        if _event_is_mandatory_for_adaptation(event)
-    }
+    mandatory_ids = _mandatory_adaptation_event_ids(events)
     protected_zero_ids = {
         event_id
         for event_id, units in generation_units.items()
@@ -2906,7 +3002,10 @@ def _repair_bounded_single_sequence_order(
     selected_dropped: set[int] = set()
     all_event_ids = set(range(1, len(events) + 1))
     for _units, _count, _model_penalty, dropped in drop_candidates:
-        kept = tuple(sorted(all_event_ids - set(dropped)))
+        kept_set = all_event_ids - set(dropped)
+        if _continuous_predecessor_event_ids(events, kept_set) != kept_set:
+            continue
+        kept = tuple(sorted(kept_set))
         selected_placements = find_placements(kept)
         if selected_placements is not None:
             selected_dropped = set(dropped)
@@ -3077,12 +3176,11 @@ def _repair_beat_action_capacity(
         if event_id in event_by_id
         and event_sequences[event_id] in sequence_slots
     }
-    mandatory_ids = {
-        event_id
-        for event_id, event in event_by_id.items()
-        if _event_is_mandatory_for_adaptation(event)
-    }
-    requested_kept = model_kept | mandatory_ids
+    mandatory_ids = _mandatory_adaptation_event_ids(events)
+    requested_kept = _continuous_predecessor_event_ids(
+        events,
+        model_kept | mandatory_ids,
+    )
     placements: Dict[int, tuple[int, ...]] = {}
 
     def generation_loads(candidate: Dict[int, tuple[int, ...]]) -> List[int]:
@@ -3164,6 +3262,11 @@ def _repair_beat_action_capacity(
         )
 
     for event_id in sorted(requested_kept - mandatory_ids):
+        event_predecessors = (
+            _continuous_predecessor_event_ids(events, {event_id}) - {event_id}
+        )
+        if not event_predecessors <= set(placements):
+            continue
         candidates = []
         for option in placement_options(event_id):
             trial = dict(placements)
@@ -3691,8 +3794,8 @@ def _atomic_write_json(path: Path, value: Any) -> None:
     os.replace(temporary, path)
 
 
-SCREENPLAY_PLAN_SCHEMA = "honcut.screenplay-plan.v2"
-LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v13"
+SCREENPLAY_PLAN_SCHEMA = "honcut.screenplay-plan.v3"
+LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v14"
 
 
 def _build_screenplay_plan(
@@ -3799,6 +3902,8 @@ def _build_screenplay_plan(
                 )
             action_scaling_records.append(copy.deepcopy(record))
     else:
+        mandatory_ids = _mandatory_adaptation_event_ids(events)
+        base_mandatory_ids = _base_mandatory_adaptation_event_ids(events)
         for event_id, event in enumerate(events, 1):
             raw_actions = event.get("micro_actions") or []
             if isinstance(raw_actions, str):
@@ -3812,7 +3917,16 @@ def _build_screenplay_plan(
                     str(event.get("sequence_id") or "").strip()
                     or "__unspecified__"
                 ),
-                "mandatory": _event_is_mandatory_for_adaptation(event),
+                "mandatory": event_id in mandatory_ids,
+                "mandatory_reason": (
+                    "structural"
+                    if event_id in base_mandatory_ids
+                    else (
+                        "continuous_predecessor"
+                        if event_id in mandatory_ids
+                        else "optional"
+                    )
+                ),
                 "selected_source_micro_action_indexes": indexes,
                 "omitted_source_micro_action_indexes": [],
                 "scaling": "full",
@@ -3938,15 +4052,19 @@ def _build_screenplay_plan(
     missing_ids = event_ids - kept_ids - omitted_ids
     if missing_ids:
         raise ValueError(f"screenplay plan does not account for events: {sorted(missing_ids)}")
-    mandatory_ids = {
-        event_id
-        for event_id, event in enumerate(events, 1)
-        if _event_is_mandatory_for_adaptation(event)
-    }
+    mandatory_ids = _mandatory_adaptation_event_ids(events)
     missing_mandatory = mandatory_ids - kept_ids
     if missing_mandatory:
         raise ValueError(
             f"screenplay plan omits mandatory events: {sorted(missing_mandatory)}"
+        )
+    missing_continuous_predecessors = (
+        _continuous_predecessor_event_ids(events, kept_ids) - kept_ids
+    )
+    if missing_continuous_predecessors:
+        raise ValueError(
+            "screenplay plan keeps events without continuous predecessors: "
+            f"{sorted(missing_continuous_predecessors)}"
         )
     if not math.isclose(total_duration, float(target_duration), abs_tol=1e-6):
         raise ValueError(
@@ -4024,7 +4142,13 @@ def _build_screenplay_plan(
             ),
             "kept_source_event_ids": sorted(kept_ids),
             "omitted_source_event_ids": sorted(omitted_ids),
+            "base_mandatory_source_event_ids": sorted(
+                _base_mandatory_adaptation_event_ids(events)
+            ),
             "mandatory_source_event_ids": sorted(mandatory_ids),
+            "causal_predecessor_source_event_ids": sorted(
+                mandatory_ids - _base_mandatory_adaptation_event_ids(events)
+            ),
         },
         "event_action_scaling": {
             "schema": DURATION_SCALED_EVENT_PLAN_SCHEMA,

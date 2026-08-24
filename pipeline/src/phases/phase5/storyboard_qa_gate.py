@@ -536,7 +536,7 @@ def run_generation_capacity_checks(
         plan_schema = str(screenplay_plan.get("schema") or "").strip()
         if plan_schema == "honcut.screenplay-plan.v1":
             production_event_ids = None
-        elif plan_schema != "honcut.screenplay-plan.v2":
+        elif plan_schema != "honcut.screenplay-plan.v3":
             issues.append(_issue(
                 "L1",
                 "severe",
@@ -547,6 +547,7 @@ def run_generation_capacity_checks(
         else:
             scaling = screenplay_plan.get("event_action_scaling")
             records = scaling.get("events") if isinstance(scaling, dict) else None
+            production_ledger = screenplay_plan.get("production_ledger")
             record_ids = [
                 record.get("source_event_id")
                 for record in records or []
@@ -557,13 +558,53 @@ def run_generation_capacity_checks(
                 for record in records or []
                 if isinstance(record, dict)
             }
+            record_mandatory_ids = {
+                record.get("source_event_id")
+                for record in records or []
+                if isinstance(record, dict) and record.get("mandatory") is True
+            }
+            record_kept_ids = {
+                record.get("source_event_id")
+                for record in records or []
+                if isinstance(record, dict)
+                and record.get("production_status") == "kept"
+            }
+            base_mandatory_ids = (
+                production_ledger.get("base_mandatory_source_event_ids")
+                if isinstance(production_ledger, dict)
+                else None
+            )
+            mandatory_ids = (
+                production_ledger.get("mandatory_source_event_ids")
+                if isinstance(production_ledger, dict)
+                else None
+            )
+            causal_predecessor_ids = (
+                production_ledger.get("causal_predecessor_source_event_ids")
+                if isinstance(production_ledger, dict)
+                else None
+            )
+            valid_mandatory_lineage = (
+                isinstance(base_mandatory_ids, list)
+                and isinstance(mandatory_ids, list)
+                and isinstance(causal_predecessor_ids, list)
+                and all(isinstance(value, int) for value in mandatory_ids)
+                and all(isinstance(value, int) for value in base_mandatory_ids)
+                and all(isinstance(value, int) for value in causal_predecessor_ids)
+                and set(base_mandatory_ids).isdisjoint(causal_predecessor_ids)
+                and set(mandatory_ids)
+                == set(base_mandatory_ids) | set(causal_predecessor_ids)
+                and record_mandatory_ids == set(mandatory_ids)
+                and set(mandatory_ids) <= record_kept_ids
+            )
             if (
                 not isinstance(scaling, dict)
-                or scaling.get("schema") != "honcut.duration-scaled-event-plan.v1"
+                or scaling.get("schema") != "honcut.duration-scaled-event-plan.v2"
                 or not isinstance(records, list)
                 or record_ids != list(range(1, len(source_events) + 1))
                 or not statuses <= {"kept", "whole_event_omitted"}
                 or not statuses
+                or not valid_mandatory_lineage
             ):
                 issues.append(_issue(
                     "L1",
