@@ -436,6 +436,69 @@ def test_global_flow_resolves_equivalent_human_descriptor_in_continuity():
     )
 
 
+def test_global_flow_resolves_source_proven_forward_identity_in_continuity():
+    events = [
+        _event(
+            who=["男性"],
+            source_excerpt="年轻男性站在开启的车门前，手中握着透明芯片。",
+            continuity_before="cut",
+        ),
+        _event(
+            who=["年轻男性", "第一名战斗人员"],
+            source_excerpt="第一名战斗人员冲出车厢，年轻男性后仰闪避。",
+            continuity_before="continuous",
+        ),
+    ]
+
+    _annotate_global_event_flow(events)
+
+    assert events[0]["who"] == ["年轻男性"]
+    assert events[0]["model_who"] == ["男性"]
+    assert events[0]["who_reconciled_from_forward_continuity"] == [
+        {"model_label": "男性", "source_identity": "年轻男性"}
+    ]
+
+
+def test_global_flow_does_not_guess_forward_identity_without_current_source_evidence():
+    events = [
+        _event(
+            who=["男性"],
+            source_excerpt="男性站在开启的车门前。",
+            continuity_before="cut",
+        ),
+        _event(
+            who=["年轻男性", "第一名战斗人员"],
+            source_excerpt="年轻男性与第一名战斗人员同时进入画面。",
+            continuity_before="continuous",
+        ),
+    ]
+
+    _annotate_global_event_flow(events)
+
+    assert events[0]["who"] == ["男性"]
+    assert "model_who" not in events[0]
+
+
+def test_global_flow_does_not_guess_ambiguous_forward_identity():
+    events = [
+        _event(
+            who=["男性"],
+            source_excerpt="年轻男性与高个男性站在开启的车门前。",
+            continuity_before="cut",
+        ),
+        _event(
+            who=["年轻男性", "高个男性"],
+            source_excerpt="年轻男性与高个男性同时进入车厢。",
+            continuity_before="continuous",
+        ),
+    ]
+
+    _annotate_global_event_flow(events)
+
+    assert events[0]["who"] == ["男性"]
+    assert "model_who" not in events[0]
+
+
 def test_global_flow_carries_exact_action_participant_from_continuity_subject():
     events = [
         _event(

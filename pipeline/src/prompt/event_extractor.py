@@ -235,7 +235,7 @@ _NARRATIVE_JUMP_CUES = (
 # caches carried over from earlier run directories — and forces every Phase 1
 # event extraction to re-run (a paid LLM pass). Never bump casually, and never
 # reuse cross-run segment caches from a run produced under a different value.
-EVENT_FLOW_SCHEMA_VERSION = "15.0"
+EVENT_FLOW_SCHEMA_VERSION = "16.0"
 
 _UNKNOWN_ACTION_PERFORMERS = {
     "",
@@ -648,6 +648,12 @@ def _annotate_global_event_flow(
         "single_take",
         "oner",
     }
+    for index in range(len(events) - 1):
+        _repair_source_proven_forward_participant(
+            events[index],
+            events[index + 1],
+            preserve_one_take=preserve_one_take,
+        )
     annotate_event_motion_modes(events)
     sequence_number = 0
     action_number = 0
@@ -733,6 +739,80 @@ def _source_introduces_distinct_role(
             if _normalized_identity_label(match.group(0)) != previous_key:
                 return True
     return False
+
+
+def _repair_source_proven_forward_participant(
+    current: Dict[str, Any],
+    following: Dict[str, Any],
+    *,
+    preserve_one_take: bool,
+) -> None:
+    """Repair one model-shortened identity from exact current source evidence.
+
+    Forward continuity alone is not identity evidence.  A replacement is made
+    only when the following continuous event supplies exactly one compatible
+    concrete label and that complete label already appears verbatim in the
+    current event's own source-backed fields.  Multiple compatible labels are
+    intentionally left unresolved for the downstream identity gate.
+    """
+
+    boundary = str(following.get("continuity_before") or "cut").strip().lower()
+    if not (
+        boundary == "continuous"
+        or (preserve_one_take and not _has_narrative_jump(following))
+    ):
+        return
+
+    current_who = [
+        str(value).strip()
+        for value in current.get("who") or []
+        if str(value).strip()
+    ]
+    following_who = [
+        str(value).strip()
+        for value in following.get("who") or []
+        if str(value).strip()
+    ]
+    evidence = " ".join(
+        str(current.get(field) or "")
+        for field in ("source_excerpt", "what", "start_state")
+    )
+    candidates: list[tuple[str, str]] = []
+    for model_label in current_who:
+        model_key = _normalized_identity_label(model_label)
+        if not model_key:
+            continue
+        for source_identity in following_who:
+            source_key = _normalized_identity_label(source_identity)
+            if (
+                not source_key
+                or source_identity in current_who
+                or source_key == model_key
+                or not (
+                    source_key.endswith(model_key)
+                    or _equivalent_human_descriptor(source_identity, model_label)
+                )
+                or not _reference_is_explicit_in_text(source_identity, evidence)
+            ):
+                continue
+            candidates.append((model_label, source_identity))
+
+    if len(candidates) != 1:
+        return
+
+    model_label, source_identity = candidates[0]
+    current["model_who"] = list(current_who)
+    current["who"] = list(dict.fromkeys(
+        source_identity if value == model_label else value
+        for value in current_who
+    ))
+    current["who_reconciled_from_forward_continuity"] = [{
+        "model_label": model_label,
+        "source_identity": source_identity,
+    }]
+    current["who_repair_reason"] = (
+        "current source identity is confirmed by the following continuous event"
+    )
 
 
 def _repair_continuous_generic_participant(
