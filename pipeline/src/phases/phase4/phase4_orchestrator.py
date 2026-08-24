@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import traceback
+from copy import deepcopy
 from pathlib import Path
 
 from phases.phase4.shot_setup import materialize_shot_directories, normalize_shots
@@ -13,6 +14,75 @@ from tools.provider_scoring import rank_providers
 from tools.video_composer import lock_runtime
 from utils.storyboard_geometry import _storyboard_canvas, _storyboard_image_size
 from utils.timing_estimator import estimate_phase_duration
+
+
+def _director_pacing_by_sequence(plan: object) -> dict[str, dict]:
+    """Validate the v1 Director artifact and index deterministic pacing."""
+    if not isinstance(plan, dict):
+        raise ValueError("director_plan.json must contain an object")
+    if plan.get("schema") != "honcut.director-plan.v1":
+        raise ValueError(
+            "director_plan.json schema must be honcut.director-plan.v1"
+        )
+    sequences = plan.get("sequences")
+    if not isinstance(sequences, list):
+        raise ValueError("director_plan.json sequences must be an array")
+    pacing_by_sequence: dict[str, dict] = {}
+    for index, sequence in enumerate(sequences, 1):
+        if not isinstance(sequence, dict):
+            raise ValueError(f"director sequence {index} must be an object")
+        sequence_id = str(sequence.get("sequence_id") or "").strip()
+        if not sequence_id or sequence_id in pacing_by_sequence:
+            raise ValueError(
+                "director plan has empty or duplicate sequence_id: "
+                f"{sequence_id!r}"
+            )
+        pacing = sequence.get("speech_pacing")
+        if not isinstance(pacing, dict):
+            raise ValueError(
+                f"director sequence {sequence_id} has no speech_pacing"
+            )
+        duration = pacing.get("duration_s")
+        emotion = pacing.get("emotion")
+        if (
+            not isinstance(duration, (int, float))
+            or isinstance(duration, bool)
+            or duration < 0
+            or not isinstance(emotion, str)
+        ):
+            raise ValueError(
+                f"director sequence {sequence_id} has invalid speech_pacing"
+            )
+        pacing_by_sequence[sequence_id] = deepcopy(pacing)
+    return pacing_by_sequence
+
+
+def _bind_director_pacing(
+    meta: dict,
+    pacing_by_sequence: dict[str, dict],
+) -> None:
+    """Bind one shot by semantic sequence identity, never list position."""
+    raw_sequence_ids = meta.get("source_sequence_ids")
+    if not isinstance(raw_sequence_ids, list):
+        raise ValueError("SHOT_META source_sequence_ids must be an array")
+    sequence_ids = list(
+        dict.fromkeys(
+            str(value).strip() for value in raw_sequence_ids if str(value).strip()
+        )
+    )
+    if len(sequence_ids) != 1:
+        raise ValueError(
+            "SHOT_META must bind exactly one Director sequence; "
+            f"source_sequence_ids={sequence_ids}"
+        )
+    sequence_id = sequence_ids[0]
+    if sequence_id not in pacing_by_sequence:
+        raise ValueError(
+            f"SHOT_META references unknown Director sequence: {sequence_id}"
+        )
+    meta["speech_pacing"] = deepcopy(pacing_by_sequence[sequence_id])
+
+
 def run_phase4(output_dir: Path, dry_run: bool) -> dict:
     """Phase 4: deterministic orchestration and code-constraint review."""
     _banner(4, 9, "编排器 (Orchestrator)", dry_run)
@@ -197,11 +267,13 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
         }
         locked_composition = lock_runtime(composition, available={"ffmpeg", "remotion"})
 
-        director_scenes = []
+        director_pacing = None
         director_plan_path = output_dir / "director_plan.json"
         if director_plan_path.exists():
-            director_scenes = json.loads(director_plan_path.read_text(encoding="utf-8")).get("scenes", [])
-        for index, shot_dir in enumerate(sorted(shots_dir.glob("S*")) if shots_dir.exists() else []):
+            director_pacing = _director_pacing_by_sequence(
+                json.loads(director_plan_path.read_text(encoding="utf-8"))
+            )
+        for shot_dir in sorted(shots_dir.glob("S*")) if shots_dir.exists() else []:
             meta_path = shot_dir / "SHOT_META.json"
             if not meta_path.exists():
                 continue
@@ -209,8 +281,8 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
             meta["provider"] = selected_provider
             meta["provider_rankings"] = locked_composition["provider_rankings"]
             meta["render_runtime"] = locked_composition["render_runtime"]
-            if index < len(director_scenes) and director_scenes[index].get("speech_pacing"):
-                meta["speech_pacing"] = director_scenes[index]["speech_pacing"]
+            if director_pacing is not None:
+                _bind_director_pacing(meta, director_pacing)
             meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
         shot_output_count = sum(item.startswith("shots/") for item in outputs)
