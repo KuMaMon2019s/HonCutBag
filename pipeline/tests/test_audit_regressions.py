@@ -4253,6 +4253,58 @@ def test_phase5_global_issue_prevents_wasted_visual_redraw(tmp_path):
     assert result["issues"] == [variation_issue, camera_issue]
 
 
+def test_phase5_shot_scoped_l1_issue_restarts_phase1_without_paid_redraw(
+    tmp_path,
+):
+    choreography_issue = storyboard_qa_gate._issue(
+        "L1",
+        "severe",
+        "body_choreography_action_uncovered",
+        "S03 ordered body actions must map to structured choreography",
+        ["S03"],
+        actions=["weapon impacts wall"],
+    )
+    visual_issue = storyboard_qa_gate._issue(
+        "L3",
+        "moderate",
+        "R4",
+        "S03 attacks the wrong target",
+        ["S03"],
+        mismatch_type="action",
+        expected="enemy_2 is thrown",
+        observed="enemy_1 is thrown",
+        confidence=0.95,
+        panel_evidence=[{
+            "shot_id": "S03_P02",
+            "observed": "enemy_1 is thrown",
+        }],
+        evidence_status="not_required",
+    )
+
+    result = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        max_correction_attempts=2,
+        qa_runner=lambda _output_dir: {
+            "status": "error",
+            "grade": "D",
+            "gate_passed": False,
+            "issues": [choreography_issue, visual_issue],
+            "failed_shot_ids": ["S03"],
+        },
+        redraw_runner=lambda *_args: pytest.fail(
+            "shot-scoped L1 defects must not authorize a paid Phase 2 redraw"
+        ),
+    )
+
+    assert result["correction"]["status"] == "requires_replanning"
+    assert result["correction"]["recommended_restart_phase"] == "phase1"
+    assert result["correction"]["attempts_used"] == 0
+    assert result["correction"]["global_issue_codes"] == [
+        "body_choreography_action_uncovered"
+    ]
+    assert not (tmp_path / "phase5_corrections").exists()
+
+
 def test_phase5_l4_issue_restarts_phase4_without_redrawing_previs(tmp_path):
     l4_issue = storyboard_qa_gate._issue(
         "L4",

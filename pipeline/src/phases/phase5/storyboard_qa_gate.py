@@ -2414,14 +2414,16 @@ def _global_uncorrectable_issues(
     report: dict[str, Any],
 ) -> list[dict[str, Any]]:
     """Return blockers that cannot be isolated to a storyboard redraw."""
+    correctable_ids = {id(issue) for issue in _correctable_issues(report)}
     return [
         issue
         for issue in blocking_issues(report.get("issues") or [])
-        # L4 reviews video-bound Phase 4 pixels. Even when the affected shot is
-        # known, redrawing Phase 2 PREVIS cannot repair it and would spend the
-        # wrong quota. Route the whole correction back to Phase 4 regeneration.
-        if not issue.get("shot_ids")
-        or str(issue.get("layer") or "").upper() == "L4"
+        # Only an evidence-complete L3 R1-R4 finding belongs to the Phase 2
+        # redraw loop.  A shot-scoped L1 contract defect is still an upstream
+        # planning defect; treating its Sxx as redraw authority wastes quota
+        # without repairing canonical metadata.  L4 likewise owns cinematic
+        # pixels and must return to Phase 4.
+        if id(issue) not in correctable_ids
     ]
 
 
@@ -2663,15 +2665,14 @@ def run_storyboard_qa_with_correction(
         issue_codes = sorted({
             str(issue.get("code") or "unknown") for issue in global_issues
         })
-        structural_codes = {
-            "scene_variation_insufficient",
-            "slideshow_risk_high",
-        }
         restart_phase = (
             "phase4"
             if any(str(issue.get("layer") or "").upper() == "L4" for issue in global_issues)
             else "phase1"
-            if any(code.casefold() in structural_codes for code in issue_codes)
+            if any(
+                str(issue.get("layer") or "").upper() == "L1"
+                for issue in global_issues
+            )
             else "phase2"
         )
         correction = {
