@@ -225,7 +225,7 @@ immutable payload + fingerprint
 - successful reuse 要求 Provider、payload、`input_fingerprint`、文件存在性、媒体有效性和已记录哈希全部匹配。
 - claim 后未确认是否提交的进程中断进入 `submission_uncertain`；只能恢复轮询或由人工/确定性证据裁决，不能创建第二个付费请求。
 - 已持久化 job ID 的任务只有在 Provider 明确报告 terminal failure 时才能标 failed。
-- timeout、poll deadline、rate-limit retry、backoff、cooldown 和 capacity 只由 Runtime policy 拥有。未知、认证、moderation 和 submission-uncertain 错误不自动重试。
+- timeout、poll deadline、rate-limit retry、backoff、cooldown 和 capacity 只由 Runtime policy 拥有。Runtime 必须区分可恢复的瞬时 429/burst 与包含明确重置窗口的固定额度耗尽；后者须保留 Provider 原始重置时间并立即 fail closed，禁止退避重试。未知、认证、moderation 和 submission-uncertain 错误不自动重试。
 - Provider 响应先通过 Pydantic envelope 验证；错误信息只保留安全摘要，不落完整响应或密钥。
 
 ## 6. Artifact、Prompt 与 Cache 血缘

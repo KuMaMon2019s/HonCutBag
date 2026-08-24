@@ -12,6 +12,10 @@ from typing import Any, Callable, Optional
 import httpx
 from openai import APIConnectionError, APIStatusError, APITimeoutError, DefaultHttpxClient, OpenAI
 
+from utils.provider_quota import (
+    FixedWindowQuotaExceededError,
+    is_fixed_window_quota_exhaustion,
+)
 from utils.config import ARK_BASE_URL, DEFAULT_TEXT_MODEL
 from utils.prompt_budget import enforce_prompt_budget
 
@@ -55,6 +59,10 @@ class LLMRateLimitedError(LLMStreamError):
     """
 
 
+class LLMQuotaExceededError(FixedWindowQuotaExceededError):
+    """The text-provider quota is unavailable until a declared reset."""
+
+
 _RATE_LIMIT_MARKERS = (
     "system protection triggered",
     "request burst",
@@ -71,6 +79,8 @@ def is_rate_limited_error(exc: BaseException) -> bool:
     """Classify server-side rate-limit / burst-protection failures."""
     from openai import RateLimitError
 
+    if is_fixed_window_quota_exhaustion(exc):
+        return False
     if isinstance(exc, RateLimitError):
         return True
     status = getattr(exc, "status_code", None)
@@ -289,6 +299,8 @@ def _attempt_llm_stream(
             raise LLMIdleTimeout(f"LLM stream idle timeout after {idle_timeout}s") from exc
         raise LLMStreamError(str(exc)) from exc
     except APIStatusError as exc:
+        if is_fixed_window_quota_exhaustion(exc):
+            raise LLMQuotaExceededError(str(exc)) from exc
         if is_rate_limited_error(exc):
             raise LLMRateLimitedError(str(exc)) from exc
         raise
@@ -297,6 +309,8 @@ def _attempt_llm_stream(
             raise LLMWallTimeout(f"LLM wall timeout after {wall_timeout}s") from exc
         if idle_expired.is_set():
             raise LLMIdleTimeout(f"LLM stream idle timeout after {idle_timeout}s") from exc
+        if is_fixed_window_quota_exhaustion(exc):
+            raise LLMQuotaExceededError(str(exc)) from exc
         if is_rate_limited_error(exc):
             raise LLMRateLimitedError(str(exc)) from exc
         raise

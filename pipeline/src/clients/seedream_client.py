@@ -34,6 +34,10 @@ from prompt.seedream_image_prompt import (
 )
 from utils.config import ARK_BASE_URL
 from utils.ip_blacklist import sanitize_prompt
+from utils.provider_quota import (
+    FixedWindowQuotaExceededError,
+    is_fixed_window_quota_exhaustion,
+)
 
 # Agent Plan base URL (NOT /api/v3/ which is pay-as-you-go)
 BASE_URL = ARK_BASE_URL.rstrip("/")
@@ -230,21 +234,8 @@ class _SeedreamRateLimiter:
 _SEEDREAM_RATE_LIMITER = _SeedreamRateLimiter()
 
 
-class AgentPlanQuotaExceededError(RuntimeError):
+class AgentPlanQuotaExceededError(FixedWindowQuotaExceededError):
     """Agent Plan returned an exhausted or repeatedly unavailable quota."""
-
-
-def _is_fixed_window_quota_exhaustion(provider_message: str) -> bool:
-    """Return whether retrying cannot help before a declared quota reset."""
-    normalized = provider_message.casefold()
-    return any(
-        marker in normalized
-        for marker in (
-            "monthly usage quota",
-            "will reset at",
-            "waiting for the reset",
-        )
-    )
 
 
 class SeedreamAPIError(requests.exceptions.HTTPError):
@@ -473,7 +464,7 @@ class SeedreamClient:
                         provider_code == "AccountQuotaExceeded"
                         or "AccountQuotaExceeded" in resp.text
                     ):
-                        if _is_fixed_window_quota_exhaustion(provider_message):
+                        if is_fixed_window_quota_exhaustion(provider_message):
                             raise AgentPlanQuotaExceededError(
                                 "HTTP 429 AccountQuotaExceeded: "
                                 f"{provider_message or 'fixed-window quota exhausted'} "
