@@ -1196,7 +1196,7 @@ def test_60s_scaled_screenplay_reconciles_source_pressure_into_executable_ledger
         source_events_hash="source-events-sha256",
     )
 
-    assert screenplay_plan["schema"] == "honcut.screenplay-plan.v3"
+    assert screenplay_plan["schema"] == "honcut.screenplay-plan.v4"
     assert screenplay_plan["source_ledger"]["capacity_status"] == (
         "screenplay_compression_required"
     )
@@ -1405,6 +1405,131 @@ def test_duration_scaling_dp_fits_long_continuous_chain_without_state_explosion(
     assert scaling_plan["intra_event_scaling_applied"] is True
 
 
+def test_production_director_projection_excludes_unselected_sequence_plot_facts():
+    selected_events = [{
+        "sequence_id": "SEQ001",
+        "what": "the chip projects coordinates",
+        "emotion": "controlled suspense",
+        "visual": "blue coordinates hover over the chip",
+        "where": "inside the train carriage",
+        "start_state": "the chip is dark",
+        "end_state": "coordinates are visible",
+        "continuity_before": "continuous",
+    }]
+    source_intent = {
+        "sequence_id": "SEQ001",
+        "scene_goal": "end with the forbidden tunnel reveal",
+        "emotion_arc": "suspense to forbidden tunnel awe",
+        "visual_focus": "FORBIDDEN_NEON_TUNNEL",
+        "spatial_intent": "leave the carriage for the tunnel exterior",
+        "transition_intent": "reveal FORBIDDEN_NEON_TUNNEL",
+    }
+
+    projection = engine._build_production_director_intent(
+        source_intent,
+        selected_events,
+        source_event_ids=[12],
+        shot={"camera_movement": "dolly_out"},
+    )
+
+    serialized = json.dumps(projection, ensure_ascii=False)
+    assert projection["schema"] == "honcut.production-director-intent.v1"
+    assert projection["source_event_ids"] == [12]
+    assert "FORBIDDEN_NEON_TUNNEL" not in serialized
+    assert "the chip projects coordinates" in projection["scene_goal"]
+    assert "blue coordinates hover over the chip" in projection["visual_focus"]
+
+
+def test_production_beat_text_fields_exclude_unselected_model_texture():
+    selected_events = [{
+        "sequence_id": "SEQ001",
+        "who": ["protagonist"],
+        "where": "inside the train carriage",
+        "what": "the chip projects coordinates",
+        "visual": "blue coordinates hover over the chip",
+    }]
+    beat = {
+        "source_events": [12],
+        "reason": "reveal FORBIDDEN_NEON_TUNNEL",
+        "who": ["invented figure"],
+        "where": "FORBIDDEN_NEON_TUNNEL",
+        "what": "reveal FORBIDDEN_NEON_TUNNEL",
+        "texture_keywords": ["FORBIDDEN_NEON_TUNNEL", "invented exterior"],
+    }
+
+    engine._ground_production_beat_text_fields(beat, selected_events)
+
+    serialized = json.dumps(beat, ensure_ascii=False)
+    assert "FORBIDDEN_NEON_TUNNEL" not in serialized
+    assert beat["who"] == ["protagonist"]
+    assert beat["where"] == "inside the train carriage"
+    assert beat["what"] == "the chip projects coordinates"
+    assert 2 <= len(beat["texture_keywords"]) <= 4
+
+
+def test_screenplay_plan_binds_production_director_projection_to_source_refs():
+    events = [{
+        "sequence_id": "SEQ001",
+        "event_role": "turning_point",
+        "dramatic_turn": True,
+        "continuity_before": "cut",
+        "what": "the chip projects coordinates",
+        "emotion": "controlled suspense",
+        "visual": "blue coordinates hover over the chip",
+        "where": "inside the train carriage",
+        "micro_actions": ["coordinates appear"],
+    }]
+    source_intent = {
+        "sequence_id": "SEQ001",
+        "scene_goal": "resolve the sequence",
+        "emotion_arc": "suspense",
+        "visual_focus": "the chip",
+        "spatial_intent": "inside the carriage",
+        "transition_intent": "hold",
+    }
+    projection = engine._build_production_director_intent(
+        source_intent,
+        events,
+        source_event_ids=[1],
+        shot={"camera_movement": "dolly_out"},
+    )
+    source_capacity = engine._estimate_action_capacity_plan(events, 12, 12)
+    shots = [{
+        "shot_order": 1,
+        "source_events": [1],
+        "dropped_source_events": [],
+        "source_sequence_ids": ["SEQ001"],
+        "suggested_duration": 12,
+        "action": "keep",
+        "what": "the chip projects coordinates",
+        "director_intent": projection,
+        "generation_action_units": [{"unit_id": "GAU001"}],
+    }]
+
+    screenplay_plan, _ = engine._build_screenplay_plan(
+        events,
+        shots,
+        source_capacity,
+        target_duration=12,
+    )
+
+    assert screenplay_plan["production_ledger"][
+        "production_director_intent_schema"
+    ] == "honcut.production-director-intent.v1"
+    assert screenplay_plan["beats"][0]["director_intent"][
+        "source_event_ids"
+    ] == [1]
+
+    shots[0]["director_intent"]["source_event_ids"] = [2]
+    with pytest.raises(ValueError, match="director intent lineage"):
+        engine._build_screenplay_plan(
+            events,
+            shots,
+            source_capacity,
+            target_duration=12,
+        )
+
+
 def test_screenplay_plan_records_intra_event_action_lineage():
     events = [{
         "sequence_id": "SEQ001",
@@ -1445,7 +1570,7 @@ def test_screenplay_plan_records_intra_event_action_lineage():
         duration_scaled_event_plan=scaling_plan,
     )
 
-    assert screenplay_plan["schema"] == "honcut.screenplay-plan.v3"
+    assert screenplay_plan["schema"] == "honcut.screenplay-plan.v4"
     assert screenplay_plan["production_ledger"]["event_action_scaling_schema"] == (
         "honcut.duration-scaled-event-plan.v2"
     )
@@ -1476,6 +1601,7 @@ def test_phase5_capacity_uses_duration_scaled_production_event_ledger():
     }
     screenplay_plan = {
         "schema": engine.SCREENPLAY_PLAN_SCHEMA,
+        "beats": [],
         "production_ledger": {
             "base_mandatory_source_event_ids": [],
             "mandatory_source_event_ids": [],
@@ -1514,17 +1640,62 @@ def test_phase5_capacity_uses_duration_scaled_production_event_ledger():
     }
 
 
-def test_phase5_rejects_pre_causal_screenplay_plan_schema():
+@pytest.mark.parametrize(
+    "old_schema",
+    ["honcut.screenplay-plan.v2", "honcut.screenplay-plan.v3"],
+)
+def test_phase5_rejects_pre_projection_screenplay_plan_schema(old_schema):
     issues = run_generation_capacity_checks(
         {"shots": []},
         {"events": []},
         {
-            "schema": "honcut.screenplay-plan.v2",
+            "schema": old_schema,
             "event_action_scaling": {
                 "schema": "honcut.duration-scaled-event-plan.v1",
                 "events": [],
             },
         },
+    )
+
+    assert "screenplay_plan_lineage_invalid" in {
+        issue["code"] for issue in issues
+    }
+
+
+def test_phase5_rejects_misaligned_production_director_projection():
+    screenplay_plan = {
+        "schema": engine.SCREENPLAY_PLAN_SCHEMA,
+        "production_ledger": {
+            "base_mandatory_source_event_ids": [],
+            "mandatory_source_event_ids": [],
+            "causal_predecessor_source_event_ids": [],
+            "production_director_intent_schema": (
+                "honcut.production-director-intent.v1"
+            ),
+        },
+        "event_action_scaling": {
+            "schema": engine.DURATION_SCALED_EVENT_PLAN_SCHEMA,
+            "events": [{
+                "source_event_id": 1,
+                "production_status": "kept",
+                "mandatory": False,
+            }],
+        },
+        "beats": [{
+            "sequence_id": "SEQ001",
+            "source_refs": [1],
+            "director_intent": {
+                "schema": "honcut.production-director-intent.v1",
+                "sequence_id": "SEQ001",
+                "source_event_ids": [2],
+            },
+        }],
+    }
+
+    issues = run_generation_capacity_checks(
+        {"shots": []},
+        {"events": [{"action_unit_id": "AU001"}]},
+        screenplay_plan,
     )
 
     assert "screenplay_plan_lineage_invalid" in {

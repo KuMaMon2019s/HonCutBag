@@ -536,7 +536,7 @@ def run_generation_capacity_checks(
         plan_schema = str(screenplay_plan.get("schema") or "").strip()
         if plan_schema == "honcut.screenplay-plan.v1":
             production_event_ids = None
-        elif plan_schema != "honcut.screenplay-plan.v3":
+        elif plan_schema != "honcut.screenplay-plan.v4":
             issues.append(_issue(
                 "L1",
                 "severe",
@@ -584,6 +584,35 @@ def run_generation_capacity_checks(
                 if isinstance(production_ledger, dict)
                 else None
             )
+            plan_beats = screenplay_plan.get("beats")
+            projected_beats = [
+                beat
+                for beat in plan_beats or []
+                if isinstance(beat, dict) and beat.get("director_intent") is not None
+            ]
+            valid_director_projections = (
+                isinstance(plan_beats, list)
+                and all(
+                    isinstance(beat.get("director_intent"), dict)
+                    and beat["director_intent"].get("schema")
+                    == "honcut.production-director-intent.v1"
+                    and beat["director_intent"].get("source_event_ids")
+                    == beat.get("source_refs")
+                    and beat["director_intent"].get("sequence_id")
+                    == beat.get("sequence_id")
+                    for beat in projected_beats
+                )
+                and (
+                    not projected_beats
+                    or (
+                        isinstance(production_ledger, dict)
+                        and production_ledger.get(
+                            "production_director_intent_schema"
+                        )
+                        == "honcut.production-director-intent.v1"
+                    )
+                )
+            )
             valid_mandatory_lineage = (
                 isinstance(base_mandatory_ids, list)
                 and isinstance(mandatory_ids, list)
@@ -605,6 +634,7 @@ def run_generation_capacity_checks(
                 or not statuses <= {"kept", "whole_event_omitted"}
                 or not statuses
                 or not valid_mandatory_lineage
+                or not valid_director_projections
             ):
                 issues.append(_issue(
                     "L1",

@@ -1423,6 +1423,198 @@ def _director_intents_by_sequence(
     return intents
 
 
+PRODUCTION_DIRECTOR_INTENT_SCHEMA = "honcut.production-director-intent.v1"
+
+
+def _source_event_narrative_fact(
+    event: Dict[str, Any],
+    event_id: int,
+) -> str:
+    for field in ("what", "summary", "source_excerpt"):
+        value = str(event.get(field) or "").strip()
+        if value:
+            return value
+    raw_actions = event.get("micro_actions") or []
+    if isinstance(raw_actions, str):
+        raw_actions = [raw_actions]
+    actions = [
+        str(action).strip()
+        for action in raw_actions
+        if str(action).strip()
+    ]
+    if actions:
+        return " → ".join(actions)
+    states = [
+        str(event.get(field) or "").strip()
+        for field in ("start_state", "end_state")
+        if str(event.get(field) or "").strip()
+    ]
+    if states:
+        return " → ".join(dict.fromkeys(states))
+    return f"canonical source event {event_id}"
+
+
+def _ground_production_beat_text_fields(
+    beat: Dict[str, Any],
+    selected_events: List[Dict[str, Any]],
+) -> None:
+    """Replace plot-bearing model prose with selected source-event facts."""
+    source_event_ids = beat.get("source_events")
+    if (
+        not isinstance(source_event_ids, list)
+        or not source_event_ids
+        or len(source_event_ids) != len(selected_events)
+    ):
+        raise ValueError(
+            "production beat grounding requires aligned source event details"
+        )
+
+    who = list(dict.fromkeys(
+        str(name).strip()
+        for event in selected_events
+        for name in (event.get("who") or [])
+        if str(name).strip()
+    ))
+    locations = list(dict.fromkeys(
+        str(event.get("where") or "").strip()
+        for event in selected_events
+        if str(event.get("where") or "").strip()
+    ))
+    narrative_facts = list(dict.fromkeys(
+        _source_event_narrative_fact(event, event_id)
+        for event_id, event in zip(
+            source_event_ids,
+            selected_events,
+            strict=True,
+        )
+    ))
+    texture_candidates = list(dict.fromkeys(
+        str(value).strip()
+        for event_id, event in zip(
+            source_event_ids,
+            selected_events,
+            strict=True,
+        )
+        for value in (
+            event.get("visual"),
+            event.get("where"),
+            _source_event_narrative_fact(event, event_id),
+        )
+        if str(value or "").strip()
+    ))
+    while len(texture_candidates) < 2:
+        texture_candidates.append(
+            f"canonical source event {source_event_ids[len(texture_candidates) % len(source_event_ids)]}"
+        )
+
+    beat["who"] = who
+    beat["where"] = (
+        locations[0]
+        if len(locations) == 1
+        else " / ".join(locations)
+        if locations
+        else "source-event location unspecified"
+    )
+    beat["what"] = "；随后".join(narrative_facts)
+    beat["reason"] = (
+        "source-grounded production mapping for events "
+        + ",".join(str(event_id) for event_id in source_event_ids)
+    )
+    beat["texture_keywords"] = texture_candidates[:4]
+
+
+def _build_production_director_intent(
+    source_intent: Dict[str, str],
+    selected_events: List[Dict[str, Any]],
+    *,
+    source_event_ids: List[int],
+    shot: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Project sequence direction onto one source-grounded production shot.
+
+    A sequence-level Director plan is authored before duration compression and
+    may therefore describe facts that the production ledger later omits.  Only
+    its identity/hash cross the production boundary; every plot-bearing field
+    below is rebuilt from the shot's selected canonical events.
+    """
+    if not selected_events or len(selected_events) != len(source_event_ids):
+        raise ValueError(
+            "production director intent requires aligned selected source events"
+        )
+    if any(not isinstance(event_id, int) or event_id < 1 for event_id in source_event_ids):
+        raise ValueError("production director intent has invalid source event ids")
+    sequence_id = str(source_intent.get("sequence_id") or "").strip()
+    event_sequences = {
+        str(event.get("sequence_id") or "").strip()
+        for event in selected_events
+    }
+    if not sequence_id or event_sequences != {sequence_id}:
+        raise ValueError(
+            "production director intent source sequence does not match selected events"
+        )
+
+    def joined(field: str, separator: str = "；") -> str:
+        values = [
+            str(event.get(field) or "").strip()
+            for event in selected_events
+            if str(event.get(field) or "").strip()
+        ]
+        return separator.join(dict.fromkeys(values))
+
+    scene_goal = "；".join(dict.fromkeys(
+        _source_event_narrative_fact(event, event_id)
+        for event_id, event in zip(
+            source_event_ids,
+            selected_events,
+            strict=True,
+        )
+    ))
+    emotion_arc = joined("emotion", " → ") or "preserve source-event emotional state"
+    visual_focus = joined("visual") or scene_goal
+    locations = joined("where", " → ") or "preserve source-event location"
+    start_state = str(selected_events[0].get("start_state") or "").strip()
+    end_state = str(selected_events[-1].get("end_state") or "").strip()
+    spatial_intent = locations
+    if start_state or end_state:
+        spatial_intent += (
+            f"；state progression: {start_state or 'source start'}"
+            f" → {end_state or 'source end'}"
+        )
+    boundary = (
+        str(selected_events[0].get("continuity_before") or "cut").strip().lower()
+        or "cut"
+    )
+    if boundary not in {"cut", "continuous"}:
+        raise ValueError(
+            f"production director intent has invalid continuity boundary: {boundary}"
+        )
+    movement = str(shot.get("camera_movement") or "static").strip() or "static"
+    transition_intent = (
+        f"{boundary} entry into selected source events; preserve source order "
+        f"with camera movement {movement}"
+    )
+    source_intent_sha256 = hashlib.sha256(
+        json.dumps(
+            source_intent,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "schema": PRODUCTION_DIRECTOR_INTENT_SCHEMA,
+        "source_director_plan_schema": DIRECTOR_PLAN_SCHEMA,
+        "source_director_intent_sha256": source_intent_sha256,
+        "sequence_id": sequence_id,
+        "source_event_ids": list(source_event_ids),
+        "scene_goal": scene_goal,
+        "emotion_arc": emotion_arc,
+        "visual_focus": visual_focus,
+        "spatial_intent": spatial_intent,
+        "transition_intent": transition_intent,
+    }
+
+
 def _normalize_character_reference(value: Any) -> str:
     """Backward-compatible wrapper around the shared identity normalizer."""
     return normalize_character_reference(value)
@@ -1561,6 +1753,7 @@ def _inherit_event_semantics(
             # Character identity is a source-ledger contract. A model synonym
             # would break downstream reference lookup and falsely report a
             # disappearance, so source labels are restored before resolution.
+            _ground_production_beat_text_fields(shot, details)
             shot["who"] = canonical_who
             shot["character_ids"] = list(dict.fromkeys(
                 str(character_id).strip()
@@ -1601,8 +1794,11 @@ def _inherit_event_semantics(
                     "adapted shot cannot bind one director intent: "
                     f"source_sequence_ids={sequence_ids}"
                 )
-            shot["director_intent"] = copy.deepcopy(
-                director_intents[sequence_ids[0]]
+            shot["director_intent"] = _build_production_director_intent(
+                director_intents[sequence_ids[0]],
+                details,
+                source_event_ids=source_ids,
+                shot=shot,
             )
         shot["source_action_unit_ids"] = list(dict.fromkeys(action_unit_ids))
         shot["source_event_roles"] = list(dict.fromkeys(roles))
@@ -3611,6 +3807,10 @@ def _build_beat_skeleton(
             event_by_id = {i: dict(event, event_id=i) for i, event in enumerate(events, 1)}
             for beat in skeleton["beats"]:
                 beat["_source_event_details"] = [event_by_id[event_id] for event_id in beat["source_events"]]
+                _ground_production_beat_text_fields(
+                    beat,
+                    beat["_source_event_details"],
+                )
                 if director_intents:
                     beat_sequences = list(
                         dict.fromkeys(
@@ -3629,8 +3829,11 @@ def _build_beat_skeleton(
                             f"source_events={beat['source_events']}, "
                             f"sequence_ids={beat_sequences}"
                         )
-                    beat["director_intent"] = copy.deepcopy(
-                        director_intents[beat_sequences[0]]
+                    beat["director_intent"] = _build_production_director_intent(
+                        director_intents[beat_sequences[0]],
+                        beat["_source_event_details"],
+                        source_event_ids=list(beat["source_events"]),
+                        shot=beat,
                     )
             return skeleton
         except (json.JSONDecodeError, ValueError) as e:
@@ -3794,8 +3997,8 @@ def _atomic_write_json(path: Path, value: Any) -> None:
     os.replace(temporary, path)
 
 
-SCREENPLAY_PLAN_SCHEMA = "honcut.screenplay-plan.v3"
-LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v14"
+SCREENPLAY_PLAN_SCHEMA = "honcut.screenplay-plan.v4"
+LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v15"
 
 
 def _build_screenplay_plan(
@@ -3942,6 +4145,7 @@ def _build_screenplay_plan(
     beats: list[dict[str, Any]] = []
     total_duration = 0.0
     production_generation_units = 0
+    director_projection_schemas: set[str] = set()
 
     for beat_order, shot in enumerate(shots, 1):
         source_refs = shot.get("source_events") or []
@@ -3989,6 +4193,30 @@ def _build_screenplay_plan(
                 f"production beat {beat_order} source refs do not match "
                 f"sequence {sequence_ids[0]}"
             )
+        director_intent = shot.get("director_intent")
+        if director_intent is not None:
+            if not isinstance(director_intent, dict):
+                raise ValueError(
+                    f"production beat {beat_order} director_intent must be an object"
+                )
+            intent_schema = str(director_intent.get("schema") or "").strip()
+            if intent_schema != PRODUCTION_DIRECTOR_INTENT_SCHEMA:
+                raise ValueError(
+                    f"production beat {beat_order} has unsupported director intent "
+                    f"schema: {intent_schema or '<missing>'}"
+                )
+            if director_intent.get("source_event_ids") != list(
+                dict.fromkeys(source_refs)
+            ):
+                raise ValueError(
+                    f"production beat {beat_order} director intent lineage does "
+                    "not match source events"
+                )
+            if director_intent.get("sequence_id") != sequence_ids[0]:
+                raise ValueError(
+                    f"production beat {beat_order} director intent sequence mismatch"
+                )
+            director_projection_schemas.add(intent_schema)
 
         raw_duration = shot.get("suggested_duration")
         if isinstance(raw_duration, bool):
@@ -4022,7 +4250,7 @@ def _build_screenplay_plan(
                 "omitted_source_refs": list(dict.fromkeys(omitted_refs)),
                 "adaptation_action": str(shot.get("action") or "keep"),
                 "narrative_summary": str(shot.get("what") or "").strip(),
-                "director_intent": copy.deepcopy(shot.get("director_intent")),
+                "director_intent": copy.deepcopy(director_intent),
                 "production_action_refs": [
                     {
                         "source_event_id": event_id,
@@ -4160,6 +4388,12 @@ def _build_screenplay_plan(
             "source_checkpoint_input_hash": source_events_hash,
         },
     }
+    if director_projection_schemas:
+        if director_projection_schemas != {PRODUCTION_DIRECTOR_INTENT_SCHEMA}:
+            raise ValueError("production beats use inconsistent director projections")
+        screenplay_plan["production_ledger"][
+            "production_director_intent_schema"
+        ] = PRODUCTION_DIRECTOR_INTENT_SCHEMA
     if duration_scaled_event_plan is not None:
         semantic_status = str(
             duration_scaled_event_plan.get("semantic_selection_status")
