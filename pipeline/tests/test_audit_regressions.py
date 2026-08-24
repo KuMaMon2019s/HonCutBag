@@ -2391,6 +2391,50 @@ def test_phase1_rejects_cooccurring_source_identities_collapsed_by_alias():
         character_discoverer._attach_source_identity_evidence(characters, stats)
 
 
+def test_phase1_rejects_distinct_ordinal_source_identities_collapsed_by_alias():
+    characters = [{
+        "id": "first_guard",
+        "name": "第一名守卫",
+        "aliases": ["第二名守卫", "third guard"],
+        "role": "antagonist",
+    }]
+    stats = {
+        "第一名守卫": {"events": [1], "contexts": []},
+        "第二名守卫": {"events": [2], "contexts": []},
+        "third guard": {"events": [3], "contexts": []},
+    }
+
+    with pytest.raises(ValueError, match="互斥序号来源身份不得映射到同一角色"):
+        character_discoverer._attach_source_identity_evidence(characters, stats)
+
+
+def test_phase1_accepts_equivalent_multilingual_ordinal_aliases():
+    characters = [{
+        "id": "first_guard",
+        "name": "第一名守卫",
+        "aliases": ["first guard", "guard #1"],
+        "role": "antagonist",
+    }]
+    stats = {
+        "第一名守卫": {
+            "events": [1],
+            "contexts": [],
+            "source_aliases": ["first guard", "guard #1"],
+        },
+    }
+
+    character_discoverer._attach_source_identity_evidence(characters, stats)
+
+    assert characters[0]["source_identity_evidence"]["event_ids"] == [1]
+
+
+def test_phase1_does_not_treat_occurrence_order_as_character_identity():
+    assert not character_discoverer._source_identities_have_conflicting_ordinals(
+        "第一次值班的守卫",
+        "第二次值班的守卫",
+    )
+
+
 def test_phase1_recovers_generic_alias_from_unique_non_cooccurring_identity():
     characters = [
         {
@@ -3163,10 +3207,53 @@ def test_character_discovery_body_contract_is_prompted_and_normalized(monkeypatc
     assert "head_to_body_ratio=7.6" in captured["prompt"]
     assert "头宽不得超过肩宽的 43%" in captured["prompt"]
     assert ADULT_LEAD_DISCOVERY_INSTRUCTIONS in character_discoverer.SYSTEM_PROMPT
-    assert character_discoverer.CHARACTER_CONTEXT_SCHEMA_VERSION == 9
+    assert character_discoverer.CHARACTER_CONTEXT_SCHEMA_VERSION == 10
     assert "interaction_props" in captured["prompt"]
     assert "bodybuilder physique" in discovered["negative_guardrails"]
     assert "Body-proportion lock" in discovered["prompt_definition"]
+
+
+def test_character_discovery_retries_ordinal_identity_collapse(monkeypatch):
+    collapsed = _adult_lead_character(
+        "第一名守卫", "male", "25-35", role="antagonist"
+    )
+    collapsed["aliases"] = ["第二名守卫", "第三名守卫"]
+    corrected = [
+        _adult_lead_character(name, "male", "25-35", role="antagonist")
+        for name in ("第一名守卫", "第二名守卫", "第三名守卫")
+    ]
+    responses = iter((
+        json.dumps({"characters": [collapsed]}, ensure_ascii=False),
+        json.dumps({"characters": corrected}, ensure_ascii=False),
+    ))
+    prompts = []
+
+    def fake_call(prompt):
+        prompts.append(prompt)
+        return next(responses)
+
+    monkeypatch.setattr(character_discoverer, "_call_llm", fake_call)
+    monkeypatch.setattr(character_discoverer.time, "sleep", lambda _seconds: None)
+    result = character_discoverer.discover_characters([
+        {
+            "id": event_id,
+            "who": [name],
+            "what": f"{name}进入画面",
+            "visual": f"{name}单独行动",
+        }
+        for event_id, name in enumerate(
+            ("第一名守卫", "第二名守卫", "第三名守卫"),
+            1,
+        )
+    ])
+
+    assert len(prompts) == 2
+    assert "互斥序号来源身份不得映射到同一角色" in prompts[1]
+    assert {character["name"] for character in result["characters"]} == {
+        "第一名守卫",
+        "第二名守卫",
+        "第三名守卫",
+    }
 
 
 def test_body_contract_reaches_character_storyboard_and_video_prompts():

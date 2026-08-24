@@ -69,8 +69,10 @@ SYSTEM_PROMPT = (
     "未被来源原文明示为代号、化名、姓名或昵称的抽象指代"
     "（如'说话者'、'观察者'、'记录者'、'思考者'、'行走者'、'试验者'、'打探人员'）、"
     "复数群体（如'保安们'应合并为'保安'）、物品、概念。"
-    "同一角色的编号、职业称呼和通用指代必须合并为一个对象："
-    "保留最具体的主名，其余写入 aliases；禁止将'主角'、'他'、'她'单独输出为角色。"
+    "只有确指同一人的职业称呼和通用指代才能合并为一个对象："
+    "保留最具体的主名，其余写入 aliases；来源以不同序号明确区分的个体必须分别输出，"
+    "禁止把第一/第二/第三或 first/second/third 等互斥身份放进同一 aliases；"
+    "禁止将'主角'、'他'、'她'单独输出为角色。"
     "方括号中的来源称呼可能混有服装、年龄、伤势、动作或地点修饰；name 必须是可跨镜头复用的"
     "稳定身份名，aliases 必须逐字收录所有属于该角色的来源称呼，瞬时修饰只能进入 appearance/variants。"
     "不得因为来源称呼使用中文、英文、编号、职业名或多词名称而丢弃角色，也不得凭子串把两个角色合并。"
@@ -92,7 +94,8 @@ USER_PROMPT_TEMPLATE = (
     "{character_context}\n\n"
     "注意：只提取有具体外貌、动作、对话的人物角色。排除：天气现象、动物、"
     "未被来源原文明示为代号、化名、姓名或昵称的抽象指代（如'说话者'、'观察者'）、复数群体。"
-    "同一实体的编号/职业/主角指代只输出一个对象，其余称呼放入 aliases；"
+    "同一实体的职业/主角指代只输出一个对象，其余称呼放入 aliases；"
+    "不同来源序号明确区分不同个体，必须分别输出，绝不能互作 aliases；"
     "'主角'、'他'、'她'不得独立成条。最多保留5个主要角色。\n\n"
     "身份归一化硬约束：每个【来源称呼】必须被审计。若称呼带有服装、年龄、伤势、动作或地点修饰，"
     "从中提取稳定身份作为 name，并把完整【来源称呼】逐字放入 aliases；若它只是物品、环境或群众描述，"
@@ -150,7 +153,7 @@ ENTITY_SUFFIXES = (
 )
 MAX_ENTITY_NAME_CHINESE_CHARS = 12
 GENERIC_CHARACTER_NAMES = {"主角", "主人公", "男主", "女主", "人物", "他", "她", "它"}
-CHARACTER_CONTEXT_SCHEMA_VERSION = 9
+CHARACTER_CONTEXT_SCHEMA_VERSION = 10
 
 GENERIC_BACKGROUND_CHARACTER_NAMES = {
     "路人", "行人", "游客", "观众", "听众", "读者",
@@ -560,6 +563,100 @@ def _source_identities_cooccur(
     return bool(left_events & right_events)
 
 
+_ENGLISH_ORDINAL_VALUES = {
+    "first": 1,
+    "second": 2,
+    "third": 3,
+    "fourth": 4,
+    "fifth": 5,
+    "sixth": 6,
+    "seventh": 7,
+    "eighth": 8,
+    "ninth": 9,
+    "tenth": 10,
+}
+_CHINESE_DIGIT_VALUES = {
+    "零": 0,
+    "〇": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+_CHINESE_UNIT_VALUES = {"十": 10, "百": 100, "千": 1000}
+
+
+def _chinese_ordinal_value(value: str) -> int | None:
+    """Parse one bounded Chinese numeral used as an identity ordinal."""
+
+    if not value:
+        return None
+    if value.isdigit():
+        return int(value)
+    total = 0
+    digit = 0
+    found = False
+    for character in value:
+        if character in _CHINESE_DIGIT_VALUES:
+            digit = _CHINESE_DIGIT_VALUES[character]
+            found = True
+            continue
+        unit = _CHINESE_UNIT_VALUES.get(character)
+        if unit is None:
+            return None
+        total += (digit or 1) * unit
+        digit = 0
+        found = True
+    return total + digit if found else None
+
+
+def _explicit_identity_ordinals(label: str) -> set[int]:
+    """Extract explicit person/entity ordinals without interpreting role prose."""
+
+    text = str(label or "").strip()
+    values: set[int] = set()
+    for match in re.finditer(
+        r"第\s*([零〇一二两三四五六七八九十百千0-9]+)\s*(?:名|位|个|号)",
+        text,
+    ):
+        if (value := _chinese_ordinal_value(match.group(1))) is not None:
+            values.add(value)
+    for match in re.finditer(
+        r"([零〇一二两三四五六七八九十百千0-9]+)\s*号",
+        text,
+    ):
+        if (value := _chinese_ordinal_value(match.group(1))) is not None:
+            values.add(value)
+    for match in re.finditer(
+        r"\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|"
+        r"[0-9]+(?:st|nd|rd|th))\b",
+        text.casefold(),
+    ):
+        token = match.group(1)
+        value = _ENGLISH_ORDINAL_VALUES.get(token)
+        values.add(value if value is not None else int(token[:-2]))
+    for match in re.finditer(r"(?:#|\bno\.?\s*)([0-9]+)\b", text.casefold()):
+        values.add(int(match.group(1)))
+    return values
+
+
+def _source_identities_have_conflicting_ordinals(
+    left_name: str,
+    right_name: str,
+) -> bool:
+    """Return true when source labels explicitly identify different ordinals."""
+
+    left = _explicit_identity_ordinals(left_name)
+    right = _explicit_identity_ordinals(right_name)
+    return bool(left and right and left.isdisjoint(right))
+
+
 def _post_filter_characters(
     characters: List[Dict[str, Any]],
     stats: Dict[str, Dict[str, Any]] | None = None,
@@ -802,6 +899,20 @@ def _attach_source_identity_evidence(
                 f"{prior_mentions} + {mentions} -> {canonical}; "
                 f"events={sorted(overlapping_events, key=str)}"
             )
+        ordinal_conflicts = [
+            (prior_mention, mention)
+            for prior_mention in evidence[canonical]["aliases"]
+            for mention in mentions
+            if _source_identities_have_conflicting_ordinals(
+                prior_mention,
+                mention,
+            )
+        ]
+        if ordinal_conflicts:
+            raise ValueError(
+                "角色身份回验失败：互斥序号来源身份不得映射到同一角色："
+                f"{ordinal_conflicts} -> {canonical}"
+            )
         character["aliases"] = list(dict.fromkeys([
             *(character.get("aliases") or []),
             *(mention for mention in mentions if mention and mention != canonical),
@@ -967,16 +1078,33 @@ def discover_characters(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     # 3. 调用 LLM（带重试）
     characters = []
     last_error = None
+    attempt_prompt = prompt
     for attempt in range(1 + MAX_RETRIES):
         try:
             print("调用 LLM 生成角色描述...", file=sys.stderr)
-            response = _call_llm(prompt)
-            characters = _parse_characters(response)
+            response = _call_llm(attempt_prompt)
+            candidate_characters = _parse_characters(response)
+            candidate_characters = _post_filter_characters(
+                candidate_characters,
+                stats,
+            )
+            _attach_source_identity_evidence(candidate_characters, stats)
+            characters = candidate_characters
             break
         except (json.JSONDecodeError, ValueError) as e:
             last_error = e
             if attempt < MAX_RETRIES:
-                print(f"  JSON 解析失败，重试 ({attempt+1}/{MAX_RETRIES}): {e}", file=sys.stderr)
+                print(
+                    f"  角色结构/身份回验失败，重试 ({attempt+1}/{MAX_RETRIES}): {e}",
+                    file=sys.stderr,
+                )
+                attempt_prompt = (
+                    f"{prompt}\n\n"
+                    "【上一响应未通过身份回验】\n"
+                    f"{e}\n"
+                    "请重新输出完整 characters JSON；保留全部来源人物，"
+                    "互斥身份必须拆成不同对象，不得互作 aliases。"
+                )
                 time.sleep(1)
             continue
         except (LLMConnectTimeout, LLMReadTimeout, LLMIdleTimeout, LLMStreamError) as e:
@@ -996,14 +1124,6 @@ def discover_characters(events: List[Dict[str, Any]]) -> Dict[str, Any]:
             "角色发现未产生通过 schema 的规范角色，禁止用伪造资产继续："
             f"{last_error or 'empty character set'}"
         )
-
-    # 3.5 后处理过滤：移除 LLM 可能错误包含的非人物角色
-    characters = _post_filter_characters(characters, stats)
-
-    # 4. Reconcile every source label against the canonical roster. This also
-    # preserves qualified source mentions as aliases and aggregates repeated
-    # labels for the same character instead of taking only the first match.
-    _attach_source_identity_evidence(characters, stats)
 
     # 5. 按出场次数排序（主角在前）
     characters.sort(key=lambda c: (-c.get("appearance_count", 0), c.get("first_appearance", 0)))
