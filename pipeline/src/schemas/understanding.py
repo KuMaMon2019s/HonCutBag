@@ -102,6 +102,21 @@ class DirectorPlanUnderstanding(StrictUnderstandingModel):
     sequences: list[DirectorSequenceIntentUnderstanding]
 
 
+class DurationScaledActionSelectionUnderstanding(StrictUnderstandingModel):
+    source_event_id: int = Field(ge=1)
+    selected_source_generation_unit_indexes: list[int]
+    narrative_purpose: str
+    emotional_beat: str
+    director_alignment: str
+
+
+class DurationScaledActionSelectionBatch(StrictUnderstandingModel):
+    selection_schema: Literal[
+        "honcut.duration-scaled-action-selection.v1"
+    ] = Field(alias="schema", serialization_alias="schema")
+    events: list[DurationScaledActionSelectionUnderstanding]
+
+
 class CharacterVariantUnderstanding(StrictUnderstandingModel):
     state_name: str
     description: str
@@ -352,6 +367,7 @@ __all__ = [
     "CharacterUnderstandingBatch",
     "CharacterReferenceUnderstanding",
     "DirectorPlanUnderstanding",
+    "DurationScaledActionSelectionBatch",
     "FirstFrameUnderstanding",
     "IdentityDetailUnderstanding",
     "EventUnderstandingBatch",

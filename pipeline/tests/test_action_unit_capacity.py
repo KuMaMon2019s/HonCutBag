@@ -1196,13 +1196,16 @@ def test_60s_scaled_screenplay_reconciles_source_pressure_into_executable_ledger
         source_events_hash="source-events-sha256",
     )
 
-    assert screenplay_plan["schema"] == "honcut.screenplay-plan.v1"
+    assert screenplay_plan["schema"] == "honcut.screenplay-plan.v2"
     assert screenplay_plan["source_ledger"]["capacity_status"] == (
         "screenplay_compression_required"
     )
     assert screenplay_plan["production_ledger"] == {
         "capacity_status": "fits_story_clock",
         "duration_scaling_status": "applied",
+        "event_action_scaling_schema": "honcut.duration-scaled-event-plan.v1",
+        "intra_event_scaling_applied": False,
+        "intra_event_omitted_micro_action_count": 0,
         "event_count": 6,
         "generation_action_units": 36,
         "effective_story_duration_s": 60,
@@ -1217,3 +1220,124 @@ def test_60s_scaled_screenplay_reconciles_source_pressure_into_executable_ledger
     assert reconciled["action_capacity_status"] == "fits_story_clock"
     assert reconciled["duration_scaling_status"] == "applied"
     assert reconciled["production_generation_action_units"] == 36
+
+
+def test_duration_scaled_event_plan_fits_dense_mandatory_actions_without_mutating_source():
+    """Dense mandatory events keep their facts while production choreography scales."""
+    unit_counts = [3, 0, 4, 5, 5, 4, 1, 4, 3, 7, 5, 5]
+    mandatory_roles = {
+        1: "scene_setup",
+        3: "turning_point",
+        7: "scene_setup",
+        10: "turning_point",
+        12: "consequence",
+    }
+    events = [
+        {
+            "sequence_id": "SEQ001",
+            "event_role": mandatory_roles.get(event_id, "action_chain"),
+            "dramatic_turn": event_id in {3, 10},
+            "what": f"来源事件 {event_id} 的因果结果",
+            "micro_actions": [
+                f"事件{event_id}依次执行动作{action_id}"
+                for action_id in range(1, unit_count + 1)
+            ],
+        }
+        for event_id, unit_count in enumerate(unit_counts, 1)
+    ]
+    source_snapshot = json.loads(json.dumps(events, ensure_ascii=False))
+    source_capacity = engine._estimate_action_capacity_plan(events, 32, 12)
+    profile = engine.get_video_capabilities()
+    beat_count = source_capacity["primary_shots"]
+    effective_shot_duration = round(32 / beat_count)
+
+    production_events, scaling_plan = engine._build_duration_scaled_event_plan(
+        events,
+        target_duration=32,
+        beat_count=beat_count,
+        effective_shot_duration=effective_shot_duration,
+        capabilities=profile,
+    )
+
+    assert events == source_snapshot
+    assert scaling_plan["schema"] == "honcut.duration-scaled-event-plan.v1"
+    assert scaling_plan["source_generation_action_units"] == 46
+    assert scaling_plan["production_generation_action_units"] < 46
+    assert scaling_plan["intra_event_scaling_applied"] is True
+    assert len(production_events) == len(events)
+    mandatory_ids = set(mandatory_roles)
+    assert mandatory_ids <= {
+        item["source_event_id"] for item in scaling_plan["events"]
+    }
+    assert any(
+        item["source_event_id"] in mandatory_ids
+        and item["omitted_source_micro_action_indexes"]
+        for item in scaling_plan["events"]
+    )
+    per_beat_capacity = engine._generation_unit_capacity_for_story_duration(
+        effective_shot_duration,
+        profile,
+    )
+    sequence_plan = engine._sequence_beat_plan(
+        production_events,
+        beat_count,
+        per_beat_capacity,
+    )
+    assert sequence_plan == ["SEQ001"] * beat_count
+    assert all(
+        production_events[event_id - 1]["what"] == events[event_id - 1]["what"]
+        for event_id in mandatory_ids
+    )
+
+
+def test_screenplay_plan_records_intra_event_action_lineage():
+    events = [{
+        "sequence_id": "SEQ001",
+        "event_role": "turning_point",
+        "dramatic_turn": True,
+        "what": "角色从受压转为反制",
+        "micro_actions": ["后退", "格挡", "控制手臂", "完成反制"],
+    }]
+    source_capacity = engine._estimate_action_capacity_plan(events, 12, 12)
+    production_events, scaling_plan = engine._build_duration_scaled_event_plan(
+        events,
+        target_duration=12,
+        beat_count=1,
+        effective_shot_duration=12,
+    )
+    selected_indexes = scaling_plan["events"][0][
+        "selected_source_micro_action_indexes"
+    ]
+    shots = [{
+        "shot_order": 1,
+        "source_events": [1],
+        "dropped_source_events": [],
+        "source_sequence_ids": ["SEQ001"],
+        "suggested_duration": 12,
+        "action": "keep",
+        "what": "角色完成反制",
+        "generation_action_units": normalize_event_action_units(
+            production_events[0]
+        )["generation_action_units"],
+    }]
+
+    screenplay_plan, _ = engine._build_screenplay_plan(
+        events,
+        shots,
+        source_capacity,
+        target_duration=12,
+        production_events=production_events,
+        duration_scaled_event_plan=scaling_plan,
+    )
+
+    assert screenplay_plan["schema"] == "honcut.screenplay-plan.v2"
+    assert screenplay_plan["production_ledger"]["event_action_scaling_schema"] == (
+        "honcut.duration-scaled-event-plan.v1"
+    )
+    assert screenplay_plan["beats"][0]["production_action_refs"] == [{
+        "source_event_id": 1,
+        "selected_source_micro_action_indexes": selected_indexes,
+        "omitted_source_micro_action_indexes": scaling_plan["events"][0][
+            "omitted_source_micro_action_indexes"
+        ],
+    }]

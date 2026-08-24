@@ -418,8 +418,16 @@ def test_layered_mode_persists_skeleton_and_each_batch(monkeypatch, tmp_path):
 
 def test_layered_resume_skips_cached_skeleton_and_batches(monkeypatch, tmp_path):
     events = _events(11)
+    production_events, _duration_scaled_event_plan = (
+        engine._build_duration_scaled_event_plan(
+            events,
+            target_duration=90,
+            beat_count=6,
+            effective_shot_duration=15,
+        )
+    )
     fingerprint = engine._layered_input_fingerprint(
-        events, "（无角色信息）", 90, 15, 6
+        production_events, "（无角色信息）", 90, 15, 6
     )
     public_beats = []
     for i in range(1, 7):
