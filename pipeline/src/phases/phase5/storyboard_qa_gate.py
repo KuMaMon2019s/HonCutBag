@@ -2207,6 +2207,77 @@ def _archive_correction_inputs(
     }
 
 
+def _restore_cinematic_aliases_after_previs_redraw(
+    output_dir: Path,
+    storyboard: dict[str, Any],
+    shot_ids: list[str],
+    archive: dict[str, Any],
+) -> list[str]:
+    """Prevent a Phase 5 PREVIS redraw from downgrading Phase 4 aliases."""
+    from phases.phase4.cinematic_first_frames import CINEMATIC_FIRST_FRAME_SCHEMA
+
+    requested = set(shot_ids)
+    archive_dir = output_dir / str(archive.get("archive_dir") or "") / "before"
+    restored: list[str] = []
+    for index, shot in enumerate(storyboard.get("shots", [])):
+        if not isinstance(shot, dict):
+            continue
+        shot_id = _shot_id(shot, index)
+        if shot_id not in requested:
+            continue
+        first_beat = next(
+            (
+                beat
+                for beat in (shot.get("storyboard_beats") or [])
+                if isinstance(beat, dict)
+            ),
+            None,
+        )
+        if not first_beat or first_beat.get(
+            "video_first_frame_kind"
+        ) != CINEMATIC_FIRST_FRAME_SCHEMA:
+            continue
+        source_value = str(first_beat.get("video_first_frame") or "").strip()
+        source = Path(source_value)
+        if not source.is_absolute():
+            source = output_dir / source
+        archived_image = archive_dir / "storyboard_images" / f"{shot_id}.png"
+        archived_receipt = archive_dir / "storyboard_images" / f"{shot_id}.json"
+        if not source.is_file() or not archived_image.is_file() or not archived_receipt.is_file():
+            raise RuntimeError(
+                f"{shot_id} cinematic alias archive is incomplete after PREVIS redraw"
+            )
+        try:
+            receipt = json.loads(archived_receipt.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"{shot_id} archived cinematic alias receipt is invalid: {exc}"
+            ) from exc
+        source_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+        archived_sha256 = hashlib.sha256(archived_image.read_bytes()).hexdigest()
+        if (
+            archived_sha256 != source_sha256
+            or receipt.get("kind") != CINEMATIC_FIRST_FRAME_SCHEMA
+            or str(receipt.get("canonical_source") or "") != source_value
+        ):
+            raise RuntimeError(
+                f"{shot_id} archived storyboard alias is not its cinematic P01"
+            )
+        alias_dir = output_dir / "storyboard_images"
+        alias_dir.mkdir(parents=True, exist_ok=True)
+        for archived_path in (archived_image, archived_receipt):
+            target = alias_dir / archived_path.name
+            temporary = target.with_suffix(target.suffix + ".tmp")
+            shutil.copy2(archived_path, temporary)
+            temporary.replace(target)
+        if hashlib.sha256((alias_dir / f"{shot_id}.png").read_bytes()).hexdigest() != source_sha256:
+            raise RuntimeError(
+                f"{shot_id} cinematic alias restoration hash mismatch"
+            )
+        restored.append(shot_id)
+    return restored
+
+
 def _redraw_failed_storyboards(
     output_dir: Path,
     shot_ids: list[str],
@@ -2280,6 +2351,12 @@ def _redraw_failed_storyboards(
             "Phase 5 correction produced invalid storyboard artifacts: "
             + "; ".join(artifact_errors[:8])
         )
+    restored_cinematic_aliases = _restore_cinematic_aliases_after_previs_redraw(
+        output_dir,
+        storyboard,
+        targets,
+        archive,
+    )
     _atomic_json(storyboard_path, storyboard)
     receipt = {
         "attempt": attempt,
@@ -2287,6 +2364,7 @@ def _redraw_failed_storyboards(
         "shot_ids": targets,
         "issue_codes": sorted({str(issue.get("code") or "") for issue in issues}),
         "archive": archive,
+        "restored_cinematic_aliases": restored_cinematic_aliases,
         "total_boards": contract.get("total_boards"),
         "total_panels": contract.get("total_panels"),
         "timestamp": datetime.now(UTC).isoformat(),

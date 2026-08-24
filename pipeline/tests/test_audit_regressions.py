@@ -4305,6 +4305,35 @@ def test_phase5_real_redraw_reuses_generator_and_archives_failed_shot(tmp_path):
         client=client,
         director_storyboard_path=tmp_path / "missing.png",
     )
+    cinematic_path = tmp_path / "video_first_frames/S02_P01.png"
+    cinematic_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (320, 180), "red").save(cinematic_path)
+    cinematic_receipt_path = tmp_path / "video_first_frames/S02_P01.json"
+    cinematic_receipt_path.write_text(
+        json.dumps({
+            "kind": CINEMATIC_FIRST_FRAME_SCHEMA,
+            "status": "done",
+            "image": "video_first_frames/S02_P01.png",
+        }),
+        encoding="utf-8",
+    )
+    storyboard["shots"][1]["storyboard_beats"][0].update({
+        "video_first_frame": "video_first_frames/S02_P01.png",
+        "video_first_frame_kind": CINEMATIC_FIRST_FRAME_SCHEMA,
+        "video_first_frame_receipt": "video_first_frames/S02_P01.json",
+    })
+    cinematic_alias = tmp_path / "storyboard_images/S02.png"
+    cinematic_alias.write_bytes(cinematic_path.read_bytes())
+    cinematic_alias_receipt = tmp_path / "storyboard_images/S02.json"
+    cinematic_alias_receipt.write_text(
+        json.dumps({
+            "kind": CINEMATIC_FIRST_FRAME_SCHEMA,
+            "status": "done",
+            "canonical_source": "video_first_frames/S02_P01.png",
+        }),
+        encoding="utf-8",
+    )
+    alias_sha256 = hashlib.sha256(cinematic_alias.read_bytes()).hexdigest()
     (tmp_path / "STORYBOARD.json").write_text(
         json.dumps(storyboard, ensure_ascii=False), encoding="utf-8"
     )
@@ -4342,6 +4371,11 @@ def test_phase5_real_redraw_reuses_generator_and_archives_failed_shot(tmp_path):
         (tmp_path / "SHOT_STORYBOARDS.json").read_text(encoding="utf-8")
     )
     assert manifest["correction"] == {"attempt": 1, "shot_ids": ["S02"]}
+    assert receipt["restored_cinematic_aliases"] == ["S02"]
+    assert hashlib.sha256(cinematic_alias.read_bytes()).hexdigest() == alias_sha256
+    assert json.loads(cinematic_alias_receipt.read_text(encoding="utf-8"))[
+        "kind"
+    ] == CINEMATIC_FIRST_FRAME_SCHEMA
 
 
 def test_phase5_l3_supplies_canonical_character_images(tmp_path):
