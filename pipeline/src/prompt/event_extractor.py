@@ -235,7 +235,84 @@ _NARRATIVE_JUMP_CUES = (
 # caches carried over from earlier run directories — and forces every Phase 1
 # event extraction to re-run (a paid LLM pass). Never bump casually, and never
 # reuse cross-run segment caches from a run produced under a different value.
-EVENT_FLOW_SCHEMA_VERSION = "14.0"
+EVENT_FLOW_SCHEMA_VERSION = "15.0"
+
+_UNKNOWN_ACTION_PERFORMERS = {
+    "",
+    "未知",
+    "不明",
+    "unknown",
+    "unspecified",
+    "他",
+    "她",
+    "它",
+}
+_EQUIVALENT_HUMAN_DESCRIPTOR_GROUPS = (
+    frozenset({"男子", "男性", "男人"}),
+    frozenset({"女子", "女性", "女人"}),
+    frozenset({"man", "male"}),
+    frozenset({"woman", "female"}),
+)
+
+
+def _equivalent_human_descriptor(left: str, right: str) -> bool:
+    left_key = str(left or "").casefold().strip()
+    right_key = str(right or "").casefold().strip()
+    return bool(
+        left_key
+        and right_key
+        and any(
+            left_key in group and right_key in group
+            for group in _EQUIVALENT_HUMAN_DESCRIPTOR_GROUPS
+        )
+    )
+
+
+def _reconcile_structured_action_performers(event: Dict[str, Any]) -> None:
+    """Make the structured participant set cover every action performer.
+
+    ``body_action_choreography.performer`` is already strict structured model
+    output, not prose inference.  Omitting that same identity from ``who``
+    would make character discovery and downstream visual ownership disagree.
+    Promote only singular, explicit performers and retain an audit field.
+    """
+
+    who = list(event.get("who") or [])
+    evidence = " ".join(
+        str(event.get(field) or "")
+        for field in ("source_excerpt", "what", "start_state")
+    )
+    added: list[str] = []
+    for beat in event.get("body_action_choreography") or []:
+        if not isinstance(beat, dict):
+            continue
+        performer = str(beat.get("performer") or "").strip()
+        if (
+            performer.casefold() in _UNKNOWN_ACTION_PERFORMERS
+            or _GROUP_PARTICIPANT_RE.search(performer)
+        ):
+            continue
+        if performer in who:
+            continue
+        equivalent = next(
+            (
+                current
+                for current in who
+                if _equivalent_human_descriptor(current, performer)
+            ),
+            None,
+        )
+        if equivalent and not _source_introduces_distinct_role(
+            evidence,
+            performer,
+            equivalent,
+        ):
+            continue
+        who.append(performer)
+        added.append(performer)
+    event["who"] = who
+    if added:
+        event["who_reconciled_from_choreography"] = added
 
 
 def is_global_production_directive_text(evidence: str) -> bool:
@@ -295,6 +372,7 @@ def _normalize_event(event: Dict[str, Any], source_content: str = "") -> Dict[st
         event.get("body_action_choreography") or event.get("action_choreography"),
         micro_actions=event["micro_actions"],
     )
+    _reconcile_structured_action_performers(event)
     apply_body_action_contract(event)
     motion_mode = str(event.get("generation_motion_mode") or "").strip().lower()
     if not event["micro_actions"]:
@@ -583,6 +661,11 @@ def _annotate_global_event_flow(
                 event,
                 preserve_one_take=preserve_one_take,
             )
+            _reconcile_continuous_action_participants(
+                previous,
+                event,
+                preserve_one_take=preserve_one_take,
+            )
         boundary = str(event.get("continuity_before") or "cut").lower()
         exact_same_place = bool(
             previous
@@ -679,6 +762,40 @@ def _repair_continuous_generic_participant(
     shared = set(previous_who) & set(current_who)
     previous_only = [value for value in previous_who if value not in shared]
     current_only = [value for value in current_who if value not in shared]
+
+    # A continuous event may introduce another participant while referring to
+    # the existing subject with an equivalent descriptor (for example
+    # ``man``/``male``).  Resolve only one unique cross-event descriptor pair,
+    # and never collapse a label when the previous stable name already appears
+    # in the current participant set.
+    descriptor_pairs = [
+        (previous_label, current_label)
+        for previous_label in previous_only
+        for current_label in current_only
+        if previous_label not in current_who
+        and _equivalent_human_descriptor(previous_label, current_label)
+    ]
+    if len(descriptor_pairs) == 1:
+        previous_label, generic_label = descriptor_pairs[0]
+        evidence = " ".join(
+            str(current.get(field) or "")
+            for field in ("source_excerpt", "what", "start_state", "causal_link")
+        )
+        if not _source_introduces_distinct_role(
+            evidence,
+            generic_label,
+            previous_label,
+        ):
+            current["model_who"] = list(current_who)
+            current["who"] = list(dict.fromkeys(
+                previous_label if value == generic_label else value
+                for value in current_who
+            ))
+            current["who_repair_reason"] = (
+                "continuous equivalent participant inherits the adjacent identity"
+            )
+            return
+
     if len(previous_only) != 1 or len(current_only) != 1:
         return
 
@@ -686,10 +803,12 @@ def _repair_continuous_generic_participant(
     generic_label = current_only[0]
     previous_key = _normalized_identity_label(previous_label)
     generic_key = _normalized_identity_label(generic_label)
-    if (
-        not generic_key
-        or previous_key == generic_key
-        or not previous_key.endswith(generic_key)
+    descriptor_equivalent = _equivalent_human_descriptor(
+        previous_label,
+        generic_label,
+    )
+    if not generic_key or previous_key == generic_key or (
+        not previous_key.endswith(generic_key) and not descriptor_equivalent
     ):
         return
 
@@ -706,8 +825,81 @@ def _repair_continuous_generic_participant(
         for value in current_who
     ]
     current["who_repair_reason"] = (
-        "continuous generic participant inherits the adjacent specific identity"
+        "continuous equivalent participant inherits the adjacent identity"
+        if descriptor_equivalent
+        else "continuous generic participant inherits the adjacent specific identity"
     )
+
+
+def _reference_is_explicit_in_text(reference: str, evidence: str) -> bool:
+    """Match one exact identity label without partial Latin-token collisions."""
+
+    label = str(reference or "").strip()
+    if not label:
+        return False
+    if re.search(r"[\u3400-\u9fff]", label):
+        return _normalized_identity_label(label) in _normalized_identity_label(
+            evidence
+        )
+    return bool(
+        re.search(
+            rf"(?<![a-z0-9]){re.escape(label.casefold())}(?![a-z0-9])",
+            str(evidence or "").casefold(),
+        )
+    )
+
+
+def _reconcile_continuous_action_participants(
+    previous: Dict[str, Any],
+    current: Dict[str, Any],
+    *,
+    preserve_one_take: bool,
+) -> None:
+    """Carry a visible action participant only from matching structured evidence.
+
+    The previous event's canonical participant, the current structured
+    ``continuity_subject``, and current action prose must all name the same
+    identity.  This retains an attack target omitted from ``who`` without
+    promoting off-screen subjects in establishing or pull-away shots.
+    """
+
+    boundary = str(current.get("continuity_before") or "cut").strip().lower()
+    if not (
+        boundary == "continuous"
+        or (preserve_one_take and not _has_narrative_jump(current))
+    ):
+        return
+    if not (current.get("micro_actions") or current.get("action_phase") != "none"):
+        return
+
+    subjects = {
+        _normalized_identity_label(value)
+        for value in re.split(
+            r"[,，、;；/|]+",
+            str(current.get("continuity_subject") or ""),
+        )
+        if _normalized_identity_label(value)
+    }
+    evidence = " ".join(
+        str(current.get(field) or "")
+        for field in ("source_excerpt", "what")
+    )
+    who = list(current.get("who") or [])
+    added: list[str] = []
+    for participant in previous.get("who") or []:
+        label = str(participant or "").strip()
+        if (
+            not label
+            or label in who
+            or _normalized_identity_label(label) not in subjects
+            or not _reference_is_explicit_in_text(label, evidence)
+        ):
+            continue
+        who.append(label)
+        added.append(label)
+    if added:
+        current["who"] = who
+        current["who_reconciled_from_continuity_subject"] = added
 
 
 def _locations_compatible(previous: Dict[str, Any], current: Dict[str, Any]) -> bool:

@@ -161,6 +161,35 @@ def test_event_parser_preserves_speaker_evidence_and_action_state():
     assert parsed[0]["lines"][0]["confidence"] == 0.92
 
 
+def test_event_parser_promotes_structured_action_performers_into_who():
+    payload = [_event(
+        who=["男性"],
+        source_excerpt="第一名敌人挥砍，男性后仰闪避。",
+        micro_actions=["第一名敌人挥砍", "男性后仰闪避"],
+        body_action_choreography=[{
+            "micro_action_index": 1,
+            "performer": "第一名敌人",
+            "technique": "横向挥砍",
+            "side": "右",
+            "limbs": ["右臂"],
+            "footwork": "向前一步",
+            "torso": "向左扭转",
+            "weight_shift": "重心前移",
+            "direction": "朝向男性",
+            "contact": "刀锋擦过风衣",
+            "end_pose": "右臂伸展",
+        }],
+    )]
+
+    parsed = _parse_events(
+        json.dumps({"events": payload}, ensure_ascii=False),
+        "第一名敌人挥砍，男性后仰闪避。",
+    )
+
+    assert parsed[0]["who"] == ["男性", "第一名敌人"]
+    assert parsed[0]["who_reconciled_from_choreography"] == ["第一名敌人"]
+
+
 def test_event_parser_rejects_invented_dialogue():
     payload = [_event(lines=[{
         "speaker": "凛", "line": "原文里没有的台词", "confidence": 1, "evidence": "",
@@ -382,6 +411,77 @@ def test_global_flow_resolves_generic_participant_to_adjacent_specific_identity(
     assert events[2]["who_repair_reason"] == (
         "continuous generic participant inherits the adjacent specific identity"
     )
+
+
+def test_global_flow_resolves_equivalent_human_descriptor_in_continuity():
+    events = [
+        _event(
+            who=["男子"],
+            source_excerpt="男子站在开启的车门前。",
+            continuity_before="cut",
+        ),
+        _event(
+            who=["男性", "第一名敌人"],
+            source_excerpt="第一名敌人挥砍，男性后仰闪避。",
+            continuity_before="continuous",
+        ),
+    ]
+
+    _annotate_global_event_flow(events)
+
+    assert events[1]["who"] == ["男子", "第一名敌人"]
+    assert events[1]["model_who"] == ["男性", "第一名敌人"]
+    assert events[1]["who_repair_reason"] == (
+        "continuous equivalent participant inherits the adjacent identity"
+    )
+
+
+def test_global_flow_carries_exact_action_participant_from_continuity_subject():
+    events = [
+        _event(
+            who=["男子", "第一名敌人"],
+            source_excerpt="第一名敌人挥砍，男子后仰闪避。",
+            continuity_before="cut",
+        ),
+        _event(
+            who=["男性"],
+            what="男性踢中第一名敌人的手腕",
+            source_excerpt="男子踢中敌人的手腕。",
+            continuity_before="continuous",
+            continuity_subject="男性,第一名敌人",
+        ),
+    ]
+
+    _annotate_global_event_flow(events)
+
+    assert events[1]["who"] == ["男子", "第一名敌人"]
+    assert events[1]["who_reconciled_from_continuity_subject"] == [
+        "第一名敌人"
+    ]
+
+
+def test_global_flow_does_not_make_offscreen_continuity_subject_visible():
+    events = [
+        _event(
+            who=["男子"],
+            source_excerpt="男子低头查看芯片。",
+            continuity_before="cut",
+        ),
+        _event(
+            who=[],
+            what="列车穿过霓虹隧道",
+            source_excerpt="镜头拉远，列车穿过霓虹隧道。",
+            micro_actions=[],
+            action_phase="none",
+            continuity_before="continuous",
+            continuity_subject="男子、列车",
+        ),
+    ]
+
+    _annotate_global_event_flow(events)
+
+    assert events[1]["who"] == []
+    assert "who_reconciled_from_continuity_subject" not in events[1]
 
 
 def test_global_flow_does_not_merge_explicitly_new_generic_role_participant():
