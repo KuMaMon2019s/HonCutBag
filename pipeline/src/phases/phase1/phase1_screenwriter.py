@@ -13,6 +13,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 from phases.phase1.adaptation_engine import AVG_SHOT_DURATION
+from phases.phase1.phase1_director import (
+    DirectorPlanningError,
+    run_phase1_director,
+)
 from prompt.shot_prompt_builder import build_batch_prompts
 from prompt.speech_pacing import annotate_shot_pacing
 from prompt.prompt_sanitizer import sanitize_quality_prompt
@@ -29,6 +33,26 @@ from utils.timing_estimator import estimate_phase_duration
 
 STYLE_SUMMARY_WALL_TIMEOUT = 180.0
 STYLE_SUMMARY_IDLE_TIMEOUT = 75.0
+
+
+def _plan_director_for_events(
+    events: list[dict[str, Any]],
+    output_dir: Path,
+    dry_run: bool,
+    director_runner,
+) -> dict[str, Any]:
+    result = director_runner(events, output_dir, dry_run)
+    status = result.get("status")
+    if status != "done" and not (dry_run and status == "skipped"):
+        detail = (
+            result.get("error")
+            or result.get("reason")
+            or "missing success evidence"
+        )
+        raise DirectorPlanningError(
+            f"director planning returned {status}: {detail}"
+        )
+    return result
 
 
 def _integrate_storyboard_prompts(storyboard: dict, characters: list[dict]) -> dict:
@@ -236,13 +260,17 @@ def run_phase1_screenwriter(
     reporter: Optional[ProgressReporter] = None,
     shot_duration: int = AVG_SHOT_DURATION,
     project_video_spec: dict[str, Any] | None = None,
+    *,
+    _director_runner=None,
 ) -> dict:
-    """Phase 1: text_parser → event_extractor → character_discoverer → adaptation_engine → storyboard_generator"""
+    """Phase 1: parse → events → director intent → adaptation → storyboard."""
     _banner(1, 9, "编剧引擎 (Screenwriter)", dry_run)
     start = _now()
     _p2_est = estimate_phase_duration("phase1")
     print(f"  ⏱ Phase 1 开始 (预估 ~{int(_p2_est)}s)")
     output_dir = Path(output_dir)
+    director_runner = _director_runner or run_phase1_director
+    director: dict[str, Any] | None = None
 
     try:
         from prompt.text_parser import parse_text
@@ -304,6 +332,12 @@ def run_phase1_screenwriter(
                 }
 
             source_events = preflight["events"]
+            director = _plan_director_for_events(
+                source_events,
+                output_dir,
+                True,
+                director_runner,
+            )
             if reporter:
                 reporter.step(
                     "phase1",
@@ -467,6 +501,7 @@ def run_phase1_screenwriter(
                 "outputs": outputs,
                 "dry_run_receipt": receipt_path.name,
                 "capacity_plan": capacity_plan,
+                "director": director,
                 "_storyboard": storyboard,
                 "_characters": characters,
             }
@@ -540,6 +575,16 @@ def run_phase1_screenwriter(
         print(f"    ✓ 提取 {len(events)} 个事件")
         if reporter:
             reporter.step("phase1", f"提取 {len(events)} 个事件", progress_pct=40)
+
+        print("  → director_planner: 规划 sequence 导演意图...")
+        if reporter:
+            reporter.step("phase1", "规划 sequence 导演意图", progress_pct=45)
+        director = _plan_director_for_events(
+            events,
+            output_dir,
+            False,
+            director_runner,
+        )
 
         # Step 2.3: character_discoverer → characters dict
         print("  → character_discoverer: 发现角色...")
@@ -647,6 +692,7 @@ def run_phase1_screenwriter(
             shot_duration=shot_duration,
             source_text=text,
             output_dir=output_dir,
+            director_plan=director["plan"],
         )
         adapted_shots = adapted.get("shots", [])
         print(f"    ✓ 改编完成，{len(adapted_shots)} 个镜头")
@@ -758,6 +804,7 @@ def run_phase1_screenwriter(
                 "_storyboard": storyboard,
                 "_characters": characters_result,
                 "storyboard_review": review,
+                "director": director,
             }
             if review.get("grade") == "D":
                 print(f"  ⚠ [M5] 分镜审核 D 级，建议重做（但不阻断管线）")
@@ -771,9 +818,12 @@ def run_phase1_screenwriter(
             "outputs": outputs,
             "_storyboard": storyboard,
             "_characters": characters_result,
+            "director": director,
         }
         return phase1_result
 
+    except DirectorPlanningError:
+        raise
     except Exception as e:
         traceback.print_exc()
         return {"status": "error", "error": str(e), "duration_s": _elapsed(start), "outputs": outputs}

@@ -43,6 +43,10 @@ from typing import Any, Dict, List, Optional
 
 from openai import APITimeoutError, OpenAI
 
+from phases.phase1.director_planner import (
+    DIRECTOR_INTENT_FIELDS,
+    DIRECTOR_PLAN_SCHEMA,
+)
 from utils.action_units import (
     normalize_action_units,
     normalize_event_action_units,
@@ -1321,6 +1325,60 @@ def _build_event_details_json(events: List[Dict[str, Any]]) -> str:
     return json.dumps(compact_events, ensure_ascii=False, indent=2)
 
 
+def _director_intents_by_sequence(
+    director_plan: Optional[Dict[str, Any]],
+    events: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, str]]:
+    """Validate and reduce the Director artifact to adaptation-owned inputs."""
+    if director_plan is None:
+        return {}
+    if not isinstance(director_plan, dict):
+        raise ValueError("director_plan must be an object")
+    if director_plan.get("schema") != DIRECTOR_PLAN_SCHEMA:
+        raise ValueError(
+            f"director_plan schema must be {DIRECTOR_PLAN_SCHEMA}"
+        )
+    sequences = director_plan.get("sequences")
+    if not isinstance(sequences, list):
+        raise ValueError("director_plan sequences must be an array")
+
+    expected_ids = list(
+        dict.fromkeys(
+            str(event.get("sequence_id") or "").strip()
+            for event in events
+        )
+    )
+    if not expected_ids or any(not value for value in expected_ids):
+        raise ValueError("adaptation events must all have sequence_id")
+
+    intents: Dict[str, Dict[str, str]] = {}
+    actual_ids: List[str] = []
+    for index, sequence in enumerate(sequences, 1):
+        if not isinstance(sequence, dict):
+            raise ValueError(f"director_plan sequence {index} must be an object")
+        sequence_id = str(sequence.get("sequence_id") or "").strip()
+        if not sequence_id or sequence_id in intents:
+            raise ValueError(
+                f"director_plan has invalid or duplicate sequence_id: {sequence_id}"
+            )
+        intent: Dict[str, str] = {"sequence_id": sequence_id}
+        for field in DIRECTOR_INTENT_FIELDS:
+            value = sequence.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"director_plan sequence {sequence_id} has empty {field}"
+                )
+            intent[field] = value.strip()
+        intents[sequence_id] = intent
+        actual_ids.append(sequence_id)
+    if actual_ids != expected_ids:
+        raise ValueError(
+            "director_plan sequence coverage/order does not match events; "
+            f"expected={expected_ids}, actual={actual_ids}"
+        )
+    return intents
+
+
 def _normalize_character_reference(value: Any) -> str:
     """Backward-compatible wrapper around the shared identity normalizer."""
     return normalize_character_reference(value)
@@ -1372,6 +1430,7 @@ def _inherit_event_semantics(
     shots: List[Dict[str, Any]],
     events: List[Dict[str, Any]],
     characters: Optional[List[Dict[str, Any]]] = None,
+    director_plan: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Carry source screenplay evidence into shots after the LLM adaptation pass.
 
@@ -1380,6 +1439,7 @@ def _inherit_event_semantics(
     deterministic and auditable downstream.
     """
     event_by_id = {index: event for index, event in enumerate(events, 1)}
+    director_intents = _director_intents_by_sequence(director_plan, events)
     event_occurrences: Dict[int, List[int]] = {}
     for shot_index, shot in enumerate(shots):
         raw_ids = shot.get("source_events", [])
@@ -1491,6 +1551,15 @@ def _inherit_event_semantics(
         ]
         roles = [str(event.get("event_role")) for event in details if event.get("event_role")]
         shot["source_sequence_ids"] = sequence_ids
+        if director_intents:
+            if len(sequence_ids) != 1 or sequence_ids[0] not in director_intents:
+                raise ValueError(
+                    "adapted shot cannot bind one director intent: "
+                    f"source_sequence_ids={sequence_ids}"
+                )
+            shot["director_intent"] = copy.deepcopy(
+                director_intents[sequence_ids[0]]
+            )
         shot["source_action_unit_ids"] = list(dict.fromkeys(action_unit_ids))
         shot["source_event_roles"] = list(dict.fromkeys(roles))
         shot["source_event_slices"] = [
@@ -1632,6 +1701,8 @@ def _inherit_event_semantics(
 BEAT_SKELETON_PROMPT = (
     "目标时长：{target_duration}秒，每镜约{shot_duration}秒。请把全部事件压缩为恰好{beat_count}个 beat。\n\n"
     "事件列表：\n{events_json}\n\n角色列表：\n{characters_summary}\n\n"
+    "逐 sequence 导演意图（只规定为什么这样拍，不替你决定具体镜头字段）：\n"
+    "{director_intents_json}\n\n"
     "固定 beat/sequence 槽位：\n{sequence_beat_plan}\n\n"
     "只做全局改编与镜头语言规划，不要展开 visual 或人物外貌。输出严格 JSON 对象："
     '{{"strategy":"一句话改编策略","beats":[{{"beat_order":1,"source_events":[1],'
@@ -1661,6 +1732,9 @@ BEAT_SKELETON_PROMPT = (
     "minimum_kept_primary_beat_occurrences；同一事件的后续引用只承载尚未表现的动作，不得重放。\n"
     "6. sequence_id 与 continuity_before 是生成连续性依据。每个 beat 只能引用固定槽位指定 sequence 的事件；"
     "同一 sequence 的连续单元落在相邻 beat，换场/跳时/关系转折不得为了省镜头而错误连拍。\n"
+    "6a. 每个 beat 必须服从对应 sequence 的 director intent：scene_goal 决定叙事目的，emotion_arc 决定"
+    "情绪推进，visual_focus 决定观众注意点，spatial_intent 决定空间关系，transition_intent 决定边界设计；"
+    "Director 不替你决定景别、机位、运镜、焦段、光影、镜头数或时长。\n"
     "7. shot_size、camera_movement、lighting_key、shot_intent、hero_moment、texture_keywords "
     "是骨架的全局结构字段，全部必填。相邻 beat 景别必须形成差异，动作 beat 不得全部 static；"
     "4 个及以上 beat 必须至少一个 hero_moment=true，每个 beat 给出 2–4 个具体纹理关键词。"
@@ -2675,6 +2749,7 @@ def _build_beat_skeleton(
     target_duration: int,
     shot_duration: int,
     beat_count: Optional[int] = None,
+    director_plan: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build a globally informed, bounded beat table (Stage 1)."""
     profile = get_video_capabilities()
@@ -2700,6 +2775,7 @@ def _build_beat_skeleton(
             1,
         )
     ]
+    director_intents = _director_intents_by_sequence(director_plan, events)
     prompt_events = []
     for event_id, event in enumerate(events, 1):
         prompt_event = dict(event)
@@ -2716,6 +2792,11 @@ def _build_beat_skeleton(
         events_json=_build_events_json(prompt_events),
         characters_summary=characters_summary,
         sequence_beat_plan=json.dumps(sequence_beat_plan, ensure_ascii=False),
+        director_intents_json=json.dumps(
+            list(director_intents.values()),
+            ensure_ascii=False,
+            indent=2,
+        ),
     )
     last_validation_error = ""
     for attempt in range(1 + MAX_RETRIES):
@@ -2769,6 +2850,27 @@ def _build_beat_skeleton(
             event_by_id = {i: dict(event, event_id=i) for i, event in enumerate(events, 1)}
             for beat in skeleton["beats"]:
                 beat["_source_event_details"] = [event_by_id[event_id] for event_id in beat["source_events"]]
+                if director_intents:
+                    beat_sequences = list(
+                        dict.fromkeys(
+                            str(
+                                event_by_id[event_id].get("sequence_id") or ""
+                            ).strip()
+                            for event_id in beat["source_events"]
+                        )
+                    )
+                    if (
+                        len(beat_sequences) != 1
+                        or beat_sequences[0] not in director_intents
+                    ):
+                        raise ValueError(
+                            "beat cannot bind one director intent: "
+                            f"source_events={beat['source_events']}, "
+                            f"sequence_ids={beat_sequences}"
+                        )
+                    beat["director_intent"] = copy.deepcopy(
+                        director_intents[beat_sequences[0]]
+                    )
             return skeleton
         except (json.JSONDecodeError, ValueError) as e:
             last_validation_error = str(e)
@@ -2862,6 +2964,10 @@ def _expand_beats_to_shots(
                     for field in _SHOT_LANGUAGE_FIELDS:
                         value = beat[field]
                         shot[field] = list(value) if isinstance(value, list) else value
+                    if beat.get("director_intent"):
+                        shot["director_intent"] = copy.deepcopy(
+                            beat["director_intent"]
+                        )
                     apply_camera_motion_contract(shot)
                     missing = expanded_fields - set(shot)
                     if missing:
@@ -2927,7 +3033,7 @@ def _atomic_write_json(path: Path, value: Any) -> None:
     os.replace(temporary, path)
 
 
-LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v9"
+LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v10"
 
 
 def _layered_input_fingerprint(
@@ -2936,6 +3042,7 @@ def _layered_input_fingerprint(
     target_duration: int,
     shot_duration: int,
     expected_beats: int,
+    director_plan: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Bind layered checkpoints to the complete semantic adaptation input."""
     contract = {
@@ -2945,6 +3052,9 @@ def _layered_input_fingerprint(
         "target_duration": target_duration,
         "shot_duration": shot_duration,
         "expected_beats": expected_beats,
+        "director_intents": list(
+            _director_intents_by_sequence(director_plan, events).values()
+        ),
     }
     encoded = json.dumps(
         contract,
@@ -3024,6 +3134,7 @@ def adapt_events(
     shot_duration: int = AVG_SHOT_DURATION,
     source_text: Optional[str] = None,
     output_dir: Optional[str | Path] = None,
+    director_plan: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     将事件列表改编为 shot 列表
@@ -3034,6 +3145,7 @@ def adapt_events(
         target_duration: 最终交付时长（秒），默认 None（根据剧本长度智能预估）
         shot_duration: 每镜平均时长（秒），默认 12
         source_text: 原始剧本文本（用于智能预估时长）
+        director_plan: Event Extractor 之后生成的 sequence 导演意图
 
     Returns:
         包含交付时长、剪辑前素材时长、容量计划与 shots 的字典
@@ -3088,6 +3200,7 @@ def adapt_events(
             material_duration,
             effective_shot_duration,
             max_shots,
+            director_plan,
         )
         skeleton = None
         resumed_shots: List[Dict[str, Any]] = []
@@ -3102,6 +3215,7 @@ def adapt_events(
             skeleton = _build_beat_skeleton(
                 events, characters_summary, material_duration, effective_shot_duration,
                 max_shots,
+                director_plan,
             )
             skeleton["_checkpoint"] = {
                 "schema": LAYERED_CHECKPOINT_SCHEMA,
@@ -3122,7 +3236,12 @@ def adapt_events(
         for i, shot in enumerate(shots, 1):
             shot["shot_order"] = i
 
-        _inherit_event_semantics(shots, events, characters)
+        _inherit_event_semantics(
+            shots,
+            events,
+            characters,
+            director_plan,
+        )
         for shot in shots:
             apply_camera_motion_contract(shot)
         from quality.shot_continuity import annotate_boundaries

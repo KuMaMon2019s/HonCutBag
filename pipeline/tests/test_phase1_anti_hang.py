@@ -271,6 +271,22 @@ def test_progress_reporter_emits_heartbeat(tmp_path):
 def test_director_planner_uses_shared_streaming_client(monkeypatch, tmp_path):
     client = object()
     observed = {}
+    events = [{
+        "sequence_id": "SEQ001",
+        "what": "仙宫从云海中显现",
+        "emotion": "敬畏",
+    }]
+    plan = {
+        "schema": director_planner.DIRECTOR_PLAN_SCHEMA,
+        "sequences": [{
+            "sequence_id": "SEQ001",
+            "scene_goal": "建立仙宫尺度",
+            "emotion_arc": "平静→敬畏",
+            "visual_focus": "仙宫与云海的尺度关系",
+            "spatial_intent": "仙宫居中，云海形成纵深",
+            "transition_intent": "沿云层运动进入下一段",
+        }],
+    }
 
     monkeypatch.setattr(director_planner, "get_api_key", lambda _name: "test-key")
 
@@ -283,11 +299,11 @@ def test_director_planner_uses_shared_streaming_client(monkeypatch, tmp_path):
     def fake_stream(*, messages, **kwargs):
         observed["messages"] = messages
         observed["stream_args"] = kwargs
-        return json.dumps({"scenes": [], "scene_transitions": []})
+        return json.dumps(plan, ensure_ascii=False)
 
     monkeypatch.setattr(director_planner, "call_llm_stream", fake_stream)
 
-    result = director_planner.plan_director("云海中的仙宫", tmp_path)
+    result = director_planner.plan_director(events, tmp_path)
 
     assert result["status"] == "done"
     assert observed["client_args"] == {"read_timeout": director_planner.LLM_IDLE_TIMEOUT}
@@ -296,7 +312,7 @@ def test_director_planner_uses_shared_streaming_client(monkeypatch, tmp_path):
     assert observed["stream_args"]["idle_timeout"] == director_planner.LLM_IDLE_TIMEOUT
     assert observed["stream_args"]["model"] == DEFAULT_TEXT_MODEL
     assert observed["messages"][0]["role"] == "system"
-    assert json.loads((tmp_path / "director_plan.json").read_text())["scenes"] == []
+    assert json.loads((tmp_path / "director_plan.json").read_text()) == plan
 
 
 def test_director_planner_propagates_provider_failure(monkeypatch, tmp_path):
@@ -309,7 +325,10 @@ def test_director_planner_propagates_provider_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(director_planner, "call_llm_stream", provider_timeout)
 
     with pytest.raises(RuntimeError, match="director planning failed: provider wall timeout"):
-        director_planner.plan_director("云海中的仙宫", tmp_path)
+        director_planner.plan_director(
+            [{"sequence_id": "SEQ001", "what": "云海中的仙宫"}],
+            tmp_path,
+        )
 
     assert not (tmp_path / "director_plan.json").exists()
 
@@ -517,10 +536,28 @@ def test_combined_phase1_starts_progress_before_director(monkeypatch, tmp_path):
         return {"status": "done"}
 
     monkeypatch.setattr(pipeline_core, "run_phase1_director", fake_director)
+
+    def fake_screenwriter(
+        _text,
+        output_dir,
+        _duration,
+        dry_run,
+        *,
+        _director_runner,
+        **_kwargs,
+    ):
+        calls.append(("event_extractor",))
+        director = _director_runner(
+            [{"sequence_id": "SEQ001", "what": "synthetic"}],
+            output_dir,
+            dry_run,
+        )
+        return {"status": "done", "director": director}
+
     monkeypatch.setattr(
         pipeline_core,
         "run_phase1_screenwriter",
-        lambda *_args, **_kwargs: {"status": "done"},
+        fake_screenwriter,
     )
 
     result = pipeline_core.run_phase1(
@@ -528,19 +565,38 @@ def test_combined_phase1_starts_progress_before_director(monkeypatch, tmp_path):
     )
 
     assert result["status"] == "done"
-    assert calls.index(("heartbeat_start", "phase1")) < calls.index(("director",))
+    assert calls.index(("heartbeat_start", "phase1")) < calls.index(("event_extractor",))
+    assert calls.index(("event_extractor",)) < calls.index(("director",))
     assert calls[-1] == ("heartbeat_stop",)
 
 
-def test_combined_phase1_fails_closed_before_screenwriter_when_director_fails(tmp_path):
+def test_combined_phase1_fails_closed_before_adaptation_when_director_fails(tmp_path):
     screenwriter_called = False
+    adaptation_called = False
 
     def failed_director(*_args, **_kwargs):
         return {"status": "error", "error": "director timeout"}
 
-    def unexpected_screenwriter(*_args, **_kwargs):
-        nonlocal screenwriter_called
+    def screenwriter_with_failed_director(
+        _text,
+        output_dir,
+        _duration,
+        dry_run,
+        *,
+        _director_runner,
+        **_kwargs,
+    ):
+        nonlocal adaptation_called, screenwriter_called
+        from phases.phase1.phase1_screenwriter import _plan_director_for_events
+
         screenwriter_called = True
+        _plan_director_for_events(
+            [{"sequence_id": "SEQ001", "what": "synthetic"}],
+            output_dir,
+            dry_run,
+            _director_runner,
+        )
+        adaptation_called = True
         return {"status": "done"}
 
     with pytest.raises(RuntimeError, match="director planning returned error"):
@@ -550,10 +606,11 @@ def test_combined_phase1_fails_closed_before_screenwriter_when_director_fails(tm
             30,
             False,
             _director_runner=failed_director,
-            _screenwriter_runner=unexpected_screenwriter,
+            _screenwriter_runner=screenwriter_with_failed_director,
         )
 
-    assert screenwriter_called is False
+    assert screenwriter_called is True
+    assert adaptation_called is False
 
 
 def test_storyboard_default_path_runs_three_shots_concurrently(monkeypatch):
@@ -587,7 +644,9 @@ def test_phase1_checkpoints_are_written_and_reused(monkeypatch, tmp_path):
     import prompt.text_parser as text_parser
 
     calls = {"events": 0, "characters": 0}
-    events_payload = {"events": [{"id": 1, "who": []}]}
+    events_payload = {
+        "events": [{"id": 1, "sequence_id": "SEQ001", "who": []}]
+    }
     characters_payload = {"characters": []}
 
     monkeypatch.setattr(text_parser, "parse_text", lambda _text: {"segments": [{"id": 1}]})
@@ -617,6 +676,14 @@ def test_phase1_checkpoints_are_written_and_reused(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(pipeline_core, "run_quality_check", lambda *_args: SimpleNamespace(passed=True, grade="A"))
     monkeypatch.setattr("quality.quality_gate.run_storyboard_review", lambda **_kwargs: {"grade": "A"})
+    monkeypatch.setattr(
+        pipeline_core,
+        "run_phase1_director",
+        lambda *_args, **_kwargs: {
+            "status": "done",
+            "plan": {"schema": "honcut.director-plan.v1", "sequences": []},
+        },
+    )
 
     first = pipeline_core.run_phase1_screenwriter("synthetic input", tmp_path, 15, False)
     second = pipeline_core.run_phase1_screenwriter("synthetic input", tmp_path, 15, False)
@@ -647,7 +714,11 @@ def test_phase1_legacy_checkpoint_is_regenerated(monkeypatch, tmp_path):
         "extract_events",
         lambda _segments, **_kwargs: (
             calls.__setitem__("events", calls["events"] + 1)
-            or {"events": [{"id": 1, "who": ["凛"]}]}
+            or {
+                "events": [
+                    {"id": 1, "sequence_id": "SEQ001", "who": ["凛"]}
+                ]
+            }
         ),
     )
     monkeypatch.setattr(
@@ -676,6 +747,14 @@ def test_phase1_legacy_checkpoint_is_regenerated(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(pipeline_core, "run_quality_check", lambda *_args: SimpleNamespace(passed=True, grade="A"))
     monkeypatch.setattr("quality.quality_gate.run_storyboard_review", lambda **_kwargs: {"grade": "A"})
+    monkeypatch.setattr(
+        pipeline_core,
+        "run_phase1_director",
+        lambda *_args, **_kwargs: {
+            "status": "done",
+            "plan": {"schema": "honcut.director-plan.v1", "sequences": []},
+        },
+    )
 
     result = pipeline_core.run_phase1_screenwriter("凛出现", tmp_path, 15, False)
 

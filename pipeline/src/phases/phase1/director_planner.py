@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-"""
-director_planner.py — M1: HonCut 导演规划层
-作为 Phase 1 的导演子步骤，产出结构化的导演规划。
-只做四件事：拆分场、台词统计、情绪分析、过渡设计。
-"""
+"""Sequence-aware director intent planning for Phase 1."""
 
 import json
 from pathlib import Path
+from typing import Any
 
 from runtime.llm_policy import LLMStreamPolicy
 from utils.ark_llm import call_llm_stream, create_ark_client
@@ -17,71 +14,125 @@ DIRECTOR_LLM_POLICY = LLMStreamPolicy.long_structured_output(max_tokens=8000)
 LLM_WALL_TIMEOUT = DIRECTOR_LLM_POLICY.wall_timeout_seconds
 LLM_IDLE_TIMEOUT = DIRECTOR_LLM_POLICY.idle_timeout_seconds
 
+DIRECTOR_PLAN_SCHEMA = "honcut.director-plan.v1"
+DIRECTOR_INTENT_FIELDS = (
+    "scene_goal",
+    "emotion_arc",
+    "visual_focus",
+    "spatial_intent",
+    "transition_intent",
+)
+
 SYSTEM_PROMPT = (
-    "你是资深影视导演。对剧本做导演级规划分析。"
-    "只做四件事：拆分场、台词统计、情绪分析、过渡设计。"
-    "不规划光影、色调、配乐。"
+    "你是资深影视导演。事件账本已经完成剧本理解与分段。"
+    "你只为每个既有 sequence_id 定义五项导演意图：scene_goal、emotion_arc、"
+    "visual_focus、spatial_intent、transition_intent。"
+    "不要重新分场，不决定镜头数量、景别、机位角度、运镜、焦段、光影或时长；"
+    "这些具体拍摄决策由下游 adaptation engine 负责。"
     "输出严格 JSON，不要输出任何解释文字。"
-    # --- P2-5e: M1 流程约束 ---
-    "严格按5步线性执行，不回退：1.通读全文→2.拆分场→3.台词统计→4.情绪分析→5.过渡设计。"
-    "方法论不外泄，只输出结构化JSON结果。"
+    "必须逐一覆盖输入中的全部 sequence_id，保持原顺序，不新增、不合并、不遗漏。"
 )
 
 USER_PROMPT_TEMPLATE = (
-    "请对以下剧本做导演规划，输出 JSON：\n\n"
-    "剧本：\n{script_text}\n\n"
+    "请读取以下 canonical 事件账本，为既有 sequence 做导演意图规划。"
+    "不要重新分场，也不要输出具体 shot 字段。\n\n"
+    "事件账本：\n{events_json}\n\n"
     "输出格式：\n"
     "{{\n"
-    '  "scenes": [\n'
+    f'  "schema": "{DIRECTOR_PLAN_SCHEMA}",\n'
+    '  "sequences": [\n'
     "    {{\n"
-    '      "scene_id": "Sc1",\n'
-    '      "scene_name": "地点·时间概况",\n'
-    '      "dialogue_count": 3,\n'
-    '      "dialogue_words": 86,\n'
-    '      "emotion_intensity": 4,\n'
+    '      "sequence_id": "SEQ001",\n'
+    '      "scene_goal": "这一段为什么存在",\n'
     '      "emotion_arc": "情绪X→情绪Y",\n'
-    '      "notes": {{\n'
-    '        "emotional_peak": "关键情感砸点",\n'
-    '        "consistency_anchors": ["角色: 外貌服装锚点"],\n'
-    '        "spatial": "空间与距离描述",\n'
-    '        "ambient_sound": "环境音提示",\n'
-    '        "pitfall": "易错提示"\n'
-    "      }}\n"
-    "    }}\n"
-    "  ],\n"
-    '  "scene_transitions": [\n'
-    "    {{\n"
-    '      "from": "Sc1",\n'
-    '      "to": "Sc2",\n'
-    '      "type": "动作桥梁|情绪接力|空间视线|台词黏合",\n'
-    '      "description": "过渡描述"\n'
-    "    }}\n"
-    "  ],\n"
-    '  "spatial_positions": [\n'
-    "    {{\n"
-    '      "character": "角色名",\n'
-    '      "default_position": "左前/右前/居中/左后/右后",\n'
-    '      "default_facing": "面朝左/面朝右/面朝镜头/背对镜头"\n'
+    '      "visual_focus": "观众应该重点看什么",\n'
+    '      "spatial_intent": "人物与环境的空间关系",\n'
+    '      "transition_intent": "如何进入下一段或如何收束"\n'
     "    }}\n"
     "  ]\n"
-    "}}\n\n"
-    "分场原则：一个场=同一时空下一段连续戏，以地点变更/时间跳变/戏剧单元收束为切点。\n"
-    "情绪分析：逐场给情绪浓度0~10 + 场内情绪推进X→Y。\n"
-    "场间过渡4种桥梁：\n"
-    "1. 动作桥梁：同一组人物连续动作，前段结尾=动作起始态，后段首镜=进行时/完成时\n"
-    "2. 情绪接力：对话/冲突情绪延续，前段结尾用反应镜/微表情铺垫，后段承接强化\n"
-    "3. 空间视线：场景切换/视线转移，空镜+视线引导+声音延续\n"
-    "4. 台词黏合：台词/音效需画面回应，前段末尾声音延续到后段首镜\n"
-    "空间位置基准：为每个角色建立默认站位和朝向，后续分镜必须按此基准标注，确保跨镜位置一致。\n"
+    "}}\n"
 )
 
 
-def plan_director(script_text: str, output_dir: Path, dry_run: bool = False) -> dict:
+def _sequence_ids(events: list[dict[str, Any]]) -> list[str]:
+    sequence_ids: list[str] = []
+    for index, event in enumerate(events, 1):
+        if not isinstance(event, dict):
+            raise ValueError(f"director event {index} must be an object")
+        sequence_id = str(event.get("sequence_id") or "").strip()
+        if not sequence_id:
+            raise ValueError(f"director event {index} is missing sequence_id")
+        if sequence_id not in sequence_ids:
+            sequence_ids.append(sequence_id)
+    if not sequence_ids:
+        raise ValueError("director planning requires at least one sequence")
+    return sequence_ids
+
+
+def validate_director_plan(
+    plan: object,
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Validate exact event-ledger coverage and the narrow intent contract."""
+    if not isinstance(plan, dict):
+        raise ValueError("director plan must be a JSON object")
+    if plan.get("schema") != DIRECTOR_PLAN_SCHEMA:
+        raise ValueError(
+            f"director plan schema must be {DIRECTOR_PLAN_SCHEMA}"
+        )
+    if set(plan) != {"schema", "sequences"}:
+        raise ValueError("director plan must contain only schema and sequences")
+    sequences = plan.get("sequences")
+    if not isinstance(sequences, list):
+        raise ValueError("director plan sequences must be an array")
+
+    expected_ids = _sequence_ids(events)
+    actual_ids: list[str] = []
+    allowed_fields = {"sequence_id", *DIRECTOR_INTENT_FIELDS}
+    for index, sequence in enumerate(sequences, 1):
+        if not isinstance(sequence, dict):
+            raise ValueError(f"director sequence {index} must be an object")
+        if set(sequence) != allowed_fields:
+            missing = sorted(allowed_fields - set(sequence))
+            extra = sorted(set(sequence) - allowed_fields)
+            raise ValueError(
+                f"director sequence {index} fields mismatch; "
+                f"missing={missing}, extra={extra}"
+            )
+        sequence_id = str(sequence.get("sequence_id") or "").strip()
+        if not sequence_id:
+            raise ValueError(f"director sequence {index} has empty sequence_id")
+        if sequence_id in actual_ids:
+            raise ValueError(f"director sequence_id is duplicated: {sequence_id}")
+        actual_ids.append(sequence_id)
+        for field in DIRECTOR_INTENT_FIELDS:
+            value = sequence.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"director sequence {sequence_id} has empty {field}"
+                )
+
+    if actual_ids != expected_ids:
+        missing = [value for value in expected_ids if value not in actual_ids]
+        unknown = [value for value in actual_ids if value not in expected_ids]
+        raise ValueError(
+            "director sequence coverage/order mismatch; "
+            f"expected={expected_ids}, actual={actual_ids}, "
+            f"missing={missing}, unknown={unknown}"
+        )
+    return plan
+
+
+def plan_director(
+    events: list[dict[str, Any]],
+    output_dir: Path,
+    dry_run: bool = False,
+) -> dict:
     """
     Phase 1: 导演规划
 
     Args:
-        script_text: 剧本文本
+        events: Event Extractor 产出的 canonical 事件账本
         output_dir: 输出目录
         dry_run: dry-run 模式
 
@@ -103,7 +154,10 @@ def plan_director(script_text: str, output_dir: Path, dry_run: bool = False) -> 
             raise RuntimeError("director planning requires ARK_AGENT_API_KEY")
 
         client = create_ark_client(read_timeout=LLM_IDLE_TIMEOUT)
-        user_prompt = USER_PROMPT_TEMPLATE.format(script_text=script_text[:8000])
+        _sequence_ids(events)
+        user_prompt = USER_PROMPT_TEMPLATE.format(
+            events_json=json.dumps(events, ensure_ascii=False, indent=2)
+        )
 
         content = call_llm_stream(
             messages=[
@@ -126,17 +180,18 @@ def plan_director(script_text: str, output_dir: Path, dry_run: bool = False) -> 
             lines = text.split("\n")
             text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
 
-        plan = json.loads(text)
+        plan = validate_director_plan(json.loads(text), events)
 
         # 写入文件
         plan_path.write_text(json.dumps(plan, indent=2, ensure_ascii=False), encoding="utf-8")
 
-        scenes = plan.get("scenes", [])
-        transitions = plan.get("scene_transitions", [])
-        print(f"  ✓ [M1] 导演规划完成: {len(scenes)} 场, {len(transitions)} 个过渡")
-        for s in scenes:
-            print(f"    {s.get('scene_id', '?')}: {s.get('scene_name', '?')} "
-                  f"(情绪{s.get('emotion_intensity', '?')}/10, {s.get('emotion_arc', '?')})")
+        sequences = plan["sequences"]
+        print(f"  ✓ [M1] 导演意图完成: {len(sequences)} 个 sequence")
+        for sequence in sequences:
+            print(
+                f"    {sequence['sequence_id']}: {sequence['scene_goal']} "
+                f"({sequence['emotion_arc']})"
+            )
 
         return {"status": "done", "plan": plan, "output": str(plan_path)}
 

@@ -860,6 +860,7 @@ def _generate_single_shot(
         "source_excerpt", "source_sequence_ids", "source_action_unit_ids",
         "source_events", "dropped_source_events", "source_event_slices",
         "source_event_roles",
+        "director_intent",
         "micro_actions", "generation_actions", "generation_action_units",
         "generation_action_categories",
         "body_action_choreography", "body_action_contract",

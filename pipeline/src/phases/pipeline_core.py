@@ -129,6 +129,8 @@ def run_phase1_screenwriter(
     reporter: Optional[ProgressReporter] = None,
     shot_duration: int = AVG_SHOT_DURATION,
     project_video_spec: dict[str, Any] | None = None,
+    *,
+    _director_runner=None,
 ) -> dict:
     _phase1_screenwriter_owner._integrate_storyboard_prompts = _integrate_storyboard_prompts
     _phase1_screenwriter_owner._attach_director_storyboard = _attach_director_storyboard
@@ -145,6 +147,7 @@ def run_phase1_screenwriter(
         reporter=reporter,
         shot_duration=shot_duration,
         project_video_spec=project_video_spec,
+        _director_runner=_director_runner or run_phase1_director,
     )
 
 

@@ -25,7 +25,7 @@ def run_phase1(
     _director_runner=None,
     _screenwriter_runner=None,
 ) -> dict:
-    """Phase 1: director planning followed by the screenwriter engine."""
+    """Phase 1 composition; Screenwriter invokes Director after event extraction."""
     started = _now()
     if reporter:
         # LangGraph enters the combined runner directly, so establish visible
@@ -36,31 +36,18 @@ def run_phase1(
             and hasattr(reporter, "phase_start")
         ):
             reporter.phase_start("phase1", "导演拆解 + 编剧引擎")
-        reporter.step("phase1", "导演规划", progress_pct=1)
+        reporter.step("phase1", "文本解析与事件提取", progress_pct=1)
         reporter.start_heartbeat("phase1")
         configure_heartbeat_callback(
             lambda: reporter.step(
                 "phase1",
-                "导演规划 LLM 流式响应",
+                "Phase 1 LLM 流式响应",
                 progress_pct=getattr(reporter, "_progress_pct", 1),
             )
         )
     director_runner = _director_runner or run_phase1_director
     screenwriter_runner = _screenwriter_runner or run_phase1_screenwriter
     try:
-        director = director_runner(text, Path(output_dir), dry_run)
-        director_status = director.get("status")
-        if director_status != "done" and not (
-            dry_run and director_status == "skipped"
-        ):
-            detail = (
-                director.get("error")
-                or director.get("reason")
-                or "missing success evidence"
-            )
-            raise RuntimeError(
-                f"director planning returned {director_status}: {detail}"
-            )
         screenwriter = screenwriter_runner(
             text,
             output_dir,
@@ -69,12 +56,12 @@ def run_phase1(
             reporter=reporter,
             shot_duration=shot_duration,
             project_video_spec=project_video_spec,
+            _director_runner=director_runner,
         )
     finally:
         configure_heartbeat_callback(None)
         if reporter:
             reporter.stop_heartbeat()
     combined = dict(screenwriter)
-    combined["director"] = director
     combined["duration_s"] = _elapsed(started)
     return combined
