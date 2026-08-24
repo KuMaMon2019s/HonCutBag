@@ -261,6 +261,8 @@ Seedream 图片请求的唯一传输 owner 是 `clients/seedream_client.py`，Ph
 
 所有 HonCut 自有 Ark SDK 传输，包括独立监督器，必须显式构造 `trust_env=False` 的 HTTP client；环境中的 `ALL_PROXY`、`HTTP_PROXY` 或 `HTTPS_PROXY` 不得改变 Provider 路由、触发可选 SOCKS 依赖或令真实 QA 静默降级。代理策略只属于明确配置的 Runtime owner，Phase 和质量门不得自行继承宿主代理。
 
+独立 storyboard 监督器只接收 `honcut.supervision-storyboard-projection.v1`：顶层交付时长与镜头统计、逐镜身份/动作/状态/时空/镜头语言/Director 五项意图，以及逐 Pxx 的叙事时长和动作状态。完整 canonical storyboard、Provider prompt、媒体路径、收据、哈希、material/capacity 账和历史补画字段不得进入监督 Prompt；确定性 Phase 5 检查仍拥有这些完整工件，语义投影不得取代其 fail-closed 验收。
+
 更换 Prompt 模板、模型、Provider、生成参数或输入资产时必须产生新 fingerprint；修改密钥不得改变 fingerprint。
 
 ## 7. Dry-run 与离线验收边界

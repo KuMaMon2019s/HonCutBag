@@ -16,6 +16,84 @@ from utils.ark_llm import call_llm_stream
 
 MAX_TOKENS = 4096
 
+_SUPERVISION_TOP_LEVEL_FIELDS = (
+    "title",
+    "target_duration",
+    "delivery_target_duration",
+    "material_duration",
+    "total_shots",
+    "storyboard_beat_count",
+    "aspect_ratio",
+)
+_SUPERVISION_SHOT_FIELDS = (
+    "id",
+    "shot_order",
+    "name",
+    "duration",
+    "where",
+    "who",
+    "character_ids",
+    "what",
+    "visual",
+    "description",
+    "action_description",
+    "micro_actions",
+    "start_state",
+    "end_state",
+    "emotion",
+    "hero_moment",
+    "shot_intent",
+    "shot_size",
+    "camera_angle",
+    "camera_movement",
+    "lens_mm",
+    "lighting_key",
+    "lighting_description",
+    "time",
+    "time_of_day",
+    "time_window",
+    "transition_to_next",
+    "source_sequence_ids",
+    "source_excerpt",
+    "dialogue",
+)
+_SUPERVISION_BEAT_FIELDS = (
+    "beat_id",
+    "position",
+    "duration_s",
+    "effective_story_duration_s",
+    "action",
+    "micro_actions",
+    "start_state",
+    "end_state",
+    "hero_moment",
+    "shot_intent",
+    "shot_size",
+    "camera_angle",
+    "camera_movement",
+    "lens_mm",
+    "lighting_key",
+    "source_action_unit_ids",
+)
+_SUPERVISION_DIRECTOR_FIELDS = (
+    "sequence_id",
+    "scene_goal",
+    "emotion_arc",
+    "visual_focus",
+    "spatial_intent",
+    "transition_intent",
+)
+_SUPERVISION_TEMPORAL_FIELDS = (
+    "period",
+    "label",
+    "source_time",
+    "source_kind",
+    "local_clock_window",
+    "visible_light_requirements",
+    "forbidden_visual_cues",
+    "continuity",
+)
+
 SYSTEM_PROMPT = """You are an independent film producer reviewing a completed storyboard.
 Review it with fresh eyes. Check narrative and spatial continuity, character
 identity and appearance consistency across shots, conformance to the supplied
@@ -69,14 +147,61 @@ def _call_llm(prompt: str, config: dict[str, Any]) -> str:
     )
 
 
+def _selected_fields(value: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
+    return {
+        field: value[field]
+        for field in fields
+        if field in value and value[field] not in (None, "", [], {})
+    }
+
+
+def _supervision_storyboard_contract(storyboard: dict[str, Any]) -> dict[str, Any]:
+    """Project authored semantics without Provider prompts or artifact history."""
+    contract = {
+        "schema": "honcut.supervision-storyboard-projection.v1",
+        **_selected_fields(storyboard, _SUPERVISION_TOP_LEVEL_FIELDS),
+        "shots": [],
+    }
+    for raw_shot in storyboard.get("shots") or []:
+        if not isinstance(raw_shot, dict):
+            continue
+        shot = _selected_fields(raw_shot, _SUPERVISION_SHOT_FIELDS)
+        director_intent = raw_shot.get("director_intent")
+        if isinstance(director_intent, dict):
+            selected_director = _selected_fields(
+                director_intent,
+                _SUPERVISION_DIRECTOR_FIELDS,
+            )
+            if selected_director:
+                shot["director_intent"] = selected_director
+        temporal_contract = raw_shot.get("temporal_visual_contract")
+        if isinstance(temporal_contract, dict):
+            selected_temporal = _selected_fields(
+                temporal_contract,
+                _SUPERVISION_TEMPORAL_FIELDS,
+            )
+            if selected_temporal:
+                shot["temporal_visual_contract"] = selected_temporal
+        beats = [
+            _selected_fields(beat, _SUPERVISION_BEAT_FIELDS)
+            for beat in (raw_shot.get("storyboard_beats") or [])
+            if isinstance(beat, dict)
+        ]
+        if beats:
+            shot["storyboard_beats"] = beats
+        contract["shots"].append(shot)
+    return contract
+
+
 def _review_prompt(storyboard: dict, visual_style: str) -> str:
+    contract = _supervision_storyboard_contract(storyboard)
     return (
         "Review the following storyboard independently. The supplied style is "
         "a constraint, not story material. Evaluate total shot duration against "
         "any target duration recorded in the storyboard.\n\n"
         f"VISUAL STYLE:\n{visual_style or '(not specified)'}\n\n"
-        "STORYBOARD JSON:\n"
-        f"{json.dumps(storyboard, ensure_ascii=False, sort_keys=True)}"
+        "STORYBOARD SEMANTIC CONTRACT:\n"
+        f"{json.dumps(contract, ensure_ascii=False, sort_keys=True)}"
     )
 
 

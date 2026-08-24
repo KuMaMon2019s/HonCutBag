@@ -88,6 +88,42 @@ def test_client_ignores_ambient_socks_proxy(monkeypatch):
         client.close()
 
 
+def test_review_prompt_uses_bounded_semantic_projection():
+    storyboard = _storyboard()
+    storyboard.update({
+        "title": "Future Station",
+        "provider_prompt": "LEAKED_PROVIDER_PROMPT" * 10_000,
+        "material_budget": {"receipt_body": "LEAKED_RECEIPT" * 10_000},
+    })
+    storyboard["shots"][0].update({
+        "where": "rain-soaked platform",
+        "what": "the train arrives",
+        "start_state": "platform empty",
+        "end_state": "doors open",
+        "prompt": "LEAKED_SHOT_PROMPT" * 10_000,
+        "storyboard_beats": [{
+            "beat_id": "S01_P01",
+            "duration_s": 5,
+            "action": "train glides into view",
+            "provider_receipt": "LEAKED_BEAT_RECEIPT" * 10_000,
+        }],
+    })
+
+    prompt = supervision_agent._review_prompt(
+        storyboard,
+        "restrained cinematic style",
+    )
+
+    assert len(prompt) < 10_000
+    assert "honcut.supervision-storyboard-projection.v1" in prompt
+    assert "rain-soaked platform" in prompt
+    assert "train glides into view" in prompt
+    assert "LEAKED_PROVIDER_PROMPT" not in prompt
+    assert "LEAKED_RECEIPT" not in prompt
+    assert "LEAKED_SHOT_PROMPT" not in prompt
+    assert "LEAKED_BEAT_RECEIPT" not in prompt
+
+
 def test_blocking_mode_aborts_and_lists_issues(tmp_path, monkeypatch):
     response = {
         "grade": "D",
