@@ -31,6 +31,11 @@ from typing import List, Dict, Any
 from collections import defaultdict
 
 from openai import OpenAI
+from schemas.understanding import (
+    CharacterUnderstandingBatch,
+    native_chat_json_schema_format,
+    parse_structured_output,
+)
 from utils.ark_llm import (
     LLMConnectTimeout,
     LLMIdleTimeout,
@@ -58,10 +63,11 @@ from utils.character_reference_contracts import (
 SYSTEM_PROMPT = (
     "你是角色设计师。根据故事事件中的角色信息，为每个角色生成视觉描述。"
     "描述必须足够详细，能让 AI 图片生成器画出一致的角色。"
-    "输出严格 JSON 数组，不要输出任何解释文字。"
+    "输出严格 JSON 对象，顶层只有 characters 数组，不要输出任何解释文字。"
     "\n\n重要过滤规则：只提取有具体外貌、动作、对话的人物角色。"
     "必须排除以下类型：天气现象（如'冷空气'、'风'）、动物（如'鸡'、'狗'）、"
-    "抽象指代（如'说话者'、'观察者'、'记录者'、'思考者'、'行走者'、'试验者'、'打探人员'）、"
+    "未被来源原文明示为代号、化名、姓名或昵称的抽象指代"
+    "（如'说话者'、'观察者'、'记录者'、'思考者'、'行走者'、'试验者'、'打探人员'）、"
     "复数群体（如'保安们'应合并为'保安'）、物品、概念。"
     "同一角色的编号、职业称呼和通用指代必须合并为一个对象："
     "保留最具体的主名，其余写入 aliases；禁止将'主角'、'他'、'她'单独输出为角色。"
@@ -85,7 +91,7 @@ USER_PROMPT_TEMPLATE = (
     "以下是故事中的角色列表和出现的事件：\n\n"
     "{character_context}\n\n"
     "注意：只提取有具体外貌、动作、对话的人物角色。排除：天气现象、动物、"
-    "抽象指代（如'说话者'、'观察者'）、复数群体。"
+    "未被来源原文明示为代号、化名、姓名或昵称的抽象指代（如'说话者'、'观察者'）、复数群体。"
     "同一实体的编号/职业/主角指代只输出一个对象，其余称呼放入 aliases；"
     "'主角'、'他'、'她'不得独立成条。最多保留5个主要角色。\n\n"
     "身份归一化硬约束：每个【来源称呼】必须被审计。若称呼带有服装、年龄、伤势、动作或地点修饰，"
@@ -93,7 +99,7 @@ USER_PROMPT_TEMPLATE = (
     "则不得生成角色。禁止按语言或字母类型区别处理，禁止把多词姓名截成最后一个词，禁止以模糊子串合并。\n\n"
     "忠实度要求：事件上下文中明确出现的服装颜色、层次、材质、发型和配饰必须逐项保留；"
     "只能补全未指定的细节，不能把淡粉改成月白、把轻纱改成其他面料或擅自换装。\n\n"
-    "为每个角色输出 JSON 对象，组成数组。每个对象包含：\n"
+    "输出 {{\"characters\":[...]}}。每个角色对象包含：\n"
     "- id: 英文标识（拼音或英文缩写，用于目录名，如 amy, wolf, old_man）\n"
     "- name: 角色名称（中文）\n"
     "- aliases: 别名数组（如 [\"小女孩\", \"她\"]）\n"
@@ -119,7 +125,8 @@ USER_PROMPT_TEMPLATE = (
     "- size: 推荐生成尺寸，默认使用 Seedream 5.0 lite 的 '2K' 档位\n"
     "- first_appearance: 首次出场的事件 ID（整数）\n"
     "- appearance_count: 出场次数（整数）\n"
-    "- relationships: 与其他角色的关系数组（可选），每项含 target_id, type, description\n\n"
+    "- relationships: 与其他角色的关系数组（可选），每项含 target_id, type, description\n"
+    "所有可选字符串/对象/数组也必须显式输出；无内容时分别使用空字符串、空对象字段值或 []。\n\n"
     "【衍生状态检测（HonCut derive_assets 规范）】\n"
     "分析每个角色在故事中是否有明显的状态变化（如淋湿、换装、受伤、变身）。\n"
     "如果有，在角色输出的 appearance 中增加 variants 字段：\n"
@@ -143,7 +150,7 @@ ENTITY_SUFFIXES = (
 )
 MAX_ENTITY_NAME_CHINESE_CHARS = 12
 GENERIC_CHARACTER_NAMES = {"主角", "主人公", "男主", "女主", "人物", "他", "她", "它"}
-CHARACTER_CONTEXT_SCHEMA_VERSION = 8
+CHARACTER_CONTEXT_SCHEMA_VERSION = 9
 
 GENERIC_BACKGROUND_CHARACTER_NAMES = {
     "路人", "行人", "游客", "观众", "听众", "读者",
@@ -202,139 +209,20 @@ def _call_llm(prompt: str) -> str:
         max_tokens=16000,
         wall_timeout=LLM_TIMEOUT,
         idle_timeout=LLM_IDLE_TIMEOUT,
+        response_format=native_chat_json_schema_format(
+            CharacterUnderstandingBatch
+        ),
         _client=client,
     )
 
 
-def _fix_json(text: str) -> str:
-    """
-    尝试修复常见的 JSON 格式错误
-
-    修复策略：
-    1. 缺少逗号：在 } 和 " 之间、} 和 { 之间、] 和 " 之间插入逗号
-    2. 尾部多余逗号：删除最后一个元素后的逗号
-    3. 截断的字符串/对象：找到最后一个完整的对象，截断后面的不完整内容
-    4. 未闭合的字符串：截断到最后一个完整的键值对
-    """
-    # 策略 1: 修复缺少逗号
-    # } 和 " 之间 (对象后跟字符串键)
-    text = re.sub(r'}\s*"', '}, "', text)
-    # } 和 { 之间 (对象后跟对象，数组中常见)
-    text = re.sub(r'}\s*{', '}, {', text)
-    # ] 和 " 之间
-    text = re.sub(r']\s*"', '], "', text)
-    # ] 和 { 之间
-    text = re.sub(r']\s*{', '], {', text)
-    # } 和 [ 之间
-    text = re.sub(r'}\s*\[', '}, [', text)
-
-    # 策略 2: 修复尾部多余逗号 (,] 或 ,})
-    text = re.sub(r',\s*]', ']', text)
-    text = re.sub(r',\s*}', '}', text)
-
-    # 策略 3: 处理截断的内容
-    # 检查是否有未闭合的引号或括号
-    open_braces = text.count('{') - text.count('}')
-    open_brackets = text.count('[') - text.count(']')
-
-    if open_braces > 0 or open_brackets > 0:
-        # 有未闭合的括号，找到最后一个完整的 } 并截断
-        last_complete_obj = text.rfind('}')
-        if last_complete_obj > 0:
-            text = text[:last_complete_obj + 1]
-            # 重新计算括号
-            open_brackets = text.count('[') - text.count(']')
-            if open_brackets > 0:
-                # 还需要闭合数组
-                text = text.rstrip()
-                if not text.endswith(']'):
-                    text += ']'
-        else:
-            # 没有完整的对象，尝试找到最后一个完整的值
-            # 查找最后一个 " 后跟 , 或 } 或 ] 的位置（表示完整值的结束）
-            last_complete_value = -1
-            for match in re.finditer(r'"\s*[,}\]]', text):
-                last_complete_value = match.end() - 1  # 位置在引号后
-            
-            if last_complete_value > 0:
-                # 截断到最后一个完整值
-                text = text[:last_complete_value + 1]
-                # 移除末尾可能的逗号
-                text = re.sub(r',\s*$', '', text)
-                # 添加必要的闭合
-                open_braces = text.count('{') - text.count('}')
-                open_brackets = text.count('[') - text.count(']')
-                while open_braces > 0:
-                    text += '}'
-                    open_braces -= 1
-                open_brackets = text.count('[') - text.count(']')
-                while open_brackets > 0:
-                    text += ']'
-                    open_brackets -= 1
-
-    return text
-
-
 def _parse_characters(response: str) -> List[Dict[str, Any]]:
-    """
-    解析 LLM 响应为角色列表
+    """Validate one complete native structured-output response."""
 
-    支持纯 JSON 数组和被 ```json ... ``` 包裹的 JSON
-    使用 strict=False 容忍一些格式问题
-    如果解析失败，尝试修复常见错误
-    """
-    text = response.strip()
-
-    # 尝试提取 ```json ... ``` 代码块
-    if "```" in text:
-        match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', text, re.DOTALL)
-        if match:
-            text = match.group(1).strip()
-
-    # 第一次尝试：使用 strict=False
-    try:
-        parsed = json.loads(text, strict=False)
-    except json.JSONDecodeError:
-        # 第二次尝试：修复 JSON 后解析
-        try:
-            fixed_text = _fix_json(text)
-            parsed = json.loads(fixed_text, strict=False)
-            print("  JSON 修复成功", file=sys.stderr)
-        except json.JSONDecodeError as e:
-            # 第三次尝试：更激进的修复 - 找到最后一个完整的对象
-            try:
-                # 找到最后一个完整的 }, 然后截断
-                last_obj_end = text.rfind('}')
-                if last_obj_end > 0:
-                    truncated = text[:last_obj_end + 1]
-                    # 确保是有效的数组结尾
-                    if not truncated.rstrip().endswith(']'):
-                        truncated = truncated.rstrip() + ']'
-                    parsed = json.loads(truncated, strict=False)
-                    print("  JSON 激进修复成功（截断到最后一个完整对象）", file=sys.stderr)
-                else:
-                    raise e
-            except json.JSONDecodeError:
-                raise ValueError(f"JSON 解析失败，已尝试修复: {e}")
-
-    # 验证是数组
-    if not isinstance(parsed, list):
-        raise ValueError(f"期望 JSON 数组，得到 {type(parsed).__name__}")
-
-    # 验证每个元素的基本结构
-    required_fields = {"id", "name", "appearance", "role"}
-    for i, char in enumerate(parsed):
-        if not isinstance(char, dict):
-            raise ValueError(f"第 {i+1} 个角色不是字典")
-        missing = required_fields - set(char.keys())
-        if missing:
-            raise ValueError(f"第 {i+1} 个角色缺少字段: {missing}")
-        # 验证 appearance.summary 存在
-        appearance = char.get("appearance", {})
-        if not isinstance(appearance, dict) or "summary" not in appearance:
-            raise ValueError(f"第 {i+1} 个角色的 appearance 缺少 summary 字段")
-
-    return parsed
+    return parse_structured_output(
+        response,
+        CharacterUnderstandingBatch,
+    ).model_dump()["characters"]
 
 
 def _collect_character_stats(events: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -344,7 +232,12 @@ def _collect_character_stats(events: List[Dict[str, Any]]) -> Dict[str, Dict[str
     Returns:
         dict: {角色名: {"events": [event_ids], "contexts": [event_summary]}}
     """
-    stats = defaultdict(lambda: {"events": [], "contexts": [], "dialogue_count": 0})
+    stats = defaultdict(lambda: {
+        "events": [],
+        "contexts": [],
+        "dialogue_count": 0,
+        "source_excerpts": [],
+    })
 
     for event in events:
         event_id = event.get("id", 0)
@@ -353,6 +246,7 @@ def _collect_character_stats(events: List[Dict[str, Any]]) -> Dict[str, Dict[str
         visual = event.get("visual", "")
         where = event.get("where", "")
         emotion = event.get("emotion", "")
+        source_excerpt = str(event.get("source_excerpt") or "").strip()
         speakers = {
             str(line.get("speaker", "")).strip()
             for line in event.get("lines", [])
@@ -376,6 +270,8 @@ def _collect_character_stats(events: List[Dict[str, Any]]) -> Dict[str, Dict[str
                 name = character_name.strip()
                 stats[name]["events"].append(event_id)
                 stats[name]["contexts"].append(f"事件{event_id}: {event_summary}")
+                if source_excerpt:
+                    stats[name]["source_excerpts"].append(source_excerpt)
                 if name in speakers:
                     stats[name]["dialogue_count"] += 1
 
@@ -398,6 +294,10 @@ def _build_character_context(stats: Dict[str, Dict[str, Any]]) -> str:
         ]
         if source_aliases:
             lines.append(f"  - 必须归并的来源称呼：{json.dumps(source_aliases, ensure_ascii=False)}")
+        if _has_explicit_identity_declaration(name, info):
+            lines.append(
+                "  - 来源原文明示该称呼为稳定身份；不得按抽象角色词删除"
+            )
         # 最多展示 5 条事件上下文
         for ctx in info["contexts"][:5]:
             lines.append(f"  - {ctx}")
@@ -412,6 +312,30 @@ def _compute_text_hash(events: List[Dict[str, Any]]) -> str:
     """计算事件列表的 SHA-256 哈希，用于溯源"""
     text = json.dumps(events, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _has_explicit_identity_declaration(
+    name: str,
+    info: Dict[str, Any] | None,
+) -> bool:
+    """Promote a generic label only when the source explicitly names it."""
+
+    label = str(name or "").strip()
+    if not label or not info:
+        return False
+    marker = (
+        r"(?:代号|化名|名为|名叫|昵称(?:是|为)?|"
+        r"codename|alias(?:ed)?(?:\s+as)?)"
+    )
+    declaration = re.compile(
+        rf"{marker}\s*[：:]?\s*[\"'“”‘’「」『』]?{re.escape(label)}"
+        r"[\"'“”‘’「」『』]?",
+        re.IGNORECASE,
+    )
+    return any(
+        declaration.search(str(excerpt or ""))
+        for excerpt in (info.get("source_excerpts") or [])
+    )
 
 
 def _is_human_character(name: str) -> bool:
@@ -472,7 +396,7 @@ def _filter_non_human_characters(stats: Dict[str, Dict[str, Any]]) -> Dict[str, 
     """
     filtered = {}
     for name, info in stats.items():
-        if _is_human_character(name):
+        if _is_human_character(name) or _has_explicit_identity_declaration(name, info):
             filtered[name] = info
         else:
             print(f"  过滤非人物角色: {name}", file=sys.stderr)
@@ -564,7 +488,7 @@ def _filter_descriptive_phrases(stats: Dict[str, Dict[str, Any]]) -> Dict[str, D
     filtered = {}
     
     def merge_info(target: Dict[str, Any], source: Dict[str, Any]) -> None:
-        for key in ("events", "contexts"):
+        for key in ("events", "contexts", "source_excerpts"):
             combined = [*(target.get(key) or []), *(source.get(key) or [])]
             target[key] = list(dict.fromkeys(combined))
         target["dialogue_count"] = int(target.get("dialogue_count") or 0) + int(
@@ -652,7 +576,10 @@ def _post_filter_characters(
     filtered = []
     for char in characters:
         name = char.get("name", "")
-        if _is_human_character(name):
+        if _is_human_character(name) or _has_explicit_identity_declaration(
+            name,
+            (stats or {}).get(name),
+        ):
             filtered.append(char)
         else:
             print(f"  后处理过滤非人物角色: {name}", file=sys.stderr)
@@ -1064,10 +991,11 @@ def discover_characters(events: List[Dict[str, Any]]) -> Dict[str, Any]:
             print(f"  LLM 调用失败: {e}", file=sys.stderr)
             break
 
-    if not characters and last_error:
-        print(f"错误：角色发现失败: {last_error}", file=sys.stderr)
-        # 回退：为每个角色名生成最简描述
-        characters = _fallback_characters(stats)
+    if not characters:
+        raise ValueError(
+            "角色发现未产生通过 schema 的规范角色，禁止用伪造资产继续："
+            f"{last_error or 'empty character set'}"
+        )
 
     # 3.5 后处理过滤：移除 LLM 可能错误包含的非人物角色
     characters = _post_filter_characters(characters, stats)
@@ -1106,42 +1034,6 @@ def discover_characters(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
     return result
-
-
-def _fallback_characters(stats: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    LLM 失败时的回退：为每个角色名生成最简描述
-    """
-    characters = []
-    trusted = [
-        (name, info)
-        for name, info in stats.items()
-        if len(info.get("events", [])) >= 2 or info.get("dialogue_count", 0) > 0
-    ]
-    trusted.sort(key=lambda item: (-len(item[1].get("events", [])), item[0]))
-    for i, (name, info) in enumerate(trusted[:5]):
-        # 简单生成 id（拼音首字母或 index）
-        char_id = f"char_{i+1:03d}"
-
-        characters.append({
-            "id": char_id,
-            "name": name,
-            "aliases": list(info.get("source_aliases") or []),
-            "role": "supporting" if len(info["events"]) < 3 else "protagonist",
-            "appearance": {
-                "gender": "unknown",
-                "age_range": "unknown",
-                "summary": name,
-            },
-            "style": "写实风格, 自然光",
-            "negative": "卡通, 3D渲染",
-            "size": "2K",
-            "first_appearance": min(info["events"]) if info["events"] else 0,
-            "appearance_count": len(info["events"]),
-            "asset_path": f"characters/{char_id}/",
-        })
-
-    return characters
 
 
 def main():

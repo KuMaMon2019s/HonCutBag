@@ -7,9 +7,15 @@ import os
 import queue
 import threading
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TypeVar
 
 from openai import OpenAI
+from pydantic import BaseModel
+
+from schemas.understanding import (
+    native_json_schema_format,
+    parse_structured_output,
+)
 
 from utils.config import (
     ARK_RESPONSES_BASE_URL,
@@ -17,6 +23,24 @@ from utils.config import (
     get_api_key,
 )
 from utils.prompt_budget import enforce_prompt_budget
+
+
+StructuredReviewT = TypeVar("StructuredReviewT", bound=BaseModel)
+
+
+def review_as(
+    client: Any,
+    media_paths: list[Path],
+    prompt: str,
+    response_model: type[StructuredReviewT],
+) -> StructuredReviewT:
+    """Use native structured output, with a narrow adapter for test reviewers."""
+
+    structured_review = getattr(client, "review_structured", None)
+    if callable(structured_review):
+        return structured_review(media_paths, prompt, response_model)
+    raw = client.review(media_paths, prompt)
+    return parse_structured_output(raw, response_model)
 
 
 class ArkMultimodalClient:
@@ -121,6 +145,34 @@ class ArkMultimodalClient:
 
     def review_media(self, media_paths: list[Path], prompt: str) -> str:
         """Review an ordered mixed-media set through Ark Responses API."""
+        return self._review_media_with_format(
+            media_paths,
+            prompt,
+            {"type": "json_object"},
+        )
+
+    def review_structured(
+        self,
+        media_paths: list[Path],
+        prompt: str,
+        response_model: type[StructuredReviewT],
+    ) -> StructuredReviewT:
+        """Return a schema-validated understanding object, never free text."""
+
+        raw = self._review_media_with_format(
+            media_paths,
+            prompt,
+            native_json_schema_format(response_model),
+        )
+        return parse_structured_output(raw, response_model)
+
+    def _review_media_with_format(
+        self,
+        media_paths: list[Path],
+        prompt: str,
+        text_format: dict[str, Any],
+    ) -> str:
+        """Execute one Responses request using the supplied output contract."""
         if not media_paths:
             raise ValueError("at least one multimodal input is required")
         normalized_paths = [Path(path) for path in media_paths]
@@ -154,7 +206,7 @@ class ArkMultimodalClient:
                 response = self.client.responses.create(
                     model=self.model,
                     input=[{"role": "user", "content": content}],
-                    text={"format": {"type": "json_object"}},
+                    text={"format": text_format},
                     max_output_tokens=self.max_tokens,
                     extra_body={"thinking": {"type": self.thinking_type}},
                 )

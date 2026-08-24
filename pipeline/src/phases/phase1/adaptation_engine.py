@@ -57,6 +57,7 @@ from utils.ark_llm import (
 )
 from utils.character_identity import (
     normalize_character_reference,
+    resolve_character_id,
     resolve_character_name,
 )
 from utils.camera_motion_contracts import (
@@ -1298,6 +1299,15 @@ def _canonicalize_shot_characters(
         if canonical != original:
             shot["source_character_mentions"] = original
         shot["who"] = canonical
+        character_ids = [
+            resolve_character_id(name, characters) for name in canonical
+        ]
+        if any(character_id is None for character_id in character_ids):
+            raise ValueError(
+                "shot contains a participant without a canonical character id: "
+                f"{canonical}"
+            )
+        shot["character_ids"] = list(dict.fromkeys(character_ids))
     return shots
 
 
@@ -1391,6 +1401,23 @@ def _inherit_event_semantics(
             # would break downstream reference lookup and falsely report a
             # disappearance, so source labels are restored before resolution.
             shot["who"] = canonical_who
+            shot["character_ids"] = list(dict.fromkeys(
+                str(character_id).strip()
+                for event in details
+                for character_id in (event.get("character_ids") or [])
+                if str(character_id).strip()
+            ))
+            participant_refs = [
+                dict(reference)
+                for event in details
+                for reference in (event.get("participant_refs") or [])
+                if isinstance(reference, dict)
+                and str(reference.get("ref_id") or "").strip()
+            ]
+            shot["participant_refs"] = list({
+                str(reference["ref_id"]): reference
+                for reference in participant_refs
+            }.values())
 
         excerpts = [str(event.get("source_excerpt") or "").strip() for event in details]
         excerpts = [excerpt for excerpt in excerpts if excerpt]

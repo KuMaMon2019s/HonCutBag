@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -156,6 +157,17 @@ def _atomic_write_phase1_json(
     }
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(stored, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
+def _atomic_write_json_artifact(path: Path, payload: dict[str, Any]) -> None:
+    """Persist one canonical artifact without exposing a partial JSON file."""
+
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     os.replace(tmp_path, path)
 
 
@@ -606,6 +618,24 @@ def run_phase1_screenwriter(
         if reporter:
             reporter.step("phase1", f"发现 {len(characters_list)} 个角色", progress_pct=60)
 
+        # Text labels are presentation data. Bind a copy to stable asset IDs so
+        # checkpoint hashes remain based on the original understanding output,
+        # while all downstream phases consume one canonical identity contract.
+        from utils.semantic_contracts import bind_story_semantics
+
+        events = copy.deepcopy(events)
+        characters_list = copy.deepcopy(characters_list)
+        semantic_ledger = bind_story_semantics(events, characters_list)
+        semantic_ledger["source_events_hash"] = events_input_hash
+        semantic_ledger["canonical_characters_hash"] = _phase1_input_hash(
+            characters_list
+        )
+        semantic_ledger_path = output_dir / "SEMANTIC_LEDGER.json"
+        _atomic_write_json_artifact(semantic_ledger_path, semantic_ledger)
+        characters_result = dict(characters_result)
+        characters_result["characters"] = characters_list
+        characters_result["semantic_ledger"] = semantic_ledger_path.name
+
         # Step 2.4: adaptation_engine → adapted shots list
         print("  → adaptation_engine: 影视化改编...")
         if reporter:
@@ -657,17 +687,24 @@ def run_phase1_screenwriter(
             )
         if continuity_mode:
             storyboard["continuity_mode"] = continuity_mode
+        storyboard["semantic_understanding"] = {
+            "schema": semantic_ledger["schema"],
+            "ledger": semantic_ledger_path.name,
+            "source_events_hash": events_input_hash,
+        }
         from phases.phase1.storyboard_beats import plan_storyboard_beats
 
         plan_storyboard_beats(storyboard)
         material_budget = storyboard.get("material_budget") or {}
         print(
-            "  ✓ 素材双账本: 故事时钟 "
+            "  ✓ 时长三账本: 故事时钟 "
             f"{float(material_budget.get('story_clock_duration_s') or 0):g}s "
-            "+ 桥接生成 "
-            f"{float(material_budget.get('bridge_generation_duration_s') or 0):g}s "
-            "= 总生成 "
-            f"{float(material_budget.get('total_generated_duration_s') or 0):g}s；"
+            "；内容 Provider 请求 "
+            f"{float(material_budget.get('content_provider_request_duration_s') or 0):g}s "
+            "+ 桥接 Provider 请求 "
+            f"{float(material_budget.get('bridge_provider_request_duration_s') or 0):g}s "
+            "= 总 Provider 请求 "
+            f"{float(material_budget.get('total_provider_request_duration_s') or 0):g}s；"
             "桥接在时间线替换等长边界把手",
             flush=True,
         )
@@ -692,7 +729,7 @@ def run_phase1_screenwriter(
         characters_path.write_text(json.dumps(characters_result, ensure_ascii=False, indent=2))
 
         outputs = [
-            "STORYBOARD.json", "CHARACTERS.json",
+            "STORYBOARD.json", "CHARACTERS.json", "SEMANTIC_LEDGER.json",
             "director_storyboard.png", "director_storyboard_prompt.txt",
             "director_storyboard.json",
         ]

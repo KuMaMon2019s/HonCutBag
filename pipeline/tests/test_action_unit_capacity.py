@@ -315,14 +315,14 @@ def test_flashmob_60s_script_passes_capacity_gate():
     plan = engine._estimate_action_capacity_plan(events, 60, 12)
 
     assert plan["generation_action_units"] == 22
-    assert plan["primary_shots"] == 4
-    assert plan["minimum_material_duration"] == 75
+    assert plan["primary_shots"] == 5
+    assert plan["minimum_material_duration"] == 33
     assert plan["material_duration"] == 60
     assert plan["storyboard_duration_limit"] == 60
-    assert plan["action_capacity_status"] == "screenplay_compression_required"
+    assert plan["action_capacity_status"] == "fits_story_clock"
     assert plan["generated_duration_ratio_reference"] == 1.3
     shots = engine.estimate_action_aware_shot_count(events, 60, 12)
-    assert shots == 4
+    assert shots == 5
 
 
 def test_evolving_model_flashmob_artifact_has_stable_capacity():
@@ -336,11 +336,11 @@ def test_evolving_model_flashmob_artifact_has_stable_capacity():
 
     assert {event["sequence_id"] for event in events} == {"SEQ001"}
     assert plan["generation_action_units"] == 22
-    assert plan["primary_shots"] == 4
-    assert plan["minimum_material_duration"] == 75
+    assert plan["primary_shots"] == 5
+    assert plan["minimum_material_duration"] == 33
     assert plan["material_duration"] == 60
     assert plan["storyboard_duration_limit"] == 60
-    assert plan["action_capacity_status"] == "screenplay_compression_required"
+    assert plan["action_capacity_status"] == "fits_story_clock"
 
 
 def test_sequence_fragmentation_is_reported_without_expanding_story_clock():
@@ -348,10 +348,10 @@ def test_sequence_fragmentation_is_reported_without_expanding_story_clock():
 
     plan = engine._estimate_action_capacity_plan(events, 60, 12)
 
-    assert plan["primary_shots"] == 4
-    assert plan["structural_shots"] > plan["primary_shots"]
+    assert plan["primary_shots"] == 5
+    assert plan["structural_shots"] == 8
     assert plan["material_duration"] == 60
-    assert plan["action_capacity_status"] == "screenplay_compression_required"
+    assert plan["action_capacity_status"] == "fits_story_clock"
 
 
 def test_explicitly_dropped_events_are_audited_without_consuming_shot_capacity():
@@ -591,17 +591,17 @@ def test_optional_transition_sequence_does_not_steal_mandatory_story_capacity():
     assert [beat["sequence_id"] for beat in repaired] == [
         "SEQ001",
         "SEQ001",
-        "SEQ001",
+        "SEQ002",
         "SEQ003",
     ]
-    assert 4 not in {
+    assert 4 in {
         event_id for beat in repaired for event_id in beat["source_events"]
     }
     assert [
         event_id
         for beat in repaired
         for event_id in beat["dropped_source_events"]
-    ] == [4]
+    ] == []
     assert 5 in repaired[-1]["source_events"]
     assert max(engine._beat_generation_unit_loads(repaired, events)) <= story_capacity
 
@@ -770,8 +770,8 @@ def test_phase5_checks_additive_bridge_ledger_and_handle_replacement():
         "material_budget_ledger_missing",
     } & {issue["code"] for issue in issues}
     assert storyboard["material_budget"]["story_clock_duration_s"] == 30
-    assert storyboard["material_budget"]["bridge_generation_duration_s"] == 4
-    assert storyboard["material_budget"]["total_generated_duration_s"] == 34
+    assert storyboard["material_budget"]["bridge_provider_request_duration_s"] == 4
+    assert storyboard["material_budget"]["total_provider_request_duration_s"] == 34
     assert storyboard["material_budget"][
         "projected_pre_edit_timeline_duration_s"
     ] == 30
@@ -802,9 +802,9 @@ def test_one_take_budget_counts_only_adjacent_continuous_boundaries():
     assert budget["story_clock_duration_s"] == 60
     assert budget["storyboard_duration_limit_s"] == 60
     assert budget["bridge_count"] == 3
-    assert budget["bridge_generation_duration_s"] == 12
-    assert budget["total_generated_duration_s"] == 72
-    assert budget["total_generated_duration_ratio"] == 1.2
+    assert budget["bridge_provider_request_duration_s"] == 12
+    assert budget["total_provider_request_duration_s"] == 72
+    assert budget["total_provider_request_duration_ratio"] == 1.2
     assert budget["generated_duration_ratio_reference"] == 1.3
     assert budget["generated_duration_ratio_is_hard_limit"] is False
     assert budget["projected_pre_edit_timeline_duration_s"] == 60
@@ -842,9 +842,9 @@ def test_bridge_overhead_may_fluctuate_above_1_3_without_growing_story_clock():
 
     ledger = build_material_budget(storyboard)
     assert ledger["story_clock_duration_s"] == 60
-    assert ledger["total_generated_duration_s"] == 88
-    assert ledger["total_generated_duration_ratio"] == 1.466667
-    assert ledger["total_generated_duration_ratio_range"] == [1.466667, 1.7]
+    assert ledger["total_provider_request_duration_s"] == 88
+    assert ledger["total_provider_request_duration_ratio"] == 1.466667
+    assert ledger["total_provider_request_duration_ratio_range"] == [1.466667, 1.7]
     assert ledger["generated_duration_ratio_is_hard_limit"] is False
 
 
@@ -897,7 +897,7 @@ def test_composite_motion_keeps_full_ledger_through_pxx_and_qa():
 # ── guard: genuinely dense sequential chains remain explicit pressure ──────
 
 
-def test_dense_sequential_combat_chain_reports_compression_pressure():
+def test_dense_sequential_chain_uses_story_time_not_provider_padding():
     events = [{
         "event_role": "action_chain",
         "micro_actions": [
@@ -910,10 +910,59 @@ def test_dense_sequential_combat_chain_reports_compression_pressure():
 
     assert plan["generation_action_units"] == 12
     assert plan["structural_shots"] == 2
-    assert plan["primary_shots"] == 2
-    assert plan["minimum_material_duration"] == 40
+    assert plan["primary_shots"] == 3
+    assert plan["minimum_material_duration"] == 18
     assert plan["material_duration"] == 30
-    assert plan["action_capacity_status"] == "screenplay_compression_required"
+    assert plan["action_capacity_status"] == "fits_story_clock"
+
+
+def test_provider_request_padding_does_not_consume_story_clock():
+    """Provider request minima are generated cost, not authored narrative time."""
+    profile = engine.get_video_capabilities()
+    assert profile.request_duration_bounds("multi_image") == (8, 15)
+    assert profile.request_duration_bounds("tail_video_extend") == (6, 10)
+    assert profile.effective_duration_bounds("multi_image") == (3, 15)
+    assert profile.effective_duration_bounds("tail_video_extend") == (3, 10)
+
+    events = [{
+        "event_role": "action_chain",
+        "sequence_id": "SEQ001",
+        "micro_actions": [f"有序操作{index}" for index in range(12)],
+    }]
+    plan = engine._estimate_action_capacity_plan(events, 30, 15)
+
+    assert plan["generation_action_units"] == 12
+    assert plan["structural_shots"] == 2
+    assert plan["minimum_material_duration"] == 18
+    assert plan["action_capacity_status"] == "fits_story_clock"
+
+    storyboard = {
+        "video_provider": "seedance",
+        "delivery_target_duration": 3,
+        "shots": [
+            {
+                "id": "S01",
+                "duration": 3,
+                "micro_actions": ["抬头确认信号"],
+            }
+        ],
+    }
+    plan_storyboard_beats(storyboard)
+    beat = storyboard["shots"][0]["storyboard_beats"][0]
+
+    assert beat["effective_story_duration_s"] == 3
+    assert beat["provider_request_duration_s"] == 8
+    assert beat["provider_minimum_padding_duration_s"] == 5
+    assert storyboard["material_budget"]["story_clock_duration_s"] == 3
+    assert storyboard["material_budget"][
+        "content_provider_request_duration_s"
+    ] == 8
+    assert storyboard["material_budget"][
+        "content_provider_padding_duration_s"
+    ] == 5
+    assert storyboard["material_budget"][
+        "provider_request_duration_is_story_clock_limit"
+    ] is False
 
 
 def test_generic_dense_actions_report_screenplay_compression_pressure():
@@ -938,7 +987,7 @@ def test_generic_dense_actions_report_screenplay_compression_pressure():
 
     assert plan["generation_action_units"] == 96
     assert plan["structural_shots"] == 16
-    assert plan["primary_shots"] == 4
-    assert plan["minimum_material_duration"] == 320
+    assert plan["primary_shots"] == 6
+    assert plan["minimum_material_duration"] == 144
     assert plan["material_duration"] == 60
     assert plan["action_capacity_status"] == "screenplay_compression_required"

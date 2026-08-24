@@ -292,7 +292,7 @@ def decide_shot_action(
             interior_black.append(segment)
 
     semantic_review = semantic_review or {}
-    if semantic_review.get("verdict") in {"fail", "reshoot"}:
+    if semantic_review.get("verdict") in {"fail", "reshoot", "unavailable"}:
         reasons.extend(str(issue) for issue in semantic_review.get("issues", []) or ["semantic visual review failed"])
         return {"action": "reshoot", "reasons": reasons, "trim_start_s": 0.0, "trim_end_s": duration}
 
@@ -448,7 +448,8 @@ def _automatic_semantic_reviewer(
     if setting in {"0", "false", "off", "no"}:
         return None
     try:
-        from clients.ark_multimodal_client import ArkMultimodalClient
+        from clients.ark_multimodal_client import ArkMultimodalClient, review_as
+        from schemas.understanding import ShotSemanticReview
 
         client = ArkMultimodalClient()
     except Exception:
@@ -524,15 +525,12 @@ def _automatic_semantic_reviewer(
             "a sustained pull-back, while a fixed shot may contain minor stabilization drift. Return JSON only: "
             '{"verdict":"pass|reshoot","issues":["..."],"confidence":0.0}.'
         )
-        raw = client.review(review_paths, prompt).strip()
-        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE)
-        parsed = json.loads(raw)
-        if not isinstance(parsed, dict):
-            return {
-                "verdict": "reshoot",
-                "issues": ["invalid semantic review"],
-                "qa_contract": qa_contract,
-            }
+        parsed = review_as(
+            client,
+            review_paths,
+            prompt,
+            ShotSemanticReview,
+        ).model_dump()
         parsed["qa_contract"] = qa_contract
         return parsed
 

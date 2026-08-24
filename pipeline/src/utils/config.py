@@ -256,9 +256,10 @@ class BaseURLs:
     
     # 火山方舟
     ARK_AGENT_PLAN: str = "https://ark.cn-beijing.volces.com/api/plan/v3"
-    # Responses-based multimodal understanding uses the standard Ark route.
-    # HonCut still reads only ARK_AGENT_API_KEY; ARK_API_KEY remains reserved.
-    ARK_RESPONSES: str = "https://ark.cn-beijing.volces.com/api/v3"
+    # Agent Plan credentials are scoped to the matching plan route for both
+    # Chat and Responses. Never send ARK_AGENT_API_KEY to the standard PAYG
+    # route or borrow the ARK_API_KEY reserved for Honcho Coding Plan memory.
+    ARK_RESPONSES: str = ARK_AGENT_PLAN
     
     # OpenAI
     OPENAI: str = "https://api.openai.com/v1"

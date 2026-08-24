@@ -95,7 +95,7 @@ def test_tiktok_project_spec_reaches_phase1_storyboard(tmp_path):
 def test_phase1_dry_run_blocks_real_source_capacity_instead_of_fixed_mock(tmp_path):
     source = "\n\n".join(
         f"{index}. 操作员先完成步骤{index}，随后确认不可逆结果{index}。"
-        for index in range(1, 10)
+        for index in range(1, 97)
     )
 
     result = pipeline_core.run_phase1_screenwriter(

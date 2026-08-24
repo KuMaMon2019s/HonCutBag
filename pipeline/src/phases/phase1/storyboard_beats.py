@@ -21,8 +21,8 @@ from utils.video_capabilities import (
     min_primary_story_duration,
 )
 
-SECONDARY_STORYBOARD_VERSION = "honcut.secondary-storyboard.v9"
-SECONDARY_EXECUTION = "content_capacity_post_primary_bridge_v9"
+SECONDARY_STORYBOARD_VERSION = "honcut.secondary-storyboard.v10"
+SECONDARY_EXECUTION = "content_capacity_post_primary_bridge_v10"
 SECONDARY_GENERATION_MODES = frozenset({
     "multi_image",
     "tail_video_extend",
@@ -544,6 +544,11 @@ def secondary_storyboard_contract_errors(
             )
 
     expected_durations = requirement["durations"] if requirement else []
+    profile = (
+        requirement["profile"]
+        if requirement is not None
+        else capabilities or capabilities_for({**storyboard, **shot})
+    )
     source_action_units = shot.get("source_action_unit_ids") or []
     if isinstance(source_action_units, str):
         source_action_units = [source_action_units]
@@ -619,6 +624,53 @@ def secondary_storyboard_contract_errors(
                     expected=expected_durations[position - 1],
                     observed=observed_duration,
                 )
+            expected_request_mode = (
+                expected_modes[position - 1]
+                if position <= len(expected_modes)
+                else mode
+            )
+            expected_request_duration = profile.request_duration_for_effective_story(
+                observed_duration,
+                expected_request_mode,
+            )
+            observed_effective = float(
+                beat.get("effective_story_duration_s") or 0
+            )
+            observed_request = float(
+                beat.get("provider_request_duration_s") or 0
+            )
+            observed_padding = float(
+                beat.get("provider_minimum_padding_duration_s") or 0
+            )
+            if not math.isclose(observed_effective, observed_duration, abs_tol=1e-6):
+                add(
+                    "secondary_storyboard_effective_duration_invalid",
+                    f"{beat_id} effective story duration must equal its Pxx story clock",
+                    expected=observed_duration,
+                    observed=observed_effective,
+                )
+            if not math.isclose(
+                observed_request,
+                expected_request_duration,
+                abs_tol=1e-6,
+            ):
+                add(
+                    "secondary_storyboard_provider_request_duration_invalid",
+                    f"{beat_id} Provider request duration is stale or incorrect",
+                    expected=expected_request_duration,
+                    observed=observed_request,
+                )
+            expected_padding = round(
+                expected_request_duration - observed_duration,
+                6,
+            )
+            if not math.isclose(observed_padding, expected_padding, abs_tol=1e-6):
+                add(
+                    "secondary_storyboard_provider_padding_invalid",
+                    f"{beat_id} Provider padding does not reconcile with story time",
+                    expected=expected_padding,
+                    observed=observed_padding,
+                )
         beat_actions = beat.get("micro_actions") or []
         if isinstance(beat_actions, str):
             beat_actions = [beat_actions]
@@ -662,7 +714,7 @@ def secondary_storyboard_contract_errors(
             )
         planning = shot.get("secondary_storyboard_planning") or {}
         bridge_policy_bounds = bridge_planning_duration_bounds(requirement["profile"])
-        bridge_provider_bounds = requirement["profile"].effective_duration_bounds(
+        bridge_provider_bounds = requirement["profile"].request_duration_bounds(
             "first_last_frame_bridge"
         )
         expected_planning = {
@@ -783,9 +835,11 @@ def plan_storyboard_beats(
         requirement = secondary_storyboard_requirements(storyboard, index, profile)
         total_count = len(requirement["modes"])
         provider_capacity = MAX_CONTENT_BEATS
-        multi_bounds = profile.effective_duration_bounds("multi_image")
-        tail_bounds = profile.effective_duration_bounds("tail_video_extend")
-        bridge_provider_bounds = profile.effective_duration_bounds(
+        multi_story_bounds = profile.effective_duration_bounds("multi_image")
+        tail_story_bounds = profile.effective_duration_bounds("tail_video_extend")
+        multi_request_bounds = profile.request_duration_bounds("multi_image")
+        tail_request_bounds = profile.request_duration_bounds("tail_video_extend")
+        bridge_provider_bounds = profile.request_duration_bounds(
             "first_last_frame_bridge"
         )
         bridge_policy_bounds = bridge_planning_duration_bounds(profile)
@@ -820,8 +874,14 @@ def plan_storyboard_beats(
                 min_primary_story_duration(profile),
                 max_primary_story_duration(profile),
             ],
-            "multi_image_duration_range_s": list(multi_bounds),
-            "tail_video_extend_duration_range_s": list(tail_bounds),
+            "multi_image_story_duration_range_s": list(multi_story_bounds),
+            "tail_video_extend_story_duration_range_s": list(tail_story_bounds),
+            "multi_image_provider_request_duration_range_s": list(
+                multi_request_bounds
+            ),
+            "tail_video_extend_provider_request_duration_range_s": list(
+                tail_request_bounds
+            ),
             "first_last_frame_bridge_duration_range_s": list(bridge_policy_bounds),
             "first_last_frame_bridge_policy_duration_range_s": list(
                 bridge_policy_bounds
@@ -899,10 +959,21 @@ def plan_storyboard_beats(
                 if position == 1
                 else "tail_video_extend"
             )
+            effective_story_duration = durations[position - 1]
+            provider_request_duration = profile.request_duration_for_effective_story(
+                effective_story_duration,
+                generation_mode,
+            )
             normalized = {
                 "beat_id": f"{sid}_P{position:02d}",
                 "position": position,
-                "duration_s": durations[position - 1],
+                "duration_s": effective_story_duration,
+                "effective_story_duration_s": effective_story_duration,
+                "provider_request_duration_s": provider_request_duration,
+                "provider_minimum_padding_duration_s": round(
+                    provider_request_duration - effective_story_duration,
+                    6,
+                ),
                 "duration_semantics": (
                     "effective_story_time_excluding_reference_overlap_and_provider_padding"
                 ),

@@ -2472,7 +2472,7 @@ def test_multimodal_request_preserves_image_video_document_audio_order(tmp_path)
     ]
 
 
-def test_multimodal_client_uses_standard_responses_url_with_agent_key(monkeypatch):
+def test_multimodal_client_pairs_agent_key_with_agent_plan_responses(monkeypatch):
     observed = {}
 
     class FakeOpenAI:
@@ -2483,14 +2483,14 @@ def test_multimodal_client_uses_standard_responses_url_with_agent_key(monkeypatc
     monkeypatch.setenv("ARK_API_KEY", "coding-plan-key")
     monkeypatch.setenv(
         "HONCUT_STORYBOARD_REVIEW_BASE_URL",
-        "https://ark.cn-beijing.volces.com/api/plan/v3",
+        "https://ark.cn-beijing.volces.com/api/v3",
     )
     monkeypatch.setattr(ark_multimodal_client, "OpenAI", FakeOpenAI)
 
     ark_multimodal_client.ArkMultimodalClient()
 
     assert observed["api_key"] == "agent-plan-key"
-    assert observed["base_url"] == "https://ark.cn-beijing.volces.com/api/v3"
+    assert observed["base_url"] == "https://ark.cn-beijing.volces.com/api/plan/v3"
     assert observed["max_retries"] == 0
 
 

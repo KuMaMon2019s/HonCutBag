@@ -13,7 +13,7 @@ from prompt import event_extractor
 
 
 def _event_response(lines=None):
-    return json.dumps([{
+    return json.dumps({"events": [{
         "who": ["凛"],
         "where": "雨夜轨道",
         "what": "凛质问烬",
@@ -22,11 +22,16 @@ def _event_response(lines=None):
         "time": "雨夜",
         "action_type": "conflict",
         **({"lines": lines} if lines is not None else {}),
-    }], ensure_ascii=False)
+    }]}, ensure_ascii=False)
 
 
 def test_extracted_dialogue_lines_reach_adaptation_prompt(monkeypatch):
-    expected_lines = [{"speaker": "凛", "line": "你为什么要拦我？"}]
+    expected_lines = [{
+        "speaker": "凛",
+        "line": "你为什么要拦我？",
+        "confidence": 1.0,
+        "evidence": "凛质问：\"你为什么要拦我？\"",
+    }]
     monkeypatch.setattr(
         event_extractor,
         "_call_llm",
@@ -85,7 +90,7 @@ def test_extracted_dialogue_lines_reach_adaptation_prompt(monkeypatch):
         }]}, ensure_ascii=False)
 
     monkeypatch.setattr(adaptation_engine, "_call_llm_with_timeout_retry", fake_adaptation_call)
-    adaptation_engine.adapt_events(events, target_duration=15)
+    adaptation_engine.adapt_events(events, target_duration=15, shot_duration=15)
 
     assert len(prompts) == 2
     assert all(expected_lines[0]["line"] in prompt for prompt in prompts)

@@ -318,6 +318,24 @@ def test_planner_carries_an_explicit_subject_prompt_into_tracking_anchors():
     assert plan.shots[0].anchors.tracking_prompt == "small cobalt-blue paper boat"
 
 
+def test_planner_prefers_canonical_character_ids_over_display_names():
+    plan = build_continuity_plan(
+        {
+            "shots": [
+                {
+                    "id": "S01",
+                    "duration": 8,
+                    "character_ids": ["operator"],
+                    "who": ["年轻男性"],
+                }
+            ]
+        }
+    )
+
+    assert plan.shots[0].anchors.characters == ["operator"]
+    assert plan.shots[0].anchors.tracking_prompt == "operator"
+
+
 def test_planner_reserves_replayed_reference_frames_without_shortening_the_shot():
     plan = build_continuity_plan(
         {"shots": [{"id": "S01", "duration": 10}]},
@@ -992,8 +1010,8 @@ def test_complex_shot_maps_to_three_secondary_generation_strategies(tmp_path):
     assert [chunk.storyboard_image for chunk in first.chunks] == [
         "storyboard_beats/S01_P01.png", "storyboard_beats/S01_P02.png",
     ]
-    assert [chunk.requested_frames for chunk in first.chunks] == [216, 168]
-    assert [chunk.expected_unique_frames for chunk in first.chunks] == [216, 168]
+    assert [chunk.requested_frames for chunk in first.chunks] == [192, 192]
+    assert [chunk.expected_unique_frames for chunk in first.chunks] == [192, 192]
     assert [chunk.expected_provider_padding_frames for chunk in first.chunks] == [0, 0]
     assert continuity.bridges[0].bridge_id == "S01__S02"
     assert continuity.bridges[0].storyboard_transition_image == (

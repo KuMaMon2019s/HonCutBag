@@ -7,6 +7,12 @@ import json
 from pathlib import Path
 from typing import Any, Protocol
 
+from clients.ark_multimodal_client import review_as
+from schemas.understanding import (
+    CharacterReferenceUnderstanding,
+    IdentityDetailUnderstanding,
+    parse_structured_output,
+)
 from utils.character_reference_contracts import (
     IDENTITY_DETAIL_ASSET_POLICY,
     STATIC_REFERENCE_QA_POLICY,
@@ -142,46 +148,12 @@ Return one JSON object only:
 Set passed=false whenever any required item or consistency fact is uncertain."""
 
 
-def _json_object(raw: str) -> dict[str, Any]:
-    text = str(raw or "").strip()
-    if "{" not in text:
-        raise CharacterReferenceQAError("character reference QA returned no JSON object")
-
-    # VLMs sometimes wrap the requested object in markdown or append a prose
-    # explanation (occasionally containing another JSON object).  ``json.loads``
-    # over first-"{" through last-"}" turns that valid response into Extra data.
-    # raw_decode consumes exactly one complete value and tells us where it ends;
-    # scan candidate object starts until the QA-shaped object is found.
-    decoder = json.JSONDecoder()
-    first_object: dict[str, Any] | None = None
-    last_error: json.JSONDecodeError | None = None
-    for start, character in enumerate(text):
-        if character != "{":
-            continue
-        try:
-            candidate, _end = decoder.raw_decode(text, start)
-        except json.JSONDecodeError as exc:
-            last_error = exc
-            continue
-        if not isinstance(candidate, dict):
-            continue
-        first_object = first_object or candidate
-        if isinstance(candidate.get("views"), dict) and isinstance(
-            candidate.get("cross_view"), dict
-        ):
-            return candidate
-
-    if first_object is not None:
-        return first_object
-    detail = f": {last_error}" if last_error is not None else ""
-    raise CharacterReferenceQAError(
-        f"character reference QA returned invalid JSON{detail}"
-    )
-
-
 def parse_identity_detail_qa(raw: str) -> dict[str, Any]:
     """Parse and recompute the identity-detail verdict from explicit evidence."""
-    payload = _json_object(raw)
+    payload = parse_structured_output(
+        raw,
+        IdentityDetailUnderstanding,
+    ).model_dump()
     fields = (
         "character_identity_consistent",
         "declared_items_present",
@@ -207,11 +179,13 @@ def review_identity_detail_reference(
     items: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Review one detail board against the approved neutral identity references."""
-    raw = reviewer.review(
+    result = review_as(
+        reviewer,
         [*canonical_paths, detail_path],
         build_identity_detail_qa_prompt(items),
+        IdentityDetailUnderstanding,
     )
-    return parse_identity_detail_qa(raw)
+    return parse_identity_detail_qa(result.model_dump_json())
 
 
 def parse_character_reference_qa(
@@ -219,7 +193,10 @@ def parse_character_reference_qa(
     view_names: tuple[str, ...] = SEEDANCE_REFERENCE_VIEWS,
 ) -> dict[str, Any]:
     """Normalize a review and recompute the verdict from its evidence fields."""
-    payload = _json_object(raw)
+    payload = parse_structured_output(
+        raw,
+        CharacterReferenceUnderstanding,
+    ).model_dump()
     raw_views = payload.get("views")
     cross = payload.get("cross_view")
     if not isinstance(raw_views, dict) or not isinstance(cross, dict):
@@ -310,8 +287,13 @@ def review_character_reference_pack(
 ) -> dict[str, Any]:
     view_names = tuple(view_paths)
     prompt = build_character_reference_qa_prompt(character_description, view_names)
-    raw = reviewer.review([view_paths[name] for name in view_names], prompt)
-    return parse_character_reference_qa(raw, view_names)
+    result = review_as(
+        reviewer,
+        [view_paths[name] for name in view_names],
+        prompt,
+        CharacterReferenceUnderstanding,
+    )
+    return parse_character_reference_qa(result.model_dump_json(), view_names)
 
 
 def build_character_reference_qa_receipt(

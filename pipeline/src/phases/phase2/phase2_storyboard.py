@@ -67,7 +67,7 @@ def run_phase2(storyboard_data: dict, characters_data: dict, output_dir: Path, d
         for shot_index, shot in enumerate(storyboard_data.get("shots", []), 1):
             if not isinstance(shot, dict):
                 continue
-            who = shot.get("who") or shot.get("character_ids") or []
+            who = shot.get("character_ids") or shot.get("who") or []
             if isinstance(who, str):
                 who = [who]
             if not who:

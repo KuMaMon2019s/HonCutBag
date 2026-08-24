@@ -4,7 +4,7 @@
 >
 > 适用基线：`main`，重构验收提交 `1b01741` 及之后版本
 >
-> 更新日期：2026-08-23
+> 更新日期：2026-08-24
 
 本文定义 HonCut 当前生产架构、持久化与恢复契约，以及后续迭代修复必须遵守的边界。实现与本文冲突时，先确认生产执行路径；若实现是有意变更，必须在同一提交中更新本文和相应特征测试。
 
@@ -57,6 +57,7 @@ Schema、State 和纯工具是共享契约，但不得反向触发上层工作�
 | 唯一生产拓扑 | `pipeline/src/graph/workflow.py` | 只定义节点和边，不导入 Provider 或 Phase 实现 |
 | 依赖装配 | `pipeline/src/graph/composition.py` | 把窄 Phase callable 注入节点，不创建第二套拓扑 |
 | State 与迁移 | `graph/state.py`、`graph/migrations.py` | 生产写 canonical 字段；旧别名只在迁移适配器读取 |
+| 文本/视觉理解 DTO | `pipeline/src/schemas/understanding.py` | Provider 使用原生 JSON Schema；返回值经 Pydantic 业务 DTO 验证后才能驱动身份、顺序或 QA |
 | Phase 业务 | `pipeline/src/phases/phaseN/` | 文件、模型、媒体和领域规则归对应 Phase owner |
 | 超时、重试、冷却与容量 | `pipeline/src/runtime/provider_policy.py` | Provider、Graph 和 Phase 不得叠加重试 |
 | 长任务账本 | `pipeline/src/runtime/generation_tasks.py` | SQLite 幂等迁移、提交去重、恢复与终态证据 |
@@ -105,7 +106,7 @@ Graph node 必须只完成三件事：读取 State、调用一个窄 owner、返
 
 | Phase | 业务 owner 与输出责任 | 主要失败边界 |
 |---|---|---|
-| 1 | 导演规划、文本解析、事件/角色发现、分层剧本与 canonical `STORYBOARD.json` / `CHARACTERS.json` | 输入/LLM/结构无效即停止；子阶段 checkpoint 可复用 |
+| 1 | 导演规划、文本解析、事件/角色发现、`SEMANTIC_LEDGER.json`、分层剧本与 canonical `STORYBOARD.json` / `CHARACTERS.json` | 输入/LLM/结构无效即停止；子阶段 checkpoint 可复用 |
 | 2 | 分镜与 Pxx 图像资产、构图和端帧契约 | 生产图片或其验证证据缺失时 fail closed |
 | 3 | 角色卡、四视图、变体和身份锁定 | 生产模式要求真实四视图 QA；dry-run 只写明确的 dry-run receipt |
 | 4 | 原生 shot 目录与 `SHOT_META.json`、场景一致性、continuity plan、cinematic first-frame | canonical storyboard 不得为元数据物化而原地改写；Phase 4 不运行视频生成子进程 |
@@ -116,11 +117,13 @@ Graph node 必须只完成三件事：读取 State、调用一个窄 owner、返
 | 9 | ASR、音频/TTS/ducking、字幕、视觉后期、节奏编辑和最终编码 | 最终时长/编码失败即停止；可选 QA 必须在 receipt 中明确标记 |
 | 9.5 | 成片交付 QA | 不通过则顶层 run failed，不交付伪成功 |
 
-Phase 1 的时长合同采用双账本：一级 `Sxx` 与其二级 `Pxx` 共用同一个故事时钟，二者不得相加，且新规划的故事时钟不得超过交付时长；跨一级镜头的 bridge 是独立 Provider 生成开销，只加入生成账本。`honcut.material-budget.v2` 必须同时记录故事时钟、Pxx 分区校验、bridge 实际/规划时长区间、总生成时长及其实际/区间比率。历史 `1.3` 只可作为成本参考值，不是容量硬上限；Phase 8 的安全变速区间是独立编辑合同，不得从生成开销比率反推。
+Phase 1 的时长合同采用三账本：`story clock` 记录一级 `Sxx` 与其二级 `Pxx` 共同表示的有效叙事时长，二者不得相加；`Provider request` 记录实际请求/计费时长；`padding/context` 记录 Provider 最低请求、尾段上下文或重叠中不属于新故事时钟的部分。每个 Pxx 必须分别持久化 `effective_story_duration_s`、`provider_request_duration_s` 与 `provider_minimum_padding_duration_s`，Runtime 按请求帧生成后规范化到 `expected_unique_frames`。Provider 的 8 秒/6 秒最低请求不得反向成为故事时钟的最低镜长或压缩阻塞条件。跨一级镜头的 bridge 是独立 Provider 请求开销，只进入请求账本；其可见部分按 `replace_boundary_handles` 替换等长边界把手。`honcut.material-budget.v3` 必须记录故事时钟、Pxx 分区校验、内容请求与 padding、bridge 请求实际/规划区间、总 Provider 请求及比率。历史 v2 只可迁移用于成本审计，不得作为当前 Phase 5 成功证据；历史 `1.3` 仍只作成本参考，不是容量硬上限。Phase 8 的安全变速区间是独立编辑合同，不得从 Provider 请求比率反推。
 
 当完整事件账本超过交付故事时钟的可执行容量时，Phase 1 只能通过 `dropped_source_events` 显式记录被删减的非关键事件；这些事件不得进入 `source_events`、Pxx、Prompt 或媒体生成。`scene_setup`、`turning_point`、`dramatic_turn` 与 `consequence` 必须保留。Phase 5 必须 fail closed 校验故事时钟上限、Sxx/Pxx 等时、bridge 区间/把手以及持久化 material ledger；未知或旧 material-budget schema 不得解释为成功。
 
 Canonical 事件账本要求 `dramatic_turn=true` 当且仅当 `event_role=turning_point`。事件提取模型返回冲突组合时，Event Extractor 必须携带具体 schema 错误进行一次有界纠错；仍不一致则 fail closed，禁止把普通动作链提升为必保转折或静默丢失真实转折。改变该规范化规则必须升级事件缓存 schema。
+
+Phase 1 的事件与角色理解请求必须使用 Chat Completions 原生 `response_format=json_schema`，并分别通过 strict `EventUnderstandingBatch` / `CharacterUnderstandingBatch` DTO；禁止扫描、截断、补括号或拼接残缺 JSON 后继续。模型产生的 `who` 只是来源称呼，角色发现完成后必须确定性绑定到唯一 canonical `character_id`，生成 `honcut.semantic-understanding.v1` 的 `SEMANTIC_LEDGER.json`。抽象角色词默认不是人物资产；只有源文本以代号、化名、姓名或昵称显式声明时，角色 owner 才可基于保存的 `source_excerpt` 将其提升为稳定身份，禁止为具体剧本标签建立白名单。下游镜头、角色参考、连续性锚点和视觉证据以 `character_ids` 为身份事实源，名称只作展示；无法绑定、多重绑定或 canonical ID 缺失必须在 adaptation 和付费边界之前 fail closed。
 
 事件级 `source_excerpt` 明确声明同一时刻并行完成的复合动作时，该源文本证据优先于 Event Extractor 模型返回的 `atomic` 标签；冲突必须确定性修正并写入原因。`最后一名/位/只/辆` 等实体序数短语不是动作时间推进，不得抵消同一事件的明确并发合同；`最后抬膝`、`随后`、`最终` 等真实阶段词仍阻止错误合并。改变该优先级或消歧规则必须升级事件缓存 schema。
 
@@ -232,7 +235,7 @@ Seedream 图片请求的唯一传输 owner 是 `clients/seedream_client.py`，Ph
 
 多参考图的职责绑定由共享模板 `honcut.seedream.reference-contract` v1 在 Phase 图片组装边界按真实输入顺序前置为 `Image 1`、`Image 2` 等；角色身份、上一故事格、导演单格和上一 cinematic 帧不得交换职责。Phase 收据必须记录模板 ID/版本、实际 Provider Prompt SHA-256、参考图顺序/角色和只含长度/哈希的 guidance 指标。官方 300 个中文字符/600 个英文单词是效果建议而非 API 硬限制；Transport 只能观测并报告超限，不得截断身份、动作、纠偏或连续性合同。Provider 的同步响应必须先通过严格 envelope 校验，24 小时 URL 产物须立即下载、验证为可解码图片并原子落盘；损坏、空数组、同时缺失/同时出现 URL 与 Base64 均 fail closed。
 
-多模态理解的唯一传输 owner 是 `clients/ark_multimodal_client.py`。它固定通过标准方舟 `https://ark.cn-beijing.volces.com/api/v3/responses` 使用 Responses content schema：图片、视频、PDF、音频分别写为 `input_image.image_url`、`input_video.video_url`、`input_file.file_url`、`input_audio.audio_url`，文本写为 `input_text`；不得把 Agent Plan 仅用于视觉生成的 `/api/plan/v3` 路径或 Chat `image_url` schema 套到理解请求。理解仍只读取 `ARK_AGENT_API_KEY`，不得读取 Honcho 使用的 `ARK_API_KEY`。本地理解素材也必须先通过 TOS owner 做格式、容量、尺寸/时长预检并上传到配置 bucket；图片 URL 小于 10 MB，视频/PDF URL 小于 50 MB，音频不超过 25 MB 且不超过 120 分钟。默认理解模型为 `doubao-seed-2-0-lite-260428`，图片使用 `detail=high`，视频抽帧默认 `fps=1` 且配置必须在官方 `[0.2, 5]` 范围。Responses 输出只读取 `message.output_text`，reasoning、空输出或未知 envelope 不得解释为成功。
+多模态理解的唯一传输 owner 是 `clients/ark_multimodal_client.py`。它固定让 `ARK_AGENT_API_KEY` 与 Agent Plan `https://ark.cn-beijing.volces.com/api/plan/v3/responses` 成对使用 Responses content schema：图片、视频、PDF、音频分别写为 `input_image.image_url`、`input_video.video_url`、`input_file.file_url`、`input_audio.audio_url`，文本写为 `input_text`；不得把 Agent Plan 凭证发往标准按量 `/api/v3`，也不得把 Chat `image_url` schema 套到理解请求。理解不得读取 Honcho 使用的 `ARK_API_KEY`。本地理解素材也必须先通过 TOS owner 做格式、容量、尺寸/时长预检并上传到配置 bucket；图片 URL 小于 10 MB，视频/PDF URL 小于 50 MB，音频不超过 25 MB 且不超过 120 分钟。默认理解模型为 `doubao-seed-2-0-lite-260428`，图片使用 `detail=high`，视频抽帧默认 `fps=1` 且配置必须在官方 `[0.2, 5]` 范围。所有会驱动角色资产验收、story order、storyboard gate、逐镜 reshoot 或成片 verdict 的请求必须用 Responses 原生 `text.format=json_schema` 和对应 strict DTO；普通 `json_object` 不能作为业务证据。Responses 输出只读取 `message.output_text` 并再次经 Pydantic 验证；额外字段、非法枚举、尾随 prose/第二对象、reasoning、空输出或未知 envelope 均不得解释为成功。测试替身可通过私有适配器返回文本，但必须经过同一 DTO，不能拥有更宽松的解析规则。
 
 更换 Prompt 模板、模型、Provider、生成参数或输入资产时必须产生新 fingerprint；修改密钥不得改变 fingerprint。
 
@@ -294,6 +297,7 @@ Dry-run receipt 只能证明“结构路径已执行且远程/像素步骤被跳
 | Provider | 初次提交、已有 job 恢复、重复/变化 payload、endpoint 变化、terminal failure、submission uncertain |
 | Artifact/cache | 原子写失败、内容篡改、缺失父资产、跨项目、semantic fingerprint 变化 |
 | Phase 3–5 dry-run | 所有生产图片、像素、多模态、监督 callable 设置为调用即报错 |
+| 结构化理解 | 原生 JSON Schema 请求、非法枚举/额外字段/残缺与尾随内容拒绝、名称到 canonical ID 唯一绑定、缺失视觉证据 fail closed |
 | Phase 6–9 | 冷启动与恢复、任务 ID/哈希稳定、真实 FFmpeg A/V、Provider 请求严格为零 |
 
 常用验收命令：

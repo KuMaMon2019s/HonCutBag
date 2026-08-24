@@ -856,6 +856,7 @@ def _generate_single_shot(
         "gen_strategy", "where", "audio", "sound", "emotion",
         "transition_to_next", "boundary_before", "continuity_reason",
         "continuity_subject", "screen_direction", "tracking_prompt",
+        "character_ids", "participant_refs", "source_character_mentions",
         "source_excerpt", "source_sequence_ids", "source_action_unit_ids",
         "source_events", "dropped_source_events", "source_event_slices",
         "source_event_roles",

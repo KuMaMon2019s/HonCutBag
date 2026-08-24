@@ -175,10 +175,10 @@ def test_flf2v_provider_capability_is_separate_from_honcut_bridge_policy():
     ("duration", "expected_durations"),
     [
         (15, [15]),
-        (16, [9, 7]),
+        (16, [8, 8]),
         (25, [15, 10]),
-        (26, [10, 8, 8]),
-        (30, [12, 9, 9]),
+        (26, [9, 9, 8]),
+        (30, [10, 10, 10]),
     ],
 )
 def test_secondary_v6_enforces_strategy_ranges_and_primary_assembly_budget(
@@ -257,8 +257,8 @@ def test_secondary_v6_keeps_bridge_time_outside_primary_content_capacity():
         "incoming_bridge_handle_s"
     ] == 2.0
     assert storyboard["material_budget"] == {
-        "schema": "honcut.material-budget.v2",
-        "policy": "story_clock_cap_plus_explicit_bridge_overhead",
+        "schema": "honcut.material-budget.v3",
+        "policy": "separate_story_clock_from_provider_request_cost",
         "timeline_policy": "replace_boundary_handles",
         "delivery_target_duration_s": 30.0,
         "storyboard_duration_limit_s": 30.0,
@@ -267,21 +267,24 @@ def test_secondary_v6_keeps_bridge_time_outside_primary_content_capacity():
         "primary_secondary_duration_match": True,
         "story_clock_duration_s": 30.0,
         "story_clock_within_delivery_target": True,
+        "content_provider_request_ledger_complete": True,
+        "content_provider_request_duration_s": 30.0,
+        "content_provider_padding_duration_s": 0.0,
         "bridge_count": 1,
-        "bridge_generation_duration_s": 4.0,
-        "bridge_generation_duration_range_s": [4.0, 6.0],
+        "bridge_provider_request_duration_s": 4.0,
+        "bridge_provider_request_duration_range_s": [4.0, 6.0],
         "bridge_visible_duration_s": 4.0,
         "bridge_replaced_handle_duration_s": 4.0,
-        "total_generated_duration_s": 34.0,
-        "total_generated_duration_range_s": [34.0, 36.0],
-        "total_generated_duration_ratio": 1.133333,
-        "total_generated_duration_ratio_range": [1.133333, 1.2],
+        "total_provider_request_duration_s": 34.0,
+        "total_provider_request_duration_range_s": [34.0, 36.0],
+        "total_provider_request_duration_ratio": 1.133333,
+        "total_provider_request_duration_ratio_range": [1.133333, 1.2],
         "generated_duration_ratio_reference": 1.3,
         "generated_duration_ratio_is_hard_limit": False,
         "delivery_pacing_speed_range": [0.85, 1.25],
-        "total_generated_covers_delivery_target": True,
+        "provider_request_duration_is_story_clock_limit": False,
         "projected_pre_edit_timeline_duration_s": 30.0,
-        "bridge_overhead_is_additive": True,
+        "provider_request_overhead_is_additive_cost_only": True,
         "primary_secondary_double_count_forbidden": True,
     }
 
@@ -395,7 +398,7 @@ def test_action_aware_adaptation_splits_paid_probe_before_secondary_planning():
             "micro_actions": ["穿门", "避让工具箱", "推向观察窗", "稳定"],
         },
     ]
-    assert adaptation_engine.estimate_action_aware_shot_count(events, 45, 12) == 3
+    assert adaptation_engine.estimate_action_aware_shot_count(events, 45, 12) == 4
 
     shots = [
         {
@@ -524,6 +527,7 @@ def test_source_event_identity_resolves_qualified_alias_to_character_asset():
     adaptation_engine._inherit_event_semantics(shots, events, characters)
 
     assert shots[0]["who"] == ["特工", "敌方保安"]
+    assert shots[0]["character_ids"] == ["agent", "security_guard"]
     assert shots[0]["source_character_mentions"] == [
         "身穿深灰色战术服的Agent", "敌方保安",
     ]
@@ -534,7 +538,7 @@ def test_event_extractor_selects_a_generic_or_action_contract(monkeypatch):
 
     def fake_call(prompt: str, system_prompt: str) -> str:
         calls.append((prompt, system_prompt))
-        return "[]"
+        return '{"events":[]}'
 
     monkeypatch.setattr(event_extractor, "_call_llm", fake_call)
     event_extractor._extract_events_from_segment(
@@ -571,6 +575,8 @@ def test_event_extractor_allows_healthy_long_streams_but_keeps_idle_guard(
     assert captured["wall_timeout"] == event_extractor.LLM_TIMEOUT == 900
     assert captured["idle_timeout"] == event_extractor.LLM_IDLE_TIMEOUT == 75
     assert event_extractor.LLM_TIMEOUT > event_extractor.LLM_IDLE_TIMEOUT
+    assert captured["response_format"]["type"] == "json_schema"
+    assert captured["response_format"]["json_schema"]["strict"] is True
 
 
 def test_video_prompt_keeps_requested_ratio_and_fast_action_semantics():
@@ -2504,6 +2510,12 @@ def test_phase1_canonical_storyboard_preserves_event_partition_audit(monkeypatch
         "where": "运输船走廊",
         "what": "镜头继续推进",
         "visual": "空走廊",
+        "character_ids": ["operator"],
+        "participant_refs": [{
+            "ref_id": "SRCCHAR_1234",
+            "mention": "操作员",
+            "character_id": "operator",
+        }],
         "source_events": [2],
         "dropped_source_events": [3, 4],
         "source_event_slices": [
@@ -2521,6 +2533,8 @@ def test_phase1_canonical_storyboard_preserves_event_partition_audit(monkeypatch
     assert canonical["source_events"] == [2]
     assert canonical["dropped_source_events"] == [3, 4]
     assert canonical["source_event_slices"] == shot["source_event_slices"]
+    assert canonical["character_ids"] == ["operator"]
+    assert canonical["participant_refs"] == shot["participant_refs"]
 
 
 def test_phase1_beat_planner_never_emits_over_capacity_beats():
@@ -2861,9 +2875,9 @@ def test_phase3_existing_pack_retries_review_without_regenerating_images(
                 "failed_views": [],
                 "summary": "all contracts pass",
             }
-            # Reproduce 17_12: a valid requested object followed by prose and
-            # another JSON object must not cause json.loads Extra data.
-            return json.dumps(payload) + '\n审核完成。 {"note":"trailing object"}'
+            # Native structured output returns exactly one complete value;
+            # trailing prose/objects are contract violations, not evidence.
+            return json.dumps(payload)
 
     monkeypatch.setattr(character_factory, "SeedreamClient", ImageClient)
     reviewer = Reviewer()
@@ -3114,7 +3128,7 @@ def test_character_reference_qa_requires_empty_hands_in_seedance_body_views():
 
 def test_character_discovery_body_contract_is_prompted_and_normalized(monkeypatch):
     response = json.dumps(
-        [_adult_lead_character("LIN", "male", "25-30")],
+        {"characters": [_adult_lead_character("LIN", "male", "25-30")]},
         ensure_ascii=False,
     )
     captured = {}
@@ -3137,7 +3151,7 @@ def test_character_discovery_body_contract_is_prompted_and_normalized(monkeypatc
     assert "head_to_body_ratio=7.6" in captured["prompt"]
     assert "头宽不得超过肩宽的 43%" in captured["prompt"]
     assert ADULT_LEAD_DISCOVERY_INSTRUCTIONS in character_discoverer.SYSTEM_PROMPT
-    assert character_discoverer.CHARACTER_CONTEXT_SCHEMA_VERSION == 8
+    assert character_discoverer.CHARACTER_CONTEXT_SCHEMA_VERSION == 9
     assert "interaction_props" in captured["prompt"]
     assert "bodybuilder physique" in discovered["negative_guardrails"]
     assert "Body-proportion lock" in discovered["prompt_definition"]
@@ -4580,6 +4594,7 @@ def test_phase5_unverified_systemic_clothing_claim_is_non_blocking(tmp_path):
                     "expected": "深灰色战术服",
                     "observed": "深灰色战术服",
                     "confidence": 0.98,
+                    "character_evidence": [],
                     "panel_evidence": [
                         {"shot_id": "S02_P01", "observed": "深灰色战术服"},
                         {"shot_id": "S03_P01", "observed": "深灰色战术服"},

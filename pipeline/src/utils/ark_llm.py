@@ -7,7 +7,7 @@ import random
 import sys
 import threading
 import time
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 from openai import APIConnectionError, APIStatusError, APITimeoutError, DefaultHttpxClient, OpenAI
@@ -152,6 +152,7 @@ def _attempt_llm_stream(
     idle_timeout: Optional[float] = None,
     heartbeat_callback: Optional[Callable[[], None]] = None,
     heartbeat_interval: float = 5.0,
+    response_format: dict[str, Any] | None = None,
     _client=None,
 ) -> str:
     """Stream a completion with idle and hard wall-clock safety limits.
@@ -224,12 +225,15 @@ def _attempt_llm_stream(
     chunks: list[str] = []
     last_heartbeat_at: Optional[float] = None
     try:
-        stream = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            stream=True,
-            max_tokens=max_tokens,
-        )
+        request = {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+            "max_tokens": max_tokens,
+        }
+        if response_format is not None:
+            request["response_format"] = response_format
+        stream = client.chat.completions.create(**request)
         for chunk in stream:
             now = time.monotonic()
             if wall_expired.is_set() or now > deadline:
@@ -328,6 +332,7 @@ def call_llm_stream(
     rate_limit_max_wait: float = 120.0,
     rate_limit_jitter: float = 1.0,
     launch_stagger: Optional[float] = None,
+    response_format: dict[str, Any] | None = None,
     _client=None,
 ) -> str:
     """Public streaming entry point shared by every pipeline LLM caller.
@@ -362,6 +367,7 @@ def call_llm_stream(
                 idle_timeout=idle_timeout,
                 heartbeat_callback=heartbeat_callback,
                 heartbeat_interval=heartbeat_interval,
+                response_format=response_format,
                 _client=client,
             )
         except LLMRateLimitedError as exc:

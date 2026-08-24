@@ -88,14 +88,51 @@ class VideoModelCapabilities:
         return self.min_shot_duration_s, self.max_shot_duration_s
 
     def effective_duration_bounds(self, execution_strategy: str) -> tuple[float, float]:
-        """Return the visible story-time range for one generated clip."""
-        if execution_strategy == "multi_image":
-            return self.request_duration_bounds(execution_strategy)
-        if execution_strategy == "tail_video_extend":
-            return self.request_duration_bounds(execution_strategy)
+        """Return visible story time, excluding Provider padding/context.
+
+        A Provider may require an 8-second request for a 3-second usable beat.
+        Treating that request minimum as narrative time makes cost accounting
+        block otherwise executable stories. Only an FLF bridge consumes its
+        complete generated clip as visible transition time.
+        """
+        if execution_strategy in {"multi_image", "tail_video_extend"}:
+            _request_minimum, request_maximum = self.request_duration_bounds(
+                execution_strategy
+            )
+            return self.min_unique_beat_s, request_maximum
         if execution_strategy == "first_last_frame_bridge":
             return self.request_duration_bounds(execution_strategy)
         return self.min_unique_beat_s, self.max_unique_beat_s
+
+    def request_duration_for_effective_story(
+        self,
+        effective_story_duration_s: float,
+        execution_strategy: str,
+    ) -> float:
+        """Select the smallest valid request that can carry visible story time."""
+
+        effective = float(effective_story_duration_s)
+        effective_minimum, effective_maximum = self.effective_duration_bounds(
+            execution_strategy
+        )
+        if not effective_minimum - 1e-6 <= effective <= effective_maximum + 1e-6:
+            raise ValueError(
+                f"effective story duration {effective:g}s is outside {self.name}'s "
+                f"{effective_minimum:g}-{effective_maximum:g}s "
+                f"{execution_strategy} range"
+            )
+        request_minimum, request_maximum = self.request_duration_bounds(
+            execution_strategy
+        )
+        quantum = self.duration_quantum_s
+        requested = max(request_minimum, effective)
+        requested = math.ceil(requested / quantum - 1e-9) * quantum
+        if requested > request_maximum + 1e-6:
+            raise ValueError(
+                f"{effective:g}s effective story time requires a {requested:g}s "
+                f"request, above {self.name}'s {request_maximum:g}s maximum"
+            )
+        return round(requested, 6)
 
     def validate_chunk_durations(
         self,
@@ -169,8 +206,8 @@ SEEDANCE_2_CAPABILITIES = VideoModelCapabilities(
     max_multi_image_duration_s=15,
     min_tail_extend_duration_s=6,
     max_tail_extend_duration_s=10,
-    min_primary_story_duration_s=15,
-    max_primary_story_duration_s=30,
+    min_primary_story_duration_s=3,
+    max_primary_story_duration_s=35,
 )
 
 

@@ -26,6 +26,7 @@ class CharacterDefinition(BaseModel):
     description: str = ""
     appearance: dict[str, Any] = Field(default_factory=dict)
     style: str = ""
+    source_identity_ref_ids: list[str] = Field(default_factory=list)
 
 
 class StoryboardShot(BaseModel):
@@ -42,6 +43,9 @@ class StoryboardShot(BaseModel):
     action: str = ""
     where: str = ""
     who: str | list[str] = Field(default_factory=list)
+    character_ids: list[str] = Field(default_factory=list)
+    participant_refs: list[dict[str, str]] = Field(default_factory=list)
+    source_character_mentions: list[str] = Field(default_factory=list)
     shot_size: str = ""
     camera_movement: str = ""
     lens_mm: int | None = Field(default=None, ge=50, le=85)

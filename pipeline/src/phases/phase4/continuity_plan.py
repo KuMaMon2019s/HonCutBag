@@ -254,7 +254,12 @@ def _boundary_before(
 
 
 def _anchors(shot: Mapping[str, Any], scene_contract: Mapping[str, Any]) -> ContinuityAnchors:
-    who = shot.get("who") or shot.get("characters") or []
+    who = (
+        shot.get("character_ids")
+        or shot.get("who")
+        or shot.get("characters")
+        or []
+    )
     if not isinstance(who, list):
         who = [who] if who else []
     camera_motion = str(
@@ -490,6 +495,28 @@ def build_continuity_plan(
                     unique_frames + reserved_overlap,
                     minimum_request_frames,
                 )
+                declared_request_s = beat.get("provider_request_duration_s")
+                if strict_secondary_contract:
+                    expected_request_s = (
+                        capability_profile.request_duration_for_effective_story(
+                            unique_frames / timeline_fps,
+                            strategy,
+                        )
+                    )
+                    if (
+                        isinstance(declared_request_s, bool)
+                        or not isinstance(declared_request_s, (int, float))
+                        or not math.isclose(
+                            float(declared_request_s),
+                            expected_request_s,
+                            abs_tol=1e-6,
+                        )
+                    ):
+                        raise ValueError(
+                            f"{shot_id} storyboard beat {sequence} declares stale "
+                            "Provider request duration"
+                        )
+                    requested_frames = round(expected_request_s * timeline_fps)
                 provider_padding_frames = (
                     requested_frames - unique_frames - reserved_overlap
                 )

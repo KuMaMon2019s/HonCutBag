@@ -1050,10 +1050,17 @@ def _vlm_semantic_check(
             f"{body_action_qa} "
             f"Storyboard: {json.dumps(storyboard, ensure_ascii=False)}"
         )
-        raw = vlm_client.review([Path(item.path) for item in sample_frames], prompt)
-        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", str(raw).strip(), flags=re.IGNORECASE)
-        parsed = json.loads(raw)
-        if not isinstance(parsed, dict) or parsed.get("verdict") not in verdict_rank:
+        from clients.ark_multimodal_client import review_as
+        from schemas.understanding import ShotSemanticReview
+
+        try:
+            parsed = review_as(
+                vlm_client,
+                [Path(item.path) for item in sample_frames],
+                prompt,
+                ShotSemanticReview,
+            ).model_dump()
+        except (json.JSONDecodeError, ValueError):
             return {
                 "status": "error",
                 "reason": "invalid semantic review response",

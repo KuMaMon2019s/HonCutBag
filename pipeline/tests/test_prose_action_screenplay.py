@@ -151,7 +151,7 @@ def test_event_parser_preserves_speaker_evidence_and_action_state():
         }],
     )]
 
-    parsed = _parse_events(json.dumps(payload, ensure_ascii=False), content)
+    parsed = _parse_events(json.dumps({"events": payload}, ensure_ascii=False), content)
 
     assert parsed[0]["event_role"] == "action_chain"
     assert parsed[0]["micro_actions"] == ["凛冲出", "烬格挡"]
@@ -167,7 +167,10 @@ def test_event_parser_rejects_invented_dialogue():
     }])]
 
     with pytest.raises(ValueError, match="逐字原文"):
-        _parse_events(json.dumps(payload, ensure_ascii=False), "凛沉默地举起刀。")
+        _parse_events(
+            json.dumps({"events": payload}, ensure_ascii=False),
+            "凛沉默地举起刀。",
+        )
 
 
 def test_event_parser_excludes_global_visual_directives_from_story_clock():
@@ -192,7 +195,9 @@ def test_event_parser_excludes_global_visual_directives_from_story_clock():
         continuity_subject="",
     )]
 
-    assert _parse_events(json.dumps(payload, ensure_ascii=False), directive) == []
+    assert _parse_events(
+        json.dumps({"events": payload}, ensure_ascii=False), directive
+    ) == []
 
 
 def test_event_parser_excludes_fragment_from_directive_only_segment():
@@ -217,7 +222,9 @@ def test_event_parser_excludes_fragment_from_directive_only_segment():
         continuity_subject="",
     )]
 
-    assert _parse_events(json.dumps(payload, ensure_ascii=False), directive) == []
+    assert _parse_events(
+        json.dumps({"events": payload}, ensure_ascii=False), directive
+    ) == []
 
 
 def test_event_parser_keeps_story_action_in_mixed_directive_segment():
@@ -247,7 +254,9 @@ def test_event_parser_keeps_story_action_in_mixed_directive_segment():
         ),
     ]
 
-    parsed = _parse_events(json.dumps(payload, ensure_ascii=False), source)
+    parsed = _parse_events(
+        json.dumps({"events": payload}, ensure_ascii=False), source
+    )
 
     assert any(event["micro_actions"] == ["机械臂进入工位"] for event in parsed)
 
@@ -271,7 +280,9 @@ def test_event_parser_keeps_real_scene_setup_without_visible_motion():
         continuity_subject="",
     )]
 
-    parsed = _parse_events(json.dumps(payload, ensure_ascii=False), setup)
+    parsed = _parse_events(
+        json.dumps({"events": payload}, ensure_ascii=False), setup
+    )
 
     assert len(parsed) == 1
     assert parsed[0]["event_role"] == "scene_setup"
@@ -438,7 +449,7 @@ def test_segment_cache_is_invalidated_by_extractor_schema(tmp_path, monkeypatch)
         nonlocal calls
         calls += 1
         assert system_prompt
-        return "[]"
+        return '{"events":[]}'
 
     segment = {
         "id": 1,
@@ -469,7 +480,7 @@ def test_segment_cache_is_invalidated_by_extractor_schema(tmp_path, monkeypatch)
 def test_group_participants_are_not_promoted_to_character_assets():
     payload = [_event(who=["凛", "烬", "数十机械单位"])]
 
-    parsed = _parse_events(json.dumps(payload, ensure_ascii=False))
+    parsed = _parse_events(json.dumps({"events": payload}, ensure_ascii=False))
 
     assert parsed[0]["who"] == ["凛", "烬"]
     assert parsed[0]["background_groups"] == ["数十机械单位"]
@@ -486,7 +497,7 @@ def test_event_parser_rejects_role_and_dramatic_turn_conflicts(
     payload = [_event(event_role=event_role, dramatic_turn=dramatic_turn)]
 
     with pytest.raises(ValueError, match="event_role.*dramatic_turn"):
-        _parse_events(json.dumps(payload, ensure_ascii=False))
+        _parse_events(json.dumps({"events": payload}, ensure_ascii=False))
 
 
 def test_event_extractor_retries_role_and_dramatic_turn_conflict(monkeypatch):
@@ -497,7 +508,7 @@ def test_event_extractor_retries_role_and_dramatic_turn_conflict(monkeypatch):
     def fake_call(prompt, **_kwargs):
         calls.append(prompt)
         payload = invalid if len(calls) == 1 else corrected
-        return json.dumps([payload], ensure_ascii=False)
+        return json.dumps({"events": [payload]}, ensure_ascii=False)
 
     monkeypatch.setattr("prompt.event_extractor._call_llm", fake_call)
     monkeypatch.setattr("prompt.event_extractor.time.sleep", lambda _seconds: None)

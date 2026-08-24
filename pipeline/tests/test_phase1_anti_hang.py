@@ -176,7 +176,7 @@ def test_event_extractor_retries_stream_interruption(monkeypatch):
         calls += 1
         if calls == 1:
             raise ark_llm.LLMStreamError("incomplete chunked read")
-        return json.dumps([{
+        return json.dumps({"events": [{
             "who": ["凛"],
             "where": "高架",
             "what": "凛出现",
@@ -184,7 +184,7 @@ def test_event_extractor_retries_stream_interruption(monkeypatch):
             "visual": "凛站在高架上",
             "time": "夜晚",
             "action_type": "reveal",
-        }], ensure_ascii=False)
+        }]}, ensure_ascii=False)
 
     monkeypatch.setattr(event_extractor, "_call_llm", call)
     monkeypatch.setattr(event_extractor.time, "sleep", lambda _seconds: None)
@@ -653,7 +653,10 @@ def test_phase1_legacy_checkpoint_is_regenerated(monkeypatch, tmp_path):
     monkeypatch.setattr(
         character_discoverer,
         "discover_characters",
-        lambda _events: {"characters": [], "total_characters": 0},
+        lambda _events: {
+            "characters": [{"id": "rin", "name": "凛", "aliases": []}],
+            "total_characters": 1,
+        },
     )
     monkeypatch.setattr(adaptation_engine, "adapt_events", lambda *_args, **_kwargs: {"shots": [{}]})
     monkeypatch.setattr(

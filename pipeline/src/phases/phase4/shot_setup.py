@@ -143,6 +143,8 @@ def normalize_shots(
             "caption": source.get("caption", ""),
             "caption_frames": source.get("caption_frames", ""),
             "who": source.get("who", []),
+            "character_ids": source.get("character_ids", []),
+            "participant_refs": source.get("participant_refs", []),
             "associate_assets": source.get("associate_assets", []),
             "gen_strategy": source.get("gen_strategy", "i2v"),
             "visual": source.get("visual", ""),
@@ -196,7 +198,8 @@ def materialize_shot_directories(
             for key in (
                 "shot_id", "name", "duration", "prompt", "route", "route_reason",
                 "ref_type", "first_frame_path", "first_frame_exists", "caption",
-                "caption_frames", "who", "associate_assets", "gen_strategy", "visual",
+                "caption_frames", "who", "character_ids", "participant_refs",
+                "associate_assets", "gen_strategy", "visual",
                 "what", "action_description", "generation_actions",
                 "body_action_choreography", "body_action_contract", "generation_load",
                 "source_action_unit_ids", "start_state", "end_state", "causal_link",

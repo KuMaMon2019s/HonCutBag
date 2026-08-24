@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import json
 import os
-import re
 from pathlib import Path
 from typing import Any
 
-from clients.ark_multimodal_client import ArkMultimodalClient
+from clients.ark_multimodal_client import ArkMultimodalClient, review_as
+from schemas.understanding import StoryOrderUnderstanding
 
 
 class InvalidStoryOrderReview(RuntimeError):
@@ -114,16 +114,17 @@ def review_with_multimodal_llm(
     prompt = REVIEW_PROMPT.format(
         storyboard_json=json.dumps(_review_payload(storyboard), ensure_ascii=False, indent=2)
     )
-    raw = reviewer.review(image_paths, prompt)
-    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.IGNORECASE)
     try:
-        result = json.loads(raw)
-    except json.JSONDecodeError as exc:
+        result = review_as(
+            reviewer,
+            image_paths,
+            prompt,
+            StoryOrderUnderstanding,
+        ).model_dump()
+    except (json.JSONDecodeError, ValueError) as exc:
         raise InvalidStoryOrderReview(
-            f"ARK multimodal review returned invalid JSON: {exc}"
+            f"ARK multimodal review violated the story-order schema: {exc}"
         ) from exc
-    if not isinstance(result, dict):
-        raise InvalidStoryOrderReview("ARK multimodal review must return a JSON object")
 
     expected = storyboard_shot_ids(storyboard)
     suggested = [_shot_id(item) for item in result.get("suggested_order", [])]
@@ -136,12 +137,6 @@ def review_with_multimodal_llm(
             "ARK multimodal review returned an invalid or incomplete shot order"
         )
     result["suggested_order"] = suggested
-    if not isinstance(result.get("narrative_consistent"), bool):
-        raise InvalidStoryOrderReview(
-            "ARK multimodal review omitted boolean narrative_consistent"
-        )
-    if not isinstance(result.get("issues"), list):
-        raise InvalidStoryOrderReview("ARK multimodal review omitted issues array")
     return result
 
 

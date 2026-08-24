@@ -410,6 +410,39 @@ def run_generation_capacity_checks(
                         f"{profile.name} {actual_mode}",
                         [sid], beat_id=beat_id, duration_seconds=beat_duration,
                     ))
+                if uses_secondary_contract:
+                    try:
+                        expected_request_duration = (
+                            profile.request_duration_for_effective_story(
+                                beat_duration,
+                                actual_mode,
+                            )
+                        )
+                    except ValueError as exc:
+                        issues.append(_issue(
+                            "L1", "severe", "storyboard_beat_story_duration_invalid",
+                            f"{beat_id} has no executable Provider request: {exc}",
+                            [sid], beat_id=beat_id,
+                        ))
+                    else:
+                        observed_request_duration = float(
+                            beat.get("provider_request_duration_s") or 0
+                        )
+                        if not math.isclose(
+                            observed_request_duration,
+                            expected_request_duration,
+                            abs_tol=1e-6,
+                        ):
+                            issues.append(_issue(
+                                "L1", "severe", "storyboard_beat_provider_request_mismatch",
+                                f"{beat_id} Provider request duration must be "
+                                f"{expected_request_duration:g}s for {beat_duration:g}s "
+                                "of effective story time",
+                                [sid], beat_id=beat_id,
+                                effective_story_duration_s=beat_duration,
+                                expected_provider_request_duration_s=expected_request_duration,
+                                observed_provider_request_duration_s=observed_request_duration,
+                            ))
             if duration and not math.isclose(
                 beat_duration_total,
                 duration,
@@ -656,16 +689,15 @@ VISUAL STYLE:
 {visual_style}"""
     input_paths = [images[frame_id] for frame_id in ordered_ids]
     try:
-        raw = (client or ArkMultimodalClient()).review(input_paths, prompt)
-        raw = re.sub(
-            r"^```(?:json)?\s*|\s*```$",
-            "",
-            raw.strip(),
-            flags=re.IGNORECASE,
-        )
-        parsed = json.loads(raw)
-        if not isinstance(parsed, dict) or not isinstance(parsed.get("issues"), list):
-            raise ValueError("response must contain an issues array")
+        from clients.ark_multimodal_client import review_as
+        from schemas.understanding import FirstFrameUnderstanding
+
+        parsed = review_as(
+            client or ArkMultimodalClient(),
+            input_paths,
+            prompt,
+            FirstFrameUnderstanding,
+        ).model_dump()
         valid_ids = set(ordered_ids)
         issues: list[dict[str, Any]] = []
         for value in parsed["issues"]:
@@ -1306,8 +1338,17 @@ def run_l3_review(
         input_records,
     )
     if client is None and not os.environ.get("ARK_AGENT_API_KEY"):
-        return [], {
-            "status": "skipped",
+        shot_ids = sorted({_parent_shot_id(value) for value in valid_storyboard_ids})
+        return [
+            _issue(
+                "L3",
+                "severe",
+                "storyboard_visual_review_unavailable",
+                "Canonical storyboard visual review is unavailable; paid video generation is blocked",
+                shot_ids,
+            )
+        ], {
+            "status": "error",
             "grid_path": str(grid_path),
             "input_manifest_path": str(input_manifest_path),
             "input_count": len(input_paths),
@@ -1347,13 +1388,15 @@ CHARACTERS:
 VISUAL STYLE:
 {visual_style}"""
     try:
-        raw = (client or ArkMultimodalClient()).review(
-            input_paths, prompt
-        )
-        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.IGNORECASE)
-        parsed = json.loads(raw)
-        if not isinstance(parsed, dict) or not isinstance(parsed.get("issues"), list):
-            raise ValueError("response must contain an issues array")
+        from clients.ark_multimodal_client import review_as
+        from schemas.understanding import StoryboardVisualUnderstanding
+
+        parsed = review_as(
+            client or ArkMultimodalClient(),
+            input_paths,
+            prompt,
+            StoryboardVisualUnderstanding,
+        ).model_dump()
         valid_ids = set(valid_storyboard_ids)
         issues = []
         for value in parsed["issues"]:
@@ -1399,8 +1442,17 @@ VISUAL STYLE:
             "raw_issue_count": len(parsed["issues"]),
         }
     except Exception as exc:
-        return [], {
-            "status": "skipped",
+        shot_ids = sorted({_parent_shot_id(value) for value in valid_storyboard_ids})
+        return [
+            _issue(
+                "L3",
+                "severe",
+                "storyboard_visual_review_unavailable",
+                f"Canonical storyboard visual review failed: {exc}",
+                shot_ids,
+            )
+        ], {
+            "status": "error",
             "grid_path": str(grid_path),
             "input_manifest_path": str(input_manifest_path),
             "input_count": len(input_paths),

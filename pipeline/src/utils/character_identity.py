@@ -115,6 +115,24 @@ def resolve_character_name(
     return next(iter(candidates)) if len(candidates) == 1 else None
 
 
+def resolve_character_id(
+    value: Any,
+    characters: list[dict[str, Any]] | None,
+) -> str | None:
+    """Resolve one source mention to one unambiguous canonical asset ID."""
+
+    canonical_name = resolve_character_name(value, characters)
+    if canonical_name is None or not characters:
+        return None
+    matches = {
+        str(character.get("id") or "").strip()
+        for character in characters
+        if str(character.get("name") or "").strip() == canonical_name
+        and str(character.get("id") or "").strip()
+    }
+    return next(iter(matches)) if len(matches) == 1 else None
+
+
 def is_declared_character_reference(
     value: Any,
     characters: list[dict[str, Any]] | None,

@@ -1,4 +1,4 @@
-"""Story-clock and additive bridge-generation accounting.
+"""Story-clock, Provider request, and padding/context accounting.
 
 Primary Sxx shots and their Pxx children describe the same story clock and
 must never be added together. Cross-primary bridges are separate generated
@@ -12,7 +12,7 @@ import math
 from collections.abc import Mapping, MutableMapping, Sequence
 from typing import Any
 
-MATERIAL_BUDGET_SCHEMA = "honcut.material-budget.v2"
+MATERIAL_BUDGET_SCHEMA = "honcut.material-budget.v3"
 BRIDGE_TIMELINE_POLICY = "replace_boundary_handles"
 DEFAULT_GENERATED_DURATION_RATIO_REFERENCE = 1.3
 DEFAULT_DELIVERY_PACING_SPEED_RANGE = (0.85, 1.25)
@@ -50,7 +50,7 @@ def _duration_range(bridge: Mapping[str, Any]) -> tuple[float, float]:
 
 
 def build_material_budget(storyboard: Mapping[str, Any]) -> dict[str, Any]:
-    """Build the canonical two-ledger budget from storyboard assets."""
+    """Build the canonical three-ledger budget from storyboard assets."""
     shots = [
         shot
         for shot in (storyboard.get("shots") or [])
@@ -67,6 +67,9 @@ def build_material_budget(storyboard: Mapping[str, Any]) -> dict[str, Any]:
     )
     secondary_duration = 0.0
     secondary_declared = False
+    content_provider_request_duration = 0.0
+    content_provider_padding_duration = 0.0
+    content_request_ledger_complete = True
     for shot in shots:
         beats = [
             beat
@@ -75,10 +78,23 @@ def build_material_budget(storyboard: Mapping[str, Any]) -> dict[str, Any]:
         ]
         if beats:
             secondary_declared = True
-            secondary_duration += sum(
-                _number(beat.get("duration_s") or beat.get("duration"))
-                for beat in beats
-            )
+            for beat in beats:
+                effective = _number(
+                    beat.get("effective_story_duration_s")
+                    or beat.get("duration_s")
+                    or beat.get("duration")
+                )
+                secondary_duration += effective
+                raw_request = beat.get("provider_request_duration_s")
+                if raw_request is None:
+                    content_request_ledger_complete = False
+                    requested = effective
+                else:
+                    requested = _number(raw_request)
+                content_provider_request_duration += requested
+                content_provider_padding_duration += max(0.0, requested - effective)
+    if not secondary_declared:
+        content_provider_request_duration = primary_duration
     secondary_matches = (
         not secondary_declared
         or math.isclose(primary_duration, secondary_duration, abs_tol=1e-6)
@@ -129,26 +145,28 @@ def build_material_budget(storyboard: Mapping[str, Any]) -> dict[str, Any]:
     else:
         pacing_minimum, pacing_maximum = DEFAULT_DELIVERY_PACING_SPEED_RANGE
     storyboard_limit = delivery_duration if delivery_duration > 0 else None
-    total_generated_duration = story_clock_duration + bridge_generation_duration
-    total_generated_range = (
-        story_clock_duration + bridge_generation_minimum,
-        story_clock_duration + bridge_generation_maximum,
+    total_provider_request_duration = (
+        content_provider_request_duration + bridge_generation_duration
+    )
+    total_provider_request_range = (
+        content_provider_request_duration + bridge_generation_minimum,
+        content_provider_request_duration + bridge_generation_maximum,
     )
     projected_timeline = (
         story_clock_duration - replaced_handle_duration + bridge_visible_duration
     )
     if delivery_duration > 0:
-        generated_ratio = total_generated_duration / delivery_duration
-        generated_ratio_range = [
-            total_generated_range[0] / delivery_duration,
-            total_generated_range[1] / delivery_duration,
+        provider_request_ratio = total_provider_request_duration / delivery_duration
+        provider_request_ratio_range = [
+            total_provider_request_range[0] / delivery_duration,
+            total_provider_request_range[1] / delivery_duration,
         ]
     else:
-        generated_ratio = None
-        generated_ratio_range = None
+        provider_request_ratio = None
+        provider_request_ratio_range = None
     return {
         "schema": MATERIAL_BUDGET_SCHEMA,
-        "policy": "story_clock_cap_plus_explicit_bridge_overhead",
+        "policy": "separate_story_clock_from_provider_request_cost",
         "timeline_policy": BRIDGE_TIMELINE_POLICY,
         "delivery_target_duration_s": (
             _rounded(delivery_duration) if delivery_duration > 0 else None
@@ -166,25 +184,38 @@ def build_material_budget(storyboard: Mapping[str, Any]) -> dict[str, Any]:
             storyboard_limit is None
             or story_clock_duration <= storyboard_limit + 1e-6
         ),
+        "content_provider_request_ledger_complete": (
+            content_request_ledger_complete
+        ),
+        "content_provider_request_duration_s": _rounded(
+            content_provider_request_duration
+        ),
+        "content_provider_padding_duration_s": _rounded(
+            content_provider_padding_duration
+        ),
         "bridge_count": len(bridges),
-        "bridge_generation_duration_s": _rounded(bridge_generation_duration),
-        "bridge_generation_duration_range_s": [
+        "bridge_provider_request_duration_s": _rounded(bridge_generation_duration),
+        "bridge_provider_request_duration_range_s": [
             _rounded(bridge_generation_minimum),
             _rounded(bridge_generation_maximum),
         ],
         "bridge_visible_duration_s": _rounded(bridge_visible_duration),
         "bridge_replaced_handle_duration_s": _rounded(replaced_handle_duration),
-        "total_generated_duration_s": _rounded(total_generated_duration),
-        "total_generated_duration_range_s": [
-            _rounded(total_generated_range[0]),
-            _rounded(total_generated_range[1]),
-        ],
-        "total_generated_duration_ratio": (
-            _rounded(generated_ratio) if generated_ratio is not None else None
+        "total_provider_request_duration_s": _rounded(
+            total_provider_request_duration
         ),
-        "total_generated_duration_ratio_range": (
-            [_rounded(value) for value in generated_ratio_range]
-            if generated_ratio_range is not None
+        "total_provider_request_duration_range_s": [
+            _rounded(total_provider_request_range[0]),
+            _rounded(total_provider_request_range[1]),
+        ],
+        "total_provider_request_duration_ratio": (
+            _rounded(provider_request_ratio)
+            if provider_request_ratio is not None
+            else None
+        ),
+        "total_provider_request_duration_ratio_range": (
+            [_rounded(value) for value in provider_request_ratio_range]
+            if provider_request_ratio_range is not None
             else None
         ),
         "generated_duration_ratio_reference": ratio_reference,
@@ -193,12 +224,9 @@ def build_material_budget(storyboard: Mapping[str, Any]) -> dict[str, Any]:
             _rounded(pacing_minimum),
             _rounded(pacing_maximum),
         ],
-        "total_generated_covers_delivery_target": (
-            storyboard_limit is None
-            or total_generated_duration + 1e-6 >= storyboard_limit
-        ),
+        "provider_request_duration_is_story_clock_limit": False,
         "projected_pre_edit_timeline_duration_s": _rounded(projected_timeline),
-        "bridge_overhead_is_additive": True,
+        "provider_request_overhead_is_additive_cost_only": True,
         "primary_secondary_double_count_forbidden": True,
     }
 
@@ -206,7 +234,7 @@ def build_material_budget(storyboard: Mapping[str, Any]) -> dict[str, Any]:
 def attach_material_budget(
     storyboard: MutableMapping[str, Any],
 ) -> dict[str, Any]:
-    """Persist the current two-ledger calculation on a storyboard."""
+    """Persist the current three-ledger calculation on a storyboard."""
     budget = build_material_budget(storyboard)
     storyboard["material_budget"] = budget
     return budget
@@ -243,15 +271,14 @@ def material_budget_contract_errors(
     secondary_version = str(storyboard.get("secondary_storyboard_version") or "")
     if (
         secondary_version.startswith("honcut.secondary-storyboard.")
-        and not budget["total_generated_covers_delivery_target"]
+        and not budget["content_provider_request_ledger_complete"]
     ):
         errors.append(
             {
-                "code": "total_generated_duration_below_delivery_target",
+                "code": "content_provider_request_ledger_missing",
                 "message": (
-                    f"story plus bridge generation totals "
-                    f"{budget['total_generated_duration_s']:g}s, below the "
-                    f"{budget['delivery_target_duration_s']:g}s delivery target"
+                    "every Pxx beat must declare Provider request duration "
+                    "separately from effective story time"
                 ),
                 "details": budget,
             }

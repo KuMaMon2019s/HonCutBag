@@ -29,6 +29,10 @@ from pathlib import Path
 from typing import List, Dict, Any
 
 from openai import OpenAI
+from schemas.understanding import (
+    EventUnderstandingBatch,
+    native_chat_json_schema_format,
+)
 from utils.action_units import annotate_event_motion_modes
 from utils.body_action_contracts import (
     apply_body_action_contract,
@@ -50,8 +54,8 @@ from utils.ark_llm import (
 GENERAL_SYSTEM_PROMPT = (
     "你是影视编剧与连续性编辑。从文本中提取可拍摄的叙事事件。"
     "事件不是镜头：不要把每句话或每个招式机械拆成一个事件，镜头划分由下游导演完成。"
-    "你必须保留动作的起始状态、结束状态、因果关系和无署名对白的可靠归属。输出严格 JSON 数组。"
-    "不要输出任何解释文字，只输出 JSON。"
+    "你必须保留动作的起始状态、结束状态、因果关系和无署名对白的可靠归属。"
+    "输出严格 JSON 对象，顶层只有 events 数组。不要输出任何解释文字。"
 )
 
 ACTION_SYSTEM_PROMPT = (
@@ -61,8 +65,8 @@ ACTION_SYSTEM_PROMPT = (
     "同一时刻并行完成的复合动作必须合成一条。"
     "舞蹈、格斗、功夫或武术段落必须进一步输出逐拍 body_action_choreography，明确左右侧、"
     "执行肢体、步法、躯干、重心、方向、接触点和终态。"
-    "你必须保留动作的起始状态、结束状态、因果关系和无署名对白的可靠归属。输出严格 JSON 数组。"
-    "不要输出任何解释文字，只输出 JSON。"
+    "你必须保留动作的起始状态、结束状态、因果关系和无署名对白的可靠归属。"
+    "输出严格 JSON 对象，顶层只有 events 数组。不要输出任何解释文字。"
 )
 
 # Backward-compatible export for integrations that imported the old constant.
@@ -74,7 +78,7 @@ USER_PROMPT_TEMPLATE = (
     "<context_before>\n{context_before}\n</context_before>\n"
     "<target>\n{content}\n</target>\n"
     "<context_after>\n{context_after}\n</context_after>\n\n"
-    "只从 <target> 提取事件。输出 JSON 数组，每个元素包含：\n"
+    "只从 <target> 提取事件。输出 {{\"events\":[...]}}，每个元素包含：\n"
     "- who: 数组，只写可跨事件复用的稳定身份标签；服装、年龄、伤势、动作、站位和地点修饰不得进入 who，"
     "应写入 visual/start_state/end_state。相同人物在 target 与上下文中必须沿用同一标签；"
     "不得把多词姓名截短，也不得用主角/他/她替换已有标签\n"
@@ -194,6 +198,7 @@ def _call_llm(prompt: str, system_prompt: str = GENERAL_SYSTEM_PROMPT) -> str:
         max_tokens=16000,
         wall_timeout=LLM_TIMEOUT,
         idle_timeout=LLM_IDLE_TIMEOUT,
+        response_format=native_chat_json_schema_format(EventUnderstandingBatch),
         _client=client,
     )
 
@@ -230,7 +235,7 @@ _NARRATIVE_JUMP_CUES = (
 # caches carried over from earlier run directories — and forces every Phase 1
 # event extraction to re-run (a paid LLM pass). Never bump casually, and never
 # reuse cross-run segment caches from a run produced under a different value.
-EVENT_FLOW_SCHEMA_VERSION = "13.0"
+EVENT_FLOW_SCHEMA_VERSION = "14.0"
 
 
 def is_global_production_directive_text(evidence: str) -> bool:
@@ -340,23 +345,7 @@ def _normalize_event(event: Dict[str, Any], source_content: str = "") -> Dict[st
 
 
 def _parse_events(response: str, source_content: str = "") -> List[Dict[str, Any]]:
-    """
-    解析 LLM 响应为事件列表
-
-    尝试从响应中提取 JSON 数组。支持：
-    - 纯 JSON 数组
-    - 被 ```json ... ``` 包裹的 JSON
-    - 被 ``` ... ``` 包裹的 JSON
-
-    Args:
-        response: LLM 原始响应字符串
-
-    Returns:
-        事件字典列表
-
-    Raises:
-        ValueError: 无法解析为有效 JSON 数组
-    """
+    """Validate the complete native ``{"events": [...]}`` response."""
     text = response.strip()
 
     # 尝试提取 ```json ... ``` 代码块
@@ -370,18 +359,9 @@ def _parse_events(response: str, source_content: str = "") -> List[Dict[str, Any
     # 尝试解析 JSON
     parsed = json.loads(text)
 
-    # 验证是数组
-    if not isinstance(parsed, list):
-        raise ValueError(f"期望 JSON 数组，得到 {type(parsed).__name__}")
+    parsed = EventUnderstandingBatch.model_validate(parsed).model_dump()["events"]
 
-    # 验证每个元素的基本结构
-    required_fields = {"who", "where", "what", "emotion", "visual", "time", "action_type"}
-    for i, event in enumerate(parsed):
-        if not isinstance(event, dict):
-            raise ValueError(f"第 {i+1} 个事件不是字典")
-        missing = required_fields - set(event.keys())
-        if missing:
-            raise ValueError(f"第 {i+1} 个事件缺少字段: {missing}")
+    for event in parsed:
         _normalize_event(event, source_content)
 
     # A model may quote only a small visual fragment from a paragraph that is
@@ -520,7 +500,10 @@ def extract_events(
             try:
                 cached = json.loads(cache_path.read_text(encoding="utf-8"))
                 events = _parse_events(
-                    json.dumps(cached.get("events", []), ensure_ascii=False),
+                    json.dumps(
+                        {"events": cached.get("events", [])},
+                        ensure_ascii=False,
+                    ),
                     str(segment.get("content", "")),
                 )
                 print(f"复用 segment {segment_id} 事件缓存...", file=sys.stderr)
