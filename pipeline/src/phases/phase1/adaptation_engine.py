@@ -29,6 +29,7 @@
 
 import argparse
 import copy
+import functools
 import hashlib
 import itertools
 import json
@@ -658,9 +659,9 @@ def _estimate_action_capacity_plan(
             maximum_story_shots,
         )
     else:
-        search_end = max(
-            baseline,
-            min(structural_shots, maximum_story_shots),
+        search_end = min(
+            maximum_story_shots,
+            max(baseline, structural_shots + 1),
         )
         capacities = {
             shot_count: _maximum_generation_units_for_story_clock(
@@ -671,11 +672,16 @@ def _estimate_action_capacity_plan(
             for shot_count in range(baseline, search_end + 1)
         }
         best_capacity = max(capacities.values())
-        primary_shots = min(
+        first_capacity_maximizer = min(
             shot_count
             for shot_count, capacity in capacities.items()
             if capacity == best_capacity
         )
+        # One additional slot on the same capacity plateau gives ordered,
+        # indivisible event ranges room to share a boundary without forcing a
+        # temporal jump.  It does not enlarge the story clock or theoretical
+        # action budget, and is bounded by the structural search range.
+        primary_shots = min(first_capacity_maximizer + 1, search_end)
     return {
         "primary_shots": primary_shots,
         "structural_shots": structural_shots,
@@ -1752,6 +1758,54 @@ def _dropped_source_event_ids(beats: List[Dict[str, Any]]) -> set[int]:
     }
 
 
+def _validate_beat_event_order(
+    beats: List[Dict[str, Any]],
+    events: List[Dict[str, Any]],
+) -> None:
+    """Require each sequence's source-event ranges to be contiguous and monotonic."""
+    event_by_id = {event_id: event for event_id, event in enumerate(events, 1)}
+    positions: Dict[int, List[int]] = {}
+    for beat_index, beat in enumerate(beats):
+        raw_ids = beat.get("source_events") or []
+        if not isinstance(raw_ids, list):
+            raise ValueError(f"beat {beat_index + 1} source_events must be an array")
+        for event_id in dict.fromkeys(raw_ids):
+            if event_id in event_by_id:
+                positions.setdefault(event_id, []).append(beat_index)
+
+    for event_id, event_positions in positions.items():
+        expected = list(range(event_positions[0], event_positions[-1] + 1))
+        if event_positions != expected:
+            raise ValueError(
+                f"event order jumps backward: event {event_id} occupies "
+                f"non-contiguous beats {event_positions}"
+            )
+
+    ordered_sequences: Dict[str, List[int]] = {}
+    for event_id, event in event_by_id.items():
+        if event_id not in positions:
+            continue
+        sequence = str(event.get("sequence_id") or "").strip() or "__unspecified__"
+        ordered_sequences.setdefault(sequence, []).append(event_id)
+    for sequence, event_ids in ordered_sequences.items():
+        previous_event_id: int | None = None
+        previous_positions: List[int] | None = None
+        for event_id in event_ids:
+            current_positions = positions[event_id]
+            if (
+                previous_positions is not None
+                and previous_positions[-1] > current_positions[0]
+            ):
+                raise ValueError(
+                    "event order jumps backward: "
+                    f"sequence {sequence} event {event_id} starts at beat "
+                    f"{current_positions[0] + 1} before event {previous_event_id} "
+                    f"finishes at beat {previous_positions[-1] + 1}"
+                )
+            previous_event_id = event_id
+            previous_positions = current_positions
+
+
 def _validate_beat_action_capacity(
     beats: List[Dict[str, Any]],
     events: List[Dict[str, Any]],
@@ -1781,6 +1835,7 @@ def _validate_beat_action_capacity(
         raise ValueError(
             f"events must be explicitly kept or dropped: {sorted(missing_event_ids)}"
         )
+    _validate_beat_event_order(beats, events)
     for beat in beats:
         if beat.get("action") == "drop":
             continue
@@ -1921,6 +1976,7 @@ def _sequence_beat_plan(
     generation_units = _event_generation_action_unit_counts(events)
     total_units = {sequence: 0 for sequence in ordered_sequences}
     mandatory_units = {sequence: 0 for sequence in ordered_sequences}
+    mandatory_event_units = {sequence: [] for sequence in ordered_sequences}
     mandatory_sequences: set[str] = set()
     for event_id, event in enumerate(events, 1):
         sequence = str(event.get("sequence_id") or "").strip() or "__unspecified__"
@@ -1929,6 +1985,31 @@ def _sequence_beat_plan(
         if _event_is_mandatory_for_adaptation(event):
             mandatory_sequences.add(sequence)
             mandatory_units[sequence] += units
+            mandatory_event_units[sequence].append(units)
+
+    def ordered_mandatory_slots(sequence: str) -> int:
+        slots = 0
+        last_load = 0
+        for units in mandatory_event_units[sequence]:
+            occurrence_count = max(1, math.ceil(units / max_generation_units_per_beat))
+            base, remainder = divmod(units, occurrence_count)
+            chunks = [
+                base + (1 if occurrence < remainder else 0)
+                for occurrence in range(occurrence_count)
+            ]
+            first, *tail = chunks
+            if slots == 0:
+                slots = 1
+                last_load = first
+            elif last_load + first <= max_generation_units_per_beat:
+                last_load += first
+            else:
+                slots += 1
+                last_load = first
+            for chunk in tail:
+                slots += 1
+                last_load = chunk
+        return slots
 
     allocations = {
         sequence: (
@@ -1937,6 +2018,7 @@ def _sequence_beat_plan(
                 math.ceil(
                     mandatory_units[sequence] / max_generation_units_per_beat
                 ),
+                ordered_mandatory_slots(sequence),
             )
             if sequence in mandatory_sequences
             else 0
@@ -1965,6 +2047,195 @@ def _sequence_beat_plan(
         for _ in range(allocations[sequence])
         if allocations[sequence] > 0
     ]
+
+
+def _repair_bounded_single_sequence_order(
+    beats: List[Dict[str, Any]],
+    events: List[Dict[str, Any]],
+    capabilities: VideoModelCapabilities,
+    *,
+    unit_capacity: int,
+    material_duration: int | None,
+) -> List[Dict[str, Any]] | None:
+    """Find an exact chronological layout for a bounded single sequence.
+
+    This path is intentionally bounded.  It handles the common dense one-take
+    case exactly, while larger or multi-sequence ledgers continue through the
+    general deterministic repair and still face the same fail-closed order
+    gate.
+    """
+    if material_duration is None or not beats or not events:
+        return None
+    sequences = {
+        str(event.get("sequence_id") or "").strip() or "__unspecified__"
+        for event in events
+    }
+    if len(sequences) != 1:
+        return None
+    generation_units = _event_generation_action_unit_counts(events)
+    if max(generation_units.values(), default=0) > unit_capacity:
+        return None
+    mandatory_ids = {
+        event_id
+        for event_id, event in enumerate(events, 1)
+        if _event_is_mandatory_for_adaptation(event)
+    }
+    protected_zero_ids = {
+        event_id
+        for event_id, units in generation_units.items()
+        if units == 0
+    }
+    optional_ids = [
+        event_id
+        for event_id in generation_units
+        if event_id not in mandatory_ids | protected_zero_ids
+    ]
+    if len(optional_ids) > 18:
+        return None
+
+    model_dropped = _dropped_source_event_ids(beats)
+    drop_candidates = []
+    for drop_count in range(len(optional_ids) + 1):
+        for dropped in itertools.combinations(optional_ids, drop_count):
+            drop_candidates.append((
+                sum(generation_units[event_id] for event_id in dropped),
+                drop_count,
+                sum(event_id not in model_dropped for event_id in dropped),
+                dropped,
+            ))
+    drop_candidates.sort()
+    occurrence_requirements = _event_primary_occurrence_requirements(
+        events,
+        capabilities,
+    )
+    beat_count = len(beats)
+    all_occupied = (1 << beat_count) - 1
+
+    def duration_cost(loads: tuple[int, ...]) -> int:
+        return sum(
+            _minimum_primary_duration_for_units(load, capabilities)
+            for load in loads
+        )
+
+    def find_placements(
+        kept_event_ids: tuple[int, ...],
+    ) -> Dict[int, tuple[int, ...]] | None:
+        @functools.lru_cache(maxsize=None)
+        def search(
+            event_offset: int,
+            previous_end: int,
+            loads: tuple[int, ...],
+            occupied: int,
+        ) -> tuple[tuple[int, ...], ...] | None:
+            if event_offset == len(kept_event_ids):
+                if occupied != all_occupied or duration_cost(loads) > material_duration:
+                    return None
+                return ()
+            event_id = kept_event_ids[event_offset]
+            units = generation_units[event_id]
+            minimum = occurrence_requirements[event_id]
+            maximum = min(beat_count, minimum + (1 if units else 0))
+            for count in range(minimum, maximum + 1):
+                for start in range(previous_end, beat_count - count + 1):
+                    positions = tuple(range(start, start + count))
+                    base, remainder = divmod(units, count)
+                    next_loads = list(loads)
+                    next_occupied = occupied
+                    valid = True
+                    for occurrence, position in enumerate(positions):
+                        next_loads[position] += base + (
+                            1 if occurrence < remainder else 0
+                        )
+                        next_occupied |= 1 << position
+                        if next_loads[position] > unit_capacity:
+                            valid = False
+                            break
+                    if not valid:
+                        continue
+                    serialized_loads = tuple(next_loads)
+                    if duration_cost(serialized_loads) > material_duration:
+                        continue
+                    suffix = search(
+                        event_offset + 1,
+                        positions[-1],
+                        serialized_loads,
+                        next_occupied,
+                    )
+                    if suffix is not None:
+                        return (positions, *suffix)
+            return None
+
+        result = search(0, 0, (0,) * beat_count, 0)
+        if result is None:
+            return None
+        return dict(zip(kept_event_ids, result, strict=True))
+
+    selected_placements: Dict[int, tuple[int, ...]] | None = None
+    selected_dropped: set[int] = set()
+    all_event_ids = set(range(1, len(events) + 1))
+    for _units, _count, _model_penalty, dropped in drop_candidates:
+        kept = tuple(sorted(all_event_ids - set(dropped)))
+        selected_placements = find_placements(kept)
+        if selected_placements is not None:
+            selected_dropped = set(dropped)
+            break
+    if selected_placements is None:
+        return None
+
+    repaired = [dict(beat) for beat in beats]
+    event_by_id = {event_id: event for event_id, event in enumerate(events, 1)}
+    sequence = next(iter(sequences))
+    for beat_index, beat in enumerate(repaired):
+        source_events = [
+            event_id
+            for event_id, positions in selected_placements.items()
+            if beat_index in positions
+        ]
+        beat["source_events"] = source_events
+        beat["dropped_source_events"] = (
+            sorted(selected_dropped) if beat_index == 0 else []
+        )
+        beat["sequence_id"] = sequence
+        beat["action"] = "merge" if len(source_events) > 1 else "keep"
+        details = [event_by_id[event_id] for event_id in source_events]
+        beat["capacity_repair"] = {
+            "reason": "ordered_single_sequence_story_capacity_rebalanced",
+            "sequence_id": sequence,
+            "max_generation_units": unit_capacity,
+        }
+        beat["who"] = list(dict.fromkeys(
+            str(name)
+            for detail in details
+            for name in (detail.get("who") or [])
+            if str(name).strip()
+        ))
+        locations = list(dict.fromkeys(
+            str(detail.get("where") or "").strip()
+            for detail in details
+            if str(detail.get("where") or "").strip()
+        ))
+        if locations:
+            beat["where"] = locations[0] if len(locations) == 1 else " / ".join(locations)
+        descriptions = [
+            str(detail.get("what") or "").strip()
+            for detail in details
+            if str(detail.get("what") or "").strip()
+        ]
+        if descriptions:
+            beat["what"] = "；随后".join(descriptions)
+        beat["reason"] = "；".join(filter(None, [
+            str(beat.get("reason") or "").strip(),
+            "代码按单一 sequence、事件顺序与故事时钟容量重建账本",
+        ]))
+
+    _validate_beat_action_capacity(repaired, events, capabilities)
+    _validate_beat_material_duration(
+        repaired,
+        events,
+        material_duration,
+        capabilities,
+    )
+    return repaired
 
 
 def _repair_beat_action_capacity(
@@ -2035,6 +2306,16 @@ def _repair_beat_action_capacity(
     except ValueError:
         pass
 
+    ordered_repair = _repair_bounded_single_sequence_order(
+        repaired,
+        events,
+        profile,
+        unit_capacity=unit_capacity,
+        material_duration=material_duration,
+    )
+    if ordered_repair is not None:
+        return ordered_repair
+
     sequence_plan = _sequence_beat_plan(events, len(repaired), unit_capacity)
     event_by_id = {index: event for index, event in enumerate(events, 1)}
     event_sequences = {
@@ -2081,6 +2362,14 @@ def _repair_beat_action_capacity(
         return loads
 
     def placement_fits(candidate: Dict[int, tuple[int, ...]]) -> bool:
+        for positions in candidate.values():
+            if tuple(positions) != tuple(range(positions[0], positions[-1] + 1)):
+                return False
+        for sequence, event_ids in sequence_event_ids.items():
+            placed_ids = [event_id for event_id in event_ids if event_id in candidate]
+            for previous_id, current_id in zip(placed_ids, placed_ids[1:]):
+                if candidate[previous_id][-1] > candidate[current_id][0]:
+                    return False
         loads = generation_loads(candidate)
         if max(loads, default=0) > unit_capacity:
             return False
@@ -2123,10 +2412,7 @@ def _repair_beat_action_capacity(
             ),
         )
 
-    mandatory_order = sorted(
-        mandatory_ids,
-        key=lambda event_id: (-generation_units[event_id], event_id),
-    )
+    mandatory_order = sorted(mandatory_ids)
 
     def place_mandatory(position: int) -> bool:
         if position >= len(mandatory_order):
@@ -2641,7 +2927,7 @@ def _atomic_write_json(path: Path, value: Any) -> None:
     os.replace(temporary, path)
 
 
-LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v8"
+LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v9"
 
 
 def _layered_input_fingerprint(

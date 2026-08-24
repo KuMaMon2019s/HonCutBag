@@ -379,7 +379,7 @@ def test_dense_single_sequence_expands_structure_before_dropping_events():
 
     assert plan["generation_action_units"] == 41
     assert plan["structural_shots"] == 7
-    assert plan["primary_shots"] == 7
+    assert plan["primary_shots"] == 8
     assert plan["material_duration"] == 60
     assert plan["action_capacity_status"] == "screenplay_compression_required"
 
@@ -477,7 +477,7 @@ def test_capacity_repair_restores_redundant_whole_event_drops():
         }
         for event_id, unit_count in enumerate(unit_counts, 1)
     ]
-    source_groups = [[1, 2], [3, 4], [5], [5], [8, 11], [13], [14]]
+    source_groups = [[1, 2], [3, 4], [5], [5], [8, 11], [13], [14], [14]]
     beats = [
         {
             "beat_order": index,
@@ -513,9 +513,54 @@ def test_capacity_repair_restores_redundant_whole_event_drops():
         for beat in repaired
         for event_id in beat["dropped_source_events"]
     }
-    assert kept_ids == set(range(1, 15)) - {10}
-    assert dropped_ids == {10}
+    assert kept_ids == set(range(1, 15)) - {9}
+    assert dropped_ids == {9}
     assert any(beat.get("capacity_repair") for beat in repaired)
+    positions = {
+        event_id: [
+            beat_index
+            for beat_index, beat in enumerate(repaired)
+            if event_id in beat["source_events"]
+        ]
+        for event_id in kept_ids
+    }
+    assert all(
+        event_positions == list(range(event_positions[0], event_positions[-1] + 1))
+        for event_positions in positions.values()
+    )
+    ordered_intervals = [positions[event_id] for event_id in sorted(positions)]
+    assert all(
+        previous[-1] <= current[0]
+        for previous, current in zip(ordered_intervals, ordered_intervals[1:])
+    )
+
+
+def test_capacity_gate_rejects_event_ranges_that_jump_back_in_time():
+    events = [
+        {
+            "sequence_id": "SEQ001",
+            "event_role": "action_chain",
+            "micro_actions": [f"事件{event_id}动作"],
+        }
+        for event_id in range(1, 5)
+    ]
+    beats = [
+        {
+            "beat_order": 1,
+            "source_events": [1, 4],
+            "dropped_source_events": [],
+            "action": "merge",
+        },
+        {
+            "beat_order": 2,
+            "source_events": [2, 3],
+            "dropped_source_events": [],
+            "action": "merge",
+        },
+    ]
+
+    with pytest.raises(ValueError, match="event order jumps backward"):
+        engine._validate_beat_action_capacity(beats, events)
 
 
 def test_capacity_repair_separates_sequences_and_rebalances_dense_station_fight():
@@ -685,17 +730,17 @@ def test_optional_transition_sequence_does_not_steal_mandatory_story_capacity():
     assert [beat["sequence_id"] for beat in repaired] == [
         "SEQ001",
         "SEQ001",
-        "SEQ002",
+        "SEQ001",
         "SEQ003",
     ]
-    assert 4 in {
+    assert 4 not in {
         event_id for beat in repaired for event_id in beat["source_events"]
     }
     assert [
         event_id
         for beat in repaired
         for event_id in beat["dropped_source_events"]
-    ] == []
+    ] == [4]
     assert 5 in repaired[-1]["source_events"]
     assert max(engine._beat_generation_unit_loads(repaired, events)) <= story_capacity
 
@@ -1081,7 +1126,7 @@ def test_generic_dense_actions_report_screenplay_compression_pressure():
 
     assert plan["generation_action_units"] == 96
     assert plan["structural_shots"] == 16
-    assert plan["primary_shots"] == 7
+    assert plan["primary_shots"] == 8
     assert plan["minimum_material_duration"] == 144
     assert plan["material_duration"] == 60
     assert plan["action_capacity_status"] == "screenplay_compression_required"
