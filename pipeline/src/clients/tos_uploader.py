@@ -33,6 +33,7 @@ IMAGE_TRANSPORT_METADATA = {
     "TIFF": ("image/tiff", ".tiff"),
     "GIF": ("image/gif", ".gif"),
 }
+TOS_CONTENT_SHA256_METADATA = "x-tos-meta-honcut-sha256"
 
 
 # ─── .env loading (same pattern as config.py) ────────────────────────────────
@@ -583,18 +584,58 @@ def upload_file(
     host = f"{config['bucket']}.{config['endpoint']}"
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     payload_hash = hashlib.sha256(image_data).hexdigest()
+    encoded_key = quote(object_key, safe="/")
+    if Path(object_key).stem == payload_hash:
+        empty_payload_hash = hashlib.sha256(b"").hexdigest()
+        head_headers = {
+            "Host": host,
+            "x-tos-content-sha256": empty_payload_hash,
+            "x-tos-date": timestamp,
+        }
+        head_headers["Authorization"] = _sign(
+            "HEAD",
+            object_key,
+            head_headers,
+            empty_payload_hash,
+            timestamp,
+            config,
+        )
+        try:
+            existing = requests.head(
+                f"https://{host}/{encoded_key}",
+                headers=head_headers,
+                timeout=10,
+            )
+            existing_headers = {
+                str(key).casefold(): str(value)
+                for key, value in existing.headers.items()
+            }
+            declared_hash = existing_headers.get(TOS_CONTENT_SHA256_METADATA)
+            declared_length = existing_headers.get("content-length")
+            if (
+                existing.status_code == 200
+                and declared_length is not None
+                and int(declared_length) == len(image_data)
+                and (not declared_hash or declared_hash == payload_hash)
+            ):
+                print(f"  [tos] Reused: {object_key} ({len(image_data)} bytes)")
+                return get_signed_url(object_key, expires=7200)
+        except (OSError, ValueError, requests.RequestException):
+            # A presence check is advisory. The authoritative PUT below still
+            # decides whether this required input has been persisted.
+            pass
     headers = {
         "Content-Type": content_type,
         "Host": host,
         "x-tos-content-sha256": payload_hash,
         "x-tos-date": timestamp,
+        TOS_CONTENT_SHA256_METADATA: payload_hash,
     }
     headers["Authorization"] = _sign(
         "PUT", object_key, headers, payload_hash, timestamp, config
     )
 
     try:
-        encoded_key = quote(object_key, safe="/")
         resp = requests.put(
             f"https://{host}/{encoded_key}",
             data=image_data,

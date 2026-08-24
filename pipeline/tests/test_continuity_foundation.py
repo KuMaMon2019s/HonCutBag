@@ -2035,6 +2035,50 @@ def test_seedance_upload_preserves_webp_transport_metadata(monkeypatch):
     assert observed["data"] == image_buffer.getvalue()
 
 
+def test_content_addressed_tos_upload_reuses_confirmed_remote_object(monkeypatch):
+    payload = b"already-uploaded-multimodal-input"
+    payload_sha256 = hashlib.sha256(payload).hexdigest()
+    object_key = f"volcengine/multimodal/{payload_sha256}.bin"
+    monkeypatch.setattr(
+        tos_uploader,
+        "_get_tos_config",
+        lambda: {
+            "ak": "test-ak",
+            "sk": "test-sk",
+            "bucket": "honcut-fixtures",
+            "endpoint": "tos-cn-beijing.volces.com",
+            "region": "cn-beijing",
+        },
+    )
+
+    def fake_head(url, headers, timeout):
+        assert url.endswith(object_key)
+        assert headers["Authorization"].startswith("TOS4-HMAC-SHA256 ")
+        assert timeout == 10
+        return SimpleNamespace(
+            status_code=200,
+            headers={"Content-Length": str(len(payload))},
+        )
+
+    monkeypatch.setattr(tos_uploader.requests, "head", fake_head)
+    monkeypatch.setattr(
+        tos_uploader.requests,
+        "put",
+        lambda *_args, **_kwargs: pytest.fail(
+            "confirmed content-addressed object must not be uploaded again"
+        ),
+    )
+
+    signed_url = tos_uploader.upload_file(
+        payload,
+        object_key,
+        "application/octet-stream",
+    )
+
+    assert signed_url is not None
+    assert object_key in signed_url
+
+
 def test_seedance_video_preflight_fails_before_tos_upload(monkeypatch, tmp_path):
     invalid_video = tmp_path / "reference.mp4"
     invalid_video.write_bytes(b"not-a-decodable-video")
