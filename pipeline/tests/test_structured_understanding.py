@@ -14,6 +14,7 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+import clients.ark_multimodal_client as ark_multimodal_client  # noqa: E402
 from clients.ark_multimodal_client import ArkMultimodalClient, review_as  # noqa: E402
 from phases.phase1 import character_discoverer  # noqa: E402
 from phases.phase8.frame_analysis import decide_shot_action  # noqa: E402
@@ -73,6 +74,26 @@ def test_multimodal_client_sends_native_json_schema_and_returns_typed_model(tmp_
     assert captured["text"]["format"]["type"] == "json_schema"
     assert captured["text"]["format"]["strict"] is True
     assert captured["text"]["format"]["schema"]["additionalProperties"] is False
+
+
+def test_multimodal_client_ignores_ambient_socks_proxy(monkeypatch):
+    captured = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setenv("ALL_PROXY", "socks5://127.0.0.1:65535")
+    monkeypatch.setenv("all_proxy", "socks5://127.0.0.1:65535")
+    monkeypatch.setattr(ark_multimodal_client, "OpenAI", FakeOpenAI)
+
+    ArkMultimodalClient(api_key="test-key")
+
+    http_client = captured["http_client"]
+    try:
+        assert http_client._trust_env is False
+    finally:
+        http_client.close()
 
 
 def test_test_reviewer_adapter_still_enforces_the_business_schema(tmp_path):

@@ -9,7 +9,7 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
-from openai import OpenAI
+from openai import DefaultHttpxClient, OpenAI
 from pydantic import BaseModel
 
 from schemas.understanding import (
@@ -86,6 +86,12 @@ class ArkMultimodalClient:
             base_url=base_url or ARK_RESPONSES_BASE_URL,
             timeout=timeout_s,
             max_retries=0,
+            # Ark endpoints are direct-routed.  Do not let an unrelated
+            # desktop SOCKS proxy become an undeclared production dependency.
+            http_client=DefaultHttpxClient(
+                timeout=timeout_s,
+                trust_env=False,
+            ),
         )
         self._media_url_resolver = media_url_resolver or self._upload_media
 
