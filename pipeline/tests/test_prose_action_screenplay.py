@@ -341,6 +341,61 @@ def test_global_flow_keeps_explicit_one_take_in_one_sequence():
     assert "one-take" in events[1]["continuity_repair_reason"]
 
 
+def test_global_flow_resolves_generic_participant_to_adjacent_specific_identity():
+    events = [
+        _event(
+            segment_id=1,
+            who=["检修员", "第一名入侵者"],
+            source_excerpt="第一名入侵者被检修员推离控制台。",
+            continuity_before="cut",
+        ),
+        _event(
+            segment_id=2,
+            who=["第三名入侵者", "检修员"],
+            source_excerpt="第三名入侵者释放脉冲，检修员展开绝缘屏障。",
+            continuity_before="continuous",
+        ),
+        _event(
+            segment_id=3,
+            who=["检修员", "入侵者"],
+            source_excerpt="检修员穿过同一脉冲余波，控制最后一名入侵者的手臂。",
+            causal_link="承接上一事件的脉冲余波",
+            continuity_before="continuous",
+        ),
+    ]
+
+    _annotate_global_event_flow(events, continuity_mode="one_take")
+
+    assert events[2]["who"] == ["检修员", "第三名入侵者"]
+    assert events[2]["model_who"] == ["检修员", "入侵者"]
+    assert events[2]["who_repair_reason"] == (
+        "continuous generic participant inherits the adjacent specific identity"
+    )
+
+
+def test_global_flow_does_not_merge_explicitly_new_generic_role_participant():
+    events = [
+        _event(
+            segment_id=1,
+            who=["检修员", "第一名入侵者"],
+            source_excerpt="第一名入侵者被检修员推离控制台。",
+            continuity_before="cut",
+        ),
+        _event(
+            segment_id=2,
+            who=["检修员", "入侵者"],
+            source_excerpt="另一名入侵者从侧门进入并靠近检修员。",
+            causal_link="侧门开启",
+            continuity_before="continuous",
+        ),
+    ]
+
+    _annotate_global_event_flow(events, continuity_mode="one_take")
+
+    assert events[1]["who"] == ["检修员", "入侵者"]
+    assert "model_who" not in events[1]
+
+
 def test_one_take_mode_does_not_hide_an_explicit_time_jump():
     events = [
         _event(continuity_before="cut", where="街道"),

@@ -230,7 +230,7 @@ _NARRATIVE_JUMP_CUES = (
 # caches carried over from earlier run directories — and forces every Phase 1
 # event extraction to re-run (a paid LLM pass). Never bump casually, and never
 # reuse cross-run segment caches from a run produced under a different value.
-EVENT_FLOW_SCHEMA_VERSION = "12.0"
+EVENT_FLOW_SCHEMA_VERSION = "13.0"
 
 
 def is_global_production_directive_text(evidence: str) -> bool:
@@ -594,6 +594,12 @@ def _annotate_global_event_flow(
     previous: Dict[str, Any] | None = None
     current_sequence = ""
     for index, event in enumerate(events, 1):
+        if previous:
+            _repair_continuous_generic_participant(
+                previous,
+                event,
+                preserve_one_take=preserve_one_take,
+            )
         boundary = str(event.get("continuity_before") or "cut").lower()
         exact_same_place = bool(
             previous
@@ -635,6 +641,90 @@ def _annotate_global_event_flow(
             line["dialogue_id"] = f"D{dialogue_number:03d}"
         previous = event
     return events
+
+
+def _normalized_identity_label(value: Any) -> str:
+    """Normalize a short identity label for suffix comparison only."""
+    return re.sub(r"[^\w\u3400-\u9fff]+", "", str(value or "").casefold())
+
+
+def _source_introduces_distinct_role(
+    evidence: str,
+    generic_label: str,
+    previous_label: str,
+) -> bool:
+    """Reject coreference when the source explicitly introduces another ordinal."""
+    escaped = re.escape(generic_label)
+    patterns = (
+        rf"(?:另(?:一|外)?|新(?:的|来)?)\s*(?:名|位|个)?\s*{escaped}",
+        rf"第[一二三四五六七八九十百0-9]+\s*(?:名|位|个)?\s*{escaped}",
+        rf"\b(?:another|different|new|first|second|third|fourth|fifth|sixth|"
+        rf"seventh|eighth|ninth|tenth)\s+{escaped}\b",
+    )
+    previous_key = _normalized_identity_label(previous_label)
+    for pattern in patterns:
+        for match in re.finditer(pattern, evidence, re.IGNORECASE):
+            if _normalized_identity_label(match.group(0)) != previous_key:
+                return True
+    return False
+
+
+def _repair_continuous_generic_participant(
+    previous: Dict[str, Any],
+    current: Dict[str, Any],
+    *,
+    preserve_one_take: bool,
+) -> None:
+    """Preserve an adjacent specific identity when the model regresses to its role.
+
+    This deliberately handles only the unambiguous one-to-one shape: both events
+    share the same other participants, the previous event has exactly one extra
+    specific label, and the current event has exactly one shorter suffix label.
+    Explicit introductions such as ``another guard`` or ``second inspector``
+    remain distinct.  Ambiguous multi-participant cases are left unchanged for
+    the downstream identity gate to reject rather than guessed here.
+    """
+    boundary = str(current.get("continuity_before") or "cut").strip().lower()
+    if not (
+        boundary == "continuous"
+        or (preserve_one_take and not _has_narrative_jump(current))
+    ):
+        return
+
+    previous_who = [str(value).strip() for value in previous.get("who") or [] if str(value).strip()]
+    current_who = [str(value).strip() for value in current.get("who") or [] if str(value).strip()]
+    shared = set(previous_who) & set(current_who)
+    previous_only = [value for value in previous_who if value not in shared]
+    current_only = [value for value in current_who if value not in shared]
+    if len(previous_only) != 1 or len(current_only) != 1:
+        return
+
+    previous_label = previous_only[0]
+    generic_label = current_only[0]
+    previous_key = _normalized_identity_label(previous_label)
+    generic_key = _normalized_identity_label(generic_label)
+    if (
+        not generic_key
+        or previous_key == generic_key
+        or not previous_key.endswith(generic_key)
+    ):
+        return
+
+    evidence = " ".join(
+        str(current.get(field) or "")
+        for field in ("source_excerpt", "what", "start_state", "causal_link")
+    )
+    if _source_introduces_distinct_role(evidence, generic_label, previous_label):
+        return
+
+    current["model_who"] = list(current_who)
+    current["who"] = [
+        previous_label if value == generic_label else value
+        for value in current_who
+    ]
+    current["who_repair_reason"] = (
+        "continuous generic participant inherits the adjacent specific identity"
+    )
 
 
 def _locations_compatible(previous: Dict[str, Any], current: Dict[str, Any]) -> bool:

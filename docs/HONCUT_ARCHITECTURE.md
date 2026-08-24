@@ -124,6 +124,8 @@ Canonical 事件账本要求 `dramatic_turn=true` 当且仅当 `event_role=turni
 
 事件级 `source_excerpt` 明确声明同一时刻并行完成的复合动作时，该源文本证据优先于 Event Extractor 模型返回的 `atomic` 标签；冲突必须确定性修正并写入原因。`最后一名/位/只/辆` 等实体序数短语不是动作时间推进，不得抵消同一事件的明确并发合同；`最后抬膝`、`随后`、`最终` 等真实阶段词仍阻止错误合并。改变该优先级或消歧规则必须升级事件缓存 schema。
 
+相邻连续事件若共享其余参与者，前一事件只有一个额外的具体身份，而后一事件把该身份退化为同职业/类型的短泛称，Event Extractor 必须确定性继承相邻具体身份并保留模型原始 `who` 供审计。来源明确引入“另一名/新的/第二名”或等价英文新参与者时不得合并；多人歧义不得猜测。改变这项跨事件指代规范化规则必须升级事件缓存 schema。
+
 全局角色一致性、摄影、风格和负面约束属于项目级 Prompt/视觉风格合同，不占故事时钟，也不得被解释为 `scene_setup`、`character_state` 或 `transition`。Event Extractor 必须在进入 adaptation 前确定性排除只含此类指令且没有剧情动作/台词的记录；当模型的 `source_excerpt` 只摘录该段中的局部视觉短语而丢失“全程/必须/禁止”等范围词时，若完整源段落仍确定为制作指令且该段所有抽取记录均无动作/对白，也必须整体排除。含真实剧情动作或对白的混合段落不得因此整段删除。改变这项分类规则必须升级事件缓存 schema，防止复用旧的时间线事件。
 
 Phase 1 的骨架账本按 screenplay `sequence_id` 预先分配连续且互不合并的 beat 槽位。包含必保事件的 sequence 必须获得足以承载必保动作单元的槽位；只含可删事件的 sequence 不得无条件强占故事时钟，可在容量不足时整体进入 `dropped_source_events` 并绑定到相邻已规划槽位留审计证据。模型返回跨 sequence、遗漏必保事件或超过故事时钟动作容量时，Phase owner 必须按固定槽位确定性重建 `source_events` / `dropped_source_events`：必保事件不得删除，删减只能显式进入 dropped 账本，重建后仍不满足容量则 fail closed。
