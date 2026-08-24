@@ -10,6 +10,7 @@ direction/contact and the resulting pose.
 from __future__ import annotations
 
 import copy
+import hashlib
 import re
 from typing import Any, Iterable
 
@@ -250,6 +251,23 @@ def _normalize_explicit_non_contact(beats: list[dict[str, Any]]) -> None:
             beat["contact"] = "无目标接触；身体保持既有支撑接触"
 
 
+def _normalize_director_side(beats: list[dict[str, Any]]) -> None:
+    """Resolve absent source laterality into stable production staging."""
+    for beat in beats:
+        if not _is_placeholder_mechanics_value(beat.get("side")):
+            continue
+        performer = str(beat.get("performer") or "").strip()
+        action = str(
+            beat.get("micro_action")
+            or beat.get("technique")
+            or beat.get("description")
+            or ""
+        ).strip()
+        staging_key = f"{performer}\0{action}".encode("utf-8")
+        side = "左侧" if hashlib.sha256(staging_key).digest()[0] % 2 == 0 else "右侧"
+        beat["side"] = f"{side}（确定性导演编排）"
+
+
 def _matching_choreography_beats(
     beats: list[dict[str, Any]],
     action: str,
@@ -377,6 +395,7 @@ def build_body_action_contract(record: dict[str, Any]) -> dict[str, Any] | None:
                 1,
             )
         ]
+        _normalize_director_side(beats)
         _normalize_explicit_non_contact(beats)
     if not beats:
         # Legacy explicit action strings remain usable and auditable. Vague

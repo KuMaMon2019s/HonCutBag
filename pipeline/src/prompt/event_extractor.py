@@ -66,7 +66,8 @@ ACTION_SYSTEM_PROMPT = (
     "同一时刻并行完成的复合动作必须合成一条。"
     "舞蹈、格斗、功夫或武术段落必须进一步输出逐拍 body_action_choreography，明确左右侧、"
     "执行肢体、步法、躯干、重心、方向、接触点和终态；没有目标接触的位移/闪避也必须明确写"
-    "‘无目标接触，身体保持既有支撑接触’，不得写‘无/不适用/未明确’。"
+    "‘无目标接触，身体保持既有支撑接触’，不得写‘无/不适用/未明确’。原文未指定左右时，"
+    "side 是导演编排选择，必须直接给出具体左侧或右侧，不得回写来源未明确。"
     "你必须保留动作的起始状态、结束状态、因果关系和无署名对白的可靠归属。"
     "输出严格 JSON 对象，顶层只有 events 数组。不要输出任何解释文字。"
 )
@@ -239,7 +240,7 @@ _NARRATIVE_JUMP_CUES = (
 # caches carried over from earlier run directories — and forces every Phase 1
 # event extraction to re-run (a paid LLM pass). Never bump casually, and never
 # reuse cross-run segment caches from a run produced under a different value.
-EVENT_FLOW_SCHEMA_VERSION = "22.0"
+EVENT_FLOW_SCHEMA_VERSION = "23.0"
 
 _UNKNOWN_ACTION_PERFORMERS = {
     "",

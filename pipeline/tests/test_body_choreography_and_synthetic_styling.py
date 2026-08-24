@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import sys
 from pathlib import Path
@@ -181,9 +182,9 @@ def test_explicit_choreography_requires_complete_mechanics_without_domain_label(
             "micro_action": "男子伸手抓住列车扶手",
             "performer": "男子",
             "technique": "抓握扶手借力",
-            "side": "未明确",
+            "side": "右侧",
             "limbs": ["手"],
-            "footwork": "随身体旋转调整步点",
+            "footwork": "未明确",
             "torso": "向扶手方向转动",
             "weight_shift": "重心向扶手侧转移",
             "direction": "朝向扶手",
@@ -196,11 +197,11 @@ def test_explicit_choreography_requires_complete_mechanics_without_domain_label(
         "body_choreography_vague_action",
         "body_choreography_incomplete_beat",
     ]
-    assert errors[1]["beats"][0]["missing_fields"] == ["side"]
+    assert errors[1]["beats"][0]["missing_fields"] == ["footwork"]
 
 
-def test_enriched_placeholder_cannot_masquerade_as_executable_side():
-    errors = body_action_contract_errors({
+def test_enriched_side_placeholder_becomes_stable_director_staging():
+    record = {
         "micro_actions": ["敌人挥动能量刃横向斩击"],
         "body_action_choreography": [{
             "micro_action_index": 1,
@@ -216,13 +217,28 @@ def test_enriched_placeholder_cannot_masquerade_as_executable_side():
             "contact": "刀刃擦过衣物，未命中身体",
             "end_pose": "持械手臂伸展，双脚稳定落地",
         }],
-    })
+    }
 
-    assert [error["code"] for error in errors] == [
-        "body_choreography_vague_action",
-        "body_choreography_incomplete_beat",
-    ]
-    assert errors[1]["beats"][0]["missing_fields"] == ["side"]
+    first = apply_body_action_contract(copy.deepcopy(record))
+    second = apply_body_action_contract(copy.deepcopy(record))
+
+    assert first is not None and first["valid"] is True
+    assert second is not None and second["valid"] is True
+    assert first["beats"][0]["side"] == second["beats"][0]["side"]
+    assert first["beats"][0]["side"] in {
+        "左侧（确定性导演编排）",
+        "右侧（确定性导演编排）",
+    }
+    assert "未明确" not in first["prompt"]
+
+
+def test_explicit_authored_side_is_not_replaced_by_director_staging():
+    record = _choreography_shot()
+
+    contract = apply_body_action_contract(record)
+
+    assert contract is not None
+    assert contract["beats"][0]["side"] == "左手支撑"
 
 
 def test_body_contract_uses_current_action_ledger_not_fight_context():
