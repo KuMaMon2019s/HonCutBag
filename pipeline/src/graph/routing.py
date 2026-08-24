@@ -11,6 +11,7 @@ MAX_QUALITY_ATTEMPTS = 2
 MAX_RESHOOT_ATTEMPTS = 2
 
 VideoGenerationMode = Literal["txt2vid", "img2vid", "reference"]
+Phase5Route = Literal["txt2vid", "img2vid", "reference", "block"]
 QARoute = Literal["generate", "repair", "failed"]
 ConsistencyRoute = Literal["assemble", "regenerate", "failed"]
 AssemblyRoute = Literal["post_process", "reshoot", "failed"]
@@ -32,8 +33,18 @@ def select_video_generation_mode(
     return "txt2vid"
 
 
-def route_phase5(state: Mapping[str, Any]) -> VideoGenerationMode:
+def route_phase5(state: Mapping[str, Any]) -> Phase5Route:
     """Select the concrete Phase 6 node from checkpoint-safe graph state."""
+
+    phase_receipt = state.get("phase_results", {}).get("phase5", {})
+    if (
+        state.get("status") == "failed"
+        or (
+            isinstance(phase_receipt, Mapping)
+            and phase_receipt.get("status") == "error"
+        )
+    ):
+        return "block"
 
     storyboard = state.get("storyboard", {})
     if not isinstance(storyboard, Mapping):
@@ -46,6 +57,16 @@ def route_phase5(state: Mapping[str, Any]) -> VideoGenerationMode:
 
 def quality_gate_router(state: Mapping[str, Any]) -> Literal["pass", "block"]:
     """Block structural storyboard failures; Phase 8 owns pixel reshoots."""
+
+    phase_receipt = state.get("phase_results", {}).get("phase7", {})
+    if (
+        state.get("status") == "failed"
+        or (
+            isinstance(phase_receipt, Mapping)
+            and phase_receipt.get("status") == "error"
+        )
+    ):
+        return "block"
 
     quality = state.get("consistency", state.get("quality_report", {}))
     if not isinstance(quality, Mapping):

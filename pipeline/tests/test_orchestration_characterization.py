@@ -21,6 +21,7 @@ from graph.migrations import (
     StateMigrationError,
     migrate_state,
 )
+from graph.routing import quality_gate_router, route_phase5
 from graph.state import HonCutState
 from graph.workflow import PHASE_NODE_IDS, build_workflow
 from phases import pipeline_core
@@ -120,6 +121,40 @@ def test_production_composition_strips_legacy_node_patch_aliases(tmp_path):
     assert result.update["errors"][-1]["message"] == (
         "Phase 1 failed: screenwriter failed"
     )
+
+
+def test_production_graph_stops_before_phase2_after_phase1_error(tmp_path):
+    phase2_calls: list[dict[str, Any]] = []
+
+    def guarded_phase2(**kwargs):
+        phase2_calls.append(kwargs)
+        raise AssertionError("Phase 2 must not run after a failed Phase 1")
+
+    owner = SimpleNamespace(
+        AVG_SHOT_DURATION=5,
+        run_phase1=lambda **_kwargs: {
+            "status": "error",
+            "error": "semantic bind failed",
+        },
+        run_phase2=guarded_phase2,
+    )
+    graph = build_composed_graph(phase_owner=owner).compile()
+    state = initial_state_from_config(
+        GraphRunConfig(input_text="story", output_dir=str(tmp_path)),
+        include_legacy_aliases=False,
+    )
+
+    final_state = graph.invoke(state)
+
+    assert phase2_calls == []
+    assert final_state["status"] == "failed"
+    assert final_state["completed_phases"] == []
+    assert final_state["phase_results"]["phase1"]["status"] == "error"
+
+
+def test_paid_phase_routers_fail_closed_on_failed_state():
+    assert route_phase5({"status": "failed"}) == "block"
+    assert quality_gate_router({"status": "failed"}) == "block"
 
 
 def test_production_composition_uses_canonical_state_and_core_is_only_a_facade():
@@ -228,6 +263,9 @@ def test_workflow_topology_and_terminal_routes_are_stable():
     assert set(graph.nodes) == set(PHASE_NODE_IDS)
     assert graph.edges == {
         (START, "phase1"),
+        ("phase9_5", END),
+    }
+    for phase, target in (
         ("phase1", "phase2"),
         ("phase2", "phase3"),
         ("phase3", "phase4"),
@@ -235,14 +273,18 @@ def test_workflow_topology_and_terminal_routes_are_stable():
         ("phase6_txt2vid", "phase7"),
         ("phase6_img2vid", "phase7"),
         ("phase6_reference", "phase7"),
-        ("phase9_5", END),
-    }
+    ):
+        assert graph.branches[phase]["route_after_phase"].ends == {
+            "continue": target,
+            "end": END,
+        }
     phase5_branch = next(iter(graph.branches["phase5"].values()))
     phase7_branch = next(iter(graph.branches["phase7"].values()))
     assert phase5_branch.ends == {
         "txt2vid": "phase6_txt2vid",
         "img2vid": "phase6_img2vid",
         "reference": "phase6_reference",
+        "block": END,
     }
     assert phase7_branch.ends == {
         "pass": "phase8",

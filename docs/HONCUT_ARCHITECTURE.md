@@ -82,13 +82,21 @@ Schema、State 和纯工具是共享契约，但不得反向触发上层工作�
 
 ```mermaid
 flowchart LR
-    P1[Phase 1] --> P2[Phase 2] --> P3[Phase 3] --> P4[Phase 4] --> P5[Phase 5]
+    P1[Phase 1] -->|done| P2[Phase 2] -->|done| P3[Phase 3] -->|done| P4[Phase 4] -->|done| P5[Phase 5]
+    P1 -->|error| ENDP((END))
+    P2 -->|error| ENDP
+    P3 -->|error| ENDP
+    P4 -->|error| ENDP
     P5 -->|txt2vid| P6T[Phase 6 txt2vid]
     P5 -->|img2vid| P6I[Phase 6 img2vid]
     P5 -->|reference| P6R[Phase 6 reference]
+    P5 -->|error/block| ENDP
     P6T --> P7[Phase 7]
     P6I --> P7
     P6R --> P7
+    P6T -->|error| ENDP
+    P6I -->|error| ENDP
+    P6R -->|error| ENDP
     P7 -->|pass| P8[Phase 8]
     P7 -->|block| END1((END))
     P8 -->|done| P9[Phase 9]
@@ -98,7 +106,7 @@ flowchart LR
     P95 --> END4((END))
 ```
 
-Phase 5 的路由优先级固定为：任一 shot 的 `ref_type=reference` → reference；否则存在 storyboard image → img2vid；否则 txt2vid。Phase 7 的 Graph 路由只做 pass/block，像素级修复和付费补拍由 Phase 8 的有限闭环拥有。
+Phase 5 的路由优先级固定为：任一 shot 的 `ref_type=reference` → reference；否则存在 storyboard image → img2vid；否则 txt2vid。Phase 7 的 Graph 路由只做 pass/block，像素级修复和付费补拍由 Phase 8 的有限闭环拥有。每条 Phase 成功边都是显式条件边；节点写入 `status=failed/error/blocked` 后只能路由到 END，`Command(goto=END)` 不能与无条件静态成功边并存，防止失败 Phase 之后继续产生图片、视频或其他副作用。
 
 Graph node 必须只完成三件事：读取 State、调用一个窄 owner、返回 State patch。节点不得直接读写媒体、运行 subprocess、调用网络/模型或实现重试。
 

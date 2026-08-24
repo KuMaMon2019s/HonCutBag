@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import Any, Literal
 
 from langgraph.graph import END, START, StateGraph
 
@@ -24,6 +24,18 @@ PHASE_NODE_IDS = (
     "phase9",
     "phase9_5",
 )
+
+
+def route_after_phase(state: Any) -> Literal["continue", "end"]:
+    """Stop every ordinary phase edge when its node recorded failure."""
+
+    if isinstance(state, Mapping) and str(state.get("status") or "") in {
+        "failed",
+        "error",
+        "blocked",
+    }:
+        return "end"
+    return "continue"
 
 
 def build_workflow(
@@ -49,10 +61,17 @@ def build_workflow(
         graph.add_node(node_id, nodes[node_id])
 
     graph.add_edge(START, "phase1")
-    graph.add_edge("phase1", "phase2")
-    graph.add_edge("phase2", "phase3")
-    graph.add_edge("phase3", "phase4")
-    graph.add_edge("phase4", "phase5")
+    for phase, target in (
+        ("phase1", "phase2"),
+        ("phase2", "phase3"),
+        ("phase3", "phase4"),
+        ("phase4", "phase5"),
+    ):
+        graph.add_conditional_edges(
+            phase,
+            route_after_phase,
+            {"continue": target, "end": END},
+        )
 
     graph.add_conditional_edges(
         "phase5",
@@ -61,12 +80,16 @@ def build_workflow(
             "txt2vid": "phase6_txt2vid",
             "img2vid": "phase6_img2vid",
             "reference": "phase6_reference",
+            "block": END,
         },
     )
 
-    graph.add_edge("phase6_txt2vid", "phase7")
-    graph.add_edge("phase6_img2vid", "phase7")
-    graph.add_edge("phase6_reference", "phase7")
+    for phase in ("phase6_txt2vid", "phase6_img2vid", "phase6_reference"):
+        graph.add_conditional_edges(
+            phase,
+            route_after_phase,
+            {"continue": "phase7", "end": END},
+        )
 
     graph.add_conditional_edges(
         "phase7",
@@ -96,4 +119,4 @@ def build_workflow(
     return graph
 
 
-__all__ = ["PHASE_NODE_IDS", "build_workflow"]
+__all__ = ["PHASE_NODE_IDS", "build_workflow", "route_after_phase"]
