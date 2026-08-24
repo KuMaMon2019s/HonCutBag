@@ -36,6 +36,7 @@ from utils.body_action_contracts import (
     apply_body_action_contract,
     body_action_contract_errors,
     body_action_prompt,
+    build_body_action_contract,
     is_mechanically_specific_action,
 )
 from utils.privacy_visual_policy import (
@@ -169,6 +170,86 @@ def test_phase5_blocks_vague_dance_or_fight_placeholders_before_paid_generation(
         "body_choreography_beats_missing",
     }
     assert "body_choreography_vague_action" in {issue["code"] for issue in issues}
+
+
+def test_explicit_choreography_requires_complete_mechanics_without_domain_label():
+    errors = body_action_contract_errors({
+        "what": "男子抓住列车扶手",
+        "micro_actions": ["男子伸手抓住列车扶手"],
+        "body_action_choreography": [{
+            "micro_action_index": 1,
+            "micro_action": "男子伸手抓住列车扶手",
+            "performer": "男子",
+            "technique": "抓握扶手借力",
+            "side": "未明确",
+            "limbs": ["手"],
+            "footwork": "随身体旋转调整步点",
+            "torso": "向扶手方向转动",
+            "weight_shift": "重心向扶手侧转移",
+            "direction": "朝向扶手",
+            "contact": "手掌接触扶手",
+            "end_pose": "攥紧扶手",
+        }],
+    })
+
+    assert [error["code"] for error in errors] == [
+        "body_choreography_vague_action",
+        "body_choreography_incomplete_beat",
+    ]
+    assert errors[1]["beats"][0]["missing_fields"] == ["side"]
+
+
+def test_body_contract_uses_current_action_ledger_not_fight_context():
+    record = {
+        "what": "近身格斗仍在持续，护盾抵御冲击波",
+        "visual": "狭窄车厢内的格斗背景",
+        "micro_actions": [
+            "敌人释放电磁冲击",
+            "男子举起透明科技芯片",
+            "芯片爆发蓝色能量形成半透明护盾",
+            "冲击波席卷车厢，灯光闪烁，玻璃震动，雨滴被卷起",
+        ],
+    }
+
+    assert body_action_contract_errors(record) == []
+    assert build_body_action_contract(record) is None
+
+
+def test_non_body_effect_does_not_need_a_duplicate_choreography_beat():
+    record = {
+        "what": "二人在列车内格斗",
+        "micro_actions": [
+            "第一名敌人手中的能量武器撞击金属车壁",
+            "第二名敌人从侧面突袭",
+        ],
+        "body_action_choreography": [{
+            "micro_action_index": 2,
+            "micro_action": "第二名敌人从侧面突袭",
+            "performer": "第二名敌人",
+            "technique": "侧面突袭",
+            "side": "左侧",
+            "limbs": ["双腿", "双臂"],
+            "footwork": "左脚侧向突进",
+            "torso": "躯干前倾",
+            "weight_shift": "重心转移至前脚",
+            "direction": "从左侧冲向防守者",
+            "contact": "攻击被格挡，未命中身体",
+            "end_pose": "攻势被拦截的前倾姿态",
+        }],
+    }
+
+    assert body_action_contract_errors(record) == []
+
+
+def test_legacy_action_text_is_not_promoted_to_declared_structured_choreography():
+    record = {"micro_actions": ["抓住扶手"]}
+
+    contract = apply_body_action_contract(record)
+
+    assert contract is not None
+    assert contract["required"] is False
+    assert "body_action_choreography" not in record
+    assert body_action_contract_errors(record) == []
 
 
 def test_storyboard_and_video_prompts_keep_full_unabstracted_choreography():

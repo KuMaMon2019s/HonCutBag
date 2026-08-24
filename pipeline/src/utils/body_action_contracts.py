@@ -46,6 +46,23 @@ _KINETIC_VERB = re.compile(
     r"push|pull|grab|lock|throw|jump|land|shift|lean",
     re.IGNORECASE,
 )
+_UNAMBIGUOUS_BODY_EXECUTION = re.compile(
+    r"挡|格挡|闪避|(?<!灯光)闪(?!烁)|侧身|下潜|转身|旋转|撑|蹬|跨步|滑步|扫腿|踢|"
+    r"抓|扣|锁|摔|跃|跳|落地|换步|移步|压低|抬腿|突袭|"
+    r"block|parry|dodge|slip|duck|pivot|spin|plant|kick|strike|"
+    r"grab|lock|throw|jump|land|shift|lean|lunge",
+    re.IGNORECASE,
+)
+_NON_BODY_EFFECT_ACTION = re.compile(
+    r"(?:武器|刀刃|能量刃|弹丸|子弹|冲击波|气流|能量|电流|电弧|火花|"
+    r"雨滴|碎片|列车|车辆|车门|玻璃|灯光|地面|墙(?:面|壁)?|"
+    r"weapon|blade|projectile|bullet|shockwave|airflow|energy|electric|"
+    r"spark|raindrop|debris|train|vehicle|door|glass|light|floor|wall)"
+    r"[^，。；,.]{0,40}"
+    r"(?:撞击|击中|爆发|扩散|席卷|卷起|震动|闪烁|飞散|"
+    r"impact|hit|burst|spread|sweep|vibrate|flicker|scatter)",
+    re.IGNORECASE,
+)
 _VAGUE_ACTION = re.compile(
     r"复杂(?:复核|复合)?动作|高难度动作|连续动作|一套动作|完成动作|"
     r"进行(?:舞蹈|格斗|打斗|功夫|武术)|参与舞蹈|跳舞|舞动|齐舞|"
@@ -87,20 +104,69 @@ def _text_values(record: dict[str, Any], fields: Iterable[str]) -> str:
 
 def requires_explicit_body_choreography(record: dict[str, Any]) -> bool:
     """Return whether a shot/event is a dance, fight, or martial-arts passage."""
-    text = _text_values(
-        record,
-        (
-            "action_type",
-            "what",
-            "visual",
-            "action",
-            "action_description",
-            "source_excerpt",
-            "micro_actions",
-            "generation_actions",
-        ),
-    )
+    raw_choreography = record.get("body_action_choreography")
+    if raw_choreography in (None, "", []):
+        raw_choreography = record.get("action_choreography")
+    if raw_choreography not in (None, "", []):
+        # Once a producer/model asserts a structured body score, every field
+        # is authoritative and must be validated even when the surrounding
+        # prose omits generic words such as "fight" or "dance".
+        return True
+    action_ledger = _string_list(record.get("micro_actions"))
+    if not action_ledger:
+        action_ledger = _string_list(record.get("generation_actions"))
+    if action_ledger:
+        # Canonical current actions outrank contextual ``what``/``visual``.
+        # A fight may remain in the background while this beat only depicts a
+        # shield, shockwave or another non-body result.
+        if _CHOREOGRAPHY_DOMAIN.search(str(record.get("action_type") or "")):
+            return True
+        action_text = " ".join(action_ledger)
+        if (
+            _CHOREOGRAPHY_DOMAIN.search(action_text)
+            or _NAMED_TECHNIQUE.search(action_text)
+            or _VAGUE_ACTION.search(action_text)
+        ):
+            return True
+        contextual_text = _text_values(record, ("what", "visual"))
+        return bool(
+            _CHOREOGRAPHY_DOMAIN.search(contextual_text)
+            and any(
+                _UNAMBIGUOUS_BODY_EXECUTION.search(action)
+                and not _NON_BODY_EFFECT_ACTION.search(action)
+                for action in action_ledger
+            )
+        )
+    else:
+        text = _text_values(
+            record,
+            (
+                "action_type",
+                "what",
+                "visual",
+                "action",
+                "action_description",
+                "source_excerpt",
+            ),
+        )
     return bool(_CHOREOGRAPHY_DOMAIN.search(text))
+
+
+def _action_requires_body_beat(action: str) -> bool:
+    """Distinguish performer mechanics from prop/environment consequences."""
+    if _NAMED_TECHNIQUE.search(action) or _CHOREOGRAPHY_DOMAIN.search(action):
+        return True
+    if _VAGUE_ACTION.search(action):
+        return True
+    if (
+        _NON_BODY_EFFECT_ACTION.search(action)
+        and not _UNAMBIGUOUS_BODY_EXECUTION.search(action)
+    ):
+        return False
+    return bool(
+        _UNAMBIGUOUS_BODY_EXECUTION.search(action)
+        or (_BODY_PART.search(action) and _KINETIC_VERB.search(action))
+    )
 
 
 def is_mechanically_specific_action(value: Any) -> bool:
@@ -278,11 +344,7 @@ def build_body_action_contract(record: dict[str, Any]) -> dict[str, Any] | None:
                 })
         for position, action in enumerate(executable_actions, 1):
             matches = _matching_choreography_beats(beats, action, position)
-            action_requires_beat = bool(
-                _KINETIC_VERB.search(action)
-                or _CHOREOGRAPHY_DOMAIN.search(action)
-                or _VAGUE_ACTION.search(action)
-            )
+            action_requires_beat = _action_requires_body_beat(action)
             if required and action_requires_beat and not matches:
                 uncovered_actions.append(action)
             if matches and not any(
@@ -293,11 +355,7 @@ def build_body_action_contract(record: dict[str, Any]) -> dict[str, Any] | None:
         vague_actions = [
             action
             for action in executable_actions
-            if (
-                _KINETIC_VERB.search(action)
-                or _CHOREOGRAPHY_DOMAIN.search(action)
-                or _VAGUE_ACTION.search(action)
-            )
+            if _action_requires_body_beat(action)
             and not is_mechanically_specific_action(action)
         ]
     errors: list[dict[str, Any]] = []
@@ -359,11 +417,22 @@ def build_body_action_contract(record: dict[str, Any]) -> dict[str, Any] | None:
 
 def apply_body_action_contract(record: dict[str, Any]) -> dict[str, Any] | None:
     """Attach a normalized contract without mutating caller-owned nested data."""
+    declared_choreography = record.get("body_action_choreography")
+    if declared_choreography in (None, "", []):
+        declared_choreography = record.get("action_choreography")
+    has_declared_choreography = declared_choreography not in (None, "", [])
     contract = build_body_action_contract(record)
     if contract is None:
         record.pop("body_action_contract", None)
         return None
-    record["body_action_choreography"] = copy.deepcopy(contract["beats"])
+    if has_declared_choreography:
+        record["body_action_choreography"] = copy.deepcopy(contract["beats"])
+    else:
+        # A mechanically specific legacy action may yield a prompt-only
+        # compatibility beat with empty typed fields.  Persisting it as if it
+        # were authored structured choreography makes a later validation pass
+        # mistake compatibility text for an authoritative DTO.
+        record.pop("body_action_choreography", None)
     record["body_action_contract"] = contract
     return contract
 
