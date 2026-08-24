@@ -4703,6 +4703,15 @@ def test_phase4_l4_rejection_invalidates_rejected_frame_cache_once(tmp_path):
     )
     generate_cinematic_first_frames(tmp_path, storyboard, [], client=client)
     assert calls == ["S02_P01", "S02_P02", "S02_P01"]
+    assert "L4 定向纠偏合同" in (
+        tmp_path / "video_first_frames/S02_P01_prompt.txt"
+    ).read_text(encoding="utf-8")
+    (tmp_path / "storyboard_qa_report.json").write_text(
+        json.dumps({"gate_passed": True, "issues": []}),
+        encoding="utf-8",
+    )
+    generate_cinematic_first_frames(tmp_path, storyboard, [], client=client)
+    assert calls == ["S02_P01", "S02_P02", "S02_P01"]
     assert "L4 定向纠偏合同" in prompts[-1]
     assert "本轮必须呈现：幕布平面上的镂空皮影" in prompts[-1]
     assert "严禁再次呈现：幕前实体三维人偶" in prompts[-1]

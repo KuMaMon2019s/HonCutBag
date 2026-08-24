@@ -422,6 +422,7 @@ def generate_cinematic_first_frames(
                 if not isinstance(beat, dict):
                     continue
                 beat_id = str(beat.get("beat_id") or f"{shot_id}_P{beat_index:02d}")
+                correction_context = correction_context_by_frame.get(beat_id)
                 prompt = build_cinematic_first_frame_prompt(
                     shot,
                     beat,
@@ -430,7 +431,23 @@ def generate_cinematic_first_frames(
                     style,
                     scene_shots.get(shot_id) if isinstance(scene_shots, dict) else {},
                     aspect_ratio=aspect_ratio,
-                    correction_context=correction_context_by_frame.get(beat_id),
+                    correction_context=correction_context,
+                )
+                baseline_prompt = (
+                    build_cinematic_first_frame_prompt(
+                        shot,
+                        beat,
+                        shot_id,
+                        characters,
+                        style,
+                        scene_shots.get(shot_id)
+                        if isinstance(scene_shots, dict)
+                        else {},
+                        aspect_ratio=aspect_ratio,
+                        correction_context=None,
+                    )
+                    if correction_context
+                    else prompt
                 )
                 prompt_path = frame_dir / f"{beat_id}_prompt.txt"
                 image_path = frame_dir / f"{beat_id}.png"
@@ -475,14 +492,23 @@ def generate_cinematic_first_frames(
                     for path in reference_paths
                 ]
                 prompt = bind_reference_roles(prompt, reference_roles)
+                baseline_prompt = bind_reference_roles(
+                    baseline_prompt,
+                    reference_roles,
+                )
                 prompt_metrics = prompt_guidance_metrics(prompt)
-                prompt_path.write_text(prompt, encoding="utf-8")
                 reference_hashes = [
                     hashlib.sha256(path.read_bytes()).hexdigest()
                     for path in reference_paths
                 ]
                 input_sha = image_request_fingerprint(
                     prompt=prompt,
+                    model=model,
+                    size=size,
+                    reference_image_sha256=reference_hashes,
+                )
+                baseline_input_sha = image_request_fingerprint(
+                    prompt=baseline_prompt,
                     model=model,
                     size=size,
                     reference_image_sha256=reference_hashes,
@@ -502,6 +528,7 @@ def generate_cinematic_first_frames(
                         REFERENCE_CONTRACT_TEMPLATE_VERSION
                     ),
                     "input_sha256": input_sha,
+                    "baseline_input_sha256": baseline_input_sha,
                     "model": model,
                     "size_requested": size,
                     "request_contract_id": IMAGE_REQUEST_CONTRACT_ID,
@@ -540,9 +567,7 @@ def generate_cinematic_first_frames(
                         if flat_shadow_material
                         else "canonical_character_images"
                     ),
-                    "phase5_correction_context": correction_context_by_frame.get(
-                        beat_id, []
-                    ),
+                    "phase5_correction_context": correction_context or [],
                 }
                 if beat_id in rejected_frame_ids and rejected_report_sha256:
                     record["supersedes_phase5_rejection_sha256"] = (
@@ -552,10 +577,20 @@ def generate_cinematic_first_frames(
                 if receipt_path.is_file() and image_path.is_file():
                     try:
                         previous = json.loads(receipt_path.read_text(encoding="utf-8"))
+                        same_input = previous.get("input_sha256") == input_sha
+                        consumed_rejection = (
+                            beat_id not in rejected_frame_ids
+                            and bool(
+                                previous.get(
+                                    "supersedes_phase5_rejection_sha256"
+                                )
+                            )
+                            and previous.get("baseline_input_sha256") == input_sha
+                        )
                         if (
                             previous.get("kind") == CINEMATIC_FIRST_FRAME_SCHEMA
                             and previous.get("status") == "done"
-                            and previous.get("input_sha256") == input_sha
+                            and (same_input or consumed_rejection)
                             and previous.get("model") == model
                             and previous.get("size_requested") == size
                             and (
@@ -573,6 +608,7 @@ def generate_cinematic_first_frames(
                     except (OSError, ValueError, json.JSONDecodeError):
                         cached = False
                 if not cached:
+                    prompt_path.write_text(prompt, encoding="utf-8")
                     if reference_paths and hasattr(client, "image_to_image"):
                         mode = "image_to_image"
                         result_url = client.image_to_image(
