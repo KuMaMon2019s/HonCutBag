@@ -1341,3 +1341,45 @@ def test_screenplay_plan_records_intra_event_action_lineage():
             "omitted_source_micro_action_indexes"
         ],
     }]
+
+
+def test_phase5_capacity_uses_duration_scaled_production_event_ledger():
+    storyboard = {
+        "shots": [{
+            "id": "S01",
+            "duration": 5,
+            "source_action_unit_ids": ["AU001", "AU003"],
+            "camera_movement": "pan",
+        }],
+    }
+    events_data = {
+        "events": [
+            {"action_unit_id": "AU001"},
+            {"action_unit_id": "AU002"},
+            {"action_unit_id": "AU003"},
+        ]
+    }
+    screenplay_plan = {
+        "schema": engine.SCREENPLAY_PLAN_SCHEMA,
+        "event_action_scaling": {
+            "schema": engine.DURATION_SCALED_EVENT_PLAN_SCHEMA,
+            "events": [
+                {"source_event_id": 1, "production_status": "kept"},
+                {
+                    "source_event_id": 2,
+                    "production_status": "whole_event_omitted",
+                },
+                {"source_event_id": 3, "production_status": "kept"},
+            ],
+        },
+    }
+
+    issues = run_generation_capacity_checks(
+        storyboard,
+        events_data,
+        screenplay_plan,
+    )
+
+    assert "action_unit_coverage_missing" not in {
+        issue["code"] for issue in issues
+    }

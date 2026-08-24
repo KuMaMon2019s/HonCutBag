@@ -162,6 +162,7 @@ def run_l1_checks(storyboard: dict, visual_style: str) -> tuple[list[dict], dict
 def run_generation_capacity_checks(
     storyboard: dict,
     events_data: dict | None = None,
+    screenplay_plan: dict | None = None,
 ) -> list[dict]:
     """Block storyboards that exceed one video clip's narrative capacity."""
     issues: list[dict] = []
@@ -525,10 +526,66 @@ def run_generation_capacity_checks(
                 [sid], duration_seconds=duration,
             ))
 
+    source_events = [
+        event
+        for event in (events_data or {}).get("events", [])
+        if isinstance(event, dict)
+    ]
+    production_event_ids: set[int] | None = None
+    if screenplay_plan is not None:
+        plan_schema = str(screenplay_plan.get("schema") or "").strip()
+        if plan_schema == "honcut.screenplay-plan.v1":
+            production_event_ids = None
+        elif plan_schema != "honcut.screenplay-plan.v2":
+            issues.append(_issue(
+                "L1",
+                "severe",
+                "screenplay_plan_lineage_invalid",
+                f"Unsupported screenplay plan schema: {plan_schema or '<missing>'}",
+            ))
+            production_event_ids = set()
+        else:
+            scaling = screenplay_plan.get("event_action_scaling")
+            records = scaling.get("events") if isinstance(scaling, dict) else None
+            record_ids = [
+                record.get("source_event_id")
+                for record in records or []
+                if isinstance(record, dict)
+            ]
+            statuses = {
+                str(record.get("production_status") or "")
+                for record in records or []
+                if isinstance(record, dict)
+            }
+            if (
+                not isinstance(scaling, dict)
+                or scaling.get("schema") != "honcut.duration-scaled-event-plan.v1"
+                or not isinstance(records, list)
+                or record_ids != list(range(1, len(source_events) + 1))
+                or not statuses <= {"kept", "whole_event_omitted"}
+                or not statuses
+            ):
+                issues.append(_issue(
+                    "L1",
+                    "severe",
+                    "screenplay_plan_lineage_invalid",
+                    "Screenplay production event lineage is incomplete or unsupported",
+                ))
+                production_event_ids = set()
+            else:
+                production_event_ids = {
+                    int(record["source_event_id"])
+                    for record in records
+                    if record["production_status"] == "kept"
+                }
     expected_units = {
         str(event.get("action_unit_id"))
-        for event in (events_data or {}).get("events", [])
-        if isinstance(event, dict) and str(event.get("action_unit_id") or "").strip()
+        for event_id, event in enumerate(source_events, 1)
+        if (
+            production_event_ids is None
+            or event_id in production_event_ids
+        )
+        and str(event.get("action_unit_id") or "").strip()
     }
     missing_units = sorted(expected_units - observed_units)
     if missing_units:
@@ -1545,6 +1602,12 @@ def run_storyboard_qa_gate(output_dir: Path, similarity_threshold: float | None 
             if events_path.is_file()
             else None
         )
+        screenplay_plan_path = output_dir / "SCREENPLAY_PLAN.json"
+        screenplay_plan = (
+            json.loads(screenplay_plan_path.read_text(encoding="utf-8"))
+            if screenplay_plan_path.is_file()
+            else None
+        )
     except (OSError, json.JSONDecodeError) as exc:
         result = {"status": "error", "grade": "D", "gate_passed": False, "error": f"required artifact unreadable: {exc}", "issues": [_issue("L1", "severe", "artifact_unreadable", str(exc))], "failed_shot_ids": []}
         report_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1623,7 +1686,11 @@ def run_storyboard_qa_gate(output_dir: Path, similarity_threshold: float | None 
         output_dir,
         multimodal_client,
     )
-    capacity_issues = run_generation_capacity_checks(storyboard, events_data)
+    capacity_issues = run_generation_capacity_checks(
+        storyboard,
+        events_data,
+        screenplay_plan,
+    )
     artifact_issues = [
         _issue(
             "L1", "severe", "storyboard_beat_image_missing",
@@ -1773,6 +1840,12 @@ def _run_storyboard_qa_dry_run(output_dir: Path) -> dict[str, Any]:
             if events_path.is_file()
             else None
         )
+        screenplay_plan_path = output_dir / "SCREENPLAY_PLAN.json"
+        screenplay_plan = (
+            json.loads(screenplay_plan_path.read_text(encoding="utf-8"))
+            if screenplay_plan_path.is_file()
+            else None
+        )
     except (OSError, json.JSONDecodeError) as exc:
         issue = _issue(
             "L1",
@@ -1788,7 +1861,11 @@ def _run_storyboard_qa_dry_run(output_dir: Path) -> dict[str, Any]:
         slideshow_risk = 1.0
     else:
         l1_issues, per_shot = run_l1_checks(storyboard, visual_style)
-        capacity_issues = run_generation_capacity_checks(storyboard, events_data)
+        capacity_issues = run_generation_capacity_checks(
+            storyboard,
+            events_data,
+            screenplay_plan,
+        )
 
         from quality.slideshow_risk import score_slideshow_risk
         from quality.variation_checker import check_scene_variation
