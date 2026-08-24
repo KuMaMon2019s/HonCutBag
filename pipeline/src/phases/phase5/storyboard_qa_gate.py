@@ -24,6 +24,10 @@ from phases.phase1.storyboard_beats import (
     secondary_storyboard_contract_errors,
     secondary_storyboard_requirements,
 )
+from runtime.structured_understanding import (
+    StructuredUnderstandingExhausted,
+    execute_structured_understanding,
+)
 from utils.action_units import normalize_action_units
 from utils.body_action_contracts import body_action_contract_errors
 from utils.video_capabilities import capabilities_for
@@ -820,12 +824,16 @@ VISUAL STYLE:
         from clients.ark_multimodal_client import review_as
         from schemas.understanding import FirstFrameUnderstanding
 
-        parsed = review_as(
-            client or ArkMultimodalClient(),
-            input_paths,
-            prompt,
-            FirstFrameUnderstanding,
-        ).model_dump()
+        review_client = client or ArkMultimodalClient()
+        typed_review, review_execution = execute_structured_understanding(
+            lambda: review_as(
+                review_client,
+                input_paths,
+                prompt,
+                FirstFrameUnderstanding,
+            )
+        )
+        parsed = typed_review.model_dump()
         valid_ids = set(ordered_ids)
         issues: list[dict[str, Any]] = []
         for value in parsed["issues"]:
@@ -883,9 +891,18 @@ VISUAL STYLE:
             "input_manifest_path": str(input_manifest),
             "input_count": len(records),
             "raw_issue_count": len(parsed["issues"]),
+            "structured_review_execution": review_execution,
         }
     except Exception as exc:
         shot_ids = sorted({_parent_shot_id(frame_id) for frame_id in ordered_ids})
+        layer = {
+            "status": "error",
+            "input_manifest_path": str(input_manifest),
+            "input_count": len(records),
+            "skipped_reason": f"multimodal review unavailable: {exc}",
+        }
+        if isinstance(exc, StructuredUnderstandingExhausted):
+            layer["structured_review_execution"] = exc.receipt
         return [
             _issue(
                 "L4",
@@ -895,12 +912,7 @@ VISUAL STYLE:
                 shot_ids,
                 frame_ids=ordered_ids,
             )
-        ], {
-            "status": "error",
-            "input_manifest_path": str(input_manifest),
-            "input_count": len(records),
-            "skipped_reason": f"multimodal review unavailable: {exc}",
-        }
+        ], layer
 
 
 def _parent_shot_id(image_id: str) -> str:
@@ -1636,12 +1648,16 @@ def run_l3_review(
         from clients.ark_multimodal_client import review_as
         from schemas.understanding import StoryboardVisualUnderstanding
 
-        parsed = review_as(
-            client or ArkMultimodalClient(),
-            input_paths,
-            prompt,
-            StoryboardVisualUnderstanding,
-        ).model_dump()
+        review_client = client or ArkMultimodalClient()
+        typed_review, review_execution = execute_structured_understanding(
+            lambda: review_as(
+                review_client,
+                input_paths,
+                prompt,
+                StoryboardVisualUnderstanding,
+            )
+        )
+        parsed = typed_review.model_dump()
         valid_ids = set(valid_storyboard_ids)
         issues = []
         for value in parsed["issues"]:
@@ -1685,9 +1701,19 @@ def run_l3_review(
             "input_manifest_path": str(input_manifest_path),
             "input_count": len(input_paths),
             "raw_issue_count": len(parsed["issues"]),
+            "structured_review_execution": review_execution,
         }
     except Exception as exc:
         shot_ids = sorted({_parent_shot_id(value) for value in valid_storyboard_ids})
+        layer = {
+            "status": "error",
+            "grid_path": str(grid_path),
+            "input_manifest_path": str(input_manifest_path),
+            "input_count": len(input_paths),
+            "skipped_reason": f"multimodal review unavailable: {exc}",
+        }
+        if isinstance(exc, StructuredUnderstandingExhausted):
+            layer["structured_review_execution"] = exc.receipt
         return [
             _issue(
                 "L3",
@@ -1696,13 +1722,7 @@ def run_l3_review(
                 f"Canonical storyboard visual review failed: {exc}",
                 shot_ids,
             )
-        ], {
-            "status": "error",
-            "grid_path": str(grid_path),
-            "input_manifest_path": str(input_manifest_path),
-            "input_count": len(input_paths),
-            "skipped_reason": f"multimodal review unavailable: {exc}",
-        }
+        ], layer
 
 
 def is_blocking_issue(issue: dict) -> bool:

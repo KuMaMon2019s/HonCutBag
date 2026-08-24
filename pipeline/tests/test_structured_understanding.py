@@ -18,6 +18,10 @@ import clients.ark_multimodal_client as ark_multimodal_client  # noqa: E402
 from clients.ark_multimodal_client import ArkMultimodalClient, review_as  # noqa: E402
 from phases.phase1 import character_discoverer  # noqa: E402
 from phases.phase8.frame_analysis import decide_shot_action  # noqa: E402
+from runtime.structured_understanding import (  # noqa: E402
+    StructuredUnderstandingExhausted,
+    execute_structured_understanding,
+)
 from schemas.understanding import (  # noqa: E402
     CharacterUnderstandingBatch,
     ShotSemanticReview,
@@ -112,6 +116,62 @@ def test_test_reviewer_adapter_still_enforces_the_business_schema(tmp_path):
     )
 
     assert isinstance(result, ShotSemanticReview)
+
+
+def test_runtime_replays_one_rejected_structured_value_without_salvaging_json():
+    calls = 0
+
+    def review_operation():
+        nonlocal calls
+        calls += 1
+        raw = (
+            '{"verdict":"pass","issues":'
+            if calls == 1
+            else '{"verdict":"pass","issues":[],"confidence":0.9}'
+        )
+        return parse_structured_output(raw, ShotSemanticReview)
+
+    result, receipt = execute_structured_understanding(review_operation)
+
+    assert result.verdict == "pass"
+    assert calls == 2
+    assert [attempt["status"] for attempt in receipt["attempts"]] == [
+        "schema_rejected",
+        "succeeded",
+    ]
+
+
+def test_runtime_does_not_retry_non_schema_understanding_failure():
+    calls = 0
+
+    def review_operation():
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("authentication rejected")
+
+    with pytest.raises(RuntimeError, match="authentication rejected"):
+        execute_structured_understanding(review_operation)
+
+    assert calls == 1
+
+
+def test_runtime_schema_failure_receipt_never_persists_rejected_payload():
+    def review_operation():
+        return parse_structured_output(
+            json.dumps({
+                "verdict": "invalid-secret-payload",
+                "issues": ["PRIVATE_MODEL_TEXT"],
+                "confidence": 0.9,
+            }),
+            ShotSemanticReview,
+        )
+
+    with pytest.raises(StructuredUnderstandingExhausted) as raised:
+        execute_structured_understanding(review_operation, max_attempts=1)
+
+    serialized = json.dumps(raised.value.receipt, ensure_ascii=False)
+    assert "PRIVATE_MODEL_TEXT" not in serialized
+    assert "invalid-secret-payload" not in serialized
 
 
 def test_character_understanding_schema_is_native_strict_and_enveloped():

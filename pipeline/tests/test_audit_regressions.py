@@ -2221,6 +2221,48 @@ def test_phase5_l3_orders_beat_images_without_shot_image_keys(tmp_path):
     assert '"S01_P01", "S01_P02"' in client.calls[0][1]
 
 
+def test_phase5_l3_recovers_one_rejected_native_structured_response(tmp_path):
+    from PIL import Image
+
+    from phases.phase5 import storyboard_qa_gate
+
+    beat_path = tmp_path / "S01_P01.png"
+    Image.new("RGB", (160, 90), "white").save(beat_path)
+
+    class ReviewClient:
+        def __init__(self):
+            self.calls = 0
+
+        def review(self, _image_paths, _prompt):
+            self.calls += 1
+            if self.calls == 1:
+                return '{"issues":[{"red_line":'
+            return '{"issues":[]}'
+
+    client = ReviewClient()
+    issues, layer = storyboard_qa_gate.run_l3_review(
+        {
+            "shots": [{
+                "id": "S01",
+                "storyboard_beats": [{"beat_id": "S01_P01"}],
+            }]
+        },
+        {"characters": []},
+        "cinematic",
+        {"S01_P01": beat_path},
+        tmp_path / "storyboard_qa_grid.jpg",
+        client,
+    )
+
+    assert issues == []
+    assert client.calls == 2
+    assert layer["status"] == "completed"
+    assert [
+        attempt["status"]
+        for attempt in layer["structured_review_execution"]["attempts"]
+    ] == ["schema_rejected", "succeeded"]
+
+
 def test_phase5_l3_skips_unmatched_image_ids_instead_of_crashing(tmp_path):
     from PIL import Image
 
