@@ -37,6 +37,7 @@ from utils.action_units import annotate_event_motion_modes
 from utils.body_action_contracts import (
     apply_body_action_contract,
     normalize_body_action_choreography,
+    requires_explicit_body_choreography,
 )
 from utils.ark_llm import (
     LLMConnectTimeout,
@@ -235,7 +236,7 @@ _NARRATIVE_JUMP_CUES = (
 # caches carried over from earlier run directories — and forces every Phase 1
 # event extraction to re-run (a paid LLM pass). Never bump casually, and never
 # reuse cross-run segment caches from a run produced under a different value.
-EVENT_FLOW_SCHEMA_VERSION = "17.0"
+EVENT_FLOW_SCHEMA_VERSION = "18.0"
 
 _UNKNOWN_ACTION_PERFORMERS = {
     "",
@@ -373,7 +374,26 @@ def _normalize_event(event: Dict[str, Any], source_content: str = "") -> Dict[st
         micro_actions=event["micro_actions"],
     )
     _reconcile_structured_action_performers(event)
-    apply_body_action_contract(event)
+    requires_choreography = requires_explicit_body_choreography(event)
+    if requires_choreography and not event["body_action_choreography"]:
+        raise ValueError(
+            "body choreography is required for dance/combat/martial-arts events"
+        )
+    choreography_contract = apply_body_action_contract(event)
+    if (
+        requires_choreography
+        and choreography_contract
+        and choreography_contract.get("valid") is not True
+    ):
+        contract_errors = [
+            error
+            for error in choreography_contract.get("errors") or []
+            if isinstance(error, dict)
+        ]
+        raise ValueError(
+            "body choreography failed executable mechanics validation: "
+            f"{json.dumps(contract_errors, ensure_ascii=False)}"
+        )
     motion_mode = str(event.get("generation_motion_mode") or "").strip().lower()
     if not event["micro_actions"]:
         event["generation_motion_mode"] = "none"

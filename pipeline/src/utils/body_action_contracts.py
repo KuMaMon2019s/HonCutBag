@@ -54,6 +54,22 @@ _VAGUE_ACTION = re.compile(
     r"complex (?:review )?movement|complex action|dance sequence|fight sequence",
     re.IGNORECASE,
 )
+_PLACEHOLDER_MECHANICS = re.compile(
+    r"^(?:未明确|未指定|未指明|不明确|未知|无|不适用|unspecified|unknown|none|n/?a|-)$",
+    re.IGNORECASE,
+)
+_STRUCTURED_MECHANICS_FIELDS = (
+    "performer",
+    "technique",
+    "side",
+    "limbs",
+    "footwork",
+    "torso",
+    "weight_shift",
+    "direction",
+    "contact",
+    "end_pose",
+)
 
 
 def _text_values(record: dict[str, Any], fields: Iterable[str]) -> str:
@@ -107,6 +123,42 @@ def _string_list(value: Any) -> list[str]:
     if not isinstance(value, (list, tuple)):
         return []
     return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _missing_structured_mechanics(beat: dict[str, Any]) -> list[str]:
+    """Return fields whose values cannot drive an executable body beat."""
+    missing: list[str] = []
+    for field in _STRUCTURED_MECHANICS_FIELDS:
+        value = beat.get(field)
+        values = value if isinstance(value, list) else [value]
+        normalized = [str(item or "").strip() for item in values]
+        if not normalized or any(
+            not item or _PLACEHOLDER_MECHANICS.fullmatch(item)
+            for item in normalized
+        ):
+            missing.append(field)
+    return missing
+
+
+def _matching_choreography_beats(
+    beats: list[dict[str, Any]],
+    action: str,
+    position: int,
+) -> list[dict[str, Any]]:
+    normalized_action = re.sub(r"\s+", " ", action).strip()
+    matches: list[dict[str, Any]] = []
+    for beat in beats:
+        beat_action = re.sub(
+            r"\s+",
+            " ",
+            str(beat.get("micro_action") or "").strip(),
+        )
+        if beat_action and beat_action == normalized_action:
+            matches.append(beat)
+            continue
+        if not beat_action and int(beat.get("micro_action_index") or 0) == position:
+            matches.append(beat)
+    return matches
 
 
 def normalize_body_action_choreography(
@@ -191,6 +243,7 @@ def build_body_action_contract(record: dict[str, Any]) -> dict[str, Any] | None:
     raw = record.get("body_action_choreography")
     if raw in (None, "", []):
         raw = record.get("action_choreography")
+    has_structured_choreography = raw not in (None, "", [])
     beats = normalize_body_action_choreography(raw, micro_actions=micro_actions)
     if not beats:
         # Legacy explicit action strings remain usable and auditable. Vague
@@ -204,11 +257,49 @@ def build_body_action_contract(record: dict[str, Any]) -> dict[str, Any] | None:
             micro_actions=micro_actions,
         )
     required = requires_explicit_body_choreography(record)
-    executable_actions = generation_actions or micro_actions
-    vague_actions = [
-        action for action in executable_actions
-        if not is_mechanically_specific_action(action)
-    ]
+    # ``generation_actions`` may combine multiple source actions into one
+    # compact arrow-delimited prompt.  Validate the canonical source ledger
+    # whenever it exists so prompt compaction cannot create a false failure.
+    executable_actions = micro_actions or generation_actions
+    incomplete_beats: list[dict[str, Any]] = []
+    uncovered_actions: list[str] = []
+    vague_actions: list[str] = []
+    if has_structured_choreography:
+        for beat in beats:
+            missing = _missing_structured_mechanics(beat)
+            if missing:
+                incomplete_beats.append({
+                    "beat": int(beat.get("beat") or 0),
+                    "micro_action_index": int(
+                        beat.get("micro_action_index") or 0
+                    ),
+                    "micro_action": str(beat.get("micro_action") or ""),
+                    "missing_fields": missing,
+                })
+        for position, action in enumerate(executable_actions, 1):
+            matches = _matching_choreography_beats(beats, action, position)
+            action_requires_beat = bool(
+                _KINETIC_VERB.search(action)
+                or _CHOREOGRAPHY_DOMAIN.search(action)
+                or _VAGUE_ACTION.search(action)
+            )
+            if required and action_requires_beat and not matches:
+                uncovered_actions.append(action)
+            if matches and not any(
+                not _missing_structured_mechanics(beat) for beat in matches
+            ):
+                vague_actions.append(action)
+    else:
+        vague_actions = [
+            action
+            for action in executable_actions
+            if (
+                _KINETIC_VERB.search(action)
+                or _CHOREOGRAPHY_DOMAIN.search(action)
+                or _VAGUE_ACTION.search(action)
+            )
+            and not is_mechanically_specific_action(action)
+        ]
     errors: list[dict[str, Any]] = []
     if required and not executable_actions:
         errors.append({
@@ -223,6 +314,22 @@ def build_body_action_contract(record: dict[str, Any]) -> dict[str, Any] | None:
                 "footwork/weight transfer, direction/contact and resulting pose"
             ),
             "actions": vague_actions,
+        })
+    if required and incomplete_beats:
+        errors.append({
+            "code": "body_choreography_incomplete_beat",
+            "message": (
+                "structured body beats must provide executable non-placeholder "
+                "performer, technique, side, limbs, footwork, torso, weight shift, "
+                "direction, contact and end pose"
+            ),
+            "beats": incomplete_beats,
+        })
+    if required and uncovered_actions:
+        errors.append({
+            "code": "body_choreography_action_uncovered",
+            "message": "ordered body actions must each map to a structured choreography beat",
+            "actions": uncovered_actions,
         })
     if required and not beats:
         errors.append({

@@ -39,6 +39,7 @@ from utils.camera_motion_contracts import (
     apply_camera_motion_contract,
     camera_motion_prompt,
 )
+from utils.body_action_contracts import build_body_action_contract
 
 
 PROSE_ACTION_SCRIPT = """
@@ -189,6 +190,59 @@ def test_event_parser_promotes_structured_action_performers_into_who():
 
     assert parsed[0]["who"] == ["男性", "第一名敌人"]
     assert parsed[0]["who_reconciled_from_choreography"] == ["第一名敌人"]
+
+
+def test_body_choreography_structured_beat_covers_generic_action_label():
+    contract = build_body_action_contract({
+        "what": "二人在车厢内进行格斗",
+        "micro_actions": ["男子连续闪避敌人攻击"],
+        "body_action_choreography": [{
+            "micro_action_index": 1,
+            "micro_action": "男子连续闪避敌人攻击",
+            "performer": "男子",
+            "technique": "近身闪避",
+            "side": "左侧",
+            "limbs": ["左腿", "双臂"],
+            "footwork": "左脚向侧后方撤半步",
+            "torso": "躯干向左后方倾斜",
+            "weight_shift": "重心转移到右腿",
+            "direction": "向左后方避开横向攻击",
+            "contact": "能量刃从胸前掠过但未接触身体",
+            "end_pose": "右腿承重的低位警戒姿态",
+        }],
+    })
+
+    assert contract is not None
+    assert contract["valid"] is True
+    assert contract["errors"] == []
+
+
+def test_event_parser_rejects_placeholder_body_choreography_before_bad_debt():
+    payload = [_event(
+        what="男子在车厢内与敌人格斗",
+        visual="男子连续闪避敌人的格斗攻击",
+        source_excerpt="男子在车厢内连续闪避敌人攻击。",
+        micro_actions=["男子连续闪避敌人攻击"],
+        body_action_choreography=[{
+            "micro_action_index": 1,
+            "performer": "男子",
+            "technique": "近身闪避",
+            "side": "未明确",
+            "limbs": ["双腿", "躯干", "双臂"],
+            "footwork": "小幅度快速移步",
+            "torso": "随攻击方向扭转",
+            "weight_shift": "在双脚之间切换重心",
+            "direction": "随攻击方向变换",
+            "contact": "避开攻击",
+            "end_pose": "低重心警戒姿态",
+        }],
+    )]
+
+    with pytest.raises(ValueError, match="body choreography"):
+        _parse_events(
+            json.dumps({"events": payload}, ensure_ascii=False),
+            "男子在车厢内连续闪避敌人攻击。",
+        )
 
 
 def test_event_parser_rejects_invented_dialogue():
