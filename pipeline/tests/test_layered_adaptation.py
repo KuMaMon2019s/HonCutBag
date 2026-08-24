@@ -369,16 +369,24 @@ def test_beat_capacity_allows_continuous_action_units_but_rejects_cross_sequence
 def test_layered_mode_persists_skeleton_and_each_batch(monkeypatch, tmp_path):
     events = _events(11)
     beats = [_beat(i) for i in range(1, 4)]
+    for beat, source_events in zip(
+        beats,
+        (range(1, 5), range(5, 9), range(9, 12)),
+        strict=True,
+    ):
+        beat["source_events"] = list(source_events)
     skeleton = {"strategy": "preserve causal spine", "beats": beats}
     writes = []
 
     monkeypatch.setattr(engine, "estimate_shot_count", lambda *_: 3)
     monkeypatch.setattr(engine, "_build_beat_skeleton", lambda *args: skeleton)
-    monkeypatch.setattr(
-        engine,
-        "_call_llm_with_timeout_retry",
-        lambda *args, **kwargs: _batch_response(1),
-    )
+    def expanded_batch(*args, **kwargs):
+        response = json.loads(_batch_response(1))
+        for shot, beat in zip(response["shots"], beats, strict=True):
+            shot["source_events"] = beat["source_events"]
+        return json.dumps(response, ensure_ascii=False)
+
+    monkeypatch.setattr(engine, "_call_llm_with_timeout_retry", expanded_batch)
     original_write = engine._atomic_write_json
 
     def recording_write(path, value):
@@ -395,7 +403,16 @@ def test_layered_mode_persists_skeleton_and_each_batch(monkeypatch, tmp_path):
     assert partial["completed_batches"] == [1]
     assert [shot["shot_order"] for shot in partial["shots"]] == [1, 2, 3]
     assert [shot["shot_order"] for shot in result["shots"]] == [1, 2, 3]
-    assert [name for name, _ in writes] == ["beat_skeleton.json", "shots_partial.json"]
+    screenplay_plan = json.loads(
+        (tmp_path / "SCREENPLAY_PLAN.json").read_text(encoding="utf-8")
+    )
+    assert screenplay_plan["schema"] == engine.SCREENPLAY_PLAN_SCHEMA
+    assert screenplay_plan["production_ledger"]["effective_story_duration_s"] == 45
+    assert [name for name, _ in writes] == [
+        "beat_skeleton.json",
+        "shots_partial.json",
+        "SCREENPLAY_PLAN.json",
+    ]
     assert not list(tmp_path.glob("*.tmp"))
 
 

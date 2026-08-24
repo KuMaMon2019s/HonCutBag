@@ -1136,3 +1136,84 @@ def test_generic_dense_actions_report_screenplay_compression_pressure():
     assert plan["minimum_material_duration"] == 144
     assert plan["material_duration"] == 60
     assert plan["action_capacity_status"] == "screenplay_compression_required"
+
+
+def test_60s_scaled_screenplay_reconciles_source_pressure_into_executable_ledger():
+    """A fitted production screenplay must not inherit the source ledger's debt."""
+    events = [
+        {
+            "sequence_id": "SEQ001",
+            "event_role": (
+                "scene_setup" if event_id == 1
+                else "turning_point" if event_id == 7
+                else "action_chain"
+            ),
+            "dramatic_turn": event_id == 7,
+            "micro_actions": [
+                f"事件{event_id}动作{action_id}"
+                for action_id in range(1, 7)
+            ],
+        }
+        for event_id in range(1, 8)
+    ]
+    source_capacity = engine._estimate_action_capacity_plan(events, 60, 12)
+    assert source_capacity["action_capacity_status"] == (
+        "screenplay_compression_required"
+    )
+
+    source_groups = ([1], [1], [2], [2], [3], [5], [6], [7])
+    generation_unit_counts = (3, 3, 3, 3, 6, 6, 6, 6)
+    durations = (6, 6, 6, 6, 9, 9, 9, 9)
+    shots = [
+        {
+            "shot_order": shot_order,
+            "source_events": list(source_events),
+            "dropped_source_events": [4] if shot_order == 1 else [],
+            "source_sequence_ids": ["SEQ001"],
+            "suggested_duration": duration,
+            "action": "keep",
+            "what": f"生产节拍{shot_order}",
+            "generation_action_units": [
+                {"unit_id": f"GAU{unit_id:03d}"}
+                for unit_id in range(1, generation_unit_count + 1)
+            ],
+        }
+        for shot_order, (
+            source_events,
+            generation_unit_count,
+            duration,
+        ) in enumerate(
+            zip(source_groups, generation_unit_counts, durations, strict=True),
+            1,
+        )
+    ]
+
+    screenplay_plan, reconciled = engine._build_screenplay_plan(
+        events,
+        shots,
+        source_capacity,
+        target_duration=60,
+        source_events_hash="source-events-sha256",
+    )
+
+    assert screenplay_plan["schema"] == "honcut.screenplay-plan.v1"
+    assert screenplay_plan["source_ledger"]["capacity_status"] == (
+        "screenplay_compression_required"
+    )
+    assert screenplay_plan["production_ledger"] == {
+        "capacity_status": "fits_story_clock",
+        "duration_scaling_status": "applied",
+        "event_count": 6,
+        "generation_action_units": 36,
+        "effective_story_duration_s": 60,
+        "kept_source_event_ids": [1, 2, 3, 5, 6, 7],
+        "omitted_source_event_ids": [4],
+        "mandatory_source_event_ids": [1, 7],
+    }
+    assert sum(beat["duration_s"] for beat in screenplay_plan["beats"]) == 60
+    assert reconciled["source_action_capacity_status"] == (
+        "screenplay_compression_required"
+    )
+    assert reconciled["action_capacity_status"] == "fits_story_clock"
+    assert reconciled["duration_scaling_status"] == "applied"
+    assert reconciled["production_generation_action_units"] == 36

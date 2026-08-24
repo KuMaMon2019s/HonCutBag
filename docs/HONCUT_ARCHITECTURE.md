@@ -116,7 +116,7 @@ Graph node 必须只完成三件事：读取 State、调用一个窄 owner、返
 
 | Phase | 业务 owner 与输出责任 | 主要失败边界 |
 |---|---|---|
-| 1 | 文本解析、事件发现、按 sequence 的导演意图、角色发现、`SEMANTIC_LEDGER.json`、分层剧本与 canonical `STORYBOARD.json` / `CHARACTERS.json` | 输入/LLM/结构无效即停止；子阶段 checkpoint 可复用 |
+| 1 | 文本解析、源事件发现、按 sequence 的导演意图、角色发现、`SEMANTIC_LEDGER.json`、时长缩放后的 `SCREENPLAY_PLAN.json` 与 canonical `STORYBOARD.json` / `CHARACTERS.json` | 输入/LLM/结构无效即停止；子阶段 checkpoint 可复用 |
 | 2 | 分镜与 Pxx 图像资产、构图和端帧契约 | 生产图片或其验证证据缺失时 fail closed |
 | 3 | 角色卡、四视图、变体和身份锁定 | 生产模式要求真实四视图 QA；dry-run 只写明确的 dry-run receipt |
 | 4 | 原生 shot 目录与 `SHOT_META.json`、场景一致性、continuity plan、cinematic first-frame | canonical storyboard 不得为元数据物化而原地改写；Phase 4 不运行视频生成子进程 |
@@ -129,7 +129,9 @@ Graph node 必须只完成三件事：读取 State、调用一个窄 owner、返
 
 Phase 1 的时长合同采用三账本：`story clock` 记录一级 `Sxx` 与其二级 `Pxx` 共同表示的有效叙事时长，二者不得相加；`Provider request` 记录实际请求/计费时长；`padding/context` 记录 Provider 最低请求、尾段上下文或重叠中不属于新故事时钟的部分。每个 Pxx 必须分别持久化 `effective_story_duration_s`、`provider_request_duration_s` 与 `provider_minimum_padding_duration_s`，Runtime 按请求帧生成后规范化到 `expected_unique_frames`。Provider 的 8 秒/6 秒最低请求不得反向成为故事时钟的最低镜长或压缩阻塞条件。跨一级镜头的 bridge 是独立 Provider 请求开销，只进入请求账本；其可见部分按 `replace_boundary_handles` 替换等长边界把手。`honcut.material-budget.v3` 必须记录故事时钟、Pxx 分区校验、内容请求与 padding、bridge 请求实际/规划区间、总 Provider 请求及比率。历史 v2 只可迁移用于成本审计，不得作为当前 Phase 5 成功证据；历史 `1.3` 仍只作成本参考，不是容量硬上限。Phase 8 的安全变速区间是独立编辑合同，不得从 Provider 请求比率反推。
 
-当完整事件账本超过交付故事时钟的可执行容量时，Phase 1 只能通过 `dropped_source_events` 显式记录被删减的非关键事件；这些事件不得进入 `source_events`、Pxx、Prompt 或媒体生成。`scene_setup`、`turning_point`、`dramatic_turn` 与 `consequence` 必须保留。请求的平均镜长只是剪辑偏好，不是语义容量上限：完整账本能装入故事时钟时，一级镜头数必须扩展到结构槽位数；确需压缩时，先扩展到可执行动作容量最大的平台，再保留一个不增加故事时钟或理论动作预算的有界顺序槽位，供不可拆事件在相邻镜头共享边界。模型不得在仍有可用故事时钟容量时保留整事件删减；Phase owner 必须按标准化动作单元确定性恢复仍可装入的事件，并重新校验 sequence、单镜容量与总 material duration。同一 sequence 的每个事件只能占据连续的 beat 区间，且按源事件顺序单调前进；相邻事件可共享一个边界 beat，但后段事件不得提前出现、跨过前段事件或在后续回跳。Phase 5 必须 fail closed 校验故事时钟上限、Sxx/Pxx 等时、bridge 区间/把手以及持久化 material ledger；未知或旧 material-budget schema 不得解释为成功。
+`phase1_events.json` 是完整源事实账，记录 Event Extractor 从原文发现的全部 canonical 事件；它不得因交付时长而被覆盖、截短或重命名为生产结果。Adaptation 完成确定性修复与精确时长分配后，必须另写 `honcut.screenplay-plan.v1` 的 `SCREENPLAY_PLAN.json` 作为生产剧本账：逐 beat 记录稳定 ID、单一 sequence、精确时长、`source_refs`、`omitted_source_refs`、改编动作与 Director 意图，并分别汇总 source ledger 与 production ledger。进入 Adaptation 前的 `screenplay_compression_required` 只表示完整源账需要时长缩放，不得在一个已经通过 sequence、动作容量、必保事件和精确故事时钟校验的生产账上继续充当最终失败状态；成功生产账的 canonical `action_capacity_status` 必须为 `fits_story_clock`，同时以 `source_action_capacity_status` 保留原始压力证据。零请求 dry-run 没有生产语义删减证据，仍只报告源结构容量并在估算需要压缩时 fail closed。
+
+当完整事件账本超过交付故事时钟的可执行容量时，Phase 1 只能通过生产剧本账与 shot 上的 `dropped_source_events` 显式记录被删减的非关键事件；这些事件不得进入生产 `source_events`、Pxx、Prompt 或媒体生成。`scene_setup`、`turning_point`、`dramatic_turn` 与 `consequence` 必须保留。请求的平均镜长只是剪辑偏好，不是语义容量上限：完整账本能装入故事时钟时，一级镜头数必须扩展到结构槽位数；确需压缩时，先扩展到可执行动作容量最大的平台，再保留一个不增加故事时钟或理论动作预算的有界顺序槽位，供不可拆事件在相邻镜头共享边界。模型不得在仍有可用故事时钟容量时保留整事件删减；Phase owner 必须按标准化动作单元确定性恢复仍可装入的事件，并重新校验 sequence、单镜容量与总 material duration。同一 sequence 的每个事件只能占据连续的 beat 区间，且按源事件顺序单调前进；相邻事件可共享一个边界 beat，但后段事件不得提前出现、跨过前段事件或在后续回跳。Phase 5 必须 fail closed 校验故事时钟上限、Sxx/Pxx 等时、bridge 区间/把手以及持久化 material ledger；未知或旧 material-budget schema 不得解释为成功。
 
 Canonical 事件账本要求 `dramatic_turn=true` 当且仅当 `event_role=turning_point`。事件提取模型返回冲突组合时，Event Extractor 必须携带具体 schema 错误进行一次有界纠错；仍不一致则 fail closed，禁止把普通动作链提升为必保转折或静默丢失真实转折。改变该规范化规则必须升级事件缓存 schema。
 
@@ -149,7 +151,7 @@ Phase 1 的骨架账本按 screenplay `sequence_id` 预先分配连续且互不�
 
 Adaptation Engine 是具体镜头语言的唯一 owner。除 `shot_size`、`camera_movement`、`lens_mm`、`lighting_key` 等既有字段外，canonical shot 必须写入受控 `camera_angle`（`eye_level/low/high/dutch/over_shoulder/aerial/bird/worm`）；Director 意图不得预选该值。下游 Storyboard、二级 Pxx（当前 `honcut.secondary-storyboard.v11`）、Phase 4 元数据与生成 Prompt 只能保留或翻译这个 canonical 值，不得再次推断角度。未知 authored 值必须在 Phase 1 fail closed；旧产物仅可在明确兼容边界规范化为 `eye_level`。
 
-Phase 1 的 adaptation 对任意事件数量都固定执行分层骨架与分批镜头展开；生产路径不存在按事件数回退为单次 Prompt 的分支，也不得通过环境变量重新启用旧单次调用路径。分层 checkpoint 是唯一可恢复的 adaptation 中间状态；当前 schema 为 `honcut.layered-adaptation.v11`，旧版不得跨导演意图、机位角度、语义容量或事件顺序规则复用。
+Phase 1 的 adaptation 对任意事件数量都固定执行分层骨架与分批镜头展开；生产路径不存在按事件数回退为单次 Prompt 的分支，也不得通过环境变量重新启用旧单次调用路径。分层 checkpoint 是唯一可恢复的 adaptation 中间状态；当前 schema 为 `honcut.layered-adaptation.v12`，旧版不得跨导演意图、机位角度、生产剧本账、语义容量或事件顺序规则复用。
 
 Phase 间调用原则上通过 Graph/Lifecycle。唯一允许的业务闭环是已建模且有限的修复路径，例如 Phase 8 调用注入的 Phase 6 生成 callable；该依赖必须可测试注入，并在所有递归轮次中保持一致。
 

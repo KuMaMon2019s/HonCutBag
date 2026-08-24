@@ -3059,7 +3059,222 @@ def _atomic_write_json(path: Path, value: Any) -> None:
     os.replace(temporary, path)
 
 
-LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v11"
+SCREENPLAY_PLAN_SCHEMA = "honcut.screenplay-plan.v1"
+LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v12"
+
+
+def _build_screenplay_plan(
+    events: List[Dict[str, Any]],
+    shots: List[Dict[str, Any]],
+    source_capacity_plan: Dict[str, Any],
+    *,
+    target_duration: int,
+    source_events_hash: str | None = None,
+    capabilities: VideoModelCapabilities | None = None,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Separate the complete source ledger from the fitted production ledger.
+
+    ``_estimate_action_capacity_plan`` deliberately measures the complete
+    authored event ledger.  Once Adaptation has produced and validated a
+    duration-scaled shot plan, carrying that input-pressure status forward as
+    the final capacity status is incorrect accounting.  This function records
+    both ledgers and reconciles the public capacity result only after exact
+    production durations and source references exist.
+    """
+    if not shots:
+        raise ValueError("screenplay plan requires at least one production beat")
+    profile = capabilities or get_video_capabilities()
+    _validate_beat_action_capacity(shots, events, profile)
+    _validate_beat_material_duration(shots, events, target_duration, profile)
+
+    event_ids = set(range(1, len(events) + 1))
+    kept_ids: set[int] = set()
+    omitted_ids: set[int] = set()
+    omitted_occurrences: list[int] = []
+    beats: list[dict[str, Any]] = []
+    total_duration = 0.0
+    production_generation_units = 0
+
+    for beat_order, shot in enumerate(shots, 1):
+        source_refs = shot.get("source_events") or []
+        omitted_refs = shot.get("dropped_source_events") or []
+        if (
+            not isinstance(source_refs, list)
+            or not source_refs
+            or any(not isinstance(event_id, int) for event_id in source_refs)
+        ):
+            raise ValueError(
+                f"production beat {beat_order} has invalid source event references"
+            )
+        if (
+            not isinstance(omitted_refs, list)
+            or any(not isinstance(event_id, int) for event_id in omitted_refs)
+        ):
+            raise ValueError(
+                f"production beat {beat_order} has invalid omitted event references"
+            )
+        if set(source_refs) & set(omitted_refs):
+            raise ValueError(
+                f"production beat {beat_order} both keeps and omits a source event"
+            )
+
+        sequence_ids = [
+            str(value).strip()
+            for value in (shot.get("source_sequence_ids") or [])
+            if str(value).strip()
+        ]
+        sequence_ids = list(dict.fromkeys(sequence_ids))
+        source_sequences = {
+            str(events[event_id - 1].get("sequence_id") or "").strip()
+            or "__unspecified__"
+            for event_id in source_refs
+            if event_id in event_ids
+        }
+        if not sequence_ids and source_sequences == {"__unspecified__"}:
+            sequence_ids = ["__unspecified__"]
+        if len(sequence_ids) != 1:
+            raise ValueError(
+                f"production beat {beat_order} must bind exactly one sequence"
+            )
+        if source_sequences != {sequence_ids[0]}:
+            raise ValueError(
+                f"production beat {beat_order} source refs do not match "
+                f"sequence {sequence_ids[0]}"
+            )
+
+        raw_duration = shot.get("suggested_duration")
+        if isinstance(raw_duration, bool):
+            raise ValueError(f"production beat {beat_order} has invalid duration")
+        try:
+            duration = float(raw_duration)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"production beat {beat_order} has invalid duration"
+            ) from exc
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError(f"production beat {beat_order} has invalid duration")
+        total_duration += duration
+
+        generation_units = shot.get("generation_action_units") or []
+        if not isinstance(generation_units, list):
+            raise ValueError(
+                f"production beat {beat_order} generation_action_units must be a list"
+            )
+        production_generation_units += len(generation_units)
+        kept_ids.update(source_refs)
+        omitted_ids.update(omitted_refs)
+        omitted_occurrences.extend(omitted_refs)
+        beats.append(
+            {
+                "beat_id": f"SPB{beat_order:03d}",
+                "beat_order": beat_order,
+                "sequence_id": sequence_ids[0],
+                "duration_s": int(duration) if duration.is_integer() else duration,
+                "source_refs": list(dict.fromkeys(source_refs)),
+                "omitted_source_refs": list(dict.fromkeys(omitted_refs)),
+                "adaptation_action": str(shot.get("action") or "keep"),
+                "narrative_summary": str(shot.get("what") or "").strip(),
+                "director_intent": copy.deepcopy(shot.get("director_intent")),
+            }
+        )
+
+    if len(omitted_occurrences) != len(set(omitted_occurrences)):
+        raise ValueError("an omitted source event may be recorded only once")
+    if kept_ids & omitted_ids:
+        raise ValueError("source events cannot be both kept and omitted")
+    invalid_ids = (kept_ids | omitted_ids) - event_ids
+    if invalid_ids:
+        raise ValueError(f"screenplay plan references unknown events: {sorted(invalid_ids)}")
+    missing_ids = event_ids - kept_ids - omitted_ids
+    if missing_ids:
+        raise ValueError(f"screenplay plan does not account for events: {sorted(missing_ids)}")
+    mandatory_ids = {
+        event_id
+        for event_id, event in enumerate(events, 1)
+        if _event_is_mandatory_for_adaptation(event)
+    }
+    missing_mandatory = mandatory_ids - kept_ids
+    if missing_mandatory:
+        raise ValueError(
+            f"screenplay plan omits mandatory events: {sorted(missing_mandatory)}"
+        )
+    if not math.isclose(total_duration, float(target_duration), abs_tol=1e-6):
+        raise ValueError(
+            f"production screenplay duration {total_duration:g}s does not equal "
+            f"the {target_duration}s delivery target"
+        )
+
+    source_status = str(
+        source_capacity_plan.get("action_capacity_status") or ""
+    )
+    if source_status not in {
+        "fits_story_clock",
+        "screenplay_compression_required",
+    }:
+        raise ValueError(f"unsupported source capacity status: {source_status!r}")
+    duration_scaling_status = (
+        "applied"
+        if omitted_ids or source_status == "screenplay_compression_required"
+        else "not_required"
+    )
+    serialized_events = json.dumps(
+        events,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    screenplay_plan = {
+        "schema": SCREENPLAY_PLAN_SCHEMA,
+        "target_duration_s": int(target_duration),
+        "source_ledger": {
+            "artifact": "phase1_events.json",
+            "event_count": len(events),
+            "generation_action_units": int(
+                source_capacity_plan.get("generation_action_units") or 0
+            ),
+            "minimum_material_duration_s": int(
+                source_capacity_plan.get("minimum_material_duration") or 0
+            ),
+            "capacity_status": source_status,
+            "capacity_pressure_ratio": float(
+                source_capacity_plan.get("action_capacity_pressure_ratio") or 0
+            ),
+        },
+        "production_ledger": {
+            "capacity_status": "fits_story_clock",
+            "duration_scaling_status": duration_scaling_status,
+            "event_count": len(kept_ids),
+            "generation_action_units": production_generation_units,
+            "effective_story_duration_s": (
+                int(total_duration) if total_duration.is_integer() else total_duration
+            ),
+            "kept_source_event_ids": sorted(kept_ids),
+            "omitted_source_event_ids": sorted(omitted_ids),
+            "mandatory_source_event_ids": sorted(mandatory_ids),
+        },
+        "beats": beats,
+        "lineage": {
+            "source_events_sha256": hashlib.sha256(serialized_events).hexdigest(),
+            "source_checkpoint_input_hash": source_events_hash,
+        },
+    }
+    reconciled_capacity = dict(source_capacity_plan)
+    reconciled_capacity.update(
+        {
+            "source_action_capacity_status": source_status,
+            "source_generation_action_units": int(
+                source_capacity_plan.get("generation_action_units") or 0
+            ),
+            "action_capacity_status": "fits_story_clock",
+            "duration_scaling_status": duration_scaling_status,
+            "production_generation_action_units": production_generation_units,
+            "production_event_count": len(kept_ids),
+            "omitted_source_event_count": len(omitted_ids),
+            "screenplay_plan_schema": SCREENPLAY_PLAN_SCHEMA,
+        }
+    )
+    return screenplay_plan, reconciled_capacity
 
 
 def _layered_input_fingerprint(
@@ -3161,6 +3376,7 @@ def adapt_events(
     source_text: Optional[str] = None,
     output_dir: Optional[str | Path] = None,
     director_plan: Optional[Dict[str, Any]] = None,
+    source_events_hash: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     将事件列表改编为 shot 列表
@@ -3172,6 +3388,7 @@ def adapt_events(
         shot_duration: 每镜平均时长（秒），默认 12
         source_text: 原始剧本文本（用于智能预估时长）
         director_plan: Event Extractor 之后生成的 sequence 导演意图
+        source_events_hash: ``phase1_events.json`` 的输入血缘哈希
 
     Returns:
         包含交付时长、剪辑前素材时长、容量计划与 shots 的字典
@@ -3275,6 +3492,28 @@ def adapt_events(
         annotate_boundaries(shots)
         normalize_shot_durations(shots, material_duration, capability_profile)
 
+        screenplay_plan, reconciled_capacity_plan = _build_screenplay_plan(
+            events,
+            shots,
+            capacity_plan,
+            target_duration=material_duration,
+            source_events_hash=source_events_hash,
+            capabilities=capability_profile,
+        )
+        screenplay_plan_sha256 = hashlib.sha256(
+            json.dumps(
+                screenplay_plan,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if checkpoint_dir is not None:
+            _atomic_write_json(
+                checkpoint_dir / "SCREENPLAY_PLAN.json",
+                screenplay_plan,
+            )
+
         for i, shot in enumerate(shots):
             if i > 0:
                 prev = shots[i - 1]
@@ -3301,7 +3540,9 @@ def adapt_events(
             "target_duration": target_duration,
             "delivery_target_duration": target_duration,
             "material_duration": material_duration,
-            "capacity_plan": capacity_plan,
+            "capacity_plan": reconciled_capacity_plan,
+            "screenplay_plan": screenplay_plan,
+            "screenplay_plan_sha256": screenplay_plan_sha256,
             "estimated_shots": len(shots),
             "requested_shot_duration": shot_duration,
             "effective_shot_duration": effective_shot_duration,

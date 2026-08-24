@@ -694,6 +694,7 @@ def run_phase1_screenwriter(
             source_text=text,
             output_dir=output_dir,
             director_plan=director["plan"],
+            source_events_hash=events_input_hash,
         )
         adapted_shots = adapted.get("shots", [])
         print(f"    ✓ 改编完成，{len(adapted_shots)} 个镜头")
@@ -732,6 +733,22 @@ def run_phase1_screenwriter(
             ].get(
                 "generated_duration_ratio_reference"
             )
+        if adapted.get("screenplay_plan"):
+            screenplay_plan = adapted["screenplay_plan"]
+            storyboard["screenplay_plan"] = {
+                "schema": screenplay_plan["schema"],
+                "artifact": "SCREENPLAY_PLAN.json",
+                "sha256": adapted["screenplay_plan_sha256"],
+                "source_capacity_status": screenplay_plan["source_ledger"][
+                    "capacity_status"
+                ],
+                "production_capacity_status": screenplay_plan[
+                    "production_ledger"
+                ]["capacity_status"],
+                "duration_scaling_status": screenplay_plan[
+                    "production_ledger"
+                ]["duration_scaling_status"],
+            }
         if continuity_mode:
             storyboard["continuity_mode"] = continuity_mode
         storyboard["semantic_understanding"] = {
@@ -777,6 +794,7 @@ def run_phase1_screenwriter(
 
         outputs = [
             "STORYBOARD.json", "CHARACTERS.json", "SEMANTIC_LEDGER.json",
+            "SCREENPLAY_PLAN.json",
             "director_storyboard.png", "director_storyboard_prompt.txt",
             "director_storyboard.json",
         ]
