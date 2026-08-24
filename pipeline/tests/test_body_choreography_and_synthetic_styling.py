@@ -317,6 +317,60 @@ def test_non_body_rows_are_removed_from_declared_body_choreography():
     assert record["body_action_choreography"] == contract["beats"]
 
 
+def test_non_contact_locomotion_gets_explicit_support_contact():
+    record = {
+        "micro_actions": ["第一名敌人高速冲刺"],
+        "body_action_choreography": [{
+            "micro_action_index": 1,
+            "micro_action": "第一名敌人高速冲刺",
+            "performer": "第一名敌人",
+            "technique": "直线冲刺逼近",
+            "side": "双侧",
+            "limbs": ["双腿", "躯干"],
+            "footwork": "双腿交替蹬地快速迈步",
+            "torso": "躯干前倾保持冲刺姿态",
+            "weight_shift": "重心随步伐连续向前转移",
+            "direction": "沿车厢通道向前",
+            "contact": "不适用",
+            "end_pose": "双脚落地进入攻击距离",
+        }],
+    }
+
+    contract = apply_body_action_contract(record)
+
+    assert contract is not None
+    assert contract["valid"] is True
+    assert contract["beats"][0]["contact"] == "无目标接触；身体保持既有支撑接触"
+
+
+def test_contact_action_still_rejects_placeholder_contact():
+    record = {
+        "micro_actions": ["男子右脚踢向敌人手腕"],
+        "body_action_choreography": [{
+            "micro_action_index": 1,
+            "micro_action": "男子右脚踢向敌人手腕",
+            "performer": "男子",
+            "technique": "右腿前踢",
+            "side": "右侧",
+            "limbs": ["右腿", "左腿"],
+            "footwork": "左脚支撑，右腿前伸",
+            "torso": "躯干向左微倾",
+            "weight_shift": "重心转移至左腿",
+            "direction": "右脚朝敌人手腕前伸",
+            "contact": "不适用",
+            "end_pose": "右腿开始收回",
+        }],
+    }
+
+    errors = body_action_contract_errors(record)
+
+    assert [error["code"] for error in errors] == [
+        "body_choreography_vague_action",
+        "body_choreography_incomplete_beat",
+    ]
+    assert errors[1]["beats"][0]["missing_fields"] == ["contact"]
+
+
 def test_legacy_action_text_is_not_promoted_to_declared_structured_choreography():
     record = {"micro_actions": ["抓住扶手"]}
 

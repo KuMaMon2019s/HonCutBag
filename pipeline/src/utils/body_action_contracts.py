@@ -80,6 +80,13 @@ _PLACEHOLDER_MECHANICS_FRAGMENT = re.compile(
     r"未明确|未指定|未指明|不明确|未知|\bunspecified\b|\bunknown\b",
     re.IGNORECASE,
 )
+_CONTACT_REQUIRING_BODY_ACTION = re.compile(
+    r"格挡|挡住|踢|挥砍|砍|斩|(?<!冲)刺|劈|抓|握|扣|锁|摔|撞|推|拉|"
+    r"击中|拳|掌|肘|控制|接触|擦过|命中|扶手|扶住|"
+    r"\b(?:block|parry|kick|slash|stab|chop|grab|grip|lock|throw|collide|"
+    r"push|pull|strike|punch|control|contact|brush|hit|hold)\b",
+    re.IGNORECASE,
+)
 _STRUCTURED_MECHANICS_FIELDS = (
     "performer",
     "technique",
@@ -214,13 +221,33 @@ def _missing_structured_mechanics(beat: dict[str, Any]) -> list[str]:
         values = value if isinstance(value, list) else [value]
         normalized = [str(item or "").strip() for item in values]
         if not normalized or any(
-            not item
-            or _PLACEHOLDER_MECHANICS.fullmatch(item)
-            or _PLACEHOLDER_MECHANICS_FRAGMENT.search(item)
+            _is_placeholder_mechanics_value(item)
             for item in normalized
         ):
             missing.append(field)
     return missing
+
+
+def _is_placeholder_mechanics_value(value: Any) -> bool:
+    normalized = str(value or "").strip()
+    return bool(
+        not normalized
+        or _PLACEHOLDER_MECHANICS.fullmatch(normalized)
+        or _PLACEHOLDER_MECHANICS_FRAGMENT.search(normalized)
+    )
+
+
+def _normalize_explicit_non_contact(beats: list[dict[str, Any]]) -> None:
+    """Represent a real no-contact body beat without inventing a target hit."""
+    for beat in beats:
+        action = str(
+            beat.get("micro_action") or beat.get("description") or ""
+        ).strip()
+        if (
+            _is_placeholder_mechanics_value(beat.get("contact"))
+            and not _CONTACT_REQUIRING_BODY_ACTION.search(action)
+        ):
+            beat["contact"] = "无目标接触；身体保持既有支撑接触"
 
 
 def _matching_choreography_beats(
@@ -350,6 +377,7 @@ def build_body_action_contract(record: dict[str, Any]) -> dict[str, Any] | None:
                 1,
             )
         ]
+        _normalize_explicit_non_contact(beats)
     if not beats:
         # Legacy explicit action strings remain usable and auditable. Vague
         # dance/fight summaries deliberately do not get upgraded by guessing.

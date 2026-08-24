@@ -65,7 +65,8 @@ ACTION_SYSTEM_PROMPT = (
     "micro_actions 是按时间先后生成的可执行动作阶段，不是‘复杂动作’‘跳舞’‘连续格斗’等抽象标签；"
     "同一时刻并行完成的复合动作必须合成一条。"
     "舞蹈、格斗、功夫或武术段落必须进一步输出逐拍 body_action_choreography，明确左右侧、"
-    "执行肢体、步法、躯干、重心、方向、接触点和终态。"
+    "执行肢体、步法、躯干、重心、方向、接触点和终态；没有目标接触的位移/闪避也必须明确写"
+    "‘无目标接触，身体保持既有支撑接触’，不得写‘无/不适用/未明确’。"
     "你必须保留动作的起始状态、结束状态、因果关系和无署名对白的可靠归属。"
     "输出严格 JSON 对象，顶层只有 events 数组。不要输出任何解释文字。"
 )
@@ -145,6 +146,8 @@ ACTION_SCREENPLAY_CONTRACT = (
     "同一人物必须沿用 target/上下文中已有的最短无歧义标签。\n"
     "8. 舞蹈、格斗、功夫、武术或搏击段落必须逐拍填写 body_action_choreography："
     "每拍明确执行者、左右侧、肢体路径、步法、躯干旋转、重心转移、运动方向、接触点和终态。"
+    "高速位移、逼近、后仰、闪避等没有命中或抓握的动作，contact 必须明确写无目标接触以及"
+    "身体与既有支撑面的接触，不得写‘无’‘不适用’‘未明确’。"
     "原文点名的招式（例如街舞托马斯、铁山靠）必须逐字保留；原文只写泛化表演或交手时，"
     "允许在不改变人物、道具、伤亡、胜负、地点和剧情结果的边界内补足可拍摄编舞，例如左挡、"
     "右闪、换步、支撑腿、摆动腿和受力终态。禁止只写动作难度、速度、情绪或镜头效果。\n"
@@ -236,7 +239,7 @@ _NARRATIVE_JUMP_CUES = (
 # caches carried over from earlier run directories — and forces every Phase 1
 # event extraction to re-run (a paid LLM pass). Never bump casually, and never
 # reuse cross-run segment caches from a run produced under a different value.
-EVENT_FLOW_SCHEMA_VERSION = "21.0"
+EVENT_FLOW_SCHEMA_VERSION = "22.0"
 
 _UNKNOWN_ACTION_PERFORMERS = {
     "",
