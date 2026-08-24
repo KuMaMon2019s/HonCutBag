@@ -235,7 +235,7 @@ _NARRATIVE_JUMP_CUES = (
 # caches carried over from earlier run directories — and forces every Phase 1
 # event extraction to re-run (a paid LLM pass). Never bump casually, and never
 # reuse cross-run segment caches from a run produced under a different value.
-EVENT_FLOW_SCHEMA_VERSION = "16.0"
+EVENT_FLOW_SCHEMA_VERSION = "17.0"
 
 _UNKNOWN_ACTION_PERFORMERS = {
     "",
@@ -660,12 +660,14 @@ def _annotate_global_event_flow(
     dialogue_number = 0
     previous: Dict[str, Any] | None = None
     current_sequence = ""
+    known_participants: set[str] = set()
     for index, event in enumerate(events, 1):
         if previous:
             _repair_continuous_generic_participant(
                 previous,
                 event,
                 preserve_one_take=preserve_one_take,
+                known_participants=known_participants,
             )
             _reconcile_continuous_action_participants(
                 previous,
@@ -698,6 +700,7 @@ def _annotate_global_event_flow(
             boundary = "cut"
             sequence_number += 1
             current_sequence = f"SEQ{sequence_number:03d}"
+            known_participants.clear()
         event["continuity_before"] = boundary
         event["sequence_id"] = current_sequence
 
@@ -711,6 +714,11 @@ def _annotate_global_event_flow(
         for line in event.get("lines", []):
             dialogue_number += 1
             line["dialogue_id"] = f"D{dialogue_number:03d}"
+        known_participants.update(
+            str(value).strip()
+            for value in event.get("who") or []
+            if str(value).strip()
+        )
         previous = event
     return events
 
@@ -820,15 +828,16 @@ def _repair_continuous_generic_participant(
     current: Dict[str, Any],
     *,
     preserve_one_take: bool,
+    known_participants: set[str] | None = None,
 ) -> None:
     """Preserve an adjacent specific identity when the model regresses to its role.
 
-    This deliberately handles only the unambiguous one-to-one shape: both events
-    share the same other participants, the previous event has exactly one extra
-    specific label, and the current event has exactly one shorter suffix label.
-    Explicit introductions such as ``another guard`` or ``second inspector``
-    remain distinct.  Ambiguous multi-participant cases are left unchanged for
-    the downstream identity gate to reject rather than guessed here.
+    This deliberately handles only one unique specific-to-generic identity pair.
+    Other participants must either be shared with the immediately previous event
+    or already established earlier in the same continuous sequence.  This lets a
+    temporarily omitted participant reappear without making an actually new
+    participant evidence for coreference. Explicit introductions such as
+    ``another guard`` or ``second inspector`` remain distinct.
     """
     boundary = str(current.get("continuity_before") or "cut").strip().lower()
     if not (
@@ -843,28 +852,45 @@ def _repair_continuous_generic_participant(
     previous_only = [value for value in previous_who if value not in shared]
     current_only = [value for value in current_who if value not in shared]
 
-    # A continuous event may introduce another participant while referring to
-    # the existing subject with an equivalent descriptor (for example
-    # ``man``/``male``).  Resolve only one unique cross-event descriptor pair,
-    # and never collapse a label when the previous stable name already appears
-    # in the current participant set.
-    descriptor_pairs = [
+    # Resolve one unique suffix/equivalent pair. A current-only label that is not
+    # the generic candidate must have been established earlier in this sequence;
+    # otherwise it is an unseen participant and the identity shape is ambiguous.
+    identity_pairs = [
         (previous_label, current_label)
         for previous_label in previous_only
         for current_label in current_only
         if previous_label not in current_who
-        and _equivalent_human_descriptor(previous_label, current_label)
+        and _normalized_identity_label(current_label)
+        and (
+            _normalized_identity_label(previous_label).endswith(
+                _normalized_identity_label(current_label)
+            )
+            or _equivalent_human_descriptor(previous_label, current_label)
+        )
     ]
-    if len(descriptor_pairs) == 1:
-        previous_label, generic_label = descriptor_pairs[0]
+    if len(identity_pairs) == 1:
+        previous_label, generic_label = identity_pairs[0]
+        descriptor_equivalent = _equivalent_human_descriptor(
+            previous_label,
+            generic_label,
+        )
+        other_current_only = {
+            value for value in current_only if value != generic_label
+        }
         evidence = " ".join(
             str(current.get(field) or "")
             for field in ("source_excerpt", "what", "start_state", "causal_link")
         )
-        if not _source_introduces_distinct_role(
-            evidence,
-            generic_label,
-            previous_label,
+        if (
+            (
+                descriptor_equivalent
+                or other_current_only <= (known_participants or set())
+            )
+            and not _source_introduces_distinct_role(
+                evidence,
+                generic_label,
+                previous_label,
+            )
         ):
             current["model_who"] = list(current_who)
             current["who"] = list(dict.fromkeys(
@@ -873,42 +899,10 @@ def _repair_continuous_generic_participant(
             ))
             current["who_repair_reason"] = (
                 "continuous equivalent participant inherits the adjacent identity"
+                if descriptor_equivalent
+                else "continuous generic participant inherits the adjacent specific identity"
             )
             return
-
-    if len(previous_only) != 1 or len(current_only) != 1:
-        return
-
-    previous_label = previous_only[0]
-    generic_label = current_only[0]
-    previous_key = _normalized_identity_label(previous_label)
-    generic_key = _normalized_identity_label(generic_label)
-    descriptor_equivalent = _equivalent_human_descriptor(
-        previous_label,
-        generic_label,
-    )
-    if not generic_key or previous_key == generic_key or (
-        not previous_key.endswith(generic_key) and not descriptor_equivalent
-    ):
-        return
-
-    evidence = " ".join(
-        str(current.get(field) or "")
-        for field in ("source_excerpt", "what", "start_state", "causal_link")
-    )
-    if _source_introduces_distinct_role(evidence, generic_label, previous_label):
-        return
-
-    current["model_who"] = list(current_who)
-    current["who"] = [
-        previous_label if value == generic_label else value
-        for value in current_who
-    ]
-    current["who_repair_reason"] = (
-        "continuous equivalent participant inherits the adjacent identity"
-        if descriptor_equivalent
-        else "continuous generic participant inherits the adjacent specific identity"
-    )
 
 
 def _reference_is_explicit_in_text(reference: str, evidence: str) -> bool:

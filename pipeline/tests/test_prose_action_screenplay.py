@@ -413,6 +413,54 @@ def test_global_flow_resolves_generic_participant_to_adjacent_specific_identity(
     )
 
 
+def test_global_flow_allows_a_previously_seen_participant_to_reappear_during_coreference():
+    events = [
+        _event(
+            who=["检修员"],
+            source_excerpt="检修员进入控制舱。",
+            continuity_before="cut",
+        ),
+        _event(
+            who=["第三名入侵者"],
+            source_excerpt="第三名入侵者从顶部跃下。",
+            continuity_before="continuous",
+        ),
+        _event(
+            who=["检修员", "入侵者"],
+            source_excerpt="检修员闪避入侵者的重击。",
+            continuity_before="continuous",
+        ),
+    ]
+
+    _annotate_global_event_flow(events, continuity_mode="one_take")
+
+    assert events[2]["who"] == ["检修员", "第三名入侵者"]
+    assert events[2]["model_who"] == ["检修员", "入侵者"]
+    assert events[2]["who_repair_reason"] == (
+        "continuous generic participant inherits the adjacent specific identity"
+    )
+
+
+def test_global_flow_does_not_corefer_when_current_event_adds_an_unseen_participant():
+    events = [
+        _event(
+            who=["第三名入侵者"],
+            source_excerpt="第三名入侵者从顶部跃下。",
+            continuity_before="cut",
+        ),
+        _event(
+            who=["陌生检修员", "入侵者"],
+            source_excerpt="陌生检修员进入控制舱并看向入侵者。",
+            continuity_before="continuous",
+        ),
+    ]
+
+    _annotate_global_event_flow(events, continuity_mode="one_take")
+
+    assert events[1]["who"] == ["陌生检修员", "入侵者"]
+    assert "model_who" not in events[1]
+
+
 def test_global_flow_resolves_equivalent_human_descriptor_in_continuity():
     events = [
         _event(
