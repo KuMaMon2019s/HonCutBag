@@ -1300,6 +1300,147 @@ def _r1_attribute_evidence(
     }
 
 
+_L3_SHOT_CONTRACT_FIELDS = (
+    "source_sequence_ids",
+    "source_events",
+    "who",
+    "character_ids",
+    "participant_refs",
+    "where",
+    "what",
+    "visual",
+    "start_state",
+    "end_state",
+    "time",
+    "time_window",
+    "time_of_day",
+    "lighting_description",
+    "shot_size",
+    "camera_angle",
+    "camera_movement",
+    "shot_intent",
+    "transition_to_next",
+    "director_intent",
+)
+_L3_BEAT_CONTRACT_FIELDS = (
+    "beat_id",
+    "action",
+    "micro_actions",
+    "start_state",
+    "end_state",
+    "source_action_unit_ids",
+    "duration_s",
+    "generation_mode",
+    "shot_size",
+    "camera_angle",
+    "camera_movement",
+    "lighting_key",
+    "shot_intent",
+)
+
+
+def _selected_fields(value: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
+    """Project an artifact onto an explicit semantic prompt contract."""
+    return {
+        field: value[field]
+        for field in fields
+        if field in value and value[field] not in (None, "", [], {})
+    }
+
+
+def _l3_storyboard_contract(storyboard: dict[str, Any]) -> dict[str, Any]:
+    """Keep visual semantics while excluding prompts, paths, hashes and receipts."""
+    shots = []
+    for index, shot in enumerate(storyboard.get("shots") or []):
+        if not isinstance(shot, dict):
+            continue
+        projected = {
+            "shot_id": _shot_id(shot, index),
+            **_selected_fields(shot, _L3_SHOT_CONTRACT_FIELDS),
+        }
+        projected["storyboard_beats"] = [
+            _selected_fields(beat, _L3_BEAT_CONTRACT_FIELDS)
+            for beat in (shot.get("storyboard_beats") or [])
+            if isinstance(beat, dict)
+        ]
+        shots.append(projected)
+    return {
+        "schema": "honcut.phase5-l3-semantic-projection.v1",
+        "shots": shots,
+    }
+
+
+def _l3_review_prompt(
+    *,
+    reference_inputs: list[dict[str, Any]],
+    storyboard_inputs: list[dict[str, Any]],
+    overview_input: dict[str, Any],
+    canonical_contracts: dict[str, str],
+    storyboard: dict[str, Any],
+    visual_style: str,
+    valid_storyboard_ids: list[str],
+) -> str:
+    """Build one bounded, de-duplicated semantic review request."""
+    reference_index = [
+        _selected_fields(
+            item,
+            ("input_index", "kind", "character_id", "view"),
+        )
+        for item in reference_inputs
+    ]
+    storyboard_index = [
+        _selected_fields(
+            item,
+            ("input_index", "kind", "shot_id", "storyboard_ids"),
+        )
+        for item in storyboard_inputs
+    ]
+    overview_index = _selected_fields(
+        overview_input,
+        ("input_index", "kind", "storyboard_ids"),
+    )
+    compact = lambda value: json.dumps(
+        value,
+        ensure_ascii=False,
+    )
+    return f"""[L3 REVIEW CONTRACT]
+Review the supplied storyboard evidence against the canonical character references and authored project artifacts. Every image listed below is attached to this exact request in ascending input_index order.
+
+INPUT CONTRACT:
+- Canonical character inputs are mapped to character_id and view in CHARACTER REFERENCE INPUTS.
+- Storyboard inputs are high-detail per-shot boards containing only the exact Pxx images listed in STORYBOARD SHOT INPUTS, with a large black ID badge inside every panel.
+- The overview grid is for cross-shot continuity only. Use per-shot boards for fine identity, clothing, prop, and action evidence.
+- Never swap expected and observed: canonical character inputs define EXPECTED; storyboard boards define OBSERVED. Never call a character reference a storyboard image.
+- Associate observations only with the in-frame Sxx or Sxx_Pxx badge; never infer an ID from a neighbouring cell or row position.
+
+Apply red lines R1-R4: R1 character identity/gender/build/clothing continuity against canonical references; R2 time-of-day and lighting continuity; R3 scene/action continuity; R4 storyboard-to-image semantic fidelity. Do not perform face recognition or infer a public identity from appearance alone. Each Pxx image represents only its authored action and must progress from the previous Pxx without pose reset or premature future action.
+
+Evidence rules:
+- Report only visible contradictions. Absence of proof is not proof of mismatch. Do not infer clothing-color drift from red warning light, shadow, monochrome PREVIS rendering, highlights, or low saturation.
+- For every R1 clothing/color/uniform claim, set mismatch_type="clothing_color". For each affected character, add one character_evidence object containing the exact character_id, only that character's canonical reference_input_indices, expected copied verbatim from canonical_contracts, an observed visual description, and the exact storyboard_ids checked. Do not paraphrase or invent the expected contract. Also provide confidence from 0 to 1 and separate panel_evidence for every listed ID. Expected and observed must name genuinely different visible attributes. If both are dark gray, both are navy, or the difference is only illumination/style, emit no issue.
+- Never copy one panel observation across a range. List multiple IDs only after independently checking each badge; panel_evidence must contain one observation per listed ID.
+- For R4, compare the literal actor → action → target → prop ownership → end state. A mutual weapon-disarm action is not satisfied by one actor aiming a weapon. Do not reverse attacker/defender or weapon ownership.
+- For the final Pxx, verify the authored result is visibly complete. If the contract says stable/stopped/freeze-frame while another character flies toward or hits a target, ongoing mutual fighting or generic floating is a mismatch.
+
+Reserve severe for production-breaking mismatches: wrong/missing character identity or gender, wrong location/time-of-day, reversed attacker/defender, wholly unrelated core action, or a continuation panel that visibly resets/replays the prior state. Use moderate for material but recoverable semantic mismatches, exact prop/action-state errors, blocking offsets, or intermediate/final-state omissions. Only identify problems; do not propose or perform edits.
+
+Return JSON only: {{"issues":[{{"red_line":"R1|R2|R3|R4","severity":"severe|moderate|minor","mismatch_type":"identity|gender|clothing_color|lighting|action|end_state|other","shot_ids":["S01_P01"],"message":"...","reference_input_indices":[1],"expected":"canonical concise fact","observed":"visibly different concise fact","confidence":0.90,"character_evidence":[{{"character_id":"agent","reference_input_indices":[1,2],"expected":"exact canonical_contract text","observed":"specific visible storyboard attribute","storyboard_ids":["S01_P01"]}}],"panel_evidence":[{{"shot_id":"S01_P01","observed":"specific visible evidence in this panel"}}]}}]}}. Use only these exact IDs: {compact(valid_storyboard_ids)}.
+
+[L3 INPUT INDEX]
+CHARACTER REFERENCE INPUTS: {compact(reference_index)}
+STORYBOARD SHOT INPUTS: {compact(storyboard_index)}
+OVERVIEW INPUT: {compact(overview_index)}
+
+[L3 CANONICAL CONTRACTS]
+canonical_contracts: {compact(canonical_contracts)}
+
+[L3 STORYBOARD CONTRACTS]
+{compact(_l3_storyboard_contract(storyboard))}
+
+[L3 VISUAL STYLE]
+{visual_style}"""
+
+
 def run_l3_review(
     storyboard: dict,
     characters_data: dict,
@@ -1411,39 +1552,15 @@ def run_l3_review(
             "input_count": len(input_paths),
             "skipped_reason": "ARK multimodal API key missing",
         }
-    prompt = f"""Review the supplied storyboard evidence against the canonical character references and authored project artifacts. Every image listed below is attached to this exact request in ascending input_index order.
-
-INPUT CONTRACT:
-- Inputs 1 through {len(reference_inputs)} are original canonical Phase 3 character reference images, mapped to character_id and view in CHARACTER REFERENCE INPUTS.
-- Inputs {len(reference_inputs) + 1} through {len(reference_inputs) + len(storyboard_manifest)} are high-detail per-shot storyboard boards. Each board contains only the exact Pxx images named in STORYBOARD SHOT INPUTS, with a large black ID badge inside every panel.
-- Input {grid_input_index} is the complete storyboard overview grid for cross-shot continuity only. Use the per-shot boards, not the overview, for fine identity, clothing, prop, and action evidence.
-- Never swap the expected and observed sides: canonical character inputs define EXPECTED; storyboard shot boards define OBSERVED. Never call a character reference a storyboard image.
-- Associate observations only with the in-frame Sxx or Sxx_Pxx badge; never infer an ID from a neighbouring cell or row position.
-
-Apply red lines R1-R4: R1 character identity/gender/build/clothing continuity against the canonical references; R2 time-of-day and lighting continuity; R3 scene/action continuity; R4 storyboard-to-image semantic fidelity. Do not perform face recognition or infer a public identity from appearance alone. Each Pxx image represents only its own authored action and must progress from the previous Pxx without pose reset or premature future action.
-
-Evidence rules:
-- Report only visible contradictions. Absence of proof is not proof of mismatch. Do not infer clothing-color drift from red warning light, shadow, monochrome PREVIS rendering, highlights, or low saturation.
-- For every R1 clothing/color/uniform claim, set mismatch_type="clothing_color". For each affected character, add one character_evidence object containing the exact character_id, only that character's canonical reference_input_indices, expected copied verbatim from canonical_contract, an observed visual description, and the exact storyboard_ids checked. Do not paraphrase or invent the expected contract. Also provide confidence from 0 to 1 and separate panel_evidence for every listed ID. Expected and observed must name genuinely different visible attributes. If both are dark gray, both are navy, or the difference is only illumination/style, emit no issue.
-- Never copy one panel observation across a range. List multiple IDs only after independently checking each badge; panel_evidence must contain one observation per listed ID.
-- For R4, compare the literal actor → action → target → prop ownership → end state. A mutual weapon-disarm action is not satisfied by one actor aiming a weapon. Do not reverse attacker/defender or weapon ownership.
-- For the final Pxx, verify the authored result is visibly complete. If the contract says stable/stopped/freeze-frame while another character flies toward or hits a target, ongoing mutual fighting or generic floating is a mismatch.
-
-Reserve severe for production-breaking mismatches: wrong/missing character identity or gender, wrong location/time-of-day, reversed attacker/defender, wholly unrelated core action, or a continuation panel that visibly resets/replays the prior state. Use moderate for material but recoverable semantic mismatches, exact prop/action-state errors, blocking offsets, or intermediate/final-state omissions. Only identify problems; do not propose or perform edits.
-
-Return JSON only: {{"issues":[{{"red_line":"R1|R2|R3|R4","severity":"severe|moderate|minor","mismatch_type":"identity|gender|clothing_color|lighting|action|end_state|other","shot_ids":["S01_P01"],"message":"...","reference_input_indices":[1],"expected":"canonical concise fact","observed":"visibly different concise fact","confidence":0.90,"character_evidence":[{{"character_id":"agent","reference_input_indices":[1,2],"expected":"exact canonical_contract text","observed":"specific visible storyboard attribute","storyboard_ids":["S01_P01"]}}],"panel_evidence":[{{"shot_id":"S01_P01","observed":"specific visible evidence in this panel"}}]}}]}}. Use only these exact IDs: {json.dumps(valid_storyboard_ids, ensure_ascii=False)}.
-CHARACTER REFERENCE INPUTS:
-{json.dumps(reference_manifest, ensure_ascii=False)}
-STORYBOARD SHOT INPUTS:
-{json.dumps(storyboard_manifest, ensure_ascii=False)}
-OVERVIEW INPUT:
-{json.dumps(overview_manifest, ensure_ascii=False)}
-STORYBOARD:
-{json.dumps(storyboard, ensure_ascii=False)}
-CHARACTERS:
-{json.dumps(characters_data, ensure_ascii=False)}
-VISUAL STYLE:
-{visual_style}"""
+    prompt = _l3_review_prompt(
+        reference_inputs=reference_manifest,
+        storyboard_inputs=storyboard_manifest,
+        overview_input=overview_manifest,
+        canonical_contracts=canonical_contracts,
+        storyboard=storyboard,
+        visual_style=visual_style,
+        valid_storyboard_ids=valid_storyboard_ids,
+    )
     try:
         from clients.ark_multimodal_client import review_as
         from schemas.understanding import StoryboardVisualUnderstanding

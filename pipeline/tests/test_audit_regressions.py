@@ -4402,6 +4402,74 @@ def test_phase5_l3_supplies_canonical_character_images(tmp_path):
     assert "stable/stopped/freeze-frame" in client.prompt
 
 
+def test_phase5_l3_prompt_uses_compact_semantic_projection(tmp_path):
+    from PIL import Image
+
+    images = {}
+    shots = []
+    for index in range(1, 6):
+        beat_id = f"S{index:02d}_P01"
+        path = tmp_path / f"{beat_id}.png"
+        Image.new("RGB", (160, 90), "gray").save(path)
+        images[beat_id] = path
+        shots.append({
+            "id": f"S{index:02d}",
+            "who": ["agent"],
+            "where": "future train",
+            "what": f"authored action {index}",
+            "start_state": f"start {index}",
+            "end_state": f"end {index}",
+            "storyboard_beats": [{
+                "beat_id": beat_id,
+                "action": f"visible action {index}",
+                "micro_actions": [f"micro action {index}"],
+            }],
+            "legacy_prompt_blob": "SHOT_BLOB" * 6000,
+        })
+    references = {}
+    characters = []
+    for character_index in range(1, 5):
+        character_id = f"agent_{character_index}"
+        characters.append({
+            "id": character_id,
+            "name": f"Agent {character_index}",
+            "appearance": {"summary": f"canonical look {character_index}"},
+            "legacy_prompt_blob": "CHARACTER_BLOB" * 6000,
+        })
+        paths = []
+        for view in ("face", "body", "side", "back"):
+            path = tmp_path / f"{character_id}_{view}.png"
+            Image.new("RGB", (90, 160), "gray").save(path)
+            paths.append(path)
+        references[character_id] = paths
+
+    class ReviewClient:
+        prompt = ""
+
+        def review(self, _image_paths, prompt):
+            self.prompt = prompt
+            return '{"issues": []}'
+
+    client = ReviewClient()
+    issues, layer = storyboard_qa_gate.run_l3_review(
+        {"shots": shots},
+        {"characters": characters},
+        "cold blue cinematic realism",
+        images,
+        tmp_path / "grid.jpg",
+        client,
+        character_reference_images=references,
+    )
+
+    assert issues == []
+    assert layer["status"] == "completed"
+    assert len(client.prompt) < 30_000
+    assert "SHOT_BLOB" not in client.prompt
+    assert "CHARACTER_BLOB" not in client.prompt
+    assert "authored action 5" in client.prompt
+    assert "canonical look 4" in client.prompt
+
+
 def test_director_board_keeps_motion_metadata_out_of_pixels():
     storyboard = {
         "shots": [{
