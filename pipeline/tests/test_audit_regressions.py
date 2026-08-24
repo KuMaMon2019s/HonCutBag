@@ -3978,6 +3978,57 @@ def test_sequential_phase5_dry_run_skips_independent_supervision(tmp_path):
     assert not (tmp_path / "runtime.db").exists()
 
 
+def test_sequential_resume_from_without_code_acceptance_invalidates_artifacts(
+    tmp_path,
+):
+    storyboard = _phase5_dry_run_storyboard()
+    characters = {"characters": []}
+    phase2_calls = []
+
+    def run_phase1(_text, output_dir, *_args, **_kwargs):
+        _write_phase5_dry_run_inputs(output_dir, storyboard)
+        return {
+            "status": "done",
+            "_storyboard": storyboard,
+            "_characters": characters,
+        }
+
+    def run_phase2(*_args, **_kwargs):
+        phase2_calls.append(True)
+        return {"status": "done"}
+
+    owner = SimpleNamespace(
+        run_phase1=run_phase1,
+        run_phase2=run_phase2,
+        run_phase3=lambda *_args, **_kwargs: {"status": "done"},
+        run_phase4=lambda *_args, **_kwargs: {"status": "done"},
+        run_phase6=_unexpected_phase5_dry_run_owner,
+        run_phase7=_unexpected_phase5_dry_run_owner,
+        run_phase8=_unexpected_phase5_dry_run_owner,
+        run_phase9=_unexpected_phase5_dry_run_owner,
+        _run_storyboard_supervision=_unexpected_phase5_dry_run_owner,
+    )
+    common = {
+        "text": "future station fixture",
+        "duration": 8,
+        "dry_run": True,
+        "skip_phase": [6, 7, 8, 9, 9.5],
+        "output_dir": str(tmp_path),
+        "_phase_owner": owner,
+    }
+    first = pipeline_execution.run_pipeline(**common)
+    assert first["status"] == "completed"
+
+    resumed = pipeline_execution.run_pipeline(
+        **common,
+        resume=True,
+        resume_from="phase2",
+    )
+
+    assert resumed["status"] == "completed"
+    assert len(phase2_calls) == 2
+
+
 def test_phase5_global_variation_requires_replanning_without_mutation(tmp_path):
     storyboard = json.loads(PHASE5_VARIATION_FIXTURE.read_text(encoding="utf-8"))
     storyboard_path = tmp_path / "STORYBOARD.json"

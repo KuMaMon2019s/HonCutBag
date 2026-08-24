@@ -171,7 +171,6 @@ def _run_pipeline(
         from utils.artifact_chain import (
             PHASE_SEQUENCE,
             can_resume_from,
-            invalidate_checkpoints_from,
         )
 
         if not resume:
@@ -246,7 +245,11 @@ def _run_pipeline(
 
     # --- M6: --resume-from 支持 ---
     if resume_from:
-        from utils.artifact_chain import PHASE_SEQUENCE, can_resume_from
+        from utils.artifact_chain import (
+            PHASE_SEQUENCE,
+            can_resume_from,
+            invalidate_checkpoints_from,
+        )
 
         if resume_from not in PHASE_SEQUENCE:
             raise ValueError(f"未知 Phase: {resume_from}")
