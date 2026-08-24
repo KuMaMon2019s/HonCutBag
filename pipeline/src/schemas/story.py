@@ -47,6 +47,7 @@ class StoryboardShot(BaseModel):
     participant_refs: list[dict[str, str]] = Field(default_factory=list)
     source_character_mentions: list[str] = Field(default_factory=list)
     shot_size: str = ""
+    camera_angle: str = ""
     camera_movement: str = ""
     lens_mm: int | None = Field(default=None, ge=50, le=85)
     camera_motion_contract: dict[str, Any] = Field(default_factory=dict)

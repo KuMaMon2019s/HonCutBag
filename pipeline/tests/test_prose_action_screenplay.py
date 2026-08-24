@@ -13,6 +13,7 @@ from phases.phase1.adaptation_engine import (
     BATCH_EXPAND_PROMPT,
     BEAT_SKELETON_PROMPT,
     USER_PROMPT_TEMPLATE as ADAPTATION_PROMPT,
+    _CAMERA_ANGLE_VALUES,
     _CAMERA_MOVEMENT_VALUES,
     _LIGHTING_KEY_VALUES,
     _SHOT_INTENT_VALUES,
@@ -780,6 +781,7 @@ def test_adaptation_prompts_preserve_action_units_and_turning_points():
 def test_beat_skeleton_requires_explicit_global_shot_language():
     for field in (
         "shot_size",
+        "camera_angle",
         "camera_movement",
         "lighting_key",
         "shot_intent",
@@ -795,6 +797,7 @@ def test_beat_skeleton_requires_explicit_global_shot_language():
     assert _SHOT_LANGUAGE_ENUM_CONTRACT in BEAT_SKELETON_PROMPT
     for values in (
         _SHOT_SIZE_VALUES,
+        _CAMERA_ANGLE_VALUES,
         _CAMERA_MOVEMENT_VALUES,
         _LIGHTING_KEY_VALUES,
         _SHOT_INTENT_VALUES,
@@ -836,6 +839,7 @@ def test_beat_skeleton_enum_error_returns_actionable_legal_values():
             "what": "人物前进",
             "suggested_duration": 15,
             "shot_size": "medium_wide",
+            "camera_angle": "eye_level",
             "camera_movement": "handheld_backward",
             "lighting_key": "natural",
             "shot_intent": "action",
@@ -928,6 +932,7 @@ def test_beat_skeleton_persists_camera_contract_before_expansion():
             "what": "林川迎面走来",
             "suggested_duration": 15,
             "shot_size": "wide",
+            "camera_angle": "over_shoulder",
             "camera_movement": "tracking_front",
             "lighting_key": "natural",
             "shot_intent": "dialogue",

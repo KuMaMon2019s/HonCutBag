@@ -419,6 +419,7 @@ def run_phase1_screenwriter(
                         "generation_actions": micro_actions,
                         "generation_action_units": generation_action_units,
                         "shot_size": ("wide" if index % 2 == 0 else "medium"),
+                        "camera_angle": "eye_level",
                         "camera_movement": (
                             "static" if index % 2 == 0 else "dolly_in"
                         ),

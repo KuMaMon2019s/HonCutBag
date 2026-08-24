@@ -42,6 +42,10 @@ from utils.visual_style_spec import VisualStyle, parse_visual_style
 from utils.ark_llm import call_llm_stream, create_ark_client
 from utils.character_body_contracts import body_contract_prompt
 from utils.body_action_contracts import body_action_prompt
+from utils.camera_angle_contracts import (
+    camera_angle_description,
+    canonical_camera_angle,
+)
 from utils.camera_motion_contracts import (
     apply_camera_motion_contract,
     camera_motion_negative_prompt,
@@ -398,6 +402,8 @@ def _build_shot_prompt_legacy(
 
     shot_size = str(shot.get("shot_size") or "medium").lower()
     framing = SHOT_SIZE_MAP.get(shot_size, "Medium shot")
+    shot["camera_angle"] = canonical_camera_angle(shot.get("camera_angle"))
+    camera_angle = camera_angle_description(shot["camera_angle"])
     opener_key = intent if intent in INTENT_FRAMING_OPENERS else "establishing"
     if shot_size in {"medium_close_up", "close_up", "extreme_close_up"} and intent not in {
         "action", "reaction"
@@ -495,7 +501,8 @@ def _build_shot_prompt_legacy(
     )
     audio = "Ambient natural sound, no music."
     eight_part_prompt = (
-        f"{framing}. {camera_desc} Camera movement: {camera}; {camera_negation}.\n"
+        f"{framing}. Camera angle: {camera_angle}. {camera_desc} "
+        f"Camera movement: {camera}; {camera_negation}.\n"
         f"{identity_block + chr(10) if identity_block else ''}"
         f"Action: {action}.\nSetting: {where}. {scene_suffix}\n"
         f"Lighting: {lighting} lighting.\nStyle: {style}\nAudio: {audio}"
@@ -639,6 +646,8 @@ def _build_eight_layer_prompt(
     shot["camera_movement"] = camera_key
     apply_camera_motion_contract(shot)
     camera = camera_movement_description(shot["camera_movement"])
+    shot["camera_angle"] = canonical_camera_angle(shot.get("camera_angle"))
+    camera_angle = camera_angle_description(shot["camera_angle"])
     framing = SHOT_SIZE_MAP.get(str(shot.get("shot_size") or "medium").lower(), "Medium shot")
     subject = _concrete_subject_description(shot, characters)
     emotion = str(shot.get("emotion") or "")
@@ -686,6 +695,7 @@ def _build_eight_layer_prompt(
         layers.append("元素参考声明：" + "；".join(references))
     subject_layers = [
         ("景别与主体：", f"{framing}，{subject}"),
+        ("机位角度：", camera_angle),
         ("运镜：", camera),
         ("场景与光影：", f"{where}，{scene_suffix}，{lighting}".replace("，，", "，")),
     ]
@@ -848,7 +858,7 @@ def _generate_single_shot(
         if value:
             result[field] = value
     for field in (
-        "shot_size", "camera_movement", "lighting_key", "shot_intent",
+        "shot_size", "camera_angle", "camera_movement", "lighting_key", "shot_intent",
         "time", "time_of_day", "time_window", "source_time_values",
         "temporal_visual_contract",
         "lens_mm", "camera_motion_contract",

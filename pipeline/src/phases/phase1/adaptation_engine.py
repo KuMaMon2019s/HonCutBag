@@ -65,6 +65,10 @@ from utils.character_identity import (
     resolve_character_id,
     resolve_character_name,
 )
+from utils.camera_angle_contracts import (
+    CAMERA_ANGLE_PLANNING_INSTRUCTIONS,
+    CAMERA_ANGLE_VALUES,
+)
 from utils.camera_motion_contracts import (
     CAMERA_MOTION_PLANNING_INSTRUCTIONS,
     CAMERA_MOVEMENT_VALUES,
@@ -88,6 +92,7 @@ _SHOT_SIZE_VALUES = (
     "close_up", "extreme_close_up", "over_shoulder", "insert", "establishing",
 )
 _CAMERA_MOVEMENT_VALUES = CAMERA_MOVEMENT_VALUES
+_CAMERA_ANGLE_VALUES = CAMERA_ANGLE_VALUES
 _LIGHTING_KEY_VALUES = (
     "high_key", "low_key", "natural", "golden_hour", "blue_hour",
     "tungsten_warm", "neon", "silhouette", "rim_lit", "volumetric",
@@ -99,11 +104,15 @@ _SHOT_INTENT_VALUES = (
 )
 _VALID_SHOT_SIZES = frozenset(_SHOT_SIZE_VALUES)
 _VALID_CAMERA_MOVEMENTS = frozenset(_CAMERA_MOVEMENT_VALUES)
+_VALID_CAMERA_ANGLES = frozenset(_CAMERA_ANGLE_VALUES)
 _VALID_LIGHTING_KEYS = frozenset(_LIGHTING_KEY_VALUES)
 _VALID_SHOT_INTENTS = frozenset(_SHOT_INTENT_VALUES)
 
 _SHOT_LANGUAGE_ENUM_CONTRACT = (
     "  - shot_size: 字符串，景别（" + "/".join(_SHOT_SIZE_VALUES) + "）\n"
+    "  - camera_angle: 字符串，机位角度（"
+    + "/".join(_CAMERA_ANGLE_VALUES)
+    + "）\n"
     "  - camera_movement: 字符串，摄影机运动（"
     + "/".join(_CAMERA_MOVEMENT_VALUES)
     + "）\n"
@@ -146,6 +155,8 @@ USER_PROMPT_TEMPLATE = (
     "  - transition_to_next: 字符串，转场方式 cut/dissolve/fade\n"
     "  - associate_assets: 字符串数组，该镜头涉及的资产ID（格式 'char:角色id' 或 'scene:场景名'）\n"
     + _SHOT_LANGUAGE_ENUM_CONTRACT
+    + CAMERA_ANGLE_PLANNING_INSTRUCTIONS
+    + "\n"
     + CAMERA_MOTION_PLANNING_INSTRUCTIONS
     + "\n"
     + "  - hero_moment: 布尔值，是否为全片视觉峰值；4 镜以上至少且通常恰好一个为 true\n"
@@ -210,7 +221,7 @@ USER_PROMPT_TEMPLATE = (
     "6. 群演不抢戏：群演只做背景动作，不给特写和台词\n"
     "7. 景别视角错开：相邻镜头不应使用相同景别和角度\n\n"
     "【镜头语言容量闸门】\n"
-    "shot_size、camera_movement、lighting_key、shot_intent、hero_moment、texture_keywords "
+    "shot_size、camera_angle、camera_movement、lighting_key、shot_intent、hero_moment、texture_keywords "
     "都是必填生成合同，不得省略或全部套用默认值。相邻镜头景别必须形成节奏差异；动作镜头不得"
     "全部 static；4 镜以上必须指定视觉峰值并为每镜提供具体纹理。连续长镜头可以保持同一真实"
     "光源，但应依据剧本允许的构图距离、运镜和环境纹理形成变化，不得虚构时空跳变。\n\n"
@@ -242,7 +253,7 @@ BATCH_EXPAND_PROMPT = (
     "beat_order（整数，必须等于该镜展开自哪个 beat 的 beat_order）、shot_order、"
     "source_events、action、reason、who、where、what、emotion、visual、"
     "suggested_duration、boundary_before、continuity_reason、continuity_subject、"
-    "transition_to_next、associate_assets、shot_size、"
+    "transition_to_next、associate_assets、shot_size、camera_angle、"
     "camera_movement、lighting_key、shot_intent、hero_moment、texture_keywords、"
     "dialogue、gen_strategy。\n"
     "JSON 示例：{{\"strategy\":\"本批策略\",\"shots\":[{{\"beat_order\":1,"
@@ -253,6 +264,7 @@ BATCH_EXPAND_PROMPT = (
     "\"continuity_reason\":\"新场景\",\"continuity_subject\":\"\","
     "\"transition_to_next\":\"cut\","
     "\"associate_assets\":[\"char:id\",\"scene:地点\"],\"shot_size\":\"medium\","
+    "\"camera_angle\":\"eye_level\","
     "\"camera_movement\":\"dolly_in\",\"lighting_key\":\"natural\","
     "\"shot_intent\":\"action\",\"hero_moment\":false,"
     "\"texture_keywords\":[\"场景中的具体材质\",\"场景中的具体光影\"],"
@@ -285,9 +297,11 @@ BATCH_EXPAND_PROMPT = (
     "每片段必须在 15–30 秒一级镜头及其 8–15/6–10 秒二级片段承载范围内；单镜台词>20字必须拆镜（按4字/秒）；同场景人物不得无故消失；"
     "人物外观不进提示词；声音只写环境音和音效，禁止配乐/BGM/背景音乐；"
     "群演只做背景动作；相邻镜头景别和角度必须错开。\n\n"
-    "【镜头语言继承】本批每个 shot 的 shot_size、camera_movement、lighting_key、shot_intent、"
+    "【镜头语言继承】本批每个 shot 的 shot_size、camera_angle、camera_movement、lighting_key、shot_intent、"
     "hero_moment、texture_keywords 必须逐字复制对应 beat 的全局镜头语言合同，不得重新规划或"
     "退回 wide/static/natural 默认组合。\n\n"
+    + CAMERA_ANGLE_PLANNING_INSTRUCTIONS
+    + "\n"
     + CAMERA_MOTION_PLANNING_INSTRUCTIONS
     + "\n\n"
     "【HonCut Identity Anchor】身份只通过 who 与 associate_assets 结构化绑定；visual 不重复外貌。"
@@ -1032,6 +1046,7 @@ def _call_llm_with_timeout_retry(user_prompt: str, max_tokens: int = 32000) -> s
 
 _SHOT_LANGUAGE_FIELDS = (
     "shot_size",
+    "camera_angle",
     "camera_movement",
     "lighting_key",
     "shot_intent",
@@ -1052,6 +1067,12 @@ def _validate_authored_shot_language(
             raise ValueError(
                 f"第 {index} 个 {label} shot_size 无效: {shot['shot_size']}; "
                 f"合法值: {', '.join(_SHOT_SIZE_VALUES)}"
+            )
+        if shot["camera_angle"] not in _VALID_CAMERA_ANGLES:
+            raise ValueError(
+                f"第 {index} 个 {label} camera_angle 无效: "
+                f"{shot['camera_angle']}; 合法值: "
+                f"{', '.join(_CAMERA_ANGLE_VALUES)}"
             )
         if shot["camera_movement"] not in _VALID_CAMERA_MOVEMENTS:
             raise ValueError(
@@ -1127,6 +1148,9 @@ def _validate_shots(shots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         ss = shot.get("shot_size", "")
         if ss not in _VALID_SHOT_SIZES:
             shot["shot_size"] = "wide"
+        ca = shot.get("camera_angle", "")
+        if ca not in _VALID_CAMERA_ANGLES:
+            shot["camera_angle"] = "eye_level"
         cm = shot.get("camera_movement", "")
         if cm not in _VALID_CAMERA_MOVEMENTS:
             shot["camera_movement"] = "static"
@@ -1708,11 +1732,13 @@ BEAT_SKELETON_PROMPT = (
     '{{"strategy":"一句话改编策略","beats":[{{"beat_order":1,"source_events":[1],'
     '"dropped_source_events":[],"action":"keep/merge","reason":"一句话理由","who":["角色主名"],'
     '"where":"地点","what":"一句话事件","suggested_duration":15,'
-    '"shot_size":"medium_wide","camera_movement":"dolly_in",'
+    '"shot_size":"medium_wide","camera_angle":"eye_level","camera_movement":"dolly_in",'
     '"lighting_key":"natural","shot_intent":"establishing",'
     '"hero_moment":false,"texture_keywords":["场景中的具体材质","场景中的具体光影"]}}]}}。\n'
-    + "【镜头语言合法词表】以下四个枚举字段只能逐字选用所列值，禁止发明组合值或方向后缀：\n"
+    + "【镜头语言合法词表】以下枚举字段只能逐字选用所列值，禁止发明组合值或方向后缀：\n"
     + _SHOT_LANGUAGE_ENUM_CONTRACT
+    + CAMERA_ANGLE_PLANNING_INSTRUCTIONS
+    + "\n"
     + CAMERA_MOTION_PLANNING_INSTRUCTIONS
     + "\n"
     + "hero_moment 必须为 JSON 布尔值；texture_keywords 必须为 2–4 个非空字符串。\n"
@@ -1735,7 +1761,7 @@ BEAT_SKELETON_PROMPT = (
     "6a. 每个 beat 必须服从对应 sequence 的 director intent：scene_goal 决定叙事目的，emotion_arc 决定"
     "情绪推进，visual_focus 决定观众注意点，spatial_intent 决定空间关系，transition_intent 决定边界设计；"
     "Director 不替你决定景别、机位、运镜、焦段、光影、镜头数或时长。\n"
-    "7. shot_size、camera_movement、lighting_key、shot_intent、hero_moment、texture_keywords "
+    "7. shot_size、camera_angle、camera_movement、lighting_key、shot_intent、hero_moment、texture_keywords "
     "是骨架的全局结构字段，全部必填。相邻 beat 景别必须形成差异，动作 beat 不得全部 static；"
     "4 个及以上 beat 必须至少一个 hero_moment=true，每个 beat 给出 2–4 个具体纹理关键词。"
     "一镜到底可以保持同一真实光源，但镜头变化必须来自源文本允许的构图距离与运镜；禁止为了"
@@ -2955,7 +2981,7 @@ def _expand_beats_to_shots(
                 expanded_fields = {
                     "shot_order", "source_events", "action", "reason", "who", "where",
                     "what", "emotion", "visual", "suggested_duration", "transition_to_next",
-                    "associate_assets", "shot_size", "camera_movement", "lighting_key",
+                    "associate_assets", "shot_size", "camera_angle", "camera_movement", "lighting_key",
                     "shot_intent", "hero_moment", "texture_keywords", "dialogue",
                     "gen_strategy",
                 }
@@ -3033,7 +3059,7 @@ def _atomic_write_json(path: Path, value: Any) -> None:
     os.replace(temporary, path)
 
 
-LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v10"
+LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v11"
 
 
 def _layered_input_fingerprint(

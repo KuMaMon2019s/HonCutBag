@@ -21,8 +21,8 @@ from utils.video_capabilities import (
     min_primary_story_duration,
 )
 
-SECONDARY_STORYBOARD_VERSION = "honcut.secondary-storyboard.v10"
-SECONDARY_EXECUTION = "content_capacity_post_primary_bridge_v10"
+SECONDARY_STORYBOARD_VERSION = "honcut.secondary-storyboard.v11"
+SECONDARY_EXECUTION = "content_capacity_post_primary_bridge_v11"
 SECONDARY_GENERATION_MODES = frozenset({
     "multi_image",
     "tail_video_extend",
@@ -989,6 +989,7 @@ def plan_storyboard_beats(
                 "source_action_unit_ids": source_unit_buckets[position - 1],
                 "end_state": next_state,
                 "shot_size": shot.get("shot_size") or shot.get("shot_type"),
+                "camera_angle": shot.get("camera_angle"),
                 "camera_movement": shot.get("camera_movement")
                 or shot.get("camera_movement_en"),
                 "lens_mm": shot.get("lens_mm"),
