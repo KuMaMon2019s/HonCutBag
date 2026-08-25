@@ -5660,7 +5660,8 @@ def test_phase5_l3_prompt_uses_compact_semantic_projection(tmp_path):
     assert len(client.prompt) < 30_000
     assert "SHOT_BLOB" not in client.prompt
     assert "CHARACTER_BLOB" not in client.prompt
-    assert "authored action 5" in client.prompt
+    assert "authored action 5" not in client.prompt
+    assert "visible action 5" in client.prompt
     assert "canonical look 4" in client.prompt
 
 
@@ -5673,6 +5674,10 @@ def test_phase5_l3_uses_pxx_cast_instead_of_shot_wide_cast():
             "character_ids": ["lead"],
             "participant_refs": [{"character_id": "lead"}],
             "where": "rainy station platform",
+            "what": "lead and three guards appear across the whole shot",
+            "visual": "a whole-shot summary containing later panel actions",
+            "source_events": [{"what": "all guards attack later"}],
+            "director_intent": "summarize both panels as one dramatic move",
             "storyboard_beats": [
                 {
                     "beat_id": "S01_P01",
@@ -5700,15 +5705,20 @@ def test_phase5_l3_uses_pxx_cast_instead_of_shot_wide_cast():
         valid_storyboard_ids=["S01_P01", "S01_P02"],
     )
 
-    assert projection["schema"] == "honcut.phase5-l3-semantic-projection.v2"
+    assert projection["schema"] == "honcut.phase5-l3-semantic-projection.v3"
     assert "who" not in shot
     assert "character_ids" not in shot
     assert "participant_refs" not in shot
+    assert "what" not in shot
+    assert "visual" not in shot
+    assert "source_events" not in shot
+    assert "director_intent" not in shot
     assert [
         beat["character_ids"] for beat in shot["storyboard_beats"]
     ] == [[], ["lead"]]
     assert "exact visible named cast" in prompt
     assert "does not imply that character appears in every Pxx" in prompt
+    assert "Pxx action/start/end/character_ids are the only plot-bearing contract" in prompt
 
 
 def test_director_board_keeps_motion_metadata_out_of_pixels():

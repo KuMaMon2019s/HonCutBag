@@ -1464,14 +1464,9 @@ def _r1_attribute_evidence(
     }
 
 
-_L3_SHOT_CONTRACT_FIELDS = (
+_L3_SHOT_CONTEXT_FIELDS = (
     "source_sequence_ids",
-    "source_events",
     "where",
-    "what",
-    "visual",
-    "start_state",
-    "end_state",
     "time",
     "time_window",
     "time_of_day",
@@ -1481,6 +1476,14 @@ _L3_SHOT_CONTRACT_FIELDS = (
     "camera_movement",
     "shot_intent",
     "transition_to_next",
+)
+_L3_LEGACY_SHOT_CONTRACT_FIELDS = (
+    *_L3_SHOT_CONTEXT_FIELDS,
+    "source_events",
+    "what",
+    "visual",
+    "start_state",
+    "end_state",
     "director_intent",
 )
 _L3_BEAT_CONTRACT_FIELDS = (
@@ -1516,14 +1519,22 @@ def _l3_storyboard_contract(storyboard: dict[str, Any]) -> dict[str, Any]:
     for index, shot in enumerate(storyboard.get("shots") or []):
         if not isinstance(shot, dict):
             continue
+        beats = [
+            beat
+            for beat in (shot.get("storyboard_beats") or [])
+            if isinstance(beat, dict)
+        ]
         projected = {
             "shot_id": _shot_id(shot, index),
-            **_selected_fields(shot, _L3_SHOT_CONTRACT_FIELDS),
+            **_selected_fields(
+                shot,
+                _L3_SHOT_CONTEXT_FIELDS
+                if beats
+                else _L3_LEGACY_SHOT_CONTRACT_FIELDS,
+            ),
         }
         projected_beats = []
-        for beat in (shot.get("storyboard_beats") or []):
-            if not isinstance(beat, dict):
-                continue
+        for beat in beats:
             projected_beat = _selected_fields(beat, _L3_BEAT_CONTRACT_FIELDS)
             if "character_ids" in beat:
                 raw_character_ids = beat.get("character_ids")
@@ -1544,7 +1555,7 @@ def _l3_storyboard_contract(storyboard: dict[str, Any]) -> dict[str, Any]:
         projected["storyboard_beats"] = projected_beats
         shots.append(projected)
     return {
-        "schema": "honcut.phase5-l3-semantic-projection.v2",
+        "schema": "honcut.phase5-l3-semantic-projection.v3",
         "shots": shots,
     }
 
@@ -1592,6 +1603,7 @@ INPUT CONTRACT:
 - Never swap expected and observed: canonical character inputs define EXPECTED; storyboard boards define OBSERVED. Never call a character reference a storyboard image.
 - Associate observations only with the in-frame Sxx or Sxx_Pxx badge; never infer an ID from a neighbouring cell or row position.
 - Each Pxx character_ids array is the exact visible named cast for that panel; an empty array means no named character should appear. Shot-wide cast is intentionally excluded because it is only a superset across the shot. A canonical reference attached for comparison does not imply that character appears in every Pxx.
+- When storyboard_beats exist, Pxx action/start/end/character_ids are the only plot-bearing contract. Shot-wide what/visual/source_events/director_intent are intentionally excluded because they summarize multiple Pxx and must not expand one panel's cast or action.
 
 Apply red lines R1-R4: R1 character identity/gender/build/clothing continuity against canonical references; R2 time-of-day and lighting continuity; R3 scene/action continuity; R4 storyboard-to-image semantic fidelity. Do not perform face recognition or infer a public identity from appearance alone. Each Pxx image represents only its authored action and must progress from the previous Pxx without pose reset or premature future action.
 
