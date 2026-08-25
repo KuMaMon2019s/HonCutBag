@@ -830,6 +830,10 @@ def test_adaptation_inherits_source_evidence_and_repairs_dialogue_speaker():
     assert shots[0]["boundary_before"] == "cut"
     assert shots[0]["source_sequence_ids"] == ["SEQ001"]
     assert shots[0]["source_action_unit_ids"] == ["AU001"]
+    assert shots[0]["source_action_unit_refs"] == [{
+        "source_event_id": 1,
+        "action_unit_id": "AU001",
+    }]
     assert shots[0]["micro_actions"] == ["凛冲出", "烬格挡"]
     assert shots[0]["dialogue"]["speaker"] == "凛"
     assert shots[0]["dialogue"]["confidence"] == 0.93
@@ -837,6 +841,10 @@ def test_adaptation_inherits_source_evidence_and_repairs_dialogue_speaker():
     validated = StoryboardShot.model_validate(shots[0])
     assert validated.source_sequence_ids == ["SEQ001"]
     assert validated.source_action_unit_ids == ["AU001"]
+    assert validated.source_action_unit_refs == [{
+        "source_event_id": 1,
+        "action_unit_id": "AU001",
+    }]
 
 
 def test_adaptation_prompts_preserve_action_units_and_turning_points():

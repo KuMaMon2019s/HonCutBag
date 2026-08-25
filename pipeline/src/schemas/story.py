@@ -67,6 +67,7 @@ class StoryboardShot(BaseModel):
     source_excerpt: str = ""
     source_sequence_ids: list[str] = Field(default_factory=list)
     source_action_unit_ids: list[str] = Field(default_factory=list)
+    source_action_unit_refs: list[dict[str, Any]] = Field(default_factory=list)
     source_event_roles: list[str] = Field(default_factory=list)
     micro_actions: list[str] = Field(default_factory=list)
     generation_action_categories: list[str] = Field(default_factory=list)

@@ -394,6 +394,114 @@ def test_secondary_beats_scope_multi_party_cast_to_their_generation_units():
     assert secondary_storyboard_contract_errors(storyboard, 0) == []
 
 
+def test_secondary_beats_bind_zero_motion_action_unit_to_source_event_bucket():
+    """An action event may carry AU lineage even when it has no GAU motion."""
+    storyboard = {
+        "video_provider": "seedance",
+        "semantic_understanding": {
+            "schema": "honcut.semantic-understanding.v1",
+            "ledger": "SEMANTIC_LEDGER.json",
+        },
+        "shots": [{
+            "id": "S01",
+            "duration": 7,
+            "who": ["Lead", "Raider One", "Raider Two", "Raider Three"],
+            "character_ids": ["lead", "raider_1", "raider_2", "raider_3"],
+            "participant_refs": [
+                {"mention": "Lead", "character_id": "lead"},
+                {"mention": "Raider One", "character_id": "raider_1"},
+                {"mention": "Raider Two", "character_id": "raider_2"},
+                {"mention": "Raider Three", "character_id": "raider_3"},
+            ],
+            "source_events": [1, 2, 3, 4],
+            "source_event_casts": [
+                {"source_event_id": 1, "character_ids": []},
+                {"source_event_id": 2, "character_ids": ["lead"]},
+                {
+                    "source_event_id": 3,
+                    "character_ids": [
+                        "lead", "raider_1", "raider_2", "raider_3",
+                    ],
+                },
+                {
+                    "source_event_id": 4,
+                    "character_ids": ["lead", "raider_1"],
+                },
+            ],
+            "source_action_unit_ids": ["AU001", "AU002"],
+            "source_action_unit_refs": [
+                {"source_event_id": 3, "action_unit_id": "AU001"},
+                {"source_event_id": 4, "action_unit_id": "AU002"},
+            ],
+            "micro_actions": [
+                "The train door releases warm light",
+                "Raider One charges at Lead",
+                "Raider One swings a blue energy blade",
+                "Lead leans back and avoids the blade",
+            ],
+            "generation_action_units": [
+                {
+                    "unit_id": "GAU001",
+                    "kind": "sequential",
+                    "actions": ["The train door releases warm light"],
+                    "ledger_indexes": [0],
+                    "source_event_id": 1,
+                },
+                {
+                    "unit_id": "GAU002",
+                    "kind": "sequential",
+                    "actions": ["Raider One charges at Lead"],
+                    "ledger_indexes": [1],
+                    "source_event_id": 4,
+                    "source_action_unit_id": "AU002",
+                },
+                {
+                    "unit_id": "GAU003",
+                    "kind": "sequential",
+                    "actions": ["Raider One swings a blue energy blade"],
+                    "ledger_indexes": [2],
+                    "source_event_id": 4,
+                    "source_action_unit_id": "AU002",
+                },
+                {
+                    "unit_id": "GAU004",
+                    "kind": "sequential",
+                    "actions": ["Lead leans back and avoids the blade"],
+                    "ledger_indexes": [3],
+                    "source_event_id": 4,
+                    "source_action_unit_id": "AU002",
+                },
+            ],
+            "start_state": "The train waits beside the empty platform",
+            "end_state": "Lead has avoided Raider One's first attack",
+        }],
+    }
+
+    plan_storyboard_beats(storyboard)
+
+    beats = storyboard["shots"][0]["storyboard_beats"]
+    assert [beat["source_event_ids"] for beat in beats] == [
+        [1, 2, 3, 4],
+        [4],
+    ]
+    assert [beat["source_action_unit_ids"] for beat in beats] == [
+        ["AU001", "AU002"],
+        [],
+    ]
+    assert [beat["character_ids"] for beat in beats] == [
+        ["lead", "raider_1", "raider_2", "raider_3"],
+        ["lead", "raider_1"],
+    ]
+    assert secondary_storyboard_contract_errors(storyboard, 0) == []
+
+    missing_refs = json.loads(json.dumps(storyboard))
+    missing_refs["shots"][0].pop("source_action_unit_refs")
+    assert any(
+        error["code"] == "secondary_storyboard_source_action_unit_ref_invalid"
+        for error in secondary_storyboard_contract_errors(missing_refs, 0)
+    )
+
+
 def test_secondary_beats_keep_zero_cost_actions_with_their_unit_lineage():
     storyboard = {
         "video_provider": "seedance",
@@ -3046,6 +3154,11 @@ def test_phase1_canonical_storyboard_preserves_event_partition_audit(monkeypatch
             "source_event_id": 2,
             "character_ids": ["operator"],
         }],
+        "source_action_unit_ids": ["AU004"],
+        "source_action_unit_refs": [{
+            "source_event_id": 2,
+            "action_unit_id": "AU004",
+        }],
         "dropped_source_events": [3, 4],
         "source_event_slices": [
             {
@@ -3061,6 +3174,7 @@ def test_phase1_canonical_storyboard_preserves_event_partition_audit(monkeypatch
 
     assert canonical["source_events"] == [2]
     assert canonical["source_event_casts"] == shot["source_event_casts"]
+    assert canonical["source_action_unit_refs"] == shot["source_action_unit_refs"]
     assert canonical["dropped_source_events"] == [3, 4]
     assert canonical["source_event_slices"] == shot["source_event_slices"]
     assert canonical["character_ids"] == ["operator"]

@@ -1860,7 +1860,17 @@ def _inherit_event_semantics(
 
         sequence_ids = [str(event.get("sequence_id")) for event in details if event.get("sequence_id")]
         sequence_ids = list(dict.fromkeys(sequence_ids))
-        action_unit_ids = [str(event.get("action_unit_id")) for event in details if event.get("action_unit_id")]
+        source_action_unit_refs = [
+            {
+                "source_event_id": event_id,
+                "action_unit_id": str(event_by_id[event_id]["action_unit_id"]),
+            }
+            for event_id in source_ids
+            if event_id in event_by_id and event_by_id[event_id].get("action_unit_id")
+        ]
+        action_unit_ids = [
+            reference["action_unit_id"] for reference in source_action_unit_refs
+        ]
         micro_actions = [
             action
             for _event_id, event_slice in slices
@@ -1881,6 +1891,7 @@ def _inherit_event_semantics(
                 shot=shot,
             )
         shot["source_action_unit_ids"] = list(dict.fromkeys(action_unit_ids))
+        shot["source_action_unit_refs"] = source_action_unit_refs
         shot["source_event_roles"] = list(dict.fromkeys(roles))
         shot["source_event_slices"] = [
             {

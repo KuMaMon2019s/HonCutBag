@@ -868,6 +868,7 @@ def _generate_single_shot(
         "continuity_subject", "screen_direction", "tracking_prompt",
         "character_ids", "participant_refs", "source_character_mentions",
         "source_excerpt", "source_sequence_ids", "source_action_unit_ids",
+        "source_action_unit_refs",
         "source_events", "source_event_casts", "dropped_source_events",
         "source_event_slices",
         "production_action_refs",
