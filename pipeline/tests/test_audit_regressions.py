@@ -5007,7 +5007,7 @@ def test_phase5_first_frame_review_blocks_style_and_annotation_pollution(tmp_pat
     assert storyboard_qa_gate.is_blocking_issue(issues[0]) is True
 
 
-def test_phase5_unverified_systemic_clothing_claim_is_non_blocking(tmp_path):
+def test_phase5_contradictory_positive_clothing_finding_is_not_an_issue(tmp_path):
     from PIL import Image
 
     images = {}
@@ -5055,7 +5055,61 @@ def test_phase5_unverified_systemic_clothing_claim_is_non_blocking(tmp_path):
     )
 
     assert status["status"] == "completed"
-    assert issues[0]["severity"] == "minor"
-    assert issues[0]["details"]["evidence_status"] == "unverified"
-    assert "expected_equals_observed" in issues[0]["details"]["evidence_reasons"]
+    assert issues == []
+    assert status["raw_issue_count"] == 2
+    assert status["filtered_non_issue_count"] == 2
+    assert status["accepted_issue_count"] == 0
     assert storyboard_qa_gate.grade_issues(issues) == "A"
+
+
+def test_phase5_positive_clause_does_not_hide_a_contrasted_mismatch(tmp_path):
+    from PIL import Image
+
+    image = tmp_path / "S01_P01.png"
+    reference = tmp_path / "agent_full_body.png"
+    Image.new("RGB", (160, 90), "gray").save(image)
+    Image.new("RGB", (90, 160), "gray").save(reference)
+
+    class ContrastedReviewClient:
+        def review(self, _image_paths, _prompt):
+            return json.dumps({
+                "issues": [{
+                    "red_line": "R1",
+                    "severity": "moderate",
+                    "mismatch_type": "other",
+                    "shot_ids": ["S01_P01"],
+                    "message": (
+                        "Costume matches the canonical colors, but the head scale "
+                        "visibly violates the proportion lock"
+                    ),
+                    "reference_input_indices": [1],
+                    "expected": "adult head-to-body ratio 7.6-8.0",
+                    "observed": "head is visibly oversized",
+                    "confidence": 0.98,
+                    "character_evidence": [],
+                    "panel_evidence": [{
+                        "shot_id": "S01_P01",
+                        "observed": "head is visibly oversized",
+                    }],
+                }],
+            })
+
+    issues, status = storyboard_qa_gate.run_l3_review(
+        {
+            "shots": [{
+                "id": "S01",
+                "storyboard_beats": [{"beat_id": "S01_P01"}],
+            }],
+        },
+        {"characters": [{"id": "agent"}]},
+        "cinematic",
+        {"S01_P01": image},
+        tmp_path / "grid.jpg",
+        ContrastedReviewClient(),
+        character_reference_images={"agent": [reference]},
+    )
+
+    assert len(issues) == 1
+    assert issues[0]["message"].endswith("violates the proportion lock")
+    assert status["filtered_non_issue_count"] == 0
+    assert status["accepted_issue_count"] == 1

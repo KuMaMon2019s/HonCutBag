@@ -1273,6 +1273,40 @@ def _normalized_visual_attribute(value: Any) -> str:
     return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", text)
 
 
+_AFFIRMATIVE_NON_ISSUE = re.compile(
+    r"(?:\bno\s+(?:visible\s+)?(?:mismatch|difference|deviation|issue)\b|"
+    r"\b(?:fully\s+|all\s+)?match(?:es|ing)?\s+(?:the\s+)?canonical\b|"
+    r"\bconsistent\s+with\s+(?:the\s+)?canonical\b|"
+    r"(?:没有|无)(?:明显)?(?:不一致|不匹配|不符|偏差|差异|问题)|"
+    r"(?:符合|匹配)(?:原始|规范|标准|角色|服装|颜色|设定|合同|契约))",
+    re.IGNORECASE,
+)
+_CONTRASTED_FINDING = re.compile(
+    r"(?:\bbut\b|\bhowever\b|\bexcept\b|\byet\b|但|然而|不过|只是|却)",
+    re.IGNORECASE,
+)
+
+
+def _is_affirmative_non_issue(value: dict[str, Any]) -> bool:
+    """Reject provider findings that explicitly say no mismatch exists.
+
+    Structured review models occasionally put a positive observation inside
+    the ``issues`` array.  Exact expected/observed equality is conclusive.  A
+    positive message is filtered only when it contains no contrast clause, so
+    ``costume matches, but proportions drift`` remains a real finding.
+    """
+    expected = _normalized_visual_attribute(value.get("expected"))
+    observed = _normalized_visual_attribute(value.get("observed"))
+    if expected and expected == observed:
+        return True
+    message = re.sub(r"\s+", " ", str(value.get("message") or "")).strip()
+    return bool(
+        message
+        and _AFFIRMATIVE_NON_ISSUE.search(message)
+        and not _CONTRASTED_FINDING.search(message)
+    )
+
+
 def _r1_attribute_evidence(
     value: dict[str, Any],
     storyboard_ids: list[str],
@@ -1785,6 +1819,7 @@ def run_l3_review(
     issues: list[dict[str, Any]] = []
     batches: list[dict[str, Any]] = []
     raw_issue_count = 0
+    filtered_non_issue_count = 0
     failed_batches = 0
     for execution in executions:
         try:
@@ -1810,6 +1845,9 @@ def run_l3_review(
             valid_ids = set(execution["storyboard_ids"])
             for value in parsed["issues"]:
                 if not isinstance(value, dict):
+                    continue
+                if _is_affirmative_non_issue(value):
+                    filtered_non_issue_count += 1
                     continue
                 red_line = str(value.get("red_line", "semantic_review"))
                 message = str(value.get("message", "Multimodal review issue"))
@@ -1886,6 +1924,8 @@ def run_l3_review(
         "request_count": len(executions),
         "provider_request_count": len(batches),
         "raw_issue_count": raw_issue_count,
+        "filtered_non_issue_count": filtered_non_issue_count,
+        "accepted_issue_count": len(issues),
         "structured_review_batches": batches,
     }
     if len(batches) == 1 and "structured_review_execution" in batches[0]:
