@@ -11,11 +11,10 @@ from typing import Callable, Optional
 
 from phases.phase6.phase6_video_gen import run_phase6
 from quality.quality_gate import run_quality_check
+from runtime.phase_estimates import estimate_phase_duration
 from runtime.phase_timing import _banner, _elapsed, _now
 from tools.video_stitcher import build_stitch_plan
 from utils.media_profiles import _get_profile_dict
-from utils.timing_estimator import estimate_phase_duration
-
 
 TransitionEmbeddingRunner = Callable[..., dict]
 

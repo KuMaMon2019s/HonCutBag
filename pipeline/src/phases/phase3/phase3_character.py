@@ -10,12 +10,14 @@ from pathlib import Path
 
 from phases.phase2.storyboard_assets import _validate_storyboard_image_composition
 from quality.quality_gate import run_quality_check
+from runtime.phase_estimates import (
+    build_pipeline_workload,
+    estimate_phase_duration,
+)
 from runtime.phase_timing import _banner, _elapsed, _ensure_dir, _now
 from runtime.retry_execution import _retry_with_policy
 from utils.storyboard_geometry import _storyboard_canvas, _storyboard_image_size
 from utils.style_slices import get_slice
-from utils.timing_estimator import estimate_phase_duration
-
 
 PHASE3_DRY_RUN_RECEIPT_SCHEMA = "honcut.phase3-dry-run-receipt.v1"
 PHASE3_DRY_RUN_RECEIPT_NAME = "phase3_dry_run_receipt.json"
@@ -226,8 +228,26 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
                 ))),
             })
 
-        _p3_est = estimate_phase_duration("phase3", num_characters=len(char_dicts))
-        print(f"  ⏱ Phase 3 开始 (预估 ~{int(_p3_est)}s)")
+        workload_storyboard_path = output_dir / "STORYBOARD.json"
+        workload_storyboard = (
+            json.loads(workload_storyboard_path.read_text(encoding="utf-8"))
+            if workload_storyboard_path.is_file()
+            else {"shots": []}
+        )
+        phase3_workload = build_pipeline_workload(
+            characters_data,
+            workload_storyboard,
+            output_dir=output_dir,
+        )
+        _p3_est = estimate_phase_duration(
+            "phase3",
+            image_requests=phase3_workload.phase3_image_requests,
+        )
+        print(
+            "  ⏱ Phase 3 开始 "
+            f"(计划 {phase3_workload.phase3_image_requests} 次图片请求, "
+            f"预估 ~{int(_p3_est)}s)"
+        )
         print(f"  → batch_generate: {len(char_dicts)} 个角色, skip_images={dry_run}")
 
         if not dry_run:

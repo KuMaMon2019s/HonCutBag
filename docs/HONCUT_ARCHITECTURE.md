@@ -4,7 +4,7 @@
 >
 > 适用基线：`main`，重构验收提交 `1b01741` 及之后版本
 >
-> 更新日期：2026-08-24
+> 更新日期：2026-08-25
 
 本文定义 HonCut 当前生产架构、持久化与恢复契约，以及后续迭代修复必须遵守的边界。实现与本文冲突时，先确认生产执行路径；若实现是有意变更，必须在同一提交中更新本文和相应特征测试。
 
@@ -59,6 +59,7 @@ Schema、State 和纯工具是共享契约，但不得反向触发上层工作�
 | State 与迁移 | `graph/state.py`、`graph/migrations.py` | 生产写 canonical 字段；旧别名只在迁移适配器读取 |
 | 文本/视觉理解 DTO | `pipeline/src/schemas/understanding.py` | Provider 使用原生 JSON Schema；返回值经 Pydantic 业务 DTO 验证后才能驱动身份、顺序或 QA |
 | Phase 业务 | `pipeline/src/phases/phaseN/` | 文件、模型、媒体和领域规则归对应 Phase owner |
+| Phase 耗时估算 | `pipeline/src/runtime/phase_estimates.py` | 只消费 canonical 结构与 Provider 工作量；不得用剧本文字长度或固定角色/镜头默认值伪装精确 ETA |
 | 超时、重试、冷却与容量 | `pipeline/src/runtime/provider_policy.py`、`pipeline/src/runtime/llm_policy.py` | Provider、Graph 和 Phase 不得叠加重试；健康 LLM 长流由 idle 与 wall 两个时钟区分 |
 | 长任务账本 | `pipeline/src/runtime/generation_tasks.py` | SQLite 幂等迁移、提交去重、恢复与终态证据 |
 | Artifact 血缘 | `schemas/artifact.py`、`runtime/artifact_manifest.py` | 严格 schema、内容哈希、父资产与原子 manifest |
@@ -256,6 +257,8 @@ TOS 媒体对象采用内容寻址键时，basename 必须精确等于实际上�
 Provider 生成结果仍从返回 URL 直接下载并按 Artifact 合同落盘，不要求同步到 TOS；只有当该结果随后被用作延长、编辑或参考生成的输入素材时，才在下一次提交前上传 TOS。提示词中的“图片 N / 视频 N”按 `content[]` 中同类媒体的真实提交顺序编号；任一媒体上传缺失或失败时，必须在 Provider 提交和付费任务之前 fail closed，不能删除该媒体后重排编号继续提交。`role=first_frame/last_frame/reference_image/reference_video` 仍是媒体控制语义的事实源，编号只负责 Prompt 引用。
 
 Seedream 图片请求的唯一传输 owner 是 `clients/seedream_client.py`，Phase 1–4 只拥有各自的导演板、Pxx、角色参考和 cinematic first-frame 语义。HonCut 的 Agent Plan 图片合同固定使用专属 `/api/plan/v3/images/generations`、`ARK_AGENT_API_KEY` 与精确模型名 `doubao-seedream-5.0-lite`；不得把按量模型 ID、按量 Base URL 或 `ARK_API_KEY` 混入请求。新图片默认使用 `2K` 档位，单图非流式输出固定为 PNG、无水印、`sequential_image_generation=disabled`、`optimize_prompt_options.mode=standard`。显式 WxH 仍可用，但必须在 Provider 调用前满足 5.0 lite 的总像素与宽高比范围；生成一张输出时最多接收 14 张参考图，使输入图与输出图总数不超过 15。
+
+Lifecycle 与各 Phase 的 ETA 由 Runtime `phase_estimates` owner 生成。Phase 1 尚未写出 canonical `CHARACTERS.json` 与 `STORYBOARD.json` 时，只能声明全程工作量待结构化，不得再以固定“三个角色、十个镜头”承诺总耗时。结构化工作量 `honcut.pipeline-workload-estimate.v1` 必须分别计数缺失的角色四视图、身份道具细节板、有效变体、Pxx 格、Sxx 总板与 cinematic first-frame；图片阶段以实际 `SEEDREAM_MIN_INTERVAL` 乘请求数形成基线。续跑估算只包含 CLI 选中且未由可信 checkpoint 完成的 Phase。Phase 5 基线与最多三轮配置上限内的全目标 Pxx/Sxx 补画必须显示为有界区间，不能把“无纠偏”历史均值冒充唯一 ETA。该估算是可观测性收据，不改变 Provider 请求、缓存或重试决策；缓存命中可令实际耗时低于基线，Provider/QA 失败也不得因 ETA 而被解释为成功。
 
 多参考图的职责绑定由共享模板 `honcut.seedream.reference-contract` v2 在 Phase 图片组装边界按真实输入顺序前置为 `Image 1`、`Image 2` 等；角色身份、上一故事格、导演单格和上一 cinematic 帧不得交换职责。上一故事格只提供仍成立的场景事实、相对空间关系、机位轴线和画面方向，不得要求模型保留 completed pose 或动作进度；后续 Pxx 必须按当前 beat 推进到新的动作终态。Phase 收据必须记录模板 ID/版本、实际 Provider Prompt SHA-256、参考图顺序/角色和只含长度/哈希的 guidance 指标。官方 300 个中文字符/600 个英文单词是效果建议而非 API 硬限制；Transport 只能观测并报告超限，不得截断身份、动作、纠偏或连续性合同。Provider 的同步响应必须先通过严格 envelope 校验，24 小时 URL 产物须立即下载、验证为可解码图片并原子落盘；损坏、空数组、同时缺失/同时出现 URL 与 Base64 均 fail closed。
 

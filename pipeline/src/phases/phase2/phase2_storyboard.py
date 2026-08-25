@@ -15,10 +15,13 @@ from phases.phase2.storyboard_assets import (
     fill_storyboard_template,
 )
 from quality.quality_gate import run_quality_check
+from runtime.phase_estimates import (
+    build_pipeline_workload,
+    estimate_phase_duration,
+)
 from runtime.phase_timing import _banner, _elapsed, _now
 from runtime.retry_execution import _retry_with_policy
 from utils.source_paths import PIPELINE_SRC_DIR as SCRIPT_DIR
-from utils.timing_estimator import estimate_phase_duration
 
 
 def run_phase2(storyboard_data: dict, characters_data: dict, output_dir: Path, dry_run: bool) -> dict:
@@ -27,8 +30,6 @@ def run_phase2(storyboard_data: dict, characters_data: dict, output_dir: Path, d
 
     _banner("2", 9, "故事板图片生成 (ImageSelector / Seedream)", dry_run)
     start = _now()
-    _p25_est = estimate_phase_duration("phase2")
-    print(f"  ⏱ Phase 2 开始 (预估 ~{int(_p25_est)}s)")
     output_dir = Path(output_dir)
 
     if dry_run:
@@ -36,6 +37,20 @@ def run_phase2(storyboard_data: dict, characters_data: dict, output_dir: Path, d
         return {"status": "skipped", "reason": "dry-run", "duration_s": _elapsed(start)}
 
     video_width, video_height, aspect_ratio = _storyboard_canvas(storyboard_data)
+    phase2_workload = build_pipeline_workload(
+        characters_data,
+        storyboard_data,
+        output_dir=output_dir,
+    )
+    _p25_est = estimate_phase_duration(
+        "phase2",
+        image_requests=phase2_workload.phase2_image_requests,
+    )
+    print(
+        "  ⏱ Phase 2 开始 "
+        f"(计划 {phase2_workload.phase2_image_requests} 次图片请求, "
+        f"预估 ~{int(_p25_est)}s)"
+    )
 
     # Phase 1 now owns the model-generated director overview. Reuse that exact
     # image here so Phase 2 can focus on per-shot reference frames instead of

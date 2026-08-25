@@ -21,6 +21,7 @@ from runtime.generation_fingerprint import (
     GenerationFingerprint,
     build_generation_fingerprint,
 )
+from runtime.phase_estimates import estimate_phase_duration
 from runtime.phase_timing import _banner, _elapsed, _now
 from runtime.provider_policy import ProviderExecutionPolicy
 from runtime.security_boundaries import safe_error_message
@@ -29,7 +30,6 @@ from tools.vendor_adapter import VendorAdapter, VendorModel
 from utils.character_body_contracts import character_visual_description
 from utils.config import DEFAULT_SEEDANCE_MODEL_ID, get_api_key
 from utils.file_integrity import _file_sha256
-from utils.timing_estimator import estimate_phase_duration
 
 
 def _phase6_output_failure(

@@ -29,10 +29,10 @@ from phases.phase9.score_and_mix import (
     _prepare_continuous_bgm,
 )
 from quality.quality_gate import run_quality_check
+from runtime.phase_estimates import estimate_phase_duration
 from runtime.phase_timing import _banner, _elapsed, _now
 from utils.media_probe import _assert_duration_conserved, _probe_av_durations
 from utils.media_profiles import _get_profile_dict
-from utils.timing_estimator import estimate_phase_duration
 
 
 def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = None,

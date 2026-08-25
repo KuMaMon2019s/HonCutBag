@@ -9,11 +9,14 @@ from copy import deepcopy
 from pathlib import Path
 
 from phases.phase4.shot_setup import materialize_shot_directories, normalize_shots
+from runtime.phase_estimates import (
+    build_pipeline_workload,
+    estimate_phase_duration,
+)
 from runtime.phase_timing import _banner, _elapsed, _now
 from tools.provider_scoring import rank_providers
 from tools.video_composer import lock_runtime
 from utils.storyboard_geometry import _storyboard_canvas, _storyboard_image_size
-from utils.timing_estimator import estimate_phase_duration
 
 
 def _director_pacing_by_sequence(plan: object) -> dict[str, dict]:
@@ -87,8 +90,6 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
     """Phase 4: deterministic orchestration and code-constraint review."""
     _banner(4, 9, "编排器 (Orchestrator)", dry_run)
     start = _now()
-    _p4_est = estimate_phase_duration("phase4")
-    print(f"  ⏱ Phase 4 开始 (预估 ~{int(_p4_est)}s)")
     print("  → 代码约束复查：无人工审批、无审核模型调用")
     outputs = []
     output_dir = Path(output_dir)
@@ -120,6 +121,23 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
         characters_for_consistency = (
             json.loads(characters_path.read_text(encoding="utf-8"))
             if characters_path.exists() else {"characters": []}
+        )
+        phase4_image_requests = 0
+        if not dry_run:
+            phase4_workload = build_pipeline_workload(
+                characters_for_consistency,
+                storyboard_for_consistency,
+                output_dir=output_dir,
+            )
+            phase4_image_requests = phase4_workload.phase4_image_requests
+        _p4_est = estimate_phase_duration(
+            "phase4",
+            image_requests=phase4_image_requests,
+        )
+        print(
+            "  ⏱ Phase 4 开始 "
+            f"(计划 {phase4_image_requests} 次图片请求, "
+            f"预估 ~{int(_p4_est)}s)"
         )
         visual_style_path = next(
             (

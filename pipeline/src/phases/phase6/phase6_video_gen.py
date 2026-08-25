@@ -9,10 +9,10 @@ from typing import Any
 
 from phases.phase6.direct_generation import _run_phase6_fallback
 from quality.quality_gate import run_quality_check
+from runtime.phase_estimates import estimate_phase_duration
 from runtime.phase_timing import _banner, _elapsed, _now
 from tools.base_tool import BaseTool, ToolResult, ToolRuntime
 from tools.vendor_adapter import VendorAdapter, VendorModel
-from utils.timing_estimator import estimate_phase_duration
 
 
 class _PipelineVideoTool(BaseTool):

@@ -26,6 +26,11 @@ from phases.phase7.phase7_consistency import run_phase7
 from phases.phase8.phase8_assembly import run_phase8
 from phases.phase9.phase9_post import run_phase9
 from quality.quality_gate import run_quality_check
+from runtime.phase_estimates import (
+    estimate_total,
+    load_pipeline_workload,
+    remaining_phase_names,
+)
 from runtime.phase_timing import _elapsed, _ensure_dir, _now
 from runtime.pipeline_checkpoints import (
     PHASE_ORDER,
@@ -45,7 +50,6 @@ from utils.media_profiles import (
 )
 from utils.progress_reporter import ProgressReporter
 from utils.source_paths import PROJECT_ROOT
-from utils.timing_estimator import estimate_total
 
 
 def run_pipeline(
@@ -359,10 +363,40 @@ def _run_pipeline(
         print(f"  🔄 Resume: 已完成 {len(completed_phases)}/{len(PHASE_ORDER)} Phase")
     print("  ⏭️ 人工故事板复查已禁用（100% 跳过）")
     
-    # 打印预估总耗时
+    # Only present a full estimate after Phase 1 has produced the structured
+    # character/shot/beat workload. Prose length and fixed default counts are
+    # not valid substitutes for provider request volume.
     if not dry_run:
-        _est = estimate_total(num_characters=3, num_shots=10)  # 默认值，实际运行时会根据数据调整
-        print(f"  ⏱ 预估总耗时: {_est['total_human']} (基于历史数据)")
+        active_phases = remaining_phase_names(
+            skip_phase=skip_phase,
+            completed_phases=completed_phases,
+        )
+        try:
+            estimate_workload = load_pipeline_workload(output_path)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            estimate_workload = None
+            print(f"  ⚠ 结构化耗时估算不可用: {exc}")
+        if estimate_workload is not None:
+            _est = estimate_total(
+                phases=active_phases,
+                workload=estimate_workload,
+            )
+            if _est["bounded"]:
+                print(
+                    "  ⏱ 剩余耗时估算: "
+                    f"{_est['total_human']}–{_est['upper_total_human']} "
+                    "(按结构化图片请求；上界含 Phase 5 全量纠偏)"
+                )
+            else:
+                print(
+                    f"  ⏱ 剩余耗时估算: {_est['total_human']} "
+                    "(按结构化 Provider 工作量)"
+                )
+        elif any(phase in {"phase2", "phase3", "phase4", "phase5"} for phase in active_phases):
+            print("  ⏱ 全程耗时待 Phase 1 结构化工作量生成后动态计算")
+        else:
+            _est = estimate_total(phases=active_phases)
+            print(f"  ⏱ 剩余耗时估算: {_est['total_human']} (历史基线)")
     
     print(f"{'#'*60}")
 

@@ -22,14 +22,13 @@ from prompt.speech_pacing import annotate_shot_pacing
 from prompt.prompt_sanitizer import sanitize_quality_prompt
 from prompt.three_part_prompt import build_three_part_prompt
 from quality.quality_gate import run_quality_check
+from runtime.phase_estimates import estimate_phase_duration
 from runtime.phase_timing import _banner, _elapsed, _now
 from tools.asset_binder import bind_assets
 from utils.ark_llm import call_llm_stream, configure_heartbeat_callback
 from utils.media_profiles import _project_video_spec
 from utils.progress_reporter import ProgressReporter
 from utils.storyboard_geometry import _storyboard_canvas, _storyboard_image_size
-from utils.timing_estimator import estimate_phase_duration
-
 
 STYLE_SUMMARY_WALL_TIMEOUT = 180.0
 STYLE_SUMMARY_IDLE_TIMEOUT = 75.0
