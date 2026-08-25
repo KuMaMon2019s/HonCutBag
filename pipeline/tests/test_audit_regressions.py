@@ -3822,6 +3822,18 @@ def test_phase2_projects_v11_beat_cast_but_rejects_unknown_planner():
     with pytest.raises(ValueError, match="unsupported storyboard beat planner"):
         _build_panel_prompt(
             shot,
+            {
+                **legacy_beat,
+                "planner_version": "honcut.secondary-storyboard.v12",
+                "character_ids": ["lead"],
+            },
+            1,
+            2,
+            characters,
+        )
+    with pytest.raises(ValueError, match="unsupported storyboard beat planner"):
+        _build_panel_prompt(
+            shot,
             {**legacy_beat, "planner_version": "honcut.secondary-storyboard.v999"},
             1,
             2,

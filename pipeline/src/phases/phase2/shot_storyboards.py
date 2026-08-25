@@ -182,6 +182,18 @@ def _beat_cast_contract(
 ) -> dict[str, Any]:
     """Resolve the only cast contract Phase 2 may inject into one Pxx."""
     planner_version = str(beat.get("planner_version") or "").strip()
+    if planner_version == LEGACY_BEAT_CAST_PLANNER_VERSION:
+        character_ids = _legacy_v11_beat_character_ids(shot, beat, characters)
+        return {
+            "schema": BEAT_CAST_CONTRACT_SCHEMA,
+            "source": "legacy_v11_visible_fact_projection",
+            "character_ids": character_ids,
+            "who": _character_names(characters, character_ids),
+        }
+    if planner_version and planner_version != SECONDARY_STORYBOARD_VERSION:
+        raise ValueError(
+            f"unsupported storyboard beat planner version: {planner_version}"
+        )
     if "character_ids" in beat:
         raw_ids = beat.get("character_ids")
         if not isinstance(raw_ids, list):
@@ -214,16 +226,6 @@ def _beat_cast_contract(
         raise ValueError(
             f"{SECONDARY_STORYBOARD_VERSION} beat is missing canonical character_ids"
         )
-    if planner_version == LEGACY_BEAT_CAST_PLANNER_VERSION:
-        character_ids = _legacy_v11_beat_character_ids(shot, beat, characters)
-        return {
-            "schema": BEAT_CAST_CONTRACT_SCHEMA,
-            "source": "legacy_v11_visible_fact_projection",
-            "character_ids": character_ids,
-            "who": _character_names(characters, character_ids),
-        }
-    if planner_version:
-        raise ValueError(f"unsupported storyboard beat planner version: {planner_version}")
     return {
         "schema": BEAT_CAST_CONTRACT_SCHEMA,
         "source": "unversioned_test_compatibility",
