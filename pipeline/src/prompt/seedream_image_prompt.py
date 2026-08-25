@@ -13,7 +13,7 @@ import re
 from collections.abc import Sequence
 
 REFERENCE_CONTRACT_TEMPLATE_ID = "honcut.seedream.reference-contract"
-REFERENCE_CONTRACT_TEMPLATE_VERSION = "1"
+REFERENCE_CONTRACT_TEMPLATE_VERSION = "2"
 IMAGE_REQUEST_CONTRACT_ID = "honcut.seedream.agent-plan-single-image"
 IMAGE_REQUEST_CONTRACT_VERSION = "1"
 
@@ -40,8 +40,9 @@ _REFERENCE_ROLE_INSTRUCTIONS = {
         "and assigned props; ignore pose, framing, background and text"
     ),
     "prior_storyboard_state": (
-        "previous storyboard state; preserve camera axis, screen direction and the "
-        "completed pose, then advance to the requested new state"
+        "previous storyboard state; preserve camera axis, screen direction and relative "
+        "spatial continuity; do not copy its pose or action progress; advance every subject "
+        "to the requested new state"
     ),
     "director_single_panel_composition_only": (
         "director single panel; preserve only scene geometry, subject placement, "

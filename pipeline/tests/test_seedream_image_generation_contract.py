@@ -155,12 +155,23 @@ def test_reference_binding_names_every_input_in_provider_order():
         ],
     )
 
-    assert prompt.startswith("[honcut-seedream-reference-contract-v1]")
+    assert prompt.startswith("[honcut-seedream-reference-contract-v2]")
     assert "Image 1: character identity only" in prompt
     assert "Image 2: previous storyboard state" in prompt
     assert "Image 3: director single panel" in prompt
     assert prompt.index("Image 1") < prompt.index("Image 2") < prompt.index("Image 3")
     assert prompt.endswith("主体后仰闪避，刀锋掠过风衣；雨夜车站，16:9电影构图。")
+
+
+def test_prior_storyboard_binding_preserves_space_but_never_locks_pose():
+    prompt = bind_reference_roles(
+        "推进到踢腕后的新终态。",
+        ["prior_storyboard_state"],
+    )
+
+    assert "preserve camera axis, screen direction and relative spatial continuity" in prompt
+    assert "do not copy its pose or action progress" in prompt
+    assert "preserve camera axis, screen direction and the completed pose" not in prompt
 
 
 def test_prompt_guidance_metrics_never_mutate_or_truncate_contract():

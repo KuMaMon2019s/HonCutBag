@@ -1458,7 +1458,7 @@ def test_phase2_uses_director_board_as_visual_reference_for_every_shot(tmp_path)
     assert calls[0][1] == str(tmp_path / "director_panels/S07.png")
     assert calls[1][1] == str(tmp_path / "director_panels/S08.png")
     assert all(str(director) not in str(call[1]) for call in calls)
-    assert calls[0][0].startswith("[honcut-seedream-reference-contract-v1]")
+    assert calls[0][0].startswith("[honcut-seedream-reference-contract-v2]")
     assert "Image 1: director single panel" in calls[0][0]
     assert "9:16" in calls[0][0]
     first_panel_receipt = json.loads(
@@ -1467,7 +1467,7 @@ def test_phase2_uses_director_board_as_visual_reference_for_every_shot(tmp_path)
     assert first_panel_receipt["reference_contract_template_id"] == (
         "honcut.seedream.reference-contract"
     )
-    assert first_panel_receipt["reference_contract_template_version"] == "1"
+    assert first_panel_receipt["reference_contract_template_version"] == "2"
     assert first_panel_receipt["provider_prompt_guidance"]["sha256"] == (
         first_panel_receipt["provider_prompt_sha256"]
     )

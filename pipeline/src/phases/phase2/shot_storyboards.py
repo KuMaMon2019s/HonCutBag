@@ -302,6 +302,95 @@ def build_shot_storyboard_prompt(
     return prompt, beats
 
 
+PANEL_CORRECTION_DIRECTIVE_SCHEMA = "honcut.storyboard-panel-correction.v1"
+
+
+def _panel_correction_directives(
+    issues: list[dict[str, Any]],
+    beat: dict[str, Any],
+    beat_id: str,
+) -> list[dict[str, Any]]:
+    """Project shot-level QA findings into one Pxx-owned correction DTO.
+
+    QA ``expected`` text may describe multiple panels.  It remains in the
+    receipt for lineage, but the Provider-facing directive gets its executable
+    action and end state exclusively from the current canonical beat.  Visible
+    error evidence is likewise narrowed to the current panel when available.
+    """
+    directives: list[dict[str, Any]] = []
+    for issue in issues:
+        details = (
+            issue.get("details")
+            if isinstance(issue.get("details"), dict)
+            else {}
+        )
+        raw_storyboard_ids = details.get("storyboard_ids") or []
+        if not isinstance(raw_storyboard_ids, list):
+            raw_storyboard_ids = [raw_storyboard_ids]
+        source_storyboard_ids = [
+            str(value).strip()
+            for value in raw_storyboard_ids
+            if str(value).strip()
+        ]
+        if source_storyboard_ids and beat_id not in source_storyboard_ids:
+            continue
+        panel_evidence = details.get("panel_evidence") or []
+        if not isinstance(panel_evidence, list):
+            panel_evidence = []
+        panel_observations = [
+            str(value.get("observed") or "").strip()
+            for value in panel_evidence
+            if isinstance(value, dict)
+            and str(value.get("shot_id") or "").strip() == beat_id
+            and str(value.get("observed") or "").strip()
+        ]
+        observed_error = "；".join(dict.fromkeys(panel_observations))
+        if not observed_error:
+            observed_error = str(
+                details.get("observed") or issue.get("message") or ""
+            ).strip()
+        directives.append({
+            "schema": PANEL_CORRECTION_DIRECTIVE_SCHEMA,
+            "target_board_id": beat_id,
+            "issue_code": str(issue.get("code") or "QA").upper(),
+            "mismatch_type": str(details.get("mismatch_type") or "other"),
+            "required_action": str(beat.get("action") or "").strip(),
+            "required_end_state": str(beat.get("end_state") or "").strip(),
+            "observed_error": observed_error,
+            "source_expected_context": str(details.get("expected") or "").strip(),
+            "source_storyboard_ids": source_storyboard_ids,
+        })
+    return directives
+
+
+def _render_correction_contract(
+    directives: list[dict[str, Any]],
+    *,
+    attempt: int,
+) -> str:
+    """Render structured Pxx directives without reassigning adjacent actions."""
+    if not directives:
+        return ""
+    beat_id = str(directives[0].get("target_board_id") or "当前格")
+    lines = [
+        f"这是第 {int(attempt)} 轮自动纠偏，只修复 {beat_id}。",
+        "以下每项均为当前格 DTO；其他 Pxx 的 expected 只保留在审计收据，不进入动作指令。",
+    ]
+    for index, directive in enumerate(directives, 1):
+        code = str(directive.get("issue_code") or "QA")
+        mismatch_type = str(directive.get("mismatch_type") or "other")
+        action = _compact(directive.get("required_action"), 500)
+        end_state = _compact(directive.get("required_end_state"), 500)
+        observed = _compact(directive.get("observed_error"), 500)
+        lines.extend([
+            f"- 纠偏 DTO {index}：target={beat_id}；code={code}；type={mismatch_type}。",
+            f"  当前格权威动作={action or '保持本格 canonical action'}。",
+            f"  当前格权威终态={end_state or '达到本格 canonical end_state'}。",
+            f"  必须消除的本格可见错误={observed or '未达到当前格动作或终态'}。",
+        ])
+    return "\n".join(lines)
+
+
 def _build_panel_prompt(
     shot: dict[str, Any],
     beat: dict[str, Any],
@@ -352,9 +441,10 @@ def _build_panel_prompt(
         else ""
     )
     previous_state_contract = (
-        "上一参考图只用于继承空间轴线、机位、动作方向和上一格结束姿态；"
-        "项目角色参考与下方角色合同始终优先于上一格。若上一格的发型、服装基础色、"
-        "身份或武器归属有偏差，本格必须纠正，不得继续放大偏差。"
+        "上一参考图不得作为姿势模板；只继承仍然成立的场景事实与相对空间关系、机位轴线和"
+        "画面方向。所有人物必须从上一状态推进到本格动作完成后的新姿态，禁止复制上一格的"
+        "关节角度、动作进度或中间状态。项目角色参考与下方角色合同始终优先于上一格；若上一格"
+        "的发型、服装基础色、身份、武器归属或动作结果有偏差，本格必须纠正，不得继续放大偏差。"
         if is_continuation
         else "项目角色参考与下方角色合同是人物身份、发型、服装基础色和装备的唯一准绳。"
     )
@@ -1370,28 +1460,15 @@ def generate_shot_storyboards(
                     ]
                     if not storyboard_ids or beat_id in storyboard_ids:
                         beat_correction_issues.append(issue)
-                correction_lines: list[str] = []
-                for issue_index, issue in enumerate(beat_correction_issues, 1):
-                    details = (
-                        issue.get("details")
-                        if isinstance(issue.get("details"), dict)
-                        else {}
-                    )
-                    expected = _compact(details.get("expected"), 320)
-                    observed = _compact(details.get("observed"), 320)
-                    message = _compact(issue.get("message"), 420)
-                    code = str(issue.get("code") or "QA").upper()
-                    correction_lines.append(
-                        f"- 纠偏项 {issue_index}（{code}）：必须满足="
-                        f"{expected or '严格恢复本格动作与结束状态合同'}；"
-                        f"已观察到且禁止复现={observed or message}。"
-                    )
-                correction_contract = "\n".join(correction_lines)
-                if correction_contract:
-                    correction_contract = (
-                        f"这是第 {int(correction_attempt)} 轮自动纠偏，只修复 "
-                        f"{beat_id}。\n{correction_contract}"
-                    )
+                correction_directives = _panel_correction_directives(
+                    beat_correction_issues,
+                    beat,
+                    beat_id,
+                )
+                correction_contract = _render_correction_contract(
+                    correction_directives,
+                    attempt=correction_attempt,
+                )
                 panel_prompt = _build_panel_prompt(
                     shot,
                     beat,
@@ -1479,6 +1556,11 @@ def generate_shot_storyboards(
                     ],
                     "status": "planned",
                 }
+                if correction_directives:
+                    panel_record["correction"] = {
+                        "attempt": int(correction_attempt),
+                        "directives": correction_directives,
+                    }
                 cached = False
                 if panel_sidecar.is_file() and panel_path.is_file():
                     try:

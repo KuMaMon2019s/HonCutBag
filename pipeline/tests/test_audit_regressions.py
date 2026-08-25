@@ -53,6 +53,8 @@ from phases.phase2.shot_storyboards import (
     _build_panel_prompt,
     _character_contract,
     _character_reference_paths,
+    _panel_correction_directives,
+    _render_correction_contract,
     build_shot_storyboard_prompt,
     generate_shot_storyboards,
 )
@@ -2977,7 +2979,7 @@ def test_phase3_reference_generation_uses_face_only_as_identity_anchor(
     assert all(call[0] == "image" for call in calls[1:])
     assert all(str(call[2]).endswith("face_closeup.png") for call in calls[1:])
     assert all(
-        call[1].startswith("[honcut-seedream-reference-contract-v1]")
+        call[1].startswith("[honcut-seedream-reference-contract-v2]")
         for call in calls[1:]
     )
     assert all("Image 1: character identity only" in call[1] for call in calls[1:])
@@ -3714,6 +3716,69 @@ def test_phase2_panel_prompt_turns_phase5_evidence_into_negative_constraints():
     assert "保安撞破观察窗飞入太空" in prompt
     assert "禁止复现的负面约束，不是要继续画入画面的剧情" in prompt
     assert "不得通过增加破坏、伤亡、道具或画外事件来规避问题" in prompt
+
+
+def test_phase2_panel_correction_directive_is_scoped_to_one_pxx():
+    issue = storyboard_qa_gate._issue(
+        "L3",
+        "moderate",
+        "R4",
+        "两格动作顺序错误",
+        ["S02"],
+        storyboard_ids=["S02_P01", "S02_P02"],
+        mismatch_type="end_state",
+        expected="P01 后仰抓扶手；P02 踢腕后将敌人甩向座椅",
+        observed="两格都停在后仰姿态",
+        panel_evidence=[
+            {"shot_id": "S02_P01", "observed": "尚未抓住扶手"},
+            {"shot_id": "S02_P02", "observed": "仍复制 P01 后仰姿态"},
+        ],
+    )
+    beat = {
+        "beat_id": "S02_P02",
+        "action": "男子踢中敌人手腕并将第二名敌人甩向座椅",
+        "end_state": "第二名敌人落向座椅，男子保持平衡",
+    }
+
+    directives = _panel_correction_directives([issue], beat, "S02_P02")
+    contract = _render_correction_contract(directives, attempt=2)
+
+    assert directives == [{
+        "schema": "honcut.storyboard-panel-correction.v1",
+        "target_board_id": "S02_P02",
+        "issue_code": "R4",
+        "mismatch_type": "end_state",
+        "required_action": "男子踢中敌人手腕并将第二名敌人甩向座椅",
+        "required_end_state": "第二名敌人落向座椅，男子保持平衡",
+        "observed_error": "仍复制 P01 后仰姿态",
+        "source_expected_context": "P01 后仰抓扶手；P02 踢腕后将敌人甩向座椅",
+        "source_storyboard_ids": ["S02_P01", "S02_P02"],
+    }]
+    assert "当前格权威动作=男子踢中敌人手腕并将第二名敌人甩向座椅" in contract
+    assert "当前格权威终态=第二名敌人落向座椅，男子保持平衡" in contract
+    assert "必须消除的本格可见错误=仍复制 P01 后仰姿态" in contract
+    assert "尚未抓住扶手" not in contract
+    assert "P01 后仰抓扶手；P02" not in contract
+
+
+def test_phase2_continuation_prompt_does_not_preserve_previous_pose():
+    prompt = _build_panel_prompt(
+        {"who": ["agent"], "where": "列车车厢"},
+        {
+            "beat_id": "S02_P02",
+            "generation_mode": "extend",
+            "start_state": "Agent 抓住扶手",
+            "action": "Agent 踢中敌人手腕",
+            "end_state": "敌人武器撞墙，Agent 单腿稳定",
+        },
+        2,
+        2,
+        [],
+    )
+
+    assert "上一参考图不得作为姿势模板" in prompt
+    assert "只继承仍然成立的场景事实与相对空间关系" in prompt
+    assert "上一格结束姿态" not in prompt
 
 
 def test_storyboard_prompts_use_generic_role_and_prop_fidelity_contracts():
@@ -4830,7 +4895,7 @@ def test_phase4_cinematic_frames_inject_style_and_exclude_previs(tmp_path):
 
     assert manifest["status"] == "done"
     assert manifest["frame_count"] == 1
-    assert calls[0][0].startswith("[honcut-seedream-reference-contract-v1]")
+    assert calls[0][0].startswith("[honcut-seedream-reference-contract-v2]")
     assert "Image 1: director single panel" in calls[0][0]
     assert calls[0][0].index("Image 1") < calls[0][0].index(
         "【美术风格｜最高优先级｜成片质感】"
@@ -4862,7 +4927,7 @@ def test_phase4_cinematic_frames_inject_style_and_exclude_previs(tmp_path):
     assert receipt["reference_contract_template_id"] == (
         "honcut.seedream.reference-contract"
     )
-    assert receipt["reference_contract_template_version"] == "1"
+    assert receipt["reference_contract_template_version"] == "2"
     assert receipt["prompt_guidance"]["sha256"] == receipt["prompt_sha256"]
     assert receipt["upstream_director_panel"] == "director_panels/S02.png"
     assert receipt["upstream_director_panel_usage"].endswith("never_video_reference")
