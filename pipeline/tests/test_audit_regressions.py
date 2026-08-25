@@ -153,6 +153,41 @@ def test_seedance_limits_are_provider_capabilities_not_global_director_rules():
     )
 
 
+def test_secondary_beats_scope_canonical_cast_to_visible_beat_facts():
+    storyboard = {
+        "video_provider": "seedance",
+        "shots": [{
+            "id": "S01",
+            "duration": 16,
+            "who": ["Lead"],
+            "character_ids": ["lead"],
+            "participant_refs": [{
+                "ref_id": "SRCCHAR_lead",
+                "mention": "Lead",
+                "character_id": "lead",
+            }],
+            "start_state": "The empty platform has not been revealed",
+            "micro_actions": [
+                "Rain strikes the transparent roof",
+                "Lead steps through the train door",
+            ],
+            "end_state": "Lead is inside the train",
+        }],
+    }
+
+    plan_storyboard_beats(storyboard)
+
+    beats = storyboard["shots"][0]["storyboard_beats"]
+    assert [beat["character_ids"] for beat in beats] == [[], ["lead"]]
+
+    tampered = json.loads(json.dumps(storyboard))
+    tampered["shots"][0]["storyboard_beats"][0]["character_ids"] = ["lead"]
+    assert any(
+        issue["code"] == "secondary_storyboard_beat_cast_invalid"
+        for issue in secondary_storyboard_contract_errors(tampered, 0)
+    )
+
+
 def test_flf2v_provider_capability_is_separate_from_honcut_bridge_policy():
     seedance = get_video_capabilities(provider="seedance")
 

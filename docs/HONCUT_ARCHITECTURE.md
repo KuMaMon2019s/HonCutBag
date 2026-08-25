@@ -156,7 +156,7 @@ Phase 1 的事件、角色与时长缩放动作选择请求必须使用 Chat Com
 
 Phase 1 的骨架账本按 screenplay `sequence_id` 预先分配连续且互不合并的 beat 槽位。包含必保事件的 sequence 必须获得足以承载必保动作单元的槽位；只含可删事件的 sequence 不得无条件强占故事时钟，可在容量不足时整体进入 `dropped_source_events` 并绑定到相邻已规划槽位留审计证据。模型返回跨 sequence、遗漏必保事件或超过故事时钟动作容量时，Phase owner 必须按固定槽位确定性重建 `source_events` / `dropped_source_events`：必保事件不得删除，删减只能显式进入 dropped 账本，重建后仍不满足容量则 fail closed。
 
-Adaptation Engine 是具体镜头语言的唯一 owner。除 `shot_size`、`camera_movement`、`lens_mm`、`lighting_key` 等既有字段外，canonical shot 必须写入受控 `camera_angle`（`eye_level/low/high/dutch/over_shoulder/aerial/bird/worm`）；Director 意图不得预选该值。下游 Storyboard、二级 Pxx（当前 `honcut.secondary-storyboard.v11`）、Phase 4 元数据与生成 Prompt 只能保留或翻译这个 canonical 值，不得再次推断角度。未知 authored 值必须在 Phase 1 fail closed；旧产物仅可在明确兼容边界规范化为 `eye_level`。
+Adaptation Engine 是具体镜头语言的唯一 owner。除 `shot_size`、`camera_movement`、`lens_mm`、`lighting_key` 等既有字段外，canonical shot 必须写入受控 `camera_angle`（`eye_level/low/high/dutch/over_shoulder/aerial/bird/worm`）；Director 意图不得预选该值。下游 Storyboard、二级 Pxx（当前 `honcut.secondary-storyboard.v12`）、Phase 4 元数据与生成 Prompt 只能保留或翻译这个 canonical 值，不得再次推断角度。每个 Pxx 还必须写 canonical `character_ids`，只包含其自身起始状态、动作与结束状态中可见的已绑定角色；Sxx 级角色全集只是上限，禁止覆盖格级可见角色并令尚未入场的人物提前出现。未知 authored 值、缺失/重复/越界或与格级事实不一致的 Pxx 角色 ID 必须在 Phase 1 fail closed；旧产物仅可在明确兼容边界规范化机位或投影格级角色，生产代码只写 v12 canonical 字段。
 
 Phase 1 的 adaptation 对任意事件数量都固定执行分层骨架与分批镜头展开；生产路径不存在按事件数回退为单次 Prompt 的分支，也不得通过环境变量重新启用旧单次调用路径。分层 checkpoint 是唯一可恢复的 adaptation 中间状态；当前 schema 为 `honcut.layered-adaptation.v15`，旧版不得跨导演意图、生产 Director 投影、机位角度、生产事件动作账、生产剧本账、语义容量、连续前置闭包或事件顺序规则复用。
 

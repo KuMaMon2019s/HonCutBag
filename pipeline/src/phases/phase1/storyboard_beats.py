@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 from typing import Any
 
 from utils.action_units import normalize_action_units
@@ -21,8 +22,8 @@ from utils.video_capabilities import (
     min_primary_story_duration,
 )
 
-SECONDARY_STORYBOARD_VERSION = "honcut.secondary-storyboard.v11"
-SECONDARY_EXECUTION = "content_capacity_post_primary_bridge_v11"
+SECONDARY_STORYBOARD_VERSION = "honcut.secondary-storyboard.v12"
+SECONDARY_EXECUTION = "content_capacity_post_primary_bridge_v12"
 SECONDARY_GENERATION_MODES = frozenset({
     "multi_image",
     "tail_video_extend",
@@ -74,6 +75,67 @@ def _compact(value: Any, limit: int = 140) -> str:
 def _clean(value: Any) -> str:
     """Normalize authored narrative text without truncating screenplay detail."""
     return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _contains_complete_mention(text: str, mention: str) -> bool:
+    """Match one authored identity mention without Latin substring collisions."""
+    normalized_text = unicodedata.normalize("NFKC", text).casefold()
+    normalized_mention = unicodedata.normalize("NFKC", mention).casefold().strip()
+    if not normalized_mention:
+        return False
+    if re.search(r"[\u3400-\u9fff]", normalized_mention):
+        return normalized_mention in normalized_text
+    return re.search(
+        rf"(?<![a-z0-9]){re.escape(normalized_mention)}(?![a-z0-9])",
+        normalized_text,
+    ) is not None
+
+
+def _beat_character_ids(
+    shot: dict[str, Any],
+    *semantic_values: Any,
+) -> list[str]:
+    """Project shot participants into the canonical cast visible in one Pxx.
+
+    Shot-level cast is a superset across the whole Sxx.  A Pxx may precede a
+    character's entrance, so its cast must be derived only from its own
+    start/action/end facts and persisted for downstream media owners.
+    """
+    raw_ids = shot.get("character_ids") or []
+    if isinstance(raw_ids, str):
+        raw_ids = [raw_ids]
+    character_ids = list(dict.fromkeys(
+        str(value).strip() for value in raw_ids if str(value).strip()
+    ))
+    mentions_by_id = {character_id: {character_id} for character_id in character_ids}
+
+    for reference in shot.get("participant_refs") or []:
+        if not isinstance(reference, dict):
+            continue
+        character_id = str(reference.get("character_id") or "").strip()
+        mention = str(reference.get("mention") or "").strip()
+        if character_id in mentions_by_id and mention:
+            mentions_by_id[character_id].add(mention)
+
+    raw_who = shot.get("who") or []
+    if isinstance(raw_who, str):
+        raw_who = [raw_who]
+    who = [str(value).strip() for value in raw_who if str(value).strip()]
+    if len(who) == len(character_ids):
+        for character_id, mention in zip(character_ids, who, strict=True):
+            mentions_by_id[character_id].add(mention)
+
+    semantic_text = "\n".join(
+        str(value) for value in semantic_values if str(value or "").strip()
+    )
+    return [
+        character_id
+        for character_id in character_ids
+        if any(
+            _contains_complete_mention(semantic_text, mention)
+            for mention in mentions_by_id[character_id]
+        )
+    ]
 
 
 def _partition(values: list[str], count: int) -> list[list[str]]:
@@ -572,6 +634,35 @@ def secondary_storyboard_contract_errors(
     for position, beat in enumerate(beats, 1):
         beat_id = str(beat.get("beat_id") or f"{sid}_P{position:02d}")
         mode = actual_modes[position - 1]
+        raw_beat_character_ids = beat.get("character_ids")
+        if not isinstance(raw_beat_character_ids, list):
+            add(
+                "secondary_storyboard_beat_cast_invalid",
+                f"{beat_id} must declare canonical character_ids as an array",
+                observed=raw_beat_character_ids,
+            )
+        else:
+            beat_character_ids = [
+                str(value).strip()
+                for value in raw_beat_character_ids
+                if str(value).strip()
+            ]
+            expected_beat_character_ids = _beat_character_ids(
+                shot,
+                beat.get("start_state"),
+                beat.get("action"),
+                beat.get("end_state"),
+            )
+            if (
+                beat_character_ids != list(dict.fromkeys(beat_character_ids))
+                or beat_character_ids != expected_beat_character_ids
+            ):
+                add(
+                    "secondary_storyboard_beat_cast_invalid",
+                    f"{beat_id} cast does not match its own visible facts",
+                    expected=expected_beat_character_ids,
+                    observed=beat_character_ids,
+                )
         if beat.get("position") != position:
             add(
                 "secondary_storyboard_position_invalid",
@@ -988,6 +1079,12 @@ def plan_storyboard_beats(
                 "generation_action_units": generation_unit_buckets[position - 1],
                 "source_action_unit_ids": source_unit_buckets[position - 1],
                 "end_state": next_state,
+                "character_ids": _beat_character_ids(
+                    shot,
+                    previous_state,
+                    action,
+                    next_state,
+                ),
                 "shot_size": shot.get("shot_size") or shot.get("shot_type"),
                 "camera_angle": shot.get("camera_angle"),
                 "camera_movement": shot.get("camera_movement")
