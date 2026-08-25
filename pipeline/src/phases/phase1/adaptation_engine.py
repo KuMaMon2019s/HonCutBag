@@ -1830,6 +1830,17 @@ def _inherit_event_semantics(
                 for character_id in (event.get("character_ids") or [])
                 if str(character_id).strip()
             ))
+            shot["source_event_casts"] = [
+                {
+                    "source_event_id": event_id,
+                    "character_ids": list(dict.fromkeys(
+                        str(character_id).strip()
+                        for character_id in (event.get("character_ids") or [])
+                        if str(character_id).strip()
+                    )),
+                }
+                for event_id, event in zip(source_ids, details, strict=True)
+            ]
             participant_refs = [
                 dict(reference)
                 for event in details

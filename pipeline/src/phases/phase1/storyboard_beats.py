@@ -22,8 +22,8 @@ from utils.video_capabilities import (
     min_primary_story_duration,
 )
 
-SECONDARY_STORYBOARD_VERSION = "honcut.secondary-storyboard.v12"
-SECONDARY_EXECUTION = "content_capacity_post_primary_bridge_v12"
+SECONDARY_STORYBOARD_VERSION = "honcut.secondary-storyboard.v13"
+SECONDARY_EXECUTION = "content_capacity_post_primary_bridge_v13"
 SECONDARY_GENERATION_MODES = frozenset({
     "multi_image",
     "tail_video_extend",
@@ -94,6 +94,7 @@ def _contains_complete_mention(text: str, mention: str) -> bool:
 def _beat_character_ids(
     shot: dict[str, Any],
     *semantic_values: Any,
+    source_event_ids: list[int] | None = None,
 ) -> list[str]:
     """Project shot participants into the canonical cast visible in one Pxx.
 
@@ -128,14 +129,68 @@ def _beat_character_ids(
     semantic_text = "\n".join(
         str(value) for value in semantic_values if str(value or "").strip()
     )
-    return [
+    visible_ids = {
         character_id
         for character_id in character_ids
         if any(
             _contains_complete_mention(semantic_text, mention)
             for mention in mentions_by_id[character_id]
         )
+    }
+    event_casts = _source_event_cast_index(shot)
+    for event_id in source_event_ids or []:
+        visible_ids.update(event_casts.get(event_id, []))
+    return [
+        character_id for character_id in character_ids if character_id in visible_ids
     ]
+
+
+def _source_event_cast_index(shot: dict[str, Any]) -> dict[int, list[str]]:
+    """Validate and index canonical event-level cast lineage for one shot."""
+    raw_casts = shot.get("source_event_casts")
+    if raw_casts is None:
+        return {}
+    if not isinstance(raw_casts, list):
+        raise ValueError("source_event_casts must be an array")
+    shot_ids = list(dict.fromkeys(
+        str(value).strip()
+        for value in (shot.get("character_ids") or [])
+        if str(value).strip()
+    ))
+    index: dict[int, list[str]] = {}
+    for record in raw_casts:
+        if not isinstance(record, dict):
+            raise ValueError("source_event_casts entries must be objects")
+        event_id = record.get("source_event_id")
+        raw_ids = record.get("character_ids")
+        if not isinstance(event_id, int) or event_id < 1:
+            raise ValueError("source_event_casts requires positive source_event_id")
+        if event_id in index:
+            raise ValueError("source_event_casts contains duplicate source_event_id")
+        if not isinstance(raw_ids, list):
+            raise ValueError("source_event_casts character_ids must be an array")
+        cast_ids = [
+            str(value).strip() for value in raw_ids if str(value).strip()
+        ]
+        if cast_ids != list(dict.fromkeys(cast_ids)):
+            raise ValueError("source_event_casts character_ids must be unique")
+        if any(character_id not in shot_ids for character_id in cast_ids):
+            raise ValueError("source_event_casts contains an ID outside the shot cast")
+        index[event_id] = cast_ids
+    return index
+
+
+def _generation_unit_source_event_ids(
+    generation_units: list[dict[str, Any]],
+) -> list[int]:
+    """Return ordered canonical source events represented by one Pxx bucket."""
+    return list(dict.fromkeys(
+        event_id
+        for unit in generation_units
+        if isinstance(unit, dict)
+        for event_id in [unit.get("source_event_id")]
+        if isinstance(event_id, int) and event_id > 0
+    ))
 
 
 def _partition(values: list[str], count: int) -> list[list[str]]:
@@ -577,6 +632,28 @@ def secondary_storyboard_contract_errors(
         add("secondary_storyboard_beats_missing", f"{sid} has no secondary beats")
         return errors
 
+    try:
+        source_event_casts = _source_event_cast_index(shot)
+    except ValueError as exc:
+        source_event_casts = {}
+        add(
+            "secondary_storyboard_source_event_cast_invalid",
+            f"{sid} has invalid source event cast lineage: {exc}",
+        )
+    raw_source_events = shot.get("source_events") or []
+    source_events = [
+        value for value in raw_source_events if isinstance(value, int) and value > 0
+    ] if isinstance(raw_source_events, list) else []
+    if storyboard.get("semantic_understanding") and (
+        list(source_event_casts) != list(dict.fromkeys(source_events))
+    ):
+        add(
+            "secondary_storyboard_source_event_cast_invalid",
+            f"{sid} source event cast lineage must cover canonical source_events",
+            expected=list(dict.fromkeys(source_events)),
+            observed=list(source_event_casts),
+        )
+
     requirement: dict[str, Any] | None = None
     try:
         requirement = secondary_storyboard_requirements(storyboard, index, capabilities)
@@ -634,6 +711,22 @@ def secondary_storyboard_contract_errors(
     for position, beat in enumerate(beats, 1):
         beat_id = str(beat.get("beat_id") or f"{sid}_P{position:02d}")
         mode = actual_modes[position - 1]
+        beat_generation_units = [
+            unit
+            for unit in (beat.get("generation_action_units") or [])
+            if isinstance(unit, dict)
+        ]
+        expected_source_event_ids = _generation_unit_source_event_ids(
+            beat_generation_units
+        )
+        raw_beat_source_event_ids = beat.get("source_event_ids")
+        if raw_beat_source_event_ids != expected_source_event_ids:
+            add(
+                "secondary_storyboard_beat_event_lineage_invalid",
+                f"{beat_id} source_event_ids do not match its action units",
+                expected=expected_source_event_ids,
+                observed=raw_beat_source_event_ids,
+            )
         raw_beat_character_ids = beat.get("character_ids")
         if not isinstance(raw_beat_character_ids, list):
             add(
@@ -652,6 +745,7 @@ def secondary_storyboard_contract_errors(
                 beat.get("start_state"),
                 beat.get("action"),
                 beat.get("end_state"),
+                source_event_ids=expected_source_event_ids,
             )
             if (
                 beat_character_ids != list(dict.fromkeys(beat_character_ids))
@@ -1032,6 +1126,10 @@ def plan_storyboard_beats(
         final_state = _end_state(shot)
         beats: list[dict[str, Any]] = []
         for position in range(1, content_count + 1):
+            beat_generation_units = generation_unit_buckets[position - 1]
+            beat_source_event_ids = _generation_unit_source_event_ids(
+                beat_generation_units
+            )
             action = _action_for_bucket(
                 action_buckets[position - 1],
                 position=position,
@@ -1076,7 +1174,8 @@ def plan_storyboard_beats(
                 "start_state": previous_state,
                 "action": action,
                 "micro_actions": action_buckets[position - 1],
-                "generation_action_units": generation_unit_buckets[position - 1],
+                "generation_action_units": beat_generation_units,
+                "source_event_ids": beat_source_event_ids,
                 "source_action_unit_ids": source_unit_buckets[position - 1],
                 "end_state": next_state,
                 "character_ids": _beat_character_ids(
@@ -1084,6 +1183,7 @@ def plan_storyboard_beats(
                     previous_state,
                     action,
                     next_state,
+                    source_event_ids=beat_source_event_ids,
                 ),
                 "shot_size": shot.get("shot_size") or shot.get("shot_type"),
                 "camera_angle": shot.get("camera_angle"),

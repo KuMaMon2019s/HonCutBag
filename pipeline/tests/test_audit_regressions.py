@@ -189,6 +189,81 @@ def test_secondary_beats_scope_canonical_cast_to_visible_beat_facts():
     )
 
 
+def test_secondary_beats_use_structured_source_event_cast_for_implicit_actions():
+    storyboard = {
+        "video_provider": "seedance",
+        "shots": [{
+            "id": "S05",
+            "duration": 6,
+            "who": ["年轻男性", "第三名敌人"],
+            "character_ids": ["young_man", "enemy_3"],
+            "participant_refs": [
+                {"mention": "男子", "character_id": "young_man"},
+                {"mention": "第三名敌人", "character_id": "enemy_3"},
+            ],
+            "source_events": [11, 12, 13],
+            "source_event_casts": [
+                {
+                    "source_event_id": 11,
+                    "character_ids": ["young_man", "enemy_3"],
+                },
+                {"source_event_id": 12, "character_ids": ["young_man"]},
+                {"source_event_id": 13, "character_ids": ["young_man"]},
+            ],
+            "start_state": "男子与敌人位于车厢中央",
+            "micro_actions": [
+                "借助转弯惯性将敌人撞向隔离门",
+                "整理被战斗弄乱的长风衣",
+                "低头查看手中的科技芯片",
+                "科技芯片投射出未知坐标",
+            ],
+            "generation_action_units": [
+                {
+                    "unit_id": "GAU001",
+                    "kind": "sequential",
+                    "actions": ["借助转弯惯性将敌人撞向隔离门"],
+                    "ledger_indexes": [0],
+                    "source_event_id": 11,
+                },
+                {
+                    "unit_id": "GAU002",
+                    "kind": "sequential",
+                    "actions": ["整理被战斗弄乱的长风衣"],
+                    "ledger_indexes": [1],
+                    "source_event_id": 12,
+                },
+                {
+                    "unit_id": "GAU003",
+                    "kind": "sequential",
+                    "actions": ["低头查看手中的科技芯片"],
+                    "ledger_indexes": [2],
+                    "source_event_id": 12,
+                },
+                {
+                    "unit_id": "GAU004",
+                    "kind": "sequential",
+                    "actions": ["科技芯片投射出未知坐标"],
+                    "ledger_indexes": [3],
+                    "source_event_id": 13,
+                },
+            ],
+            "end_state": "科技芯片投射出未知坐标",
+        }],
+    }
+
+    plan_storyboard_beats(storyboard)
+
+    beats = storyboard["shots"][0]["storyboard_beats"]
+    assert [beat["source_event_ids"] for beat in beats] == [
+        [11, 12],
+        [12, 13],
+    ]
+    assert [beat["character_ids"] for beat in beats] == [
+        ["young_man", "enemy_3"],
+        ["young_man"],
+    ]
+
+
 def test_flf2v_provider_capability_is_separate_from_honcut_bridge_policy():
     seedance = get_video_capabilities(provider="seedance")
 
@@ -546,6 +621,7 @@ def test_source_event_identity_overrides_llm_character_synonyms():
 def test_source_event_identity_resolves_qualified_alias_to_character_asset():
     events = [{
         "who": ["身穿深灰色战术服的Agent", "敌方保安"],
+        "character_ids": ["agent", "security_guard"],
         "where": "旋转走廊",
         "what": "Agent与敌方保安搏斗",
         "micro_actions": ["Agent挥拳"],
@@ -569,6 +645,10 @@ def test_source_event_identity_resolves_qualified_alias_to_character_asset():
     assert shots[0]["source_character_mentions"] == [
         "身穿深灰色战术服的Agent", "敌方保安",
     ]
+    assert shots[0]["source_event_casts"] == [{
+        "source_event_id": 1,
+        "character_ids": ["agent", "security_guard"],
+    }]
 
 
 def test_event_extractor_selects_a_generic_or_action_contract(monkeypatch):
@@ -4893,7 +4973,7 @@ def test_phase5_l3_prompt_uses_compact_semantic_projection(tmp_path):
 
 def test_phase5_l3_uses_pxx_cast_instead_of_shot_wide_cast():
     storyboard = {
-        "secondary_storyboard_version": "honcut.secondary-storyboard.v12",
+        "secondary_storyboard_version": SECONDARY_STORYBOARD_VERSION,
         "shots": [{
             "id": "S01",
             "who": ["lead"],
