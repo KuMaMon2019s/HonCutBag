@@ -4868,6 +4868,7 @@ def test_phase5_shot_scoped_l1_issue_restarts_phase1_without_paid_redraw(
         "R4",
         "S03 attacks the wrong target",
         ["S03"],
+        storyboard_ids=["S03_P02"],
         mismatch_type="action",
         expected="enemy_2 is thrown",
         observed="enemy_1 is thrown",
@@ -4990,6 +4991,10 @@ def test_phase5_automatically_redraws_failed_shots_then_rechecks(tmp_path):
         storyboard_ids=["S05_P02", "S06_P02"],
         expected="观察窗完整且 Agent 稳定定格",
         observed="观察窗破裂且人物飞入太空",
+        panel_evidence=[
+            {"shot_id": "S05_P02", "observed": "观察窗破裂"},
+            {"shot_id": "S06_P02", "observed": "人物飞入太空"},
+        ],
     )
     qa_results = iter([
         {
@@ -5039,7 +5044,12 @@ def test_phase5_automatically_redraws_failed_shots_then_rechecks(tmp_path):
 def test_phase5_correction_is_bounded_and_fails_closed(tmp_path):
     blocking_issue = storyboard_qa_gate._issue(
         "L3", "severe", "R4", "动作完全错误", ["S03"],
+        storyboard_ids=["S03_P01"],
         expected="Agent 解除武器", observed="保安持枪射击",
+        panel_evidence=[{
+            "shot_id": "S03_P01",
+            "observed": "保安仍持枪射击",
+        }],
     )
     qa_calls = 0
     redraw_attempts = []
@@ -5174,6 +5184,10 @@ def test_phase5_real_redraw_reuses_generator_and_archives_failed_shot(tmp_path):
         storyboard_ids=["S02_P01"],
         expected="观察窗保持完整，Agent 稳定定格",
         observed="保安撞破观察窗飞入太空",
+        panel_evidence=[{
+            "shot_id": "S02_P01",
+            "observed": "保安撞破观察窗飞入太空",
+        }],
     )
 
     receipt = storyboard_qa_gate._redraw_failed_storyboards(
@@ -5195,12 +5209,168 @@ def test_phase5_real_redraw_reuses_generator_and_archives_failed_shot(tmp_path):
     manifest = json.loads(
         (tmp_path / "SHOT_STORYBOARDS.json").read_text(encoding="utf-8")
     )
-    assert manifest["correction"] == {"attempt": 1, "shot_ids": ["S02"]}
+    assert manifest["correction"] == {
+        "attempt": 1,
+        "shot_ids": ["S02"],
+        "storyboard_ids": ["S02_P01"],
+        "regenerated_storyboard_ids": ["S02_P01"],
+        "preserved_storyboard_ids": [],
+    }
     assert receipt["restored_cinematic_aliases"] == ["S02"]
     assert hashlib.sha256(cinematic_alias.read_bytes()).hexdigest() == alias_sha256
     assert json.loads(cinematic_alias_receipt.read_text(encoding="utf-8"))[
         "kind"
     ] == CINEMATIC_FIRST_FRAME_SCHEMA
+
+
+def test_phase5_correction_redraws_only_evidenced_pxx_with_identity_references(
+    tmp_path,
+):
+    from PIL import Image
+
+    character_dir = tmp_path / "characters/agent"
+    character_dir.mkdir(parents=True)
+    for name, color in (("face_closeup.png", "navy"), ("full_body.png", "gray")):
+        Image.new("RGB", (320, 180), color).save(character_dir / name)
+    characters = [{
+        "id": "agent",
+        "name": "Agent",
+        "appearance": {"summary": "深灰色战术服"},
+    }]
+    storyboard = {
+        "secondary_storyboard_version": SECONDARY_STORYBOARD_VERSION,
+        "shots": [{
+            "id": "S01",
+            "where": "高速列车车厢",
+            "character_ids": ["agent"],
+            "storyboard_beats": [
+                {
+                    "beat_id": "S01_P01",
+                    "planner_version": SECONDARY_STORYBOARD_VERSION,
+                    "character_ids": ["agent"],
+                    "duration_s": 4,
+                    "generation_mode": "fresh",
+                    "action": "Agent 抓住扶手稳定身体",
+                    "end_state": "Agent 已抓稳扶手",
+                },
+                {
+                    "beat_id": "S01_P02",
+                    "planner_version": SECONDARY_STORYBOARD_VERSION,
+                    "character_ids": ["agent"],
+                    "duration_s": 4,
+                    "generation_mode": "extend",
+                    "action": "Agent 松开扶手并站稳",
+                    "end_state": "Agent 已独立站稳",
+                },
+            ],
+        }],
+    }
+    calls = []
+
+    class FakeClient:
+        model = "fake-seedream"
+
+        def text_to_image(self, prompt, output_path, size, timeout):
+            calls.append({"output": Path(output_path).name, "references": []})
+            Image.effect_noise((320, 180), 70).convert("RGB").save(output_path)
+            return "https://image.invalid/board.png"
+
+        def image_to_image(self, prompt, ref_image, output_path, size):
+            references = ref_image if isinstance(ref_image, list) else [ref_image]
+            calls.append({
+                "output": Path(output_path).name,
+                "references": [Path(value).name for value in references],
+            })
+            Image.effect_noise((320, 180), 80).convert("RGB").save(output_path)
+            return "https://image.invalid/panel.png"
+
+    client = FakeClient()
+    generate_shot_storyboards(
+        tmp_path,
+        storyboard,
+        characters,
+        client=client,
+        director_storyboard_path=tmp_path / "missing.png",
+    )
+    (tmp_path / "CHARACTERS.json").write_text(
+        json.dumps({"characters": characters}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps(storyboard, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (tmp_path / "storyboard_qa_report.json").write_text(
+        '{"status":"error","grade":"C"}', encoding="utf-8"
+    )
+    p01_image = tmp_path / "storyboard_beats/S01_P01.png"
+    p01_sidecar = tmp_path / "storyboard_beats/S01_P01.json"
+    p01_image_sha256 = hashlib.sha256(p01_image.read_bytes()).hexdigest()
+    p01_sidecar_sha256 = hashlib.sha256(p01_sidecar.read_bytes()).hexdigest()
+    issue = storyboard_qa_gate._issue(
+        "L3",
+        "moderate",
+        "R4",
+        "第二格仍复制第一格姿态",
+        ["S01"],
+        storyboard_ids=["S01_P02"],
+        mismatch_type="end_state",
+        expected="Agent 已独立站稳",
+        observed="Agent 仍抓住扶手",
+        confidence=0.95,
+        panel_evidence=[{
+            "shot_id": "S01_P02",
+            "observed": "Agent 仍抓住扶手，没有独立站稳",
+        }],
+        evidence_status="not_required",
+    )
+
+    calls.clear()
+    receipt = storyboard_qa_gate._redraw_failed_storyboards(
+        tmp_path,
+        ["S01"],
+        [issue],
+        1,
+        image_client=client,
+    )
+
+    assert [call["output"] for call in calls] == ["S01_P02.png", "S01.png"]
+    assert calls[0]["references"] == ["face_closeup.png", "full_body.png"]
+    assert "S01_P01.png" not in calls[0]["references"]
+    assert hashlib.sha256(p01_image.read_bytes()).hexdigest() == p01_image_sha256
+    assert hashlib.sha256(p01_sidecar.read_bytes()).hexdigest() == p01_sidecar_sha256
+    assert receipt["storyboard_ids"] == ["S01_P02"]
+    assert receipt["regenerated_panel_count"] == 1
+
+
+def test_phase5_correction_excludes_affirmative_panel_evidence():
+    issue = storyboard_qa_gate._issue(
+        "L3",
+        "moderate",
+        "R4",
+        "第二格动作未完成",
+        ["S02"],
+        storyboard_ids=["S02_P01", "S02_P02"],
+        mismatch_type="action",
+        expected="P01 旋转躲避；P02 踢腕反击",
+        observed="P02 没有完成踢腕反击",
+        confidence=0.96,
+        panel_evidence=[
+            {
+                "shot_id": "S02_P01",
+                "observed": "matches the required start and mid state",
+            },
+            {
+                "shot_id": "S02_P02",
+                "observed": "the required wrist kick is not visible",
+            },
+        ],
+        evidence_status="not_required",
+    )
+
+    assert storyboard_qa_gate._correctable_storyboard_ids([issue]) == [
+        "S02_P02"
+    ]
 
 
 def test_phase5_l3_supplies_canonical_character_images(tmp_path):

@@ -1412,6 +1412,7 @@ def generate_shot_storyboards(
     correction_context_by_shot: dict[str, list[dict[str, Any]]] | None = None,
     correction_attempt: int = 0,
     target_shot_ids: set[str] | None = None,
+    target_beat_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     """Generate each Pxx as 16:9 model art, then compose the Sxx overview."""
     output_dir = Path(output_dir)
@@ -1439,6 +1440,56 @@ def generate_shot_storyboards(
         str(shot_id).strip() for shot_id in (target_shot_ids or set())
         if str(shot_id).strip()
     }
+    correction_context_by_shot = correction_context_by_shot or {}
+    normalized_target_beats = {
+        str(beat_id).strip()
+        for beat_id in (target_beat_ids or set())
+        if str(beat_id).strip()
+    }
+    if correction_context_by_shot and normalized_targets and not normalized_target_beats:
+        normalized_target_beats = {
+            str(beat_id).strip()
+            for issues in correction_context_by_shot.values()
+            for issue in issues
+            if isinstance(issue, dict)
+            for beat_id in (
+                (issue.get("details") or {}).get("storyboard_ids") or []
+                if isinstance(issue.get("details"), dict)
+                else []
+            )
+            if str(beat_id).strip()
+        }
+    if normalized_target_beats and not normalized_targets:
+        raise RuntimeError("targeted Pxx regeneration requires target_shot_ids")
+    authored_beat_ids_by_shot = {
+        _shot_id(shot, index): {
+            str(beat.get("beat_id") or f"{_shot_id(shot, index)}_P{position:02d}")
+            for position, beat in enumerate(shot.get("storyboard_beats") or [], 1)
+            if isinstance(beat, dict)
+        }
+        for index, shot in enumerate(storyboard.get("shots", []), 1)
+        if isinstance(shot, dict)
+    }
+    valid_target_beats = set().union(
+        *(authored_beat_ids_by_shot.get(shot_id, set()) for shot_id in normalized_targets)
+    ) if normalized_targets else set()
+    unknown_target_beats = normalized_target_beats - valid_target_beats
+    if unknown_target_beats:
+        raise RuntimeError(
+            "targeted storyboard regeneration references unknown Pxx IDs: "
+            + ", ".join(sorted(unknown_target_beats))
+        )
+    missing_target_shots = {
+        shot_id
+        for shot_id in normalized_targets
+        if normalized_target_beats
+        and not (authored_beat_ids_by_shot.get(shot_id, set()) & normalized_target_beats)
+    }
+    if missing_target_shots:
+        raise RuntimeError(
+            "targeted storyboard regeneration has no Pxx target for: "
+            + ", ".join(sorted(missing_target_shots))
+        )
     previous_records = {
         str(record.get("shot_id") or ""): record
         for record in (previous_manifest.get("shots") or [])
@@ -1461,11 +1512,11 @@ def generate_shot_storyboards(
         "model": model,
         "shots": preserved_records,
     }
-    correction_context_by_shot = correction_context_by_shot or {}
     if correction_context_by_shot:
         contract["correction"] = {
             "attempt": int(correction_attempt),
             "shot_ids": sorted(correction_context_by_shot),
+            "storyboard_ids": sorted(normalized_target_beats),
         }
     if aspect_ratio is None:
         aspect_ratio = str(storyboard.get("aspect_ratio") or "").strip()
@@ -1521,6 +1572,8 @@ def generate_shot_storyboards(
 
     previous_storyboard_panel: Path | None = None
     accepted_reference_hashes: set[str] = set()
+    regenerated_panel_ids: list[str] = []
+    preserved_panel_ids: list[str] = []
     try:
         for index, shot in enumerate(storyboard.get("shots", []), 1):
             if not isinstance(shot, dict):
@@ -1616,6 +1669,57 @@ def generate_shot_storyboards(
             last_content_position = max(content_positions, default=0)
             for position, beat in enumerate(beats, 1):
                 beat_id = str(beat.get("beat_id") or f"{shot_id}_P{position:02d}")
+                if normalized_target_beats and beat_id not in normalized_target_beats:
+                    panel_path = beats_dir / f"{beat_id}.png"
+                    panel_sidecar = beats_dir / f"{beat_id}.json"
+                    previous_panels = {
+                        str(value.get("beat_id") or ""): value
+                        for value in ((previous_records.get(shot_id) or {}).get("panels") or [])
+                        if isinstance(value, dict) and value.get("beat_id")
+                    }
+                    previous_panel_record = previous_panels.get(beat_id)
+                    try:
+                        preserved_record = json.loads(
+                            panel_sidecar.read_text(encoding="utf-8")
+                        )
+                        with Image.open(panel_path) as preserved_image:
+                            preserved_image.verify()
+                    except (OSError, ValueError, json.JSONDecodeError) as exc:
+                        raise RuntimeError(
+                            f"targeted storyboard regeneration cannot preserve {beat_id}: {exc}"
+                        ) from exc
+                    if (
+                        not previous_panel_record
+                        or preserved_record.get("status") != "done"
+                        or preserved_record.get("beat_id") != beat_id
+                        or preserved_record.get("image")
+                        != str(panel_path.relative_to(output_dir))
+                        or any(
+                            preserved_record.get(field)
+                            != previous_panel_record.get(field)
+                            for field in (
+                                "prompt_sha256",
+                                "model",
+                                "size_requested",
+                            )
+                        )
+                    ):
+                        raise RuntimeError(
+                            f"targeted storyboard regeneration has untrusted prior panel {beat_id}"
+                        )
+                    beat["storyboard_image"] = preserved_record["image"]
+                    panel_records.append(preserved_record)
+                    panel_paths.append(panel_path)
+                    previous_panel = panel_path
+                    accepted_reference_hashes.update(
+                        str(value)
+                        for value in (
+                            preserved_record.get("reference_image_sha256") or []
+                        )
+                        if str(value)
+                    )
+                    preserved_panel_ids.append(beat_id)
+                    continue
                 beat_cast = _beat_cast_contract(shot, beat, characters)
                 character_references = _character_reference_paths(
                     output_dir,
@@ -1643,6 +1747,15 @@ def generate_shot_storyboards(
                     correction_directives,
                     attempt=correction_attempt,
                 )
+                if (
+                    normalized_target_beats
+                    and beat_id in normalized_target_beats
+                    and correction_context_by_shot
+                    and not correction_directives
+                ):
+                    raise RuntimeError(
+                        f"targeted storyboard regeneration has no correction DTO for {beat_id}"
+                    )
                 panel_prompt = _build_panel_prompt(
                     shot,
                     beat,
@@ -1659,10 +1772,15 @@ def generate_shot_storyboards(
                 panel_sidecar = beats_dir / f"{beat_id}.json"
                 reference_paths: list[Path] = []
                 reference_paths.extend(character_references)
-                if previous_panel is not None:
-                    reference_paths.append(previous_panel)
-                if director_panel is not None:
-                    reference_paths.append(director_panel)
+                # During a semantic correction, canonical text and identity
+                # assets are authoritative.  Previous/director panels can
+                # contain the very premature action or stale location being
+                # corrected, so they must not visually outvote the DTO.
+                if not correction_directives:
+                    if previous_panel is not None:
+                        reference_paths.append(previous_panel)
+                    if director_panel is not None:
+                        reference_paths.append(director_panel)
                 reference_hashes = [
                     hashlib.sha256(path.read_bytes()).hexdigest()
                     for path in reference_paths
@@ -1735,6 +1853,7 @@ def generate_shot_storyboards(
                     panel_record["correction"] = {
                         "attempt": int(correction_attempt),
                         "directives": correction_directives,
+                        "reference_policy": "canonical_identity_only_v1",
                     }
                 cached = False
                 if panel_sidecar.is_file() and panel_path.is_file():
@@ -2029,6 +2148,7 @@ def generate_shot_storyboards(
                 panel_records.append(panel_record)
                 panel_paths.append(panel_path)
                 previous_panel = panel_path
+                regenerated_panel_ids.append(beat_id)
             # The Sxx board is a director/LLM-only nine-grid narrative artifact.
             # It is generated independently from the per-Pxx images and is never
             # eligible as video-model media. Exact grid boundaries and cell IDs
@@ -2146,6 +2266,14 @@ def generate_shot_storyboards(
             int(item.get("panel_count") or 0) for item in contract["shots"]
         )
         contract["total_transition_panels"] = len(bridge_records)
+        if contract.get("correction"):
+            contract["correction"]["regenerated_storyboard_ids"] = sorted(
+                regenerated_panel_ids
+            )
+            contract["correction"]["preserved_storyboard_ids"] = sorted(
+                preserved_panel_ids
+            )
+        contract["regenerated_panel_count"] = len(regenerated_panel_ids)
         _write_json(manifest_path, contract)
         return contract
     except Exception as exc:

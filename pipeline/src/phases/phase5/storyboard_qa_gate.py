@@ -1291,6 +1291,8 @@ def _normalized_visual_attribute(value: Any) -> str:
 _AFFIRMATIVE_NON_ISSUE = re.compile(
     r"(?:\bno\s+(?:visible\s+)?(?:mismatch|difference|deviation|issue)\b|"
     r"\b(?:fully\s+|all\s+)?match(?:es|ing)?\s+(?:the\s+)?canonical\b|"
+    r"\b(?:fully\s+|all\s+)?match(?:es|ing)?\s+(?:the\s+)?"
+    r"(?:required|authored|expected|contracted)\b|"
     r"\bconsistent\s+with\s+(?:the\s+)?canonical\b|"
     r"\b(?:is|are|was|were|has\s+been|have\s+been)\s+"
     r"(?:fully|completely)\s+(?:completed|satisfied|fulfilled|achieved)\b|"
@@ -2479,9 +2481,62 @@ def _correctable_issues(report: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         layer = str(issue.get("layer") or "").upper()
         code = str(issue.get("code") or "").upper()
-        if layer == "L3" and code in {"R1", "R2", "R3", "R4"}:
+        if (
+            layer == "L3"
+            and code in {"R1", "R2", "R3", "R4"}
+            and _correctable_storyboard_ids([issue])
+        ):
             result.append(issue)
     return result
+
+
+def _correctable_storyboard_ids(
+    issues: list[dict[str, Any]],
+) -> list[str]:
+    """Return evidence-backed Pxx IDs without affirmative observations.
+
+    The visual reviewer may attach one shot-level finding to multiple Pxx
+    panels.  A panel is redraw authority only when it has its own visible
+    evidence and that evidence describes a mismatch rather than an explicit
+    match.  This prevents a failing sibling panel from authorizing mutation of
+    an already-correct asset.
+    """
+    storyboard_ids: list[str] = []
+    for issue in issues:
+        details = (
+            issue.get("details")
+            if isinstance(issue.get("details"), dict)
+            else {}
+        )
+        raw_ids = details.get("storyboard_ids") or []
+        if not isinstance(raw_ids, list):
+            raw_ids = [raw_ids]
+        raw_evidence = details.get("panel_evidence") or []
+        if not isinstance(raw_evidence, list):
+            raw_evidence = []
+        observations_by_id: dict[str, list[str]] = {}
+        for evidence in raw_evidence:
+            if not isinstance(evidence, dict):
+                continue
+            storyboard_id = str(evidence.get("shot_id") or "").strip()
+            observed = str(evidence.get("observed") or "").strip()
+            if storyboard_id and observed:
+                observations_by_id.setdefault(storyboard_id, []).append(observed)
+        for raw_id in raw_ids:
+            storyboard_id = str(raw_id or "").strip()
+            if "_P" not in storyboard_id:
+                continue
+            observations = observations_by_id.get(storyboard_id, [])
+            if not observations:
+                continue
+            if all(
+                _is_affirmative_non_issue({"message": observed})
+                for observed in observations
+            ):
+                continue
+            if storyboard_id not in storyboard_ids:
+                storyboard_ids.append(storyboard_id)
+    return sorted(storyboard_ids)
 
 
 def _global_uncorrectable_issues(
@@ -2653,6 +2708,15 @@ def _redraw_failed_storyboards(
         ]
         for shot_id in targets
     }
+    target_storyboard_ids = [
+        storyboard_id
+        for storyboard_id in _correctable_storyboard_ids(issues)
+        if _parent_shot_id(storyboard_id) in targets
+    ]
+    if not target_storyboard_ids:
+        raise RuntimeError(
+            "Phase 5 correction has no evidence-backed Pxx targets"
+        )
     archive = _archive_correction_inputs(output_dir, targets, attempt)
     previous_manifest_path = output_dir / "SHOT_STORYBOARDS.json"
     try:
@@ -2686,6 +2750,7 @@ def _redraw_failed_storyboards(
         correction_context_by_shot=context_by_shot,
         correction_attempt=attempt,
         target_shot_ids=set(targets),
+        target_beat_ids=set(target_storyboard_ids),
     )
     artifact_errors = validate_shot_storyboard_artifacts(output_dir, storyboard)
     if artifact_errors:
@@ -2704,11 +2769,13 @@ def _redraw_failed_storyboards(
         "attempt": attempt,
         "status": "redrawn",
         "shot_ids": targets,
+        "storyboard_ids": target_storyboard_ids,
         "issue_codes": sorted({str(issue.get("code") or "") for issue in issues}),
         "archive": archive,
         "restored_cinematic_aliases": restored_cinematic_aliases,
         "total_boards": contract.get("total_boards"),
         "total_panels": contract.get("total_panels"),
+        "regenerated_panel_count": contract.get("regenerated_panel_count", 0),
         "timestamp": datetime.now(UTC).isoformat(),
     }
     attempt_dir = output_dir / archive["archive_dir"]
@@ -2782,10 +2849,10 @@ def run_storyboard_qa_with_correction(
         if result.get("gate_passed") is True or result.get("status") != "error":
             break
         issues = _correctable_issues(result)
+        target_storyboard_ids = _correctable_storyboard_ids(issues)
         target_ids = sorted({
-            shot_id
-            for issue in issues
-            for shot_id in (issue.get("shot_ids") or [])
+            _parent_shot_id(storyboard_id)
+            for storyboard_id in target_storyboard_ids
         })
         if not issues or not target_ids:
             break
@@ -2823,6 +2890,7 @@ def run_storyboard_qa_with_correction(
             "attempt": attempt,
             "status": "passed" if result.get("gate_passed") is True else "rejected",
             "shot_ids": target_ids,
+            "storyboard_ids": target_storyboard_ids,
             "before_grade": before_grade,
             "after_grade": result.get("grade"),
             "redraw": redraw_receipt,
