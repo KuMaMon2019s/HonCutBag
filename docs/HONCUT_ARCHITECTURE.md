@@ -158,6 +158,8 @@ Phase 1 的骨架账本按 screenplay `sequence_id` 预先分配连续且互不�
 
 Adaptation Engine 是具体镜头语言的唯一 owner。除 `shot_size`、`camera_movement`、`lens_mm`、`lighting_key` 等既有字段外，canonical shot 必须写入受控 `camera_angle`（`eye_level/low/high/dutch/over_shoulder/aerial/bird/worm`）；Director 意图不得预选该值。下游 Storyboard、二级 Pxx（当前 `honcut.secondary-storyboard.v12`）、Phase 4 元数据与生成 Prompt 只能保留或翻译这个 canonical 值，不得再次推断角度。每个 Pxx 还必须写 canonical `character_ids`，只包含其自身起始状态、动作与结束状态中可见的已绑定角色；Sxx 级角色全集只是上限，禁止覆盖格级可见角色并令尚未入场的人物提前出现。未知 authored 值、缺失/重复/越界或与格级事实不一致的 Pxx 角色 ID 必须在 Phase 1 fail closed；旧产物仅可在明确兼容边界规范化机位或投影格级角色，生产代码只写 v12 canonical 字段。
 
+Phase 5 的 L3 视觉审查使用 `honcut.phase5-l3-semantic-projection.v2`。角色可见性必须按 Pxx 的 canonical `character_ids` 投影，显式空数组代表该格没有具名角色；Sxx 级 `who/character_ids/participant_refs` 不得进入 L3 语义投影并覆盖格级合同。按整镜附带的 canonical 角色参考图只用于该镜内相关角色的身份比较，不构成角色必须出现在每个 Pxx 的证据。
+
 当 duration-scaled event plan 在同一来源事件内仅保留部分 micro action 时，未选择的动作只能保留在 `production_action_selection`、来源哈希和审计账中。生产 beat 与 canonical shot 的 `what/visual/texture_keywords`、`honcut.production-director-intent.v1` 以及后续 QA/Provider Prompt 只能重新投影已选择动作；禁止从来源事件的宽泛 `what/visual` 或 sequence 级 Director 文案恢复被省略动作。选择索引、生产动作和来源血缘不一致时必须 fail closed。
 
 Phase 1 的 adaptation 对任意事件数量都固定执行分层骨架与分批镜头展开；生产路径不存在按事件数回退为单次 Prompt 的分支，也不得通过环境变量重新启用旧单次调用路径。分层 checkpoint 是唯一可恢复的 adaptation 中间状态；当前 schema 为 `honcut.layered-adaptation.v15`，旧版不得跨导演意图、生产 Director 投影、机位角度、生产事件动作账、生产剧本账、语义容量、连续前置闭包或事件顺序规则复用。

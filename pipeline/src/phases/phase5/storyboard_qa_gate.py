@@ -1448,9 +1448,6 @@ def _r1_attribute_evidence(
 _L3_SHOT_CONTRACT_FIELDS = (
     "source_sequence_ids",
     "source_events",
-    "who",
-    "character_ids",
-    "participant_refs",
     "where",
     "what",
     "visual",
@@ -1469,6 +1466,7 @@ _L3_SHOT_CONTRACT_FIELDS = (
 )
 _L3_BEAT_CONTRACT_FIELDS = (
     "beat_id",
+    "character_ids",
     "action",
     "micro_actions",
     "start_state",
@@ -1503,14 +1501,31 @@ def _l3_storyboard_contract(storyboard: dict[str, Any]) -> dict[str, Any]:
             "shot_id": _shot_id(shot, index),
             **_selected_fields(shot, _L3_SHOT_CONTRACT_FIELDS),
         }
-        projected["storyboard_beats"] = [
-            _selected_fields(beat, _L3_BEAT_CONTRACT_FIELDS)
-            for beat in (shot.get("storyboard_beats") or [])
-            if isinstance(beat, dict)
-        ]
+        projected_beats = []
+        for beat in (shot.get("storyboard_beats") or []):
+            if not isinstance(beat, dict):
+                continue
+            projected_beat = _selected_fields(beat, _L3_BEAT_CONTRACT_FIELDS)
+            if "character_ids" in beat:
+                raw_character_ids = beat.get("character_ids")
+                if not isinstance(raw_character_ids, list):
+                    raise ValueError("L3 beat character_ids must be an array")
+                character_ids = [
+                    str(value).strip()
+                    for value in raw_character_ids
+                    if str(value).strip()
+                ]
+                if character_ids != list(dict.fromkeys(character_ids)):
+                    raise ValueError(
+                        "L3 beat character_ids must be unique and ordered"
+                    )
+                # An explicit empty array is a meaningful no-character contract.
+                projected_beat["character_ids"] = character_ids
+            projected_beats.append(projected_beat)
+        projected["storyboard_beats"] = projected_beats
         shots.append(projected)
     return {
-        "schema": "honcut.phase5-l3-semantic-projection.v1",
+        "schema": "honcut.phase5-l3-semantic-projection.v2",
         "shots": shots,
     }
 
@@ -1557,6 +1572,7 @@ INPUT CONTRACT:
 - The overview grid is for cross-shot continuity only. Use per-shot boards for fine identity, clothing, prop, and action evidence.
 - Never swap expected and observed: canonical character inputs define EXPECTED; storyboard boards define OBSERVED. Never call a character reference a storyboard image.
 - Associate observations only with the in-frame Sxx or Sxx_Pxx badge; never infer an ID from a neighbouring cell or row position.
+- Each Pxx character_ids array is the exact visible named cast for that panel; an empty array means no named character should appear. Shot-wide cast is intentionally excluded because it is only a superset across the shot. A canonical reference attached for comparison does not imply that character appears in every Pxx.
 
 Apply red lines R1-R4: R1 character identity/gender/build/clothing continuity against canonical references; R2 time-of-day and lighting continuity; R3 scene/action continuity; R4 storyboard-to-image semantic fidelity. Do not perform face recognition or infer a public identity from appearance alone. Each Pxx image represents only its authored action and must progress from the previous Pxx without pose reset or premature future action.
 

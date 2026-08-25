@@ -4891,6 +4891,53 @@ def test_phase5_l3_prompt_uses_compact_semantic_projection(tmp_path):
     assert "canonical look 4" in client.prompt
 
 
+def test_phase5_l3_uses_pxx_cast_instead_of_shot_wide_cast():
+    storyboard = {
+        "secondary_storyboard_version": "honcut.secondary-storyboard.v12",
+        "shots": [{
+            "id": "S01",
+            "who": ["lead"],
+            "character_ids": ["lead"],
+            "participant_refs": [{"character_id": "lead"}],
+            "where": "rainy station platform",
+            "storyboard_beats": [
+                {
+                    "beat_id": "S01_P01",
+                    "character_ids": [],
+                    "action": "the train enters the empty platform",
+                },
+                {
+                    "beat_id": "S01_P02",
+                    "character_ids": ["lead"],
+                    "action": "lead waits beside the open door",
+                },
+            ],
+        }],
+    }
+
+    projection = storyboard_qa_gate._l3_storyboard_contract(storyboard)
+    shot = projection["shots"][0]
+    prompt = storyboard_qa_gate._l3_review_prompt(
+        reference_inputs=[],
+        storyboard_inputs=[],
+        overview_input={},
+        canonical_contracts={"lead": "same lead identity"},
+        storyboard=storyboard,
+        visual_style="cinematic realism",
+        valid_storyboard_ids=["S01_P01", "S01_P02"],
+    )
+
+    assert projection["schema"] == "honcut.phase5-l3-semantic-projection.v2"
+    assert "who" not in shot
+    assert "character_ids" not in shot
+    assert "participant_refs" not in shot
+    assert [
+        beat["character_ids"] for beat in shot["storyboard_beats"]
+    ] == [[], ["lead"]]
+    assert "exact visible named cast" in prompt
+    assert "does not imply that character appears in every Pxx" in prompt
+
+
 def test_director_board_keeps_motion_metadata_out_of_pixels():
     storyboard = {
         "shots": [{
