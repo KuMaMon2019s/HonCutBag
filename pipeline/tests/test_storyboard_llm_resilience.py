@@ -4,6 +4,9 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+from pydantic import ValidationError
+
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -89,7 +92,22 @@ def test_call_llm_uses_streaming_and_joins_chunks(monkeypatch):
     assert json.loads(result)["prompt"] == "A shot"
     assert calls[0]["stream"] is True
     assert calls[0]["max_tokens"] == 16000
+    assert calls[0]["response_format"]["type"] == "json_schema"
+    assert calls[0]["response_format"]["json_schema"]["strict"] is True
     assert "测试风格" in calls[0]["messages"][0]["content"]
+
+
+def test_storyboard_parser_repairs_syntax_but_keeps_schema_strict():
+    parsed = storyboard_generator._parse_llm_response(
+        '{"prompt":"A cinematic shot" "caption":"测试镜头"}'
+    )
+
+    assert parsed == {"prompt": "A cinematic shot", "caption": "测试镜头"}
+
+    with pytest.raises(ValidationError):
+        storyboard_generator._parse_llm_response(
+            '{"prompt":"A cinematic shot","caption":"测试镜头","extra":"reject"}'
+        )
 
 
 def test_shot_wall_clock_timeout_uses_fallback(monkeypatch, capsys):

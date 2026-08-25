@@ -11,6 +11,7 @@ import json
 import re
 from typing import Literal, TypeVar
 
+from json_repair import repair_json
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -181,6 +182,11 @@ class CharacterUnderstandingBatch(StrictUnderstandingModel):
     characters: list[CharacterUnderstanding]
 
 
+class StoryboardPromptUnderstanding(StrictUnderstandingModel):
+    prompt: str
+    caption: str
+
+
 class SemanticMachineSemantics(StrictUnderstandingModel):
     entity_type: Literal["character"] = "character"
     gender: Literal["male", "female", "nonbinary", "unknown"] = "unknown"
@@ -338,7 +344,7 @@ UnderstandingT = TypeVar("UnderstandingT", bound=BaseModel)
 
 
 def _json_text(raw: str) -> str:
-    """Remove one complete Markdown fence, never salvage partial JSON."""
+    """Remove one complete Markdown fence without scanning for JSON fragments."""
 
     text = str(raw).strip()
     fenced = re.fullmatch(
@@ -349,13 +355,127 @@ def _json_text(raw: str) -> str:
     return fenced.group(1).strip() if fenced else text
 
 
+def _raise_document_error(message: str, text: str, position: int = 0) -> None:
+    raise json.JSONDecodeError(message, text, max(0, min(position, len(text))))
+
+
+def _validate_repair_candidate(text: str) -> None:
+    """Allow syntax repair for exactly one bounded JSON document.
+
+    ``json-repair`` can intentionally recover stray prose, multiple top-level
+    fragments, and value-level truncation.  Those behaviours are unsafe at a
+    production contract boundary because they can turn an incomplete QA list
+    into an empty passing list.  HonCut permits punctuation/delimiter repair,
+    but never document scanning or incomplete-value salvage.
+    """
+
+    if not text:
+        _raise_document_error("empty structured response", text)
+
+    decoder = json.JSONDecoder()
+    try:
+        _, end = decoder.raw_decode(text)
+    except json.JSONDecodeError:
+        pass
+    else:
+        if text[end:].strip():
+            _raise_document_error(
+                "structured response contains trailing content",
+                text,
+                end,
+            )
+        return
+
+    if text[0] not in "[{":
+        _raise_document_error(
+            "structured response must start with one JSON container",
+            text,
+        )
+
+    stack: list[tuple[str, int]] = []
+    in_string = False
+    escaped = False
+    matching_opener = {"}": "{", "]": "["}
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+            continue
+        if char in "[{":
+            stack.append((char, index))
+            continue
+        if char not in "]}":
+            continue
+        opener = matching_opener[char]
+        if not any(value == opener for value, _ in stack):
+            _raise_document_error(
+                "structured response has an unmatched closing delimiter",
+                text,
+                index,
+            )
+        while stack and stack[-1][0] != opener:
+            _, missing_closer_position = stack.pop()
+            completed_value = text[missing_closer_position + 1 : index].strip()
+            if not completed_value or completed_value[-1] in "{[:,":
+                _raise_document_error(
+                    "structured response ends before a nested value is complete",
+                    text,
+                    index,
+                )
+        stack.pop()
+        if not stack and text[index + 1 :].strip():
+            _raise_document_error(
+                "structured response contains multiple documents or trailing prose",
+                text,
+                index + 1,
+            )
+
+    if in_string or escaped:
+        _raise_document_error(
+            "structured response ends inside a string",
+            text,
+            len(text),
+        )
+    if text[-1] in "{[:," or re.search(
+        r"(?:tru|fals|nul|[-+.eE])$",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        _raise_document_error(
+            "structured response ends before a value is complete",
+            text,
+            len(text),
+        )
+
+
 def parse_structured_output(
     raw: str,
     response_model: type[UnderstandingT],
 ) -> UnderstandingT:
-    """Validate one complete model response against its business DTO."""
+    """Repair bounded JSON syntax, then validate the strict business DTO."""
 
-    payload = json.loads(_json_text(raw))
+    text = _json_text(raw)
+    _validate_repair_candidate(text)
+    try:
+        payload = repair_json(
+            text,
+            return_objects=True,
+            ensure_ascii=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise json.JSONDecodeError(
+            "structured response JSON repair failed",
+            text,
+            0,
+        ) from exc
     return response_model.model_validate(payload)
 
 
@@ -415,6 +535,7 @@ __all__ = [
     "IdentityDetailUnderstanding",
     "EventUnderstandingBatch",
     "ShotSemanticReview",
+    "StoryboardPromptUnderstanding",
     "StoryboardVisualUnderstanding",
     "StoryOrderUnderstanding",
     "native_json_schema_format",

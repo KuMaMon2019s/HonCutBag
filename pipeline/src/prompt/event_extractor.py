@@ -32,6 +32,7 @@ from openai import OpenAI
 from schemas.understanding import (
     EventUnderstandingBatch,
     native_chat_json_schema_format,
+    parse_structured_output,
 )
 from utils.action_units import annotate_event_motion_modes
 from utils.body_action_contracts import (
@@ -432,20 +433,10 @@ def _normalize_event(event: Dict[str, Any], source_content: str = "") -> Dict[st
 
 def _parse_events(response: str, source_content: str = "") -> List[Dict[str, Any]]:
     """Validate the complete native ``{"events": [...]}`` response."""
-    text = response.strip()
-
-    # 尝试提取 ```json ... ``` 代码块
-    if "```" in text:
-        # 匹配 ```json 或 ``` 包裹的内容
-        import re
-        match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', text, re.DOTALL)
-        if match:
-            text = match.group(1).strip()
-
-    # 尝试解析 JSON
-    parsed = json.loads(text)
-
-    parsed = EventUnderstandingBatch.model_validate(parsed).model_dump()["events"]
+    parsed = parse_structured_output(
+        response,
+        EventUnderstandingBatch,
+    ).model_dump()["events"]
 
     for event in parsed:
         _normalize_event(event, source_content)

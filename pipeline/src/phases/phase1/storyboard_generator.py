@@ -36,6 +36,11 @@ from typing import List, Dict, Any, Optional
 from openai import APIConnectionError, OpenAI
 
 from prompt.eight_layer_summary import build_subject_summary
+from schemas.understanding import (
+    StoryboardPromptUnderstanding,
+    native_chat_json_schema_format,
+    parse_structured_output,
+)
 from utils.config import ToolPaths
 from utils.pipeline_config import load_config
 from utils.visual_style_spec import VisualStyle, parse_visual_style
@@ -242,6 +247,9 @@ def _call_llm(user_prompt: str, visual_style_text: Optional[str] = None) -> str:
         max_tokens=16000,
         wall_timeout=LLM_TIMEOUT,
         idle_timeout=LLM_IDLE_TIMEOUT,
+        response_format=native_chat_json_schema_format(
+            StoryboardPromptUnderstanding
+        ),
         _client=client,
     )
 
@@ -259,26 +267,10 @@ def _parse_llm_response(response: str) -> Dict[str, str]:
     Raises:
         ValueError: 无法解析为有效 JSON 或缺少必要字段
     """
-    text = response.strip()
-
-    # 尝试提取 ```json ... ``` 代码块
-    if "```" in text:
-        match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', text, re.DOTALL)
-        if match:
-            text = match.group(1).strip()
-
-    # 解析 JSON
-    parsed = json.loads(text)
-
-    if not isinstance(parsed, dict):
-        raise ValueError(f"期望 JSON 对象，得到 {type(parsed).__name__}")
-
-    if "prompt" not in parsed:
-        raise ValueError("缺少 'prompt' 字段")
-    if "caption" not in parsed:
-        raise ValueError("缺少 'caption' 字段")
-
-    return {"prompt": parsed["prompt"], "caption": parsed["caption"]}
+    return parse_structured_output(
+        response,
+        StoryboardPromptUnderstanding,
+    ).model_dump()
 
 
 # ─── 辅助函数 ────────────────────────────────────────────────────────────────

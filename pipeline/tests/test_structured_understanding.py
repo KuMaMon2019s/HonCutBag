@@ -44,6 +44,44 @@ def test_structured_parser_rejects_unknown_fields_and_invalid_enums():
         parse_structured_output(raw, ShotSemanticReview)
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected_issues"),
+    [
+        ('{"verdict":"pass" "issues":[],"confidence":0.8}', []),
+        ('{"verdict":"pass","issues":[],"confidence":0.8', []),
+        ('{"verdict":"pass","confidence":0.8,"issues":["minor"}', ["minor"]),
+        ('```json\n{"verdict":"pass" "issues":[],"confidence":0.8}\n```', []),
+    ],
+)
+def test_structured_parser_repairs_single_document_json_syntax(
+    raw,
+    expected_issues,
+):
+    parsed = parse_structured_output(raw, ShotSemanticReview)
+
+    assert parsed.verdict == "pass"
+    assert parsed.issues == expected_issues
+    assert parsed.confidence == 0.8
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"verdict":"pass","issues":[],"confidence":0.8} trailing prose',
+        (
+            '{"verdict":"pass","issues":[],"confidence":0.8}'
+            '{"verdict":"fail","issues":[],"confidence":0.1}'
+        ),
+        '{"verdict":"pass","issues":[',
+        '{"verdict":"pass","confidence":0.8,"issues":[}',
+        '{"verdict":"pass","issues":[],"confidence":tru',
+    ],
+)
+def test_structured_parser_rejects_unsafe_document_salvage(raw):
+    with pytest.raises((json.JSONDecodeError, ValidationError)):
+        parse_structured_output(raw, ShotSemanticReview)
+
+
 def test_multimodal_client_sends_native_json_schema_and_returns_typed_model(tmp_path):
     image = tmp_path / "frame.png"
     image.write_bytes(b"image")
