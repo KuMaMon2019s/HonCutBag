@@ -5178,3 +5178,34 @@ def test_phase5_positive_clause_does_not_hide_a_contrasted_mismatch(tmp_path):
     assert issues[0]["message"].endswith("violates the proportion lock")
     assert status["filtered_non_issue_count"] == 0
     assert status["accepted_issue_count"] == 1
+
+
+def test_phase5_completed_action_sequence_is_not_an_issue():
+    completed = {
+        "red_line": "R4",
+        "severity": "moderate",
+        "mismatch_type": "action",
+        "message": (
+            "The contracted sequence of actions is fully completed and the "
+            "required end state is reached"
+        ),
+    }
+    incomplete = {
+        **completed,
+        "message": "The contracted sequence of actions is not fully completed",
+    }
+    contrasted = {
+        **completed,
+        "message": (
+            "The contracted sequence of actions is fully completed, but the "
+            "required end state is visibly wrong"
+        ),
+    }
+    completed_zh = {**completed, "message": "规定动作序列均已完成"}
+    incomplete_zh = {**completed, "message": "规定动作序列未全部完成"}
+
+    assert storyboard_qa_gate._is_affirmative_non_issue(completed) is True
+    assert storyboard_qa_gate._is_affirmative_non_issue(incomplete) is False
+    assert storyboard_qa_gate._is_affirmative_non_issue(contrasted) is False
+    assert storyboard_qa_gate._is_affirmative_non_issue(completed_zh) is True
+    assert storyboard_qa_gate._is_affirmative_non_issue(incomplete_zh) is False

@@ -1277,7 +1277,10 @@ _AFFIRMATIVE_NON_ISSUE = re.compile(
     r"(?:\bno\s+(?:visible\s+)?(?:mismatch|difference|deviation|issue)\b|"
     r"\b(?:fully\s+|all\s+)?match(?:es|ing)?\s+(?:the\s+)?canonical\b|"
     r"\bconsistent\s+with\s+(?:the\s+)?canonical\b|"
+    r"\b(?:is|are|was|were|has\s+been|have\s+been)\s+"
+    r"(?:fully|completely)\s+(?:completed|satisfied|fulfilled|achieved)\b|"
     r"(?:没有|无)(?:明显)?(?:不一致|不匹配|不符|偏差|差异|问题)|"
+    r"(?:均已|已经|已全部|已完整|已完全)(?:完成|达成|满足)|"
     r"(?:符合|匹配)(?:原始|规范|标准|角色|服装|颜色|设定|合同|契约))",
     re.IGNORECASE,
 )
