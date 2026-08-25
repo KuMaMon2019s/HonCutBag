@@ -2815,6 +2815,10 @@ def test_phase1_canonical_storyboard_preserves_event_partition_audit(monkeypatch
             "character_id": "operator",
         }],
         "source_events": [2],
+        "source_event_casts": [{
+            "source_event_id": 2,
+            "character_ids": ["operator"],
+        }],
         "dropped_source_events": [3, 4],
         "source_event_slices": [
             {
@@ -2829,6 +2833,7 @@ def test_phase1_canonical_storyboard_preserves_event_partition_audit(monkeypatch
     canonical = storyboard_generator._generate_single_shot(shot, 1, 1)
 
     assert canonical["source_events"] == [2]
+    assert canonical["source_event_casts"] == shot["source_event_casts"]
     assert canonical["dropped_source_events"] == [3, 4]
     assert canonical["source_event_slices"] == shot["source_event_slices"]
     assert canonical["character_ids"] == ["operator"]
