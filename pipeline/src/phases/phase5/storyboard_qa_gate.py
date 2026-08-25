@@ -19,6 +19,11 @@ from pathlib import Path
 from typing import Any
 
 from clients.ark_multimodal_client import ArkMultimodalClient
+from phases.phase1.adaptation_engine import (
+    DURATION_SCALED_EVENT_PLAN_SCHEMA,
+    SCREENPLAY_PLAN_SCHEMA,
+    terminal_outcome_event_ids,
+)
 from phases.phase1.storyboard_beats import (
     secondary_contract_declared,
     secondary_storyboard_contract_errors,
@@ -540,7 +545,7 @@ def run_generation_capacity_checks(
         plan_schema = str(screenplay_plan.get("schema") or "").strip()
         if plan_schema == "honcut.screenplay-plan.v1":
             production_event_ids = None
-        elif plan_schema != "honcut.screenplay-plan.v4":
+        elif plan_schema != SCREENPLAY_PLAN_SCHEMA:
             issues.append(_issue(
                 "L1",
                 "severe",
@@ -588,6 +593,11 @@ def run_generation_capacity_checks(
                 if isinstance(production_ledger, dict)
                 else None
             )
+            terminal_outcome_ids = (
+                production_ledger.get("terminal_outcome_source_event_ids")
+                if isinstance(production_ledger, dict)
+                else None
+            )
             plan_beats = screenplay_plan.get("beats")
             projected_beats = [
                 beat
@@ -621,10 +631,15 @@ def run_generation_capacity_checks(
                 isinstance(base_mandatory_ids, list)
                 and isinstance(mandatory_ids, list)
                 and isinstance(causal_predecessor_ids, list)
+                and isinstance(terminal_outcome_ids, list)
                 and all(isinstance(value, int) for value in mandatory_ids)
                 and all(isinstance(value, int) for value in base_mandatory_ids)
                 and all(isinstance(value, int) for value in causal_predecessor_ids)
+                and all(isinstance(value, int) for value in terminal_outcome_ids)
                 and set(base_mandatory_ids).isdisjoint(causal_predecessor_ids)
+                and set(terminal_outcome_ids)
+                == terminal_outcome_event_ids(source_events)
+                and set(terminal_outcome_ids) <= set(base_mandatory_ids)
                 and set(mandatory_ids)
                 == set(base_mandatory_ids) | set(causal_predecessor_ids)
                 and record_mandatory_ids == set(mandatory_ids)
@@ -632,7 +647,7 @@ def run_generation_capacity_checks(
             )
             if (
                 not isinstance(scaling, dict)
-                or scaling.get("schema") != "honcut.duration-scaled-event-plan.v2"
+                or scaling.get("schema") != DURATION_SCALED_EVENT_PLAN_SCHEMA
                 or not isinstance(records, list)
                 or record_ids != list(range(1, len(source_events) + 1))
                 or not statuses <= {"kept", "whole_event_omitted"}

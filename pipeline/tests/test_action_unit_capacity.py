@@ -1196,14 +1196,14 @@ def test_60s_scaled_screenplay_reconciles_source_pressure_into_executable_ledger
         source_events_hash="source-events-sha256",
     )
 
-    assert screenplay_plan["schema"] == "honcut.screenplay-plan.v4"
+    assert screenplay_plan["schema"] == "honcut.screenplay-plan.v5"
     assert screenplay_plan["source_ledger"]["capacity_status"] == (
         "screenplay_compression_required"
     )
     assert screenplay_plan["production_ledger"] == {
         "capacity_status": "fits_story_clock",
         "duration_scaling_status": "applied",
-        "event_action_scaling_schema": "honcut.duration-scaled-event-plan.v2",
+        "event_action_scaling_schema": "honcut.duration-scaled-event-plan.v3",
         "intra_event_scaling_applied": False,
         "intra_event_omitted_micro_action_count": 0,
         "event_count": 6,
@@ -1212,6 +1212,7 @@ def test_60s_scaled_screenplay_reconciles_source_pressure_into_executable_ledger
         "kept_source_event_ids": [1, 2, 3, 5, 6, 7],
         "omitted_source_event_ids": [4],
         "base_mandatory_source_event_ids": [1, 7],
+        "terminal_outcome_source_event_ids": [7],
         "mandatory_source_event_ids": [1, 7],
         "causal_predecessor_source_event_ids": [],
     }
@@ -1262,7 +1263,7 @@ def test_duration_scaled_event_plan_fits_dense_mandatory_actions_without_mutatin
     )
 
     assert events == source_snapshot
-    assert scaling_plan["schema"] == "honcut.duration-scaled-event-plan.v2"
+    assert scaling_plan["schema"] == "honcut.duration-scaled-event-plan.v3"
     assert scaling_plan["source_generation_action_units"] == 46
     assert scaling_plan["production_generation_action_units"] < 46
     assert scaling_plan["intra_event_scaling_applied"] is True
@@ -1290,6 +1291,59 @@ def test_duration_scaled_event_plan_fits_dense_mandatory_actions_without_mutatin
         production_events[event_id - 1]["what"] == events[event_id - 1]["what"]
         for event_id in mandatory_ids
     )
+
+
+def test_terminal_outcome_anchor_survives_role_drift_and_closes_predecessors():
+    events = [
+        {
+            "sequence_id": "SEQ001",
+            "event_role": "action_chain",
+            "continuity_before": "cut",
+            "what": "the journey begins",
+            "micro_actions": ["the vehicle departs"],
+        },
+        {
+            "sequence_id": "SEQ001",
+            "event_role": "action_chain",
+            "continuity_before": "continuous",
+            "what": "the obstacle appears",
+            "micro_actions": ["the obstacle blocks the route"],
+        },
+        {
+            "sequence_id": "SEQ001",
+            "event_role": "action_chain",
+            "continuity_before": "continuous",
+            "what": "the obstacle is resolved",
+            "micro_actions": ["the route opens"],
+        },
+        {
+            "sequence_id": "SEQ001",
+            "event_role": "transition",
+            "continuity_before": "continuous",
+            "what": "the final destination becomes visible",
+            "micro_actions": [],
+        },
+    ]
+
+    production_events, scaling = engine._build_duration_scaled_event_plan(
+        events,
+        target_duration=20,
+        beat_count=5,
+        effective_shot_duration=4,
+    )
+
+    assert engine.terminal_outcome_event_ids(events) == {4}
+    assert engine._base_mandatory_adaptation_event_ids(events) == {4}
+    assert engine._mandatory_adaptation_event_ids(events) == {1, 2, 3, 4}
+    assert len(production_events) == 4
+    records = scaling["events"]
+    assert [record["mandatory"] for record in records] == [True] * 4
+    assert [record["mandatory_reason"] for record in records] == [
+        "continuous_predecessor",
+        "continuous_predecessor",
+        "continuous_predecessor",
+        "terminal_outcome",
+    ]
 
 
 def test_mandatory_event_protects_continuous_predecessors_until_cut_boundary():
@@ -1332,7 +1386,7 @@ def test_mandatory_event_protects_continuous_predecessors_until_cut_boundary():
         },
     ]
 
-    assert engine._mandatory_adaptation_event_ids(events) == {2, 3, 4}
+    assert engine._mandatory_adaptation_event_ids(events) == {2, 3, 4, 5}
 
     production_events, scaling_plan = engine._build_duration_scaled_event_plan(
         events,
@@ -1342,12 +1396,13 @@ def test_mandatory_event_protects_continuous_predecessors_until_cut_boundary():
     )
 
     assert len(production_events) == len(events)
-    assert scaling_plan["mandatory_source_event_ids"] == [2, 3, 4]
+    assert scaling_plan["terminal_outcome_source_event_ids"] == [5]
+    assert scaling_plan["mandatory_source_event_ids"] == [2, 3, 4, 5]
     assert {
         record["source_event_id"]
         for record in scaling_plan["events"]
         if record["mandatory"]
-    } == {2, 3, 4}
+    } == {2, 3, 4, 5}
 
 
 def test_optional_kept_event_cannot_orphan_its_continuous_predecessor():
@@ -1479,7 +1534,7 @@ def test_production_projection_excludes_unselected_intra_event_actions():
         "end_state": "blue current covers the cracked floor",
         "continuity_before": "continuous",
         "production_action_selection": {
-            "schema": "honcut.duration-scaled-event-plan.v2",
+            "schema": engine.DURATION_SCALED_EVENT_PLAN_SCHEMA,
             "source_event_id": 9,
             "selected_source_micro_action_indexes": [4],
             "omitted_source_micro_action_indexes": [1, 2, 3],
@@ -1617,9 +1672,9 @@ def test_screenplay_plan_records_intra_event_action_lineage():
         duration_scaled_event_plan=scaling_plan,
     )
 
-    assert screenplay_plan["schema"] == "honcut.screenplay-plan.v4"
+    assert screenplay_plan["schema"] == "honcut.screenplay-plan.v5"
     assert screenplay_plan["production_ledger"]["event_action_scaling_schema"] == (
-        "honcut.duration-scaled-event-plan.v2"
+        "honcut.duration-scaled-event-plan.v3"
     )
     assert screenplay_plan["beats"][0]["production_action_refs"] == [{
         "source_event_id": 1,
@@ -1651,6 +1706,7 @@ def test_phase5_capacity_uses_duration_scaled_production_event_ledger():
         "beats": [],
         "production_ledger": {
             "base_mandatory_source_event_ids": [],
+            "terminal_outcome_source_event_ids": [],
             "mandatory_source_event_ids": [],
             "causal_predecessor_source_event_ids": [],
         },
@@ -1689,7 +1745,11 @@ def test_phase5_capacity_uses_duration_scaled_production_event_ledger():
 
 @pytest.mark.parametrize(
     "old_schema",
-    ["honcut.screenplay-plan.v2", "honcut.screenplay-plan.v3"],
+    [
+        "honcut.screenplay-plan.v2",
+        "honcut.screenplay-plan.v3",
+        "honcut.screenplay-plan.v4",
+    ],
 )
 def test_phase5_rejects_pre_projection_screenplay_plan_schema(old_schema):
     issues = run_generation_capacity_checks(
@@ -1714,6 +1774,7 @@ def test_phase5_rejects_misaligned_production_director_projection():
         "schema": engine.SCREENPLAY_PLAN_SCHEMA,
         "production_ledger": {
             "base_mandatory_source_event_ids": [],
+            "terminal_outcome_source_event_ids": [],
             "mandatory_source_event_ids": [],
             "causal_predecessor_source_event_ids": [],
             "production_director_intent_schema": (
@@ -1742,6 +1803,48 @@ def test_phase5_rejects_misaligned_production_director_projection():
     issues = run_generation_capacity_checks(
         {"shots": []},
         {"events": [{"action_unit_id": "AU001"}]},
+        screenplay_plan,
+    )
+
+    assert "screenplay_plan_lineage_invalid" in {
+        issue["code"] for issue in issues
+    }
+
+
+def test_phase5_rejects_missing_terminal_outcome_lineage():
+    events = [
+        {"what": "the story begins"},
+        {"what": "the visible ending resolves the story"},
+    ]
+    screenplay_plan = {
+        "schema": engine.SCREENPLAY_PLAN_SCHEMA,
+        "production_ledger": {
+            "base_mandatory_source_event_ids": [2],
+            "terminal_outcome_source_event_ids": [],
+            "mandatory_source_event_ids": [2],
+            "causal_predecessor_source_event_ids": [],
+        },
+        "event_action_scaling": {
+            "schema": engine.DURATION_SCALED_EVENT_PLAN_SCHEMA,
+            "events": [
+                {
+                    "source_event_id": 1,
+                    "production_status": "kept",
+                    "mandatory": False,
+                },
+                {
+                    "source_event_id": 2,
+                    "production_status": "kept",
+                    "mandatory": True,
+                },
+            ],
+        },
+        "beats": [],
+    }
+
+    issues = run_generation_capacity_checks(
+        {"shots": []},
+        {"events": events},
         screenplay_plan,
     )
 

@@ -2153,14 +2153,40 @@ def _event_is_mandatory_for_adaptation(event: Dict[str, Any]) -> bool:
     return role in _MANDATORY_ADAPTATION_EVENT_ROLES or bool(event.get("dramatic_turn"))
 
 
+def terminal_outcome_event_ids(events: List[Dict[str, Any]]) -> set[int]:
+    """Protect the final authored narrative fact even when its role drifts.
+
+    Event extraction already removes production-only directives.  Walking
+    backward still avoids anchoring a malformed empty record while preserving
+    a terminal transition or resolution that has visible state but no atomic
+    micro-action.
+    """
+    for event_id in range(len(events), 0, -1):
+        event = events[event_id - 1]
+        has_visible_fact = any(
+            str(event.get(field) or "").strip()
+            for field in (
+                "what",
+                "visual",
+                "source_excerpt",
+                "start_state",
+                "end_state",
+            )
+        ) or bool(event.get("micro_actions") or event.get("lines"))
+        if has_visible_fact:
+            return {event_id}
+    return set()
+
+
 def _base_mandatory_adaptation_event_ids(
     events: List[Dict[str, Any]],
 ) -> set[int]:
-    return {
+    structural_ids = {
         event_id
         for event_id, event in enumerate(events, 1)
         if _event_is_mandatory_for_adaptation(event)
     }
+    return structural_ids | terminal_outcome_event_ids(events)
 
 
 def _continuous_predecessor_event_ids(
@@ -2535,7 +2561,7 @@ def _sequence_beat_plan(
     ]
 
 
-DURATION_SCALED_EVENT_PLAN_SCHEMA = "honcut.duration-scaled-event-plan.v2"
+DURATION_SCALED_EVENT_PLAN_SCHEMA = "honcut.duration-scaled-event-plan.v3"
 DURATION_SCALED_ACTION_SELECTION_SCHEMA = (
     "honcut.duration-scaled-action-selection.v1"
 )
@@ -2686,7 +2712,15 @@ def _build_duration_scaled_event_plan(
 
     source_contracts = _source_event_generation_contracts(events)
 
-    base_mandatory_event_ids = _base_mandatory_adaptation_event_ids(events)
+    structural_mandatory_event_ids = {
+        event_id
+        for event_id, event in enumerate(events, 1)
+        if _event_is_mandatory_for_adaptation(event)
+    }
+    terminal_event_ids = terminal_outcome_event_ids(events)
+    base_mandatory_event_ids = (
+        structural_mandatory_event_ids | terminal_event_ids
+    )
     mandatory_event_ids = sorted(_mandatory_adaptation_event_ids(events))
     source_counts = {
         contract["event_id"]: len(contract["generation_units"])
@@ -2728,11 +2762,15 @@ def _build_duration_scaled_event_plan(
                 "mandatory": event_id in mandatory_event_ids,
                 "mandatory_reason": (
                     "structural"
-                    if event_id in base_mandatory_event_ids
+                    if event_id in structural_mandatory_event_ids
                     else (
-                        "continuous_predecessor"
-                        if event_id in mandatory_event_ids
-                        else "optional"
+                        "terminal_outcome"
+                        if event_id in terminal_event_ids
+                        else (
+                            "continuous_predecessor"
+                            if event_id in mandatory_event_ids
+                            else "optional"
+                        )
                     )
                 ),
                 "source_micro_action_count": len(contract["actions"]),
@@ -2881,6 +2919,7 @@ def _build_duration_scaled_event_plan(
             record["scaling"] == "representative" for record in records
         ),
         "base_mandatory_source_event_ids": sorted(base_mandatory_event_ids),
+        "terminal_outcome_source_event_ids": sorted(terminal_event_ids),
         "mandatory_source_event_ids": mandatory_event_ids,
         "causal_predecessor_source_event_ids": sorted(
             set(mandatory_event_ids) - base_mandatory_event_ids
@@ -4077,7 +4116,7 @@ def _atomic_write_json(path: Path, value: Any) -> None:
     os.replace(temporary, path)
 
 
-SCREENPLAY_PLAN_SCHEMA = "honcut.screenplay-plan.v4"
+SCREENPLAY_PLAN_SCHEMA = "honcut.screenplay-plan.v5"
 LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v15"
 
 
@@ -4186,7 +4225,12 @@ def _build_screenplay_plan(
             action_scaling_records.append(copy.deepcopy(record))
     else:
         mandatory_ids = _mandatory_adaptation_event_ids(events)
-        base_mandatory_ids = _base_mandatory_adaptation_event_ids(events)
+        structural_mandatory_ids = {
+            event_id
+            for event_id, event in enumerate(events, 1)
+            if _event_is_mandatory_for_adaptation(event)
+        }
+        terminal_event_ids = terminal_outcome_event_ids(events)
         for event_id, event in enumerate(events, 1):
             raw_actions = event.get("micro_actions") or []
             if isinstance(raw_actions, str):
@@ -4203,11 +4247,15 @@ def _build_screenplay_plan(
                 "mandatory": event_id in mandatory_ids,
                 "mandatory_reason": (
                     "structural"
-                    if event_id in base_mandatory_ids
+                    if event_id in structural_mandatory_ids
                     else (
-                        "continuous_predecessor"
-                        if event_id in mandatory_ids
-                        else "optional"
+                        "terminal_outcome"
+                        if event_id in terminal_event_ids
+                        else (
+                            "continuous_predecessor"
+                            if event_id in mandatory_ids
+                            else "optional"
+                        )
                     )
                 ),
                 "selected_source_micro_action_indexes": indexes,
@@ -4452,6 +4500,9 @@ def _build_screenplay_plan(
             "omitted_source_event_ids": sorted(omitted_ids),
             "base_mandatory_source_event_ids": sorted(
                 _base_mandatory_adaptation_event_ids(events)
+            ),
+            "terminal_outcome_source_event_ids": sorted(
+                terminal_outcome_event_ids(events)
             ),
             "mandatory_source_event_ids": sorted(mandatory_ids),
             "causal_predecessor_source_event_ids": sorted(
