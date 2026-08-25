@@ -2874,6 +2874,57 @@ def test_phase1_normalizes_qualified_identities_without_script_language_bias():
     assert filtered["林岚"]["source_aliases"] == ["受伤的林岚"]
 
 
+@pytest.mark.parametrize(
+    ("attribute_label", "stable_label"),
+    [
+        ("男性", "男子"),
+        ("女性", "女子"),
+        ("male", "man"),
+        ("female", "woman"),
+    ],
+)
+def test_phase1_preserves_gender_attribute_mentions_as_source_aliases(
+    attribute_label,
+    stable_label,
+):
+    stats = {
+        attribute_label: {
+            "events": [2],
+            "contexts": [f"{attribute_label} stands at the train door"],
+            "source_excerpts": [f"{attribute_label} stands at the train door"],
+            "dialogue_count": 0,
+        },
+        stable_label: {
+            "events": [3, 4],
+            "contexts": [f"{stable_label} enters the train"],
+            "source_excerpts": [f"{stable_label} enters the train"],
+            "dialogue_count": 0,
+        },
+    }
+
+    filtered = character_discoverer._filter_descriptive_phrases(stats)
+
+    assert set(filtered) == {stable_label}
+    assert filtered[stable_label]["events"] == [3, 4, 2]
+    assert filtered[stable_label]["source_aliases"] == [attribute_label]
+
+
+def test_phase1_does_not_guess_ambiguous_gender_attribute_identity():
+    stats = {
+        "男性": {"events": [1], "contexts": [], "source_excerpts": []},
+        "男子": {"events": [2], "contexts": [], "source_excerpts": []},
+        "男人": {"events": [3], "contexts": [], "source_excerpts": []},
+    }
+
+    filtered = character_discoverer._filter_descriptive_phrases(stats)
+
+    assert set(filtered) == {"男子", "男人"}
+    assert all(
+        "男性" not in (info.get("source_aliases") or [])
+        for info in filtered.values()
+    )
+
+
 def test_phase1_does_not_promote_qualified_objects_or_merge_relational_roles():
     stats = {
         "穿着漂亮的红裙": {"events": [1], "contexts": []},
@@ -3795,10 +3846,77 @@ def test_character_discovery_body_contract_is_prompted_and_normalized(monkeypatc
     assert "head_to_body_ratio=7.6" in captured["prompt"]
     assert "头宽不得超过肩宽的 43%" in captured["prompt"]
     assert ADULT_LEAD_DISCOVERY_INSTRUCTIONS in character_discoverer.SYSTEM_PROMPT
-    assert character_discoverer.CHARACTER_CONTEXT_SCHEMA_VERSION == 10
+    assert character_discoverer.CHARACTER_CONTEXT_SCHEMA_VERSION == 11
     assert "interaction_props" in captured["prompt"]
     assert "bodybuilder physique" in discovered["negative_guardrails"]
     assert "Body-proportion lock" in discovered["prompt_definition"]
+
+
+def test_character_discovery_binds_attribute_and_referential_mentions_to_one_id(
+    monkeypatch,
+):
+    from utils.semantic_contracts import bind_story_semantics
+
+    lead = _adult_lead_character("男子", "male", "28-35")
+    lead["id"] = "lead_01"
+    enemy = _adult_lead_character(
+        "第一名敌人",
+        "unknown",
+        "unknown",
+        role="antagonist",
+    )
+    enemy["id"] = "enemy_01"
+    monkeypatch.setattr(
+        character_discoverer,
+        "_call_llm",
+        lambda _prompt: json.dumps(
+            {"characters": [lead, enemy]},
+            ensure_ascii=False,
+        ),
+    )
+    events = [
+        {
+            "id": 1,
+            "who": ["男性"],
+            "source_excerpt": "年轻男性站在列车门前。",
+            "what": "男性等待列车",
+        },
+        {
+            "id": 2,
+            "who": ["男性", "第一名敌人"],
+            "source_excerpt": "第一名敌人冲向男性。",
+            "what": "第一名敌人发动攻击",
+        },
+        {
+            "id": 3,
+            "who": ["男子", "第一名敌人"],
+            "source_excerpt": "男子格挡第一名敌人。",
+            "what": "男子完成格挡",
+        },
+    ]
+
+    result = character_discoverer.discover_characters(events)
+    characters = result["characters"]
+    discovered_lead = next(
+        character for character in characters if character["id"] == "lead_01"
+    )
+    ledger = bind_story_semantics(events, characters)
+
+    assert discovered_lead["aliases"] == ["男性"]
+    assert discovered_lead["source_identity_evidence"] == {
+        "event_ids": [1, 2, 3],
+        "source_mentions": ["男子", "男性"],
+        "inferred_aliases": [],
+    }
+    assert [event["character_ids"][0] for event in events] == [
+        "lead_01",
+        "lead_01",
+        "lead_01",
+    ]
+    assert {item["text"] for item in ledger["source_mentions"]} >= {
+        "男性",
+        "男子",
+    }
 
 
 def test_character_discovery_retries_ordinal_identity_collapse(monkeypatch):

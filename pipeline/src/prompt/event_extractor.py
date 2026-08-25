@@ -39,6 +39,7 @@ from utils.body_action_contracts import (
     normalize_body_action_choreography,
     requires_explicit_body_choreography,
 )
+from utils.character_identity import equivalent_human_descriptors
 from utils.ark_llm import (
     LLMConnectTimeout,
     LLMIdleTimeout,
@@ -252,25 +253,8 @@ _UNKNOWN_ACTION_PERFORMERS = {
     "她",
     "它",
 }
-_EQUIVALENT_HUMAN_DESCRIPTOR_GROUPS = (
-    frozenset({"男子", "男性", "男人"}),
-    frozenset({"女子", "女性", "女人"}),
-    frozenset({"man", "male"}),
-    frozenset({"woman", "female"}),
-)
-
-
 def _equivalent_human_descriptor(left: str, right: str) -> bool:
-    left_key = str(left or "").casefold().strip()
-    right_key = str(right or "").casefold().strip()
-    return bool(
-        left_key
-        and right_key
-        and any(
-            left_key in group and right_key in group
-            for group in _EQUIVALENT_HUMAN_DESCRIPTOR_GROUPS
-        )
-    )
+    return equivalent_human_descriptors(left, right)
 
 
 def _reconcile_structured_action_performers(event: Dict[str, Any]) -> None:

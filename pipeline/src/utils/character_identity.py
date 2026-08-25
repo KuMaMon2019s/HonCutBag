@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from typing import Any
+from typing import Any, Literal
 
 GENERIC_CHARACTER_REFERENCES = {
     "他",
@@ -22,11 +22,52 @@ GENERIC_CHARACTER_REFERENCES = {
     "角色",
 }
 
+HumanGender = Literal["male", "female"]
+
+# Source prose may alternate between a gender adjective and a referential noun.
+# Keep those presentation labels language-aware while reducing their machine
+# meaning to one controlled English enum.  These labels are never character
+# identities by themselves; callers may reconcile them only when a unique
+# canonical identity is independently anchored.
+_HUMAN_GENDER_DESCRIPTOR_GROUPS: dict[HumanGender, frozenset[str]] = {
+    "male": frozenset({"男子", "男性", "男人", "man", "male"}),
+    "female": frozenset({"女子", "女性", "女人", "woman", "female"}),
+}
+_HUMAN_GENDER_ATTRIBUTE_REFERENCES = frozenset({
+    "男性",
+    "女性",
+    "male",
+    "female",
+})
+
 
 def normalize_character_reference(value: Any) -> str:
     """Normalize presentation differences without erasing word boundaries."""
     text = unicodedata.normalize("NFKC", str(value or "")).casefold().strip()
     return re.sub(r"[\s·•_\-]+", "", text)
+
+
+def human_gender_descriptor(value: Any) -> HumanGender | None:
+    """Return the controlled gender meaning of one exact source descriptor."""
+
+    key = normalize_character_reference(value)
+    for gender, labels in _HUMAN_GENDER_DESCRIPTOR_GROUPS.items():
+        if key in labels:
+            return gender
+    return None
+
+
+def is_gender_attribute_reference(value: Any) -> bool:
+    """Return whether ``value`` is an attribute label, not a stable identity."""
+
+    return normalize_character_reference(value) in _HUMAN_GENDER_ATTRIBUTE_REFERENCES
+
+
+def equivalent_human_descriptors(left: Any, right: Any) -> bool:
+    """Compare exact human descriptors through controlled machine semantics."""
+
+    left_gender = human_gender_descriptor(left)
+    return left_gender is not None and left_gender == human_gender_descriptor(right)
 
 
 def _latin_tokens(value: Any) -> tuple[str, ...]:

@@ -44,7 +44,11 @@ from utils.ark_llm import (
     call_llm_stream,
     create_ark_client,
 )
-from utils.character_identity import resolve_character_name
+from utils.character_identity import (
+    equivalent_human_descriptors,
+    is_gender_attribute_reference,
+    resolve_character_name,
+)
 from utils.character_body_contracts import (
     ADULT_LEAD_DISCOVERY_INSTRUCTIONS,
     apply_adult_lead_body_contracts,
@@ -153,12 +157,13 @@ ENTITY_SUFFIXES = (
 )
 MAX_ENTITY_NAME_CHINESE_CHARS = 12
 GENERIC_CHARACTER_NAMES = {"主角", "主人公", "男主", "女主", "人物", "他", "她", "它"}
-CHARACTER_CONTEXT_SCHEMA_VERSION = 10
+CHARACTER_CONTEXT_SCHEMA_VERSION = 11
 
 GENERIC_BACKGROUND_CHARACTER_NAMES = {
     "路人", "行人", "游客", "观众", "听众", "读者",
     "女性", "男性", "老人", "小孩", "孩子", "青年", "中年",
     "人群", "群众", "大家", "情侣", "夫妻", "朋友", "同事", "邻居",
+    "male", "female",
 }
 
 # A qualified ``who`` label can accidentally end in an object or environment
@@ -501,6 +506,47 @@ def _filter_descriptive_phrases(stats: Dict[str, Dict[str, Any]]) -> Dict[str, D
             *(target.get("source_aliases") or []),
             *(source.get("source_aliases") or []),
         ]))
+
+    # Gender adjectives are source presentation, not identity.  Preserve one as
+    # an alias only when the same source ledger contains exactly one referential
+    # descriptor with the same controlled gender and the two never co-occur.
+    # Ambiguity is intentionally left unresolved for the semantic gate.
+    normalized_stats = {
+        name: {
+            key: list(value) if isinstance(value, list) else value
+            for key, value in info.items()
+        }
+        for name, info in stats.items()
+    }
+    for attribute_name, attribute_info in stats.items():
+        if not is_gender_attribute_reference(attribute_name):
+            continue
+        candidates = [
+            candidate
+            for candidate in stats
+            if candidate != attribute_name
+            and not is_gender_attribute_reference(candidate)
+            and equivalent_human_descriptors(attribute_name, candidate)
+            and not _source_identities_cooccur(attribute_name, candidate, stats)
+        ]
+        if len(candidates) != 1:
+            continue
+        canonical_name = candidates[0]
+        alias_info = {
+            **attribute_info,
+            "source_aliases": list(dict.fromkeys([
+                *(attribute_info.get("source_aliases") or []),
+                attribute_name,
+            ])),
+        }
+        merge_info(normalized_stats[canonical_name], alias_info)
+        normalized_stats.pop(attribute_name, None)
+        print(
+            f"  归一化性别属性称呼: {attribute_name} → {canonical_name}",
+            file=sys.stderr,
+        )
+
+    stats = normalized_stats
 
     known_mentions = {str(name).strip() for name in stats if str(name).strip()}
     for name, info in stats.items():

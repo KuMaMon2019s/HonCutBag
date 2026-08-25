@@ -3,14 +3,29 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from typing import Any
 
+from schemas.understanding import SemanticUnderstandingLedger
 from utils.character_identity import (
     normalize_character_reference,
     resolve_character_id,
 )
 
-SEMANTIC_UNDERSTANDING_SCHEMA = "honcut.semantic-understanding.v1"
+SEMANTIC_UNDERSTANDING_SCHEMA = "honcut.semantic-understanding.v2"
+
+
+def _source_language(value: Any) -> str:
+    text = str(value or "")
+    has_zh = bool(re.search(r"[\u3400-\u9fff]", text))
+    has_en = bool(re.search(r"[A-Za-z]", text))
+    if has_zh and has_en:
+        return "mixed"
+    if has_zh:
+        return "zh"
+    if has_en:
+        return "en"
+    return "und"
 
 
 def source_identity_ref(mention: Any) -> str:
@@ -52,6 +67,9 @@ def bind_story_semantics(
     refs_by_character: dict[str, list[str]] = {
         character_id: [] for character_id in character_by_id
     }
+    source_mentions: list[dict[str, str]] = []
+    source_mention_keys: set[tuple[str, str, str]] = set()
+    ref_owners: dict[str, str] = {}
     event_records: list[dict[str, Any]] = []
     for position, event in enumerate(events, 1):
         event_id = int(event.get("event_id") or event.get("id") or position)
@@ -69,9 +87,24 @@ def bind_story_semantics(
                     f"{event_id}"
                 )
             ref_id = source_identity_ref(mention)
+            prior_owner = ref_owners.setdefault(ref_id, character_id)
+            if prior_owner != character_id:
+                raise ValueError(
+                    f"source identity ref {ref_id} maps to multiple characters"
+                )
+            mention_key = (ref_id, mention, character_id)
+            if mention_key not in source_mention_keys:
+                source_mentions.append({
+                    "ref_id": ref_id,
+                    "text": mention,
+                    "language": _source_language(mention),
+                    "character_id": character_id,
+                })
+                source_mention_keys.add(mention_key)
             participant_refs.append({
                 "ref_id": ref_id,
                 "mention": mention,
+                "source_language": _source_language(mention),
                 "character_id": character_id,
             })
             if character_id not in character_ids:
@@ -91,17 +124,36 @@ def bind_story_semantics(
     for character_id, character in character_by_id.items():
         ref_ids = refs_by_character[character_id]
         character["source_identity_ref_ids"] = ref_ids
+        appearance = character.get("appearance")
+        appearance = appearance if isinstance(appearance, dict) else {}
+        gender = str(appearance.get("gender") or "unknown").strip().lower()
+        if gender not in {"male", "female", "nonbinary", "unknown"}:
+            gender = "unknown"
+        role = str(character.get("role") or "unknown").strip().lower()
+        if role not in {
+            "protagonist", "antagonist", "supporting", "extra", "unknown",
+        }:
+            role = "unknown"
         entity_records.append({
             "character_id": character_id,
-            "name": str(character.get("name") or ""),
+            "display_name": str(character.get("name") or ""),
             "source_identity_ref_ids": ref_ids,
+            "machine_semantics": {
+                "entity_type": "character",
+                "gender": gender,
+                "role": role,
+            },
         })
 
-    return {
+    payload = {
         "schema": SEMANTIC_UNDERSTANDING_SCHEMA,
         "entities": entity_records,
+        "source_mentions": source_mentions,
         "events": event_records,
     }
+    return SemanticUnderstandingLedger.model_validate(payload).model_dump(
+        by_alias=True
+    )
 
 
 __all__ = [

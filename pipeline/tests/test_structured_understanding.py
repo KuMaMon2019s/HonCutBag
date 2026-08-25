@@ -223,7 +223,7 @@ def test_text_semantic_ledger_binds_mentions_to_stable_character_ids():
 
     ledger = bind_story_semantics(events, characters)
 
-    assert ledger["schema"] == "honcut.semantic-understanding.v1"
+    assert ledger["schema"] == "honcut.semantic-understanding.v2"
     assert events[0]["character_ids"] == ["operator", "intruder_3"]
     assert events[1]["character_ids"] == ["operator", "intruder_3"]
     assert events[0]["participant_refs"][1]["ref_id"] == (
@@ -232,6 +232,62 @@ def test_text_semantic_ledger_binds_mentions_to_stable_character_ids():
     assert characters[1]["source_identity_ref_ids"] == [
         events[0]["participant_refs"][1]["ref_id"]
     ]
+    assert ledger["source_mentions"] == [
+        {
+            "ref_id": events[0]["participant_refs"][0]["ref_id"],
+            "text": "操作员",
+            "language": "zh",
+            "character_id": "operator",
+        },
+        {
+            "ref_id": events[0]["participant_refs"][1]["ref_id"],
+            "text": "第三名入侵者",
+            "language": "zh",
+            "character_id": "intruder_3",
+        },
+    ]
+    assert ledger["entities"][0]["machine_semantics"] == {
+        "entity_type": "character",
+        "gender": "unknown",
+        "role": "unknown",
+    }
+
+
+def test_text_semantic_ledger_keeps_dialogue_verbatim_and_uses_controlled_enums():
+    original_line = {
+        "dialogue_id": "D001",
+        "speaker": "男子",
+        "line": "别动，这是原始对白。",
+        "confidence": 1.0,
+        "evidence": "source",
+    }
+    events = [{
+        "event_id": 1,
+        "who": ["男性"],
+        "lines": [dict(original_line)],
+    }]
+    characters = [{
+        "id": "lead_01",
+        "name": "男子",
+        "aliases": ["男性"],
+        "role": "protagonist",
+        "appearance": {"gender": "male"},
+    }]
+
+    ledger = bind_story_semantics(events, characters)
+
+    assert events[0]["lines"] == [original_line]
+    assert ledger["source_mentions"] == [{
+        "ref_id": events[0]["participant_refs"][0]["ref_id"],
+        "text": "男性",
+        "language": "zh",
+        "character_id": "lead_01",
+    }]
+    assert ledger["entities"][0]["machine_semantics"] == {
+        "entity_type": "character",
+        "gender": "male",
+        "role": "protagonist",
+    }
 
 
 def test_text_semantic_ledger_fails_closed_on_unbound_participant():

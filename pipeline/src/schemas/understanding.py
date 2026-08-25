@@ -181,6 +181,49 @@ class CharacterUnderstandingBatch(StrictUnderstandingModel):
     characters: list[CharacterUnderstanding]
 
 
+class SemanticMachineSemantics(StrictUnderstandingModel):
+    entity_type: Literal["character"] = "character"
+    gender: Literal["male", "female", "nonbinary", "unknown"] = "unknown"
+    role: Literal[
+        "protagonist",
+        "antagonist",
+        "supporting",
+        "extra",
+        "unknown",
+    ] = "unknown"
+
+
+class SemanticEntityRecord(StrictUnderstandingModel):
+    character_id: str
+    display_name: str
+    source_identity_ref_ids: list[str]
+    machine_semantics: SemanticMachineSemantics
+
+
+class SemanticSourceMentionRecord(StrictUnderstandingModel):
+    ref_id: str
+    text: str
+    language: Literal["zh", "en", "mixed", "und"]
+    character_id: str
+
+
+class SemanticEventRecord(StrictUnderstandingModel):
+    event_id: int = Field(ge=1)
+    action_unit_id: str
+    participant_ref_ids: list[str]
+    character_ids: list[str]
+
+
+class SemanticUnderstandingLedger(StrictUnderstandingModel):
+    semantic_schema: Literal["honcut.semantic-understanding.v2"] = Field(
+        alias="schema",
+        serialization_alias="schema",
+    )
+    entities: list[SemanticEntityRecord]
+    source_mentions: list[SemanticSourceMentionRecord]
+    events: list[SemanticEventRecord]
+
+
 class StoryOrderUnderstanding(StrictUnderstandingModel):
     suggested_order: list[str]
     narrative_consistent: bool
