@@ -7,11 +7,13 @@ import json
 import math
 import re
 import shutil
+import unicodedata
 from pathlib import Path
 from typing import Any, Protocol
 
 import requests
 from PIL import Image, ImageDraw, ImageFont, ImageOps
+from phases.phase1.storyboard_beats import SECONDARY_STORYBOARD_VERSION
 from prompt.seedream_image_prompt import (
     IMAGE_REQUEST_CONTRACT_ID,
     IMAGE_REQUEST_CONTRACT_VERSION,
@@ -86,6 +88,148 @@ def _shot_who(shot: dict[str, Any]) -> list[Any] | None:
     if isinstance(raw, list):
         return raw
     return [raw] if raw else []
+
+
+BEAT_CAST_CONTRACT_SCHEMA = "honcut.storyboard-beat-cast.v1"
+LEGACY_BEAT_CAST_PLANNER_VERSION = "honcut.secondary-storyboard.v11"
+
+
+def _contains_complete_character_reference(text: str, reference: str) -> bool:
+    normalized_text = unicodedata.normalize("NFKC", text).casefold()
+    normalized_reference = (
+        unicodedata.normalize("NFKC", reference).casefold().strip()
+    )
+    if not normalized_reference:
+        return False
+    if re.search(r"[\u3400-\u9fff]", normalized_reference):
+        return normalized_reference in normalized_text
+    return re.search(
+        rf"(?<![a-z0-9]){re.escape(normalized_reference)}(?![a-z0-9])",
+        normalized_text,
+    ) is not None
+
+
+def _character_names(
+    characters: list[dict[str, Any]],
+    character_ids: list[str],
+) -> list[str]:
+    names = []
+    for character_id in character_ids:
+        matches = [
+            character
+            for character in characters
+            if str(character.get("id") or "").strip() == character_id
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "beat character_id must resolve to exactly one character asset: "
+                f"{character_id}"
+            )
+        names.append(str(matches[0].get("name") or character_id).strip())
+    return names
+
+
+def _legacy_v11_beat_character_ids(
+    shot: dict[str, Any],
+    beat: dict[str, Any],
+    characters: list[dict[str, Any]],
+) -> list[str]:
+    """Project v11 shot-wide cast into one beat at the migration boundary."""
+    who = _shot_who(shot)
+    if not who:
+        return []
+    semantic_text = "\n".join(
+        str(beat.get(field) or "")
+        for field in ("start_state", "action", "end_state")
+    )
+    visible_ids = []
+    for requested in who:
+        requested_key = str(requested or "").casefold().strip()
+        matches = []
+        for character in characters:
+            references = [
+                str(value).strip()
+                for value in (
+                    character.get("id"),
+                    character.get("name"),
+                    *(character.get("aliases") or []),
+                )
+                if str(value or "").strip()
+            ]
+            if requested_key in {value.casefold() for value in references}:
+                matches.append((character, references))
+        if len(matches) != 1:
+            raise ValueError(
+                "legacy v11 beat cast cannot resolve shot participant exactly once: "
+                f"{requested}"
+            )
+        character, references = matches[0]
+        if any(
+            _contains_complete_character_reference(semantic_text, reference)
+            for reference in references
+        ):
+            character_id = str(character.get("id") or "").strip()
+            if not character_id:
+                raise ValueError("legacy v11 beat cast resolved an empty character id")
+            visible_ids.append(character_id)
+    return list(dict.fromkeys(visible_ids))
+
+
+def _beat_cast_contract(
+    shot: dict[str, Any],
+    beat: dict[str, Any],
+    characters: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Resolve the only cast contract Phase 2 may inject into one Pxx."""
+    planner_version = str(beat.get("planner_version") or "").strip()
+    if "character_ids" in beat:
+        raw_ids = beat.get("character_ids")
+        if not isinstance(raw_ids, list):
+            raise ValueError("beat character_ids must be an array")
+        character_ids = [
+            str(value).strip() for value in raw_ids if str(value).strip()
+        ]
+        if character_ids != list(dict.fromkeys(character_ids)):
+            raise ValueError("beat character_ids must be unique and ordered")
+        raw_shot_ids = shot.get("character_ids") or []
+        if isinstance(raw_shot_ids, str):
+            raw_shot_ids = [raw_shot_ids]
+        shot_ids = {
+            str(value).strip() for value in raw_shot_ids if str(value).strip()
+        }
+        unknown = [value for value in character_ids if value not in shot_ids]
+        if unknown:
+            raise ValueError(
+                "beat character_ids are outside the parent shot cast: "
+                + ", ".join(unknown)
+            )
+        names = _character_names(characters, character_ids) if character_ids else []
+        return {
+            "schema": BEAT_CAST_CONTRACT_SCHEMA,
+            "source": "canonical_beat_character_ids",
+            "character_ids": character_ids,
+            "who": names,
+        }
+    if planner_version == SECONDARY_STORYBOARD_VERSION:
+        raise ValueError(
+            f"{SECONDARY_STORYBOARD_VERSION} beat is missing canonical character_ids"
+        )
+    if planner_version == LEGACY_BEAT_CAST_PLANNER_VERSION:
+        character_ids = _legacy_v11_beat_character_ids(shot, beat, characters)
+        return {
+            "schema": BEAT_CAST_CONTRACT_SCHEMA,
+            "source": "legacy_v11_visible_fact_projection",
+            "character_ids": character_ids,
+            "who": _character_names(characters, character_ids),
+        }
+    if planner_version:
+        raise ValueError(f"unsupported storyboard beat planner version: {planner_version}")
+    return {
+        "schema": BEAT_CAST_CONTRACT_SCHEMA,
+        "source": "unversioned_test_compatibility",
+        "character_ids": [],
+        "who": _shot_who(shot),
+    }
 
 
 def _edge_handle_contract(beat: dict[str, Any]) -> str:
@@ -410,7 +554,8 @@ def _build_panel_prompt(
         if temporal_contract
         else ""
     )
-    who = _shot_who(shot)
+    beat_cast = _beat_cast_contract(shot, beat, characters)
+    who = beat_cast["who"]
     beat_id = str(beat.get("beat_id") or f"P{position:02d}")
     choreography_section = body_action_prompt({**shot, **beat})
     generation_mode = str(beat.get("generation_mode") or "").strip().lower()
@@ -1460,11 +1605,6 @@ def generate_shot_storyboards(
                 == "continuous"
                 else None
             )
-            character_references = _character_reference_paths(
-                output_dir,
-                characters,
-                _shot_who(shot),
-            )
             content_positions = [
                 beat_position
                 for beat_position, authored_beat in enumerate(beats, 1)
@@ -1474,6 +1614,12 @@ def generate_shot_storyboards(
             last_content_position = max(content_positions, default=0)
             for position, beat in enumerate(beats, 1):
                 beat_id = str(beat.get("beat_id") or f"{shot_id}_P{position:02d}")
+                beat_cast = _beat_cast_contract(shot, beat, characters)
+                character_references = _character_reference_paths(
+                    output_dir,
+                    characters,
+                    beat_cast["who"],
+                )
                 beat_correction_issues = []
                 for issue in correction_issues:
                     details = (
@@ -1568,6 +1714,7 @@ def generate_shot_storyboards(
                         REFERENCE_CONTRACT_TEMPLATE_VERSION
                     ),
                     "reference_roles": requested_reference_roles,
+                    "beat_cast": beat_cast,
                     "character_references": [
                         str(path.relative_to(output_dir))
                         if path.is_relative_to(output_dir)

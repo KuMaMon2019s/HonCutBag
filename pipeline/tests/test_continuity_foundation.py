@@ -1034,6 +1034,74 @@ def test_complex_shot_maps_to_three_secondary_generation_strategies(tmp_path):
     ] == "storyboard_beats/S01_P02.png"
 
 
+def test_phase2_only_attaches_character_references_to_visible_pxx_cast(tmp_path):
+    reference = tmp_path / "characters/lead/face_closeup.png"
+    reference.parent.mkdir(parents=True)
+    Image.new("RGB", (128, 128), "red").save(reference)
+    storyboard = {
+        "video_provider": "seedance",
+        "shots": [{
+            "id": "S01",
+            "duration": 16,
+            "who": ["Lead"],
+            "character_ids": ["lead"],
+            "participant_refs": [{
+                "ref_id": "SRCCHAR_lead",
+                "mention": "Lead",
+                "character_id": "lead",
+            }],
+            "start_state": "The platform is empty",
+            "micro_actions": [
+                "Rain strikes the transparent roof",
+                "Lead steps through the train door",
+            ],
+            "end_state": "Lead is inside the train",
+        }],
+    }
+    plan_storyboard_beats(storyboard)
+    calls = []
+
+    class FakeImageClient:
+        model = "fake-seedream"
+
+        def text_to_image(self, prompt, output_path, size, timeout):
+            calls.append(("text_to_image", prompt, []))
+            Image.new("RGB", (2560, 1440), "blue").save(output_path)
+            return "https://image.invalid/generated.png"
+
+        def image_to_image(self, prompt, ref_image, output_path, size):
+            references = [ref_image] if isinstance(ref_image, str) else ref_image
+            calls.append(("image_to_image", prompt, references))
+            Image.new("RGB", (2560, 1440), "green").save(output_path)
+            return "https://image.invalid/generated.png"
+
+    generate_shot_storyboards(
+        tmp_path,
+        storyboard,
+        [{
+            "id": "lead",
+            "name": "Lead",
+            "appearance": {"summary": "red coat and black hair"},
+        }],
+        client=FakeImageClient(),
+    )
+
+    first = json.loads(
+        (tmp_path / "storyboard_beats/S01_P01.json").read_text(encoding="utf-8")
+    )
+    second = json.loads(
+        (tmp_path / "storyboard_beats/S01_P02.json").read_text(encoding="utf-8")
+    )
+    assert first["beat_cast"]["character_ids"] == []
+    assert first["character_references"] == []
+    assert "禁止生成任何角色" in calls[0][1]
+    assert second["beat_cast"]["character_ids"] == ["lead"]
+    assert second["character_references"] == [
+        "characters/lead/face_closeup.png"
+    ]
+    assert str(reference) in calls[1][2]
+
+
 def test_identical_storyboard_rerun_reuses_pxx_and_sxx_without_provider_calls(tmp_path):
     storyboard = {
         "shots": [

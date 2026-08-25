@@ -44,6 +44,7 @@ from phases.phase1.director_storyboard import (
 )
 from phases.phase1.phase1_director import run_phase1_director
 from phases.phase1.storyboard_beats import (
+    SECONDARY_STORYBOARD_VERSION,
     bridge_planning_duration_bounds,
     plan_storyboard_beats,
     secondary_storyboard_contract_errors,
@@ -3687,6 +3688,65 @@ def test_phase2_panel_prompt_enforces_disarm_and_final_state_contracts():
     assert "动作→对象→道具→结束状态" in prompt
     assert "不得仍停留在搏斗、争夺、准备或前一动作中" in prompt
     assert "不得用运动线否定静止" in prompt
+
+
+def test_phase2_panel_prompt_uses_beat_scoped_canonical_cast():
+    prompt = _build_panel_prompt(
+        {
+            "who": ["Lead"],
+            "character_ids": ["lead"],
+            "where": "empty platform",
+        },
+        {
+            "beat_id": "S01_P01",
+            "planner_version": SECONDARY_STORYBOARD_VERSION,
+            "character_ids": [],
+            "action": "Rain strikes the transparent roof",
+            "end_state": "The train reaches the empty platform",
+        },
+        1,
+        2,
+        [{
+            "id": "lead",
+            "name": "Lead",
+            "appearance": {"summary": "red coat and black hair"},
+        }],
+    )
+
+    assert "禁止生成任何角色" in prompt
+    assert "画面中恰好出现 0 个具名角色实体" in prompt
+    assert "red coat" not in prompt
+
+
+def test_phase2_projects_v11_beat_cast_but_rejects_unknown_planner():
+    shot = {
+        "who": ["Lead"],
+        "character_ids": ["lead"],
+        "where": "empty platform",
+    }
+    characters = [{
+        "id": "lead",
+        "name": "Lead",
+        "appearance": {"summary": "red coat and black hair"},
+    }]
+    legacy_beat = {
+        "beat_id": "S01_P01",
+        "planner_version": "honcut.secondary-storyboard.v11",
+        "action": "Rain strikes the transparent roof",
+        "end_state": "The train reaches the empty platform",
+    }
+
+    prompt = _build_panel_prompt(shot, legacy_beat, 1, 2, characters)
+
+    assert "禁止生成任何角色" in prompt
+    with pytest.raises(ValueError, match="unsupported storyboard beat planner"):
+        _build_panel_prompt(
+            shot,
+            {**legacy_beat, "planner_version": "honcut.secondary-storyboard.v999"},
+            1,
+            2,
+            characters,
+        )
 
 
 def test_phase2_bridge_panel_is_not_treated_as_the_last_story_beat():
