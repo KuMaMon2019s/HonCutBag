@@ -1034,6 +1034,188 @@ def test_complex_shot_maps_to_three_secondary_generation_strategies(tmp_path):
     ] == "storyboard_beats/S01_P02.png"
 
 
+def test_identical_storyboard_rerun_reuses_pxx_and_sxx_without_provider_calls(tmp_path):
+    storyboard = {
+        "shots": [
+            {
+                "id": "S01",
+                "duration": 8,
+                "who": [],
+                "where": "platform",
+                "micro_actions": ["train arrives"],
+                "boundary_before": "cut",
+            }
+        ]
+    }
+    plan_storyboard_beats(storyboard)
+    calls = []
+
+    class FakeImageClient:
+        model = "fake-seedream"
+
+        def text_to_image(self, prompt, output_path, size, timeout):
+            calls.append(("text_to_image", prompt))
+            Image.new("RGB", (2560, 1440), "blue").save(output_path)
+            return "https://image.invalid/generated.png"
+
+        def image_to_image(self, prompt, ref_image, output_path, size):
+            calls.append(("image_to_image", prompt))
+            Image.new("RGB", (2560, 1440), "green").save(output_path)
+            return "https://image.invalid/generated.png"
+
+    generate_shot_storyboards(
+        tmp_path,
+        storyboard,
+        [],
+        client=FakeImageClient(),
+    )
+    assert calls
+
+    calls.clear()
+    contract = generate_shot_storyboards(
+        tmp_path,
+        storyboard,
+        [],
+        client=FakeImageClient(),
+    )
+
+    assert calls == []
+    assert contract["shots"][0]["cache_hit"] is True
+    assert contract["shots"][0]["panels"][0]["cache_hit"] is True
+
+
+def test_storyboard_rerun_regenerates_only_a_tampered_sxx_board(tmp_path):
+    storyboard = {
+        "shots": [
+            {
+                "id": "S01",
+                "duration": 8,
+                "who": [],
+                "micro_actions": ["train arrives"],
+            }
+        ]
+    }
+    plan_storyboard_beats(storyboard)
+    calls = []
+
+    class FakeImageClient:
+        model = "fake-seedream"
+
+        def text_to_image(self, prompt, output_path, size, timeout):
+            calls.append(Path(output_path).parent.name)
+            Image.new("RGB", (2560, 1440), "blue").save(output_path)
+            return "https://image.invalid/generated.png"
+
+        def image_to_image(self, prompt, ref_image, output_path, size):
+            pytest.fail("this fixture has no reference-image request")
+
+    generate_shot_storyboards(
+        tmp_path,
+        storyboard,
+        [],
+        client=FakeImageClient(),
+    )
+    calls.clear()
+    Image.new("RGB", (2560, 1440), "red").save(
+        tmp_path / "shot_storyboards/S01.png"
+    )
+
+    contract = generate_shot_storyboards(
+        tmp_path,
+        storyboard,
+        [],
+        client=FakeImageClient(),
+    )
+
+    assert calls == ["shot_storyboards"]
+    assert contract["shots"][0].get("cache_hit") is not True
+    assert contract["shots"][0]["panels"][0]["cache_hit"] is True
+
+
+def test_storyboard_rerun_rejects_unknown_future_manifest_schema(tmp_path):
+    (tmp_path / "SHOT_STORYBOARDS.json").write_text(
+        json.dumps({"kind": "honcut.shot_storyboards.v999", "shots": []}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="unsupported prior storyboard manifest schema"):
+        generate_shot_storyboards(
+            tmp_path,
+            {"shots": []},
+            [],
+            client=object(),
+        )
+
+
+def test_same_phase5_storyboard_correction_attempt_is_recoverable_without_resubmit(
+    tmp_path,
+):
+    storyboard = {
+        "shots": [
+            {
+                "id": "S01",
+                "duration": 8,
+                "who": [],
+                "micro_actions": ["train arrives"],
+            }
+        ]
+    }
+    plan_storyboard_beats(storyboard)
+    calls = []
+
+    class FakeImageClient:
+        model = "fake-seedream"
+
+        def text_to_image(self, prompt, output_path, size, timeout):
+            calls.append(Path(output_path).name)
+            Image.new("RGB", (2560, 1440), "blue").save(output_path)
+            return "https://image.invalid/generated.png"
+
+        def image_to_image(self, prompt, ref_image, output_path, size):
+            pytest.fail("this fixture has no reference-image request")
+
+    client = FakeImageClient()
+    generate_shot_storyboards(tmp_path, storyboard, [], client=client)
+    correction = {
+        "S01": [
+            {
+                "code": "R4",
+                "details": {
+                    "storyboard_ids": ["S01_P01"],
+                    "panel_evidence": {
+                        "S01_P01": {"observed": "train is absent"}
+                    },
+                },
+            }
+        ]
+    }
+    calls.clear()
+    generate_shot_storyboards(
+        tmp_path,
+        storyboard,
+        [],
+        client=client,
+        correction_context_by_shot=correction,
+        correction_attempt=1,
+        target_shot_ids={"S01"},
+    )
+    assert calls == ["S01_P01.png", "S01.png"]
+
+    calls.clear()
+    recovered = generate_shot_storyboards(
+        tmp_path,
+        storyboard,
+        [],
+        client=client,
+        correction_context_by_shot=correction,
+        correction_attempt=1,
+        target_shot_ids={"S01"},
+    )
+
+    assert calls == []
+    assert recovered["shots"][0]["cache_hit"] is True
+
+
 def test_secondary_strategies_follow_content_capacity_and_boundary_semantics():
     intense_but_single_clip = {
         "video_provider": "seedance",

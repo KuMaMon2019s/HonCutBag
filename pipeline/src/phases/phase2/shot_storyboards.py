@@ -1277,13 +1277,17 @@ def generate_shot_storyboards(
     model = getattr(client, "model", None) or "doubao-seedream-5.0-lite"
     manifest_path = output_dir / "SHOT_STORYBOARDS.json"
     previous_manifest: dict[str, Any] = {}
-    if target_shot_ids and manifest_path.is_file():
+    if manifest_path.is_file():
         try:
             previous_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            raise RuntimeError(
-                "targeted storyboard regeneration requires a readable prior manifest"
-            ) from exc
+            if target_shot_ids:
+                raise RuntimeError(
+                    "targeted storyboard regeneration requires a readable prior manifest"
+                ) from exc
+            previous_manifest = {}
+        if previous_manifest and previous_manifest.get("kind") != "honcut.shot_storyboards.v2":
+            raise RuntimeError("unsupported prior storyboard manifest schema")
     normalized_targets = {
         str(shot_id).strip() for shot_id in (target_shot_ids or set())
         if str(shot_id).strip()
@@ -1293,10 +1297,15 @@ def generate_shot_storyboards(
         for record in (previous_manifest.get("shots") or [])
         if isinstance(record, dict) and record.get("shot_id")
     }
-    preserved_records = [
-        record for shot_id, record in previous_records.items()
-        if shot_id not in normalized_targets
-    ]
+    preserved_records = (
+        [
+            record
+            for shot_id, record in previous_records.items()
+            if shot_id not in normalized_targets
+        ]
+        if normalized_targets
+        else []
+    )
     contract: dict[str, Any] = {
         "kind": "honcut.shot_storyboards.v2",
         "version": 2,
@@ -1426,6 +1435,23 @@ def generate_shot_storyboards(
                     "attempt": int(correction_attempt),
                     "issues": correction_issues,
                 }
+            board_generation_fingerprint = hashlib.sha256(
+                json.dumps(
+                    {
+                        "prompt_sha256": prompt_sha,
+                        "model": contract["model"],
+                        "size_requested": size,
+                        "aspect_ratio": aspect_ratio,
+                        "request_contract_id": IMAGE_REQUEST_CONTRACT_ID,
+                        "request_contract_version": IMAGE_REQUEST_CONTRACT_VERSION,
+                        "correction": record.get("correction"),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            record["generation_fingerprint"] = board_generation_fingerprint
             panel_records = []
             panel_paths: list[Path] = []
             previous_panel = (
@@ -1859,18 +1885,63 @@ def generate_shot_storyboards(
             # eligible as video-model media. Exact grid boundaries and cell IDs
             # are then overlaid deterministically so layout cannot silently
             # collapse into a linear strip.
-            board_result_url = client.text_to_image(
-                prompt=prompt,
-                output_path=str(board_path),
-                size=size,
-                timeout=180,
-            )
-            if not board_path.is_file() or board_path.stat().st_size == 0:
-                raise RuntimeError(f"Seedream returned without {board_path.name}")
-            with Image.open(board_path) as board_image:
-                board_image.verify()
-            raw_board_sha256 = hashlib.sha256(board_path.read_bytes()).hexdigest()
-            grid_contract = _normalize_nine_grid_board(board_path, shot_id)
+            previous_record = previous_records.get(shot_id)
+            board_cached = False
+            if (
+                previous_record
+                and previous_record.get("status") == "done"
+                and previous_record.get("generation_fingerprint")
+                == board_generation_fingerprint
+                and previous_record.get("prompt_sha256") == prompt_sha
+                and previous_record.get("model") == contract["model"]
+                and previous_manifest.get("size_requested") == size
+                and previous_manifest.get("aspect_ratio") == aspect_ratio
+                and previous_manifest.get("request_contract_id")
+                == IMAGE_REQUEST_CONTRACT_ID
+                and previous_manifest.get("request_contract_version")
+                == IMAGE_REQUEST_CONTRACT_VERSION
+            ):
+                try:
+                    with Image.open(board_path) as board_image:
+                        board_image.verify()
+                    observed_board_sha256 = hashlib.sha256(
+                        board_path.read_bytes()
+                    ).hexdigest()
+                    if observed_board_sha256 != str(
+                        previous_record.get("board_sha256") or ""
+                    ):
+                        raise ValueError("board hash mismatch")
+                    previous_grid = previous_record.get("grid_contract") or {}
+                    if (
+                        previous_grid.get("columns")
+                        != SHOT_STORYBOARD_GRID_COLUMNS
+                        or previous_grid.get("rows")
+                        != SHOT_STORYBOARD_GRID_ROWS
+                        or previous_grid.get("cell_count")
+                        != SHOT_STORYBOARD_GRID_CELLS
+                        or len(previous_grid.get("cells") or [])
+                        != SHOT_STORYBOARD_GRID_CELLS
+                    ):
+                        raise ValueError("invalid cached grid contract")
+                    board_result_url = previous_record.get("result_url")
+                    raw_board_sha256 = previous_record.get("raw_board_sha256")
+                    grid_contract = previous_grid
+                    board_cached = True
+                except (OSError, ValueError):
+                    board_cached = False
+            if not board_cached:
+                board_result_url = client.text_to_image(
+                    prompt=prompt,
+                    output_path=str(board_path),
+                    size=size,
+                    timeout=180,
+                )
+                if not board_path.is_file() or board_path.stat().st_size == 0:
+                    raise RuntimeError(f"Seedream returned without {board_path.name}")
+                with Image.open(board_path) as board_image:
+                    board_image.verify()
+                raw_board_sha256 = hashlib.sha256(board_path.read_bytes()).hexdigest()
+                grid_contract = _normalize_nine_grid_board(board_path, shot_id)
             legacy_preview_path = image_dir / f"{shot_id}.png"
             shutil.copy2(panel_paths[0], legacy_preview_path)
             _write_json(
@@ -1897,6 +1968,8 @@ def generate_shot_storyboards(
                 "board_sha256": hashlib.sha256(board_path.read_bytes()).hexdigest(),
                 "grid_contract": grid_contract,
             })
+            if board_cached:
+                record["cache_hit"] = True
             shot["storyboard_board"] = record["board"]
             shot["storyboard_beats"] = beats
             _write_json(boards_dir / f"{shot_id}.json", record)
