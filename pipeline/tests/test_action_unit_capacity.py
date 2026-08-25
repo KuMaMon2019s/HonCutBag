@@ -1467,6 +1467,53 @@ def test_production_beat_text_fields_exclude_unselected_model_texture():
     assert 2 <= len(beat["texture_keywords"]) <= 4
 
 
+def test_production_projection_excludes_unselected_intra_event_actions():
+    scaled_event = {
+        "sequence_id": "SEQ001",
+        "who": ["enemy_3"],
+        "where": "inside the train carriage",
+        "what": "enemy_3 jumps from above, strikes the floor, then blue current spreads",
+        "visual": "enemy_3 is airborne before a heavy floor strike and blue current spreads",
+        "micro_actions": ["blue current spreads along the floor cracks"],
+        "start_state": "the carriage is shaking",
+        "end_state": "blue current covers the cracked floor",
+        "continuity_before": "continuous",
+        "production_action_selection": {
+            "schema": "honcut.duration-scaled-event-plan.v2",
+            "source_event_id": 9,
+            "selected_source_micro_action_indexes": [4],
+            "omitted_source_micro_action_indexes": [1, 2, 3],
+            "source_micro_actions_sha256": "source-ledger-hash",
+        },
+    }
+    beat = {
+        "source_events": [9],
+        "what": "enemy_3 jumps from above and strikes the floor",
+        "visual": "enemy_3 is airborne above the carriage floor",
+        "texture_keywords": ["airborne enemy", "floor strike"],
+    }
+
+    engine._ground_production_beat_text_fields(beat, [scaled_event])
+    projection = engine._build_production_director_intent(
+        {
+            "sequence_id": "SEQ001",
+            "scene_goal": "show every source action",
+            "visual_focus": "enemy_3 jumps from above and strikes the floor",
+        },
+        [scaled_event],
+        source_event_ids=[9],
+        shot={"camera_movement": "static"},
+    )
+
+    serialized = json.dumps({"beat": beat, "director": projection})
+    assert "jumps from above" not in serialized
+    assert "strikes the floor" not in serialized
+    assert beat["what"] == "blue current spreads along the floor cracks"
+    assert beat["visual"] == "blue current spreads along the floor cracks"
+    assert projection["scene_goal"] == "blue current spreads along the floor cracks"
+    assert projection["visual_focus"] == "blue current spreads along the floor cracks"
+
+
 def test_screenplay_plan_binds_production_director_projection_to_source_refs():
     events = [{
         "sequence_id": "SEQ001",

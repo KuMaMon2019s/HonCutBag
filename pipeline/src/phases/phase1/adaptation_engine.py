@@ -1426,10 +1426,50 @@ def _director_intents_by_sequence(
 PRODUCTION_DIRECTOR_INTENT_SCHEMA = "honcut.production-director-intent.v1"
 
 
+def _duration_scaled_visible_actions(
+    event: Dict[str, Any],
+) -> List[str] | None:
+    """Return selected actions when intra-event omissions narrow visible facts."""
+    selection = event.get("production_action_selection")
+    if not isinstance(selection, dict):
+        return None
+    selected = selection.get("selected_source_micro_action_indexes")
+    omitted = selection.get("omitted_source_micro_action_indexes")
+    if not isinstance(selected, list) or not isinstance(omitted, list):
+        raise ValueError("production action selection has invalid index arrays")
+    if not omitted:
+        return None
+    raw_actions = event.get("micro_actions") or []
+    if isinstance(raw_actions, str):
+        raw_actions = [raw_actions]
+    actions = [
+        str(action).strip() for action in raw_actions if str(action).strip()
+    ]
+    if len(actions) != len(selected):
+        raise ValueError(
+            "duration-scaled event actions do not match selected source indexes"
+        )
+    return actions
+
+
 def _source_event_narrative_fact(
     event: Dict[str, Any],
     event_id: int,
 ) -> str:
+    selected_actions = _duration_scaled_visible_actions(event)
+    if selected_actions is not None:
+        if selected_actions:
+            return " → ".join(selected_actions)
+        states = [
+            str(event.get(field) or "").strip()
+            for field in ("start_state", "end_state")
+            if str(event.get(field) or "").strip()
+        ]
+        return (
+            " → ".join(dict.fromkeys(states))
+            if states
+            else f"canonical source event {event_id} retained state"
+        )
     for field in ("what", "summary", "source_excerpt"):
         value = str(event.get(field) or "").strip()
         if value:
@@ -1452,6 +1492,19 @@ def _source_event_narrative_fact(
     if states:
         return " → ".join(dict.fromkeys(states))
     return f"canonical source event {event_id}"
+
+
+def _source_event_visual_fact(
+    event: Dict[str, Any],
+    event_id: int,
+) -> str:
+    """Keep visual prose only when duration scaling did not omit its actions."""
+    if _duration_scaled_visible_actions(event) is not None:
+        return _source_event_narrative_fact(event, event_id)
+    return (
+        str(event.get("visual") or "").strip()
+        or _source_event_narrative_fact(event, event_id)
+    )
 
 
 def _ground_production_beat_text_fields(
@@ -1488,6 +1541,14 @@ def _ground_production_beat_text_fields(
             strict=True,
         )
     ))
+    visual_facts = list(dict.fromkeys(
+        _source_event_visual_fact(event, event_id)
+        for event_id, event in zip(
+            source_event_ids,
+            selected_events,
+            strict=True,
+        )
+    ))
     texture_candidates = list(dict.fromkeys(
         str(value).strip()
         for event_id, event in zip(
@@ -1496,7 +1557,7 @@ def _ground_production_beat_text_fields(
             strict=True,
         )
         for value in (
-            event.get("visual"),
+            _source_event_visual_fact(event, event_id),
             event.get("where"),
             _source_event_narrative_fact(event, event_id),
         )
@@ -1516,6 +1577,7 @@ def _ground_production_beat_text_fields(
         else "source-event location unspecified"
     )
     beat["what"] = "；随后".join(narrative_facts)
+    beat["visual"] = "；随后".join(visual_facts)
     beat["reason"] = (
         "source-grounded production mapping for events "
         + ",".join(str(event_id) for event_id in source_event_ids)
@@ -1570,7 +1632,14 @@ def _build_production_director_intent(
         )
     ))
     emotion_arc = joined("emotion", " → ") or "preserve source-event emotional state"
-    visual_focus = joined("visual") or scene_goal
+    visual_focus = "；".join(dict.fromkeys(
+        _source_event_visual_fact(event, event_id)
+        for event_id, event in zip(
+            source_event_ids,
+            selected_events,
+            strict=True,
+        )
+    )) or scene_goal
     locations = joined("where", " → ") or "preserve source-event location"
     start_state = str(selected_events[0].get("start_state") or "").strip()
     end_state = str(selected_events[-1].get("end_state") or "").strip()
