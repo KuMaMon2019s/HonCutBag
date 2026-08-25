@@ -242,7 +242,7 @@ _NARRATIVE_JUMP_CUES = (
 # caches carried over from earlier run directories — and forces every Phase 1
 # event extraction to re-run (a paid LLM pass). Never bump casually, and never
 # reuse cross-run segment caches from a run produced under a different value.
-EVENT_FLOW_SCHEMA_VERSION = "23.0"
+EVENT_FLOW_SCHEMA_VERSION = "24.0"
 
 _UNKNOWN_ACTION_PERFORMERS = {
     "",
@@ -637,21 +637,24 @@ def _annotate_global_event_flow(
 ) -> list[dict[str, Any]]:
     """Assign deterministic global sequence/action/dialogue identities in source order.
 
-    An explicit one-take direction is a source-level continuity fact. Segment-local
-    extraction may still call later paragraphs a ``cut`` because their location is
-    paraphrased (``street``, ``road ahead``, ``sidewalk``). In one-take mode those
-    paragraph boundaries must not become unrelated screenplay sequences.
+    An explicit one-take or single-sequence direction is a source-level continuity
+    fact. Segment-local extraction may still call later paragraphs a ``cut`` because
+    their location is paraphrased (``street``, ``road ahead``, ``sidewalk``). Those
+    paragraph boundaries must not become unrelated screenplay sequences. A real
+    narrative jump remains a hard boundary in either mode.
     """
-    preserve_one_take = str(continuity_mode or "").strip().lower() in {
+    normalized_mode = str(continuity_mode or "").strip().lower()
+    preserve_explicit_sequence = normalized_mode in {
         "one_take",
         "single_take",
         "oner",
+        "single_sequence",
     }
     for index in range(len(events) - 1):
         _repair_source_proven_forward_participant(
             events[index],
             events[index + 1],
-            preserve_one_take=preserve_one_take,
+            preserve_explicit_sequence=preserve_explicit_sequence,
         )
     annotate_event_motion_modes(events)
     sequence_number = 0
@@ -665,13 +668,13 @@ def _annotate_global_event_flow(
             _repair_continuous_generic_participant(
                 previous,
                 event,
-                preserve_one_take=preserve_one_take,
+                preserve_explicit_sequence=preserve_explicit_sequence,
                 known_participants=known_participants,
             )
             _reconcile_continuous_action_participants(
                 previous,
                 event,
-                preserve_one_take=preserve_one_take,
+                preserve_explicit_sequence=preserve_explicit_sequence,
             )
         boundary = str(event.get("continuity_before") or "cut").lower()
         exact_same_place = bool(
@@ -680,11 +683,18 @@ def _annotate_global_event_flow(
             and str(previous.get("where") or "").strip() == str(event.get("where") or "").strip()
         )
         compatible_place = bool(previous and _locations_compatible(previous, event))
-        if previous and preserve_one_take and not _has_narrative_jump(event):
+        if (
+            previous
+            and preserve_explicit_sequence
+            and not _has_narrative_jump(event)
+        ):
             if boundary != "continuous":
                 event["model_continuity_before"] = boundary
                 event["continuity_repair_reason"] = (
                     "explicit one-take source keeps all events in one screenplay sequence"
+                    if normalized_mode in {"one_take", "single_take", "oner"}
+                    else "explicit single-sequence source keeps chronologically "
+                    "continuous events in one screenplay sequence"
                 )
             boundary = "continuous"
         elif previous and boundary == "cut" and _should_repair_cross_segment_boundary(previous, event):
@@ -694,7 +704,8 @@ def _annotate_global_event_flow(
             )
             boundary = "continuous"
         if index == 1 or boundary != "continuous" or (
-            not preserve_one_take and not (exact_same_place or compatible_place)
+            not preserve_explicit_sequence
+            and not (exact_same_place or compatible_place)
         ):
             boundary = "cut"
             sequence_number += 1
@@ -752,7 +763,7 @@ def _repair_source_proven_forward_participant(
     current: Dict[str, Any],
     following: Dict[str, Any],
     *,
-    preserve_one_take: bool,
+    preserve_explicit_sequence: bool,
 ) -> None:
     """Repair one model-shortened identity from exact current source evidence.
 
@@ -766,7 +777,7 @@ def _repair_source_proven_forward_participant(
     boundary = str(following.get("continuity_before") or "cut").strip().lower()
     if not (
         boundary == "continuous"
-        or (preserve_one_take and not _has_narrative_jump(following))
+        or (preserve_explicit_sequence and not _has_narrative_jump(following))
     ):
         return
 
@@ -826,7 +837,7 @@ def _repair_continuous_generic_participant(
     previous: Dict[str, Any],
     current: Dict[str, Any],
     *,
-    preserve_one_take: bool,
+    preserve_explicit_sequence: bool,
     known_participants: set[str] | None = None,
 ) -> None:
     """Preserve an adjacent specific identity when the model regresses to its role.
@@ -841,7 +852,7 @@ def _repair_continuous_generic_participant(
     boundary = str(current.get("continuity_before") or "cut").strip().lower()
     if not (
         boundary == "continuous"
-        or (preserve_one_take and not _has_narrative_jump(current))
+        or (preserve_explicit_sequence and not _has_narrative_jump(current))
     ):
         return
 
@@ -926,7 +937,7 @@ def _reconcile_continuous_action_participants(
     previous: Dict[str, Any],
     current: Dict[str, Any],
     *,
-    preserve_one_take: bool,
+    preserve_explicit_sequence: bool,
 ) -> None:
     """Carry a visible action participant only from matching structured evidence.
 
@@ -939,7 +950,7 @@ def _reconcile_continuous_action_participants(
     boundary = str(current.get("continuity_before") or "cut").strip().lower()
     if not (
         boundary == "continuous"
-        or (preserve_one_take and not _has_narrative_jump(current))
+        or (preserve_explicit_sequence and not _has_narrative_jump(current))
     ):
         return
     if not (current.get("micro_actions") or current.get("action_phase") != "none"):

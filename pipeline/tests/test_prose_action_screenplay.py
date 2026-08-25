@@ -22,6 +22,8 @@ from phases.phase1.adaptation_engine import (
     _inherit_event_semantics,
     _parse_beat_skeleton,
 )
+from phases.phase1.phase1_screenwriter import _continuity_mode_from_text
+from phases.phase1.storyboard_beats import _bridge_requirement
 from prompt.event_extractor import (
     ACTION_SCREENPLAY_CONTRACT,
     EVENT_FLOW_SCHEMA_VERSION,
@@ -451,6 +453,68 @@ def test_global_flow_keeps_explicit_one_take_in_one_sequence():
     assert "one-take" in events[1]["continuity_repair_reason"]
 
 
+@pytest.mark.parametrize(
+    "brief",
+    [
+        "全程是一个单一、连续、按时间顺序推进的动作 sequence，不回闪、不跳时空。",
+        "整个视频保持单一连续动作序列，事件严格按时间顺序展开。",
+        "The entire film unfolds as one single continuous action sequence.",
+    ],
+)
+def test_phase1_detects_explicit_single_sequence_direction(brief):
+    assert _continuity_mode_from_text(brief) == "single_sequence"
+
+
+@pytest.mark.parametrize(
+    "brief",
+    [
+        "本片不是一个单一连续动作 sequence，可以按场景分段。",
+        "不要求保持单一、连续的动作序列。",
+        "The film is not a single continuous sequence and may use scene breaks.",
+    ],
+)
+def test_phase1_rejects_negated_single_sequence_direction(brief):
+    assert _continuity_mode_from_text(brief) is None
+
+
+def test_phase1_keeps_single_take_and_single_sequence_as_distinct_modes():
+    assert _continuity_mode_from_text("全片一镜到底。") == "one_take"
+    assert _continuity_mode_from_text("全片采用单一连续动作 sequence。") == (
+        "single_sequence"
+    )
+
+
+def test_global_flow_keeps_explicit_single_sequence_in_one_sequence():
+    events = [
+        _event(continuity_before="cut", where="透明穹顶下的站台"),
+        _event(continuity_before="cut", where="列车开启的车门处"),
+        _event(continuity_before="cut", where="高速行驶的列车车厢"),
+    ]
+
+    _annotate_global_event_flow(events, continuity_mode="single_sequence")
+
+    assert [event["sequence_id"] for event in events] == ["SEQ001"] * 3
+    assert [event["continuity_before"] for event in events] == [
+        "cut",
+        "continuous",
+        "continuous",
+    ]
+    assert events[1]["model_continuity_before"] == "cut"
+    assert "single-sequence" in events[1]["continuity_repair_reason"]
+
+
+def test_single_sequence_does_not_enable_one_take_camera_bridges():
+    storyboard = {"continuity_mode": "single_sequence"}
+    shots = [
+        {"id": "S01", "transition_to_next": "cut"},
+        {"id": "S02", "boundary_before": "cut"},
+    ]
+
+    required, _reason = _bridge_requirement(storyboard, shots, 0)
+
+    assert required is False
+
+
 def test_global_flow_resolves_generic_participant_to_adjacent_specific_identity():
     events = [
         _event(
@@ -688,7 +752,8 @@ def test_global_flow_does_not_merge_explicitly_new_generic_role_participant():
     assert "model_who" not in events[1]
 
 
-def test_one_take_mode_does_not_hide_an_explicit_time_jump():
+@pytest.mark.parametrize("continuity_mode", ["one_take", "single_sequence"])
+def test_explicit_sequence_mode_does_not_hide_a_time_jump(continuity_mode):
     events = [
         _event(continuity_before="cut", where="街道"),
         _event(
@@ -698,7 +763,7 @@ def test_one_take_mode_does_not_hide_an_explicit_time_jump():
         ),
     ]
 
-    _annotate_global_event_flow(events, continuity_mode="one_take")
+    _annotate_global_event_flow(events, continuity_mode=continuity_mode)
 
     assert [event["sequence_id"] for event in events] == ["SEQ001", "SEQ002"]
     assert events[1]["continuity_before"] == "cut"

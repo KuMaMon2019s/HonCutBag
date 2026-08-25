@@ -238,17 +238,49 @@ def _write_project_visual_style(output_dir: Path, style_text: str) -> Path:
 
 
 def _continuity_mode_from_text(text: str) -> str | None:
-    """Extract only explicit single-take direction from the source brief."""
+    """Extract explicit camera-take or screenplay-sequence continuity intent."""
     normalized = re.sub(r"\s+", " ", str(text or "")).casefold()
-    markers = (
-        "一镜到底",
-        "单镜到底",
-        "one take",
-        "one-take",
-        "single continuous shot",
-        "continuous oner",
+    negated_before = re.compile(
+        r"(?:"
+        r"不(?:是|要|需|应|要求)?|并非|无需|无须|禁止|避免|未要求|"
+        r"not|no|without|avoid|forbid(?:den)?|do not|don't|does not|"
+        r"must not|should not|need not"
+        r")\s*(?:(?:采用|保持|使用|呈现为|做成|成为|一个|一条|一种|"
+        r"require|use|keep|maintain|be|as|a|an|one|necessarily)\s*)*$",
+        re.IGNORECASE,
     )
-    return "one_take" if any(marker in normalized for marker in markers) else None
+
+    def has_affirmed(pattern: re.Pattern[str]) -> bool:
+        for match in pattern.finditer(normalized):
+            prefix = normalized[max(0, match.start() - 64):match.start()]
+            if not negated_before.search(prefix):
+                return True
+        return False
+
+    one_take = re.compile(
+        r"一镜到底|单镜到底|\bone[ -]take\b|"
+        r"\bsingle continuous shot\b|\bcontinuous oner\b",
+        re.IGNORECASE,
+    )
+    if has_affirmed(one_take):
+        return "one_take"
+
+    single_sequence = re.compile(
+        r"(?:"
+        r"(?:(?:一个|一条)\s*)?(?:单一|唯一)"
+        r"|(?:一个|一条)"
+        r")\s*[、，,]?\s*连续"
+        r"(?:\s*[、，,]\s*按(?:照)?时间顺序(?:推进|展开)?的?)?"
+        r"\s*的?\s*(?:动作|叙事|故事|时间)?\s*(?:sequence|序列)"
+        r"|\b(?:one\s+)?single[ -]+continuous"
+        r"(?:[ -]+(?:action|narrative|story|chronological))?"
+        r"[ -]+sequence\b"
+        r"|\bone[ -]+continuous"
+        r"(?:[ -]+(?:action|narrative|story|chronological))?"
+        r"[ -]+sequence\b",
+        re.IGNORECASE,
+    )
+    return "single_sequence" if has_affirmed(single_sequence) else None
 
 
 def run_phase1_screenwriter(
