@@ -264,6 +264,233 @@ def test_secondary_beats_use_structured_source_event_cast_for_implicit_actions()
     ]
 
 
+def test_secondary_beats_scope_multi_party_cast_to_their_generation_units():
+    storyboard = {
+        "video_provider": "seedance",
+        "shots": [{
+            "id": "S01",
+            "duration": 7,
+            "who": ["Lead", "Raider One", "Raider Two", "Raider Three"],
+            "character_ids": ["lead", "raider_1", "raider_2", "raider_3"],
+            "participant_refs": [
+                {"mention": "Lead", "character_id": "lead"},
+                {"mention": "Raider One", "character_id": "raider_1"},
+                {"mention": "Raider Two", "character_id": "raider_2"},
+                {"mention": "Raider Three", "character_id": "raider_3"},
+            ],
+            "source_events": [1, 3],
+            "source_event_casts": [
+                {"source_event_id": 1, "character_ids": []},
+                {
+                    "source_event_id": 3,
+                    "character_ids": [
+                        "lead", "raider_1", "raider_2", "raider_3",
+                    ],
+                },
+            ],
+            "start_state": "The empty platform waits beside the train",
+            "micro_actions": [
+                "The train door releases warm light",
+                "Lead steps toward the train door",
+                "The armored squad emerges from the carriage",
+                "The armored squad raises its equipment",
+            ],
+            "generation_action_units": [
+                {
+                    "unit_id": "GAU001",
+                    "kind": "sequential",
+                    "actions": ["The train door releases warm light"],
+                    "ledger_indexes": [0],
+                    "source_event_id": 1,
+                },
+                {
+                    "unit_id": "GAU002",
+                    "kind": "sequential",
+                    "actions": ["Lead steps toward the train door"],
+                    "ledger_indexes": [1],
+                    "source_event_id": 3,
+                    "source_action_unit_id": "AU001",
+                },
+                {
+                    "unit_id": "GAU003",
+                    "kind": "sequential",
+                    "actions": ["The armored squad emerges from the carriage"],
+                    "ledger_indexes": [2],
+                    "source_event_id": 3,
+                    "source_action_unit_id": "AU001",
+                },
+                {
+                    "unit_id": "GAU004",
+                    "kind": "sequential",
+                    "actions": ["The armored squad raises its equipment"],
+                    "ledger_indexes": [3],
+                    "source_event_id": 3,
+                    "source_action_unit_id": "AU001",
+                },
+            ],
+            "source_action_unit_ids": ["AU001"],
+            "end_state": "The armored squad controls the carriage entrance",
+        }],
+    }
+
+    plan_storyboard_beats(storyboard)
+
+    beats = storyboard["shots"][0]["storyboard_beats"]
+    assert [beat["micro_actions"] for beat in beats] == [
+        [
+            "The train door releases warm light",
+            "Lead steps toward the train door",
+        ],
+        [
+            "The armored squad emerges from the carriage",
+            "The armored squad raises its equipment",
+        ],
+    ]
+    assert [beat["source_event_ids"] for beat in beats] == [[1, 3], [3]]
+    assert [beat["source_action_unit_ids"] for beat in beats] == [
+        ["AU001"],
+        [],
+    ]
+    assert [beat["character_ids"] for beat in beats] == [
+        ["lead"],
+        ["lead", "raider_1", "raider_2", "raider_3"],
+    ]
+    characters = [
+        {"id": "lead", "name": "Lead", "description": "dark long coat"},
+        {
+            "id": "raider_1",
+            "name": "Raider One",
+            "description": "distinct blue energy blade",
+        },
+        {
+            "id": "raider_2",
+            "name": "Raider Two",
+            "description": "distinct energy launcher",
+        },
+        {
+            "id": "raider_3",
+            "name": "Raider Three",
+            "description": "distinct mechanical gauntlets",
+        },
+    ]
+    first_prompt = _build_panel_prompt(
+        storyboard["shots"][0],
+        beats[0],
+        1,
+        len(beats),
+        characters,
+    )
+    second_prompt = _build_panel_prompt(
+        storyboard["shots"][0],
+        beats[1],
+        2,
+        len(beats),
+        characters,
+    )
+    assert "Raider One" not in first_prompt
+    assert "distinct blue energy blade" not in first_prompt
+    assert "Raider One" in second_prompt
+    assert "distinct blue energy blade" in second_prompt
+    assert secondary_storyboard_contract_errors(storyboard, 0) == []
+
+
+def test_secondary_beats_keep_zero_cost_actions_with_their_unit_lineage():
+    storyboard = {
+        "video_provider": "seedance",
+        "shots": [{
+            "id": "S05",
+            "duration": 6,
+            "who": ["Lead"],
+            "character_ids": ["lead"],
+            "participant_refs": [{"mention": "Lead", "character_id": "lead"}],
+            "source_events": [11, 12, 13],
+            "source_event_casts": [
+                {"source_event_id": event_id, "character_ids": ["lead"]}
+                for event_id in (11, 12, 13)
+            ],
+            "source_action_unit_ids": ["AU009", "AU010"],
+            "micro_actions": [
+                "Lead straightens the long coat",
+                "Lead checks the transparent chip",
+                "The chip projects unknown coordinates",
+                "City lights pass the window",
+                "The camera pulls back slowly",
+                "The train crosses the neon tunnel",
+            ],
+            "generation_action_units": [
+                {
+                    "unit_id": "GAU001",
+                    "kind": "sequential",
+                    "actions": ["Lead straightens the long coat"],
+                    "ledger_indexes": [0],
+                    "source_event_id": 11,
+                    "source_action_unit_id": "AU009",
+                },
+                {
+                    "unit_id": "GAU002",
+                    "kind": "sequential",
+                    "actions": ["Lead checks the transparent chip"],
+                    "ledger_indexes": [1],
+                    "source_event_id": 11,
+                    "source_action_unit_id": "AU009",
+                },
+                {
+                    "unit_id": "GAU003",
+                    "kind": "sequential",
+                    "actions": ["The chip projects unknown coordinates"],
+                    "ledger_indexes": [2],
+                    "source_event_id": 12,
+                    "source_action_unit_id": "AU010",
+                },
+                {
+                    "unit_id": "GAU004",
+                    "kind": "simultaneous",
+                    "actions": [
+                        "City lights pass the window",
+                        "The train crosses the neon tunnel",
+                    ],
+                    "ledger_indexes": [3, 5],
+                    "source_event_id": 13,
+                },
+            ],
+            "start_state": "Lead stands in the moving carriage",
+            "end_state": "The camera reveals the train crossing the neon tunnel",
+        }],
+    }
+
+    plan_storyboard_beats(storyboard)
+
+    beats = storyboard["shots"][0]["storyboard_beats"]
+    assert [beat["micro_actions"] for beat in beats] == [
+        [
+            "Lead straightens the long coat",
+            "Lead checks the transparent chip",
+        ],
+        [
+            "The chip projects unknown coordinates",
+            "City lights pass the window",
+            "The camera pulls back slowly",
+            "The train crosses the neon tunnel",
+        ],
+    ]
+    assert "coordinates" not in beats[0]["action"]
+    assert "coordinates" in beats[1]["action"]
+    assert [beat["source_event_ids"] for beat in beats] == [[11], [12, 13]]
+    assert [beat["source_action_unit_ids"] for beat in beats] == [
+        ["AU009"],
+        ["AU010"],
+    ]
+    assert [beat["character_ids"] for beat in beats] == [["lead"], ["lead"]]
+    assert secondary_storyboard_contract_errors(storyboard, 0) == []
+
+    tampered = json.loads(json.dumps(storyboard))
+    tampered["shots"][0]["generation_action_units"][2]["ledger_indexes"] = [99]
+    assert any(
+        error["code"] == "secondary_storyboard_generation_lineage_invalid"
+        for error in secondary_storyboard_contract_errors(tampered, 0)
+    )
+
+
 def test_flf2v_provider_capability_is_separate_from_honcut_bridge_policy():
     seedance = get_video_capabilities(provider="seedance")
 

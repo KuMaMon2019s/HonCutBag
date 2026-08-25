@@ -22,8 +22,8 @@ from utils.video_capabilities import (
     min_primary_story_duration,
 )
 
-SECONDARY_STORYBOARD_VERSION = "honcut.secondary-storyboard.v13"
-SECONDARY_EXECUTION = "content_capacity_post_primary_bridge_v13"
+SECONDARY_STORYBOARD_VERSION = "honcut.secondary-storyboard.v14"
+SECONDARY_EXECUTION = "content_capacity_post_primary_bridge_v14"
 SECONDARY_GENERATION_MODES = frozenset({
     "multi_image",
     "tail_video_extend",
@@ -95,6 +95,7 @@ def _beat_character_ids(
     shot: dict[str, Any],
     *semantic_values: Any,
     source_event_ids: list[int] | None = None,
+    generation_action_units: list[dict[str, Any]] | None = None,
 ) -> list[str]:
     """Project shot participants into the canonical cast visible in one Pxx.
 
@@ -126,20 +127,49 @@ def _beat_character_ids(
         for character_id, mention in zip(character_ids, who, strict=True):
             mentions_by_id[character_id].add(mention)
 
-    semantic_text = "\n".join(
-        str(value) for value in semantic_values if str(value or "").strip()
-    )
-    visible_ids = {
-        character_id
-        for character_id in character_ids
-        if any(
-            _contains_complete_mention(semantic_text, mention)
-            for mention in mentions_by_id[character_id]
-        )
-    }
+    def mentioned_ids(value: Any) -> set[str]:
+        text = str(value or "")
+        return {
+            character_id
+            for character_id in character_ids
+            if any(
+                _contains_complete_mention(text, mention)
+                for mention in mentions_by_id[character_id]
+            )
+        }
+
+    visible_ids = set().union(*(mentioned_ids(value) for value in semantic_values))
     event_casts = _source_event_cast_index(shot)
-    for event_id in source_event_ids or []:
-        visible_ids.update(event_casts.get(event_id, []))
+    if generation_action_units is None:
+        for event_id in source_event_ids or []:
+            visible_ids.update(event_casts.get(event_id, []))
+    else:
+        unit_event_ids = _generation_unit_source_event_ids(generation_action_units)
+        if unit_event_ids != list(dict.fromkeys(source_event_ids or [])):
+            raise ValueError(
+                "beat cast generation units do not match source_event_ids"
+            )
+        for unit in generation_action_units:
+            event_id = unit.get("source_event_id")
+            event_cast = event_casts.get(event_id, [])
+            unit_explicit_ids = set().union(*(
+                mentioned_ids(action)
+                for action in (unit.get("actions") or [])
+                if str(action or "").strip()
+            ))
+            if not event_cast:
+                visible_ids.update(unit_explicit_ids)
+            elif not unit_explicit_ids or len(event_cast) <= 2:
+                # An implicit unit inherits its canonical event cast.  Binary
+                # interactions keep both endpoints even when one is expressed
+                # through a pronoun or generic role such as "the opponent".
+                visible_ids.update(event_cast)
+            else:
+                # A multi-party source event may be partitioned across Pxx.
+                # When one unit explicitly names a strict subset, importing the
+                # whole event cast would make characters appear before their
+                # own action bucket.
+                visible_ids.update(unit_explicit_ids & set(event_cast))
     return [
         character_id for character_id in character_ids if character_id in visible_ids
     ]
@@ -191,6 +221,113 @@ def _generation_unit_source_event_ids(
         for event_id in [unit.get("source_event_id")]
         if isinstance(event_id, int) and event_id > 0
     ))
+
+
+def _generation_unit_action_buckets(
+    source_actions: list[str],
+    generation_unit_buckets: list[list[dict[str, Any]]],
+) -> list[list[str]]:
+    """Bind every source action to the same buckets as its generation units.
+
+    ``ledger_indexes`` are the canonical link to the primary action ledger.
+    Contiguous ranges also retain zero-capacity actions, such as camera motion
+    or sustained environment state, without partitioning them independently.
+    """
+    if not generation_unit_buckets:
+        return []
+    if not source_actions:
+        return [[] for _ in generation_unit_buckets]
+    if not any(generation_unit_buckets):
+        return _partition(source_actions, len(generation_unit_buckets))
+
+    bucket_indexes: list[list[int]] = []
+    all_have_indexes = True
+    for bucket in generation_unit_buckets:
+        indexes: list[int] = []
+        for unit in bucket:
+            raw_indexes = unit.get("ledger_indexes")
+            if not isinstance(raw_indexes, list) or not raw_indexes:
+                all_have_indexes = False
+                continue
+            if any(
+                not isinstance(index, int)
+                or isinstance(index, bool)
+                or index < 0
+                or index >= len(source_actions)
+                for index in raw_indexes
+            ):
+                raise ValueError(
+                    "generation action unit contains an invalid ledger index"
+                )
+            indexes.extend(raw_indexes)
+        bucket_indexes.append(indexes)
+
+    if all_have_indexes and all(bucket_indexes):
+        for previous, current in zip(bucket_indexes, bucket_indexes[1:], strict=False):
+            if max(previous) >= min(current):
+                raise ValueError(
+                    "generation action unit buckets cross primary action order"
+                )
+        starts = [0, *(min(indexes) for indexes in bucket_indexes[1:])]
+        ends = [*starts[1:], len(source_actions)]
+        buckets = [
+            source_actions[start:end]
+            for start, end in zip(starts, ends, strict=True)
+        ]
+    else:
+        buckets = [
+            [
+                str(action).strip()
+                for unit in bucket
+                for action in (unit.get("actions") or [])
+                if str(action or "").strip()
+            ]
+            for bucket in generation_unit_buckets
+        ]
+        if [action for bucket in buckets for action in bucket] != source_actions:
+            raise ValueError(
+                "generation action units cannot be reconciled with source actions"
+            )
+
+    if [action for bucket in buckets for action in bucket] != source_actions:
+        raise ValueError(
+            "generation action unit buckets do not cover the primary action ledger"
+        )
+    return buckets
+
+
+def _generation_unit_source_action_unit_buckets(
+    source_action_unit_ids: list[str],
+    generation_unit_buckets: list[list[dict[str, Any]]],
+) -> list[list[str]]:
+    """Assign each source action-unit ID to its first owning Pxx bucket."""
+    discovered = list(dict.fromkeys(
+        str(unit.get("source_action_unit_id") or "").strip()
+        for bucket in generation_unit_buckets
+        for unit in bucket
+        if str(unit.get("source_action_unit_id") or "").strip()
+    ))
+    if not discovered:
+        return _partition(source_action_unit_ids, len(generation_unit_buckets))
+    if discovered != source_action_unit_ids:
+        raise ValueError(
+            "generation action units do not match source_action_unit_ids"
+        )
+    remaining = set(source_action_unit_ids)
+    buckets: list[list[str]] = []
+    for bucket in generation_unit_buckets:
+        owned: list[str] = []
+        for unit in bucket:
+            unit_id = str(unit.get("source_action_unit_id") or "").strip()
+            if unit_id and unit_id in remaining:
+                owned.append(unit_id)
+                remaining.remove(unit_id)
+        buckets.append(owned)
+    if remaining:
+        raise ValueError(
+            "source action-unit IDs have no generation bucket owner"
+        )
+    return buckets
 
 
 def _partition(values: list[str], count: int) -> list[list[str]]:
@@ -694,6 +831,30 @@ def secondary_storyboard_contract_errors(
     source_action_units = list(dict.fromkeys(
         str(value) for value in source_action_units if str(value).strip()
     ))
+    expected_generation_unit_buckets: list[list[dict[str, Any]]] = []
+    expected_action_buckets: list[list[str]] = []
+    expected_source_action_unit_buckets: list[list[str]] = []
+    if requirement:
+        expected_generation_unit_buckets = _partition(
+            requirement["generation_action_units"],
+            requirement["content_count"],
+        )
+        try:
+            expected_action_buckets = _generation_unit_action_buckets(
+                requirement["source_actions"],
+                expected_generation_unit_buckets,
+            )
+            expected_source_action_unit_buckets = (
+                _generation_unit_source_action_unit_buckets(
+                    source_action_units,
+                    expected_generation_unit_buckets,
+                )
+            )
+        except ValueError as exc:
+            add(
+                "secondary_storyboard_generation_lineage_invalid",
+                f"{sid} cannot reconcile generation-unit lineage: {exc}",
+            )
     observed_actions: list[str] = []
     observed_units: list[str] = []
     content_actions: list[str] = []
@@ -716,8 +877,20 @@ def secondary_storyboard_contract_errors(
             for unit in (beat.get("generation_action_units") or [])
             if isinstance(unit, dict)
         ]
+        expected_generation_units = (
+            expected_generation_unit_buckets[position - 1]
+            if position <= len(expected_generation_unit_buckets)
+            else []
+        )
+        if beat_generation_units != expected_generation_units:
+            add(
+                "secondary_storyboard_beat_generation_lineage_invalid",
+                f"{beat_id} generation units do not match its canonical bucket",
+                expected=expected_generation_units,
+                observed=beat_generation_units,
+            )
         expected_source_event_ids = _generation_unit_source_event_ids(
-            beat_generation_units
+            expected_generation_units
         )
         raw_beat_source_event_ids = beat.get("source_event_ids")
         if raw_beat_source_event_ids != expected_source_event_ids:
@@ -742,10 +915,10 @@ def secondary_storyboard_contract_errors(
             ]
             expected_beat_character_ids = _beat_character_ids(
                 shot,
-                beat.get("start_state"),
                 beat.get("action"),
                 beat.get("end_state"),
                 source_event_ids=expected_source_event_ids,
+                generation_action_units=expected_generation_units,
             )
             if (
                 beat_character_ids != list(dict.fromkeys(beat_character_ids))
@@ -864,6 +1037,30 @@ def secondary_storyboard_contract_errors(
         if isinstance(beat_units, str):
             beat_units = [beat_units]
         beat_units = [str(value) for value in beat_units if str(value).strip()]
+        expected_beat_actions = (
+            expected_action_buckets[position - 1]
+            if position <= len(expected_action_buckets)
+            else []
+        )
+        if beat_actions != expected_beat_actions:
+            add(
+                "secondary_storyboard_beat_action_lineage_invalid",
+                f"{beat_id} actions do not match its generation-unit bucket",
+                expected=expected_beat_actions,
+                observed=beat_actions,
+            )
+        expected_beat_units = (
+            expected_source_action_unit_buckets[position - 1]
+            if position <= len(expected_source_action_unit_buckets)
+            else []
+        )
+        if beat_units != expected_beat_units:
+            add(
+                "secondary_storyboard_beat_action_unit_lineage_invalid",
+                f"{beat_id} source action-unit IDs do not match its bucket",
+                expected=expected_beat_units,
+                observed=beat_units,
+            )
         observed_actions.extend(beat_actions)
         observed_units.extend(beat_units)
         content_actions.append(str(beat.get("action") or ""))
@@ -1108,10 +1305,13 @@ def plan_storyboard_beats(
             or shot.get("visual")
             or "保持当前场景中的自然表演"
         )
-        action_buckets = _partition(source_actions, content_count)
         generation_action_units = requirement["generation_action_units"]
         generation_unit_buckets = _partition(
             generation_action_units, content_count
+        )
+        action_buckets = _generation_unit_action_buckets(
+            source_actions,
+            generation_unit_buckets,
         )
         shot["generation_action_units"] = generation_action_units
         raw_units = shot.get("source_action_unit_ids") or []
@@ -1120,7 +1320,10 @@ def plan_storyboard_beats(
         action_units = list(dict.fromkeys(
             str(value) for value in raw_units if str(value).strip()
         ))
-        source_unit_buckets = _partition(action_units, content_count)
+        source_unit_buckets = _generation_unit_source_action_unit_buckets(
+            action_units,
+            generation_unit_buckets,
+        )
         durations = requirement["durations"]
         start_state = _start_state(shot)
         final_state = _end_state(shot)
@@ -1180,10 +1383,10 @@ def plan_storyboard_beats(
                 "end_state": next_state,
                 "character_ids": _beat_character_ids(
                     shot,
-                    previous_state,
                     action,
                     next_state,
                     source_event_ids=beat_source_event_ids,
+                    generation_action_units=beat_generation_units,
                 ),
                 "shot_size": shot.get("shot_size") or shot.get("shot_type"),
                 "camera_angle": shot.get("camera_angle"),
