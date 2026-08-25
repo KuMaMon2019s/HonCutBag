@@ -186,7 +186,14 @@ def test_phase3_production_still_fails_closed_without_reference_images(
         return [{"id": char_id}]
 
     monkeypatch.setattr("phases.phase3.character_factory.batch_generate", fake_batch)
-    monkeypatch.setattr("phases.phase3.phase3_character.time.sleep", lambda _seconds: None)
+
+    def forbidden_cooldown(_seconds):
+        raise AssertionError("Phase 3 must leave image pacing to Runtime")
+
+    monkeypatch.setattr(
+        "time.sleep",
+        forbidden_cooldown,
+    )
 
     result = pipeline_core.run_phase3(tmp_path, source, dry_run=False)
 

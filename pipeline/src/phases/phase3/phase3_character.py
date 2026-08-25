@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import time
 import traceback
 from pathlib import Path
 
@@ -245,14 +244,10 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
         )
         print(
             "  ⏱ Phase 3 开始 "
-            f"(计划 {phase3_workload.phase3_image_requests} 次图片请求, "
-            f"预估 ~{int(_p3_est)}s)"
+            f"(最多 {phase3_workload.phase3_image_requests} 次图片请求, "
+            f"限流耗时上限 ~{int(_p3_est)}s；缓存命中时更短)"
         )
         print(f"  → batch_generate: {len(char_dicts)} 个角色, skip_images={dry_run}")
-
-        if not dry_run:
-            print("[cooldown] 等待 120s 让 Agent Plan 限流窗口重置...", flush=True)
-            time.sleep(120)
 
         # Use retry policy for each character generation
         results = []
