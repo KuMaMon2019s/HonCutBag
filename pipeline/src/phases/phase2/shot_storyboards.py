@@ -450,6 +450,67 @@ def build_shot_storyboard_prompt(
 
 PANEL_CORRECTION_DIRECTIVE_SCHEMA = "honcut.storyboard-panel-correction.v1"
 
+_AFFIRMATIVE_OBSERVATION_MARKERS = (
+    "match",
+    "matches",
+    "matched",
+    "matching",
+    "consistent with",
+    "complies with",
+    "conforms to",
+    "satisfies",
+    "satisfied",
+    "meets the",
+    "符合",
+    "一致",
+    "匹配",
+    "满足",
+)
+_NEGATED_AFFIRMATIVE_MARKERS = (
+    "not match",
+    "does not match",
+    "did not match",
+    "inconsistent with",
+    "does not comply",
+    "does not conform",
+    "does not satisfy",
+    "不符合",
+    "不一致",
+    "不匹配",
+    "未满足",
+)
+_CONTRAST_MARKERS = (" but ", " however ", " yet ", "但", "但是", "然而", "却")
+
+
+def _negative_correction_observation(value: Any) -> str:
+    """Remove standalone affirmative clauses from a correction instruction."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    clauses = [
+        clause.strip()
+        for clause in re.split(r"(?<=[.!?。！？；;])\s*", text)
+        if clause.strip()
+    ]
+    negative_clauses: list[str] = []
+    for clause in clauses:
+        normalized = f" {clause.casefold()} "
+        is_negated = any(
+            marker in normalized for marker in _NEGATED_AFFIRMATIVE_MARKERS
+        )
+        has_contrast = any(marker in normalized for marker in _CONTRAST_MARKERS)
+        is_affirmative = bool(
+            re.search(r"\b(?:match|matches|matched|matching)\b", normalized)
+        ) or any(
+            marker in normalized
+            for marker in _AFFIRMATIVE_OBSERVATION_MARKERS
+            if marker not in {"match", "matches", "matched", "matching"}
+        )
+        if is_affirmative and not is_negated and not has_contrast:
+            continue
+        negative_clauses.append(clause)
+    return " ".join(negative_clauses).strip()
+
 
 def _panel_correction_directives(
     issues: list[dict[str, Any]],
@@ -483,18 +544,23 @@ def _panel_correction_directives(
         panel_evidence = details.get("panel_evidence") or []
         if not isinstance(panel_evidence, list):
             panel_evidence = []
-        panel_observations = [
+        raw_panel_observations = [
             str(value.get("observed") or "").strip()
             for value in panel_evidence
             if isinstance(value, dict)
             and str(value.get("shot_id") or "").strip() == beat_id
             and str(value.get("observed") or "").strip()
         ]
+        panel_observations = [
+            sanitized
+            for value in raw_panel_observations
+            if (sanitized := _negative_correction_observation(value))
+        ]
         observed_error = "；".join(dict.fromkeys(panel_observations))
-        if not observed_error:
-            observed_error = str(
+        if not raw_panel_observations:
+            observed_error = _negative_correction_observation(
                 details.get("observed") or issue.get("message") or ""
-            ).strip()
+            )
         directives.append({
             "schema": PANEL_CORRECTION_DIRECTIVE_SCHEMA,
             "target_board_id": beat_id,
@@ -656,6 +722,7 @@ def _build_panel_prompt(
 Phase 5 定向纠偏合同：
 {correction_contract}
 - 上述“已观察到的错误”是本轮禁止复现的负面约束，不是要继续画入画面的剧情。
+- QA 观察中已明确符合当前动作或终态的事实只作审计上下文，绝不能作为需要消除的负面约束。
 - 纠偏时仍以本格起始状态、唯一动作、结束状态和角色合同为最高事实源；不得通过增加破坏、伤亡、道具或画外事件来规避问题。
 - 输出前逐项确认：原偏差已经消失，且没有引入新的角色、动作、道具、环境结果或连续性跳变。
 """
@@ -688,6 +755,7 @@ Phase 5 定向纠偏合同：
 - 舞蹈/格斗/功夫/武术动作必须逐拍执行上述肢体动作谱，明确左挡、右闪、支撑侧、摆动侧、躯干旋转、重心转移、接触点和终态；原文点名的托马斯、铁山靠等招式不得泛化、镜像或换招。
 - 每个角色只执行本格明确分配给自己的动作；不得把其他角色或群体的动作复制给旁观者、记录者、驾驶者、守卫或任何未被指定的角色。
 - 严格保留本格声明的道具类型、持有者和使用方式；不得替换设备、交换道具或让角色无故放下道具。
+- 角色或道具合同中的“可、能够、can、capable of”只声明身份能力，不授权在当前格发动该能力。装备外形与佩挂状态照常保持，但发光、放电、喷射、攻击、护盾或其他效果只有在“本格唯一可见动作”或“结束状态”明确调用时才可激活；后续格的能力不得提前出现。
 - 静态故事格只能画一个时间点，不得把多个时间点或动作过程拼贴在一起；但若本格给主体分配了肢体或位移动作，必须选择达到结束状态时仍具动力学信息的瞬间，以关节弯曲、肢体伸展、重心偏移、接触关系和动作方向清楚表现该动作。不得把“终态”误画成人物中性站立；只有源合同明确要求静止、停止或定格时才画静止姿态。
 - 主动作角色必须是画面的主要运动来源。不得只让背景人群、车辆、光影、粒子、衣物、头发或摄影机产生动感，而让被分配动作的主体保持参考图原姿势；背景与运镜只能辅助，不能替代主体动作。
 - 人物构图必须遵守运镜合同中的 50–85mm 自然透视与稳定人物尺度；禁止：{camera_motion_negative_prompt({**shot, **beat})}。

@@ -7,6 +7,7 @@ a bounded, auditable redraw-and-recheck loop before Phase 6.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -43,6 +44,7 @@ from utils.material_budget import material_budget_contract_errors
 DEFAULT_SIMILARITY_THRESHOLD = 0.85
 DEFAULT_MAX_CORRECTION_ATTEMPTS = 2
 MAX_CORRECTION_ATTEMPTS = 3
+MAX_REVIEW_ADJUDICATIONS = 2
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
 PHASE5_DRY_RUN_RECEIPT_SCHEMA = "honcut.phase5-dry-run-receipt.v1"
 PHASE5_DRY_RUN_RECEIPT_NAME = "phase5_dry_run_receipt.json"
@@ -2539,6 +2541,212 @@ def _correctable_storyboard_ids(
     return sorted(storyboard_ids)
 
 
+def _blocking_storyboard_issue_map(
+    report: dict[str, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    """Index evidence-backed blocking findings by their canonical Pxx ID."""
+    indexed: dict[str, list[dict[str, Any]]] = {}
+    for issue in _correctable_issues(report):
+        for storyboard_id in _correctable_storyboard_ids([issue]):
+            indexed.setdefault(storyboard_id, []).append(issue)
+    return indexed
+
+
+def _storyboard_panel_hashes(output_dir: Path) -> dict[str, str]:
+    """Hash the exact Pxx pixels reviewed by L3 without trusting sidecars."""
+    try:
+        storyboard = json.loads(
+            (output_dir / "STORYBOARD.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {
+        storyboard_id: _sha256_file(path)
+        for storyboard_id, path in find_storyboard_beat_images(
+            output_dir, storyboard
+        ).items()
+    }
+
+
+def _issue_for_storyboard_id(
+    issue: dict[str, Any],
+    storyboard_id: str,
+) -> dict[str, Any] | None:
+    """Narrow a multi-panel finding to one adjudicated Pxx."""
+    if storyboard_id not in _correctable_storyboard_ids([issue]):
+        return None
+    narrowed = copy.deepcopy(issue)
+    details = (
+        narrowed.get("details")
+        if isinstance(narrowed.get("details"), dict)
+        else {}
+    )
+    details["storyboard_ids"] = [storyboard_id]
+    details["panel_evidence"] = [
+        value
+        for value in (details.get("panel_evidence") or [])
+        if isinstance(value, dict)
+        and str(value.get("shot_id") or "").strip() == storyboard_id
+    ]
+    narrowed["details"] = details
+    narrowed["shot_ids"] = [_parent_shot_id(storyboard_id)]
+    return narrowed
+
+
+def _recompute_qa_verdict(
+    report: dict[str, Any],
+    issues: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Rebuild derived gate fields after evidence-level adjudication."""
+    reconciled = copy.deepcopy(report)
+    reconciled["issues"] = issues
+    grade = grade_issues(issues)
+    gate_passed = grade in {"A", "B"}
+    reconciled["grade"] = grade
+    reconciled["gate_passed"] = gate_passed
+    reconciled["status"] = "done" if gate_passed else "error"
+    reconciled["issue_counts"] = {
+        severity: sum(issue.get("severity") == severity for issue in issues)
+        for severity in ("severe", "moderate", "minor")
+    }
+    reconciled["failed_shot_ids"] = sorted({
+        shot_id
+        for issue in blocking_issues(issues)
+        for shot_id in issue.get("shot_ids") or []
+    })
+    shots = reconciled.get("shots")
+    if isinstance(shots, dict):
+        for shot_id, detail in shots.items():
+            if isinstance(detail, dict):
+                detail["issues"] = [
+                    issue
+                    for issue in issues
+                    if shot_id in (issue.get("shot_ids") or [])
+                ]
+    if gate_passed:
+        reconciled.pop("error", None)
+        reconciled.pop("recommended_restart_phase", None)
+    else:
+        reconciled["error"] = (
+            f"Storyboard QA grade {grade} blocks Phase 6; "
+            "redraw only failed_shot_ids"
+        )
+    return reconciled
+
+
+def _adjudicate_unchanged_panel_flips(
+    output_dir: Path,
+    previous: dict[str, Any],
+    previous_hashes: dict[str, str],
+    current: dict[str, Any],
+    current_hashes: dict[str, str],
+    qa: Callable[[Path], dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Use one bounded tie-break review when unchanged pixels flip verdict.
+
+    A previous vote, current vote, and confirmation vote form a per-Pxx
+    two-out-of-three decision.  Changed pixels are never adjudicated against
+    their pre-redraw verdict because they are new evidence.
+    """
+    previous_map = _blocking_storyboard_issue_map(previous)
+    current_map = _blocking_storyboard_issue_map(current)
+    disputed = sorted(
+        storyboard_id
+        for storyboard_id in set(previous_map) ^ set(current_map)
+        if previous_hashes.get(storyboard_id)
+        and previous_hashes.get(storyboard_id) == current_hashes.get(storyboard_id)
+    )
+    if not disputed:
+        return current, None
+
+    confirmation = qa(output_dir)
+    confirmation_hashes = _storyboard_panel_hashes(output_dir)
+    if any(
+        confirmation_hashes.get(storyboard_id) != current_hashes.get(storyboard_id)
+        for storyboard_id in disputed
+    ):
+        raise RuntimeError(
+            "Phase 5 QA mutated Pxx pixels during verdict adjudication"
+        )
+    confirmation_map = _blocking_storyboard_issue_map(confirmation)
+    unavailable = any(
+        str(issue.get("code") or "") == "storyboard_visual_review_unavailable"
+        for issue in confirmation.get("issues") or []
+    )
+    if unavailable:
+        raise RuntimeError(
+            "Phase 5 tie-break visual review is unavailable; refusing to "
+            "adjudicate unchanged pixels"
+        )
+
+    decisions: dict[str, bool] = {}
+    votes: dict[str, dict[str, bool]] = {}
+    for storyboard_id in disputed:
+        panel_votes = {
+            "previous_blocked": storyboard_id in previous_map,
+            "current_blocked": storyboard_id in current_map,
+            "confirmation_blocked": storyboard_id in confirmation_map,
+        }
+        votes[storyboard_id] = panel_votes
+        decisions[storyboard_id] = sum(panel_votes.values()) >= 2
+
+    pass_ids = {
+        storyboard_id
+        for storyboard_id, blocked in decisions.items()
+        if not blocked
+    }
+    issues: list[dict[str, Any]] = []
+    for issue in current.get("issues") or []:
+        issue_ids = set(_correctable_storyboard_ids([issue]))
+        removed = issue_ids & pass_ids
+        if not removed:
+            issues.append(copy.deepcopy(issue))
+            continue
+        retained = sorted(issue_ids - pass_ids)
+        if not retained:
+            continue
+        for storyboard_id in retained:
+            narrowed = _issue_for_storyboard_id(issue, storyboard_id)
+            if narrowed is not None:
+                issues.append(narrowed)
+
+    current_ids = set(_blocking_storyboard_issue_map({"issues": issues}))
+    for storyboard_id, blocked in decisions.items():
+        if not blocked or storyboard_id in current_ids:
+            continue
+        source_issue = next(
+            iter(
+                previous_map.get(storyboard_id)
+                or confirmation_map.get(storyboard_id)
+                or []
+            ),
+            None,
+        )
+        if source_issue is not None:
+            narrowed = _issue_for_storyboard_id(source_issue, storyboard_id)
+            if narrowed is not None:
+                issues.append(narrowed)
+
+    reconciled = _recompute_qa_verdict(current, issues)
+    receipt = {
+        "schema": "honcut.phase5-review-adjudication.v1",
+        "status": "completed",
+        "reason": "unchanged_panel_verdict_flip",
+        "storyboard_ids": disputed,
+        "asset_sha256": {
+            storyboard_id: current_hashes[storyboard_id]
+            for storyboard_id in disputed
+        },
+        "votes": votes,
+        "decisions": {
+            storyboard_id: "blocked" if blocked else "passed"
+            for storyboard_id, blocked in decisions.items()
+        },
+        "confirmation_layers": copy.deepcopy(confirmation.get("layers") or {}),
+    }
+    return reconciled, receipt
+
+
 def _global_uncorrectable_issues(
     report: dict[str, Any],
 ) -> list[dict[str, Any]]:
@@ -2800,6 +3008,9 @@ def run_storyboard_qa_with_correction(
     qa = qa_runner or run_storyboard_qa_gate
     result = qa(output_dir)
     history: list[dict[str, Any]] = []
+    adjudications: list[dict[str, Any]] = []
+    previous_result = copy.deepcopy(result)
+    previous_hashes = _storyboard_panel_hashes(output_dir)
 
     global_issues = _global_uncorrectable_issues(result)
     if result.get("gate_passed") is not True and global_issues:
@@ -2885,7 +3096,56 @@ def run_storyboard_qa_with_correction(
                 "error": f"Phase 5 automatic correction failed: {exc}",
             }
             break
+        current_hashes = _storyboard_panel_hashes(output_dir)
         result = qa(output_dir)
+        adjudication = None
+        try:
+            if len(adjudications) < MAX_REVIEW_ADJUDICATIONS:
+                result, adjudication = _adjudicate_unchanged_panel_flips(
+                    output_dir,
+                    previous_result,
+                    previous_hashes,
+                    result,
+                    current_hashes,
+                    qa,
+                )
+        except Exception as exc:
+            history.append({
+                "attempt": attempt,
+                "status": "adjudication_error",
+                "shot_ids": target_ids,
+                "storyboard_ids": target_storyboard_ids,
+                "before_grade": before_grade,
+                "after_grade": result.get("grade"),
+                "redraw": redraw_receipt,
+                "error": str(exc),
+            })
+            result = {
+                **result,
+                "status": "error",
+                "gate_passed": False,
+                "error": f"Phase 5 automatic correction failed: {exc}",
+            }
+            break
+        if adjudication is not None:
+            adjudication["after_correction_attempt"] = attempt
+            adjudications.append(adjudication)
+            result["review_adjudications"] = copy.deepcopy(adjudications)
+            outputs = list(result.get("outputs") or [])
+            if "phase5_review_adjudication_report.json" not in outputs:
+                outputs.append("phase5_review_adjudication_report.json")
+            result["outputs"] = outputs
+            _atomic_json(
+                output_dir / "phase5_review_adjudication_report.json",
+                {
+                    "schema": "honcut.phase5-review-adjudications.v1",
+                    "status": "completed",
+                    "adjudications": adjudications,
+                },
+            )
+            # The confirmation QA writes its raw report.  Restore the
+            # reconciled two-out-of-three verdict before a later archive.
+            _atomic_json(output_dir / "storyboard_qa_report.json", result)
         history.append({
             "attempt": attempt,
             "status": "passed" if result.get("gate_passed") is True else "rejected",
@@ -2894,7 +3154,10 @@ def run_storyboard_qa_with_correction(
             "before_grade": before_grade,
             "after_grade": result.get("grade"),
             "redraw": redraw_receipt,
+            **({"review_adjudication": adjudication} if adjudication else {}),
         })
+        previous_result = copy.deepcopy(result)
+        previous_hashes = current_hashes
 
     if history:
         correction = {
@@ -2902,6 +3165,7 @@ def run_storyboard_qa_with_correction(
             "max_attempts": attempts_allowed,
             "attempts_used": len(history),
             "history": history,
+            "review_adjudications": adjudications,
             "final_gate_passed": result.get("gate_passed") is True,
         }
         result["correction"] = correction

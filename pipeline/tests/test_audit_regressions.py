@@ -4294,6 +4294,60 @@ def test_phase2_panel_correction_directive_is_scoped_to_one_pxx():
     assert "P01 后仰抓扶手；P02" not in contract
 
 
+def test_phase2_correction_keeps_only_negative_clauses_for_provider():
+    issue = storyboard_qa_gate._issue(
+        "L3",
+        "moderate",
+        "R4",
+        "one defect and one already-correct fact",
+        ["S03"],
+        storyboard_ids=["S03_P02"],
+        mismatch_type="end_state",
+        expected="guard releases the device and the rear window stays intact",
+        observed="guard still holds the device",
+        panel_evidence=[{
+            "shot_id": "S03_P02",
+            "observed": (
+                "Guard still holds the device; the rear window remains intact, "
+                "matching the required end state."
+            ),
+        }],
+    )
+    beat = {
+        "beat_id": "S03_P02",
+        "action": "guard releases the device",
+        "end_state": "the rear window remains intact",
+    }
+
+    directives = _panel_correction_directives([issue], beat, "S03_P02")
+    contract = _render_correction_contract(directives, attempt=1)
+
+    assert directives[0]["observed_error"] == "Guard still holds the device;"
+    assert "Guard still holds the device" in contract
+    assert "matching the required end state" not in contract
+
+
+def test_phase2_panel_prompt_does_not_activate_declared_capabilities_early():
+    prompt = _build_panel_prompt(
+        {"who": ["courier"], "where": "cargo platform"},
+        {
+            "beat_id": "S01_P01",
+            "action": "courier runs toward the cargo door",
+            "end_state": "courier reaches the door",
+        },
+        1,
+        2,
+        [{
+            "id": "courier",
+            "name": "courier",
+            "appearance": {"summary": "wears a powered utility glove"},
+        }],
+    )
+
+    assert "只声明身份能力，不授权在当前格发动该能力" in prompt
+    assert "后续格的能力不得提前出现" in prompt
+
+
 def test_phase2_continuation_prompt_does_not_preserve_previous_pose():
     prompt = _build_panel_prompt(
         {"who": ["agent"], "where": "列车车厢"},
@@ -5082,6 +5136,117 @@ def test_phase5_correction_is_bounded_and_fails_closed(tmp_path):
     assert result["gate_passed"] is False
     assert "after 2/2 automatic correction attempt" in result["error"]
     assert result["correction"]["attempts_used"] == 2
+
+
+def test_phase5_uses_two_of_three_for_unchanged_panel_verdict_flip(tmp_path):
+    from PIL import Image
+
+    storyboard = {
+        "shots": [{
+            "id": "S01",
+            "storyboard_beats": [
+                {"beat_id": "S01_P01"},
+                {"beat_id": "S01_P02"},
+            ],
+        }],
+    }
+    beat_dir = tmp_path / "storyboard_beats"
+    beat_dir.mkdir()
+    storyboard["shots"][0]["storyboard_beats"][0]["storyboard_image"] = (
+        "storyboard_beats/S01_P01.png"
+    )
+    storyboard["shots"][0]["storyboard_beats"][1]["storyboard_image"] = (
+        "storyboard_beats/S01_P02.png"
+    )
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps(storyboard), encoding="utf-8"
+    )
+    Image.effect_noise((128, 72), 80).convert("RGB").save(
+        beat_dir / "S01_P01.png"
+    )
+    Image.effect_noise((128, 72), 120).convert("RGB").save(
+        beat_dir / "S01_P02.png"
+    )
+
+    def issue(storyboard_id):
+        return storyboard_qa_gate._issue(
+            "L3",
+            "moderate",
+            "R4",
+            f"{storyboard_id} action mismatch",
+            ["S01"],
+            storyboard_ids=[storyboard_id],
+            mismatch_type="action",
+            expected="actor reaches the canonical end state",
+            observed="actor remains in the wrong action",
+            confidence=0.95,
+            panel_evidence=[{
+                "shot_id": storyboard_id,
+                "observed": "actor remains in the wrong action",
+            }],
+        )
+
+    p01_issue = issue("S01_P01")
+    p02_flip = issue("S01_P02")
+    qa_results = iter([
+        {
+            "status": "error",
+            "grade": "C",
+            "gate_passed": False,
+            "issues": [p01_issue],
+        },
+        {
+            "status": "error",
+            "grade": "C",
+            "gate_passed": False,
+            "issues": [p01_issue, p02_flip],
+        },
+        {  # tie-break: unchanged P02 passes, so pass/fail/pass wins
+            "status": "error",
+            "grade": "C",
+            "gate_passed": False,
+            "issues": [p01_issue],
+        },
+        {
+            "status": "done",
+            "grade": "A",
+            "gate_passed": True,
+            "issues": [],
+        },
+    ])
+    redraw_calls = []
+
+    def redraw(_output_dir, _shot_ids, issues, attempt):
+        target_ids = storyboard_qa_gate._correctable_storyboard_ids(issues)
+        redraw_calls.append((attempt, target_ids))
+        Image.effect_noise((128, 72), 20 + attempt * 20).convert("RGB").save(
+            beat_dir / "S01_P01.png"
+        )
+        return {"status": "redrawn", "attempt": attempt}
+
+    result = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        max_correction_attempts=2,
+        qa_runner=lambda _output_dir: next(qa_results),
+        redraw_runner=redraw,
+    )
+
+    assert result["gate_passed"] is True
+    assert redraw_calls == [
+        (1, ["S01_P01"]),
+        (2, ["S01_P01"]),
+    ]
+    adjudication = result["correction"]["review_adjudications"][0]
+    assert adjudication["storyboard_ids"] == ["S01_P02"]
+    assert adjudication["decisions"] == {"S01_P02": "passed"}
+    assert adjudication["votes"]["S01_P02"] == {
+        "previous_blocked": False,
+        "current_blocked": True,
+        "confirmation_blocked": False,
+    }
+    assert (
+        tmp_path / "phase5_review_adjudication_report.json"
+    ).is_file()
 
 
 def test_phase5_real_redraw_reuses_generator_and_archives_failed_shot(tmp_path):
