@@ -307,7 +307,7 @@ Dry-run receipt 只能证明“结构路径已执行且远程/像素步骤被跳
 - Provider JSON 先做 schema 校验，成功状态必须包含输出位置，失败状态必须包含安全错误信息。
 - Runtime 事件至少带 `project_id/run_id/node_id/task_id`。
 - 日志自动脱敏 token、API key、Bearer header；Prompt 只记录长度和 SHA-256。
-- HonCut 的 Ark 凭据只使用 `ARK_AGENT_API_KEY`：项目 `.env` 中的值覆盖长驻启动器继承的同名旧值。`ARK_API_KEY` 保留给 Honcho 的 Coding Plan 记忆系统，HonCut 不得读取、删除或将其作为 LLM、图像、视频、QA、ASR 或 TTS 的回退凭据。密钥本身不得进入 config、State、manifest、日志或提交。
+- HonCut 的 Ark 凭据只使用 `ARK_AGENT_API_KEY`：项目 `.env` 中的值覆盖长驻启动器继承的同名旧值。普通 checkout 读取当前仓库根 `.env`；Git linked worktree 缺少被忽略的 `.env` 时，配置 owner 必须只通过 `.git/commondir` 确定性解析 common worktree 的主项目 `.env`，不得退回陈旧进程 Key，也不得要求每次启动复制或导出秘密。该 canonical `.env` 同时为当前进程补齐未显式导出的 TOS 等项目配置。`ARK_API_KEY` 保留给 Honcho 的 Coding Plan 记忆系统，HonCut 不得读取、删除或将其作为 LLM、图像、视频、QA、ASR 或 TTS 的回退凭据。密钥本身不得进入 config、State、manifest、日志或提交。
 - import 不得创建文件、连接 DB/网络、改写标准流或打印 capability warning。
 
 ## 9. 迭代修复规范
