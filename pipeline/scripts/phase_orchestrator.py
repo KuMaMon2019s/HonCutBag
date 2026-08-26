@@ -192,8 +192,8 @@ def _read_json(path: Path, default: dict) -> dict:
         return default
 
 
-def _merge_phase_report(report_path: Path, existing_report: dict, phase: str) -> None:
-    """Keep prior phase results when the single-phase runner rewrites its report."""
+def _merge_phase_report(report_path: Path, existing_report: dict, phase: str) -> dict:
+    """Merge the child report and return the selected phase's real outcome."""
     generated_report = _read_json(report_path, {})
     phase_number = PHASE_NUMBERS[phase]
     generated_phases = generated_report.get("phases", {})
@@ -214,6 +214,7 @@ def _merge_phase_report(report_path: Path, existing_report: dict, phase: str) ->
     temporary = report_path.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(report_path)
+    return current_result if isinstance(current_result, dict) else {}
 
 
 def _set_report_status(report_path: Path, status: str) -> None:
@@ -468,7 +469,7 @@ def run_phase(phase: str, config: dict) -> dict:
     if "video_model" in config:
         child_env["SEEDANCE_MODEL"] = str(config["video_model"])
     result = _stream_subprocess(cmd, log_path, RUNNER.parent, child_env, monitor=monitor)
-    _merge_phase_report(report_path, existing_report, phase)
+    authoritative_result = _merge_phase_report(report_path, existing_report, phase)
     phase_result = {
         "phase": phase,
         "exit_code": result["returncode"],
@@ -477,6 +478,10 @@ def run_phase(phase: str, config: dict) -> dict:
         "log_path": str(log_path),
         "timestamp": datetime.now().isoformat(),
     }
+    if authoritative_result.get("status"):
+        phase_result["phase_status"] = authoritative_result["status"]
+    if authoritative_result.get("reason"):
+        phase_result["phase_reason"] = authoritative_result["reason"]
     if monitor.stall_killed:
         phase_result["stall_killed"] = True
         phase_result["stall_reason"] = monitor.kill_reason
@@ -530,7 +535,13 @@ def main() -> None:
     results = _resume_results(Path(config["output_dir"]), progress_file, args.resume_from) if args.resume_from else []
     _write_progress(
         progress_file,
-        {"results": results, "current_phase": None, "status": "pending", "phases": PHASES},
+        {
+            "results": results,
+            "current_phase": None,
+            "status": "pending",
+            "phases": PHASES,
+            "dry_run": bool(config.get("dry_run")),
+        },
     )
 
     for phase in phases:
@@ -544,7 +555,13 @@ def main() -> None:
         print(f"\n{'=' * 60}\n  Running {phase}...\n{'=' * 60}\n", flush=True)
         _write_progress(
             progress_file,
-            {"results": results, "current_phase": phase, "status": "running", "phases": PHASES},
+            {
+                "results": results,
+                "current_phase": phase,
+                "status": "running",
+                "phases": PHASES,
+                "dry_run": bool(config.get("dry_run")),
+            },
         )
 
         result = run_phase(phase, config)
@@ -553,7 +570,13 @@ def main() -> None:
         current_phase = phase if result["exit_code"] != 0 else None
         _write_progress(
             progress_file,
-            {"results": results, "current_phase": current_phase, "status": state, "phases": PHASES},
+            {
+                "results": results,
+                "current_phase": current_phase,
+                "status": state,
+                "phases": PHASES,
+                "dry_run": bool(config.get("dry_run")),
+            },
         )
 
         if result["exit_code"] != 0:
@@ -565,14 +588,37 @@ def main() -> None:
             print(f"Error: {result['stderr'][:500]}", flush=True)
             raise SystemExit(1)
 
-        print(f"\n✅ {phase} completed", flush=True)
+        phase_status = result.get("phase_status", "unknown")
+        if phase_status == "skipped":
+            reason = result.get("phase_reason", "unspecified")
+            print(f"\n⏭️ {phase} skipped ({reason})", flush=True)
+        elif phase_status in {"success", "completed", "done"}:
+            print(f"\n✅ {phase} completed", flush=True)
+        else:
+            print(
+                f"\nℹ️ {phase} subprocess exited successfully; "
+                f"authoritative outcome is {phase_status}",
+                flush=True,
+            )
 
     _write_progress(
         progress_file,
-        {"results": results, "current_phase": None, "status": "completed", "phases": PHASES},
+        {
+            "results": results,
+            "current_phase": None,
+            "status": "completed",
+            "phases": PHASES,
+            "dry_run": bool(config.get("dry_run")),
+        },
     )
     _set_report_status(Path(config["output_dir"]) / "pipeline_report.json", "completed")
-    print(f"\n{'=' * 60}\n  All phases completed successfully!\n{'=' * 60}", flush=True)
+    final_message = (
+        "Dry-run structural validation completed; skipped production operations "
+        "are not production evidence."
+        if config.get("dry_run")
+        else "All phases completed successfully!"
+    )
+    print(f"\n{'=' * 60}\n  {final_message}\n{'=' * 60}", flush=True)
 
 
 if __name__ == "__main__":

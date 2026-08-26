@@ -22,6 +22,7 @@ if str(SRC) not in sys.path:
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+import cron_monitor
 import phase_orchestrator
 
 from clients import (
@@ -498,6 +499,130 @@ def test_phase_orchestrator_writes_full_streamed_log(monkeypatch, tmp_path):
     assert full_output in log_path.read_text(encoding="utf-8")
     assert log_path.stat().st_size > 2000
     assert result["stdout"] == full_output[-2000:]
+
+
+def test_phase_orchestrator_preserves_authoritative_skipped_outcome(
+    monkeypatch, tmp_path
+):
+    def fake_stream(_cmd, _log_path, _cwd, _env, monitor=None):
+        (tmp_path / "pipeline_report.json").write_text(
+            json.dumps(
+                {
+                    "status": "running",
+                    "phases": {
+                        "2": {"status": "skipped", "reason": "dry-run"}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return {"returncode": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(phase_orchestrator, "_stream_subprocess", fake_stream)
+
+    result = phase_orchestrator.run_phase(
+        "phase2",
+        {
+            "input": str(tmp_path / "story.txt"),
+            "duration": 36,
+            "shot_duration": 12,
+            "output_dir": str(tmp_path),
+        },
+    )
+
+    assert result["exit_code"] == 0
+    assert result["phase_status"] == "skipped"
+    assert result["phase_reason"] == "dry-run"
+
+
+def test_phase_orchestrator_main_reports_dry_run_skips_truthfully(
+    monkeypatch, tmp_path, capsys
+):
+    output_dir = tmp_path / "output"
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "input": str(tmp_path / "story.txt"),
+                "duration": 36,
+                "shot_duration": 12,
+                "output_dir": str(output_dir),
+                "dry_run": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_run_phase(phase, _config):
+        return {
+            "phase": phase,
+            "exit_code": 0,
+            "phase_status": "skipped" if phase == "phase2" else "done",
+            "phase_reason": "dry-run" if phase == "phase2" else None,
+            "stdout": "",
+            "stderr": "",
+            "timestamp": "2026-08-26T00:00:00",
+        }
+
+    monkeypatch.setattr(phase_orchestrator, "run_phase", fake_run_phase)
+    monkeypatch.setattr(
+        sys, "argv", ["phase_orchestrator.py", "--config", str(config_path)]
+    )
+
+    phase_orchestrator.main()
+
+    output = capsys.readouterr().out
+    progress = json.loads(
+        (output_dir / "phase_progress.json").read_text(encoding="utf-8")
+    )
+    assert "⏭️ phase2 skipped (dry-run)" in output
+    assert "✅ phase2 completed" not in output
+    assert "Dry-run structural validation completed" in output
+    assert progress["dry_run"] is True
+
+
+def test_monitor_separates_dry_run_skips_from_completed_phases(tmp_path):
+    (tmp_path / "phase_progress.json").write_text(
+        json.dumps(
+            {
+                "status": "completed",
+                "dry_run": True,
+                "phases": phase_orchestrator.PHASES,
+                "results": [
+                    {
+                        "phase": "phase1",
+                        "exit_code": 0,
+                        "phase_status": "done",
+                        "timestamp": "2026-08-08T08:00:00",
+                    },
+                    {
+                        "phase": "phase2",
+                        "exit_code": 0,
+                        "phase_status": "skipped",
+                        "phase_reason": "dry-run",
+                        "timestamp": "2026-08-08T08:00:00",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    status = cron_monitor.get_phase_status(str(tmp_path))
+    report = cron_monitor.format_report(status)
+
+    assert [item["phase"] for item in status["completed_phases"]] == ["phase1"]
+    assert status["skipped_phases"] == [
+        {
+            "phase": "phase2",
+            "reason": "dry-run",
+            "timestamp": "2026-08-08T08:00:00",
+        }
+    ]
+    assert "⏭️ phase2 (dry-run)" in report
+    assert "✅ phase2" not in report
+    assert "1 completed, 1 skipped" in report
+    assert "not production evidence" in report
 
 
 def test_phase_orchestrator_failure_prints_stdout_and_stderr_tails(

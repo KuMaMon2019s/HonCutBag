@@ -301,7 +301,9 @@ Phase 2 的 Pxx、模型绘制 Sxx 九宫格与跨一级镜头 bridge 都必须�
 
 Dry-run receipt 只能证明“结构路径已执行且远程/像素步骤被跳过”，不能替代生产图片、语义 QA 或 Provider 成功凭证。
 
-Dry-run 的 result、report 与 receipt 必须显式标记 `evidence_scope=dry_run_structural_only` 和 `production_evidence=false`（质量门使用 `production_gate_passed=false`）；结构检查可保留兼容性的 `gate_passed`，但必须同时标明 `grade_scope=structural_metadata_only`。任何被跳过的生产图片、像素、多模态或监督检查必须写成 `skipped`，不得写成 `passed`。
+Phase 4 dry-run result 必须显式标记 `evidence_scope=dry_run_structural_only` 和 `production_evidence=false`；Phase 5 dry-run report 与 receipt 必须使用相同 `evidence_scope` 并标记 `production_gate_passed=false`。结构检查可保留兼容性的 `gate_passed`，但必须同时标明 `grade_scope=structural_metadata_only`。任何被跳过的生产图片、像素、多模态或监督检查必须写成 `skipped`，不得写成 `passed`。
+
+编排器必须把子进程生成的 canonical phase result 回写到进度文件，区分 `done`、`skipped` 与失败；子进程退出码为零只表示进程执行成功，不能单独解释为阶段生产成功。监控必须单独统计和展示 `skipped`，dry-run 终态只可宣告结构验收完成，并明确跳过阶段不构成生产证据。
 
 - Phase 1 dry-run 必须从真实源文本生成 `phase1_dry_run_receipt.json` 与 source-derived 结构夹具，复用 adaptation 容量 owner 做零请求的源结构容量估算；估算要求 screenplay compression 时 fail closed，禁止用固定 mock 事件或固定故事板伪装通过。该估算不替代生产 Event Extractor 的语义账本，receipt 必须明确记录此限制。
 - Phase 3 dry-run 写角色卡与 `phase3_dry_run_receipt.json`，不生成占位图片、不进入四视图 QA、不刷新生产 Pxx，也不读取、创建或修改显式角色库。
