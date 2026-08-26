@@ -42,6 +42,7 @@ from utils.video_generation_contracts import (
     has_synthetic_identity_policy,
 )
 from utils.video_geometry import resolve_video_geometry
+from utils.visual_style_contract import BASE_STYLE_SCHEMA
 
 BASE_NEGATIVE_PROMPT = (
     "变形扭曲(warping), 形态渐变(morphing), 面部扭曲(distorted faces), "
@@ -290,11 +291,29 @@ def build_video_prompt(
     # Project-level summaries often contain plot nouns (characters, palaces,
     # props, future locations). Repeating that prose in every prompt caused a
     # cloud-only opening shot to invent a fairy and a palace.
-    style = (
-        "仅继承该镜头参考分镜帧的渲染方式、色彩科学、光影质感、材质真实度、"
-        "镜头语言与氛围；不得从项目级风格描述引入本镜头动作与视觉契约未明确列出的"
-        "人物、建筑、地点、道具或剧情元素"
+    style_contract = scene.get("style_contract") or scene_consistency.get(
+        "style_contract"
     )
+    if (
+        isinstance(style_contract, dict)
+        and style_contract.get("schema") == BASE_STYLE_SCHEMA
+        and style_contract.get("base_style")
+        and style_contract.get("positive_prompt")
+        and style_contract.get("negative_prompt")
+    ):
+        style = (
+            "BASE VISUAL STYLE: "
+            f"{style_contract['base_style']}; {style_contract['positive_prompt']}; "
+            "同时仅继承该镜头参考成片首帧的色彩科学、光影质感、材质真实度、"
+            "镜头语言与氛围；不得从项目级风格描述引入本镜头动作与视觉契约未明确列出的"
+            "人物、建筑、地点、道具或剧情元素"
+        )
+    else:
+        style = (
+            "仅继承该镜头参考分镜帧的渲染方式、色彩科学、光影质感、材质真实度、"
+            "镜头语言与氛围；不得从项目级风格描述引入本镜头动作与视觉契约未明确列出的"
+            "人物、建筑、地点、道具或剧情元素"
+        )
     style = get_slice(style, "video")
     ratio, _width, _height = resolve_video_geometry({**scene, **shot_meta})
     quality = str(
@@ -316,6 +335,11 @@ def build_video_prompt(
     parts.append(PIXEL_TEXT_METADATA_CONTRACT)
 
     negatives = [str(scene.get("negative_prompt", "")).strip()]
+    if (
+        isinstance(style_contract, dict)
+        and style_contract.get("schema") == BASE_STYLE_SCHEMA
+    ):
+        negatives.append(str(style_contract.get("negative_prompt") or "").strip())
     if explicit_scenery:
         negatives.append(
             "人物(people), 人形主体(humanoid figures), 角色(characters), "

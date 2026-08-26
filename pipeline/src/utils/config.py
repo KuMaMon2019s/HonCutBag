@@ -83,7 +83,56 @@ class VideoModel(str, Enum):
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-ENV_FILE = PROJECT_ROOT / ".env"
+
+
+def _linked_worktree_common_git_dir(project_root: Path) -> Optional[Path]:
+    """Resolve a linked worktree's common Git directory without a subprocess."""
+    git_pointer = Path(project_root) / ".git"
+    if not git_pointer.is_file():
+        return None
+    try:
+        pointer = git_pointer.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    prefix = "gitdir:"
+    if not pointer.lower().startswith(prefix):
+        return None
+    git_dir_value = pointer[len(prefix):].strip()
+    if not git_dir_value:
+        return None
+    git_dir = Path(git_dir_value)
+    if not git_dir.is_absolute():
+        git_dir = (git_pointer.parent / git_dir).resolve()
+    common_pointer = git_dir / "commondir"
+    try:
+        common_value = common_pointer.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not common_value:
+        return None
+    common_git_dir = Path(common_value)
+    if not common_git_dir.is_absolute():
+        common_git_dir = (git_dir / common_git_dir).resolve()
+    if common_git_dir.name != ".git":
+        return None
+    return common_git_dir
+
+
+def resolve_project_env_file(project_root: Path = PROJECT_ROOT) -> Path:
+    """Prefer this checkout's env, then the main env shared by Git worktrees."""
+    project_root = Path(project_root).resolve()
+    local_env = project_root / ".env"
+    if local_env.is_file():
+        return local_env
+    common_git_dir = _linked_worktree_common_git_dir(project_root)
+    if common_git_dir is not None:
+        common_env = common_git_dir.parent / ".env"
+        if common_env.is_file():
+            return common_env
+    return local_env
+
+
+ENV_FILE = resolve_project_env_file()
 
 
 def configure_ark_agent_environment(env_file: Path = ENV_FILE) -> str:
@@ -123,12 +172,21 @@ def configure_seedance_model_environment(env_file: Path = ENV_FILE) -> str:
     return "default"
 
 
+def configure_project_environment(env_file: Path = ENV_FILE) -> dict[str, str]:
+    """Load one canonical project env and apply credential-specific precedence."""
+    load_dotenv(env_file, override=False)
+    return {
+        "ark_agent": configure_ark_agent_environment(env_file),
+        "seedance_model": configure_seedance_model_environment(env_file),
+    }
+
+
 # Load before pipeline_runner starts child processes so they inherit the same
 # repository-level configuration.  Other explicitly exported variables retain
 # priority; the Ark credential follows the narrower policy above.
-load_dotenv(ENV_FILE, override=False)
-ARK_AGENT_CREDENTIAL_SOURCE = configure_ark_agent_environment()
-SEEDANCE_MODEL_SOURCE = configure_seedance_model_environment()
+_PROJECT_ENV_SOURCES = configure_project_environment()
+ARK_AGENT_CREDENTIAL_SOURCE = _PROJECT_ENV_SOURCES["ark_agent"]
+SEEDANCE_MODEL_SOURCE = _PROJECT_ENV_SOURCES["seedance_model"]
 
 # 火山系服务（ARK/TOS/TTS/ASR）是国内服务，走本地代理会多一跳且不稳：
 # 2026-08-09 R5/R7 实测 http_proxy=127.0.0.1:7897 时事件提取 8/19 段超时、

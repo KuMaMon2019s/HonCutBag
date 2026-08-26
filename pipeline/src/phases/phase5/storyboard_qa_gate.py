@@ -824,13 +824,14 @@ def run_l4_first_frame_review(
         }
     prompt = f"""Review every supplied image as a video-bound cinematic first frame. Each image is attached in ascending input_index order and mapped to an exact frame_id below.
 
-Two fail-closed checks apply independently:
+Three fail-closed checks apply independently:
 1. ANNOTATION_CONTAMINATION: report any visible action/camera arrow, trajectory or helper line, Sxx/Pxx/Gxx label, letter, number, subtitle, watermark, UI, panel border, split-screen, contact sheet, storyboard grid, handwritten note, or other production annotation.
 2. STYLE_MISMATCH: compare the visible palette, materials, rendering medium, stage/environment structure, lighting, and finish against VISUAL STYLE. Report a mismatch when the frame is visibly PREVIS, pencil/charcoal/line-art, generic CGI/photography that contradicts the authored medium, or omits a defining environment such as a stage/curtain explicitly required by the style. Do not report minor composition differences.
+3. SUBJECT_DUPLICATION: report an unintended duplicate, translucent copy, double exposure, repeated face/body, or extra instance of the same authored subject. Do not report multiple distinct characters when the scene calls for them.
 
-Inspect each frame independently. Never copy one observation across multiple IDs. Every issue needs concrete visible evidence, expected, observed, and confidence >= 0.75. Annotation contamination and material style mismatch are severe because these pixels are about to enter paid video generation.
+Inspect each frame independently. Never copy one observation across multiple IDs. Every issue needs concrete visible evidence, expected, observed, and confidence >= 0.75. Annotation contamination, subject duplication, and material style mismatch are severe because these pixels are about to enter paid video generation.
 
-Return JSON only: {{"issues":[{{"code":"ANNOTATION_CONTAMINATION|STYLE_MISMATCH","severity":"severe|moderate|minor","frame_ids":["S01_P01"],"message":"...","expected":"...","observed":"...","confidence":0.95,"frame_evidence":[{{"frame_id":"S01_P01","observed":"specific visible evidence"}}]}}]}}.
+Return JSON only: {{"issues":[{{"code":"ANNOTATION_CONTAMINATION|STYLE_MISMATCH|SUBJECT_DUPLICATION","severity":"severe|moderate|minor","frame_ids":["S01_P01"],"message":"...","expected":"...","observed":"...","confidence":0.95,"frame_evidence":[{{"frame_id":"S01_P01","observed":"specific visible evidence"}}]}}]}}.
 Use only these frame IDs: {json.dumps(ordered_ids, ensure_ascii=False)}.
 INPUTS:
 {json.dumps(records, ensure_ascii=False)}
@@ -857,7 +858,11 @@ VISUAL STYLE:
             if not isinstance(value, dict):
                 continue
             code = str(value.get("code") or "").upper()
-            if code not in {"ANNOTATION_CONTAMINATION", "STYLE_MISMATCH"}:
+            if code not in {
+                "ANNOTATION_CONTAMINATION",
+                "STYLE_MISMATCH",
+                "SUBJECT_DUPLICATION",
+            }:
                 continue
             frame_ids = [
                 frame_id
@@ -2504,6 +2509,62 @@ def _correctable_issues(report: dict[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
+def _correctable_cinematic_frame_ids(
+    issues: list[dict[str, Any]],
+) -> list[str]:
+    """Return exact evidence-backed first frames safe for local regeneration."""
+    frame_ids: list[str] = []
+    for issue in issues:
+        if str(issue.get("layer") or "").upper() != "L4":
+            continue
+        if str(issue.get("code") or "").casefold() not in {
+            "first_frame_annotation_contamination",
+            "first_frame_subject_duplication",
+        }:
+            continue
+        details = issue.get("details") if isinstance(issue.get("details"), dict) else {}
+        if details.get("evidence_status") != "validated":
+            continue
+        raw_ids = details.get("frame_ids") or []
+        if not isinstance(raw_ids, list):
+            raw_ids = [raw_ids]
+        evidence = details.get("frame_evidence") or []
+        if not isinstance(evidence, list):
+            continue
+        evidence_by_id = {
+            str(item.get("frame_id") or "").strip(): str(item.get("observed") or "").strip()
+            for item in evidence
+            if isinstance(item, dict)
+            and str(item.get("frame_id") or "").strip()
+            and str(item.get("observed") or "").strip()
+        }
+        candidate_ids = [
+            str(value or "").strip()
+            for value in raw_ids
+            if re.fullmatch(r"S[^\s]+_P\d+", str(value or "").strip(), re.IGNORECASE)
+        ]
+        if not candidate_ids or not set(candidate_ids).issubset(evidence_by_id):
+            continue
+        if any(
+            _is_affirmative_non_issue({"message": evidence_by_id[frame_id]})
+            for frame_id in candidate_ids
+        ):
+            continue
+        for frame_id in candidate_ids:
+            if frame_id not in frame_ids:
+                frame_ids.append(frame_id)
+    return sorted(frame_ids)
+
+
+def _correctable_cinematic_issues(report: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return only local L4 contamination with complete per-frame evidence."""
+    return [
+        issue
+        for issue in blocking_issues(report.get("issues") or [])
+        if _correctable_cinematic_frame_ids([issue])
+    ]
+
+
 def _correctable_storyboard_ids(
     issues: list[dict[str, Any]],
 ) -> list[str]:
@@ -2763,15 +2824,18 @@ def _global_uncorrectable_issues(
     report: dict[str, Any],
 ) -> list[dict[str, Any]]:
     """Return blockers that cannot be isolated to a storyboard redraw."""
-    correctable_ids = {id(issue) for issue in _correctable_issues(report)}
+    correctable_ids = {
+        id(issue)
+        for issue in _correctable_issues(report) + _correctable_cinematic_issues(report)
+    }
     return [
         issue
         for issue in blocking_issues(report.get("issues") or [])
         # Only an evidence-complete L3 R1-R4 finding belongs to the Phase 2
         # redraw loop.  A shot-scoped L1 contract defect is still an upstream
         # planning defect; treating its Sxx as redraw authority wastes quota
-        # without repairing canonical metadata.  L4 likewise owns cinematic
-        # pixels and must return to Phase 4.
+        # without repairing canonical metadata. Evidence-complete L4 annotation
+        # contamination owns exact cinematic frames; other L4 defects restart Phase 4.
         if id(issue) not in correctable_ids
     ]
 
@@ -2822,6 +2886,183 @@ def _archive_correction_inputs(
         "archive_dir": str(attempt_dir.relative_to(output_dir)),
         "copied": copied,
     }
+
+
+def _cinematic_dependency_frame_ids(
+    storyboard: dict[str, Any],
+    target_frame_ids: list[str],
+) -> list[str]:
+    """Include later frames that consume a corrected prior cinematic frame."""
+    targets = set(target_frame_ids)
+    declared: set[str] = set()
+    dependency_ids: set[str] = set()
+    for shot_index, shot in enumerate(storyboard.get("shots") or [], 1):
+        if not isinstance(shot, dict):
+            continue
+        shot_id = _shot_id(shot, shot_index)
+        beat_ids = [
+            str(beat.get("beat_id") or f"{shot_id}_P{beat_index:02d}")
+            for beat_index, beat in enumerate(shot.get("storyboard_beats") or [], 1)
+            if isinstance(beat, dict)
+        ]
+        declared.update(beat_ids)
+        first_target = next(
+            (index for index, beat_id in enumerate(beat_ids) if beat_id in targets),
+            None,
+        )
+        if first_target is not None:
+            dependency_ids.update(beat_ids[first_target:])
+    missing = targets - declared
+    if missing:
+        raise RuntimeError(
+            "Phase 5 cinematic correction references unknown frame IDs: "
+            + ", ".join(sorted(missing))
+        )
+    return sorted(dependency_ids)
+
+
+def _archive_cinematic_correction_inputs(
+    output_dir: Path,
+    frame_ids: list[str],
+    dependency_frame_ids: list[str],
+    attempt: int,
+) -> dict[str, Any]:
+    """Archive exact Phase 4 pixels and receipts before local regeneration."""
+    correction_root = output_dir / "phase5_cinematic_corrections"
+    attempt_dir = correction_root / f"attempt_{attempt:02d}"
+    revision = 1
+    while attempt_dir.exists():
+        revision += 1
+        attempt_dir = correction_root / f"attempt_{attempt:02d}_r{revision:02d}"
+    before_dir = attempt_dir / "before"
+    before_dir.mkdir(parents=True, exist_ok=True)
+    copied: list[str] = []
+    sources = [
+        output_dir / name
+        for name in (
+            "storyboard_qa_report.json",
+            "STORYBOARD.json",
+            "CINEMATIC_FIRST_FRAMES.json",
+        )
+    ]
+    for frame_id in dependency_frame_ids:
+        sources.extend(sorted((output_dir / "video_first_frames").glob(f"{frame_id}.*")))
+    affected_shots = sorted({_parent_shot_id(frame_id) for frame_id in frame_ids})
+    for shot_id in affected_shots:
+        sources.extend(sorted((output_dir / "storyboard_images").glob(f"{shot_id}.*")))
+    for source in dict.fromkeys(sources):
+        if not source.is_file():
+            continue
+        target = before_dir / source.relative_to(output_dir)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        copied.append(str(target.relative_to(output_dir)))
+    return {
+        "attempt": attempt,
+        "archive_dir": str(attempt_dir.relative_to(output_dir)),
+        "frame_ids": frame_ids,
+        "dependency_frame_ids": dependency_frame_ids,
+        "copied": copied,
+    }
+
+
+def _redraw_failed_cinematic_frames(
+    output_dir: Path,
+    frame_ids: list[str],
+    issues: list[dict[str, Any]],
+    attempt: int,
+    *,
+    image_client: Any = None,
+) -> dict[str, Any]:
+    """Regenerate rejected Phase 4 frames through the canonical Phase 4 owner."""
+    storyboard_path = output_dir / "STORYBOARD.json"
+    storyboard = json.loads(storyboard_path.read_text(encoding="utf-8"))
+    targets = sorted(set(frame_ids))
+    if not targets:
+        raise RuntimeError("Phase 5 cinematic correction has no frame targets")
+    dependency_frame_ids = _cinematic_dependency_frame_ids(storyboard, targets)
+    archive = _archive_cinematic_correction_inputs(
+        output_dir, targets, dependency_frame_ids, attempt
+    )
+
+    def optional_json(name: str, fallback: dict[str, Any]) -> dict[str, Any]:
+        path = output_dir / name
+        if not path.is_file():
+            return fallback
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else fallback
+
+    characters = optional_json("CHARACTERS.json", {"characters": []})
+    scene_consistency = optional_json("SCENE_CONSISTENCY.json", {"shots": {}})
+    previous_manifest = optional_json("CINEMATIC_FIRST_FRAMES.json", {})
+    visual_style_path = next(
+        (
+            candidate
+            for candidate in (
+                output_dir / "visual-style.md",
+                output_dir / "visual_style_spec.md",
+            )
+            if candidate.is_file()
+        ),
+        None,
+    )
+    from phases.phase4.cinematic_first_frames import (
+        generate_cinematic_first_frames,
+        validate_cinematic_first_frame_artifacts,
+    )
+    from utils.clip_style_classifier import ClipStyleClassifier
+
+    manifest = generate_cinematic_first_frames(
+        output_dir,
+        storyboard,
+        characters.get("characters") or [],
+        scene_consistency,
+        client=image_client,
+        size=str(previous_manifest.get("size_requested") or "2K"),
+        visual_style_path=visual_style_path,
+        aspect_ratio=(
+            str(previous_manifest.get("aspect_ratio") or "").strip()
+            or str(storyboard.get("aspect_ratio") or "16:9")
+        ),
+        style_classifier=ClipStyleClassifier(),
+    )
+    artifact_errors = validate_cinematic_first_frame_artifacts(output_dir, storyboard)
+    if artifact_errors:
+        raise RuntimeError(
+            "Phase 5 correction produced invalid cinematic first frames: "
+            + "; ".join(artifact_errors[:8])
+        )
+    rejected_ids = set(manifest.get("phase5_rejected_frame_ids") or [])
+    if not set(targets).issubset(rejected_ids):
+        raise RuntimeError("Phase 4 did not consume every local Phase 5 frame rejection")
+    regenerated_ids = {
+        str(frame.get("beat_id") or "")
+        for frame in manifest.get("frames") or []
+        if isinstance(frame, dict) and frame.get("cache_hit") is not True
+    }
+    missing_regeneration = set(targets) - regenerated_ids
+    unexpected_regeneration = regenerated_ids - set(dependency_frame_ids)
+    if missing_regeneration or unexpected_regeneration:
+        raise RuntimeError(
+            "Phase 5 cinematic correction violated its target boundary: "
+            f"missing={sorted(missing_regeneration)}, "
+            f"unexpected={sorted(unexpected_regeneration)}"
+        )
+    _atomic_json(storyboard_path, storyboard)
+    receipt = {
+        "attempt": attempt,
+        "status": "redrawn",
+        "correction_family": "cinematic_first_frame",
+        "frame_ids": targets,
+        "dependency_frame_ids": dependency_frame_ids,
+        "regenerated_frame_ids": sorted(regenerated_ids),
+        "issue_codes": sorted({str(issue.get("code") or "") for issue in issues}),
+        "archive": archive,
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
+    attempt_dir = output_dir / archive["archive_dir"]
+    _atomic_json(attempt_dir / "redraw_receipt.json", receipt)
+    return receipt
 
 
 def _restore_cinematic_aliases_after_previs_redraw(
@@ -3009,10 +3250,11 @@ def run_storyboard_qa_with_correction(
     max_correction_attempts: int | None = None,
     qa_runner: Callable[[Path], dict[str, Any]] | None = None,
     redraw_runner: Callable[[Path, list[str], list[dict[str, Any]], int], dict[str, Any]] | None = None,
+    cinematic_redraw_runner: Callable[[Path, list[str], list[dict[str, Any]], int], dict[str, Any]] | None = None,
     image_client: Any = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Run Phase 5 with a bounded failed-shot redraw and recheck loop."""
+    """Run Phase 5 with one bounded correction family and recheck loop."""
     output_dir = Path(output_dir)
     if dry_run:
         return _run_storyboard_qa_dry_run(output_dir)
@@ -3068,20 +3310,46 @@ def run_storyboard_qa_with_correction(
         _atomic_json(output_dir / "storyboard_qa_report.json", result)
         return result
 
+    correction_family = (
+        "cinematic_first_frame"
+        if _correctable_cinematic_issues(result)
+        else "storyboard_previs"
+    )
     for attempt in range(1, attempts_allowed + 1):
         if result.get("gate_passed") is True or result.get("status") != "error":
             break
-        issues = _correctable_issues(result)
-        target_storyboard_ids = _correctable_storyboard_ids(issues)
-        target_ids = sorted({
-            _parent_shot_id(storyboard_id)
-            for storyboard_id in target_storyboard_ids
-        })
+        if _global_uncorrectable_issues(result):
+            break
+        if correction_family == "cinematic_first_frame":
+            issues = _correctable_cinematic_issues(result)
+            target_frame_ids = _correctable_cinematic_frame_ids(issues)
+            target_storyboard_ids: list[str] = []
+            target_ids = sorted({_parent_shot_id(value) for value in target_frame_ids})
+        else:
+            issues = _correctable_issues(result)
+            target_storyboard_ids = _correctable_storyboard_ids(issues)
+            target_frame_ids = []
+            target_ids = sorted({
+                _parent_shot_id(value) for value in target_storyboard_ids
+            })
         if not issues or not target_ids:
             break
         before_grade = result.get("grade")
         try:
-            if redraw_runner is not None:
+            if correction_family == "cinematic_first_frame":
+                if cinematic_redraw_runner is not None:
+                    redraw_receipt = cinematic_redraw_runner(
+                        output_dir, target_frame_ids, issues, attempt
+                    )
+                else:
+                    redraw_receipt = _redraw_failed_cinematic_frames(
+                        output_dir,
+                        target_frame_ids,
+                        issues,
+                        attempt,
+                        image_client=image_client,
+                    )
+            elif redraw_runner is not None:
                 redraw_receipt = redraw_runner(
                     output_dir, target_ids, issues, attempt
                 )
@@ -3097,7 +3365,9 @@ def run_storyboard_qa_with_correction(
             history.append({
                 "attempt": attempt,
                 "status": "redraw_error",
+                "correction_family": correction_family,
                 "shot_ids": target_ids,
+                **({"frame_ids": target_frame_ids} if target_frame_ids else {}),
                 "before_grade": before_grade,
                 "error": str(exc),
             })
@@ -3112,7 +3382,10 @@ def run_storyboard_qa_with_correction(
         result = qa(output_dir)
         adjudication = None
         try:
-            if len(adjudications) < MAX_REVIEW_ADJUDICATIONS:
+            if (
+                correction_family == "storyboard_previs"
+                and len(adjudications) < MAX_REVIEW_ADJUDICATIONS
+            ):
                 result, adjudication = _adjudicate_unchanged_panel_flips(
                     output_dir,
                     previous_result,
@@ -3125,6 +3398,7 @@ def run_storyboard_qa_with_correction(
             history.append({
                 "attempt": attempt,
                 "status": "adjudication_error",
+                "correction_family": correction_family,
                 "shot_ids": target_ids,
                 "storyboard_ids": target_storyboard_ids,
                 "before_grade": before_grade,
@@ -3161,8 +3435,10 @@ def run_storyboard_qa_with_correction(
         history.append({
             "attempt": attempt,
             "status": "passed" if result.get("gate_passed") is True else "rejected",
+            "correction_family": correction_family,
             "shot_ids": target_ids,
             "storyboard_ids": target_storyboard_ids,
+            **({"frame_ids": target_frame_ids} if target_frame_ids else {}),
             "before_grade": before_grade,
             "after_grade": result.get("grade"),
             "redraw": redraw_receipt,
@@ -3176,6 +3452,7 @@ def run_storyboard_qa_with_correction(
             "enabled": attempts_allowed > 0,
             "max_attempts": attempts_allowed,
             "attempts_used": len(history),
+            "correction_family": correction_family,
             "history": history,
             "review_adjudications": adjudications,
             "final_gate_passed": result.get("gate_passed") is True,
@@ -3189,10 +3466,17 @@ def run_storyboard_qa_with_correction(
             "Phase 5 automatic correction failed:"
         )
         if result.get("gate_passed") is not True and not automatic_failure:
-            result["error"] = (
-                "Storyboard QA still blocks Phase 6 after "
-                f"{len(history)}/{attempts_allowed} automatic correction attempt(s)"
-            )
+            if len(history) < attempts_allowed:
+                result["error"] = (
+                    "Storyboard QA still blocks Phase 6 after completing the "
+                    f"{correction_family} correction family; no second correction "
+                    "family was started"
+                )
+            else:
+                result["error"] = (
+                    "Storyboard QA still blocks Phase 6 after "
+                    f"{len(history)}/{attempts_allowed} automatic correction attempt(s)"
+                )
         _atomic_json(output_dir / "phase5_correction_report.json", correction)
         _atomic_json(output_dir / "storyboard_qa_report.json", result)
     return result

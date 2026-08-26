@@ -158,6 +158,8 @@ brew install uv ffmpeg
 
 # Create .venv with the pinned interpreter and locked dependencies
 make install
+# Install the pinned local CLIP model used for fixed-enum style ranking
+make install-style-model
 make doctor
 
 # Run the full pipeline from a script
@@ -181,6 +183,8 @@ Online visual generation uses the Volcano Ark Agent Plan only. Configure
 `ARK_AGENT_API_KEY`; HonCut does not read `ARK_API_KEY`, which remains reserved
 for the Honcho Coding Plan memory integration. Seedream image generation uses
 the Agent Plan model `doubao-seedream-5.0-lite` with a default `2K` PNG output.
+Linked Git worktrees automatically reuse the main HonCut checkout's `.env`, so
+clean worktree runs do not inherit a stale launcher key or require secret copies.
 Seedance image/video inputs are always uploaded to TOS before submission, so
 online video generation also requires `TOS_ACCESS_KEY`, `TOS_SECRET_KEY`, and
 `TOS_BUCKET`; upload failure stops before the Provider call rather than

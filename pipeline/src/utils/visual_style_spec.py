@@ -45,6 +45,8 @@ class VisualStyle:
     mood_era: str = ""
     mood_avoid: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
+    base_style: str = ""
+    style_tags: list[str] = field(default_factory=list)
 
 
 def _frontmatter(md_text: str) -> dict[str, Any]:
@@ -107,6 +109,8 @@ def parse_visual_style(md_text: str) -> VisualStyle:
     return VisualStyle(
         name=str(data["name"]),
         version=str(data.get("version", "1.0")),
+        base_style=str(data.get("base_style", "") or ""),
+        style_tags=_strings(data.get("style_tags")),
         style_prompt_short=str(data.get("style_prompt_short", "") or ""),
         style_prompt_full=str(data.get("style_prompt_full", "") or ""),
         colors_primary=_colors(colors.get("primary")),
@@ -146,6 +150,8 @@ def serialize_visual_style(style: VisualStyle) -> str:
     data = {
         "name": style.name,
         "version": style.version,
+        "base_style": style.base_style,
+        "style_tags": style.style_tags,
         "tags": style.tags,
         "style_prompt_short": style.style_prompt_short,
         "style_prompt_full": style.style_prompt_full,

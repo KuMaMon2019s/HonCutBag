@@ -2,11 +2,12 @@ UV ?= uv
 UV_SYNC = $(UV) sync --locked --managed-python
 UV_RUN = $(UV) run --locked --managed-python
 
-.PHONY: help install doctor test lint run clean docker-up docker-down
+.PHONY: help install install-style-model doctor test lint run clean docker-up docker-down
 
 help:
 	@echo "HonCut Pipeline Commands:"
 	@echo "  make install      - Install dependencies"
+	@echo "  make install-style-model - Install the pinned local CLIP style model"
 	@echo "  make doctor       - Verify the locked project interpreter"
 	@echo "  make test         - Run tests"
 	@echo "  make lint         - Run critical Ruff checks"
@@ -19,6 +20,9 @@ install:
 	@command -v $(UV) >/dev/null 2>&1 || { echo "Error: uv is required (https://docs.astral.sh/uv/)"; exit 1; }
 	@echo "Installing locked dependencies with uv..."
 	$(UV_SYNC)
+
+install-style-model: install
+	$(UV_RUN) python pipeline/scripts/install_clip_style_model.py
 
 doctor:
 	@command -v $(UV) >/dev/null 2>&1 || { echo "Error: uv is required (https://docs.astral.sh/uv/)"; exit 1; }

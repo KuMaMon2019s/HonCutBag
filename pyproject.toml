@@ -30,6 +30,7 @@ dependencies = [
     "websockets>=12.0",
     "arq>=0.28.0",
     "json-repair>=0.63.4",
+    "open-clip-torch==3.3.0",
 ]
 
 [dependency-groups]

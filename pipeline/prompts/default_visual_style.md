@@ -1,6 +1,9 @@
 ---
 name: "HonCut Cinematic Default"
-version: "1.0"
+version: "1.1"
+base_style: cinematic
+style_tags:
+  - cinematic
 tags:
   - cinematic
   - warm-tones

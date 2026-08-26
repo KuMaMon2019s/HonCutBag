@@ -12,6 +12,41 @@ from clients import asr_client, local_video_client
 from utils import config
 
 
+def test_linked_worktree_resolves_and_loads_the_common_project_env(
+    tmp_path, monkeypatch
+):
+    project_root = tmp_path / "honcut"
+    common_git_dir = project_root / ".git"
+    worktree_root = tmp_path / "honcut-clean-worktree"
+    worktree_git_dir = common_git_dir / "worktrees" / "clean"
+    worktree_git_dir.mkdir(parents=True)
+    worktree_root.mkdir()
+    (worktree_root / ".git").write_text(
+        f"gitdir: {worktree_git_dir}\n",
+        encoding="utf-8",
+    )
+    (worktree_git_dir / "commondir").write_text("../..\n", encoding="utf-8")
+    (project_root / ".env").write_text(
+        "ARK_AGENT_API_KEY=project-agent-key\n"
+        "TOS_ACCESS_KEY=project-tos-key\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ARK_AGENT_API_KEY", "stale-process-key")
+    monkeypatch.delenv("TOS_ACCESS_KEY", raising=False)
+    monkeypatch.delenv("SEEDANCE_MODEL", raising=False)
+
+    env_file = config.resolve_project_env_file(worktree_root)
+    sources = config.configure_project_environment(env_file)
+
+    assert env_file == project_root / ".env"
+    assert sources == {
+        "ark_agent": "project_env",
+        "seedance_model": "default",
+    }
+    assert config.os.environ["ARK_AGENT_API_KEY"] == "project-agent-key"
+    assert config.os.environ["TOS_ACCESS_KEY"] == "project-tos-key"
+
+
 def test_project_agent_key_overrides_stale_process_key_and_preserves_coding_key(
     tmp_path, monkeypatch
 ):

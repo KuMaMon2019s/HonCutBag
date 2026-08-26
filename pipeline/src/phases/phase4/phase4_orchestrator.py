@@ -162,10 +162,12 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
                 generate_cinematic_first_frames,
                 validate_cinematic_first_frame_artifacts,
             )
+            from utils.clip_style_classifier import ClipStyleClassifier
 
             video_width, video_height, cinematic_aspect_ratio = _storyboard_canvas(
                 storyboard_for_consistency
             )
+            style_classifier = ClipStyleClassifier()
             cinematic_frames = generate_cinematic_first_frames(
                 output_dir,
                 storyboard_for_consistency,
@@ -177,6 +179,7 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
                 ),
                 visual_style_path=visual_style_path,
                 aspect_ratio=cinematic_aspect_ratio,
+                style_classifier=style_classifier,
             )
             cinematic_errors = validate_cinematic_first_frame_artifacts(
                 output_dir,
