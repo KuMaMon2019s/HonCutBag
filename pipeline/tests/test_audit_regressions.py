@@ -87,6 +87,7 @@ from quality.shot_continuity import annotate_boundaries, classify_boundary
 from quality.variation_checker import check_scene_variation
 from runtime.run_manifest import prepare_run_manifest
 from runtime import pipeline_execution
+from runtime.pipeline_checkpoints import record_stage_checkpoint
 from tools.checkpoint import invalidate_checkpoint_from, write_checkpoint
 from tools.asset_packager import _assert_video_frame_provenance
 from tools.smart_transition import decide_all_transitions
@@ -4893,6 +4894,136 @@ def test_phase5_dry_run_writes_atomic_structural_receipts_without_pixel_qa(
     }
     assert (tmp_path / "STORYBOARD.json").read_bytes() == canonical_before
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_phase6_single_phase_dry_run_accepts_current_phase5_dry_run_receipt(
+    monkeypatch, tmp_path
+):
+    text = "a clean-room dry-run handoff script"
+    all_phases = [1, 2, 3, 4, 5, 6, 7, 8, 9, 9.5]
+    initial = pipeline_execution.run_pipeline(
+        text=text,
+        output_dir=str(tmp_path),
+        dry_run=True,
+        no_real_person=True,
+        project_id="phase6-dry-run-handoff",
+        skip_phase=all_phases,
+    )
+    assert initial["status"] == "completed"
+
+    _write_phase5_dry_run_inputs(tmp_path)
+    for shot_id in ("S01", "S02"):
+        (tmp_path / "shots" / shot_id).mkdir(parents=True)
+    phase5 = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        dry_run=True,
+        qa_runner=_unexpected_phase5_dry_run_owner,
+        redraw_runner=_unexpected_phase5_dry_run_owner,
+        image_client=object(),
+    )
+    assert phase5["status"] == "done"
+    record_stage_checkpoint(tmp_path, "phase5", phase5)
+    assert not (tmp_path / "SHOT_STORYBOARDS.json").exists()
+
+    calls = []
+
+    def dry_run_phase6(storyboard, output_dir, dry_run, **kwargs):
+        calls.append(
+            {
+                "storyboard": storyboard,
+                "output_dir": Path(output_dir),
+                "dry_run": dry_run,
+                **kwargs,
+            }
+        )
+        return {"status": "skipped", "reason": "dry-run", "duration_s": 0.0}
+
+    monkeypatch.setattr(pipeline_execution, "run_phase6", dry_run_phase6)
+    selected = pipeline_execution.run_pipeline(
+        text=text,
+        output_dir=str(tmp_path),
+        dry_run=True,
+        no_real_person=True,
+        project_id="phase6-dry-run-handoff",
+        skip_phase=[1, 2, 3, 4, 5, 7, 8, 9, 9.5],
+    )
+
+    assert selected["status"] == "completed"
+    assert selected["phases"]["phase5"]["gate_validation"] == (
+        "current-run checkpoint"
+    )
+    assert selected["phases"]["phase6"] == {
+        "status": "skipped",
+        "reason": "dry-run",
+        "duration_s": 0.0,
+    }
+    assert len(calls) == 1
+    assert calls[0]["dry_run"] is True
+
+    (tmp_path / "STORYBOARD.json").write_text("{}", encoding="utf-8")
+    tampered = pipeline_execution.run_pipeline(
+        text=text,
+        output_dir=str(tmp_path),
+        dry_run=True,
+        no_real_person=True,
+        project_id="phase6-dry-run-handoff",
+        skip_phase=[1, 2, 3, 4, 5, 7, 8, 9, 9.5],
+    )
+    assert tampered["status"] == "failed"
+    assert "no passing Phase 5 checkpoint" in tampered["error"]
+    assert len(calls) == 1
+
+
+def test_phase6_single_phase_production_keeps_missing_storyboard_assets_blocking(
+    monkeypatch, tmp_path
+):
+    text = "a clean-room production handoff script"
+    all_phases = [1, 2, 3, 4, 5, 6, 7, 8, 9, 9.5]
+    initial = pipeline_execution.run_pipeline(
+        text=text,
+        output_dir=str(tmp_path),
+        dry_run=False,
+        no_real_person=True,
+        project_id="phase6-production-handoff",
+        skip_phase=all_phases,
+    )
+    assert initial["status"] == "completed"
+
+    _write_phase5_dry_run_inputs(tmp_path)
+    for shot_id in ("S01", "S02"):
+        (tmp_path / "shots" / shot_id).mkdir(parents=True)
+    phase5 = {
+        "schema": "honcut.storyboard-qa-report.v1",
+        "status": "done",
+        "grade": "A",
+        "gate_passed": True,
+        "dry_run": False,
+    }
+    (tmp_path / "storyboard_qa_report.json").write_text(
+        json.dumps(phase5),
+        encoding="utf-8",
+    )
+    record_stage_checkpoint(tmp_path, "phase5", phase5)
+    assert not (tmp_path / "SHOT_STORYBOARDS.json").exists()
+    monkeypatch.setattr(
+        pipeline_execution,
+        "run_phase6",
+        lambda *_args, **_kwargs: pytest.fail(
+            "production Phase 6 must not bypass missing storyboard assets"
+        ),
+    )
+
+    selected = pipeline_execution.run_pipeline(
+        text=text,
+        output_dir=str(tmp_path),
+        dry_run=False,
+        no_real_person=True,
+        project_id="phase6-production-handoff",
+        skip_phase=[1, 2, 3, 4, 5, 7, 8, 9, 9.5],
+    )
+
+    assert selected["status"] == "failed"
+    assert "no passing Phase 5 checkpoint" in selected["error"]
 
 
 def test_phase5_dry_run_still_blocks_structural_grade_c_without_redraw(tmp_path):

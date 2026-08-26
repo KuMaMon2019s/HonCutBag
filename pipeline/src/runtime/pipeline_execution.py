@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -68,6 +69,90 @@ _GRAPH_PROGRESS_PHASES = {
     "phase9": ("phase9", "音频与后期"),
     "phase9_5": ("phase9_5", "成片交付质检"),
 }
+
+
+def _phase5_dry_run_handoff_is_current(
+    output_dir: Path,
+    phase5_checkpoint: Mapping[str, Any],
+    gate_report: Mapping[str, Any],
+) -> bool:
+    """Validate zero-request Phase 5 evidence without production pixels."""
+    receipt_name = "phase5_dry_run_receipt.json"
+    if not (
+        phase5_checkpoint.get("status") == "done"
+        and phase5_checkpoint.get("gate_passed") is True
+        and phase5_checkpoint.get("dry_run") is True
+        and phase5_checkpoint.get("dry_run_receipt") == receipt_name
+        and gate_report.get("status") == "done"
+        and gate_report.get("gate_passed") is True
+        and gate_report.get("dry_run") is True
+        and gate_report.get("dry_run_receipt") == receipt_name
+    ):
+        return False
+    try:
+        dry_run_receipt = json.loads(
+            (output_dir / receipt_name).read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(dry_run_receipt, dict) or not (
+        dry_run_receipt.get("schema") == "honcut.phase5-dry-run-receipt.v1"
+        and dry_run_receipt.get("status") == "completed"
+        and dry_run_receipt.get("dry_run") is True
+        and dry_run_receipt.get("gate_passed") is True
+    ):
+        return False
+
+    root = output_dir.resolve()
+
+    def artifact_hashes(value: Any) -> dict[str, str] | None:
+        if not isinstance(value, list) or not value:
+            return None
+        records: dict[str, str] = {}
+        for item in value:
+            if not isinstance(item, Mapping):
+                return None
+            relative_value = item.get("path")
+            expected_hash = item.get("sha256")
+            if not isinstance(relative_value, str) or not relative_value.strip():
+                return None
+            if not isinstance(expected_hash, str) or len(expected_hash) != 64:
+                return None
+            expected_hash = expected_hash.casefold()
+            if any(
+                character not in "0123456789abcdef"
+                for character in expected_hash
+            ):
+                return None
+            relative_path = Path(relative_value)
+            if relative_path.is_absolute() or ".." in relative_path.parts:
+                return None
+            artifact_path = (root / relative_path).resolve()
+            if (
+                not artifact_path.is_relative_to(root)
+                or not artifact_path.is_file()
+            ):
+                return None
+            if relative_value in records:
+                return None
+            try:
+                actual_hash = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+            except OSError:
+                return None
+            if actual_hash != expected_hash:
+                return None
+            records[relative_value] = expected_hash
+        if "STORYBOARD.json" not in records:
+            return None
+        return records
+
+    checkpoint_inputs = artifact_hashes(phase5_checkpoint.get("input_artifacts"))
+    gate_inputs = artifact_hashes(gate_report.get("input_artifacts"))
+    receipt_inputs = artifact_hashes(dry_run_receipt.get("input_artifacts"))
+    return bool(
+        checkpoint_inputs is not None
+        and checkpoint_inputs == gate_inputs == receipt_inputs
+    )
 
 
 def _stream_graph_with_progress(
@@ -865,7 +950,15 @@ def _run_pipeline(
                 and phase5_receipt.get("status") == "done"
                 and isinstance(gate_report, dict)
                 and gate_report.get("gate_passed") is True
-                and can_resume_from("phase6", output_path)
+                and (
+                    _phase5_dry_run_handoff_is_current(
+                        output_path,
+                        phase5_receipt,
+                        gate_report,
+                    )
+                    if dry_run
+                    else can_resume_from("phase6", output_path)
+                )
             )
             if not gate_is_current_and_passing:
                 error = (
