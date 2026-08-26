@@ -252,12 +252,15 @@ def test_previs_pixels_are_separated_end_to_end_before_video_transport(
         },
     )
     prompt = next(item["text"] for item in content if item["type"] == "text")
-    assert [item.get("role") for item in content if item["type"] == "image_url"] == [
-        "first_frame"
+    image_roles = [
+        item.get("role") for item in content if item["type"] == "image_url"
     ]
+    assert image_roles
+    assert set(image_roles) == {"reference_image"}
     assert cinematic_sha256 in uploaded_sha256
     assert director_sha256 not in uploaded_sha256
     assert previs_sha256 not in uploaded_sha256
     assert nine_grid_sha256 not in uploaded_sha256
+    assert "首帧为图片1" in prompt
     assert "成片质感第一帧" in prompt
     assert "读取动作箭头" not in prompt

@@ -11,8 +11,7 @@ from tools.asset_packager import (
     _assert_video_frame_provenance,
     _detect_shot_characters,
     collect_character_reference_assets,
-    inject_flf2v_identity_lock,
-    inject_reference_instruction,
+    inject_omni_reference_instruction,
 )
 from utils.prompt_budget import enforce_prompt_budget
 
@@ -88,7 +87,7 @@ def build_task_dir(output_dir, shot_ids: Sequence[str], meta: Mapping) -> Path:
             if frame_override
             else output_dir / "storyboard_images" / f"{shot_id}.png"
         )
-        first_frame = None
+        cinematic_frame = None
         if first_source.exists():
             _assert_video_frame_provenance(
                 first_source,
@@ -96,12 +95,8 @@ def build_task_dir(output_dir, shot_ids: Sequence[str], meta: Mapping) -> Path:
                 or CINEMATIC_FIRST_FRAME_SCHEMA,
             )
             first_destination = _copy_image(first_source, shot_dir / "分镜" / "分镜图.png")
-            first_frame = first_destination.relative_to(shot_dir).as_posix()
-        if requested_strategy == "phantom" and first_frame:
-            # Keep task-dir transport equivalent to content[] transport: the
-            # clean Phase 4 render is an exact first frame, never a generic
-            # Phantom reference mixed with separate character images.
-            strategy = "i2v"
+            cinematic_frame = first_destination.relative_to(shot_dir).as_posix()
+        first_frame = cinematic_frame if strategy == "flf2v" else None
         last_frame = None
         if strategy == "flf2v":
             end_source = output_dir / "storyboard_images" / f"{shot_id}_end.png"
@@ -125,7 +120,23 @@ def build_task_dir(output_dir, shot_ids: Sequence[str], meta: Mapping) -> Path:
                 f"{shot_id}; expected reference_board.png, legacy canonical "
                 "views, identity_detail.png, or variant_*.png"
             )
-        assets = phantom_identity_assets if strategy == "phantom" else []
+        assets = []
+        if strategy == "phantom" and cinematic_frame:
+            assets.append({
+                "path": first_source,
+                "char_id": None,
+                "role": "reference_image",
+                "priority": "high",
+                "bind_subject": False,
+                "reference_kind": "cinematic_composition",
+                "reference_description": (
+                    f"{shot_id}成片质感第一帧，用于锁定本生成片段的构图、"
+                    "角色站位、场景结构、项目美术风格、时间天气和光影；"
+                    "该资产已经过无文字、无箭头、无分格的像素洁净检查"
+                ),
+            })
+        if strategy == "phantom":
+            assets.extend(phantom_identity_assets)
         variant_totals = {}
         for asset in assets:
             if asset["path"].name.startswith("variant_"):
@@ -133,7 +144,9 @@ def build_task_dir(output_dir, shot_ids: Sequence[str], meta: Mapping) -> Path:
         variant_indexes = {}
         for index, asset in enumerate(assets, start=1):
             source = asset["path"]
-            if source.name == "reference_board.png":
+            if asset.get("reference_kind") == "cinematic_composition":
+                relative = cinematic_frame
+            elif source.name == "reference_board.png":
                 filename = "四视图身份参考板.png"
             elif source.name == "face_closeup.png":
                 filename = "大头照.png"
@@ -143,8 +156,9 @@ def build_task_dir(output_dir, shot_ids: Sequence[str], meta: Mapping) -> Path:
                 char_id = asset["char_id"]
                 variant_indexes[char_id] = variant_indexes.get(char_id, 0) + 1
                 filename = _variant_name(source, variant_indexes[char_id], variant_totals[char_id])
-            destination = _copy_image(source, shot_dir / asset["char_id"] / filename)
-            relative = destination.relative_to(shot_dir).as_posix()
+            if asset.get("reference_kind") != "cinematic_composition":
+                destination = _copy_image(source, shot_dir / asset["char_id"] / filename)
+                relative = destination.relative_to(shot_dir).as_posix()
             references.append({
                 "path": relative,
                 "label": f"图片{index}",
@@ -154,12 +168,10 @@ def build_task_dir(output_dir, shot_ids: Sequence[str], meta: Mapping) -> Path:
         prompt_dir = shot_dir / "提示词"
         prompt_dir.mkdir(parents=True, exist_ok=True)
         prompt = current.get("prompt", "")
-        if requested_strategy == "phantom" and strategy == "i2v":
-            prompt = inject_flf2v_identity_lock(output_dir, current, prompt)
         if references:
             # Preserve character ids so face/full-body/variant images of one
             # person bind to one subject, matching the ordinary content[] path.
-            prompt = inject_reference_instruction(prompt, assets)
+            prompt = inject_omni_reference_instruction(prompt, assets)
         frame_instructions = []
         if first_frame:
             frame_instructions.append(

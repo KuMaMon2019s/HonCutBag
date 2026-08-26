@@ -66,7 +66,9 @@ def _multi_character_project(tmp_path: Path) -> dict:
     }
 
 
-def test_task_dir_and_content_promote_phantom_to_strict_first_frame(tmp_path, monkeypatch):
+def test_task_dir_and_content_share_numbered_omni_reference_contract(
+    tmp_path, monkeypatch
+):
     shot_meta = _multi_character_project(tmp_path)
     monkeypatch.setattr(
         tos_uploader,
@@ -81,16 +83,24 @@ def test_task_dir_and_content_promote_phantom_to_strict_first_frame(tmp_path, mo
     prompt = (task_dir / "S02" / "提示词" / "提示词.txt").read_text(encoding="utf-8")
 
     content_prompt = next(item["text"] for item in content if item["type"] == "text")
-    assert [item.get("role") for item in content if item["type"] == "image_url"] == [
-        "first_frame"
+    image_roles = [
+        item.get("role") for item in content if item["type"] == "image_url"
     ]
-    assert manifest["strategy"] == "i2v"
-    assert manifest["references"] == []
-    assert "分镜/分镜图.png是S02成片质感首帧" in prompt
+    assert image_roles
+    assert set(image_roles) == {"reference_image"}
+    assert manifest["strategy"] == "phantom"
+    assert manifest["first_frame"] is None
+    assert manifest["references"][0]["path"] == "分镜/分镜图.png"
+    assert [item["label"] for item in manifest["references"]] == [
+        f"图片{index}"
+        for index in range(1, len(manifest["references"]) + 1)
+    ]
+    assert "首帧为图片1" in prompt
     assert "构图、角色站位、场景结构、项目美术风格、时间天气和光影" in prompt
+    assert "首帧为图片1" in content_prompt
     assert "图片1为S02成片质感第一帧" in content_prompt
-    assert not (task_dir / "S02" / "black_merc").exists()
-    assert not (task_dir / "S02" / "silver_tech").exists()
+    assert (task_dir / "S02" / "black_merc").is_dir()
+    assert (task_dir / "S02" / "silver_tech").is_dir()
 
 
 def test_task_directory_matches_contract_structure(tmp_path):
@@ -106,8 +116,8 @@ def test_task_directory_matches_contract_structure(tmp_path):
     manifest = json.loads((task_dir / "S02" / "manifest.json").read_text(encoding="utf-8"))
     assert manifest == {
         "shot_id": "S02",
-        "strategy": "i2v",
-        "first_frame": "分镜/分镜图.png",
+        "strategy": "phantom",
+        "first_frame": None,
         "last_frame": None,
         "references": manifest["references"],
         "prompt_file": "提示词/提示词.txt",
@@ -134,7 +144,8 @@ def test_upload_preserves_utf8_object_keys_without_network(tmp_path, monkeypatch
     keys = [key for key, _ in uploads]
     assert f"tasks/{task_id}/S02/提示词/提示词.txt" in keys
     assert f"tasks/{task_id}/S02/分镜/分镜图.png" in keys
-    assert not any("大头照" in key or "全身照" in key for key in keys)
+    assert any("大头照" in key for key in keys)
+    assert any("全身照" in key for key in keys)
     assert all("%" not in key for key in keys)
 
 

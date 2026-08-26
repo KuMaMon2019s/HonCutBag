@@ -16,6 +16,7 @@ from typing import Any, List, Optional, Tuple
 
 from utils.storyboard_motion_policy import apply_storyboard_motion_policy
 from utils.video_generation_contracts import ensure_video_generation_contract
+from utils.video_capabilities import SEEDANCE_2_CAPABILITIES
 from tools.character_reference_board import (
     ensure_character_reference_board,
     resolve_character_reference_board,
@@ -556,6 +557,34 @@ def inject_reference_instruction(prompt_text: str, descriptions: List[Any]) -> s
     return f"元素参考：{instruction}{prompt_text}"
 
 
+def inject_omni_reference_instruction(
+    prompt_text: str,
+    descriptions: List[Any],
+) -> str:
+    """Bind numbered references and request the cinematic image as frame one."""
+    prompt_text = inject_reference_instruction(prompt_text, descriptions)
+    cinematic_number = next(
+        (
+            index
+            for index, asset in enumerate(descriptions, start=1)
+            if isinstance(asset, dict)
+            and asset.get("reference_kind") == "cinematic_composition"
+        ),
+        None,
+    )
+    if cinematic_number is None:
+        return prompt_text
+    return (
+        "全模态参考首帧合同："
+        f"首帧为图片{cinematic_number}。"
+        f"图片{cinematic_number}锁定开场构图、角色站位、场景结构、"
+        "项目美术风格、时间天气和光影；其余图片只按各自编号锁定"
+        "角色身份、服装、身体比例、道具或明确声明的参考职责。"
+        f"不得把图片{cinematic_number}中的单一姿态冻结为全片动作。"
+        f"{prompt_text}"
+    )
+
+
 def inject_flf2v_identity_lock(
     output_dir: Path,
     shot_meta: dict,
@@ -635,13 +664,14 @@ def build_content_for_shot(
         List of content items for Bridge /generate API:
         [
             {"type": "text", "text": "shot prompt"},
-            {"type": "image_url", "image_url": {"url": "https://..."}, "role": "first_frame", "priority": "high"}
+            {"type": "image_url", "image_url": {"url": "https://..."}, "role": "reference_image", "priority": "high"}
         ]
 
-    i2v uses one first frame; FLF2V uses an explicit first and last frame.
-    A legacy Phantom request is upgraded to strict i2v transport whenever a
-    Phase 4 cinematic frame exists.  Phantom's separate character references
-    remain only as a compatibility fallback for projects without that frame.
+    Standard Seedance generation uses numbered ``reference_image`` inputs.  A
+    Phase 4 cinematic frame is image 1 and the prompt explicitly asks the model
+    to use image 1 as the first frame; canonical character boards follow it in
+    the same all-modal reference request.  FLF2V alone keeps explicit
+    ``first_frame`` / ``last_frame`` endpoint control.
 
     Legacy paths (zip/base64) are preserved for backward compatibility but not
     used in the primary content[] workflow.
@@ -686,12 +716,12 @@ def build_content_for_shot(
     if prompt_text:
         content.append({"type": "text", "text": prompt_text})
 
-    # Every route uses the Phase 4 cinematic frame as a strict frame.  In
-    # particular, a legacy Phantom request must not downgrade it to a generic
-    # reference_image or mix in separate character media: either behavior lets
-    # the provider redraw the approved start state and can reintroduce solid
-    # actors into a flat shadow-puppet shot. Director/PREVIS pixels are rejected
-    # at this boundary even when an old continuity plan points at them.
+    # The Phase 4 cinematic frame is the first numbered all-modal reference for
+    # ordinary generation.  The prompt binds it as the requested first frame;
+    # canonical character boards can therefore travel in the same request.
+    # Strict frame roles are reserved for FLF2V endpoints. Director/PREVIS
+    # pixels are rejected at this boundary even when an old continuity plan
+    # points at them.
     storyboard_images_dir = output_dir / "storyboard_images"
     if not storyboard_images_dir.exists():
         print(
@@ -720,9 +750,14 @@ def build_content_for_shot(
         )
         image_assets.append({
             "path": shot_frame_path,
-            "role": "first_frame",
+            "role": (
+                "first_frame"
+                if strategy == "flf2v"
+                else "reference_image"
+            ),
             "priority": "high",
             "bind_subject": False,
+            "reference_kind": "cinematic_composition",
             "reference_description": (
                 f"{frame_label}，用于锁定本生成片段的构图、角色站位、"
                 "场景结构、项目美术风格、时间天气和光影；该资产已经过"
@@ -756,23 +791,10 @@ def build_content_for_shot(
                 "identity_detail.png, or variant_*.png"
             )
         if image_assets:
-            # The approved Phase 4 render already resolves identity, costume,
-            # medium, composition, and continuity. Seedance cannot legally mix
-            # first_frame with reference_image, and doing so would weaken the
-            # exact-start-frame contract, so keep identity text-only here.
-            strategy = "i2v"
-            text_item = next(
-                (item for item in content if item.get("type") == "text"), None
-            )
-            if text_item is not None:
-                text_item["text"] = inject_flf2v_identity_lock(
-                    output_dir,
-                    shot_meta,
-                    text_item["text"],
-                )
+            image_assets.extend(character_assets)
             print(
-                "  [assets] phantom -> i2v: Phase 4 cinematic frame promoted "
-                "to strict first_frame; character references kept text-only"
+                "  [assets] phantom all-modal reference: cinematic image 1 + "
+                f"{len(character_assets)} character reference image(s)"
             )
         elif not character_assets:
             raise FileNotFoundError(
@@ -799,7 +821,8 @@ def build_content_for_shot(
             + 1
             + min(active_detail_count, 1)
         )
-        motion_budget = max(2, min(4, motion_budget))
+        provider_budget = SEEDANCE_2_CAPABILITIES.max_reference_images or 9
+        motion_budget = max(2, min(provider_budget, motion_budget))
         max_reference_images = (
             motion_budget
             if max_reference_images is None
@@ -833,15 +856,17 @@ def build_content_for_shot(
                 # variant, and keep the face crop only as a last fallback.
                 def action_reference_rank(asset: dict) -> int:
                     name = Path(asset.get("path", "")).name
-                    if name == "full_body.png":
+                    if name == "reference_board.png":
                         return 0
-                    if name == "identity_detail.png":
+                    if name == "full_body.png":
                         return 1
-                    if name.startswith("variant_"):
+                    if name == "identity_detail.png":
                         return 2
-                    if name == "face_closeup.png":
+                    if name.startswith("variant_"):
                         return 3
-                    return 4
+                    if name == "face_closeup.png":
+                        return 4
+                    return 5
 
                 for assets in grouped.values():
                     assets.sort(key=action_reference_rank)
@@ -858,7 +883,7 @@ def build_content_for_shot(
                 if not added:
                     break
                 round_index += 1
-            image_assets = [*selected_characters, *composition_assets]
+            image_assets = [*composition_assets, *selected_characters]
             print(
                 "  [assets] continuation reference budget: "
                 f"trimmed to {len(image_assets)}/{max_reference_images} images"
@@ -916,12 +941,12 @@ def build_content_for_shot(
         if asset["role"] == "reference_image":
             uploaded_reference_descriptions.append(asset)
     
-    if strategy == "phantom" and uploaded_reference_descriptions and content:
+    if strategy in {"phantom", "i2v"} and uploaded_reference_descriptions and content:
         text_item = next(
             (item for item in content if item.get("type") == "text"), None
         )
         if text_item is not None:
-            text_item["text"] = inject_reference_instruction(
+            text_item["text"] = inject_omni_reference_instruction(
                 text_item["text"], uploaded_reference_descriptions
             )
 

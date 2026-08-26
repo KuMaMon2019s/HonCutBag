@@ -315,7 +315,9 @@ def _write_cinematic_frame(path: Path, marker: bytes = b"s") -> None:
     )
 
 
-def test_phantom_with_cinematic_frame_uses_strict_first_frame_only(tmp_path, monkeypatch):
+def test_phantom_with_cinematic_frame_uses_numbered_omni_references(
+    tmp_path, monkeypatch
+):
     _stub_tos_upload(monkeypatch)
     storyboard_dir = tmp_path / "storyboard_images"
     _write_cinematic_frame(storyboard_dir / "S01.png")
@@ -331,9 +333,17 @@ def test_phantom_with_cinematic_frame_uses_strict_first_frame_only(tmp_path, mon
     )
 
     roles = [item.get("role", item["type"]) for item in content]
-    assert roles == ["text", "first_frame"]
+    assert roles == [
+        "text",
+        "reference_image",
+        "reference_image",
+        "reference_image",
+    ]
     assert "last_frame" not in roles
-    assert "reference_image" not in roles
+    prompt = next(item["text"] for item in content if item["type"] == "text")
+    assert "首帧为图片1" in prompt
+    assert "图片1为S01成片质感第一帧" in prompt
+    assert "lin=<主体1>（图片2）" in prompt
 
 
 def test_flf2v_content_keeps_first_and_last_frames(tmp_path, monkeypatch):

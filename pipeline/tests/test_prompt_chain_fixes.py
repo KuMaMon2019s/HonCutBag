@@ -276,7 +276,7 @@ def test_phase5_uses_stricter_action_budget_for_four_second_clip():
     assert overload["details"]["action_limit"] == 1
 
 
-def test_action_phantom_with_cinematic_frame_keeps_only_strict_first_frame(
+def test_action_phantom_with_cinematic_frame_uses_numbered_omni_references(
     tmp_path, monkeypatch
 ):
     characters = [
@@ -306,8 +306,16 @@ def test_action_phantom_with_cinematic_frame_keeps_only_strict_first_frame(
 
     images = [item for item in content if item["type"] == "image_url"]
     prompt = next(item["text"] for item in content if item["type"] == "text")
-    assert [item["role"] for item in images] == ["first_frame"]
+    assert [item["role"] for item in images] == [
+        "reference_image",
+        "reference_image",
+        "reference_image",
+    ]
     assert images[0]["image_url"]["url"] == storyboard_url
+    assert "首帧为图片1" in prompt
+    assert "图片1为S01成片质感第一帧" in prompt
+    assert "凛=<主体1>（图片2）" in prompt
+    assert "烬=<主体2>（图片3）" in prompt
     assert "motion-priority" in prompt
     assert "主体箭头控制主体的运动方向、路径和速度趋势" in prompt
     assert "不得把它们转化成光效、道具、HUD、UI 或字幕" in prompt
@@ -652,6 +660,8 @@ def test_reference_instruction_binds_face_and_full_body_to_one_subject():
 
     assert "<主体1>的面部特征参考图片1（大头照）" in prompt
     assert "<主体1>的妆造和身体比例参考图片2（全身照）" in prompt
+    assert prompt.count("<主体1>的面部特征参考图片1（大头照）") == 1
+    assert prompt.count("<主体1>的妆造和身体比例参考图片2（全身照）") == 1
     assert prompt.count("定义为<主体1>") == 1
 
 
