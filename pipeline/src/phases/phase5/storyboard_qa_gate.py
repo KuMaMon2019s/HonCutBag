@@ -1297,9 +1297,13 @@ def _normalized_visual_attribute(value: Any) -> str:
 
 _AFFIRMATIVE_NON_ISSUE = re.compile(
     r"(?:\bno\s+(?:visible\s+)?(?:mismatch|difference|deviation|issue)\b|"
+    r"\bno\s+(?:visible\s+)?(?:incomplete|missing|incorrect)\s+"
+    r"(?:end[- ]?state|action|sequence)\b|"
     r"\b(?:fully\s+|all\s+)?match(?:es|ing)?\s+(?:the\s+)?canonical\b|"
     r"\b(?:fully\s+|all\s+)?match(?:es|ing)?\s+(?:the\s+)?"
     r"(?:required|authored|expected|contracted)\b|"
+    r"\b(?:fully\s+|all\s+)?match(?:es|ing)?\s+(?:the\s+)?"
+    r"(?:action|end[- ]?state|sequence)\s+requirements?\b|"
     r"\bconsistent\s+with\s+(?:the\s+)?canonical\b|"
     r"\b(?:is|are|was|were|has\s+been|have\s+been)\s+"
     r"(?:fully|completely)\s+(?:completed|satisfied|fulfilled|achieved)\b|"
@@ -1312,19 +1316,55 @@ _CONTRASTED_FINDING = re.compile(
     r"(?:\bbut\b|\bhowever\b|\bexcept\b|\byet\b|但|然而|不过|只是|却)",
     re.IGNORECASE,
 )
+_NEGATED_VISUAL_PROBLEM = re.compile(
+    r"(?:\b(?:no|without)\s+(?:visible\s+)?"
+    r"(?:mismatch|difference|deviation|issue)\b|"
+    r"\b(?:no|without)\s+(?:visible\s+)?"
+    r"(?:incomplete|missing|incorrect)\s+"
+    r"(?:end[- ]?state|action|sequence)\b|"
+    r"(?:没有|无)(?:明显)?(?:不一致|不匹配|不符|偏差|差异|问题))",
+    re.IGNORECASE,
+)
+_NEGATIVE_VISUAL_FINDING = re.compile(
+    r"(?:\b(?:does?|do|is|are|was|were|has|have)\s+not\b|"
+    r"\bnot\s+(?:fully\s+)?(?:match(?:ing)?|complete(?:d)?|"
+    r"consistent|correct)\b|"
+    r"\b(?:mismatch(?:es|ed)?|differ(?:s|ed)?|deviat(?:es|ed|ion)|"
+    r"wrong|incorrect|missing|absent|incomplete|oversized|undersized|"
+    r"violat(?:es|ed|ing|ion)|fail(?:s|ed|ure)?)\b|"
+    r"(?:不一致|不匹配|不符|错误|缺失|缺少|未完成|偏离|违反|失败))",
+    re.IGNORECASE,
+)
+
+
+def _contains_negative_visual_finding(text: str) -> bool:
+    """Return whether an observation still asserts a problem after negation."""
+    without_negated_problems = _NEGATED_VISUAL_PROBLEM.sub(" ", text)
+    return bool(_NEGATIVE_VISUAL_FINDING.search(without_negated_problems))
 
 
 def _is_affirmative_non_issue(value: dict[str, Any]) -> bool:
     """Reject provider findings that explicitly say no mismatch exists.
 
     Structured review models occasionally put a positive observation inside
-    the ``issues`` array.  Exact expected/observed equality is conclusive.  A
-    positive message is filtered only when it contains no contrast clause, so
-    ``costume matches, but proportions drift`` remains a real finding.
+    the ``issues`` array.  Exact expected/observed equality is conclusive.  An
+    explicitly affirmative observation is conclusive only when it contains no
+    remaining negative visual claim.  A positive message is filtered only
+    when it contains no contrast clause, so ``costume matches, but proportions
+    drift`` remains a real finding.
     """
     expected = _normalized_visual_attribute(value.get("expected"))
     observed = _normalized_visual_attribute(value.get("observed"))
     if expected and expected == observed:
+        return True
+    observed_text = re.sub(
+        r"\s+", " ", str(value.get("observed") or "")
+    ).strip()
+    if (
+        observed_text
+        and _AFFIRMATIVE_NON_ISSUE.search(observed_text)
+        and not _contains_negative_visual_finding(observed_text)
+    ):
         return True
     message = re.sub(r"\s+", " ", str(value.get("message") or "")).strip()
     return bool(
@@ -3382,10 +3422,7 @@ def run_storyboard_qa_with_correction(
         result = qa(output_dir)
         adjudication = None
         try:
-            if (
-                correction_family == "storyboard_previs"
-                and len(adjudications) < MAX_REVIEW_ADJUDICATIONS
-            ):
+            if len(adjudications) < MAX_REVIEW_ADJUDICATIONS:
                 result, adjudication = _adjudicate_unchanged_panel_flips(
                     output_dir,
                     previous_result,
