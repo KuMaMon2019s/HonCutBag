@@ -33,6 +33,11 @@ from utils.temporal_visual_contracts import (
     temporal_visual_negative_prompt,
     temporal_visual_prompt,
 )
+from utils.visual_style_contract import (
+    BASE_STYLE_SCHEMA,
+    build_visual_style_contract,
+    style_reference_compatible,
+)
 from utils.visual_style_spec import VisualStyle, parse_visual_style
 
 CINEMATIC_FIRST_FRAME_SCHEMA = "honcut.cinematic-first-frame.v1"
@@ -67,6 +72,10 @@ class ImageGenerationClient(Protocol):
     ) -> str: ...
 
 
+class ImageStyleClassifier(Protocol):
+    def classify(self, path: Path) -> dict[str, Any]: ...
+
+
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
@@ -93,8 +102,13 @@ def _compact(value: Any, limit: int = 1200) -> str:
     return text if len(text) <= limit else text[:limit].rstrip() + "…"
 
 
-def _style_prompt(style: VisualStyle) -> str:
-    parts = [style.style_prompt_full or style.style_prompt_short]
+def _style_prompt(style: VisualStyle, style_contract: dict[str, Any]) -> str:
+    parts = [
+        "BASE VISUAL STYLE HARD CONTRACT: "
+        f"{style_contract['base_style']}. {style_contract['positive_prompt']}. "
+        f"{style_contract['negative_prompt']}.",
+        style.style_prompt_full or style.style_prompt_short,
+    ]
     if style.colors_primary or style.colors_accent:
         colors = [
             f"{entry.name} {entry.hex} ({entry.role})"
@@ -127,7 +141,8 @@ def load_cinematic_style_contract(
         source_kind = "bundled_default_visual_style"
     raw = source.read_text(encoding="utf-8")
     parsed = parse_visual_style(raw)
-    prompt = _style_prompt(parsed)
+    style_contract = build_visual_style_contract(parsed)
+    prompt = _style_prompt(parsed, style_contract)
     if not prompt:
         raise RuntimeError(f"cinematic visual style has no prompt content: {source}")
     return {
@@ -135,6 +150,8 @@ def load_cinematic_style_contract(
         "source_kind": source_kind,
         "source_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
         "name": parsed.name,
+        "style_contract": style_contract,
+        "base_style": style_contract["base_style"],
         "prompt": prompt,
         "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
     }
@@ -372,6 +389,7 @@ def generate_cinematic_first_frames(
     size: str = "2K",
     visual_style_path: Path | None = None,
     aspect_ratio: str | None = None,
+    style_classifier: ImageStyleClassifier | None = None,
 ) -> dict[str, Any]:
     """Generate every Pxx video frame and replace legacy Sxx preview aliases."""
     output_dir = Path(output_dir)
@@ -403,6 +421,7 @@ def generate_cinematic_first_frames(
         "size_requested": size,
         "aspect_ratio": aspect_ratio,
         "style": style,
+        "style_contract": style["style_contract"],
         "phase5_rejected_frame_ids": sorted(rejected_frame_ids),
         "phase5_rejection_report_sha256": rejected_report_sha256,
         "frames": [],
@@ -413,10 +432,19 @@ def generate_cinematic_first_frames(
             if not isinstance(shot, dict):
                 continue
             shot_id = _shot_id(shot, shot_index)
-            director_composition = _director_composition_reference(
+            director_panel = _director_composition_reference(
                 output_dir,
                 shot_id,
             )
+            director_composition = director_panel
+            director_panel_style: dict[str, Any] | None = None
+            if director_panel is not None and style_classifier is not None:
+                director_panel_style = style_classifier.classify(director_panel)
+                if not style_reference_compatible(
+                    style["base_style"],
+                    director_panel_style,
+                ):
+                    director_composition = None
             previous_cinematic: Path | None = None
             for beat_index, beat in enumerate(shot.get("storyboard_beats") or [], 1):
                 if not isinstance(beat, dict):
@@ -536,24 +564,31 @@ def generate_cinematic_first_frames(
                     "style_source": style["source"],
                     "style_source_sha256": style["source_sha256"],
                     "style_prompt_sha256": style["prompt_sha256"],
+                    "style_contract": style["style_contract"],
                     "reference_images": [
                         _portable_path(output_dir, path) for path in reference_paths
                     ],
                     "reference_image_sha256": reference_hashes,
                     "reference_roles": reference_roles,
                     "upstream_director_panel": (
-                        _portable_path(output_dir, director_composition)
-                        if director_composition is not None
+                        _portable_path(output_dir, director_panel)
+                        if director_panel is not None
                         else None
                     ),
                     "upstream_director_panel_sha256": (
-                        hashlib.sha256(director_composition.read_bytes()).hexdigest()
-                        if director_composition is not None
+                        hashlib.sha256(director_panel.read_bytes()).hexdigest()
+                        if director_panel is not None
                         else None
                     ),
+                    "upstream_director_panel_included": (
+                        director_composition is not None
+                    ),
+                    "upstream_director_panel_style": director_panel_style,
                     "upstream_director_panel_usage": (
                         "image_generation_composition_only_never_video_reference"
-                        if director_composition is not None
+                        if director_panel is not None and director_composition is not None
+                        else "style_incompatible_excluded_before_provider"
+                        if director_panel is not None
                         else None
                     ),
                     # This field is the video-transport boundary: no PREVIS pixel
@@ -706,6 +741,13 @@ def validate_cinematic_first_frame_artifacts(
                     raise RuntimeError("receipt status/hash mismatch")
                 if not receipt.get("style_source_sha256") or not receipt.get("style_prompt_sha256"):
                     raise RuntimeError("style injection receipt is missing")
+                style_contract = receipt.get("style_contract")
+                if (
+                    not isinstance(style_contract, dict)
+                    or style_contract.get("schema") != BASE_STYLE_SCHEMA
+                    or not style_contract.get("base_style")
+                ):
+                    raise RuntimeError("controlled style contract is missing")
                 if receipt.get("previs_reference_images") != []:
                     raise RuntimeError("direct-to-video PREVIS reference list is not empty")
                 upstream_value = str(receipt.get("upstream_director_panel") or "")
@@ -713,15 +755,26 @@ def validate_cinematic_first_frame_artifacts(
                 if expected_upstream.is_file():
                     if upstream_value != str(expected_upstream.relative_to(output_dir)):
                         raise RuntimeError("per-shot director composition input is missing")
-                    if receipt.get("upstream_director_panel_usage") != (
-                        "image_generation_composition_only_never_video_reference"
-                    ):
-                        raise RuntimeError("director panel usage is not generation-only")
                     if receipt.get("upstream_director_panel_sha256") != hashlib.sha256(
                         expected_upstream.read_bytes()
                     ).hexdigest():
                         raise RuntimeError("director panel lineage hash mismatch")
-                allowed_upstream = {upstream_value} if upstream_value else set()
+                    included = receipt.get("upstream_director_panel_included")
+                    usage = receipt.get("upstream_director_panel_usage")
+                    if included is True and usage != (
+                        "image_generation_composition_only_never_video_reference"
+                    ):
+                        raise RuntimeError("included director panel usage is invalid")
+                    if included is False and usage != (
+                        "style_incompatible_excluded_before_provider"
+                    ):
+                        raise RuntimeError("excluded director panel usage is invalid")
+                allowed_upstream = (
+                    {upstream_value}
+                    if upstream_value
+                    and receipt.get("upstream_director_panel_included") is True
+                    else set()
+                )
                 leaked = [
                     value
                     for value in receipt.get("reference_images", [])

@@ -66,6 +66,7 @@ from phases.phase4.cinematic_first_frames import (
     generate_cinematic_first_frames,
     validate_cinematic_first_frame_artifacts,
 )
+from phases.phase4.scene_consistency import generate_scene_consistency
 from phases.phase5 import storyboard_qa_gate
 from phases.phase6.video_generator import build_video_prompt
 from phases.phase8 import duration_gate
@@ -93,6 +94,14 @@ from utils.artifact_chain import get_resumable_phase, invalidate_checkpoints_fro
 from utils.shot_embedder import compute_transition_similarity
 from utils.video_capabilities import get_video_capabilities
 from utils.video_geometry import resolve_video_geometry
+from utils.clip_interrogator_rank import rank_label_scores
+from utils.clip_style_classifier import validate_clip_model
+from utils.visual_style_contract import (
+    BASE_STYLE_SCHEMA,
+    build_visual_style_contract,
+    style_reference_compatible,
+)
+from utils.visual_style_spec import VisualStyle, parse_visual_style
 from utils.ark_llm import create_ark_client
 from utils.character_body_contracts import (
     ADULT_LEAD_DISCOVERY_INSTRUCTIONS,
@@ -6252,3 +6261,181 @@ def test_phase5_completed_action_sequence_is_not_an_issue():
     assert storyboard_qa_gate._is_affirmative_non_issue(contrasted) is False
     assert storyboard_qa_gate._is_affirmative_non_issue(completed_zh) is True
     assert storyboard_qa_gate._is_affirmative_non_issue(incomplete_zh) is False
+
+
+def _style_classification_fixture(*rankings: tuple[str, float]) -> dict:
+    return {
+        "schema": "honcut.clip-style-classification.v1",
+        "status": "done",
+        "model": "fixture/clip",
+        "top_style": rankings[0][0],
+        "rankings": [
+            {"base_style": base_style, "score": score}
+            for base_style, score in rankings
+        ],
+    }
+
+
+def test_script_style_is_serialized_as_a_controlled_base_style(tmp_path):
+    path = _write_project_visual_style(
+        tmp_path,
+        "写实电影感，真实皮肤纹理、电影镜头和物理材质",
+    )
+
+    parsed = parse_visual_style(path.read_text(encoding="utf-8"))
+    contract = build_visual_style_contract(parsed)
+
+    assert parsed.base_style == "photorealistic"
+    assert parsed.style_tags == ["cinematic"]
+    assert contract["schema"] == BASE_STYLE_SCHEMA
+    assert contract["base_style"] == "photorealistic"
+    assert "live-action" in contract["positive_prompt"]
+    assert "anime" in contract["negative_prompt"]
+
+
+def test_legacy_free_text_styles_are_inferred_without_script_whitelists():
+    assert build_visual_style_contract(
+        VisualStyle(name="cel", style_prompt_full="二维赛璐璐动画，手绘线条")
+    )["base_style"] == "anime"
+    assert build_visual_style_contract(
+        VisualStyle(name="puppet", style_prompt_full="中式皮影戏，平面镂空幕布")
+    )["base_style"] == "shadow_puppet"
+    with pytest.raises(ValueError, match="unknown visual base_style"):
+        build_visual_style_contract(
+            VisualStyle(name="invented", base_style="invented_style")
+        )
+
+
+def test_clip_model_integrity_fails_closed_when_the_pinned_weight_is_missing(tmp_path):
+    with pytest.raises(RuntimeError, match="is not installed"):
+        validate_clip_model(tmp_path / "missing.safetensors")
+
+
+def test_clip_interrogator_ranking_port_keeps_scores_and_order():
+    import numpy as np
+
+    ranked = rank_label_scores(
+        np.array([1.0, 0.0], dtype=np.float32),
+        np.array(
+            [[0.1, 0.9], [0.9, 0.1], [0.5, 0.5]],
+            dtype=np.float32,
+        ),
+        ["anime", "photorealistic", "concept_art"],
+        top_count=2,
+    )
+
+    assert [item["base_style"] for item in ranked] == [
+        "photorealistic",
+        "concept_art",
+    ]
+    assert ranked[0]["score"] > ranked[1]["score"]
+
+
+def test_reference_compatibility_accepts_cinematic_photo_but_rejects_line_art():
+    assert style_reference_compatible(
+        "photorealistic",
+        _style_classification_fixture(
+            ("cinematic", 0.24),
+            ("concept_art", 0.22),
+        ),
+    )
+    assert not style_reference_compatible(
+        "photorealistic",
+        _style_classification_fixture(
+            ("concept_art", 0.25),
+            ("anime", 0.24),
+            ("cinematic", 0.21),
+            ("photorealistic", 0.20),
+        ),
+    )
+
+
+def test_phase4_excludes_a_style_incompatible_director_panel(tmp_path):
+    from PIL import Image
+
+    _write_project_visual_style(tmp_path, "写实电影感，真实皮肤与摄影镜头")
+    director_dir = tmp_path / "director_panels"
+    director_dir.mkdir()
+    Image.new("RGB", (640, 360), "white").save(director_dir / "S01.png")
+    storyboard = {
+        "shots": [{
+            "id": "S01",
+            "where": "未来列车车厢",
+            "storyboard_beats": [{
+                "beat_id": "S01_P01",
+                "start_state": "男子站在车厢中央",
+                "action": "男子抬起芯片",
+                "end_state": "芯片发出蓝光",
+            }],
+        }],
+    }
+    calls: list[tuple[str, object]] = []
+
+    class FakeClient:
+        model = "fake-seedream"
+
+        def text_to_image(self, prompt, output_path, size, timeout):
+            calls.append(("text", None))
+            Image.new("RGB", (1280, 720), "navy").save(output_path)
+            return "offline://frame"
+
+        def image_to_image(self, prompt, ref_image, output_path, size):
+            calls.append(("image", ref_image))
+            Image.new("RGB", (1280, 720), "navy").save(output_path)
+            return "offline://frame"
+
+    class FakeStyleClassifier:
+        def classify(self, path: Path) -> dict:
+            if "director_panels" in path.parts:
+                return _style_classification_fixture(
+                    ("concept_art", 0.25),
+                    ("anime", 0.24),
+                    ("cinematic", 0.21),
+                    ("photorealistic", 0.20),
+                )
+            return _style_classification_fixture(
+                ("cinematic", 0.24),
+                ("photorealistic", 0.23),
+            )
+
+    generate_cinematic_first_frames(
+        tmp_path,
+        storyboard,
+        [],
+        client=FakeClient(),
+        style_classifier=FakeStyleClassifier(),
+    )
+
+    assert calls == [("text", None)]
+    receipt = json.loads(
+        (tmp_path / "video_first_frames/S01_P01.json").read_text(encoding="utf-8")
+    )
+    assert receipt["style_contract"]["base_style"] == "photorealistic"
+    assert receipt["upstream_director_panel_included"] is False
+    assert receipt["upstream_director_panel_usage"] == (
+        "style_incompatible_excluded_before_provider"
+    )
+    assert receipt["upstream_director_panel_style"]["top_style"] == "concept_art"
+    assert receipt["reference_images"] == []
+
+
+def test_scene_and_video_prompts_share_the_same_base_style_contract():
+    scene = generate_scene_consistency(
+        {"shots": [{"id": "S01", "where": "雨夜车站", "who": []}]},
+        visual_style_path=None,
+    )
+    prompt = build_video_prompt(
+        {"id": "S01", "where": "雨夜车站", "who": []},
+        {"characters": []},
+        scene,
+        "seedance",
+    )
+
+    assert scene["style_contract"]["schema"] == BASE_STYLE_SCHEMA
+    assert scene["style_contract"]["base_style"] in {
+        "cinematic",
+        "photorealistic",
+    }
+    assert "BASE VISUAL STYLE" in prompt
+    assert scene["style_contract"]["positive_prompt"] in prompt
+    assert scene["style_contract"]["negative_prompt"] in prompt

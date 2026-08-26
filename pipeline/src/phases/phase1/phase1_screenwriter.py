@@ -223,9 +223,18 @@ def _load_phase1_checkpoint(
 def _write_project_visual_style(output_dir: Path, style_text: str) -> Path:
     """Write the minimal frontmatter accepted by parse_visual_style."""
     import yaml
+    from utils.visual_style_contract import BaseStyle, infer_base_style
+
+    base_style = infer_base_style(style_text)
     payload = {
         "name": "Script-derived project style",
-        "version": "1.0",
+        "version": "1.1",
+        "base_style": base_style.value,
+        "style_tags": (
+            ["cinematic"]
+            if base_style in {BaseStyle.PHOTOREALISTIC, BaseStyle.CINEMATIC}
+            else []
+        ),
         "style_prompt_short": style_text,
         "style_prompt_full": style_text,
     }

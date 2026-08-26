@@ -12,6 +12,7 @@ from utils.temporal_visual_contracts import (
     temporal_visual_negative_prompt,
     temporal_visual_prompt,
 )
+from utils.visual_style_contract import build_visual_style_contract
 
 
 BASE_NEGATIVE_PROMPTS = [
@@ -127,6 +128,7 @@ def build_scene_reference_prompt(
     related = [shot for shot in shots if str(shot.get("where") or "").strip() == where]
     reference_shot = dict(related[0]) if related else {"where": where}
     temporal_contract = apply_temporal_visual_contract(reference_shot)
+    style_contract = build_visual_style_contract(visual_style)
     style = visual_style.style_prompt_full or visual_style.style_prompt_short or "电影叙事风格"
     lighting = _lighting_for(reference_shot, visual_style)
     evidence = " ".join(
@@ -148,8 +150,10 @@ def build_scene_reference_prompt(
         else ""
     )
     return (
-        f"Scene: {where}. {time_lock}Lighting: {lighting}. Style: {style}. "
-        "Photorealistic environment, cinematic quality, no people, establishing shot."
+        f"Scene: {where}. {time_lock}Lighting: {lighting}. "
+        f"BASE VISUAL STYLE: {style_contract['base_style']}; "
+        f"{style_contract['positive_prompt']}; {style_contract['negative_prompt']}. "
+        f"Project style details: {style}. No people, establishing shot."
     )
 
 
@@ -160,6 +164,7 @@ def generate_scene_consistency(
 ) -> dict[str, Any]:
     """Create deterministic spatial, lighting, style, and guardrail metadata."""
     style = _load_style(visual_style_path)
+    style_contract = build_visual_style_contract(style)
     characters = list((characters_data or {}).get("characters", []))
     shots = list(storyboard.get("shots", []))
     global_style = style.style_prompt_full or style.style_prompt_short or "电影质感，高清细节"
@@ -180,6 +185,7 @@ def generate_scene_consistency(
 
     contract: dict[str, Any] = {
         "version": "1.0",
+        "style_contract": style_contract,
         "global_style_lock": global_style,
         "global_lighting": "主光方向与色温跨镜头连续，冷暖实景光保持一致",
         "spatial_anchors": {
@@ -221,6 +227,7 @@ def generate_scene_consistency(
             "temporal_visual_contract": temporal_contract,
             "style_anchor": style_anchor,
             "style_suffix": f"保持{style_anchor}",
+            "style_contract": style_contract,
             "negative_prompt": negative,
             "quality_suffix": quality,
             "consistency_constraints": constraints,

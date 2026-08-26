@@ -94,6 +94,21 @@ class _CleanFirstFrameReviewer:
         return json.dumps({"issues": []})
 
 
+class _CompatibleStyleClassifier:
+    def classify(self, path: Path) -> dict:
+        return {
+            "schema": "honcut.clip-style-classification.v1",
+            "status": "done",
+            "model": "offline-style-fixture",
+            "source_sha256": _sha256(path),
+            "top_style": "shadow_puppet",
+            "rankings": [
+                {"base_style": "shadow_puppet", "score": 0.3},
+                {"base_style": "concept_art", "score": 0.2},
+            ],
+        }
+
+
 def test_previs_pixels_are_separated_end_to_end_before_video_transport(
     tmp_path,
     monkeypatch,
@@ -164,6 +179,10 @@ def test_previs_pixels_are_separated_end_to_end_before_video_transport(
         encoding="utf-8",
     )
     monkeypatch.setattr(seedream_client, "SeedreamClient", lambda: client)
+    monkeypatch.setattr(
+        "utils.clip_style_classifier.ClipStyleClassifier",
+        _CompatibleStyleClassifier,
+    )
     phase4 = pipeline_core.run_phase4(tmp_path, dry_run=False)
     assert phase4["status"] == "done"
     assert phase4["constraint_review"]["status"] == "passed"

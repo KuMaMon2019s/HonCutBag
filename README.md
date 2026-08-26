@@ -158,6 +158,8 @@ brew install uv ffmpeg
 
 # Create .venv with the pinned interpreter and locked dependencies
 make install
+# Install the pinned local CLIP model used for fixed-enum style ranking
+make install-style-model
 make doctor
 
 # Run the full pipeline from a script
