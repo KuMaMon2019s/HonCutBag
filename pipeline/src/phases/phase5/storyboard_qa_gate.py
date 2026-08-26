@@ -40,6 +40,7 @@ from utils.video_capabilities import capabilities_for
 from utils.character_body_contracts import character_visual_description
 from utils.camera_motion_contracts import apply_camera_motion_contract
 from utils.material_budget import material_budget_contract_errors
+from tools.character_reference_board import resolve_character_reference_board
 
 DEFAULT_SIMILARITY_THRESHOLD = 0.85
 DEFAULT_MAX_CORRECTION_ATTEMPTS = 2
@@ -1179,6 +1180,10 @@ def find_character_reference_images(
         character_id = str(character.get("id") or "").strip()
         if not character_id:
             continue
+        reference_board = resolve_character_reference_board(output_dir, character_id)
+        if reference_board is not None:
+            result[character_id] = [reference_board]
+            continue
         character_dir = output_dir / "characters" / character_id
         card_path = character_dir / "character_card.json"
         declared: dict[str, Any] = {}
@@ -1643,6 +1648,7 @@ Review the supplied storyboard evidence against the canonical character referenc
 
 INPUT CONTRACT:
 - Canonical character inputs are mapped to character_id and view in CHARACTER REFERENCE INPUTS.
+- A canonical input with view=reference_board is one 2x2 board showing four views of the same single character, never four people or clones; compare its face, front, side and back cells as one identity.
 - Storyboard inputs are high-detail per-shot boards containing only the exact Pxx images listed in STORYBOARD SHOT INPUTS, with a large black ID badge inside every panel.
 - The overview grid is for cross-shot continuity only. Use per-shot boards for fine identity, clothing, prop, and action evidence.
 - Never swap expected and observed: canonical character inputs define EXPECTED; storyboard boards define OBSERVED. Never call a character reference a storyboard image.

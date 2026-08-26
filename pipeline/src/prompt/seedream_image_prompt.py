@@ -31,6 +31,12 @@ _REFERENCE_ROLE_INSTRUCTIONS = {
         "character identity only; preserve face, hair, body proportions, outfit and "
         "assigned props; ignore pose, framing, background, layout and text"
     ),
+    "character_identity_board_only": (
+        "one 2x2 identity board whose four cells are different views of the same single "
+        "character, never four people or clones; preserve face, hair, body proportions, "
+        "outfit, side/back silhouette and assigned props; ignore board layout, neutral "
+        "background and cell boundaries"
+    ),
     "character_face_identity_only": (
         "canonical face identity only; preserve facial geometry, skin, hairline and "
         "distinctive facial details; ignore framing, pose, background and text"

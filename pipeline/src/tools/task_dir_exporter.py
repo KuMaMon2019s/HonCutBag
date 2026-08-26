@@ -122,8 +122,8 @@ def build_task_dir(output_dir, shot_ids: Sequence[str], meta: Mapping) -> Path:
         if expected_characters and not phantom_identity_assets:
             raise FileNotFoundError(
                 "Phantom character references missing for shot "
-                f"{shot_id}; expected face_closeup.png, full_body.png, "
-                "identity_detail.png, or variant_*.png"
+                f"{shot_id}; expected reference_board.png, legacy canonical "
+                "views, identity_detail.png, or variant_*.png"
             )
         assets = phantom_identity_assets if strategy == "phantom" else []
         variant_totals = {}
@@ -133,7 +133,9 @@ def build_task_dir(output_dir, shot_ids: Sequence[str], meta: Mapping) -> Path:
         variant_indexes = {}
         for index, asset in enumerate(assets, start=1):
             source = asset["path"]
-            if source.name == "face_closeup.png":
+            if source.name == "reference_board.png":
+                filename = "四视图身份参考板.png"
+            elif source.name == "face_closeup.png":
                 filename = "大头照.png"
             elif source.name == "full_body.png":
                 filename = "全身照.png"

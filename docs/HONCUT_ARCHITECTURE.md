@@ -119,7 +119,7 @@ Graph node 必须只完成三件事：读取 State、调用一个窄 owner、返
 |---|---|---|
 | 1 | 文本解析、源事件发现、按 sequence 的导演意图、角色发现、`SEMANTIC_LEDGER.json`、时长缩放后的 `SCREENPLAY_PLAN.json` 与 canonical `STORYBOARD.json` / `CHARACTERS.json` | 输入/LLM/结构无效即停止；子阶段 checkpoint 可复用 |
 | 2 | 分镜与 Pxx 图像资产、构图和端帧契约 | 生产图片或其验证证据缺失时 fail closed |
-| 3 | 角色卡、四视图、变体和身份锁定 | 生产模式要求真实四视图 QA；dry-run 只写明确的 dry-run receipt |
+| 3 | 角色卡、四视图、单图四视图参考板、变体和身份锁定 | 生产模式要求真实四视图 QA；参考板只能由已验收四视图确定性派生；dry-run 只写明确的 dry-run receipt |
 | 4 | 原生 shot 目录与 `SHOT_META.json`、场景一致性、continuity plan、cinematic first-frame | canonical storyboard 不得为元数据物化而原地改写；Phase 4 不运行视频生成子进程 |
 | 5 | storyboard QA、生成容量、variation/slideshow、监督与进入视频生成前的硬门 | C/D 或 blocking supervision 阻止 Phase 6；dry-run 不做像素/模型监督 |
 | 6 | 视频生成与 continuity chunk 执行 | 所有长请求经过 Runtime task ledger；相同输入恢复不得重复提交 |
@@ -273,6 +273,8 @@ Seedream 图片请求的唯一传输 owner 是 `clients/seedream_client.py`，Ph
 Lifecycle 与各 Phase 的 ETA 由 Runtime `phase_estimates` owner 生成。Phase 1 尚未写出 canonical `CHARACTERS.json` 与 `STORYBOARD.json` 时，只能声明全程工作量待结构化，不得再以固定“三个角色、十个镜头”承诺总耗时。结构化工作量 `honcut.pipeline-workload-estimate.v1` 必须分别计数缺失的角色四视图、身份道具细节板、有效变体、Pxx 格、Sxx 总板与 cinematic first-frame；图片阶段以实际 `SEEDREAM_MIN_INTERVAL` 乘请求数形成基线。续跑估算只包含 CLI 选中且未由可信 checkpoint 完成的 Phase。Phase 5 基线与最多三轮配置上限内的全目标 Pxx/Sxx 补画必须显示为有界区间，不能把“无纠偏”历史均值冒充唯一 ETA。该估算是可观测性收据，不改变 Provider 请求、缓存或重试决策；缓存命中可令实际耗时低于基线，Provider/QA 失败也不得因 ETA 而被解释为成功。
 
 多参考图的职责绑定由共享模板 `honcut.seedream.reference-contract` v2 在 Phase 图片组装边界按真实输入顺序前置为 `Image 1`、`Image 2` 等；角色身份、上一故事格、导演单格和上一 cinematic 帧不得交换职责。上一故事格只提供仍成立的场景事实、相对空间关系、机位轴线和画面方向，不得要求模型保留 completed pose 或动作进度；后续 Pxx 必须按当前 beat 推进到新的动作终态。Phase 收据必须记录模板 ID/版本、实际 Provider Prompt SHA-256、参考图顺序/角色和只含长度/哈希的 guidance 指标。官方 300 个中文字符/600 个英文单词是效果建议而非 API 硬限制；Transport 只能观测并报告超限，不得截断身份、动作、纠偏或连续性合同。Provider 的同步响应必须先通过严格 envelope 校验，24 小时 URL 产物须立即下载、验证为可解码图片并原子落盘；损坏、空数组、同时缺失/同时出现 URL 与 Base64 均 fail closed。
+
+Phase 3 的四张 canonical 角色图 `face_closeup/full_body/side/back` 继续分别生成并逐视角 QA，它们是身份一致性和视角真实性的事实证据，不得用一张模型直出的拼图替代质检。四图通过后，`tools.character_reference_board` 必须在本地确定性派生一张无文字、无边框的 2×2 `reference_board.png`，固定顺序为左上面部特写、右上正面全身、左下侧面全身、右下背面全身；`honcut.character-reference-board.v1` 收据绑定四张源图哈希、布局、输出哈希与角色 ID，派生过程不得产生 Provider 请求。Phase 2/4 的图片角色参考、Phase 5 L3 身份复核和 Phase 6 Phantom/legacy reference 输入对每个角色最多携带这一张参考板；`identity_detail` 和显式有效变体只按各自合同另行携带。Phase 4 每个一级 Sxx 的 P01 单格电影质感渲染图必须物化为 `storyboard_images/Sxx.png` 并作为该一级镜头的 `first_frame`；原始导演总板裁切格、Pxx PREVIS 和九宫格不得直接进入视频。Seedance 的 I2V/FLF2V 控制边界仍只传该 cinematic `first_frame/last_frame`，不得把角色参考板与帧控制角色混传，也不得把参考板充当成片首帧。
 
 Phase 2 的 Pxx、模型绘制 Sxx 九宫格与跨一级镜头 bridge 都必须在相同语义输入的普通重入和 Phase 3 character-lock 刷新中复用。Sxx cache 至少绑定当前 Prompt SHA-256、模型、尺寸、宽高比、图片请求合同版本、结构化 Phase 5 纠偏 attempt/issue（如有）、可解码文件、内容 SHA-256 与完整 3×3 grid receipt；任一项变化或损坏时只重生成该 Sxx，不得连带重提已验证的 Pxx。同一纠偏 attempt 的崩溃恢复可复用，而新的有界纠偏 attempt 必须形成不同语义 fingerprint 并授权一次重画。未知未来 `SHOT_STORYBOARDS.json` schema 必须在覆盖旧证据前 fail closed。定向 Phase 5 补画仍只保留非目标 Sxx，目标镜按纠偏语义产生新 fingerprint。
 

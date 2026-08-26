@@ -3290,8 +3290,54 @@ def test_phase1_detects_explicit_one_take_direction():
     ) is None
 
 
-def test_phase2_uses_face_and_body_references_for_each_character(tmp_path):
+def test_character_reference_board_packs_four_views_with_auditable_lineage(
+    tmp_path,
+):
     from PIL import Image
+    from tools.character_reference_board import ensure_character_reference_board
+
+    char_dir = tmp_path / "characters/agent"
+    char_dir.mkdir(parents=True)
+    colors = {
+        "face_closeup": "red",
+        "full_body": "green",
+        "side": "blue",
+        "back": "yellow",
+    }
+    for view, color in colors.items():
+        Image.new("RGB", (320, 480), color).save(char_dir / f"{view}.png")
+
+    board = ensure_character_reference_board(char_dir, character_id="agent")
+    first_sha256 = hashlib.sha256(board.read_bytes()).hexdigest()
+    board_again = ensure_character_reference_board(char_dir, character_id="agent")
+
+    assert board_again == board
+    assert hashlib.sha256(board_again.read_bytes()).hexdigest() == first_sha256
+    with Image.open(board) as image:
+        assert image.size == (1536, 1536)
+        assert image.getpixel((384, 384)) == (255, 0, 0)
+        assert image.getpixel((1152, 384)) == (0, 128, 0)
+        assert image.getpixel((384, 1152)) == (0, 0, 255)
+        assert image.getpixel((1152, 1152)) == (255, 255, 0)
+    receipt = json.loads(
+        (char_dir / "reference_board.json").read_text(encoding="utf-8")
+    )
+    assert receipt["schema"] == "honcut.character-reference-board.v1"
+    assert receipt["character_id"] == "agent"
+    assert receipt["layout"] == [
+        "face_closeup",
+        "full_body",
+        "side",
+        "back",
+    ]
+    assert receipt["image_sha256"] == first_sha256
+    assert [source["view"] for source in receipt["sources"]] == receipt["layout"]
+
+
+def test_phase2_uses_one_four_view_board_per_character(tmp_path):
+    from PIL import Image
+    from prompt.seedream_image_prompt import bind_reference_roles
+    from tools.character_reference_board import character_reference_role
 
     char_dir = tmp_path / "characters/agent"
     char_dir.mkdir(parents=True)
@@ -3304,7 +3350,98 @@ def test_phase2_uses_face_and_body_references_for_each_character(tmp_path):
         ["特工"],
     )
 
-    assert [path.name for path in references] == ["face_closeup.png", "full_body.png"]
+    assert [path.name for path in references] == ["reference_board.png"]
+    role = character_reference_role(references[0])
+    assert role == "character_identity_board_only"
+    bound_prompt = bind_reference_roles("render one shot", [role])
+    assert "same single character, never four people or clones" in bound_prompt
+
+
+def test_phase6_reference_assets_use_one_four_view_board_per_character(tmp_path):
+    from PIL import Image
+    from tools.asset_packager import collect_character_reference_assets
+
+    characters = []
+    for character_id in ("agent", "guard"):
+        characters.append({"id": character_id, "name": character_id.title()})
+        char_dir = tmp_path / f"characters/{character_id}"
+        char_dir.mkdir(parents=True)
+        for view in ("face_closeup", "full_body", "side", "back"):
+            Image.effect_noise((512, 512), 80).convert("RGB").save(
+                char_dir / f"{view}.png"
+            )
+    (tmp_path / "CHARACTERS.json").write_text(
+        json.dumps({"characters": characters}), encoding="utf-8"
+    )
+
+    assets = collect_character_reference_assets(
+        tmp_path,
+        {"who": ["agent", "guard"], "generation_actions": ["run"]},
+    )
+
+    assert [Path(asset["path"]).name for asset in assets] == [
+        "reference_board.png",
+        "reference_board.png",
+    ]
+    assert [asset["char_id"] for asset in assets] == ["agent", "guard"]
+    assert all(asset["reference_kind"] == "character_identity_board" for asset in assets)
+
+
+def test_phase4_renders_one_character_board_into_the_primary_shot_first_frame(
+    tmp_path,
+):
+    from PIL import Image
+
+    char_dir = tmp_path / "characters/agent"
+    char_dir.mkdir(parents=True)
+    for view in ("face_closeup", "full_body", "side", "back"):
+        Image.effect_noise((512, 512), 80).convert("RGB").save(
+            char_dir / f"{view}.png"
+        )
+    storyboard = {
+        "shots": [{
+            "id": "S01",
+            "who": ["agent"],
+            "where": "rainy station",
+            "storyboard_beats": [{
+                "beat_id": "S01_P01",
+                "action": "agent waits beside the train door",
+            }],
+        }],
+    }
+    calls = []
+
+    class FakeClient:
+        model = "fake-seedream"
+
+        def image_to_image(self, prompt, ref_image, output_path, size):
+            calls.append((prompt, ref_image))
+            Image.new("RGB", (1280, 720), "navy").save(output_path)
+            return "offline://cinematic-first-frame"
+
+        def text_to_image(self, **_kwargs):
+            pytest.fail("a canonical character board must use image-to-image")
+
+    manifest = generate_cinematic_first_frames(
+        tmp_path,
+        storyboard,
+        [{"id": "agent", "name": "Agent"}],
+        client=FakeClient(),
+    )
+
+    board = char_dir / "reference_board.png"
+    assert manifest["status"] == "done"
+    assert calls[0][1] == str(board)
+    assert "same single character, never four people or clones" in calls[0][0]
+    beat = storyboard["shots"][0]["storyboard_beats"][0]
+    first_frame = tmp_path / beat["video_first_frame"]
+    primary_alias = tmp_path / "storyboard_images/S01.png"
+    assert primary_alias.read_bytes() == first_frame.read_bytes()
+    receipt = json.loads(
+        (tmp_path / beat["video_first_frame_receipt"]).read_text(encoding="utf-8")
+    )
+    assert receipt["reference_roles"] == ["character_identity_board_only"]
+    assert beat["video_first_frame_kind"] == CINEMATIC_FIRST_FRAME_SCHEMA
 
 
 def test_phase2_defers_character_storyboards_until_phase3(monkeypatch, tmp_path):
@@ -3512,7 +3649,15 @@ def test_phase3_reference_generation_uses_face_only_as_identity_anchor(
     assert "previous back failed blocking view qa" in calls[4][1].lower()
     assert "front-facing face is visible" in calls[4][1].lower()
     assert (tmp_path / "characters/agent/reference_qa_attempts/attempt_01/back.png").is_file()
+    assert (tmp_path / "characters/agent/reference_board.png").is_file()
+    assert (tmp_path / "characters/agent/reference_board.json").is_file()
     assert Path(result["card"]).is_file()
+    card = json.loads(Path(result["card"]).read_text(encoding="utf-8"))
+    assert card["reference_board"] == "characters/agent/reference_board.png"
+    assert card["reference_board_receipt"] == (
+        "characters/agent/reference_board.json"
+    )
+    assert card["reference_contract_version"] == 5
     assert run_quality_check("phase3", tmp_path).passed is True
 
 
@@ -6029,6 +6174,30 @@ def test_phase5_l3_supplies_canonical_character_images(tmp_path):
     assert "stable/stopped/freeze-frame" in client.prompt
 
 
+def test_phase5_resolves_one_four_view_board_per_character(tmp_path):
+    from PIL import Image
+
+    char_dir = tmp_path / "characters/agent"
+    char_dir.mkdir(parents=True)
+    for view in ("face_closeup", "full_body", "side", "back"):
+        Image.effect_noise((512, 512), 80).convert("RGB").save(
+            char_dir / f"{view}.png"
+        )
+
+    references = storyboard_qa_gate.find_character_reference_images(
+        tmp_path,
+        {"characters": [{"id": "agent", "name": "Agent"}]},
+    )
+
+    assert [path.name for path in references["agent"]] == [
+        "reference_board.png"
+    ]
+    receipt = json.loads(
+        (char_dir / "reference_board.json").read_text(encoding="utf-8")
+    )
+    assert receipt["schema"] == "honcut.character-reference-board.v1"
+
+
 def test_phase5_l3_prompt_uses_compact_semantic_projection(tmp_path):
     from PIL import Image
 
@@ -6139,6 +6308,7 @@ def test_phase5_l3_uses_pxx_cast_instead_of_shot_wide_cast():
     )
 
     assert projection["schema"] == "honcut.phase5-l3-semantic-projection.v3"
+    assert "view=reference_board is one 2x2 board" in prompt
     assert "who" not in shot
     assert "character_ids" not in shot
     assert "participant_refs" not in shot

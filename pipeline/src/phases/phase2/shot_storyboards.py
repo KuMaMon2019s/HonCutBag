@@ -29,6 +29,10 @@ from utils.character_reference_contracts import (
     character_identity_detail_items,
     identity_detail_prompt_items,
 )
+from tools.character_reference_board import (
+    character_reference_role,
+    resolve_character_reference_board,
+)
 from utils.camera_motion_contracts import (
     camera_motion_negative_prompt,
     camera_motion_prompt,
@@ -1296,6 +1300,10 @@ def _character_reference_paths(
         character_id = str(character.get("id") or "").strip()
         if not character_id:
             continue
+        reference_board = resolve_character_reference_board(output_dir, character_id)
+        if reference_board is not None:
+            references.append(reference_board)
+            continue
         character_references: list[Path] = []
         for character_dir in (
             output_dir / "characters" / character_id,
@@ -1856,7 +1864,9 @@ def generate_shot_storyboards(
                 requested_reference_roles = []
                 for reference_path in reference_paths:
                     if reference_path in character_references:
-                        requested_reference_roles.append("character_identity_only")
+                        requested_reference_roles.append(
+                            character_reference_role(reference_path)
+                        )
                     elif reference_path == previous_panel:
                         requested_reference_roles.append("prior_storyboard_state")
                     elif reference_path == director_panel:
@@ -1963,7 +1973,9 @@ def generate_shot_storyboards(
                         reference_roles = []
                         for reference_path in selected_references:
                             if reference_path in character_references:
-                                reference_roles.append("character_identity_only")
+                                reference_roles.append(
+                                    character_reference_role(reference_path)
+                                )
                             elif reference_path == previous_panel:
                                 reference_roles.append("prior_storyboard_state")
                             elif reference_path == director_panel:

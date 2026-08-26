@@ -21,6 +21,7 @@ from prompt.seedream_image_prompt import (
     image_request_fingerprint,
     prompt_guidance_metrics,
 )
+from tools.character_reference_board import character_reference_role
 from utils.body_action_contracts import body_action_prompt
 from utils.camera_motion_contracts import camera_motion_negative_prompt, camera_motion_prompt
 from utils.character_body_contracts import character_visual_description
@@ -517,7 +518,7 @@ def generate_cinematic_first_frames(
                     if path == director_composition
                     else "prior_cinematic_state"
                     if path == previous_cinematic
-                    else "character_identity_only"
+                    else character_reference_role(path)
                     for path in reference_paths
                 ]
                 prompt = bind_reference_roles(prompt, reference_roles)

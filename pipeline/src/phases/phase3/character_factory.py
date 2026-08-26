@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 _SRC_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_SRC_DIR))
 from clients.seedream_client import SeedreamClient
+from tools.character_reference_board import ensure_character_reference_board
 
 # Import prompt validator from prompts/ directory
 _PROMPTS_DIR = Path(__file__).resolve().parents[3] / "prompts"
@@ -969,6 +970,7 @@ def generate_character(
     normalized_identity_props = normalize_identity_props(identity_props or [])
     identity_detail_path: Path | None = None
     identity_detail_receipt: dict[str, Any] | None = None
+    reference_board_path: Path | None = None
 
     print(f"\n{'='*60}")
     print(f"  Character Factory: {name} ({char_id})")
@@ -1066,6 +1068,10 @@ def generate_character(
             max_retries=view_qa_max_retries,
             review_max_retries=review_qa_max_retries,
         )
+        reference_board_path = ensure_character_reference_board(
+            Path(char_dir),
+            character_id=char_id,
+        )
         if normalized_identity_props:
             identity_detail_path = Path(char_dir) / "identity_detail.png"
             detail_face_view = (
@@ -1127,7 +1133,17 @@ def generate_character(
         else "seedance_four_views"
     )
     card["source_image_rules"] = SOURCE_IMAGE_RULES
-    card["reference_contract_version"] = 4
+    card["reference_contract_version"] = 5
+    card["reference_board"] = (
+        f"characters/{char_id}/reference_board.png"
+        if reference_board_path is not None
+        else None
+    )
+    card["reference_board_receipt"] = (
+        f"characters/{char_id}/reference_board.json"
+        if reference_board_path is not None
+        else None
+    )
     card["identity_props"] = normalized_identity_props
     card["identity_detail_reference"] = (
         f"characters/{char_id}/identity_detail.png"

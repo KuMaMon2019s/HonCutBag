@@ -16,6 +16,10 @@ from typing import Any, List, Optional, Tuple
 
 from utils.storyboard_motion_policy import apply_storyboard_motion_policy
 from utils.video_generation_contracts import ensure_video_generation_contract
+from tools.character_reference_board import (
+    ensure_character_reference_board,
+    resolve_character_reference_board,
+)
 
 CINEMATIC_FIRST_FRAME_SCHEMA = "honcut.cinematic-first-frame.v1"
 PREVIS_FRAME_PATH_PARTS = frozenset({
@@ -93,7 +97,7 @@ def package_shot_assets(
     Zip structure:
         assets.zip
         ├─ meta.json
-        ├─ character_refs/      (face_closeup/full_body/identity_detail/variant_*.png)
+        ├─ character_refs/      (reference_board/identity_detail/variant_*.png)
         └─ shot_frames/         (Phase 4 cinematic storyboard_images/{shot_id}.png)
     
     meta.json structure:
@@ -124,12 +128,25 @@ def package_shot_assets(
             for char_dir in char_base.iterdir():
                 if char_dir.is_dir() and char_dir.name not in seen_char_dirs:
                     seen_char_dirs.add(char_dir.name)
-                    reference_paths = [
-                        char_dir / "face_closeup.png",
-                        char_dir / "full_body.png",
+                    try:
+                        identity_reference = ensure_character_reference_board(
+                            char_dir,
+                            character_id=char_dir.name,
+                        )
+                    except FileNotFoundError:
+                        identity_reference = None
+                    reference_paths = (
+                        [identity_reference]
+                        if identity_reference is not None
+                        else [
+                            char_dir / "face_closeup.png",
+                            char_dir / "full_body.png",
+                        ]
+                    )
+                    reference_paths.extend([
                         char_dir / "identity_detail.png",
                         *sorted(char_dir.glob("variant_*.png")),
-                    ]
+                    ])
                     for reference_path in reference_paths:
                         if reference_path.exists():
                             assets.append({
@@ -359,12 +376,19 @@ def collect_character_reference_assets(
         char_dir = output_dir / "characters" / char_id
         if not char_dir.exists():
             char_dir = output_dir / "characters" / "characters" / char_id
-        reference_paths = [
-            char_dir / "face_closeup.png",
-            char_dir / "full_body.png",
+        identity_reference = resolve_character_reference_board(output_dir, char_id)
+        reference_paths = (
+            [identity_reference]
+            if identity_reference is not None
+            else [
+                char_dir / "face_closeup.png",
+                char_dir / "full_body.png",
+            ]
+        )
+        reference_paths.extend([
             char_dir / "identity_detail.png",
             *sorted(char_dir.glob("variant_*.png")),
-        ]
+        ])
         for reference_path in reference_paths:
             if reference_path.exists() and reference_path.stat().st_size > 1024:
                 references.append({
@@ -377,6 +401,8 @@ def collect_character_reference_assets(
                     "reference_kind": (
                         "identity_detail"
                         if reference_path.name == "identity_detail.png"
+                        else "character_identity_board"
+                        if reference_path.name == "reference_board.png"
                         else "character_identity"
                     ),
                     "bind_subject": reference_path.name != "identity_detail.png",
@@ -387,7 +413,9 @@ def collect_character_reference_assets(
                         else False
                     ),
                     "reference_description": (
-                        f"{character_name}的面部特写"
+                        f"{character_name}的四视图身份参考板（面部特写、正面全身、侧面全身、背面全身）"
+                        if reference_path.name == "reference_board.png"
+                        else f"{character_name}的面部特写"
                         if reference_path.name == "face_closeup.png"
                         else f"{character_name}的全身照"
                         if reference_path.name == "full_body.png"
@@ -442,6 +470,16 @@ def inject_reference_instruction(prompt_text: str, descriptions: List[Any]) -> s
     reference_role_bindings = []
     for char_id, (first_image_number, subject_number) in subject_numbers.items():
         subject_references = references_by_subject.get(char_id, [])
+        board_number = next(
+            (
+                image_number
+                for image_number, item in subject_references
+                if item.get("reference_kind") == "character_identity_board"
+                or "reference_board" in str(item.get("path") or "")
+                or "四视图" in str(item.get("reference_description") or "")
+            ),
+            None,
+        )
         face_number = next(
             (
                 image_number
@@ -467,9 +505,13 @@ def inject_reference_instruction(prompt_text: str, descriptions: List[Any]) -> s
             None,
         )
         role_parts = []
-        if face_number is not None:
+        if board_number is not None:
+            role_parts.append(
+                f"<主体{subject_number}>的面部、妆造、身体比例及侧背轮廓统一参考图片{board_number}（同一张四视图身份板）"
+            )
+        elif face_number is not None:
             role_parts.append(f"<主体{subject_number}>的面部特征参考图片{face_number}（大头照）")
-        if body_number is not None:
+        if board_number is None and body_number is not None:
             role_parts.append(
                 f"<主体{subject_number}>的妆造和身体比例参考图片{body_number}（全身照）"
             )
@@ -710,7 +752,8 @@ def build_content_for_shot(
         if expected_characters and not character_assets:
             raise FileNotFoundError(
                 "Phantom character references missing for shot "
-                f"{shot_id}; expected face_closeup.png, full_body.png, identity_detail.png, or variant_*.png"
+                f"{shot_id}; expected reference_board.png, legacy canonical views, "
+                "identity_detail.png, or variant_*.png"
             )
         if image_assets:
             # The approved Phase 4 render already resolves identity, costume,
@@ -767,7 +810,7 @@ def build_content_for_shot(
         if len(image_assets) > max_reference_images:
             # Continuation reserves three provider image slots for ordered tail
             # anchors. Keep the composition frame and distribute the remaining
-            # identity budget across characters in rounds (face, body, detail, variant)
+            # identity budget across characters in rounds (board, detail, variant)
             # so one character cannot consume every slot.
             composition_assets = [
                 asset
