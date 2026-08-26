@@ -5179,6 +5179,97 @@ def test_phase5_local_l4_contamination_uses_only_cinematic_correction(tmp_path):
     ]
 
 
+def test_phase5_adjudicates_unchanged_l3_flip_after_cinematic_correction(
+    tmp_path,
+):
+    from PIL import Image
+
+    storyboard = {
+        "shots": [{
+            "id": "S01",
+            "storyboard_beats": [{
+                "beat_id": "S01_P01",
+                "storyboard_image": "storyboard_beats/S01_P01.png",
+            }],
+        }],
+    }
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps(storyboard), encoding="utf-8"
+    )
+    beat_dir = tmp_path / "storyboard_beats"
+    beat_dir.mkdir()
+    Image.effect_noise((128, 72), 80).convert("RGB").save(
+        beat_dir / "S01_P01.png"
+    )
+
+    l4_issue = storyboard_qa_gate._issue(
+        "L4", "severe", "first_frame_subject_duplication",
+        "S01_P01 contains two overlapping copies of the protagonist", ["S01"],
+        frame_ids=["S01_P01"],
+        expected="one protagonist",
+        observed="two overlapping copies of the protagonist",
+        confidence=0.97,
+        frame_evidence=[{
+            "frame_id": "S01_P01",
+            "observed": "two overlapping copies of the protagonist",
+        }],
+        evidence_status="validated",
+    )
+    l3_flip = storyboard_qa_gate._issue(
+        "L3", "moderate", "R4", "S01_P01 action mismatch", ["S01"],
+        storyboard_ids=["S01_P01"],
+        mismatch_type="action",
+        expected="the actor reaches the canonical end state",
+        observed="the actor remains in the wrong action",
+        confidence=0.95,
+        panel_evidence=[{
+            "shot_id": "S01_P01",
+            "observed": "the actor remains in the wrong action",
+        }],
+    )
+    qa_results = iter([
+        {
+            "status": "error", "grade": "D", "gate_passed": False,
+            "issues": [l4_issue], "failed_shot_ids": ["S01"],
+        },
+        {
+            "status": "error", "grade": "C", "gate_passed": False,
+            "issues": [l3_flip], "failed_shot_ids": ["S01"],
+        },
+        {  # tie-break: unchanged P01 passes, so pass/fail/pass wins
+            "status": "done", "grade": "A", "gate_passed": True,
+            "issues": [], "failed_shot_ids": [],
+        },
+    ])
+    cinematic_calls = []
+
+    def redraw_cinematic(_output_dir, frame_ids, _issues, attempt):
+        cinematic_calls.append((attempt, frame_ids))
+        return {"status": "redrawn", "attempt": attempt}
+
+    result = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        max_correction_attempts=2,
+        qa_runner=lambda _output_dir: next(qa_results),
+        redraw_runner=lambda *_args: pytest.fail(
+            "L3 adjudication after L4 correction must not start a second family"
+        ),
+        cinematic_redraw_runner=redraw_cinematic,
+    )
+
+    assert cinematic_calls == [(1, ["S01_P01"])]
+    assert result["gate_passed"] is True
+    assert result["correction"]["correction_family"] == "cinematic_first_frame"
+    adjudication = result["correction"]["review_adjudications"][0]
+    assert adjudication["storyboard_ids"] == ["S01_P01"]
+    assert adjudication["decisions"] == {"S01_P01": "passed"}
+    assert adjudication["votes"]["S01_P01"] == {
+        "previous_blocked": False,
+        "current_blocked": True,
+        "confirmation_blocked": False,
+    }
+
+
 def test_phase5_local_l4_contamination_correction_is_bounded(tmp_path):
     l4_issue = storyboard_qa_gate._issue(
         "L4", "severe", "first_frame_annotation_contamination",

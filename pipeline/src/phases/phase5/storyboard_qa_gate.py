@@ -3382,10 +3382,7 @@ def run_storyboard_qa_with_correction(
         result = qa(output_dir)
         adjudication = None
         try:
-            if (
-                correction_family == "storyboard_previs"
-                and len(adjudications) < MAX_REVIEW_ADJUDICATIONS
-            ):
+            if len(adjudications) < MAX_REVIEW_ADJUDICATIONS:
                 result, adjudication = _adjudicate_unchanged_panel_flips(
                     output_dir,
                     previous_result,
