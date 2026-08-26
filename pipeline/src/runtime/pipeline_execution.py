@@ -157,6 +157,7 @@ def run_pipeline(
     resume_from: str = None,
     accept_code_change_from: str = None,
     project_id: str = "local",
+    character_library_dir: str | None = None,
     *,
     _phase_owner=None,
 ) -> dict:
@@ -173,6 +174,7 @@ def run_pipeline(
             skip_phase=skip_phase,
             output_dir=output_dir,
             project_id=project_id,
+            character_library_dir=character_library_dir,
             transition=transition,
             transition_duration=transition_duration,
             media_profile=media_profile,
@@ -210,6 +212,7 @@ def _run_pipeline(
     resume_from: str = None,
     accept_code_change_from: str = None,
     project_id: str = "local",
+    character_library_dir: str | None = None,
     *,
     _phase_owner=None,
 ) -> dict:
@@ -226,6 +229,7 @@ def _run_pipeline(
         skip_phase: 跳过指定 phase 列表，如 [3, 8]
         output_dir: 输出目录
         project_id: 项目隔离标识；默认 `local`
+        character_library_dir: 显式的项目角色资产库目录；默认禁用跨 run 复用
         transition: Phase 8 转场模式 ("crossfade" | "fade" | "cut")
         transition_duration: Phase 8 转场时长（秒），默认 0.5
         media_profile: 编码配置名称，从 MEDIA_PROFILES 中选择（默认 "480p"）
@@ -255,6 +259,18 @@ def _run_pipeline(
     skip_phase = list(skip_phase or [])
     output_path = Path(output_dir).resolve()
     _ensure_dir(output_path)
+    resolved_character_library_dir = None
+    if character_library_dir:
+        character_library_path = Path(character_library_dir).expanduser().resolve()
+        if (
+            character_library_path == output_path
+            or character_library_path in output_path.parents
+            or output_path in character_library_path.parents
+        ):
+            raise ValueError(
+                "character library must be outside and non-overlapping with the run directory"
+            )
+        resolved_character_library_dir = str(character_library_path)
     os.environ["HONCUT_NO_REAL_PERSON"] = "1" if no_real_person else "0"
 
     if accept_code_change_from is not None:
@@ -299,28 +315,31 @@ def _run_pipeline(
     )
     effective_video_route = get_video_route(configured_video_provider)
 
+    resolved_run_config = {
+        "project_id": project_id,
+        "duration": duration,
+        "shot_duration": shot_duration,
+        "chain_mode": chain_mode,
+        "transition": transition,
+        "transition_duration": transition_duration,
+        "media_profile": media_profile,
+        "enable_reshoot": enable_reshoot,
+        "no_real_person": no_real_person,
+        "dry_run": dry_run,
+        "video_provider": effective_video_provider,
+        "video_generation_mode": effective_video_route,
+        "video_model": os.environ.get(
+            "SEEDANCE_MODEL",
+            os.environ.get("VIDEO_MODEL", "doubao-seedance-2.0-fast"),
+        ),
+        "project_video_spec": project_video_spec,
+    }
+    if resolved_character_library_dir is not None:
+        resolved_run_config["character_library_dir"] = resolved_character_library_dir
     run_manifest = prepare_run_manifest(
         output_path,
         source_text=text,
-        resolved_config={
-            "project_id": project_id,
-            "duration": duration,
-            "shot_duration": shot_duration,
-            "chain_mode": chain_mode,
-            "transition": transition,
-            "transition_duration": transition_duration,
-            "media_profile": media_profile,
-            "enable_reshoot": enable_reshoot,
-            "no_real_person": no_real_person,
-            "dry_run": dry_run,
-            "video_provider": effective_video_provider,
-            "video_generation_mode": effective_video_route,
-            "video_model": os.environ.get(
-                "SEEDANCE_MODEL",
-                os.environ.get("VIDEO_MODEL", "doubao-seedance-2.0-fast"),
-            ),
-            "project_video_spec": project_video_spec,
-        },
+        resolved_config=resolved_run_config,
         repo_root=PROJECT_ROOT,
         resume=resume,
         accepted_code_change_from=accept_code_change_from,

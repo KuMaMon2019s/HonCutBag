@@ -421,6 +421,10 @@ def run_phase(phase: str, config: dict) -> dict:
     ]
     if config.get("project_id"):
         cmd.extend(["--project-id", str(config["project_id"])])
+    if config.get("character_library_dir"):
+        cmd.extend(
+            ["--character-library-dir", str(config["character_library_dir"])]
+        )
     if config.get("transition"):
         cmd.extend(["--transition", str(config["transition"])])
     if config.get("auto_approve"):
@@ -511,7 +515,9 @@ def main() -> None:
 
     # Match direct runner usage from pipeline/src: relative input/output paths
     # are interpreted from that directory for both execution and monitoring.
-    for path_key in ("input", "output_dir"):
+    for path_key in ("input", "output_dir", "character_library_dir"):
+        if not config.get(path_key):
+            continue
         configured_path = Path(config[path_key]).expanduser()
         if not configured_path.is_absolute():
             configured_path = RUNNER.parent / configured_path

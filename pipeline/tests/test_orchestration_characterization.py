@@ -230,6 +230,8 @@ def test_cli_dispatch_preserves_public_arguments_and_exit_contract(monkeypatch, 
             str(tmp_path),
             "--project-id",
             "studio-a",
+            "--character-library-dir",
+            str(tmp_path / "character-library"),
             "--duration",
             "12",
             "--phase",
@@ -247,6 +249,7 @@ def test_cli_dispatch_preserves_public_arguments_and_exit_contract(monkeypatch, 
     assert captured["dry_run"] is True
     assert captured["output_dir"] == str(tmp_path)
     assert captured["project_id"] == "studio-a"
+    assert captured["character_library_dir"] == str(tmp_path / "character-library")
     assert captured["skip_phase"] == [2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 9.5]
 
 

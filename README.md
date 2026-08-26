@@ -92,7 +92,7 @@ Phases use contiguous integer IDs (`phase1`–`phase9`); every phase writes a ch
 |-------|------|-------------|
 | Phase 1 | Screenwriter Engine | Text parsing → event extraction → sequence-aware Director intent (`scene_goal`, `emotion_arc`, `visual_focus`, `spatial_intent`, `transition_intent`) → character discovery → duration-scaled production action ledger → layered cinematic adaptation → continuity-boundary classification → per-shot storyboard JSON with eight-layer prompts. Source wording and dialogue remain verbatim, while identity joins use language-neutral character/ref IDs and English controlled enums in the strict semantic ledger. Code owns action capacity; a strict Director-aligned selector may only choose source action indexes and records narrative purpose/emotional beat. Adaptation remains the sole owner of shot count, framing, controlled camera angle, movement, lighting, and duration. Sub-phase checkpoints and a 15s heartbeat keep it observable |
 | Phase 2 | Storyboard Images | Per-shot storyboard images (Seedream) as visual reference for video generation |
-| Phase 3 | Character Factory | Character reference assets (face close-up + full-body + variants) + character cards, with skip-if-exists reuse |
+| Phase 3 | Character Factory | Four canonical views, deterministic 2×2 reference board, QA receipts, character cards, and optional project-scoped reuse of exact approved packs |
 | Phase 4 | Scene Consistency | Shot directory layout, timeline planning, scene consistency contracts, and continuity groups: a group starts from image references and later shots depend on the preceding video |
 | Phase 5 | QA Gate + Supervision | L1/L2/L3 structural quality gate plus an LLM supervision agent (continuity / character / style / pacing / dialogue). Blocking visual failures trigger a bounded failed-shot redraw and full recheck (default 2 rounds, max 3); unresolved C/D grades still block video generation. On pass, a graph router picks the Phase 6 strategy (txt2vid / img2vid / reference) |
 | Phase 6 | Video Generation | Continuity groups execute serially through Seedance while independent groups remain concurrent: group heads use multi-image generation and later shots use predecessor-video extension on the crash-safe runtime |
@@ -168,7 +168,8 @@ uv run --locked --managed-python python pipeline/scripts/phase_orchestrator.py \
 
 # Or invoke the stable CLI directly with an explicit cache/project namespace
 uv run --locked --managed-python python pipeline/src/pipeline_runner.py \
-  --input story.txt --output-dir workspaces/example/output --project-id studio-a
+  --input story.txt --output-dir workspaces/example/output --project-id studio-a \
+  --character-library-dir /absolute/path/to/studio-character-library
 
 # Resume from a checkpoint (e.g. after a single shot failure)
 uv run --locked --managed-python python pipeline/scripts/phase_orchestrator.py \
@@ -178,6 +179,12 @@ uv run --locked --managed-python python pipeline/scripts/phase_orchestrator.py \
 `uv.lock` and `.python-version` are authoritative. Project commands must use
 `make` or `uv run --locked ...`; bare `python`, `pip`, and `pytest` may resolve
 to an unrelated Conda or system interpreter.
+
+`--character-library-dir` is optional and disabled by default. When enabled,
+Phase 3 only reuses an immutable `canonical_approved` pack from the same
+`project-id` with an exact versioned character-spec match and valid QA,
+approval, and file hashes. Similarity search does not authorize automatic
+reuse, and state variants are not promoted by the v1 registry.
 
 Online visual generation uses the Volcano Ark Agent Plan only. Configure
 `ARK_AGENT_API_KEY`; HonCut does not read `ARK_API_KEY`, which remains reserved

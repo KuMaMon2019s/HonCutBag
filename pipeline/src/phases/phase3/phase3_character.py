@@ -27,6 +27,63 @@ PHASE3_DRY_RUN_SKIPPED_OPERATIONS = (
 )
 
 
+def _configured_character_registry(output_dir: Path, *, dry_run: bool):
+    """Resolve the explicit project library without consulting ambient state."""
+    if dry_run:
+        return None, None
+    manifest_path = output_dir / "RUN_MANIFEST.json"
+    if not manifest_path.is_file():
+        return None, None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        resolved = manifest["resolved_config"]
+        project_id = resolved["project_id"]
+        configured = resolved.get("character_library_dir")
+        run_id = manifest["run_fingerprint"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
+        raise RuntimeError("RUN_MANIFEST.json has invalid character-library identity") from error
+    if not configured:
+        return None, None
+    library_root = Path(str(configured)).expanduser().resolve()
+    run_root = output_dir.resolve()
+    if library_root == run_root or library_root in run_root.parents or run_root in library_root.parents:
+        raise RuntimeError(
+            "character library must be outside and non-overlapping with the run directory"
+        )
+    from runtime.character_registry import CharacterRegistry
+
+    return CharacterRegistry(library_root, project_id=str(project_id)), str(run_id)
+
+
+def _write_character_registry_receipt(
+    output_dir: Path,
+    *,
+    project_id: str,
+    entries: list[dict],
+) -> Path:
+    """Persist a run-local audit of exact reuse and canonical promotion."""
+    from runtime.character_registry import CHARACTER_REGISTRY_RECEIPT_SCHEMA
+
+    payload = {
+        "schema": CHARACTER_REGISTRY_RECEIPT_SCHEMA,
+        "status": "completed",
+        "project_id": project_id,
+        "registry_provider_requests": 0,
+        "characters": entries,
+    }
+    path = output_dir / "character_registry_receipt.json"
+    temporary = path.with_suffix(".json.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return path
+
+
 def _hashed_artifact(root: Path, path: Path) -> dict | None:
     """Describe one existing run-local artifact without embedding its content."""
     if not path.is_file():
@@ -218,6 +275,9 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
                 "name": c.get("name", f"角色{i}"),
                 "description": character_reference_identity_description(c),
                 "appearance": c.get("appearance", {}),  # 传递完整 appearance dict
+                "visual_identity_policy": characters_data.get(
+                    "visual_identity_policy"
+                ),
                 "style": "\n\n".join(
                     part for part in (c.get("style", ""), character_style) if part
                 ),
@@ -226,6 +286,41 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
                     str(c.get("negative_guardrails", "")).strip(),
                 ))),
             })
+
+        registry, source_run_id = _configured_character_registry(
+            output_dir,
+            dry_run=dry_run,
+        )
+        registry_entries: list[dict] = []
+        reused_results: list[dict] = []
+        generation_queue: list[dict] = []
+        if registry is not None:
+            for char_dict in char_dicts:
+                approved = registry.find_exact(char_dict)
+                if approved is None:
+                    generation_queue.append(char_dict)
+                    continue
+                registry.import_into_run(approved, output_dir)
+                reused_results.append({
+                    "char_id": char_dict["id"],
+                    "name": char_dict["name"],
+                    "char_dir": str(output_dir / "characters" / char_dict["id"]),
+                    "reused": True,
+                    "version_id": approved.version_id,
+                })
+                registry_entries.append({
+                    "character_id": char_dict["id"],
+                    "action": "reused",
+                    "version_id": approved.version_id,
+                    "spec_fingerprint": approved.spec_fingerprint,
+                    "asset_count": len(approved.assets),
+                })
+                print(
+                    f"  ♻ {char_dict['name']}: reused canonical character "
+                    f"{approved.version_id[:12]} (zero Provider requests)"
+                )
+        else:
+            generation_queue = list(char_dicts)
 
         workload_storyboard_path = output_dir / "STORYBOARD.json"
         workload_storyboard = (
@@ -247,20 +342,23 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
             f"(最多 {phase3_workload.phase3_image_requests} 次图片请求, "
             f"限流耗时上限 ~{int(_p3_est)}s；缓存命中时更短)"
         )
-        print(f"  → batch_generate: {len(char_dicts)} 个角色, skip_images={dry_run}")
+        print(
+            f"  → batch_generate: {len(generation_queue)}/{len(char_dicts)} 个角色, "
+            f"skip_images={dry_run}; registry_reused={len(reused_results)}"
+        )
 
         # Use retry policy for each character generation
-        results = []
+        results = list(reused_results)
         _p3_char_start = _now()
-        for i, char_dict in enumerate(char_dicts):
+        for i, char_dict in enumerate(generation_queue):
             char_name = char_dict.get("name", f"角色{i}")
-            print(f"    → [{i+1}/{len(char_dicts)}] {char_name}...")
+            print(f"    → [{i+1}/{len(generation_queue)}] {char_name}...")
             _char_t0 = _now()
 
-            def _gen_char():
+            def _gen_char(_character=char_dict):
                 # Pass output_dir (not chars_dir) — generate_character appends /characters/ internally
                 return batch_generate(
-                    [char_dict],
+                    [_character],
                     str(output_dir),
                     skip_images=dry_run,
                     raise_on_error=True,
@@ -331,6 +429,83 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
                 "duration_s": _elapsed(start),
             }
 
+        registry_summary = None
+        if registry is not None:
+            from runtime.artifact_manifest import ArtifactManifestStore, file_sha256
+            from runtime.character_registry import (
+                CharacterRegistryError,
+                character_has_unapproved_variants,
+            )
+
+            reused_ids = {
+                entry["character_id"]
+                for entry in registry_entries
+                if entry.get("action") == "reused"
+            }
+            for char_dict in char_dicts:
+                if char_dict["id"] in reused_ids:
+                    continue
+                if character_has_unapproved_variants(char_dict):
+                    registry_entries.append({
+                        "character_id": char_dict["id"],
+                        "action": "not_promoted",
+                        "reason": "state variants are outside the v1 approval contract",
+                    })
+                    continue
+                try:
+                    approved = registry.promote_from_run(
+                        output_dir,
+                        char_dict,
+                        quality_grade=qg_report.grade,
+                        source_run_id=source_run_id,
+                    )
+                except CharacterRegistryError:
+                    # A configured library is a correctness boundary. Do not
+                    # hide an approval conflict and continue with an ambiguous
+                    # canonical identity.
+                    raise
+                registry_entries.append({
+                    "character_id": char_dict["id"],
+                    "action": "promoted",
+                    "version_id": approved.version_id,
+                    "spec_fingerprint": approved.spec_fingerprint,
+                    "asset_count": len(approved.assets),
+                })
+            receipt_path = _write_character_registry_receipt(
+                output_dir,
+                project_id=registry.project_id,
+                entries=registry_entries,
+            )
+            outputs.append(receipt_path.name)
+            receipt_sha256 = file_sha256(receipt_path)
+            artifact_store = ArtifactManifestStore.from_run_directory(
+                output_dir,
+                required=False,
+            )
+            if artifact_store is not None:
+                artifact_store.register_file(
+                    receipt_path,
+                    artifact_type="character_registry_receipt",
+                    producer_node="phase3.character_registry",
+                    expected_sha256=receipt_sha256,
+                    semantic_fingerprint=receipt_sha256,
+                )
+            registry_summary = {
+                "receipt": receipt_path.name,
+                "reused": sum(
+                    entry.get("action") == "reused" for entry in registry_entries
+                ),
+                "generated": len(generation_queue),
+                "promoted": sum(
+                    entry.get("action") == "promoted" for entry in registry_entries
+                ),
+                "not_promoted": sum(
+                    entry.get("action") == "not_promoted"
+                    for entry in registry_entries
+                ),
+                "registry_provider_requests": 0,
+            }
+
         # Phase 3 owns the first point at which character reference packs are
         # guaranteed to exist. Regenerate the canonical Pxx chain here so the
         # continuity runtime and ordinary Sxx path consume the same identity-
@@ -396,13 +571,16 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
                     "duration_s": _elapsed(start),
                 }
 
-        return {
+        result = {
             "status": "done",
             "duration_s": _elapsed(start),
             "outputs": outputs or ["characters/"],
             "derive_assets_count": len(derive_assets),
             "derive_assets": derive_assets,
         }
+        if registry_summary is not None:
+            result["character_registry"] = registry_summary
+        return result
 
     except ImportError as e:
         print(f"  ⚠ Phase 3 import 失败: {e}")

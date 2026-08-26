@@ -137,8 +137,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--project-id",
         type=str,
-        default="local",
+        default=None,
         help="项目隔离标识，默认 local",
+    )
+    parser.add_argument(
+        "--character-library-dir",
+        type=str,
+        default=None,
+        help="显式角色资产库目录；仅复用同 project-id 的已批准精确版本",
     )
     parser.add_argument("--skip-phase", type=float, nargs="+", default=[], help="跳过指定 Phase")
     parser.add_argument(
@@ -245,6 +251,7 @@ def _resolved_run_arguments(args: argparse.Namespace) -> dict:
         return explicit if explicit is not None else stored.get(name, fallback)
 
     return {
+        "project_id": choose("project_id", "local"),
         "duration": choose("duration", 60),
         "shot_duration": choose("shot_duration", AVG_SHOT_DURATION),
         "chain_mode": choose("chain_mode", False),
@@ -254,6 +261,7 @@ def _resolved_run_arguments(args: argparse.Namespace) -> dict:
         "media_profile": choose("media_profile", DEFAULT_MEDIA_PROFILE),
         "enable_reshoot": choose("enable_reshoot", True),
         "no_real_person": choose("no_real_person", False),
+        "character_library_dir": choose("character_library_dir", None),
     }
 
 
@@ -290,7 +298,8 @@ def main() -> None:
         dry_run=resolved["dry_run"],
         skip_phase=_phase_skip_list(args, parser),
         output_dir=args.output_dir,
-        project_id=args.project_id,
+        project_id=resolved["project_id"],
+        character_library_dir=resolved["character_library_dir"],
         transition=resolved["transition"],
         transition_duration=resolved["transition_duration"],
         media_profile=resolved["media_profile"],

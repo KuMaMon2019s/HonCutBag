@@ -218,6 +218,28 @@ def ensure_character_reference_board(
     return board_path
 
 
+def validate_character_reference_board(
+    character_dir: Path,
+    *,
+    character_id: str | None = None,
+) -> bool:
+    """Validate an existing board and receipt without regenerating either file."""
+    character_dir = Path(character_dir)
+    character_id = str(character_id or character_dir.name).strip()
+    if not character_id:
+        return False
+    try:
+        sources = _source_records(character_dir)
+    except (FileNotFoundError, OSError, ValueError):
+        return False
+    return _valid_existing_board(
+        character_dir / CHARACTER_REFERENCE_BOARD_FILENAME,
+        character_dir / CHARACTER_REFERENCE_BOARD_RECEIPT,
+        character_id=character_id,
+        sources=sources,
+    )
+
+
 def resolve_character_reference_board(
     output_dir: Path,
     character_id: str,

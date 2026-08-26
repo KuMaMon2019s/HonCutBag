@@ -62,6 +62,7 @@ Schema、State 和纯工具是共享契约，但不得反向触发上层工作�
 | Phase 耗时估算 | `pipeline/src/runtime/phase_estimates.py` | 只消费 canonical 结构与 Provider 工作量；不得用剧本文字长度或固定角色/镜头默认值伪装精确 ETA |
 | 超时、重试、冷却与容量 | `pipeline/src/runtime/provider_policy.py`、`pipeline/src/runtime/llm_policy.py` | Provider、Graph 和 Phase 不得叠加重试；健康 LLM 长流由 idle 与 wall 两个时钟区分 |
 | 长任务账本 | `pipeline/src/runtime/generation_tasks.py` | SQLite 幂等迁移、提交去重、恢复与终态证据 |
+| 已批准角色资产注册表 | `pipeline/src/runtime/character_registry.py` | 显式项目库、精确规格匹配、QA/审批/内容哈希校验和不可变资产包；向量索引不拥有复用权限 |
 | Artifact 血缘 | `schemas/artifact.py`、`runtime/artifact_manifest.py` | 严格 schema、内容哈希、父资产与原子 manifest |
 | Provider 传输 | `runtime/video_provider.py` 与现有 clients/adapters | submit/status/cancel、能力和错误分类；不决定全局策略 |
 
@@ -119,7 +120,7 @@ Graph node 必须只完成三件事：读取 State、调用一个窄 owner、返
 |---|---|---|
 | 1 | 文本解析、源事件发现、按 sequence 的导演意图、角色发现、`SEMANTIC_LEDGER.json`、时长缩放后的 `SCREENPLAY_PLAN.json` 与 canonical `STORYBOARD.json` / `CHARACTERS.json` | 输入/LLM/结构无效即停止；子阶段 checkpoint 可复用 |
 | 2 | 分镜与 Pxx 图像资产、构图和端帧契约 | 生产图片或其验证证据缺失时 fail closed |
-| 3 | 角色卡、四视图、单图四视图参考板、变体和身份锁定 | 生产模式要求真实四视图 QA；参考板只能由已验收四视图确定性派生；dry-run 只写明确的 dry-run receipt |
+| 3 | 角色卡、四视图、单图四视图参考板、变体、身份锁定，以及显式项目角色库的精确导入/批准 | 生产模式要求真实四视图 QA；参考板只能由已验收四视图确定性派生；角色库证据缺失、篡改或冲突时 fail closed；dry-run 只写明确的 dry-run receipt |
 | 4 | 原生 shot 目录与 `SHOT_META.json`、场景一致性、continuity plan、cinematic first-frame | canonical storyboard 不得为元数据物化而原地改写；Phase 4 不运行视频生成子进程 |
 | 5 | storyboard QA、生成容量、variation/slideshow、监督与进入视频生成前的硬门 | C/D 或 blocking supervision 阻止 Phase 6；dry-run 不做像素/模型监督 |
 | 6 | 视频生成与 continuity chunk 执行 | 所有长请求经过 Runtime task ledger；相同输入恢复不得重复提交 |
@@ -254,6 +255,12 @@ immutable payload + fingerprint
 - manifest 通过同目录临时文件、`fsync` 和 `os.replace` 原子更新；
 - 跨项目、缺失父资产、哈希不匹配、未知版本或 provenance 冲突全部 fail closed。
 
+跨 run 的角色复用默认关闭，只能通过稳定 CLI 参数 `--character-library-dir` 显式启用。该目录必须与当前 run 目录完全分离；Lifecycle 把规范化绝对路径写入不可变 `RUN_MANIFEST.json`，Phase 3 从该清单读取，禁止从环境变量、工作区扫描或最近使用记录猜测角色库。`runtime.character_registry` 的普通 SQLite `characters.db` 只作为审批元数据事实源，图片和 JSON 继续以不可变文件资产包保存。数据库 schema 使用 `PRAGMA user_version`，未知未来版本、无版本旧表、项目身份不匹配或审批/资产哈希变化全部 fail closed。
+
+自动复用只允许同一 `project_id`、同一 canonical `character_id` 和同一版本化静态角色规格 fingerprint 的 `canonical_approved` 资产包。Phase 3 的 A 级只是必要条件；四个 canonical 视角、逐视角 QA receipt、确定性 2×2 参考板 receipt、当前角色卡合同、审批单和每个文件 SHA-256 必须同时有效。命中后先把完整资产包按哈希导入当前 run，再由共同 Phase owner 继续质量门；相同规格出现不同已批准像素时禁止任意挑选并 fail closed。含状态变体的角色在 v1 不提升、不自动复用，避免把剧情状态误当静态身份。
+
+`sqlite-vec` 可在后续版本作为从已批准库中产生候选的可重建相似度索引，但不得成为资产、审批或哈希事实源，也不得直接触发自动复用。任何向量候选仍必须经过项目范围、精确规格、QA、审批和内容哈希裁决；本版本不创建向量表、不下载 embedding 模型，也不把相似角色匹配接入生产决策。
+
 付费生成 fingerprint 固定包含 Prompt 模板 ID/版本、Prompt 内容哈希、Provider/模型 ID 与版本、语义参数和输入 Artifact 哈希，并递归排除 credential 字段。Cache key 固定包含：
 
 ```text
@@ -295,7 +302,7 @@ Phase 2 的 Pxx、模型绘制 Sxx 九宫格与跨一级镜头 bridge 都必须�
 Dry-run receipt 只能证明“结构路径已执行且远程/像素步骤被跳过”，不能替代生产图片、语义 QA 或 Provider 成功凭证。
 
 - Phase 1 dry-run 必须从真实源文本生成 `phase1_dry_run_receipt.json` 与 source-derived 结构夹具，复用 adaptation 容量 owner 做零请求的源结构容量估算；估算要求 screenplay compression 时 fail closed，禁止用固定 mock 事件或固定故事板伪装通过。该估算不替代生产 Event Extractor 的语义账本，receipt 必须明确记录此限制。
-- Phase 3 dry-run 写角色卡与 `phase3_dry_run_receipt.json`，不生成占位图片、不进入四视图 QA、不刷新生产 Pxx。
+- Phase 3 dry-run 写角色卡与 `phase3_dry_run_receipt.json`，不生成占位图片、不进入四视图 QA、不刷新生产 Pxx，也不读取、创建或修改显式角色库。
 - Phase 4 直接从 canonical `STORYBOARD.json` 确定性物化 shot 目录与 `SHOT_META.json`；不写 legacy 适配副本、不启动子进程，也不调用 Provider。
 - Phase 5 dry-run 只运行结构、容量、variation 与 slideshow 检查；跳过像素、embedding、多模态修正和 supervision。
 - Phase 6–9 离线真实媒体验收只能通过私有依赖注入使用 `offline_fixture` executor 和空 transition embedding runner；不得提供普通 CLI 环境变量来伪装 Provider。

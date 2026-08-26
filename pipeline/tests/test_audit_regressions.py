@@ -1316,6 +1316,7 @@ def test_phase_orchestrator_propagates_run_identity_and_provider_config(
             "shot_duration": 15,
             "output_dir": str(tmp_path / "run"),
             "project_id": "future-station-32s",
+            "character_library_dir": str(tmp_path / "character-library"),
             "video_provider": "seedance",
             "video_model": "doubao-seedance-2.0-fast",
             "media_profile": "480p",
@@ -1327,6 +1328,9 @@ def test_phase_orchestrator_propagates_run_identity_and_provider_config(
     assert result["exit_code"] == 0
     command = captured["cmd"]
     assert command[command.index("--project-id") + 1] == "future-station-32s"
+    assert command[command.index("--character-library-dir") + 1] == str(
+        tmp_path / "character-library"
+    )
     assert captured["env"]["VIDEO_PROVIDER"] == "seedance"
     assert captured["env"]["SEEDANCE_MODEL"] == "doubao-seedance-2.0-fast"
 
@@ -2301,6 +2305,7 @@ def test_semantic_media_ratios_and_cli_resume_defaults(tmp_path):
         json.dumps(
             {
                 "resolved_config": {
+                    "project_id": "series-a",
                     "duration": 37,
                     "shot_duration": 5,
                     "chain_mode": True,
@@ -2310,6 +2315,7 @@ def test_semantic_media_ratios_and_cli_resume_defaults(tmp_path):
                     "media_profile": "cinematic",
                     "enable_reshoot": False,
                     "no_real_person": True,
+                    "character_library_dir": str(tmp_path / "character-library"),
                 }
             }
         ),
@@ -2319,10 +2325,14 @@ def test_semantic_media_ratios_and_cli_resume_defaults(tmp_path):
 
     assert args.text is None and args.input is None
     assert pipeline_runner_cli._resolved_run_arguments(args)["duration"] == 37
+    assert pipeline_runner_cli._resolved_run_arguments(args)["project_id"] == "series-a"
     assert pipeline_runner_cli._resolved_run_arguments(args)["media_profile"] == (
         "cinematic"
     )
     assert pipeline_runner_cli._resolved_run_arguments(args)["no_real_person"] is True
+    assert pipeline_runner_cli._resolved_run_arguments(args)[
+        "character_library_dir"
+    ] == str(tmp_path / "character-library")
 
     accepted_args = parser.parse_args(
         ["--resume", "--phase", "phase6", "--accept-code-change"]
@@ -5014,6 +5024,7 @@ def test_sequential_phase5_dry_run_skips_independent_supervision(tmp_path):
         dry_run=True,
         skip_phase=[6, 7, 8, 9, 9.5],
         output_dir=str(tmp_path),
+        character_library_dir=str(tmp_path.parent / f"{tmp_path.name}-characters"),
         _phase_owner=owner,
     )
 
@@ -5024,6 +5035,10 @@ def test_sequential_phase5_dry_run_skips_independent_supervision(tmp_path):
         "reason": "dry-run",
     }
     assert not (tmp_path / "runtime.db").exists()
+    manifest = json.loads((tmp_path / "RUN_MANIFEST.json").read_text(encoding="utf-8"))
+    assert manifest["resolved_config"]["character_library_dir"] == str(
+        (tmp_path.parent / f"{tmp_path.name}-characters").resolve()
+    )
 
 
 def test_sequential_resume_from_without_code_acceptance_invalidates_artifacts(
@@ -5066,6 +5081,10 @@ def test_sequential_resume_from_without_code_acceptance_invalidates_artifacts(
     }
     first = pipeline_execution.run_pipeline(**common)
     assert first["status"] == "completed"
+    initial_manifest = json.loads(
+        (tmp_path / "RUN_MANIFEST.json").read_text(encoding="utf-8")
+    )
+    assert "character_library_dir" not in initial_manifest["resolved_config"]
 
     resumed = pipeline_execution.run_pipeline(
         **common,
