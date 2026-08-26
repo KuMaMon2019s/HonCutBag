@@ -6611,12 +6611,39 @@ def test_phase5_completed_action_sequence_is_not_an_issue():
     }
     completed_zh = {**completed, "message": "规定动作序列均已完成"}
     incomplete_zh = {**completed, "message": "规定动作序列未全部完成"}
+    contradictory_message_but_affirmative_observation = {
+        **completed,
+        "message": (
+            "The chip has already projected the hologram, but the final end "
+            "state does not match the required progression"
+        ),
+        "expected": "the chip projects the coordinates while the train moves",
+        "observed": (
+            "The projection is displayed in the man's hand, the end state "
+            "matches the action requirement but the character position is "
+            "consistent, there is no incomplete end state"
+        ),
+    }
+    genuinely_contrasted_observation = {
+        **completed,
+        "message": "The storyboard has a visible continuity mismatch",
+        "observed": (
+            "The costume matches the required colors, but the head is visibly "
+            "oversized"
+        ),
+    }
 
     assert storyboard_qa_gate._is_affirmative_non_issue(completed) is True
     assert storyboard_qa_gate._is_affirmative_non_issue(incomplete) is False
     assert storyboard_qa_gate._is_affirmative_non_issue(contrasted) is False
     assert storyboard_qa_gate._is_affirmative_non_issue(completed_zh) is True
     assert storyboard_qa_gate._is_affirmative_non_issue(incomplete_zh) is False
+    assert storyboard_qa_gate._is_affirmative_non_issue(
+        contradictory_message_but_affirmative_observation
+    ) is True
+    assert storyboard_qa_gate._is_affirmative_non_issue(
+        genuinely_contrasted_observation
+    ) is False
 
 
 def _style_classification_fixture(*rankings: tuple[str, float]) -> dict:
