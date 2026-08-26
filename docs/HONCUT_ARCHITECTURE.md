@@ -92,6 +92,7 @@ flowchart LR
     P5 -->|txt2vid| P6T[Phase 6 txt2vid]
     P5 -->|img2vid| P6I[Phase 6 img2vid]
     P5 -->|reference| P6R[Phase 6 reference]
+    P5 -->|padding rewrite 1/1| P1
     P5 -->|error/block| ENDP
     P6T --> P7[Phase 7]
     P6I --> P7
@@ -108,7 +109,7 @@ flowchart LR
     P95 --> END4((END))
 ```
 
-Phase 5 的路由优先级固定为：任一 shot 的 `ref_type=reference` → reference；否则存在 storyboard image → img2vid；否则 txt2vid。Phase 7 的 Graph 路由只做 pass/block，像素级修复和付费补拍由 Phase 8 的有限闭环拥有。每条 Phase 成功边都是显式条件边；节点写入 `status=failed/error/blocked` 后只能路由到 END，`Command(goto=END)` 不能与无条件静态成功边并存，防止失败 Phase 之后继续产生图片、视频或其他副作用。
+Phase 5 的路由优先级固定为：当前 receipt 明确写入 `correction.status=rewrite_scheduled` → Phase 1；否则任一 shot 的 `ref_type=reference` → reference；否则存在 storyboard image → img2vid；否则 txt2vid。`rewrite_scheduled` 只允许由下述 Provider padding 账本策略产生一次，顶层 State 保持 `running`，不能被普通 `status=error` 冒充。Phase 7 的 Graph 路由只做 pass/block，像素级修复和付费补拍由 Phase 8 的有限闭环拥有。除这个有版本、有计数的有限回边外，每条 Phase 成功边都是显式条件边；节点写入顶层 `status=failed/error/blocked` 后只能路由到 END，`Command(goto=END)` 不能与无条件静态成功边并存，防止失败 Phase 之后继续产生图片、视频或其他副作用。
 
 Graph node 必须只完成三件事：读取 State、调用一个窄 owner、返回 State patch。节点不得直接读写媒体、运行 subprocess、调用网络/模型或实现重试。
 
@@ -129,7 +130,9 @@ Graph node 必须只完成三件事：读取 State、调用一个窄 owner、返
 | 9 | ASR、音频/TTS/ducking、字幕、视觉后期、节奏编辑和最终编码 | 最终时长/编码失败即停止；可选 QA 必须在 receipt 中明确标记 |
 | 9.5 | 成片交付 QA | 不通过则顶层 run failed，不交付伪成功 |
 
-Phase 1 的时长合同采用三账本：`story clock` 记录一级 `Sxx` 与其二级 `Pxx` 共同表示的有效叙事时长，二者不得相加；`Provider request` 记录实际请求/计费时长；`padding/context` 记录 Provider 最低请求、尾段上下文或重叠中不属于新故事时钟的部分。每个 Pxx 必须分别持久化 `effective_story_duration_s`、`provider_request_duration_s` 与 `provider_minimum_padding_duration_s`，Runtime 按请求帧生成后规范化到 `expected_unique_frames`。Provider 的 8 秒/6 秒最低请求不得反向成为故事时钟的最低镜长或压缩阻塞条件。跨一级镜头的 bridge 是独立 Provider 请求开销，只进入请求账本；其可见部分按 `replace_boundary_handles` 替换等长边界把手。`honcut.material-budget.v3` 必须记录故事时钟、Pxx 分区校验、内容请求与 padding、bridge 请求实际/规划区间、总 Provider 请求及比率。历史 v2 只可迁移用于成本审计，不得作为当前 Phase 5 成功证据；历史 `1.3` 仍只作成本参考，不是容量硬上限。Phase 8 的安全变速区间是独立编辑合同，不得从 Provider 请求比率反推。
+Phase 1 的时长合同采用三账本：`story clock` 记录一级 `Sxx` 与其二级 `Pxx` 共同表示的有效叙事时长，二者不得相加；`Provider request` 记录实际请求/计费时长；`padding/context` 记录 Provider 最低请求、尾段上下文或重叠中不属于新故事时钟的部分。每个 Pxx 必须分别持久化 `effective_story_duration_s`、`provider_request_duration_s` 与 `provider_minimum_padding_duration_s`，Runtime 按请求帧生成后规范化到 `expected_unique_frames`。Provider 的 8 秒/6 秒最低请求不得反向成为故事时钟的最低镜长或首次编剧的压缩阻塞条件。跨一级镜头的 bridge 是独立 Provider 请求开销，只进入请求账本；其可见部分按 `replace_boundary_handles` 替换等长边界把手。`honcut.material-budget.v3` 必须记录故事时钟、Pxx 分区校验、内容请求与 padding、bridge 请求实际/规划区间、总 Provider 请求及比率。历史 v2 只可迁移用于成本审计，不得作为当前 Phase 5 成功证据；历史 `1.3` 仍只作成本参考，不是容量硬上限。Phase 8 的安全变速区间是独立编辑合同，不得从 Provider 请求比率反推。
+
+内容请求的 padding 损失率固定定义为 `content_provider_padding_duration_s / content_provider_request_duration_s`。单个短请求的 Provider 最低时长不可避免，免于该策略；存在多个 Pxx 请求时，损失率上限为 25%。Phase 1 首次编剧必须先完整落盘账本，不能因该策略在 Phase 1 内直接报错；Phase 5 才以 L1 `content_provider_padding_loss_exceeds_limit` 作硬门。首次命中时，Phase 5 必须零补画生成 `honcut.screenplay-rewrite-request.v1`，持久化观察值、25% 上限和 `screenplay_rewrite_attempt=1`，由 Graph 或顺序 Lifecycle 返回 Phase 1。Phase 1 选择仍满足上限的最大单请求镜头槽位数，将每槽 production generation-unit 上限收紧到当前模型的单个 Pxx 容量，并继续用来源索引、源动作哈希、必保事件和连续前置闭包记录删减；rewrite request 必须进入 layered adaptation fingerprint，禁止命中旧 beat/shots checkpoint 原样重跑。重编后 Phase 2～5 依据新 fingerprint 重建或复用各自产物，Phase 6 在新的 Phase 5 成功 receipt 前不得提交任何视频任务。该回流全局最多一次；第二次仍命中同一错误必须写 `rewrite_exhausted` 并 fail closed，禁止循环或第三次编剧。Graph 的次数以 `phase_results.phase5.correction` checkpoint 为事实源；顺序执行器在同一 Lifecycle 调用中携带相同版本化 request 和计数，两条路径必须产生一致终态。
 
 `phase1_events.json` 是完整源事实账，记录 Event Extractor 从原文发现的全部 canonical 事件；它不得因交付时长而被覆盖、截短或重命名为生产结果。Adaptation 先生成 `honcut.duration-scaled-event-plan.v3` 的生产事件动作账，再在确定性修复与精确时长分配后写 `honcut.screenplay-plan.v5` 的 `SCREENPLAY_PLAN.json`：逐 beat 记录稳定 ID、单一 sequence、精确时长、`source_refs`、`omitted_source_refs`、来源动作索引、改编动作与生产 Director 投影，并分别汇总 source ledger 与 production ledger。除结构角色外，完整来源流最后一个具有可见叙事事实的事件必须作为 terminal outcome 锚点，即使 Event Extractor 将其角色标成普通 action/transition；生产账必须分别持久化 `terminal_outcome_source_event_ids`、包含结构角色和终局锚点的 `base_mandatory_source_event_ids`、`continuous` 闭包产生的 `causal_predecessor_source_event_ids` 及其并集 `mandatory_source_event_ids`。四者不自洽或任一必保事件被整体删减时 fail closed；容量不足时必须优先做来源索引约束的事件内动作压缩，禁止以删除结局换取时长。进入 Adaptation 前的 `screenplay_compression_required` 只表示完整源账需要时长缩放，不得在一个已经通过 sequence、动作容量、必保事件和精确故事时钟校验的生产账上继续充当最终失败状态；成功生产账的 canonical `action_capacity_status` 必须为 `fits_story_clock`，同时以 `source_action_capacity_status` 保留原始压力证据。零请求 dry-run 没有生产语义删减证据，仍只报告源结构容量并在估算需要压缩时 fail closed。
 
@@ -186,7 +189,7 @@ Canonical 字段包括：
 - 身份与配置：`state_schema_version`、`run_id`、`run_fingerprint`、`project_id`、输入、时长、媒体配置和恢复参数。
 - 领域元数据：storyboard、characters、shot IDs，以及 QA/一致性摘要。
 - Artifact 路径：`assembled_video`、`final_video`；不包含媒体内容。
-- 编排元数据：`phase_results`、`completed_phases`、`current_phase`、`status`、结构化 `errors` 与有限尝试计数。
+- 编排元数据：`phase_results`、`completed_phases`、`current_phase`、`status`、结构化 `errors` 与有限尝试计数；Phase 5→1 padding 重编次数保存在 `phase_results.phase5.correction.screenplay_rewrite_attempt`，不另建旁路状态。
 
 `text/duration/shot_duration/transition_duration/shots/videos/quality_report/error` 是只读旧别名。生产 composition 会在 checkpoint 前移除这些字段；新代码不得继续写它们。
 

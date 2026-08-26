@@ -7,6 +7,7 @@ import re
 import unicodedata
 from typing import Any
 
+from schemas.replanning import PADDING_LOSS_ERROR_CODE
 from utils.action_units import normalize_action_units
 from utils.body_action_contracts import apply_body_action_contract
 from utils.material_budget import (
@@ -1711,7 +1712,14 @@ def plan_storyboard_beats(
     if contract_errors:
         summary = "; ".join(error["message"] for error in contract_errors[:5])
         raise AssertionError(f"secondary storyboard planner emitted an invalid contract: {summary}")
-    budget_errors = material_budget_contract_errors(storyboard)
+    # Padding efficiency is a Phase 5 policy gate.  Phase 1 must persist the
+    # measured ledger so Lifecycle can authorize one bounded screenplay
+    # rewrite; every structural/accounting defect remains a local hard error.
+    budget_errors = [
+        error
+        for error in material_budget_contract_errors(storyboard)
+        if error.get("code") != PADDING_LOSS_ERROR_CODE
+    ]
     if budget_errors:
         summary = "; ".join(error["message"] for error in budget_errors[:5])
         raise AssertionError(f"material budget planner emitted an invalid contract: {summary}")

@@ -5234,6 +5234,195 @@ def test_sequential_resume_from_without_code_acceptance_invalidates_artifacts(
     assert len(phase2_calls) == 2
 
 
+@pytest.mark.parametrize(
+    ("second_gate_status", "expected_status"),
+    [("done", "completed"), ("error", "failed")],
+)
+def test_sequential_phase5_padding_rewrites_screenplay_exactly_once(
+    monkeypatch,
+    tmp_path,
+    second_gate_status,
+    expected_status,
+):
+    from phases.phase5.replanning import PADDING_LOSS_ERROR_CODE
+
+    monkeypatch.setattr(pipeline_execution, "LANGGRAPH_AVAILABLE", False)
+    phase1_calls = []
+    gate_calls = []
+
+    def run_phase1(_text, _output_dir, *_args, **kwargs):
+        phase1_calls.append(kwargs.get("screenplay_rewrite_request"))
+        return {
+            "status": "done",
+            "_storyboard": {"shots": [{"shot_id": "S01"}]},
+            "_characters": {"characters": []},
+        }
+
+    owner = SimpleNamespace(
+        run_phase1=run_phase1,
+        run_phase2=lambda *_args, **_kwargs: {"status": "done"},
+        run_phase3=lambda *_args, **_kwargs: {"status": "done"},
+        run_phase4=lambda *_args, **_kwargs: {"status": "done"},
+        run_phase6=_unexpected_phase5_dry_run_owner,
+        run_phase7=_unexpected_phase5_dry_run_owner,
+        run_phase8=_unexpected_phase5_dry_run_owner,
+        run_phase9=_unexpected_phase5_dry_run_owner,
+        _run_storyboard_supervision=_unexpected_phase5_dry_run_owner,
+    )
+    request = {
+        "schema": "honcut.screenplay-rewrite-request.v1",
+        "reason_code": PADDING_LOSS_ERROR_CODE,
+        "attempt": 1,
+        "maximum_padding_loss_rate": 0.25,
+        "observed_padding_loss_rate": 0.357143,
+        "content_provider_request_duration_s": 56.0,
+        "content_provider_padding_duration_s": 20.0,
+    }
+
+    def phase5_gate(*_args, **_kwargs):
+        gate_calls.append(True)
+        if len(gate_calls) == 1 or second_gate_status == "error":
+            return {
+                "status": "error",
+                "gate_passed": False,
+                "error": "padding budget blocked",
+                "correction": {
+                    "status": "requires_replanning",
+                    "recommended_restart_phase": "phase1",
+                    "global_issue_codes": [PADDING_LOSS_ERROR_CODE],
+                    "screenplay_rewrite_request": request,
+                },
+            }
+        return {"status": "done", "gate_passed": True, "grade": "A"}
+
+    monkeypatch.setattr(
+        storyboard_qa_gate,
+        "run_storyboard_qa_with_correction",
+        phase5_gate,
+    )
+
+    result = pipeline_execution.run_pipeline(
+        text="future station fixture",
+        duration=36,
+        dry_run=True,
+        skip_phase=[6, 7, 8, 9, 9.5],
+        output_dir=str(tmp_path),
+        _phase_owner=owner,
+    )
+
+    assert result["status"] == expected_status
+    assert len(phase1_calls) == 2
+    assert phase1_calls[0] is None
+    assert phase1_calls[1] == request
+    assert len(gate_calls) == 2
+    assert result["screenplay_rewrite"]["attempts_used"] == 1
+
+
+@pytest.mark.parametrize("second_gate_status", ["done", "error"])
+def test_graph_phase5_padding_rewrites_screenplay_exactly_once(
+    monkeypatch,
+    tmp_path,
+    second_gate_status,
+):
+    from phases.phase5.replanning import PADDING_LOSS_ERROR_CODE
+
+    phase1_calls = []
+    gate_calls = []
+    phase6_calls = []
+    request = {
+        "schema": "honcut.screenplay-rewrite-request.v1",
+        "reason_code": PADDING_LOSS_ERROR_CODE,
+        "attempt": 1,
+        "maximum_padding_loss_rate": 0.25,
+        "observed_padding_loss_rate": 0.357143,
+        "content_provider_request_duration_s": 56.0,
+        "content_provider_padding_duration_s": 20.0,
+    }
+
+    def run_phase1(**kwargs):
+        phase1_calls.append(kwargs.get("screenplay_rewrite_request"))
+        return {
+            "status": "done",
+            "_storyboard": {"shots": [{"shot_id": "S01"}]},
+            "_characters": {"characters": []},
+        }
+
+    def phase5_gate(*_args, **_kwargs):
+        gate_calls.append(True)
+        if len(gate_calls) == 1 or second_gate_status == "error":
+            return {
+                "status": "error",
+                "gate_passed": False,
+                "error": "padding budget blocked",
+                "correction": {
+                    "status": "requires_replanning",
+                    "recommended_restart_phase": "phase1",
+                    "global_issue_codes": [PADDING_LOSS_ERROR_CODE],
+                    "screenplay_rewrite_request": request,
+                },
+            }
+        return {"status": "done", "gate_passed": True, "grade": "A"}
+
+    monkeypatch.setattr(pipeline_core, "run_phase1", run_phase1)
+    monkeypatch.setattr(
+        pipeline_core,
+        "run_phase2",
+        lambda **_kwargs: {"status": "done"},
+    )
+    monkeypatch.setattr(
+        pipeline_core,
+        "run_phase3",
+        lambda **_kwargs: {"status": "done"},
+    )
+    monkeypatch.setattr(
+        pipeline_core,
+        "run_phase4",
+        lambda **_kwargs: {"status": "done"},
+    )
+    monkeypatch.setattr(
+        storyboard_qa_gate,
+        "run_storyboard_qa_with_correction",
+        phase5_gate,
+    )
+
+    def run_phase6(**_kwargs):
+        phase6_calls.append(True)
+        return {"status": "done"}
+
+    monkeypatch.setattr(pipeline_core, "run_phase6", run_phase6)
+    graph = pipeline_core.build_pipeline_graph(auto_approve=True).compile(
+        interrupt_after=["phase6_txt2vid"]
+    )
+    state = {
+        "input_text": "future station fixture",
+        "output_dir": str(tmp_path),
+        "target_duration_s": 36,
+        "shot_duration_s": 6,
+        "dry_run": True,
+        "storyboard": {},
+        "characters": [],
+        "storyboard_image": "",
+        "phase_results": {},
+        "completed_phases": [],
+        "skip_phase": [],
+        "status": "running",
+    }
+
+    final_state = graph.invoke(state)
+
+    assert phase1_calls == [None, request]
+    assert len(gate_calls) == 2
+    if second_gate_status == "done":
+        assert phase6_calls == [True]
+        assert final_state["phase_results"]["phase5"]["status"] == "done"
+    else:
+        assert phase6_calls == []
+        assert final_state["status"] == "failed"
+        assert final_state["phase_results"]["phase5"]["correction"][
+            "status"
+        ] == "rewrite_exhausted"
+
+
 def test_phase5_global_variation_requires_replanning_without_mutation(tmp_path):
     storyboard = json.loads(PHASE5_VARIATION_FIXTURE.read_text(encoding="utf-8"))
     storyboard_path = tmp_path / "STORYBOARD.json"
@@ -5277,6 +5466,53 @@ def test_phase5_global_variation_requires_replanning_without_mutation(tmp_path):
     ]
     assert storyboard_path.read_bytes() == before
     assert qa_calls == [tmp_path]
+    assert not (tmp_path / "phase5_corrections").exists()
+
+
+def test_phase5_padding_blocker_emits_versioned_screenplay_rewrite_request(
+    tmp_path,
+):
+    issue = storyboard_qa_gate._issue(
+        "L1",
+        "severe",
+        "content_provider_padding_loss_exceeds_limit",
+        "content Provider padding consumes 35.7%; maximum is 25.0%",
+        [],
+        content_provider_request_duration_s=56.0,
+        content_provider_padding_duration_s=20.0,
+        padding_loss_rate=0.357143,
+        maximum_padding_loss_rate=0.25,
+    )
+
+    result = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        qa_runner=lambda _output_dir: {
+            "status": "error",
+            "grade": "D",
+            "gate_passed": False,
+            "issues": [issue],
+            "failed_shot_ids": [],
+        },
+        redraw_runner=lambda *_args: pytest.fail(
+            "padding budget must replan without image redraw"
+        ),
+    )
+
+    correction = result["correction"]
+    assert correction["status"] == "requires_replanning"
+    assert correction["recommended_restart_phase"] == "phase1"
+    assert correction["replanning_policy"] == (
+        "rewrite_screenplay_once_then_fail_closed"
+    )
+    assert correction["screenplay_rewrite_request"] == {
+        "schema": "honcut.screenplay-rewrite-request.v1",
+        "reason_code": "content_provider_padding_loss_exceeds_limit",
+        "attempt": 1,
+        "maximum_padding_loss_rate": 0.25,
+        "observed_padding_loss_rate": 0.357143,
+        "content_provider_request_duration_s": 56.0,
+        "content_provider_padding_duration_s": 20.0,
+    }
     assert not (tmp_path / "phase5_corrections").exists()
 
 

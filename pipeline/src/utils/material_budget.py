@@ -16,6 +16,7 @@ MATERIAL_BUDGET_SCHEMA = "honcut.material-budget.v3"
 BRIDGE_TIMELINE_POLICY = "replace_boundary_handles"
 DEFAULT_GENERATED_DURATION_RATIO_REFERENCE = 1.3
 DEFAULT_DELIVERY_PACING_SPEED_RANGE = (0.85, 1.25)
+MAX_CONTENT_PROVIDER_PADDING_LOSS_RATE = 0.25
 
 
 def _number(value: object, default: float = 0.0) -> float:
@@ -283,6 +284,46 @@ def material_budget_contract_errors(
                 "details": budget,
             }
         )
+    content_request_duration = _number(
+        budget["content_provider_request_duration_s"]
+    )
+    content_padding_duration = _number(
+        budget["content_provider_padding_duration_s"]
+    )
+    content_request_count = sum(
+        1
+        for shot in storyboard.get("shots") or []
+        if isinstance(shot, Mapping)
+        for beat in shot.get("storyboard_beats") or []
+        if isinstance(beat, Mapping)
+    )
+    # A single short request can have unavoidable Provider-minimum padding.
+    # The hard gate targets avoidable fragmentation across multiple requests.
+    if content_request_count > 1 and content_request_duration > 0:
+        padding_loss_rate = content_padding_duration / content_request_duration
+        if padding_loss_rate > MAX_CONTENT_PROVIDER_PADDING_LOSS_RATE + 1e-6:
+            errors.append(
+                {
+                    "code": "content_provider_padding_loss_exceeds_limit",
+                    "message": (
+                        "content Provider padding consumes "
+                        f"{padding_loss_rate:.1%} of generated duration; maximum "
+                        f"is {MAX_CONTENT_PROVIDER_PADDING_LOSS_RATE:.1%}"
+                    ),
+                    "details": {
+                        "content_provider_request_duration_s": _rounded(
+                            content_request_duration
+                        ),
+                        "content_provider_padding_duration_s": _rounded(
+                            content_padding_duration
+                        ),
+                        "padding_loss_rate": _rounded(padding_loss_rate),
+                        "maximum_padding_loss_rate": (
+                            MAX_CONTENT_PROVIDER_PADDING_LOSS_RATE
+                        ),
+                    },
+                }
+            )
     for bridge in storyboard.get("primary_shot_bridges") or []:
         if not isinstance(bridge, Mapping):
             continue

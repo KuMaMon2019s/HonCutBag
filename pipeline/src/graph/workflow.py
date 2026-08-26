@@ -77,6 +77,7 @@ def build_workflow(
         "phase5",
         route_phase5,
         {
+            "rewrite": "phase1",
             "txt2vid": "phase6_txt2vid",
             "img2vid": "phase6_img2vid",
             "reference": "phase6_reference",

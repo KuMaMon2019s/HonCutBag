@@ -300,6 +300,7 @@ def run_phase1_screenwriter(
     reporter: Optional[ProgressReporter] = None,
     shot_duration: int = AVG_SHOT_DURATION,
     project_video_spec: dict[str, Any] | None = None,
+    screenplay_rewrite_request: dict[str, Any] | None = None,
     *,
     _director_runner=None,
 ) -> dict:
@@ -369,6 +370,25 @@ def run_phase1_screenwriter(
                     "outputs": outputs,
                     "dry_run_receipt": receipt_path.name,
                     "capacity_plan": capacity_plan,
+                }
+
+            dry_run_rewrite_layout = None
+            if screenplay_rewrite_request is not None:
+                from phases.phase1.adaptation_engine import (
+                    _resolve_padding_rewrite_layout,
+                    get_video_capabilities,
+                )
+
+                dry_run_rewrite_layout = _resolve_padding_rewrite_layout(
+                    capacity_plan,
+                    target_duration=max(15, int(duration or 15)),
+                    capabilities=get_video_capabilities(),
+                    rewrite_request=screenplay_rewrite_request,
+                )
+                capacity_plan = {
+                    **capacity_plan,
+                    "primary_shots": dry_run_rewrite_layout["primary_shots"],
+                    "screenplay_rewrite": dry_run_rewrite_layout,
                 }
 
             source_events = preflight["events"]
@@ -546,6 +566,7 @@ def run_phase1_screenwriter(
                 "dry_run_receipt": receipt_path.name,
                 "capacity_plan": capacity_plan,
                 "director": director,
+                "screenplay_rewrite": dry_run_rewrite_layout,
                 "_storyboard": storyboard,
                 "_characters": characters,
             }
@@ -738,6 +759,7 @@ def run_phase1_screenwriter(
             output_dir=output_dir,
             director_plan=director["plan"],
             source_events_hash=events_input_hash,
+            screenplay_rewrite_request=screenplay_rewrite_request,
         )
         adapted_shots = adapted.get("shots", [])
         print(f"    ✓ 改编完成，{len(adapted_shots)} 个镜头")
@@ -776,6 +798,8 @@ def run_phase1_screenwriter(
             ].get(
                 "generated_duration_ratio_reference"
             )
+        if adapted.get("screenplay_rewrite"):
+            storyboard["screenplay_rewrite"] = adapted["screenplay_rewrite"]
         if adapted.get("screenplay_plan"):
             screenplay_plan = adapted["screenplay_plan"]
             storyboard["screenplay_plan"] = {
@@ -868,6 +892,10 @@ def run_phase1_screenwriter(
                 "storyboard_review": review,
                 "director": director,
             }
+            if adapted.get("screenplay_rewrite"):
+                result_data["screenplay_rewrite"] = adapted[
+                    "screenplay_rewrite"
+                ]
             if review.get("grade") == "D":
                 print(f"  ⚠ [M5] 分镜审核 D 级，建议重做（但不阻断管线）")
             return result_data
@@ -881,6 +909,11 @@ def run_phase1_screenwriter(
             "_storyboard": storyboard,
             "_characters": characters_result,
             "director": director,
+            **(
+                {"screenplay_rewrite": adapted["screenplay_rewrite"]}
+                if adapted.get("screenplay_rewrite")
+                else {}
+            ),
         }
         return phase1_result
 

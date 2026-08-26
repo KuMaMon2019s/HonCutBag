@@ -129,6 +129,7 @@ def run_phase1_screenwriter(
     reporter: Optional[ProgressReporter] = None,
     shot_duration: int = AVG_SHOT_DURATION,
     project_video_spec: dict[str, Any] | None = None,
+    screenplay_rewrite_request: dict[str, Any] | None = None,
     *,
     _director_runner=None,
 ) -> dict:
@@ -147,6 +148,7 @@ def run_phase1_screenwriter(
         reporter=reporter,
         shot_duration=shot_duration,
         project_video_spec=project_video_spec,
+        screenplay_rewrite_request=screenplay_rewrite_request,
         _director_runner=_director_runner or run_phase1_director,
     )
 
@@ -159,6 +161,7 @@ def run_phase1(
     reporter: Optional[ProgressReporter] = None,
     shot_duration: int = AVG_SHOT_DURATION,
     project_video_spec: dict[str, Any] | None = None,
+    screenplay_rewrite_request: dict[str, Any] | None = None,
 ) -> dict:
     return _phase1_pipeline_owner.run_phase1(
         text,
@@ -168,6 +171,7 @@ def run_phase1(
         reporter=reporter,
         shot_duration=shot_duration,
         project_video_spec=project_video_spec,
+        screenplay_rewrite_request=screenplay_rewrite_request,
         _director_runner=run_phase1_director,
         _screenwriter_runner=run_phase1_screenwriter,
     )

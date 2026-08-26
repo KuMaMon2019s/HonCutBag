@@ -746,6 +746,105 @@ def _estimate_action_capacity_plan(
     }
 
 
+def _resolve_padding_rewrite_layout(
+    capacity_plan: Dict[str, Any],
+    *,
+    target_duration: int,
+    capabilities: VideoModelCapabilities,
+    rewrite_request: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Choose the least-loss single-request layout for one Phase 5 rewrite."""
+
+    from schemas.replanning import (
+        PADDING_LOSS_ERROR_CODE,
+        SCREENPLAY_REWRITE_REQUEST_SCHEMA,
+    )
+
+    if rewrite_request.get("schema") != SCREENPLAY_REWRITE_REQUEST_SCHEMA:
+        raise ValueError("unsupported screenplay rewrite request schema")
+    if rewrite_request.get("reason_code") != PADDING_LOSS_ERROR_CODE:
+        raise ValueError("unsupported screenplay rewrite reason")
+    if rewrite_request.get("attempt") != 1:
+        raise ValueError("screenplay padding rewrite attempt must equal 1")
+    raw_limit = rewrite_request.get("maximum_padding_loss_rate")
+    if isinstance(raw_limit, bool):
+        raise ValueError("screenplay padding rewrite limit must be numeric")
+    try:
+        maximum_padding_loss_rate = float(raw_limit)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "screenplay padding rewrite limit must be numeric"
+        ) from exc
+    if not 0 < maximum_padding_loss_rate < 1:
+        raise ValueError("screenplay padding rewrite limit must be between 0 and 1")
+
+    current_shots = int(capacity_plan.get("primary_shots") or 0)
+    mandatory_sequences = int(
+        capacity_plan.get("mandatory_sequence_count") or 1
+    )
+    if current_shots < 2:
+        raise ValueError("screenplay padding rewrite has no smaller shot layout")
+    effective_minimum, effective_maximum = capabilities.effective_duration_bounds(
+        "multi_image"
+    )
+    minimum_shots = max(
+        1,
+        mandatory_sequences,
+        math.ceil(float(target_duration) / effective_maximum),
+    )
+    maximum_shots = min(
+        current_shots - 1,
+        math.floor(float(target_duration) / effective_minimum),
+    )
+
+    for primary_shots in range(maximum_shots, minimum_shots - 1, -1):
+        base, remainder = divmod(int(target_duration), primary_shots)
+        allocations = [
+            base + (1 if index < remainder else 0)
+            for index in range(primary_shots)
+        ]
+        try:
+            request_durations = [
+                capabilities.request_duration_for_effective_story(
+                    duration,
+                    "multi_image",
+                )
+                for duration in allocations
+            ]
+        except ValueError:
+            continue
+        total_request = sum(request_durations)
+        padding = total_request - float(target_duration)
+        loss_rate = padding / total_request if total_request else 0.0
+        if loss_rate <= maximum_padding_loss_rate + 1e-6:
+            return {
+                "schema": "honcut.padding-efficient-screenplay-layout.v1",
+                "reason_code": PADDING_LOSS_ERROR_CODE,
+                "rewrite_attempt": 1,
+                "maximum_padding_loss_rate": maximum_padding_loss_rate,
+                "primary_shots": primary_shots,
+                "story_duration_allocations_s": allocations,
+                "effective_shot_duration_s": round(
+                    float(target_duration) / primary_shots
+                ),
+                "max_generation_action_units_per_primary_shot": (
+                    capabilities.max_micro_actions_per_beat
+                ),
+                "projected_content_provider_request_duration_s": round(
+                    total_request, 6
+                ),
+                "projected_content_provider_padding_duration_s": round(
+                    padding, 6
+                ),
+                "projected_padding_loss_rate": round(loss_rate, 6),
+                "capability_profile": capabilities.name,
+            }
+    raise ValueError(
+        "no screenplay layout can satisfy the Phase 5 Provider padding limit "
+        "while preserving mandatory sequence isolation"
+    )
+
+
 def _event_primary_occurrence_requirement(
     event: Dict[str, Any],
     capabilities: VideoModelCapabilities,
@@ -2702,6 +2801,7 @@ def _build_duration_scaled_event_plan(
     beat_count: int,
     effective_shot_duration: int,
     capabilities: VideoModelCapabilities | None = None,
+    max_generation_units_per_beat: int | None = None,
 ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Create a source-linked production event ledger that fits beat slots.
 
@@ -2720,6 +2820,16 @@ def _build_duration_scaled_event_plan(
         effective_shot_duration,
         profile,
     )
+    if max_generation_units_per_beat is not None:
+        if (
+            isinstance(max_generation_units_per_beat, bool)
+            or int(max_generation_units_per_beat) < 1
+        ):
+            raise ValueError("generation-unit rewrite capacity must be positive")
+        per_beat_capacity = min(
+            per_beat_capacity,
+            int(max_generation_units_per_beat),
+        )
 
     source_contracts = _source_event_generation_contracts(events)
 
@@ -3837,6 +3947,7 @@ def _build_beat_skeleton(
     shot_duration: int,
     beat_count: Optional[int] = None,
     director_plan: Optional[Dict[str, Any]] = None,
+    max_generation_units_per_beat: int | None = None,
 ) -> Dict[str, Any]:
     """Build a globally informed, bounded beat table (Stage 1)."""
     profile = get_video_capabilities()
@@ -3851,6 +3962,11 @@ def _build_beat_skeleton(
         shot_duration,
         profile,
     )
+    if max_generation_units_per_beat is not None:
+        per_beat_generation_unit_capacity = min(
+            per_beat_generation_unit_capacity,
+            int(max_generation_units_per_beat),
+        )
     sequence_beat_plan = [
         {"beat_order": index, "sequence_id": sequence}
         for index, sequence in enumerate(
@@ -4587,6 +4703,7 @@ def _layered_input_fingerprint(
     shot_duration: int,
     expected_beats: int,
     director_plan: Optional[Dict[str, Any]] = None,
+    screenplay_rewrite_request: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Bind layered checkpoints to the complete semantic adaptation input."""
     contract = {
@@ -4599,6 +4716,7 @@ def _layered_input_fingerprint(
         "director_intents": list(
             _director_intents_by_sequence(director_plan, events).values()
         ),
+        "screenplay_rewrite_request": screenplay_rewrite_request,
     }
     encoded = json.dumps(
         contract,
@@ -4680,6 +4798,7 @@ def adapt_events(
     output_dir: Optional[str | Path] = None,
     director_plan: Optional[Dict[str, Any]] = None,
     source_events_hash: Optional[str] = None,
+    screenplay_rewrite_request: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     将事件列表改编为 shot 列表
@@ -4726,6 +4845,19 @@ def adapt_events(
         target_duration,
         shot_duration,
     )
+    rewrite_layout = None
+    if screenplay_rewrite_request is not None:
+        rewrite_layout = _resolve_padding_rewrite_layout(
+            capacity_plan,
+            target_duration=target_duration,
+            capabilities=capability_profile,
+            rewrite_request=screenplay_rewrite_request,
+        )
+        capacity_plan = {
+            **capacity_plan,
+            "primary_shots": rewrite_layout["primary_shots"],
+            "screenplay_rewrite": rewrite_layout,
+        }
     max_shots = capacity_plan["primary_shots"]
     material_duration = capacity_plan["material_duration"]
     effective_shot_duration = max(
@@ -4742,6 +4874,13 @@ def adapt_events(
             beat_count=max_shots,
             effective_shot_duration=effective_shot_duration,
             capabilities=capability_profile,
+            max_generation_units_per_beat=(
+                rewrite_layout[
+                    "max_generation_action_units_per_primary_shot"
+                ]
+                if rewrite_layout is not None
+                else None
+            ),
         )
     )
     if duration_scaled_event_plan["intra_event_scaling_applied"]:
@@ -4765,6 +4904,11 @@ def adapt_events(
 
     def _run_layered_adaptation() -> Dict[str, Any]:
         checkpoint_dir = Path(output_dir) if output_dir is not None else None
+        fingerprint_kwargs = {}
+        if screenplay_rewrite_request is not None:
+            fingerprint_kwargs["screenplay_rewrite_request"] = (
+                screenplay_rewrite_request
+            )
         layered_fingerprint = _layered_input_fingerprint(
             production_events,
             characters_summary,
@@ -4772,6 +4916,7 @@ def adapt_events(
             effective_shot_duration,
             max_shots,
             director_plan,
+            **fingerprint_kwargs,
         )
         skeleton = None
         resumed_shots: List[Dict[str, Any]] = []
@@ -4783,6 +4928,13 @@ def adapt_events(
                 layered_fingerprint,
             )
         if skeleton is None:
+            skeleton_kwargs = {}
+            if rewrite_layout is not None:
+                skeleton_kwargs["max_generation_units_per_beat"] = (
+                    rewrite_layout[
+                        "max_generation_action_units_per_primary_shot"
+                    ]
+                )
             skeleton = _build_beat_skeleton(
                 production_events,
                 characters_summary,
@@ -4790,6 +4942,7 @@ def adapt_events(
                 effective_shot_duration,
                 max_shots,
                 director_plan,
+                **skeleton_kwargs,
             )
             skeleton["_checkpoint"] = {
                 "schema": LAYERED_CHECKPOINT_SCHEMA,
@@ -4874,6 +5027,7 @@ def adapt_events(
             "delivery_target_duration": target_duration,
             "material_duration": material_duration,
             "capacity_plan": reconciled_capacity_plan,
+            "screenplay_rewrite": rewrite_layout,
             "screenplay_plan": screenplay_plan,
             "duration_scaled_event_plan": duration_scaled_event_plan,
             "screenplay_plan_sha256": screenplay_plan_sha256,

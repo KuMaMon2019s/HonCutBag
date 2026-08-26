@@ -24,6 +24,10 @@ from phases.phase2.phase2_storyboard import run_phase2
 from phases.phase3.phase3_character import run_phase3
 from phases.phase4.phase4_orchestrator import run_phase4
 from phases.phase5.supervision import _run_storyboard_supervision
+from phases.phase5.replanning import (
+    MAX_PADDING_SCREENPLAY_REWRITES,
+    rewrite_request_from_receipt,
+)
 from phases.phase6.phase6_video_gen import run_phase6
 from phases.phase7.phase7_consistency import run_phase7
 from phases.phase8.phase8_assembly import run_phase8
@@ -300,6 +304,9 @@ def _run_pipeline(
     character_library_dir: str | None = None,
     *,
     _phase_owner=None,
+    _screenplay_rewrite_request: dict[str, Any] | None = None,
+    _screenplay_rewrite_attempt: int = 0,
+    _force_sequential: bool = False,
 ) -> dict:
     """
     主入口：端到端管线
@@ -474,7 +481,10 @@ def _run_pipeline(
     reporter = ProgressReporter(
         str(output_path),
         total_phases=len(PHASE_ORDER),
-        clear_events=not os.environ.get("HONCUT_APPEND_EVENTS"),
+        clear_events=(
+            _screenplay_rewrite_attempt == 0
+            and not os.environ.get("HONCUT_APPEND_EVENTS")
+        ),
     )
 
     # --- M6: 产物链（增量）---
@@ -544,6 +554,12 @@ def _run_pipeline(
         "resumed": resume,
         "phases": {},
     }
+    if _screenplay_rewrite_attempt:
+        report["screenplay_rewrite"] = {
+            "attempts_used": _screenplay_rewrite_attempt,
+            "max_attempts": MAX_PADDING_SCREENPLAY_REWRITES,
+            "request": _screenplay_rewrite_request,
+        }
 
     print(f"\n{'#'*60}")
     print(f"  Honcut AI Video Pipeline")
@@ -591,7 +607,7 @@ def _run_pipeline(
     print(f"{'#'*60}")
 
     # --- LangGraph StateGraph execution path ---
-    if LANGGRAPH_AVAILABLE and not skip_phase and (
+    if not _force_sequential and LANGGRAPH_AVAILABLE and not skip_phase and (
         not resume or not completed_phases or resume_uses_graph
     ):
         print(f"\n  🚀 Using LangGraph StateGraph for pipeline execution")
@@ -749,7 +765,7 @@ def _run_pipeline(
             return report
     
     # --- Sequential execution (fallback or when skip_phase is used) ---
-    if LANGGRAPH_AVAILABLE and not skip_phase and (
+    if not _force_sequential and LANGGRAPH_AVAILABLE and not skip_phase and (
         not resume or not completed_phases or resume_uses_graph
     ):
         pass  # Already tried above
@@ -778,14 +794,21 @@ def _run_pipeline(
         print(f"  🔄 Phase 1: 从 checkpoint 恢复 (已跳过)")
     else:
         reporter.phase_start("phase1", "导演拆解 + 编剧引擎")
+        phase1_kwargs = {
+            "reporter": reporter,
+            "shot_duration": shot_duration,
+            "project_video_spec": project_video_spec,
+        }
+        if _screenplay_rewrite_request is not None:
+            phase1_kwargs["screenplay_rewrite_request"] = (
+                _screenplay_rewrite_request
+            )
         p2 = run_phase1(
             text,
             output_path,
             duration,
             dry_run,
-            reporter=reporter,
-            shot_duration=shot_duration,
-            project_video_spec=project_video_spec,
+            **phase1_kwargs,
         )
         # 提取内部数据（不写入 report）
         storyboard_data = p2.pop("_storyboard", None)
@@ -999,6 +1022,68 @@ def _run_pipeline(
         report["phases"]["phase5"] = p4_5
         reporter.phase_done("phase5", f"分镜质检 {p4_5.get('grade', '?')} 级", duration_s=p4_5.get("duration_s"))
         if p4_5["status"] == "error":
+            rewrite_request = rewrite_request_from_receipt(p4_5)
+            if (
+                rewrite_request is not None
+                and _screenplay_rewrite_attempt
+                < MAX_PADDING_SCREENPLAY_REWRITES
+                and not ({1, 2, 3, 4, 5} & set(skip_phase))
+            ):
+                print(
+                    "  ↩ Phase 5 Provider padding 超过阈值：返回 Phase 1 "
+                    "执行唯一一次编剧重写"
+                )
+                from utils.artifact_chain import (
+                    PHASE_SEQUENCE,
+                    invalidate_checkpoints_from,
+                )
+
+                invalidate_stage_checkpoint(
+                    _checkpoint_path(output_path),
+                    "phase1",
+                    PHASE_SEQUENCE,
+                )
+                invalidate_checkpoints_from("phase1", output_path)
+                return _run_pipeline(
+                    text=text,
+                    duration=duration,
+                    shot_duration=shot_duration,
+                    chain_mode=chain_mode,
+                    dry_run=dry_run,
+                    skip_phase=skip_phase,
+                    output_dir=str(output_path),
+                    transition=transition,
+                    transition_duration=transition_duration,
+                    media_profile=media_profile,
+                    enable_reshoot=enable_reshoot,
+                    no_real_person=no_real_person,
+                    resume=False,
+                    auto_approve=auto_approve,
+                    project_id=project_id,
+                    character_library_dir=resolved_character_library_dir,
+                    _phase_owner=phase_owner,
+                    _screenplay_rewrite_request=rewrite_request,
+                    _screenplay_rewrite_attempt=(
+                        _screenplay_rewrite_attempt + 1
+                    ),
+                    _force_sequential=True,
+                )
+            if rewrite_request is not None and _screenplay_rewrite_attempt:
+                correction = dict(p4_5.get("correction") or {})
+                correction.update(
+                    status="rewrite_exhausted",
+                    screenplay_rewrite_attempt=_screenplay_rewrite_attempt,
+                )
+                p4_5 = {
+                    **p4_5,
+                    "correction": correction,
+                    "error": (
+                        "Phase 5 padding budget still blocks Phase 6 after "
+                        f"{_screenplay_rewrite_attempt}/"
+                        f"{MAX_PADDING_SCREENPLAY_REWRITES} screenplay rewrite"
+                    ),
+                }
+                report["phases"]["phase5"] = p4_5
             reporter.mark_failed(p4_5.get("error", "Phase 5 blocked Phase 6"))
             report["status"] = "failed"
             report["error"] = p4_5.get("error", "Phase 5 blocked Phase 6")

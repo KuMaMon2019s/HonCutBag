@@ -9,6 +9,11 @@ from langgraph.graph import END
 from langgraph.types import Command
 
 from graph.state import HonCutState
+from phases.phase5.replanning import (
+    MAX_PADDING_SCREENPLAY_REWRITES,
+    rewrite_attempt_from_receipt,
+    rewrite_request_from_receipt,
+)
 
 
 class Phase5QaRunner(Protocol):
@@ -37,6 +42,7 @@ def phase5_node(
     """Run the existing QA and supervision gates without owning their logic."""
 
     output_dir = Path(state["output_dir"])
+    previous_phase_receipt = state.get("phase_results", {}).get("phase5")
     phase_receipt = qa_runner(output_dir)
     update: dict[str, Any] = {
         "phase_results": {
@@ -48,6 +54,43 @@ def phase5_node(
         "skip_phase": state.get("skip_phase", []),
     }
     if phase_receipt.get("status") == "error":
+        rewrite_request = rewrite_request_from_receipt(phase_receipt)
+        previous_attempt = rewrite_attempt_from_receipt(previous_phase_receipt)
+        if (
+            rewrite_request is not None
+            and previous_attempt < MAX_PADDING_SCREENPLAY_REWRITES
+        ):
+            correction = dict(phase_receipt.get("correction") or {})
+            correction.update(
+                status="rewrite_scheduled",
+                screenplay_rewrite_attempt=previous_attempt + 1,
+            )
+            scheduled_receipt = {
+                **phase_receipt,
+                "correction": correction,
+            }
+            update["phase_results"]["phase5"] = scheduled_receipt
+            update.update(
+                status="running",
+                completed_phases=[],
+            )
+            return update
+        if rewrite_request is not None:
+            correction = dict(phase_receipt.get("correction") or {})
+            correction.update(
+                status="rewrite_exhausted",
+                screenplay_rewrite_attempt=previous_attempt,
+            )
+            phase_receipt = {
+                **phase_receipt,
+                "correction": correction,
+                "error": (
+                    "Phase 5 padding budget still blocks Phase 6 after "
+                    f"{previous_attempt}/{MAX_PADDING_SCREENPLAY_REWRITES} "
+                    "screenplay rewrite"
+                ),
+            }
+            update["phase_results"]["phase5"] = phase_receipt
         update.update(
             status="failed",
             error=phase_receipt.get("error", "Phase 5 blocked Phase 6"),

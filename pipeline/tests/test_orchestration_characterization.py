@@ -284,6 +284,7 @@ def test_workflow_topology_and_terminal_routes_are_stable():
     phase5_branch = next(iter(graph.branches["phase5"].values()))
     phase7_branch = next(iter(graph.branches["phase7"].values()))
     assert phase5_branch.ends == {
+        "rewrite": "phase1",
         "txt2vid": "phase6_txt2vid",
         "img2vid": "phase6_img2vid",
         "reference": "phase6_reference",

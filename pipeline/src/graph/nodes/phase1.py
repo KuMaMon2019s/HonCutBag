@@ -9,6 +9,7 @@ from langgraph.graph import END
 from langgraph.types import Command
 
 from graph.state import HonCutState
+from phases.phase5.replanning import rewrite_request_from_receipt
 
 
 class Phase1Runner(Protocol):
@@ -23,6 +24,7 @@ class Phase1Runner(Protocol):
         reporter: Any | None = None,
         shot_duration: int = ...,
         project_video_spec: dict[str, Any] | None = ...,
+        screenplay_rewrite_request: dict[str, Any] | None = ...,
     ) -> dict[str, Any]: ...
 
 
@@ -35,21 +37,38 @@ def phase1_node(
 ) -> dict[str, Any] | Command:
     """Call Phase 1 and return its existing compatibility State patch."""
 
-    phase_receipt = runner(
-        text=(state["input_text"] if "input_text" in state else state["text"]),
-        output_dir=Path(state["output_dir"]),
-        duration=(
+    runner_kwargs = {
+        "text": (state["input_text"] if "input_text" in state else state["text"]),
+        "output_dir": Path(state["output_dir"]),
+        "duration": (
             state["target_duration_s"]
             if "target_duration_s" in state
             else state["duration"]
         ),
-        dry_run=state["dry_run"],
-        reporter=reporter,
-        shot_duration=state.get(
+        "dry_run": state["dry_run"],
+        "reporter": reporter,
+        "shot_duration": state.get(
             "shot_duration_s",
             state.get("shot_duration", default_shot_duration),
         ),
-        project_video_spec=state.get("project_video_spec"),
+        "project_video_spec": state.get("project_video_spec"),
+    }
+    previous_phase5 = state.get("phase_results", {}).get("phase5")
+    rewrite_request = rewrite_request_from_receipt(previous_phase5)
+    correction = (
+        previous_phase5.get("correction")
+        if isinstance(previous_phase5, dict)
+        else None
+    )
+    if (
+        rewrite_request is not None
+        and isinstance(correction, dict)
+        and correction.get("status") == "rewrite_scheduled"
+    ):
+        runner_kwargs["screenplay_rewrite_request"] = rewrite_request
+
+    phase_receipt = runner(
+        **runner_kwargs,
     )
 
     storyboard = phase_receipt.pop("_storyboard", None)

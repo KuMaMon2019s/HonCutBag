@@ -3320,6 +3320,10 @@ def run_storyboard_qa_with_correction(
 
     global_issues = _global_uncorrectable_issues(result)
     if result.get("gate_passed") is not True and global_issues:
+        from phases.phase5.replanning import (
+            build_padding_screenplay_rewrite_request,
+        )
+
         issue_codes = sorted({
             str(issue.get("code") or "unknown") for issue in global_issues
         })
@@ -3343,6 +3347,12 @@ def run_storyboard_qa_with_correction(
             "history": [],
             "final_gate_passed": False,
         }
+        rewrite_request = build_padding_screenplay_rewrite_request(global_issues)
+        if restart_phase == "phase1" and rewrite_request is not None:
+            correction["replanning_policy"] = (
+                "rewrite_screenplay_once_then_fail_closed"
+            )
+            correction["screenplay_rewrite_request"] = rewrite_request
         result = {
             **result,
             "status": "error",

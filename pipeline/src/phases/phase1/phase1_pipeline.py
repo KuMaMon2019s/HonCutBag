@@ -21,6 +21,7 @@ def run_phase1(
     reporter: Optional[ProgressReporter] = None,
     shot_duration: int = AVG_SHOT_DURATION,
     project_video_spec: dict[str, Any] | None = None,
+    screenplay_rewrite_request: dict[str, Any] | None = None,
     *,
     _director_runner=None,
     _screenwriter_runner=None,
@@ -56,6 +57,7 @@ def run_phase1(
             reporter=reporter,
             shot_duration=shot_duration,
             project_video_spec=project_video_spec,
+            screenplay_rewrite_request=screenplay_rewrite_request,
             _director_runner=director_runner,
         )
     finally:

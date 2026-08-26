@@ -39,6 +39,10 @@ from utils.action_units import (  # noqa: E402
     normalize_event_action_units,
     normalized_action_unit_count,
 )
+from utils.material_budget import (  # noqa: E402
+    attach_material_budget,
+    material_budget_contract_errors,
+)
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "flashmob_60s_events.json"
 EVOLVING_FIXTURE = (
@@ -1108,6 +1112,146 @@ def test_provider_request_padding_does_not_consume_story_clock():
     assert storyboard["material_budget"][
         "provider_request_duration_is_story_clock_limit"
     ] is False
+
+
+def test_36s_dense_plan_preserves_semantic_slots_before_padding_gate():
+    """The cost gate must not hide semantic loss by silently dropping a cut."""
+    events = [{
+        "event_role": "action_chain",
+        "sequence_id": "SEQ001",
+        "micro_actions": [f"有序动作{index}" for index in range(45)],
+    }]
+
+    plan = engine._estimate_action_capacity_plan(events, 36, 6)
+
+    assert plan["action_capacity_status"] == "screenplay_compression_required"
+    assert plan["structural_shots"] == 8
+    assert plan["primary_shots"] == 7
+
+
+def test_padding_rewrite_compresses_36s_plan_to_six_single_request_beats():
+    events = [{
+        "event_role": "action_chain",
+        "sequence_id": "SEQ001",
+        "micro_actions": [f"有序动作{index}" for index in range(45)],
+    }]
+    profile = engine.get_video_capabilities()
+    capacity_plan = engine._estimate_action_capacity_plan(events, 36, 6)
+    request = {
+        "schema": "honcut.screenplay-rewrite-request.v1",
+        "reason_code": "content_provider_padding_loss_exceeds_limit",
+        "attempt": 1,
+        "maximum_padding_loss_rate": 0.25,
+    }
+
+    layout = engine._resolve_padding_rewrite_layout(
+        capacity_plan,
+        target_duration=36,
+        capabilities=profile,
+        rewrite_request=request,
+    )
+    production_events, scaled = engine._build_duration_scaled_event_plan(
+        events,
+        target_duration=36,
+        beat_count=layout["primary_shots"],
+        effective_shot_duration=layout["effective_shot_duration_s"],
+        capabilities=profile,
+        max_generation_units_per_beat=layout[
+            "max_generation_action_units_per_primary_shot"
+        ],
+    )
+
+    assert layout["primary_shots"] == 6
+    assert layout["projected_content_provider_request_duration_s"] == 48.0
+    assert layout["projected_padding_loss_rate"] == 0.25
+    assert layout["max_generation_action_units_per_primary_shot"] == 2
+    assert scaled["production_generation_action_units"] == 12
+    assert len(production_events) == 1
+
+    normal_fingerprint = engine._layered_input_fingerprint(
+        production_events,
+        "",
+        36,
+        6,
+        6,
+    )
+    rewrite_fingerprint = engine._layered_input_fingerprint(
+        production_events,
+        "",
+        36,
+        6,
+        6,
+        screenplay_rewrite_request=request,
+    )
+    assert rewrite_fingerprint != normal_fingerprint
+
+
+def test_material_budget_rejects_content_padding_loss_above_25_percent():
+    def storyboard_for(durations: list[int]) -> dict:
+        storyboard = {
+            "delivery_target_duration": 36,
+            "secondary_storyboard_version": "honcut.secondary-storyboard.v15",
+            "shots": [
+                {
+                    "id": f"S{index:02d}",
+                    "duration": duration,
+                    "storyboard_beats": [{
+                        "beat_id": f"S{index:02d}_P01",
+                        "duration_s": duration,
+                        "effective_story_duration_s": duration,
+                        "provider_request_duration_s": 8,
+                        "provider_minimum_padding_duration_s": 8 - duration,
+                    }],
+                }
+                for index, duration in enumerate(durations, 1)
+            ],
+        }
+        attach_material_budget(storyboard)
+        return storyboard
+
+    inefficient = storyboard_for([6, 5, 5, 5, 5, 5, 5])
+    efficient = storyboard_for([6, 6, 6, 6, 6, 6])
+
+    errors = material_budget_contract_errors(inefficient)
+    padding_error = next(
+        error
+        for error in errors
+        if error["code"] == "content_provider_padding_loss_exceeds_limit"
+    )
+    assert padding_error["details"] == {
+        "content_provider_request_duration_s": 56.0,
+        "content_provider_padding_duration_s": 20.0,
+        "padding_loss_rate": 0.357143,
+        "maximum_padding_loss_rate": 0.25,
+    }
+    assert material_budget_contract_errors(efficient) == []
+
+
+def test_phase1_persists_over_limit_padding_ledger_for_phase5_rewrite():
+    storyboard = {
+        "delivery_target_duration": 36,
+        "shots": [
+            {
+                "id": f"S{index:02d}",
+                "duration": duration,
+                "micro_actions": [f"动作{index}"],
+            }
+            for index, duration in enumerate([6, 5, 5, 5, 5, 5, 5], 1)
+        ],
+    }
+
+    planned = plan_storyboard_beats(storyboard)
+    errors = material_budget_contract_errors(planned)
+
+    assert planned["material_budget"][
+        "content_provider_request_duration_s"
+    ] == 56.0
+    assert planned["material_budget"][
+        "content_provider_padding_duration_s"
+    ] == 20.0
+    assert [error["code"] for error in errors] == [
+        "content_provider_padding_loss_exceeds_limit"
+    ]
 
 
 def test_generic_dense_actions_report_screenplay_compression_pressure():

@@ -11,7 +11,7 @@ MAX_QUALITY_ATTEMPTS = 2
 MAX_RESHOOT_ATTEMPTS = 2
 
 VideoGenerationMode = Literal["txt2vid", "img2vid", "reference"]
-Phase5Route = Literal["txt2vid", "img2vid", "reference", "block"]
+Phase5Route = Literal["rewrite", "txt2vid", "img2vid", "reference", "block"]
 QARoute = Literal["generate", "repair", "failed"]
 ConsistencyRoute = Literal["assemble", "regenerate", "failed"]
 AssemblyRoute = Literal["post_process", "reshoot", "failed"]
@@ -37,12 +37,18 @@ def route_phase5(state: Mapping[str, Any]) -> Phase5Route:
     """Select the concrete Phase 6 node from checkpoint-safe graph state."""
 
     phase_receipt = state.get("phase_results", {}).get("phase5", {})
+    if state.get("status") == "failed":
+        return "block"
+    if isinstance(phase_receipt, Mapping):
+        correction = phase_receipt.get("correction")
+        if (
+            isinstance(correction, Mapping)
+            and correction.get("status") == "rewrite_scheduled"
+        ):
+            return "rewrite"
     if (
-        state.get("status") == "failed"
-        or (
-            isinstance(phase_receipt, Mapping)
-            and phase_receipt.get("status") == "error"
-        )
+        isinstance(phase_receipt, Mapping)
+        and phase_receipt.get("status") == "error"
     ):
         return "block"
 
