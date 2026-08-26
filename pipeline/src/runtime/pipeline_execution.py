@@ -6,7 +6,9 @@ import json
 import os
 import sys
 import traceback
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 try:
     from langgraph.errors import GraphInterrupt
@@ -50,6 +52,90 @@ from utils.media_profiles import (
 )
 from utils.progress_reporter import ProgressReporter
 from utils.source_paths import PROJECT_ROOT
+
+
+_GRAPH_PROGRESS_PHASES = {
+    "phase1": ("phase1", "导演拆解 + 编剧引擎"),
+    "phase2": ("phase2", "故事板图片生成"),
+    "phase3": ("phase3", "角色工厂"),
+    "phase4": ("phase4", "编排器"),
+    "phase5": ("phase5", "分镜质检闸门"),
+    "phase6_txt2vid": ("phase6", "视频生成"),
+    "phase6_img2vid": ("phase6", "视频生成"),
+    "phase6_reference": ("phase6", "视频生成"),
+    "phase7": ("phase7", "一致性检查"),
+    "phase8": ("phase8", "剪辑与有限补拍"),
+    "phase9": ("phase9", "音频与后期"),
+    "phase9_5": ("phase9_5", "成片交付质检"),
+}
+
+
+def _stream_graph_with_progress(
+    app: Any,
+    invocation_input: Any,
+    *,
+    config: dict[str, Any],
+    reporter: ProgressReporter,
+) -> dict[str, Any]:
+    """Run the graph while deriving progress from LangGraph task events.
+
+    Progress belongs to the lifecycle, not to graph nodes. Task events expose
+    the exact node that is about to run, so long Phase calls update
+    ``progress.json`` before they begin without adding file I/O to node owners.
+    """
+
+    final_state: Mapping[str, Any] | None = None
+    for stream_mode, event in app.stream(
+        invocation_input,
+        config=config,
+        stream_mode=["tasks", "values"],
+    ):
+        if stream_mode == "values":
+            if isinstance(event, Mapping):
+                final_state = event
+            continue
+        if stream_mode != "tasks" or not isinstance(event, Mapping):
+            continue
+
+        phase = _GRAPH_PROGRESS_PHASES.get(str(event.get("name") or ""))
+        if phase is None:
+            continue
+        phase_id, phase_name = phase
+
+        if "input" in event:
+            reporter.phase_start(phase_id, phase_name)
+            continue
+        if "result" not in event:
+            continue
+
+        result = event.get("result")
+        result_status = ""
+        phase_receipt: Mapping[str, Any] | None = None
+        if isinstance(result, Mapping):
+            result_status = str(result.get("status") or "")
+            phase_results = result.get("phase_results")
+            if isinstance(phase_results, Mapping):
+                candidate = phase_results.get(phase_id)
+                if isinstance(candidate, Mapping):
+                    phase_receipt = candidate
+                    result_status = str(candidate.get("status") or result_status)
+        if event.get("error") is not None or result_status in {
+            "error",
+            "failed",
+            "blocked",
+        }:
+            continue
+
+        duration_s = phase_receipt.get("duration_s") if phase_receipt else None
+        reporter.phase_done(
+            phase_id,
+            f"{phase_name}完成",
+            duration_s=duration_s,
+        )
+
+    if final_state is None:
+        raise RuntimeError("LangGraph stream ended without a final state")
+    return dict(final_state)
 
 
 def run_pipeline(
@@ -487,7 +573,12 @@ def _run_pipeline(
             
             # Execute the graph
             try:
-                final_state = app.invoke(invocation_input, config=config)
+                final_state = _stream_graph_with_progress(
+                    app,
+                    invocation_input,
+                    config=config,
+                    reporter=reporter,
+                )
 
                 pending_interrupts = final_state.get("__interrupt__", ())
                 if pending_interrupts:
