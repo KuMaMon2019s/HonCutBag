@@ -248,7 +248,11 @@ class FrameEvidence(StrictUnderstandingModel):
 
 
 class FirstFrameIssue(StrictUnderstandingModel):
-    code: Literal["ANNOTATION_CONTAMINATION", "STYLE_MISMATCH"]
+    code: Literal[
+        "ANNOTATION_CONTAMINATION",
+        "STYLE_MISMATCH",
+        "SUBJECT_DUPLICATION",
+    ]
     severity: Literal["severe", "moderate", "minor"]
     frame_ids: list[str]
     message: str

@@ -5117,6 +5117,221 @@ def test_phase5_l4_issue_restarts_phase4_without_redrawing_previs(tmp_path):
     assert result["correction"]["attempts_used"] == 0
 
 
+def test_phase5_local_l4_contamination_uses_only_cinematic_correction(tmp_path):
+    l4_issue = storyboard_qa_gate._issue(
+        "L4", "severe", "first_frame_annotation_contamination",
+        "S04 contains a transparent duplicate of the same protagonist", ["S04"],
+        frame_ids=["S04_P01", "S04_P02"],
+        expected="one physically coherent protagonist per frame",
+        observed="a second translucent copy overlaps the protagonist",
+        confidence=0.96,
+        frame_evidence=[
+            {"frame_id": "S04_P01", "observed": "duplicate torso behind protagonist"},
+            {"frame_id": "S04_P02", "observed": "two copies of face and coat overlap"},
+        ],
+        evidence_status="validated",
+    )
+    l3_issue = storyboard_qa_gate._issue(
+        "L3", "severe", "R4", "S04_P02 has the wrong end state", ["S04"],
+        storyboard_ids=["S04_P02"],
+        expected="the protagonist controls the opponent's arm",
+        observed="the opponent remains unrestrained",
+        panel_evidence=[{
+            "shot_id": "S04_P02", "observed": "the opponent remains unrestrained",
+        }],
+    )
+    qa_results = iter([
+        {
+            "status": "error", "grade": "D", "gate_passed": False,
+            "issues": [l4_issue, l3_issue], "failed_shot_ids": ["S04"],
+        },
+        {
+            "status": "error", "grade": "C", "gate_passed": False,
+            "issues": [l3_issue], "failed_shot_ids": ["S04"],
+        },
+    ])
+    cinematic_calls = []
+
+    def redraw_cinematic(output_dir, frame_ids, issues, attempt):
+        cinematic_calls.append((output_dir, frame_ids, issues, attempt))
+        return {"status": "redrawn", "frame_ids": frame_ids, "attempt": attempt}
+
+    result = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        max_correction_attempts=2,
+        qa_runner=lambda _output_dir: next(qa_results),
+        redraw_runner=lambda *_args: pytest.fail(
+            "one correction run must not mix L4 cinematic and L3 PREVIS redraws"
+        ),
+        cinematic_redraw_runner=redraw_cinematic,
+    )
+
+    assert len(cinematic_calls) == 1
+    assert cinematic_calls[0][0] == tmp_path
+    assert cinematic_calls[0][1] == ["S04_P01", "S04_P02"]
+    assert cinematic_calls[0][2] == [l4_issue]
+    assert cinematic_calls[0][3] == 1
+    assert result["gate_passed"] is False
+    assert result["correction"]["correction_family"] == "cinematic_first_frame"
+    assert result["correction"]["attempts_used"] == 1
+    assert result["correction"]["history"][0]["frame_ids"] == [
+        "S04_P01", "S04_P02",
+    ]
+
+
+def test_phase5_local_l4_contamination_correction_is_bounded(tmp_path):
+    l4_issue = storyboard_qa_gate._issue(
+        "L4", "severe", "first_frame_annotation_contamination",
+        "S04_P01 contains a duplicate protagonist", ["S04"],
+        frame_ids=["S04_P01"],
+        expected="one protagonist",
+        observed="two overlapping copies of the protagonist",
+        confidence=0.97,
+        frame_evidence=[{
+            "frame_id": "S04_P01",
+            "observed": "two overlapping copies of the protagonist",
+        }],
+        evidence_status="validated",
+    )
+    qa_calls = 0
+    redraw_attempts = []
+
+    def qa(_output_dir):
+        nonlocal qa_calls
+        qa_calls += 1
+        return {
+            "status": "error", "grade": "C", "gate_passed": False,
+            "issues": [l4_issue], "failed_shot_ids": ["S04"],
+        }
+
+    def redraw_cinematic(_output_dir, frame_ids, _issues, attempt):
+        redraw_attempts.append((attempt, frame_ids))
+        return {"status": "redrawn", "attempt": attempt}
+
+    result = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        max_correction_attempts=2,
+        qa_runner=qa,
+        cinematic_redraw_runner=redraw_cinematic,
+    )
+
+    assert qa_calls == 3
+    assert redraw_attempts == [(1, ["S04_P01"]), (2, ["S04_P01"])]
+    assert result["status"] == "error"
+    assert result["gate_passed"] is False
+    assert result["correction"]["attempts_used"] == 2
+
+
+def test_phase5_default_l4_correction_preserves_unrelated_cinematic_frames(
+    tmp_path,
+    monkeypatch,
+):
+    from PIL import Image
+
+    class UnusedStyleClassifier:
+        def classify(self, _path):
+            pytest.fail("fixture has no director panels to classify")
+
+    monkeypatch.setattr(
+        "utils.clip_style_classifier.ClipStyleClassifier",
+        UnusedStyleClassifier,
+    )
+    _write_project_visual_style(tmp_path, "photorealistic cinematic blue train interior")
+    storyboard = {
+        "aspect_ratio": "16:9",
+        "shots": [
+            {
+                "id": "S04",
+                "where": "future train interior",
+                "storyboard_beats": [
+                    {"beat_id": "S04_P01", "action": "protagonist raises chip"},
+                    {"beat_id": "S04_P02", "action": "shield stabilizes"},
+                ],
+            },
+            {
+                "id": "S05",
+                "where": "future train interior",
+                "storyboard_beats": [
+                    {"beat_id": "S05_P01", "action": "train enters tunnel"},
+                ],
+            },
+        ],
+    }
+    calls = []
+
+    class FakeClient:
+        model = "fake-seedream"
+
+        def _render(self, output_path):
+            calls.append(Path(output_path).stem)
+            color = (len(calls) * 40 % 255, 24, 96)
+            Image.new("RGB", (1280, 720), color).save(output_path)
+
+        def text_to_image(self, prompt, output_path, size, timeout=180):
+            self._render(output_path)
+            return "offline://text-to-image"
+
+        def image_to_image(self, prompt, ref_image, output_path, size):
+            self._render(output_path)
+            return "offline://image-to-image"
+
+    client = FakeClient()
+    generate_cinematic_first_frames(tmp_path, storyboard, [], client=client)
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps(storyboard), encoding="utf-8"
+    )
+    (tmp_path / "CHARACTERS.json").write_text(
+        json.dumps({"characters": []}), encoding="utf-8"
+    )
+    untouched_path = tmp_path / "video_first_frames/S05_P01.png"
+    untouched_sha256 = hashlib.sha256(untouched_path.read_bytes()).hexdigest()
+    l4_issue = storyboard_qa_gate._issue(
+        "L4", "severe", "first_frame_subject_duplication",
+        "S04 first frames duplicate the protagonist", ["S04"],
+        frame_ids=["S04_P01", "S04_P02"],
+        expected="one protagonist",
+        observed="a transparent duplicate of the protagonist",
+        confidence=0.98,
+        frame_evidence=[
+            {"frame_id": "S04_P01", "observed": "duplicate face and coat"},
+            {"frame_id": "S04_P02", "observed": "duplicate torso and arm"},
+        ],
+        evidence_status="validated",
+    )
+    qa_results = iter([
+        {
+            "status": "error", "grade": "C", "gate_passed": False,
+            "issues": [l4_issue], "failed_shot_ids": ["S04"],
+        },
+        {
+            "status": "done", "grade": "A", "gate_passed": True,
+            "issues": [], "failed_shot_ids": [],
+        },
+    ])
+
+    def qa(output_dir):
+        report = next(qa_results)
+        (output_dir / "storyboard_qa_report.json").write_text(
+            json.dumps(report), encoding="utf-8"
+        )
+        return report
+
+    result = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        max_correction_attempts=2,
+        qa_runner=qa,
+        image_client=client,
+    )
+
+    assert result["gate_passed"] is True
+    assert calls == ["S04_P01", "S04_P02", "S05_P01", "S04_P01", "S04_P02"]
+    assert hashlib.sha256(untouched_path.read_bytes()).hexdigest() == untouched_sha256
+    redraw = result["correction"]["history"][0]["redraw"]
+    assert redraw["frame_ids"] == ["S04_P01", "S04_P02"]
+    assert redraw["dependency_frame_ids"] == ["S04_P01", "S04_P02"]
+    assert (tmp_path / redraw["archive"]["archive_dir"] / "redraw_receipt.json").is_file()
+
+
 @pytest.mark.parametrize("shot_count", [3, 5, 8])
 def test_variation_check_is_pure_for_different_storyboard_shapes(shot_count):
     scenes = [
@@ -6059,6 +6274,7 @@ def test_phase4_l4_rejection_invalidates_rejected_frame_cache_once(tmp_path):
     assert "L4 定向纠偏合同" in prompts[-1]
     assert "本轮必须呈现：幕布平面上的镂空皮影" in prompts[-1]
     assert "严禁再次呈现：幕前实体三维人偶" in prompts[-1]
+    assert "禁止同一已声明角色出现透明复写、双重曝光或重复实例" in prompts[-1]
     generate_cinematic_first_frames(tmp_path, storyboard, [], client=client)
     assert calls == ["S02_P01", "S02_P02", "S02_P01"]
 
@@ -6120,6 +6336,55 @@ def test_phase5_first_frame_review_blocks_style_and_annotation_pollution(tmp_pat
 
     assert layer["status"] == "completed"
     assert issues[0]["code"] == "first_frame_annotation_contamination"
+    assert issues[0]["severity"] == "severe"
+    assert storyboard_qa_gate.is_blocking_issue(issues[0]) is True
+
+
+def test_phase5_first_frame_review_classifies_duplicate_subjects(tmp_path):
+    from PIL import Image
+
+    frame = tmp_path / "S04_P01.png"
+    Image.effect_noise((320, 180), 80).convert("RGB").save(frame)
+    storyboard = {
+        "shots": [{
+            "id": "S04",
+            "storyboard_beats": [{
+                "beat_id": "S04_P01",
+                "video_first_frame_kind": CINEMATIC_FIRST_FRAME_SCHEMA,
+            }],
+        }],
+    }
+
+    class ReviewClient:
+        def review(self, paths, prompt):
+            assert paths == [frame]
+            assert "SUBJECT_DUPLICATION" in prompt
+            return json.dumps({
+                "issues": [{
+                    "code": "SUBJECT_DUPLICATION",
+                    "severity": "severe",
+                    "frame_ids": ["S04_P01"],
+                    "message": "the same protagonist appears twice",
+                    "expected": "one coherent protagonist",
+                    "observed": "a translucent duplicate overlaps his torso",
+                    "confidence": 0.98,
+                    "frame_evidence": [{
+                        "frame_id": "S04_P01",
+                        "observed": "same face and coat duplicated with transparency",
+                    }],
+                }]
+            })
+
+    issues, layer = storyboard_qa_gate.run_l4_first_frame_review(
+        storyboard,
+        "photorealistic cinematic future train interior",
+        {"S04_P01": frame},
+        tmp_path,
+        ReviewClient(),
+    )
+
+    assert layer["status"] == "completed"
+    assert issues[0]["code"] == "first_frame_subject_duplication"
     assert issues[0]["severity"] == "severe"
     assert storyboard_qa_gate.is_blocking_issue(issues[0]) is True
 
