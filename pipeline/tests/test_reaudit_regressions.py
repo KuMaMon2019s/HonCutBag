@@ -8,6 +8,7 @@ import json
 import pytest
 
 from phases import pipeline_core
+from phases.phase1.phase1_screenwriter import run_phase1_screenwriter
 from runtime.run_manifest import prepare_run_manifest
 
 
@@ -148,6 +149,52 @@ def test_phase1_dry_run_uses_scoped_composite_source_in_structural_fixture(tmp_p
     assert "组件1" in json.dumps(storyboard, ensure_ascii=False)
     assert "神秘地图" not in json.dumps(storyboard, ensure_ascii=False)
     assert all(event["dry_run_source_derived"] for event in storyboard["events"])
+
+
+def test_phase1_dry_run_indexes_actions_after_a_sustained_event(tmp_path):
+    items = [
+        "操作员打开第一道安全门。",
+        "操作员检查控制面板。",
+        "持续状态：操作员保持警戒。",
+        "操作员按下启动按钮。",
+        "操作员锁定第一组组件。",
+        "操作员移动第二组组件。",
+        "操作员确认压力读数。",
+        "操作员关闭旁路阀门。",
+        "操作员接通备用电源。",
+        "操作员校准导航模块。",
+        "操作员完成系统复位。",
+        "持续状态：操作员保持待命。",
+    ]
+    source = "\n\n".join(
+        f"{index}. {item}" for index, item in enumerate(items, 1)
+    )
+
+    result = run_phase1_screenwriter(
+        source,
+        tmp_path,
+        duration=36,
+        dry_run=True,
+    )
+
+    assert result["status"] == "done"
+    receipt = json.loads(
+        (tmp_path / "phase1_dry_run_receipt.json").read_text(encoding="utf-8")
+    )
+    assert receipt["source_derived_event_count"] == 12
+    assert receipt["capacity_plan"]["generation_action_units"] == 10
+    assert receipt["remote_requests"] == 0
+
+    storyboard = json.loads(
+        (tmp_path / "STORYBOARD.json").read_text(encoding="utf-8")
+    )
+    first_shot = storyboard["shots"][0]
+    assert first_shot["source_events"] == [1, 2, 3, 4]
+    assert len(first_shot["micro_actions"]) == 3
+    assert [
+        unit["ledger_indexes"]
+        for unit in first_shot["generation_action_units"]
+    ] == [[0], [1], [2]]
 
 
 def test_production_source_has_no_audited_story_specific_branches():

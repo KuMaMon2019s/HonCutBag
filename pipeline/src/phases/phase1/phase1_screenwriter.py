@@ -407,25 +407,28 @@ def run_phase1_screenwriter(
                     for event in assigned_events
                     if str(event.get("what") or "").strip()
                 ) or text.strip() or "source-derived dry-run scene"
-                micro_actions = [
-                    action
-                    for event in assigned_events
-                    for action in event.get("micro_actions", [])
-                ]
-                generation_action_units = [
-                    {
-                        "unit_id": f"DRYRUN_GAU{unit_index:03d}",
-                        "kind": (
-                            "simultaneous"
-                            if event.get("generation_motion_mode") == "composite"
-                            else "sequential"
-                        ),
-                        "actions": list(event.get("micro_actions", [])),
-                        "ledger_indexes": [unit_index - 1],
-                    }
-                    for unit_index, event in enumerate(assigned_events, 1)
-                    if event.get("micro_actions")
-                ]
+                micro_actions = []
+                generation_action_units = []
+                for unit_index, event in enumerate(assigned_events, 1):
+                    event_actions = list(event.get("micro_actions", []))
+                    if not event_actions:
+                        continue
+                    ledger_start = len(micro_actions)
+                    micro_actions.extend(event_actions)
+                    generation_action_units.append(
+                        {
+                            "unit_id": f"DRYRUN_GAU{unit_index:03d}",
+                            "kind": (
+                                "simultaneous"
+                                if event.get("generation_motion_mode") == "composite"
+                                else "sequential"
+                            ),
+                            "actions": event_actions,
+                            "ledger_indexes": list(
+                                range(ledger_start, len(micro_actions))
+                            ),
+                        }
+                    )
                 shot_id = index + 1
                 shots.append(
                     {
