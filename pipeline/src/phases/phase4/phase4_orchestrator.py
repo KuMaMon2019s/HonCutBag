@@ -312,8 +312,12 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
         constraint_checks = [
             {
                 "id": "storyboard_artifacts_complete",
-                "status": "passed",
-                "detail": "all authored Pxx storyboard assets are present",
+                "status": "skipped" if dry_run else "passed",
+                "detail": (
+                    "dry-run did not validate production evidence for storyboard assets"
+                    if dry_run
+                    else "all authored Pxx storyboard assets are present"
+                ),
             },
             {
                 "id": "scene_and_continuity_contracts_written",
@@ -322,10 +326,17 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
             },
             {
                 "id": "cinematic_first_frames_previs_isolated",
-                "status": "passed" if dry_run or not cinematic_errors else "failed",
+                "status": (
+                    "skipped"
+                    if dry_run
+                    else "passed" if not cinematic_errors else "failed"
+                ),
                 "detail": (
-                    "every video first frame has a style-injection receipt and zero "
-                    "PREVIS pixel references"
+                    "dry-run did not generate or validate production cinematic "
+                    "first-frame evidence"
+                    if dry_run
+                    else "every video first frame has a style-injection receipt and "
+                    "zero PREVIS pixel references"
                 ),
             },
             {
@@ -345,6 +356,10 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
             print("  ✗ Phase 4 代码约束复查失败（人工复查：禁用）")
         return {
             "status": status,
+            "evidence_scope": (
+                "dry_run_structural_only" if dry_run else "production"
+            ),
+            "production_evidence": not dry_run and status == "done",
             "duration_s": _elapsed(start),
             "outputs": outputs or ["shots/"],
             "provider": selected_provider,
@@ -354,6 +369,10 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
                 "mode": "deterministic_code",
                 "human_review_required": False,
                 "model_review_used": False,
+                "evidence_scope": (
+                    "dry_run_structural_only" if dry_run else "production"
+                ),
+                "production_evidence": not dry_run and status == "done",
                 "checks": constraint_checks,
             },
             **(

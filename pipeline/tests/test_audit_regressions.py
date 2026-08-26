@@ -4865,6 +4865,9 @@ def test_phase5_dry_run_writes_atomic_structural_receipts_without_pixel_qa(
 
     assert result["status"] == "done"
     assert result["gate_passed"] is True
+    assert result["production_gate_passed"] is False
+    assert result["evidence_scope"] == "dry_run_structural_only"
+    assert result["grade_scope"] == "structural_metadata_only"
     assert result["dry_run_receipt"] == "phase5_dry_run_receipt.json"
     assert result["layers"]["L1"]["status"] == "completed"
     assert all(
@@ -4887,6 +4890,10 @@ def test_phase5_dry_run_writes_atomic_structural_receipts_without_pixel_qa(
     )
     assert receipt["schema"] == "honcut.phase5-dry-run-receipt.v1"
     assert receipt["status"] == "completed"
+    assert receipt["gate_passed"] is True
+    assert receipt["production_gate_passed"] is False
+    assert receipt["evidence_scope"] == "dry_run_structural_only"
+    assert receipt["grade_scope"] == "structural_metadata_only"
     assert compatibility_report == result
     assert receipt["input_artifacts"][0] == {
         "path": "STORYBOARD.json",

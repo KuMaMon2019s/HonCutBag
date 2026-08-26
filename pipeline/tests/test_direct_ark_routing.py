@@ -644,6 +644,10 @@ def test_phase4_native_setup_does_not_invoke_subprocess(monkeypatch, tmp_path):
     assert review["mode"] == "deterministic_code"
     assert review["human_review_required"] is False
     assert review["model_review_used"] is False
+    assert result["evidence_scope"] == "dry_run_structural_only"
+    assert result["production_evidence"] is False
+    assert review["evidence_scope"] == "dry_run_structural_only"
+    assert review["production_evidence"] is False
     assert {item["id"] for item in review["checks"]} == {
         "storyboard_artifacts_complete",
         "scene_and_continuity_contracts_written",
@@ -651,6 +655,10 @@ def test_phase4_native_setup_does_not_invoke_subprocess(monkeypatch, tmp_path):
         "native_shot_metadata_only",
         "shot_meta_ids_exact",
     }
+    checks = {item["id"]: item for item in review["checks"]}
+    assert checks["storyboard_artifacts_complete"]["status"] == "skipped"
+    assert checks["cinematic_first_frames_previs_isolated"]["status"] == "skipped"
+    assert "production evidence" in checks["storyboard_artifacts_complete"]["detail"]
 
 
 def test_phase4_native_setup_completes_partial_expected_directories(
