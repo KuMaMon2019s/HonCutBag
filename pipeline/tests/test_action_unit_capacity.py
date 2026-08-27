@@ -14,6 +14,7 @@ The complete micro_actions ledger is never truncated; only capacity math
 consumes the normalized units.
 """
 
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -25,7 +26,10 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from phases.phase1 import adaptation_engine as engine  # noqa: E402
-from phases.phase1.storyboard_beats import plan_storyboard_beats  # noqa: E402
+from phases.phase1.storyboard_beats import (  # noqa: E402
+    bind_primary_shot_execution_plan,
+    plan_storyboard_beats,
+)
 from phases.phase5.storyboard_qa_gate import (  # noqa: E402
     run_generation_capacity_checks,
     run_l1_checks,
@@ -1334,6 +1338,274 @@ def test_continuity_policy_preserves_seven_content_beats_in_two_long_shots():
     ) == 14
 
 
+def _canonical_sha256(value):
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _long_shot_execution_fixture():
+    events = [{
+        "event_role": "action_chain",
+        "sequence_id": "SEQ001",
+        "micro_actions": [f"有序动作{index}" for index in range(45)],
+    }]
+    layout = engine._estimate_action_capacity_plan(
+        events,
+        36,
+        6,
+        shot_policy="continuity",
+    )["primary_shot_layout"]
+    screenplay_plan = {
+        "schema": engine.SCREENPLAY_PLAN_SCHEMA,
+        "primary_shot_layout": layout,
+        "production_ledger": {
+            "generation_action_units": 14,
+            "kept_source_event_ids": [1],
+        },
+        "event_action_scaling": {
+            "schema": engine.DURATION_SCALED_EVENT_PLAN_SCHEMA,
+            "events": [{
+                "source_event_id": 1,
+                "production_generation_action_units": 14,
+                "production_status": "kept",
+            }],
+        },
+    }
+    shots = []
+    for shot_index, (duration, unit_count) in enumerate(
+        zip([18, 18], [8, 6], strict=True),
+        1,
+    ):
+        shots.append({
+            "id": f"S{shot_index:02d}",
+            "duration": duration,
+            "suggested_duration": duration,
+            "source_events": [1],
+            "source_event_generation_unit_counts": {"1": unit_count},
+            "micro_actions": [
+                f"S{shot_index:02d}动作{unit_index}"
+                for unit_index in range(1, unit_count + 1)
+            ],
+            "generation_action_units": [
+                {
+                    "unit_id": f"S{shot_index:02d}_GAU{unit_index:03d}",
+                    "actions": [f"S{shot_index:02d}动作{unit_index}"],
+                }
+                for unit_index in range(1, unit_count + 1)
+            ],
+        })
+    return layout, screenplay_plan, shots
+
+
+def test_primary_shot_handoff_binds_canonical_four_plus_three_layout():
+    layout, screenplay_plan, shots = _long_shot_execution_fixture()
+    screenplay_plan_sha256 = _canonical_sha256(screenplay_plan)
+    storyboard = {"delivery_target_duration": 36, "shots": shots}
+
+    bind_primary_shot_execution_plan(
+        storyboard,
+        screenplay_plan,
+        screenplay_plan_sha256,
+        projected_layout=layout,
+        capacity_layout=layout,
+    )
+    plan_storyboard_beats(storyboard)
+
+    assert storyboard["primary_shot_layout"] == layout
+    assert storyboard["primary_shot_execution"] == {
+        "schema": "honcut.primary-shot-execution-handoff.v1",
+        "screenplay_plan_schema": engine.SCREENPLAY_PLAN_SCHEMA,
+        "screenplay_plan_sha256": screenplay_plan_sha256,
+        "primary_shot_layout_schema": "honcut.primary-shot-layout.v1",
+        "primary_shot_layout_sha256": _canonical_sha256(layout),
+    }
+    assert [
+        shot["storyboard_beat_count"] for shot in storyboard["shots"]
+    ] == [4, 3]
+    assert [
+        shot["secondary_storyboard_planning"]["declared_content_beat_count"]
+        for shot in storyboard["shots"]
+    ] == [4, 3]
+    assert [
+        [beat["provider_request_duration_s"] for beat in shot["storyboard_beats"]]
+        for shot in storyboard["shots"]
+    ] == [[8, 6, 6, 6], [8, 6, 6]]
+
+
+def test_primary_shot_handoff_rejects_per_shot_capacity_drift():
+    layout, screenplay_plan, shots = _long_shot_execution_fixture()
+    shots[1]["generation_action_units"].extend([
+        {"unit_id": "S02_GAU007", "actions": ["S02动作7"]},
+        {"unit_id": "S02_GAU008", "actions": ["S02动作8"]},
+    ])
+    shots[1]["micro_actions"].extend(["S02动作7", "S02动作8"])
+    shots[1]["source_event_generation_unit_counts"] = {"1": 8}
+
+    with pytest.raises(
+        ValueError,
+        match="primary_shot_layout_handoff_invalid.*S02.*capacity 6",
+    ):
+        bind_primary_shot_execution_plan(
+            {"shots": shots},
+            screenplay_plan,
+            _canonical_sha256(screenplay_plan),
+            projected_layout=layout,
+            capacity_layout=layout,
+        )
+
+
+def test_primary_shot_handoff_rejects_source_event_allocation_drift():
+    layout, screenplay_plan, shots = _long_shot_execution_fixture()
+    shots[1]["source_event_generation_unit_counts"] = {"999": 6}
+
+    with pytest.raises(
+        ValueError,
+        match="primary_shot_layout_handoff_invalid.*allocation keys",
+    ):
+        bind_primary_shot_execution_plan(
+            {"shots": shots},
+            screenplay_plan,
+            _canonical_sha256(screenplay_plan),
+            projected_layout=layout,
+            capacity_layout=layout,
+        )
+
+
+def test_primary_shot_handoff_rejects_cross_shot_event_unit_transfer():
+    layout, screenplay_plan, shots = _long_shot_execution_fixture()
+    screenplay_plan["production_ledger"]["kept_source_event_ids"] = [1, 2]
+    screenplay_plan["event_action_scaling"]["events"].append({
+        "source_event_id": 2,
+        "production_generation_action_units": 0,
+        "production_status": "kept",
+    })
+    for shot in shots:
+        shot["source_events"] = [1, 2]
+    shots[0]["source_event_generation_unit_counts"] = {"1": 7, "2": 1}
+    shots[1]["source_event_generation_unit_counts"] = {"1": 6, "2": 0}
+
+    with pytest.raises(
+        ValueError,
+        match="primary_shot_layout_handoff_invalid.*SCREENPLAY_PLAN",
+    ):
+        bind_primary_shot_execution_plan(
+            {"shots": shots},
+            screenplay_plan,
+            _canonical_sha256(screenplay_plan),
+            projected_layout=layout,
+            capacity_layout=layout,
+        )
+
+
+def test_new_continuity_storyboard_missing_layout_fails_closed():
+    storyboard = {
+        "delivery_target_duration": 18,
+        "shot_policy": "continuity",
+        "screenplay_plan": {"schema": engine.SCREENPLAY_PLAN_SCHEMA},
+        "shots": [{
+            "id": "S01",
+            "duration": 18,
+            "micro_actions": [f"动作{index}" for index in range(1, 9)],
+        }],
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="primary_shot_layout_handoff_invalid.*missing",
+    ):
+        plan_storyboard_beats(storyboard)
+
+
+def test_primary_shot_handoff_rejects_plan_hash_and_future_schema():
+    layout, screenplay_plan, shots = _long_shot_execution_fixture()
+
+    with pytest.raises(
+        ValueError,
+        match="primary_shot_layout_handoff_invalid.*hash mismatch",
+    ):
+        bind_primary_shot_execution_plan(
+            {"shots": shots},
+            screenplay_plan,
+            "0" * 64,
+            projected_layout=layout,
+            capacity_layout=layout,
+        )
+
+    future = {**screenplay_plan, "schema": "honcut.screenplay-plan.v99"}
+    with pytest.raises(
+        ValueError,
+        match="primary_shot_layout_handoff_invalid.*screenplay plan schema",
+    ):
+        bind_primary_shot_execution_plan(
+            {"shots": shots},
+            future,
+            _canonical_sha256(future),
+            projected_layout=layout,
+            capacity_layout=layout,
+        )
+
+    tampered = json.loads(json.dumps(screenplay_plan, ensure_ascii=False))
+    tampered_layout = tampered["primary_shot_layout"]
+    tampered_layout["projected_content_provider_request_duration_s"] += 1
+    with pytest.raises(
+        ValueError,
+        match="primary_shot_layout_handoff_invalid.*aggregate ledger",
+    ):
+        bind_primary_shot_execution_plan(
+            {"shots": shots},
+            tampered,
+            _canonical_sha256(tampered),
+            projected_layout=tampered_layout,
+            capacity_layout=tampered_layout,
+        )
+
+
+def test_primary_shot_handoff_rejects_tampered_execution_receipt():
+    layout, screenplay_plan, shots = _long_shot_execution_fixture()
+    storyboard = {"delivery_target_duration": 36, "shots": shots}
+    bind_primary_shot_execution_plan(
+        storyboard,
+        screenplay_plan,
+        _canonical_sha256(screenplay_plan),
+        projected_layout=layout,
+        capacity_layout=layout,
+    )
+    storyboard["primary_shot_execution"]["primary_shot_layout_sha256"] = (
+        "0" * 64
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="primary_shot_layout_handoff_invalid.*receipt",
+    ):
+        plan_storyboard_beats(storyboard)
+
+
+def test_legacy_cut_driven_storyboard_without_layout_keeps_three_pxx():
+    storyboard = {
+        "delivery_target_duration": 18,
+        "shot_policy": "cut-driven",
+        "shots": [{
+            "id": "S01",
+            "duration": 18,
+            "micro_actions": [f"动作{index}" for index in range(1, 7)],
+        }],
+    }
+
+    plan_storyboard_beats(storyboard)
+
+    assert storyboard["shots"][0]["storyboard_beat_count"] == 3
+    assert storyboard["shots"][0]["secondary_storyboard_planning"][
+        "declared_content_beat_count"
+    ] is None
+
+
 def test_long_shot_repacking_keeps_every_continuous_story_event():
     action_counts = [3, 0, 3, 5, 5, 4, 4, 4, 5, 5, 3, 2, 3]
     roles = [
@@ -1673,8 +1945,27 @@ def test_continuity_storyboard_executes_four_ordered_pxx_without_action_loss():
         "primary_shot_layout": {
             "schema": "honcut.primary-shot-layout.v1",
             "shot_policy": "continuity",
+            "primary_shots": 1,
+            "story_duration_allocations_s": [18],
             "content_beat_counts": [4],
+            "effective_story_durations_s": [[5, 5, 4, 4]],
+            "provider_request_durations_s": [[8, 6, 6, 6]],
+            "generation_action_unit_capacities": [8],
+            "max_generation_action_units_per_primary_shot": 8,
             "max_content_beats_per_primary_shot": 4,
+            "total_generation_action_unit_capacity": 8,
+            "production_action_unit_target": 8,
+            "cross_sxx_boundary_count": 0,
+            "projected_content_provider_request_duration_s": 26,
+            "projected_content_provider_padding_duration_s": 8.0,
+            "projected_padding_loss_rate": 0.307692,
+            "maximum_padding_loss_rate": 0.25,
+            "capability_profile": "seedance-2.x",
+            "objective_order": ["explicit_test_fixture"],
+            "objective_decision": {
+                "selected_primary_shot_count": 1,
+                "selected_production_action_unit_target": 8,
+            },
         },
         "shots": [{
             "id": "S01",

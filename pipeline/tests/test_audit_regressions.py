@@ -3286,6 +3286,7 @@ def test_phase1_canonical_storyboard_preserves_event_partition_audit(monkeypatch
                 "micro_actions": ["穿过舱门"],
             }
         ],
+        "source_event_generation_unit_counts": {"2": 1},
     }
 
     canonical = storyboard_generator._generate_single_shot(shot, 1, 1)
@@ -3295,6 +3296,7 @@ def test_phase1_canonical_storyboard_preserves_event_partition_audit(monkeypatch
     assert canonical["source_action_unit_refs"] == shot["source_action_unit_refs"]
     assert canonical["dropped_source_events"] == [3, 4]
     assert canonical["source_event_slices"] == shot["source_event_slices"]
+    assert canonical["source_event_generation_unit_counts"] == {"2": 1}
     assert canonical["character_ids"] == ["operator"]
     assert canonical["participant_refs"] == shot["participant_refs"]
 

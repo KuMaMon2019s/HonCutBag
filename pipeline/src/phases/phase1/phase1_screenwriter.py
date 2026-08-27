@@ -5,7 +5,6 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-import math
 import os
 import re
 import traceback
@@ -343,6 +342,7 @@ def run_phase1_screenwriter(
         if dry_run:
             from phases.phase1.dry_run_capacity import (
                 build_dry_run_capacity_preflight,
+                partition_preflight_events_by_layout,
                 write_dry_run_receipt,
             )
 
@@ -423,15 +423,13 @@ def run_phase1_screenwriter(
             planned_allocations = primary_shot_layout[
                 "story_duration_allocations_s"
             ]
+            event_groups = partition_preflight_events_by_layout(
+                source_events,
+                primary_shot_layout["generation_action_unit_capacities"],
+            )
             shots = []
-            for index in range(shot_count):
-                event_start = math.floor(index * len(source_events) / shot_count)
-                event_end = math.floor((index + 1) * len(source_events) / shot_count)
-                assigned_events = source_events[event_start:event_end]
-                if not assigned_events and source_events:
-                    assigned_events = [
-                        source_events[min(event_start, len(source_events) - 1)]
-                    ]
+            for index, event_group in enumerate(event_groups):
+                assigned_events = event_group["events"]
                 source_slice = "；".join(
                     str(event.get("what") or "").strip()
                     for event in assigned_events
@@ -439,26 +437,26 @@ def run_phase1_screenwriter(
                 ) or text.strip() or "source-derived dry-run scene"
                 micro_actions = []
                 generation_action_units = []
-                for unit_index, event in enumerate(assigned_events, 1):
-                    event_actions = list(event.get("micro_actions", []))
-                    if not event_actions:
-                        continue
+                for event, action_contract in zip(
+                    assigned_events,
+                    event_group["action_contracts"],
+                    strict=True,
+                ):
+                    event_actions = list(action_contract["ledger"])
                     ledger_start = len(micro_actions)
                     micro_actions.extend(event_actions)
-                    generation_action_units.append(
-                        {
-                            "unit_id": f"DRYRUN_GAU{unit_index:03d}",
-                            "kind": (
-                                "simultaneous"
-                                if event.get("generation_motion_mode") == "composite"
-                                else "sequential"
+                    for unit in action_contract["generation_action_units"]:
+                        generation_action_units.append({
+                            **unit,
+                            "unit_id": (
+                                f"DRYRUN_S{index + 1:02d}_GAU"
+                                f"{len(generation_action_units) + 1:03d}"
                             ),
-                            "actions": event_actions,
                             "ledger_indexes": list(
-                                range(ledger_start, len(micro_actions))
+                                ledger_start + ledger_index
+                                for ledger_index in unit["ledger_indexes"]
                             ),
-                        }
-                    )
+                        })
                 shot_id = index + 1
                 shots.append(
                     {
@@ -775,6 +773,46 @@ def run_phase1_screenwriter(
             shot_policy=shot_policy,
         )
         adapted_shots = adapted.get("shots", [])
+        screenplay_plan = adapted.get("screenplay_plan")
+        screenplay_plan_sha256 = adapted.get("screenplay_plan_sha256")
+        if not isinstance(screenplay_plan, dict) or not isinstance(
+            screenplay_plan_sha256, str
+        ):
+            raise ValueError(
+                "primary_shot_layout_handoff_invalid: adaptation did not "
+                "produce a canonical screenplay plan"
+            )
+        from phases.phase1.storyboard_beats import (
+            bind_primary_shot_execution_plan,
+            plan_storyboard_beats,
+        )
+
+        adapted_layout = adapted.get("primary_shot_layout")
+        capacity_plan = adapted.get("capacity_plan")
+        capacity_layout = (
+            capacity_plan.get("primary_shot_layout")
+            if isinstance(capacity_plan, dict)
+            else None
+        )
+        if not isinstance(adapted_layout, dict) or not isinstance(
+            capacity_layout, dict
+        ):
+            raise ValueError(
+                "primary_shot_layout_handoff_invalid: adaptation did not "
+                "preserve every canonical layout projection"
+            )
+
+        # Validate the complete layout before spending additional storyboard
+        # LLM/image work. The generated storyboard is validated again because
+        # its field projection is a separate transformation boundary.
+        handoff_probe = {"shots": adapted_shots}
+        primary_shot_layout = bind_primary_shot_execution_plan(
+            handoff_probe,
+            screenplay_plan,
+            screenplay_plan_sha256,
+            projected_layout=adapted_layout,
+            capacity_layout=capacity_layout,
+        )
         print(f"    ✓ 改编完成，{len(adapted_shots)} 个镜头")
         if reporter:
             reporter.step("phase1", f"改编完成，{len(adapted_shots)} 个镜头", progress_pct=80)
@@ -799,6 +837,13 @@ def run_phase1_screenwriter(
             visual_style_text=visual_style_text,
             config=project_video_spec or _project_video_spec("1080p"),
         )
+        bind_primary_shot_execution_plan(
+            storyboard,
+            screenplay_plan,
+            screenplay_plan_sha256,
+            projected_layout=primary_shot_layout,
+            capacity_layout=capacity_layout,
+        )
         storyboard["delivery_target_duration"] = duration
         storyboard["material_duration"] = adapted.get(
             "material_duration",
@@ -813,22 +858,23 @@ def run_phase1_screenwriter(
             )
         if adapted.get("screenplay_rewrite"):
             storyboard["screenplay_rewrite"] = adapted["screenplay_rewrite"]
-        if adapted.get("screenplay_plan"):
-            screenplay_plan = adapted["screenplay_plan"]
-            storyboard["screenplay_plan"] = {
-                "schema": screenplay_plan["schema"],
-                "artifact": "SCREENPLAY_PLAN.json",
-                "sha256": adapted["screenplay_plan_sha256"],
-                "source_capacity_status": screenplay_plan["source_ledger"][
-                    "capacity_status"
-                ],
-                "production_capacity_status": screenplay_plan[
-                    "production_ledger"
-                ]["capacity_status"],
-                "duration_scaling_status": screenplay_plan[
-                    "production_ledger"
-                ]["duration_scaling_status"],
-            }
+        storyboard["screenplay_plan"] = {
+            "schema": screenplay_plan["schema"],
+            "artifact": "SCREENPLAY_PLAN.json",
+            "sha256": screenplay_plan_sha256,
+            "primary_shot_layout_sha256": storyboard[
+                "primary_shot_layout_sha256"
+            ],
+            "source_capacity_status": screenplay_plan["source_ledger"][
+                "capacity_status"
+            ],
+            "production_capacity_status": screenplay_plan[
+                "production_ledger"
+            ]["capacity_status"],
+            "duration_scaling_status": screenplay_plan[
+                "production_ledger"
+            ]["duration_scaling_status"],
+        }
         if continuity_mode:
             storyboard["continuity_mode"] = continuity_mode
         storyboard["semantic_understanding"] = {
@@ -836,8 +882,6 @@ def run_phase1_screenwriter(
             "ledger": semantic_ledger_path.name,
             "source_events_hash": events_input_hash,
         }
-        from phases.phase1.storyboard_beats import plan_storyboard_beats
-
         plan_storyboard_beats(storyboard)
         material_budget = storyboard.get("material_budget") or {}
         print(

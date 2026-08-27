@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sys
 import threading
@@ -25,6 +26,146 @@ def _chunk(content):
     return SimpleNamespace(
         choices=[SimpleNamespace(delta=SimpleNamespace(content=content))]
     )
+
+
+def _phase1_stub_adapted_result(adaptation_engine):
+    event = {
+        "event_role": "action_chain",
+        "sequence_id": "SEQ001",
+        "micro_actions": ["站立"],
+    }
+    layout = adaptation_engine._estimate_action_capacity_plan(
+        [event],
+        15,
+        15,
+        shot_policy="continuity",
+    )["primary_shot_layout"]
+    shot = {
+        "id": "S01",
+        "suggested_duration": 15,
+        "source_events": [1],
+        "source_event_casts": [{
+            "source_event_id": 1,
+            "character_ids": [],
+        }],
+        "source_event_generation_unit_counts": {"1": 1},
+        "micro_actions": ["站立"],
+        "generation_action_units": [{
+            "unit_id": "GAU001",
+            "actions": ["站立"],
+        }],
+    }
+    screenplay_plan = {
+        "schema": adaptation_engine.SCREENPLAY_PLAN_SCHEMA,
+        "primary_shot_layout": layout,
+        "source_ledger": {"capacity_status": "fits_story_clock"},
+        "production_ledger": {
+            "capacity_status": "fits_story_clock",
+            "duration_scaling_status": "not_required",
+            "generation_action_units": 1,
+            "kept_source_event_ids": [1],
+        },
+        "event_action_scaling": {
+            "schema": adaptation_engine.DURATION_SCALED_EVENT_PLAN_SCHEMA,
+            "events": [{
+                "source_event_id": 1,
+                "production_generation_action_units": 1,
+                "production_status": "kept",
+            }],
+        },
+    }
+    screenplay_plan_sha256 = hashlib.sha256(
+        json.dumps(
+            screenplay_plan,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "shots": [shot],
+        "material_duration": 15,
+        "capacity_plan": {"primary_shot_layout": layout},
+        "primary_shot_layout": layout,
+        "screenplay_plan": screenplay_plan,
+        "screenplay_plan_sha256": screenplay_plan_sha256,
+    }
+
+
+def _phase1_long_shot_adapted_result(adaptation_engine):
+    event = {
+        "event_role": "action_chain",
+        "sequence_id": "SEQ001",
+        "micro_actions": [f"有序动作{index}" for index in range(45)],
+    }
+    layout = adaptation_engine._estimate_action_capacity_plan(
+        [event],
+        36,
+        6,
+        shot_policy="continuity",
+    )["primary_shot_layout"]
+    shots = []
+    for shot_index, (duration, unit_count) in enumerate(
+        zip([18, 18], [8, 6], strict=True),
+        1,
+    ):
+        actions = [
+            f"S{shot_index:02d}动作{unit_index}"
+            for unit_index in range(1, unit_count + 1)
+        ]
+        shots.append({
+            "id": f"S{shot_index:02d}",
+            "suggested_duration": duration,
+            "source_events": [1],
+            "source_event_casts": [{
+                "source_event_id": 1,
+                "character_ids": [],
+            }],
+            "source_event_generation_unit_counts": {"1": unit_count},
+            "micro_actions": actions,
+            "generation_action_units": [
+                {
+                    "unit_id": f"S{shot_index:02d}_GAU{unit_index:03d}",
+                    "actions": [action],
+                }
+                for unit_index, action in enumerate(actions, 1)
+            ],
+        })
+    screenplay_plan = {
+        "schema": adaptation_engine.SCREENPLAY_PLAN_SCHEMA,
+        "primary_shot_layout": layout,
+        "source_ledger": {"capacity_status": "requires_compression"},
+        "production_ledger": {
+            "capacity_status": "fits_story_clock",
+            "duration_scaling_status": "applied",
+            "generation_action_units": 14,
+            "kept_source_event_ids": [1],
+        },
+        "event_action_scaling": {
+            "schema": adaptation_engine.DURATION_SCALED_EVENT_PLAN_SCHEMA,
+            "events": [{
+                "source_event_id": 1,
+                "production_generation_action_units": 14,
+                "production_status": "kept",
+            }],
+        },
+    }
+    screenplay_plan_sha256 = hashlib.sha256(
+        json.dumps(
+            screenplay_plan,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "shots": shots,
+        "material_duration": 36,
+        "capacity_plan": {"primary_shot_layout": layout},
+        "primary_shot_layout": layout,
+        "screenplay_plan": screenplay_plan,
+        "screenplay_plan_sha256": screenplay_plan_sha256,
+    }
 
 
 def test_wall_timeout_closes_blocked_stream():
@@ -660,12 +801,18 @@ def test_phase1_checkpoints_are_written_and_reused(monkeypatch, tmp_path):
         ),
     )
     monkeypatch.setattr(character_discoverer, "discover_characters", lambda _events: (calls.__setitem__("characters", calls["characters"] + 1) or characters_payload))
-    monkeypatch.setattr(adaptation_engine, "adapt_events", lambda *_args, **_kwargs: {"shots": [{}]})
+    monkeypatch.setattr(
+        adaptation_engine,
+        "adapt_events",
+        lambda *_args, **_kwargs: _phase1_stub_adapted_result(
+            adaptation_engine
+        ),
+    )
     monkeypatch.setattr(
         storyboard_generator,
         "generate_storyboard",
-        lambda *_args, **_kwargs: {
-            "shots": [{"id": "S01", "duration": 15, "micro_actions": ["站立"]}]
+        lambda shots, *_args, **_kwargs: {
+            "shots": [{**shots[0], "id": "S01", "duration": 15}]
         },
     )
     monkeypatch.setattr(pipeline_core, "_integrate_storyboard_prompts", lambda value, _characters: value)
@@ -700,6 +847,108 @@ def test_phase1_checkpoints_are_written_and_reused(monkeypatch, tmp_path):
     assert stored_characters["_checkpoint"]["schema_version"] == pipeline_core.PHASE1_CHECKPOINT_SCHEMA_VERSION
 
 
+def test_phase1_production_route_preserves_canonical_four_plus_three_layout(
+    monkeypatch,
+    tmp_path,
+):
+    import phases.phase1.adaptation_engine as adaptation_engine
+    import phases.phase1.character_discoverer as character_discoverer
+
+    monkeypatch.setattr(
+        text_parser,
+        "parse_text",
+        lambda _text: {"segments": [{"id": 1, "content": "连续动作"}]},
+    )
+    monkeypatch.setattr(
+        event_extractor,
+        "extract_events",
+        lambda _segments, **_kwargs: {
+            "events": [{"id": 1, "sequence_id": "SEQ001", "who": []}]
+        },
+    )
+    monkeypatch.setattr(
+        character_discoverer,
+        "discover_characters",
+        lambda _events: {"characters": [], "total_characters": 0},
+    )
+    monkeypatch.setattr(
+        adaptation_engine,
+        "adapt_events",
+        lambda *_args, **_kwargs: _phase1_long_shot_adapted_result(
+            adaptation_engine
+        ),
+    )
+    monkeypatch.setattr(
+        storyboard_generator,
+        "generate_storyboard",
+        lambda shots, *_args, **_kwargs: {
+            "shots": [
+                {**shot, "duration": shot["suggested_duration"]}
+                for shot in shots
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        pipeline_core,
+        "_integrate_storyboard_prompts",
+        lambda value, _characters: value,
+    )
+    monkeypatch.setattr(
+        pipeline_core,
+        "annotate_shot_pacing",
+        lambda _shots: None,
+    )
+    monkeypatch.setattr(
+        pipeline_core,
+        "_summarize_visual_style_with_llm",
+        lambda _text: None,
+    )
+    monkeypatch.setattr(
+        pipeline_core,
+        "_attach_director_storyboard",
+        lambda *_args, **_kwargs: {"panels": []},
+    )
+    monkeypatch.setattr(
+        pipeline_core,
+        "run_quality_check",
+        lambda *_args: SimpleNamespace(passed=True, grade="A"),
+    )
+    monkeypatch.setattr(
+        "quality.quality_gate.run_storyboard_review",
+        lambda **_kwargs: {"grade": "A"},
+    )
+    monkeypatch.setattr(
+        pipeline_core,
+        "run_phase1_director",
+        lambda *_args, **_kwargs: {
+            "status": "done",
+            "plan": {"schema": "honcut.director-plan.v1", "sequences": []},
+        },
+    )
+
+    result = pipeline_core.run_phase1_screenwriter(
+        "连续动作",
+        tmp_path,
+        36,
+        False,
+        shot_duration=6,
+        shot_policy="continuity",
+    )
+
+    assert result["status"] == "done"
+    storyboard = result["_storyboard"]
+    assert [
+        shot["storyboard_beat_count"] for shot in storyboard["shots"]
+    ] == [4, 3]
+    assert [
+        [beat["provider_request_duration_s"] for beat in shot["storyboard_beats"]]
+        for shot in storyboard["shots"]
+    ] == [[8, 6, 6, 6], [8, 6, 6]]
+    assert storyboard["primary_shot_execution"]["primary_shot_layout_sha256"] == (
+        storyboard["screenplay_plan"]["primary_shot_layout_sha256"]
+    )
+
+
 def test_phase1_legacy_checkpoint_is_regenerated(monkeypatch, tmp_path):
     import phases.phase1.character_discoverer as character_discoverer
     import phases.phase1.adaptation_engine as adaptation_engine
@@ -731,12 +980,18 @@ def test_phase1_legacy_checkpoint_is_regenerated(monkeypatch, tmp_path):
             "total_characters": 1,
         },
     )
-    monkeypatch.setattr(adaptation_engine, "adapt_events", lambda *_args, **_kwargs: {"shots": [{}]})
+    monkeypatch.setattr(
+        adaptation_engine,
+        "adapt_events",
+        lambda *_args, **_kwargs: _phase1_stub_adapted_result(
+            adaptation_engine
+        ),
+    )
     monkeypatch.setattr(
         storyboard_generator,
         "generate_storyboard",
-        lambda *_args, **_kwargs: {
-            "shots": [{"id": "S01", "duration": 15, "micro_actions": ["站立"]}]
+        lambda shots, *_args, **_kwargs: {
+            "shots": [{**shots[0], "id": "S01", "duration": 15}]
         },
     )
     monkeypatch.setattr(pipeline_core, "_integrate_storyboard_prompts", lambda value, _characters: value)

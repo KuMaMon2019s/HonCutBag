@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
+import json
 import math
 import re
 import unicodedata
@@ -32,6 +35,12 @@ SECONDARY_GENERATION_MODES = frozenset({
 })
 MAX_CONTENT_BEATS = MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
 MAX_CONTINUITY_CONTENT_BEATS = 4
+PRIMARY_SHOT_LAYOUT_SCHEMA = "honcut.primary-shot-layout.v1"
+PRIMARY_SHOT_EXECUTION_HANDOFF_SCHEMA = (
+    "honcut.primary-shot-execution-handoff.v1"
+)
+CURRENT_SCREENPLAY_PLAN_SCHEMA = "honcut.screenplay-plan.v6"
+CURRENT_EVENT_SCALING_SCHEMA = "honcut.duration-scaled-event-plan.v3"
 SPOKEN_CHARACTERS_PER_SECOND = 4.0
 
 # Editorial policy, deliberately separate from provider/model capabilities.
@@ -765,25 +774,494 @@ def required_content_beat_count(
     return required
 
 
-def _storyboard_content_beat_limit(storyboard: dict[str, Any]) -> int:
-    """Read the current layout's explicit Pxx envelope without widening legacy runs."""
+def _canonical_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _primary_layout_error(detail: str) -> ValueError:
+    return ValueError(f"primary_shot_layout_handoff_invalid: {detail}")
+
+
+def _requires_primary_layout(storyboard: dict[str, Any]) -> bool:
+    screenplay = storyboard.get("screenplay_plan")
+    return bool(
+        storyboard.get("primary_shot_execution")
+        or (
+            isinstance(screenplay, dict)
+            and screenplay.get("schema") == CURRENT_SCREENPLAY_PLAN_SCHEMA
+            and str(storyboard.get("shot_policy") or "").strip().lower()
+            == "continuity"
+        )
+    )
+
+
+def _validate_primary_shot_layout(
+    shots: list[dict[str, Any]],
+    layout: dict[str, Any],
+    capabilities: VideoModelCapabilities | None = None,
+    *,
+    require_event_allocation: bool = False,
+) -> str:
+    """Validate one immutable Sxx/Pxx layout against the transformed shots."""
+    if layout.get("schema") != PRIMARY_SHOT_LAYOUT_SCHEMA:
+        raise _primary_layout_error("unsupported primary-shot layout schema")
+    policy = str(layout.get("shot_policy") or "").strip().lower()
+    if policy not in {"continuity", "balanced", "cut-driven"}:
+        raise _primary_layout_error("unknown shot policy")
+    declared_primary_shots = layout.get("primary_shots")
+    if (
+        isinstance(declared_primary_shots, bool)
+        or not isinstance(declared_primary_shots, int)
+        or declared_primary_shots != len(shots)
+    ):
+        raise _primary_layout_error(
+            "primary shot count does not match storyboard shots"
+        )
+
+    vector_fields = (
+        "story_duration_allocations_s",
+        "content_beat_counts",
+        "effective_story_durations_s",
+        "provider_request_durations_s",
+        "generation_action_unit_capacities",
+    )
+    vectors: dict[str, list[Any]] = {}
+    for field in vector_fields:
+        value = layout.get(field)
+        if not isinstance(value, list) or len(value) != len(shots):
+            raise _primary_layout_error(
+                f"{field} must cover every primary shot"
+            )
+        vectors[field] = value
+
+    policy_limit = (
+        MAX_CONTINUITY_CONTENT_BEATS
+        if policy == "continuity"
+        else MAX_CONTENT_BEATS
+    )
+    declared_limit = layout.get("max_content_beats_per_primary_shot")
+    if (
+        isinstance(declared_limit, bool)
+        or not isinstance(declared_limit, int)
+        or declared_limit < 1
+        or declared_limit > policy_limit
+    ):
+        raise _primary_layout_error("invalid maximum content-beat limit")
+
+    observed_request_duration = 0.0
+    observed_story_duration = 0.0
+    observed_action_units = 0
+    for index, shot in enumerate(shots):
+        sid = _shot_id(shot, index + 1)
+        duration = shot.get("duration") or shot.get("suggested_duration")
+        if isinstance(duration, bool) or not isinstance(duration, (int, float)):
+            raise _primary_layout_error(f"{sid} has no numeric duration")
+        planned_duration = vectors["story_duration_allocations_s"][index]
+        if (
+            isinstance(planned_duration, bool)
+            or not isinstance(planned_duration, (int, float))
+            or not math.isclose(
+                float(duration), float(planned_duration), abs_tol=1e-6
+            )
+        ):
+            raise _primary_layout_error(
+                f"{sid} duration does not match the canonical layout"
+            )
+
+        content_count = vectors["content_beat_counts"][index]
+        if (
+            isinstance(content_count, bool)
+            or not isinstance(content_count, int)
+            or not 1 <= content_count <= declared_limit
+        ):
+            raise _primary_layout_error(
+                f"{sid} has an invalid declared Pxx count"
+            )
+        effective_durations = vectors["effective_story_durations_s"][index]
+        request_durations = vectors["provider_request_durations_s"][index]
+        if (
+            not isinstance(effective_durations, list)
+            or not isinstance(request_durations, list)
+            or len(effective_durations) != content_count
+            or len(request_durations) != content_count
+        ):
+            raise _primary_layout_error(
+                f"{sid} Pxx duration ledger does not match its declared count"
+            )
+        if any(
+            isinstance(value, bool) or not isinstance(value, (int, float))
+            for value in [*effective_durations, *request_durations]
+        ):
+            raise _primary_layout_error(f"{sid} Pxx duration ledger is invalid")
+        if not math.isclose(
+            sum(float(value) for value in effective_durations),
+            float(planned_duration),
+            abs_tol=1e-6,
+        ):
+            raise _primary_layout_error(
+                f"{sid} Pxx story durations do not sum to the Sxx duration"
+            )
+        observed_story_duration += float(planned_duration)
+        observed_request_duration += sum(
+            float(value) for value in request_durations
+        )
+
+        profile = capabilities or capabilities_for(shot)
+        modes = ["multi_image"] + [
+            "tail_video_extend"
+        ] * (content_count - 1)
+        for position, (effective, requested, mode) in enumerate(
+            zip(effective_durations, request_durations, modes, strict=True),
+            1,
+        ):
+            expected_request = profile.request_duration_for_effective_story(
+                float(effective), mode
+            )
+            if not math.isclose(
+                float(requested), float(expected_request), abs_tol=1e-6
+            ):
+                raise _primary_layout_error(
+                    f"{sid}_P{position:02d} Provider duration disagrees with "
+                    "the capability profile"
+                )
+
+        capacity = vectors["generation_action_unit_capacities"][index]
+        expected_capacity = content_count * profile.max_micro_actions_per_beat
+        if (
+            isinstance(capacity, bool)
+            or not isinstance(capacity, int)
+            or capacity != expected_capacity
+        ):
+            raise _primary_layout_error(
+                f"{sid} action capacity does not match its Pxx count"
+            )
+        source_actions = _source_actions(shot)
+        generation_units = _generation_action_units(shot, source_actions)
+        observed_action_units += len(generation_units)
+        if len(generation_units) > capacity:
+            raise _primary_layout_error(
+                f"{sid} action load {len(generation_units)} exceeds capacity {capacity}"
+            )
+        allocation = shot.get("source_event_generation_unit_counts")
+        if require_event_allocation and shot.get("source_events"):
+            if not isinstance(allocation, dict):
+                raise _primary_layout_error(
+                    f"{sid} is missing source-event action allocation"
+                )
+            expected_event_ids = {
+                str(event_id) for event_id in shot["source_events"]
+            }
+            if set(allocation) != expected_event_ids:
+                raise _primary_layout_error(
+                    f"{sid} source-event action allocation keys disagree"
+                )
+            values = list(allocation.values())
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                for value in values
+            ) or sum(values) != len(generation_units):
+                raise _primary_layout_error(
+                    f"{sid} source-event action allocation does not match its load"
+                )
+        required, _reasons = _content_beat_requirement(
+            shot,
+            float(duration),
+            source_actions,
+            profile,
+            max_content_beats=policy_limit,
+        )
+        if required != content_count:
+            raise _primary_layout_error(
+                f"{sid} requires {required} Pxx but the canonical layout declares "
+                f"{content_count}"
+            )
+
+    capacities = vectors["generation_action_unit_capacities"]
+    total_capacity = sum(capacities)
+    production_target = layout.get("production_action_unit_target")
+    projected_request = layout.get(
+        "projected_content_provider_request_duration_s"
+    )
+    projected_padding = layout.get(
+        "projected_content_provider_padding_duration_s"
+    )
+    projected_padding_rate = layout.get("projected_padding_loss_rate")
+    maximum_padding_rate = layout.get("maximum_padding_loss_rate")
+    expected_padding = observed_request_duration - observed_story_duration
+    expected_padding_rate = (
+        expected_padding / observed_request_duration
+        if observed_request_duration
+        else 0.0
+    )
+    objective_decision = layout.get("objective_decision")
+    if (
+        layout.get("total_generation_action_unit_capacity") != total_capacity
+        or layout.get("max_generation_action_units_per_primary_shot")
+        != max(capacities, default=0)
+        or isinstance(production_target, bool)
+        or not isinstance(production_target, int)
+        or not 0 <= production_target <= total_capacity
+        or (
+            require_event_allocation
+            and observed_action_units != production_target
+        )
+        or layout.get("cross_sxx_boundary_count")
+        != max(0, declared_primary_shots - 1)
+        or isinstance(projected_request, bool)
+        or not isinstance(projected_request, (int, float))
+        or not math.isclose(
+            float(projected_request),
+            observed_request_duration,
+            abs_tol=1e-6,
+        )
+        or isinstance(projected_padding, bool)
+        or not isinstance(projected_padding, (int, float))
+        or not math.isclose(
+            float(projected_padding), expected_padding, abs_tol=1e-6
+        )
+        or isinstance(projected_padding_rate, bool)
+        or not isinstance(projected_padding_rate, (int, float))
+        or not math.isclose(
+            float(projected_padding_rate),
+            expected_padding_rate,
+            abs_tol=1e-6,
+        )
+        or isinstance(maximum_padding_rate, bool)
+        or not isinstance(maximum_padding_rate, (int, float))
+        or not 0 <= float(maximum_padding_rate) <= 1
+        or not isinstance(layout.get("capability_profile"), str)
+        or not layout["capability_profile"].strip()
+        or not isinstance(layout.get("objective_order"), list)
+        or not layout["objective_order"]
+        or not isinstance(objective_decision, dict)
+        or objective_decision.get("selected_primary_shot_count")
+        != declared_primary_shots
+        or objective_decision.get("selected_production_action_unit_target")
+        != production_target
+    ):
+        raise _primary_layout_error(
+            "primary-shot layout aggregate ledger is inconsistent"
+        )
+    return _canonical_sha256(layout)
+
+
+def bind_primary_shot_execution_plan(
+    storyboard: dict[str, Any],
+    screenplay_plan: dict[str, Any],
+    screenplay_plan_sha256: str,
+    *,
+    projected_layout: dict[str, Any],
+    capacity_layout: dict[str, Any],
+    capabilities: VideoModelCapabilities | None = None,
+) -> dict[str, Any]:
+    """Bind the canonical screenplay layout before any Pxx inference occurs."""
+    if screenplay_plan.get("schema") != CURRENT_SCREENPLAY_PLAN_SCHEMA:
+        raise _primary_layout_error("unsupported screenplay plan schema")
+    observed_plan_sha256 = _canonical_sha256(screenplay_plan)
+    if screenplay_plan_sha256 != observed_plan_sha256:
+        raise _primary_layout_error("screenplay plan hash mismatch")
+    layout = screenplay_plan.get("primary_shot_layout")
+    if not isinstance(layout, dict):
+        raise _primary_layout_error("canonical primary-shot layout is missing")
+    for name, candidate, required in (
+        ("adaptation projection", projected_layout, True),
+        ("capacity projection", capacity_layout, True),
+        ("storyboard projection", storyboard.get("primary_shot_layout"), False),
+    ):
+        if candidate is None and not required:
+            continue
+        if not isinstance(candidate, dict):
+            raise _primary_layout_error(f"{name} is missing")
+        if candidate != layout:
+            raise _primary_layout_error(f"{name} disagrees with SCREENPLAY_PLAN")
+    shots = [
+        shot for shot in storyboard.get("shots", []) if isinstance(shot, dict)
+    ]
+    layout_sha256 = _validate_primary_shot_layout(
+        shots,
+        layout,
+        capabilities,
+        require_event_allocation=True,
+    )
+    production_ledger = screenplay_plan.get("production_ledger")
+    event_scaling = screenplay_plan.get("event_action_scaling")
+    scaling_records = (
+        event_scaling.get("events")
+        if isinstance(event_scaling, dict)
+        else None
+    )
+    if (
+        not isinstance(production_ledger, dict)
+        or not isinstance(event_scaling, dict)
+        or event_scaling.get("schema") != CURRENT_EVENT_SCALING_SCHEMA
+        or not isinstance(scaling_records, list)
+    ):
+        raise _primary_layout_error(
+            "screenplay production event allocation is missing"
+        )
+    expected_event_units: dict[str, int] = {}
+    for record in scaling_records:
+        if not isinstance(record, dict):
+            raise _primary_layout_error(
+                "screenplay production event allocation is invalid"
+            )
+        status = record.get("production_status")
+        if status not in {"kept", "whole_event_omitted"}:
+            raise _primary_layout_error(
+                "screenplay production event status is invalid"
+            )
+        if status == "whole_event_omitted":
+            continue
+        event_id = record.get("source_event_id")
+        units = record.get("production_generation_action_units")
+        event_key = str(event_id)
+        if (
+            isinstance(event_id, bool)
+            or not isinstance(event_id, (int, str))
+            or not event_key.strip()
+            or event_key in expected_event_units
+            or isinstance(units, bool)
+            or not isinstance(units, int)
+            or units < 0
+        ):
+            raise _primary_layout_error(
+                "screenplay production event allocation is invalid"
+            )
+        expected_event_units[event_key] = units
+    observed_event_units = {event_id: 0 for event_id in expected_event_units}
+    for shot in shots:
+        for event_id, units in shot[
+            "source_event_generation_unit_counts"
+        ].items():
+            if event_id not in observed_event_units:
+                raise _primary_layout_error(
+                    "storyboard contains an unplanned source event allocation"
+                )
+            observed_event_units[event_id] += units
+    production_units = production_ledger.get("generation_action_units")
+    kept_event_ids = production_ledger.get("kept_source_event_ids")
+    if (
+        isinstance(production_units, bool)
+        or not isinstance(production_units, int)
+        or production_units != sum(expected_event_units.values())
+        or production_units != layout.get("production_action_unit_target")
+        or not isinstance(kept_event_ids, list)
+        or {str(event_id) for event_id in kept_event_ids}
+        != set(expected_event_units)
+        or observed_event_units != expected_event_units
+    ):
+        raise _primary_layout_error(
+            "storyboard source-event allocation disagrees with SCREENPLAY_PLAN"
+        )
+    storyboard["shot_policy"] = layout["shot_policy"]
+    storyboard["primary_shot_layout"] = copy.deepcopy(layout)
+    storyboard["primary_shot_layout_sha256"] = layout_sha256
+    storyboard["primary_shot_execution"] = {
+        "schema": PRIMARY_SHOT_EXECUTION_HANDOFF_SCHEMA,
+        "screenplay_plan_schema": CURRENT_SCREENPLAY_PLAN_SCHEMA,
+        "screenplay_plan_sha256": screenplay_plan_sha256,
+        "primary_shot_layout_schema": PRIMARY_SHOT_LAYOUT_SCHEMA,
+        "primary_shot_layout_sha256": layout_sha256,
+    }
+    existing_summary = storyboard.get("screenplay_plan")
+    if existing_summary is not None and not isinstance(existing_summary, dict):
+        raise _primary_layout_error("storyboard screenplay summary is invalid")
+    existing_summary = dict(existing_summary or {})
+    existing_schema = existing_summary.get("schema")
+    if existing_schema is not None and existing_schema != CURRENT_SCREENPLAY_PLAN_SCHEMA:
+        raise _primary_layout_error("storyboard screenplay schema disagrees")
+    existing_sha256 = existing_summary.get("sha256")
+    if existing_sha256 is not None and existing_sha256 != screenplay_plan_sha256:
+        raise _primary_layout_error("storyboard screenplay hash disagrees")
+    existing_layout_sha256 = existing_summary.get("primary_shot_layout_sha256")
+    if (
+        existing_layout_sha256 is not None
+        and existing_layout_sha256 != layout_sha256
+    ):
+        raise _primary_layout_error("storyboard layout hash disagrees")
+    storyboard["screenplay_plan"] = {
+        **existing_summary,
+        "schema": CURRENT_SCREENPLAY_PLAN_SCHEMA,
+        "sha256": screenplay_plan_sha256,
+        "primary_shot_layout_sha256": layout_sha256,
+    }
+    return storyboard["primary_shot_layout"]
+
+
+def _primary_shot_layout_entry(
+    storyboard: dict[str, Any],
+    index: int,
+    capabilities: VideoModelCapabilities | None = None,
+) -> dict[str, Any] | None:
     layout = storyboard.get("primary_shot_layout")
     if not isinstance(layout, dict):
-        return MAX_CONTENT_BEATS
-    if str(layout.get("shot_policy") or "").strip().lower() != "continuity":
-        return MAX_CONTENT_BEATS
-    declared = layout.get("max_content_beats_per_primary_shot")
-    if isinstance(declared, bool) or not isinstance(declared, int):
-        counts = layout.get("content_beat_counts") or []
-        declared = max(
-            [value for value in counts if isinstance(value, int)]
-            or [MAX_CONTENT_BEATS]
+        if _requires_primary_layout(storyboard):
+            raise _primary_layout_error("canonical primary-shot layout is missing")
+        return None
+    shots = [
+        shot for shot in storyboard.get("shots", []) if isinstance(shot, dict)
+    ]
+    layout_sha256 = _validate_primary_shot_layout(
+        shots,
+        layout,
+        capabilities,
+        require_event_allocation=bool(storyboard.get("primary_shot_execution")),
+    )
+    execution = storyboard.get("primary_shot_execution")
+    if execution is not None:
+        screenplay = storyboard.get("screenplay_plan")
+        recorded_plan_sha256 = (
+            screenplay.get("sha256") if isinstance(screenplay, dict) else None
         )
-    if not MAX_CONTENT_BEATS <= declared <= MAX_CONTINUITY_CONTENT_BEATS:
-        raise ValueError(
-            "continuity primary-shot layout has an invalid content-beat limit"
+        execution_plan_sha256 = (
+            execution.get("screenplay_plan_sha256")
+            if isinstance(execution, dict)
+            else None
         )
-    return declared
+        if (
+            not isinstance(execution, dict)
+            or execution.get("schema")
+            != PRIMARY_SHOT_EXECUTION_HANDOFF_SCHEMA
+            or execution.get("screenplay_plan_schema")
+            != CURRENT_SCREENPLAY_PLAN_SCHEMA
+            or not isinstance(execution_plan_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", execution_plan_sha256)
+            or (
+                not isinstance(screenplay, dict)
+                or screenplay.get("schema") != CURRENT_SCREENPLAY_PLAN_SCHEMA
+                or recorded_plan_sha256 != execution_plan_sha256
+                or screenplay.get("primary_shot_layout_sha256")
+                != layout_sha256
+            )
+            or execution.get("primary_shot_layout_schema")
+            != PRIMARY_SHOT_LAYOUT_SCHEMA
+            or execution.get("primary_shot_layout_sha256") != layout_sha256
+            or storyboard.get("primary_shot_layout_sha256") != layout_sha256
+        ):
+            raise _primary_layout_error("execution handoff receipt is inconsistent")
+    return {
+        "layout_sha256": layout_sha256,
+        "content_count": layout["content_beat_counts"][index],
+        "action_capacity": layout[
+            "generation_action_unit_capacities"
+        ][index],
+        "effective_story_durations": list(
+            layout["effective_story_durations_s"][index]
+        ),
+        "provider_request_durations": list(
+            layout["provider_request_durations_s"][index]
+        ),
+        "policy_limit": layout["max_content_beats_per_primary_shot"],
+    }
 
 
 def _bridge_requirement(
@@ -817,8 +1295,13 @@ def secondary_storyboard_requirements(
     if index < 0 or index >= len(shots):
         raise IndexError(f"secondary storyboard shot index out of range: {index}")
     shot = shots[index]
-    max_content_beats = _storyboard_content_beat_limit(storyboard)
     profile = capabilities or capabilities_for({**storyboard, **shot})
+    layout_entry = _primary_shot_layout_entry(storyboard, index, profile)
+    max_content_beats = (
+        layout_entry["policy_limit"]
+        if layout_entry is not None
+        else MAX_CONTENT_BEATS
+    )
     sid = _shot_id(shot, index + 1)
     duration = float(shot.get("duration") or shot.get("suggested_duration") or 5)
     _quantized_units(duration, profile)
@@ -852,14 +1335,28 @@ def secondary_storyboard_requirements(
         profile,
         max_content_beats=max_content_beats,
     )
+    if (
+        layout_entry is not None
+        and content_count != layout_entry["content_count"]
+    ):
+        raise _primary_layout_error(
+            f"{sid} requires {content_count} Pxx but the canonical layout "
+            f"declares {layout_entry['content_count']}"
+        )
     first_minimum, first_maximum = profile.effective_duration_bounds("multi_image")
     tail_minimum, tail_maximum = profile.effective_duration_bounds("tail_video_extend")
-    content_durations = _duration_budgets(
-        content_duration,
-        content_count,
-        profile,
-        minimum_durations=[first_minimum] + [tail_minimum] * (content_count - 1),
-        maximum_durations=[first_maximum] + [tail_maximum] * (content_count - 1),
+    content_durations = (
+        list(layout_entry["effective_story_durations"])
+        if layout_entry is not None
+        else _duration_budgets(
+            content_duration,
+            content_count,
+            profile,
+            minimum_durations=[first_minimum]
+            + [tail_minimum] * (content_count - 1),
+            maximum_durations=[first_maximum]
+            + [tail_maximum] * (content_count - 1),
+        )
     )
     modes = ["multi_image"] + ["tail_video_extend"] * (content_count - 1)
     if len(modes) > max_content_beats:
@@ -867,6 +1364,14 @@ def secondary_storyboard_requirements(
             f"{sid} requires {len(modes)} secondary beats, above the "
             f"{max_content_beats}-beat contract"
         )
+    provider_request_durations = (
+        list(layout_entry["provider_request_durations"])
+        if layout_entry is not None
+        else [
+            profile.request_duration_for_effective_story(duration, mode)
+            for duration, mode in zip(content_durations, modes, strict=True)
+        ]
+    )
     return {
         "shot_id": sid,
         "profile": profile,
@@ -875,7 +1380,26 @@ def secondary_storyboard_requirements(
         "generation_action_units": generation_action_units,
         "content_duration": content_duration,
         "content_count": content_count,
-        "provider_capacity": max_content_beats,
+        "provider_capacity": (
+            layout_entry["content_count"]
+            if layout_entry is not None
+            else max_content_beats
+        ),
+        "declared_content_beat_count": (
+            layout_entry["content_count"]
+            if layout_entry is not None
+            else None
+        ),
+        "declared_generation_action_unit_capacity": (
+            layout_entry["action_capacity"]
+            if layout_entry is not None
+            else None
+        ),
+        "primary_shot_layout_sha256": (
+            layout_entry["layout_sha256"]
+            if layout_entry is not None
+            else None
+        ),
         "content_durations": content_durations,
         "extension_required": content_count > 1,
         "extension_reasons": extension_reasons,
@@ -884,6 +1408,7 @@ def secondary_storyboard_requirements(
         "bridge_duration": bridge_duration,
         "modes": modes,
         "durations": content_durations,
+        "provider_request_durations": provider_request_durations,
     }
 
 
@@ -1149,6 +1674,15 @@ def secondary_storyboard_contract_errors(
                 f"{beat_id} is not bound to {SECONDARY_STORYBOARD_VERSION}",
                 observed=beat.get("planner_version"),
             )
+        if storyboard.get("primary_shot_execution") and beat.get(
+            "primary_shot_layout_sha256"
+        ) != storyboard.get("primary_shot_layout_sha256"):
+            add(
+                "secondary_storyboard_layout_lineage_invalid",
+                f"{beat_id} is not bound to the canonical primary-shot layout",
+                expected=storyboard.get("primary_shot_layout_sha256"),
+                observed=beat.get("primary_shot_layout_sha256"),
+            )
         if str(beat.get("execution_strategy") or "").strip().lower() != mode:
             add(
                 "secondary_storyboard_execution_strategy_invalid",
@@ -1397,6 +1931,17 @@ def plan_storyboard_beats(
     """Attach plot-faithful Pxx clips and separate post-primary bridges."""
     total = 0
     shots = [shot for shot in storyboard.get("shots", []) if isinstance(shot, dict)]
+    if storyboard.get("primary_shot_layout") is not None:
+        _validate_primary_shot_layout(
+            shots,
+            storyboard["primary_shot_layout"],
+            capabilities,
+            require_event_allocation=bool(
+                storyboard.get("primary_shot_execution")
+            ),
+        )
+    elif _requires_primary_layout(storyboard):
+        raise _primary_layout_error("canonical primary-shot layout is missing")
     continuity_mode = str(storyboard.get("continuity_mode") or "").strip().lower()
     if continuity_mode in {"one_take", "single_take", "oner"}:
         for index, shot in enumerate(shots):
@@ -1433,6 +1978,15 @@ def plan_storyboard_beats(
         bridge_policy_bounds = bridge_planning_duration_bounds(profile)
         shot["secondary_storyboard_planning"] = {
             "content_beat_count": requirement["content_count"],
+            "declared_content_beat_count": requirement[
+                "declared_content_beat_count"
+            ],
+            "declared_generation_action_unit_capacity": requirement[
+                "declared_generation_action_unit_capacity"
+            ],
+            "primary_shot_layout_sha256": requirement[
+                "primary_shot_layout_sha256"
+            ],
             "generation_action_unit_count": len(
                 requirement["generation_action_units"]
             ),
@@ -1579,10 +2133,9 @@ def plan_storyboard_beats(
                 else "tail_video_extend"
             )
             effective_story_duration = durations[position - 1]
-            provider_request_duration = profile.request_duration_for_effective_story(
-                effective_story_duration,
-                generation_mode,
-            )
+            provider_request_duration = requirement[
+                "provider_request_durations"
+            ][position - 1]
             normalized = {
                 "beat_id": f"{sid}_P{position:02d}",
                 "position": position,
@@ -1599,6 +2152,9 @@ def plan_storyboard_beats(
                 "generation_mode": generation_mode,
                 "execution_strategy": generation_mode,
                 "planner_version": SECONDARY_STORYBOARD_VERSION,
+                "primary_shot_layout_sha256": requirement[
+                    "primary_shot_layout_sha256"
+                ],
                 "parent_shot_id": sid,
                 "plot_fidelity_contract": "primary_shot_source_only_no_invention",
                 "start_state": previous_state,

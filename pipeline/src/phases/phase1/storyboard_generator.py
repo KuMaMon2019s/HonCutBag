@@ -862,7 +862,7 @@ def _generate_single_shot(
         "source_excerpt", "source_sequence_ids", "source_action_unit_ids",
         "source_action_unit_refs",
         "source_events", "source_event_casts", "dropped_source_events",
-        "source_event_slices",
+        "source_event_slices", "source_event_generation_unit_counts",
         "production_action_refs",
         "source_event_roles",
         "director_intent",
