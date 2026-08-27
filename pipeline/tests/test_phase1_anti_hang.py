@@ -811,6 +811,18 @@ def test_phase1_checkpoints_are_written_and_reused(monkeypatch, tmp_path):
     }
     characters_payload = {"characters": []}
 
+    def director_with_body_repair(events, *_args, **_kwargs):
+        events[0]["body_action_director_repairs"] = [
+            {
+                "micro_action_index": 1,
+                "fields": ["footwork"],
+            }
+        ]
+        return {
+            "status": "done",
+            "plan": {"schema": "honcut.director-plan.v1", "sequences": []},
+        }
+
     monkeypatch.setattr(text_parser, "parse_text", lambda _text: {"segments": [{"id": 1}]})
     monkeypatch.setattr(
         event_extractor,
@@ -847,10 +859,7 @@ def test_phase1_checkpoints_are_written_and_reused(monkeypatch, tmp_path):
     monkeypatch.setattr(
         pipeline_core,
         "run_phase1_director",
-        lambda *_args, **_kwargs: {
-            "status": "done",
-            "plan": {"schema": "honcut.director-plan.v1", "sequences": []},
-        },
+        director_with_body_repair,
     )
 
     first = pipeline_core.run_phase1_screenwriter("synthetic input", tmp_path, 15, False)
@@ -861,6 +870,7 @@ def test_phase1_checkpoints_are_written_and_reused(monkeypatch, tmp_path):
     stored_events = json.loads((tmp_path / "phase1_events.json").read_text())
     stored_characters = json.loads((tmp_path / "phase1_characters.json").read_text())
     assert stored_events["events"] == events_payload["events"]
+    assert stored_events["director_body_repair_count"] == 1
     assert stored_characters["characters"] == characters_payload["characters"]
     assert stored_events["_checkpoint"]["schema_version"] == pipeline_core.PHASE1_CHECKPOINT_SCHEMA_VERSION
     assert stored_characters["_checkpoint"]["schema_version"] == pipeline_core.PHASE1_CHECKPOINT_SCHEMA_VERSION

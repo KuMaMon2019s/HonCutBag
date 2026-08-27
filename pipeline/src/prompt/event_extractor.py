@@ -30,6 +30,8 @@ from typing import List, Dict, Any
 
 from openai import OpenAI
 from schemas.understanding import (
+    BodyActionUnderstanding,
+    EventUnderstanding,
     EventUnderstandingBatch,
     native_chat_json_schema_format,
     parse_structured_output,
@@ -41,6 +43,7 @@ from utils.action_units import (
 )
 from utils.body_action_contracts import (
     apply_body_action_contract,
+    deferred_director_body_action_repairs,
     normalize_body_action_choreography,
     requires_explicit_body_choreography,
 )
@@ -293,7 +296,7 @@ _NARRATIVE_JUMP_CUES = (
 # caches carried over from earlier run directories — and forces every Phase 1
 # event extraction to re-run (a paid LLM pass). Never bump casually, and never
 # reuse cross-run segment caches from a run produced under a different value.
-EVENT_FLOW_SCHEMA_VERSION = "26.0"
+EVENT_FLOW_SCHEMA_VERSION = "27.0"
 
 _UNKNOWN_ACTION_PERFORMERS = {
     "",
@@ -430,10 +433,17 @@ def _normalize_event(event: Dict[str, Any], source_content: str = "") -> Dict[st
             for error in choreography_contract.get("errors") or []
             if isinstance(error, dict)
         ]
-        raise ValueError(
-            "body choreography failed executable mechanics validation: "
-            f"{json.dumps(contract_errors, ensure_ascii=False)}"
+        deferred_repairs = deferred_director_body_action_repairs(
+            event,
+            choreography_contract,
         )
+        if deferred_repairs:
+            event["body_action_director_repairs_pending"] = deferred_repairs
+        else:
+            raise ValueError(
+                "body choreography failed executable mechanics validation: "
+                f"{json.dumps(contract_errors, ensure_ascii=False)}"
+            )
     motion_mode = str(event.get("generation_motion_mode") or "").strip().lower()
     if not event["micro_actions"]:
         event["generation_motion_mode"] = "none"
@@ -511,6 +521,29 @@ def _parse_events(response: str, source_content: str = "") -> List[Dict[str, Any
     ):
         return []
     return [event for event in parsed if not _is_global_production_directive(event)]
+
+
+def _cached_event_schema_payload(event: object) -> dict[str, Any]:
+    """Remove normalized internal fields before revalidating a segment cache."""
+    if not isinstance(event, dict):
+        raise TypeError("cached event must be an object")
+    payload = {
+        field: event[field]
+        for field in EventUnderstanding.model_fields
+        if field in event
+    }
+    choreography = payload.get("body_action_choreography")
+    if isinstance(choreography, list):
+        payload["body_action_choreography"] = [
+            {
+                field: beat[field]
+                for field in BodyActionUnderstanding.model_fields
+                if isinstance(beat, dict) and field in beat
+            }
+            for beat in choreography
+            if isinstance(beat, dict)
+        ]
+    return payload
 
 
 def _extract_events_from_segment(segment: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -654,7 +687,12 @@ def extract_events(
                 cached = json.loads(cache_path.read_text(encoding="utf-8"))
                 events = _parse_events(
                     json.dumps(
-                        {"events": cached.get("events", [])},
+                        {
+                            "events": [
+                                _cached_event_schema_payload(event)
+                                for event in cached.get("events", [])
+                            ]
+                        },
                         ensure_ascii=False,
                     ),
                     str(segment.get("content", "")),

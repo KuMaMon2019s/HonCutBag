@@ -14,6 +14,9 @@ from schemas.understanding import (
     parse_structured_output,
 )
 from utils.ark_llm import call_llm_stream, create_ark_client
+from utils.body_action_contracts import (
+    complete_director_owned_body_action_contract,
+)
 from utils.config import DEFAULT_TEXT_MODEL, get_api_key
 
 DIRECTOR_LLM_POLICY = LLMStreamPolicy.long_structured_output(max_tokens=8000)
@@ -138,6 +141,8 @@ def plan_director(
 
     # 调用 LLM。生产导演规划是 Phase 1 的必需证据，失败必须向上冒泡。
     try:
+        for event in events:
+            complete_director_owned_body_action_contract(event)
         api_key = get_api_key("ARK_AGENT_API_KEY")
         if not api_key:
             raise RuntimeError("director planning requires ARK_AGENT_API_KEY")

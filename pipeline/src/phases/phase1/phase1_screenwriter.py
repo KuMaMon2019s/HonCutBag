@@ -672,6 +672,18 @@ def run_phase1_screenwriter(
             False,
             director_runner,
         )
+        director_body_repairs = sum(
+            len(event.get("body_action_director_repairs") or [])
+            for event in events
+        )
+        if director_body_repairs:
+            events_result["director_body_repair_count"] = director_body_repairs
+            _atomic_write_phase1_json(
+                events_checkpoint,
+                events_result,
+                collection_key="events",
+                input_hash=events_input_hash,
+            )
 
         # Step 2.3: character_discoverer → characters dict
         print("  → character_discoverer: 发现角色...")

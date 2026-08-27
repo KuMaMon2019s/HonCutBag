@@ -9,6 +9,7 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from phases.phase1 import director_planner
 from phases.phase1.adaptation_engine import (
     BATCH_EXPAND_PROMPT,
     BEAT_SKELETON_PROMPT,
@@ -404,8 +405,71 @@ def test_body_choreography_uses_source_index_as_canonical_action_identity():
     assert contract["beats"][0]["micro_action"] == "第一名敌人高速冲刺逼近"
 
 
-def test_event_parser_rejects_placeholder_body_choreography_before_bad_debt():
+def test_event_parser_defers_two_director_owned_body_details():
     payload = [_event(
+        what="男子在车厢内与敌人格斗",
+        visual="男子连续闪避敌人的格斗攻击",
+        source_excerpt="男子在车厢内连续闪避敌人攻击。",
+        micro_actions=["男子连续闪避敌人攻击"],
+        body_action_choreography=[{
+            "micro_action_index": 1,
+            "performer": "男子",
+            "technique": "近身闪避",
+            "side": "右侧",
+            "limbs": ["双腿", "躯干", "双臂"],
+            "footwork": "未明确",
+            "torso": "未指定",
+            "weight_shift": "在双脚之间切换重心",
+            "direction": "随攻击方向变换",
+            "contact": "避开攻击",
+            "end_pose": "低重心警戒姿态",
+        }],
+    )]
+
+    parsed = _parse_events(
+        json.dumps({"events": payload}, ensure_ascii=False),
+        "男子在车厢内连续闪避敌人攻击。",
+    )
+
+    assert parsed[0]["body_action_contract"]["valid"] is False
+    assert parsed[0]["body_action_director_repairs_pending"] == [
+        {"micro_action_index": 1, "fields": ["footwork", "torso"]}
+    ]
+
+
+def test_event_parser_still_rejects_sparse_body_choreography():
+    payload = [_event(
+        what="男子在车厢内与敌人格斗",
+        visual="男子连续闪避敌人的格斗攻击",
+        source_excerpt="男子在车厢内连续闪避敌人攻击。",
+        micro_actions=["男子连续闪避敌人攻击"],
+        body_action_choreography=[{
+            "micro_action_index": 1,
+            "performer": "男子",
+            "technique": "近身闪避",
+            "side": "右侧",
+            "limbs": [],
+            "footwork": "未明确",
+            "torso": "",
+            "weight_shift": "在双脚之间切换重心",
+            "direction": "随攻击方向变换",
+            "contact": "避开攻击",
+            "end_pose": "低重心警戒姿态",
+        }],
+    )]
+
+    with pytest.raises(ValueError, match="body choreography"):
+        _parse_events(
+            json.dumps({"events": payload}, ensure_ascii=False),
+            "男子在车厢内连续闪避敌人攻击。",
+        )
+
+
+def test_director_completes_deferred_body_detail_before_planning(
+    tmp_path,
+    monkeypatch,
+):
+    payload = _event(
         what="男子在车厢内与敌人格斗",
         visual="男子连续闪避敌人的格斗攻击",
         source_excerpt="男子在车厢内连续闪避敌人攻击。",
@@ -423,13 +487,41 @@ def test_event_parser_rejects_placeholder_body_choreography_before_bad_debt():
             "contact": "避开攻击",
             "end_pose": "低重心警戒姿态",
         }],
-    )]
+    )
+    event = _parse_events(
+        json.dumps({"events": [payload]}, ensure_ascii=False),
+        payload["source_excerpt"],
+    )[0]
+    event["sequence_id"] = "SEQ001"
 
-    with pytest.raises(ValueError, match="body choreography"):
-        _parse_events(
-            json.dumps({"events": payload}, ensure_ascii=False),
-            "男子在车厢内连续闪避敌人攻击。",
-        )
+    def fake_call_llm_stream(*, messages, **_kwargs):
+        assert event["body_action_contract"]["valid"] is True
+        assert event["body_action_director_repairs"] == [
+            {"micro_action_index": 1, "fields": ["footwork"]}
+        ]
+        assert "确定性导演补全" in event["body_action_choreography"][0][
+            "footwork"
+        ]
+        return json.dumps({
+            "schema": "honcut.director-plan.v1",
+            "sequences": [{
+                "sequence_id": "SEQ001",
+                "scene_goal": "推进冲突",
+                "emotion_arc": "戒备→紧张",
+                "visual_focus": "闪避动作",
+                "spatial_intent": "车厢内近身对峙",
+                "transition_intent": "动作后收束",
+            }],
+        }, ensure_ascii=False)
+
+    monkeypatch.setattr(director_planner, "get_api_key", lambda _name: "test-key")
+    monkeypatch.setattr(director_planner, "create_ark_client", lambda **_kwargs: object())
+    monkeypatch.setattr(director_planner, "call_llm_stream", fake_call_llm_stream)
+
+    result = director_planner.plan_director([event], tmp_path)
+
+    assert result["status"] == "done"
+    assert "body_action_director_repairs_pending" not in event
 
 
 def test_event_parser_rejects_invented_dialogue():
@@ -991,6 +1083,55 @@ def test_segment_cache_is_invalidated_by_extractor_schema(tmp_path, monkeypatch)
 
     assert calls == 2
     assert len(list((tmp_path / "phase1_event_segments").glob("*.json"))) == 2
+
+
+def test_segment_cache_reuses_nonempty_normalized_event(tmp_path, monkeypatch):
+    calls = 0
+    content = "男子在车厢内连续闪避敌人攻击。"
+    payload = _event(
+        who=["男子", "敌人"],
+        what=content,
+        visual=content,
+        source_excerpt=content,
+        micro_actions=["男子向右侧身闪避敌人攻击"],
+        body_action_choreography=[{
+            "micro_action_index": 1,
+            "performer": "男子",
+            "technique": "右侧身闪避",
+            "side": "右侧",
+            "limbs": ["双腿", "躯干", "双臂"],
+            "footwork": "右脚向右后方撤半步",
+            "torso": "躯干向右后方倾斜",
+            "weight_shift": "重心转移到左腿",
+            "direction": "向右后方避开攻击",
+            "contact": "无目标接触；双脚保持地面支撑",
+            "end_pose": "左腿承重的低位警戒姿态",
+        }],
+    )
+
+    def fake_call(_prompt: str, system_prompt: str) -> str:
+        nonlocal calls
+        calls += 1
+        assert system_prompt
+        return json.dumps({"events": [payload]}, ensure_ascii=False)
+
+    segment = {
+        "id": 1,
+        "content": content,
+        "format_hint": "prose_action_screenplay",
+        "context_before": "",
+        "context_after": "",
+    }
+    monkeypatch.setattr("prompt.event_extractor._call_llm", fake_call)
+
+    from prompt import event_extractor
+
+    first = event_extractor.extract_events([segment], checkpoint_dir=tmp_path)
+    second = event_extractor.extract_events([segment], checkpoint_dir=tmp_path)
+
+    assert calls == 1
+    assert first["events"][0]["body_action_contract"]["valid"] is True
+    assert second["events"][0]["body_action_contract"]["valid"] is True
 
 
 def test_group_participants_are_not_promoted_to_character_assets():

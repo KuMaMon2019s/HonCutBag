@@ -100,6 +100,10 @@ _STRUCTURED_MECHANICS_FIELDS = (
     "contact",
     "end_pose",
 )
+_DIRECTOR_REPAIRABLE_MECHANICS_FIELDS = frozenset(
+    set(_STRUCTURED_MECHANICS_FIELDS) - {"performer"}
+)
+MAX_DIRECTOR_REPAIR_FIELDS_PER_BEAT = 2
 
 
 def _text_values(record: dict[str, Any], fields: Iterable[str]) -> str:
@@ -270,6 +274,184 @@ def _is_placeholder_mechanics_value(value: Any) -> bool:
         or _PLACEHOLDER_MECHANICS.fullmatch(normalized)
         or _PLACEHOLDER_MECHANICS_FRAGMENT.search(normalized)
     )
+
+
+def deferred_director_body_action_repairs(
+    record: dict[str, Any],
+    contract: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Return a bounded list of production details the Director may complete.
+
+    Event extraction owns source facts: performer identity, action indexes and
+    temporal relations.  A paid response that preserves those facts should not
+    be regenerated solely because one or two production-staging fields are
+    absent.  Sparse choreography and any missing performer remain hard errors.
+    """
+
+    contract = contract or build_body_action_contract(record)
+    if not contract or contract.get("valid") is True:
+        return []
+    errors = [
+        error
+        for error in contract.get("errors") or []
+        if isinstance(error, dict)
+    ]
+    allowed_codes = {
+        "body_choreography_vague_action",
+        "body_choreography_incomplete_beat",
+    }
+    if not errors or any(error.get("code") not in allowed_codes for error in errors):
+        return []
+
+    incomplete = next(
+        (
+            error.get("beats") or []
+            for error in errors
+            if error.get("code") == "body_choreography_incomplete_beat"
+        ),
+        [],
+    )
+    repairs: list[dict[str, Any]] = []
+    incomplete_actions: set[str] = set()
+    for beat in incomplete:
+        if not isinstance(beat, dict):
+            return []
+        fields = sorted({str(field) for field in beat.get("missing_fields") or []})
+        if (
+            not fields
+            or len(fields) > MAX_DIRECTOR_REPAIR_FIELDS_PER_BEAT
+            or not set(fields) <= _DIRECTOR_REPAIRABLE_MECHANICS_FIELDS
+        ):
+            return []
+        try:
+            action_index = int(beat.get("micro_action_index") or 0)
+        except (TypeError, ValueError):
+            return []
+        if action_index <= 0:
+            return []
+        incomplete_actions.add(str(beat.get("micro_action") or "").strip())
+        repairs.append(
+            {
+                "micro_action_index": action_index,
+                "fields": fields,
+            }
+        )
+
+    vague_actions = {
+        str(action).strip()
+        for error in errors
+        if error.get("code") == "body_choreography_vague_action"
+        for action in error.get("actions") or []
+        if str(action).strip()
+    }
+    if vague_actions and not vague_actions <= incomplete_actions:
+        return []
+    return repairs
+
+
+def _director_mechanics_value(
+    field: str,
+    *,
+    action: str,
+    relation: dict[str, Any],
+) -> str | list[str]:
+    marker = "（确定性导演补全）"
+    targets = [
+        str(value).strip()
+        for value in relation.get("targets") or []
+        if str(value).strip()
+    ]
+    action_kind = str(relation.get("action_kind") or "").strip().lower()
+    if field == "technique":
+        return f"{action}{marker}"
+    if field == "side":
+        return f"动作侧{marker}"
+    if field == "limbs":
+        if re.search(r"踢|腿|膝|kick|knee", action, re.IGNORECASE):
+            return [f"动作侧腿{marker}", "支撑腿", "躯干"]
+        if re.search(r"冲刺|奔跑|跨步|跃|跳|sprint|run|jump", action, re.IGNORECASE):
+            return [f"双腿{marker}", "躯干", "双臂"]
+        if re.search(r"闪避|侧身|后仰|下潜|dodge|slip|duck|lean", action, re.IGNORECASE):
+            return [f"躯干{marker}", "双腿"]
+        return [f"动作侧手臂{marker}", "躯干", "双腿"]
+    if field == "footwork":
+        if action_kind == "locomotion" or re.search(
+            r"冲刺|奔跑|跨步|跃|跳|sprint|run|jump",
+            action,
+            re.IGNORECASE,
+        ):
+            return f"双脚按来源动作方向交替移动并稳定落脚{marker}"
+        return f"双脚建立稳定支撑并随动作调整站位{marker}"
+    if field == "torso":
+        return f"躯干随来源动作方向协同转动并保持平衡{marker}"
+    if field == "weight_shift":
+        return f"重心沿来源动作方向转移并落到稳定支撑面{marker}"
+    if field == "direction":
+        target = targets[0] if targets else "来源动作目标"
+        return f"朝向{target}并遵循来源动作既定轨迹{marker}"
+    if field == "contact":
+        if _CONTACT_REQUIRING_BODY_ACTION.search(action):
+            target = targets[0] if targets else "来源动作目标"
+            return f"按来源动作与{target}发生既定接触{marker}"
+        return f"无目标接触；身体保持既有支撑接触{marker}"
+    if field == "end_pose":
+        return f"完成“{action}”后进入可承接下一动作的稳定终态{marker}"
+    raise ValueError(f"unsupported director mechanics field: {field}")
+
+
+def complete_director_owned_body_action_contract(
+    record: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Complete a bounded deferred contract without changing source facts."""
+
+    contract = build_body_action_contract(record)
+    if not contract or contract.get("valid") is True:
+        record.pop("body_action_director_repairs_pending", None)
+        return []
+    repairs = deferred_director_body_action_repairs(record, contract)
+    if not repairs:
+        raise ValueError(
+            "body choreography is too sparse for deterministic director completion"
+        )
+
+    beats = copy.deepcopy(contract.get("beats") or [])
+    relations = {
+        int(relation.get("micro_action_index") or 0): relation
+        for relation in record.get("action_temporal_relations") or []
+        if isinstance(relation, dict)
+    }
+    for repair in repairs:
+        action_index = repair["micro_action_index"]
+        beat = next(
+            (
+                candidate
+                for candidate in beats
+                if int(candidate.get("micro_action_index") or 0) == action_index
+            ),
+            None,
+        )
+        if beat is None:
+            raise ValueError(
+                f"director body repair references missing action {action_index}"
+            )
+        action = str(beat.get("micro_action") or "").strip()
+        relation = relations.get(action_index, {})
+        for field in repair["fields"]:
+            beat[field] = _director_mechanics_value(
+                field,
+                action=action,
+                relation=relation,
+            )
+
+    record["body_action_choreography"] = beats
+    completed = apply_body_action_contract(record)
+    if not completed or completed.get("valid") is not True:
+        raise ValueError(
+            "deterministic director completion did not produce a valid body contract"
+        )
+    record.pop("body_action_director_repairs_pending", None)
+    record["body_action_director_repairs"] = copy.deepcopy(repairs)
+    return repairs
 
 
 def _normalize_explicit_non_contact(beats: list[dict[str, Any]]) -> None:
