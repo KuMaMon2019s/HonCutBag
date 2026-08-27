@@ -23,6 +23,8 @@ def run_phase1(
     project_video_spec: dict[str, Any] | None = None,
     screenplay_rewrite_request: dict[str, Any] | None = None,
     shot_policy: str = DEFAULT_SHOT_POLICY,
+    max_material_padding_ratio: float = 0.25,
+    delivery_overrun_ratio: float = 0.0,
     *,
     _director_runner=None,
     _screenwriter_runner=None,
@@ -60,6 +62,8 @@ def run_phase1(
             project_video_spec=project_video_spec,
             screenplay_rewrite_request=screenplay_rewrite_request,
             shot_policy=shot_policy,
+            max_material_padding_ratio=max_material_padding_ratio,
+            delivery_overrun_ratio=delivery_overrun_ratio,
             _director_runner=director_runner,
         )
     finally:

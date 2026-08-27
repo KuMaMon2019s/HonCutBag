@@ -27,6 +27,8 @@ class VideoModelCapabilities:
     max_action_units_per_beat: int
     max_micro_actions_per_beat: int
     action_budget_steps: tuple[tuple[float, int], ...]
+    max_temporal_slices_per_beat: int | None = None
+    max_motion_contributions_per_slice: int | None = None
     duration_quantum_s: float = 0.001
     tail_reference_window_s: float | None = None
     tail_reference_frame_fractions: tuple[float, ...] = ()
@@ -40,6 +42,22 @@ class VideoModelCapabilities:
     max_tail_extend_duration_s: float | None = None
     min_primary_story_duration_s: float | None = None
     max_primary_story_duration_s: float | None = None
+
+    @property
+    def temporal_slice_limit(self) -> int:
+        return int(
+            self.max_temporal_slices_per_beat
+            if self.max_temporal_slices_per_beat is not None
+            else self.max_micro_actions_per_beat
+        )
+
+    @property
+    def motion_contribution_limit(self) -> int:
+        return int(
+            self.max_motion_contributions_per_slice
+            if self.max_motion_contributions_per_slice is not None
+            else self.max_micro_actions_per_beat
+        )
 
     def action_limit(self, duration_seconds: float | int | None) -> int:
         if duration_seconds is None:
@@ -195,6 +213,8 @@ SEEDANCE_2_CAPABILITIES = VideoModelCapabilities(
     max_action_units_per_beat=1,
     max_micro_actions_per_beat=2,
     action_budget_steps=((5, 1), (6, 2), (8, 3), (15, 4)),
+    max_temporal_slices_per_beat=2,
+    max_motion_contributions_per_slice=2,
     duration_quantum_s=1,
     tail_reference_window_s=2,
     tail_reference_frame_fractions=(0.2, 0.6, 0.95),
@@ -223,6 +243,8 @@ GENERIC_VIDEO_CAPABILITIES = VideoModelCapabilities(
     max_action_units_per_beat=2,
     max_micro_actions_per_beat=4,
     action_budget_steps=((5, 2), (10, 4), (60, 6)),
+    max_temporal_slices_per_beat=4,
+    max_motion_contributions_per_slice=4,
 )
 
 

@@ -44,17 +44,9 @@ def test_extracted_dialogue_lines_reach_adaptation_prompt(monkeypatch):
 
     def fake_adaptation_call(prompt, max_tokens=32000):
         prompts.append(prompt)
-        if "固定 beat/sequence 槽位" in prompt:
+        if "不可变 beat 合同" in prompt:
             return json.dumps({"strategy": "保留对白", "beats": [{
                 "beat_order": 1,
-                "source_events": [1],
-                "dropped_source_events": [],
-                "action": "keep",
-                "reason": "保留原台词",
-                "who": ["凛"],
-                "where": "雨夜轨道",
-                "what": "凛质问烬",
-                "suggested_duration": 15,
                 "shot_size": "medium",
                 "camera_angle": "over_shoulder",
                 "camera_movement": "dolly_in",

@@ -34,7 +34,11 @@ from schemas.understanding import (
     native_chat_json_schema_format,
     parse_structured_output,
 )
-from utils.action_units import annotate_event_motion_modes
+from utils.action_units import (
+    ACTION_TIMELINE_SCHEMA,
+    annotate_event_motion_modes,
+    build_event_action_timeline,
+)
 from utils.body_action_contracts import (
     apply_body_action_contract,
     normalize_body_action_choreography,
@@ -57,19 +61,27 @@ from utils.ark_llm import (
 GENERAL_SYSTEM_PROMPT = (
     "你是影视编剧与连续性编辑。从文本中提取可拍摄的叙事事件。"
     "事件不是镜头：不要把每句话或每个招式机械拆成一个事件，镜头划分由下游导演完成。"
+    "同一故事时刻发生的多角色动作必须留在同一事件中，以便建立可验证的并行时间片；"
+    "event_role 只描述该事件的主导叙事功能，不能作为拆开攻击与同步闪避/格挡的理由。"
     "你必须保留动作的起始状态、结束状态、因果关系和无署名对白的可靠归属。"
+    "逐动作时间关系必须区分多角色并行、交互式攻防、串行位移、环境结果和持续状态。"
     "输出严格 JSON 对象，顶层只有 events 数组。不要输出任何解释文字。"
 )
 
 ACTION_SYSTEM_PROMPT = (
     "你是动作影视编剧与连续性编辑。从动作型文本中提取可拍摄的因果动作单元。"
     "事件不是镜头：不要把每句话或每个招式机械拆成一个事件，镜头划分由下游导演完成。"
+    "同一故事时刻的攻击、闪避/格挡与被动环境反馈必须留在同一事件中；"
+    "不得为了分别填写 action_chain/reaction/consequence 而把一个并行动作时间片拆成多个事件。"
     "micro_actions 是按时间先后生成的可执行动作阶段，不是‘复杂动作’‘跳舞’‘连续格斗’等抽象标签；"
     "同一时刻并行完成的复合动作必须合成一条。"
     "舞蹈、格斗、功夫或武术段落必须进一步输出逐拍 body_action_choreography，明确左右侧、"
     "执行肢体、步法、躯干、重心、方向、接触点和终态；没有目标接触的位移/闪避也必须明确写"
     "‘无目标接触，身体保持既有支撑接触’，不得写‘无/不适用/未明确’。原文未指定左右时，"
     "side 是导演编排选择，必须直接给出具体左侧或右侧，不得回写来源未明确。"
+    "每条 micro_action 都必须输出一条 action_temporal_relations：不同角色确实在同一时刻"
+    "行动时才用 overlap；攻击与同一交互中的闪避或格挡用 reaction_overlap；随后反击、"
+    "位移后抓取、控制后投掷及慢节奏观察保持 after；粒子、火花、震动等结果使用 effect_of。"
     "你必须保留动作的起始状态、结束状态、因果关系和无署名对白的可靠归属。"
     "输出严格 JSON 对象，顶层只有 events 数组。不要输出任何解释文字。"
 )
@@ -99,6 +111,17 @@ USER_PROMPT_TEMPLATE = (
     "- body_action_choreography: 数组；仅舞蹈/格斗/功夫/武术段落必填，每项必须包含 "
     "micro_action_index、performer、technique、side、limbs（数组）、footwork、torso、"
     "weight_shift、direction、contact、end_pose；非此类事件为 []\n"
+    "- action_temporal_relations: 数组；必须与 micro_actions 一一对应且索引从1开始，每项包含 "
+    "micro_action_index、performers（数组）、targets（数组）、action_kind"
+    "（locomotion/attack/defense/control/impact/state_change/environment_effect/sustained）、"
+    "temporal_relation（root/after/overlap/reaction_overlap/effect_of/sustained_during）、"
+    "reference_action_indexes（只引用更早动作）、pace（fast/normal/slow）、"
+    "ensemble_id（字符串；通常为空，仅原文明示不同角色同步完成同类群体动作时，"
+    "同组填写同一稳定ID）、state_reads（数组）、state_writes（数组）。首个独立动作使用 root；after/overlap/"
+    "reaction_overlap/effect_of/sustained_during 必须引用其直接前置或所属动作。"
+    "若这些关系填写多个 reference_action_indexes，则所有引用必须已经属于同一个并行时间片；"
+    "不得把不同时刻的动作同时作为一个零时长效果或并行动作的所属时间片。"
+    "micro_actions=[] 时必须为 []\n"
     "- generation_motion_mode: 字符串，只能是 none/atomic/composite；micro_actions=[] 时为 none；"
     "需按先后执行的动作阶段为 atomic；原文明确说明同一时刻并行完成、"
     "融为一个整体且不是逐个执行时才为 composite\n"
@@ -115,12 +138,29 @@ USER_PROMPT_TEMPLATE = (
     "line 必须逐字保留剧本原文，禁止改写、摘要或翻译。\n"
     "剧本对白可能写作 角色名：\"台词\" 或 角色名:\"台词\"，全角/半角冒号与引号均可能出现。"
     "只有证据充分才填写角色名；若只能猜测，speaker 写‘未知’并降低 confidence，禁止为了完整而编造。\n\n"
-    "{format_contract}"
+    "{format_contract}\n\n"
+    "{semantic_timeline_contract}"
+)
+
+
+SEMANTIC_TIMELINE_CONTRACT = (
+    "【语义时间线与生产容量分离】\n"
+    "1. 本阶段只还原来源中真实的故事时间关系，不按任何具体视频模型的容量改写、删减或"
+    "强行串行化。同一瞬间确有三名角色、载具与角色等多条独立轨道时，必须如实保留在同一"
+    "语义时间片；下游布局器会把超容量语义片编排为相邻 Provider 执行子片。\n"
+    "2. 载具启动、急停、转向、加速等状态改变是有故事时间的主动贡献，必须使用 root/after/"
+    "overlap；只有状态已经建立后的持续行驶、持续惯性、持续暴雨或持续震动才可使用"
+    "sustained_during。\n"
+    "3. 持握、站立、保持姿势等不产生新运动的角色持续状态也使用 sustained_during、"
+    "performers=[]，把角色和物体写入 targets/state_reads/state_writes；不得伪装成 overlap。\n"
+    "4. 不得为了迎合生成模型而改变原文因果：攻击与同步闪避/格挡仍是 reaction_overlap；"
+    "抓取后投掷、位移后控制、回合制反击和慢节奏检查仍是 after。"
 )
 
 GENERAL_PROSE_CONTRACT = (
     "【通用叙事规则】\n"
     "1. 场景建立、人物状态、对白、行为、反应、后果与关系变化按叙事功能划分 event_role。\n"
+    "同一故事时刻的多角色动作仍属于一个事件，event_role 取主导功能；不得把可并行关系拆到事件边界外。\n"
     "2. 只在原文明确描述可见行为时填写 micro_actions；氛围、说明与内心信息不得虚构肢体动作。\n"
     "3. 对人物、物体或空间造成的持久变化必须进入 end_state，供后续事件承接。\n"
     "4. 目标、关系、认知或处境发生转折时单列 turning_point，并设置 dramatic_turn=true；"
@@ -129,11 +169,21 @@ GENERAL_PROSE_CONTRACT = (
     "6. who 只放可作为角色资产的具名个体；群体与背景参与者写入 visual，不得写入 who。\n"
     "7. who 的每个值必须是稳定身份标签，不得包含服装、年龄、伤势、动作、站位或地点修饰；"
     "同一人物必须沿用 target/上下文中已有的最短无歧义标签。"
+    "\n8. 每条可见动作都必须进入角色时间线：不同角色在同一故事时刻可以 overlap；"
+    "攻击与同时发生的闪避/格挡使用 reaction_overlap。同一角色的位移后抓取、控制后投掷、"
+    "回合制反击，以及检查、整理、揭示等慢节奏动作必须使用 after。"
+    "粒子、火花、碎片、雨滴、玻璃震动等由动作直接产生的被动反馈才可使用 effect_of；"
+    "effect_of/sustained_during 的 action_kind 只能是 impact、state_change、"
+    "environment_effect 或 sustained，performers 必须为 []，绝不能填写‘环境’‘场景’‘雨水’"
+    "‘火花’等伪执行者；被动反馈绝不能使用 overlap/reaction_overlap。"
+    "任何角色主动动作不得标成零时长效果。"
 )
 
 ACTION_SCREENPLAY_CONTRACT = (
     "【动作型叙事规则】\n"
     "1. 场景建立、人物当前状态、对白、动作链、反应、后果和叙事转折是不同 event_role。\n"
+    "同一故事时刻的攻击、闪避/格挡、受击与被动环境反馈必须保留在同一事件，"
+    "event_role 取该时间片的主导功能；不得用 event_role 把并行动作拆成串行事件。\n"
     "2. micro_actions 只表示视频模型需要按时间先后完成的可见动作阶段，"
     "不得写‘复杂动作’‘复合动作’‘跳舞’‘激烈格斗’‘连续攻击’等不可执行占位词。"
     "原文明确说明多个贡献在同一时刻并行完成、"
@@ -148,6 +198,7 @@ ACTION_SCREENPLAY_CONTRACT = (
     "7. who 的每个值必须是稳定身份标签，不得包含服装、年龄、伤势、动作、站位或地点修饰；"
     "同一人物必须沿用 target/上下文中已有的最短无歧义标签。\n"
     "8. 舞蹈、格斗、功夫、武术或搏击段落必须逐拍填写 body_action_choreography："
+    "每个需要身体执行的 micro_action 必须恰有一个对应 beat，micro_action_index 必须引用该来源动作；"
     "每拍明确执行者、左右侧、肢体路径、步法、躯干旋转、重心转移、运动方向、接触点和终态。"
     "高速位移、逼近、后仰、闪避等没有命中或抓握的动作，contact 必须明确写无目标接触以及"
     "身体与既有支撑面的接触，不得写‘无’‘不适用’‘未明确’。"
@@ -242,7 +293,7 @@ _NARRATIVE_JUMP_CUES = (
 # caches carried over from earlier run directories — and forces every Phase 1
 # event extraction to re-run (a paid LLM pass). Never bump casually, and never
 # reuse cross-run segment caches from a run produced under a different value.
-EVENT_FLOW_SCHEMA_VERSION = "24.0"
+EVENT_FLOW_SCHEMA_VERSION = "26.0"
 
 _UNKNOWN_ACTION_PERFORMERS = {
     "",
@@ -428,6 +479,12 @@ def _normalize_event(event: Dict[str, Any], source_content: str = "") -> Dict[st
                 "evidence": str(raw.get("evidence") or "").strip(),
             })
     event["lines"] = normalized_lines
+    timeline = build_event_action_timeline(event)
+    if event["micro_actions"] and timeline is None:
+        raise ValueError(
+            "action_temporal_relations must cover every micro_action under "
+            f"{ACTION_TIMELINE_SCHEMA}"
+        )
     return event
 
 
@@ -485,6 +542,7 @@ def _extract_events_from_segment(segment: Dict[str, Any]) -> List[Dict[str, Any]
         format_contract=(
             ACTION_SCREENPLAY_CONTRACT if is_action_format else GENERAL_PROSE_CONTRACT
         ),
+        semantic_timeline_contract=SEMANTIC_TIMELINE_CONTRACT,
     )
     system_prompt = ACTION_SYSTEM_PROMPT if is_action_format else GENERAL_SYSTEM_PROMPT
 
@@ -497,6 +555,24 @@ def _extract_events_from_segment(segment: Dict[str, Any]) -> List[Dict[str, Any]
                     "\n\n【重试纠错】上次响应未通过 canonical event schema："
                     f"{last_error}。event_role 与 dramatic_turn 必须严格对应："
                     "turning_point=true，其他 event_role=false。"
+                    "每条 micro_action 还必须有唯一、可验证的 action_temporal_relations，"
+                    "同一角色冲突动作和有先后依赖的动作不得标成 overlap。"
+                    "effect_of/sustained_during 只能附着被动冲击、状态、环境反馈或持续背景；"
+                    "这两类附属项的 performers 必须为 []，不得填写‘环境’‘场景’‘雨水’‘火花’"
+                    "等伪执行者，也绝不能改写成 overlap/reaction_overlap；"
+                    "角色主动动作必须使用 root/after/overlap/reaction_overlap。"
+                    "overlap/reaction_overlap/effect_of/sustained_during 的多个引用若不在"
+                    "同一并行时间片，必须只保留直接所属动作的一个引用，不能跨时间片合并。"
+                    "body_action_choreography 必须逐项覆盖所有需要身体执行的 micro_action，"
+                    "并用准确的 micro_action_index 绑定来源动作；不得漏掉冲刺、逼近、后仰或闪避。"
+                    "原文明示多个不同角色同步完成同类群体动作时，才可给这些动作填写同一 ensemble_id；"
+                    "同一 ensemble_id 内必须至少两个不同执行者，且所有动作的 action_kind 必须完全相同。"
+                    "同一角色通过传递引用在同片重复运动也属于冲突，必须拆开。"
+                    "不要为了满足视频模型容量而改变来源中真实的同时关系；本阶段允许一个语义时间片"
+                    "包含多于两个独立运动贡献，下游会拆成 Provider 执行子片。载具启动/加速是主动"
+                    "状态改变；只有已经建立的持续惯性才可用 action_kind=sustained、"
+                    "sustained_during、performers=[]。持握、站立、保持姿态等不产生新运动的角色"
+                    "状态同样使用 sustained_during、performers=[]，角色写入 targets/状态字段。"
                 )
             response = _call_llm(attempt_prompt, system_prompt=system_prompt)
             events = _parse_events(response, content)

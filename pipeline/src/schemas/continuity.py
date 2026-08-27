@@ -192,6 +192,17 @@ class PrimaryShotBridge(BaseModel):
     action_prompt: str = ""
     start_state: str = ""
     end_state: str = ""
+    source_timeline_assignment_id: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    target_timeline_assignment_id: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    timeline_layout_binding_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+        exclude_if=lambda value: value is None,
+    )
     storyboard_transition_image: str | None = Field(
         default=None, exclude_if=lambda value: value is None
     )

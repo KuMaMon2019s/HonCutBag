@@ -142,6 +142,17 @@ def test_event_normalization_persists_structured_body_action_contract():
         "action_type": "dance",
         "event_role": "action_chain",
         "micro_actions": ["舞者左手撑地、右腿外摆启动街舞托马斯全旋"],
+        "action_temporal_relations": [{
+            "micro_action_index": 1,
+            "performers": ["舞者"],
+            "targets": [],
+            "action_kind": "locomotion",
+            "temporal_relation": "root",
+            "reference_action_indexes": [],
+            "pace": "fast",
+            "state_reads": ["双脚站立"],
+            "state_writes": ["左手撑地、右腿外摆"],
+        }],
         "body_action_choreography": _choreography_shot()["body_action_choreography"][:1],
     }
 

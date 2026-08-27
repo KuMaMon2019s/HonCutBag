@@ -28,6 +28,7 @@ from prompt.event_extractor import (
     ACTION_SCREENPLAY_CONTRACT,
     EVENT_FLOW_SCHEMA_VERSION,
     GENERAL_PROSE_CONTRACT,
+    SEMANTIC_TIMELINE_CONTRACT,
     USER_PROMPT_TEMPLATE as EVENT_PROMPT,
     _annotate_global_event_flow,
     _parse_events,
@@ -42,6 +43,7 @@ from utils.camera_motion_contracts import (
     camera_motion_prompt,
 )
 from utils.body_action_contracts import build_body_action_contract
+from utils.action_units import build_action_timeline
 
 
 PROSE_ACTION_SCRIPT = """
@@ -113,6 +115,25 @@ def _event(**overrides):
         "lines": [],
     }
     base.update(overrides)
+    if "action_temporal_relations" not in overrides:
+        actions = [str(item) for item in base.get("micro_actions") or []]
+        performers = [str(item) for item in base.get("who") or []]
+        base["action_temporal_relations"] = [
+            {
+                "micro_action_index": index,
+                "performers": [performers[(index - 1) % len(performers)]]
+                if performers
+                else [],
+                "targets": [],
+                "action_kind": "state_change",
+                "temporal_relation": "root" if index == 1 else "after",
+                "reference_action_indexes": [] if index == 1 else [index - 1],
+                "pace": "normal",
+                "state_reads": [],
+                "state_writes": [action],
+            }
+            for index, action in enumerate(actions, start=1)
+        ]
     return base
 
 
@@ -139,8 +160,78 @@ def test_event_prompt_uses_read_only_context_and_action_unit_contract():
     assert "肩、胸、胯" not in ACTION_SCREENPLAY_CONTRACT
     assert "舞蹈词汇清单" not in ACTION_SCREENPLAY_CONTRACT
     assert "氛围、说明与内心信息不得虚构肢体动作" in GENERAL_PROSE_CONTRACT
+    assert "performers 必须为 []" in GENERAL_PROSE_CONTRACT
+    assert "被动反馈绝不能使用 overlap/reaction_overlap" in GENERAL_PROSE_CONTRACT
     assert "speaker 写‘未知’" in EVENT_PROMPT
     assert "continuity_before" in EVENT_PROMPT
+    assert "{semantic_timeline_contract}" in EVENT_PROMPT
+
+
+def test_event_prompt_separates_semantic_timeline_from_provider_capacity():
+    contract = SEMANTIC_TIMELINE_CONTRACT
+
+    assert "不按任何具体视频模型的容量" in contract
+    assert "相邻 Provider 执行子片" in contract
+    assert "载具启动、急停、转向、加速" in contract
+    assert "sustained_during" in contract
+    assert "performers=[]" in contract
+
+
+def test_event_parser_accepts_true_three_track_semantic_slice_before_layout():
+    content = "同一瞬间列车启动，左机械臂升起，右机械臂合拢。"
+    event = _event(
+        who=[],
+        what=content,
+        visual=content,
+        action_type="transition",
+        event_role="transition",
+        action_phase="none",
+        source_excerpt=content,
+        micro_actions=["列车启动", "左机械臂升起", "右机械臂合拢"],
+        action_temporal_relations=[
+            {
+                "micro_action_index": 1,
+                "performers": ["列车"],
+                "targets": [],
+                "action_kind": "state_change",
+                "temporal_relation": "root",
+                "reference_action_indexes": [],
+                "pace": "fast",
+            },
+            {
+                "micro_action_index": 2,
+                "performers": ["左机械臂"],
+                "targets": [],
+                "action_kind": "state_change",
+                "temporal_relation": "overlap",
+                "reference_action_indexes": [1],
+                "pace": "fast",
+            },
+            {
+                "micro_action_index": 3,
+                "performers": ["右机械臂"],
+                "targets": [],
+                "action_kind": "state_change",
+                "temporal_relation": "overlap",
+                "reference_action_indexes": [1],
+                "pace": "fast",
+            },
+        ],
+        body_action_choreography=[],
+    )
+
+    parsed = _parse_events(
+        json.dumps({"events": [event]}, ensure_ascii=False),
+        content,
+    )
+
+    assert len(parsed) == 1
+    timeline = build_action_timeline(
+        parsed,
+        max_motion_contributions_per_slice=2,
+    )
+    assert timeline["slices"][0]["motion_load"] == 3
+    assert timeline["slices"][0]["motion_capacity_status"] == "rewrite_required"
 
 
 def test_event_parser_preserves_speaker_evidence_and_action_state():
@@ -163,6 +254,59 @@ def test_event_parser_preserves_speaker_evidence_and_action_state():
     assert parsed[0]["end_state"] == "刀锋压在机械臂上"
     assert parsed[0]["lines"][0]["speaker"] == "凛"
     assert parsed[0]["lines"][0]["confidence"] == 0.92
+
+
+def test_body_choreography_uses_temporal_effect_semantics_not_impact_keyword():
+    payload = [_event(
+        who=["男性", "敌人"],
+        source_excerpt="男性踢中敌人手腕，能量武器脱手撞击金属车壁。",
+        micro_actions=[
+            "男性踢中敌人手腕",
+            "敌人手中的能量武器脱手，撞击在金属车壁上，迸发蓝色电弧与火花",
+        ],
+        action_temporal_relations=[
+            {
+                "micro_action_index": 1,
+                "performers": ["男性"],
+                "targets": ["敌人"],
+                "action_kind": "attack",
+                "temporal_relation": "root",
+                "reference_action_indexes": [],
+                "pace": "fast",
+                "state_reads": ["男性贴近敌人"],
+                "state_writes": ["敌人手腕受击"],
+            },
+            {
+                "micro_action_index": 2,
+                "performers": [],
+                "targets": ["金属车壁"],
+                "action_kind": "environment_effect",
+                "temporal_relation": "effect_of",
+                "reference_action_indexes": [1],
+                "pace": "fast",
+                "state_reads": ["武器脱手"],
+                "state_writes": ["车壁出现电弧火花"],
+            },
+        ],
+        body_action_choreography=[{
+            "micro_action_index": 1,
+            "performer": "男性",
+            "technique": "右脚踢击手腕",
+            "side": "右",
+            "limbs": ["右腿"],
+            "footwork": "左脚稳定支撑",
+            "torso": "躯干左旋",
+            "weight_shift": "重心落在左脚",
+            "direction": "由下向上",
+            "contact": "右脚命中敌人手腕",
+            "end_pose": "右腿回收并保持平衡",
+        }],
+    )]
+
+    parsed = _parse_events(json.dumps({"events": payload}, ensure_ascii=False))
+
+    assert len(parsed[0]["body_action_choreography"]) == 1
+    assert parsed[0]["body_action_contract"]["valid"] is True
 
 
 def test_event_parser_promotes_structured_action_performers_into_who():
@@ -232,6 +376,32 @@ def test_body_choreography_structured_beat_covers_generic_action_label():
     assert contract is not None
     assert contract["valid"] is True
     assert contract["errors"] == []
+
+
+def test_body_choreography_uses_source_index_as_canonical_action_identity():
+    contract = build_body_action_contract({
+        "what": "第一名敌人高速冲刺逼近",
+        "micro_actions": ["第一名敌人高速冲刺逼近"],
+        "body_action_choreography": [{
+            "micro_action_index": 1,
+            "micro_action": "敌人压低身体向前爆发冲刺",
+            "performer": "第一名敌人",
+            "technique": "低姿高速冲刺",
+            "side": "右侧",
+            "limbs": ["双腿", "双臂"],
+            "footwork": "右脚蹬地后双腿交替加速",
+            "torso": "躯干前倾并保持核心稳定",
+            "weight_shift": "重心由右脚快速转移至前脚",
+            "direction": "沿站台朝男性直线逼近",
+            "contact": "双脚持续接触湿润地面，无目标接触",
+            "end_pose": "以前脚制动进入挥砍距离",
+        }],
+    })
+
+    assert contract is not None
+    assert contract["valid"] is True
+    assert contract["errors"] == []
+    assert contract["beats"][0]["micro_action"] == "第一名敌人高速冲刺逼近"
 
 
 def test_event_parser_rejects_placeholder_body_choreography_before_bad_debt():

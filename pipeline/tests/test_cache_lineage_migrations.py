@@ -56,7 +56,7 @@ def test_cache_identity_fails_closed_instead_of_using_a_weaker_key():
 
 
 def test_state_migration_registry_upgrades_v0_and_rejects_future_versions():
-    assert set(STATE_MIGRATIONS) == {0, 1}
+    assert set(STATE_MIGRATIONS) == {0, 1, 2}
     migrated = migrate_state(
         {
             "text": "story",
@@ -65,14 +65,16 @@ def test_state_migration_registry_upgrades_v0_and_rejects_future_versions():
             "error": "legacy failure",
         }
     )
-    assert migrated["state_schema_version"] == 2
+    assert migrated["state_schema_version"] == 3
     assert migrated["shot_policy"] == "cut-driven"
+    assert migrated["max_material_padding_ratio"] == 0.25
+    assert migrated["delivery_overrun_ratio"] == 0.0
     assert migrated["input_text"] == "story"
     assert migrated["target_duration_s"] == 30
     assert migrated["shot_ids"] == ["S01"]
     assert "text" not in migrated
     with pytest.raises(StateMigrationError, match="newer than supported"):
-        migrate_state({"state_schema_version": 3})
+        migrate_state({"state_schema_version": 4})
 
 
 def test_artifact_migration_registry_upgrades_known_v0_manifest(tmp_path):

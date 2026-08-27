@@ -88,6 +88,8 @@ class GraphRunConfig(BaseModel):
         validation_alias=AliasChoices("shot_duration_s", "shot_duration"),
     )
     shot_policy: Literal["continuity", "balanced", "cut-driven"] = "continuity"
+    max_material_padding_ratio: float = Field(default=0.25, ge=0, le=0.25)
+    delivery_overrun_ratio: float = Field(default=0.0, ge=0, le=0.25)
     dry_run: bool = False
     chain_mode: bool = False
     # Human storyboard review is permanently disabled. Keep this field for

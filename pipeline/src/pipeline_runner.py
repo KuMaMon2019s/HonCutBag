@@ -141,6 +141,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="一级分镜策略；新运行默认 continuity",
     )
+    parser.add_argument(
+        "--max-material-padding-ratio",
+        type=float,
+        default=None,
+        help="Provider 素材 padding 上限，范围 0–0.25，默认 0.25",
+    )
+    parser.add_argument(
+        "--delivery-overrun-ratio",
+        type=float,
+        default=None,
+        help="最终交付可超出 nominal 时长的比例，范围 0–0.25，默认 0",
+    )
     parser.add_argument("--chain-mode", action="store_true", default=None,
                         help="Seedance 尾帧接力模式（镜头串行生成）")
     parser.add_argument("--dry-run", action="store_true", default=None, help="dry-run 模式")
@@ -269,6 +281,10 @@ def _resolved_run_arguments(args: argparse.Namespace) -> dict:
             "shot_policy",
             SHOT_POLICY_CUT_DRIVEN if args.resume else DEFAULT_SHOT_POLICY,
         ),
+        "max_material_padding_ratio": choose(
+            "max_material_padding_ratio", 0.25
+        ),
+        "delivery_overrun_ratio": choose("delivery_overrun_ratio", 0.0),
         "chain_mode": choose("chain_mode", False),
         "dry_run": choose("dry_run", False),
         "transition": choose("transition", "crossfade"),
@@ -310,6 +326,8 @@ def main() -> None:
         duration=resolved["duration"],
         shot_duration=resolved["shot_duration"],
         shot_policy=resolved["shot_policy"],
+        max_material_padding_ratio=resolved["max_material_padding_ratio"],
+        delivery_overrun_ratio=resolved["delivery_overrun_ratio"],
         chain_mode=resolved["chain_mode"],
         dry_run=resolved["dry_run"],
         skip_phase=_phase_skip_list(args, parser),

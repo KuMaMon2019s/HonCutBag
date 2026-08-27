@@ -187,7 +187,7 @@ def test_director_intent_changes_layered_checkpoint_identity():
     assert first != changed
 
 
-def test_duration_scaling_uses_strict_director_aligned_source_index_selection(
+def test_duration_scaling_uses_strict_source_indexed_screenplay_rewrite(
     monkeypatch,
 ):
     events = [{
@@ -231,11 +231,25 @@ def test_duration_scaling_uses_strict_director_aligned_source_index_selection(
     def fake_stream(*, messages, response_format, **_kwargs):
         observed["prompt"] = messages[1]["content"]
         observed["response_format"] = response_format
+        groups = production_events[0]["production_action_rewrite"]["groups"]
         return json.dumps({
-            "schema": "honcut.duration-scaled-action-selection.v1",
+            "schema": "honcut.source-indexed-screenplay-rewrite.v1",
             "events": [{
                 "source_event_id": 1,
-                "selected_source_generation_unit_indexes": [1, 3, 5, 7],
+                "production_actions": [
+                    {
+                        "production_action_index": group[
+                            "production_action_index"
+                        ],
+                        "source_micro_action_indexes": group[
+                            "source_micro_action_indexes"
+                        ],
+                        "rewritten_micro_action": (
+                            "连续保全：" + "；".join(group["source_actions"])
+                        ),
+                    }
+                    for group in groups
+                ],
                 "narrative_purpose": "保留由受压到主动的因果端点",
                 "emotional_beat": "警觉转为决断",
                 "director_alignment": "对齐反应、控制动作与稳定收束",
@@ -256,10 +270,20 @@ def test_duration_scaling_uses_strict_director_aligned_source_index_selection(
     assert observed["response_format"]["type"] == "json_schema"
     assert observed["response_format"]["json_schema"]["strict"] is True
     assert "让角色从受压转为主动" in observed["prompt"]
-    assert selected_events[0]["micro_actions"] == [
-        events[0]["micro_actions"][index] for index in (0, 2, 4, 6)
-    ]
-    assert selected_plan["semantic_selection_status"] == "director_aligned"
+    assert all(
+        action.startswith("连续保全：")
+        for action in selected_events[0]["micro_actions"]
+    )
+    rewrite = selected_events[0]["production_action_rewrite"]
+    assert {
+        index
+        for group in rewrite["groups"]
+        for index in group["source_micro_action_indexes"]
+    } == set(range(1, 8))
+    assert rewrite["omitted_source_micro_action_indexes"] == []
+    assert selected_plan["semantic_selection_status"] == (
+        "source_indexed_rewrite"
+    )
     assert selected_plan["events"][0]["narrative_purpose"] == (
         "保留由受压到主动的因果端点"
     )

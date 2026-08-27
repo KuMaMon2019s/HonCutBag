@@ -28,128 +28,129 @@ def _chunk(content):
     )
 
 
-def _phase1_stub_adapted_result(adaptation_engine):
+def _canonical_adapted_result(
+    adaptation_engine,
+    *,
+    actions,
+    target_duration,
+    shot_duration,
+):
+    relations = [
+        {
+            "micro_action_index": index,
+            "performers": [],
+            "targets": [],
+            "action_kind": "state_change",
+            "temporal_relation": "root" if index == 1 else "after",
+            "reference_action_indexes": [] if index == 1 else [index - 1],
+            "pace": "normal",
+            "state_reads": [],
+            "state_writes": [action],
+        }
+        for index, action in enumerate(actions, 1)
+    ]
     event = {
         "event_role": "action_chain",
         "sequence_id": "SEQ001",
-        "micro_actions": ["站立"],
+        "micro_actions": list(actions),
+        "action_temporal_relations": relations,
     }
-    layout = adaptation_engine._estimate_action_capacity_plan(
-        [event],
-        15,
-        15,
+    events = [event]
+    source_capacity_plan = adaptation_engine._estimate_action_capacity_plan(
+        events,
+        target_duration,
+        shot_duration,
         shot_policy="continuity",
-    )["primary_shot_layout"]
-    shot = {
-        "id": "S01",
-        "suggested_duration": 15,
-        "source_events": [1],
-        "source_event_casts": [{
-            "source_event_id": 1,
-            "character_ids": [],
-        }],
-        "source_event_generation_unit_counts": {"1": 1},
-        "micro_actions": ["站立"],
-        "generation_action_units": [{
-            "unit_id": "GAU001",
-            "actions": ["站立"],
-        }],
-    }
-    screenplay_plan = {
-        "schema": adaptation_engine.SCREENPLAY_PLAN_SCHEMA,
-        "primary_shot_layout": layout,
-        "source_ledger": {"capacity_status": "fits_story_clock"},
-        "production_ledger": {
-            "capacity_status": "fits_story_clock",
-            "duration_scaling_status": "not_required",
-            "generation_action_units": 1,
-            "kept_source_event_ids": [1],
-        },
-        "event_action_scaling": {
-            "schema": adaptation_engine.DURATION_SCALED_EVENT_PLAN_SCHEMA,
-            "events": [{
-                "source_event_id": 1,
-                "production_generation_action_units": 1,
-                "production_status": "kept",
-            }],
-        },
-    }
-    screenplay_plan_sha256 = hashlib.sha256(
-        json.dumps(
-            screenplay_plan,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
-    return {
-        "shots": [shot],
-        "material_duration": 15,
-        "capacity_plan": {"primary_shot_layout": layout},
-        "primary_shot_layout": layout,
-        "screenplay_plan": screenplay_plan,
-        "screenplay_plan_sha256": screenplay_plan_sha256,
-    }
-
-
-def _phase1_long_shot_adapted_result(adaptation_engine):
-    event = {
-        "event_role": "action_chain",
-        "sequence_id": "SEQ001",
-        "micro_actions": [f"有序动作{index}" for index in range(45)],
-    }
-    layout = adaptation_engine._estimate_action_capacity_plan(
-        [event],
-        36,
-        6,
-        shot_policy="continuity",
-    )["primary_shot_layout"]
+    )
+    layout = source_capacity_plan["primary_shot_layout"]
+    effective_shot_duration = round(
+        target_duration / layout["primary_shots"]
+    )
+    production_events, duration_plan = (
+        adaptation_engine._build_duration_scaled_event_plan(
+            events,
+            target_duration=target_duration,
+            beat_count=layout["primary_shots"],
+            effective_shot_duration=effective_shot_duration,
+            capabilities=adaptation_engine.get_video_capabilities(),
+            max_generation_units_per_beat=layout[
+                "max_generation_action_units_per_primary_shot"
+            ],
+            maximum_total_generation_units=layout[
+                "production_action_unit_target"
+            ],
+            generation_unit_capacities_per_beat=list(
+                layout["generation_action_unit_capacities"]
+            ),
+        )
+    )
+    source_timeline = adaptation_engine.build_action_timeline(
+        events,
+        max_motion_contributions_per_slice=(
+            adaptation_engine.get_video_capabilities().motion_contribution_limit
+        ),
+    )
+    production_timeline = adaptation_engine.build_action_timeline(
+        production_events,
+        max_motion_contributions_per_slice=(
+            adaptation_engine.get_video_capabilities().motion_contribution_limit
+        ),
+    )
+    timeline_binding = adaptation_engine._bind_action_timeline_to_primary_layout(
+        production_events,
+        duration_plan,
+        layout,
+        adaptation_engine.get_video_capabilities(),
+    )
+    contracts = adaptation_engine._canonical_beat_contracts(
+        production_events,
+        duration_plan,
+        timeline_binding,
+    )
+    production_actions = production_events[0]["micro_actions"]
+    action_cursor = 0
     shots = []
-    for shot_index, (duration, unit_count) in enumerate(
-        zip([18, 18], [8, 6], strict=True),
-        1,
-    ):
-        actions = [
-            f"S{shot_index:02d}动作{unit_index}"
-            for unit_index in range(1, unit_count + 1)
-        ]
+    for contract in contracts:
+        unit_count = contract["execution_subslice_count"]
+        shot_actions = production_actions[action_cursor:action_cursor + unit_count]
+        action_cursor += unit_count
         shots.append({
-            "id": f"S{shot_index:02d}",
-            "suggested_duration": duration,
-            "source_events": [1],
+            **contract,
+            "id": contract["sxx_id"],
+            "duration": contract["suggested_duration"],
+            "source_sequence_ids": [contract["sequence_id"]],
             "source_event_casts": [{
                 "source_event_id": 1,
                 "character_ids": [],
             }],
-            "source_event_generation_unit_counts": {"1": unit_count},
-            "micro_actions": actions,
+            "micro_actions": shot_actions,
+            "generation_actions": shot_actions,
+            "generation_motion_mode": "atomic",
             "generation_action_units": [
                 {
-                    "unit_id": f"S{shot_index:02d}_GAU{unit_index:03d}",
+                    "unit_id": (
+                        f"{contract['sxx_id']}_GAU{unit_index:03d}"
+                    ),
+                    "source_event_id": 1,
                     "actions": [action],
                 }
-                for unit_index, action in enumerate(actions, 1)
+                for unit_index, action in enumerate(shot_actions, 1)
             ],
+            "action": "keep",
+            "what": " → ".join(shot_actions),
         })
-    screenplay_plan = {
-        "schema": adaptation_engine.SCREENPLAY_PLAN_SCHEMA,
-        "primary_shot_layout": layout,
-        "source_ledger": {"capacity_status": "requires_compression"},
-        "production_ledger": {
-            "capacity_status": "fits_story_clock",
-            "duration_scaling_status": "applied",
-            "generation_action_units": 14,
-            "kept_source_event_ids": [1],
-        },
-        "event_action_scaling": {
-            "schema": adaptation_engine.DURATION_SCALED_EVENT_PLAN_SCHEMA,
-            "events": [{
-                "source_event_id": 1,
-                "production_generation_action_units": 14,
-                "production_status": "kept",
-            }],
-        },
-    }
+    screenplay_plan, capacity_plan = adaptation_engine._build_screenplay_plan(
+        events,
+        shots,
+        source_capacity_plan,
+        target_duration=target_duration,
+        production_events=production_events,
+        duration_scaled_event_plan=duration_plan,
+        primary_shot_layout=layout,
+        source_action_timeline=source_timeline,
+        production_action_timeline=production_timeline,
+        timeline_layout_binding=timeline_binding,
+    )
     screenplay_plan_sha256 = hashlib.sha256(
         json.dumps(
             screenplay_plan,
@@ -160,12 +161,30 @@ def _phase1_long_shot_adapted_result(adaptation_engine):
     ).hexdigest()
     return {
         "shots": shots,
-        "material_duration": 36,
-        "capacity_plan": {"primary_shot_layout": layout},
+        "material_duration": target_duration,
+        "capacity_plan": capacity_plan,
         "primary_shot_layout": layout,
         "screenplay_plan": screenplay_plan,
         "screenplay_plan_sha256": screenplay_plan_sha256,
     }
+
+
+def _phase1_stub_adapted_result(adaptation_engine):
+    return _canonical_adapted_result(
+        adaptation_engine,
+        actions=["站立"],
+        target_duration=15,
+        shot_duration=15,
+    )
+
+
+def _phase1_long_shot_adapted_result(adaptation_engine):
+    return _canonical_adapted_result(
+        adaptation_engine,
+        actions=[f"有序动作{index}" for index in range(45)],
+        target_duration=36,
+        shot_duration=6,
+    )
 
 
 def test_wall_timeout_closes_blocked_stream():

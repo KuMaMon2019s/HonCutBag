@@ -108,6 +108,7 @@ Phases use contiguous integer IDs (`phase1`–`phase9`); every phase writes a ch
 - **Continuity-group generation** — the screenwriter labels real action continuations; each group begins from canonical multi-image references and subsequent shots extend the preceding video. Scene changes start fresh and remain eligible for editorial transitions.
 - **Prose-action screenplay understanding** — Phase 1 recognizes scene-state prose, character damage/wardrobe state, unlabelled quoted dialogue, causal attack/counter chains, physical consequences, and relationship reversals. Neighboring text is supplied as read-only context, exact dialogue is confidence-attributed, and deterministic `sequence_id` / `action_unit_id` metadata survives into storyboard generation.
 - **Continuity-first primary-shot layout** — the default `continuity` policy preserves the executable semantic beat/action ledger inside model and 25% Provider-padding limits, then minimizes Sxx count and boundaries. It repacks ordered content beats instead of deleting later short shots: a long Sxx carries one continuous causal segment through one to four scoped Pxx requests, each still limited to 1–2 action units. `SCREENPLAY_PLAN.json` is the sole layout authority for new runs; its per-shot Pxx counts, story/request durations, action capacities and hash are bound into the storyboard before Pxx planning, so a lost or drifted projection fails before image/video spend instead of silently falling back to three Pxx. `balanced` follows the requested average more closely, while `cut-driven` preserves the historical short-shot algorithm.
+- **Official Seedance continuity contract** — P01 uses numbered all-modal references, later Pxx requests explicitly extend `视频1` and request the Provider tail frame, and cross-Sxx bridges use only strict `first_frame/last_frame` endpoints with `ratio=adaptive`. The client rejects requests outside Seedance 2.0's 4–15 second output window or 9-image/3-video reference limits before a paid submission; media dimensions, codecs, FPS, size and duration are preflighted before TOS upload.
 - **Narrative-order verification (Phase 8)** — before assembly, storyboard images are reviewed against the full script with a multimodal LLM; extracted frames are scanned for black/still frames; a duration gate compares actual vs. target runtime and can trigger a bounded reshoot loop.
 - **Real ASR subtitles (Phase 9)** — the final audio track is transcribed via SeedASR WebSocket (`volc.seedasr.sauc.duration`), merged across shots with cumulative time offsets, and burned into the film. Shots without speech fall back to script captions, explicitly marked `script_fallback` — no fabricated timelines.
 - **Unified streaming LLM client** — every Phase 1 scripting call flows through a single streaming client with hard wall-clock timeouts (forced stream termination, not just a pre-request budget check), a 15-second heartbeat, and sub-phase checkpoints, so a hung LLM call can never block the pipeline silently for hours.
@@ -168,9 +169,11 @@ uv run --locked --managed-python python pipeline/scripts/phase_orchestrator.py \
 
 # Or invoke the stable CLI directly with an explicit cache/project namespace
 uv run --locked --managed-python python pipeline/src/pipeline_runner.py \
-  --input story.txt --output-dir workspaces/example/output --project-id studio-a \
+  --input story.txt --output-dir /Users/name/knowledge-base/YY-MM-DD_NN \
+  --project-id studio-a \
   --character-library-dir /absolute/path/to/studio-character-library \
-  --shot-policy continuity
+  --shot-policy continuity --max-material-padding-ratio 0.25 \
+  --delivery-overrun-ratio 0
 
 # Resume from a checkpoint (e.g. after a single shot failure)
 uv run --locked --managed-python python pipeline/scripts/phase_orchestrator.py \
@@ -194,6 +197,13 @@ default to `continuity`; `--shot-duration` is a soft preference for
 content beats: their ordered Pxx ledger is preserved and repacked into longer
 continuous shots. Historical manifests and checkpoints without `shot_policy`
 resume deterministically as `cut-driven`.
+
+`--max-material-padding-ratio` limits paid Provider padding to `0–0.25`
+(default `0.25`). `--delivery-overrun-ratio` separately defines the audited
+final-delivery window (default `0`); setting it to `0.25` lets a 36-second run
+select the shortest full-content plan in `[36,45]` seconds. It never authorizes
+an under-length result or destructive tail trimming. New production runs should
+use a fresh `/Users/<name>/knowledge-base/YY-MM-DD_NN` output directory.
 
 Online visual generation uses the Volcano Ark Agent Plan only. Configure
 `ARK_AGENT_API_KEY`; HonCut does not read `ARK_API_KEY`, which remains reserved

@@ -119,6 +119,7 @@ def evaluate_duration_gate(
     round_number: int = 0,
     reshoots: list[dict] | None = None,
     *,
+    delivery_ceiling_duration: float | None = None,
     timeline_fps: int = 30,
     tolerance_frames: int = 2,
 ) -> tuple[dict, dict | None]:
@@ -141,24 +142,43 @@ def evaluate_duration_gate(
         reshoot_path.unlink(missing_ok=True)
     else:
         target = float(target_duration)
+        ceiling = float(
+            delivery_ceiling_duration
+            if delivery_ceiling_duration is not None
+            else target
+        )
+        if ceiling < target:
+            raise ValueError("delivery ceiling cannot be below nominal target")
         target_frames = round(target * timeline_fps)
+        ceiling_frames = round(ceiling * timeline_fps)
         actual_frames = round(actual * timeline_fps)
         delta_frames = actual_frames - target_frames
+        ceiling_delta_frames = actual_frames - ceiling_frames
         gap = max(0.0, -delta_frames / timeline_fps)
-        excess = max(0.0, delta_frames / timeline_fps)
-        passed = abs(delta_frames) <= tolerance_frames
-        status = "PASS" if passed else ("SHORTFALL" if delta_frames < 0 else "OVERLONG")
+        excess = max(0.0, ceiling_delta_frames / timeline_fps)
+        passed = (
+            actual_frames >= target_frames - tolerance_frames
+            and actual_frames <= ceiling_frames + tolerance_frames
+        )
+        status = (
+            "PASS"
+            if passed
+            else ("SHORTFALL" if actual_frames < target_frames else "OVERLONG")
+        )
         gate = {
             "status": status,
             "target_s": round(target, 3),
+            "ceiling_s": round(ceiling, 3),
             "actual_s": round(actual, 3),
             "gap_s": round(gap, 3),
             "excess_s": round(excess, 3),
             "passed": passed,
             "timeline_fps": timeline_fps,
             "target_frames": target_frames,
+            "ceiling_frames": ceiling_frames,
             "actual_frames": actual_frames,
             "delta_frames": delta_frames,
+            "ceiling_delta_frames": ceiling_delta_frames,
             "tolerance_frames": tolerance_frames,
             "reshoots": history,
         }

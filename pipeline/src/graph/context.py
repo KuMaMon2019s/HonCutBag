@@ -29,6 +29,8 @@ def initial_state_from_config(
         target_duration_s=config.target_duration_s,
         shot_duration_s=config.shot_duration_s,
         shot_policy=config.shot_policy,
+        max_material_padding_ratio=config.max_material_padding_ratio,
+        delivery_overrun_ratio=config.delivery_overrun_ratio,
         dry_run=config.dry_run,
         chain_mode=config.chain_mode,
         auto_approve=config.auto_approve,

@@ -75,15 +75,47 @@ def _finish_phase8(
             outputs.append(artifact)
     phase_result["outputs"] = outputs
 
+    delivery_ceiling_duration = target_duration
+    if target_duration is not None:
+        try:
+            storyboard = json.loads(
+                (Path(output_dir) / "STORYBOARD.json").read_text(encoding="utf-8")
+            )
+            declared_nominal = float(
+                storyboard.get("delivery_target_duration") or target_duration
+            )
+            if abs(declared_nominal - float(target_duration)) > 1e-6:
+                raise ValueError(
+                    "storyboard nominal delivery duration does not match runtime"
+                )
+            delivery_ceiling_duration = float(
+                storyboard.get("delivery_ceiling_duration") or target_duration
+            )
+            if not (
+                float(target_duration)
+                <= delivery_ceiling_duration
+                <= float(target_duration) * 1.25 + 1e-6
+            ):
+                raise ValueError("storyboard delivery ceiling is out of range")
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            phase_result["status"] = "error"
+            phase_result["error"] = (
+                f"Phase 8 delivery window validation failed: {exc}"
+            )
+            return phase_result
+
     try:
         gate, reshoot_plan = evaluate_duration_gate(
             output_dir,
             target_duration,
             round_number=reshoot_round,
             reshoots=reshoot_history,
+            delivery_ceiling_duration=delivery_ceiling_duration,
         )
         if gate.get("status") != "OVERLONG":
-            duration_trim = trim_excess_to_target(output_dir, target_duration)
+            duration_trim = trim_excess_to_target(
+                output_dir, delivery_ceiling_duration
+            )
             if duration_trim:
                 phase_result["duration_trim"] = duration_trim
                 if "duration_trim.json" not in phase_result["outputs"]:
@@ -98,6 +130,7 @@ def _finish_phase8(
                     target_duration,
                     round_number=reshoot_round,
                     reshoots=reshoot_history,
+                    delivery_ceiling_duration=delivery_ceiling_duration,
                 )
     except Exception as exc:
         print(f"  ⚠⚠ [8.3] 时长闸门执行失败: {exc}；阻止交付", flush=True)

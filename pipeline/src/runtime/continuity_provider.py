@@ -595,6 +595,17 @@ def _chunk_scoped_shot_meta(
     scoped["visual"] = str(matched.get("visual") or action or scoped["what"])
     scoped["start_state"] = request.chunk.start_state or matched.get("start_state") or ""
     scoped["end_state"] = request.chunk.end_state or matched.get("end_state") or ""
+    source_fact_echoes = matched.get("source_fact_echoes") or []
+    if isinstance(source_fact_echoes, str):
+        source_fact_echoes = [source_fact_echoes]
+    scoped["source_fact_echoes"] = [
+        str(value).strip()
+        for value in source_fact_echoes
+        if str(value).strip()
+    ]
+    scoped["source_generation_unit_indexes"] = list(
+        matched.get("source_generation_unit_indexes") or []
+    )
     if matched.get("subject_description"):
         scoped["subject_description"] = matched["subject_description"]
     feedback = scoped.get("phase8_reshoot")
@@ -677,11 +688,26 @@ def _chunk_prompt(
             or shot_meta.get("end_state")
             or "complete that action"
         ).strip()
+        source_fact_echoes = shot_meta.get("source_fact_echoes") or []
+        if isinstance(source_fact_echoes, str):
+            source_fact_echoes = [source_fact_echoes]
+        source_fact_contract = (
+            " Source facts that must remain visibly represented in this Pxx: "
+            + " | ".join(
+                str(value).strip()
+                for value in source_fact_echoes
+                if str(value).strip()
+            )
+            + "."
+            if source_fact_echoes
+            else ""
+        )
         beat_contract = (
             f"\n[authoritative storyboard beat {request.chunk.storyboard_beat_id}] "
             f"Start state: {current_start}. "
             f"Execute only this visible action: {current_action}. "
             f"Required end state: {current_end}. "
+            f"{source_fact_contract} "
             "Specify the current limbs, contact force, center of gravity, weight "
             "transfer, resistance, and inertia with physically credible motion. "
             "Do not execute another Pxx panel, skip ahead, or replay an earlier panel."
@@ -1608,6 +1634,11 @@ def _direct_seedance_executor(
         ratio, _width, _height = _video_geometry(
             _read_shot_meta(output_dir, request.shot_id)
         )
+        provider_ratio = (
+            "adaptive"
+            if request.chunk.execution_strategy == "first_last_frame_bridge"
+            else ratio
+        )
         payload = _task_payload(
             request,
             model=model,
@@ -1617,7 +1648,18 @@ def _direct_seedance_executor(
             run_id=run_id,
             duration=duration,
             seed=seed,
-            generation_parameters={"ratio": ratio, "resolution": resolution},
+            generation_parameters={
+                "ratio": provider_ratio,
+                "resolution": resolution,
+                "return_last_frame": True,
+                "seedance_prompt_contract": (
+                    "first_last_frame_v1"
+                    if request.chunk.execution_strategy == "first_last_frame_bridge"
+                    else "video1_tail_extend_v1"
+                    if request.chunk.execution_strategy == "tail_video_extend"
+                    else "all_modal_reference_v1"
+                ),
+            },
         )
         repairs: list[dict[str, Any]] = []
         privacy_repairs: list[dict[str, Any]] = []
@@ -1713,9 +1755,10 @@ def _direct_seedance_executor(
                                     api_key=api_key,
                                     model=model,
                                     duration=duration,
-                                    ratio=ratio,
+                                    ratio=provider_ratio,
                                     resolution=resolution,
                                     seed=current_seed,
+                                    return_last_frame=True,
                                     timeout=(
                                         provider_policy.submit_timeout_seconds
                                     ),

@@ -671,6 +671,15 @@ def build_continuity_plan(
                 action_prompt=str(spec.get("action_prompt") or ""),
                 start_state=str(spec.get("start_state") or ""),
                 end_state=str(spec.get("end_state") or ""),
+                source_timeline_assignment_id=(
+                    str(spec.get("source_timeline_assignment_id") or "") or None
+                ),
+                target_timeline_assignment_id=(
+                    str(spec.get("target_timeline_assignment_id") or "") or None
+                ),
+                timeline_layout_binding_sha256=(
+                    str(spec.get("timeline_layout_binding_sha256") or "") or None
+                ),
                 storyboard_transition_image=(
                     str(storyboard_transition.get("image") or "") or None
                 ),

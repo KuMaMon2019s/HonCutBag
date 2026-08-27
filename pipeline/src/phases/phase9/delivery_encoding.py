@@ -17,6 +17,8 @@ def _final_encode_duration_gate(
     delivery_contract: dict[str, Any],
     requested_duration: float | None,
     fps: float,
+    delivery_ceiling_duration: float | None = None,
+    planned_delivery_duration: float | None = None,
 ) -> dict[str, Any]:
     """Build the non-contradictory Phase 9 final-encode duration receipt.
 
@@ -83,8 +85,26 @@ def _final_encode_duration_gate(
         else requested_duration_delta
         <= duration_tolerance_s + comparison_epsilon_s
     )
+    delivery_window_passed = True
+    if requested_duration is not None and encoded_durations["video"] is not None:
+        ceiling = float(
+            delivery_ceiling_duration
+            if delivery_ceiling_duration is not None
+            else requested_duration
+        )
+        actual_video = float(encoded_durations["video"])
+        delivery_window_passed = (
+            actual_video >= float(requested_duration) - duration_tolerance_s
+            and actual_video <= ceiling + duration_tolerance_s
+        )
+    else:
+        ceiling = delivery_ceiling_duration
     return {
-        "passed": encode_conserved and reviewed_timeline_matched,
+        "passed": (
+            encode_conserved
+            and reviewed_timeline_matched
+            and delivery_window_passed
+        ),
         "artifact": "polished.mp4",
         "expected": encode_input_durations,
         "actual": encoded_durations,
@@ -95,6 +115,29 @@ def _final_encode_duration_gate(
         "encoded_to_authoritative_delta_s": encoded_to_reviewed_delta,
         "reviewed_timeline": delivery_contract,
         "requested_duration_s": requested_duration,
+        "delivery_ceiling_duration_s": ceiling,
+        "planned_delivery_duration_s": planned_delivery_duration,
+        "actual_delivery_duration_s": encoded_durations["video"],
+        "actual_minus_nominal_s": (
+            None
+            if requested_duration is None or encoded_durations["video"] is None
+            else round(
+                float(encoded_durations["video"])
+                - float(requested_duration),
+                6,
+            )
+        ),
+        "actual_minus_planned_s": (
+            None
+            if planned_delivery_duration is None
+            or encoded_durations["video"] is None
+            else round(
+                float(encoded_durations["video"])
+                - float(planned_delivery_duration),
+                6,
+            )
+        ),
+        "delivery_window_passed": delivery_window_passed,
         "requested_duration_delta_s": requested_duration_delta,
         "requested_duration_within_tolerance": requested_duration_within_tolerance,
         "requested_duration_enforced_by_final_encode": False,

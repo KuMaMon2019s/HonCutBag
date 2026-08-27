@@ -50,10 +50,14 @@ from phases.phase1.director_planner import (
 )
 from schemas.understanding import (
     DurationScaledActionSelectionBatch,
+    SourceIndexedScreenplayRewriteBatch,
     native_chat_json_schema_format,
     parse_structured_output,
 )
 from utils.action_units import (
+    ACTION_TIMELINE_SCHEMA,
+    SOURCE_INDEXED_SCREENPLAY_REWRITE_SCHEMA,
+    build_action_timeline,
     normalize_action_units,
     normalize_event_action_units,
     normalized_action_unit_count,
@@ -86,7 +90,7 @@ SHOT_POLICIES = (
     SHOT_POLICY_CUT_DRIVEN,
 )
 DEFAULT_SHOT_POLICY = SHOT_POLICY_CONTINUITY
-PRIMARY_SHOT_LAYOUT_SCHEMA = "honcut.primary-shot-layout.v1"
+PRIMARY_SHOT_LAYOUT_SCHEMA = "honcut.primary-shot-layout.v2"
 MAX_CONTINUITY_CONTENT_BEATS_PER_PRIMARY_SHOT = 4
 from utils.camera_motion_contracts import (
     CAMERA_MOTION_PLANNING_INSTRUCTIONS,
@@ -497,7 +501,7 @@ def _minimum_primary_duration_for_units(
     """Return executable story time for one base clip plus its extensions."""
     content_beats = max(
         1,
-        math.ceil(generation_units / capabilities.max_micro_actions_per_beat),
+        math.ceil(generation_units / capabilities.temporal_slice_limit),
     )
     if content_beats > max_content_beats:
         raise ValueError(
@@ -522,12 +526,12 @@ def _generation_unit_capacity_for_story_duration(
     content_beats = 0
     for candidate in range(1, max_content_beats + 1):
         if _minimum_primary_duration_for_units(
-            candidate * capabilities.max_micro_actions_per_beat,
+            candidate * capabilities.temporal_slice_limit,
             capabilities,
             max_content_beats=max_content_beats,
         ) <= story_duration + 1e-6:
             content_beats = candidate
-    return max(1, content_beats) * capabilities.max_micro_actions_per_beat
+    return max(1, content_beats) * capabilities.temporal_slice_limit
 
 
 def _sequence_material_cost(
@@ -541,7 +545,7 @@ def _sequence_material_cost(
     if primary_shots < 1:
         return math.inf
     unit_capacity = (
-        capabilities.max_micro_actions_per_beat
+        capabilities.temporal_slice_limit
         * MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
     )
     if generation_units > primary_shots * unit_capacity:
@@ -612,7 +616,7 @@ def _maximum_generation_units_for_story_clock(
 ) -> int:
     """Return the largest normalized action ledger executable in the clock."""
     unit_capacity = (
-        capabilities.max_micro_actions_per_beat
+        capabilities.temporal_slice_limit
         * MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
     )
     for generation_units in range(primary_shots * unit_capacity, -1, -1):
@@ -638,7 +642,7 @@ def _material_duration_bound(
     """Return a layout-duration bound with every shot owned by one sequence."""
     allocations: dict[int, float] = {0: 0.0}
     unit_capacity = (
-        capabilities.max_micro_actions_per_beat
+        capabilities.temporal_slice_limit
         * MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
     )
     for _sequence, units in sequence_units:
@@ -693,7 +697,7 @@ def _estimate_cut_driven_action_capacity_plan(
     if not sequence_units:
         sequence_units = [("__unspecified__", 0)]
     unit_capacity = (
-        profile.max_micro_actions_per_beat * MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
+        profile.temporal_slice_limit * MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
     )
     structural_shots = sum(
         max(1, math.ceil(units / unit_capacity))
@@ -943,7 +947,7 @@ def _build_primary_shot_layout_candidate(
         return None
 
     action_capacities = [
-        count * capabilities.max_micro_actions_per_beat
+        count * capabilities.temporal_slice_limit
         for count in beat_counts
     ]
     total_action_capacity = sum(action_capacities)
@@ -956,6 +960,13 @@ def _build_primary_shot_layout_candidate(
         "effective_story_durations_s": effective_beat_durations,
         "provider_request_durations_s": request_durations,
         "generation_action_unit_capacities": action_capacities,
+        "temporal_slice_capacities": action_capacities,
+        "max_temporal_slices_per_content_beat": (
+            capabilities.temporal_slice_limit
+        ),
+        "max_motion_contributions_per_slice": (
+            capabilities.motion_contribution_limit
+        ),
         "max_generation_action_units_per_primary_shot": max(action_capacities),
         "max_content_beats_per_primary_shot": int(
             maximum_content_beats_per_primary_shot
@@ -1114,7 +1125,7 @@ def _legacy_primary_shot_layout(
         for duration in allocations
     ]
     content_beats = sum(
-        math.ceil(capacity / capabilities.max_micro_actions_per_beat)
+        math.ceil(capacity / capabilities.temporal_slice_limit)
         for capacity in capacities
     )
     source_action_units = int(
@@ -1150,58 +1161,127 @@ def _estimate_action_capacity_plan(
     requested_shot_duration: int,
     *,
     shot_policy: str = DEFAULT_SHOT_POLICY,
+    max_material_padding_ratio: float = MAX_CONTENT_PROVIDER_PADDING_LOSS_RATE,
+    delivery_overrun_ratio: float = 0.0,
 ) -> dict[str, Any]:
     policy = _validate_shot_policy(shot_policy)
-    legacy_plan = _estimate_cut_driven_action_capacity_plan(
-        events,
-        delivery_duration,
-        requested_shot_duration,
-    )
+    for field, raw_value in (
+        ("max_material_padding_ratio", max_material_padding_ratio),
+        ("delivery_overrun_ratio", delivery_overrun_ratio),
+    ):
+        if isinstance(raw_value, bool):
+            raise ValueError(f"{field} must be numeric")
+        value = float(raw_value)
+        if not 0 <= value <= 0.25:
+            raise ValueError(f"{field} must be between 0 and 0.25")
+    max_material_padding_ratio = float(max_material_padding_ratio)
+    delivery_overrun_ratio = float(delivery_overrun_ratio)
     profile = get_video_capabilities()
-    if policy == SHOT_POLICY_CUT_DRIVEN:
-        legacy_plan["shot_policy"] = policy
-        legacy_plan["minimum_primary_segment_count"] = (
-            _non_mergeable_primary_segment_count(events)
-        )
-        legacy_plan["primary_shot_layout"] = _legacy_primary_shot_layout(
-            legacy_plan,
-            target_duration=delivery_duration,
-            capabilities=profile,
-        )
-        return legacy_plan
-
-    sequence_count = len(
-        _sequence_generation_unit_counts([
-            event
-            for event in events
-            if str(event.get("event_role") or "") != "drop"
-        ])
+    nominal_duration = int(delivery_duration)
+    ceiling_duration = math.floor(
+        nominal_duration * (1.0 + delivery_overrun_ratio) + 1e-9
     )
-    minimum_primary_segments = _non_mergeable_primary_segment_count(events)
-    layout = _solve_primary_shot_layout(
-        target_duration=delivery_duration,
-        requested_shot_duration=requested_shot_duration,
-        capabilities=profile,
-        shot_policy=policy,
-        source_action_units=int(legacy_plan["generation_action_units"]),
-        minimum_primary_shots=max(
-            1,
-            sequence_count,
-            minimum_primary_segments,
-            int(legacy_plan["mandatory_sequence_count"]),
+    candidates: list[dict[str, Any]] = []
+    first_error: ValueError | None = None
+    for planned_duration in range(nominal_duration, ceiling_duration + 1):
+        try:
+            candidate = _estimate_cut_driven_action_capacity_plan(
+                events,
+                planned_duration,
+                requested_shot_duration,
+            )
+            minimum_primary_segments = _non_mergeable_primary_segment_count(events)
+            if policy == SHOT_POLICY_CUT_DRIVEN:
+                candidate["shot_policy"] = policy
+                candidate["minimum_primary_segment_count"] = (
+                    minimum_primary_segments
+                )
+                layout = _legacy_primary_shot_layout(
+                    candidate,
+                    target_duration=planned_duration,
+                    capabilities=profile,
+                )
+            else:
+                sequence_count = len(
+                    _sequence_generation_unit_counts([
+                        event
+                        for event in events
+                        if str(event.get("event_role") or "") != "drop"
+                    ])
+                )
+                layout = _solve_primary_shot_layout(
+                    target_duration=planned_duration,
+                    requested_shot_duration=requested_shot_duration,
+                    capabilities=profile,
+                    shot_policy=policy,
+                    source_action_units=int(candidate["generation_action_units"]),
+                    minimum_primary_shots=max(
+                        1,
+                        sequence_count,
+                        minimum_primary_segments,
+                        int(candidate["mandatory_sequence_count"]),
+                    ),
+                    maximum_padding_loss_rate=max_material_padding_ratio,
+                )
+                candidate["shot_policy"] = policy
+                candidate["primary_shots"] = layout["primary_shots"]
+                candidate["minimum_primary_segment_count"] = (
+                    minimum_primary_segments
+                )
+            candidate["primary_shot_layout"] = layout
+            layout["nominal_delivery_duration_s"] = nominal_duration
+            layout["delivery_ceiling_duration_s"] = ceiling_duration
+            layout["planned_delivery_duration_s"] = planned_duration
+            layout["delivery_overrun_ratio"] = delivery_overrun_ratio
+            layout["maximum_padding_loss_rate"] = (
+                max_material_padding_ratio
+            )
+            candidate["action_capacity_status"] = (
+                "fits_story_clock"
+                if layout["production_action_unit_target"]
+                >= candidate["generation_action_units"]
+                else "screenplay_compression_required"
+            )
+            candidate["nominal_delivery_duration"] = nominal_duration
+            candidate["delivery_ceiling_duration"] = ceiling_duration
+            candidate["planned_delivery_duration"] = planned_duration
+            candidate["delivery_overrun_ratio"] = delivery_overrun_ratio
+            candidate["max_material_padding_ratio"] = (
+                max_material_padding_ratio
+            )
+            candidates.append(candidate)
+        except ValueError as exc:
+            if first_error is None:
+                first_error = exc
+    if not candidates:
+        if first_error is not None:
+            raise first_error
+        raise ValueError("no delivery duration has an executable shot layout")
+    source_units = max(
+        int(candidate["generation_action_units"]) for candidate in candidates
+    )
+    selected = min(
+        candidates,
+        key=lambda candidate: (
+            -min(
+                source_units,
+                int(candidate["primary_shot_layout"][
+                    "production_action_unit_target"
+                ]),
+            ),
+            int(candidate["planned_delivery_duration"]) - nominal_duration,
+            int(candidate["primary_shot_layout"]["primary_shots"]),
+            float(candidate["primary_shot_layout"].get(
+                "projected_content_provider_padding_duration_s"
+            ) or 0.0),
         ),
     )
-    legacy_plan["shot_policy"] = policy
-    legacy_plan["primary_shots"] = layout["primary_shots"]
-    legacy_plan["primary_shot_layout"] = layout
-    legacy_plan["minimum_primary_segment_count"] = minimum_primary_segments
-    legacy_plan["action_capacity_status"] = (
-        "fits_story_clock"
-        if layout["production_action_unit_target"]
-        >= legacy_plan["generation_action_units"]
-        else "screenplay_compression_required"
+    selected["material_duration"] = int(selected["planned_delivery_duration"])
+    selected["storyboard_duration_limit"] = int(
+        selected["planned_delivery_duration"]
     )
-    return legacy_plan
+    selected["delivery_duration"] = nominal_duration
+    return selected
 
 
 def _resolve_padding_rewrite_layout(
@@ -1309,7 +1389,7 @@ def _resolve_padding_rewrite_layout(
         loss_rate = padding / total_request if total_request else 0.0
         if loss_rate <= maximum_padding_loss_rate + 1e-6:
             action_capacities = [
-                capabilities.max_micro_actions_per_beat
+                capabilities.temporal_slice_limit
             ] * primary_shots
             return {
                 "schema": PRIMARY_SHOT_LAYOUT_SCHEMA,
@@ -1340,7 +1420,7 @@ def _resolve_padding_rewrite_layout(
                     float(target_duration) / primary_shots
                 ),
                 "max_generation_action_units_per_primary_shot": (
-                    capabilities.max_micro_actions_per_beat
+                    capabilities.temporal_slice_limit
                 ),
                 "projected_content_provider_request_duration_s": round(
                     total_request, 6
@@ -1395,23 +1475,38 @@ def _event_content_beat_requirement(
         actions = [actions]
     if not actions:
         return 0
-    units = normalize_event_action_units(event, actions=actions, seen=seen)["units"]
+    units = normalize_event_action_units(
+        event,
+        actions=actions,
+        seen=seen,
+        max_motion_contributions_per_slice=(
+            capabilities.motion_contribution_limit
+        ),
+    )["units"]
     if units == 0:
         return 0
     return max(
         1,
-        math.ceil(units / capabilities.max_micro_actions_per_beat),
+        math.ceil(units / capabilities.temporal_slice_limit),
     )
 
 
 def _event_generation_action_unit_counts(
     events: List[Dict[str, Any]],
+    capabilities: VideoModelCapabilities | None = None,
 ) -> Dict[int, int]:
-    """Count normalized units for an ordered ledger with cross-event dedupe."""
+    """Count Provider execution units with cross-event source dedupe."""
 
+    profile = capabilities or get_video_capabilities()
     seen: set = set()
     return {
-        event_id: normalize_event_action_units(event, seen=seen)["units"]
+        event_id: normalize_event_action_units(
+            event,
+            seen=seen,
+            max_motion_contributions_per_slice=(
+                profile.motion_contribution_limit
+            ),
+        )["units"]
         for event_id, event in enumerate(events, 1)
     }
 
@@ -1422,10 +1517,13 @@ def _event_content_beat_requirements(
 ) -> Dict[int, int]:
     """Normalize an ordered event ledger once, including cross-event dedupe."""
 
-    unit_counts = _event_generation_action_unit_counts(events)
+    unit_counts = _event_generation_action_unit_counts(
+        events,
+        capabilities=capabilities,
+    )
     return {
         event_id: (
-            math.ceil(units / capabilities.max_micro_actions_per_beat)
+            math.ceil(units / capabilities.temporal_slice_limit)
             if units else 0
         )
         for event_id, units in unit_counts.items()
@@ -1535,7 +1633,7 @@ def normalize_shot_durations(
             generation_unit_count = normalized_action_unit_count(actions)
         spoken = float(shot.get("speech_duration_s") or 0)
         action_beats = math.ceil(
-            generation_unit_count / profile.max_micro_actions_per_beat
+            generation_unit_count / profile.temporal_slice_limit
         ) if generation_unit_count else 1
         spoken_beats = math.ceil(spoken / profile.max_unique_beat_s) if spoken else 1
         content_beats = max(1, action_beats, spoken_beats)
@@ -2413,6 +2511,9 @@ def _inherit_event_semantics(
             event,
             actions=actions,
             seen=set(seen_before_event[event_id]),
+            max_motion_contributions_per_slice=(
+                get_video_capabilities().motion_contribution_limit
+            ),
         )
         generation_units = normalized_event["generation_action_units"]
         declared_counts = []
@@ -2438,12 +2539,16 @@ def _inherit_event_semantics(
                 )
             unit_sizes = declared_counts
             declared_action_indexes: list[list[int]] = []
+            declared_units_per_occurrence: list[list[dict[str, Any]]] = []
             unit_offset = 0
             for size in unit_sizes:
                 selected_units = generation_units[
                     unit_offset : unit_offset + size
                 ]
                 unit_offset += size
+                declared_units_per_occurrence.append(
+                    [copy.deepcopy(unit) for unit in selected_units]
+                )
                 declared_action_indexes.append(sorted({
                     int(index)
                     for unit in selected_units
@@ -2478,14 +2583,41 @@ def _inherit_event_semantics(
         else:
             base, remainder = divmod(len(actions), len(occurrence_shots))
             unit_sizes = [None] * len(occurrence_shots)
+            declared_units_per_occurrence = []
         action_cursor = 0
         previous_state = str(event.get("start_state") or "").strip()
         for occurrence, shot_index in enumerate(occurrence_shots):
             if has_declared_counts:
+                selected_action_indexes = declared_action_indexes[occurrence]
                 action_slice = [
                     actions[index]
-                    for index in declared_action_indexes[occurrence]
+                    for index in selected_action_indexes
                     if 0 <= index < len(actions)
+                ]
+                local_index_by_event_index = {
+                    event_action_index: local_index
+                    for local_index, event_action_index in enumerate(
+                        selected_action_indexes
+                    )
+                }
+                scoped_generation_units: list[dict[str, Any]] = []
+                for unit in declared_units_per_occurrence[occurrence]:
+                    scoped = copy.deepcopy(unit)
+                    for index_field in (
+                        "ledger_indexes",
+                        "contribution_ledger_indexes",
+                        "effect_ledger_indexes",
+                        "sustained_ledger_indexes",
+                    ):
+                        scoped[index_field] = [
+                            local_index_by_event_index[index]
+                            for index in unit.get(index_field) or []
+                            if index in local_index_by_event_index
+                        ]
+                    scoped_generation_units.append(scoped)
+                scoped_categories = [
+                    normalized_event["categories"][index]
+                    for index in selected_action_indexes
                 ]
             else:
                 size = base + (
@@ -2493,6 +2625,8 @@ def _inherit_event_semantics(
                 )
                 action_slice = actions[action_cursor : action_cursor + size]
                 action_cursor += size
+                scoped_generation_units = []
+                scoped_categories = []
             is_last = occurrence == len(occurrence_shots) - 1
             if is_last:
                 end_state = str(event.get("end_state") or "").strip()
@@ -2506,6 +2640,8 @@ def _inherit_event_semantics(
                 "end_state": end_state,
                 "occurrence": occurrence + 1,
                 "occurrence_count": len(occurrence_shots),
+                "generation_action_units": scoped_generation_units,
+                "generation_action_categories": scoped_categories,
             }
             previous_state = end_state
 
@@ -2621,13 +2757,25 @@ def _inherit_event_semantics(
         ledger_offset = 0
         for event_id, event_slice in slices:
             slice_actions = list(event_slice["micro_actions"])
-            normalized = normalize_event_action_units(
-                event_by_id[event_id],
-                actions=slice_actions,
-                seen=set(seen_before_event[event_id]),
-            )
-            generation_categories.extend(normalized["categories"])
-            for unit in normalized["generation_action_units"]:
+            precomputed_units = event_slice.get("generation_action_units")
+            if precomputed_units:
+                normalized_categories = list(
+                    event_slice.get("generation_action_categories") or []
+                )
+                normalized_units = precomputed_units
+            else:
+                normalized = normalize_event_action_units(
+                    event_by_id[event_id],
+                    actions=slice_actions,
+                    seen=set(seen_before_event[event_id]),
+                    max_motion_contributions_per_slice=(
+                        get_video_capabilities().motion_contribution_limit
+                    ),
+                )
+                normalized_categories = list(normalized["categories"])
+                normalized_units = normalized["generation_action_units"]
+            generation_categories.extend(normalized_categories)
+            for unit in normalized_units:
                 serialized = dict(unit)
                 serialized["unit_id"] = f"GAU{len(generation_units) + 1:03d}"
                 serialized["ledger_indexes"] = [
@@ -2795,6 +2943,34 @@ BEAT_SKELETON_PROMPT = (
 )
 
 
+CANONICAL_BEAT_LANGUAGE_PROMPT = (
+    "目标时长：{target_duration}秒，共 {beat_count} 个一级镜头。代码已经固定每个镜头的 "
+    "sequence、来源事件、执行子片、时长与容量；你不得重新分配、删减、重排或补写这些账本。\n\n"
+    "当前生产事件（只用于理解每个固定编号的内容）：\n{events_json}\n\n"
+    "canonical 角色列表：\n{characters_summary}\n\n"
+    "不可变 beat 合同：\n{canonical_beat_contracts}\n\n"
+    "逐 sequence 导演意图（只说明为什么这样拍）：\n{director_intents_json}\n\n"
+    "你只负责摄影语言、构图、光影和视觉节奏。输出严格 JSON 对象："
+    '{{"strategy":"一句话摄影策略","beats":[{{"beat_order":1,'
+    '"shot_size":"medium_wide","camera_angle":"eye_level",'
+    '"camera_movement":"dolly_in","lighting_key":"natural",'
+    '"shot_intent":"establishing","hero_moment":false,'
+    '"texture_keywords":["具体材质","具体光影"]}}]}}。\n'
+    + "【镜头语言合法词表】以下枚举字段只能逐字选用所列值，禁止发明组合值或方向后缀：\n"
+    + _SHOT_LANGUAGE_ENUM_CONTRACT
+    + CAMERA_ANGLE_PLANNING_INSTRUCTIONS
+    + "\n"
+    + CAMERA_MOTION_PLANNING_INSTRUCTIONS
+    + "\n"
+    + "hero_moment 必须为 JSON 布尔值；texture_keywords 必须为 2–4 个非空字符串。\n"
+    "beats 数量必须恰好为 {beat_count}，beat_order 从 1 连续递增。"
+    "禁止输出 source_events、dropped_source_events、sequence_id、action、"
+    "source_event_generation_unit_counts、timeline_assignment_ids、who、where、what、"
+    "suggested_duration 或任何动作文本。相邻镜头景别应形成有意义差异；动作镜头不能全部 static；"
+    "只有来源允许时才能使用环绕、摇臂、无人机或跳切，不得为追求变化虚构时空边界。"
+)
+
+
 def _parse_beat_skeleton(response: str, expected_count: int, event_count: int) -> Dict[str, Any]:
     """Parse and validate the bounded Stage 1 beat table."""
     text = response.strip()
@@ -2859,6 +3035,334 @@ def _parse_beat_skeleton(response: str, expected_count: int, event_count: int) -
         apply_camera_motion_contract(beat)
     parsed.setdefault("strategy", "")
     return parsed
+
+
+def _parse_canonical_beat_language(
+    response: str,
+    expected_count: int,
+) -> Dict[str, Any]:
+    """Parse only the model-owned camera-language projection."""
+    text = response.strip()
+    if "```" in text:
+        match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', text, re.DOTALL)
+        if match:
+            text = match.group(1).strip()
+    parsed = json.loads(text)
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("beats"), list):
+        raise ValueError("镜头语言响应必须是包含 beats 数组的 JSON 对象")
+    beats = parsed["beats"]
+    if len(beats) != expected_count:
+        raise ValueError(
+            f"镜头语言 beat 数量应为 {expected_count}，实际为 {len(beats)}"
+        )
+    protected_fields = {
+        "source_events",
+        "dropped_source_events",
+        "sequence_id",
+        "action",
+        "source_event_generation_unit_counts",
+        "timeline_assignment_ids",
+        "who",
+        "where",
+        "what",
+        "suggested_duration",
+    }
+    for beat_order, beat in enumerate(beats, 1):
+        if not isinstance(beat, dict):
+            raise ValueError(f"第 {beat_order} 个镜头语言 beat 不是字典")
+        if beat.get("beat_order") != beat_order:
+            raise ValueError("镜头语言 beat_order 必须从 1 连续递增")
+        leaked = protected_fields & set(beat)
+        if leaked:
+            raise ValueError(
+                "模型不得改写 canonical beat 账本字段: "
+                f"{sorted(leaked)}"
+            )
+    _validate_authored_shot_language(beats, label="镜头语言 beat")
+    for beat in beats:
+        apply_camera_motion_contract(beat)
+    parsed.setdefault("strategy", "")
+    return parsed
+
+
+def _canonical_beat_contracts(
+    events: List[Dict[str, Any]],
+    duration_scaled_event_plan: Dict[str, Any],
+    timeline_layout_binding: Dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Project the persisted duration vector into immutable Sxx contracts."""
+    if duration_scaled_event_plan.get("schema") != DURATION_SCALED_EVENT_PLAN_SCHEMA:
+        raise ValueError("canonical beat contracts require duration plan v4")
+    if timeline_layout_binding.get("schema") != ACTION_TIMELINE_SCHEMA:
+        raise ValueError("canonical beat contracts require action timeline v1")
+    if timeline_layout_binding.get("duration_plan_schema") != (
+        DURATION_SCALED_EVENT_PLAN_SCHEMA
+    ):
+        raise ValueError("timeline binding does not match the duration plan")
+
+    sequence_plan = duration_scaled_event_plan.get("sequence_beat_plan")
+    capacities = duration_scaled_event_plan.get(
+        "generation_action_unit_capacities_per_beat"
+    )
+    event_counts_per_beat = duration_scaled_event_plan.get(
+        "source_event_generation_unit_counts_per_beat"
+    )
+    binding_sxx = timeline_layout_binding.get("sxx")
+    assignments = timeline_layout_binding.get("assignments")
+    zero_attachments = timeline_layout_binding.get(
+        "zero_story_time_attachments"
+    )
+    values = (
+        sequence_plan,
+        capacities,
+        event_counts_per_beat,
+        binding_sxx,
+    )
+    if any(not isinstance(value, list) for value in values):
+        raise ValueError("canonical beat ledgers must be arrays")
+    beat_count = len(sequence_plan)
+    if (
+        beat_count < 1
+        or len(capacities) != beat_count
+        or len(event_counts_per_beat) != beat_count
+        or len(binding_sxx) != beat_count
+    ):
+        raise ValueError("canonical beat ledgers have inconsistent lengths")
+    if not isinstance(assignments, list) or not isinstance(zero_attachments, list):
+        raise ValueError("canonical timeline binding is incomplete")
+
+    generation_counts = _event_generation_action_unit_counts(events)
+    attachment_by_shot: dict[str, list[int]] = {}
+    attached_zero_events: set[int] = set()
+    for attachment in zero_attachments:
+        if not isinstance(attachment, dict):
+            raise ValueError("zero-story-time attachment must be an object")
+        event_id = attachment.get("source_event_id")
+        sxx_id = str(attachment.get("sxx_id") or "")
+        if (
+            not isinstance(event_id, int)
+            or event_id not in generation_counts
+            or generation_counts[event_id] != 0
+            or event_id in attached_zero_events
+            or not sxx_id
+            or attachment.get("consumes_temporal_capacity") is not False
+        ):
+            raise ValueError("zero-story-time attachment is invalid")
+        attached_zero_events.add(event_id)
+        attachment_by_shot.setdefault(sxx_id, []).append(event_id)
+
+    assignment_counts: dict[tuple[str, int], int] = {}
+    assignment_ids: set[str] = set()
+    for assignment in assignments:
+        if not isinstance(assignment, dict):
+            raise ValueError("timeline assignment must be an object")
+        assignment_id = str(assignment.get("assignment_id") or "")
+        event_id = assignment.get("source_event_id")
+        sxx_id = str(assignment.get("sxx_id") or "")
+        if (
+            not assignment_id
+            or assignment_id in assignment_ids
+            or not isinstance(event_id, int)
+            or event_id not in generation_counts
+            or not sxx_id
+        ):
+            raise ValueError("timeline assignment identity is invalid")
+        assignment_ids.add(assignment_id)
+        assignment_counts[(sxx_id, event_id)] = (
+            assignment_counts.get((sxx_id, event_id), 0) + 1
+        )
+
+    declared_totals = {event_id: 0 for event_id in generation_counts}
+    contracts: list[dict[str, Any]] = []
+    for beat_order, (sequence_item, capacity, raw_counts, sxx) in enumerate(
+        zip(
+            sequence_plan,
+            capacities,
+            event_counts_per_beat,
+            binding_sxx,
+            strict=True,
+        ),
+        1,
+    ):
+        if (
+            not isinstance(sequence_item, dict)
+            or sequence_item.get("beat_order") != beat_order
+            or not isinstance(capacity, int)
+            or isinstance(capacity, bool)
+            or capacity < 1
+            or not isinstance(raw_counts, dict)
+            or not isinstance(sxx, dict)
+        ):
+            raise ValueError("canonical beat vector contains invalid entries")
+        sequence_id = str(sequence_item.get("sequence_id") or "").strip()
+        sxx_id = f"S{beat_order:03d}"
+        if (
+            not sequence_id
+            or sxx.get("sxx_order") != beat_order
+            or sxx.get("sxx_id") != sxx_id
+            or str(sxx.get("sequence_id") or "").strip() != sequence_id
+        ):
+            raise ValueError("canonical beat sequence and timeline binding drifted")
+
+        normalized_counts: dict[str, int] = {}
+        for raw_event_id, raw_count in raw_counts.items():
+            try:
+                event_id = int(raw_event_id)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("canonical beat references an invalid event") from exc
+            if (
+                event_id not in generation_counts
+                or isinstance(raw_count, bool)
+                or not isinstance(raw_count, int)
+                or raw_count <= 0
+            ):
+                raise ValueError("canonical beat has an invalid event count")
+            event_sequence = (
+                str(events[event_id - 1].get("sequence_id") or "").strip()
+                or "__unspecified__"
+            )
+            if event_sequence != sequence_id:
+                raise ValueError("canonical beat crosses a sequence boundary")
+            if assignment_counts.get((sxx_id, event_id), 0) != raw_count:
+                raise ValueError("timeline assignment count drifted from duration plan")
+            normalized_counts[str(event_id)] = raw_count
+            declared_totals[event_id] += raw_count
+
+        zero_event_ids = attachment_by_shot.get(sxx_id, [])
+        for event_id in zero_event_ids:
+            event_sequence = (
+                str(events[event_id - 1].get("sequence_id") or "").strip()
+                or "__unspecified__"
+            )
+            if event_sequence != sequence_id:
+                raise ValueError("zero-story-time fact crossed a sequence boundary")
+            normalized_counts[str(event_id)] = 0
+
+        source_event_ids = sorted(int(value) for value in normalized_counts)
+        if not source_event_ids:
+            raise ValueError("canonical Sxx cannot be detached from source facts")
+        pxx = sxx.get("pxx")
+        if not isinstance(pxx, list) or not pxx:
+            raise ValueError("canonical Sxx requires Pxx timeline records")
+        pxx_assignment_ids: list[str] = []
+        story_duration = 0.0
+        for pxx_record in pxx:
+            if not isinstance(pxx_record, dict):
+                raise ValueError("canonical Pxx timeline record is invalid")
+            raw_assignment_ids = pxx_record.get("assignment_ids")
+            duration = pxx_record.get("effective_story_duration_s")
+            if (
+                not isinstance(raw_assignment_ids, list)
+                or isinstance(duration, bool)
+                or not isinstance(duration, (int, float))
+                or float(duration) <= 0
+            ):
+                raise ValueError("canonical Pxx duration/assignment ledger is invalid")
+            pxx_assignment_ids.extend(str(value) for value in raw_assignment_ids)
+            story_duration += float(duration)
+        expected_assignment_ids = {
+            str(item.get("assignment_id") or "")
+            for item in assignments
+            if isinstance(item, dict) and item.get("sxx_id") == sxx_id
+        }
+        if set(pxx_assignment_ids) != expected_assignment_ids or len(
+            pxx_assignment_ids
+        ) != len(expected_assignment_ids):
+            raise ValueError("canonical Pxx assignment ledger is incomplete")
+        if sum(normalized_counts.values()) != len(pxx_assignment_ids):
+            raise ValueError("canonical Sxx count and execution subslices differ")
+        if sum(normalized_counts.values()) > capacity:
+            raise ValueError("canonical Sxx exceeds its vector capacity")
+        contracts.append({
+            "beat_order": beat_order,
+            "sxx_id": sxx_id,
+            "sequence_id": sequence_id,
+            "source_events": source_event_ids,
+            "dropped_source_events": [],
+            "source_event_generation_unit_counts": normalized_counts,
+            "max_generation_action_units": capacity,
+            "execution_subslice_count": len(pxx_assignment_ids),
+            "timeline_assignment_ids": pxx_assignment_ids,
+            "zero_story_time_source_event_ids": list(zero_event_ids),
+            "suggested_duration": story_duration,
+        })
+
+    for event_id, expected_count in generation_counts.items():
+        if declared_totals[event_id] != expected_count:
+            raise ValueError(
+                f"canonical beat ledger changed event {event_id} capacity from "
+                f"{expected_count} to {declared_totals[event_id]}"
+            )
+        if expected_count == 0 and event_id not in attached_zero_events:
+            raise ValueError(
+                f"zero-story-time event {event_id} is not attached to an Sxx"
+            )
+        if expected_count > 0 and event_id in attached_zero_events:
+            raise ValueError("execution event cannot use zero-story-time attachment")
+    return contracts
+
+
+def _validate_beats_match_canonical_contracts(
+    beats: List[Dict[str, Any]],
+    contracts: list[dict[str, Any]],
+) -> None:
+    """Reject checkpoint/model drift in every code-owned beat field."""
+    if len(beats) != len(contracts):
+        raise ValueError("canonical beat count changed after duration planning")
+    protected_fields = (
+        "beat_order",
+        "sxx_id",
+        "sequence_id",
+        "source_events",
+        "dropped_source_events",
+        "source_event_generation_unit_counts",
+        "max_generation_action_units",
+        "execution_subslice_count",
+        "timeline_assignment_ids",
+        "zero_story_time_source_event_ids",
+        "suggested_duration",
+    )
+    for beat_order, (beat, contract) in enumerate(
+        zip(beats, contracts, strict=True),
+        1,
+    ):
+        for field in protected_fields:
+            if beat.get(field) != contract.get(field):
+                raise ValueError(
+                    f"canonical beat {beat_order} field {field} drifted from "
+                    "the duration/timeline contract"
+                )
+
+
+def _validate_shots_match_beat_ledgers(
+    shots: List[Dict[str, Any]],
+    beats: List[Dict[str, Any]],
+) -> None:
+    """Keep resumed/expanded shots on the exact code-owned beat mapping."""
+    if len(shots) > len(beats):
+        raise ValueError("expanded shots exceed the canonical beat ledger")
+    protected_fields = (
+        "source_events",
+        "dropped_source_events",
+        "source_event_generation_unit_counts",
+        "sxx_id",
+        "sequence_id",
+        "max_generation_action_units",
+        "execution_subslice_count",
+        "timeline_assignment_ids",
+        "zero_story_time_source_event_ids",
+        "suggested_duration",
+    )
+    for shot_order, (shot, beat) in enumerate(
+        zip(shots, beats, strict=False),
+        1,
+    ):
+        for field in protected_fields:
+            if field in beat and shot.get(field) != beat.get(field):
+                raise ValueError(
+                    f"expanded shot {shot_order} field {field} drifted from "
+                    "its canonical beat"
+                )
 
 
 _MANDATORY_ADAPTATION_EVENT_ROLES = frozenset({
@@ -3222,7 +3726,7 @@ def _beat_content_loads(
     for generation_unit_count in _beat_generation_unit_loads(beats, events):
         action_beats = (
             math.ceil(
-                generation_unit_count / capabilities.max_micro_actions_per_beat
+                generation_unit_count / capabilities.temporal_slice_limit
             )
             if generation_unit_count else 1
         )
@@ -3235,7 +3739,13 @@ def _sequence_beat_plan(
     beat_count: int,
     max_generation_units_per_beat: int,
 ) -> List[str]:
-    """Allocate contiguous primary-beat slots to non-mergeable sequences."""
+    """Allocate legacy scalar beat slots for historical artifact migration.
+
+    Current runs use ``_vector_sequence_beat_allocation`` and must never call
+    this scalar estimator after a duration plan has been persisted.  Keeping
+    the function isolated preserves deterministic recovery for old artifacts
+    without allowing their packing semantics back into production planning.
+    """
     if beat_count < 1 or max_generation_units_per_beat < 1:
         raise ValueError("beat count and per-beat generation capacity must be positive")
     ordered_sequences: List[str] = []
@@ -3322,7 +3832,171 @@ def _sequence_beat_plan(
     ]
 
 
-DURATION_SCALED_EVENT_PLAN_SCHEMA = "honcut.duration-scaled-event-plan.v3"
+def _vector_sequence_beat_allocation(
+    events: List[Dict[str, Any]],
+    generation_unit_capacities_per_beat: list[int],
+) -> tuple[List[str], list[dict[str, int]]]:
+    """Allocate ordered sequences and selected event slices to exact capacities.
+
+    Unlike the legacy scalar estimator above, this is a production allocation:
+    an event may continue into the next adjacent beat, capacities may be
+    asymmetric, and the returned event matrix is the evidence consumed by
+    downstream screenplay projection.  Non-mergeable sequences still own
+    contiguous, disjoint beat intervals.
+    """
+
+    capacities = list(generation_unit_capacities_per_beat)
+    if not capacities or any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 1
+        for value in capacities
+    ):
+        raise ValueError("generation-unit capacity ledger must be positive")
+    if not events:
+        raise ValueError("cannot allocate beat sequences without source events")
+
+    ordered_sequences: list[str] = []
+    events_by_sequence: dict[str, list[int]] = {}
+    for event_id, event in enumerate(events, 1):
+        sequence = str(event.get("sequence_id") or "").strip() or "__unspecified__"
+        if sequence not in events_by_sequence:
+            ordered_sequences.append(sequence)
+            events_by_sequence[sequence] = []
+        events_by_sequence[sequence].append(event_id)
+
+    generation_units = _event_generation_action_unit_counts(events)
+    mandatory_event_ids = _mandatory_adaptation_event_ids(events)
+    sequence_contracts = []
+    for sequence in ordered_sequences:
+        event_ids = events_by_sequence[sequence]
+        mandatory_ids = [
+            event_id for event_id in event_ids if event_id in mandatory_event_ids
+        ]
+        selected_ids = [
+            event_id for event_id in event_ids if generation_units[event_id] > 0
+        ]
+        sequence_contracts.append({
+            "sequence_id": sequence,
+            "event_ids": event_ids,
+            "mandatory_event_ids": mandatory_ids,
+            "selected_event_ids": selected_ids,
+            # A zero-story-time posture, environment, or sustained-state fact
+            # still belongs to its authored sequence.  The sequence therefore
+            # needs one Sxx to which that fact can be attached even though the
+            # fact does not consume Provider temporal capacity.
+            "mandatory": bool(event_ids),
+            "mandatory_units": sum(
+                generation_units[event_id] for event_id in mandatory_ids
+            ),
+            "total_units": sum(
+                generation_units[event_id] for event_id in event_ids
+            ),
+        })
+
+    beat_count = len(capacities)
+    # State is the number of beats already consumed.  The score first keeps as
+    # much source capacity as possible, then minimizes unused Provider capacity,
+    # then uses a stable earlier-sequence tie break through the length tuple.
+    states: dict[int, tuple[tuple[int, int, tuple[int, ...]], tuple[int, ...]]] = {
+        0: ((0, 0, ()), ())
+    }
+    for sequence_index, contract in enumerate(sequence_contracts):
+        next_states: dict[
+            int,
+            tuple[tuple[int, int, tuple[int, ...]], tuple[int, ...]],
+        ] = {}
+        remaining_mandatory = sum(
+            1
+            for later in sequence_contracts[sequence_index + 1 :]
+            if later["mandatory"]
+        )
+        for consumed, (score, lengths) in states.items():
+            minimum = 1 if contract["mandatory"] else 0
+            maximum = beat_count - consumed - remaining_mandatory
+            for length in range(minimum, maximum + 1):
+                segment_capacity = sum(capacities[consumed : consumed + length])
+                if segment_capacity < contract["total_units"]:
+                    continue
+                served = min(contract["total_units"], segment_capacity)
+                unused = max(0, segment_capacity - served)
+                candidate_lengths = lengths + (length,)
+                candidate_score = (
+                    score[0] + served,
+                    score[1] - unused,
+                    tuple(-value for value in candidate_lengths),
+                )
+                key = consumed + length
+                incumbent = next_states.get(key)
+                if incumbent is None or candidate_score > incumbent[0]:
+                    next_states[key] = (candidate_score, candidate_lengths)
+        states = next_states
+        if not states:
+            break
+
+    selected = states.get(beat_count)
+    if selected is None:
+        mandatory_sequences = sum(
+            1 for contract in sequence_contracts if contract["mandatory"]
+        )
+        raise ValueError(
+            "mandatory sequence content cannot fit the exact generation-unit "
+            f"capacity vector {capacities}; mandatory_sequences={mandatory_sequences}"
+        )
+    _score, selected_lengths = selected
+    sequence_plan = [
+        contract["sequence_id"]
+        for contract, length in zip(
+            sequence_contracts,
+            selected_lengths,
+            strict=True,
+        )
+        for _ in range(length)
+    ]
+    if len(sequence_plan) != beat_count:
+        raise ValueError("vector sequence allocation did not cover every beat")
+
+    event_counts_per_beat: list[dict[str, int]] = [
+        {} for _ in range(beat_count)
+    ]
+    beat_offset = 0
+    for contract, length in zip(
+        sequence_contracts,
+        selected_lengths,
+        strict=True,
+    ):
+        if length == 0:
+            continue
+        segment_end = beat_offset + length
+        cursor = beat_offset
+        loads = [0] * length
+        # The duration plan has already selected the complete production
+        # ledger. Every selected event slice is bound here; downstream prompt
+        # generation may not silently drop or repack it.
+        for event_id in contract["selected_event_ids"]:
+            remaining = generation_units[event_id]
+            while remaining:
+                while (
+                    cursor < segment_end
+                    and loads[cursor - beat_offset] >= capacities[cursor]
+                ):
+                    cursor += 1
+                if cursor >= segment_end:
+                    raise ValueError(
+                        "mandatory event allocation exceeded its sequence segment"
+                    )
+                room = capacities[cursor] - loads[cursor - beat_offset]
+                assigned = min(remaining, room)
+                event_counts_per_beat[cursor][str(event_id)] = (
+                    event_counts_per_beat[cursor].get(str(event_id), 0)
+                    + assigned
+                )
+                loads[cursor - beat_offset] += assigned
+                remaining -= assigned
+        beat_offset = segment_end
+
+    return sequence_plan, event_counts_per_beat
+
+
+DURATION_SCALED_EVENT_PLAN_SCHEMA = "honcut.duration-scaled-event-plan.v4"
 DURATION_SCALED_ACTION_SELECTION_SCHEMA = (
     "honcut.duration-scaled-action-selection.v1"
 )
@@ -3334,6 +4008,7 @@ def _source_event_generation_contracts(
     """Normalize the immutable source ledger once for index-based selection."""
     contracts: list[dict[str, Any]] = []
     source_seen: set[str] = set()
+    capabilities = get_video_capabilities()
     for event_id, event in enumerate(events, 1):
         raw_actions = event.get("micro_actions") or []
         if isinstance(raw_actions, str):
@@ -3347,6 +4022,9 @@ def _source_event_generation_contracts(
             event,
             actions=actions,
             seen=source_seen,
+            max_motion_contributions_per_slice=(
+                capabilities.motion_contribution_limit
+            ),
         )
         contracts.append({
             "event_id": event_id,
@@ -3387,29 +4065,111 @@ def _materialize_production_event(
     *,
     preserve_duplicate_actions: bool,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
-    """Project source-index selections into one prompt-safe event copy."""
-    selected_action_indexes = {
-        int(action_index)
-        for unit_index in selected_unit_indexes
-        for action_index in contract["generation_units"][unit_index].get(
-            "ledger_indexes", []
+    """Compress complete source slices into fixed contiguous production groups.
+
+    ``selected_unit_indexes`` historically meant "surviving" source units.
+    That severed causal dependencies and silently removed the intervening
+    screenplay.  Its length now supplies only the solver's production-unit
+    target.  Every source action remains in exactly one contiguous rewrite
+    group, and the persisted group ledger is the authority for the later real
+    screenplay rewrite.
+    """
+    del preserve_duplicate_actions
+    source_units = [
+        copy.deepcopy(unit) for unit in contract["generation_units"]
+    ]
+    target_count = len(selected_unit_indexes)
+    if source_units and not 1 <= target_count <= len(source_units):
+        raise ValueError(
+            "source-indexed screenplay rewrite target must retain at least "
+            "one production action per non-empty event"
         )
-    }
-    selected_action_indexes.update(
+    if not source_units and target_count:
+        raise ValueError("zero-unit source event cannot gain production actions")
+
+    if not source_units:
+        source_hash = hashlib.sha256(
+            json.dumps(
+                contract["actions"],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        production_event = copy.deepcopy(source_event)
+        production_event["micro_actions"] = list(contract["actions"])
+        rewrite = {
+            "schema": SOURCE_INDEXED_SCREENPLAY_REWRITE_SCHEMA,
+            "source_event_id": int(contract["event_id"]),
+            "source_micro_actions_sha256": source_hash,
+            "source_micro_action_count": len(contract["actions"]),
+            "source_generation_action_unit_count": 0,
+            "production_generation_action_unit_count": 0,
+            "groups": [],
+            "static_source_facts": list(contract["actions"]),
+            "omitted_source_micro_action_indexes": [],
+        }
+        production_event["production_action_rewrite"] = rewrite
+        selection = {
+            "schema": DURATION_SCALED_EVENT_PLAN_SCHEMA,
+            "source_event_id": contract["event_id"],
+            "selected_source_micro_action_indexes": list(
+                range(1, len(contract["actions"]) + 1)
+            ),
+            "omitted_source_micro_action_indexes": [],
+            "source_micro_actions_sha256": source_hash,
+            "production_action_rewrite_schema": (
+                SOURCE_INDEXED_SCREENPLAY_REWRITE_SCHEMA
+            ),
+            "production_action_groups": [],
+        }
+        production_event["production_action_selection"] = selection
+        return production_event, selection
+
+    unit_groups: list[list[dict[str, Any]]] = []
+    unit_group_indexes: list[list[int]] = []
+    if target_count:
+        quotient, remainder = divmod(len(source_units), target_count)
+        cursor = 0
+        for group_index in range(target_count):
+            group_size = quotient + (1 if group_index < remainder else 0)
+            unit_group_indexes.append(
+                list(range(cursor + 1, cursor + group_size + 1))
+            )
+            unit_groups.append(source_units[cursor:cursor + group_size])
+            cursor += group_size
+        if cursor != len(source_units) or any(not group for group in unit_groups):
+            raise ValueError("source-indexed screenplay rewrite grouping failed")
+
+    grouped_action_indexes: list[list[int]] = []
+    assigned_indexes: set[int] = set()
+    for unit_group in unit_groups:
+        indexes = sorted({
+            int(action_index)
+            for unit in unit_group
+            for action_index in unit.get("ledger_indexes") or []
+            if 0 <= int(action_index) < len(contract["actions"])
+        })
+        grouped_action_indexes.append(indexes)
+        assigned_indexes.update(indexes)
+    unassigned_indexes = [
         index
-        for index, category in enumerate(contract["categories"])
-        if category == "sustained"
-        or (category == "duplicate" and preserve_duplicate_actions)
-    )
-    selected_action_indexes = {
-        index
-        for index in selected_action_indexes
-        if 0 <= index < len(contract["actions"])
-    }
-    selected_indexes = sorted(selected_action_indexes)
-    omitted_indexes = sorted(
-        set(range(len(contract["actions"]))) - selected_action_indexes
-    )
+        for index in range(len(contract["actions"]))
+        if index not in assigned_indexes
+    ]
+    for source_index in unassigned_indexes:
+        if not grouped_action_indexes:
+            break
+        destination = len(grouped_action_indexes) - 1
+        for group_index, indexes in enumerate(grouped_action_indexes):
+            if indexes and source_index <= indexes[-1]:
+                destination = group_index
+                break
+        grouped_action_indexes[destination].append(source_index)
+        grouped_action_indexes[destination].sort()
+        assigned_indexes.add(source_index)
+
+    if source_units and assigned_indexes != set(range(len(contract["actions"]))):
+        raise ValueError("source-indexed screenplay rewrite lost source facts")
     source_hash = hashlib.sha256(
         json.dumps(
             contract["actions"],
@@ -3418,28 +4178,136 @@ def _materialize_production_event(
         ).encode("utf-8")
     ).hexdigest()
     production_event = copy.deepcopy(source_event)
-    production_event["micro_actions"] = [
-        contract["actions"][index] for index in selected_indexes
-    ]
+    groups: list[dict[str, Any]] = []
+    source_index_to_group: dict[int, int] = {}
+    production_actions: list[str] = []
+    for production_index, (unit_group, unit_indexes, action_indexes) in enumerate(
+        zip(
+            unit_groups,
+            unit_group_indexes,
+            grouped_action_indexes,
+            strict=True,
+        ),
+        1,
+    ):
+        source_actions = [
+            contract["actions"][index] for index in action_indexes
+        ]
+        rewritten_action = (
+            source_actions[0]
+            if len(source_actions) == 1
+            else "连续因果动作：" + " → ".join(source_actions)
+        )
+        production_actions.append(rewritten_action)
+        for source_index in action_indexes:
+            source_index_to_group[source_index + 1] = production_index
+        groups.append({
+            "production_action_index": production_index,
+            "source_generation_unit_indexes": list(unit_indexes),
+            "source_micro_action_indexes": [
+                index + 1 for index in action_indexes
+            ],
+            "source_actions": source_actions,
+            "source_actions_sha256": hashlib.sha256(
+                json.dumps(
+                    source_actions,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "rewritten_micro_action": rewritten_action,
+            "maximum_motion_load": max(
+                (int(unit.get("motion_load") or 1) for unit in unit_group),
+                default=0,
+            ),
+            "pace_weight": sum(
+                int(unit.get("pace_weight") or 1) for unit in unit_group
+            ),
+            "performers": list(dict.fromkeys(
+                performer
+                for unit in unit_group
+                for performer in unit.get("performers") or []
+            )),
+            "targets": list(dict.fromkeys(
+                target
+                for unit in unit_group
+                for target in unit.get("targets") or []
+            )),
+            "state_reads": list(dict.fromkeys(
+                value
+                for unit in unit_group
+                for value in unit.get("state_reads") or []
+            )),
+            "state_writes": list(dict.fromkeys(
+                value
+                for unit in unit_group
+                for value in unit.get("state_writes") or []
+            )),
+            "start_state": str(unit_group[0].get("start_state") or ""),
+            "end_state": str(unit_group[-1].get("end_state") or ""),
+        })
+    production_event["micro_actions"] = production_actions
     choreography = source_event.get("body_action_choreography") or []
     if isinstance(choreography, list):
-        production_event["body_action_choreography"] = [
-            copy.deepcopy(beat)
-            for beat in choreography
-            if isinstance(beat, dict)
-            and isinstance(beat.get("micro_action_index"), int)
-            and beat["micro_action_index"] - 1 in selected_action_indexes
-        ]
+        rewritten_choreography = []
+        for beat in choreography:
+            if not isinstance(beat, dict):
+                continue
+            source_index = beat.get("micro_action_index")
+            if source_index not in source_index_to_group:
+                continue
+            migrated_beat = copy.deepcopy(beat)
+            migrated_beat["source_micro_action_index"] = source_index
+            migrated_beat["micro_action_index"] = source_index_to_group[
+                source_index
+            ]
+            rewritten_choreography.append(migrated_beat)
+        production_event["body_action_choreography"] = rewritten_choreography
+    production_event.pop("body_action_contract", None)
+    production_event["action_temporal_relations"] = [
+        {
+            "micro_action_index": group_index,
+            "performers": list(group["performers"]),
+            "targets": list(group["targets"]),
+            "action_kind": "state_change",
+            "temporal_relation": "root" if group_index == 1 else "after",
+            "reference_action_indexes": [] if group_index == 1 else [group_index - 1],
+            "pace": (
+                "slow" if int(group["pace_weight"]) >= 3 else (
+                    "normal" if int(group["pace_weight"]) >= 2 else "fast"
+                )
+            ),
+            "state_reads": list(group["state_reads"]),
+            "state_writes": list(group["state_writes"]),
+        }
+        for group_index, group in enumerate(groups, 1)
+    ]
+    production_event["generation_motion_mode"] = (
+        "atomic" if production_actions else "none"
+    )
+    rewrite = {
+        "schema": SOURCE_INDEXED_SCREENPLAY_REWRITE_SCHEMA,
+        "source_event_id": int(contract["event_id"]),
+        "source_micro_actions_sha256": source_hash,
+        "source_micro_action_count": len(contract["actions"]),
+        "source_generation_action_unit_count": len(source_units),
+        "production_generation_action_unit_count": target_count,
+        "groups": groups,
+        "omitted_source_micro_action_indexes": [],
+    }
+    production_event["production_action_rewrite"] = rewrite
     selection = {
         "schema": DURATION_SCALED_EVENT_PLAN_SCHEMA,
         "source_event_id": contract["event_id"],
-        "selected_source_micro_action_indexes": [
-            index + 1 for index in selected_indexes
-        ],
-        "omitted_source_micro_action_indexes": [
-            index + 1 for index in omitted_indexes
-        ],
+        "selected_source_micro_action_indexes": list(
+            range(1, len(contract["actions"]) + 1)
+        ),
+        "omitted_source_micro_action_indexes": [],
         "source_micro_actions_sha256": source_hash,
+        "production_action_rewrite_schema": (
+            SOURCE_INDEXED_SCREENPLAY_REWRITE_SCHEMA
+        ),
+        "production_action_groups": copy.deepcopy(groups),
     }
     production_event["production_action_selection"] = selection
     return production_event, selection
@@ -3478,7 +4346,7 @@ def _build_duration_scaled_event_plan(
             MAX_CONTENT_BEATS_PER_PRIMARY_SHOT,
             math.ceil(
                 int(max_generation_units_per_beat)
-                / profile.max_micro_actions_per_beat
+                / profile.temporal_slice_limit
             ),
         )
     per_beat_capacity = _generation_unit_capacity_for_story_duration(
@@ -3540,20 +4408,22 @@ def _build_duration_scaled_event_plan(
         contract["event_id"]: len(contract["generation_units"])
         for contract in source_contracts
     }
+    planned_event_ids = list(range(1, len(events) + 1))
+
     def build_candidate(
-        mandatory_targets: tuple[int, ...],
+        selected_targets: tuple[int, ...],
     ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        targets = dict(zip(mandatory_event_ids, mandatory_targets, strict=True))
+        targets = dict(zip(planned_event_ids, selected_targets, strict=True))
         compression_active = any(
             targets[event_id] < source_counts[event_id]
-            for event_id in mandatory_event_ids
+            for event_id in planned_event_ids
         )
         production_events: List[Dict[str, Any]] = []
         records: List[Dict[str, Any]] = []
         for contract, source_event in zip(source_contracts, events, strict=True):
             event_id = contract["event_id"]
             units = contract["generation_units"]
-            target_count = targets.get(event_id, len(units))
+            target_count = targets[event_id]
             role = str(source_event.get("event_role") or "").strip().lower()
             selected_unit_indexes = _representative_generation_unit_indexes(
                 len(units),
@@ -3589,9 +4459,10 @@ def _build_duration_scaled_event_plan(
                 ),
                 "source_micro_action_count": len(contract["actions"]),
                 "source_generation_action_units": len(units),
-                "selected_source_generation_unit_indexes": [
-                    index + 1 for index in selected_unit_indexes
-                ],
+                "selected_source_generation_unit_indexes": list(
+                    range(1, len(units) + 1)
+                ),
+                "production_generation_action_unit_target": target_count,
                 "selected_source_micro_action_indexes": list(
                     selection["selected_source_micro_action_indexes"]
                 ),
@@ -3612,9 +4483,23 @@ def _build_duration_scaled_event_plan(
             record["production_generation_action_units"] = production_counts[
                 event_id
             ]
+            rewrite_groups = (
+                production_event.get("production_action_rewrite", {}).get(
+                    "groups"
+                )
+                or []
+            )
             record["scaling"] = (
-                "representative"
-                if record["omitted_source_micro_action_indexes"]
+                "rewrite"
+                if (
+                    record["production_generation_action_units"]
+                    < record["source_generation_action_units"]
+                    or any(
+                        len(group.get("source_micro_action_indexes") or []) > 1
+                        for group in rewrite_groups
+                        if isinstance(group, dict)
+                    )
+                )
                 else "full"
             )
         return production_events, records
@@ -3640,11 +4525,15 @@ def _build_duration_scaled_event_plan(
         (0, 0, 0): (0, 0, 0, ())
     }
     previous_sequence: str | None = None
-    for event_id in mandatory_event_ids:
+    for event_id in planned_event_ids:
         event = events[event_id - 1]
         sequence = str(event.get("sequence_id") or "").strip() or "__unspecified__"
         starts_sequence = sequence != previous_sequence
         source_count = source_counts[event_id]
+        # Source facts are immutable for current runs.  Capacity pressure may
+        # compress a non-empty event into one source-indexed production action,
+        # but may not silently erase the event because it was classified as
+        # optional by an upstream narrative heuristic.
         minimum_target = 1 if source_count > 0 else 0
         role_weight = role_weights.get(
             str(event.get("event_role") or "").strip().lower(),
@@ -3721,27 +4610,41 @@ def _build_duration_scaled_event_plan(
         List[Dict[str, Any]],
         List[Dict[str, Any]],
         List[str],
+        list[dict[str, int]],
     ] | None = None
     if packing_states:
         _removed, _weighted, _relative, targets = min(packing_states.values())
         production_events, records = build_candidate(targets)
         try:
-            sequence_plan = _sequence_beat_plan(
+            (
+                sequence_plan,
+                event_counts_per_beat,
+            ) = _vector_sequence_beat_allocation(
                 production_events,
-                beat_count,
-                per_beat_capacity,
+                per_beat_capacities,
             )
         except ValueError:
             sequence_plan = []
+            event_counts_per_beat = []
         if sequence_plan:
-            selected = production_events, records, sequence_plan
+            selected = (
+                production_events,
+                records,
+                sequence_plan,
+                event_counts_per_beat,
+            )
 
     if selected is None:
         raise ValueError(
             "mandatory sequence facts cannot fit the available story-beat slots "
             "even after bounded intra-event action scaling"
         )
-    production_events, records, sequence_plan = selected
+    (
+        production_events,
+        records,
+        sequence_plan,
+        event_counts_per_beat,
+    ) = selected
     production_counts = _event_generation_action_unit_counts(production_events)
     source_generation_units = sum(source_counts.values())
     production_generation_units = sum(production_counts.values())
@@ -3762,7 +4665,7 @@ def _build_duration_scaled_event_plan(
         "source_generation_action_units": source_generation_units,
         "production_generation_action_units": production_generation_units,
         "intra_event_scaling_applied": any(
-            record["scaling"] == "representative" for record in records
+            record["scaling"] == "rewrite" for record in records
         ),
         "base_mandatory_source_event_ids": sorted(base_mandatory_event_ids),
         "terminal_outcome_source_event_ids": sorted(terminal_event_ids),
@@ -3774,9 +4677,678 @@ def _build_duration_scaled_event_plan(
             {"beat_order": index, "sequence_id": sequence}
             for index, sequence in enumerate(sequence_plan, 1)
         ],
+        "source_event_generation_unit_counts_per_beat": event_counts_per_beat,
         "events": records,
     }
     return production_events, plan
+
+
+def _bind_action_timeline_to_primary_layout(
+    production_events: List[Dict[str, Any]],
+    duration_scaled_event_plan: Dict[str, Any],
+    primary_shot_layout: Dict[str, Any],
+    capabilities: VideoModelCapabilities,
+) -> dict[str, Any]:
+    """Bind canonical temporal slices to one exact Sxx/Pxx capacity matrix.
+
+    Duration planning owns how many slices from each event enter each Sxx.
+    This function is the single deterministic handoff from that vector ledger
+    into Provider-sized Pxx slots; it never recomputes a scalar beat plan.
+    """
+
+    def bucket_counts(
+        units: list[dict[str, Any]],
+        durations: list[float],
+        limit: int,
+    ) -> tuple[int, ...]:
+        """Balance contiguous temporal slices against canonical Pxx time."""
+        unit_count = len(units)
+        beat_count = len(durations)
+        minimum = 1 if unit_count >= beat_count else 0
+        candidates: list[tuple[tuple[float, ...], tuple[int, ...]]] = []
+
+        def visit(prefix: tuple[int, ...], remaining: int) -> None:
+            position = len(prefix)
+            if position == beat_count:
+                if remaining:
+                    return
+                cursor = 0
+                weights = []
+                for count in prefix:
+                    weights.append(sum(
+                        int(unit.get("pace_weight") or 1)
+                        for unit in units[cursor:cursor + count]
+                    ))
+                    cursor += count
+                total_weight = sum(weights)
+                total_duration = sum(durations)
+                imbalance = sum(
+                    abs(
+                        weight
+                        - total_weight * float(duration) / total_duration
+                    )
+                    for weight, duration in zip(weights, durations, strict=True)
+                ) if total_duration else float("inf")
+                empty_between_content = sum(
+                    1
+                    for index, count in enumerate(prefix)
+                    if count == 0
+                    and any(value > 0 for value in prefix[:index])
+                    and any(value > 0 for value in prefix[index + 1:])
+                )
+                leading_empty = 0
+                for count in prefix:
+                    if count:
+                        break
+                    leading_empty += 1
+                trailing_empty = 0
+                for count in reversed(prefix):
+                    if count:
+                        break
+                    trailing_empty += 1
+                candidates.append((
+                    (
+                        float(leading_empty + empty_between_content),
+                        round(imbalance, 9),
+                        float(trailing_empty),
+                        *tuple(float(-count) for count in prefix),
+                    ),
+                    prefix,
+                ))
+                return
+            slots_left = beat_count - position - 1
+            lower = max(minimum, remaining - slots_left * limit)
+            upper = min(limit, remaining - slots_left * minimum)
+            for count in range(lower, upper + 1):
+                visit((*prefix, count), remaining - count)
+
+        visit((), unit_count)
+        if not candidates:
+            raise ValueError("timeline slices cannot fit the canonical Pxx vector")
+        return min(candidates, key=lambda item: item[0])[1]
+
+    if duration_scaled_event_plan.get("schema") != DURATION_SCALED_EVENT_PLAN_SCHEMA:
+        raise ValueError("timeline binding requires the current duration plan")
+    if primary_shot_layout.get("schema") != PRIMARY_SHOT_LAYOUT_SCHEMA:
+        raise ValueError("timeline binding requires the current primary-shot layout")
+    event_counts_per_shot = duration_scaled_event_plan.get(
+        "source_event_generation_unit_counts_per_beat"
+    )
+    sequence_beat_plan = duration_scaled_event_plan.get("sequence_beat_plan")
+    content_beat_counts = primary_shot_layout.get("content_beat_counts")
+    effective_story_durations = primary_shot_layout.get(
+        "effective_story_durations_s"
+    )
+    if (
+        not isinstance(event_counts_per_shot, list)
+        or not isinstance(sequence_beat_plan, list)
+        or not isinstance(content_beat_counts, list)
+        or not isinstance(effective_story_durations, list)
+        or len(event_counts_per_shot) != len(content_beat_counts)
+        or len(sequence_beat_plan) != len(content_beat_counts)
+        or len(effective_story_durations) != len(content_beat_counts)
+    ):
+        raise ValueError("timeline binding ledgers do not match primary shots")
+    sequence_ids: list[str] = []
+    for shot_index, item in enumerate(sequence_beat_plan, 1):
+        if (
+            not isinstance(item, dict)
+            or item.get("beat_order") != shot_index
+            or not str(item.get("sequence_id") or "").strip()
+        ):
+            raise ValueError("timeline binding has an invalid sequence beat plan")
+        sequence_ids.append(str(item["sequence_id"]).strip())
+
+    event_units: dict[int, list[dict[str, Any]]] = {}
+    seen: set[str] = set()
+    for event_id, event in enumerate(production_events, 1):
+        normalized = normalize_event_action_units(
+            event,
+            seen=seen,
+            max_motion_contributions_per_slice=(
+                capabilities.motion_contribution_limit
+            ),
+        )
+        units = [
+            copy.deepcopy(unit)
+            for unit in normalized.get("generation_action_units") or []
+            if isinstance(unit, dict)
+        ]
+        for unit_order, unit in enumerate(units, 1):
+            unit["source_event_id"] = event_id
+            unit["event_temporal_slice_order"] = unit_order
+        event_units[event_id] = units
+
+    cursors = {event_id: 0 for event_id in event_units}
+    assignments: list[dict[str, Any]] = []
+    sxx_records: list[dict[str, Any]] = []
+    global_pxx_order = 0
+    slice_limit = capabilities.temporal_slice_limit
+    motion_limit = capabilities.motion_contribution_limit
+    for shot_index, (raw_counts, pxx_count, pxx_durations, sequence_id) in enumerate(
+        zip(
+            event_counts_per_shot,
+            content_beat_counts,
+            effective_story_durations,
+            sequence_ids,
+            strict=True,
+        ),
+        1,
+    ):
+        if not isinstance(raw_counts, dict) or (
+            isinstance(pxx_count, bool)
+            or not isinstance(pxx_count, int)
+            or pxx_count < 1
+        ):
+            raise ValueError("timeline binding contains an invalid Sxx ledger")
+        if (
+            not isinstance(pxx_durations, list)
+            or len(pxx_durations) != pxx_count
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or float(value) <= 0
+                for value in pxx_durations
+            )
+        ):
+            raise ValueError("timeline binding has invalid Pxx story durations")
+        shot_units: list[dict[str, Any]] = []
+        for raw_event_id, raw_count in raw_counts.items():
+            try:
+                event_id = int(raw_event_id)
+                count = int(raw_count)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("timeline binding has invalid event counts") from exc
+            if count < 0 or event_id not in event_units:
+                raise ValueError("timeline binding references an invalid event")
+            start = cursors[event_id]
+            end = start + count
+            if end > len(event_units[event_id]):
+                raise ValueError("timeline binding exceeds an event slice ledger")
+            shot_units.extend(event_units[event_id][start:end])
+            cursors[event_id] = end
+        if len(shot_units) > pxx_count * slice_limit:
+            raise ValueError("timeline binding exceeds Sxx temporal capacity")
+
+        pxx_records: list[dict[str, Any]] = []
+        temporal_bucket_counts = bucket_counts(
+            shot_units,
+            [float(value) for value in pxx_durations],
+            slice_limit,
+        )
+        shot_unit_cursor = 0
+        for local_pxx_order in range(1, pxx_count + 1):
+            global_pxx_order += 1
+            temporal_bucket_count = temporal_bucket_counts[
+                local_pxx_order - 1
+            ]
+            pxx_units = shot_units[
+                shot_unit_cursor:shot_unit_cursor + temporal_bucket_count
+            ]
+            shot_unit_cursor += temporal_bucket_count
+            pxx_id = f"P{global_pxx_order:03d}"
+            pxx_assignment_ids: list[str] = []
+            for unit in pxx_units:
+                motion_load = int(unit.get("motion_load") or 1)
+                if motion_load > motion_limit:
+                    raise ValueError(
+                        "timeline slice exceeds Provider motion contribution capacity"
+                    )
+                assignment_id = f"TA{len(assignments) + 1:03d}"
+                pxx_assignment_ids.append(assignment_id)
+                assignments.append({
+                    "assignment_id": assignment_id,
+                    "source_event_id": int(unit["source_event_id"]),
+                    "event_temporal_slice_order": int(
+                        unit["event_temporal_slice_order"]
+                    ),
+                    "source_temporal_slice_id": str(
+                        unit.get("temporal_slice_id") or ""
+                    ),
+                    "semantic_temporal_slice_id": str(
+                        unit.get("semantic_temporal_slice_id")
+                        or unit.get("temporal_slice_id")
+                        or ""
+                    ),
+                    "semantic_motion_load": int(
+                        unit.get("semantic_motion_load")
+                        or unit.get("motion_load")
+                        or 1
+                    ),
+                    "execution_subslice_id": str(
+                        unit.get("execution_subslice_id") or ""
+                    ),
+                    "execution_subslice_order": int(
+                        unit.get("execution_subslice_order") or 1
+                    ),
+                    "execution_subslice_count": int(
+                        unit.get("execution_subslice_count") or 1
+                    ),
+                    "provider_capacity_staging": str(
+                        unit.get("provider_capacity_staging")
+                        or "not_required"
+                    ),
+                    "source_micro_action_indexes": [
+                        int(index)
+                        for index in (
+                            unit.get("source_micro_action_indexes")
+                            or [
+                                int(value) + 1
+                                for value in unit.get("ledger_indexes") or []
+                            ]
+                        )
+                    ],
+                    "contribution_micro_action_indexes": [
+                        int(index) + 1
+                        for index in unit.get(
+                            "contribution_ledger_indexes"
+                        ) or unit.get("ledger_indexes") or []
+                    ],
+                    "effect_micro_action_indexes": [
+                        int(index) + 1
+                        for index in unit.get("effect_ledger_indexes") or []
+                    ],
+                    "sustained_micro_action_indexes": [
+                        int(index) + 1
+                        for index in unit.get("sustained_ledger_indexes") or []
+                    ],
+                    "motion_load": motion_load,
+                    "pace_weight": int(unit.get("pace_weight") or 1),
+                    "performers": list(unit.get("performers") or []),
+                    "targets": list(unit.get("targets") or []),
+                    "state_reads": list(unit.get("state_reads") or []),
+                    "state_writes": list(unit.get("state_writes") or []),
+                    "start_state": str(unit.get("start_state") or ""),
+                    "end_state": str(unit.get("end_state") or ""),
+                    "source_fact_echoes": list(
+                        unit.get("source_fact_echoes") or unit.get("actions") or []
+                    ),
+                    "source_generation_unit_indexes": list(
+                        unit.get("source_generation_unit_indexes") or []
+                    ),
+                    "source_actions_sha256": str(
+                        unit.get("source_actions_sha256") or ""
+                    ),
+                    "screenplay_rewrite_schema": (
+                        SOURCE_INDEXED_SCREENPLAY_REWRITE_SCHEMA
+                        if unit.get("source_fact_echoes")
+                        else None
+                    ),
+                    "sxx_id": f"S{shot_index:03d}",
+                    "pxx_id": pxx_id,
+                })
+            pxx_records.append({
+                "pxx_id": pxx_id,
+                "pxx_order_within_sxx": local_pxx_order,
+                "temporal_slice_capacity": slice_limit,
+                "effective_story_duration_s": float(
+                    pxx_durations[local_pxx_order - 1]
+                ),
+                "assigned_pace_weight": sum(
+                    int(unit.get("pace_weight") or 1) for unit in pxx_units
+                ),
+                "assignment_ids": pxx_assignment_ids,
+            })
+        sxx_records.append({
+            "sxx_id": f"S{shot_index:03d}",
+            "sxx_order": shot_index,
+            "sequence_id": sequence_id,
+            "temporal_slice_capacity": pxx_count * slice_limit,
+            "assigned_temporal_slice_count": len(shot_units),
+            "pxx": pxx_records,
+        })
+
+    unassigned = {
+        event_id: len(units) - cursors[event_id]
+        for event_id, units in event_units.items()
+        if len(units) != cursors[event_id]
+    }
+    if unassigned:
+        raise ValueError(
+            f"timeline binding left production slices unassigned: {unassigned}"
+        )
+
+    positive_positions: dict[int, list[int]] = {}
+    for shot_index, raw_counts in enumerate(event_counts_per_shot, 1):
+        for raw_event_id, raw_count in raw_counts.items():
+            event_id = int(raw_event_id)
+            if int(raw_count) > 0:
+                positive_positions.setdefault(event_id, []).append(shot_index)
+    zero_story_time_attachments: list[dict[str, Any]] = []
+    zero_event_ids_by_sequence: dict[str, list[int]] = {}
+    for event_id, units in event_units.items():
+        if units:
+            continue
+        event_sequence = (
+            str(production_events[event_id - 1].get("sequence_id") or "").strip()
+            or "__unspecified__"
+        )
+        zero_event_ids_by_sequence.setdefault(event_sequence, []).append(event_id)
+    for event_id, units in event_units.items():
+        if units:
+            continue
+        event_sequence = (
+            str(production_events[event_id - 1].get("sequence_id") or "").strip()
+            or "__unspecified__"
+        )
+        candidate_shots = [
+            shot_index
+            for shot_index, sequence_id in enumerate(sequence_ids, 1)
+            if sequence_id == event_sequence
+        ]
+        if not candidate_shots:
+            raise ValueError(
+                "zero-story-time source fact has no Sxx in its authored "
+                f"sequence: event={event_id}, sequence={event_sequence}"
+            )
+        next_event_id = next(
+            (
+                candidate_id
+                for candidate_id in range(event_id + 1, len(production_events) + 1)
+                if positive_positions.get(candidate_id)
+                and (
+                    str(
+                        production_events[candidate_id - 1].get("sequence_id")
+                        or ""
+                    ).strip()
+                    or "__unspecified__"
+                ) == event_sequence
+            ),
+            None,
+        )
+        previous_event_id = next(
+            (
+                candidate_id
+                for candidate_id in range(event_id - 1, 0, -1)
+                if positive_positions.get(candidate_id)
+                and (
+                    str(
+                        production_events[candidate_id - 1].get("sequence_id")
+                        or ""
+                    ).strip()
+                    or "__unspecified__"
+                ) == event_sequence
+            ),
+            None,
+        )
+        if next_event_id is not None:
+            attached_shot = positive_positions[next_event_id][0]
+            anchor_event_id = next_event_id
+            attachment_rule = "nearest_next_execution_event"
+        elif previous_event_id is not None:
+            attached_shot = positive_positions[previous_event_id][-1]
+            anchor_event_id = previous_event_id
+            attachment_rule = "nearest_previous_execution_event"
+        else:
+            sequence_zero_events = zero_event_ids_by_sequence[event_sequence]
+            zero_event_offset = sequence_zero_events.index(event_id)
+            attached_shot = candidate_shots[
+                min(
+                    len(candidate_shots) - 1,
+                    (
+                        zero_event_offset * len(candidate_shots)
+                        // len(sequence_zero_events)
+                    ),
+                )
+            ]
+            anchor_event_id = None
+            attachment_rule = "sequence_source_order_distribution"
+        sxx_records[attached_shot - 1].setdefault(
+            "zero_story_time_source_event_ids", []
+        ).append(event_id)
+        zero_story_time_attachments.append({
+            "source_event_id": event_id,
+            "sequence_id": event_sequence,
+            "sxx_id": f"S{attached_shot:03d}",
+            "anchor_source_event_id": anchor_event_id,
+            "attachment_rule": attachment_rule,
+            "consumes_temporal_capacity": False,
+        })
+    return {
+        "schema": ACTION_TIMELINE_SCHEMA,
+        "layout_schema": PRIMARY_SHOT_LAYOUT_SCHEMA,
+        "duration_plan_schema": DURATION_SCALED_EVENT_PLAN_SCHEMA,
+        "max_temporal_slices_per_content_beat": slice_limit,
+        "max_motion_contributions_per_slice": motion_limit,
+        "sxx": sxx_records,
+        "assignments": assignments,
+        "zero_story_time_attachments": zero_story_time_attachments,
+    }
+
+
+def _apply_source_indexed_screenplay_rewrite(
+    source_events: List[Dict[str, Any]],
+    production_events: List[Dict[str, Any]],
+    duration_scaled_event_plan: Dict[str, Any],
+    director_plan: Dict[str, Any],
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Perform one real, fixed-lineage screenplay compression request.
+
+    The deterministic solver owns event counts and contiguous source groups.
+    The model may only rewrite each fixed group into one richer production
+    action.  Exact source actions remain in the rewrite ledger and later Pxx
+    prompts, so prose quality can change without changing facts or capacity.
+    """
+    plan = copy.deepcopy(duration_scaled_event_plan)
+    records = plan.get("events")
+    if not isinstance(records, list) or len(records) != len(source_events):
+        raise ValueError("source-indexed rewrite requires aligned event records")
+    rewrite_records = [
+        record for record in records if record.get("scaling") == "rewrite"
+    ]
+    if not rewrite_records:
+        plan["semantic_selection_status"] = "not_required"
+        return copy.deepcopy(production_events), plan
+
+    intents = _director_intents_by_sequence(director_plan, source_events)
+    inputs: list[dict[str, Any]] = []
+    expected_groups: dict[int, list[dict[str, Any]]] = {}
+    for record in rewrite_records:
+        event_id = record.get("source_event_id")
+        if not isinstance(event_id, int) or not 1 <= event_id <= len(source_events):
+            raise ValueError("source-indexed rewrite has an invalid event id")
+        production_event = production_events[event_id - 1]
+        rewrite = production_event.get("production_action_rewrite")
+        if (
+            not isinstance(rewrite, dict)
+            or rewrite.get("schema") != SOURCE_INDEXED_SCREENPLAY_REWRITE_SCHEMA
+            or rewrite.get("omitted_source_micro_action_indexes") != []
+        ):
+            raise ValueError("source-indexed rewrite ledger is missing or invalid")
+        groups = rewrite.get("groups")
+        if not isinstance(groups, list) or not groups:
+            raise ValueError("source-indexed rewrite requires fixed groups")
+        expected_groups[event_id] = copy.deepcopy(groups)
+        source_event = source_events[event_id - 1]
+        sequence_id = (
+            str(source_event.get("sequence_id") or "").strip()
+            or "__unspecified__"
+        )
+        inputs.append({
+            "source_event_id": event_id,
+            "sequence_id": sequence_id,
+            "event_role": source_event.get("event_role"),
+            "what": source_event.get("what"),
+            "start_state": source_event.get("start_state"),
+            "end_state": source_event.get("end_state"),
+            "causal_link": source_event.get("causal_link"),
+            "fixed_production_actions": [
+                {
+                    "production_action_index": group[
+                        "production_action_index"
+                    ],
+                    "source_micro_action_indexes": group[
+                        "source_micro_action_indexes"
+                    ],
+                    "source_actions": group["source_actions"],
+                    "performers": group.get("performers") or [],
+                    "targets": group.get("targets") or [],
+                    "start_state": group.get("start_state") or "",
+                    "end_state": group.get("end_state") or "",
+                }
+                for group in groups
+            ],
+            "director_intent": intents[sequence_id],
+        })
+
+    system_prompt = (
+        "你是影视编剧，执行一次来源索引受约束的时长压缩重写。代码已经固定事件、"
+        "生产动作数量、每个生产动作覆盖的来源动作索引和顺序。你只能把同组来源动作写成"
+        "一个具体、连续、有重量和因果承接的生产动作描述；不得删减、调序、跨组移动、"
+        "新增剧情、改变人物/道具/胜负/终态，也不得输出镜头字段。输出严格 JSON。"
+    )
+    base_prompt = (
+        "请重写下列事件。必须逐事件、逐 production_action_index 完整返回；"
+        "source_micro_action_indexes 必须与输入逐项完全一致。rewritten_micro_action 要按"
+        "source_actions 原顺序写出全部事实，明确执行者、目标、起止状态、力度、重心与惯性；"
+        "并行攻击/反应/效果写在同一故事时刻，串行动作保持先后。每组只能得到一个连续动作段。\n\n"
+        f"输入：\n{json.dumps(inputs, ensure_ascii=False, indent=2)}"
+    )
+    client = create_ark_client(read_timeout=LLM_IDLE_TIMEOUT)
+    parsed: dict[str, Any] | None = None
+    correction = ""
+    expected_ids = [record["source_event_id"] for record in rewrite_records]
+    for attempt in range(MAX_RETRIES + 1):
+        content = call_llm_stream(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": base_prompt + correction},
+            ],
+            max_tokens=12000,
+            wall_timeout=LLM_TIMEOUT,
+            idle_timeout=LLM_IDLE_TIMEOUT,
+            response_format=native_chat_json_schema_format(
+                SourceIndexedScreenplayRewriteBatch
+            ),
+            _client=client,
+        )
+        try:
+            candidate = parse_structured_output(
+                content,
+                SourceIndexedScreenplayRewriteBatch,
+            ).model_dump(by_alias=True)
+            returned = candidate["events"]
+            returned_ids = [item["source_event_id"] for item in returned]
+            if returned_ids != expected_ids:
+                raise ValueError(
+                    "source-indexed rewrite event coverage/order mismatch; "
+                    f"expected={expected_ids}, actual={returned_ids}"
+                )
+            for item in returned:
+                event_id = item["source_event_id"]
+                groups = expected_groups[event_id]
+                actions = item["production_actions"]
+                if len(actions) != len(groups):
+                    raise ValueError(
+                        f"source-indexed rewrite event {event_id} changed group count"
+                    )
+                for action, group in zip(actions, groups, strict=True):
+                    if (
+                        action["production_action_index"]
+                        != group["production_action_index"]
+                        or action["source_micro_action_indexes"]
+                        != group["source_micro_action_indexes"]
+                        or not str(action["rewritten_micro_action"]).strip()
+                    ):
+                        raise ValueError(
+                            f"source-indexed rewrite event {event_id} changed lineage"
+                        )
+                for field in (
+                    "narrative_purpose",
+                    "emotional_beat",
+                    "director_alignment",
+                ):
+                    if not str(item.get(field) or "").strip():
+                        raise ValueError(
+                            f"source-indexed rewrite event {event_id} has empty {field}"
+                        )
+            parsed = candidate
+            break
+        except (json.JSONDecodeError, ValidationError, ValueError) as exc:
+            if attempt >= MAX_RETRIES:
+                raise ValueError(
+                    f"source-indexed screenplay rewrite failed validation: {exc}"
+                ) from exc
+            correction = (
+                "\n\n上次输出未通过固定来源索引校验："
+                f"{exc}。请完整重写 JSON，严禁改变事件、组数或来源索引。"
+            )
+    if parsed is None:
+        raise ValueError("source-indexed screenplay rewrite returned no valid plan")
+
+    rewritten_events = copy.deepcopy(production_events)
+    semantic_by_event = {
+        item["source_event_id"]: item for item in parsed["events"]
+    }
+    records_by_event = {
+        record["source_event_id"]: record for record in records
+    }
+    for event_id, item in semantic_by_event.items():
+        event = rewritten_events[event_id - 1]
+        rewrite = event["production_action_rewrite"]
+        rewritten_actions = [
+            str(action["rewritten_micro_action"]).strip()
+            for action in item["production_actions"]
+        ]
+        event["micro_actions"] = rewritten_actions
+        for group, action in zip(
+            rewrite["groups"],
+            item["production_actions"],
+            strict=True,
+        ):
+            group["rewritten_micro_action"] = str(
+                action["rewritten_micro_action"]
+            ).strip()
+        selection = event.get("production_action_selection")
+        if isinstance(selection, dict):
+            selection["production_action_groups"] = copy.deepcopy(
+                rewrite["groups"]
+            )
+        record = records_by_event[event_id]
+        for field in (
+            "narrative_purpose",
+            "emotional_beat",
+            "director_alignment",
+        ):
+            record[field] = item[field]
+        record["screenplay_rewrite_attempt"] = 1
+
+    production_counts = _event_generation_action_unit_counts(rewritten_events)
+    for record in records:
+        event_id = record["source_event_id"]
+        target = int(record.get("production_generation_action_unit_target") or 0)
+        if production_counts[event_id] != target:
+            raise ValueError(
+                f"source-indexed rewrite changed event {event_id} capacity from "
+                f"{target} to {production_counts[event_id]}"
+            )
+        record["production_generation_action_units"] = production_counts[event_id]
+
+    per_beat_capacities = [
+        int(value)
+        for value in plan["generation_action_unit_capacities_per_beat"]
+    ]
+    sequence_plan, event_counts_per_beat = _vector_sequence_beat_allocation(
+        rewritten_events,
+        per_beat_capacities,
+    )
+    if sequence_plan != [
+        item["sequence_id"] for item in plan["sequence_beat_plan"]
+    ]:
+        raise ValueError("source-indexed rewrite changed sequence ownership")
+    plan["source_event_generation_unit_counts_per_beat"] = (
+        event_counts_per_beat
+    )
+    plan["production_generation_action_units"] = sum(
+        production_counts.values()
+    )
+    plan["semantic_selection_schema"] = (
+        SOURCE_INDEXED_SCREENPLAY_REWRITE_SCHEMA
+    )
+    plan["semantic_selection_status"] = "source_indexed_rewrite"
+    plan["screenplay_rewrite_attempt"] = 1
+    plan["director_plan_schema"] = director_plan.get("schema")
+    return rewritten_events, plan
 
 
 def _apply_director_action_selection(
@@ -3802,6 +5374,15 @@ def _apply_director_action_selection(
     records = plan.get("events")
     if not isinstance(records, list) or len(records) != len(source_events):
         raise ValueError("duration-scaled event plan has incomplete event records")
+    if any(record.get("scaling") == "rewrite" for record in records):
+        if any(record.get("scaling") == "representative" for record in records):
+            raise ValueError("mixed duration rewrite generations are unsupported")
+        return _apply_source_indexed_screenplay_rewrite(
+            source_events,
+            production_events,
+            duration_scaled_event_plan,
+            director_plan,
+        )
     scaled_records = [
         record
         for record in records
@@ -4021,16 +5602,21 @@ def _apply_director_action_selection(
             event_id
         ]
 
-    per_beat_capacity = int(plan["max_generation_action_units_per_beat"])
-    sequence_plan = _sequence_beat_plan(
+    per_beat_capacities = [
+        int(value)
+        for value in plan["generation_action_unit_capacities_per_beat"]
+    ]
+    sequence_plan, event_counts_per_beat = _vector_sequence_beat_allocation(
         selected_production_events,
-        int(plan["beat_count"]),
-        per_beat_capacity,
+        per_beat_capacities,
     )
     if sequence_plan != [
         item["sequence_id"] for item in plan["sequence_beat_plan"]
     ]:
         raise ValueError("director action selection changed sequence beat ownership")
+    plan["source_event_generation_unit_counts_per_beat"] = (
+        event_counts_per_beat
+    )
     plan["production_generation_action_units"] = sum(
         production_counts.values()
     )
@@ -4332,15 +5918,15 @@ def _repair_beat_action_capacity(
             int(
                 max_generation_units_per_beat
                 or (
-                    profile.max_micro_actions_per_beat
+                    profile.temporal_slice_limit
                     * MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
                 )
             )
-            / profile.max_micro_actions_per_beat
+            / profile.temporal_slice_limit
         ),
     )
     hard_capacity = (
-        profile.max_micro_actions_per_beat
+        profile.temporal_slice_limit
         * max_content_beats_per_primary_shot
     )
     unit_capacity = min(
@@ -4885,6 +6471,188 @@ def _restore_redundantly_dropped_events(
     return repaired
 
 
+def _build_canonical_beat_skeleton(
+    events: List[Dict[str, Any]],
+    characters_summary: str,
+    target_duration: int,
+    director_plan: Optional[Dict[str, Any]],
+    duration_scaled_event_plan: Dict[str, Any],
+    timeline_layout_binding: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Build Sxx from the persisted vector while the model authors cameras."""
+    profile = get_video_capabilities()
+    contracts = _canonical_beat_contracts(
+        events,
+        duration_scaled_event_plan,
+        timeline_layout_binding,
+    )
+    director_intents = _director_intents_by_sequence(director_plan, events)
+    public_contracts = [
+        {
+            "beat_order": contract["beat_order"],
+            "sxx_id": contract["sxx_id"],
+            "sequence_id": contract["sequence_id"],
+            "source_events": contract["source_events"],
+            "source_event_generation_unit_counts": contract[
+                "source_event_generation_unit_counts"
+            ],
+            "execution_subslice_count": contract["execution_subslice_count"],
+            "zero_story_time_source_event_ids": contract[
+                "zero_story_time_source_event_ids"
+            ],
+            "suggested_duration": contract["suggested_duration"],
+        }
+        for contract in contracts
+    ]
+    prompt = CANONICAL_BEAT_LANGUAGE_PROMPT.format(
+        target_duration=target_duration,
+        beat_count=len(contracts),
+        events_json=_build_events_json(events),
+        characters_summary=characters_summary,
+        canonical_beat_contracts=json.dumps(
+            public_contracts,
+            ensure_ascii=False,
+            indent=2,
+        ),
+        director_intents_json=json.dumps(
+            list(director_intents.values()),
+            ensure_ascii=False,
+            indent=2,
+        ),
+    )
+    last_validation_error = ""
+    for attempt in range(1 + MAX_RETRIES):
+        try:
+            attempt_prompt = prompt
+            if attempt:
+                attempt_prompt += (
+                    "\n\n【重试纠错】上次响应越过了摄影语言边界或字段不合法。"
+                    "只返回 beat_order 与合法镜头语言字段，不得返回来源、动作、时长或容量账本。"
+                )
+                if last_validation_error:
+                    attempt_prompt += (
+                        "\n上次响应的具体失败原因："
+                        f"{last_validation_error}。请修正后输出完整 JSON。"
+                    )
+            response = _call_llm_with_timeout_retry(
+                attempt_prompt,
+                max_tokens=8000,
+            )
+            language_plan = _parse_canonical_beat_language(
+                response,
+                len(contracts),
+            )
+            beats: list[dict[str, Any]] = []
+            event_by_id = {
+                event_id: dict(event, event_id=event_id)
+                for event_id, event in enumerate(events, 1)
+            }
+            for contract, authored in zip(
+                contracts,
+                language_plan["beats"],
+                strict=True,
+            ):
+                beat = copy.deepcopy(contract)
+                for field in _SHOT_LANGUAGE_FIELDS:
+                    value = authored[field]
+                    beat[field] = (
+                        list(value) if isinstance(value, list) else value
+                    )
+                beat["action"] = (
+                    "merge" if len(beat["source_events"]) > 1 else "keep"
+                )
+                beat["reason"] = "canonical duration-plan vector projection"
+                beat["who"] = []
+                beat["where"] = ""
+                beat["what"] = ""
+                beat["_source_event_details"] = [
+                    event_by_id[event_id]
+                    for event_id in beat["source_events"]
+                ]
+                _ground_production_beat_text_fields(
+                    beat,
+                    beat["_source_event_details"],
+                )
+                if director_intents:
+                    sequence_id = beat["sequence_id"]
+                    if sequence_id not in director_intents:
+                        raise ValueError(
+                            "canonical beat cannot bind director intent for "
+                            f"sequence {sequence_id}"
+                        )
+                    beat["director_intent"] = _build_production_director_intent(
+                        director_intents[sequence_id],
+                        beat["_source_event_details"],
+                        source_event_ids=list(beat["source_events"]),
+                        shot=beat,
+                    )
+                beats.append(beat)
+
+            _validate_beats_match_canonical_contracts(beats, contracts)
+            expected_loads = [
+                sum(contract["source_event_generation_unit_counts"].values())
+                for contract in contracts
+            ]
+            actual_loads = _beat_generation_unit_loads(beats, events)
+            if actual_loads != expected_loads:
+                raise ValueError(
+                    "canonical beat loads drifted from the duration vector: "
+                    f"expected={expected_loads}, actual={actual_loads}"
+                )
+            if any(
+                load > contract["max_generation_action_units"]
+                for load, contract in zip(actual_loads, contracts, strict=True)
+            ):
+                raise ValueError("canonical beat exceeds its persisted capacity")
+            max_content_beats = max(
+                MAX_CONTENT_BEATS_PER_PRIMARY_SHOT,
+                max(
+                    math.ceil(
+                        contract["max_generation_action_units"]
+                        / profile.temporal_slice_limit
+                    )
+                    for contract in contracts
+                ),
+            )
+            _validate_beat_action_capacity(
+                beats,
+                events,
+                profile,
+                max_content_beats_per_primary_shot=max_content_beats,
+            )
+            _validate_beat_material_duration(
+                beats,
+                events,
+                target_duration,
+                profile,
+            )
+            strategy = str(language_plan.get("strategy") or "").strip()
+            skeleton = {
+                "strategy": strategy,
+                "beats": beats,
+                "canonical_layout_source": DURATION_SCALED_EVENT_PLAN_SCHEMA,
+                "shot_language_plan": _validate_shot_language_variation(beats),
+            }
+            return skeleton
+        except (json.JSONDecodeError, ValueError) as exc:
+            last_validation_error = str(exc)
+            if attempt < MAX_RETRIES:
+                print(
+                    "canonical 骨架镜头语言解析失败，重试中"
+                    f"（{attempt + 1}/{MAX_RETRIES}）: {exc}",
+                    file=sys.stderr,
+                )
+                time.sleep(1)
+            else:
+                raise RuntimeError(
+                    "canonical 骨架镜头语言响应解析失败"
+                    f"（已重试 {MAX_RETRIES} 次）: {exc}"
+                ) from exc
+        except Exception as exc:
+            raise RuntimeError(f"canonical 骨架 LLM 调用失败: {exc}") from exc
+    raise RuntimeError("canonical 骨架 LLM 调用失败：未获得有效响应")
+
+
 def _build_beat_skeleton(
     events: List[Dict[str, Any]],
     characters_summary: str,
@@ -4894,6 +6662,8 @@ def _build_beat_skeleton(
     director_plan: Optional[Dict[str, Any]] = None,
     max_generation_units_per_beat: int | None = None,
     generation_unit_capacities_per_beat: list[int] | None = None,
+    duration_scaled_event_plan: Dict[str, Any] | None = None,
+    timeline_layout_binding: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Build a globally informed, bounded beat table (Stage 1)."""
     profile = get_video_capabilities()
@@ -4902,6 +6672,39 @@ def _build_beat_skeleton(
         shot_duration,
         profile,
     )
+    if duration_scaled_event_plan is not None or timeline_layout_binding is not None:
+        if duration_scaled_event_plan is None or timeline_layout_binding is None:
+            raise ValueError(
+                "canonical skeleton requires both duration plan and timeline binding"
+            )
+        if duration_scaled_event_plan.get("beat_count") != beat_count:
+            raise ValueError("canonical duration plan beat count drifted")
+        canonical_capacities = duration_scaled_event_plan.get(
+            "generation_action_unit_capacities_per_beat"
+        )
+        if (
+            generation_unit_capacities_per_beat is not None
+            and list(generation_unit_capacities_per_beat)
+            != canonical_capacities
+        ):
+            raise ValueError("caller capacity vector drifted from duration plan")
+        if (
+            max_generation_units_per_beat is not None
+            and (
+                not isinstance(canonical_capacities, list)
+                or not canonical_capacities
+                or max(canonical_capacities) != max_generation_units_per_beat
+            )
+        ):
+            raise ValueError("caller maximum capacity drifted from duration plan")
+        return _build_canonical_beat_skeleton(
+            events,
+            characters_summary,
+            target_duration,
+            director_plan,
+            duration_scaled_event_plan,
+            timeline_layout_binding,
+        )
     if generation_unit_capacities_per_beat is not None and (
         len(generation_unit_capacities_per_beat) != beat_count
         or any(
@@ -4921,11 +6724,11 @@ def _build_beat_skeleton(
             int(
                 max_generation_units_per_beat
                 or (
-                    profile.max_micro_actions_per_beat
+                    profile.temporal_slice_limit
                     * MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
                 )
             )
-            / profile.max_micro_actions_per_beat
+            / profile.temporal_slice_limit
         ),
     )
     occurrence_requirements = _event_primary_occurrence_requirements(
@@ -5215,7 +7018,20 @@ def _expand_beats_to_shots(
                 )
             else:
                 shot.pop("source_event_generation_unit_counts", None)
+            for field in (
+                "sxx_id",
+                "sequence_id",
+                "max_generation_action_units",
+                "execution_subslice_count",
+                "timeline_assignment_ids",
+                "zero_story_time_source_event_ids",
+            ):
+                if field in beat:
+                    shot[field] = copy.deepcopy(beat[field])
+                else:
+                    shot.pop(field, None)
             shot["action"] = beat["action"]
+            shot["suggested_duration"] = beat["suggested_duration"]
             shot["shot_order"] = len(shots) + 1
             shot.pop("beat_order", None)
             shots.append(shot)
@@ -5237,6 +7053,7 @@ def _expand_beats_to_shots(
             "where": str(last.get("where", "")),
             "visual": last.get("visual"),
         }
+    _validate_shots_match_beat_ledgers(shots, beats)
     return shots
 
 
@@ -5248,9 +7065,13 @@ def _atomic_write_json(path: Path, value: Any) -> None:
     os.replace(temporary, path)
 
 
-SCREENPLAY_PLAN_SCHEMA = "honcut.screenplay-plan.v6"
-LEGACY_SCREENPLAY_PLAN_SCHEMA = "honcut.screenplay-plan.v5"
-LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v16"
+SCREENPLAY_PLAN_SCHEMA = "honcut.screenplay-plan.v7"
+LEGACY_SCREENPLAY_PLAN_SCHEMAS = frozenset({
+    "honcut.screenplay-plan.v1",
+    "honcut.screenplay-plan.v5",
+    "honcut.screenplay-plan.v6",
+})
+LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v18"
 
 
 def migrate_screenplay_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
@@ -5258,7 +7079,7 @@ def migrate_screenplay_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(plan, dict):
         raise ValueError("screenplay plan must be an object")
     schema = str(plan.get("schema") or "").strip()
-    if schema in {SCREENPLAY_PLAN_SCHEMA, "honcut.screenplay-plan.v1"}:
+    if schema == SCREENPLAY_PLAN_SCHEMA:
         return copy.deepcopy(plan)
     match = re.fullmatch(r"honcut\.screenplay-plan\.v(\d+)", schema)
     if match and int(match.group(1)) > int(SCREENPLAY_PLAN_SCHEMA.rsplit("v", 1)[1]):
@@ -5266,7 +7087,7 @@ def migrate_screenplay_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
             f"screenplay plan schema {schema} is newer than supported version "
             f"{SCREENPLAY_PLAN_SCHEMA}"
         )
-    if schema != LEGACY_SCREENPLAY_PLAN_SCHEMA:
+    if schema not in LEGACY_SCREENPLAY_PLAN_SCHEMAS:
         raise ValueError(f"unsupported screenplay plan schema: {schema or '<missing>'}")
     migrated = copy.deepcopy(plan)
     beats = [beat for beat in migrated.get("beats") or [] if isinstance(beat, dict)]
@@ -5285,7 +7106,7 @@ def migrate_screenplay_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
     ):
         raise ValueError("legacy screenplay plan has invalid beat durations")
     profile = get_video_capabilities()
-    action_capacities = [profile.max_micro_actions_per_beat] * len(beats)
+    action_capacities = [profile.temporal_slice_limit] * len(beats)
     migrated["schema"] = SCREENPLAY_PLAN_SCHEMA
     migrated["primary_shot_layout"] = {
         "schema": PRIMARY_SHOT_LAYOUT_SCHEMA,
@@ -5297,8 +7118,15 @@ def migrate_screenplay_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
             MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
         ),
         "generation_action_unit_capacities": action_capacities,
+        "temporal_slice_capacities": action_capacities,
+        "max_temporal_slices_per_content_beat": (
+            profile.temporal_slice_limit
+        ),
+        "max_motion_contributions_per_slice": (
+            profile.motion_contribution_limit
+        ),
         "max_generation_action_units_per_primary_shot": (
-            profile.max_micro_actions_per_beat
+            profile.temporal_slice_limit
         ),
         "total_generation_action_unit_capacity": sum(action_capacities),
         "cross_sxx_boundary_count": max(0, len(beats) - 1),
@@ -5311,11 +7139,11 @@ def migrate_screenplay_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
         "objective_decision": {
             "migration_preserves_historical_layout": True,
         },
-        "migration_source": LEGACY_SCREENPLAY_PLAN_SCHEMA,
+        "migration_source": schema,
         "provider_ledger_source": "storyboard_material_budget",
     }
     migrated["migration"] = {
-        "source_schema": LEGACY_SCREENPLAY_PLAN_SCHEMA,
+        "source_schema": schema,
         "target_schema": SCREENPLAY_PLAN_SCHEMA,
         "deterministic": True,
     }
@@ -5333,6 +7161,9 @@ def _build_screenplay_plan(
     production_events: List[Dict[str, Any]] | None = None,
     duration_scaled_event_plan: Dict[str, Any] | None = None,
     primary_shot_layout: Dict[str, Any] | None = None,
+    source_action_timeline: Dict[str, Any] | None = None,
+    production_action_timeline: Dict[str, Any] | None = None,
+    timeline_layout_binding: Dict[str, Any] | None = None,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
     """Separate the complete source ledger from the fitted production ledger.
 
@@ -5445,14 +7276,61 @@ def _build_screenplay_plan(
                 raise ValueError(
                     f"duration-scaled event {event_id} action lineage is incomplete"
                 )
-            expected_actions = [source_actions[index - 1] for index in selected]
             actual_actions = production_event.get("micro_actions") or []
             if isinstance(actual_actions, str):
                 actual_actions = [actual_actions]
-            if expected_actions != list(actual_actions):
-                raise ValueError(
-                    f"production event {event_id} actions do not match source lineage"
-                )
+            if record.get("scaling") == "rewrite":
+                rewrite = production_event.get("production_action_rewrite")
+                if (
+                    selected != list(range(1, len(source_actions) + 1))
+                    or omitted
+                    or not isinstance(rewrite, dict)
+                    or rewrite.get("schema")
+                    != SOURCE_INDEXED_SCREENPLAY_REWRITE_SCHEMA
+                    or rewrite.get("omitted_source_micro_action_indexes") != []
+                ):
+                    raise ValueError(
+                        f"production event {event_id} has an invalid rewrite ledger"
+                    )
+                groups = rewrite.get("groups")
+                if not isinstance(groups, list):
+                    raise ValueError(
+                        f"production event {event_id} rewrite groups are missing"
+                    )
+                rewritten_actions = [
+                    str(group.get("rewritten_micro_action") or "").strip()
+                    for group in groups
+                    if isinstance(group, dict)
+                ]
+                source_actions_by_index = {
+                    int(index): str(action)
+                    for group in groups
+                    for index, action in zip(
+                        group.get("source_micro_action_indexes") or [],
+                        group.get("source_actions") or [],
+                        strict=True,
+                    )
+                }
+                if (
+                    rewritten_actions != list(actual_actions)
+                    or set(source_actions_by_index) != expected_indexes
+                    or [
+                        source_actions_by_index[index]
+                        for index in range(1, len(source_actions) + 1)
+                    ] != source_actions
+                ):
+                    raise ValueError(
+                        f"production event {event_id} rewrite lineage is incomplete"
+                    )
+                normalize_event_action_units(production_event)
+            else:
+                expected_actions = [
+                    source_actions[index - 1] for index in selected
+                ]
+                if expected_actions != list(actual_actions):
+                    raise ValueError(
+                        f"production event {event_id} actions do not match source lineage"
+                    )
             action_scaling_records.append(copy.deepcopy(record))
     else:
         mandatory_ids = _mandatory_adaptation_event_ids(events)
@@ -5623,6 +7501,21 @@ def _build_screenplay_plan(
                                 "omitted_source_micro_action_indexes"
                             ) or []
                         ),
+                        "production_action_rewrite_schema": (
+                            SOURCE_INDEXED_SCREENPLAY_REWRITE_SCHEMA
+                            if action_scaling_by_event[event_id].get("scaling")
+                            == "rewrite"
+                            else None
+                        ),
+                        "source_micro_action_groups": [
+                            list(group.get("source_micro_action_indexes") or [])
+                            for group in (
+                                adapted_events[event_id - 1].get(
+                                    "production_action_rewrite", {}
+                                ).get("groups")
+                                or []
+                            )
+                        ],
                     }
                     for event_id in dict.fromkeys(source_refs)
                 ],
@@ -5668,7 +7561,8 @@ def _build_screenplay_plan(
     }:
         raise ValueError(f"unsupported source capacity status: {source_status!r}")
     intra_event_scaling_applied = any(
-        record.get("omitted_source_micro_action_indexes")
+        record.get("scaling") == "rewrite"
+        or record.get("omitted_source_micro_action_indexes")
         for record in action_scaling_records
     )
     duration_scaling_status = (
@@ -5701,6 +7595,8 @@ def _build_screenplay_plan(
         "primary_shot_layout": resolved_primary_layout,
         "source_ledger": {
             "artifact": "phase1_events.json",
+            "action_timeline_artifact": "ACTION_TIMELINE.json",
+            "action_timeline_schema": ACTION_TIMELINE_SCHEMA,
             "event_count": len(events),
             "generation_action_units": int(
                 source_capacity_plan.get("generation_action_units") or 0
@@ -5722,6 +7618,22 @@ def _build_screenplay_plan(
                 len(record.get("omitted_source_micro_action_indexes") or [])
                 for record in action_scaling_records
                 if record["source_event_id"] in kept_ids
+            ),
+            "source_fact_loss_count": 0,
+            "source_indexed_rewrite_schema": (
+                SOURCE_INDEXED_SCREENPLAY_REWRITE_SCHEMA
+                if any(
+                    record.get("scaling") == "rewrite"
+                    for record in action_scaling_records
+                    if record["source_event_id"] in kept_ids
+                )
+                else None
+            ),
+            "source_indexed_rewrite_event_count": sum(
+                1
+                for record in action_scaling_records
+                if record["source_event_id"] in kept_ids
+                and record.get("scaling") == "rewrite"
             ),
             "event_count": len(kept_ids),
             "generation_action_units": production_generation_units,
@@ -5745,6 +7657,11 @@ def _build_screenplay_plan(
             "schema": DURATION_SCALED_EVENT_PLAN_SCHEMA,
             "events": serialized_action_scaling,
         },
+        "source_action_timeline": copy.deepcopy(source_action_timeline),
+        "production_action_timeline": copy.deepcopy(
+            production_action_timeline
+        ),
+        "timeline_layout_binding": copy.deepcopy(timeline_layout_binding),
         "beats": beats,
         "lineage": {
             "source_events_sha256": hashlib.sha256(serialized_events).hexdigest(),
@@ -5811,6 +7728,9 @@ def _layered_input_fingerprint(
     screenplay_rewrite_request: Optional[Dict[str, Any]] = None,
     shot_policy: str = DEFAULT_SHOT_POLICY,
     primary_shot_layout: Optional[Dict[str, Any]] = None,
+    source_action_timeline: Optional[Dict[str, Any]] = None,
+    production_action_timeline: Optional[Dict[str, Any]] = None,
+    timeline_layout_binding: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Bind layered checkpoints to the complete semantic adaptation input."""
     contract = {
@@ -5826,6 +7746,9 @@ def _layered_input_fingerprint(
         "screenplay_rewrite_request": screenplay_rewrite_request,
         "shot_policy": _validate_shot_policy(shot_policy),
         "primary_shot_layout": primary_shot_layout,
+        "source_action_timeline": source_action_timeline,
+        "production_action_timeline": production_action_timeline,
+        "timeline_layout_binding": timeline_layout_binding,
     }
     encoded = json.dumps(
         contract,
@@ -5856,6 +7779,8 @@ def _load_layered_checkpoints(
         MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
     ),
     generation_unit_capacities_per_beat: list[int] | None = None,
+    duration_scaled_event_plan: Dict[str, Any] | None = None,
+    timeline_layout_binding: Dict[str, Any] | None = None,
 ) -> tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
     """Load only valid, contiguous layered checkpoints."""
     skeleton = None
@@ -5885,6 +7810,17 @@ def _load_layered_checkpoints(
                     raise ValueError(
                         "layered skeleton exceeds the primary-shot capacity ledger"
                     )
+            if duration_scaled_event_plan is not None or timeline_layout_binding is not None:
+                if duration_scaled_event_plan is None or timeline_layout_binding is None:
+                    raise ValueError("canonical checkpoint validation is incomplete")
+                _validate_beats_match_canonical_contracts(
+                    candidate["beats"],
+                    _canonical_beat_contracts(
+                        events,
+                        duration_scaled_event_plan,
+                        timeline_layout_binding,
+                    ),
+                )
             candidate["shot_language_plan"] = _validate_shot_language_variation(
                 candidate["beats"]
             )
@@ -5912,6 +7848,10 @@ def _load_layered_checkpoints(
             if completed != contiguous or len(candidate_shots) != expected_count:
                 raise ValueError("partial checkpoint is not batch-contiguous")
             _validate_shots(candidate_shots)
+            _validate_shots_match_beat_ledgers(
+                candidate_shots,
+                skeleton["beats"],
+            )
             shots = candidate_shots
             print(f"  ↺ Reusing {len(completed)} completed layered batch(es): {partial_path}")
         except (OSError, json.JSONDecodeError, ValueError, TypeError):
@@ -5932,6 +7872,8 @@ def adapt_events(
     source_events_hash: Optional[str] = None,
     screenplay_rewrite_request: Optional[Dict[str, Any]] = None,
     shot_policy: str = DEFAULT_SHOT_POLICY,
+    max_material_padding_ratio: float = MAX_CONTENT_PROVIDER_PADDING_LOSS_RATE,
+    delivery_overrun_ratio: float = 0.0,
 ) -> Dict[str, Any]:
     """
     将事件列表改编为 shot 列表
@@ -5971,6 +7913,17 @@ def adapt_events(
     capability_profile = get_video_capabilities()
     if shot_duration <= 0:
         raise ValueError(f"每镜时长不合理：{shot_duration}秒（必须大于 0）")
+    source_action_timeline = build_action_timeline(
+        events,
+        max_motion_contributions_per_slice=(
+            capability_profile.motion_contribution_limit
+        ),
+    )
+    if output_dir is not None:
+        _atomic_write_json(
+            Path(output_dir) / "ACTION_TIMELINE.json",
+            source_action_timeline,
+        )
 
     # ── 分离交付时长与 Phase 8 剪辑前的素材时长 ───────────────────────────
     capacity_plan = _estimate_action_capacity_plan(
@@ -5978,15 +7931,31 @@ def adapt_events(
         target_duration,
         shot_duration,
         shot_policy=shot_policy,
+        max_material_padding_ratio=max_material_padding_ratio,
+        delivery_overrun_ratio=delivery_overrun_ratio,
     )
     rewrite_layout = None
     if screenplay_rewrite_request is not None:
+        rewrite_story_duration = int(
+            capacity_plan.get("planned_delivery_duration")
+            or target_duration
+        )
         rewrite_layout = _resolve_padding_rewrite_layout(
             capacity_plan,
-            target_duration=target_duration,
+            target_duration=rewrite_story_duration,
             capabilities=capability_profile,
             rewrite_request=screenplay_rewrite_request,
             shot_policy=shot_policy,
+        )
+        rewrite_layout["nominal_delivery_duration_s"] = int(
+            capacity_plan.get("nominal_delivery_duration") or target_duration
+        )
+        rewrite_layout["delivery_ceiling_duration_s"] = int(
+            capacity_plan.get("delivery_ceiling_duration") or target_duration
+        )
+        rewrite_layout["planned_delivery_duration_s"] = rewrite_story_duration
+        rewrite_layout["delivery_overrun_ratio"] = float(
+            capacity_plan.get("delivery_overrun_ratio") or 0.0
         )
         capacity_plan = {
             **capacity_plan,
@@ -6047,6 +8016,25 @@ def adapt_events(
     else:
         duration_scaled_event_plan["semantic_selection_status"] = "not_required"
 
+    production_action_timeline = build_action_timeline(
+        production_events,
+        max_motion_contributions_per_slice=(
+            capability_profile.motion_contribution_limit
+        ),
+    )
+    timeline_layout_binding = _bind_action_timeline_to_primary_layout(
+        production_events,
+        duration_scaled_event_plan,
+        primary_shot_layout,
+        capability_profile,
+    )
+    duration_scaled_event_plan["timeline_layout_binding"] = copy.deepcopy(
+        timeline_layout_binding
+    )
+    primary_shot_layout["timeline_assignment_count"] = len(
+        timeline_layout_binding["assignments"]
+    )
+
     characters_summary = _build_characters_summary(characters)
 
     def _run_layered_adaptation() -> Dict[str, Any]:
@@ -6065,6 +8053,9 @@ def adapt_events(
             director_plan,
             shot_policy=shot_policy,
             primary_shot_layout=primary_shot_layout,
+            source_action_timeline=source_action_timeline,
+            production_action_timeline=production_action_timeline,
+            timeline_layout_binding=timeline_layout_binding,
             **fingerprint_kwargs,
         )
         skeleton = None
@@ -6083,6 +8074,8 @@ def adapt_events(
                         "generation_action_unit_capacities"
                     ]
                 ),
+                duration_scaled_event_plan=duration_scaled_event_plan,
+                timeline_layout_binding=timeline_layout_binding,
             )
         if skeleton is None:
             skeleton_kwargs = {
@@ -6094,6 +8087,8 @@ def adapt_events(
                         "generation_action_unit_capacities"
                     ]
                 ),
+                "duration_scaled_event_plan": duration_scaled_event_plan,
+                "timeline_layout_binding": timeline_layout_binding,
             }
             skeleton = _build_beat_skeleton(
                 production_events,
@@ -6174,6 +8169,9 @@ def adapt_events(
             production_events=production_events,
             duration_scaled_event_plan=duration_scaled_event_plan,
             primary_shot_layout=primary_shot_layout,
+            source_action_timeline=source_action_timeline,
+            production_action_timeline=production_action_timeline,
+            timeline_layout_binding=timeline_layout_binding,
         )
         screenplay_plan_sha256 = hashlib.sha256(
             json.dumps(
@@ -6214,11 +8212,20 @@ def adapt_events(
         return {
             "target_duration": target_duration,
             "delivery_target_duration": target_duration,
+            "planned_delivery_duration": material_duration,
+            "delivery_ceiling_duration": capacity_plan[
+                "delivery_ceiling_duration"
+            ],
+            "delivery_overrun_ratio": delivery_overrun_ratio,
+            "max_material_padding_ratio": max_material_padding_ratio,
             "material_duration": material_duration,
             "capacity_plan": reconciled_capacity_plan,
             "screenplay_rewrite": rewrite_layout,
             "shot_policy": shot_policy,
             "primary_shot_layout": primary_shot_layout,
+            "source_action_timeline": source_action_timeline,
+            "production_action_timeline": production_action_timeline,
+            "timeline_layout_binding": timeline_layout_binding,
             "screenplay_plan": screenplay_plan,
             "duration_scaled_event_plan": duration_scaled_event_plan,
             "screenplay_plan_sha256": screenplay_plan_sha256,

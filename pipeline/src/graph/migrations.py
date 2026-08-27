@@ -8,7 +8,7 @@ from typing import Any
 from langgraph.types import Command
 from runtime.migration_registry import apply_migration_registry
 
-CURRENT_STATE_SCHEMA_VERSION = 2
+CURRENT_STATE_SCHEMA_VERSION = 3
 SHOT_POLICIES = frozenset({"continuity", "balanced", "cut-driven"})
 LEGACY_STATE_ALIASES = frozenset(
     {
@@ -101,13 +101,39 @@ def _migrate_state_v1_to_v2(state: dict[str, Any]) -> dict[str, Any]:
     return migrated
 
 
-def _canonicalize_v2_state(state: dict[str, Any]) -> dict[str, Any]:
+def _migrate_state_v2_to_v3(state: dict[str, Any]) -> dict[str, Any]:
+    migrated = dict(state)
+    migrated.setdefault("max_material_padding_ratio", 0.25)
+    migrated.setdefault("delivery_overrun_ratio", 0.0)
+    migrated["state_schema_version"] = 3
+    return migrated
+
+
+def _canonicalize_v3_state(state: dict[str, Any]) -> dict[str, Any]:
     policy = str(state.get("shot_policy") or "").strip().lower()
     if policy not in SHOT_POLICIES:
         raise StateMigrationError(
             "checkpoint state has an invalid or missing shot_policy"
         )
     state["shot_policy"] = policy
+    for field, default in (
+        ("max_material_padding_ratio", 0.25),
+        ("delivery_overrun_ratio", 0.0),
+    ):
+        raw_value = state.get(field, default)
+        if isinstance(raw_value, bool):
+            raise StateMigrationError(f"checkpoint state has an invalid {field}")
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise StateMigrationError(
+                f"checkpoint state has an invalid {field}"
+            ) from exc
+        if not 0 <= value <= 0.25:
+            raise StateMigrationError(
+                f"checkpoint state has an out-of-range {field}"
+            )
+        state[field] = value
     state["state_schema_version"] = CURRENT_STATE_SCHEMA_VERSION
     for alias in LEGACY_STATE_ALIASES:
         state.pop(alias, None)
@@ -117,6 +143,7 @@ def _canonicalize_v2_state(state: dict[str, Any]) -> dict[str, Any]:
 STATE_MIGRATIONS = {
     0: _migrate_state_v0_to_v1,
     1: _migrate_state_v1_to_v2,
+    2: _migrate_state_v2_to_v3,
 }
 
 
@@ -136,7 +163,7 @@ def migrate_state(raw_state: Mapping[str, Any]) -> dict[str, Any]:
         )
     except ValueError as error:
         raise StateMigrationError(str(error)) from error
-    return _canonicalize_v2_state(state)
+    return _canonicalize_v3_state(state)
 
 
 def _canonical_patch(

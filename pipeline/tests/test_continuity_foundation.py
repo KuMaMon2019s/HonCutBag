@@ -1992,6 +1992,115 @@ def test_post_primary_bridge_uses_actual_source_tail_and_target_head(
     assert content[0]["text"].count("[storyboard-motion-notation]") == 1
 
 
+def test_current_pxx_prompt_preserves_only_its_source_fact_echoes(monkeypatch, tmp_path):
+    shot_dir = tmp_path / "shots/S01"
+    shot_dir.mkdir(parents=True)
+    shot_meta = {
+        "prompt": "完整一级分镜连续性上下文",
+        "storyboard_beats": [
+            {
+                "beat_id": "S01_P01",
+                "action": "敌人挥刀，男子后仰闪避",
+                "source_fact_echoes": ["蓝色能量刃横向挥砍", "刀锋擦过风衣边缘"],
+                "source_generation_unit_indexes": [1, 2],
+            },
+            {
+                "beat_id": "S01_P02",
+                "action": "男子踢向敌人手腕",
+                "source_fact_echoes": ["武器撞击金属车壁产生蓝色电弧"],
+                "source_generation_unit_indexes": [3],
+            },
+        ],
+    }
+    (shot_dir / "SHOT_META.json").write_text(json.dumps(shot_meta), encoding="utf-8")
+    monkeypatch.setattr(
+        "tools.asset_packager.build_content_for_shot",
+        lambda **kwargs: [{"type": "text", "text": kwargs["shot_meta"]["prompt"]}],
+    )
+    request = ChunkExecutionRequest(
+        resource_id="S01_C01",
+        shot_id="S01",
+        chunk=GenerationChunk(
+            chunk_id="S01_C01",
+            sequence=1,
+            target_duration_s=6,
+            requested_frames=144,
+            expected_unique_frames=144,
+            mode="fresh",
+            execution_strategy="multi_image",
+            storyboard_beat_id="S01_P01",
+            action_prompt="敌人挥刀，男子后仰闪避",
+        ),
+        anchors={},
+        output_path=tmp_path / "S01_C01.mp4",
+        previous_output_path=None,
+        input_fingerprint="source-fact-echoes",
+        memory_context="",
+    )
+
+    prompt = _base_content(tmp_path, request, shot_meta)[0]["text"]
+
+    assert "蓝色能量刃横向挥砍" in prompt
+    assert "刀锋擦过风衣边缘" in prompt
+    assert "武器撞击金属车壁产生蓝色电弧" not in prompt
+
+
+def test_seedance_transport_contract_rejects_invalid_limits(monkeypatch):
+    image_url = _signed_tos_url(monkeypatch, "fixture/frame.png")
+    video_url = _signed_tos_url(monkeypatch, "fixture/reference.mp4")
+    images = [
+        {
+            "type": "image_url",
+            "image_url": {"url": image_url},
+            "role": "reference_image",
+        }
+        for _ in range(10)
+    ]
+    videos = [
+        {
+            "type": "video_url",
+            "video_url": {"url": video_url},
+            "role": "reference_video",
+        }
+        for _ in range(4)
+    ]
+
+    with pytest.raises(ValueError, match="4..15"):
+        seedance_client._validate_content_media_roles(
+            [{"type": "text", "text": "prompt"}], duration=3, ratio="16:9"
+        )
+    with pytest.raises(ValueError, match="at most 9 reference images"):
+        seedance_client._validate_content_media_roles(
+            [{"type": "text", "text": "prompt"}, *images],
+            duration=5,
+            ratio="16:9",
+        )
+    with pytest.raises(ValueError, match="at most 3 reference videos"):
+        seedance_client._validate_content_media_roles(
+            [{"type": "text", "text": "prompt"}, *videos],
+            duration=5,
+            ratio="16:9",
+        )
+    with pytest.raises(ValueError, match="ratio=adaptive"):
+        seedance_client._validate_content_media_roles(
+            [
+                {"type": "text", "text": "图片1到图片2之间的过渡"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image_url},
+                    "role": "first_frame",
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image_url},
+                    "role": "last_frame",
+                },
+            ],
+            duration=5,
+            ratio="16:9",
+        )
+
+
 def test_seedance_duration_separates_provider_request_from_effective_story_time(
     tmp_path,
 ):
@@ -2489,8 +2598,11 @@ def test_video_extension_uses_reference_video_with_persistent_image_anchors(monk
         "reference_video",
     ]
     assert observed["content"][-1]["video_url"]["url"] == chunk_url
+    assert "向后延长视频1" in observed["content"][0]["text"]
+    assert "图片1" in observed["content"][0]["text"]
     assert observed["kwargs"]["duration"] == 8
     assert observed["kwargs"]["seed"] == 7
+    assert observed["kwargs"]["return_last_frame"] is True
 
 
 def test_ark_agent_plan_generation_endpoints_share_the_canonical_base_url():
@@ -3905,6 +4017,7 @@ def test_direct_continuity_adapter_reuses_succeeded_paid_task(monkeypatch, tmp_p
     assert len(submissions) == 1
     assert submissions[0][1]["model"] == "doubao-seedance-2.0-fast"
     assert submissions[0][1]["resolution"] == "480p"
+    assert submissions[0][1]["return_last_frame"] is True
 
 
 def test_direct_continuity_adapter_drops_provider_rejected_privacy_images_once(
@@ -4406,6 +4519,8 @@ def test_flf2v_privacy_rejection_uses_local_handle_passthrough_without_dropping_
 
     def rejected_submit(content, **_kwargs):
         submissions.append(content)
+        assert _kwargs["ratio"] == "adaptive"
+        assert _kwargs["return_last_frame"] is True
         raise RuntimeError(
             "InputImageSensitiveContentDetected.PrivacyInformation: "
             "content[1] may contain real person"
@@ -6783,10 +6898,14 @@ def test_phase9_final_encode_preserves_reviewed_timeline_when_plan_target_differ
         {"video": 82.633333, "audio": 82.645333},
         delivery_contract=delivery_contract,
         requested_duration=80.0,
+        delivery_ceiling_duration=100.0,
+        planned_delivery_duration=82.633333,
         fps=30,
     )
 
     assert receipt["passed"] is True
+    assert receipt["delivery_window_passed"] is True
+    assert receipt["delivery_ceiling_duration_s"] == 100.0
     assert receipt["requested_duration_delta_s"] == pytest.approx(2.633333)
     assert receipt["requested_duration_within_tolerance"] is False
     assert receipt["requested_duration_enforced_by_final_encode"] is False
@@ -6911,7 +7030,9 @@ def test_phase9_final_encode_contract_with_real_av_artifact(tmp_path):
         before,
         after,
         delivery_contract=delivery_contract,
-        requested_duration=1.5,
+        requested_duration=1.6,
+        delivery_ceiling_duration=2.0,
+        planned_delivery_duration=float(before["video"]),
         fps=24,
     )
 

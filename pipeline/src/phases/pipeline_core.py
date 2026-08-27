@@ -131,6 +131,8 @@ def run_phase1_screenwriter(
     project_video_spec: dict[str, Any] | None = None,
     screenplay_rewrite_request: dict[str, Any] | None = None,
     shot_policy: str = "continuity",
+    max_material_padding_ratio: float = 0.25,
+    delivery_overrun_ratio: float = 0.0,
     *,
     _director_runner=None,
 ) -> dict:
@@ -151,6 +153,8 @@ def run_phase1_screenwriter(
         project_video_spec=project_video_spec,
         screenplay_rewrite_request=screenplay_rewrite_request,
         shot_policy=shot_policy,
+        max_material_padding_ratio=max_material_padding_ratio,
+        delivery_overrun_ratio=delivery_overrun_ratio,
         _director_runner=_director_runner or run_phase1_director,
     )
 
@@ -165,6 +169,8 @@ def run_phase1(
     project_video_spec: dict[str, Any] | None = None,
     screenplay_rewrite_request: dict[str, Any] | None = None,
     shot_policy: str = "continuity",
+    max_material_padding_ratio: float = 0.25,
+    delivery_overrun_ratio: float = 0.0,
 ) -> dict:
     return _phase1_pipeline_owner.run_phase1(
         text,
@@ -176,6 +182,8 @@ def run_phase1(
         project_video_spec=project_video_spec,
         screenplay_rewrite_request=screenplay_rewrite_request,
         shot_policy=shot_policy,
+        max_material_padding_ratio=max_material_padding_ratio,
+        delivery_overrun_ratio=delivery_overrun_ratio,
         _director_runner=run_phase1_director,
         _screenwriter_runner=run_phase1_screenwriter,
     )

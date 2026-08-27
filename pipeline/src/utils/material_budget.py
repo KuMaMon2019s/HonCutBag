@@ -12,7 +12,7 @@ import math
 from collections.abc import Mapping, MutableMapping, Sequence
 from typing import Any
 
-MATERIAL_BUDGET_SCHEMA = "honcut.material-budget.v3"
+MATERIAL_BUDGET_SCHEMA = "honcut.material-budget.v4"
 BRIDGE_TIMELINE_POLICY = "replace_boundary_handles"
 DEFAULT_GENERATED_DURATION_RATIO_REFERENCE = 1.3
 DEFAULT_DELIVERY_PACING_SPEED_RANGE = (0.85, 1.25)
@@ -125,6 +125,24 @@ def build_material_budget(storyboard: Mapping[str, Any]) -> dict[str, Any]:
     delivery_duration = _number(
         storyboard.get("delivery_target_duration") or storyboard.get("duration")
     )
+    delivery_overrun_ratio = _number(
+        storyboard.get("delivery_overrun_ratio"), 0.0
+    )
+    if not 0 <= delivery_overrun_ratio <= 0.25:
+        delivery_overrun_ratio = 0.0
+    delivery_ceiling = _number(
+        storyboard.get("delivery_ceiling_duration"),
+        delivery_duration * (1.0 + delivery_overrun_ratio),
+    )
+    planned_delivery_duration = _number(
+        storyboard.get("planned_delivery_duration"), story_clock_duration
+    )
+    maximum_padding_loss_rate = _number(
+        storyboard.get("max_material_padding_ratio"),
+        MAX_CONTENT_PROVIDER_PADDING_LOSS_RATE,
+    )
+    if not 0 <= maximum_padding_loss_rate <= 0.25:
+        maximum_padding_loss_rate = MAX_CONTENT_PROVIDER_PADDING_LOSS_RATE
     ratio_reference = _number(
         storyboard.get("generated_duration_ratio_reference"),
         DEFAULT_GENERATED_DURATION_RATIO_REFERENCE,
@@ -145,7 +163,7 @@ def build_material_budget(storyboard: Mapping[str, Any]) -> dict[str, Any]:
             pacing_minimum, pacing_maximum = DEFAULT_DELIVERY_PACING_SPEED_RANGE
     else:
         pacing_minimum, pacing_maximum = DEFAULT_DELIVERY_PACING_SPEED_RANGE
-    storyboard_limit = delivery_duration if delivery_duration > 0 else None
+    storyboard_limit = delivery_ceiling if delivery_ceiling > 0 else None
     total_provider_request_duration = (
         content_provider_request_duration + bridge_generation_duration
     )
@@ -171,6 +189,17 @@ def build_material_budget(storyboard: Mapping[str, Any]) -> dict[str, Any]:
         "timeline_policy": BRIDGE_TIMELINE_POLICY,
         "delivery_target_duration_s": (
             _rounded(delivery_duration) if delivery_duration > 0 else None
+        ),
+        "delivery_ceiling_duration_s": (
+            _rounded(delivery_ceiling) if delivery_ceiling > 0 else None
+        ),
+        "planned_delivery_duration_s": (
+            _rounded(planned_delivery_duration)
+            if planned_delivery_duration > 0 else None
+        ),
+        "delivery_overrun_ratio": _rounded(delivery_overrun_ratio),
+        "maximum_content_padding_loss_rate": _rounded(
+            maximum_padding_loss_rate
         ),
         "storyboard_duration_limit_s": (
             _rounded(storyboard_limit) if storyboard_limit is not None else None
@@ -247,6 +276,47 @@ def material_budget_contract_errors(
     """Return actionable accounting errors without trusting a stored ledger."""
     budget = build_material_budget(storyboard)
     errors: list[dict[str, Any]] = []
+    for field, default in (
+        ("max_material_padding_ratio", MAX_CONTENT_PROVIDER_PADDING_LOSS_RATE),
+        ("delivery_overrun_ratio", 0.0),
+    ):
+        raw_value = storyboard.get(field, default)
+        if (
+            isinstance(raw_value, bool)
+            or not isinstance(raw_value, (int, float))
+            or not 0 <= float(raw_value) <= 0.25
+        ):
+            errors.append({
+                "code": "delivery_configuration_invalid",
+                "message": f"{field} must be numeric and between 0 and 0.25",
+                "details": {"field": field, "observed": raw_value},
+            })
+    nominal = _number(budget.get("delivery_target_duration_s"))
+    ceiling = _number(budget.get("delivery_ceiling_duration_s"))
+    planned = _number(budget.get("planned_delivery_duration_s"))
+    story_clock = _number(budget.get("story_clock_duration_s"))
+    if nominal > 0 and not nominal <= planned <= ceiling:
+        errors.append({
+            "code": "delivery_window_invalid",
+            "message": (
+                f"planned delivery {planned:g}s must remain inside the "
+                f"declared {nominal:g}-{ceiling:g}s window"
+            ),
+            "details": budget,
+        })
+    if planned > 0 and not math.isclose(
+        story_clock,
+        planned,
+        abs_tol=1e-6,
+    ):
+        errors.append({
+            "code": "planned_story_clock_mismatch",
+            "message": (
+                f"story clock {story_clock:g}s does not equal the canonical "
+                f"planned delivery {planned:g}s"
+            ),
+            "details": budget,
+        })
     if not budget["story_clock_within_delivery_target"]:
         errors.append(
             {
@@ -301,14 +371,18 @@ def material_budget_contract_errors(
     # The hard gate targets avoidable fragmentation across multiple requests.
     if content_request_count > 1 and content_request_duration > 0:
         padding_loss_rate = content_padding_duration / content_request_duration
-        if padding_loss_rate > MAX_CONTENT_PROVIDER_PADDING_LOSS_RATE + 1e-6:
+        maximum_padding_loss_rate = _number(
+            budget.get("maximum_content_padding_loss_rate"),
+            MAX_CONTENT_PROVIDER_PADDING_LOSS_RATE,
+        )
+        if padding_loss_rate > maximum_padding_loss_rate + 1e-6:
             errors.append(
                 {
                     "code": "content_provider_padding_loss_exceeds_limit",
                     "message": (
                         "content Provider padding consumes "
                         f"{padding_loss_rate:.1%} of generated duration; maximum "
-                        f"is {MAX_CONTENT_PROVIDER_PADDING_LOSS_RATE:.1%}"
+                        f"is {maximum_padding_loss_rate:.1%}"
                     ),
                     "details": {
                         "content_provider_request_duration_s": _rounded(
@@ -319,7 +393,7 @@ def material_budget_contract_errors(
                         ),
                         "padding_loss_rate": _rounded(padding_loss_rate),
                         "maximum_padding_loss_rate": (
-                            MAX_CONTENT_PROVIDER_PADDING_LOSS_RATE
+                            maximum_padding_loss_rate
                         ),
                     },
                 }

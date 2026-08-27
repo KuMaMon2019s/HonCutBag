@@ -71,6 +71,38 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
     storyboard_path = output_dir / "STORYBOARD.json"
     sb_path_str = str(storyboard_path) if storyboard_path.exists() else None
     storyboard_data = None
+    delivery_ceiling_duration = target_duration
+    planned_delivery_duration = target_duration
+    if storyboard_path.exists() and target_duration is not None:
+        storyboard_data = json.loads(storyboard_path.read_text(encoding="utf-8"))
+        declared_nominal = float(
+            storyboard_data.get("delivery_target_duration") or target_duration
+        )
+        if abs(declared_nominal - float(target_duration)) > 1e-6:
+            return {
+                "status": "error",
+                "error": "Phase 9 nominal delivery duration mismatches storyboard",
+                "duration_s": _elapsed(start),
+            }
+        delivery_ceiling_duration = float(
+            storyboard_data.get("delivery_ceiling_duration") or target_duration
+        )
+        planned_delivery_duration = float(
+            storyboard_data.get("planned_delivery_duration") or target_duration
+        )
+        if not (
+            float(target_duration)
+            <= delivery_ceiling_duration
+            <= float(target_duration) * 1.25 + 1e-6
+            and float(target_duration)
+            <= planned_delivery_duration
+            <= delivery_ceiling_duration + 1e-6
+        ):
+            return {
+                "status": "error",
+                "error": "Phase 9 delivery window is invalid",
+                "duration_s": _elapsed(start),
+            }
 
     # --- P0-D3: Check whether the audio track is genuinely audible ──────────
     # Previously this only checked "has audio stream" — but local Wan2.2 videos
@@ -605,6 +637,8 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             encoded_durations,
             delivery_contract=delivery_contract,
             requested_duration=target_duration,
+            delivery_ceiling_duration=delivery_ceiling_duration,
+            planned_delivery_duration=planned_delivery_duration,
             fps=float(profile["fps"]),
         )
         duration_tolerance_s = final_duration_gate["tolerance_s"]["video"]
@@ -631,6 +665,8 @@ def run_phase9(output_dir: Path, dry_run: bool, color_grade: Optional[str] = Non
             polished_durations,
             delivery_contract=delivery_contract,
             requested_duration=target_duration,
+            delivery_ceiling_duration=delivery_ceiling_duration,
+            planned_delivery_duration=planned_delivery_duration,
             fps=float(profile["fps"]),
         )
         (output_dir / "final_duration_gate.json").write_text(

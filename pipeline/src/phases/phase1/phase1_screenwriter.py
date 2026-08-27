@@ -154,7 +154,7 @@ def _summarize_visual_style_with_llm(script_text: str) -> Optional[str]:
         return None
 
 
-PHASE1_CHECKPOINT_SCHEMA_VERSION = 3
+PHASE1_CHECKPOINT_SCHEMA_VERSION = 4
 
 
 def _phase1_input_hash(items: list) -> str:
@@ -301,6 +301,8 @@ def run_phase1_screenwriter(
     project_video_spec: dict[str, Any] | None = None,
     screenplay_rewrite_request: dict[str, Any] | None = None,
     shot_policy: str = DEFAULT_SHOT_POLICY,
+    max_material_padding_ratio: float = 0.25,
+    delivery_overrun_ratio: float = 0.0,
     *,
     _director_runner=None,
 ) -> dict:
@@ -355,6 +357,8 @@ def run_phase1_screenwriter(
                 duration=max(15, int(duration or 15)),
                 shot_duration=shot_duration,
                 shot_policy=shot_policy,
+                max_material_padding_ratio=max_material_padding_ratio,
+                delivery_overrun_ratio=delivery_overrun_ratio,
             )
             receipt = preflight["receipt"]
             receipt_path = output_dir / "phase1_dry_run_receipt.json"
@@ -511,6 +515,14 @@ def run_phase1_screenwriter(
                 "total_duration": requested_duration,
                 "capacity_plan": capacity_plan,
                 "shot_policy": shot_policy,
+                "max_material_padding_ratio": max_material_padding_ratio,
+                "delivery_overrun_ratio": delivery_overrun_ratio,
+                "delivery_ceiling_duration": capacity_plan.get(
+                    "delivery_ceiling_duration", requested_duration
+                ),
+                "planned_delivery_duration": capacity_plan.get(
+                    "planned_delivery_duration", requested_duration
+                ),
                 "primary_shot_layout": primary_shot_layout,
                 "style": "source-derived dry-run structural fixture",
                 "aspect_ratio": resolved_video_spec["aspect_ratio"],
@@ -771,6 +783,8 @@ def run_phase1_screenwriter(
             source_events_hash=events_input_hash,
             screenplay_rewrite_request=screenplay_rewrite_request,
             shot_policy=shot_policy,
+            max_material_padding_ratio=max_material_padding_ratio,
+            delivery_overrun_ratio=delivery_overrun_ratio,
         )
         adapted_shots = adapted.get("shots", [])
         screenplay_plan = adapted.get("screenplay_plan")
@@ -845,6 +859,16 @@ def run_phase1_screenwriter(
             capacity_layout=capacity_layout,
         )
         storyboard["delivery_target_duration"] = duration
+        storyboard["delivery_ceiling_duration"] = adapted.get(
+            "delivery_ceiling_duration", duration
+        )
+        storyboard["planned_delivery_duration"] = adapted.get(
+            "planned_delivery_duration", duration
+        )
+        storyboard["delivery_overrun_ratio"] = delivery_overrun_ratio
+        storyboard["max_material_padding_ratio"] = (
+            max_material_padding_ratio
+        )
         storyboard["material_duration"] = adapted.get(
             "material_duration",
             storyboard.get("target_duration"),
@@ -864,6 +888,9 @@ def run_phase1_screenwriter(
             "sha256": screenplay_plan_sha256,
             "primary_shot_layout_sha256": storyboard[
                 "primary_shot_layout_sha256"
+            ],
+            "timeline_layout_binding_sha256": storyboard[
+                "timeline_layout_binding_sha256"
             ],
             "source_capacity_status": screenplay_plan["source_ledger"][
                 "capacity_status"

@@ -11,7 +11,7 @@ import unicodedata
 from typing import Any
 
 from schemas.replanning import PADDING_LOSS_ERROR_CODE
-from utils.action_units import normalize_action_units
+from utils.action_units import ACTION_TIMELINE_SCHEMA, normalize_action_units
 from utils.body_action_contracts import apply_body_action_contract
 from utils.material_budget import (
     BRIDGE_TIMELINE_POLICY,
@@ -26,8 +26,8 @@ from utils.video_capabilities import (
     min_primary_story_duration,
 )
 
-SECONDARY_STORYBOARD_VERSION = "honcut.secondary-storyboard.v15"
-SECONDARY_EXECUTION = "content_capacity_post_primary_bridge_v15"
+SECONDARY_STORYBOARD_VERSION = "honcut.secondary-storyboard.v16"
+SECONDARY_EXECUTION = "canonical_timeline_post_primary_bridge_v16"
 SECONDARY_GENERATION_MODES = frozenset({
     "multi_image",
     "tail_video_extend",
@@ -35,12 +35,12 @@ SECONDARY_GENERATION_MODES = frozenset({
 })
 MAX_CONTENT_BEATS = MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
 MAX_CONTINUITY_CONTENT_BEATS = 4
-PRIMARY_SHOT_LAYOUT_SCHEMA = "honcut.primary-shot-layout.v1"
+PRIMARY_SHOT_LAYOUT_SCHEMA = "honcut.primary-shot-layout.v2"
 PRIMARY_SHOT_EXECUTION_HANDOFF_SCHEMA = (
-    "honcut.primary-shot-execution-handoff.v1"
+    "honcut.primary-shot-execution-handoff.v2"
 )
-CURRENT_SCREENPLAY_PLAN_SCHEMA = "honcut.screenplay-plan.v6"
-CURRENT_EVENT_SCALING_SCHEMA = "honcut.duration-scaled-event-plan.v3"
+CURRENT_SCREENPLAY_PLAN_SCHEMA = "honcut.screenplay-plan.v7"
+CURRENT_EVENT_SCALING_SCHEMA = "honcut.duration-scaled-event-plan.v4"
 SPOKEN_CHARACTERS_PER_SECOND = 4.0
 
 # Editorial policy, deliberately separate from provider/model capabilities.
@@ -626,7 +626,7 @@ def _content_beat_requirement(
     generation_action_units = _generation_action_units(shot, actions)
     action_count = (
         math.ceil(
-            len(generation_action_units) / capabilities.max_micro_actions_per_beat
+            len(generation_action_units) / capabilities.temporal_slice_limit
         )
         if generation_action_units else 1
     )
@@ -789,6 +789,239 @@ def _primary_layout_error(detail: str) -> ValueError:
     return ValueError(f"primary_shot_layout_handoff_invalid: {detail}")
 
 
+def _validate_timeline_layout_binding(
+    shots: list[dict[str, Any]],
+    binding: dict[str, Any],
+    layout: dict[str, Any],
+) -> str:
+    """Validate the one canonical temporal-slice → Sxx/Pxx handoff.
+
+    Phase 1 has already solved the vector layout.  Every downstream owner must
+    consume this mapping verbatim; reconstructing buckets from aggregate counts
+    would silently change concurrency, effects, and event boundary state.
+    """
+    if binding.get("schema") != ACTION_TIMELINE_SCHEMA:
+        raise _primary_layout_error("unsupported action-timeline binding schema")
+    if binding.get("layout_schema") != PRIMARY_SHOT_LAYOUT_SCHEMA:
+        raise _primary_layout_error("timeline binding layout schema disagrees")
+    if binding.get("duration_plan_schema") != CURRENT_EVENT_SCALING_SCHEMA:
+        raise _primary_layout_error("timeline binding duration schema disagrees")
+    slice_limit = binding.get("max_temporal_slices_per_content_beat")
+    motion_limit = binding.get("max_motion_contributions_per_slice")
+    if (
+        isinstance(slice_limit, bool)
+        or not isinstance(slice_limit, int)
+        or slice_limit < 1
+        or isinstance(motion_limit, bool)
+        or not isinstance(motion_limit, int)
+        or motion_limit < 1
+        or slice_limit != layout.get("max_temporal_slices_per_content_beat")
+        or motion_limit != layout.get("max_motion_contributions_per_slice")
+    ):
+        raise _primary_layout_error("timeline binding capability matrix disagrees")
+    sxx_records = binding.get("sxx")
+    assignments = binding.get("assignments")
+    zero_attachments = binding.get("zero_story_time_attachments")
+    if (
+        not isinstance(sxx_records, list)
+        or len(sxx_records) != len(shots)
+        or not isinstance(assignments, list)
+        or not isinstance(zero_attachments, list)
+    ):
+        raise _primary_layout_error("timeline binding primary-shot ledger is invalid")
+    zero_events_by_sxx: dict[str, list[int]] = {}
+    seen_zero_events: set[int] = set()
+    for attachment in zero_attachments:
+        if not isinstance(attachment, dict):
+            raise _primary_layout_error(
+                "zero-story-time timeline attachment must be an object"
+            )
+        event_id = attachment.get("source_event_id")
+        sxx_id = str(attachment.get("sxx_id") or "").strip()
+        if (
+            isinstance(event_id, bool)
+            or not isinstance(event_id, int)
+            or event_id < 1
+            or event_id in seen_zero_events
+            or not sxx_id
+            or attachment.get("consumes_temporal_capacity") is not False
+        ):
+            raise _primary_layout_error(
+                "zero-story-time timeline attachment is invalid"
+            )
+        seen_zero_events.add(event_id)
+        zero_events_by_sxx.setdefault(sxx_id, []).append(event_id)
+    assignment_by_id: dict[str, dict[str, Any]] = {}
+    for assignment in assignments:
+        if not isinstance(assignment, dict):
+            raise _primary_layout_error("timeline assignment must be an object")
+        assignment_id = str(assignment.get("assignment_id") or "").strip()
+        event_id = assignment.get("source_event_id")
+        slice_order = assignment.get("event_temporal_slice_order")
+        motion_load = assignment.get("motion_load")
+        if (
+            not assignment_id
+            or assignment_id in assignment_by_id
+            or isinstance(event_id, bool)
+            or not isinstance(event_id, int)
+            or event_id < 1
+            or isinstance(slice_order, bool)
+            or not isinstance(slice_order, int)
+            or slice_order < 1
+            or isinstance(motion_load, bool)
+            or not isinstance(motion_load, int)
+            or not 1 <= motion_load <= motion_limit
+        ):
+            raise _primary_layout_error("timeline assignment identity/load is invalid")
+        for key in (
+            "source_micro_action_indexes",
+            "contribution_micro_action_indexes",
+            "effect_micro_action_indexes",
+            "sustained_micro_action_indexes",
+            "performers",
+            "targets",
+            "state_reads",
+            "state_writes",
+        ):
+            if not isinstance(assignment.get(key), list):
+                raise _primary_layout_error(
+                    f"timeline assignment {assignment_id} has invalid {key}"
+                )
+        if not isinstance(assignment.get("start_state"), str) or not isinstance(
+            assignment.get("end_state"), str
+        ):
+            raise _primary_layout_error(
+                f"timeline assignment {assignment_id} has invalid boundary state"
+            )
+        assignment_by_id[assignment_id] = assignment
+
+    observed_assignment_ids: list[str] = []
+    for index, (shot, sxx) in enumerate(zip(shots, sxx_records, strict=True)):
+        if not isinstance(sxx, dict) or sxx.get("sxx_order") != index + 1:
+            raise _primary_layout_error("timeline Sxx order is invalid")
+        pxx_records = sxx.get("pxx")
+        expected_pxx_count = layout["content_beat_counts"][index]
+        expected_capacity = expected_pxx_count * slice_limit
+        if (
+            not isinstance(pxx_records, list)
+            or len(pxx_records) != expected_pxx_count
+            or sxx.get("temporal_slice_capacity") != expected_capacity
+        ):
+            raise _primary_layout_error("timeline Sxx/Pxx capacity is invalid")
+        shot_assignment_ids: list[str] = []
+        for pxx_order, pxx in enumerate(pxx_records, 1):
+            if (
+                not isinstance(pxx, dict)
+                or pxx.get("pxx_order_within_sxx") != pxx_order
+                or pxx.get("temporal_slice_capacity") != slice_limit
+                or not isinstance(pxx.get("assignment_ids"), list)
+                or len(pxx["assignment_ids"]) > slice_limit
+                or not math.isclose(
+                    float(pxx.get("effective_story_duration_s") or 0),
+                    float(layout["effective_story_durations_s"][index][pxx_order - 1]),
+                    abs_tol=1e-6,
+                )
+            ):
+                raise _primary_layout_error("timeline Pxx ledger is invalid")
+            for assignment_id in pxx["assignment_ids"]:
+                if assignment_id not in assignment_by_id:
+                    raise _primary_layout_error(
+                        "timeline Pxx references an unknown assignment"
+                    )
+                assignment = assignment_by_id[assignment_id]
+                if (
+                    assignment.get("sxx_id") != sxx.get("sxx_id")
+                    or assignment.get("pxx_id") != pxx.get("pxx_id")
+                ):
+                    raise _primary_layout_error(
+                        "timeline assignment disagrees with its Sxx/Pxx owner"
+                    )
+                shot_assignment_ids.append(assignment_id)
+            if pxx.get("assigned_pace_weight") != sum(
+                int(assignment_by_id[assignment_id].get("pace_weight") or 1)
+                for assignment_id in pxx["assignment_ids"]
+            ):
+                raise _primary_layout_error("timeline Pxx pace ledger is invalid")
+        if len(shot_assignment_ids) != sxx.get("assigned_temporal_slice_count"):
+            raise _primary_layout_error("timeline Sxx assigned-count is invalid")
+        expected_event_counts = shot.get("source_event_generation_unit_counts")
+        expected_zero_events = zero_events_by_sxx.get(
+            str(sxx.get("sxx_id") or ""),
+            [],
+        )
+        if sxx.get("zero_story_time_source_event_ids", []) != expected_zero_events:
+            raise _primary_layout_error(
+                "timeline Sxx zero-story-time attachment ledger is invalid"
+            )
+        observed_event_counts: dict[str, int] = {}
+        for assignment_id in shot_assignment_ids:
+            event_key = str(assignment_by_id[assignment_id]["source_event_id"])
+            observed_event_counts[event_key] = observed_event_counts.get(event_key, 0) + 1
+        for event_id in expected_zero_events:
+            event_key = str(event_id)
+            if event_key in observed_event_counts:
+                raise _primary_layout_error(
+                    "execution event cannot also be a zero-story-time attachment"
+                )
+            observed_event_counts[event_key] = 0
+        if expected_event_counts != observed_event_counts:
+            raise _primary_layout_error(
+                "timeline Sxx event allocation disagrees with the production shot"
+            )
+        generation_units = _generation_action_units(shot, _source_actions(shot))
+        if len(generation_units) != len(shot_assignment_ids):
+            raise _primary_layout_error(
+                "timeline Sxx assignment count disagrees with generation units"
+            )
+        unit_event_ids = [unit.get("source_event_id") for unit in generation_units]
+        assignment_event_ids = [
+            assignment_by_id[assignment_id]["source_event_id"]
+            for assignment_id in shot_assignment_ids
+        ]
+        if unit_event_ids != assignment_event_ids:
+            raise _primary_layout_error(
+                "timeline assignment order disagrees with generation-unit lineage"
+            )
+        observed_assignment_ids.extend(shot_assignment_ids)
+    if observed_assignment_ids != list(assignment_by_id):
+        raise _primary_layout_error(
+            "timeline assignments are duplicated, missing, or out of canonical order"
+        )
+    return _canonical_sha256(binding)
+
+
+def _timeline_generation_unit_buckets(
+    shot: dict[str, Any],
+    timeline_sxx: dict[str, Any],
+    assignment_by_id: dict[str, dict[str, Any]],
+) -> tuple[list[list[dict[str, Any]]], list[list[dict[str, Any]]]]:
+    """Project exact canonical assignments onto the shot's persisted GAUs."""
+    units = _generation_action_units(shot, _source_actions(shot))
+    unit_cursor = 0
+    unit_buckets: list[list[dict[str, Any]]] = []
+    assignment_buckets: list[list[dict[str, Any]]] = []
+    for pxx in timeline_sxx["pxx"]:
+        pxx_assignments = [
+            assignment_by_id[assignment_id]
+            for assignment_id in pxx["assignment_ids"]
+        ]
+        pxx_units = units[unit_cursor:unit_cursor + len(pxx_assignments)]
+        unit_cursor += len(pxx_assignments)
+        if [unit.get("source_event_id") for unit in pxx_units] != [
+            assignment["source_event_id"] for assignment in pxx_assignments
+        ]:
+            raise _primary_layout_error(
+                "canonical Pxx assignments disagree with generation-unit order"
+            )
+        unit_buckets.append([copy.deepcopy(unit) for unit in pxx_units])
+        assignment_buckets.append(
+            [copy.deepcopy(assignment) for assignment in pxx_assignments]
+        )
+    if unit_cursor != len(units):
+        raise _primary_layout_error("canonical Pxx assignments left units unbound")
+    return unit_buckets, assignment_buckets
+
+
 def _requires_primary_layout(storyboard: dict[str, Any]) -> bool:
     screenplay = storyboard.get("screenplay_plan")
     return bool(
@@ -933,7 +1166,7 @@ def _validate_primary_shot_layout(
                 )
 
         capacity = vectors["generation_action_unit_capacities"][index]
-        expected_capacity = content_count * profile.max_micro_actions_per_beat
+        expected_capacity = content_count * profile.temporal_slice_limit
         if (
             isinstance(capacity, bool)
             or not isinstance(capacity, int)
@@ -1162,15 +1395,27 @@ def bind_primary_shot_execution_plan(
         raise _primary_layout_error(
             "storyboard source-event allocation disagrees with SCREENPLAY_PLAN"
         )
+    timeline_binding = screenplay_plan.get("timeline_layout_binding")
+    if not isinstance(timeline_binding, dict):
+        raise _primary_layout_error("canonical timeline-layout binding is missing")
+    timeline_binding_sha256 = _validate_timeline_layout_binding(
+        shots,
+        timeline_binding,
+        layout,
+    )
     storyboard["shot_policy"] = layout["shot_policy"]
     storyboard["primary_shot_layout"] = copy.deepcopy(layout)
     storyboard["primary_shot_layout_sha256"] = layout_sha256
+    storyboard["timeline_layout_binding"] = copy.deepcopy(timeline_binding)
+    storyboard["timeline_layout_binding_sha256"] = timeline_binding_sha256
     storyboard["primary_shot_execution"] = {
         "schema": PRIMARY_SHOT_EXECUTION_HANDOFF_SCHEMA,
         "screenplay_plan_schema": CURRENT_SCREENPLAY_PLAN_SCHEMA,
         "screenplay_plan_sha256": screenplay_plan_sha256,
         "primary_shot_layout_schema": PRIMARY_SHOT_LAYOUT_SCHEMA,
         "primary_shot_layout_sha256": layout_sha256,
+        "action_timeline_schema": ACTION_TIMELINE_SCHEMA,
+        "timeline_layout_binding_sha256": timeline_binding_sha256,
     }
     existing_summary = storyboard.get("screenplay_plan")
     if existing_summary is not None and not isinstance(existing_summary, dict):
@@ -1193,6 +1438,7 @@ def bind_primary_shot_execution_plan(
         "schema": CURRENT_SCREENPLAY_PLAN_SCHEMA,
         "sha256": screenplay_plan_sha256,
         "primary_shot_layout_sha256": layout_sha256,
+        "timeline_layout_binding_sha256": timeline_binding_sha256,
     }
     return storyboard["primary_shot_layout"]
 
@@ -1218,6 +1464,14 @@ def _primary_shot_layout_entry(
     )
     execution = storyboard.get("primary_shot_execution")
     if execution is not None:
+        timeline_binding = storyboard.get("timeline_layout_binding")
+        if not isinstance(timeline_binding, dict):
+            raise _primary_layout_error("canonical timeline-layout binding is missing")
+        timeline_binding_sha256 = _validate_timeline_layout_binding(
+            shots,
+            timeline_binding,
+            layout,
+        )
         screenplay = storyboard.get("screenplay_plan")
         recorded_plan_sha256 = (
             screenplay.get("sha256") if isinstance(screenplay, dict) else None
@@ -1246,8 +1500,31 @@ def _primary_shot_layout_entry(
             != PRIMARY_SHOT_LAYOUT_SCHEMA
             or execution.get("primary_shot_layout_sha256") != layout_sha256
             or storyboard.get("primary_shot_layout_sha256") != layout_sha256
+            or execution.get("action_timeline_schema") != ACTION_TIMELINE_SCHEMA
+            or execution.get("timeline_layout_binding_sha256")
+            != timeline_binding_sha256
+            or storyboard.get("timeline_layout_binding_sha256")
+            != timeline_binding_sha256
+            or screenplay.get("timeline_layout_binding_sha256")
+            != timeline_binding_sha256
         ):
             raise _primary_layout_error("execution handoff receipt is inconsistent")
+    else:
+        timeline_binding = None
+        timeline_binding_sha256 = None
+    timeline_sxx = (
+        timeline_binding["sxx"][index]
+        if isinstance(timeline_binding, dict)
+        else None
+    )
+    assignment_by_id = (
+        {
+            assignment["assignment_id"]: assignment
+            for assignment in timeline_binding["assignments"]
+        }
+        if isinstance(timeline_binding, dict)
+        else {}
+    )
     return {
         "layout_sha256": layout_sha256,
         "content_count": layout["content_beat_counts"][index],
@@ -1261,6 +1538,9 @@ def _primary_shot_layout_entry(
             layout["provider_request_durations_s"][index]
         ),
         "policy_limit": layout["max_content_beats_per_primary_shot"],
+        "timeline_binding_sha256": timeline_binding_sha256,
+        "timeline_sxx": copy.deepcopy(timeline_sxx),
+        "timeline_assignment_by_id": copy.deepcopy(assignment_by_id),
     }
 
 
@@ -1372,12 +1652,36 @@ def secondary_storyboard_requirements(
             for duration, mode in zip(content_durations, modes, strict=True)
         ]
     )
+    if layout_entry is not None and layout_entry["timeline_sxx"] is not None:
+        (
+            generation_unit_buckets,
+            timeline_assignment_buckets,
+        ) = _timeline_generation_unit_buckets(
+            shot,
+            layout_entry["timeline_sxx"],
+            layout_entry["timeline_assignment_by_id"],
+        )
+    else:
+        # Historical v15 storyboards have no canonical timeline handoff.  Keep
+        # their deterministic legacy bucket shape; new v16 runs never enter it.
+        generation_unit_buckets = _partition(
+            generation_action_units,
+            content_count,
+        )
+        timeline_assignment_buckets = [[] for _ in range(content_count)]
     return {
         "shot_id": sid,
         "profile": profile,
         "duration": duration,
         "source_actions": source_actions,
         "generation_action_units": generation_action_units,
+        "generation_unit_buckets": generation_unit_buckets,
+        "timeline_assignment_buckets": timeline_assignment_buckets,
+        "timeline_layout_binding_sha256": (
+            layout_entry["timeline_binding_sha256"]
+            if layout_entry is not None
+            else None
+        ),
         "content_duration": content_duration,
         "content_count": content_count,
         "provider_capacity": (
@@ -1385,6 +1689,7 @@ def secondary_storyboard_requirements(
             if layout_entry is not None
             else max_content_beats
         ),
+        "max_content_beats": max_content_beats,
         "declared_content_beat_count": (
             layout_entry["content_count"]
             if layout_entry is not None
@@ -1551,10 +1856,9 @@ def secondary_storyboard_contract_errors(
     expected_source_event_buckets: list[list[int]] = []
     expected_source_action_unit_buckets: list[list[str]] = []
     if requirement:
-        expected_generation_unit_buckets = _partition(
-            requirement["generation_action_units"],
-            requirement["content_count"],
-        )
+        expected_generation_unit_buckets = requirement[
+            "generation_unit_buckets"
+        ]
         try:
             expected_source_event_buckets = _generation_unit_source_event_buckets(
                 source_events,
@@ -1610,6 +1914,23 @@ def secondary_storyboard_contract_errors(
                 f"{beat_id} generation units do not match its canonical bucket",
                 expected=expected_generation_units,
                 observed=beat_generation_units,
+            )
+        expected_timeline_assignments = (
+            requirement["timeline_assignment_buckets"][position - 1]
+            if requirement
+            and position <= len(requirement["timeline_assignment_buckets"])
+            else []
+        )
+        expected_assignment_ids = [
+            assignment["assignment_id"]
+            for assignment in expected_timeline_assignments
+        ]
+        if beat.get("timeline_assignment_ids") != expected_assignment_ids:
+            add(
+                "secondary_storyboard_timeline_assignment_invalid",
+                f"{beat_id} does not consume its canonical timeline assignments",
+                expected=expected_assignment_ids,
+                observed=beat.get("timeline_assignment_ids"),
             )
         expected_source_event_ids = (
             expected_source_event_buckets[position - 1]
@@ -1865,8 +2186,31 @@ def secondary_storyboard_contract_errors(
         if requirement["bridge_required"]:
             next_shot = shots[index + 1]
             next_sid = _shot_id(next_shot, index + 2)
-            expected_next_start = _start_state(next_shot)
-            expected_current_end = _end_state(shot)
+            next_requirement = secondary_storyboard_requirements(
+                storyboard,
+                index + 1,
+                capabilities_for({**storyboard, **next_shot}),
+            )
+            source_boundary_assignment = next((
+                assignment
+                for bucket in reversed(requirement["timeline_assignment_buckets"])
+                for assignment in reversed(bucket)
+            ), None)
+            target_boundary_assignment = next((
+                assignment
+                for bucket in next_requirement["timeline_assignment_buckets"]
+                for assignment in bucket
+            ), None)
+            expected_current_end = (
+                str(source_boundary_assignment.get("end_state") or "").strip()
+                if source_boundary_assignment is not None
+                else ""
+            ) or _end_state(shot)
+            expected_next_start = (
+                str(target_boundary_assignment.get("start_state") or "").strip()
+                if target_boundary_assignment is not None
+                else ""
+            ) or _start_state(next_shot)
             if bridge is None:
                 add("secondary_storyboard_bridge_missing", f"{sid} requires a bridge")
             else:
@@ -1883,6 +2227,20 @@ def secondary_storyboard_contract_errors(
                     != BRIDGE_TIMELINE_POLICY
                     or str(bridge.get("start_state") or "") != expected_current_end
                     or str(bridge.get("end_state") or "") != expected_next_start
+                    or bridge.get("source_timeline_assignment_id")
+                    != (
+                        source_boundary_assignment["assignment_id"]
+                        if source_boundary_assignment is not None
+                        else None
+                    )
+                    or bridge.get("target_timeline_assignment_id")
+                    != (
+                        target_boundary_assignment["assignment_id"]
+                        if target_boundary_assignment is not None
+                        else None
+                    )
+                    or bridge.get("timeline_layout_binding_sha256")
+                    != requirement["timeline_layout_binding_sha256"]
                     or not math.isclose(
                         float(bridge.get("duration_s") or 0),
                         float(requirement["bridge_duration"]),
@@ -1987,6 +2345,9 @@ def plan_storyboard_beats(
             "primary_shot_layout_sha256": requirement[
                 "primary_shot_layout_sha256"
             ],
+            "timeline_layout_binding_sha256": requirement[
+                "timeline_layout_binding_sha256"
+            ],
             "generation_action_unit_count": len(
                 requirement["generation_action_units"]
             ),
@@ -2066,9 +2427,10 @@ def plan_storyboard_beats(
             or "保持当前场景中的自然表演"
         )
         generation_action_units = requirement["generation_action_units"]
-        generation_unit_buckets = _partition(
-            generation_action_units, content_count
-        )
+        generation_unit_buckets = requirement["generation_unit_buckets"]
+        timeline_assignment_buckets = requirement[
+            "timeline_assignment_buckets"
+        ]
         action_buckets = _generation_unit_action_buckets(
             source_actions,
             generation_unit_buckets,
@@ -2113,6 +2475,9 @@ def plan_storyboard_beats(
         beats: list[dict[str, Any]] = []
         for position in range(1, content_count + 1):
             beat_generation_units = generation_unit_buckets[position - 1]
+            beat_timeline_assignments = timeline_assignment_buckets[
+                position - 1
+            ]
             beat_source_event_ids = source_event_buckets[position - 1]
             action = _action_for_bucket(
                 action_buckets[position - 1],
@@ -2121,8 +2486,20 @@ def plan_storyboard_beats(
                 fallback_action=fallback_action,
                 final_state=final_state,
             )
-            previous_state = beats[-1]["end_state"] if beats else start_state
-            next_state = (
+            canonical_start_state = next((
+                str(assignment.get("start_state") or "").strip()
+                for assignment in beat_timeline_assignments
+                if str(assignment.get("start_state") or "").strip()
+            ), "")
+            canonical_end_state = next((
+                str(assignment.get("end_state") or "").strip()
+                for assignment in reversed(beat_timeline_assignments)
+                if str(assignment.get("end_state") or "").strip()
+            ), "")
+            previous_state = canonical_start_state or (
+                beats[-1]["end_state"] if beats else start_state
+            )
+            next_state = canonical_end_state or (
                 final_state
                 if position == content_count
                 else _compact(f"已完成本格动作：{action}")
@@ -2155,6 +2532,18 @@ def plan_storyboard_beats(
                 "primary_shot_layout_sha256": requirement[
                     "primary_shot_layout_sha256"
                 ],
+                "timeline_layout_binding_sha256": requirement[
+                    "timeline_layout_binding_sha256"
+                ],
+                "timeline_assignment_ids": [
+                    assignment["assignment_id"]
+                    for assignment in beat_timeline_assignments
+                ],
+                "timeline_assignments": beat_timeline_assignments,
+                "motion_contribution_load": sum(
+                    int(assignment.get("motion_load") or 0)
+                    for assignment in beat_timeline_assignments
+                ),
                 "parent_shot_id": sid,
                 "plot_fidelity_contract": "primary_shot_source_only_no_invention",
                 "start_state": previous_state,
@@ -2223,7 +2612,26 @@ def plan_storyboard_beats(
         if bridge_required:
             next_shot, next_requirement = planned[index + 1]
             next_sid = next_requirement["shot_id"]
-            next_start_state = _start_state(next_shot)
+            source_boundary_assignment = next((
+                assignment
+                for bucket in reversed(timeline_assignment_buckets)
+                for assignment in reversed(bucket)
+            ), None)
+            target_boundary_assignment = next((
+                assignment
+                for bucket in next_requirement["timeline_assignment_buckets"]
+                for assignment in bucket
+            ), None)
+            bridge_start_state = (
+                str(source_boundary_assignment.get("end_state") or "").strip()
+                if source_boundary_assignment is not None
+                else ""
+            ) or final_state
+            next_start_state = (
+                str(target_boundary_assignment.get("start_state") or "").strip()
+                if target_boundary_assignment is not None
+                else ""
+            ) or _start_state(next_shot)
             source_handle = float(shot.get("outgoing_bridge_handle_s") or 0)
             target_handle = float(next_shot.get("incoming_bridge_handle_s") or 0)
             bridge = {
@@ -2242,12 +2650,25 @@ def plan_storyboard_beats(
                 "execution_strategy": "first_last_frame_bridge",
                 "planner_version": SECONDARY_STORYBOARD_VERSION,
                 "plot_fidelity_contract": "primary_shot_source_only_no_invention",
-                "start_state": final_state,
+                "start_state": bridge_start_state,
                 "action_prompt": _compact(
                     f"保持{sid}结束动作的因果连续，从当前终态平滑过渡到"
                     f"{next_sid}成片起始状态；不得执行{next_sid}的新动作"
                 ),
                 "end_state": next_start_state,
+                "source_timeline_assignment_id": (
+                    source_boundary_assignment["assignment_id"]
+                    if source_boundary_assignment is not None
+                    else None
+                ),
+                "target_timeline_assignment_id": (
+                    target_boundary_assignment["assignment_id"]
+                    if target_boundary_assignment is not None
+                    else None
+                ),
+                "timeline_layout_binding_sha256": requirement[
+                    "timeline_layout_binding_sha256"
+                ],
                 "boundary_kind": "continuous",
                 "boundary_reason": bridge_reason,
                 "generation_phase": "post_primary_shots",

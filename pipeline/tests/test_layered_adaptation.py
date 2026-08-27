@@ -423,6 +423,7 @@ def test_layered_mode_persists_skeleton_and_each_batch(monkeypatch, tmp_path):
     assert screenplay_plan["schema"] == engine.SCREENPLAY_PLAN_SCHEMA
     assert screenplay_plan["production_ledger"]["effective_story_duration_s"] == 45
     assert [name for name, _ in writes] == [
+        "ACTION_TIMELINE.json",
         "beat_skeleton.json",
         "shots_partial.json",
         "SCREENPLAY_PLAN.json",
@@ -438,13 +439,48 @@ def test_layered_resume_skips_cached_skeleton_and_batches(monkeypatch, tmp_path)
         15,
         shot_policy="cut-driven",
     )
+    layout = capacity_plan["primary_shot_layout"]
     production_events, _duration_scaled_event_plan = (
         engine._build_duration_scaled_event_plan(
             events,
             target_duration=90,
             beat_count=6,
             effective_shot_duration=15,
+            capabilities=engine.get_video_capabilities(),
+            max_generation_units_per_beat=layout[
+                "max_generation_action_units_per_primary_shot"
+            ],
+            maximum_total_generation_units=layout[
+                "production_action_unit_target"
+            ],
+            generation_unit_capacities_per_beat=list(
+                layout["generation_action_unit_capacities"]
+            ),
         )
+    )
+    source_action_timeline = engine.build_action_timeline(
+        events,
+        max_motion_contributions_per_slice=(
+            engine.get_video_capabilities().motion_contribution_limit
+        ),
+    )
+    production_action_timeline = engine.build_action_timeline(
+        production_events,
+        max_motion_contributions_per_slice=(
+            engine.get_video_capabilities().motion_contribution_limit
+        ),
+    )
+    timeline_layout_binding = engine._bind_action_timeline_to_primary_layout(
+        production_events,
+        _duration_scaled_event_plan,
+        layout,
+        engine.get_video_capabilities(),
+    )
+    layout["timeline_assignment_count"] = len(
+        timeline_layout_binding["assignments"]
+    )
+    _duration_scaled_event_plan["timeline_layout_binding"] = (
+        timeline_layout_binding
     )
     fingerprint = engine._layered_input_fingerprint(
         production_events,
@@ -453,14 +489,21 @@ def test_layered_resume_skips_cached_skeleton_and_batches(monkeypatch, tmp_path)
         15,
         6,
         shot_policy="cut-driven",
-        primary_shot_layout=capacity_plan["primary_shot_layout"],
+        primary_shot_layout=layout,
+        source_action_timeline=source_action_timeline,
+        production_action_timeline=production_action_timeline,
+        timeline_layout_binding=timeline_layout_binding,
+    )
+    contracts = engine._canonical_beat_contracts(
+        production_events,
+        _duration_scaled_event_plan,
+        timeline_layout_binding,
     )
     public_beats = []
-    for i in range(1, 7):
-        beat = _beat(i)
+    for i, contract in enumerate(contracts, 1):
+        beat = {**_beat(i), **contract}
         beat.pop("_source_event_details")
         public_beats.append(beat)
-    public_beats[-1]["source_events"] = list(range(6, 12))
     (tmp_path / "beat_skeleton.json").write_text(
         json.dumps({
             "_checkpoint": {
@@ -472,9 +515,11 @@ def test_layered_resume_skips_cached_skeleton_and_batches(monkeypatch, tmp_path)
         }),
         encoding="utf-8",
     )
-    cached_shots = [_shot(i) for i in range(1, 4)]
-    for shot in cached_shots:
+    cached_shots = []
+    for i, contract in enumerate(contracts[:3], 1):
+        shot = {**_shot(i), **contract}
         shot.pop("beat_order")
+        cached_shots.append(shot)
     (tmp_path / "shots_partial.json").write_text(
         json.dumps({
             "_checkpoint": {
@@ -497,7 +542,12 @@ def test_layered_resume_skips_cached_skeleton_and_batches(monkeypatch, tmp_path)
     def expand_only_missing(prompt, **kwargs):
         calls.append(prompt)
         response = json.loads(_batch_response(4, beat_first=4))
-        response["shots"][-1]["source_events"] = list(range(6, 12))
+        for shot, beat in zip(
+            response["shots"],
+            public_beats[3:],
+            strict=True,
+        ):
+            shot["source_events"] = beat["source_events"]
         return json.dumps(response)
 
     monkeypatch.setattr(engine, "_call_llm_with_timeout_retry", expand_only_missing)

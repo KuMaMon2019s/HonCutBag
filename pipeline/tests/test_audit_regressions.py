@@ -715,10 +715,14 @@ def test_secondary_v6_keeps_bridge_time_outside_primary_content_capacity():
         "incoming_bridge_handle_s"
     ] == 2.0
     assert storyboard["material_budget"] == {
-        "schema": "honcut.material-budget.v3",
+            "schema": "honcut.material-budget.v4",
         "policy": "separate_story_clock_from_provider_request_cost",
         "timeline_policy": "replace_boundary_handles",
-        "delivery_target_duration_s": 30.0,
+            "delivery_target_duration_s": 30.0,
+            "delivery_ceiling_duration_s": 30.0,
+            "planned_delivery_duration_s": 30.0,
+            "delivery_overrun_ratio": 0.0,
+            "maximum_content_padding_loss_rate": 0.25,
         "storyboard_duration_limit_s": 30.0,
         "primary_story_duration_s": 30.0,
         "secondary_story_duration_s": 30.0,
@@ -1560,6 +1564,13 @@ def test_overlong_duration_never_creates_reshoot_plan(monkeypatch, tmp_path):
 
 
 def test_phase8_overlong_gate_requires_reedit_without_reshoot(monkeypatch, tmp_path):
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps({
+            "delivery_target_duration": 60.0,
+            "delivery_ceiling_duration": 60.0,
+        }),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(
         duration_gate,
         "evaluate_duration_gate",

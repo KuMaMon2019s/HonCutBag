@@ -26,6 +26,8 @@ class Phase1Runner(Protocol):
         project_video_spec: dict[str, Any] | None = ...,
         screenplay_rewrite_request: dict[str, Any] | None = ...,
         shot_policy: str = ...,
+        max_material_padding_ratio: float = ...,
+        delivery_overrun_ratio: float = ...,
     ) -> dict[str, Any]: ...
 
 
@@ -54,6 +56,10 @@ def phase1_node(
         ),
         "project_video_spec": state.get("project_video_spec"),
         "shot_policy": state.get("shot_policy", "cut-driven"),
+        "max_material_padding_ratio": state.get(
+            "max_material_padding_ratio", 0.25
+        ),
+        "delivery_overrun_ratio": state.get("delivery_overrun_ratio", 0.0),
     }
     previous_phase5 = state.get("phase_results", {}).get("phase5")
     rewrite_request = rewrite_request_from_receipt(previous_phase5)

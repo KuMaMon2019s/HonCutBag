@@ -19,6 +19,7 @@ from utils.action_units import (
     event_uses_composite_motion,
     normalize_event_action_units,
 )
+from utils.video_capabilities import get_video_capabilities
 
 
 PHASE1_DRY_RUN_RECEIPT_SCHEMA = "honcut.phase1-dry-run-receipt.v1"
@@ -108,6 +109,8 @@ def build_dry_run_capacity_preflight(
     duration: int,
     shot_duration: int,
     shot_policy: str = DEFAULT_SHOT_POLICY,
+    max_material_padding_ratio: float = 0.25,
+    delivery_overrun_ratio: float = 0.0,
 ) -> dict[str, Any]:
     """Estimate source-structure pressure without an LLM or Provider call."""
     events, ignored_directives, source_item_count = _preflight_events(text, segments)
@@ -116,6 +119,8 @@ def build_dry_run_capacity_preflight(
         duration,
         shot_duration,
         shot_policy=shot_policy,
+        max_material_padding_ratio=max_material_padding_ratio,
+        delivery_overrun_ratio=delivery_overrun_ratio,
     )
     passed = capacity_plan["action_capacity_status"] == "fits_story_clock"
     receipt = {
@@ -160,11 +165,21 @@ def partition_preflight_events_by_layout(
         raise ValueError("dry-run layout action capacities are invalid")
 
     seen: set[str] = set()
+    capabilities = get_video_capabilities()
     event_contracts: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for raw_event in events:
         event = dict(raw_event)
         event_contracts.append(
-            (event, normalize_event_action_units(event, seen=seen))
+            (
+                event,
+                normalize_event_action_units(
+                    event,
+                    seen=seen,
+                    max_motion_contributions_per_slice=(
+                        capabilities.motion_contribution_limit
+                    ),
+                ),
+            )
         )
     total_units = sum(contract["units"] for _, contract in event_contracts)
     total_capacity = sum(action_capacities)

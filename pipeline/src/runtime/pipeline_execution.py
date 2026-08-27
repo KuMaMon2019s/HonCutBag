@@ -269,6 +269,8 @@ def run_pipeline(
     duration: int = 60,
     shot_duration: int = AVG_SHOT_DURATION,
     shot_policy: str | None = None,
+    max_material_padding_ratio: float = 0.25,
+    delivery_overrun_ratio: float = 0.0,
     chain_mode: bool = False,
     dry_run: bool = False,
     skip_phase: list = None,
@@ -296,6 +298,8 @@ def run_pipeline(
             duration=duration,
             shot_duration=shot_duration,
             shot_policy=shot_policy,
+            max_material_padding_ratio=max_material_padding_ratio,
+            delivery_overrun_ratio=delivery_overrun_ratio,
             chain_mode=chain_mode,
             dry_run=dry_run,
             skip_phase=skip_phase,
@@ -326,6 +330,8 @@ def _run_pipeline(
     duration: int = 60,
     shot_duration: int = AVG_SHOT_DURATION,
     shot_policy: str | None = None,
+    max_material_padding_ratio: float = 0.25,
+    delivery_overrun_ratio: float = 0.0,
     chain_mode: bool = False,
     dry_run: bool = False,
     skip_phase: list = None,
@@ -395,6 +401,14 @@ def _run_pipeline(
         resume=resume,
         shot_policy=shot_policy,
     )
+    for field, value in (
+        ("max_material_padding_ratio", max_material_padding_ratio),
+        ("delivery_overrun_ratio", delivery_overrun_ratio),
+    ):
+        if isinstance(value, bool) or not 0 <= float(value) <= 0.25:
+            raise ValueError(f"{field} must be between 0 and 0.25")
+    max_material_padding_ratio = float(max_material_padding_ratio)
+    delivery_overrun_ratio = float(delivery_overrun_ratio)
     resolved_character_library_dir = None
     if character_library_dir:
         character_library_path = Path(character_library_dir).expanduser().resolve()
@@ -456,6 +470,8 @@ def _run_pipeline(
         "duration": duration,
         "shot_duration": shot_duration,
         "shot_policy": shot_policy,
+        "max_material_padding_ratio": max_material_padding_ratio,
+        "delivery_overrun_ratio": delivery_overrun_ratio,
         "chain_mode": chain_mode,
         "transition": transition,
         "transition_duration": transition_duration,
@@ -696,6 +712,8 @@ def _run_pipeline(
                 target_duration_s=duration,
                 shot_duration_s=shot_duration,
                 shot_policy=shot_policy,
+                max_material_padding_ratio=max_material_padding_ratio,
+                delivery_overrun_ratio=delivery_overrun_ratio,
                 dry_run=dry_run,
                 chain_mode=chain_mode,
                 auto_approve=auto_approve,
@@ -844,6 +862,8 @@ def _run_pipeline(
             "reporter": reporter,
             "shot_duration": shot_duration,
             "shot_policy": shot_policy,
+            "max_material_padding_ratio": max_material_padding_ratio,
+            "delivery_overrun_ratio": delivery_overrun_ratio,
             "project_video_spec": project_video_spec,
         }
         if _screenplay_rewrite_request is not None:
@@ -1096,6 +1116,8 @@ def _run_pipeline(
                     duration=duration,
                     shot_duration=shot_duration,
                     shot_policy=shot_policy,
+                    max_material_padding_ratio=max_material_padding_ratio,
+                    delivery_overrun_ratio=delivery_overrun_ratio,
                     chain_mode=chain_mode,
                     dry_run=dry_run,
                     skip_phase=skip_phase,

@@ -126,10 +126,12 @@ def requires_explicit_body_choreography(record: dict[str, Any]) -> bool:
             micro_actions=_string_list(record.get("micro_actions")),
         )
         if any(
-            _action_requires_body_beat(
-                str(beat.get("micro_action") or beat.get("description") or "")
+            _record_action_requires_body_beat(
+                record,
+                str(beat.get("micro_action") or beat.get("description") or ""),
+                int(beat.get("micro_action_index") or position),
             )
-            for beat in declared_beats
+            for position, beat in enumerate(declared_beats, 1)
         ):
             # A declared performer-mechanics score is authoritative even when
             # surrounding prose omits generic labels such as "fight".  Pure
@@ -143,7 +145,10 @@ def requires_explicit_body_choreography(record: dict[str, Any]) -> bool:
         # A fight may remain in the background while this beat only depicts a
         # shield, shockwave or another non-body result.
         if _CHOREOGRAPHY_DOMAIN.search(str(record.get("action_type") or "")):
-            return True
+            return any(
+                _record_action_requires_body_beat(record, action, position)
+                for position, action in enumerate(action_ledger, 1)
+            )
         action_text = " ".join(action_ledger)
         if (
             _CHOREOGRAPHY_DOMAIN.search(action_text)
@@ -155,9 +160,10 @@ def requires_explicit_body_choreography(record: dict[str, Any]) -> bool:
         return bool(
             _CHOREOGRAPHY_DOMAIN.search(contextual_text)
             and any(
-                _UNAMBIGUOUS_BODY_EXECUTION.search(action)
-                and not _NON_BODY_EFFECT_ACTION.search(action)
-                for action in action_ledger
+                _record_action_requires_body_beat(
+                    record, action, position
+                )
+                for position, action in enumerate(action_ledger, 1)
             )
         )
     else:
@@ -190,6 +196,34 @@ def _action_requires_body_beat(action: str) -> bool:
         _UNAMBIGUOUS_BODY_EXECUTION.search(action)
         or (_BODY_PART.search(action) and _KINETIC_VERB.search(action))
     )
+
+
+def _record_action_requires_body_beat(
+    record: dict[str, Any],
+    action: str,
+    position: int,
+) -> bool:
+    """Apply canonical temporal semantics before lexical body heuristics.
+
+    A prop/environment consequence can contain verbs such as ``撞击`` while
+    still being a zero-time effect of an earlier performer action. Event Flow
+    v26 records that distinction explicitly; the body owner must not reclassify
+    it from keywords and demand a fictitious human choreography beat.
+    """
+
+    for raw in record.get("action_temporal_relations") or []:
+        if not isinstance(raw, dict) or raw.get("micro_action_index") != position:
+            continue
+        temporal_relation = str(
+            raw.get("temporal_relation") or ""
+        ).strip().lower()
+        action_kind = str(raw.get("action_kind") or "").strip().lower()
+        if temporal_relation in {"effect_of", "sustained_during"} or (
+            action_kind in {"environment_effect", "sustained"}
+        ):
+            return False
+        break
+    return _action_requires_body_beat(action)
 
 
 def is_mechanically_specific_action(value: Any) -> bool:
@@ -312,7 +346,12 @@ def normalize_body_action_choreography(
             action_index = position
         action_index = max(1, action_index)
         micro_action = str(raw.get("micro_action") or "").strip()
-        if not micro_action and action_index <= len(actions):
+        if action_index <= len(actions):
+            # ``micro_action_index`` is the durable identity for a body beat.
+            # Model-authored choreography often paraphrases the source action
+            # while describing mechanics; persist the canonical source text so
+            # coverage does not depend on lexical equality.  Invalid/out-of-
+            # range indexes remain unmatched and therefore fail closed below.
             micro_action = actions[action_index - 1]
         beat = {
             "beat": len(beats) + 1,
@@ -384,12 +423,14 @@ def build_body_action_contract(record: dict[str, Any]) -> dict[str, Any] | None:
                 (
                     beat
                     for beat in beats
-                    if _action_requires_body_beat(
+                    if _record_action_requires_body_beat(
+                        record,
                         str(
                             beat.get("micro_action")
                             or beat.get("description")
                             or ""
-                        )
+                        ),
+                        int(beat.get("micro_action_index") or 0),
                     )
                 ),
                 1,
@@ -430,7 +471,9 @@ def build_body_action_contract(record: dict[str, Any]) -> dict[str, Any] | None:
                 })
         for position, action in enumerate(executable_actions, 1):
             matches = _matching_choreography_beats(beats, action, position)
-            action_requires_beat = _action_requires_body_beat(action)
+            action_requires_beat = _record_action_requires_body_beat(
+                record, action, position
+            )
             if required and action_requires_beat and not matches:
                 uncovered_actions.append(action)
             if action_requires_beat and matches and not any(
@@ -440,8 +483,8 @@ def build_body_action_contract(record: dict[str, Any]) -> dict[str, Any] | None:
     else:
         vague_actions = [
             action
-            for action in executable_actions
-            if _action_requires_body_beat(action)
+            for position, action in enumerate(executable_actions, 1)
+            if _record_action_requires_body_beat(record, action, position)
             and not is_mechanically_specific_action(action)
         ]
     errors: list[dict[str, Any]] = []

@@ -14,6 +14,7 @@ The complete micro_actions ledger is never truncated; only capacity math
 consumes the normalized units.
 """
 
+import copy
 import hashlib
 import json
 import sys
@@ -26,7 +27,9 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from phases.phase1 import adaptation_engine as engine  # noqa: E402
+from phases.phase1 import storyboard_beats as beat_owner  # noqa: E402
 from phases.phase1.storyboard_beats import (  # noqa: E402
+    PRIMARY_SHOT_EXECUTION_HANDOFF_SCHEMA,
     bind_primary_shot_execution_plan,
     plan_storyboard_beats,
 )
@@ -34,9 +37,12 @@ from phases.phase5.storyboard_qa_gate import (  # noqa: E402
     run_generation_capacity_checks,
     run_l1_checks,
 )
+from phases.phase8 import duration_gate  # noqa: E402
 from prompt.event_extractor import _annotate_global_event_flow  # noqa: E402
 from utils.action_units import (  # noqa: E402
+    ACTION_TIMELINE_SCHEMA,
     annotate_event_motion_modes,
+    build_action_timeline,
     classify_micro_action,
     event_uses_composite_motion,
     normalize_action_units,
@@ -271,6 +277,590 @@ def test_structured_motion_contract_preserves_real_progression():
     assert normalize_event_action_units(events[0])["units"] == 1
     assert events[1]["generation_motion_mode"] == "atomic"
     assert normalize_event_action_units(events[1])["units"] == 3
+
+
+def test_temporal_timeline_groups_multi_actor_exchange_and_attaches_effects():
+    event = {
+        "micro_actions": [
+            "敌人横向挥出能量刃",
+            "男子身体后仰躲避横斩",
+            "刀锋擦过风衣，雨水和纤维飞散",
+        ],
+        "start_state": "敌人在攻击距离外，男子站在车门前",
+        "end_state": "横斩落空，男子保持平衡",
+        "action_temporal_relations": [
+            {
+                "micro_action_index": 1,
+                "performers": ["敌人"],
+                "targets": ["男子"],
+                "action_kind": "attack",
+                "temporal_relation": "root",
+                "reference_action_indexes": [],
+                "pace": "fast",
+            },
+            {
+                "micro_action_index": 2,
+                "performers": ["男子"],
+                "targets": ["能量刃"],
+                "action_kind": "defense",
+                "temporal_relation": "reaction_overlap",
+                "reference_action_indexes": [1],
+                "pace": "fast",
+            },
+            {
+                "micro_action_index": 3,
+                "performers": [],
+                "targets": ["风衣"],
+                "action_kind": "environment_effect",
+                "temporal_relation": "effect_of",
+                "reference_action_indexes": [1],
+                "pace": "fast",
+            },
+        ],
+    }
+
+    normalized = normalize_event_action_units(event)
+
+    assert normalized["units"] == 1
+    assert normalized["motion_mode"] == "temporal"
+    assert normalized["generation_action_units"][0]["motion_load"] == 2
+    assert normalized["generation_action_units"][0]["actions"] == event[
+        "micro_actions"
+    ]
+    assert normalized["generation_action_units"][0][
+        "effect_ledger_indexes"
+    ] == [2]
+
+
+def test_temporal_timeline_keeps_traversal_control_and_slow_reveal_serial():
+    event = {
+        "micro_actions": [
+            "男子穿过能量余波靠近敌人",
+            "男子控制敌人手臂",
+            "男子低头查看芯片",
+            "芯片投射未知坐标",
+        ],
+        "action_temporal_relations": [
+            {
+                "micro_action_index": 1,
+                "performers": ["男子"],
+                "targets": ["敌人"],
+                "action_kind": "locomotion",
+                "temporal_relation": "root",
+                "reference_action_indexes": [],
+                "pace": "fast",
+            },
+            {
+                "micro_action_index": 2,
+                "performers": ["男子"],
+                "targets": ["敌人"],
+                "action_kind": "control",
+                "temporal_relation": "after",
+                "reference_action_indexes": [1],
+                "pace": "fast",
+            },
+            {
+                "micro_action_index": 3,
+                "performers": ["男子"],
+                "targets": ["芯片"],
+                "action_kind": "state_change",
+                "temporal_relation": "after",
+                "reference_action_indexes": [2],
+                "pace": "slow",
+            },
+            {
+                "micro_action_index": 4,
+                "performers": [],
+                "targets": ["坐标"],
+                "action_kind": "state_change",
+                "temporal_relation": "after",
+                "reference_action_indexes": [3],
+                "pace": "slow",
+            },
+        ],
+    }
+
+    normalized = normalize_event_action_units(event)
+
+    assert normalized["units"] == 4
+    assert [
+        unit["pace_weight"]
+        for unit in normalized["generation_action_units"]
+    ] == [1, 1, 3, 3]
+
+
+def test_temporal_timeline_rejects_same_actor_overlap_without_composite_contract():
+    event = {
+        "micro_actions": ["男子快速靠近", "男子同时控制敌人手臂"],
+        "action_temporal_relations": [
+            {
+                "micro_action_index": 1,
+                "performers": ["男子"],
+                "targets": ["敌人"],
+                "action_kind": "locomotion",
+                "temporal_relation": "root",
+                "reference_action_indexes": [],
+                "pace": "fast",
+            },
+            {
+                "micro_action_index": 2,
+                "performers": ["男子"],
+                "targets": ["敌人"],
+                "action_kind": "control",
+                "temporal_relation": "overlap",
+                "reference_action_indexes": [1],
+                "pace": "fast",
+            },
+        ],
+    }
+
+    with pytest.raises(ValueError, match="one performer cannot execute"):
+        normalize_event_action_units(event)
+
+
+def test_temporal_timeline_rejects_transitive_same_actor_slice_conflict():
+    event = {
+        "micro_actions": [
+            "男子穿过余波逼近敌人",
+            "敌人同时发动近身攻击",
+            "男子格挡敌人攻击",
+        ],
+        "action_temporal_relations": [
+            {
+                "micro_action_index": 1,
+                "performers": ["男子"],
+                "targets": ["敌人"],
+                "action_kind": "locomotion",
+                "temporal_relation": "root",
+                "reference_action_indexes": [],
+                "pace": "fast",
+            },
+            {
+                "micro_action_index": 2,
+                "performers": ["敌人"],
+                "targets": ["男子"],
+                "action_kind": "attack",
+                "temporal_relation": "overlap",
+                "reference_action_indexes": [1],
+                "pace": "fast",
+            },
+            {
+                "micro_action_index": 3,
+                "performers": ["男子"],
+                "targets": ["敌人"],
+                "action_kind": "defense",
+                "temporal_relation": "reaction_overlap",
+                "reference_action_indexes": [2],
+                "pace": "fast",
+            },
+        ],
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="one performer cannot contribute multiple independent motions",
+    ):
+        normalize_event_action_units(event)
+
+
+def test_explicit_coordinated_group_counts_as_one_ensemble_contribution():
+    event = {
+        "what": "三名敌人同时从车厢内部出现并举起同类武器",
+        "source_excerpt": "三名敌人突然同时从车厢内部出现并举起武器。",
+        "micro_actions": [
+            "第一名敌人出现并举起武器",
+            "第二名敌人出现并举起武器",
+            "第三名敌人出现并举起武器",
+        ],
+        "action_temporal_relations": [
+            {
+                "micro_action_index": index,
+                "performers": [f"第{label}名敌人"],
+                "targets": ["男子"],
+                "action_kind": "locomotion",
+                "temporal_relation": "root" if index == 1 else "overlap",
+                "reference_action_indexes": [] if index == 1 else [1],
+                "ensemble_id": "EN001",
+                "pace": "fast",
+            }
+            for index, label in enumerate(("一", "二", "三"), 1)
+        ],
+    }
+
+    normalized = normalize_event_action_units(event)
+
+    assert normalized["units"] == 1
+    assert normalized["generation_action_units"][0]["motion_load"] == 1
+    assert normalized["generation_action_units"][0]["performers"] == [
+        "第一名敌人",
+        "第二名敌人",
+        "第三名敌人",
+    ]
+
+
+def test_one_group_action_with_multiple_performers_is_one_ensemble_contribution():
+    event = {
+        "what": "三名敌人同时从车厢内部出现",
+        "source_excerpt": "三名敌人突然同时从车厢内部出现。",
+        "micro_actions": ["三名敌人同时从车厢内部出现"],
+        "action_temporal_relations": [
+            {
+                "micro_action_index": 1,
+                "performers": ["第一名敌人", "第二名敌人", "第三名敌人"],
+                "targets": ["男子"],
+                "action_kind": "locomotion",
+                "temporal_relation": "root",
+                "reference_action_indexes": [],
+                "ensemble_id": "enemy_squad_emerge",
+                "pace": "fast",
+            }
+        ],
+    }
+
+    normalized = normalize_event_action_units(event)
+
+    assert normalized["units"] == 1
+    assert normalized["generation_action_units"][0]["motion_load"] == 1
+    assert normalized["generation_action_units"][0]["performers"] == [
+        "第一名敌人",
+        "第二名敌人",
+        "第三名敌人",
+    ]
+
+
+def test_ensemble_contribution_requires_explicit_source_coordination():
+    event = {
+        "source_excerpt": "第一名敌人出现。第二名敌人随后出现。",
+        "micro_actions": ["第一名敌人出现", "第二名敌人出现"],
+        "action_temporal_relations": [
+            {
+                "micro_action_index": 1,
+                "performers": ["第一名敌人"],
+                "targets": ["男子"],
+                "action_kind": "locomotion",
+                "temporal_relation": "root",
+                "reference_action_indexes": [],
+                "ensemble_id": "EN001",
+                "pace": "fast",
+            },
+            {
+                "micro_action_index": 2,
+                "performers": ["第二名敌人"],
+                "targets": ["男子"],
+                "action_kind": "locomotion",
+                "temporal_relation": "overlap",
+                "reference_action_indexes": [1],
+                "ensemble_id": "EN001",
+                "pace": "fast",
+            },
+        ],
+    }
+
+    with pytest.raises(ValueError, match="ensemble contribution requires"):
+        normalize_event_action_units(event)
+
+
+def test_passive_environment_effect_has_no_actor_overlap_or_fake_performer():
+    overlap_event = {
+        "micro_actions": ["冲击波席卷车厢", "玻璃震动", "雨滴被气流卷起"],
+        "action_temporal_relations": [
+            {
+                "micro_action_index": 1,
+                "performers": ["冲击波"],
+                "targets": ["车厢"],
+                "action_kind": "impact",
+                "temporal_relation": "root",
+                "reference_action_indexes": [],
+                "pace": "fast",
+            },
+            {
+                "micro_action_index": 2,
+                "performers": [],
+                "targets": ["玻璃"],
+                "action_kind": "environment_effect",
+                "temporal_relation": "effect_of",
+                "reference_action_indexes": [1],
+                "pace": "fast",
+            },
+            {
+                "micro_action_index": 3,
+                "performers": ["环境"],
+                "targets": ["雨滴"],
+                "action_kind": "environment_effect",
+                "temporal_relation": "overlap",
+                "reference_action_indexes": [1],
+                "pace": "fast",
+            },
+        ],
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="passive environment/sustained actions must use effect_of",
+    ):
+        normalize_event_action_units(overlap_event)
+
+    fake_performer_event = copy.deepcopy(overlap_event)
+    fake_performer_event["action_temporal_relations"][2]["temporal_relation"] = (
+        "effect_of"
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="passive effect/sustained actions cannot claim an independent performer",
+    ):
+        normalize_event_action_units(fake_performer_event)
+
+
+def test_canonical_action_timeline_records_model_motion_capacity():
+    event = {
+        "micro_actions": ["敌人挥刀", "男子格挡"],
+        "action_temporal_relations": [
+            {
+                "micro_action_index": 1,
+                "performers": ["敌人"],
+                "targets": ["男子"],
+                "action_kind": "attack",
+                "temporal_relation": "root",
+                "reference_action_indexes": [],
+                "pace": "fast",
+            },
+            {
+                "micro_action_index": 2,
+                "performers": ["男子"],
+                "targets": ["敌人"],
+                "action_kind": "defense",
+                "temporal_relation": "reaction_overlap",
+                "reference_action_indexes": [1],
+                "pace": "fast",
+            },
+        ],
+    }
+
+    timeline = build_action_timeline(
+        [event],
+        max_motion_contributions_per_slice=1,
+    )
+
+    assert timeline["schema"] == ACTION_TIMELINE_SCHEMA
+    assert timeline["source_micro_action_count"] == 2
+    assert timeline["temporal_slice_count"] == 1
+    assert timeline["maximum_motion_load"] == 2
+    assert timeline["slices"][0]["motion_capacity_status"] == "rewrite_required"
+
+
+def test_overloaded_semantic_slice_stages_provider_subslices_without_fact_loss():
+    event = {
+        "micro_actions": [
+            "列车突然启动并建立前冲惯性",
+            "第二名敌人从侧面突袭男子",
+            "男子快速格挡第二名敌人的攻击",
+            "车厢随列车启动产生震动",
+        ],
+        "action_temporal_relations": [
+            {
+                "micro_action_index": 1,
+                "performers": ["列车"],
+                "targets": ["车厢"],
+                "action_kind": "state_change",
+                "temporal_relation": "root",
+                "reference_action_indexes": [],
+                "pace": "fast",
+            },
+            {
+                "micro_action_index": 2,
+                "performers": ["第二名敌人"],
+                "targets": ["男子"],
+                "action_kind": "attack",
+                "temporal_relation": "overlap",
+                "reference_action_indexes": [1],
+                "pace": "fast",
+            },
+            {
+                "micro_action_index": 3,
+                "performers": ["男子"],
+                "targets": ["第二名敌人"],
+                "action_kind": "defense",
+                "temporal_relation": "reaction_overlap",
+                "reference_action_indexes": [2],
+                "pace": "fast",
+            },
+            {
+                "micro_action_index": 4,
+                "performers": [],
+                "targets": ["车厢"],
+                "action_kind": "environment_effect",
+                "temporal_relation": "effect_of",
+                "reference_action_indexes": [1],
+                "pace": "fast",
+            },
+        ],
+    }
+
+    semantic = normalize_event_action_units(event)
+    execution = normalize_event_action_units(
+        event,
+        max_motion_contributions_per_slice=2,
+    )
+
+    assert semantic["units"] == 1
+    assert semantic["generation_action_units"][0]["motion_load"] == 3
+    assert execution["semantic_units"] == 1
+    assert execution["units"] == 2
+    assert execution["staged_semantic_slice_count"] == 1
+    units = execution["generation_action_units"]
+    assert [unit["motion_load"] for unit in units] == [1, 2]
+    assert [unit["execution_subslice_order"] for unit in units] == [1, 2]
+    assert {unit["semantic_temporal_slice_id"] for unit in units} == {"TS001"}
+    assert units[0]["actions"] == [
+        "列车突然启动并建立前冲惯性",
+        "车厢随列车启动产生震动",
+    ]
+    assert units[1]["actions"] == [
+        "第二名敌人从侧面突袭男子",
+        "男子快速格挡第二名敌人的攻击",
+    ]
+    assert sorted(
+        index for unit in units for index in unit["ledger_indexes"]
+    ) == [0, 1, 2, 3]
+    assert engine._event_generation_action_unit_counts([event]) == {1: 2}
+    profile = engine.get_video_capabilities()
+    binding = engine._bind_action_timeline_to_primary_layout(
+        [event],
+        {
+            "schema": engine.DURATION_SCALED_EVENT_PLAN_SCHEMA,
+            "sequence_beat_plan": [
+                {"beat_order": 1, "sequence_id": "__unspecified__"}
+            ],
+            "source_event_generation_unit_counts_per_beat": [{"1": 2}],
+        },
+        {
+            "schema": engine.PRIMARY_SHOT_LAYOUT_SCHEMA,
+            "content_beat_counts": [1],
+            "effective_story_durations_s": [[6]],
+        },
+        profile,
+    )
+    assignments = binding["assignments"]
+    assert len(assignments) == 2
+    assert {item["semantic_temporal_slice_id"] for item in assignments} == {
+        "TS001"
+    }
+    assert [item["execution_subslice_order"] for item in assignments] == [1, 2]
+    assert all(item["motion_load"] <= 2 for item in assignments)
+    assert all(item["semantic_motion_load"] == 3 for item in assignments)
+    assert {
+        index
+        for item in assignments
+        for index in item["source_micro_action_indexes"]
+    } == {1, 2, 3, 4}
+
+
+def test_action_timeline_preserves_duplicate_source_fact_without_story_time():
+    relation = {
+        "micro_action_index": 1,
+        "performers": ["男子"],
+        "targets": ["芯片"],
+        "action_kind": "control",
+        "temporal_relation": "root",
+        "reference_action_indexes": [],
+        "pace": "normal",
+        "state_reads": [],
+        "state_writes": ["芯片被握紧"],
+    }
+    events = [
+        {
+            "micro_actions": ["男子握紧芯片"],
+            "action_temporal_relations": [relation],
+        },
+        {
+            "micro_actions": ["男子握紧芯片"],
+            "action_temporal_relations": [relation],
+        },
+    ]
+
+    timeline = build_action_timeline(
+        events,
+        max_motion_contributions_per_slice=2,
+    )
+
+    assert timeline["source_micro_action_count"] == 2
+    assert timeline["temporal_slice_count"] == 1
+    duplicate = timeline["slices"][1]
+    assert duplicate["source_event_id"] == 2
+    assert duplicate["source_actions"] == ["男子握紧芯片"]
+    assert duplicate["duplicate_action_indexes"] == [1]
+    assert duplicate["motion_load"] == 0
+
+
+def test_delivery_overrun_selects_shortest_full_content_window():
+    events = [{
+        "event_role": "action_chain",
+        "sequence_id": "SEQ001",
+        "micro_actions": [f"有序动作{index}" for index in range(18)],
+    }]
+
+    exact = engine._estimate_action_capacity_plan(
+        events,
+        36,
+        6,
+        shot_policy="continuity",
+        delivery_overrun_ratio=0.0,
+    )
+    extended = engine._estimate_action_capacity_plan(
+        events,
+        36,
+        6,
+        shot_policy="continuity",
+        delivery_overrun_ratio=0.25,
+    )
+
+    assert exact["planned_delivery_duration"] == 36
+    assert exact["action_capacity_status"] == "screenplay_compression_required"
+    assert extended["planned_delivery_duration"] == 45
+    assert extended["delivery_ceiling_duration"] == 45
+    assert extended["action_capacity_status"] == "fits_story_clock"
+    assert extended["primary_shot_layout"][
+        "production_action_unit_target"
+    ] == 18
+
+
+@pytest.mark.parametrize("field", [
+    "max_material_padding_ratio",
+    "delivery_overrun_ratio",
+])
+def test_duration_policy_ratios_fail_closed_outside_quarter(field):
+    kwargs = {field: 0.2501}
+    with pytest.raises(ValueError, match="between 0 and 0.25"):
+        engine._estimate_action_capacity_plan(
+            [{
+                "event_role": "scene_setup",
+                "sequence_id": "SEQ001",
+                "micro_actions": ["列车驶入"],
+            }],
+            36,
+            6,
+            **kwargs,
+        )
+
+
+def test_phase8_duration_gate_accepts_reviewed_overrun_without_tail_trim(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(duration_gate, "probe_duration", lambda _path: 42.0)
+
+    gate, reshoot = duration_gate.evaluate_duration_gate(
+        tmp_path,
+        36.0,
+        delivery_ceiling_duration=45.0,
+    )
+
+    assert gate["status"] == "PASS"
+    assert gate["target_s"] == 36.0
+    assert gate["ceiling_s"] == 45.0
+    assert gate["actual_s"] == 42.0
+    assert reshoot is None
 
 
 def test_same_event_repeats_survive_shot_slicing_but_later_event_deduplicates():
@@ -842,6 +1432,12 @@ def test_layered_expansion_preserves_skeleton_shot_language(monkeypatch):
         "beat_order": 1,
         "source_events": [1],
         "source_event_generation_unit_counts": {"1": 2},
+        "sxx_id": "S001",
+        "sequence_id": "SEQ001",
+        "max_generation_action_units": 2,
+        "execution_subslice_count": 2,
+        "timeline_assignment_ids": ["TA001", "TA002"],
+        "zero_story_time_source_event_ids": [],
         "action": "keep",
         "reason": "保留开场",
         "who": [],
@@ -902,6 +1498,12 @@ def test_layered_expansion_preserves_skeleton_shot_language(monkeypatch):
         for field in engine._SHOT_LANGUAGE_FIELDS
     }
     assert shots[0]["source_event_generation_unit_counts"] == {"1": 2}
+    assert shots[0]["sxx_id"] == "S001"
+    assert shots[0]["sequence_id"] == "SEQ001"
+    assert shots[0]["max_generation_action_units"] == 2
+    assert shots[0]["execution_subslice_count"] == 2
+    assert shots[0]["timeline_assignment_ids"] == ["TA001", "TA002"]
+    assert shots[0]["zero_story_time_source_event_ids"] == []
 
 
 def test_storyboard_story_clock_is_capped_but_generated_ratio_is_advisory():
@@ -1251,7 +1853,7 @@ def test_continuity_policy_preserves_seven_content_beats_in_two_long_shots():
 
     assert plan["action_capacity_status"] == "screenplay_compression_required"
     assert plan["primary_shots"] == 2
-    assert layout["schema"] == "honcut.primary-shot-layout.v1"
+    assert layout["schema"] == engine.PRIMARY_SHOT_LAYOUT_SCHEMA
     assert layout["shot_policy"] == "continuity"
     assert layout["story_duration_allocations_s"] == [18, 18]
     assert layout["content_beat_counts"] == [4, 3]
@@ -1338,6 +1940,398 @@ def test_continuity_policy_preserves_seven_content_beats_in_two_long_shots():
     ) == 14
 
 
+def test_duration_scaling_allows_one_event_to_cross_asymmetric_primary_shots():
+    """A sub-capacity event may continue across the persisted [8, 6] ledger.
+
+    Regression for 26-08-27_01: the vector-aware DP found the exact 14-unit
+    production plan, then the legacy scalar verifier treated event 6 as an
+    indivisible five-unit block and incorrectly demanded a third Sxx.
+    """
+
+    action_counts = [2, 0, 7, 4, 6, 5, 5, 5]
+    roles = [
+        "scene_setup",
+        "character_state",
+        "action_chain",
+        "action_chain",
+        "action_chain",
+        "turning_point",
+        "action_chain",
+        "consequence",
+    ]
+    events = [
+        {
+            "sequence_id": "SEQ001",
+            "continuity_before": "cut" if event_id == 1 else "continuous",
+            "event_role": role,
+            "micro_actions": [
+                f"事件{event_id}动作{action_id}"
+                for action_id in range(1, action_count + 1)
+            ],
+        }
+        for event_id, (action_count, role) in enumerate(
+            zip(action_counts, roles, strict=True),
+            1,
+        )
+    ]
+
+    production_events, scaled = engine._build_duration_scaled_event_plan(
+        events,
+        target_duration=36,
+        beat_count=2,
+        effective_shot_duration=18,
+        capabilities=engine.get_video_capabilities(),
+        max_generation_units_per_beat=8,
+        maximum_total_generation_units=14,
+        generation_unit_capacities_per_beat=[8, 6],
+    )
+
+    assert scaled["generation_action_unit_capacities_per_beat"] == [8, 6]
+    assert scaled["production_generation_action_units"] == 14
+    assert [
+        record["production_generation_action_units"]
+        for record in scaled["events"]
+    ] == [1, 0, 1, 1, 1, 5, 1, 4]
+    assert len(production_events) == 8
+    assert scaled["source_event_generation_unit_counts_per_beat"] == [
+        {"1": 1, "3": 1, "4": 1, "5": 1, "6": 4},
+        {"6": 1, "7": 1, "8": 4},
+    ]
+
+
+def test_canonical_skeleton_consumes_asymmetric_vector_without_legacy_repacking(
+    monkeypatch,
+):
+    """Regression for real run _12: valid [8, 6] must remain two Sxx."""
+    action_counts = [1, 0, 1, 1, 1, 5, 1, 4]
+    roles = [
+        "scene_setup",
+        "character_state",
+        "action_chain",
+        "action_chain",
+        "action_chain",
+        "turning_point",
+        "action_chain",
+        "consequence",
+    ]
+    events = [
+        {
+            "sequence_id": "SEQ001",
+            "continuity_before": "cut" if event_id == 1 else "continuous",
+            "event_role": role,
+            "where": "未来列车车厢",
+            "what": f"事件{event_id}的可见因果结果",
+            "micro_actions": [
+                f"事件{event_id}动作{action_id}"
+                for action_id in range(1, action_count + 1)
+            ],
+        }
+        for event_id, (action_count, role) in enumerate(
+            zip(action_counts, roles, strict=True),
+            1,
+        )
+    ]
+    capacity_plan = engine._estimate_action_capacity_plan(
+        events,
+        36,
+        6,
+        shot_policy="continuity",
+    )
+    layout = capacity_plan["primary_shot_layout"]
+    production_events, scaled = engine._build_duration_scaled_event_plan(
+        events,
+        target_duration=36,
+        beat_count=2,
+        effective_shot_duration=18,
+        capabilities=engine.get_video_capabilities(),
+        max_generation_units_per_beat=8,
+        maximum_total_generation_units=14,
+        generation_unit_capacities_per_beat=[8, 6],
+    )
+    binding = engine._bind_action_timeline_to_primary_layout(
+        production_events,
+        scaled,
+        layout,
+        engine.get_video_capabilities(),
+    )
+    response = {
+        "strategy": "以两个连续长镜承载完整因果链",
+        "beats": [
+            {
+                "beat_order": 1,
+                "shot_size": "medium_wide",
+                "camera_angle": "eye_level",
+                "camera_movement": "dolly_in",
+                "lighting_key": "neon",
+                "shot_intent": "establishing",
+                "hero_moment": False,
+                "texture_keywords": ["湿润金属", "冷蓝反射"],
+            },
+            {
+                "beat_order": 2,
+                "shot_size": "medium_close",
+                "camera_angle": "low",
+                "camera_movement": "tracking_front",
+                "lighting_key": "low_key",
+                "shot_intent": "action",
+                "hero_moment": True,
+                "texture_keywords": ["金属火花", "高速窗景"],
+            },
+        ],
+    }
+    monkeypatch.setattr(
+        engine,
+        "_sequence_beat_plan",
+        lambda *_args, **_kwargs: pytest.fail(
+            "current canonical runs must not call the legacy scalar packer"
+        ),
+    )
+    monkeypatch.setattr(
+        engine,
+        "_call_llm_with_timeout_retry",
+        lambda *_args, **_kwargs: json.dumps(response, ensure_ascii=False),
+    )
+
+    skeleton = engine._build_beat_skeleton(
+        production_events,
+        "",
+        36,
+        18,
+        2,
+        None,
+        max_generation_units_per_beat=8,
+        generation_unit_capacities_per_beat=[8, 6],
+        duration_scaled_event_plan=scaled,
+        timeline_layout_binding=binding,
+    )
+
+    assert skeleton["canonical_layout_source"] == (
+        engine.DURATION_SCALED_EVENT_PLAN_SCHEMA
+    )
+    assert engine._beat_generation_unit_loads(
+        skeleton["beats"], production_events
+    ) == [8, 6]
+    assert skeleton["beats"][0]["source_event_generation_unit_counts"] == {
+        "1": 1,
+        "2": 0,
+        "3": 1,
+        "4": 1,
+        "5": 1,
+        "6": 4,
+    }
+    assert skeleton["beats"][1]["source_event_generation_unit_counts"] == {
+        "6": 1,
+        "7": 1,
+        "8": 4,
+    }
+    assert 6 in skeleton["beats"][0]["source_events"]
+    assert 6 in skeleton["beats"][1]["source_events"]
+    assert binding["zero_story_time_attachments"] == [
+        {
+            "source_event_id": 2,
+            "sequence_id": "SEQ001",
+            "sxx_id": "S001",
+            "anchor_source_event_id": 3,
+            "attachment_rule": "nearest_next_execution_event",
+            "consumes_temporal_capacity": False,
+        }
+    ]
+
+
+def test_canonical_camera_model_cannot_rewrite_source_layout_fields():
+    response = json.dumps(
+        {
+            "beats": [
+                {
+                    "beat_order": 1,
+                    "source_events": [99],
+                    "shot_size": "medium",
+                    "camera_angle": "eye_level",
+                    "camera_movement": "static",
+                    "lighting_key": "natural",
+                    "shot_intent": "establishing",
+                    "hero_moment": False,
+                    "texture_keywords": ["金属", "玻璃"],
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+    with pytest.raises(ValueError, match="不得改写 canonical beat"):
+        engine._parse_canonical_beat_language(response, 1)
+
+
+def test_zero_story_time_only_sequence_distributes_facts_across_canonical_sxx():
+    events = [
+        {
+            "sequence_id": "SEQ001",
+            "event_role": "scene_setup",
+            "what": f"持续环境事实{event_id}",
+            "micro_actions": [],
+        }
+        for event_id in range(1, 7)
+    ]
+    capacity_plan = engine._estimate_action_capacity_plan(
+        events,
+        45,
+        15,
+        shot_policy="cut-driven",
+    )
+    layout = capacity_plan["primary_shot_layout"]
+    production_events, duration_plan = engine._build_duration_scaled_event_plan(
+        events,
+        target_duration=45,
+        beat_count=3,
+        effective_shot_duration=15,
+        capabilities=engine.get_video_capabilities(),
+        max_generation_units_per_beat=layout[
+            "max_generation_action_units_per_primary_shot"
+        ],
+        maximum_total_generation_units=layout["production_action_unit_target"],
+        generation_unit_capacities_per_beat=list(
+            layout["generation_action_unit_capacities"]
+        ),
+    )
+
+    binding = engine._bind_action_timeline_to_primary_layout(
+        production_events,
+        duration_plan,
+        layout,
+        engine.get_video_capabilities(),
+    )
+    contracts = engine._canonical_beat_contracts(
+        production_events,
+        duration_plan,
+        binding,
+    )
+
+    assert [
+        contract["zero_story_time_source_event_ids"]
+        for contract in contracts
+    ] == [[1, 2], [3, 4], [5, 6]]
+    assert {
+        attachment["attachment_rule"]
+        for attachment in binding["zero_story_time_attachments"]
+    } == {"sequence_source_order_distribution"}
+
+
+def test_duration_scaling_rewrites_a_complete_dependency_chain_without_loss():
+    event = {
+        "sequence_id": "SEQ001",
+        "continuity_before": "cut",
+        "event_role": "action_chain",
+        "micro_actions": [
+            "敌人冲刺逼近",
+            "敌人横向挥砍",
+            "男子后仰闪避",
+            "男子抓住扶手旋转脱离",
+        ],
+        "action_temporal_relations": [
+            {
+                "micro_action_index": 1,
+                "performers": ["敌人"],
+                "targets": ["男子"],
+                "action_kind": "locomotion",
+                "temporal_relation": "root",
+                "reference_action_indexes": [],
+                "pace": "fast",
+                "state_reads": ["敌人在车厢内"],
+                "state_writes": ["敌人进入挥砍距离"],
+            },
+            {
+                "micro_action_index": 2,
+                "performers": ["敌人"],
+                "targets": ["男子"],
+                "action_kind": "attack",
+                "temporal_relation": "after",
+                "reference_action_indexes": [1],
+                "pace": "fast",
+                "state_reads": ["敌人进入挥砍距离"],
+                "state_writes": ["能量刃横向扫过"],
+            },
+            {
+                "micro_action_index": 3,
+                "performers": ["男子"],
+                "targets": ["能量刃"],
+                "action_kind": "defense",
+                "temporal_relation": "reaction_overlap",
+                "reference_action_indexes": [2],
+                "pace": "fast",
+                "state_reads": ["能量刃横向扫来"],
+                "state_writes": ["男子后仰避开刀锋"],
+            },
+            {
+                "micro_action_index": 4,
+                "performers": ["男子"],
+                "targets": ["车门扶手"],
+                "action_kind": "control",
+                "temporal_relation": "after",
+                "reference_action_indexes": [3],
+                "pace": "fast",
+                "state_reads": ["男子处于后仰闪避终态"],
+                "state_writes": ["男子借扶手旋转脱离攻击线"],
+            },
+        ],
+    }
+
+    production_events, scaled = engine._build_duration_scaled_event_plan(
+        [event],
+        target_duration=6,
+        beat_count=1,
+        effective_shot_duration=6,
+        capabilities=engine.get_video_capabilities(),
+        max_generation_units_per_beat=2,
+        maximum_total_generation_units=2,
+        generation_unit_capacities_per_beat=[2],
+    )
+
+    assert scaled["production_generation_action_units"] == 2
+    assert len(production_events[0]["micro_actions"]) == 2
+    rewrite = production_events[0]["production_action_rewrite"]
+    assert rewrite["omitted_source_micro_action_indexes"] == []
+    assert [
+        group["source_micro_action_indexes"] for group in rewrite["groups"]
+    ] == [[1, 2, 3], [4]]
+    assert {
+        index
+        for group in rewrite["groups"]
+        for index in group["source_micro_action_indexes"]
+    } == {1, 2, 3, 4}
+    production_timeline = build_action_timeline(
+        production_events,
+        max_motion_contributions_per_slice=2,
+    )
+    assert production_timeline["temporal_slice_count"] == 2
+
+
+def test_duration_scaling_keeps_zero_capacity_static_source_facts():
+    event = {
+        "sequence_id": "SEQ001",
+        "continuity_before": "cut",
+        "event_role": "character_state",
+        "micro_actions": ["男子始终握着透明六边形芯片"],
+    }
+
+    production_events, scaled = engine._build_duration_scaled_event_plan(
+        [event],
+        target_duration=6,
+        beat_count=1,
+        effective_shot_duration=6,
+        capabilities=engine.get_video_capabilities(),
+        max_generation_units_per_beat=2,
+        maximum_total_generation_units=2,
+        generation_unit_capacities_per_beat=[2],
+    )
+
+    assert scaled["production_generation_action_units"] == 0
+    assert production_events[0]["micro_actions"] == event["micro_actions"]
+    rewrite = production_events[0]["production_action_rewrite"]
+    assert rewrite["groups"] == []
+    assert rewrite["static_source_facts"] == event["micro_actions"]
+    assert rewrite["omitted_source_micro_action_indexes"] == []
+
+
 def _canonical_sha256(value):
     return hashlib.sha256(
         json.dumps(
@@ -1378,6 +2372,10 @@ def _long_shot_execution_fixture():
         },
     }
     shots = []
+    assignments = []
+    sxx_records = []
+    global_slice_order = 0
+    global_pxx_order = 0
     for shot_index, (duration, unit_count) in enumerate(
         zip([18, 18], [8, 6], strict=True),
         1,
@@ -1396,10 +2394,67 @@ def _long_shot_execution_fixture():
                 {
                     "unit_id": f"S{shot_index:02d}_GAU{unit_index:03d}",
                     "actions": [f"S{shot_index:02d}动作{unit_index}"],
+                    "source_event_id": 1,
                 }
                 for unit_index in range(1, unit_count + 1)
             ],
         })
+        pxx_records = []
+        for pxx_order in range(1, layout["content_beat_counts"][shot_index - 1] + 1):
+            global_pxx_order += 1
+            pxx_id = f"P{global_pxx_order:03d}"
+            assignment_ids = []
+            for _ in range(2):
+                global_slice_order += 1
+                assignment_id = f"TA{global_slice_order:03d}"
+                assignment_ids.append(assignment_id)
+                assignments.append({
+                    "assignment_id": assignment_id,
+                    "source_event_id": 1,
+                    "event_temporal_slice_order": global_slice_order,
+                    "source_temporal_slice_id": f"TS{global_slice_order:03d}",
+                    "source_micro_action_indexes": [global_slice_order],
+                    "contribution_micro_action_indexes": [global_slice_order],
+                    "effect_micro_action_indexes": [],
+                    "sustained_micro_action_indexes": [],
+                    "motion_load": 1,
+                    "pace_weight": 2,
+                    "performers": ["CHAR001"],
+                    "targets": [],
+                    "state_reads": [],
+                    "state_writes": [],
+                    "start_state": "",
+                    "end_state": f"完成动作{global_slice_order}",
+                    "sxx_id": f"S{shot_index:03d}",
+                    "pxx_id": pxx_id,
+                })
+            pxx_records.append({
+                "pxx_id": pxx_id,
+                "pxx_order_within_sxx": pxx_order,
+                "temporal_slice_capacity": 2,
+                "effective_story_duration_s": layout[
+                    "effective_story_durations_s"
+                ][shot_index - 1][pxx_order - 1],
+                "assigned_pace_weight": 4,
+                "assignment_ids": assignment_ids,
+            })
+        sxx_records.append({
+            "sxx_id": f"S{shot_index:03d}",
+            "sxx_order": shot_index,
+            "temporal_slice_capacity": unit_count,
+            "assigned_temporal_slice_count": unit_count,
+            "pxx": pxx_records,
+        })
+    screenplay_plan["timeline_layout_binding"] = {
+        "schema": ACTION_TIMELINE_SCHEMA,
+        "layout_schema": engine.PRIMARY_SHOT_LAYOUT_SCHEMA,
+        "duration_plan_schema": engine.DURATION_SCALED_EVENT_PLAN_SCHEMA,
+        "max_temporal_slices_per_content_beat": 2,
+        "max_motion_contributions_per_slice": 2,
+        "sxx": sxx_records,
+        "assignments": assignments,
+        "zero_story_time_attachments": [],
+    }
     return layout, screenplay_plan, shots
 
 
@@ -1419,11 +2474,15 @@ def test_primary_shot_handoff_binds_canonical_four_plus_three_layout():
 
     assert storyboard["primary_shot_layout"] == layout
     assert storyboard["primary_shot_execution"] == {
-        "schema": "honcut.primary-shot-execution-handoff.v1",
+        "schema": PRIMARY_SHOT_EXECUTION_HANDOFF_SCHEMA,
         "screenplay_plan_schema": engine.SCREENPLAY_PLAN_SCHEMA,
         "screenplay_plan_sha256": screenplay_plan_sha256,
-        "primary_shot_layout_schema": "honcut.primary-shot-layout.v1",
+        "primary_shot_layout_schema": engine.PRIMARY_SHOT_LAYOUT_SCHEMA,
         "primary_shot_layout_sha256": _canonical_sha256(layout),
+        "action_timeline_schema": ACTION_TIMELINE_SCHEMA,
+        "timeline_layout_binding_sha256": _canonical_sha256(
+            screenplay_plan["timeline_layout_binding"]
+        ),
     }
     assert [
         shot["storyboard_beat_count"] for shot in storyboard["shots"]
@@ -1436,6 +2495,97 @@ def test_primary_shot_handoff_binds_canonical_four_plus_three_layout():
         [beat["provider_request_duration_s"] for beat in shot["storyboard_beats"]]
         for shot in storyboard["shots"]
     ] == [[8, 6, 6, 6], [8, 6, 6]]
+    assert "secondary_storyboard_count_invalid" not in {
+        issue["code"]
+        for issue in run_generation_capacity_checks(
+            storyboard,
+            screenplay_plan=screenplay_plan,
+        )
+    }
+
+
+def test_timeline_handoff_accepts_audited_zero_story_time_attachment():
+    layout, screenplay_plan, shots = _long_shot_execution_fixture()
+    binding = screenplay_plan["timeline_layout_binding"]
+    shots[0]["source_events"].append(2)
+    shots[0]["source_event_generation_unit_counts"]["2"] = 0
+    binding["zero_story_time_attachments"] = [
+        {
+            "source_event_id": 2,
+            "sequence_id": "SEQ001",
+            "sxx_id": "S001",
+            "anchor_source_event_id": 1,
+            "attachment_rule": "nearest_previous_execution_event",
+            "consumes_temporal_capacity": False,
+        }
+    ]
+    binding["sxx"][0]["zero_story_time_source_event_ids"] = [2]
+
+    digest = beat_owner._validate_timeline_layout_binding(
+        shots,
+        binding,
+        layout,
+    )
+
+    assert digest == _canonical_sha256(binding)
+
+
+def test_primary_handoff_preserves_nonuniform_canonical_pxx_buckets():
+    layout, screenplay_plan, shots = _long_shot_execution_fixture()
+    layout["production_action_unit_target"] = 12
+    layout["objective_decision"]["selected_production_action_unit_target"] = 12
+    screenplay_plan["production_ledger"]["generation_action_units"] = 12
+    screenplay_plan["event_action_scaling"]["events"][0][
+        "production_generation_action_units"
+    ] = 12
+    for shot, unit_count in zip(shots, [7, 5], strict=True):
+        shot["micro_actions"] = shot["micro_actions"][:unit_count]
+        shot["generation_action_units"] = shot["generation_action_units"][:unit_count]
+        shot["source_event_generation_unit_counts"] = {"1": unit_count}
+
+    binding = screenplay_plan["timeline_layout_binding"]
+    assignment_by_id = {
+        item["assignment_id"]: item for item in binding["assignments"]
+    }
+    bucket_ids = [
+        [["TA001"], ["TA002", "TA003"], ["TA004", "TA005"], ["TA006", "TA007"]],
+        [["TA009", "TA010"], ["TA011"], ["TA012", "TA013"]],
+    ]
+    canonical_ids = []
+    for sxx, sxx_buckets in zip(binding["sxx"], bucket_ids, strict=True):
+        canonical_ids.extend(
+            assignment_id
+            for bucket in sxx_buckets
+            for assignment_id in bucket
+        )
+        sxx["assigned_temporal_slice_count"] = sum(map(len, sxx_buckets))
+        for pxx, assignment_ids in zip(sxx["pxx"], sxx_buckets, strict=True):
+            pxx["assignment_ids"] = assignment_ids
+            pxx["assigned_pace_weight"] = 2 * len(assignment_ids)
+            for assignment_id in assignment_ids:
+                assignment_by_id[assignment_id]["sxx_id"] = sxx["sxx_id"]
+                assignment_by_id[assignment_id]["pxx_id"] = pxx["pxx_id"]
+    binding["assignments"] = [assignment_by_id[item] for item in canonical_ids]
+
+    storyboard = {"delivery_target_duration": 36, "shots": shots}
+    bind_primary_shot_execution_plan(
+        storyboard,
+        screenplay_plan,
+        _canonical_sha256(screenplay_plan),
+        projected_layout=layout,
+        capacity_layout=layout,
+    )
+    plan_storyboard_beats(storyboard)
+
+    assert [
+        [len(beat["generation_action_units"]) for beat in shot["storyboard_beats"]]
+        for shot in storyboard["shots"]
+    ] == [[1, 2, 2, 2], [2, 1, 2]]
+    assert [
+        beat["timeline_assignment_ids"]
+        for shot in storyboard["shots"]
+        for beat in shot["storyboard_beats"]
+    ] == [bucket for sxx_buckets in bucket_ids for bucket in sxx_buckets]
 
 
 def test_primary_shot_handoff_rejects_per_shot_capacity_drift():
@@ -1778,7 +2928,7 @@ def test_screenplay_plan_v5_migrates_to_cut_driven_layout_deterministically():
 
     assert migrated["schema"] == engine.SCREENPLAY_PLAN_SCHEMA
     assert migrated["primary_shot_layout"]["schema"] == (
-        "honcut.primary-shot-layout.v1"
+        engine.PRIMARY_SHOT_LAYOUT_SCHEMA
     )
     assert migrated["primary_shot_layout"]["shot_policy"] == "cut-driven"
     assert migrated["primary_shot_layout"][
@@ -1943,7 +3093,7 @@ def test_continuity_storyboard_executes_four_ordered_pxx_without_action_loss():
         "delivery_target_duration": 18,
         "shot_policy": "continuity",
         "primary_shot_layout": {
-            "schema": "honcut.primary-shot-layout.v1",
+            "schema": engine.PRIMARY_SHOT_LAYOUT_SCHEMA,
             "shot_policy": "continuity",
             "primary_shots": 1,
             "story_duration_allocations_s": [18],
@@ -2164,9 +3314,12 @@ def test_60s_scaled_screenplay_reconciles_source_pressure_into_executable_ledger
     assert screenplay_plan["production_ledger"] == {
         "capacity_status": "fits_story_clock",
         "duration_scaling_status": "applied",
-        "event_action_scaling_schema": "honcut.duration-scaled-event-plan.v3",
-        "intra_event_scaling_applied": False,
-        "intra_event_omitted_micro_action_count": 0,
+        "event_action_scaling_schema": engine.DURATION_SCALED_EVENT_PLAN_SCHEMA,
+            "intra_event_scaling_applied": False,
+            "intra_event_omitted_micro_action_count": 0,
+            "source_fact_loss_count": 0,
+            "source_indexed_rewrite_schema": None,
+            "source_indexed_rewrite_event_count": 0,
         "event_count": 6,
         "generation_action_units": 36,
         "effective_story_duration_s": 60,
@@ -2224,7 +3377,7 @@ def test_duration_scaled_event_plan_fits_dense_mandatory_actions_without_mutatin
     )
 
     assert events == source_snapshot
-    assert scaling_plan["schema"] == "honcut.duration-scaled-event-plan.v3"
+    assert scaling_plan["schema"] == engine.DURATION_SCALED_EVENT_PLAN_SCHEMA
     assert scaling_plan["source_generation_action_units"] == 46
     assert scaling_plan["production_generation_action_units"] < 46
     assert scaling_plan["intra_event_scaling_applied"] is True
@@ -2233,11 +3386,26 @@ def test_duration_scaled_event_plan_fits_dense_mandatory_actions_without_mutatin
     assert mandatory_ids <= {
         item["source_event_id"] for item in scaling_plan["events"]
     }
-    assert any(
-        item["source_event_id"] in mandatory_ids
-        and item["omitted_source_micro_action_indexes"]
+    assert all(
+        item["omitted_source_micro_action_indexes"] == []
         for item in scaling_plan["events"]
     )
+    assert any(
+        item["source_event_id"] in mandatory_ids
+        and item["scaling"] == "rewrite"
+        for item in scaling_plan["events"]
+    )
+    for source_event, production_event in zip(
+        events,
+        production_events,
+        strict=True,
+    ):
+        rewrite = production_event["production_action_rewrite"]
+        assert {
+            index
+            for group in rewrite["groups"]
+            for index in group["source_micro_action_indexes"]
+        } == set(range(1, len(source_event["micro_actions"]) + 1))
     per_beat_capacity = engine._generation_unit_capacity_for_story_duration(
         effective_shot_duration,
         profile,
@@ -2635,7 +3803,7 @@ def test_screenplay_plan_records_intra_event_action_lineage():
 
     assert screenplay_plan["schema"] == engine.SCREENPLAY_PLAN_SCHEMA
     assert screenplay_plan["production_ledger"]["event_action_scaling_schema"] == (
-        "honcut.duration-scaled-event-plan.v3"
+        engine.DURATION_SCALED_EVENT_PLAN_SCHEMA
     )
     assert screenplay_plan["beats"][0]["production_action_refs"] == [{
         "source_event_id": 1,
@@ -2643,6 +3811,8 @@ def test_screenplay_plan_records_intra_event_action_lineage():
         "omitted_source_micro_action_indexes": scaling_plan["events"][0][
             "omitted_source_micro_action_indexes"
         ],
+        "production_action_rewrite_schema": None,
+        "source_micro_action_groups": [[1], [2], [3], [4]],
     }]
 
 

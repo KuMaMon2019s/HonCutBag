@@ -40,6 +40,37 @@ class BodyActionUnderstanding(StrictUnderstandingModel):
     end_pose: str
 
 
+class ActionTemporalRelationUnderstanding(StrictUnderstandingModel):
+    """Model-proposed temporal semantics for one immutable micro action."""
+
+    micro_action_index: int = Field(ge=1)
+    performers: list[str] = Field(default_factory=list)
+    targets: list[str] = Field(default_factory=list)
+    action_kind: Literal[
+        "locomotion",
+        "attack",
+        "defense",
+        "control",
+        "impact",
+        "state_change",
+        "environment_effect",
+        "sustained",
+    ]
+    temporal_relation: Literal[
+        "root",
+        "after",
+        "overlap",
+        "reaction_overlap",
+        "effect_of",
+        "sustained_during",
+    ]
+    reference_action_indexes: list[int] = Field(default_factory=list)
+    ensemble_id: str = ""
+    pace: Literal["fast", "normal", "slow"] = "normal"
+    state_reads: list[str] = Field(default_factory=list)
+    state_writes: list[str] = Field(default_factory=list)
+
+
 class EventUnderstanding(StrictUnderstandingModel):
     who: list[str]
     where: str
@@ -61,6 +92,9 @@ class EventUnderstanding(StrictUnderstandingModel):
     source_excerpt: str = ""
     micro_actions: list[str] = Field(default_factory=list)
     body_action_choreography: list[BodyActionUnderstanding] = Field(
+        default_factory=list
+    )
+    action_temporal_relations: list[ActionTemporalRelationUnderstanding] = Field(
         default_factory=list
     )
     generation_motion_mode: Literal["none", "atomic", "composite"] = "none"
@@ -116,6 +150,33 @@ class DurationScaledActionSelectionBatch(StrictUnderstandingModel):
         "honcut.duration-scaled-action-selection.v1"
     ] = Field(alias="schema", serialization_alias="schema")
     events: list[DurationScaledActionSelectionUnderstanding]
+
+
+class SourceIndexedScreenplayRewriteActionUnderstanding(
+    StrictUnderstandingModel
+):
+    production_action_index: int = Field(ge=1)
+    source_micro_action_indexes: list[int]
+    rewritten_micro_action: str
+
+
+class SourceIndexedScreenplayRewriteEventUnderstanding(
+    StrictUnderstandingModel
+):
+    source_event_id: int = Field(ge=1)
+    production_actions: list[
+        SourceIndexedScreenplayRewriteActionUnderstanding
+    ]
+    narrative_purpose: str
+    emotional_beat: str
+    director_alignment: str
+
+
+class SourceIndexedScreenplayRewriteBatch(StrictUnderstandingModel):
+    rewrite_schema: Literal[
+        "honcut.source-indexed-screenplay-rewrite.v1"
+    ] = Field(alias="schema", serialization_alias="schema")
+    events: list[SourceIndexedScreenplayRewriteEventUnderstanding]
 
 
 class CharacterVariantUnderstanding(StrictUnderstandingModel):
@@ -535,6 +596,7 @@ __all__ = [
     "CharacterReferenceUnderstanding",
     "DirectorPlanUnderstanding",
     "DurationScaledActionSelectionBatch",
+    "SourceIndexedScreenplayRewriteBatch",
     "FirstFrameUnderstanding",
     "IdentityDetailUnderstanding",
     "EventUnderstandingBatch",

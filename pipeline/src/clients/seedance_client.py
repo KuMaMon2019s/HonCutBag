@@ -28,6 +28,10 @@ SUBMIT_ENDPOINT = TASKS_ENDPOINT
 POLL_ENDPOINT = TASK_ENDPOINT
 SEEDANCE_RESOLUTIONS = {"480p", "720p", "1080p", "4k"}
 SEEDANCE_FAST_RESOLUTIONS = {"480p", "720p"}
+SEEDANCE_MIN_OUTPUT_DURATION_S = 4
+SEEDANCE_MAX_OUTPUT_DURATION_S = 15
+SEEDANCE_MAX_REFERENCE_IMAGES = 9
+SEEDANCE_MAX_REFERENCE_VIDEOS = 3
 
 
 def resolution_for_media_profile(media_profile: str, model: str) -> str:
@@ -76,8 +80,22 @@ def _response_json(response: requests.Response, operation: str) -> dict:
     return payload
 
 
-def _validate_content_media_roles(content: list[dict]) -> None:
+def _validate_content_media_roles(
+    content: list[dict],
+    *,
+    duration: int | None = None,
+    ratio: str | None = None,
+) -> None:
     """Reject Seedance media-role combinations that Ark cannot accept."""
+    if duration is not None and not (
+        SEEDANCE_MIN_OUTPUT_DURATION_S
+        <= duration
+        <= SEEDANCE_MAX_OUTPUT_DURATION_S
+    ):
+        raise ValueError(
+            "Seedance output duration must be within "
+            f"{SEEDANCE_MIN_OUTPUT_DURATION_S}..{SEEDANCE_MAX_OUTPUT_DURATION_S} seconds"
+        )
     frame_roles = {
         item.get("role")
         for item in content
@@ -94,6 +112,40 @@ def _validate_content_media_roles(content: list[dict]) -> None:
             "Seedance content cannot mix first/last frame control with reference "
             f"media (frame_roles={sorted(frame_roles)}, "
             f"reference_roles={sorted(reference_roles)})"
+        )
+    first_frames = [
+        item
+        for item in content
+        if item.get("type") == "image_url" and item.get("role") == "first_frame"
+    ]
+    last_frames = [
+        item
+        for item in content
+        if item.get("type") == "image_url" and item.get("role") == "last_frame"
+    ]
+    if len(first_frames) > 1 or len(last_frames) > 1:
+        raise ValueError("Seedance first/last-frame input accepts at most one endpoint per role")
+    if last_frames and not first_frames:
+        raise ValueError("Seedance last_frame requires one first_frame endpoint")
+    if last_frames and ratio != "adaptive":
+        raise ValueError("Seedance first/last-frame generation requires ratio=adaptive")
+    reference_images = sum(
+        item.get("type") == "image_url" and item.get("role") == "reference_image"
+        for item in content
+    )
+    reference_videos = sum(
+        item.get("type") == "video_url" and item.get("role") == "reference_video"
+        for item in content
+    )
+    if reference_images > SEEDANCE_MAX_REFERENCE_IMAGES:
+        raise ValueError(
+            "Seedance 2.x all-modal input accepts at most "
+            f"{SEEDANCE_MAX_REFERENCE_IMAGES} reference images"
+        )
+    if reference_videos > SEEDANCE_MAX_REFERENCE_VIDEOS:
+        raise ValueError(
+            "Seedance 2.x all-modal/extension input accepts at most "
+            f"{SEEDANCE_MAX_REFERENCE_VIDEOS} reference videos"
         )
     for item in content:
         media_type = item.get("type")
@@ -254,7 +306,7 @@ def _submit_direct(
             "role": "reference_video",
         })
 
-    _validate_content_media_roles(content)
+    _validate_content_media_roles(content, duration=duration, ratio=ratio)
 
     # ALL params at top level — CRITICAL
     payload = {
@@ -286,13 +338,16 @@ def submit_content(
     resolution: str = "480p",
     seed: int = None,
     generate_audio: Optional[bool] = None,
+    return_last_frame: bool = False,
     timeout: float = 30,
 ) -> str:
     """Submit a preassembled ARK Agent Plan content array. Returns task_id."""
     resolution = resolution_for_media_profile(resolution, model)
     if generate_audio is not None and not isinstance(generate_audio, bool):
         raise ValueError("Agent Plan generate_audio must be a boolean")
-    _validate_content_media_roles(content)
+    if not isinstance(return_last_frame, bool):
+        raise ValueError("Agent Plan return_last_frame must be a boolean")
+    _validate_content_media_roles(content, duration=duration, ratio=ratio)
     prompt = "\n".join(
         str(item.get("text") or "")
         for item in content
@@ -314,6 +369,8 @@ def submit_content(
         "resolution": resolution,
         "watermark": False,
     }
+    if return_last_frame:
+        payload["return_last_frame"] = True
     if seed is not None:
         payload["seed"] = seed
 
@@ -341,14 +398,29 @@ def build_video_extension_content(
         print(f"  [seedance] IP filter: removed {filtered_terms}")
     if not reference_video_url:
         raise ValueError("reference_video_url is required for video extension")
-    content: list[dict] = [{"type": "text", "text": sanitized_prompt}]
+    numbered_images = [url for url in (reference_image_urls or []) if url]
+    reference_contract = ""
+    if numbered_images:
+        labels = "、".join(
+            f"图片{index}" for index in range(1, len(numbered_images) + 1)
+        )
+        reference_contract = (
+            f"{labels}只作为身份、场景、构图和连续状态参考。"
+        )
+    directive = (
+        "向后延长视频1；新内容必须从视频1真实尾部状态继续，不得重播、"
+        "重置或让主体重新入画。"
+    )
+    content: list[dict] = [
+        {"type": "text", "text": f"{directive}{reference_contract}{sanitized_prompt}"}
+    ]
     content.extend(
         {
             "type": "image_url",
             "image_url": {"url": url},
             "role": "reference_image",
         }
-        for url in (reference_image_urls or [])
+        for url in numbered_images
         if url
     )
     content.append({
@@ -394,6 +466,7 @@ def submit_video_extension(
         resolution=resolution,
         seed=seed,
         generate_audio=generate_audio,
+        return_last_frame=True,
     )
 
 

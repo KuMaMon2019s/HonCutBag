@@ -268,6 +268,7 @@ def run_generation_capacity_checks(
             )
             expected_modes: list[str] = []
             bridge_required = False
+            allowed_content_beats = 3
             if uses_secondary_contract:
                 try:
                     requirement = secondary_storyboard_requirements(
@@ -280,6 +281,9 @@ def run_generation_capacity_checks(
                 if requirement is not None:
                     bridge_required = requirement["bridge_required"]
                     expected_modes = list(requirement["modes"])
+                    allowed_content_beats = int(
+                        requirement["max_content_beats"]
+                    )
                 actual_modes = [
                     str(beat.get("generation_mode") or "").strip().lower()
                     for beat in storyboard_beats
@@ -292,11 +296,16 @@ def run_generation_capacity_checks(
                         [sid], expected_modes=expected_modes, observed_modes=actual_modes,
                         bridge_required=bridge_required,
                     ))
-            if uses_secondary_contract and not 1 <= len(storyboard_beats) <= 3:
+            if (
+                uses_secondary_contract
+                and not 1 <= len(storyboard_beats) <= allowed_content_beats
+            ):
                 issues.append(_issue(
                     "L1", "severe", "secondary_storyboard_count_invalid",
-                    f"{sid} must contain one to three capacity/boundary-selected Pxx beats",
+                    f"{sid} must contain one to {allowed_content_beats} "
+                    "capacity-selected Pxx beats",
                     [sid], observed_count=len(storyboard_beats),
+                    allowed_count=allowed_content_beats,
                 ))
             for position, beat in enumerate(storyboard_beats, 1):
                 beat_id = str(beat.get("beat_id") or f"{sid}_P{position:02d}")
@@ -367,12 +376,12 @@ def run_generation_capacity_checks(
                     beat_generation_units = normalize_action_units(
                         [str(value) for value in micro_actions if str(value).strip()]
                     )["generation_action_units"]
-                if len(beat_generation_units) > profile.max_micro_actions_per_beat:
+                if len(beat_generation_units) > profile.temporal_slice_limit:
                     issues.append(_issue(
                         "L1", "severe", "storyboard_beat_generation_action_overload",
                         f"{beat_id} exceeds {profile.name}'s normalized generation-action "
                         "capacity "
-                        f"({profile.max_micro_actions_per_beat})",
+                        f"({profile.temporal_slice_limit})",
                         [sid], beat_id=beat_id,
                         generation_action_units=len(beat_generation_units),
                     ))
@@ -489,14 +498,14 @@ def run_generation_capacity_checks(
                 ))
 
         if (
-            len(shot_generation_units) > profile.max_micro_actions_per_beat
+            len(shot_generation_units) > profile.temporal_slice_limit
             and not storyboard_beats
         ):
             issues.append(_issue(
                 "L1", "severe", "generation_action_unit_overload",
                 f"{sid} contains {len(shot_generation_units)} normalized generation "
                 f"action units; {profile.name} supports "
-                f"{profile.max_micro_actions_per_beat} per beat",
+                f"{profile.temporal_slice_limit} per beat",
                 [sid], generation_action_units=len(shot_generation_units),
             ))
         if has_generation_action and not generation_actions and not storyboard_beats:

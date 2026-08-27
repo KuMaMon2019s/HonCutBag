@@ -22,6 +22,8 @@ class HonCutState(TypedDict, total=False):
     target_duration_s: int
     shot_duration_s: int
     shot_policy: str
+    max_material_padding_ratio: float
+    delivery_overrun_ratio: float
     dry_run: bool
     chain_mode: bool
     auto_approve: bool
