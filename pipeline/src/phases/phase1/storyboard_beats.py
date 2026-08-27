@@ -31,7 +31,7 @@ SECONDARY_GENERATION_MODES = frozenset({
     "first_last_frame_bridge",
 })
 MAX_CONTENT_BEATS = MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
-MAX_SECONDARY_BEATS = MAX_CONTENT_BEATS
+MAX_CONTINUITY_CONTENT_BEATS = 4
 SPOKEN_CHARACTERS_PER_SECOND = 4.0
 
 # Editorial policy, deliberately separate from provider/model capabilities.
@@ -605,6 +605,8 @@ def _content_beat_requirement(
     duration: float,
     actions: list[str],
     capabilities: VideoModelCapabilities,
+    *,
+    max_content_beats: int = MAX_CONTENT_BEATS,
 ) -> tuple[int, list[str]]:
     """Return the number of story-bearing clips required by provider capacity.
 
@@ -623,8 +625,8 @@ def _content_beat_requirement(
     tail_minimum, tail_maximum = capabilities.effective_duration_bounds(
         "tail_video_extend"
     )
-    duration_count = MAX_CONTENT_BEATS + 1
-    for candidate in range(1, MAX_CONTENT_BEATS + 1):
+    duration_count = max_content_beats + 1
+    for candidate in range(1, max_content_beats + 1):
         minimum = first_minimum + (candidate - 1) * tail_minimum
         maximum = first_maximum + (candidate - 1) * tail_maximum
         if minimum - 1e-6 <= duration <= maximum + 1e-6:
@@ -650,7 +652,7 @@ def _content_beat_requirement(
         reasons.append("p01_generation_action_unit_capacity_exceeded")
     if dialogue_count > 1:
         reasons.append("p01_spoken_content_capacity_exceeded")
-    if required > MAX_CONTENT_BEATS:
+    if required > max_content_beats:
         raise ValueError(
             f"{_shot_id(shot, 1)} cannot fit {len(actions)} micro-actions into "
             f"one base clip plus bounded extensions for {capabilities.name}: "
@@ -744,6 +746,7 @@ def required_content_beat_count(
     capabilities: VideoModelCapabilities | None = None,
     *,
     available_duration_s: float | None = None,
+    max_content_beats: int = MAX_CONTENT_BEATS,
 ) -> int:
     """Public deterministic capacity check shared by planning and Phase 5 QA."""
     profile = capabilities or capabilities_for(shot)
@@ -757,8 +760,30 @@ def required_content_beat_count(
         duration,
         _source_actions(shot),
         profile,
+        max_content_beats=max_content_beats,
     )
     return required
+
+
+def _storyboard_content_beat_limit(storyboard: dict[str, Any]) -> int:
+    """Read the current layout's explicit Pxx envelope without widening legacy runs."""
+    layout = storyboard.get("primary_shot_layout")
+    if not isinstance(layout, dict):
+        return MAX_CONTENT_BEATS
+    if str(layout.get("shot_policy") or "").strip().lower() != "continuity":
+        return MAX_CONTENT_BEATS
+    declared = layout.get("max_content_beats_per_primary_shot")
+    if isinstance(declared, bool) or not isinstance(declared, int):
+        counts = layout.get("content_beat_counts") or []
+        declared = max(
+            [value for value in counts if isinstance(value, int)]
+            or [MAX_CONTENT_BEATS]
+        )
+    if not MAX_CONTENT_BEATS <= declared <= MAX_CONTINUITY_CONTENT_BEATS:
+        raise ValueError(
+            "continuity primary-shot layout has an invalid content-beat limit"
+        )
+    return declared
 
 
 def _bridge_requirement(
@@ -792,6 +817,7 @@ def secondary_storyboard_requirements(
     if index < 0 or index >= len(shots):
         raise IndexError(f"secondary storyboard shot index out of range: {index}")
     shot = shots[index]
+    max_content_beats = _storyboard_content_beat_limit(storyboard)
     profile = capabilities or capabilities_for({**storyboard, **shot})
     sid = _shot_id(shot, index + 1)
     duration = float(shot.get("duration") or shot.get("suggested_duration") or 5)
@@ -824,6 +850,7 @@ def secondary_storyboard_requirements(
         content_duration,
         source_actions,
         profile,
+        max_content_beats=max_content_beats,
     )
     first_minimum, first_maximum = profile.effective_duration_bounds("multi_image")
     tail_minimum, tail_maximum = profile.effective_duration_bounds("tail_video_extend")
@@ -835,10 +862,10 @@ def secondary_storyboard_requirements(
         maximum_durations=[first_maximum] + [tail_maximum] * (content_count - 1),
     )
     modes = ["multi_image"] + ["tail_video_extend"] * (content_count - 1)
-    if len(modes) > MAX_SECONDARY_BEATS:
+    if len(modes) > max_content_beats:
         raise ValueError(
             f"{sid} requires {len(modes)} secondary beats, above the "
-            f"{MAX_SECONDARY_BEATS}-beat contract"
+            f"{max_content_beats}-beat contract"
         )
     return {
         "shot_id": sid,
@@ -848,6 +875,7 @@ def secondary_storyboard_requirements(
         "generation_action_units": generation_action_units,
         "content_duration": content_duration,
         "content_count": content_count,
+        "provider_capacity": max_content_beats,
         "content_durations": content_durations,
         "extension_required": content_count > 1,
         "extension_reasons": extension_reasons,
@@ -1394,7 +1422,7 @@ def plan_storyboard_beats(
         profile = capabilities or capabilities_for({**storyboard, **shot})
         requirement = secondary_storyboard_requirements(storyboard, index, profile)
         total_count = len(requirement["modes"])
-        provider_capacity = MAX_CONTENT_BEATS
+        provider_capacity = requirement["provider_capacity"]
         multi_story_bounds = profile.effective_duration_bounds("multi_image")
         tail_story_bounds = profile.effective_duration_bounds("tail_video_extend")
         multi_request_bounds = profile.request_duration_bounds("multi_image")

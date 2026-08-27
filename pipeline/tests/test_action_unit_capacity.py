@@ -308,6 +308,23 @@ def test_zero_cost_event_still_requires_one_primary_occurrence():
     assert engine._event_primary_occurrence_requirements([{}], profile) == {1: 1}
 
 
+def test_explicit_long_shot_unit_ledger_keeps_zero_cost_story_detail():
+    events = [{
+        "sequence_id": "SEQ001",
+        "micro_actions": ["露出轻松自然的笑容"],
+    }]
+    shots = [{
+        "source_events": [1],
+        "source_event_generation_unit_counts": {"1": 0},
+        "suggested_duration": 18,
+    }]
+
+    engine._inherit_event_semantics(shots, events)
+
+    assert shots[0]["micro_actions"] == ["露出轻松自然的笑容"]
+    assert shots[0]["generation_action_units"] == []
+
+
 # ── gate regression: 60s flash-mob script must pass ─────────────────────────
 
 
@@ -820,6 +837,7 @@ def test_layered_expansion_preserves_skeleton_shot_language(monkeypatch):
     beat = {
         "beat_order": 1,
         "source_events": [1],
+        "source_event_generation_unit_counts": {"1": 2},
         "action": "keep",
         "reason": "保留开场",
         "who": [],
@@ -879,6 +897,7 @@ def test_layered_expansion_preserves_skeleton_shot_language(monkeypatch):
         field: beat[field]
         for field in engine._SHOT_LANGUAGE_FIELDS
     }
+    assert shots[0]["source_event_generation_unit_counts"] == {"1": 2}
 
 
 def test_storyboard_story_clock_is_capped_but_generated_ratio_is_advisory():
@@ -1211,7 +1230,7 @@ def test_cut_driven_padding_rewrite_keeps_legacy_six_shot_result():
     assert rewrite_fingerprint != normal_fingerprint
 
 
-def test_continuity_policy_prefers_two_dense_18s_primary_shots():
+def test_continuity_policy_preserves_seven_content_beats_in_two_long_shots():
     events = [{
         "event_role": "action_chain",
         "sequence_id": "SEQ001",
@@ -1231,17 +1250,18 @@ def test_continuity_policy_prefers_two_dense_18s_primary_shots():
     assert layout["schema"] == "honcut.primary-shot-layout.v1"
     assert layout["shot_policy"] == "continuity"
     assert layout["story_duration_allocations_s"] == [18, 18]
-    assert layout["content_beat_counts"] == [3, 3]
-    assert layout["generation_action_unit_capacities"] == [6, 6]
-    assert layout["production_action_unit_target"] == 12
+    assert layout["content_beat_counts"] == [4, 3]
+    assert layout["generation_action_unit_capacities"] == [8, 6]
+    assert layout["production_action_unit_target"] == 14
+    assert layout["max_content_beats_per_primary_shot"] == 4
     assert layout["cross_sxx_boundary_count"] == 1
     assert layout["provider_request_durations_s"] == [
-        [8, 6, 6],
+        [8, 6, 6, 6],
         [8, 6, 6],
     ]
-    assert layout["projected_content_provider_request_duration_s"] == 40.0
-    assert layout["projected_content_provider_padding_duration_s"] == 4.0
-    assert layout["projected_padding_loss_rate"] == 0.1
+    assert layout["projected_content_provider_request_duration_s"] == 46.0
+    assert layout["projected_content_provider_padding_duration_s"] == 10.0
+    assert layout["projected_padding_loss_rate"] == pytest.approx(0.217391)
 
     production_events, scaled = engine._build_duration_scaled_event_plan(
         events,
@@ -1252,10 +1272,165 @@ def test_continuity_policy_prefers_two_dense_18s_primary_shots():
         max_generation_units_per_beat=layout[
             "max_generation_action_units_per_primary_shot"
         ],
+        maximum_total_generation_units=layout[
+            "production_action_unit_target"
+        ],
+        generation_unit_capacities_per_beat=layout[
+            "generation_action_unit_capacities"
+        ],
     )
 
-    assert scaled["production_generation_action_units"] == 12
+    assert scaled["production_generation_action_units"] == 14
     assert len(production_events) == 1
+    repaired = engine._repair_beat_action_capacity(
+        [
+            {
+                "beat_order": 1,
+                "source_events": [1],
+                "dropped_source_events": [],
+                "action": "keep",
+            },
+            {
+                "beat_order": 2,
+                "source_events": [1],
+                "dropped_source_events": [],
+                "action": "keep",
+            },
+        ],
+        production_events,
+        engine.get_video_capabilities(),
+        max_generation_units_per_beat=8,
+        material_duration=36,
+        generation_unit_capacities_per_beat=[8, 6],
+    )
+    assert engine._beat_generation_unit_loads(repaired, production_events) == [
+        8,
+        6,
+    ]
+    for index, (shot, duration) in enumerate(
+        zip(repaired, [18, 18], strict=True),
+        1,
+    ):
+        shot.update({
+            "id": f"S{index:02d}",
+            "shot_order": index,
+            "suggested_duration": duration,
+            "duration": duration,
+        })
+    engine._inherit_event_semantics(repaired, production_events)
+    assert [len(shot["generation_action_units"]) for shot in repaired] == [8, 6]
+    storyboard = {
+        "delivery_target_duration": 36,
+        "shot_policy": "continuity",
+        "primary_shot_layout": layout,
+        "shots": repaired,
+    }
+    plan_storyboard_beats(storyboard)
+    assert [shot["storyboard_beat_count"] for shot in repaired] == [4, 3]
+    assert sum(
+        len(beat["generation_action_units"])
+        for shot in repaired
+        for beat in shot["storyboard_beats"]
+    ) == 14
+
+
+def test_long_shot_repacking_keeps_every_continuous_story_event():
+    action_counts = [3, 0, 3, 5, 5, 4, 4, 4, 5, 5, 3, 2, 3]
+    roles = [
+        "scene_setup",
+        "character_state",
+        "action_chain",
+        "action_chain",
+        "action_chain",
+        "action_chain",
+        "action_chain",
+        "action_chain",
+        "turning_point",
+        "action_chain",
+        "character_state",
+        "turning_point",
+        "transition",
+    ]
+    events = [
+        {
+            "sequence_id": "SEQ001",
+            "continuity_before": "cut" if index == 1 else "continuous",
+            "event_role": role,
+            "micro_actions": [
+                f"事件{index}动作{action}"
+                for action in range(1, action_count + 1)
+            ],
+        }
+        for index, (action_count, role) in enumerate(
+            zip(action_counts, roles, strict=True),
+            1,
+        )
+    ]
+    layout = engine._estimate_action_capacity_plan(
+        events,
+        36,
+        6,
+        shot_policy="continuity",
+    )["primary_shot_layout"]
+
+    production_events, scaled = engine._build_duration_scaled_event_plan(
+        events,
+        target_duration=36,
+        beat_count=layout["primary_shots"],
+        effective_shot_duration=18,
+        capabilities=engine.get_video_capabilities(),
+        max_generation_units_per_beat=layout[
+            "max_generation_action_units_per_primary_shot"
+        ],
+        maximum_total_generation_units=layout[
+            "production_action_unit_target"
+        ],
+        generation_unit_capacities_per_beat=layout[
+            "generation_action_unit_capacities"
+        ],
+    )
+
+    assert layout["primary_shots"] == 2
+    assert layout["content_beat_counts"] == [4, 3]
+    assert scaled["production_generation_action_units"] == 14
+    assert scaled["generation_action_unit_capacities_per_beat"] == [8, 6]
+    assert scaled["mandatory_source_event_ids"] == list(range(1, 14))
+    assert all(
+        record["production_generation_action_units"] >= 1
+        for record in scaled["events"]
+        if record["source_generation_action_units"]
+    )
+    assert len(production_events) == 13
+    repaired = engine._repair_beat_action_capacity(
+        [
+            {
+                "beat_order": 1,
+                "source_events": list(range(1, 14)),
+                "dropped_source_events": [],
+                "action": "merge",
+            },
+            {
+                "beat_order": 2,
+                "source_events": [],
+                "dropped_source_events": [],
+                "action": "keep",
+            },
+        ],
+        production_events,
+        engine.get_video_capabilities(),
+        max_generation_units_per_beat=8,
+        material_duration=36,
+        generation_unit_capacities_per_beat=[8, 6],
+    )
+    loads = engine._beat_generation_unit_loads(repaired, production_events)
+    assert sum(loads) == 14
+    assert loads[0] <= 8
+    assert loads[1] <= 6
+    assert {
+        event_id
+        for beat in repaired
+        for event_id in beat["source_events"]
+    } == set(range(1, 14))
 
 
 def test_continuity_padding_rewrite_reuses_the_same_layout_solver():
@@ -1287,7 +1462,7 @@ def test_continuity_padding_rewrite_reuses_the_same_layout_solver():
 
     assert rewritten["primary_shots"] == 2
     assert rewritten["story_duration_allocations_s"] == [18, 18]
-    assert rewritten["content_beat_counts"] == [3, 3]
+    assert rewritten["content_beat_counts"] == [4, 3]
     assert rewritten["rewrite_attempt"] == 1
     assert rewritten["objective_decision"][
         "rewrite_replanned_with_shared_solver"
@@ -1482,6 +1657,49 @@ def test_long_primary_shot_dialogue_capacity_expands_inside_sxx():
         beat["effective_story_duration_s"]
         for beat in shot["storyboard_beats"]
     ) == 20
+
+
+def test_continuity_storyboard_executes_four_ordered_pxx_without_action_loss():
+    generation_units = [
+        {
+            "unit_id": f"GAU{index:03d}",
+            "actions": [f"动作{index}"],
+        }
+        for index in range(1, 9)
+    ]
+    storyboard = {
+        "delivery_target_duration": 18,
+        "shot_policy": "continuity",
+        "primary_shot_layout": {
+            "schema": "honcut.primary-shot-layout.v1",
+            "shot_policy": "continuity",
+            "content_beat_counts": [4],
+            "max_content_beats_per_primary_shot": 4,
+        },
+        "shots": [{
+            "id": "S01",
+            "duration": 18,
+            "micro_actions": [f"动作{index}" for index in range(1, 9)],
+            "generation_action_units": generation_units,
+        }],
+    }
+
+    plan_storyboard_beats(storyboard)
+
+    beats = storyboard["shots"][0]["storyboard_beats"]
+    assert [beat["beat_id"] for beat in beats] == [
+        "S01_P01",
+        "S01_P02",
+        "S01_P03",
+        "S01_P04",
+    ]
+    assert sum(len(beat["generation_action_units"]) for beat in beats) == 8
+    assert [beat["provider_request_duration_s"] for beat in beats] == [
+        8.0,
+        6.0,
+        6.0,
+        6.0,
+    ]
 
 
 def test_material_budget_rejects_content_padding_loss_above_25_percent():

@@ -87,6 +87,7 @@ SHOT_POLICIES = (
 )
 DEFAULT_SHOT_POLICY = SHOT_POLICY_CONTINUITY
 PRIMARY_SHOT_LAYOUT_SCHEMA = "honcut.primary-shot-layout.v1"
+MAX_CONTINUITY_CONTENT_BEATS_PER_PRIMARY_SHOT = 4
 from utils.camera_motion_contracts import (
     CAMERA_MOTION_PLANNING_INSTRUCTIONS,
     CAMERA_MOVEMENT_VALUES,
@@ -490,16 +491,18 @@ def estimate_action_aware_shot_count(
 def _minimum_primary_duration_for_units(
     generation_units: int,
     capabilities: VideoModelCapabilities,
+    *,
+    max_content_beats: int = MAX_CONTENT_BEATS_PER_PRIMARY_SHOT,
 ) -> int:
     """Return executable story time for one base clip plus its extensions."""
     content_beats = max(
         1,
         math.ceil(generation_units / capabilities.max_micro_actions_per_beat),
     )
-    if content_beats > MAX_CONTENT_BEATS_PER_PRIMARY_SHOT:
+    if content_beats > max_content_beats:
         raise ValueError(
             f"{generation_units} generation action units exceed one primary shot's "
-            f"{MAX_CONTENT_BEATS_PER_PRIMARY_SHOT}-clip capacity"
+            f"{max_content_beats}-clip capacity"
         )
     first_minimum, _ = capabilities.effective_duration_bounds("multi_image")
     tail_minimum, _ = capabilities.effective_duration_bounds("tail_video_extend")
@@ -512,13 +515,16 @@ def _minimum_primary_duration_for_units(
 def _generation_unit_capacity_for_story_duration(
     story_duration: float,
     capabilities: VideoModelCapabilities,
+    *,
+    max_content_beats: int = MAX_CONTENT_BEATS_PER_PRIMARY_SHOT,
 ) -> int:
     """Return the action-unit capacity that fits one Sxx story allocation."""
     content_beats = 0
-    for candidate in range(1, MAX_CONTENT_BEATS_PER_PRIMARY_SHOT + 1):
+    for candidate in range(1, max_content_beats + 1):
         if _minimum_primary_duration_for_units(
             candidate * capabilities.max_micro_actions_per_beat,
             capabilities,
+            max_content_beats=max_content_beats,
         ) <= story_duration + 1e-6:
             content_beats = candidate
     return max(1, content_beats) * capabilities.max_micro_actions_per_beat
@@ -848,13 +854,16 @@ def _build_primary_shot_layout_candidate(
     source_action_units: int,
     maximum_production_action_units: int,
     maximum_padding_loss_rate: float,
+    maximum_content_beats_per_primary_shot: int = (
+        MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
+    ),
 ) -> dict[str, Any] | None:
     beat_counts = _balanced_content_beat_counts(
         primary_shots,
         total_content_beats,
     )
     if any(
-        count < 1 or count > MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
+        count < 1 or count > maximum_content_beats_per_primary_shot
         for count in beat_counts
     ):
         return None
@@ -948,6 +957,9 @@ def _build_primary_shot_layout_candidate(
         "provider_request_durations_s": request_durations,
         "generation_action_unit_capacities": action_capacities,
         "max_generation_action_units_per_primary_shot": max(action_capacities),
+        "max_content_beats_per_primary_shot": int(
+            maximum_content_beats_per_primary_shot
+        ),
         "total_generation_action_unit_capacity": total_action_capacity,
         "production_action_unit_target": min(
             int(source_action_units),
@@ -989,14 +1001,26 @@ def _solve_primary_shot_layout(
     )
     maximum_shots = math.floor(float(target_duration) / minimum_story)
     candidates: list[dict[str, Any]] = []
-    maximum_production_action_units = max(
-        1,
-        math.floor(float(target_duration) / capabilities.min_unique_beat_s),
+    maximum_content_beats = (
+        MAX_CONTINUITY_CONTENT_BEATS_PER_PRIMARY_SHOT
+        if policy == SHOT_POLICY_CONTINUITY
+        else MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
+    )
+    # Continuity repacks the complete executable content ledger into longer
+    # Sxx containers.  Balanced retains the established story-clock cap; its
+    # requested shot count remains the editorial tie-breaker.
+    maximum_production_action_units = (
+        max(1, int(source_action_units))
+        if policy == SHOT_POLICY_CONTINUITY
+        else max(
+            1,
+            math.floor(float(target_duration) / capabilities.min_unique_beat_s),
+        )
     )
     for primary_shots in range(minimum_shots, maximum_shots + 1):
         for total_content_beats in range(
             primary_shots,
-            primary_shots * MAX_CONTENT_BEATS_PER_PRIMARY_SHOT + 1,
+            primary_shots * maximum_content_beats + 1,
         ):
             candidate = _build_primary_shot_layout_candidate(
                 target_duration=target_duration,
@@ -1007,6 +1031,7 @@ def _solve_primary_shot_layout(
                 source_action_units=source_action_units,
                 maximum_production_action_units=maximum_production_action_units,
                 maximum_padding_loss_rate=maximum_padding_loss_rate,
+                maximum_content_beats_per_primary_shot=maximum_content_beats,
             )
             if candidate is not None:
                 candidates.append(candidate)
@@ -1064,7 +1089,10 @@ def _solve_primary_shot_layout(
         "selected_production_action_unit_target": selected[
             "production_action_unit_target"
         ],
-        "story_clock_action_unit_limit": maximum_production_action_units,
+        "story_clock_action_unit_limit": selected[
+            "total_generation_action_unit_capacity"
+        ],
+        "source_action_unit_count": int(source_action_units),
     }
     return selected
 
@@ -1292,6 +1320,9 @@ def _resolve_padding_rewrite_layout(
                 "primary_shots": primary_shots,
                 "story_duration_allocations_s": allocations,
                 "content_beat_counts": [1] * primary_shots,
+                "max_content_beats_per_primary_shot": (
+                    MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
+                ),
                 "effective_story_durations_s": [
                     [duration] for duration in allocations
                 ],
@@ -1334,12 +1365,16 @@ def _event_primary_occurrence_requirement(
     event: Dict[str, Any],
     capabilities: VideoModelCapabilities,
     seen: Optional[set] = None,
+    *,
+    max_content_beats_per_primary_shot: int = (
+        MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
+    ),
 ) -> int:
     """Return how many primary shots an event needs under the one-extension rule."""
     content_beats = _event_content_beat_requirement(event, capabilities, seen=seen)
     return max(
         1,
-        math.ceil(content_beats / MAX_CONTENT_BEATS_PER_PRIMARY_SHOT),
+        math.ceil(content_beats / max_content_beats_per_primary_shot),
     )
 
 
@@ -1400,6 +1435,10 @@ def _event_content_beat_requirements(
 def _event_primary_occurrence_requirements(
     events: List[Dict[str, Any]],
     capabilities: VideoModelCapabilities,
+    *,
+    max_content_beats_per_primary_shot: int = (
+        MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
+    ),
 ) -> Dict[int, int]:
     content = _event_content_beat_requirements(events, capabilities)
     return {
@@ -1408,7 +1447,7 @@ def _event_primary_occurrence_requirements(
         # generation action capacity.
         event_id: max(
             1,
-            math.ceil(beats / MAX_CONTENT_BEATS_PER_PRIMARY_SHOT),
+            math.ceil(beats / max_content_beats_per_primary_shot),
         )
         for event_id, beats in content.items()
     }
@@ -1460,6 +1499,10 @@ def normalize_shot_durations(
     shots: List[Dict[str, Any]],
     target_duration: int,
     capabilities: VideoModelCapabilities | None = None,
+    *,
+    max_content_beats_per_primary_shot: int = (
+        MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
+    ),
 ) -> List[Dict[str, Any]]:
     """Assign exact seconds, giving dense action/dialogue enough Pxx capacity."""
     if not shots:
@@ -1496,7 +1539,7 @@ def normalize_shot_durations(
         ) if generation_unit_count else 1
         spoken_beats = math.ceil(spoken / profile.max_unique_beat_s) if spoken else 1
         content_beats = max(1, action_beats, spoken_beats)
-        if content_beats > MAX_CONTENT_BEATS_PER_PRIMARY_SHOT:
+        if content_beats > max_content_beats_per_primary_shot:
             raise ValueError(
                 f"a primary shot requires {content_beats} story-bearing clips for "
                 f"{profile.name}; split the source event before duration allocation"
@@ -2337,6 +2380,27 @@ def _inherit_event_semantics(
             if event_id in event_by_id:
                 event_occurrences.setdefault(event_id, []).append(shot_index)
 
+    # Capture the actionable keys owned by earlier source events once.  Every
+    # slice of the same event receives the same snapshot, so a deliberate
+    # repeated action split across two shots is preserved while a later event's
+    # exact repeat is still classified as a cross-event duplicate.
+    seen_before_event: Dict[int, set[str]] = {}
+    preceding_event_keys: set[str] = set()
+    for event_id, event in event_by_id.items():
+        seen_before_event[event_id] = set(preceding_event_keys)
+        event_actions = event.get("micro_actions") or []
+        if isinstance(event_actions, str):
+            event_actions = [event_actions]
+        normalize_event_action_units(
+            event,
+            actions=[
+                str(action).strip()
+                for action in event_actions
+                if str(action).strip()
+            ],
+            seen=preceding_event_keys,
+        )
+
     event_slices: Dict[tuple[int, int], Dict[str, Any]] = {}
     for event_id, occurrence_shots in event_occurrences.items():
         event = event_by_id[event_id]
@@ -2345,13 +2409,90 @@ def _inherit_event_semantics(
             for action in (event.get("micro_actions") or [])
             if str(action).strip()
         ]
-        base, remainder = divmod(len(actions), len(occurrence_shots))
-        cursor = 0
+        normalized_event = normalize_event_action_units(
+            event,
+            actions=actions,
+            seen=set(seen_before_event[event_id]),
+        )
+        generation_units = normalized_event["generation_action_units"]
+        declared_counts = []
+        has_declared_counts = False
+        for shot_index in occurrence_shots:
+            raw_ledger = shots[shot_index].get(
+                "source_event_generation_unit_counts"
+            )
+            ledger = raw_ledger if isinstance(raw_ledger, dict) else {}
+            declared = ledger.get(str(event_id))
+            if declared is not None:
+                has_declared_counts = True
+            declared_counts.append(declared)
+        if has_declared_counts:
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                for value in declared_counts
+            ) or sum(declared_counts) != len(generation_units):
+                raise ValueError(
+                    f"event {event_id} has an invalid inherited generation-unit ledger"
+                )
+            unit_sizes = declared_counts
+            declared_action_indexes: list[list[int]] = []
+            unit_offset = 0
+            for size in unit_sizes:
+                selected_units = generation_units[
+                    unit_offset : unit_offset + size
+                ]
+                unit_offset += size
+                declared_action_indexes.append(sorted({
+                    int(index)
+                    for unit in selected_units
+                    for index in (unit.get("ledger_indexes") or [])
+                }))
+            owned_indexes = {
+                index
+                for indexes in declared_action_indexes
+                for index in indexes
+            }
+            # Sustained/duplicate constraints cost zero generation units, but
+            # remain authored semantic detail.  Attach each to the next
+            # visible action slice (or the final slice) without consuming Pxx
+            # capacity.
+            for action_index in range(len(actions)):
+                if action_index in owned_indexes:
+                    continue
+                owner = next(
+                    (
+                        occurrence
+                        for occurrence, indexes in enumerate(
+                            declared_action_indexes
+                        )
+                        if any(index >= action_index for index in indexes)
+                    ),
+                    len(declared_action_indexes) - 1,
+                )
+                declared_action_indexes[owner].append(action_index)
+            declared_action_indexes = [
+                sorted(indexes) for indexes in declared_action_indexes
+            ]
+        else:
+            base, remainder = divmod(len(actions), len(occurrence_shots))
+            unit_sizes = [None] * len(occurrence_shots)
+        action_cursor = 0
         previous_state = str(event.get("start_state") or "").strip()
         for occurrence, shot_index in enumerate(occurrence_shots):
-            size = base + (1 if occurrence < remainder else 0)
-            action_slice = actions[cursor : cursor + size]
-            cursor += size
+            if has_declared_counts:
+                action_slice = [
+                    actions[index]
+                    for index in declared_action_indexes[occurrence]
+                    if 0 <= index < len(actions)
+                ]
+            else:
+                size = base + (
+                    1 if occurrence < remainder else 0
+                )
+                action_slice = actions[action_cursor : action_cursor + size]
+                action_cursor += size
             is_last = occurrence == len(occurrence_shots) - 1
             if is_last:
                 end_state = str(event.get("end_state") or "").strip()
@@ -2367,23 +2508,6 @@ def _inherit_event_semantics(
                 "occurrence_count": len(occurrence_shots),
             }
             previous_state = end_state
-
-    # Capture the actionable keys owned by earlier source events once.  Every
-    # slice of the same event receives the same snapshot, so a deliberate
-    # repeated action split across two shots is preserved while a later event's
-    # exact repeat is still classified as a cross-event duplicate.
-    seen_before_event: Dict[int, set[str]] = {}
-    preceding_event_keys: set[str] = set()
-    for event_id, event in event_by_id.items():
-        seen_before_event[event_id] = set(preceding_event_keys)
-        event_actions = event.get("micro_actions") or []
-        if isinstance(event_actions, str):
-            event_actions = [event_actions]
-        normalize_event_action_units(
-            event,
-            actions=[str(action).strip() for action in event_actions if str(action).strip()],
-            seen=preceding_event_keys,
-        )
 
     previous_sequence_ids: List[str] = []
     for shot_index, shot in enumerate(shots):
@@ -2641,7 +2765,7 @@ BEAT_SKELETON_PROMPT = (
     + "【全局铁律】\n"
     "1. beats 数量必须恰好等于 {beat_count}，总建议时长应接近 {target_duration} 秒（±10%）；"
     "每个 beat 的 generation_action_unit_count 合计不得超过 "
-    "{max_generation_action_units_per_beat}。\n"
+    "{max_generation_action_units_per_beat}，且固定槽位中的 max_generation_action_units 是该 beat 的更精确硬上限。\n"
     "2. 每个输入事件编号必须进入 source_events 或 dropped_source_events；两者不得重叠。"
     "每个 beat 至少保留一个 source_event。非关键重复动作可显式删减，但 scene_setup、turning_point、"
     "dramatic_turn、consequence 必须保留。\n"
@@ -2653,6 +2777,7 @@ BEAT_SKELETON_PROMPT = (
     "5. beat 是导演级叙事镜头，不是单次视频调用。一个 beat 应承载一个内容完整的连续因果段，"
     "可以包含多个有序 action_unit；同一 sequence_id、同一时空、同一主体和因果链应优先合并，"
     "但必须完整保留 source_events 与 micro_actions 原顺序，后续会拆成 P01/P02…；不同 sequence_id、"
+    "减少一级 beat 数只允许把原有内容段依次装入这些 Pxx，禁止只保留前几个段落并裁掉后续剧情；"
     "换场/跳时、主体切换或真实导演硬切才新增 beat。turning_point 可与同 sequence 中紧邻的因果动作共用 beat，但必须明确"
     "保留转折。被保留事件在 beats 中的引用次数不得少于输入中的 "
     "minimum_kept_primary_beat_occurrences；同一事件的后续引用只承载尚未表现的动作，不得重放。\n"
@@ -2907,11 +3032,21 @@ def _validate_beat_action_capacity(
     beats: List[Dict[str, Any]],
     events: List[Dict[str, Any]],
     capabilities: VideoModelCapabilities | None = None,
+    *,
+    max_content_beats_per_primary_shot: int = (
+        MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
+    ),
 ) -> None:
     """Allow inner Pxx expansion while rejecting unrelated narrative merges."""
     profile = capabilities or get_video_capabilities()
     event_by_id = {i: event for i, event in enumerate(events, 1)}
-    occurrence_requirements = _event_primary_occurrence_requirements(events, profile)
+    occurrence_requirements = _event_primary_occurrence_requirements(
+        events,
+        profile,
+        max_content_beats_per_primary_shot=(
+            max_content_beats_per_primary_shot
+        ),
+    )
     dropped_event_ids = _dropped_source_event_ids(beats)
     kept_event_ids = {
         event_id
@@ -2963,10 +3098,11 @@ def _validate_beat_action_capacity(
             )
     content_loads = _beat_content_loads(beats, events, profile)
     for index, content_beats in enumerate(content_loads, 1):
-        if content_beats > MAX_CONTENT_BEATS_PER_PRIMARY_SHOT:
+        if content_beats > max_content_beats_per_primary_shot:
             raise ValueError(
                 f"beat {index} requires {content_beats} story-bearing clips for "
-                f"{profile.name}; maximum is {MAX_CONTENT_BEATS_PER_PRIMARY_SHOT}"
+                f"{profile.name}; maximum is "
+                f"{max_content_beats_per_primary_shot}"
             )
     for event_id, event in event_by_id.items():
         observed = sum(
@@ -3039,9 +3175,38 @@ def _beat_generation_unit_loads(
     generation_unit_counts = _event_generation_action_unit_counts(events)
     for event_id, occurrence_positions in positions.items():
         generation_unit_count = generation_unit_counts[event_id]
-        base, remainder = divmod(generation_unit_count, len(occurrence_positions))
-        for occurrence, beat_index in enumerate(occurrence_positions):
-            size = base + (1 if occurrence < remainder else 0)
+        declared = []
+        has_declared = False
+        for beat_index in occurrence_positions:
+            raw_ledger = beats[beat_index].get(
+                "source_event_generation_unit_counts"
+            )
+            ledger = raw_ledger if isinstance(raw_ledger, dict) else {}
+            value = ledger.get(str(event_id))
+            if value is not None:
+                has_declared = True
+            declared.append(value)
+        if has_declared:
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                for value in declared
+            ) or sum(declared) != generation_unit_count:
+                raise ValueError(
+                    f"event {event_id} has an invalid per-shot generation-unit ledger"
+                )
+            sizes = declared
+        else:
+            base, remainder = divmod(
+                generation_unit_count,
+                len(occurrence_positions),
+            )
+            sizes = [
+                base + (1 if occurrence < remainder else 0)
+                for occurrence in range(len(occurrence_positions))
+            ]
+        for beat_index, size in zip(occurrence_positions, sizes, strict=True):
             generation_units_by_beat[beat_index] += size
 
     return generation_units_by_beat
@@ -3288,6 +3453,8 @@ def _build_duration_scaled_event_plan(
     effective_shot_duration: int,
     capabilities: VideoModelCapabilities | None = None,
     max_generation_units_per_beat: int | None = None,
+    maximum_total_generation_units: int | None = None,
+    generation_unit_capacities_per_beat: list[int] | None = None,
 ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Create a source-linked production event ledger that fits beat slots.
 
@@ -3302,9 +3469,22 @@ def _build_duration_scaled_event_plan(
     if target_duration < 1 or beat_count < 1 or effective_shot_duration < 1:
         raise ValueError("duration-scaled event planning requires positive timing")
     profile = capabilities or get_video_capabilities()
+    layout_content_beat_limit = MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
+    if (
+        maximum_total_generation_units is not None
+        and max_generation_units_per_beat is not None
+    ):
+        layout_content_beat_limit = max(
+            MAX_CONTENT_BEATS_PER_PRIMARY_SHOT,
+            math.ceil(
+                int(max_generation_units_per_beat)
+                / profile.max_micro_actions_per_beat
+            ),
+        )
     per_beat_capacity = _generation_unit_capacity_for_story_duration(
         effective_shot_duration,
         profile,
+        max_content_beats=layout_content_beat_limit,
     )
     if max_generation_units_per_beat is not None:
         if (
@@ -3315,6 +3495,33 @@ def _build_duration_scaled_event_plan(
         per_beat_capacity = min(
             per_beat_capacity,
             int(max_generation_units_per_beat),
+        )
+    if generation_unit_capacities_per_beat is None:
+        per_beat_capacities = [per_beat_capacity] * beat_count
+    else:
+        if (
+            len(generation_unit_capacities_per_beat) != beat_count
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 1
+                or value > per_beat_capacity
+                for value in generation_unit_capacities_per_beat
+            )
+        ):
+            raise ValueError(
+                "generation-unit capacity ledger must match the primary shots"
+            )
+        per_beat_capacities = list(generation_unit_capacities_per_beat)
+    if maximum_total_generation_units is not None:
+        if (
+            isinstance(maximum_total_generation_units, bool)
+            or int(maximum_total_generation_units) < 0
+        ):
+            raise ValueError("total generation-unit capacity cannot be negative")
+        maximum_total_generation_units = min(
+            int(maximum_total_generation_units),
+            sum(per_beat_capacities),
         )
 
     source_contracts = _source_event_generation_contracts(events)
@@ -3429,8 +3636,8 @@ def _build_duration_scaled_event_plan(
     # Its state space is bounded by ``beat_count * per_beat_capacity`` rather
     # than by the number of action-count combinations.
     ScoreAndTargets = tuple[int, int, int, tuple[int, ...]]
-    packing_states: dict[tuple[int, int], ScoreAndTargets] = {
-        (0, 0): (0, 0, 0, ())
+    packing_states: dict[tuple[int, int, int], ScoreAndTargets] = {
+        (0, 0, 0): (0, 0, 0, ())
     }
     previous_sequence: str | None = None
     for event_id in mandatory_event_ids:
@@ -3443,31 +3650,51 @@ def _build_duration_scaled_event_plan(
             str(event.get("event_role") or "").strip().lower(),
             5,
         )
-        next_states: dict[tuple[int, int], ScoreAndTargets] = {}
-        for (occupied_beats, trailing_load), state in packing_states.items():
+        next_states: dict[tuple[int, int, int], ScoreAndTargets] = {}
+        for (
+            occupied_beats,
+            trailing_load,
+            selected_so_far,
+        ), state in packing_states.items():
             removed_so_far, weighted_so_far, relative_so_far, targets_so_far = state
             for target in range(source_count, minimum_target - 1, -1):
-                occurrence_count = max(1, math.ceil(target / per_beat_capacity))
-                base, remainder = divmod(target, occurrence_count)
-                chunks = [
-                    base + (1 if occurrence < remainder else 0)
-                    for occurrence in range(occurrence_count)
-                ]
+                candidate_selected = selected_so_far + target
+                if (
+                    maximum_total_generation_units is not None
+                    and candidate_selected > maximum_total_generation_units
+                ):
+                    continue
                 candidate_beats = occupied_beats
                 candidate_trailing = trailing_load
-                first, *tail = chunks
                 if starts_sequence or candidate_beats == 0:
                     candidate_beats += 1
-                    candidate_trailing = first
-                elif candidate_trailing + first <= per_beat_capacity:
-                    candidate_trailing += first
-                else:
-                    candidate_beats += 1
-                    candidate_trailing = first
-                for chunk in tail:
-                    candidate_beats += 1
-                    candidate_trailing = chunk
-                if candidate_beats > beat_count:
+                    candidate_trailing = 0
+                remaining_target = target
+                packing_invalid = candidate_beats > beat_count
+                while remaining_target and not packing_invalid:
+                    room = (
+                        per_beat_capacities[candidate_beats - 1]
+                        - candidate_trailing
+                    )
+                    if room <= 0:
+                        candidate_beats += 1
+                        candidate_trailing = 0
+                        if candidate_beats > beat_count:
+                            packing_invalid = True
+                            break
+                        continue
+                    assigned = min(remaining_target, room)
+                    candidate_trailing += assigned
+                    remaining_target -= assigned
+                    if remaining_target:
+                        candidate_beats += 1
+                        candidate_trailing = 0
+                        if candidate_beats > beat_count:
+                            packing_invalid = True
+                            break
+                if packing_invalid:
+                    continue
+                if target == 0 and candidate_beats > beat_count:
                     continue
                 removed = source_count - target
                 candidate: ScoreAndTargets = (
@@ -3477,7 +3704,11 @@ def _build_duration_scaled_event_plan(
                     + round(10000 * removed / max(source_count, 1)),
                     targets_so_far + (target,),
                 )
-                key = (candidate_beats, candidate_trailing)
+                key = (
+                    candidate_beats,
+                    candidate_trailing,
+                    candidate_selected,
+                )
                 incumbent = next_states.get(key)
                 if incumbent is None or candidate < incumbent:
                     next_states[key] = candidate
@@ -3520,6 +3751,14 @@ def _build_duration_scaled_event_plan(
         "beat_count": int(beat_count),
         "effective_shot_duration_s": int(effective_shot_duration),
         "max_generation_action_units_per_beat": int(per_beat_capacity),
+        "generation_action_unit_capacities_per_beat": list(
+            per_beat_capacities
+        ),
+        "maximum_total_generation_action_units": (
+            int(maximum_total_generation_units)
+            if maximum_total_generation_units is not None
+            else beat_count * per_beat_capacity
+        ),
         "source_generation_action_units": source_generation_units,
         "production_generation_action_units": production_generation_units,
         "intra_event_scaling_applied": any(
@@ -3810,6 +4049,10 @@ def _repair_bounded_single_sequence_order(
     *,
     unit_capacity: int,
     material_duration: int | None,
+    generation_unit_capacities_per_beat: list[int] | None = None,
+    max_content_beats_per_primary_shot: int = (
+        MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
+    ),
 ) -> List[Dict[str, Any]] | None:
     """Find an exact chronological layout for a bounded single sequence.
 
@@ -3857,13 +4100,28 @@ def _repair_bounded_single_sequence_order(
     occurrence_requirements = _event_primary_occurrence_requirements(
         events,
         capabilities,
+        max_content_beats_per_primary_shot=(
+            max_content_beats_per_primary_shot
+        ),
     )
     beat_count = len(beats)
+    explicit_capacity_ledger = generation_unit_capacities_per_beat is not None
+    beat_capacities = (
+        list(generation_unit_capacities_per_beat)
+        if generation_unit_capacities_per_beat is not None
+        else [unit_capacity] * beat_count
+    )
+    if len(beat_capacities) != beat_count:
+        raise ValueError("generation-unit capacity ledger must match repair beats")
     all_occupied = (1 << beat_count) - 1
 
     def duration_cost(loads: tuple[int, ...]) -> int:
         return sum(
-            _minimum_primary_duration_for_units(load, capabilities)
+            _minimum_primary_duration_for_units(
+                load,
+                capabilities,
+                max_content_beats=max_content_beats_per_primary_shot,
+            )
             for load in loads
         )
 
@@ -3888,19 +4146,40 @@ def _repair_bounded_single_sequence_order(
             for count in range(minimum, maximum + 1):
                 for start in range(previous_end, beat_count - count + 1):
                     positions = tuple(range(start, start + count))
-                    base, remainder = divmod(units, count)
                     next_loads = list(loads)
                     next_occupied = occupied
-                    valid = True
-                    for occurrence, position in enumerate(positions):
-                        next_loads[position] += base + (
-                            1 if occurrence < remainder else 0
-                        )
+                    if explicit_capacity_ledger:
+                        remaining_units = units
+                        additions = []
+                        for position in positions:
+                            assigned = min(
+                                remaining_units,
+                                max(
+                                    0,
+                                    beat_capacities[position]
+                                    - next_loads[position],
+                                ),
+                            )
+                            additions.append(assigned)
+                            remaining_units -= assigned
+                    else:
+                        base, remainder = divmod(units, count)
+                        additions = [
+                            base + (1 if occurrence < remainder else 0)
+                            for occurrence in range(count)
+                        ]
+                        remaining_units = 0
+                    for position, assigned in zip(
+                        positions,
+                        additions,
+                        strict=True,
+                    ):
+                        next_loads[position] += assigned
                         next_occupied |= 1 << position
-                        if next_loads[position] > unit_capacity:
-                            valid = False
-                            break
-                    if not valid:
+                    if remaining_units or any(
+                        next_loads[position] > beat_capacities[position]
+                        for position in positions
+                    ):
                         continue
                     serialized_loads = tuple(next_loads)
                     if duration_cost(serialized_loads) > material_duration:
@@ -3938,6 +4217,35 @@ def _repair_bounded_single_sequence_order(
     repaired = [dict(beat) for beat in beats]
     event_by_id = {event_id: event for event_id, event in enumerate(events, 1)}
     sequence = next(iter(sequences))
+    selected_allocations: dict[int, dict[int, int]] = {}
+    selected_loads = [0] * beat_count
+    for event_id, positions in selected_placements.items():
+        remaining_units = generation_units[event_id]
+        selected_allocations[event_id] = {}
+        if explicit_capacity_ledger:
+            additions = []
+            for position in positions:
+                assigned = min(
+                    remaining_units,
+                    max(
+                        0,
+                        beat_capacities[position] - selected_loads[position],
+                    ),
+                )
+                additions.append(assigned)
+                remaining_units -= assigned
+        else:
+            base, remainder = divmod(remaining_units, len(positions))
+            additions = [
+                base + (1 if occurrence < remainder else 0)
+                for occurrence in range(len(positions))
+            ]
+            remaining_units = 0
+        for position, assigned in zip(positions, additions, strict=True):
+            selected_allocations[event_id][position] = assigned
+            selected_loads[position] += assigned
+        if remaining_units:
+            raise ValueError("selected event placement lost generation units")
     for beat_index, beat in enumerate(repaired):
         source_events = [
             event_id
@@ -3950,6 +4258,10 @@ def _repair_bounded_single_sequence_order(
         )
         beat["sequence_id"] = sequence
         beat["action"] = "merge" if len(source_events) > 1 else "keep"
+        beat["source_event_generation_unit_counts"] = {
+            str(event_id): selected_allocations[event_id][beat_index]
+            for event_id in source_events
+        }
         details = [event_by_id[event_id] for event_id in source_events]
         beat["capacity_repair"] = {
             "reason": "ordered_single_sequence_story_capacity_rebalanced",
@@ -3981,7 +4293,14 @@ def _repair_bounded_single_sequence_order(
             "代码按单一 sequence、事件顺序与故事时钟容量重建账本",
         ]))
 
-    _validate_beat_action_capacity(repaired, events, capabilities)
+    _validate_beat_action_capacity(
+        repaired,
+        events,
+        capabilities,
+        max_content_beats_per_primary_shot=(
+            max_content_beats_per_primary_shot
+        ),
+    )
     _validate_beat_material_duration(
         repaired,
         events,
@@ -3998,6 +4317,7 @@ def _repair_beat_action_capacity(
     *,
     max_generation_units_per_beat: int | None = None,
     material_duration: int | None = None,
+    generation_unit_capacities_per_beat: list[int] | None = None,
 ) -> List[Dict[str, Any]]:
     """Repair the source ledger without crossing sequences or story capacity.
 
@@ -4006,14 +4326,45 @@ def _repair_beat_action_capacity(
     retention, explicit non-key drops, and deterministic action-unit slicing.
     """
     profile = capabilities or get_video_capabilities()
+    max_content_beats_per_primary_shot = max(
+        MAX_CONTENT_BEATS_PER_PRIMARY_SHOT,
+        math.ceil(
+            int(
+                max_generation_units_per_beat
+                or (
+                    profile.max_micro_actions_per_beat
+                    * MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
+                )
+            )
+            / profile.max_micro_actions_per_beat
+        ),
+    )
     hard_capacity = (
-        profile.max_micro_actions_per_beat * MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
+        profile.max_micro_actions_per_beat
+        * max_content_beats_per_primary_shot
     )
     unit_capacity = min(
         hard_capacity,
         max_generation_units_per_beat or hard_capacity,
     )
     repaired = [dict(beat) for beat in beats]
+    explicit_capacity_ledger = generation_unit_capacities_per_beat is not None
+    beat_capacities = (
+        list(generation_unit_capacities_per_beat)
+        if generation_unit_capacities_per_beat is not None
+        else [unit_capacity] * len(repaired)
+    )
+    if (
+        len(beat_capacities) != len(repaired)
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 1
+            or value > unit_capacity
+            for value in beat_capacities
+        )
+    ):
+        raise ValueError("generation-unit capacity ledger must match repair beats")
     for beat in repaired:
         raw_ids = beat.get("source_events") or []
         raw_dropped_ids = beat.get("dropped_source_events") or []
@@ -4041,10 +4392,21 @@ def _repair_beat_action_capacity(
         return True
 
     try:
-        _validate_beat_action_capacity(repaired, events, profile)
+        _validate_beat_action_capacity(
+            repaired,
+            events,
+            profile,
+            max_content_beats_per_primary_shot=(
+                max_content_beats_per_primary_shot
+            ),
+        )
         if (
-            max(_beat_generation_unit_loads(repaired, events), default=0)
-            <= unit_capacity
+            all(
+                load <= beat_capacities[index]
+                for index, load in enumerate(
+                    _beat_generation_unit_loads(repaired, events)
+                )
+            )
             and material_fits(repaired)
         ):
             for beat in repaired:
@@ -4065,6 +4427,12 @@ def _repair_beat_action_capacity(
         profile,
         unit_capacity=unit_capacity,
         material_duration=material_duration,
+        generation_unit_capacities_per_beat=(
+            generation_unit_capacities_per_beat
+        ),
+        max_content_beats_per_primary_shot=(
+            max_content_beats_per_primary_shot
+        ),
     )
     if ordered_repair is not None:
         return ordered_repair
@@ -4090,7 +4458,13 @@ def _repair_beat_action_capacity(
         for sequence in sequence_slots
     }
     generation_units = _event_generation_action_unit_counts(events)
-    occurrence_requirements = _event_primary_occurrence_requirements(events, profile)
+    occurrence_requirements = _event_primary_occurrence_requirements(
+        events,
+        profile,
+        max_content_beats_per_primary_shot=(
+            max_content_beats_per_primary_shot
+        ),
+    )
     model_kept = {
         event_id
         for beat in repaired
@@ -4105,12 +4479,50 @@ def _repair_beat_action_capacity(
     )
     placements: Dict[int, tuple[int, ...]] = {}
 
-    def generation_loads(candidate: Dict[int, tuple[int, ...]]) -> List[int]:
+    def generation_allocation(
+        candidate: Dict[int, tuple[int, ...]],
+    ) -> tuple[List[int], Dict[int, Dict[int, int]], bool]:
         loads = [0 for _ in repaired]
-        for event_id, positions in candidate.items():
-            base, remainder = divmod(generation_units[event_id], len(positions))
-            for occurrence, beat_index in enumerate(positions):
-                loads[beat_index] += base + (1 if occurrence < remainder else 0)
+        allocations: Dict[int, Dict[int, int]] = {}
+        for event_id in sorted(candidate):
+            positions = candidate[event_id]
+            remaining_units = generation_units[event_id]
+            allocations[event_id] = {}
+            if explicit_capacity_ledger:
+                additions = []
+                for beat_index in positions:
+                    assigned = min(
+                        remaining_units,
+                        max(
+                            0,
+                            beat_capacities[beat_index] - loads[beat_index],
+                        ),
+                    )
+                    additions.append(assigned)
+                    remaining_units -= assigned
+            else:
+                base, remainder = divmod(remaining_units, len(positions))
+                additions = [
+                    base + (1 if occurrence < remainder else 0)
+                    for occurrence in range(len(positions))
+                ]
+                remaining_units = 0
+            for beat_index, assigned in zip(
+                positions,
+                additions,
+                strict=True,
+            ):
+                allocations[event_id][beat_index] = assigned
+                loads[beat_index] += assigned
+            if remaining_units or any(
+                loads[beat_index] > beat_capacities[beat_index]
+                for beat_index in positions
+            ):
+                return loads, allocations, False
+        return loads, allocations, True
+
+    def generation_loads(candidate: Dict[int, tuple[int, ...]]) -> List[int]:
+        loads, _allocations, _valid = generation_allocation(candidate)
         return loads
 
     def placement_fits(candidate: Dict[int, tuple[int, ...]]) -> bool:
@@ -4122,13 +4534,22 @@ def _repair_beat_action_capacity(
             for previous_id, current_id in zip(placed_ids, placed_ids[1:]):
                 if candidate[previous_id][-1] > candidate[current_id][0]:
                     return False
-        loads = generation_loads(candidate)
-        if max(loads, default=0) > unit_capacity:
+        loads, _allocations, allocation_valid = generation_allocation(candidate)
+        if not allocation_valid:
+            return False
+        if any(
+            load > beat_capacities[index]
+            for index, load in enumerate(loads)
+        ):
             return False
         if material_duration is None:
             return True
         material_cost = sum(
-            _minimum_primary_duration_for_units(load, profile)
+            _minimum_primary_duration_for_units(
+                load,
+                profile,
+                max_content_beats=max_content_beats_per_primary_shot,
+            )
             for load in loads
         )
         return material_cost <= material_duration + 1e-6
@@ -4203,7 +4624,11 @@ def _repair_beat_action_capacity(
             }
             candidates.append((
                 sum(
-                    _minimum_primary_duration_for_units(load, profile)
+                    _minimum_primary_duration_for_units(
+                        load,
+                        profile,
+                        max_content_beats=max_content_beats_per_primary_shot,
+                    )
                     for load in loads
                 ),
                 sum(abs(slot - preferred_slot(event_id)) for slot in option),
@@ -4245,7 +4670,13 @@ def _repair_beat_action_capacity(
             if placement_fits(trial):
                 candidates.append((
                     sum(
-                        _minimum_primary_duration_for_units(load, profile)
+                        _minimum_primary_duration_for_units(
+                            load,
+                            profile,
+                            max_content_beats=(
+                                max_content_beats_per_primary_shot
+                            ),
+                        )
                         for load in loads
                     ),
                     min(abs(empty - position) for position in positions),
@@ -4263,6 +4694,11 @@ def _repair_beat_action_capacity(
         for beat_index in positions:
             sources_by_beat[beat_index].append(event_id)
     dropped_ids = set(event_by_id) - set(placements)
+    _final_loads, final_allocations, allocation_valid = generation_allocation(
+        placements
+    )
+    if not allocation_valid:
+        raise ValueError("repaired event placement lost generation units")
     dropped_by_beat: List[List[int]] = [[] for _ in repaired]
     ordered_event_sequences = list(dict.fromkeys(event_sequences.values()))
 
@@ -4293,6 +4729,10 @@ def _repair_beat_action_capacity(
         beat["sequence_id"] = sequence_plan[index]
         details = [event_by_id[event_id] for event_id in source_events]
         beat["action"] = "merge" if len(details) > 1 else "keep"
+        beat["source_event_generation_unit_counts"] = {
+            str(event_id): final_allocations[event_id][index]
+            for event_id in source_events
+        }
         if not changed:
             continue
         beat["capacity_repair"] = {
@@ -4326,8 +4766,20 @@ def _repair_beat_action_capacity(
             "代码按 sequence 与故事时钟容量重建可审计事件账本",
         ]))
 
-    _validate_beat_action_capacity(repaired, events, profile)
-    if max(_beat_generation_unit_loads(repaired, events), default=0) > unit_capacity:
+    _validate_beat_action_capacity(
+        repaired,
+        events,
+        profile,
+        max_content_beats_per_primary_shot=(
+            max_content_beats_per_primary_shot
+        ),
+    )
+    if any(
+        load > beat_capacities[index]
+        for index, load in enumerate(
+            _beat_generation_unit_loads(repaired, events)
+        )
+    ):
         raise ValueError("repaired beat ledger still exceeds story capacity")
     if material_duration is not None:
         _validate_beat_material_duration(
@@ -4346,6 +4798,7 @@ def _restore_redundantly_dropped_events(
     material_duration: int,
     capabilities: VideoModelCapabilities | None = None,
     max_generation_units_per_beat: int | None = None,
+    generation_unit_capacities_per_beat: list[int] | None = None,
 ) -> List[Dict[str, Any]]:
     """Restore whole events that still fit the structured story clock.
 
@@ -4362,6 +4815,9 @@ def _restore_redundantly_dropped_events(
         profile,
         max_generation_units_per_beat=max_generation_units_per_beat,
         material_duration=material_duration,
+        generation_unit_capacities_per_beat=(
+            generation_unit_capacities_per_beat
+        ),
     )
     generation_units = _event_generation_action_unit_counts(events)
 
@@ -4417,6 +4873,9 @@ def _restore_redundantly_dropped_events(
                 profile,
                 max_generation_units_per_beat=max_generation_units_per_beat,
                 material_duration=material_duration,
+                generation_unit_capacities_per_beat=(
+                    generation_unit_capacities_per_beat
+                ),
             )
         except ValueError:
             continue
@@ -4434,6 +4893,7 @@ def _build_beat_skeleton(
     beat_count: Optional[int] = None,
     director_plan: Optional[Dict[str, Any]] = None,
     max_generation_units_per_beat: int | None = None,
+    generation_unit_capacities_per_beat: list[int] | None = None,
 ) -> Dict[str, Any]:
     """Build a globally informed, bounded beat table (Stage 1)."""
     profile = get_video_capabilities()
@@ -4442,11 +4902,43 @@ def _build_beat_skeleton(
         shot_duration,
         profile,
     )
-    occurrence_requirements = _event_primary_occurrence_requirements(events, profile)
+    if generation_unit_capacities_per_beat is not None and (
+        len(generation_unit_capacities_per_beat) != beat_count
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 1
+            for value in generation_unit_capacities_per_beat
+        )
+    ):
+        raise ValueError(
+            "generation-unit capacity ledger must match the screenplay beats"
+        )
     generation_unit_counts = _event_generation_action_unit_counts(events)
+    max_content_beats_per_primary_shot = max(
+        MAX_CONTENT_BEATS_PER_PRIMARY_SHOT,
+        math.ceil(
+            int(
+                max_generation_units_per_beat
+                or (
+                    profile.max_micro_actions_per_beat
+                    * MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
+                )
+            )
+            / profile.max_micro_actions_per_beat
+        ),
+    )
+    occurrence_requirements = _event_primary_occurrence_requirements(
+        events,
+        profile,
+        max_content_beats_per_primary_shot=(
+            max_content_beats_per_primary_shot
+        ),
+    )
     per_beat_generation_unit_capacity = _generation_unit_capacity_for_story_duration(
         shot_duration,
         profile,
+        max_content_beats=max_content_beats_per_primary_shot,
     )
     if max_generation_units_per_beat is not None:
         per_beat_generation_unit_capacity = min(
@@ -4454,7 +4946,15 @@ def _build_beat_skeleton(
             int(max_generation_units_per_beat),
         )
     sequence_beat_plan = [
-        {"beat_order": index, "sequence_id": sequence}
+        {
+            "beat_order": index,
+            "sequence_id": sequence,
+            "max_generation_action_units": (
+                generation_unit_capacities_per_beat[index - 1]
+                if generation_unit_capacities_per_beat is not None
+                else per_beat_generation_unit_capacity
+            ),
+        }
         for index, sequence in enumerate(
             _sequence_beat_plan(
                 events,
@@ -4515,6 +5015,9 @@ def _build_beat_skeleton(
                 profile,
                 max_generation_units_per_beat=per_beat_generation_unit_capacity,
                 material_duration=target_duration,
+                generation_unit_capacities_per_beat=(
+                    generation_unit_capacities_per_beat
+                ),
             )
             skeleton["beats"] = _restore_redundantly_dropped_events(
                 skeleton["beats"],
@@ -4522,11 +5025,21 @@ def _build_beat_skeleton(
                 material_duration=target_duration,
                 capabilities=profile,
                 max_generation_units_per_beat=per_beat_generation_unit_capacity,
+                generation_unit_capacities_per_beat=(
+                    generation_unit_capacities_per_beat
+                ),
             )
             skeleton["shot_language_plan"] = _validate_shot_language_variation(
                 skeleton["beats"]
             )
-            _validate_beat_action_capacity(skeleton["beats"], events, profile)
+            _validate_beat_action_capacity(
+                skeleton["beats"],
+                events,
+                profile,
+                max_content_beats_per_primary_shot=(
+                    max_content_beats_per_primary_shot
+                ),
+            )
             if target_duration >= len(skeleton["beats"]) * math.ceil(
                 min_primary_story_duration(profile)
             ):
@@ -4696,6 +5209,12 @@ def _expand_beats_to_shots(
             shot["dropped_source_events"] = list(
                 beat.get("dropped_source_events") or []
             )
+            if "source_event_generation_unit_counts" in beat:
+                shot["source_event_generation_unit_counts"] = copy.deepcopy(
+                    beat["source_event_generation_unit_counts"]
+                )
+            else:
+                shot.pop("source_event_generation_unit_counts", None)
             shot["action"] = beat["action"]
             shot["shot_order"] = len(shots) + 1
             shot.pop("beat_order", None)
@@ -4774,6 +5293,9 @@ def migrate_screenplay_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
         "primary_shots": len(beats),
         "story_duration_allocations_s": durations,
         "content_beat_counts": [1] * len(beats),
+        "max_content_beats_per_primary_shot": (
+            MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
+        ),
         "generation_action_unit_capacities": action_capacities,
         "max_generation_action_units_per_primary_shot": (
             profile.max_micro_actions_per_beat
@@ -4835,6 +5357,10 @@ def _build_screenplay_plan(
         raise ValueError("primary-shot layout has an invalid shot policy")
     if int(resolved_primary_layout.get("primary_shots") or 0) != len(shots):
         raise ValueError("primary-shot layout count does not match production shots")
+    max_content_beats_per_primary_shot = int(
+        resolved_primary_layout.get("max_content_beats_per_primary_shot")
+        or MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
+    )
     layout_durations = resolved_primary_layout.get(
         "story_duration_allocations_s"
     )
@@ -4860,7 +5386,14 @@ def _build_screenplay_plan(
             raise ValueError(
                 f"production event {event_id} changed source sequence identity"
             )
-    _validate_beat_action_capacity(shots, adapted_events, profile)
+    _validate_beat_action_capacity(
+        shots,
+        adapted_events,
+        profile,
+        max_content_beats_per_primary_shot=(
+            max_content_beats_per_primary_shot
+        ),
+    )
     _validate_beat_material_duration(
         shots,
         adapted_events,
@@ -5318,6 +5851,11 @@ def _load_layered_checkpoints(
     events: List[Dict[str, Any]],
     expected_beats: int,
     input_fingerprint: str,
+    *,
+    max_content_beats_per_primary_shot: int = (
+        MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
+    ),
+    generation_unit_capacities_per_beat: list[int] | None = None,
 ) -> tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
     """Load only valid, contiguous layered checkpoints."""
     skeleton = None
@@ -5328,7 +5866,25 @@ def _load_layered_checkpoints(
             if not _checkpoint_matches(candidate, input_fingerprint):
                 raise ValueError("layered skeleton belongs to a different input")
             _parse_beat_skeleton(json.dumps(candidate, ensure_ascii=False), expected_beats, len(events))
-            _validate_beat_action_capacity(candidate["beats"], events)
+            _validate_beat_action_capacity(
+                candidate["beats"],
+                events,
+                max_content_beats_per_primary_shot=(
+                    max_content_beats_per_primary_shot
+                ),
+            )
+            if generation_unit_capacities_per_beat is not None:
+                loads = _beat_generation_unit_loads(candidate["beats"], events)
+                if (
+                    len(generation_unit_capacities_per_beat) != len(loads)
+                    or any(
+                        load > generation_unit_capacities_per_beat[index]
+                        for index, load in enumerate(loads)
+                    )
+                ):
+                    raise ValueError(
+                        "layered skeleton exceeds the primary-shot capacity ledger"
+                    )
             candidate["shot_language_plan"] = _validate_shot_language_variation(
                 candidate["beats"]
             )
@@ -5441,6 +5997,10 @@ def adapt_events(
     primary_shot_layout = (
         rewrite_layout or capacity_plan["primary_shot_layout"]
     )
+    max_content_beats_per_primary_shot = int(
+        primary_shot_layout.get("max_content_beats_per_primary_shot")
+        or MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
+    )
     max_shots = capacity_plan["primary_shots"]
     material_duration = capacity_plan["material_duration"]
     effective_shot_duration = max(
@@ -5461,6 +6021,12 @@ def adapt_events(
                 primary_shot_layout[
                     "max_generation_action_units_per_primary_shot"
                 ]
+            ),
+            maximum_total_generation_units=primary_shot_layout[
+                "production_action_unit_target"
+            ],
+            generation_unit_capacities_per_beat=list(
+                primary_shot_layout["generation_action_unit_capacities"]
             ),
         )
     )
@@ -5509,12 +6075,25 @@ def adapt_events(
                 production_events,
                 max_shots,
                 layered_fingerprint,
+                max_content_beats_per_primary_shot=(
+                    max_content_beats_per_primary_shot
+                ),
+                generation_unit_capacities_per_beat=list(
+                    primary_shot_layout[
+                        "generation_action_unit_capacities"
+                    ]
+                ),
             )
         if skeleton is None:
             skeleton_kwargs = {
                 "max_generation_units_per_beat": primary_shot_layout[
                     "max_generation_action_units_per_primary_shot"
-                ]
+                ],
+                "generation_unit_capacities_per_beat": list(
+                    primary_shot_layout[
+                        "generation_action_unit_capacities"
+                    ]
+                ),
             }
             skeleton = _build_beat_skeleton(
                 production_events,
@@ -5555,7 +6134,14 @@ def adapt_events(
         from quality.shot_continuity import annotate_boundaries
 
         annotate_boundaries(shots)
-        normalize_shot_durations(shots, material_duration, capability_profile)
+        normalize_shot_durations(
+            shots,
+            material_duration,
+            capability_profile,
+            max_content_beats_per_primary_shot=(
+                max_content_beats_per_primary_shot
+            ),
+        )
         planned_allocations = primary_shot_layout.get(
             "story_duration_allocations_s"
         )

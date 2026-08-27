@@ -107,7 +107,7 @@ Phases use contiguous integer IDs (`phase1`–`phase9`); every phase writes a ch
 - **Seedance-first with graceful fallback** — shots are generated via Seedance online API by default; on timeout or stall the pipeline falls back to local Wan2.2 generation through the Windows Bridge with explicit duration-loss logging.
 - **Continuity-group generation** — the screenwriter labels real action continuations; each group begins from canonical multi-image references and subsequent shots extend the preceding video. Scene changes start fresh and remain eligible for editorial transitions.
 - **Prose-action screenplay understanding** — Phase 1 recognizes scene-state prose, character damage/wardrobe state, unlabelled quoted dialogue, causal attack/counter chains, physical consequences, and relationship reversals. Neighboring text is supplied as read-only context, exact dialogue is confidence-attributed, and deterministic `sequence_id` / `action_unit_id` metadata survives into storyboard generation.
-- **Continuity-first primary-shot layout** — the default `continuity` policy maximizes story-clock action capacity inside model and 25% Provider-padding limits, then minimizes Sxx count and boundaries. A long Sxx carries one continuous causal segment through one to three scoped Pxx requests; `balanced` follows the requested average more closely, while `cut-driven` preserves the historical short-shot algorithm.
+- **Continuity-first primary-shot layout** — the default `continuity` policy preserves the executable semantic beat/action ledger inside model and 25% Provider-padding limits, then minimizes Sxx count and boundaries. It repacks ordered content beats instead of deleting later short shots: a long Sxx carries one continuous causal segment through one to four scoped Pxx requests, each still limited to 1–2 action units. `balanced` follows the requested average more closely, while `cut-driven` preserves the historical short-shot algorithm.
 - **Narrative-order verification (Phase 8)** — before assembly, storyboard images are reviewed against the full script with a multimodal LLM; extracted frames are scanned for black/still frames; a duration gate compares actual vs. target runtime and can trigger a bounded reshoot loop.
 - **Real ASR subtitles (Phase 9)** — the final audio track is transcribed via SeedASR WebSocket (`volc.seedasr.sauc.duration`), merged across shots with cumulative time offsets, and burned into the film. Shots without speech fall back to script captions, explicitly marked `script_fallback` — no fabricated timelines.
 - **Unified streaming LLM client** — every Phase 1 scripting call flows through a single streaming client with hard wall-clock timeouts (forced stream termination, not just a pre-request budget check), a 15-second heartbeat, and sub-phase checkpoints, so a hung LLM call can never block the pipeline silently for hours.
@@ -190,7 +190,9 @@ reuse, and state variants are not promoted by the v1 registry.
 `--shot-policy` accepts `continuity`, `balanced`, or `cut-driven`. Fresh runs
 default to `continuity`; `--shot-duration` is a soft preference for
 `continuity` and `balanced`, but remains a hard editorial target for
-`cut-driven`. Historical manifests and checkpoints without `shot_policy`
+`cut-driven`. Under `continuity`, reducing Sxx never authorizes dropping later
+content beats: their ordered Pxx ledger is preserved and repacked into longer
+continuous shots. Historical manifests and checkpoints without `shot_policy`
 resume deterministically as `cut-driven`.
 
 Online visual generation uses the Volcano Ark Agent Plan only. Configure
