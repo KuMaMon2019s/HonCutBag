@@ -130,6 +130,7 @@ def run_phase1_screenwriter(
     shot_duration: int = AVG_SHOT_DURATION,
     project_video_spec: dict[str, Any] | None = None,
     screenplay_rewrite_request: dict[str, Any] | None = None,
+    shot_policy: str = "continuity",
     *,
     _director_runner=None,
 ) -> dict:
@@ -149,6 +150,7 @@ def run_phase1_screenwriter(
         shot_duration=shot_duration,
         project_video_spec=project_video_spec,
         screenplay_rewrite_request=screenplay_rewrite_request,
+        shot_policy=shot_policy,
         _director_runner=_director_runner or run_phase1_director,
     )
 
@@ -162,6 +164,7 @@ def run_phase1(
     shot_duration: int = AVG_SHOT_DURATION,
     project_video_spec: dict[str, Any] | None = None,
     screenplay_rewrite_request: dict[str, Any] | None = None,
+    shot_policy: str = "continuity",
 ) -> dict:
     return _phase1_pipeline_owner.run_phase1(
         text,
@@ -172,6 +175,7 @@ def run_phase1(
         shot_duration=shot_duration,
         project_video_spec=project_video_spec,
         screenplay_rewrite_request=screenplay_rewrite_request,
+        shot_policy=shot_policy,
         _director_runner=run_phase1_director,
         _screenwriter_runner=run_phase1_screenwriter,
     )
@@ -354,6 +358,7 @@ def run_pipeline(
     input_file: str = None,
     duration: int = 60,
     shot_duration: int = AVG_SHOT_DURATION,
+    shot_policy: str | None = None,
     chain_mode: bool = False,
     dry_run: bool = False,
     skip_phase: list = None,
@@ -374,6 +379,7 @@ def run_pipeline(
         input_file=input_file,
         duration=duration,
         shot_duration=shot_duration,
+        shot_policy=shot_policy,
         chain_mode=chain_mode,
         dry_run=dry_run,
         skip_phase=skip_phase,

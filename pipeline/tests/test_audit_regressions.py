@@ -843,7 +843,7 @@ def test_secondary_v6_cannot_downgrade_or_use_storyboard_proxy_for_bridge():
         build_continuity_plan(invented)
 
 
-def test_action_aware_adaptation_splits_paid_probe_before_secondary_planning():
+def test_action_aware_adaptation_prefers_long_primary_shots_before_secondary_planning():
     events = [
         {
             "sequence_id": "SEQ001",
@@ -856,7 +856,7 @@ def test_action_aware_adaptation_splits_paid_probe_before_secondary_planning():
             "micro_actions": ["穿门", "避让工具箱", "推向观察窗", "稳定"],
         },
     ]
-    assert adaptation_engine.estimate_action_aware_shot_count(events, 45, 12) == 4
+    assert adaptation_engine.estimate_action_aware_shot_count(events, 45, 12) == 2
 
     shots = [
         {
@@ -1712,6 +1712,47 @@ def test_new_run_refuses_a_different_run_in_the_same_workspace(tmp_path):
         )
 
 
+def test_legacy_manifest_missing_shot_policy_resumes_as_cut_driven(tmp_path):
+    repo_root = tmp_path / "repo"
+    source_path = repo_root / "pipeline/src/example.py"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text("VERSION = 1\n", encoding="utf-8")
+    output_dir = tmp_path / "run"
+    legacy_config = {
+        "duration": 36,
+        "shot_duration": 6,
+        "video_provider": "seedance",
+        "video_model": "doubao-seedance-2.0-mini",
+        "project_video_spec": pipeline_core._project_video_spec("1080p"),
+    }
+    initial = prepare_run_manifest(
+        output_dir,
+        source_text="legacy script",
+        resolved_config=legacy_config,
+        repo_root=repo_root,
+        resume=False,
+    )
+
+    resumed = prepare_run_manifest(
+        output_dir,
+        source_text="legacy script",
+        resolved_config={**legacy_config, "shot_policy": "cut-driven"},
+        repo_root=repo_root,
+        resume=True,
+    )
+
+    assert resumed["run_fingerprint"] == initial["run_fingerprint"]
+    assert "shot_policy" not in resumed["resolved_config"]
+    with pytest.raises(RuntimeError, match="immutable run identity changed"):
+        prepare_run_manifest(
+            output_dir,
+            source_text="legacy script",
+            resolved_config={**legacy_config, "shot_policy": "continuity"},
+            repo_root=repo_root,
+            resume=True,
+        )
+
+
 def test_explicit_code_change_acceptance_preserves_run_identity_and_audits_transition(
     tmp_path,
 ):
@@ -2302,6 +2343,9 @@ def test_semantic_media_ratios_and_cli_resume_defaults(tmp_path):
     assert pipeline_runner_cli._resolved_run_arguments(fresh_args)[
         "media_profile"
     ] == "480p"
+    assert pipeline_runner_cli._resolved_run_arguments(fresh_args)[
+        "shot_policy"
+    ] == "continuity"
     (tmp_path / "RUN_MANIFEST.json").write_text(
         json.dumps(
             {
@@ -2326,6 +2370,9 @@ def test_semantic_media_ratios_and_cli_resume_defaults(tmp_path):
 
     assert args.text is None and args.input is None
     assert pipeline_runner_cli._resolved_run_arguments(args)["duration"] == 37
+    assert pipeline_runner_cli._resolved_run_arguments(args)[
+        "shot_policy"
+    ] == "cut-driven"
     assert pipeline_runner_cli._resolved_run_arguments(args)["project_id"] == "series-a"
     assert pipeline_runner_cli._resolved_run_arguments(args)["media_profile"] == (
         "cinematic"
@@ -5251,7 +5298,12 @@ def test_sequential_phase5_padding_rewrites_screenplay_exactly_once(
     gate_calls = []
 
     def run_phase1(_text, _output_dir, *_args, **kwargs):
-        phase1_calls.append(kwargs.get("screenplay_rewrite_request"))
+        phase1_calls.append(
+            (
+                kwargs.get("screenplay_rewrite_request"),
+                kwargs.get("shot_policy"),
+            )
+        )
         return {
             "status": "done",
             "_storyboard": {"shots": [{"shot_id": "S01"}]},
@@ -5312,8 +5364,7 @@ def test_sequential_phase5_padding_rewrites_screenplay_exactly_once(
 
     assert result["status"] == expected_status
     assert len(phase1_calls) == 2
-    assert phase1_calls[0] is None
-    assert phase1_calls[1] == request
+    assert phase1_calls == [(None, "continuity"), (request, "continuity")]
     assert len(gate_calls) == 2
     assert result["screenplay_rewrite"]["attempts_used"] == 1
 
@@ -5340,7 +5391,12 @@ def test_graph_phase5_padding_rewrites_screenplay_exactly_once(
     }
 
     def run_phase1(**kwargs):
-        phase1_calls.append(kwargs.get("screenplay_rewrite_request"))
+        phase1_calls.append(
+            (
+                kwargs.get("screenplay_rewrite_request"),
+                kwargs.get("shot_policy"),
+            )
+        )
         return {
             "status": "done",
             "_storyboard": {"shots": [{"shot_id": "S01"}]},
@@ -5398,6 +5454,7 @@ def test_graph_phase5_padding_rewrites_screenplay_exactly_once(
         "output_dir": str(tmp_path),
         "target_duration_s": 36,
         "shot_duration_s": 6,
+        "shot_policy": "continuity",
         "dry_run": True,
         "storyboard": {},
         "characters": [],
@@ -5410,7 +5467,7 @@ def test_graph_phase5_padding_rewrites_screenplay_exactly_once(
 
     final_state = graph.invoke(state)
 
-    assert phase1_calls == [None, request]
+    assert phase1_calls == [(None, "continuity"), (request, "continuity")]
     assert len(gate_calls) == 2
     if second_gate_status == "done":
         assert phase6_calls == [True]

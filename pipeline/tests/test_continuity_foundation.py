@@ -1795,8 +1795,29 @@ def test_missing_pxx_blocks_validation_and_resume(tmp_path):
 def test_provider_uses_each_chunk_storyboard_panel_and_action(monkeypatch, tmp_path):
     shot_dir = tmp_path / "shots/S01"
     shot_dir.mkdir(parents=True)
+    shot_meta = {
+        "prompt": "完整镜头摘要",
+        "gen_strategy": "phantom",
+        "storyboard_beats": [
+            {
+                "beat_id": "S01_P01",
+                "action": "烬抓住扶手稳定重心",
+                "visual": "左手抓扶手，身体重心下沉",
+            },
+            {
+                "beat_id": "S01_P02",
+                "action": "烬抬起机械臂格挡",
+                "visual": "右臂贴近身体格挡，冲击力压低重心",
+            },
+            {
+                "beat_id": "S01_P03",
+                "action": "烬借惯性将敌人甩向座椅",
+                "visual": "列车转弯后借惯性反击",
+            },
+        ],
+    }
     (shot_dir / "SHOT_META.json").write_text(
-        json.dumps({"prompt": "完整镜头摘要", "gen_strategy": "phantom"}),
+        json.dumps(shot_meta),
         encoding="utf-8",
     )
     observed = {}
@@ -1836,7 +1857,12 @@ def test_provider_uses_each_chunk_storyboard_panel_and_action(monkeypatch, tmp_p
     assert observed["_storyboard_beat_id"] == "S01_P02"
     assert observed["gen_strategy"] == "i2v"
     assert observed["generation_actions"] == ["烬抬起机械臂格挡"]
+    assert observed["micro_actions"] == ["烬抬起机械臂格挡"]
     assert "Execute only this visible action: 烬抬起机械臂格挡" in content[0]["text"]
+    assert "借惯性将敌人甩向座椅" not in content[0]["text"]
+    assert "center of gravity, weight transfer, resistance, and inertia" in (
+        content[0]["text"]
+    )
     assert "摄影机箭头控制机位的移动方向和轨迹" in content[0]["text"]
     assert "背景与运镜只能辅助，不能替代主体完成动作" in content[0]["text"]
     assert "最终视频的任何一帧都不得出现或残留箭头" in content[0]["text"]

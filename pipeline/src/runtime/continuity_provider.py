@@ -441,6 +441,11 @@ def _storyboard_group_prompt(
                 f"Current beat starting state: {chunk.start_state or 'continue the supplied state'}",
                 "The authoritative Pxx contract below defines the only action to execute now.",
                 f"Current beat required result: {chunk.end_state or 'complete the current beat action'}",
+                (
+                    "Describe this Pxx with physically specific limbs, contact force, "
+                    "center of gravity, weight transfer, resistance, and inertia; keep "
+                    "the motion humanly executable and limited to the current 1-2 actions."
+                ),
                 "Do not jump to a later panel, combine later actions, replay an earlier panel, or render a collage.",
             )
         )
@@ -677,6 +682,8 @@ def _chunk_prompt(
             f"Start state: {current_start}. "
             f"Execute only this visible action: {current_action}. "
             f"Required end state: {current_end}. "
+            "Specify the current limbs, contact force, center of gravity, weight "
+            "transfer, resistance, and inertia with physically credible motion. "
             "Do not execute another Pxx panel, skip ahead, or replay an earlier panel."
         )
     prompt = apply_storyboard_motion_policy(

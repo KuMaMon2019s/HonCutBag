@@ -25,6 +25,7 @@ class Phase1Runner(Protocol):
         shot_duration: int = ...,
         project_video_spec: dict[str, Any] | None = ...,
         screenplay_rewrite_request: dict[str, Any] | None = ...,
+        shot_policy: str = ...,
     ) -> dict[str, Any]: ...
 
 
@@ -52,6 +53,7 @@ def phase1_node(
             state.get("shot_duration", default_shot_duration),
         ),
         "project_video_spec": state.get("project_video_spec"),
+        "shot_policy": state.get("shot_policy", "cut-driven"),
     }
     previous_phase5 = state.get("phase_results", {}).get("phase5")
     rewrite_request = rewrite_request_from_receipt(previous_phase5)

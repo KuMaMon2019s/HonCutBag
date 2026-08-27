@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Optional
 
-from phases.phase1.adaptation_engine import AVG_SHOT_DURATION
+from phases.phase1.adaptation_engine import AVG_SHOT_DURATION, DEFAULT_SHOT_POLICY
 from phases.phase1.phase1_director import run_phase1_director
 from phases.phase1.phase1_screenwriter import run_phase1_screenwriter
 from runtime.phase_timing import _elapsed, _now
@@ -22,6 +22,7 @@ def run_phase1(
     shot_duration: int = AVG_SHOT_DURATION,
     project_video_spec: dict[str, Any] | None = None,
     screenplay_rewrite_request: dict[str, Any] | None = None,
+    shot_policy: str = DEFAULT_SHOT_POLICY,
     *,
     _director_runner=None,
     _screenwriter_runner=None,
@@ -58,6 +59,7 @@ def run_phase1(
             shot_duration=shot_duration,
             project_video_spec=project_video_spec,
             screenplay_rewrite_request=screenplay_rewrite_request,
+            shot_policy=shot_policy,
             _director_runner=director_runner,
         )
     finally:

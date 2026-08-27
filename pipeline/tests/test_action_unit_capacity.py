@@ -316,7 +316,9 @@ def test_flashmob_60s_script_passes_capacity_gate():
     assert len(events) == 26
 
     _annotate_global_event_flow(events, continuity_mode="one_take")
-    plan = engine._estimate_action_capacity_plan(events, 60, 12)
+    plan = engine._estimate_action_capacity_plan(
+        events, 60, 12, shot_policy="cut-driven"
+    )
 
     assert plan["generation_action_units"] == 22
     assert plan["primary_shots"] == 5
@@ -325,7 +327,9 @@ def test_flashmob_60s_script_passes_capacity_gate():
     assert plan["storyboard_duration_limit"] == 60
     assert plan["action_capacity_status"] == "fits_story_clock"
     assert plan["generated_duration_ratio_reference"] == 1.3
-    shots = engine.estimate_action_aware_shot_count(events, 60, 12)
+    shots = engine.estimate_action_aware_shot_count(
+        events, 60, 12, shot_policy="cut-driven"
+    )
     assert shots == 5
 
 
@@ -336,7 +340,9 @@ def test_evolving_model_flashmob_artifact_has_stable_capacity():
     assert len(events) == 26
 
     _annotate_global_event_flow(events, continuity_mode="one_take")
-    plan = engine._estimate_action_capacity_plan(events, 60, 12)
+    plan = engine._estimate_action_capacity_plan(
+        events, 60, 12, shot_policy="cut-driven"
+    )
 
     assert {event["sequence_id"] for event in events} == {"SEQ001"}
     assert plan["generation_action_units"] == 22
@@ -350,7 +356,9 @@ def test_evolving_model_flashmob_artifact_has_stable_capacity():
 def test_sequence_fragmentation_is_reported_without_expanding_story_clock():
     events = _load_capacity_fixture(FIXTURE, LEGACY_COMPOSITE_EVENTS)
 
-    plan = engine._estimate_action_capacity_plan(events, 60, 12)
+    plan = engine._estimate_action_capacity_plan(
+        events, 60, 12, shot_policy="cut-driven"
+    )
 
     assert plan["primary_shots"] == 8
     assert plan["structural_shots"] == 8
@@ -379,7 +387,9 @@ def test_dense_single_sequence_expands_structure_before_dropping_events():
         for event_id, unit_count in enumerate(unit_counts, 1)
     ]
 
-    plan = engine._estimate_action_capacity_plan(events, 60, 12)
+    plan = engine._estimate_action_capacity_plan(
+        events, 60, 12, shot_policy="cut-driven"
+    )
 
     assert plan["generation_action_units"] == 41
     assert plan["structural_shots"] == 7
@@ -1055,7 +1065,9 @@ def test_dense_sequential_chain_uses_story_time_not_provider_padding():
             "翻滚压制", "降服拍地",
         ],
     }]
-    plan = engine._estimate_action_capacity_plan(events, 30, 12)
+    plan = engine._estimate_action_capacity_plan(
+        events, 30, 12, shot_policy="cut-driven"
+    )
 
     assert plan["generation_action_units"] == 12
     assert plan["structural_shots"] == 2
@@ -1078,7 +1090,9 @@ def test_provider_request_padding_does_not_consume_story_clock():
         "sequence_id": "SEQ001",
         "micro_actions": [f"有序操作{index}" for index in range(12)],
     }]
-    plan = engine._estimate_action_capacity_plan(events, 30, 15)
+    plan = engine._estimate_action_capacity_plan(
+        events, 30, 15, shot_policy="cut-driven"
+    )
 
     assert plan["generation_action_units"] == 12
     assert plan["structural_shots"] == 2
@@ -1114,29 +1128,39 @@ def test_provider_request_padding_does_not_consume_story_clock():
     ] is False
 
 
-def test_36s_dense_plan_preserves_semantic_slots_before_padding_gate():
-    """The cost gate must not hide semantic loss by silently dropping a cut."""
+def test_cut_driven_36s_dense_plan_preserves_legacy_short_shot_layout():
+    """Historical resumes keep the former hard shot-duration semantics."""
     events = [{
         "event_role": "action_chain",
         "sequence_id": "SEQ001",
         "micro_actions": [f"有序动作{index}" for index in range(45)],
     }]
 
-    plan = engine._estimate_action_capacity_plan(events, 36, 6)
+    plan = engine._estimate_action_capacity_plan(
+        events,
+        36,
+        6,
+        shot_policy="cut-driven",
+    )
 
     assert plan["action_capacity_status"] == "screenplay_compression_required"
     assert plan["structural_shots"] == 8
     assert plan["primary_shots"] == 7
 
 
-def test_padding_rewrite_compresses_36s_plan_to_six_single_request_beats():
+def test_cut_driven_padding_rewrite_keeps_legacy_six_shot_result():
     events = [{
         "event_role": "action_chain",
         "sequence_id": "SEQ001",
         "micro_actions": [f"有序动作{index}" for index in range(45)],
     }]
     profile = engine.get_video_capabilities()
-    capacity_plan = engine._estimate_action_capacity_plan(events, 36, 6)
+    capacity_plan = engine._estimate_action_capacity_plan(
+        events,
+        36,
+        6,
+        shot_policy="cut-driven",
+    )
     request = {
         "schema": "honcut.screenplay-rewrite-request.v1",
         "reason_code": "content_provider_padding_loss_exceeds_limit",
@@ -1149,6 +1173,7 @@ def test_padding_rewrite_compresses_36s_plan_to_six_single_request_beats():
         target_duration=36,
         capabilities=profile,
         rewrite_request=request,
+        shot_policy="cut-driven",
     )
     production_events, scaled = engine._build_duration_scaled_event_plan(
         events,
@@ -1184,6 +1209,279 @@ def test_padding_rewrite_compresses_36s_plan_to_six_single_request_beats():
         screenplay_rewrite_request=request,
     )
     assert rewrite_fingerprint != normal_fingerprint
+
+
+def test_continuity_policy_prefers_two_dense_18s_primary_shots():
+    events = [{
+        "event_role": "action_chain",
+        "sequence_id": "SEQ001",
+        "micro_actions": [f"有序动作{index}" for index in range(45)],
+    }]
+
+    plan = engine._estimate_action_capacity_plan(
+        events,
+        36,
+        6,
+        shot_policy="continuity",
+    )
+    layout = plan["primary_shot_layout"]
+
+    assert plan["action_capacity_status"] == "screenplay_compression_required"
+    assert plan["primary_shots"] == 2
+    assert layout["schema"] == "honcut.primary-shot-layout.v1"
+    assert layout["shot_policy"] == "continuity"
+    assert layout["story_duration_allocations_s"] == [18, 18]
+    assert layout["content_beat_counts"] == [3, 3]
+    assert layout["generation_action_unit_capacities"] == [6, 6]
+    assert layout["production_action_unit_target"] == 12
+    assert layout["cross_sxx_boundary_count"] == 1
+    assert layout["provider_request_durations_s"] == [
+        [8, 6, 6],
+        [8, 6, 6],
+    ]
+    assert layout["projected_content_provider_request_duration_s"] == 40.0
+    assert layout["projected_content_provider_padding_duration_s"] == 4.0
+    assert layout["projected_padding_loss_rate"] == 0.1
+
+    production_events, scaled = engine._build_duration_scaled_event_plan(
+        events,
+        target_duration=36,
+        beat_count=plan["primary_shots"],
+        effective_shot_duration=18,
+        capabilities=engine.get_video_capabilities(),
+        max_generation_units_per_beat=layout[
+            "max_generation_action_units_per_primary_shot"
+        ],
+    )
+
+    assert scaled["production_generation_action_units"] == 12
+    assert len(production_events) == 1
+
+
+def test_continuity_padding_rewrite_reuses_the_same_layout_solver():
+    events = [{
+        "event_role": "action_chain",
+        "sequence_id": "SEQ001",
+        "micro_actions": [f"有序动作{index}" for index in range(45)],
+    }]
+    capacity_plan = engine._estimate_action_capacity_plan(
+        events,
+        36,
+        6,
+        shot_policy="continuity",
+    )
+    request = {
+        "schema": "honcut.screenplay-rewrite-request.v1",
+        "reason_code": "content_provider_padding_loss_exceeds_limit",
+        "attempt": 1,
+        "maximum_padding_loss_rate": 0.25,
+    }
+
+    rewritten = engine._resolve_padding_rewrite_layout(
+        capacity_plan,
+        target_duration=36,
+        capabilities=engine.get_video_capabilities(),
+        rewrite_request=request,
+        shot_policy="continuity",
+    )
+
+    assert rewritten["primary_shots"] == 2
+    assert rewritten["story_duration_allocations_s"] == [18, 18]
+    assert rewritten["content_beat_counts"] == [3, 3]
+    assert rewritten["rewrite_attempt"] == 1
+    assert rewritten["objective_decision"][
+        "rewrite_replanned_with_shared_solver"
+    ] is True
+
+
+def test_balanced_policy_honors_six_second_soft_target_after_content_capacity():
+    events = [{
+        "event_role": "action_chain",
+        "sequence_id": "SEQ001",
+        "micro_actions": [f"有序动作{index}" for index in range(45)],
+    }]
+
+    plan = engine._estimate_action_capacity_plan(
+        events,
+        36,
+        6,
+        shot_policy="balanced",
+    )
+    layout = plan["primary_shot_layout"]
+
+    assert plan["primary_shots"] == 6
+    assert layout["story_duration_allocations_s"] == [6, 6, 6, 6, 6, 6]
+    assert layout["content_beat_counts"] == [1, 1, 1, 1, 1, 1]
+    assert layout["production_action_unit_target"] == 12
+    assert layout["projected_content_provider_request_duration_s"] == 48.0
+    assert layout["projected_padding_loss_rate"] == 0.25
+
+
+def test_screenplay_plan_v5_migrates_to_cut_driven_layout_deterministically():
+    legacy = {
+        "schema": "honcut.screenplay-plan.v5",
+        "target_duration_s": 12,
+        "beats": [
+            {"beat_id": "SPB001", "duration_s": 6},
+            {"beat_id": "SPB002", "duration_s": 6},
+        ],
+    }
+
+    migrated = engine.migrate_screenplay_plan(legacy)
+
+    assert migrated["schema"] == engine.SCREENPLAY_PLAN_SCHEMA
+    assert migrated["primary_shot_layout"]["schema"] == (
+        "honcut.primary-shot-layout.v1"
+    )
+    assert migrated["primary_shot_layout"]["shot_policy"] == "cut-driven"
+    assert migrated["primary_shot_layout"][
+        "story_duration_allocations_s"
+    ] == [6, 6]
+    assert migrated["primary_shot_layout"]["migration_source"] == (
+        "honcut.screenplay-plan.v5"
+    )
+    assert legacy["schema"] == "honcut.screenplay-plan.v5"
+
+
+def test_screenplay_plan_future_schema_fails_closed():
+    with pytest.raises(ValueError, match="newer than supported"):
+        engine.migrate_screenplay_plan({"schema": "honcut.screenplay-plan.v99"})
+
+
+@pytest.mark.parametrize(
+    ("duration", "source_actions", "expected_content_beats"),
+    [(8, 2, 1), (12, 4, 2), (18, 6, 3)],
+)
+def test_continuity_layout_uses_one_to_three_pxx_by_content_capacity(
+    duration,
+    source_actions,
+    expected_content_beats,
+):
+    events = [{
+        "sequence_id": "SEQ001",
+        "event_role": "action_chain",
+        "micro_actions": [f"动作{index}" for index in range(source_actions)],
+    }]
+
+    layout = engine._estimate_action_capacity_plan(
+        events,
+        duration,
+        duration,
+        shot_policy="continuity",
+    )["primary_shot_layout"]
+
+    assert layout["primary_shots"] == 1
+    assert layout["content_beat_counts"] == [expected_content_beats]
+    assert layout["production_action_unit_target"] == source_actions
+
+
+def test_continuity_layout_preserves_non_mergeable_sequence_boundaries():
+    events = [
+        {
+            "sequence_id": f"SEQ{index:03d}",
+            "event_role": "action_chain",
+            "micro_actions": [f"场景{index}动作{action}" for action in range(4)],
+        }
+        for index in range(1, 4)
+    ]
+
+    layout = engine._estimate_action_capacity_plan(
+        events,
+        36,
+        6,
+        shot_policy="continuity",
+    )["primary_shot_layout"]
+
+    assert layout["primary_shots"] == 3
+    assert layout["cross_sxx_boundary_count"] == 2
+
+
+def test_continuity_layout_preserves_explicit_hard_cut_inside_sequence():
+    events = [
+        {
+            "sequence_id": "SEQ001",
+            "continuity_before": "cut",
+            "event_role": "action_chain",
+            "micro_actions": ["进入车厢"],
+        },
+        {
+            "sequence_id": "SEQ001",
+            "continuity_before": "cut",
+            "event_role": "action_chain",
+            "micro_actions": ["硬切到另一主体"],
+        },
+    ]
+
+    layout = engine._estimate_action_capacity_plan(
+        events,
+        30,
+        15,
+        shot_policy="continuity",
+    )["primary_shot_layout"]
+
+    assert layout["primary_shots"] == 2
+    assert layout["cross_sxx_boundary_count"] == 1
+
+
+def test_layout_accepts_exact_25_percent_padding_boundary():
+    events = [{
+        "sequence_id": "SEQ001",
+        "event_role": "action_chain",
+        "micro_actions": [f"动作{index}" for index in range(12)],
+    }]
+
+    layout = engine._estimate_action_capacity_plan(
+        events,
+        36,
+        6,
+        shot_policy="balanced",
+    )["primary_shot_layout"]
+
+    assert layout["projected_padding_loss_rate"] == 0.25
+
+
+def test_layout_fails_when_sequence_isolation_cannot_fit_story_clock():
+    events = [
+        {
+            "sequence_id": f"SEQ{index:03d}",
+            "event_role": "action_chain",
+            "micro_actions": [f"场景{index}动作"],
+        }
+        for index in range(1, 5)
+    ]
+
+    with pytest.raises(ValueError, match="story clock|sequence isolation"):
+        engine._estimate_action_capacity_plan(
+            events,
+            9,
+            3,
+            shot_policy="continuity",
+        )
+
+
+def test_long_primary_shot_dialogue_capacity_expands_inside_sxx():
+    storyboard = {
+        "delivery_target_duration": 20,
+        "shots": [{
+            "id": "S01",
+            "duration": 20,
+            "speech_duration_s": 20,
+            "dialogue": {"speaker": "Agent", "line": "原文对白"},
+            "micro_actions": [],
+        }],
+    }
+
+    plan_storyboard_beats(storyboard)
+
+    shot = storyboard["shots"][0]
+    assert shot["storyboard_beat_count"] == 2
+    assert "p01_spoken_content_capacity_exceeded" in shot[
+        "secondary_storyboard_planning"
+    ]["extension_reasons"]
+    assert sum(
+        beat["effective_story_duration_s"]
+        for beat in shot["storyboard_beats"]
+    ) == 20
 
 
 def test_material_budget_rejects_content_padding_loss_above_25_percent():
@@ -1272,7 +1570,9 @@ def test_generic_dense_actions_report_screenplay_compression_pressure():
         *generic[8:],
         {"event_role": "scene_setup"},
     ]
-    plan = engine._estimate_action_capacity_plan(events, 60, 10)
+    plan = engine._estimate_action_capacity_plan(
+        events, 60, 10, shot_policy="cut-driven"
+    )
 
     assert plan["generation_action_units"] == 96
     assert plan["structural_shots"] == 16
@@ -1338,9 +1638,17 @@ def test_60s_scaled_screenplay_reconciles_source_pressure_into_executable_ledger
         source_capacity,
         target_duration=60,
         source_events_hash="source-events-sha256",
+        primary_shot_layout={
+            **source_capacity["primary_shot_layout"],
+            "primary_shots": 8,
+            "story_duration_allocations_s": list(durations),
+            "content_beat_counts": [2, 2, 2, 2, 3, 3, 3, 3],
+            "generation_action_unit_capacities": [4, 4, 4, 4, 6, 6, 6, 6],
+            "max_generation_action_units_per_primary_shot": 6,
+        },
     )
 
-    assert screenplay_plan["schema"] == "honcut.screenplay-plan.v5"
+    assert screenplay_plan["schema"] == engine.SCREENPLAY_PLAN_SCHEMA
     assert screenplay_plan["source_ledger"]["capacity_status"] == (
         "screenplay_compression_required"
     )
@@ -1816,7 +2124,7 @@ def test_screenplay_plan_records_intra_event_action_lineage():
         duration_scaled_event_plan=scaling_plan,
     )
 
-    assert screenplay_plan["schema"] == "honcut.screenplay-plan.v5"
+    assert screenplay_plan["schema"] == engine.SCREENPLAY_PLAN_SCHEMA
     assert screenplay_plan["production_ledger"]["event_action_scaling_schema"] == (
         "honcut.duration-scaled-event-plan.v3"
     )

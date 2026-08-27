@@ -225,13 +225,25 @@ def prepare_run_manifest(
     normalized_config = json.loads(
         json.dumps(resolved_config, ensure_ascii=False, sort_keys=True, default=str)
     )
+    identity_config = normalized_config
+    if resume and isinstance(existing.get("resolved_config"), dict):
+        stored_config = existing["resolved_config"]
+        if (
+            "shot_policy" not in stored_config
+            and normalized_config.get("shot_policy") == "cut-driven"
+        ):
+            # v1 manifests predate shot_policy. Their historical behavior is
+            # deterministically cut-driven, but adding the migration default
+            # must not rewrite the stable run fingerprint or task identities.
+            identity_config = dict(normalized_config)
+            identity_config.pop("shot_policy", None)
     identity = {
         "schema_version": RUN_MANIFEST_SCHEMA,
         "input_sha256": input_sha256,
-        "config_sha256": _sha256_json(normalized_config),
-        "provider": normalized_config.get("video_provider"),
-        "model": normalized_config.get("video_model"),
-        "project_video_spec": normalized_config.get("project_video_spec"),
+        "config_sha256": _sha256_json(identity_config),
+        "provider": identity_config.get("video_provider"),
+        "model": identity_config.get("video_model"),
+        "project_video_spec": identity_config.get("project_video_spec"),
         "code_version": _code_version(Path(repo_root)),
     }
     identity["run_fingerprint"] = _sha256_json(identity)

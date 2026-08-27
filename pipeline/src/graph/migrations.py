@@ -8,7 +8,8 @@ from typing import Any
 from langgraph.types import Command
 from runtime.migration_registry import apply_migration_registry
 
-CURRENT_STATE_SCHEMA_VERSION = 1
+CURRENT_STATE_SCHEMA_VERSION = 2
+SHOT_POLICIES = frozenset({"continuity", "balanced", "cut-driven"})
 LEGACY_STATE_ALIASES = frozenset(
     {
         "text",
@@ -83,7 +84,7 @@ def _canonicalize_v1_state(state: dict[str, Any]) -> dict[str, Any]:
 
     state.setdefault("project_id", "local")
     state.setdefault("run_id", state.get("run_fingerprint", "pipeline_run"))
-    state["state_schema_version"] = CURRENT_STATE_SCHEMA_VERSION
+    state["state_schema_version"] = 1
     for alias in LEGACY_STATE_ALIASES:
         state.pop(alias, None)
     return state
@@ -93,11 +94,34 @@ def _migrate_state_v0_to_v1(state: dict[str, Any]) -> dict[str, Any]:
     return _canonicalize_v1_state(state)
 
 
-STATE_MIGRATIONS = {0: _migrate_state_v0_to_v1}
+def _migrate_state_v1_to_v2(state: dict[str, Any]) -> dict[str, Any]:
+    migrated = dict(state)
+    migrated.setdefault("shot_policy", "cut-driven")
+    migrated["state_schema_version"] = 2
+    return migrated
+
+
+def _canonicalize_v2_state(state: dict[str, Any]) -> dict[str, Any]:
+    policy = str(state.get("shot_policy") or "").strip().lower()
+    if policy not in SHOT_POLICIES:
+        raise StateMigrationError(
+            "checkpoint state has an invalid or missing shot_policy"
+        )
+    state["shot_policy"] = policy
+    state["state_schema_version"] = CURRENT_STATE_SCHEMA_VERSION
+    for alias in LEGACY_STATE_ALIASES:
+        state.pop(alias, None)
+    return state
+
+
+STATE_MIGRATIONS = {
+    0: _migrate_state_v0_to_v1,
+    1: _migrate_state_v1_to_v2,
+}
 
 
 def migrate_state(raw_state: Mapping[str, Any]) -> dict[str, Any]:
-    """Return canonical v1 state through the explicit migration registry."""
+    """Return canonical current state through the explicit migration registry."""
 
     if not isinstance(raw_state, Mapping):
         raise StateMigrationError("checkpoint state must be an object")
@@ -112,7 +136,7 @@ def migrate_state(raw_state: Mapping[str, Any]) -> dict[str, Any]:
         )
     except ValueError as error:
         raise StateMigrationError(str(error)) from error
-    return _canonicalize_v1_state(state)
+    return _canonicalize_v2_state(state)
 
 
 def _canonical_patch(

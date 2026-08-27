@@ -71,10 +71,22 @@ from utils.character_identity import (
     resolve_character_id,
     resolve_character_name,
 )
+from utils.material_budget import MAX_CONTENT_PROVIDER_PADDING_LOSS_RATE
 from utils.camera_angle_contracts import (
     CAMERA_ANGLE_PLANNING_INSTRUCTIONS,
     CAMERA_ANGLE_VALUES,
 )
+
+SHOT_POLICY_CONTINUITY = "continuity"
+SHOT_POLICY_BALANCED = "balanced"
+SHOT_POLICY_CUT_DRIVEN = "cut-driven"
+SHOT_POLICIES = (
+    SHOT_POLICY_CONTINUITY,
+    SHOT_POLICY_BALANCED,
+    SHOT_POLICY_CUT_DRIVEN,
+)
+DEFAULT_SHOT_POLICY = SHOT_POLICY_CONTINUITY
+PRIMARY_SHOT_LAYOUT_SCHEMA = "honcut.primary-shot-layout.v1"
 from utils.camera_motion_contracts import (
     CAMERA_MOTION_PLANNING_INSTRUCTIONS,
     CAMERA_MOVEMENT_VALUES,
@@ -138,7 +150,9 @@ SYSTEM_PROMPT = (
 
 USER_PROMPT_TEMPLATE = (
     "目标时长：{target_duration}秒，每镜约{shot_duration}秒，必须输出恰好{max_shots}个镜头。"
-    "每镜只完成一个明确情节，并遵守当前视频模型的 generation_action_units 上限。\n\n"
+    "每个 Sxx 承载一个连续因果段，可包含多个有序动作单元，并遵守当前视频模型的 "
+    "generation_action_units 上限。shot_duration 仅是软偏好；同一时空、主体和因果链应优先留在"
+    "同一 Sxx，只有换场、跳时、主体切换或真实导演硬切才新增 Sxx。\n\n"
     "事件列表：\n{events_json}\n\n"
     "角色列表：\n{characters_summary}\n\n"
     "请输出一个 JSON 对象，包含：\n"
@@ -253,7 +267,8 @@ USER_PROMPT_TEMPLATE = (
 # adaptation has no single-call route.
 BATCH_EXPAND_PROMPT = (
     "本批目标时长：{batch_target}秒，每镜约{shot_duration}秒，恰好输出{max_shots}个镜头。"
-    "每镜只完成一个明确情节。\n\n"
+    "每个 Sxx 承载一个连续因果段，可包含多个有序动作单元；同一时空、主体和因果链优先保留在"
+    "同一 Sxx，只有换场、跳时、主体切换或真实导演硬切才新增 Sxx。\n\n"
     "本批来源事件：\n{events_json}\n\n角色列表：\n{characters_summary}\n\n"
     "输出严格 JSON 对象，包含 strategy 和 shots。每个 shot 必须包含以下字段：\n"
     "beat_order（整数，必须等于该镜展开自哪个 beat 的 beat_order）、shot_order、"
@@ -448,6 +463,8 @@ def estimate_action_aware_shot_count(
     events: List[Dict[str, Any]],
     target_duration: int,
     requested_shot_duration: int,
+    *,
+    shot_policy: str = DEFAULT_SHOT_POLICY,
 ) -> int:
     """Estimate editorial shots, leaving paid clip capacity to inner beats.
 
@@ -466,6 +483,7 @@ def estimate_action_aware_shot_count(
         events,
         target_duration,
         requested_shot_duration,
+        shot_policy=shot_policy,
     )["primary_shots"]
 
 
@@ -556,6 +574,31 @@ def _sequence_generation_unit_counts(
     return list(ordered.items())
 
 
+def _non_mergeable_primary_segment_count(
+    events: list[dict[str, Any]],
+) -> int:
+    """Count sequence changes and explicit director hard-cut boundaries."""
+    segments = 0
+    previous_sequence: str | None = None
+    for event in events:
+        if str(event.get("event_role") or "") == "drop":
+            continue
+        sequence = str(event.get("sequence_id") or "").strip() or "__unspecified__"
+        boundary = str(
+            event.get("continuity_before")
+            or event.get("boundary_before")
+            or ""
+        ).strip().lower()
+        if (
+            segments == 0
+            or sequence != previous_sequence
+            or boundary in {"cut", "hard_cut", "hard-cut"}
+        ):
+            segments += 1
+        previous_sequence = sequence
+    return max(1, segments)
+
+
 def _maximum_generation_units_for_story_clock(
     primary_shots: int,
     story_duration: int,
@@ -616,7 +659,7 @@ def _material_duration_bound(
     return allocations.get(primary_shots, math.inf)
 
 
-def _estimate_action_capacity_plan(
+def _estimate_cut_driven_action_capacity_plan(
     events: list[dict[str, Any]],
     delivery_duration: int,
     requested_shot_duration: int,
@@ -742,8 +785,395 @@ def _estimate_action_capacity_plan(
         "generated_duration_ratio_reference": GENERATED_DURATION_RATIO_REFERENCE,
         "generated_duration_ratio_reference_is_advisory": True,
         "delivery_duration": int(delivery_duration),
+        "requested_shot_duration": int(requested_shot_duration),
         "capability_profile": profile.name,
     }
+
+
+def _validate_shot_policy(shot_policy: str) -> str:
+    normalized = str(shot_policy or "").strip().lower()
+    if normalized not in SHOT_POLICIES:
+        raise ValueError(
+            f"shot_policy must be one of {', '.join(SHOT_POLICIES)}"
+        )
+    return normalized
+
+
+def _balanced_bounded_allocations(
+    total: int,
+    lower_bounds: list[int],
+    upper_bounds: list[int],
+) -> list[int] | None:
+    """Allocate an integer clock as evenly as provider bounds permit."""
+    if len(lower_bounds) != len(upper_bounds) or not lower_bounds:
+        return None
+    if any(lower > upper for lower, upper in zip(lower_bounds, upper_bounds)):
+        return None
+    if total < sum(lower_bounds) or total > sum(upper_bounds):
+        return None
+    allocations = list(lower_bounds)
+    remaining = int(total) - sum(allocations)
+    while remaining:
+        candidates = [
+            index
+            for index, value in enumerate(allocations)
+            if value < upper_bounds[index]
+        ]
+        if not candidates:
+            return None
+        selected = min(candidates, key=lambda index: (allocations[index], index))
+        allocations[selected] += 1
+        remaining -= 1
+    return allocations
+
+
+def _balanced_content_beat_counts(
+    primary_shots: int,
+    total_content_beats: int,
+) -> list[int]:
+    base, remainder = divmod(total_content_beats, primary_shots)
+    return [
+        base + (1 if index < remainder else 0)
+        for index in range(primary_shots)
+    ]
+
+
+def _build_primary_shot_layout_candidate(
+    *,
+    target_duration: int,
+    primary_shots: int,
+    total_content_beats: int,
+    capabilities: VideoModelCapabilities,
+    shot_policy: str,
+    source_action_units: int,
+    maximum_production_action_units: int,
+    maximum_padding_loss_rate: float,
+) -> dict[str, Any] | None:
+    beat_counts = _balanced_content_beat_counts(
+        primary_shots,
+        total_content_beats,
+    )
+    if any(
+        count < 1 or count > MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
+        for count in beat_counts
+    ):
+        return None
+
+    base_minimum, base_maximum = capabilities.effective_duration_bounds(
+        "multi_image"
+    )
+    tail_minimum, tail_maximum = capabilities.effective_duration_bounds(
+        "tail_video_extend"
+    )
+    primary_minimum = math.ceil(min_primary_story_duration(capabilities))
+    primary_maximum = math.floor(max_primary_story_duration(capabilities))
+    primary_lower_bounds = [
+        max(
+            primary_minimum,
+            math.ceil(base_minimum + (count - 1) * tail_minimum),
+        )
+        for count in beat_counts
+    ]
+    primary_upper_bounds = [
+        min(
+            primary_maximum,
+            math.floor(base_maximum + (count - 1) * tail_maximum),
+        )
+        for count in beat_counts
+    ]
+    primary_allocations = _balanced_bounded_allocations(
+        int(target_duration),
+        primary_lower_bounds,
+        primary_upper_bounds,
+    )
+    if primary_allocations is None:
+        return None
+
+    effective_beat_durations: list[list[int]] = []
+    request_durations: list[list[float]] = []
+    for primary_duration, content_beats in zip(
+        primary_allocations,
+        beat_counts,
+    ):
+        beat_lower_bounds = [math.ceil(base_minimum)] + [
+            math.ceil(tail_minimum)
+        ] * (content_beats - 1)
+        beat_upper_bounds = [math.floor(base_maximum)] + [
+            math.floor(tail_maximum)
+        ] * (content_beats - 1)
+        beat_allocations = _balanced_bounded_allocations(
+            primary_duration,
+            beat_lower_bounds,
+            beat_upper_bounds,
+        )
+        if beat_allocations is None:
+            return None
+        strategies = ["multi_image"] + [
+            "tail_video_extend"
+        ] * (content_beats - 1)
+        try:
+            primary_requests = [
+                capabilities.request_duration_for_effective_story(
+                    duration,
+                    strategy,
+                )
+                for duration, strategy in zip(beat_allocations, strategies)
+            ]
+        except ValueError:
+            return None
+        effective_beat_durations.append(beat_allocations)
+        request_durations.append(primary_requests)
+
+    total_request = sum(sum(items) for items in request_durations)
+    padding = total_request - float(target_duration)
+    loss_rate = padding / total_request if total_request else 0.0
+    if (
+        total_content_beats > 1
+        and loss_rate > maximum_padding_loss_rate + 1e-6
+    ):
+        return None
+
+    action_capacities = [
+        count * capabilities.max_micro_actions_per_beat
+        for count in beat_counts
+    ]
+    total_action_capacity = sum(action_capacities)
+    return {
+        "schema": PRIMARY_SHOT_LAYOUT_SCHEMA,
+        "shot_policy": shot_policy,
+        "primary_shots": primary_shots,
+        "story_duration_allocations_s": primary_allocations,
+        "content_beat_counts": beat_counts,
+        "effective_story_durations_s": effective_beat_durations,
+        "provider_request_durations_s": request_durations,
+        "generation_action_unit_capacities": action_capacities,
+        "max_generation_action_units_per_primary_shot": max(action_capacities),
+        "total_generation_action_unit_capacity": total_action_capacity,
+        "production_action_unit_target": min(
+            int(source_action_units),
+            int(maximum_production_action_units),
+            total_action_capacity,
+        ),
+        "cross_sxx_boundary_count": max(0, primary_shots - 1),
+        "projected_content_provider_request_duration_s": round(
+            total_request,
+            6,
+        ),
+        "projected_content_provider_padding_duration_s": round(padding, 6),
+        "projected_padding_loss_rate": round(loss_rate, 6),
+        "maximum_padding_loss_rate": float(maximum_padding_loss_rate),
+        "capability_profile": capabilities.name,
+    }
+
+
+def _solve_primary_shot_layout(
+    *,
+    target_duration: int,
+    requested_shot_duration: int,
+    capabilities: VideoModelCapabilities,
+    shot_policy: str,
+    source_action_units: int,
+    minimum_primary_shots: int,
+    maximum_padding_loss_rate: float = MAX_CONTENT_PROVIDER_PADDING_LOSS_RATE,
+) -> dict[str, Any]:
+    """Enumerate executable Sxx/Pxx layouts and apply one policy objective."""
+    policy = _validate_shot_policy(shot_policy)
+    if policy == SHOT_POLICY_CUT_DRIVEN:
+        raise ValueError("cut-driven layouts must use the legacy planner")
+    minimum_story = math.ceil(min_primary_story_duration(capabilities))
+    maximum_story = math.floor(max_primary_story_duration(capabilities))
+    minimum_shots = max(
+        1,
+        int(minimum_primary_shots),
+        math.ceil(float(target_duration) / maximum_story),
+    )
+    maximum_shots = math.floor(float(target_duration) / minimum_story)
+    candidates: list[dict[str, Any]] = []
+    maximum_production_action_units = max(
+        1,
+        math.floor(float(target_duration) / capabilities.min_unique_beat_s),
+    )
+    for primary_shots in range(minimum_shots, maximum_shots + 1):
+        for total_content_beats in range(
+            primary_shots,
+            primary_shots * MAX_CONTENT_BEATS_PER_PRIMARY_SHOT + 1,
+        ):
+            candidate = _build_primary_shot_layout_candidate(
+                target_duration=target_duration,
+                primary_shots=primary_shots,
+                total_content_beats=total_content_beats,
+                capabilities=capabilities,
+                shot_policy=policy,
+                source_action_units=source_action_units,
+                maximum_production_action_units=maximum_production_action_units,
+                maximum_padding_loss_rate=maximum_padding_loss_rate,
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+    if not candidates:
+        raise ValueError(
+            "no primary-shot layout can satisfy story clock, sequence isolation, "
+            "Provider capacity, and padding constraints"
+        )
+
+    preferred_shots = max(
+        1,
+        math.ceil(float(target_duration) / requested_shot_duration),
+    )
+    if policy == SHOT_POLICY_CONTINUITY:
+        objective_order = [
+            "maximum_production_action_unit_target",
+            "minimum_primary_shots",
+            "minimum_cross_sxx_boundary_count",
+            "minimum_provider_padding",
+        ]
+        selected = min(
+            candidates,
+            key=lambda candidate: (
+                -candidate["production_action_unit_target"],
+                candidate["primary_shots"],
+                candidate["cross_sxx_boundary_count"],
+                candidate["projected_content_provider_padding_duration_s"],
+                candidate["total_generation_action_unit_capacity"],
+            ),
+        )
+    else:
+        objective_order = [
+            "maximum_production_action_unit_target",
+            "nearest_requested_shot_count",
+            "minimum_primary_shots",
+            "minimum_provider_padding",
+        ]
+        selected = min(
+            candidates,
+            key=lambda candidate: (
+                -candidate["production_action_unit_target"],
+                abs(candidate["primary_shots"] - preferred_shots),
+                candidate["primary_shots"],
+                candidate["projected_content_provider_padding_duration_s"],
+                candidate["total_generation_action_unit_capacity"],
+            ),
+        )
+    selected = copy.deepcopy(selected)
+    selected["objective_order"] = objective_order
+    selected["objective_decision"] = {
+        "candidate_count": len(candidates),
+        "requested_shot_duration_s": int(requested_shot_duration),
+        "preferred_primary_shot_count": preferred_shots,
+        "selected_primary_shot_count": selected["primary_shots"],
+        "selected_production_action_unit_target": selected[
+            "production_action_unit_target"
+        ],
+        "story_clock_action_unit_limit": maximum_production_action_units,
+    }
+    return selected
+
+
+def _legacy_primary_shot_layout(
+    capacity_plan: dict[str, Any],
+    *,
+    target_duration: int,
+    capabilities: VideoModelCapabilities,
+) -> dict[str, Any]:
+    primary_shots = int(capacity_plan["primary_shots"])
+    base, remainder = divmod(int(target_duration), primary_shots)
+    allocations = [
+        base + (1 if index < remainder else 0)
+        for index in range(primary_shots)
+    ]
+    capacities = [
+        _generation_unit_capacity_for_story_duration(duration, capabilities)
+        for duration in allocations
+    ]
+    content_beats = sum(
+        math.ceil(capacity / capabilities.max_micro_actions_per_beat)
+        for capacity in capacities
+    )
+    source_action_units = int(
+        capacity_plan.get("generation_action_units") or 0
+    )
+    layout = _build_primary_shot_layout_candidate(
+        target_duration=target_duration,
+        primary_shots=primary_shots,
+        total_content_beats=content_beats,
+        capabilities=capabilities,
+        shot_policy=SHOT_POLICY_CUT_DRIVEN,
+        source_action_units=source_action_units,
+        maximum_production_action_units=source_action_units,
+        # Legacy selection is intentionally preserved even when its audited
+        # request padding is above the current Phase 5 safety threshold.
+        maximum_padding_loss_rate=1.0,
+    )
+    if layout is None:
+        raise ValueError("legacy cut-driven layout is not Provider-executable")
+    layout["maximum_padding_loss_rate"] = (
+        MAX_CONTENT_PROVIDER_PADDING_LOSS_RATE
+    )
+    layout["objective_order"] = ["legacy_cut_driven_algorithm"]
+    layout["objective_decision"] = {
+        "selected_primary_shot_count": primary_shots,
+    }
+    return layout
+
+
+def _estimate_action_capacity_plan(
+    events: list[dict[str, Any]],
+    delivery_duration: int,
+    requested_shot_duration: int,
+    *,
+    shot_policy: str = DEFAULT_SHOT_POLICY,
+) -> dict[str, Any]:
+    policy = _validate_shot_policy(shot_policy)
+    legacy_plan = _estimate_cut_driven_action_capacity_plan(
+        events,
+        delivery_duration,
+        requested_shot_duration,
+    )
+    profile = get_video_capabilities()
+    if policy == SHOT_POLICY_CUT_DRIVEN:
+        legacy_plan["shot_policy"] = policy
+        legacy_plan["minimum_primary_segment_count"] = (
+            _non_mergeable_primary_segment_count(events)
+        )
+        legacy_plan["primary_shot_layout"] = _legacy_primary_shot_layout(
+            legacy_plan,
+            target_duration=delivery_duration,
+            capabilities=profile,
+        )
+        return legacy_plan
+
+    sequence_count = len(
+        _sequence_generation_unit_counts([
+            event
+            for event in events
+            if str(event.get("event_role") or "") != "drop"
+        ])
+    )
+    minimum_primary_segments = _non_mergeable_primary_segment_count(events)
+    layout = _solve_primary_shot_layout(
+        target_duration=delivery_duration,
+        requested_shot_duration=requested_shot_duration,
+        capabilities=profile,
+        shot_policy=policy,
+        source_action_units=int(legacy_plan["generation_action_units"]),
+        minimum_primary_shots=max(
+            1,
+            sequence_count,
+            minimum_primary_segments,
+            int(legacy_plan["mandatory_sequence_count"]),
+        ),
+    )
+    legacy_plan["shot_policy"] = policy
+    legacy_plan["primary_shots"] = layout["primary_shots"]
+    legacy_plan["primary_shot_layout"] = layout
+    legacy_plan["minimum_primary_segment_count"] = minimum_primary_segments
+    legacy_plan["action_capacity_status"] = (
+        "fits_story_clock"
+        if layout["production_action_unit_target"]
+        >= legacy_plan["generation_action_units"]
+        else "screenplay_compression_required"
+    )
+    return legacy_plan
 
 
 def _resolve_padding_rewrite_layout(
@@ -752,6 +1182,7 @@ def _resolve_padding_rewrite_layout(
     target_duration: int,
     capabilities: VideoModelCapabilities,
     rewrite_request: Dict[str, Any],
+    shot_policy: str = DEFAULT_SHOT_POLICY,
 ) -> Dict[str, Any]:
     """Choose the least-loss single-request layout for one Phase 5 rewrite."""
 
@@ -777,6 +1208,38 @@ def _resolve_padding_rewrite_layout(
         ) from exc
     if not 0 < maximum_padding_loss_rate < 1:
         raise ValueError("screenplay padding rewrite limit must be between 0 and 1")
+
+    policy = _validate_shot_policy(shot_policy)
+    if policy != SHOT_POLICY_CUT_DRIVEN:
+        layout = _solve_primary_shot_layout(
+            target_duration=target_duration,
+            requested_shot_duration=max(
+                1,
+                int(
+                    capacity_plan.get("requested_shot_duration")
+                    or round(
+                        float(target_duration)
+                        / max(1, int(capacity_plan.get("primary_shots") or 1))
+                    )
+                ),
+            ),
+            capabilities=capabilities,
+            shot_policy=policy,
+            source_action_units=int(
+                capacity_plan.get("generation_action_units") or 0
+            ),
+            minimum_primary_shots=max(
+                1,
+                int(capacity_plan.get("mandatory_sequence_count") or 1),
+                int(capacity_plan.get("minimum_primary_segment_count") or 1),
+                len(capacity_plan.get("sequence_generation_action_units") or {}),
+            ),
+            maximum_padding_loss_rate=maximum_padding_loss_rate,
+        )
+        layout["reason_code"] = PADDING_LOSS_ERROR_CODE
+        layout["rewrite_attempt"] = 1
+        layout["objective_decision"]["rewrite_replanned_with_shared_solver"] = True
+        return layout
 
     current_shots = int(capacity_plan.get("primary_shots") or 0)
     mandatory_sequences = int(
@@ -817,13 +1280,31 @@ def _resolve_padding_rewrite_layout(
         padding = total_request - float(target_duration)
         loss_rate = padding / total_request if total_request else 0.0
         if loss_rate <= maximum_padding_loss_rate + 1e-6:
+            action_capacities = [
+                capabilities.max_micro_actions_per_beat
+            ] * primary_shots
             return {
-                "schema": "honcut.padding-efficient-screenplay-layout.v1",
+                "schema": PRIMARY_SHOT_LAYOUT_SCHEMA,
+                "shot_policy": policy,
                 "reason_code": PADDING_LOSS_ERROR_CODE,
                 "rewrite_attempt": 1,
                 "maximum_padding_loss_rate": maximum_padding_loss_rate,
                 "primary_shots": primary_shots,
                 "story_duration_allocations_s": allocations,
+                "content_beat_counts": [1] * primary_shots,
+                "effective_story_durations_s": [
+                    [duration] for duration in allocations
+                ],
+                "provider_request_durations_s": [
+                    [duration] for duration in request_durations
+                ],
+                "generation_action_unit_capacities": action_capacities,
+                "total_generation_action_unit_capacity": sum(action_capacities),
+                "production_action_unit_target": min(
+                    int(capacity_plan.get("generation_action_units") or 0),
+                    sum(action_capacities),
+                ),
+                "cross_sxx_boundary_count": max(0, primary_shots - 1),
                 "effective_shot_duration_s": round(
                     float(target_duration) / primary_shots
                 ),
@@ -838,6 +1319,10 @@ def _resolve_padding_rewrite_layout(
                 ),
                 "projected_padding_loss_rate": round(loss_rate, 6),
                 "capability_profile": capabilities.name,
+                "objective_order": ["legacy_cut_driven_padding_rewrite"],
+                "objective_decision": {
+                    "selected_primary_shot_count": primary_shots,
+                },
             }
     raise ValueError(
         "no screenplay layout can satisfy the Phase 5 Provider padding limit "
@@ -2165,9 +2650,10 @@ BEAT_SKELETON_PROMPT = (
     "不得据此恢复 omitted_source_micro_action_indexes 指向的动作，也不得另造替代动作。\n"
     "3. keep 保留关键因果/情感节点，merge 合并连续事件；dropped_source_events 只放不影响因果链的删减。\n"
     "4. 台词归属必须忠于原事件；who 只能使用角色列表主名，别名改为主名，群众不得写入 who。\n"
-    "5. beat 是导演级叙事镜头，不是单次视频调用。同一 sequence_id 的连续 action_unit 可以合并，"
+    "5. beat 是导演级叙事镜头，不是单次视频调用。一个 beat 应承载一个内容完整的连续因果段，"
+    "可以包含多个有序 action_unit；同一 sequence_id、同一时空、同一主体和因果链应优先合并，"
     "但必须完整保留 source_events 与 micro_actions 原顺序，后续会拆成 P01/P02…；不同 sequence_id、"
-    "换场/跳时不得错误合并。turning_point 可与同 sequence 中紧邻的因果动作共用 beat，但必须明确"
+    "换场/跳时、主体切换或真实导演硬切才新增 beat。turning_point 可与同 sequence 中紧邻的因果动作共用 beat，但必须明确"
     "保留转折。被保留事件在 beats 中的引用次数不得少于输入中的 "
     "minimum_kept_primary_beat_occurrences；同一事件的后续引用只承载尚未表现的动作，不得重放。\n"
     "6. sequence_id 与 continuity_before 是生成连续性依据。每个 beat 只能引用固定槽位指定 sequence 的事件；"
@@ -4243,8 +4729,75 @@ def _atomic_write_json(path: Path, value: Any) -> None:
     os.replace(temporary, path)
 
 
-SCREENPLAY_PLAN_SCHEMA = "honcut.screenplay-plan.v5"
-LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v15"
+SCREENPLAY_PLAN_SCHEMA = "honcut.screenplay-plan.v6"
+LEGACY_SCREENPLAY_PLAN_SCHEMA = "honcut.screenplay-plan.v5"
+LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v16"
+
+
+def migrate_screenplay_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """Upgrade the last production screenplay plan without inventing evidence."""
+    if not isinstance(plan, dict):
+        raise ValueError("screenplay plan must be an object")
+    schema = str(plan.get("schema") or "").strip()
+    if schema in {SCREENPLAY_PLAN_SCHEMA, "honcut.screenplay-plan.v1"}:
+        return copy.deepcopy(plan)
+    match = re.fullmatch(r"honcut\.screenplay-plan\.v(\d+)", schema)
+    if match and int(match.group(1)) > int(SCREENPLAY_PLAN_SCHEMA.rsplit("v", 1)[1]):
+        raise ValueError(
+            f"screenplay plan schema {schema} is newer than supported version "
+            f"{SCREENPLAY_PLAN_SCHEMA}"
+        )
+    if schema != LEGACY_SCREENPLAY_PLAN_SCHEMA:
+        raise ValueError(f"unsupported screenplay plan schema: {schema or '<missing>'}")
+    migrated = copy.deepcopy(plan)
+    beats = [beat for beat in migrated.get("beats") or [] if isinstance(beat, dict)]
+    durations = [
+        beat.get("duration_s")
+        for beat in beats
+    ]
+    if (
+        not beats
+        or any(
+            isinstance(duration, bool)
+            or not isinstance(duration, (int, float))
+            or float(duration) <= 0
+            for duration in durations
+        )
+    ):
+        raise ValueError("legacy screenplay plan has invalid beat durations")
+    profile = get_video_capabilities()
+    action_capacities = [profile.max_micro_actions_per_beat] * len(beats)
+    migrated["schema"] = SCREENPLAY_PLAN_SCHEMA
+    migrated["primary_shot_layout"] = {
+        "schema": PRIMARY_SHOT_LAYOUT_SCHEMA,
+        "shot_policy": SHOT_POLICY_CUT_DRIVEN,
+        "primary_shots": len(beats),
+        "story_duration_allocations_s": durations,
+        "content_beat_counts": [1] * len(beats),
+        "generation_action_unit_capacities": action_capacities,
+        "max_generation_action_units_per_primary_shot": (
+            profile.max_micro_actions_per_beat
+        ),
+        "total_generation_action_unit_capacity": sum(action_capacities),
+        "cross_sxx_boundary_count": max(0, len(beats) - 1),
+        "provider_request_durations_s": None,
+        "projected_content_provider_request_duration_s": None,
+        "projected_content_provider_padding_duration_s": None,
+        "projected_padding_loss_rate": None,
+        "capability_profile": profile.name,
+        "objective_order": ["legacy_cut_driven_algorithm"],
+        "objective_decision": {
+            "migration_preserves_historical_layout": True,
+        },
+        "migration_source": LEGACY_SCREENPLAY_PLAN_SCHEMA,
+        "provider_ledger_source": "storyboard_material_budget",
+    }
+    migrated["migration"] = {
+        "source_schema": LEGACY_SCREENPLAY_PLAN_SCHEMA,
+        "target_schema": SCREENPLAY_PLAN_SCHEMA,
+        "deterministic": True,
+    }
+    return migrated
 
 
 def _build_screenplay_plan(
@@ -4257,6 +4810,7 @@ def _build_screenplay_plan(
     capabilities: VideoModelCapabilities | None = None,
     production_events: List[Dict[str, Any]] | None = None,
     duration_scaled_event_plan: Dict[str, Any] | None = None,
+    primary_shot_layout: Dict[str, Any] | None = None,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
     """Separate the complete source ledger from the fitted production ledger.
 
@@ -4270,6 +4824,23 @@ def _build_screenplay_plan(
     if not shots:
         raise ValueError("screenplay plan requires at least one production beat")
     profile = capabilities or get_video_capabilities()
+    resolved_primary_layout = copy.deepcopy(
+        primary_shot_layout or source_capacity_plan.get("primary_shot_layout")
+    )
+    if not isinstance(resolved_primary_layout, dict) or (
+        resolved_primary_layout.get("schema") != PRIMARY_SHOT_LAYOUT_SCHEMA
+    ):
+        raise ValueError("screenplay plan requires a current primary-shot layout")
+    if resolved_primary_layout.get("shot_policy") not in SHOT_POLICIES:
+        raise ValueError("primary-shot layout has an invalid shot policy")
+    if int(resolved_primary_layout.get("primary_shots") or 0) != len(shots):
+        raise ValueError("primary-shot layout count does not match production shots")
+    layout_durations = resolved_primary_layout.get(
+        "story_duration_allocations_s"
+    )
+    shot_durations = [shot.get("suggested_duration") for shot in shots]
+    if layout_durations != shot_durations:
+        raise ValueError("primary-shot layout duration ledger does not match shots")
     adapted_events = production_events or events
     if len(adapted_events) != len(events):
         raise ValueError("production event ledger must preserve source event cardinality")
@@ -4594,6 +5165,7 @@ def _build_screenplay_plan(
     screenplay_plan = {
         "schema": SCREENPLAY_PLAN_SCHEMA,
         "target_duration_s": int(target_duration),
+        "primary_shot_layout": resolved_primary_layout,
         "source_ledger": {
             "artifact": "phase1_events.json",
             "event_count": len(events),
@@ -4704,6 +5276,8 @@ def _layered_input_fingerprint(
     expected_beats: int,
     director_plan: Optional[Dict[str, Any]] = None,
     screenplay_rewrite_request: Optional[Dict[str, Any]] = None,
+    shot_policy: str = DEFAULT_SHOT_POLICY,
+    primary_shot_layout: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Bind layered checkpoints to the complete semantic adaptation input."""
     contract = {
@@ -4717,6 +5291,8 @@ def _layered_input_fingerprint(
             _director_intents_by_sequence(director_plan, events).values()
         ),
         "screenplay_rewrite_request": screenplay_rewrite_request,
+        "shot_policy": _validate_shot_policy(shot_policy),
+        "primary_shot_layout": primary_shot_layout,
     }
     encoded = json.dumps(
         contract,
@@ -4799,6 +5375,7 @@ def adapt_events(
     director_plan: Optional[Dict[str, Any]] = None,
     source_events_hash: Optional[str] = None,
     screenplay_rewrite_request: Optional[Dict[str, Any]] = None,
+    shot_policy: str = DEFAULT_SHOT_POLICY,
 ) -> Dict[str, Any]:
     """
     将事件列表改编为 shot 列表
@@ -4844,6 +5421,7 @@ def adapt_events(
         events,
         target_duration,
         shot_duration,
+        shot_policy=shot_policy,
     )
     rewrite_layout = None
     if screenplay_rewrite_request is not None:
@@ -4852,12 +5430,17 @@ def adapt_events(
             target_duration=target_duration,
             capabilities=capability_profile,
             rewrite_request=screenplay_rewrite_request,
+            shot_policy=shot_policy,
         )
         capacity_plan = {
             **capacity_plan,
             "primary_shots": rewrite_layout["primary_shots"],
             "screenplay_rewrite": rewrite_layout,
+            "primary_shot_layout": rewrite_layout,
         }
+    primary_shot_layout = (
+        rewrite_layout or capacity_plan["primary_shot_layout"]
+    )
     max_shots = capacity_plan["primary_shots"]
     material_duration = capacity_plan["material_duration"]
     effective_shot_duration = max(
@@ -4875,11 +5458,9 @@ def adapt_events(
             effective_shot_duration=effective_shot_duration,
             capabilities=capability_profile,
             max_generation_units_per_beat=(
-                rewrite_layout[
+                primary_shot_layout[
                     "max_generation_action_units_per_primary_shot"
                 ]
-                if rewrite_layout is not None
-                else None
             ),
         )
     )
@@ -4916,6 +5497,8 @@ def adapt_events(
             effective_shot_duration,
             max_shots,
             director_plan,
+            shot_policy=shot_policy,
+            primary_shot_layout=primary_shot_layout,
             **fingerprint_kwargs,
         )
         skeleton = None
@@ -4928,13 +5511,11 @@ def adapt_events(
                 layered_fingerprint,
             )
         if skeleton is None:
-            skeleton_kwargs = {}
-            if rewrite_layout is not None:
-                skeleton_kwargs["max_generation_units_per_beat"] = (
-                    rewrite_layout[
-                        "max_generation_action_units_per_primary_shot"
-                    ]
-                )
+            skeleton_kwargs = {
+                "max_generation_units_per_beat": primary_shot_layout[
+                    "max_generation_action_units_per_primary_shot"
+                ]
+            }
             skeleton = _build_beat_skeleton(
                 production_events,
                 characters_summary,
@@ -4975,6 +5556,27 @@ def adapt_events(
 
         annotate_boundaries(shots)
         normalize_shot_durations(shots, material_duration, capability_profile)
+        planned_allocations = primary_shot_layout.get(
+            "story_duration_allocations_s"
+        )
+        if (
+            not isinstance(planned_allocations, list)
+            or len(planned_allocations) != len(shots)
+        ):
+            raise ValueError("primary-shot layout does not match production shots")
+        for shot, duration in zip(shots, planned_allocations, strict=True):
+            shot["suggested_duration"] = duration
+            shot["duration_allocation"] = {
+                "method": "primary_shot_layout",
+                "layout_schema": PRIMARY_SHOT_LAYOUT_SCHEMA,
+                "shot_policy": shot_policy,
+            }
+        _validate_beat_material_duration(
+            shots,
+            production_events,
+            material_duration,
+            capability_profile,
+        )
 
         screenplay_plan, reconciled_capacity_plan = _build_screenplay_plan(
             events,
@@ -4985,6 +5587,7 @@ def adapt_events(
             capabilities=capability_profile,
             production_events=production_events,
             duration_scaled_event_plan=duration_scaled_event_plan,
+            primary_shot_layout=primary_shot_layout,
         )
         screenplay_plan_sha256 = hashlib.sha256(
             json.dumps(
@@ -5028,6 +5631,8 @@ def adapt_events(
             "material_duration": material_duration,
             "capacity_plan": reconciled_capacity_plan,
             "screenplay_rewrite": rewrite_layout,
+            "shot_policy": shot_policy,
+            "primary_shot_layout": primary_shot_layout,
             "screenplay_plan": screenplay_plan,
             "duration_scaled_event_plan": duration_scaled_event_plan,
             "screenplay_plan_sha256": screenplay_plan_sha256,
@@ -5081,6 +5686,13 @@ def main():
         type=int,
         default=AVG_SHOT_DURATION,
         help=f"每镜平均时长（秒），默认 {AVG_SHOT_DURATION}",
+    )
+
+    parser.add_argument(
+        "--shot-policy",
+        choices=SHOT_POLICIES,
+        default=DEFAULT_SHOT_POLICY,
+        help="一级分镜策略，默认 continuity",
     )
 
     parser.add_argument(
@@ -5160,6 +5772,7 @@ def main():
             characters=characters,
             target_duration=args.duration,
             shot_duration=args.shot_duration,
+            shot_policy=args.shot_policy,
             output_dir=Path(args.output).parent if args.output else None,
         )
     except (ValueError, RuntimeError) as e:

@@ -18,7 +18,12 @@ except ImportError:
     GraphInterrupt = None
     LANGGRAPH_AVAILABLE = False
 
-from phases.phase1.adaptation_engine import AVG_SHOT_DURATION
+from phases.phase1.adaptation_engine import (
+    AVG_SHOT_DURATION,
+    DEFAULT_SHOT_POLICY,
+    SHOT_POLICIES,
+    SHOT_POLICY_CUT_DRIVEN,
+)
 from phases.phase1.phase1_pipeline import run_phase1
 from phases.phase2.phase2_storyboard import run_phase2
 from phases.phase3.phase3_character import run_phase3
@@ -73,6 +78,37 @@ _GRAPH_PROGRESS_PHASES = {
     "phase9": ("phase9", "音频与后期"),
     "phase9_5": ("phase9_5", "成片交付质检"),
 }
+
+
+def _resolve_runtime_shot_policy(
+    output_dir: Path,
+    *,
+    resume: bool,
+    shot_policy: str | None,
+) -> str:
+    """Default fresh runs to continuity and historical resumes to cut-driven."""
+    if shot_policy is not None:
+        normalized = str(shot_policy).strip().lower()
+        if normalized not in SHOT_POLICIES:
+            raise ValueError(
+                f"shot_policy must be one of {', '.join(SHOT_POLICIES)}"
+            )
+        return normalized
+    if not resume:
+        return DEFAULT_SHOT_POLICY
+    try:
+        manifest = json.loads(
+            (output_dir / "RUN_MANIFEST.json").read_text(encoding="utf-8")
+        )
+        stored = manifest.get("resolved_config", {}).get("shot_policy")
+    except (OSError, json.JSONDecodeError, AttributeError):
+        stored = None
+    if stored is None:
+        return SHOT_POLICY_CUT_DRIVEN
+    normalized = str(stored).strip().lower()
+    if normalized not in SHOT_POLICIES:
+        raise ValueError("run manifest contains an invalid shot_policy")
+    return normalized
 
 
 def _phase5_dry_run_handoff_is_current(
@@ -232,6 +268,7 @@ def run_pipeline(
     input_file: str = None,
     duration: int = 60,
     shot_duration: int = AVG_SHOT_DURATION,
+    shot_policy: str | None = None,
     chain_mode: bool = False,
     dry_run: bool = False,
     skip_phase: list = None,
@@ -258,6 +295,7 @@ def run_pipeline(
             input_file=input_file,
             duration=duration,
             shot_duration=shot_duration,
+            shot_policy=shot_policy,
             chain_mode=chain_mode,
             dry_run=dry_run,
             skip_phase=skip_phase,
@@ -287,6 +325,7 @@ def _run_pipeline(
     input_file: str = None,
     duration: int = 60,
     shot_duration: int = AVG_SHOT_DURATION,
+    shot_policy: str | None = None,
     chain_mode: bool = False,
     dry_run: bool = False,
     skip_phase: list = None,
@@ -351,6 +390,11 @@ def _run_pipeline(
     skip_phase = list(skip_phase or [])
     output_path = Path(output_dir).resolve()
     _ensure_dir(output_path)
+    shot_policy = _resolve_runtime_shot_policy(
+        output_path,
+        resume=resume,
+        shot_policy=shot_policy,
+    )
     resolved_character_library_dir = None
     if character_library_dir:
         character_library_path = Path(character_library_dir).expanduser().resolve()
@@ -411,6 +455,7 @@ def _run_pipeline(
         "project_id": project_id,
         "duration": duration,
         "shot_duration": shot_duration,
+        "shot_policy": shot_policy,
         "chain_mode": chain_mode,
         "transition": transition,
         "transition_duration": transition_duration,
@@ -650,6 +695,7 @@ def _run_pipeline(
                 output_dir=str(output_path),
                 target_duration_s=duration,
                 shot_duration_s=shot_duration,
+                shot_policy=shot_policy,
                 dry_run=dry_run,
                 chain_mode=chain_mode,
                 auto_approve=auto_approve,
@@ -797,6 +843,7 @@ def _run_pipeline(
         phase1_kwargs = {
             "reporter": reporter,
             "shot_duration": shot_duration,
+            "shot_policy": shot_policy,
             "project_video_spec": project_video_spec,
         }
         if _screenplay_rewrite_request is not None:
@@ -1048,6 +1095,7 @@ def _run_pipeline(
                     text=text,
                     duration=duration,
                     shot_duration=shot_duration,
+                    shot_policy=shot_policy,
                     chain_mode=chain_mode,
                     dry_run=dry_run,
                     skip_phase=skip_phase,

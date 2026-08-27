@@ -18,7 +18,12 @@ from utils.deps import check_dependencies
 
 check_dependencies()
 
-from phases.phase1.adaptation_engine import AVG_SHOT_DURATION
+from phases.phase1.adaptation_engine import (
+    AVG_SHOT_DURATION,
+    DEFAULT_SHOT_POLICY,
+    SHOT_POLICIES,
+    SHOT_POLICY_CUT_DRIVEN,
+)
 from runtime import pipeline_execution as _core
 from utils.media_profiles import AVAILABLE_PROFILES, DEFAULT_MEDIA_PROFILE
 from utils.pipeline_config import DEFAULT_CONFIG, load_config
@@ -130,6 +135,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--duration", type=int, default=None, help="目标视频时长（秒），默认 60")
     parser.add_argument("--shot-duration", type=int, default=None,
                         help=f"每镜平均时长（秒），默认 {AVG_SHOT_DURATION}")
+    parser.add_argument(
+        "--shot-policy",
+        choices=SHOT_POLICIES,
+        default=None,
+        help="一级分镜策略；新运行默认 continuity",
+    )
     parser.add_argument("--chain-mode", action="store_true", default=None,
                         help="Seedance 尾帧接力模式（镜头串行生成）")
     parser.add_argument("--dry-run", action="store_true", default=None, help="dry-run 模式")
@@ -254,6 +265,10 @@ def _resolved_run_arguments(args: argparse.Namespace) -> dict:
         "project_id": choose("project_id", "local"),
         "duration": choose("duration", 60),
         "shot_duration": choose("shot_duration", AVG_SHOT_DURATION),
+        "shot_policy": choose(
+            "shot_policy",
+            SHOT_POLICY_CUT_DRIVEN if args.resume else DEFAULT_SHOT_POLICY,
+        ),
         "chain_mode": choose("chain_mode", False),
         "dry_run": choose("dry_run", False),
         "transition": choose("transition", "crossfade"),
@@ -294,6 +309,7 @@ def main() -> None:
         input_file=args.input,
         duration=resolved["duration"],
         shot_duration=resolved["shot_duration"],
+        shot_policy=resolved["shot_policy"],
         chain_mode=resolved["chain_mode"],
         dry_run=resolved["dry_run"],
         skip_phase=_phase_skip_list(args, parser),

@@ -12,7 +12,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Optional
 
-from phases.phase1.adaptation_engine import AVG_SHOT_DURATION
+from phases.phase1.adaptation_engine import AVG_SHOT_DURATION, DEFAULT_SHOT_POLICY
 from phases.phase1.phase1_director import (
     DirectorPlanningError,
     run_phase1_director,
@@ -301,6 +301,7 @@ def run_phase1_screenwriter(
     shot_duration: int = AVG_SHOT_DURATION,
     project_video_spec: dict[str, Any] | None = None,
     screenplay_rewrite_request: dict[str, Any] | None = None,
+    shot_policy: str = DEFAULT_SHOT_POLICY,
     *,
     _director_runner=None,
 ) -> dict:
@@ -353,6 +354,7 @@ def run_phase1_screenwriter(
                 segments,
                 duration=max(15, int(duration or 15)),
                 shot_duration=shot_duration,
+                shot_policy=shot_policy,
             )
             receipt = preflight["receipt"]
             receipt_path = output_dir / "phase1_dry_run_receipt.json"
@@ -384,11 +386,13 @@ def run_phase1_screenwriter(
                     target_duration=max(15, int(duration or 15)),
                     capabilities=get_video_capabilities(),
                     rewrite_request=screenplay_rewrite_request,
+                    shot_policy=shot_policy,
                 )
                 capacity_plan = {
                     **capacity_plan,
                     "primary_shots": dry_run_rewrite_layout["primary_shots"],
                     "screenplay_rewrite": dry_run_rewrite_layout,
+                    "primary_shot_layout": dry_run_rewrite_layout,
                 }
 
             source_events = preflight["events"]
@@ -412,7 +416,13 @@ def run_phase1_screenwriter(
             resolved_video_spec = project_video_spec or _project_video_spec("1080p")
             requested_duration = max(15, int(duration or 15))
             shot_count = max(1, int(capacity_plan["primary_shots"]))
-            base_duration, remainder = divmod(requested_duration, shot_count)
+            primary_shot_layout = (
+                dry_run_rewrite_layout
+                or capacity_plan["primary_shot_layout"]
+            )
+            planned_allocations = primary_shot_layout[
+                "story_duration_allocations_s"
+            ]
             shots = []
             for index in range(shot_count):
                 event_start = math.floor(index * len(source_events) / shot_count)
@@ -456,10 +466,8 @@ def run_phase1_screenwriter(
                         "name": f"source-derived dry-run shot {shot_id}",
                         "prompt": source_slice,
                         "caption": "",
-                        "duration": base_duration + (1 if index < remainder else 0),
-                        "suggested_duration": base_duration + (
-                            1 if index < remainder else 0
-                        ),
+                        "duration": planned_allocations[index],
+                        "suggested_duration": planned_allocations[index],
                         "aspect_ratio": resolved_video_spec["aspect_ratio"],
                         "width": resolved_video_spec["width"],
                         "height": resolved_video_spec["height"],
@@ -504,6 +512,8 @@ def run_phase1_screenwriter(
                 "material_duration": requested_duration,
                 "total_duration": requested_duration,
                 "capacity_plan": capacity_plan,
+                "shot_policy": shot_policy,
+                "primary_shot_layout": primary_shot_layout,
                 "style": "source-derived dry-run structural fixture",
                 "aspect_ratio": resolved_video_spec["aspect_ratio"],
                 "width": resolved_video_spec["width"],
@@ -567,6 +577,8 @@ def run_phase1_screenwriter(
                 "capacity_plan": capacity_plan,
                 "director": director,
                 "screenplay_rewrite": dry_run_rewrite_layout,
+                "shot_policy": shot_policy,
+                "primary_shot_layout": primary_shot_layout,
                 "_storyboard": storyboard,
                 "_characters": characters,
             }
@@ -760,6 +772,7 @@ def run_phase1_screenwriter(
             director_plan=director["plan"],
             source_events_hash=events_input_hash,
             screenplay_rewrite_request=screenplay_rewrite_request,
+            shot_policy=shot_policy,
         )
         adapted_shots = adapted.get("shots", [])
         print(f"    ✓ 改编完成，{len(adapted_shots)} 个镜头")

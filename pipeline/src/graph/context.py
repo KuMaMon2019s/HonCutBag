@@ -28,6 +28,7 @@ def initial_state_from_config(
         output_dir=config.output_dir,
         target_duration_s=config.target_duration_s,
         shot_duration_s=config.shot_duration_s,
+        shot_policy=config.shot_policy,
         dry_run=config.dry_run,
         chain_mode=config.chain_mode,
         auto_approve=config.auto_approve,

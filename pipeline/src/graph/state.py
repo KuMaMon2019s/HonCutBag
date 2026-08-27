@@ -21,6 +21,7 @@ class HonCutState(TypedDict, total=False):
     output_dir: str
     target_duration_s: int
     shot_duration_s: int
+    shot_policy: str
     dry_run: bool
     chain_mode: bool
     auto_approve: bool

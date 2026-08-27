@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
@@ -87,6 +87,7 @@ class GraphRunConfig(BaseModel):
         ge=1,
         validation_alias=AliasChoices("shot_duration_s", "shot_duration"),
     )
+    shot_policy: Literal["continuity", "balanced", "cut-driven"] = "continuity"
     dry_run: bool = False
     chain_mode: bool = False
     # Human storyboard review is permanently disabled. Keep this field for

@@ -9,7 +9,10 @@ import re
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from phases.phase1.adaptation_engine import _estimate_action_capacity_plan
+from phases.phase1.adaptation_engine import (
+    DEFAULT_SHOT_POLICY,
+    _estimate_action_capacity_plan,
+)
 from prompt.event_extractor import is_global_production_directive_text
 from utils.action_units import classify_micro_action, event_uses_composite_motion
 
@@ -100,10 +103,16 @@ def build_dry_run_capacity_preflight(
     *,
     duration: int,
     shot_duration: int,
+    shot_policy: str = DEFAULT_SHOT_POLICY,
 ) -> dict[str, Any]:
     """Estimate source-structure pressure without an LLM or Provider call."""
     events, ignored_directives, source_item_count = _preflight_events(text, segments)
-    capacity_plan = _estimate_action_capacity_plan(events, duration, shot_duration)
+    capacity_plan = _estimate_action_capacity_plan(
+        events,
+        duration,
+        shot_duration,
+        shot_policy=shot_policy,
+    )
     passed = capacity_plan["action_capacity_status"] == "fits_story_clock"
     receipt = {
         "schema": PHASE1_DRY_RUN_RECEIPT_SCHEMA,

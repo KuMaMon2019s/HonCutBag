@@ -90,7 +90,7 @@ Phases use contiguous integer IDs (`phase1`–`phase9`); every phase writes a ch
 
 | Phase | Name | Description |
 |-------|------|-------------|
-| Phase 1 | Screenwriter Engine | Text parsing → event extraction → sequence-aware Director intent (`scene_goal`, `emotion_arc`, `visual_focus`, `spatial_intent`, `transition_intent`) → character discovery → duration-scaled production action ledger → layered cinematic adaptation → continuity-boundary classification → per-shot storyboard JSON with eight-layer prompts. Source wording and dialogue remain verbatim, while identity joins use language-neutral character/ref IDs and English controlled enums in the strict semantic ledger. Code owns action capacity; a strict Director-aligned selector may only choose source action indexes and records narrative purpose/emotional beat. Adaptation remains the sole owner of shot count, framing, controlled camera angle, movement, lighting, and duration. Sub-phase checkpoints and a 15s heartbeat keep it observable |
+| Phase 1 | Screenwriter Engine | Text parsing → event extraction → sequence-aware Director intent (`scene_goal`, `emotion_arc`, `visual_focus`, `spatial_intent`, `transition_intent`) → character discovery → duration-scaled production action ledger → policy-driven primary-shot layout → layered cinematic adaptation → continuity-boundary classification → per-shot storyboard JSON with eight-layer prompts. Source wording and dialogue remain verbatim, while identity joins use language-neutral character/ref IDs and English controlled enums in the strict semantic ledger. Code owns action capacity; a strict Director-aligned selector may only choose source action indexes and records narrative purpose/emotional beat. Adaptation remains the sole owner of shot count, Sxx/Pxx layout, framing, controlled camera angle, movement, lighting, and duration. Sub-phase checkpoints and a 15s heartbeat keep it observable |
 | Phase 2 | Storyboard Images | Per-shot storyboard images (Seedream) as visual reference for video generation |
 | Phase 3 | Character Factory | Four canonical views, deterministic 2×2 reference board, QA receipts, character cards, and optional project-scoped reuse of exact approved packs |
 | Phase 4 | Scene Consistency | Shot directory layout, timeline planning, scene consistency contracts, and continuity groups: a group starts from image references and later shots depend on the preceding video |
@@ -107,7 +107,7 @@ Phases use contiguous integer IDs (`phase1`–`phase9`); every phase writes a ch
 - **Seedance-first with graceful fallback** — shots are generated via Seedance online API by default; on timeout or stall the pipeline falls back to local Wan2.2 generation through the Windows Bridge with explicit duration-loss logging.
 - **Continuity-group generation** — the screenwriter labels real action continuations; each group begins from canonical multi-image references and subsequent shots extend the preceding video. Scene changes start fresh and remain eligible for editorial transitions.
 - **Prose-action screenplay understanding** — Phase 1 recognizes scene-state prose, character damage/wardrobe state, unlabelled quoted dialogue, causal attack/counter chains, physical consequences, and relationship reversals. Neighboring text is supplied as read-only context, exact dialogue is confidence-attributed, and deterministic `sequence_id` / `action_unit_id` metadata survives into storyboard generation.
-- **Segmentation-aware shot duration** — shot length follows video-model segmentation best practice (medium-form video: fewer, longer shots, one clear plot beat per shot) instead of many short fragments. Duration is computed as `max(4, min(15, num_frames // fps))` and passed through to Seedance.
+- **Continuity-first primary-shot layout** — the default `continuity` policy maximizes story-clock action capacity inside model and 25% Provider-padding limits, then minimizes Sxx count and boundaries. A long Sxx carries one continuous causal segment through one to three scoped Pxx requests; `balanced` follows the requested average more closely, while `cut-driven` preserves the historical short-shot algorithm.
 - **Narrative-order verification (Phase 8)** — before assembly, storyboard images are reviewed against the full script with a multimodal LLM; extracted frames are scanned for black/still frames; a duration gate compares actual vs. target runtime and can trigger a bounded reshoot loop.
 - **Real ASR subtitles (Phase 9)** — the final audio track is transcribed via SeedASR WebSocket (`volc.seedasr.sauc.duration`), merged across shots with cumulative time offsets, and burned into the film. Shots without speech fall back to script captions, explicitly marked `script_fallback` — no fabricated timelines.
 - **Unified streaming LLM client** — every Phase 1 scripting call flows through a single streaming client with hard wall-clock timeouts (forced stream termination, not just a pre-request budget check), a 15-second heartbeat, and sub-phase checkpoints, so a hung LLM call can never block the pipeline silently for hours.
@@ -169,7 +169,8 @@ uv run --locked --managed-python python pipeline/scripts/phase_orchestrator.py \
 # Or invoke the stable CLI directly with an explicit cache/project namespace
 uv run --locked --managed-python python pipeline/src/pipeline_runner.py \
   --input story.txt --output-dir workspaces/example/output --project-id studio-a \
-  --character-library-dir /absolute/path/to/studio-character-library
+  --character-library-dir /absolute/path/to/studio-character-library \
+  --shot-policy continuity
 
 # Resume from a checkpoint (e.g. after a single shot failure)
 uv run --locked --managed-python python pipeline/scripts/phase_orchestrator.py \
@@ -185,6 +186,12 @@ Phase 3 only reuses an immutable `canonical_approved` pack from the same
 `project-id` with an exact versioned character-spec match and valid QA,
 approval, and file hashes. Similarity search does not authorize automatic
 reuse, and state variants are not promoted by the v1 registry.
+
+`--shot-policy` accepts `continuity`, `balanced`, or `cut-driven`. Fresh runs
+default to `continuity`; `--shot-duration` is a soft preference for
+`continuity` and `balanced`, but remains a hard editorial target for
+`cut-driven`. Historical manifests and checkpoints without `shot_policy`
+resume deterministically as `cut-driven`.
 
 Online visual generation uses the Volcano Ark Agent Plan only. Configure
 `ARK_AGENT_API_KEY`; HonCut does not read `ARK_API_KEY`, which remains reserved

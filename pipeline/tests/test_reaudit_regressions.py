@@ -189,12 +189,12 @@ def test_phase1_dry_run_indexes_actions_after_a_sustained_event(tmp_path):
         (tmp_path / "STORYBOARD.json").read_text(encoding="utf-8")
     )
     first_shot = storyboard["shots"][0]
-    assert first_shot["source_events"] == [1, 2, 3, 4]
-    assert len(first_shot["micro_actions"]) == 3
+    assert first_shot["source_events"] == [1, 2, 3, 4, 5, 6]
+    assert len(first_shot["micro_actions"]) == 5
     assert [
         unit["ledger_indexes"]
         for unit in first_shot["generation_action_units"]
-    ] == [[0], [1], [2]]
+    ] == [[0], [1], [2], [3], [4]]
 
 
 def test_production_source_has_no_audited_story_specific_branches():

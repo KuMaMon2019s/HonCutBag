@@ -23,6 +23,7 @@ from clients.ark_multimodal_client import ArkMultimodalClient
 from phases.phase1.adaptation_engine import (
     DURATION_SCALED_EVENT_PLAN_SCHEMA,
     SCREENPLAY_PLAN_SCHEMA,
+    migrate_screenplay_plan,
     terminal_outcome_event_ids,
 )
 from phases.phase1.storyboard_beats import (
@@ -2128,11 +2129,13 @@ def run_storyboard_qa_gate(output_dir: Path, similarity_threshold: float | None 
         )
         screenplay_plan_path = output_dir / "SCREENPLAY_PLAN.json"
         screenplay_plan = (
-            json.loads(screenplay_plan_path.read_text(encoding="utf-8"))
+            migrate_screenplay_plan(
+                json.loads(screenplay_plan_path.read_text(encoding="utf-8"))
+            )
             if screenplay_plan_path.is_file()
             else None
         )
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
         result = {"status": "error", "grade": "D", "gate_passed": False, "error": f"required artifact unreadable: {exc}", "issues": [_issue("L1", "severe", "artifact_unreadable", str(exc))], "failed_shot_ids": []}
         report_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         return result
@@ -2366,11 +2369,13 @@ def _run_storyboard_qa_dry_run(output_dir: Path) -> dict[str, Any]:
         )
         screenplay_plan_path = output_dir / "SCREENPLAY_PLAN.json"
         screenplay_plan = (
-            json.loads(screenplay_plan_path.read_text(encoding="utf-8"))
+            migrate_screenplay_plan(
+                json.loads(screenplay_plan_path.read_text(encoding="utf-8"))
+            )
             if screenplay_plan_path.is_file()
             else None
         )
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
         issue = _issue(
             "L1",
             "severe",

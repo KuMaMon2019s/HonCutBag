@@ -147,7 +147,7 @@ def test_single_mode_override_cannot_reenable_legacy_path(monkeypatch):
         lambda *args, **kwargs: pytest.fail("legacy single-call path was used"),
     )
 
-    def build(*_args):
+    def build(*_args, **_kwargs):
         calls["skeleton"] += 1
         return {"strategy": "layered", "beats": [_beat(1)]}
 
@@ -192,7 +192,7 @@ def test_small_script_automatically_uses_layered(monkeypatch):
     monkeypatch.delenv("HONCUT_ADAPT_MODE", raising=False)
     calls = {"skeleton": 0}
 
-    def build(*_args):
+    def build(*_args, **_kwargs):
         calls["skeleton"] += 1
         return {"strategy": "layered", "beats": [_beat(1)]}
 
@@ -290,7 +290,12 @@ def test_action_dense_script_reports_compression_without_expanding_target_runtim
         {"event_role": "scene_setup"},
     ]
 
-    plan = engine._estimate_action_capacity_plan(events, 60, 10)
+    plan = engine._estimate_action_capacity_plan(
+        events,
+        60,
+        10,
+        shot_policy="cut-driven",
+    )
 
     assert plan["material_duration"] == 60
     assert plan["primary_shots"] == 8
@@ -379,7 +384,11 @@ def test_layered_mode_persists_skeleton_and_each_batch(monkeypatch, tmp_path):
     writes = []
 
     monkeypatch.setattr(engine, "estimate_shot_count", lambda *_: 3)
-    monkeypatch.setattr(engine, "_build_beat_skeleton", lambda *args: skeleton)
+    monkeypatch.setattr(
+        engine,
+        "_build_beat_skeleton",
+        lambda *args, **kwargs: skeleton,
+    )
     def expanded_batch(*args, **kwargs):
         response = json.loads(_batch_response(1))
         for shot, beat in zip(response["shots"], beats, strict=True):
@@ -394,7 +403,12 @@ def test_layered_mode_persists_skeleton_and_each_batch(monkeypatch, tmp_path):
         writes.append((path.name, json.loads(path.read_text(encoding="utf-8"))))
 
     monkeypatch.setattr(engine, "_atomic_write_json", recording_write)
-    result = engine.adapt_events(events, target_duration=45, output_dir=tmp_path)
+    result = engine.adapt_events(
+        events,
+        target_duration=45,
+        output_dir=tmp_path,
+        shot_policy="cut-driven",
+    )
 
     persisted_skeleton = json.loads((tmp_path / "beat_skeleton.json").read_text(encoding="utf-8"))
     partial = json.loads((tmp_path / "shots_partial.json").read_text(encoding="utf-8"))
@@ -418,6 +432,12 @@ def test_layered_mode_persists_skeleton_and_each_batch(monkeypatch, tmp_path):
 
 def test_layered_resume_skips_cached_skeleton_and_batches(monkeypatch, tmp_path):
     events = _events(11)
+    capacity_plan = engine._estimate_action_capacity_plan(
+        events,
+        90,
+        15,
+        shot_policy="cut-driven",
+    )
     production_events, _duration_scaled_event_plan = (
         engine._build_duration_scaled_event_plan(
             events,
@@ -427,7 +447,13 @@ def test_layered_resume_skips_cached_skeleton_and_batches(monkeypatch, tmp_path)
         )
     )
     fingerprint = engine._layered_input_fingerprint(
-        production_events, "（无角色信息）", 90, 15, 6
+        production_events,
+        "（无角色信息）",
+        90,
+        15,
+        6,
+        shot_policy="cut-driven",
+        primary_shot_layout=capacity_plan["primary_shot_layout"],
     )
     public_beats = []
     for i in range(1, 7):
@@ -463,7 +489,9 @@ def test_layered_resume_skips_cached_skeleton_and_batches(monkeypatch, tmp_path)
     calls = []
     monkeypatch.setattr(engine, "estimate_shot_count", lambda *_: 6)
     monkeypatch.setattr(
-        engine, "_build_beat_skeleton", lambda *args: pytest.fail("cached skeleton was rebuilt")
+        engine,
+        "_build_beat_skeleton",
+        lambda *args, **kwargs: pytest.fail("cached skeleton was rebuilt"),
     )
 
     def expand_only_missing(prompt, **kwargs):
@@ -473,7 +501,13 @@ def test_layered_resume_skips_cached_skeleton_and_batches(monkeypatch, tmp_path)
         return json.dumps(response)
 
     monkeypatch.setattr(engine, "_call_llm_with_timeout_retry", expand_only_missing)
-    result = engine.adapt_events(events, target_duration=90, output_dir=tmp_path)
+    result = engine.adapt_events(
+        events,
+        target_duration=90,
+        shot_duration=15,
+        output_dir=tmp_path,
+        shot_policy="cut-driven",
+    )
 
     assert len(calls) == 1
     assert "第一个 shot_order 必须为 4" in calls[0]

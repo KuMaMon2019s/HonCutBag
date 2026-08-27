@@ -64,6 +64,7 @@ def test_live_graph_config_seeds_complete_json_safe_compatibility_state():
     assert state["input_text"] == state["text"] == "story"
     assert state["target_duration_s"] == state["duration"] == 12
     assert state["shot_duration_s"] == state["shot_duration"] == 4
+    assert state["shot_policy"] == "continuity"
     assert state["project_video_spec"] == {"width": 1920, "height": 1080}
     assert state["resume_from"] == "phase5"
     assert json.loads(json.dumps(state))["phase_results"] == {}
@@ -94,6 +95,7 @@ def test_legacy_state_migrates_deterministically_and_future_versions_fail():
     assert migrated["target_duration_s"] == 30
     assert migrated["shot_ids"] == ["S01"]
     assert migrated["generated_shots"] == ["shots/S01/output.mp4"]
+    assert migrated["shot_policy"] == "cut-driven"
     assert migrated["errors"][-1]["message"] == "legacy failure"
     assert LEGACY_STATE_ALIASES.isdisjoint(migrated)
 
@@ -246,6 +248,7 @@ def test_cli_dispatch_preserves_public_arguments_and_exit_contract(monkeypatch, 
     assert exit_info.value.code == 0
     assert captured["text"] == "story"
     assert captured["duration"] == 12
+    assert captured["shot_policy"] == "continuity"
     assert captured["dry_run"] is True
     assert captured["output_dir"] == str(tmp_path)
     assert captured["project_id"] == "studio-a"
@@ -417,6 +420,7 @@ def test_resume_resolver_rejects_future_and_cross_project_state(tmp_path):
                         "run_id": "run-1",
                         "run_fingerprint": "run-1",
                         "project_id": "project-a",
+                        "shot_policy": "continuity",
                     },
                 )
             ],
