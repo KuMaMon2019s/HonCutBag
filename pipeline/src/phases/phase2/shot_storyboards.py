@@ -22,6 +22,7 @@ from prompt.seedream_image_prompt import (
     bind_reference_roles,
     image_request_fingerprint,
     prompt_guidance_metrics,
+    single_image_request_parameters,
 )
 from utils.character_body_contracts import character_visual_description
 from utils.body_action_contracts import body_action_prompt
@@ -49,6 +50,9 @@ SHOT_STORYBOARD_GRID_ROWS = 3
 SHOT_STORYBOARD_GRID_CELLS = (
     SHOT_STORYBOARD_GRID_COLUMNS * SHOT_STORYBOARD_GRID_ROWS
 )
+PANEL_PROMPT_TEMPLATE_ID = "honcut.storyboard-panel-prompt"
+PANEL_PROMPT_TEMPLATE_VERSION = "2"
+PANEL_CORRECTION_PROMPT_POLICY = "canonical-positive-projection-v2"
 
 
 class ImageGenerationClient(Protocol):
@@ -310,11 +314,19 @@ def _narrative_grid_contract(
 def _character_contract(
     characters: list[dict[str, Any]],
     who: list[Any] | None,
+    *,
+    referenced_character_ids: set[str] | None = None,
 ) -> str:
     if who == []:
         return "- 无人物镜头；禁止生成任何角色、群众、剪影或人形主体。"
     requested = {str(value).casefold() for value in who or []}
+    referenced_ids = {
+        str(value).casefold().strip()
+        for value in (referenced_character_ids or set())
+        if str(value).strip()
+    }
     lines = []
+    has_identity_items = False
     for character in characters:
         names = {
             str(character.get("id") or "").casefold(),
@@ -323,19 +335,27 @@ def _character_contract(
         }
         if requested and requested.isdisjoint(names):
             continue
+        character_id = str(character.get("id") or "").casefold().strip()
+        label = character.get("name") or character.get("id")
         description = character_visual_description(character)
-        if description:
+        if character_id and character_id in referenced_ids:
             lines.append(
-                f"- {character.get('name') or character.get('id')}："
-                f"{_compact(description, 1400)}"
+                f"- {label}：身份由已绑定的 canonical 参考图锁定；"
+                "保持其中的面貌、发型、体型、服装、轮廓和分配道具，不复制参考板版式。"
             )
+        elif description:
+            lines.append(f"- {label}：{_compact(description, 1400)}")
         identity_items = character_identity_detail_items(character)
         if identity_items:
+            has_identity_items = True
             lines.append(
                 f"  身份道具细节参考：{identity_detail_prompt_items(identity_items)}。"
-                "body_attached 项保持在固定佩挂点；isolated_handheld 项只有本格动作明确调用时才出现，"
-                "出现时几何、颜色、材质和标记必须与独立细节板一致。"
             )
+    if has_identity_items:
+        lines.append(
+            "- body_attached 道具保持固定佩挂点；isolated_handheld 道具只有本格动作明确调用时才出现，"
+            "其几何、颜色、材质和标记必须与独立细节参考一致。"
+        )
     contract = "\n".join(lines) or "- 严格使用 STORYBOARD.json 声明的角色设定，不自行增加人物。"
     from utils.privacy_visual_policy import (
         is_no_real_person_enabled,
@@ -590,21 +610,132 @@ def _render_correction_contract(
     beat_id = str(directives[0].get("target_board_id") or "当前格")
     lines = [
         f"这是第 {int(attempt)} 轮自动纠偏，只修复 {beat_id}。",
-        "以下每项均为当前格 DTO；其他 Pxx 的 expected 只保留在审计收据，不进入动作指令。",
+        "动作与终态只读取本格主合同；QA 的 expected/observed 原文只保留在审计收据，"
+        "不得再次注入 Provider Prompt。",
     ]
-    for index, directive in enumerate(directives, 1):
-        code = str(directive.get("issue_code") or "QA")
+    constraints: list[str] = []
+    for directive in directives:
         mismatch_type = str(directive.get("mismatch_type") or "other")
-        action = _compact(directive.get("required_action"), 500)
-        end_state = _compact(directive.get("required_end_state"), 500)
-        observed = _compact(directive.get("observed_error"), 500)
-        lines.extend([
-            f"- 纠偏 DTO {index}：target={beat_id}；code={code}；type={mismatch_type}。",
-            f"  当前格权威动作={action or '保持本格 canonical action'}。",
-            f"  当前格权威终态={end_state or '达到本格 canonical end_state'}。",
-            f"  必须消除的本格可见错误={observed or '未达到当前格动作或终态'}。",
-        ])
+        constraint = {
+            "action": (
+                "只画主合同的 canonical cast、动作、对象和位置；"
+                "不得增加格外人物、攻击、效果或场外事件"
+            ),
+            "end_state": (
+                "必须到达主合同结束状态；不得停留、回退或复制前一格动作状态"
+            ),
+            "clothing_color": (
+                "人物外观只服从绑定身份参考与主合同；不得改变服装基础色或角色归属"
+            ),
+            "identity": (
+                "人物身份只服从绑定 canonical 参考；不得合并、复制、替换或交换角色"
+            ),
+        }.get(
+            mismatch_type.casefold(),
+            "只画主合同内的人物、动作、道具、场景和结束状态；不得增加格外事实",
+        )
+        if constraint not in constraints:
+            constraints.append(constraint)
+    lines.extend(f"- {constraint}。" for constraint in constraints)
     return "\n".join(lines)
+
+
+_STAGED_CONFLICT_MARKERS = (
+    "attack",
+    "block",
+    "combat",
+    "fight",
+    "fire",
+    "grab",
+    "hit",
+    "kick",
+    "punch",
+    "shoot",
+    "weapon",
+    "攻击",
+    "突袭",
+    "格挡",
+    "武器",
+    "搏斗",
+    "格斗",
+    "踢",
+    "撞",
+    "扔",
+    "抓",
+    "扣",
+    "锁",
+    "砍",
+    "斩",
+    "刺",
+    "射击",
+    "开火",
+)
+_EXPLICIT_INJURY_MARKERS = (
+    "blood",
+    "bleeding",
+    "broken bone",
+    "death",
+    "fatal",
+    "injury",
+    "wound",
+    "伤口",
+    "流血",
+    "骨折",
+    "死亡",
+    "致命",
+    "重伤",
+)
+
+
+def _first_request_safety_contract(beat: dict[str, Any]) -> str:
+    """Render safe staging when conflict exists but injury is not canonical."""
+    semantic_text = " ".join(
+        str(beat.get(field) or "")
+        for field in ("start_state", "action", "end_state")
+    ).casefold()
+    if not any(marker in semantic_text for marker in _STAGED_CONFLICT_MARKERS):
+        return ""
+    if any(marker in semantic_text for marker in _EXPLICIT_INJURY_MARKERS):
+        return ""
+    return (
+        "首请求安全表现合同：这是完全虚构、风格化的 PREVIS 特技排练，不是真人暴力。"
+        "冲突使用清晰、可读、非血腥的动作编排；近身接触优先表现为受控格挡与控制动作、"
+        "清晰重心和方向箭头。无血液、伤口、痛苦、骨折、身体损伤或处决；武器只有当前"
+        "主合同明确要求时才可激活或开火。不得改变角色、攻守关系、动作顺序或结束状态。"
+    )
+
+
+def _panel_choreography_prompt(
+    shot: dict[str, Any],
+    beat: dict[str, Any],
+    action_text: str,
+) -> str:
+    """Avoid repeating legacy prompt-only choreography already in action."""
+    choreography = body_action_prompt({**shot, **beat})
+    contract = beat.get("body_action_contract")
+    if not isinstance(contract, dict):
+        contract = shot.get("body_action_contract")
+    if not choreography or not isinstance(contract, dict):
+        return choreography
+    if contract.get("required") is not False:
+        return choreography
+    normalized_action = re.sub(r"\s+", "", str(action_text or ""))
+    authored_beats = [
+        str(item.get("micro_action") or item.get("description") or "").strip()
+        for item in (contract.get("beats") or [])
+        if isinstance(item, dict)
+        and str(item.get("micro_action") or item.get("description") or "").strip()
+    ]
+    if authored_beats and all(
+        re.sub(r"\s+", "", item) in normalized_action
+        for item in authored_beats
+        if item
+    ):
+        return ""
+    contract_prompt = re.sub(r"\s+", "", str(contract.get("prompt") or ""))
+    if contract_prompt and contract_prompt in normalized_action:
+        return ""
+    return choreography
 
 
 def _build_panel_prompt(
@@ -618,6 +749,7 @@ def _build_panel_prompt(
     aspect_ratio: str = "16:9",
     correction_contract: str = "",
     is_last_content_beat: bool | None = None,
+    referenced_character_ids: set[str] | None = None,
 ) -> str:
     temporal_contract = apply_temporal_visual_contract(shot)
     temporal_section = (
@@ -629,7 +761,16 @@ def _build_panel_prompt(
     beat_cast = _beat_cast_contract(shot, beat, characters)
     who = beat_cast["who"]
     beat_id = str(beat.get("beat_id") or f"P{position:02d}")
-    choreography_section = body_action_prompt({**shot, **beat})
+    action_text = _compact(beat.get("action"), 500)
+    choreography_section = _panel_choreography_prompt(shot, beat, action_text)
+    choreography_line = (
+        f"本格逐拍肢体动作谱：{_compact(choreography_section, 1600)}\n"
+        if choreography_section
+        else ""
+    )
+    first_request_safety = _first_request_safety_contract(beat)
+    safety_section = f"{first_request_safety}\n" if first_request_safety else ""
+    is_correction = bool(correction_contract.strip())
     generation_mode = str(beat.get("generation_mode") or "").strip().lower()
     is_bridge = generation_mode == "first_last_frame_bridge"
     if is_last_content_beat is None:
@@ -640,6 +781,12 @@ def _build_panel_prompt(
         "first_last_frame_bridge",
     }
     continuation = (
+        (
+            "这是后续剧情纠偏格；只按 canonical 起始状态、动作、终态与身份参考推进，"
+            "不得复制旧姿态或引入其他格事实。"
+        )
+        if is_correction
+        else
         (
             "这是当前一级分镜内的后续剧情格。严格继承上一参考图的角色身份、服装、场景、"
             "机位轴线和动作方向，但姿态必须推进到本格的新状态；不得复制上一格。"
@@ -658,6 +805,12 @@ def _build_panel_prompt(
         else ""
     )
     previous_state_contract = (
+        (
+            "纠偏请求不携带上一格或导演格；身份只读 canonical 角色参考，"
+            "动作、场景与状态只读本格主合同。"
+        )
+        if is_correction
+        else
         "上一参考图不得作为姿势模板；只继承仍然成立的场景事实与相对空间关系、机位轴线和"
         "画面方向。所有人物必须从上一状态推进到本格动作完成后的新姿态，禁止复制上一格的"
         "关节角度、动作进度或中间状态。项目角色参考与下方角色合同始终优先于上一格；若上一格"
@@ -691,7 +844,6 @@ def _build_panel_prompt(
         final_beat_contract = (
             "本格仍必须画出本格动作完成后的结束状态快照；只是不准抢先执行后续剧情格的动作。"
         )
-    action_text = _compact(beat.get("action"), 500)
     end_state_text = _compact(beat.get("end_state"), 500)
     semantic_text = f"{action_text} {end_state_text}".casefold()
     disarm_requested = bool(
@@ -706,10 +858,7 @@ def _build_panel_prompt(
         "同一武器；武器只能已由 Agent 控制、固定在远离敌方的位置或独立失重漂浮。画面中恰好"
         "一件该武器，禁止复制武器。\n"
         if disarm_requested
-        else (
-            "- 只有剧情明确写成尚未完成的‘争夺武器’时，才可画双方共同控制同一武器的过程；"
-            "不得替换为单方持枪瞄准、开枪或普通对打。\n"
-        )
+        else ""
     )
     canonical_cast = list(dict.fromkeys(
         str(name) for name in (who or []) if str(name).strip()
@@ -725,35 +874,21 @@ def _build_panel_prompt(
 
 Phase 5 定向纠偏合同：
 {correction_contract}
-- 上述“已观察到的错误”是本轮禁止复现的负面约束，不是要继续画入画面的剧情。
-- QA 观察中已明确符合当前动作或终态的事实只作审计上下文，绝不能作为需要消除的负面约束。
-- 纠偏时仍以本格起始状态、唯一动作、结束状态和角色合同为最高事实源；不得通过增加破坏、伤亡、道具或画外事件来规避问题。
-- 输出前逐项确认：原偏差已经消失，且没有引入新的角色、动作、道具、环境结果或连续性跳变。
+- 只修正上述偏差；不得新增角色、动作、道具、破坏、伤亡、画外事件或连续性跳变。
 """
         if correction_contract.strip()
         else ""
     )
-    return f"""绘制一张单独的 {aspect_ratio} PREVIS 导演手绘故事格：{beat_id}（第 {position}/{count} 格）。
-
-{continuation}
-{director_reference}
-{previous_state_contract}
-{bridge_contract}
-本格起始状态：{_compact(beat.get('start_state'))}
-本格唯一可见动作：{_compact(beat.get('action'))}
-本格逐拍肢体动作谱：{_compact(choreography_section, 1600) or '无专项舞蹈/格斗动作'}
-本格必须到达的结束状态：{_compact(beat.get('end_state'))}
-场景：{_compact(shot.get('where') or shot.get('visual'), 260)}
-{temporal_section}景别：{beat.get('shot_size') or shot.get('shot_size') or 'medium'}
-运镜意图：{beat.get('camera_movement') or shot.get('camera_movement') or 'steadicam'}
-运镜物理硬合同：{camera_motion_prompt({**shot, **beat})}
-边界把手合同：{_edge_handle_contract(beat)}
-
-角色：
-{_character_contract(characters, who)}
-
-角色与动作硬约束：
-- 若角色合同启用“非真人视觉硬约束”，每个角色必须逐格保持自己声明的面纱/遮罩、图形化妆、面部纹样、机械纹理、非人材质或其他合成妆造锚点；禁止退化为无妆造的自然真人，也禁止擅自给所有人套用同一种头盔。
+    hard_constraints = (
+        """- 身份与外观：逐字遵守角色合同；每人只出现一次；非真人妆造锚点不可丢失，光影不得改变服装基础色。
+- 动作与归属：执行者、承受者、位置、朝向、攻守关系、道具类型/用法/持有人只读本格；每人只做分配给自己的动作，不复制旁观者动作。
+- 肢体谱：逐拍保留招式、侧别、支撑/摆动肢、躯干旋转、重心、接触点与终态，不得镜像、换招或泛化。
+- 能力：“可/能够/can/capable of”不等于激活；发光、放电、喷射、攻击、护盾只在本格 action/end_state 明示时出现。
+- 单时点：画动作完成后的终态；用关节、重心、接触和方向显示本格动作，禁止多时点拼贴、中性站立或仅背景运动；只有合同明确静止/定格时才画静止。
+- 摄影：主动作角色是主要运动来源；保持 50–85mm 自然透视、稳定尺度与地平线；禁止随机漂移、超广角/鱼眼畸变、人物拉伸或头身比例变化。
+"""
+        if is_correction
+        else """- 若角色合同启用“非真人视觉硬约束”，每个角色必须逐格保持自己声明的面纱/遮罩、图形化妆、面部纹样、机械纹理、非人材质或其他合成妆造锚点；禁止退化为无妆造的自然真人，也禁止擅自给所有人套用同一种头盔。
 - 逐字遵守角色合同中的发型、服装基础色、制服类型、体型和装备；警示灯、阴影和炭笔风格只能改变受光，不得把服装基础色改成另一角色的颜色。
 - 每个动作的执行者、承受者、左右位置、朝向以及武器持有者必须与“本格唯一可见动作”一致；禁止交换人物、攻守关系或武器归属。
 - 舞蹈/格斗/功夫/武术动作必须逐拍执行上述肢体动作谱，明确左挡、右闪、支撑侧、摆动侧、躯干旋转、重心转移、接触点和终态；原文点名的托马斯、铁山靠等招式不得泛化、镜像或换招。
@@ -762,8 +897,29 @@ Phase 5 定向纠偏合同：
 - 角色或道具合同中的“可、能够、can、capable of”只声明身份能力，不授权在当前格发动该能力。装备外形与佩挂状态照常保持，但发光、放电、喷射、攻击、护盾或其他效果只有在“本格唯一可见动作”或“结束状态”明确调用时才可激活；后续格的能力不得提前出现。
 - 静态故事格只能画一个时间点，不得把多个时间点或动作过程拼贴在一起；但若本格给主体分配了肢体或位移动作，必须选择达到结束状态时仍具动力学信息的瞬间，以关节弯曲、肢体伸展、重心偏移、接触关系和动作方向清楚表现该动作。不得把“终态”误画成人物中性站立；只有源合同明确要求静止、停止或定格时才画静止姿态。
 - 主动作角色必须是画面的主要运动来源。不得只让背景人群、车辆、光影、粒子、衣物、头发或摄影机产生动感，而让被分配动作的主体保持参考图原姿势；背景与运镜只能辅助，不能替代主体动作。
-- 人物构图必须遵守运镜合同中的 50–85mm 自然透视与稳定人物尺度；禁止：{camera_motion_negative_prompt({**shot, **beat})}。
-{disarm_contract}{cast_contract}- 其他动作不得用相邻剧情或泛化搏斗代替。
+- 人物构图必须遵守运镜合同中的 50–85mm 自然透视与稳定人物尺度；禁止："""
+        f"{camera_motion_negative_prompt({**shot, **beat})}。\n"
+    )
+    return f"""绘制一张单独的 {aspect_ratio} PREVIS 导演手绘故事格：{beat_id}（第 {position}/{count} 格）。
+
+{continuation}
+{director_reference}
+{previous_state_contract}
+{bridge_contract}
+{safety_section}本格起始状态：{_compact(beat.get('start_state'))}
+本格唯一可见动作：{action_text}
+{choreography_line}本格必须到达的结束状态：{_compact(beat.get('end_state'))}
+场景：{_compact(shot.get('where') or shot.get('visual'), 260)}
+{temporal_section}景别：{beat.get('shot_size') or shot.get('shot_size') or 'medium'}
+运镜意图：{beat.get('camera_movement') or shot.get('camera_movement') or 'steadicam'}
+运镜物理硬合同：{camera_motion_prompt({**shot, **beat})}
+边界把手合同：{_edge_handle_contract(beat)}
+
+角色：
+{_character_contract(characters, who, referenced_character_ids=referenced_character_ids)}
+
+角色与动作硬约束：
+{hard_constraints}{disarm_contract}{cast_contract}- 其他动作不得用相邻剧情或泛化搏斗代替。
 - {final_beat_contract}
 {correction_section}
 
@@ -1607,6 +1763,11 @@ def generate_shot_storyboards(
     contract["size_requested"] = size
     contract["request_contract_id"] = IMAGE_REQUEST_CONTRACT_ID
     contract["request_contract_version"] = IMAGE_REQUEST_CONTRACT_VERSION
+    contract["prompt_optimization"] = single_image_request_parameters(size)[
+        "optimize_prompt_options"
+    ]
+    contract["panel_prompt_template_id"] = PANEL_PROMPT_TEMPLATE_ID
+    contract["panel_prompt_template_version"] = PANEL_PROMPT_TEMPLATE_VERSION
     _write_json(manifest_path, contract)
     if client is None:
         from clients.seedream_client import SeedreamClient
@@ -1838,10 +1999,15 @@ def generate_shot_storyboards(
                     position,
                     len(beats),
                     characters,
-                    uses_director_board=director_panel is not None,
+                    uses_director_board=(
+                        director_panel is not None and not correction_directives
+                    ),
                     aspect_ratio=aspect_ratio,
                     correction_contract=correction_contract,
                     is_last_content_beat=position == last_content_position,
+                    referenced_character_ids={
+                        path.parent.name for path in character_references
+                    },
                 )
                 panel_prompt_path = beats_dir / f"{beat_id}_prompt.txt"
                 panel_path = beats_dir / f"{beat_id}.png"
@@ -1905,6 +2071,21 @@ def generate_shot_storyboards(
                     "size_requested": size,
                     "request_contract_id": IMAGE_REQUEST_CONTRACT_ID,
                     "request_contract_version": IMAGE_REQUEST_CONTRACT_VERSION,
+                    "prompt_optimization": single_image_request_parameters(size)[
+                        "optimize_prompt_options"
+                    ],
+                    "panel_prompt_template_id": PANEL_PROMPT_TEMPLATE_ID,
+                    "panel_prompt_template_version": PANEL_PROMPT_TEMPLATE_VERSION,
+                    "correction_prompt_policy": (
+                        PANEL_CORRECTION_PROMPT_POLICY
+                        if correction_directives
+                        else None
+                    ),
+                    "first_request_safety_policy": (
+                        "non_graphic_staged_conflict_v1"
+                        if _first_request_safety_contract(beat)
+                        else None
+                    ),
                     "reference_contract_template_id": (
                         REFERENCE_CONTRACT_TEMPLATE_ID
                     ),

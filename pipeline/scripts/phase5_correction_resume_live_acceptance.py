@@ -27,11 +27,18 @@ for import_root in (REPO_ROOT, PIPELINE_SRC):
 
 from clients import seedream_client
 from clients.seedream_client import SeedreamClient
+from phases.phase2 import shot_storyboards
 from phases.phase5 import storyboard_qa_gate
+from prompt.seedream_image_prompt import (
+    bind_reference_roles,
+    prompt_guidance_metrics,
+    single_image_request_parameters,
+)
 from runtime.security_boundaries import redact_text
+from tools.character_reference_board import character_reference_role
 from utils.config import ARK_AGENT_CREDENTIAL_SOURCE, get_api_key
 
-RECEIPT_SCHEMA = "honcut.phase5-correction-resume-live-acceptance.v1"
+RECEIPT_SCHEMA = "honcut.phase5-correction-resume-live-acceptance.v2"
 RECEIPT_NAME = "phase5_correction_resume_live_acceptance.json"
 MAX_PAID_PROVIDER_REQUESTS = 1
 REQUIRED_ACCEPTANCE_GATES = ["regression", "live_paid_provider"]
@@ -39,6 +46,18 @@ REQUIRED_ACCEPTANCE_GATES = ["regression", "live_paid_provider"]
 
 class ProviderRequestLimitError(RuntimeError):
     """The acceptance tried to cross its one-request Provider boundary."""
+
+
+def _provider_error_summary(error: BaseException) -> dict[str, Any]:
+    """Persist stable Provider evidence without response bodies or Prompt text."""
+    safe_message = f"{type(error).__name__}: {redact_text(str(error))}"
+    return {
+        "type": type(error).__name__,
+        "status_code": getattr(error, "status_code", None),
+        "provider_code": str(getattr(error, "provider_code", "") or "") or None,
+        "request_id": str(getattr(error, "request_id", "") or "") or None,
+        "message_sha256": hashlib.sha256(safe_message.encode("utf-8")).hexdigest(),
+    }
 
 
 class SinglePaidRequestImageClient:
@@ -49,6 +68,7 @@ class SinglePaidRequestImageClient:
         self.image_operation_attempt_count = 0
         self.image_operation_count = 0
         self.blocked_image_operation_count = 0
+        self.first_provider_error: dict[str, Any] | None = None
 
     def _invoke(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
         self.image_operation_attempt_count += 1
@@ -59,7 +79,12 @@ class SinglePaidRequestImageClient:
                 "Seedream image operation"
             )
         self.image_operation_count += 1
-        return getattr(self._delegate, method_name)(*args, **kwargs)
+        try:
+            return getattr(self._delegate, method_name)(*args, **kwargs)
+        except Exception as exc:
+            if self.first_provider_error is None:
+                self.first_provider_error = _provider_error_summary(exc)
+            raise
 
     def text_to_image(self, *args: Any, **kwargs: Any) -> Any:
         return self._invoke("text_to_image", *args, **kwargs)
@@ -171,7 +196,7 @@ def _continuation_preflight(
         )
     panel_hashes = storyboard_qa_gate._storyboard_panel_hashes(output_dir)
     protected_ids = sorted(set(panel_hashes) - {expected_storyboard_id})
-    return {
+    preflight = {
         "output_dir": str(output_dir),
         "storyboard_id": expected_storyboard_id,
         "available_storyboard_ids": targets,
@@ -189,6 +214,13 @@ def _continuation_preflight(
         ),
         "credentials": _credential_readiness(),
     }
+    preflight["prompt_projection"] = _prompt_projection_preflight(
+        output_dir,
+        state=state,
+        storyboard_id=expected_storyboard_id,
+        correction_attempt=attempts_used + 1,
+    )
+    return preflight
 
 
 def _issues_for_storyboard_id(
@@ -205,6 +237,147 @@ def _issues_for_storyboard_id(
     if not issues:
         raise RuntimeError("live acceptance target lost its correction evidence")
     return issues
+
+
+def _prompt_projection_preflight(
+    output_dir: Path,
+    *,
+    state: dict[str, Any],
+    storyboard_id: str,
+    correction_attempt: int,
+) -> dict[str, Any]:
+    """Rebuild the exact next Provider Prompt without making a request."""
+    storyboard = _read_json_object(output_dir / "STORYBOARD.json")
+    characters_path = output_dir / "CHARACTERS.json"
+    characters_payload = (
+        _read_json_object(characters_path)
+        if characters_path.is_file()
+        else {"characters": []}
+    )
+    characters = characters_payload.get("characters") or []
+    if not isinstance(characters, list):
+        raise ValueError("CHARACTERS.json characters must be a list")
+
+    matches: list[tuple[dict[str, Any], int, dict[str, Any]]] = []
+    for shot in storyboard.get("shots") or []:
+        if not isinstance(shot, dict):
+            continue
+        for position, beat in enumerate(shot.get("storyboard_beats") or [], 1):
+            if (
+                isinstance(beat, dict)
+                and str(beat.get("beat_id") or "") == storyboard_id
+            ):
+                matches.append((shot, position, beat))
+    if len(matches) != 1:
+        raise RuntimeError("live acceptance target must resolve to exactly one Pxx")
+    shot, position, beat = matches[0]
+    beats = [
+        value
+        for value in (shot.get("storyboard_beats") or [])
+        if isinstance(value, dict)
+    ]
+    issues = _issues_for_storyboard_id(state["result"], storyboard_id)
+    directives = shot_storyboards._panel_correction_directives(
+        issues,
+        beat,
+        storyboard_id,
+    )
+    if not directives:
+        raise RuntimeError("live acceptance target has no correction DTO")
+    beat_cast = shot_storyboards._beat_cast_contract(shot, beat, characters)
+    character_references = shot_storyboards._character_reference_paths(
+        output_dir,
+        characters,
+        beat_cast["who"],
+    )
+    content_positions = [
+        index
+        for index, value in enumerate(beats, 1)
+        if str(value.get("generation_mode") or "").strip().lower()
+        != "first_last_frame_bridge"
+    ]
+    manifest_path = output_dir / "SHOT_STORYBOARDS.json"
+    manifest = (
+        _read_json_object(manifest_path)
+        if manifest_path.is_file()
+        else {}
+    )
+    aspect_ratio = (
+        str(manifest.get("aspect_ratio") or storyboard.get("aspect_ratio") or "")
+        .strip()
+        or "16:9"
+    )
+    panel_prompt = shot_storyboards._build_panel_prompt(
+        shot,
+        beat,
+        position,
+        len(beats),
+        characters,
+        uses_director_board=False,
+        aspect_ratio=aspect_ratio,
+        correction_contract=shot_storyboards._render_correction_contract(
+            directives,
+            attempt=correction_attempt,
+        ),
+        is_last_content_beat=position == max(content_positions, default=0),
+        referenced_character_ids={
+            path.parent.name for path in character_references
+        },
+    )
+    provider_prompt = bind_reference_roles(
+        panel_prompt,
+        [character_reference_role(path) for path in character_references],
+    )
+    action_projection = shot_storyboards._compact(beat.get("action"), 500)
+    observed_evidence = [
+        str(value.get("observed_error") or "")
+        for value in directives
+        if str(value.get("observed_error") or "")
+    ]
+    checks = {
+        "canonical_action_once": (
+            bool(action_projection)
+            and provider_prompt.count(action_projection) == 1
+        ),
+        "raw_observed_excluded": all(
+            value not in provider_prompt for value in observed_evidence
+        ),
+        "correction_policy_current": (
+            shot_storyboards.PANEL_CORRECTION_PROMPT_POLICY
+            == "canonical-positive-projection-v2"
+        ),
+    }
+    if not all(checks.values()):
+        raise RuntimeError("live acceptance Provider Prompt projection failed checks")
+    request_parameters = single_image_request_parameters(
+        str(manifest.get("size_requested") or shot_storyboards.SHOT_STORYBOARD_SIZE)
+    )
+    safety_policy = (
+        "non_graphic_staged_conflict_v1"
+        if shot_storyboards._first_request_safety_contract(beat)
+        else None
+    )
+    return {
+        "panel_prompt_template_id": shot_storyboards.PANEL_PROMPT_TEMPLATE_ID,
+        "panel_prompt_template_version": (
+            shot_storyboards.PANEL_PROMPT_TEMPLATE_VERSION
+        ),
+        "correction_prompt_policy": (
+            shot_storyboards.PANEL_CORRECTION_PROMPT_POLICY
+        ),
+        "first_request_safety_policy": safety_policy,
+        "prompt_optimization": request_parameters["optimize_prompt_options"],
+        "provider_prompt_guidance": prompt_guidance_metrics(provider_prompt),
+        "reference_count": len(character_references),
+        "action_sha256": hashlib.sha256(
+            action_projection.encode("utf-8")
+        ).hexdigest(),
+        "observed_evidence_sha256": [
+            hashlib.sha256(value.encode("utf-8")).hexdigest()
+            for value in observed_evidence
+        ],
+        "checks": checks,
+    }
 
 
 def run_acceptance(
@@ -294,6 +467,15 @@ def run_acceptance(
             for relative_path in protected_sidecars
             if (output_dir / relative_path).is_file()
         }
+        target_sidecar_path = (
+            output_dir / "storyboard_beats" / f"{target}.json"
+        )
+        target_sidecar = (
+            _read_json_object(target_sidecar_path)
+            if target_sidecar_path.is_file()
+            else {}
+        )
+        prompt_projection = preflight.get("prompt_projection") or {}
         business_assertions = {
             "exact_storyboard_scope": redraw.get("storyboard_ids") == [target],
             "single_panel_regenerated": redraw.get("regenerated_panel_count") == 1,
@@ -307,6 +489,27 @@ def run_acceptance(
             "protected_panel_sidecars_unchanged": (
                 current_sidecars == protected_sidecars
             ),
+            "prompt_projection_preflight_passed": bool(
+                prompt_projection.get("checks")
+            ) and all((prompt_projection.get("checks") or {}).values()),
+            "target_prompt_matches_preflight": (
+                target_sidecar.get("provider_prompt_sha256")
+                == (prompt_projection.get("provider_prompt_guidance") or {}).get(
+                    "sha256"
+                )
+            ),
+            "target_prompt_policy_current": (
+                target_sidecar.get("panel_prompt_template_id")
+                == prompt_projection.get("panel_prompt_template_id")
+                and target_sidecar.get("panel_prompt_template_version")
+                == prompt_projection.get("panel_prompt_template_version")
+                and target_sidecar.get("correction_prompt_policy")
+                == prompt_projection.get("correction_prompt_policy")
+                and target_sidecar.get("first_request_safety_policy")
+                == prompt_projection.get("first_request_safety_policy")
+                and target_sidecar.get("prompt_optimization")
+                == prompt_projection.get("prompt_optimization")
+            ),
         }
         receipt.update(
             provider_request_count=transport.provider_request_count,
@@ -319,14 +522,22 @@ def run_acceptance(
             blocked_image_operation_count=(
                 limited_client.blocked_image_operation_count
             ),
+            first_provider_error=limited_client.first_provider_error,
             redraw=redraw,
             business_assertions=business_assertions,
             completed_at=_utc_now(),
         )
         accepted = (
             transport.provider_request_count == MAX_PAID_PROVIDER_REQUESTS
+            and transport.provider_request_attempt_count
+            == MAX_PAID_PROVIDER_REQUESTS
+            and transport.blocked_provider_request_count == 0
             and limited_client.image_operation_count
             == MAX_PAID_PROVIDER_REQUESTS
+            and limited_client.image_operation_attempt_count
+            == MAX_PAID_PROVIDER_REQUESTS
+            and limited_client.blocked_image_operation_count == 0
+            and limited_client.first_provider_error is None
             and all(business_assertions.values())
         )
         receipt["status"] = "passed" if accepted else "live_acceptance_failed"
@@ -359,6 +570,7 @@ def run_acceptance(
                 blocked_image_operation_count=(
                     limited_client.blocked_image_operation_count
                 ),
+                first_provider_error=limited_client.first_provider_error,
             )
     _atomic_write_json(receipt_path, receipt)
     return receipt

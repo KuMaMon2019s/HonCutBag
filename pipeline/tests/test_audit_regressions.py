@@ -4566,34 +4566,49 @@ def test_phase2_bridge_panel_is_not_treated_as_the_last_story_beat():
     assert "绝不能把不同参考图复制成多个实体" in bridge_prompt
 
 
-def test_phase2_panel_prompt_turns_phase5_evidence_into_negative_constraints():
+def test_phase2_panel_prompt_projects_phase5_evidence_without_raw_observation():
+    beat = {
+        "beat_id": "S06_P02",
+        "generation_mode": "extend",
+        "start_state": "保安飞向观察窗",
+        "action": "Agent 恢复稳定姿态",
+        "end_state": "观察窗保持完整，Agent 定格",
+    }
+    issue = storyboard_qa_gate._issue(
+        "L3",
+        "severe",
+        "R4",
+        "观察窗状态错误",
+        ["S06"],
+        storyboard_ids=["S06_P02"],
+        mismatch_type="end_state",
+        expected="观察窗保持完整，Agent 稳定定格",
+        observed="保安撞破观察窗飞入太空",
+        panel_evidence=[{
+            "shot_id": "S06_P02",
+            "observed": "保安撞破观察窗飞入太空",
+        }],
+    )
     prompt = _build_panel_prompt(
         {"who": ["agent", "guard"], "where": "透明观察窗前"},
-        {
-            "beat_id": "S06_P02",
-            "generation_mode": "extend",
-            "start_state": "保安飞向观察窗",
-            "action": "Agent 恢复稳定姿态",
-            "end_state": "观察窗保持完整，Agent 定格",
-        },
+        beat,
         2,
         2,
         [
             {"id": "agent", "appearance": {"summary": "深灰色战术服"}},
             {"id": "guard", "appearance": {"summary": "藏蓝色保安制服"}},
         ],
-        correction_contract=(
-            "这是第 1 轮自动纠偏，只修复 S06。\n"
-            "- 纠偏项 1（R4）：必须满足=观察窗保持完整；"
-            "已观察到且禁止复现=保安撞破观察窗飞入太空。"
+        correction_contract=_render_correction_contract(
+            _panel_correction_directives([issue], beat, "S06_P02"),
+            attempt=1,
         ),
     )
 
     assert "Phase 5 定向纠偏合同" in prompt
     assert "观察窗保持完整" in prompt
-    assert "保安撞破观察窗飞入太空" in prompt
-    assert "禁止复现的负面约束，不是要继续画入画面的剧情" in prompt
-    assert "不得通过增加破坏、伤亡、道具或画外事件来规避问题" in prompt
+    assert "保安撞破观察窗飞入太空" not in prompt
+    assert "QA 的 expected/observed 原文只保留在审计收据" in prompt
+    assert "不得新增角色、动作、道具、破坏、伤亡" in prompt
 
 
 def test_phase2_panel_correction_directive_is_scoped_to_one_pxx():
@@ -4632,9 +4647,10 @@ def test_phase2_panel_correction_directive_is_scoped_to_one_pxx():
         "source_expected_context": "P01 后仰抓扶手；P02 踢腕后将敌人甩向座椅",
         "source_storyboard_ids": ["S02_P01", "S02_P02"],
     }]
-    assert "当前格权威动作=男子踢中敌人手腕并将第二名敌人甩向座椅" in contract
-    assert "当前格权威终态=第二名敌人落向座椅，男子保持平衡" in contract
-    assert "必须消除的本格可见错误=仍复制 P01 后仰姿态" in contract
+    assert "动作与终态只读取本格主合同" in contract
+    assert "男子踢中敌人手腕并将第二名敌人甩向座椅" not in contract
+    assert "第二名敌人落向座椅，男子保持平衡" not in contract
+    assert "仍复制 P01 后仰姿态" not in contract
     assert "尚未抓住扶手" not in contract
     assert "P01 后仰抓扶手；P02" not in contract
 
@@ -4668,8 +4684,60 @@ def test_phase2_correction_keeps_only_negative_clauses_for_provider():
     contract = _render_correction_contract(directives, attempt=1)
 
     assert directives[0]["observed_error"] == "Guard still holds the device;"
-    assert "Guard still holds the device" in contract
+    assert "Guard still holds the device" not in contract
     assert "matching the required end state" not in contract
+
+
+def test_phase2_correction_prompt_is_deduplicated_and_safe_on_first_request():
+    action = (
+        "第二名敌人侧身冲向年轻男性；年轻男性双臂格挡后控制其手臂，"
+        "列车启动，双方随惯性后仰。"
+    )
+    beat = {
+        "beat_id": "S01_P02",
+        "generation_mode": "tail_video_extend",
+        "start_state": "第一名敌人的攻势已经结束",
+        "action": action,
+        "end_state": "年轻男性完成格挡，列车已经启动",
+        "body_action_contract": {
+            "required": False,
+            "prompt": action,
+            "beats": [{"micro_action": action}],
+        },
+    }
+    directives = [{
+        "schema": "honcut.storyboard-panel-correction.v1",
+        "target_board_id": "S01_P02",
+        "issue_code": "R4",
+        "mismatch_type": "action",
+        "required_action": action,
+        "required_end_state": beat["end_state"],
+        "observed_error": (
+            "a third armored enemy outside the train fires energy blasts"
+        ),
+        "source_expected_context": "only the canonical cast is present",
+        "source_storyboard_ids": ["S01_P02"],
+    }]
+
+    prompt = _build_panel_prompt(
+        {"who": ["年轻男性", "第二名敌人"], "where": "列车车厢"},
+        beat,
+        2,
+        3,
+        [
+            {"id": "lead", "name": "年轻男性", "description": "黑色长风衣"},
+            {"id": "enemy_2", "name": "第二名敌人", "description": "黑色装甲"},
+        ],
+        correction_contract=_render_correction_contract(directives, attempt=2),
+        referenced_character_ids={"lead", "enemy_2"},
+    )
+
+    assert prompt.count(action) == 1
+    assert "a third armored enemy" not in prompt
+    assert "首请求安全表现合同" in prompt
+    assert "受控格挡与控制动作" in prompt
+    assert "不得改变角色、攻守关系、动作顺序或结束状态" in prompt
+    assert "身份由已绑定的 canonical 参考图锁定" in prompt
 
 
 def test_phase2_panel_prompt_does_not_activate_declared_capabilities_early():
@@ -6611,6 +6679,7 @@ def test_phase5_live_acceptance_blocks_second_provider_request_at_transport():
 
 
 def _phase5_correction_live_preflight(tmp_path, target_sha256, protected_sha256):
+    provider_prompt_sha256 = hashlib.sha256(b"strict correction").hexdigest()
     return {
         "output_dir": str(tmp_path.resolve()),
         "storyboard_id": "S01_P02",
@@ -6621,6 +6690,21 @@ def _phase5_correction_live_preflight(tmp_path, target_sha256, protected_sha256)
         "protected_panel_sha256": {"S01_P01": protected_sha256},
         "protected_sidecar_sha256": {},
         "credentials": {"ark_agent_credential_source": "test"},
+        "prompt_projection": {
+            "panel_prompt_template_id": "honcut.storyboard-panel-prompt",
+            "panel_prompt_template_version": "2",
+            "correction_prompt_policy": "canonical-positive-projection-v2",
+            "first_request_safety_policy": None,
+            "prompt_optimization": {"mode": "standard"},
+            "provider_prompt_guidance": {
+                "sha256": provider_prompt_sha256,
+            },
+            "checks": {
+                "canonical_action_once": True,
+                "raw_observed_excluded": True,
+                "correction_policy_current": True,
+            },
+        },
     }
 
 
@@ -6657,6 +6741,71 @@ def test_phase5_correction_live_preflight_is_zero_request(monkeypatch, tmp_path)
         ).read_text(encoding="utf-8")
     )
     assert persisted == result
+
+
+def test_phase5_correction_live_preflight_projects_exact_safe_prompt(tmp_path):
+    storyboard = {
+        "aspect_ratio": "16:9",
+        "shots": [{
+            "id": "S01",
+            "who": [],
+            "where": "训练车厢",
+            "storyboard_beats": [{
+                "beat_id": "S01_P02",
+                "character_ids": [],
+                "start_state": "来袭者接近",
+                "action": "Agent 格挡来袭者并控制其手臂",
+                "end_state": "Agent 完成格挡，双方稳定",
+            }],
+        }],
+    }
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps(storyboard, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (tmp_path / "CHARACTERS.json").write_text(
+        '{"characters":[]}',
+        encoding="utf-8",
+    )
+    (tmp_path / "SHOT_STORYBOARDS.json").write_text(
+        '{"aspect_ratio":"16:9","size_requested":"2K"}',
+        encoding="utf-8",
+    )
+    issue = storyboard_qa_gate._issue(
+        "L3",
+        "moderate",
+        "R4",
+        "action mismatch",
+        ["S01"],
+        storyboard_ids=["S01_P02"],
+        mismatch_type="action",
+        expected="Agent completes the block",
+        observed="an extra attacker fires from outside",
+        confidence=0.95,
+        panel_evidence=[{
+            "shot_id": "S01_P02",
+            "observed": "an extra attacker fires from outside",
+        }],
+    )
+
+    projection = (
+        phase5_correction_resume_live_acceptance._prompt_projection_preflight(
+            tmp_path,
+            state={"result": {"issues": [issue]}},
+            storyboard_id="S01_P02",
+            correction_attempt=2,
+        )
+    )
+
+    assert projection["panel_prompt_template_version"] == "2"
+    assert projection["correction_prompt_policy"] == (
+        "canonical-positive-projection-v2"
+    )
+    assert projection["first_request_safety_policy"] == (
+        "non_graphic_staged_conflict_v1"
+    )
+    assert projection["prompt_optimization"] == {"mode": "standard"}
+    assert all(projection["checks"].values())
 
 
 def test_phase5_correction_live_acceptance_allows_one_request_and_refuses_replay(
@@ -6760,6 +6909,28 @@ def test_phase5_correction_live_acceptance_allows_one_request_and_refuses_replay
             "reference.png",
             output_path=str(beat_dir / "S01_P02.png"),
         )
+        projection = preflight["prompt_projection"]
+        (beat_dir / "S01_P02.json").write_text(
+            json.dumps({
+                "provider_prompt_sha256": projection[
+                    "provider_prompt_guidance"
+                ]["sha256"],
+                "panel_prompt_template_id": projection[
+                    "panel_prompt_template_id"
+                ],
+                "panel_prompt_template_version": projection[
+                    "panel_prompt_template_version"
+                ],
+                "correction_prompt_policy": projection[
+                    "correction_prompt_policy"
+                ],
+                "first_request_safety_policy": projection[
+                    "first_request_safety_policy"
+                ],
+                "prompt_optimization": projection["prompt_optimization"],
+            }),
+            encoding="utf-8",
+        )
         return {
             "status": "redrawn",
             "attempt": attempt,
@@ -6825,6 +6996,133 @@ def test_phase5_correction_live_acceptance_blocks_second_raw_request(
     assert len(raw_calls) == 1
     assert guard.provider_request_count == 1
     assert guard.blocked_provider_request_count == 1
+
+
+def test_phase5_correction_live_receipt_keeps_first_provider_rejection(
+    monkeypatch,
+    tmp_path,
+):
+    from PIL import Image
+
+    beat_dir = tmp_path / "storyboard_beats"
+    beat_dir.mkdir()
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps({
+            "shots": [{
+                "id": "S01",
+                "storyboard_beats": [
+                    {
+                        "beat_id": "S01_P01",
+                        "storyboard_image": "storyboard_beats/S01_P01.png",
+                    },
+                    {
+                        "beat_id": "S01_P02",
+                        "storyboard_image": "storyboard_beats/S01_P02.png",
+                    },
+                ],
+            }],
+        }),
+        encoding="utf-8",
+    )
+    Image.effect_noise((128, 72), 80).convert("RGB").save(
+        beat_dir / "S01_P01.png"
+    )
+    Image.effect_noise((128, 72), 120).convert("RGB").save(
+        beat_dir / "S01_P02.png"
+    )
+    initial_hashes = storyboard_qa_gate._storyboard_panel_hashes(tmp_path)
+    preflight = _phase5_correction_live_preflight(
+        tmp_path,
+        initial_hashes["S01_P02"],
+        initial_hashes["S01_P01"],
+    )
+    monkeypatch.setattr(
+        phase5_correction_resume_live_acceptance,
+        "_continuation_preflight",
+        lambda *_args, **_kwargs: preflight,
+    )
+    issue = storyboard_qa_gate._issue(
+        "L3", "moderate", "R4", "action mismatch", ["S01"],
+        storyboard_ids=["S01_P02"], mismatch_type="action",
+        expected="complete", observed="incomplete", confidence=0.95,
+        panel_evidence=[{
+            "shot_id": "S01_P02",
+            "observed": "incomplete",
+        }],
+    )
+    monkeypatch.setattr(
+        phase5_correction_resume_live_acceptance.storyboard_qa_gate,
+        "_load_completed_adjudication_correction",
+        lambda *_args, **_kwargs: {
+            "continuable": True,
+            "result": {"issues": [issue]},
+            "correction": {"attempts_used": 1, "max_attempts": 2},
+            "receipts": [],
+        },
+    )
+    raw_post_calls = []
+
+    def raw_post(*_args, **_kwargs):
+        raw_post_calls.append(True)
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        phase5_correction_resume_live_acceptance.seedream_client.requests,
+        "post",
+        raw_post,
+    )
+
+    class OutputSafetyRejection(RuntimeError):
+        status_code = 400
+        provider_code = "OutputImageSensitiveContentDetected"
+        request_id = "request-output-sensitive-123"
+
+    class RejectingImageClient:
+        def image_to_image(self, *_args, **_kwargs):
+            phase5_correction_resume_live_acceptance.seedream_client.requests.post(
+                "https://example.invalid/images"
+            )
+            raise OutputSafetyRejection("output image rejected")
+
+    def redraw_runner(*_args, image_client, **_kwargs):
+        try:
+            image_client.image_to_image(
+                "first request",
+                "reference.png",
+                output_path=str(beat_dir / "S01_P02.png"),
+            )
+        except OutputSafetyRejection:
+            image_client.image_to_image(
+                "semantic safety fallback",
+                "reference.png",
+                output_path=str(beat_dir / "S01_P02.png"),
+            )
+        raise AssertionError("the second image operation must be blocked")
+
+    result = phase5_correction_resume_live_acceptance.run_acceptance(
+        tmp_path,
+        submit=True,
+        expected_storyboard_id="S01_P02",
+        client_factory=RejectingImageClient,
+        redraw_runner=redraw_runner,
+    )
+
+    assert result["status"] == "live_acceptance_failed"
+    assert result["provider_request_count"] == 1
+    assert result["provider_request_attempt_count"] == 1
+    assert result["image_operation_count"] == 1
+    assert result["image_operation_attempt_count"] == 2
+    assert result["blocked_image_operation_count"] == 1
+    assert result["first_provider_error"] == {
+        "type": "OutputSafetyRejection",
+        "status_code": 400,
+        "provider_code": "OutputImageSensitiveContentDetected",
+        "request_id": "request-output-sensitive-123",
+        "message_sha256": hashlib.sha256(
+            b"OutputSafetyRejection: output image rejected"
+        ).hexdigest(),
+    }
+    assert len(raw_post_calls) == 1
 
 
 def test_phase5_persists_safe_receipt_when_adjudication_is_unavailable(tmp_path):
@@ -7824,7 +8122,7 @@ def test_phase5_real_redraw_reuses_generator_and_archives_failed_shot(tmp_path):
     correction_prompt = generated_prompts[-2]
     assert "Phase 5 定向纠偏合同" in correction_prompt
     assert "观察窗保持完整，Agent 稳定定格" in correction_prompt
-    assert "保安撞破观察窗飞入太空" in correction_prompt
+    assert "保安撞破观察窗飞入太空" not in correction_prompt
     archive = tmp_path / receipt["archive"]["archive_dir"] / "before"
     assert (archive / "storyboard_beats/S02_P01.png").is_file()
     assert (archive / "storyboard_qa_report.json").is_file()
@@ -7838,6 +8136,24 @@ def test_phase5_real_redraw_reuses_generator_and_archives_failed_shot(tmp_path):
         "regenerated_storyboard_ids": ["S02_P01"],
         "preserved_storyboard_ids": [],
     }
+    assert manifest["panel_prompt_template_id"] == (
+        "honcut.storyboard-panel-prompt"
+    )
+    assert manifest["panel_prompt_template_version"] == "2"
+    assert manifest["prompt_optimization"] == {"mode": "standard"}
+    target_sidecar = json.loads(
+        (tmp_path / "storyboard_beats/S02_P01.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert target_sidecar["panel_prompt_template_version"] == "2"
+    assert target_sidecar["prompt_optimization"] == {"mode": "standard"}
+    assert target_sidecar["correction_prompt_policy"] == (
+        "canonical-positive-projection-v2"
+    )
+    assert target_sidecar["first_request_safety_policy"] == (
+        "non_graphic_staged_conflict_v1"
+    )
     assert receipt["restored_cinematic_aliases"] == ["S02"]
     assert hashlib.sha256(cinematic_alias.read_bytes()).hexdigest() == alias_sha256
     assert json.loads(cinematic_alias_receipt.read_text(encoding="utf-8"))[
