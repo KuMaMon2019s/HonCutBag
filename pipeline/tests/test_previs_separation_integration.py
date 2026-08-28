@@ -29,7 +29,9 @@ from phases.phase4.cinematic_first_frames import (
     validate_cinematic_first_frame_artifacts,
 )
 from phases.phase5.storyboard_qa_gate import run_l4_first_frame_review
-from tools.asset_packager import build_content_for_shot
+from runtime.continuity_chunks import ChunkExecutionRequest
+from runtime.continuity_provider import _provider_content
+from schemas.continuity import ContinuityPlan
 
 
 def _signed_tos_url(monkeypatch, object_key: str) -> str:
@@ -167,8 +169,10 @@ def test_previs_pixels_are_separated_end_to_end_before_video_transport(
     assert validate_shot_storyboard_artifacts(tmp_path, storyboard) == []
     previs_path = tmp_path / "storyboard_beats" / "S02_P01.png"
     nine_grid_path = tmp_path / "shot_storyboards" / "S02.png"
+    narrative_guide_path = tmp_path / "storyboard_guides" / "S02_P01.png"
     previs_sha256 = _sha256(previs_path)
     nine_grid_sha256 = _sha256(nine_grid_path)
+    narrative_guide_sha256 = _sha256(narrative_guide_path)
     phase2_alias_receipt = json.loads(
         (tmp_path / "storyboard_images" / "S02.json").read_text(encoding="utf-8")
     )
@@ -220,6 +224,12 @@ def test_previs_pixels_are_separated_end_to_end_before_video_transport(
     chunk = continuity["shots"][0]["chunks"][0]
     assert chunk["storyboard_image"] == beat["video_first_frame"]
     assert chunk["storyboard_image_kind"] == CINEMATIC_FIRST_FRAME_SCHEMA
+    assert chunk["storyboard_narrative_guide"] == (
+        "storyboard_guides/S02_P01.png"
+    )
+    assert chunk["storyboard_narrative_guide_cell_ids"] == [
+        f"S02_G{index:02d}" for index in range(1, 10)
+    ]
 
     l4_issues, l4 = run_l4_first_frame_review(
         storyboard,
@@ -239,17 +249,20 @@ def test_previs_pixels_are_separated_end_to_end_before_video_transport(
         return _signed_tos_url(monkeypatch, f"fixture/{digest}.png")
 
     monkeypatch.setattr(tos_uploader, "upload_image", _record_upload)
-    content = build_content_for_shot(
+    continuity_plan = ContinuityPlan.model_validate(continuity)
+    continuity_chunk = continuity_plan.shots[0].chunks[0]
+    content, *_ = _provider_content(
         tmp_path,
-        "S02",
-        {
-            "prompt": "银色傀儡在靛蓝幕布前缓慢抬手。",
-            "gen_strategy": "phantom",
-            "_char_ids": ["puppet"],
-            "_storyboard_frame_path": chunk["storyboard_image"],
-            "_storyboard_frame_kind": chunk["storyboard_image_kind"],
-            "_storyboard_beat_id": "S02_P01",
-        },
+        ChunkExecutionRequest(
+            resource_id=continuity_chunk.chunk_id,
+            shot_id="S02",
+            chunk=continuity_chunk,
+            anchors={},
+            output_path=tmp_path / "shots/S02/chunks/S02_C01.mp4",
+            previous_output_path=None,
+            input_fingerprint="previs-separation-fixture",
+            memory_context="",
+        ),
     )
     prompt = next(item["text"] for item in content if item["type"] == "text")
     image_roles = [
@@ -257,10 +270,19 @@ def test_previs_pixels_are_separated_end_to_end_before_video_transport(
     ]
     assert image_roles
     assert set(image_roles) == {"reference_image"}
+    assert uploaded_sha256[0] == cinematic_sha256
     assert cinematic_sha256 in uploaded_sha256
+    assert narrative_guide_sha256 in uploaded_sha256
     assert director_sha256 not in uploaded_sha256
     assert previs_sha256 not in uploaded_sha256
     assert nine_grid_sha256 not in uploaded_sha256
+    assert chunk["storyboard_narrative_guide_source_board_sha256"] == (
+        nine_grid_sha256
+    )
     assert "首帧为图片1" in prompt
     assert "成片质感第一帧" in prompt
-    assert "读取动作箭头" not in prompt
+    assert "当前剧情导航图是图片" in prompt
+    assert "S02_G01→S02_G02→S02_G03" in prompt
+    assert "红色箭头表示主体或物体运动方向" in prompt
+    assert "蓝色箭头表示摄影机运动" in prompt
+    assert "严禁渲染进视频画面" in prompt

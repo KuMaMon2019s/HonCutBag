@@ -50,6 +50,10 @@ SHOT_STORYBOARD_GRID_ROWS = 3
 SHOT_STORYBOARD_GRID_CELLS = (
     SHOT_STORYBOARD_GRID_COLUMNS * SHOT_STORYBOARD_GRID_ROWS
 )
+SHOT_STORYBOARDS_SCHEMA = "honcut.shot_storyboards.v3"
+SHOT_STORYBOARD_GRID_SCHEMA = "honcut.shot-storyboard-grid.v2"
+STORYBOARD_NARRATIVE_GUIDE_SCHEMA = "honcut.storyboard-narrative-guide.v1"
+STORYBOARD_NARRATIVE_GUIDE_USAGE = "phase6_story_narrative_guide_not_output_pixels"
 PANEL_PROMPT_TEMPLATE_ID = "honcut.storyboard-panel-prompt"
 PANEL_PROMPT_TEMPLATE_VERSION = "2"
 PANEL_CORRECTION_PROMPT_POLICY = "canonical-positive-projection-v2"
@@ -268,6 +272,10 @@ def _narrative_grid_contract(
     Cells subdivide only already-authored start/action/end facts and therefore do
     not create new plot events when one Pxx needs more than three review cells.
     """
+    if not beats or len(beats) > SHOT_STORYBOARD_GRID_CELLS:
+        raise ValueError(
+            f"{shot_id} needs 1-{SHOT_STORYBOARD_GRID_CELLS} Pxx beats for a 3x3 guide"
+        )
     base, remainder = divmod(SHOT_STORYBOARD_GRID_CELLS, len(beats))
     cells: list[dict[str, Any]] = []
     for beat_index, beat in enumerate(beats):
@@ -301,7 +309,12 @@ def _narrative_grid_contract(
                 "camera_movement": beat.get("camera_movement")
                 or shot.get("camera_movement")
                 or "steadicam",
-                "rendered_annotations": ["cell_label"],
+                "rendered_annotations": [
+                    "cell_label",
+                    "action_direction_arrow_red",
+                    "camera_motion_arrow_blue",
+                    "spatial_gaze_action_instruction_markers",
+                ],
             })
     if len(cells) != SHOT_STORYBOARD_GRID_CELLS:
         raise RuntimeError(
@@ -309,6 +322,162 @@ def _narrative_grid_contract(
             f"{SHOT_STORYBOARD_GRID_CELLS}"
         )
     return cells
+
+
+def _bind_narrative_grid_contract(
+    grid_contract: dict[str, Any],
+    narrative_grid: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Bind pixel bboxes and authored narrative semantics by exact Gxx label."""
+    pixel_cells = grid_contract.get("cells") or []
+    if len(pixel_cells) != SHOT_STORYBOARD_GRID_CELLS:
+        raise ValueError("nine-grid pixel contract does not contain nine cells")
+    narrative_by_label = {
+        str(cell.get("label") or ""): cell
+        for cell in narrative_grid
+        if isinstance(cell, dict)
+    }
+    bound_cells: list[dict[str, Any]] = []
+    for pixel_cell in pixel_cells:
+        label = str(pixel_cell.get("label") or "")
+        narrative = narrative_by_label.get(label)
+        if narrative is None:
+            raise ValueError(f"nine-grid pixel cell {label!r} has no narrative binding")
+        bound_cells.append({**pixel_cell, **narrative})
+    expected_labels = [
+        f"{bound_cells[0]['primary_shot_id']}_G{index:02d}"
+        for index in range(1, SHOT_STORYBOARD_GRID_CELLS + 1)
+    ]
+    if [cell["label"] for cell in bound_cells] != expected_labels:
+        raise ValueError("nine-grid labels are not contiguous in reading order")
+    return {
+        **grid_contract,
+        "schema": SHOT_STORYBOARD_GRID_SCHEMA,
+        "cells": bound_cells,
+        "annotation_contract": {
+            "cell_labels": "required",
+            "action_direction_arrows": "red_required_when_action_has_direction",
+            "camera_motion_arrows": "blue_required_when_camera_moves",
+            "instruction_markers": "required_for_spatial_gaze_action_relationships",
+            "video_output_policy": "understand_only_never_render",
+        },
+    }
+
+
+def _beat_cell_assignments(
+    narrative_grid: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    assignments: list[dict[str, Any]] = []
+    for cell in narrative_grid:
+        beat_id = str(cell.get("secondary_beat_id") or "")
+        label = str(cell.get("label") or "")
+        if not beat_id or not label:
+            raise ValueError("narrative grid cell is missing its Pxx/Gxx binding")
+        if assignments and assignments[-1]["beat_id"] == beat_id:
+            assignments[-1]["cell_ids"].append(label)
+        else:
+            assignments.append({"beat_id": beat_id, "cell_ids": [label]})
+    flattened = [cell_id for item in assignments for cell_id in item["cell_ids"]]
+    if len(flattened) != 9 or len(set(flattened)) != 9:
+        raise ValueError("Gxx to Pxx assignments must cover nine unique cells")
+    return assignments
+
+
+def _guide_layout(cell_count: int, cell_aspect: float) -> tuple[int, int]:
+    candidates = []
+    for columns in range(1, cell_count + 1):
+        rows = math.ceil(cell_count / columns)
+        aspect = columns * cell_aspect / rows
+        if 0.4 <= aspect <= 2.5:
+            candidates.append(
+                (abs(aspect - (16 / 9)), rows * columns - cell_count, columns, rows)
+            )
+    if not candidates:
+        raise ValueError(f"cannot lay out {cell_count} narrative cells within media limits")
+    _distance, _blanks, columns, rows = min(candidates)
+    return columns, rows
+
+
+def _derive_narrative_guides(
+    output_dir: Path,
+    board_path: Path,
+    grid_contract: dict[str, Any],
+    assignments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Crop/recompose Pxx guides locally without another Provider request."""
+    guide_dir = output_dir / "storyboard_guides"
+    guide_dir.mkdir(parents=True, exist_ok=True)
+    source_sha256 = hashlib.sha256(board_path.read_bytes()).hexdigest()
+    cells_by_label = {
+        str(cell.get("label") or ""): cell
+        for cell in (grid_contract.get("cells") or [])
+        if isinstance(cell, dict)
+    }
+    records: list[dict[str, Any]] = []
+    with Image.open(board_path) as source_image:
+        source = source_image.convert("RGB")
+        for assignment in assignments:
+            beat_id = str(assignment["beat_id"])
+            cell_ids = list(assignment["cell_ids"])
+            selected = [cells_by_label.get(cell_id) for cell_id in cell_ids]
+            if any(cell is None for cell in selected):
+                raise ValueError(f"{beat_id} narrative guide references an unknown Gxx cell")
+            crops = [source.crop(tuple(cell["bbox_px"])) for cell in selected]
+            cell_width = min(image.width for image in crops)
+            cell_height = min(image.height for image in crops)
+            columns, rows = _guide_layout(len(crops), cell_width / cell_height)
+            canvas = Image.new(
+                "RGB",
+                (columns * cell_width, rows * cell_height),
+                "white",
+            )
+            for index, crop in enumerate(crops):
+                normalized = ImageOps.fit(
+                    crop,
+                    (cell_width, cell_height),
+                    method=Image.Resampling.LANCZOS,
+                )
+                canvas.paste(
+                    normalized,
+                    ((index % columns) * cell_width, (index // columns) * cell_height),
+                )
+            guide_path = guide_dir / f"{beat_id}.png"
+            temporary = guide_path.with_suffix(".png.tmp")
+            canvas.save(temporary, format="PNG", optimize=True)
+            temporary.replace(guide_path)
+            guide_sha256 = hashlib.sha256(guide_path.read_bytes()).hexdigest()
+            receipt_path = guide_dir / f"{beat_id}.json"
+            record = {
+                "kind": STORYBOARD_NARRATIVE_GUIDE_SCHEMA,
+                "version": 1,
+                "status": "done",
+                "usage": STORYBOARD_NARRATIVE_GUIDE_USAGE,
+                "beat_id": beat_id,
+                "primary_shot_id": str(selected[0]["primary_shot_id"]),
+                "image": _portable_path(output_dir, guide_path),
+                "image_sha256": guide_sha256,
+                "source_board": _portable_path(output_dir, board_path),
+                "source_board_sha256": source_sha256,
+                "cell_ids": cell_ids,
+                "layout": {
+                    "columns": columns,
+                    "rows": rows,
+                    "reading_order": "left_to_right_top_to_bottom",
+                    "blank_cells": columns * rows - len(crops),
+                },
+                "annotation_policy": {
+                    "cell_labels": "preserved",
+                    "action_direction_arrows": "red_preserved",
+                    "camera_motion_arrows": "blue_preserved",
+                    "instruction_markers": "preserved",
+                    "video_output_policy": "understand_only_never_render",
+                },
+                "provider_request_count": 0,
+            }
+            _write_json(receipt_path, record)
+            record["receipt"] = _portable_path(output_dir, receipt_path)
+            records.append(record)
+    return records
 
 
 def _character_contract(
@@ -438,6 +607,7 @@ def build_shot_storyboard_prompt(
 绘画风格：
 - 专业 PREVIS 手绘工作稿，黑色粗铅笔和炭笔，少量灰色阴影，快速 gesture drawing。
 - 动作方向用红色手绘箭头，摄影机运动用蓝色手绘箭头。
+- 用简洁指示标识明确空间、视线、动作接续、接触点与前后景关系；这些标识必须与对应 Gxx 格内的剧情事实绑定。
 - 不是剧照、不是完成度很高的漫画或概念图；人物身份与项目角色设定保持一致。
 - 同一角色在所有格保持发型、服装、武器、受伤状态和左右站位连续。
 
@@ -1043,7 +1213,7 @@ def _normalize_nine_grid_board(board_path: Path, shot_id: str) -> dict[str, Any]
     board.save(temporary, format="PNG", optimize=True)
     temporary.replace(board_path)
     return {
-        "schema": "honcut.shot-storyboard-grid.v1",
+        "schema": SHOT_STORYBOARD_GRID_SCHEMA,
         "columns": SHOT_STORYBOARD_GRID_COLUMNS,
         "rows": SHOT_STORYBOARD_GRID_ROWS,
         "cell_count": SHOT_STORYBOARD_GRID_CELLS,
@@ -1559,8 +1729,8 @@ def validate_shot_storyboard_artifacts(
         manifest = output_dir / "SHOT_STORYBOARDS.json"
         try:
             document = json.loads(manifest.read_text(encoding="utf-8"))
-            if document.get("kind") != "honcut.shot_storyboards.v2":
-                errors.append("SHOT_STORYBOARDS.json is not the nine-grid v2 contract")
+            if document.get("kind") != SHOT_STORYBOARDS_SCHEMA:
+                errors.append("SHOT_STORYBOARDS.json is not the narrative-guide v3 contract")
             if document.get("status") != "done":
                 errors.append("SHOT_STORYBOARDS.json is not complete")
             if int(document.get("total_panels") or 0) != authored_count:
@@ -1608,8 +1778,97 @@ def validate_shot_storyboard_artifacts(
                     or len(narrative) != SHOT_STORYBOARD_GRID_CELLS
                 ):
                     errors.append(f"{shot_id} has an invalid 3x3 narrative grid contract")
-                if record.get("usage") != "director_llm_review_only_not_video_reference":
+                if record.get("usage") != STORYBOARD_NARRATIVE_GUIDE_USAGE:
                     errors.append(f"{shot_id} nine-grid board has unsafe usage metadata")
+                assignments = record.get("beat_cell_assignments") or []
+                flattened = [
+                    str(cell_id)
+                    for assignment in assignments
+                    if isinstance(assignment, dict)
+                    for cell_id in (assignment.get("cell_ids") or [])
+                ]
+                expected_labels = [f"{shot_id}_G{index:02d}" for index in range(1, 10)]
+                if flattened != expected_labels or len(set(flattened)) != 9:
+                    errors.append(f"{shot_id} has an invalid Gxx to Pxx assignment")
+                guides_by_beat = {
+                    str(guide.get("beat_id") or ""): guide
+                    for guide in (record.get("narrative_guides") or [])
+                    if isinstance(guide, dict)
+                }
+                expected_beats = [
+                    str(beat.get("beat_id") or f"{shot_id}_P{position:02d}")
+                    for position, beat in enumerate(shot.get("storyboard_beats") or [], 1)
+                    if isinstance(beat, dict)
+                ]
+                assignment_beats = [
+                    str(assignment.get("beat_id") or "")
+                    for assignment in assignments
+                    if isinstance(assignment, dict)
+                ]
+                if assignment_beats != expected_beats:
+                    errors.append(f"{shot_id} Gxx assignments do not match authored Pxx order")
+                if set(guides_by_beat) != set(expected_beats):
+                    errors.append(f"{shot_id} narrative-guide coverage is incomplete")
+                authored_beats = {
+                    str(beat.get("beat_id") or f"{shot_id}_P{position:02d}"): beat
+                    for position, beat in enumerate(shot.get("storyboard_beats") or [], 1)
+                    if isinstance(beat, dict)
+                }
+                for assignment in assignments:
+                    if not isinstance(assignment, dict):
+                        continue
+                    beat_id = str(assignment.get("beat_id") or "")
+                    guide = guides_by_beat.get(beat_id)
+                    if guide is None:
+                        continue
+                    guide_value = str(guide.get("image") or "")
+                    receipt_value = str(guide.get("receipt") or "")
+                    try:
+                        guide_path = _artifact_path(output_dir, guide_value)
+                        receipt_path = _artifact_path(output_dir, receipt_value)
+                        source_path = _artifact_path(output_dir, guide.get("source_board"))
+                        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                        observed = hashlib.sha256(guide_path.read_bytes()).hexdigest()
+                        source_observed = hashlib.sha256(
+                            source_path.read_bytes()
+                        ).hexdigest()
+                        beat = authored_beats.get(beat_id) or {}
+                        if (
+                            guide.get("kind") != STORYBOARD_NARRATIVE_GUIDE_SCHEMA
+                            or guide.get("usage") != STORYBOARD_NARRATIVE_GUIDE_USAGE
+                            or guide.get("cell_ids") != assignment.get("cell_ids")
+                            or receipt.get("kind") != STORYBOARD_NARRATIVE_GUIDE_SCHEMA
+                            or receipt.get("status") != "done"
+                            or receipt.get("usage") != STORYBOARD_NARRATIVE_GUIDE_USAGE
+                            or receipt.get("beat_id") != beat_id
+                            or receipt.get("primary_shot_id") != shot_id
+                            or receipt.get("image_sha256") != observed
+                            or receipt.get("source_board") != guide.get("source_board")
+                            or receipt.get("source_board_sha256") != source_observed
+                            or receipt.get("cell_ids") != assignment.get("cell_ids")
+                            or int(receipt.get("provider_request_count") or 0) != 0
+                            or guide.get("image_sha256") != observed
+                            or guide.get("source_board_sha256") != source_observed
+                            or beat.get("storyboard_narrative_guide") != guide_value
+                            or beat.get("storyboard_narrative_guide_kind")
+                            != STORYBOARD_NARRATIVE_GUIDE_SCHEMA
+                            or beat.get("storyboard_narrative_guide_usage")
+                            != STORYBOARD_NARRATIVE_GUIDE_USAGE
+                            or beat.get("storyboard_narrative_guide_cell_ids")
+                            != assignment.get("cell_ids")
+                            or beat.get("storyboard_narrative_guide_sha256") != observed
+                            or beat.get("storyboard_narrative_guide_source_board")
+                            != guide.get("source_board")
+                            or beat.get(
+                                "storyboard_narrative_guide_source_board_sha256"
+                            )
+                            != source_observed
+                            or beat.get("storyboard_narrative_guide_receipt")
+                            != receipt_value
+                        ):
+                            raise ValueError("guide receipt/hash/cell binding mismatch")
+                    except (OSError, ValueError, json.JSONDecodeError) as exc:
+                        errors.append(f"{beat_id} invalid narrative guide: {exc}")
                 board_value = str(record.get("board") or "").strip()
                 if not board_value:
                     errors.append(f"{shot_id} nine-grid board path is missing")
@@ -1666,7 +1925,10 @@ def generate_shot_storyboards(
                     "targeted storyboard regeneration requires a readable prior manifest"
                 ) from exc
             previous_manifest = {}
-        if previous_manifest and previous_manifest.get("kind") != "honcut.shot_storyboards.v2":
+        if previous_manifest and previous_manifest.get("kind") not in {
+            "honcut.shot_storyboards.v2",
+            SHOT_STORYBOARDS_SCHEMA,
+        }:
             raise RuntimeError("unsupported prior storyboard manifest schema")
     normalized_targets = {
         str(shot_id).strip() for shot_id in (target_shot_ids or set())
@@ -1737,8 +1999,8 @@ def generate_shot_storyboards(
         else []
     )
     contract: dict[str, Any] = {
-        "kind": "honcut.shot_storyboards.v2",
-        "version": 2,
+        "kind": SHOT_STORYBOARDS_SCHEMA,
+        "version": 3,
         "status": "running",
         "provider": "seedream",
         "model": model,
@@ -1836,6 +2098,50 @@ def generate_shot_storyboards(
                             f"targeted storyboard regeneration is missing prior panel {candidate}"
                         )
                     previous_storyboard_panel = candidate
+                preserved = previous_records[shot_id]
+                board_path = _artifact_path(output_dir, preserved.get("board"))
+                narrative_grid = _narrative_grid_contract(
+                    shot,
+                    shot_id,
+                    authored_beats,
+                )
+                grid_contract = _bind_narrative_grid_contract(
+                    dict(preserved.get("grid_contract") or {}),
+                    narrative_grid,
+                )
+                assignments = _beat_cell_assignments(narrative_grid)
+                guides = _derive_narrative_guides(
+                    output_dir,
+                    board_path,
+                    grid_contract,
+                    assignments,
+                )
+                guides_by_beat = {
+                    str(guide["beat_id"]): guide for guide in guides
+                }
+                for beat in authored_beats:
+                    beat_id = str(beat.get("beat_id") or "")
+                    guide = guides_by_beat[beat_id]
+                    beat.update({
+                        "storyboard_narrative_guide": guide["image"],
+                        "storyboard_narrative_guide_kind": guide["kind"],
+                        "storyboard_narrative_guide_usage": guide["usage"],
+                        "storyboard_narrative_guide_cell_ids": guide["cell_ids"],
+                        "storyboard_narrative_guide_sha256": guide["image_sha256"],
+                        "storyboard_narrative_guide_source_board": guide["source_board"],
+                        "storyboard_narrative_guide_source_board_sha256": guide[
+                            "source_board_sha256"
+                        ],
+                        "storyboard_narrative_guide_receipt": guide["receipt"],
+                    })
+                preserved.update({
+                    "usage": STORYBOARD_NARRATIVE_GUIDE_USAGE,
+                    "narrative_grid": narrative_grid,
+                    "grid_contract": grid_contract,
+                    "beat_cell_assignments": assignments,
+                    "narrative_guides": guides,
+                })
+                _write_json(boards_dir / f"{shot_id}.json", preserved)
                 continue
             prompt, beats = build_shot_storyboard_prompt(
                 shot,
@@ -2410,11 +2716,9 @@ def generate_shot_storyboards(
                 panel_paths.append(panel_path)
                 previous_panel = panel_path
                 regenerated_panel_ids.append(beat_id)
-            # The Sxx board is a director/LLM-only nine-grid narrative artifact.
-            # It is generated independently from the per-Pxx images and is never
-            # eligible as video-model media. Exact grid boundaries and cell IDs
-            # are then overlaid deterministically so layout cannot silently
-            # collapse into a linear strip.
+            # The Sxx board is an annotated narrative guide. It is generated
+            # independently from cinematic first-frame pixels; exact Gxx cells
+            # are then assigned and locally projected into the current Pxx only.
             previous_record = previous_records.get(shot_id)
             board_cached = False
             if (
@@ -2472,6 +2776,58 @@ def generate_shot_storyboards(
                     board_image.verify()
                 raw_board_sha256 = hashlib.sha256(board_path.read_bytes()).hexdigest()
                 grid_contract = _normalize_nine_grid_board(board_path, shot_id)
+            grid_contract = _bind_narrative_grid_contract(
+                grid_contract,
+                narrative_grid,
+            )
+            assignments = _beat_cell_assignments(narrative_grid)
+            guide_records = _derive_narrative_guides(
+                output_dir,
+                board_path,
+                grid_contract,
+                assignments,
+            )
+            guides_by_beat = {
+                str(guide["beat_id"]): guide for guide in guide_records
+            }
+            panels_by_beat = {
+                str(panel.get("beat_id") or ""): panel
+                for panel in panel_records
+                if isinstance(panel, dict)
+            }
+            for beat in beats:
+                beat_id = str(beat.get("beat_id") or "")
+                guide = guides_by_beat.get(beat_id)
+                if guide is None:
+                    raise RuntimeError(f"{beat_id} has no derived narrative guide")
+                beat.update({
+                    "storyboard_narrative_guide": guide["image"],
+                    "storyboard_narrative_guide_kind": guide["kind"],
+                    "storyboard_narrative_guide_usage": guide["usage"],
+                    "storyboard_narrative_guide_cell_ids": guide["cell_ids"],
+                    "storyboard_narrative_guide_sha256": guide["image_sha256"],
+                    "storyboard_narrative_guide_source_board": guide["source_board"],
+                    "storyboard_narrative_guide_source_board_sha256": guide[
+                        "source_board_sha256"
+                    ],
+                    "storyboard_narrative_guide_receipt": guide["receipt"],
+                })
+                panel = panels_by_beat.get(beat_id)
+                if panel is not None:
+                    panel["storyboard_narrative_guide"] = {
+                        key: guide[key]
+                        for key in (
+                            "kind",
+                            "usage",
+                            "image",
+                            "image_sha256",
+                            "source_board",
+                            "source_board_sha256",
+                            "cell_ids",
+                            "receipt",
+                        )
+                    }
+                    _write_json(beats_dir / f"{beat_id}.json", panel)
             legacy_preview_path = image_dir / f"{shot_id}.png"
             shutil.copy2(panel_paths[0], legacy_preview_path)
             _write_json(
@@ -2492,11 +2848,13 @@ def generate_shot_storyboards(
                 "status": "done",
                 "model": contract["model"],
                 "panels": panel_records,
-                "usage": "director_llm_review_only_not_video_reference",
+                "usage": STORYBOARD_NARRATIVE_GUIDE_USAGE,
                 "result_url": board_result_url,
                 "raw_board_sha256": raw_board_sha256,
                 "board_sha256": hashlib.sha256(board_path.read_bytes()).hexdigest(),
                 "grid_contract": grid_contract,
+                "beat_cell_assignments": assignments,
+                "narrative_guides": guide_records,
             })
             if board_cached:
                 record["cache_hit"] = True
