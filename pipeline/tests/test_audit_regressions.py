@@ -31,6 +31,7 @@ import detached_pipeline_launch
 import phase_orchestrator
 import phase5_adjudication_live_acceptance
 import phase5_correction_resume_live_acceptance
+import phase6_storyboard_guide_live_acceptance
 import pipeline_runner as pipeline_runner_cli
 from phases import pipeline_core
 from phases.phase1 import (
@@ -6063,14 +6064,13 @@ def test_phase5_default_l4_correction_preserves_unrelated_cinematic_frames(
     untouched_sha256 = hashlib.sha256(untouched_path.read_bytes()).hexdigest()
     l4_issue = storyboard_qa_gate._issue(
         "L4", "severe", "first_frame_subject_duplication",
-        "S04 first frames duplicate the protagonist", ["S04"],
-        frame_ids=["S04_P01", "S04_P02"],
+        "S04 cinematic first frame duplicates the protagonist", ["S04"],
+        frame_ids=["S04_P01"],
         expected="one protagonist",
         observed="a transparent duplicate of the protagonist",
         confidence=0.98,
         frame_evidence=[
             {"frame_id": "S04_P01", "observed": "duplicate face and coat"},
-            {"frame_id": "S04_P02", "observed": "duplicate torso and arm"},
         ],
         evidence_status="validated",
     )
@@ -6100,11 +6100,11 @@ def test_phase5_default_l4_correction_preserves_unrelated_cinematic_frames(
     )
 
     assert result["gate_passed"] is True
-    assert calls == ["S04_P01", "S04_P02", "S05_P01", "S04_P01", "S04_P02"]
+    assert calls == ["S04_P01", "S05_P01", "S04_P01"]
     assert hashlib.sha256(untouched_path.read_bytes()).hexdigest() == untouched_sha256
     redraw = result["correction"]["history"][0]["redraw"]
-    assert redraw["frame_ids"] == ["S04_P01", "S04_P02"]
-    assert redraw["dependency_frame_ids"] == ["S04_P01", "S04_P02"]
+    assert redraw["frame_ids"] == ["S04_P01"]
+    assert redraw["dependency_frame_ids"] == ["S04_P01"]
     assert (tmp_path / redraw["archive"]["archive_dir"] / "redraw_receipt.json").is_file()
 
 
@@ -6502,6 +6502,188 @@ def _phase5_live_acceptance_preflight(tmp_path):
             "tos_media_upload_configured": True,
         },
     }
+
+
+def _phase6_live_acceptance_preflight(tmp_path, **_kwargs):
+    output_path = tmp_path / "live_acceptance/phase6_storyboard_guide/S01_P01.mp4"
+    preflight = {
+        "output_dir": str(tmp_path.resolve()),
+        "shot_id": "S01",
+        "beat_id": "S01_P01",
+        "p_count": 2,
+        "visible_character_ids": ["CHAR_01"],
+        "narrative_cell_ids": ["S01_G01", "S01_G02"],
+        "prompt_sha256": "a" * 64,
+        "media_index_manifest": [],
+        "image_count": 3,
+        "video_count": 0,
+        "provider_request_count": 0,
+        "source": {"git_commit": "f" * 40, "worktree_clean": True},
+    }
+    runtime = {
+        "content": [{"type": "text", "text": "strict prompt"}],
+        "payload": {
+            "generation_fingerprint": "b" * 64,
+            "input_fingerprint": "b" * 64,
+        },
+        "run_id": "fixture:phase6-live",
+        "output_path": output_path,
+        "task_store_path": (
+            tmp_path / "live_acceptance/phase6_storyboard_guide/runtime.db"
+        ),
+        "duration": 4,
+        "ratio": "16:9",
+        "resolution": "480p",
+        "seed": 7,
+    }
+    return preflight, runtime
+
+
+def test_phase6_live_acceptance_preflight_is_zero_submit(tmp_path):
+    result = phase6_storyboard_guide_live_acceptance.run_acceptance(
+        tmp_path,
+        submit=False,
+        preflight_builder=lambda *_args, **kwargs: (
+            _phase6_live_acceptance_preflight(tmp_path, **kwargs)
+        ),
+    )
+
+    assert result["status"] == "pending_live_acceptance"
+    assert result["submitted"] is False
+    assert result["provider_request_count"] == 0
+    assert result["required_acceptance_gates"] == [
+        "regression",
+        "live_paid_provider",
+    ]
+    assert result["gates"]["regression"]["status"] == "pending"
+    assert result["gates"]["live_paid_provider"]["status"] == "pending"
+
+
+def test_phase6_live_acceptance_submits_once_refuses_replay_and_needs_both_gates(
+    monkeypatch,
+    tmp_path,
+):
+    raw_posts = []
+
+    def fake_raw_post(*_args, **_kwargs):
+        raw_posts.append(True)
+        return SimpleNamespace()
+
+    def fake_submit_content(content, **_kwargs):
+        phase6_storyboard_guide_live_acceptance.seedance_client.requests.post(
+            "https://ark.test/tasks",
+            json={
+                "model": "seedance-test",
+                "duration": 4,
+                "ratio": "16:9",
+                "resolution": "480p",
+                "return_last_frame": True,
+                "watermark": False,
+                "content": content,
+            },
+        )
+        return "provider-task-1"
+
+    def fake_execute(_store, **kwargs):
+        provider_job_id = kwargs["submit"]()
+        output_path = Path(kwargs["output_path"])
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"valid-live-video-fixture")
+        return SimpleNamespace(
+            task_id="generation-task-1",
+            provider_job_id=provider_job_id,
+            output_path=str(output_path),
+        )
+
+    monkeypatch.setattr(
+        phase6_storyboard_guide_live_acceptance.seedance_client.requests,
+        "post",
+        fake_raw_post,
+    )
+    monkeypatch.setattr(
+        phase6_storyboard_guide_live_acceptance.seedance_client,
+        "submit_content",
+        fake_submit_content,
+    )
+    monkeypatch.setattr(
+        phase6_storyboard_guide_live_acceptance,
+        "execute_seedance_video_task",
+        fake_execute,
+    )
+    monkeypatch.setattr(
+        phase6_storyboard_guide_live_acceptance,
+        "_write_contact_sheet",
+        lambda _path: None,
+    )
+    monkeypatch.setattr(
+        phase6_storyboard_guide_live_acceptance,
+        "get_api_key",
+        lambda _name: "test-key",
+    )
+
+    result = phase6_storyboard_guide_live_acceptance.run_acceptance(
+        tmp_path,
+        submit=True,
+        preflight_builder=lambda *_args, **kwargs: (
+            _phase6_live_acceptance_preflight(tmp_path, **kwargs)
+        ),
+    )
+
+    assert raw_posts == [True]
+    assert result["provider_request_count"] == 1
+    assert result["logical_submit_count"] == 1
+    assert result["status"] == "pending_business_verdict"
+    assert result["gates"]["live_paid_provider"]["call_chain_status"] == "passed"
+    with pytest.raises(RuntimeError, match="already consumed"):
+        phase6_storyboard_guide_live_acceptance.run_acceptance(
+            tmp_path,
+            submit=True,
+            preflight_builder=lambda *_args, **_kwargs: pytest.fail(
+                "replay must stop before rebuilding preflight"
+            ),
+        )
+
+    evidence = tmp_path / "regression.json"
+    evidence.write_text(json.dumps({
+        "schema": phase6_storyboard_guide_live_acceptance.REGRESSION_SCHEMA,
+        "status": "passed",
+        "source": {"git_commit": "f" * 40},
+    }), encoding="utf-8")
+    finalized = phase6_storyboard_guide_live_acceptance.run_acceptance(
+        tmp_path,
+        business_verdict="pass",
+        verdict_notes="starts at P01 and contains no guide annotations",
+        regression_evidence=evidence,
+    )
+    assert finalized["status"] == "accepted"
+    assert finalized["gates"]["regression"]["status"] == "passed"
+    assert finalized["gates"]["live_paid_provider"]["business_verdict"] == "pass"
+
+
+def test_phase6_live_transport_blocks_second_raw_submit(monkeypatch):
+    raw_posts = []
+    monkeypatch.setattr(
+        phase6_storyboard_guide_live_acceptance.seedance_client.requests,
+        "post",
+        lambda *_args, **_kwargs: raw_posts.append(True),
+    )
+    with phase6_storyboard_guide_live_acceptance.SinglePaidRequestTransport() as guard:
+        phase6_storyboard_guide_live_acceptance.seedance_client.requests.post(
+            "https://ark.test/tasks",
+            json={"content": []},
+        )
+        with pytest.raises(
+            phase6_storyboard_guide_live_acceptance.ProviderRequestLimitError,
+            match="exactly one paid Provider request",
+        ):
+            phase6_storyboard_guide_live_acceptance.seedance_client.requests.post(
+                "https://ark.test/tasks",
+                json={"content": []},
+            )
+
+    assert raw_posts == [True]
+    assert guard.provider_request_count == 1
+    assert guard.blocked_provider_request_count == 1
 
 
 def test_phase1_through_phase9_repair_acceptance_contract_is_persisted():
@@ -8315,7 +8497,7 @@ def test_phase5_correction_redraws_only_evidenced_pxx_with_identity_references(
     p01_image = tmp_path / "storyboard_beats/S01_P01.png"
     p01_sidecar = tmp_path / "storyboard_beats/S01_P01.json"
     p01_image_sha256 = hashlib.sha256(p01_image.read_bytes()).hexdigest()
-    p01_sidecar_sha256 = hashlib.sha256(p01_sidecar.read_bytes()).hexdigest()
+    p01_sidecar_before = json.loads(p01_sidecar.read_text(encoding="utf-8"))
     issue = storyboard_qa_gate._issue(
         "L3",
         "moderate",
@@ -8347,7 +8529,11 @@ def test_phase5_correction_redraws_only_evidenced_pxx_with_identity_references(
     assert calls[0]["references"] == ["face_closeup.png", "full_body.png"]
     assert "S01_P01.png" not in calls[0]["references"]
     assert hashlib.sha256(p01_image.read_bytes()).hexdigest() == p01_image_sha256
-    assert hashlib.sha256(p01_sidecar.read_bytes()).hexdigest() == p01_sidecar_sha256
+    p01_sidecar_after = json.loads(p01_sidecar.read_text(encoding="utf-8"))
+    assert p01_sidecar_before.pop("storyboard_narrative_guide") != (
+        p01_sidecar_after.pop("storyboard_narrative_guide")
+    )
+    assert p01_sidecar_after == p01_sidecar_before
     assert receipt["storyboard_ids"] == ["S01_P02"]
     assert receipt["regenerated_panel_count"] == 1
 
@@ -8768,7 +8954,8 @@ def test_phase4_l4_rejection_invalidates_rejected_frame_cache_once(tmp_path):
 
     client = FakeClient()
     generate_cinematic_first_frames(tmp_path, storyboard, [], client=client)
-    assert calls == ["S02_P01", "S02_P02"]
+    assert calls == ["S02_P01"]
+    assert "video_first_frame" not in storyboard["shots"][0]["storyboard_beats"][1]
 
     (tmp_path / "storyboard_qa_report.json").write_text(
         json.dumps({
@@ -8788,7 +8975,7 @@ def test_phase4_l4_rejection_invalidates_rejected_frame_cache_once(tmp_path):
         encoding="utf-8",
     )
     generate_cinematic_first_frames(tmp_path, storyboard, [], client=client)
-    assert calls == ["S02_P01", "S02_P02", "S02_P01"]
+    assert calls == ["S02_P01", "S02_P01"]
     assert "L4 定向纠偏合同" in (
         tmp_path / "video_first_frames/S02_P01_prompt.txt"
     ).read_text(encoding="utf-8")
@@ -8797,13 +8984,13 @@ def test_phase4_l4_rejection_invalidates_rejected_frame_cache_once(tmp_path):
         encoding="utf-8",
     )
     generate_cinematic_first_frames(tmp_path, storyboard, [], client=client)
-    assert calls == ["S02_P01", "S02_P02", "S02_P01"]
+    assert calls == ["S02_P01", "S02_P01"]
     assert "L4 定向纠偏合同" in prompts[-1]
     assert "本轮必须呈现：幕布平面上的镂空皮影" in prompts[-1]
     assert "严禁再次呈现：幕前实体三维人偶" in prompts[-1]
     assert "禁止同一已声明角色出现透明复写、双重曝光或重复实例" in prompts[-1]
     generate_cinematic_first_frames(tmp_path, storyboard, [], client=client)
-    assert calls == ["S02_P01", "S02_P02", "S02_P01"]
+    assert calls == ["S02_P01", "S02_P01"]
 
 
 def test_video_transport_rejects_previs_frame_even_when_it_exists(tmp_path):

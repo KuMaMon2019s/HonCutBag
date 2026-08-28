@@ -23,6 +23,8 @@ from tools.character_reference_board import (
 )
 
 CINEMATIC_FIRST_FRAME_SCHEMA = "honcut.cinematic-first-frame.v1"
+STORYBOARD_NARRATIVE_GUIDE_SCHEMA = "honcut.storyboard-narrative-guide.v1"
+STORYBOARD_NARRATIVE_GUIDE_USAGE = "phase6_story_narrative_guide_not_output_pixels"
 PREVIS_FRAME_PATH_PARTS = frozenset({
     "director_panels",
     "storyboard_beats",
@@ -75,6 +77,62 @@ def _assert_video_frame_provenance(path: Path, declared_kind: Any = None) -> Non
         raise ValueError(f"cinematic video frame receipt hash mismatch: {path}")
     if receipt.get("previs_reference_images") != []:
         raise ValueError(f"cinematic video frame contains PREVIS lineage: {path}")
+
+
+def _assert_narrative_guide_provenance(
+    path: Path,
+    *,
+    declared_kind: Any,
+    declared_usage: Any,
+    declared_cell_ids: Any,
+    declared_sha256: Any,
+    declared_source_board: Any,
+    declared_source_board_sha256: Any,
+    declared_receipt: Any,
+    declared_beat_id: Any,
+    output_dir: Path,
+) -> dict[str, Any]:
+    """Validate an annotated story guide without treating it as a video frame."""
+    if str(declared_kind or "") != STORYBOARD_NARRATIVE_GUIDE_SCHEMA:
+        raise ValueError("storyboard narrative guide has an unknown provenance kind")
+    if str(declared_usage or "") != STORYBOARD_NARRATIVE_GUIDE_USAGE:
+        raise ValueError("storyboard narrative guide has an unsafe usage contract")
+    receipt_path = Path(str(declared_receipt or ""))
+    if not receipt_path.is_absolute():
+        receipt_path = output_dir / receipt_path
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("storyboard narrative guide receipt is unreadable") from exc
+    source_board = Path(str(declared_source_board or ""))
+    if not source_board.is_absolute():
+        source_board = output_dir / source_board
+    if not path.is_file() or not source_board.is_file():
+        raise ValueError("storyboard narrative guide or source board is missing")
+    observed = hashlib.sha256(path.read_bytes()).hexdigest()
+    source_observed = hashlib.sha256(source_board.read_bytes()).hexdigest()
+    cell_ids = [str(value) for value in (declared_cell_ids or [])]
+    beat_id = str(declared_beat_id or "").strip()
+    if not cell_ids or len(cell_ids) != len(set(cell_ids)):
+        raise ValueError("storyboard narrative guide needs ordered unique Gxx cells")
+    if (
+        str(declared_sha256 or "") != observed
+        or str(declared_source_board_sha256 or "") != source_observed
+        or receipt.get("kind") != STORYBOARD_NARRATIVE_GUIDE_SCHEMA
+        or receipt.get("version") != 1
+        or receipt.get("usage") != STORYBOARD_NARRATIVE_GUIDE_USAGE
+        or receipt.get("status") != "done"
+        or receipt.get("beat_id") != beat_id
+        or receipt.get("primary_shot_id") != beat_id.split("_P", 1)[0]
+        or receipt.get("image") != str(path.relative_to(output_dir))
+        or receipt.get("source_board") != str(declared_source_board or "")
+        or receipt.get("image_sha256") != observed
+        or receipt.get("source_board_sha256") != source_observed
+        or receipt.get("cell_ids") != cell_ids
+        or int(receipt.get("provider_request_count") or 0) != 0
+    ):
+        raise ValueError("storyboard narrative guide receipt/hash/cell binding mismatch")
+    return receipt
 
 
 def package_shot_assets(
@@ -737,7 +795,12 @@ def build_content_for_shot(
         else storyboard_images_dir / f"{shot_id}.png"
     )
     image_assets = []
-    if shot_frame_path.exists() and shot_frame_path.stat().st_size > 1024:
+    include_cinematic_frame = shot_meta.get("_include_cinematic_frame", True) is not False
+    if (
+        include_cinematic_frame
+        and shot_frame_path.exists()
+        and shot_frame_path.stat().st_size > 1024
+    ):
         _assert_video_frame_provenance(
             shot_frame_path,
             shot_meta.get("_storyboard_frame_kind"),
@@ -757,6 +820,7 @@ def build_content_for_shot(
             ),
             "priority": "high",
             "bind_subject": False,
+            "mandatory": True,
             "reference_kind": "cinematic_composition",
             "reference_description": (
                 f"{frame_label}，用于锁定本生成片段的构图、角色站位、"
@@ -784,110 +848,157 @@ def build_content_for_shot(
     elif strategy == "phantom":
         character_assets = collect_character_reference_assets(output_dir, shot_meta)
         expected_characters = _detect_shot_characters(output_dir, shot_meta)
-        if expected_characters and not character_assets:
+        by_character: dict[str, list[dict]] = {}
+        for asset in character_assets:
+            by_character.setdefault(str(asset.get("char_id") or ""), []).append(asset)
+        missing_characters = [
+            character_id
+            for character_id in expected_characters
+            if not by_character.get(character_id)
+        ]
+        if missing_characters:
             raise FileNotFoundError(
                 "Phantom character references missing for shot "
-                f"{shot_id}; expected reference_board.png, legacy canonical views, "
-                "identity_detail.png, or variant_*.png"
+                f"{shot_id}: {', '.join(missing_characters)}"
             )
-        if image_assets:
-            image_assets.extend(character_assets)
-            print(
-                "  [assets] phantom all-modal reference: cinematic image 1 + "
-                f"{len(character_assets)} character reference image(s)"
+        guide_value = str(
+            shot_meta.get("_storyboard_narrative_guide_path") or ""
+        ).strip()
+        if not guide_value:
+            # Compatibility for direct/legacy callers that do not declare a
+            # current authored beat. Preserve their historical reference order;
+            # for action, keep only one body-capable identity image per actor.
+            if generation_actions:
+                selected_characters = []
+                for character_id in expected_characters:
+                    candidates = by_character.get(character_id, [])
+                    selected = next(
+                        (
+                            asset
+                            for asset in candidates
+                            if asset.get("reference_kind")
+                            == "character_identity_board"
+                        ),
+                        next(
+                            (
+                                asset
+                                for asset in candidates
+                                if Path(asset.get("path", "")).name
+                                == "full_body.png"
+                            ),
+                            candidates[0] if candidates else None,
+                        ),
+                    )
+                    if selected is not None:
+                        selected_characters.append({**selected, "mandatory": True})
+                image_assets.extend(selected_characters)
+            else:
+                image_assets.extend(character_assets)
+        else:
+            primary_character_assets: list[dict] = []
+            optional_character_assets: list[dict] = []
+            for character_id in expected_characters:
+                candidates = by_character.get(character_id, [])
+                if not candidates:
+                    continue
+                primary = next(
+                    (
+                        asset
+                        for asset in candidates
+                        if asset.get("reference_kind")
+                        == "character_identity_board"
+                    ),
+                    candidates[0],
+                )
+                primary_character_assets.append({**primary, "mandatory": True})
+                optional_character_assets.extend(
+                    {**asset, "mandatory": False}
+                    for asset in candidates
+                    if asset is not primary
+                )
+            image_assets.extend(primary_character_assets)
+            guide_path = Path(guide_value)
+            if not guide_path.is_absolute():
+                guide_path = output_dir / guide_path
+            guide_receipt = _assert_narrative_guide_provenance(
+                guide_path,
+                declared_kind=shot_meta.get("_storyboard_narrative_guide_kind"),
+                declared_usage=shot_meta.get("_storyboard_narrative_guide_usage"),
+                declared_cell_ids=shot_meta.get(
+                    "_storyboard_narrative_guide_cell_ids"
+                ),
+                declared_sha256=shot_meta.get(
+                    "_storyboard_narrative_guide_sha256"
+                ),
+                declared_source_board=shot_meta.get(
+                    "_storyboard_narrative_guide_source_board"
+                ),
+                declared_source_board_sha256=shot_meta.get(
+                    "_storyboard_narrative_guide_source_board_sha256"
+                ),
+                declared_receipt=shot_meta.get(
+                    "_storyboard_narrative_guide_receipt"
+                ),
+                declared_beat_id=shot_meta.get("_storyboard_beat_id"),
+                output_dir=output_dir,
             )
-        elif not character_assets:
+            cell_ids = list(guide_receipt["cell_ids"])
+            image_assets.append({
+                "path": guide_path,
+                "role": "reference_image",
+                "priority": "high",
+                "bind_subject": False,
+                "mandatory": True,
+                "reference_kind": "storyboard_narrative_guide",
+                "narrative_cell_ids": cell_ids,
+                "narrative_beat_id": guide_receipt["beat_id"],
+                "reference_description": (
+                    f"{guide_receipt['beat_id']}剧情导航图，只按"
+                    + "→".join(cell_ids)
+                    + "理解剧情、动作方向、运镜和空间关系；图中序号、"
+                    "文字、箭头、边框、网格和指示标识不得渲染进视频"
+                ),
+            })
+            image_assets.extend(optional_character_assets)
+        if not image_assets:
             raise FileNotFoundError(
                 "Phantom references missing for shot "
-                f"{shot_id}; expected a cinematic first frame or character reference"
+                f"{shot_id}; expected cinematic, character, or narrative-guide media"
             )
-        else:
-            # Compatibility only: legacy projects that have not generated a
-            # Phase 4 cinematic frame still use Phantom identity references.
-            image_assets = character_assets
+        print(
+            "  [assets] phantom all-modal reference: "
+            f"{sum(asset.get('mandatory') is True for asset in image_assets)} "
+            "mandatory image(s)"
+        )
 
     max_reference_images = shot_meta.get("_max_reference_images")
-    if strategy == "phantom" and generation_actions:
-        # Dense identity packs over-constrain motion. For action, retain one
-        # identity image per character plus the composition frame; native
-        # continuation adds its ordered tail anchors outside this budget.
-        active_detail_count = sum(
-            asset.get("reference_kind") == "identity_detail"
-            and asset.get("identity_detail_active") is True
-            for asset in image_assets
+    provider_budget = int(SEEDANCE_2_CAPABILITIES.max_reference_images or 9)
+    effective_budget = (
+        provider_budget
+        if max_reference_images is None
+        else min(provider_budget, max(0, int(max_reference_images)))
+    )
+    mandatory_assets = [asset for asset in image_assets if asset.get("mandatory")]
+    optional_assets = [asset for asset in image_assets if not asset.get("mandatory")]
+    if len(mandatory_assets) > effective_budget:
+        raise ValueError(
+            f"{shot_id} requires {len(mandatory_assets)} mandatory reference images, "
+            f"above the available Seedance budget {effective_budget}"
         )
-        motion_budget = (
-            len(_detect_shot_characters(output_dir, shot_meta))
-            + 1
-            + min(active_detail_count, 1)
+    optional_capacity = effective_budget - len(mandatory_assets)
+    selected_optional_ids = {
+        id(asset) for asset in optional_assets[:optional_capacity]
+    }
+    image_assets = [
+        asset
+        for asset in image_assets
+        if asset.get("mandatory") or id(asset) in selected_optional_ids
+    ]
+    if len(optional_assets) > optional_capacity:
+        print(
+            "  [assets] omitted optional identity detail/variant references: "
+            f"{len(optional_assets) - optional_capacity}"
         )
-        provider_budget = SEEDANCE_2_CAPABILITIES.max_reference_images or 9
-        motion_budget = max(2, min(provider_budget, motion_budget))
-        max_reference_images = (
-            motion_budget
-            if max_reference_images is None
-            else min(int(max_reference_images), motion_budget)
-        )
-    if max_reference_images is not None:
-        max_reference_images = max(0, int(max_reference_images))
-        if len(image_assets) > max_reference_images:
-            # Continuation reserves three provider image slots for ordered tail
-            # anchors. Keep the composition frame and distribute the remaining
-            # identity budget across characters in rounds (board, detail, variant)
-            # so one character cannot consume every slot.
-            composition_assets = [
-                asset
-                for asset in image_assets
-                if asset.get("reference_kind") == "cinematic_composition"
-            ][:1]
-            character_assets = [
-                asset
-                for asset in image_assets
-                if asset.get("reference_kind") != "cinematic_composition"
-            ]
-            character_budget = max(0, max_reference_images - len(composition_assets))
-            grouped: dict[str, list[dict]] = {}
-            for asset in character_assets:
-                grouped.setdefault(str(asset.get("char_id") or ""), []).append(asset)
-            if strategy == "phantom" and generation_actions:
-                # Face close-ups bias an action generation toward portrait
-                # framing and can push the second fighter out of frame. Prefer
-                # a full-body identity anchor for choreography, then a state
-                # variant, and keep the face crop only as a last fallback.
-                def action_reference_rank(asset: dict) -> int:
-                    name = Path(asset.get("path", "")).name
-                    if name == "reference_board.png":
-                        return 0
-                    if name == "full_body.png":
-                        return 1
-                    if name == "identity_detail.png":
-                        return 2
-                    if name.startswith("variant_"):
-                        return 3
-                    if name == "face_closeup.png":
-                        return 4
-                    return 5
-
-                for assets in grouped.values():
-                    assets.sort(key=action_reference_rank)
-            selected_characters = []
-            round_index = 0
-            while len(selected_characters) < character_budget:
-                added = False
-                for assets in grouped.values():
-                    if round_index < len(assets):
-                        selected_characters.append(assets[round_index])
-                        added = True
-                        if len(selected_characters) >= character_budget:
-                            break
-                if not added:
-                    break
-                round_index += 1
-            image_assets = [*composition_assets, *selected_characters]
-            print(
-                "  [assets] continuation reference budget: "
-                f"trimmed to {len(image_assets)}/{max_reference_images} images"
-            )
 
     route_label = (
         f"{requested_strategy}->{strategy}"
@@ -931,12 +1042,27 @@ def build_content_for_shot(
             tos_uploader.upload_image(img_data, "image/png"),
             label=f"{asset['role']} image {asset['path'].name}",
         )
-        content.append({
+        content_item = {
             "type": "image_url",
             "image_url": {"url": tos_url},
             "role": asset["role"],
             "priority": asset["priority"],
-        })
+            "_reference_kind": asset.get("reference_kind"),
+            "_reference_description": asset.get("reference_description"),
+            "_character_id": asset.get("char_id"),
+            "_narrative_cell_ids": asset.get("narrative_cell_ids"),
+            "_narrative_beat_id": asset.get("narrative_beat_id"),
+            "_mandatory_reference": asset.get("mandatory") is True,
+            "_reference_path": (
+                str(asset["path"].relative_to(output_dir))
+                if asset["path"].is_relative_to(output_dir)
+                else str(asset["path"])
+            ),
+            "_reference_sha256": hashlib.sha256(
+                asset["path"].read_bytes()
+            ).hexdigest(),
+        }
+        content.append(content_item)
         uploaded_count += 1
         if asset["role"] == "reference_image":
             uploaded_reference_descriptions.append(asset)

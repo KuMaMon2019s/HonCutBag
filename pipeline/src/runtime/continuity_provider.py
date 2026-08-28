@@ -362,6 +362,19 @@ def _validate_seedance_continuity_plan(plan: ContinuityPlan) -> None:
                 _validated_seedance_chunk_duration(chunk, chunk.chunk_id)
             except ValueError as exc:
                 errors.append(str(exc))
+            if chunk.storyboard_beat_id and not chunk.storyboard_narrative_guide:
+                errors.append(
+                    f"{chunk.chunk_id} has no validated storyboard narrative guide"
+                )
+            if chunk.sequence == 1 and chunk.execution_strategy == "multi_image":
+                if not chunk.storyboard_image:
+                    errors.append(
+                        f"{chunk.chunk_id} has no primary-shot cinematic composition"
+                    )
+            elif chunk.sequence > 1 and chunk.storyboard_image:
+                errors.append(
+                    f"{chunk.chunk_id} must extend predecessor video without a new cinematic frame"
+                )
     for bridge in plan.bridges:
         try:
             SEEDANCE_2_CAPABILITIES.validate_chunk_durations(
@@ -606,6 +619,13 @@ def _chunk_scoped_shot_meta(
     scoped["source_generation_unit_indexes"] = list(
         matched.get("source_generation_unit_indexes") or []
     )
+    if "character_ids" in matched:
+        visible_character_ids = matched.get("character_ids") or []
+        if not isinstance(visible_character_ids, list):
+            raise ValueError(f"{beat_id} character_ids must be an ordered array")
+        scoped["who"] = list(visible_character_ids)
+        scoped["characters"] = list(visible_character_ids)
+        scoped["_char_ids"] = list(visible_character_ids)
     if matched.get("subject_description"):
         scoped["subject_description"] = matched["subject_description"]
     feedback = scoped.get("phase8_reshoot")
@@ -803,11 +823,11 @@ def _append_group_board_reference(
     content: list[dict[str, Any]],
     board_path: Path | None,
 ) -> list[dict[str, Any]]:
-    """Retain the legacy seam as an enforced no-op.
+    """Retain the legacy continuity-group board seam as an enforced no-op.
 
-    Storyboard boards are allowed in text/LLM review only. Keeping this helper
-    as a no-op prevents an old call site from silently reintroducing grid pixels
-    into provider requests.
+    ``storyboard_groups/CGxx`` is not the Phase 2 per-Sxx narrative guide.
+    Keeping this helper as a no-op prevents that obsolete group-board pixel
+    contract from being confused with ``storyboard_narrative_guide``.
     """
     _ = board_path
     return content
@@ -873,18 +893,48 @@ def _base_content(
         # Frame roles cannot be mixed with reference media in Seedance.  The
         # bridge helper adds the actual predecessor tail and next P01 below.
         return [{"type": "text", "text": content_meta["prompt"]}]
+    content_meta["_include_cinematic_frame"] = request.chunk.sequence == 1
+    if request.chunk.storyboard_beat_id:
+        content_meta["_storyboard_beat_id"] = request.chunk.storyboard_beat_id
+    if strategy in {"multi_image", "tail_video_extend"}:
+        content_meta["gen_strategy"] = "phantom"
     if request.chunk.storyboard_image:
         content_meta["_storyboard_frame_path"] = request.chunk.storyboard_image
         content_meta["_storyboard_frame_kind"] = request.chunk.storyboard_image_kind
-        content_meta["_storyboard_beat_id"] = request.chunk.storyboard_beat_id
         content_meta["generation_actions"] = [request.chunk.action_prompt]
-        content_meta["gen_strategy"] = (
-            "phantom"
-            if strategy in {"multi_image", "tail_video_extend"}
-            else "i2v"
-        )
-    # Storyboard/group boards are director and LLM evidence only. Their grids,
-    # labels, and motion notation never consume provider image slots.
+        if strategy not in {"multi_image", "tail_video_extend"}:
+            content_meta["gen_strategy"] = "i2v"
+    if request.chunk.storyboard_beat_id:
+        if not request.chunk.storyboard_narrative_guide:
+            raise ValueError(
+                f"{request.resource_id} has no storyboard narrative guide"
+            )
+        content_meta.update({
+            "_storyboard_narrative_guide_path": (
+                request.chunk.storyboard_narrative_guide
+            ),
+            "_storyboard_narrative_guide_kind": (
+                request.chunk.storyboard_narrative_guide_kind
+            ),
+            "_storyboard_narrative_guide_usage": (
+                request.chunk.storyboard_narrative_guide_usage
+            ),
+            "_storyboard_narrative_guide_cell_ids": list(
+                request.chunk.storyboard_narrative_guide_cell_ids
+            ),
+            "_storyboard_narrative_guide_sha256": (
+                request.chunk.storyboard_narrative_guide_sha256
+            ),
+            "_storyboard_narrative_guide_source_board": (
+                request.chunk.storyboard_narrative_guide_source_board
+            ),
+            "_storyboard_narrative_guide_source_board_sha256": (
+                request.chunk.storyboard_narrative_guide_source_board_sha256
+            ),
+            "_storyboard_narrative_guide_receipt": (
+                request.chunk.storyboard_narrative_guide_receipt
+            ),
+        })
     if request.chunk.mode == "native_extend":
         content_meta["_max_reference_images"] = (
             SEEDANCE_MAX_REFERENCE_IMAGES
@@ -957,6 +1007,22 @@ def _extension_content(
     text_item = next((item for item in normalized if item.get("type") == "text"), None)
     if text_item is not None:
         text_item["text"] = f"{directive}{text_item.get('text', '')}"
+    # P02+ ordering is a semantic contract: predecessor video first, then
+    # current-character and narrative-guide images, then local tail anchors.
+    normalized.append(
+        {
+            "type": "video_url",
+            "video_url": {"url": video_url},
+            "role": "reference_video",
+            "_continuity_role": "tail_window_video",
+            "_reference_kind": "predecessor_tail_video",
+            "_reference_description": "上一 Pxx 已完成视频的末段",
+            "_reference_path": str(tail_video_path),
+            "_reference_sha256": hashlib.sha256(
+                tail_video_path.read_bytes()
+            ).hexdigest(),
+        }
+    )
     for item in base_images:
         item["role"] = "reference_image"
         item.pop("priority", None)
@@ -967,18 +1033,141 @@ def _extension_content(
             "image_url": {"url": url},
             "role": "reference_image",
             "_continuity_role": "ordered_tail_frame",
+            "_reference_kind": "ordered_tail_frame",
+            "_reference_description": "视频1末段按时间顺序截取的连续性状态帧",
+            "_reference_path": str(path),
+            "_reference_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         }
-        for url in frame_urls
-    )
-    normalized.append(
-        {
-            "type": "video_url",
-            "video_url": {"url": video_url},
-            "role": "reference_video",
-            "_continuity_role": "tail_window_video",
-        }
+        for url, path in zip(frame_urls, frame_paths, strict=True)
     )
     return normalized
+
+
+def _media_index_manifest(content: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Describe final provider media order without storing URLs or media bytes."""
+    counters = {"image_url": 0, "video_url": 0, "audio_url": 0}
+    labels = {"image_url": "图片", "video_url": "视频", "audio_url": "音频"}
+    manifest: list[dict[str, Any]] = []
+    for content_index, item in enumerate(content):
+        media_type = str(item.get("type") or "")
+        if media_type not in counters:
+            continue
+        counters[media_type] += 1
+        manifest.append({
+            "content_index": content_index,
+            "media_type": media_type,
+            "media_index": counters[media_type],
+            "prompt_index": f"{labels[media_type]}{counters[media_type]}",
+            "role": item.get("role"),
+            "responsibility": (
+                item.get("_reference_kind")
+                or item.get("_continuity_role")
+                or item.get("role")
+            ),
+            "description": item.get("_reference_description"),
+            "path": item.get("_reference_path"),
+            "sha256": item.get("_reference_sha256"),
+            "character_id": item.get("_character_id"),
+            "narrative_beat_id": item.get("_narrative_beat_id"),
+            "narrative_cell_ids": list(item.get("_narrative_cell_ids") or []),
+            "mandatory": item.get("_mandatory_reference") is True
+            or bool(item.get("_continuity_role")),
+        })
+    return manifest
+
+
+def _bind_final_media_index_prompt(
+    content: Sequence[dict[str, Any]],
+    request: ChunkExecutionRequest,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Bind 图片N/视频N only after the final content order is fixed."""
+    normalized = [dict(item) for item in content]
+    manifest = _media_index_manifest(normalized)
+    if request.chunk.execution_strategy == "first_last_frame_bridge":
+        if any(
+            item.get("responsibility") == "storyboard_narrative_guide"
+            for item in manifest
+        ):
+            raise ValueError("cross-primary bridge must not contain a narrative guide")
+        return normalized, manifest
+
+    guides = [
+        item
+        for item in manifest
+        if item.get("responsibility") == "storyboard_narrative_guide"
+    ]
+    if request.chunk.storyboard_beat_id:
+        if len(guides) != 1:
+            raise ValueError(
+                f"{request.resource_id} must contain exactly one current narrative guide"
+            )
+        guide = guides[0]
+        expected_cells = list(request.chunk.storyboard_narrative_guide_cell_ids)
+        if (
+            guide.get("narrative_beat_id") != request.chunk.storyboard_beat_id
+            or guide.get("narrative_cell_ids") != expected_cells
+        ):
+            raise ValueError(
+                f"{request.resource_id} narrative guide does not match its persisted Gxx assignment"
+            )
+    if (
+        request.chunk.sequence == 1
+        and request.chunk.execution_strategy == "multi_image"
+        and request.chunk.storyboard_beat_id
+    ):
+        image_items = [
+            item for item in manifest if item.get("media_type") == "image_url"
+        ]
+        if not image_items or image_items[0].get("responsibility") != (
+            "cinematic_composition"
+        ):
+            raise ValueError(
+                f"{request.resource_id} 图片1 must be the primary-shot cinematic composition"
+            )
+    if request.chunk.mode == "native_extend":
+        videos = [
+            item for item in manifest if item.get("media_type") == "video_url"
+        ]
+        if len(videos) != 1 or videos[0].get("prompt_index") != "视频1":
+            raise ValueError(
+                f"{request.resource_id} must extend exactly one predecessor as 视频1"
+            )
+
+    index_lines = []
+    for item in manifest:
+        description = str(item.get("description") or "").strip()
+        if not description:
+            responsibility = str(item.get("responsibility") or "参考素材")
+            description = responsibility.replace("_", " ")
+        index_lines.append(f"{item['prompt_index']}：{description}")
+    guide_contract = ""
+    if guides:
+        guide = guides[0]
+        cells = [str(value) for value in guide["narrative_cell_ids"]]
+        guide_contract = (
+            f"\n当前剧情导航图是{guide['prompt_index']}；本次只按"
+            + "→".join(cells)
+            + "的顺序演绎，不得提前演绎其他 Gxx 或后续 Pxx。"
+            "红色箭头表示主体或物体运动方向；蓝色箭头表示摄影机运动；"
+            "其他指示标识表示空间、视线、接触点和动作接续关系。"
+            "Gxx 序号、文字、箭头、轨迹线、指示标识、边框和九宫格只供理解，"
+            "严禁渲染进视频画面。"
+        )
+    prefix = (
+        "【参考素材索引｜顺序不可交换】\n"
+        + "\n".join(index_lines)
+        + guide_contract
+        + "\n"
+    )
+    text_item = next(
+        (item for item in normalized if item.get("type") == "text"),
+        None,
+    )
+    if text_item is None:
+        normalized.insert(0, {"type": "text", "text": prefix})
+    else:
+        text_item["text"] = prefix + str(text_item.get("text") or "")
+    return normalized, manifest
 
 
 def _first_last_bridge_content(
@@ -1044,6 +1233,12 @@ def _first_last_bridge_content(
             "role": "first_frame",
             "priority": "high",
             "_continuity_role": "required_first_frame",
+            "_reference_kind": "cross_shot_source_tail_frame",
+            "_reference_description": "上一一级分镜视频真实尾帧",
+            "_reference_path": str(tail_frame),
+            "_reference_sha256": hashlib.sha256(
+                tail_frame.read_bytes()
+            ).hexdigest(),
         },
         {
             "type": "image_url",
@@ -1051,6 +1246,12 @@ def _first_last_bridge_content(
             "role": "last_frame",
             "priority": "high",
             "_continuity_role": "required_last_frame",
+            "_reference_kind": "cross_shot_target_head_frame",
+            "_reference_description": "下一一级分镜视频真实首帧",
+            "_reference_path": str(head_frame),
+            "_reference_sha256": hashlib.sha256(
+                head_frame.read_bytes()
+            ).hexdigest(),
         },
     ]
 
@@ -1076,9 +1277,7 @@ def _provider_content(
         if request.previous_output_path is None:
             raise RuntimeError(f"{request.resource_id} has no predecessor video")
         content = _extension_content(content, request.previous_output_path)
-    # Keep the group narrative in the text prompt, but never attach its pixels.
-    # The only composition pixels accepted by the video route are Phase 4
-    # cinematic first frames with provenance receipts.
+    content, _media_manifest = _bind_final_media_index_prompt(content, request)
     return content, shot_meta, _generation_seed(request), _chunk_duration(request)
 
 
@@ -1134,6 +1333,28 @@ def _task_payload(
             else None
         ),
         "bridge_target_beat_id": request.chunk.bridge_target_beat_id,
+        "storyboard_narrative_guide": request.chunk.storyboard_narrative_guide,
+        "storyboard_narrative_guide_kind": (
+            request.chunk.storyboard_narrative_guide_kind
+        ),
+        "storyboard_narrative_guide_usage": (
+            request.chunk.storyboard_narrative_guide_usage
+        ),
+        "storyboard_narrative_guide_cell_ids": list(
+            request.chunk.storyboard_narrative_guide_cell_ids
+        ),
+        "storyboard_narrative_guide_sha256": (
+            request.chunk.storyboard_narrative_guide_sha256
+        ),
+        "storyboard_narrative_guide_source_board_sha256": (
+            request.chunk.storyboard_narrative_guide_source_board_sha256
+        ),
+        "storyboard_narrative_guide_source_board": (
+            request.chunk.storyboard_narrative_guide_source_board
+        ),
+        "storyboard_narrative_guide_receipt": (
+            request.chunk.storyboard_narrative_guide_receipt
+        ),
         "duration": duration,
         "provider_request_duration_s": duration,
         "effective_story_duration_s": round(unique_duration, 6),
@@ -1183,8 +1404,10 @@ def _provider_input_context(
     chunk_id: str,
     *,
     storyboard_image: str | None = None,
+    storyboard_narrative_guide: str | None = None,
+    storyboard_narrative_guide_cell_ids: Sequence[str] = (),
     bridge_target_storyboard_image: str | None = None,
-) -> dict[str, str | None]:
+) -> dict[str, Any]:
     shot_meta = output_dir / "shots" / shot_id / "SHOT_META.json"
     storyboard_frame = output_dir / "storyboard_images" / f"{shot_id}.png"
     group, group_board = _storyboard_group_for_shot(output_dir, shot_id)
@@ -1222,6 +1445,12 @@ def _provider_input_context(
         ),
         "chunk_id": chunk_id,
         "secondary_storyboard_image_sha256": optional_hash(storyboard_image),
+        "storyboard_narrative_guide_sha256": optional_hash(
+            storyboard_narrative_guide
+        ),
+        "storyboard_narrative_guide_cell_ids": list(
+            storyboard_narrative_guide_cell_ids
+        ),
         "bridge_target_storyboard_image_sha256": optional_hash(
             bridge_target_storyboard_image
         ),
@@ -1315,6 +1544,17 @@ def _privacy_repair_content(
         raise RequiredContinuityEndpointPrivacyError(
             "provider privacy review rejected required first/last bridge endpoint(s): "
             + ", ".join(f"content[{index}]" for index in required_endpoints)
+        )
+    required_references = [
+        index
+        for index in rejected
+        if content[index].get("_mandatory_reference") is True
+    ]
+    if required_references:
+        raise RuntimeError(
+            "provider privacy review rejected mandatory cinematic/identity/"
+            "narrative-guide reference(s); automatic media removal is forbidden: "
+            + ", ".join(f"content[{index}]" for index in required_references)
         )
 
     corrected = _without_content_indices(content, rejected)
@@ -1639,28 +1879,18 @@ def _direct_seedance_executor(
             if request.chunk.execution_strategy == "first_last_frame_bridge"
             else ratio
         )
-        payload = _task_payload(
-            request,
-            model=model,
-            provider_id="seedance",
-            provider_version="ark-agent-plan-v3",
-            project_id=project_id,
-            run_id=run_id,
-            duration=duration,
-            seed=seed,
-            generation_parameters={
-                "ratio": provider_ratio,
-                "resolution": resolution,
-                "return_last_frame": True,
-                "seedance_prompt_contract": (
-                    "first_last_frame_v1"
-                    if request.chunk.execution_strategy == "first_last_frame_bridge"
-                    else "video1_tail_extend_v1"
-                    if request.chunk.execution_strategy == "tail_video_extend"
-                    else "all_modal_reference_v1"
-                ),
-            },
-        )
+        generation_parameters = {
+            "ratio": provider_ratio,
+            "resolution": resolution,
+            "return_last_frame": True,
+            "seedance_prompt_contract": (
+                "first_last_frame_v1"
+                if request.chunk.execution_strategy == "first_last_frame_bridge"
+                else "video1_tail_extend_v1"
+                if request.chunk.execution_strategy == "tail_video_extend"
+                else "all_modal_reference_with_narrative_guide_v2"
+            ),
+        }
         repairs: list[dict[str, Any]] = []
         privacy_repairs: list[dict[str, Any]] = []
         privacy_resubmission_attempt = 0
@@ -1695,6 +1925,33 @@ def _direct_seedance_executor(
                     if privacy_repair_budget is None:
                         privacy_repair_budget = _privacy_policy_repair_budget(content)
                     assert privacy_repair_budget is not None
+
+                    media_index_manifest = _media_index_manifest(content)
+                    provider_prompt = next(
+                        (
+                            str(item.get("text") or "")
+                            for item in content
+                            if item.get("type") == "text"
+                        ),
+                        "",
+                    )
+                    payload = _task_payload(
+                        request,
+                        model=model,
+                        provider_id="seedance",
+                        provider_version="ark-agent-plan-v3",
+                        project_id=project_id,
+                        run_id=run_id,
+                        duration=duration,
+                        seed=seed,
+                        generation_parameters={
+                            **generation_parameters,
+                            "media_index_manifest": media_index_manifest,
+                            "provider_prompt_sha256": hashlib.sha256(
+                                provider_prompt.encode("utf-8")
+                            ).hexdigest(),
+                        },
+                    )
 
                     attempt_seed = _copyright_repair_seed(seed, repairs)
                     policy_attempt = len(repairs)
@@ -2057,6 +2314,14 @@ def _bridge_seedance_executor(
         ratio, width, height = _video_geometry(
             _read_shot_meta(output_dir, request.shot_id)
         )
+        content, _shot_meta, _seed, _duration = _provider_content(
+            output_dir,
+            request,
+        )
+        prompt = next(
+            (str(item.get("text")) for item in content if item.get("type") == "text"),
+            "",
+        )
         payload = _task_payload(
             request,
             model=model,
@@ -2070,15 +2335,14 @@ def _bridge_seedance_executor(
                 "ratio": ratio,
                 "width": width,
                 "height": height,
+                "media_index_manifest": _media_index_manifest(content),
+                "provider_prompt_sha256": hashlib.sha256(
+                    prompt.encode("utf-8")
+                ).hexdigest(),
             },
         )
 
         def generate(**runtime_kwargs: Any) -> str | dict[str, Any]:
-            content, _shot_meta, _seed, _duration = _provider_content(output_dir, request)
-            prompt = next(
-                (str(item.get("text")) for item in content if item.get("type") == "text"),
-                "",
-            )
             return local_video_client.generate_video(
                 prompt=prompt,
                 output_path=str(request.output_path),
@@ -2097,17 +2361,17 @@ def _bridge_seedance_executor(
             )
 
         with slots.reserve("bridge", "video", request.resource_id, capacity=capacity):
-                execution = execute_bridge_video_task(
+            execution = execute_bridge_video_task(
                 task_store,
-                    run_id=run_id,
+                run_id=run_id,
                 resource_id=request.resource_id,
                 payload=payload,
                 provider_endpoint=local_video_client.get_api_url(),
-                    output_path=request.output_path,
-                    generate=generate,
-                    validate_output=is_valid_video,
-                    artifact_store=artifact_store,
-                )
+                output_path=request.output_path,
+                generate=generate,
+                validate_output=is_valid_video,
+                artifact_store=artifact_store,
+            )
         return ChunkExecutionResult(
             output_path=Path(execution.output_path),
             provider_task_id=execution.provider_job_id,
@@ -2552,6 +2816,10 @@ def execute_phase6_auto_continuity(
             shot.shot_id,
             chunk.chunk_id,
             storyboard_image=chunk.storyboard_image,
+            storyboard_narrative_guide=chunk.storyboard_narrative_guide,
+            storyboard_narrative_guide_cell_ids=(
+                chunk.storyboard_narrative_guide_cell_ids
+            ),
             bridge_target_storyboard_image=chunk.bridge_target_storyboard_image,
         ),
         seam_calibration=(

@@ -83,6 +83,7 @@ from runtime.continuity_memory import (
 )
 from runtime.continuity_provider import (
     _base_content,
+    _bind_final_media_index_prompt,
     _bridge_seedance_executor,
     _chunk_duration,
     _continuity_bridge_preparer,
@@ -105,7 +106,7 @@ from sam3_runtime.policy import (
     resolve_runtime_policy,
 )
 from schemas.continuity import ContinuityPlan, GenerationChunk
-from tools.asset_packager import inject_reference_instruction
+from tools.asset_packager import build_content_for_shot, inject_reference_instruction
 from utils.artifact_chain import can_resume_from
 
 
@@ -115,6 +116,50 @@ def _signed_tos_url(monkeypatch, object_key):
     monkeypatch.setenv("TOS_BUCKET", "honcut-fixtures")
     monkeypatch.setenv("TOS_ENDPOINT", "tos-cn-beijing.volces.com")
     return tos_uploader.get_signed_url(object_key)
+
+
+def _narrative_guide_fields(
+    beat_id: str,
+    cell_ids: tuple[str, ...] | None = None,
+) -> dict[str, object]:
+    shot_id = beat_id.split("_P", 1)[0]
+    ordered_cells = list(cell_ids or (f"{shot_id}_G01",))
+    return {
+        "storyboard_narrative_guide": f"storyboard_guides/{beat_id}.png",
+        "storyboard_narrative_guide_kind": (
+            "honcut.storyboard-narrative-guide.v1"
+        ),
+        "storyboard_narrative_guide_usage": (
+            "phase6_story_narrative_guide_not_output_pixels"
+        ),
+        "storyboard_narrative_guide_cell_ids": ordered_cells,
+        "storyboard_narrative_guide_sha256": "a" * 64,
+        "storyboard_narrative_guide_source_board": (
+            f"shot_storyboards/{shot_id}.png"
+        ),
+        "storyboard_narrative_guide_source_board_sha256": "b" * 64,
+        "storyboard_narrative_guide_receipt": (
+            f"storyboard_guides/{beat_id}.json"
+        ),
+    }
+
+
+def _narrative_guide_media(
+    beat_id: str,
+    cell_ids: tuple[str, ...] | None = None,
+) -> dict[str, object]:
+    shot_id = beat_id.split("_P", 1)[0]
+    ordered_cells = list(cell_ids or (f"{shot_id}_G01",))
+    return {
+        "type": "image_url",
+        "image_url": {"url": f"https://image.test/{beat_id}-guide.png"},
+        "role": "reference_image",
+        "_reference_kind": "storyboard_narrative_guide",
+        "_reference_description": f"{beat_id} current narrative guide",
+        "_narrative_beat_id": beat_id,
+        "_narrative_cell_ids": ordered_cells,
+        "_mandatory_reference": True,
+    }
 
 
 def _write_grid_image(
@@ -291,9 +336,51 @@ def test_planner_splits_long_shot_and_preserves_explicit_anchors(tmp_path):
         "S02_C01", "S03_C01", "S03_C02"
     ]
     persisted = json.loads((tmp_path / "CONTINUITY_PLAN.json").read_text())
-    assert persisted["version"] == 1
+    assert persisted["version"] == 2
     assert persisted["timeline_fps"] == 24
     assert persisted["shots"][1]["chunks"][2]["mode"] == "native_extend"
+
+
+def test_continuity_v1_migration_reuses_only_p01_cinematic_and_future_fails_closed():
+    payload = build_continuity_plan({
+        "shots": [{
+            "id": "S01",
+            "duration": 8,
+            "storyboard_beats": [
+                {
+                    "beat_id": "S01_P01",
+                    "duration_s": 4,
+                    "execution_strategy": "multi_image",
+                    "video_first_frame": "video_first_frames/S01_P01.png",
+                    "video_first_frame_kind": "honcut.cinematic-first-frame.v1",
+                },
+                {
+                    "beat_id": "S01_P02",
+                    "duration_s": 4,
+                    "execution_strategy": "tail_video_extend",
+                    "video_first_frame": "video_first_frames/S01_P02.png",
+                    "video_first_frame_kind": "honcut.cinematic-first-frame.v1",
+                },
+            ],
+        }],
+    }).model_dump(mode="json")
+    payload["version"] = 1
+    payload["shots"][0]["chunks"][1].update({
+        "storyboard_image": "video_first_frames/S01_P02.png",
+        "storyboard_image_kind": "honcut.cinematic-first-frame.v1",
+    })
+
+    migrated = ContinuityPlan.model_validate(payload)
+
+    assert migrated.version == 2
+    assert migrated.migrated_from_version == 1
+    assert migrated.shots[0].chunks[0].storyboard_image == (
+        "video_first_frames/S01_P01.png"
+    )
+    assert migrated.shots[0].chunks[1].storyboard_image is None
+    assert migrated.shots[0].chunks[1].storyboard_image_kind is None
+    with pytest.raises(ValidationError):
+        ContinuityPlan.model_validate({**payload, "version": 99})
 
 
 def test_planner_balances_a_sixteen_second_shot_without_a_one_second_tail():
@@ -1000,7 +1087,34 @@ def test_complex_shot_maps_to_three_secondary_generation_strategies(tmp_path):
     assert shot_record["grid_contract"]["rows"] == 3
     assert shot_record["grid_contract"]["cell_count"] == 9
     assert len(shot_record["narrative_grid"]) == 9
-    assert shot_record["usage"] == "director_llm_review_only_not_video_reference"
+    assert shot_record["usage"] == (
+        "phase6_story_narrative_guide_not_output_pixels"
+    )
+    assert [
+        cell_id
+        for assignment in shot_record["beat_cell_assignments"]
+        for cell_id in assignment["cell_ids"]
+    ] == [f"S01_G{index:02d}" for index in range(1, 10)]
+    assert [
+        guide["beat_id"] for guide in shot_record["narrative_guides"]
+    ] == ["S01_P01", "S01_P02"]
+    guide_hashes = {
+        guide["beat_id"]: guide["image_sha256"]
+        for guide in shot_record["narrative_guides"]
+    }
+    provider_call_count = len(calls)
+    resumed = generate_shot_storyboards(
+        tmp_path,
+        storyboard,
+        [],
+        client=FakeImageClient(),
+    )
+    assert len(calls) == provider_call_count
+    resumed_s01 = next(item for item in resumed["shots"] if item["shot_id"] == "S01")
+    assert {
+        guide["beat_id"]: guide["image_sha256"]
+        for guide in resumed_s01["narrative_guides"]
+    } == guide_hashes
     manifest_path = tmp_path / "SHOT_STORYBOARDS.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["shots"][0]["grid_contract"]["cell_count"] = 8
@@ -1011,6 +1125,26 @@ def test_complex_shot_maps_to_three_secondary_generation_strategies(tmp_path):
     )
     manifest["shots"][0]["grid_contract"]["cell_count"] = 9
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    guide_receipt_path = tmp_path / shot_record["narrative_guides"][0]["receipt"]
+    guide_receipt = json.loads(guide_receipt_path.read_text(encoding="utf-8"))
+    guide_receipt["image_sha256"] = "0" * 64
+    guide_receipt_path.write_text(json.dumps(guide_receipt), encoding="utf-8")
+    assert any(
+        "S01_P01 invalid narrative guide" in error
+        for error in validate_shot_storyboard_artifacts(tmp_path, storyboard)
+    )
+    guide_receipt["image_sha256"] = shot_record["narrative_guides"][0][
+        "image_sha256"
+    ]
+    guide_receipt["kind"] = "honcut.storyboard-narrative-guide.v2"
+    guide_receipt_path.write_text(json.dumps(guide_receipt), encoding="utf-8")
+    assert any(
+        "S01_P01 invalid narrative guide" in error
+        for error in validate_shot_storyboard_artifacts(tmp_path, storyboard)
+    )
+    guide_receipt["kind"] = "honcut.storyboard-narrative-guide.v1"
+    guide_receipt_path.write_text(json.dumps(guide_receipt), encoding="utf-8")
+    assert validate_shot_storyboard_artifacts(tmp_path, storyboard) == []
     assert (tmp_path / "storyboard_beats/S01_P01.png").is_file()
     assert (tmp_path / "storyboard_beats/S01_P02.png").is_file()
     assert (tmp_path / "storyboard_images/S01.png").is_file()
@@ -1029,8 +1163,16 @@ def test_complex_shot_maps_to_three_secondary_generation_strategies(tmp_path):
     assert [chunk.storyboard_beat_id for chunk in first.chunks] == [
         "S01_P01", "S01_P02",
     ]
-    assert [chunk.storyboard_image for chunk in first.chunks] == [
-        "storyboard_beats/S01_P01.png", "storyboard_beats/S01_P02.png",
+    assert [chunk.storyboard_image for chunk in first.chunks] == [None, None]
+    assert [chunk.storyboard_narrative_guide for chunk in first.chunks] == [
+        "storyboard_guides/S01_P01.png",
+        "storyboard_guides/S01_P02.png",
+    ]
+    assert first.chunks[0].storyboard_narrative_guide_cell_ids == [
+        f"S01_G{index:02d}" for index in range(1, 6)
+    ]
+    assert first.chunks[1].storyboard_narrative_guide_cell_ids == [
+        f"S01_G{index:02d}" for index in range(6, 10)
     ]
     assert [chunk.requested_frames for chunk in first.chunks] == [192, 192]
     assert [chunk.expected_unique_frames for chunk in first.chunks] == [192, 192]
@@ -1814,25 +1956,29 @@ def test_missing_pxx_blocks_validation_and_resume(tmp_path):
     assert can_resume_from("phase4", tmp_path) is False
 
 
-def test_provider_uses_each_chunk_storyboard_panel_and_action(monkeypatch, tmp_path):
+def test_provider_scopes_each_chunk_to_current_action_cast_and_guide(monkeypatch, tmp_path):
     shot_dir = tmp_path / "shots/S01"
     shot_dir.mkdir(parents=True)
     shot_meta = {
         "prompt": "完整镜头摘要",
         "gen_strategy": "phantom",
+        "who": ["CHAR_LIN", "CHAR_JIN"],
         "storyboard_beats": [
             {
                 "beat_id": "S01_P01",
+                "character_ids": ["CHAR_LIN", "CHAR_JIN"],
                 "action": "烬抓住扶手稳定重心",
                 "visual": "左手抓扶手，身体重心下沉",
             },
             {
                 "beat_id": "S01_P02",
+                "character_ids": ["CHAR_JIN"],
                 "action": "烬抬起机械臂格挡",
                 "visual": "右臂贴近身体格挡，冲击力压低重心",
             },
             {
                 "beat_id": "S01_P03",
+                "character_ids": ["CHAR_LIN", "CHAR_JIN"],
                 "action": "烬借惯性将敌人甩向座椅",
                 "visual": "列车转弯后借惯性反击",
             },
@@ -1859,10 +2005,10 @@ def test_provider_uses_each_chunk_storyboard_panel_and_action(monkeypatch, tmp_p
             mode="native_extend",
             depends_on="S01_C01",
             storyboard_beat_id="S01_P02",
-            storyboard_image="storyboard_beats/S01_P02.png",
             action_prompt="烬抬起机械臂格挡",
             start_state="凛已经冲到面前",
             end_state="火星炸开",
+            **_narrative_guide_fields("S01_P02", ("S01_G06", "S01_G07")),
         ),
         anchors={"scene": "roof"},
         output_path=tmp_path / "S01_C02.mp4",
@@ -1875,9 +2021,11 @@ def test_provider_uses_each_chunk_storyboard_panel_and_action(monkeypatch, tmp_p
 
     content = _base_content(tmp_path, request, json.loads((shot_dir / "SHOT_META.json").read_text()))
 
-    assert observed["_storyboard_frame_path"] == "storyboard_beats/S01_P02.png"
     assert observed["_storyboard_beat_id"] == "S01_P02"
-    assert observed["gen_strategy"] == "i2v"
+    assert "_storyboard_frame_path" not in observed
+    assert observed["who"] == ["CHAR_JIN"]
+    assert observed["_char_ids"] == ["CHAR_JIN"]
+    assert observed["gen_strategy"] == "phantom"
     assert observed["generation_actions"] == ["烬抬起机械臂格挡"]
     assert observed["micro_actions"] == ["烬抬起机械臂格挡"]
     assert "Execute only this visible action: 烬抬起机械臂格挡" in content[0]["text"]
@@ -1914,6 +2062,7 @@ def test_secondary_first_beat_uses_multi_image_generation(monkeypatch, tmp_path)
             storyboard_beat_id="S01_P01",
             storyboard_image="storyboard_beats/S01_P01.png",
             action_prompt="Agent抓住扶手接近保安",
+            **_narrative_guide_fields("S01_P01", ("S01_G01", "S01_G02")),
         ),
         anchors={"scene": "rotating corridor"},
         output_path=tmp_path / "S01_C01.mp4",
@@ -2052,6 +2201,7 @@ def test_current_pxx_prompt_preserves_only_its_source_fact_echoes(monkeypatch, t
             execution_strategy="multi_image",
             storyboard_beat_id="S01_P01",
             action_prompt="敌人挥刀，男子后仰闪避",
+            **_narrative_guide_fields("S01_P01", ("S01_G01", "S01_G02")),
         ),
         anchors={},
         output_path=tmp_path / "S01_C01.mp4",
@@ -2065,6 +2215,81 @@ def test_current_pxx_prompt_preserves_only_its_source_fact_echoes(monkeypatch, t
     assert "蓝色能量刃横向挥砍" in prompt
     assert "刀锋擦过风衣边缘" in prompt
     assert "武器撞击金属车壁产生蓝色电弧" not in prompt
+
+
+def test_p02_media_indices_bind_after_predecessor_character_guide_and_tail_order():
+    cells = ("S01_G06", "S01_G07", "S01_G08", "S01_G09")
+    request = ChunkExecutionRequest(
+        resource_id="S01_C02",
+        shot_id="S01",
+        chunk=GenerationChunk(
+            chunk_id="S01_C02",
+            sequence=2,
+            target_duration_s=6,
+            mode="native_extend",
+            depends_on="S01_C01",
+            execution_strategy="tail_video_extend",
+            storyboard_beat_id="S01_P02",
+            action_prompt="只完成第二段动作",
+            **_narrative_guide_fields("S01_P02", cells),
+        ),
+        anchors={},
+        output_path=Path("S01_C02.mp4"),
+        previous_output_path=Path("S01_C01.mp4"),
+        input_fingerprint="p02-media-index",
+        memory_context="",
+    )
+    content, manifest = _bind_final_media_index_prompt(
+        [
+            {"type": "text", "text": "只完成当前 Pxx。"},
+            {
+                "type": "video_url",
+                "video_url": {"url": "https://video.test/prior.mp4"},
+                "role": "reference_video",
+                "_reference_kind": "predecessor_tail_video",
+                "_reference_description": "上一 Pxx 已完成视频的末段",
+                "_continuity_role": "tail_window_video",
+            },
+            {
+                "type": "image_url",
+                "image_url": {"url": "https://image.test/character.png"},
+                "role": "reference_image",
+                "_reference_kind": "character_identity_board",
+                "_reference_description": "可见角色四视图",
+                "_character_id": "CHAR_01",
+                "_mandatory_reference": True,
+            },
+            _narrative_guide_media("S01_P02", cells),
+            {
+                "type": "image_url",
+                "image_url": {"url": "https://image.test/tail.jpg"},
+                "role": "reference_image",
+                "_reference_kind": "ordered_tail_frame",
+                "_reference_description": "前序真实尾帧锚点",
+                "_continuity_role": "ordered_tail_frame",
+            },
+        ],
+        request,
+    )
+
+    assert [item["responsibility"] for item in manifest] == [
+        "predecessor_tail_video",
+        "character_identity_board",
+        "storyboard_narrative_guide",
+        "ordered_tail_frame",
+    ]
+    assert [item["prompt_index"] for item in manifest] == [
+        "视频1",
+        "图片1",
+        "图片2",
+        "图片3",
+    ]
+    prompt = content[0]["text"]
+    assert "视频1：上一 Pxx 已完成视频的末段" in prompt
+    assert "当前剧情导航图是图片2" in prompt
+    assert "S01_G06→S01_G07→S01_G08→S01_G09" in prompt
+    assert "不得提前演绎其他 Gxx 或后续 Pxx" in prompt
+    assert "严禁渲染进视频画面" in prompt
 
 
 def test_seedance_transport_contract_rejects_invalid_limits(monkeypatch):
@@ -2120,6 +2345,69 @@ def test_seedance_transport_contract_rejects_invalid_limits(monkeypatch):
             ],
             duration=5,
             ratio="16:9",
+        )
+
+
+def test_phase6_fails_closed_when_mandatory_reference_images_exceed_nine(
+    monkeypatch,
+    tmp_path,
+):
+    frame = tmp_path / "storyboard_images/S01.png"
+    guide = tmp_path / "storyboard_guides/S01_P01.png"
+    identity = tmp_path / "characters/reference.png"
+    for path in (frame, guide, identity):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        Image.effect_noise((320, 180), 50).convert("RGB").save(path)
+    character_ids = [f"CHAR_{index:02d}" for index in range(1, 9)]
+    monkeypatch.setattr(
+        "tools.asset_packager._assert_video_frame_provenance",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "tools.asset_packager._detect_shot_characters",
+        lambda *_args, **_kwargs: character_ids,
+    )
+    monkeypatch.setattr(
+        "tools.asset_packager.collect_character_reference_assets",
+        lambda *_args, **_kwargs: [
+            {
+                "path": identity,
+                "char_id": character_id,
+                "character_name": character_id,
+                "role": "reference_image",
+                "priority": "high",
+                "reference_kind": "character_identity_board",
+                "reference_description": f"{character_id}四视图",
+            }
+            for character_id in character_ids
+        ],
+    )
+    monkeypatch.setattr(
+        "tools.asset_packager._assert_narrative_guide_provenance",
+        lambda *_args, **_kwargs: {
+            "beat_id": "S01_P01",
+            "cell_ids": ["S01_G01"],
+        },
+    )
+
+    with pytest.raises(ValueError, match=r"10 mandatory reference images.*budget 9"):
+        build_content_for_shot(
+            tmp_path,
+            "S01",
+            {
+                "prompt": "eight characters enter together",
+                "gen_strategy": "phantom",
+                "who": character_ids,
+                "_storyboard_frame_path": "storyboard_images/S01.png",
+                "_storyboard_frame_kind": "honcut.cinematic-first-frame.v1",
+                "_storyboard_beat_id": "S01_P01",
+                "_storyboard_narrative_guide_path": (
+                    "storyboard_guides/S01_P01.png"
+                ),
+                "_storyboard_narrative_guide_kind": (
+                    "honcut.storyboard-narrative-guide.v1"
+                ),
+            },
         )
 
 
@@ -2298,6 +2586,31 @@ def test_phase5_blocks_secondary_plot_reordering_and_wrong_bridge_target():
 
     assert "secondary_storyboard_action_order_mismatch" in codes
     assert "secondary_storyboard_bridge_invalid" in codes
+
+
+def test_phase5_uses_canonical_secondary_actions_for_punctuation():
+    storyboard = {
+        "video_provider": "seedance",
+        "shots": [
+            {
+                "id": "S01",
+                "duration": 15,
+                "micro_actions": [
+                    "角色进门",
+                    "动作约束：",
+                    "衣摆符合惯性",
+                    "保持真实质感",
+                ],
+            }
+        ],
+    }
+    plan_storyboard_beats(storyboard)
+
+    codes = {
+        issue["code"] for issue in run_generation_capacity_checks(storyboard)
+    }
+
+    assert "secondary_storyboard_action_order_mismatch" not in codes
 
 
 def test_planner_allocates_fractional_shots_from_cumulative_frame_endpoints():
@@ -3561,11 +3874,11 @@ def test_extension_provider_content_keeps_images_as_anchors_and_adds_video(monke
     assert duration == 8
     assert [item.get("role") for item in content] == [
         None,
-        "reference_image",
-        "reference_image",
-        "reference_image",
-        "reference_image",
         "reference_video",
+        "reference_image",
+        "reference_image",
+        "reference_image",
+        "reference_image",
     ]
     assert "向后延长视频1" in content[0]["text"]
     assert "图片2、图片3、图片4" in content[0]["text"]
@@ -3577,12 +3890,12 @@ def test_extension_provider_content_keeps_images_as_anchors_and_adds_video(monke
     assert "图片5是本连续组" not in content[0]["text"]
     assert "主体动作箭头和摄影机箭头" not in content[0]["text"]
     assert content[0]["text"].count("[storyboard-motion-notation]") == 1
-    assert content[1]["image_url"]["url"] == "https://image.test/frame.png"
-    assert [item["image_url"]["url"] for item in content[2:5]] == [
+    assert content[1]["video_url"]["url"] == tail_url
+    assert content[2]["image_url"]["url"] == "https://image.test/frame.png"
+    assert [item["image_url"]["url"] for item in content[3:6]] == [
         uploaded_media_urls[path.name]
         for path in sorted((tmp_path / "continuity_anchors").glob("*_frame_*.jpg"))
     ]
-    assert content[-1]["video_url"]["url"] == tail_url
 
 
 @pytest.mark.parametrize(
@@ -3655,6 +3968,7 @@ def test_fresh_provider_does_not_mix_first_frame_with_group_board(monkeypatch, t
                 "image_url": {"url": "https://image.test/S01.png"},
                 "role": "first_frame",
             },
+            _narrative_guide_media("S01_P01"),
         ],
     )
     monkeypatch.setattr(
@@ -3672,6 +3986,7 @@ def test_fresh_provider_does_not_mix_first_frame_with_group_board(monkeypatch, t
             storyboard_beat_id="S01_P01",
             storyboard_image="storyboard_beats/S01_P01.png",
             action_prompt="凛踩水冲出",
+            **_narrative_guide_fields("S01_P01"),
         ),
         anchors={"scene": "roof"},
         output_path=tmp_path / "S01_C01.mp4",
@@ -3682,7 +3997,11 @@ def test_fresh_provider_does_not_mix_first_frame_with_group_board(monkeypatch, t
 
     content, *_ = _provider_content(tmp_path, request)
 
-    assert [item.get("role") for item in content] == [None, "first_frame"]
+    assert [item.get("role") for item in content] == [
+        None,
+        "first_frame",
+        "reference_image",
+    ]
     assert uploaded == []
     assert "storyboard group CG001; step 1/1" in content[0]["text"]
 
@@ -5242,6 +5561,14 @@ def test_phase6_auto_accepts_zero_overlap_first_last_bridge(monkeypatch, tmp_pat
         ],
     }
     plan_storyboard_beats(storyboard)
+    for shot in storyboard["shots"]:
+        for beat_index, beat in enumerate(shot["storyboard_beats"], 1):
+            beat.update(_narrative_guide_fields(beat["beat_id"]))
+            if beat_index == 1:
+                beat.update({
+                    "video_first_frame": f"video_first_frames/{beat['beat_id']}.png",
+                    "video_first_frame_kind": "honcut.cinematic-first-frame.v1",
+                })
     plan = build_continuity_plan(storyboard)
     assert plan.shots[0].chunks[-1].execution_strategy == "multi_image"
     assert plan.bridges[0].execution_strategy == "first_last_frame_bridge"

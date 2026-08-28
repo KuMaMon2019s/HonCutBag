@@ -292,6 +292,12 @@ def run_generation_capacity_checks(
                 except (TypeError, ValueError):
                     requirement = None
                 if requirement is not None:
+                    # Compare Pxx output with the same canonicalized source
+                    # actions used by the Phase 1 secondary-storyboard owner.
+                    # Raw authored punctuation (for example a trailing Chinese
+                    # colon) is deliberately removed by that owner and must not
+                    # be reported here as a plot-order mutation.
+                    source_micro_actions = list(requirement["source_actions"])
                     bridge_required = requirement["bridge_required"]
                     expected_modes = list(requirement["modes"])
                     allowed_content_beats = int(
@@ -1681,6 +1687,8 @@ INPUT CONTRACT:
 
 Apply red lines R1-R4: R1 character identity/gender/build/clothing continuity against canonical references; R2 time-of-day and lighting continuity; R3 scene/action continuity; R4 storyboard-to-image semantic fidelity. Do not perform face recognition or infer a public identity from appearance alone. Each Pxx image represents only its authored action and must progress from the previous Pxx without pose reset or premature future action.
 
+The current Sxx narrative-guide image is intentionally annotated production guidance, not a cinematic frame. Under R4, verify it visibly contains the exact Sxx_G01-G09 labels plus red subject/object direction arrows, blue camera-motion arrows where camera motion is declared, and spatial/gaze/action instruction markers. Missing or misindexed guidance is a blocking storyboard-authoring mismatch. Do not report those required annotations as cinematic contamination; the separate L4 review owns the rule that cinematic first frames contain none of them.
+
 Evidence rules:
 - Report only visible contradictions. Absence of proof is not proof of mismatch. Do not infer clothing-color drift from red warning light, shadow, monochrome PREVIS rendering, highlights, or low saturation.
 - For every R1 clothing/color/uniform claim, set mismatch_type="clothing_color". For each affected character, add one character_evidence object containing the exact character_id, only that character's canonical reference_input_indices, expected copied verbatim from canonical_contracts, an observed visual description, and the exact storyboard_ids checked. Do not paraphrase or invent the expected contract. Also provide confidence from 0 to 1 and separate panel_evidence for every listed ID. Expected and observed must name genuinely different visible attributes. If both are dark gray, both are navy, or the difference is only illumination/style, emit no issue.
@@ -1858,6 +1866,26 @@ def run_l3_review(
             "input_index": len(local_records) + 1,
         }
         local_records.append(local_board_record)
+        narrative_value = str(shot.get("storyboard_board") or "").strip()
+        narrative_path = Path(narrative_value) if narrative_value else None
+        if narrative_path is not None and not narrative_path.is_absolute():
+            narrative_path = grid_path.parent / narrative_path
+        local_guide_record = None
+        if (
+            narrative_path is not None
+            and narrative_path.is_file()
+            and narrative_path.stat().st_size > 0
+        ):
+            local_paths.append(narrative_path)
+            local_guide_record = {
+                "input_index": len(local_records) + 1,
+                "kind": "storyboard_narrative_guide",
+                "shot_id": shot_id,
+                "storyboard_ids": list(board["storyboard_ids"]),
+                "path": str(narrative_path),
+                "sha256": _sha256_file(narrative_path),
+            }
+            local_records.append(local_guide_record)
         local_paths.append(grid_path)
         local_overview_record = {
             **overview_manifest,
@@ -1880,7 +1908,10 @@ def run_l3_review(
                 for record in local_records
                 if record["kind"] == "canonical_character_reference"
             ],
-            storyboard_inputs=[local_board_record],
+            storyboard_inputs=[
+                local_board_record,
+                *([local_guide_record] if local_guide_record is not None else []),
+            ],
             overview_input=local_overview_record,
             canonical_contracts=local_contracts,
             storyboard=context_storyboard,
@@ -2255,6 +2286,32 @@ def run_storyboard_qa_gate(output_dir: Path, similarity_threshold: float | None 
         for beat_id in expected_beats
         if beat_id not in beat_images
     ]
+    from phases.phase2.shot_storyboards import validate_shot_storyboard_artifacts
+
+    narrative_guide_errors = [
+        error
+        for error in validate_shot_storyboard_artifacts(output_dir, storyboard)
+        if any(
+            marker in error.casefold()
+            for marker in ("narrative guide", "nine-grid", "gxx", "3x3")
+        )
+    ]
+    narrative_guide_issues = [
+        _issue(
+            "L3",
+            "severe",
+            "storyboard_narrative_guide_invalid",
+            error,
+            sorted(
+                {
+                    match.group(1)
+                    for match in [re.match(r"^(S[^ _]+)", error)]
+                    if match
+                }
+            ),
+        )
+        for error in narrative_guide_errors
+    ]
     declared_cinematic_ids = [
         str(beat.get("beat_id") or f"{_shot_id(shot, shot_index)}_P{position:02d}")
         for shot_index, shot in enumerate(storyboard.get("shots", []))
@@ -2296,6 +2353,7 @@ def run_storyboard_qa_gate(output_dir: Path, similarity_threshold: float | None 
         l1_issues
         + structural_issues
         + artifact_issues
+        + narrative_guide_issues
         + cinematic_artifact_issues
         + capacity_issues
         + l2_issues
@@ -3398,7 +3456,7 @@ def _cinematic_dependency_frame_ids(
         beat_ids = [
             str(beat.get("beat_id") or f"{shot_id}_P{beat_index:02d}")
             for beat_index, beat in enumerate(shot.get("storyboard_beats") or [], 1)
-            if isinstance(beat, dict)
+            if isinstance(beat, dict) and beat.get("video_first_frame")
         ]
         declared.update(beat_ids)
         first_target = next(
