@@ -33,6 +33,7 @@ from phases.phase1.storyboard_beats import (  # noqa: E402
     bind_primary_shot_execution_plan,
     plan_storyboard_beats,
 )
+from phases.phase4.continuity_plan import build_continuity_plan  # noqa: E402
 from phases.phase5.storyboard_qa_gate import (  # noqa: E402
     run_generation_capacity_checks,
     run_l1_checks,
@@ -3141,6 +3142,31 @@ def test_continuity_storyboard_executes_four_ordered_pxx_without_action_loss():
         6.0,
         6.0,
     ]
+
+    continuity = build_continuity_plan(storyboard)
+
+    assert len(continuity.shots) == 1
+    assert [chunk.storyboard_beat_id for chunk in continuity.shots[0].chunks] == [
+        "S01_P01",
+        "S01_P02",
+        "S01_P03",
+        "S01_P04",
+    ]
+    assert [chunk.execution_strategy for chunk in continuity.shots[0].chunks] == [
+        "multi_image",
+        "tail_video_extend",
+        "tail_video_extend",
+        "tail_video_extend",
+    ]
+    assert [chunk.depends_on for chunk in continuity.shots[0].chunks] == [
+        None,
+        "S01_C01",
+        "S01_C02",
+        "S01_C03",
+    ]
+    assert sum(
+        chunk.expected_unique_frames for chunk in continuity.shots[0].chunks
+    ) == 18 * continuity.timeline_fps
 
 
 def test_material_budget_rejects_content_padding_loss_above_25_percent():

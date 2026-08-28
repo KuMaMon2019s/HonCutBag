@@ -302,6 +302,28 @@ def test_planner_balances_a_sixteen_second_shot_without_a_one_second_tail():
     assert [chunk.target_duration_s for chunk in plan.shots[0].chunks] == [8, 8]
 
 
+def test_planner_keeps_the_three_pxx_ceiling_for_legacy_secondary_artifacts():
+    storyboard = {
+        "shots": [{
+            "id": "S01",
+            "duration": 18,
+            "storyboard_beats": [
+                {
+                    "beat_id": f"S01_P{index:02d}",
+                    "duration_s": duration,
+                    "execution_strategy": (
+                        "multi_image" if index == 1 else "tail_video_extend"
+                    ),
+                }
+                for index, duration in enumerate([5, 5, 4, 4], 1)
+            ],
+        }],
+    }
+
+    with pytest.raises(ValueError, match="zero, one, or two capacity extensions"):
+        build_continuity_plan(storyboard)
+
+
 def test_planner_carries_an_explicit_subject_prompt_into_tracking_anchors():
     plan = build_continuity_plan(
         {

@@ -324,11 +324,11 @@ def _beat_action_prompt(beat: Mapping[str, Any]) -> str:
     return "。".join(value for value in clauses if value)
 
 
-def _validate_secondary_strategy_sequence(
+def _validate_legacy_secondary_strategy_sequence(
     shot_id: str,
     strategies: list[str],
 ) -> None:
-    """Enforce content-first ordering without assigning semantics by position."""
+    """Keep the historical three-Pxx ceiling for non-canonical artifacts."""
     valid = (
         1 <= len(strategies) <= 3
         and strategies[0] == "multi_image"
@@ -438,8 +438,11 @@ def build_continuity_plan(
         uses_secondary_contract = bool(authored_beats) and all(
             strategy != "legacy" for strategy in secondary_strategies
         )
-        if uses_secondary_contract:
-            _validate_secondary_strategy_sequence(shot_id, secondary_strategies)
+        if uses_secondary_contract and not strict_secondary_contract:
+            _validate_legacy_secondary_strategy_sequence(
+                shot_id,
+                secondary_strategies,
+            )
         capped_group = (
             requested_extension
             and not preserve_one_take
