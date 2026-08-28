@@ -550,19 +550,52 @@ def build_continuity_plan(
                     storyboard_beat_id=str(
                         beat.get("beat_id") or f"{shot_id}_P{sequence:02d}"
                     ),
-                    storyboard_image=str(
-                        beat.get("video_first_frame")
-                        or beat.get("storyboard_image")
-                        or ""
-                    ) or None,
-                    storyboard_image_kind=str(
-                        beat.get("video_first_frame_kind")
-                        or (
-                            "legacy_storyboard_image"
-                            if beat.get("storyboard_image")
-                            else ""
+                    storyboard_image=(
+                        str(beat.get("video_first_frame") or "") or None
+                        if sequence == 1
+                        else None
+                    ),
+                    storyboard_image_kind=(
+                        str(beat.get("video_first_frame_kind") or "") or None
+                        if sequence == 1
+                        else None
+                    ),
+                    storyboard_narrative_guide=(
+                        str(beat.get("storyboard_narrative_guide") or "") or None
+                    ),
+                    storyboard_narrative_guide_kind=(
+                        beat.get("storyboard_narrative_guide_kind") or None
+                    ),
+                    storyboard_narrative_guide_usage=(
+                        beat.get("storyboard_narrative_guide_usage") or None
+                    ),
+                    storyboard_narrative_guide_cell_ids=list(
+                        beat.get("storyboard_narrative_guide_cell_ids") or []
+                    ),
+                    storyboard_narrative_guide_sha256=(
+                        str(beat.get("storyboard_narrative_guide_sha256") or "")
+                        or None
+                    ),
+                    storyboard_narrative_guide_source_board=(
+                        str(
+                            beat.get("storyboard_narrative_guide_source_board")
+                            or ""
                         )
-                    ) or None,
+                        or None
+                    ),
+                    storyboard_narrative_guide_source_board_sha256=(
+                        str(
+                            beat.get(
+                                "storyboard_narrative_guide_source_board_sha256"
+                            )
+                            or ""
+                        )
+                        or None
+                    ),
+                    storyboard_narrative_guide_receipt=(
+                        str(beat.get("storyboard_narrative_guide_receipt") or "")
+                        or None
+                    ),
                     bridge_target_shot_id=(
                         str(beat.get("bridge_target_shot_id") or "") or None
                     ),

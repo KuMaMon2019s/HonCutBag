@@ -60,6 +60,35 @@ class GenerationChunk(BaseModel):
     storyboard_image_kind: str | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
+    storyboard_narrative_guide: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    storyboard_narrative_guide_kind: Literal[
+        "honcut.storyboard-narrative-guide.v1"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    storyboard_narrative_guide_usage: Literal[
+        "phase6_story_narrative_guide_not_output_pixels"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    storyboard_narrative_guide_cell_ids: list[str] = Field(
+        default_factory=list,
+        exclude_if=lambda value: not value,
+    )
+    storyboard_narrative_guide_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+        exclude_if=lambda value: value is None,
+    )
+    storyboard_narrative_guide_source_board: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    storyboard_narrative_guide_source_board_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+        exclude_if=lambda value: value is None,
+    )
+    storyboard_narrative_guide_receipt: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     bridge_target_shot_id: str | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
@@ -114,6 +143,37 @@ class GenerationChunk(BaseModel):
                     "expected unique frames must equal requested frames minus overlap "
                     "and provider-minimum padding"
                 )
+        guide_fields = (
+            self.storyboard_narrative_guide,
+            self.storyboard_narrative_guide_kind,
+            self.storyboard_narrative_guide_usage,
+            self.storyboard_narrative_guide_sha256,
+            self.storyboard_narrative_guide_source_board,
+            self.storyboard_narrative_guide_source_board_sha256,
+            self.storyboard_narrative_guide_receipt,
+        )
+        guide_declared = any(value is not None for value in guide_fields) or bool(
+            self.storyboard_narrative_guide_cell_ids
+        )
+        if guide_declared and (
+            any(value is None for value in guide_fields)
+            or not self.storyboard_narrative_guide_cell_ids
+        ):
+            raise ValueError("narrative guide provenance fields must be declared together")
+        if self.storyboard_narrative_guide_cell_ids:
+            if not self.storyboard_beat_id:
+                raise ValueError("narrative guide requires storyboard_beat_id")
+            expected_prefix = self.storyboard_beat_id.split("_P", 1)[0] + "_G"
+            expected_numbers = []
+            for cell_id in self.storyboard_narrative_guide_cell_ids:
+                if not isinstance(cell_id, str) or not cell_id.startswith(expected_prefix):
+                    raise ValueError("narrative guide cell IDs must belong to the current Sxx")
+                suffix = cell_id.removeprefix(expected_prefix)
+                if not suffix.isdigit() or not 1 <= int(suffix) <= 9:
+                    raise ValueError("narrative guide cell IDs must be G01-G09")
+                expected_numbers.append(int(suffix))
+            if expected_numbers != sorted(set(expected_numbers)):
+                raise ValueError("narrative guide cell IDs must be unique and ordered")
         return self
 
 
@@ -241,12 +301,47 @@ class ContinuityPlan(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    version: Literal[1] = 1
+    version: Literal[2] = 2
     provider_chunk_limit_s: float = Field(gt=0)
     timeline_fps: int = Field(default=24, gt=0)
     shots: list[ContinuityShot] = Field(default_factory=list)
     bridges: list[PrimaryShotBridge] = Field(default_factory=list)
     material_budget: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_known_v1(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        version = value.get("version", 2)
+        if version == 1:
+            migrated = dict(value)
+            migrated["version"] = 2
+            migrated["migrated_from_version"] = 1
+            migrated_shots = []
+            for shot in value.get("shots") or []:
+                if not isinstance(shot, dict):
+                    migrated_shots.append(shot)
+                    continue
+                migrated_shot = dict(shot)
+                migrated_chunks = []
+                for chunk in shot.get("chunks") or []:
+                    if not isinstance(chunk, dict):
+                        migrated_chunks.append(chunk)
+                        continue
+                    migrated_chunk = dict(chunk)
+                    if int(migrated_chunk.get("sequence") or 0) > 1:
+                        # A v1 plan could point every Pxx at a separately paid
+                        # cinematic frame. Keep those artifacts on disk, but
+                        # stop referencing them from P02+ after migration.
+                        migrated_chunk.pop("storyboard_image", None)
+                        migrated_chunk.pop("storyboard_image_kind", None)
+                    migrated_chunks.append(migrated_chunk)
+                migrated_shot["chunks"] = migrated_chunks
+                migrated_shots.append(migrated_shot)
+            migrated["shots"] = migrated_shots
+            return migrated
+        return value
 
     @model_validator(mode="after")
     def resource_ids_are_globally_unique(self) -> ContinuityPlan:

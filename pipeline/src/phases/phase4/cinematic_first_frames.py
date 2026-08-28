@@ -42,7 +42,7 @@ from utils.visual_style_contract import (
 from utils.visual_style_spec import VisualStyle, parse_visual_style
 
 CINEMATIC_FIRST_FRAME_SCHEMA = "honcut.cinematic-first-frame.v1"
-CINEMATIC_FIRST_FRAMES_SCHEMA = "honcut.cinematic-first-frames.v1"
+CINEMATIC_FIRST_FRAMES_SCHEMA = "honcut.cinematic-first-frames.v2"
 PREVIS_PATH_PARTS = frozenset({
     "director_panels",
     "storyboard_beats",
@@ -393,7 +393,7 @@ def generate_cinematic_first_frames(
     aspect_ratio: str | None = None,
     style_classifier: ImageStyleClassifier | None = None,
 ) -> dict[str, Any]:
-    """Generate every Pxx video frame and replace legacy Sxx preview aliases."""
+    """Generate exactly one clean P01 composition frame for every primary Sxx."""
     output_dir = Path(output_dir)
     frame_dir = output_dir / "video_first_frames"
     alias_dir = output_dir / "storyboard_images"
@@ -416,7 +416,7 @@ def generate_cinematic_first_frames(
     ) = _phase5_rejected_frame_ids(output_dir)
     manifest: dict[str, Any] = {
         "kind": CINEMATIC_FIRST_FRAMES_SCHEMA,
-        "version": 1,
+        "version": 2,
         "status": "running",
         "provider": "seedream",
         "model": model,
@@ -447,9 +447,16 @@ def generate_cinematic_first_frames(
                     director_panel_style,
                 ):
                     director_composition = None
-            previous_cinematic: Path | None = None
             for beat_index, beat in enumerate(shot.get("storyboard_beats") or [], 1):
                 if not isinstance(beat, dict):
+                    continue
+                if beat_index > 1:
+                    # Known v1 runs may carry a paid cinematic frame for every
+                    # Pxx. Preserve those files on disk for audit, but remove
+                    # their production reference fields deterministically.
+                    beat.pop("video_first_frame", None)
+                    beat.pop("video_first_frame_kind", None)
+                    beat.pop("video_first_frame_receipt", None)
                     continue
                 beat_id = str(beat.get("beat_id") or f"{shot_id}_P{beat_index:02d}")
                 correction_context = correction_context_by_frame.get(beat_id)
@@ -500,8 +507,6 @@ def generate_cinematic_first_frames(
                     else []
                 )
                 reference_paths.extend(identity_references)
-                if previous_cinematic is not None:
-                    reference_paths.append(previous_cinematic)
                 reference_paths = list(dict.fromkeys(reference_paths))[:8]
                 forbidden = [
                     path
@@ -516,8 +521,6 @@ def generate_cinematic_first_frames(
                 reference_roles = [
                     "director_single_panel_composition_only"
                     if path == director_composition
-                    else "prior_cinematic_state"
-                    if path == previous_cinematic
                     else character_reference_role(path)
                     for path in reference_paths
                 ]
@@ -605,6 +608,7 @@ def generate_cinematic_first_frames(
                         else "canonical_character_images"
                     ),
                     "phase5_correction_context": correction_context or [],
+                    "scope": "primary_shot_p01_composition",
                 }
                 if beat_id in rejected_frame_ids and rejected_report_sha256:
                     record["supersedes_phase5_rejection_sha256"] = (
@@ -680,18 +684,16 @@ def generate_cinematic_first_frames(
                     output_dir, receipt_path
                 )
                 manifest["frames"].append(record)
-                previous_cinematic = image_path
-                if beat_index == 1:
-                    alias_path = alias_dir / f"{shot_id}.png"
-                    shutil.copy2(image_path, alias_path)
-                    alias_record = {
-                        **record,
-                        "image": _portable_path(output_dir, alias_path),
-                        "image_sha256": hashlib.sha256(alias_path.read_bytes()).hexdigest(),
-                        "canonical_source": record["image"],
-                        "canonical_receipt": _portable_path(output_dir, receipt_path),
-                    }
-                    _write_json(alias_dir / f"{shot_id}.json", alias_record)
+                alias_path = alias_dir / f"{shot_id}.png"
+                shutil.copy2(image_path, alias_path)
+                alias_record = {
+                    **record,
+                    "image": _portable_path(output_dir, alias_path),
+                    "image_sha256": hashlib.sha256(alias_path.read_bytes()).hexdigest(),
+                    "canonical_source": record["image"],
+                    "canonical_receipt": _portable_path(output_dir, receipt_path),
+                }
+                _write_json(alias_dir / f"{shot_id}.json", alias_record)
         manifest["status"] = "done"
         manifest["frame_count"] = len(manifest["frames"])
         _write_json(manifest_path, manifest)
@@ -717,6 +719,24 @@ def validate_cinematic_first_frame_artifacts(
         shot_id = _shot_id(shot, shot_index)
         for beat_index, beat in enumerate(shot.get("storyboard_beats") or [], 1):
             if not isinstance(beat, dict):
+                continue
+            if beat_index > 1:
+                stale_fields = [
+                    field
+                    for field in (
+                        "video_first_frame",
+                        "video_first_frame_kind",
+                        "video_first_frame_receipt",
+                    )
+                    if beat.get(field)
+                ]
+                if stale_fields:
+                    beat_id = str(
+                        beat.get("beat_id") or f"{shot_id}_P{beat_index:02d}"
+                    )
+                    errors.append(
+                        f"{beat_id} must not declare a separate cinematic first frame"
+                    )
                 continue
             expected += 1
             beat_id = str(beat.get("beat_id") or f"{shot_id}_P{beat_index:02d}")

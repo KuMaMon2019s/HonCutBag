@@ -225,7 +225,9 @@ def build_pipeline_workload(
         # Phase 3 owns missing character packs and the canonical character-
         # locked Pxx refresh. Cache hits may make the real count lower.
         phase3_image_requests=character_reference_requests + storyboard_requests,
-        phase4_image_requests=beat_count,
+        # One clean cinematic composition is rendered per primary Sxx. P02+
+        # extends the predecessor video and must not reset from a new frame.
+        phase4_image_requests=len(shots),
         # Each bounded correction can redraw every Pxx plus one Sxx board per
         # affected shot. It never submits video work.
         phase5_max_correction_image_requests=attempts * storyboard_requests,

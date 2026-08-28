@@ -55,7 +55,7 @@ def test_structured_workload_counts_provider_image_requests(tmp_path):
     assert workload.character_reference_image_requests == 7
     assert workload.phase2_image_requests == 0
     assert workload.phase3_image_requests == 10
-    assert workload.phase4_image_requests == 2
+    assert workload.phase4_image_requests == 1
     assert workload.phase5_max_correction_image_requests == 6
 
 
@@ -79,11 +79,11 @@ def test_total_estimate_exposes_bounded_phase5_correction_range(monkeypatch, tmp
     assert estimate["phases"] == {
         "phase2": 0,
         "phase3": 1200,
-        "phase4": 240,
+        "phase4": 120,
         "phase5": 10,
     }
-    assert estimate["total"] == 1450
-    assert estimate["upper_total"] == 2170
+    assert estimate["total"] == 1330
+    assert estimate["upper_total"] == 2050
     assert estimate["bounded"] is True
     assert estimate["basis"] == "structured_provider_workload"
 
