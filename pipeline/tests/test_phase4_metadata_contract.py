@@ -8,6 +8,7 @@ from phases.phase4.shot_setup import materialize_shot_directories, normalize_sho
 from phases.phase4.phase4_orchestrator import (
     _bind_director_pacing,
     _director_pacing_by_sequence,
+    run_phase4,
 )
 from phases.phase6.video_generator import _shot_number
 
@@ -137,3 +138,65 @@ def test_setup_shot_dirs_writes_generation_contract(tmp_path):
         "causal_link",
     ):
         assert written[key] == source[key]
+
+
+def test_phase4_preflights_continuity_before_cinematic_provider_calls(
+    monkeypatch,
+    tmp_path,
+):
+    storyboard = {
+        "shots": [{
+            "id": "S01",
+            "duration": 18,
+            "storyboard_beats": [
+                {
+                    "beat_id": f"S01_P{index:02d}",
+                    "duration_s": duration,
+                    "execution_strategy": (
+                        "multi_image" if index == 1 else "tail_video_extend"
+                    ),
+                }
+                for index, duration in enumerate([5, 5, 4, 4], 1)
+            ],
+        }],
+    }
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps(storyboard),
+        encoding="utf-8",
+    )
+    (tmp_path / "CHARACTERS.json").write_text(
+        json.dumps({"characters": []}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        "phases.phase2.shot_storyboards.validate_shot_storyboard_artifacts",
+        lambda *_args, **_kwargs: [],
+    )
+
+    def write_scene_contract(output_path, *_args, **_kwargs):
+        contract = {"shots": {}}
+        output_path.write_text(json.dumps(contract), encoding="utf-8")
+        return contract
+
+    monkeypatch.setattr(
+        "phases.phase4.scene_consistency.write_scene_consistency",
+        write_scene_contract,
+    )
+    cinematic_calls = []
+
+    def fail_if_cinematic_generation_starts(*_args, **_kwargs):
+        cinematic_calls.append(True)
+        raise AssertionError("cinematic generation must not run before preflight")
+
+    monkeypatch.setattr(
+        "phases.phase4.cinematic_first_frames.generate_cinematic_first_frames",
+        fail_if_cinematic_generation_starts,
+    )
+
+    result = run_phase4(tmp_path, dry_run=False)
+
+    assert result["status"] == "error"
+    assert "zero, one, or two capacity extensions" in result["error"]
+    assert cinematic_calls == []
+    assert not (tmp_path / "CONTINUITY_PLAN.json").exists()

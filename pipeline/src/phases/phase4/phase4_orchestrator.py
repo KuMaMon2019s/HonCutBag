@@ -99,7 +99,11 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
         return {"status": "error", "error": "STORYBOARD.json not found", "duration_s": _elapsed(start)}
 
     try:
-        from phases.phase4.continuity_plan import write_continuity_plan, write_storyboard_groups
+        from phases.phase4.continuity_plan import (
+            build_continuity_plan,
+            write_continuity_plan,
+            write_storyboard_groups,
+        )
         from phases.phase4.scene_consistency import write_scene_consistency
 
         storyboard_for_consistency = json.loads(storyboard_path.read_text(encoding="utf-8"))
@@ -156,6 +160,22 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
         )
         outputs.append("SCENE_CONSISTENCY.json")
         print("  ✓ 场景一致性契约: SCENE_CONSISTENCY.json")
+        continuity_options = {
+            # Every native extension reserves replay context. Phase 8 removes
+            # the planned prefix (and any detected extra rollback) by frame.
+            "continuation_overlap_s": float(
+                os.environ.get("HONCUT_CONTINUITY_OVERLAP_SECONDS", "2.0")
+            ),
+            "continuity_group_max_shots": int(
+                os.environ.get("HONCUT_CONTINUITY_GROUP_MAX_SHOTS", "3")
+            ),
+        }
+        build_continuity_plan(
+            storyboard_for_consistency,
+            scene_consistency,
+            **continuity_options,
+        )
+        print("  ✓ 连续性计划预检通过（零 Provider 请求）")
         cinematic_errors: list[str] = []
         if not dry_run:
             from phases.phase4.cinematic_first_frames import (
@@ -215,14 +235,7 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
             output_dir / "CONTINUITY_PLAN.json",
             storyboard_for_consistency,
             scene_consistency,
-            # Every native extension reserves replay context. Phase 8 removes
-            # the planned prefix (and any detected extra rollback) by frame.
-            continuation_overlap_s=float(
-                os.environ.get("HONCUT_CONTINUITY_OVERLAP_SECONDS", "2.0")
-            ),
-            continuity_group_max_shots=int(
-                os.environ.get("HONCUT_CONTINUITY_GROUP_MAX_SHOTS", "3")
-            ),
+            **continuity_options,
         )
         outputs.append("CONTINUITY_PLAN.json")
         print("  ✓ 连续性计划: CONTINUITY_PLAN.json")
