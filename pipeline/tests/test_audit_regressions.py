@@ -29,6 +29,7 @@ if str(SCRIPTS) not in sys.path:
 
 import detached_pipeline_launch
 import phase_orchestrator
+import phase5_adjudication_live_acceptance
 import pipeline_runner as pipeline_runner_cli
 from phases import pipeline_core
 from phases.phase1 import (
@@ -6416,6 +6417,196 @@ def test_phase5_adjudication_review_scopes_l3_to_disputed_panels(
     assert captured["kwargs"]["evidence_dir"].name == (
         "phase5_review_adjudication_evidence"
     )
+
+
+def _phase5_live_acceptance_preflight(tmp_path):
+    return {
+        "output_dir": str(tmp_path),
+        "storyboard_ids": ["S01_P02", "S01_P03"],
+        "parent_shot_ids": ["S01"],
+        "asset_sha256": {"S01_P02": "a" * 64, "S01_P03": "b" * 64},
+        "pending_receipt_schema": "honcut.phase5-review-adjudication.v1",
+        "pending_receipt_status": "blocked_unavailable",
+        "legacy_reconstructed": False,
+        "credentials": {
+            "ark_agent_credential_source": "test",
+            "tos_media_upload_configured": True,
+        },
+    }
+
+
+def test_phase1_through_phase9_repair_acceptance_contract_is_persisted():
+    agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    architecture = (ROOT / "docs/HONCUT_ARCHITECTURE.md").read_text(
+        encoding="utf-8"
+    )
+
+    for document in (agents, architecture):
+        assert "Phase 1～Phase 9" in document
+        assert "regression" in document
+        assert "live_paid_provider" in document
+        assert "两门都通过" in document
+
+
+def test_phase5_live_acceptance_preflight_is_zero_request(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        phase5_adjudication_live_acceptance,
+        "_pending_preflight",
+        lambda *_args, **_kwargs: _phase5_live_acceptance_preflight(tmp_path),
+    )
+
+    result = phase5_adjudication_live_acceptance.run_acceptance(
+        tmp_path,
+        submit=False,
+        expected_storyboard_ids=["S01_P02", "S01_P03"],
+        client_factory=lambda: pytest.fail(
+            "zero-request preflight must not construct a Provider client"
+        ),
+        resume_runner=lambda *_args, **_kwargs: pytest.fail(
+            "zero-request preflight must not enter Phase 5 resume"
+        ),
+    )
+
+    assert result["status"] == "preflight_passed"
+    assert result["submitted"] is False
+    assert result["acceptance_gate"] == "live_paid_provider"
+    assert result["required_acceptance_gates"] == [
+        "regression",
+        "live_paid_provider",
+    ]
+    assert result["provider_request_limit"] == 1
+    assert result["provider_request_count"] == 0
+    persisted = json.loads(
+        (tmp_path / "phase5_adjudication_live_acceptance.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert persisted == result
+
+
+def test_phase5_live_acceptance_allows_one_request_and_refuses_replay(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(
+        phase5_adjudication_live_acceptance,
+        "_pending_preflight",
+        lambda *_args, **_kwargs: _phase5_live_acceptance_preflight(tmp_path),
+    )
+
+    class FakeResponses:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, *_args, **_kwargs):
+            self.calls += 1
+            return {"strict": "dto"}
+
+    class FakeArkClient:
+        def __init__(self):
+            self.client = SimpleNamespace(responses=FakeResponses())
+
+        def review_structured(self, *_args, **_kwargs):
+            return self.client.responses.create()
+
+    raw_client = FakeArkClient()
+
+    def adjudication_review(
+        output_dir,
+        storyboard_ids,
+        *,
+        multimodal_client,
+        structured_understanding_max_attempts,
+    ):
+        assert output_dir == tmp_path.resolve()
+        assert storyboard_ids == ["S01_P02", "S01_P03"]
+        assert structured_understanding_max_attempts == 1
+        multimodal_client.review_structured([], "strict prompt", object)
+        return {
+            "status": "error",
+            "gate_passed": False,
+            "layers": {"L3": {"status": "completed"}},
+        }
+
+    def resume_runner(
+        output_dir,
+        *,
+        resume_pending_adjudication,
+        adjudication_runner,
+    ):
+        assert output_dir == tmp_path.resolve()
+        assert resume_pending_adjudication is True
+        confirmation = adjudication_runner(
+            output_dir,
+            ["S01_P02", "S01_P03"],
+        )
+        assert confirmation["layers"]["L3"]["status"] == "completed"
+        return {
+            "status": "error",
+            "grade": "C",
+            "gate_passed": False,
+            "review_adjudications": [{
+                "status": "completed",
+                "decisions": {"S01_P02": "blocked", "S01_P03": "passed"},
+            }],
+        }
+
+    result = phase5_adjudication_live_acceptance.run_acceptance(
+        tmp_path,
+        submit=True,
+        expected_storyboard_ids=["S01_P02", "S01_P03"],
+        client_factory=lambda: raw_client,
+        resume_runner=resume_runner,
+        adjudication_review=adjudication_review,
+    )
+
+    assert result["status"] == "passed"
+    assert result["submitted"] is True
+    assert result["provider_request_count"] == 1
+    assert result["provider_request_attempt_count"] == 1
+    assert result["phase5"]["gate_passed"] is False
+    assert raw_client.client.responses._delegate.calls == 1
+    with pytest.raises(RuntimeError, match="already consumed or attempted"):
+        phase5_adjudication_live_acceptance.run_acceptance(
+            tmp_path,
+            submit=True,
+            client_factory=lambda: pytest.fail("must refuse before client creation"),
+        )
+
+
+def test_phase5_live_acceptance_blocks_second_provider_request_at_transport():
+    class FakeResponses:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, *_args, **_kwargs):
+            self.calls += 1
+            return {"strict": "dto"}
+
+    class FakeArkClient:
+        def __init__(self):
+            self.client = SimpleNamespace(responses=FakeResponses())
+
+        def review_structured(self, *_args, **_kwargs):
+            return self.client.responses.create()
+
+    raw_client = FakeArkClient()
+    guarded = phase5_adjudication_live_acceptance.SinglePaidRequestReviewClient(
+        raw_client
+    )
+
+    assert guarded.review_structured([], "strict prompt", object) == {
+        "strict": "dto"
+    }
+    with pytest.raises(
+        phase5_adjudication_live_acceptance.ProviderRequestLimitError,
+        match="exactly one paid Provider request",
+    ):
+        guarded.review_structured([], "strict prompt", object)
+
+    assert raw_client.client.responses._delegate.calls == 1
+    assert guarded.provider_request_count == 1
+    assert guarded.blocked_provider_request_count == 1
 
 
 def test_phase5_persists_safe_receipt_when_adjudication_is_unavailable(tmp_path):

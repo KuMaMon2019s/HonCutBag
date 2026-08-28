@@ -186,6 +186,18 @@ snapshots, and exact Pxx hashes, then retries only that narrow L3 confirmation.
 It does not rerun full storyboard QA or redraw images; missing or changed
 evidence is rejected.
 
+Every independent Phase 1-9 repair has two required acceptance gates. The
+zero-request regression/full/offline suite is the first gate; the second is one
+explicitly authorized paid request against the real Provider path relevant to
+that repair. Both must pass before the repair is called accepted. Each Phase
+uses a dedicated live acceptance rather than a fake production switch; for the
+Phase 5 adjudication path use
+`pipeline/scripts/phase5_adjudication_live_acceptance.py`. Run it first without
+`--submit`; the submitted form persists a receipt before the call, hard-caps
+the Runtime and Responses boundary at one request, and never retries after
+failure or an uncertain interruption. Transport/schema acceptance and the
+model's QA verdict are recorded separately.
+
 `uv.lock` and `.python-version` are authoritative. Project commands must use
 `make` or `uv run --locked ...`; bare `python`, `pip`, and `pytest` may resolve
 to an unrelated Conda or system interpreter.

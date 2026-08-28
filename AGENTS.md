@@ -26,3 +26,4 @@
 - 先用回归测试冻结正确行为，再修复唯一 owner。不同 owner 或后续 Phase 的阻塞应单独记录、分支和提交，不混入当前修复。
 - 每个独立行为单独提交并可独立回滚。提交前依次运行目标 pytest、`make lint`、`git diff --check` 和 `make test`。
 - 涉及恢复、Provider、Artifact 或媒体时，按架构文档执行相应零请求离线验收；冷启动与恢复必须保持任务 ID、任务数量和产物哈希一致，Provider 请求数为零。
+- Phase 1～Phase 9 的每个独立修复都采用持久化双门验收，且两门都通过才可宣告验收成功：`regression` 门是默认零付费的目标回归、完整测试和相应离线验收；`live_paid_provider` 门是与本次修复路径直接相关、经用户当次费用授权的一次真实付费 Provider 接口验收。真实门必须先运行无 `--submit` 预检，再用对应 Phase 的专用 live acceptance；在 Runtime 和传输边界硬限制为最多一次，调用前原子写入 `submission_uncertain` 收据，失败或中断后禁止自动重试。缺少授权时标记 `pending_live_acceptance`，真实门失败时标记 `live_acceptance_failed`，两者都不得写成验收成功；模型业务 verdict 与调用链验收结果分别记录。

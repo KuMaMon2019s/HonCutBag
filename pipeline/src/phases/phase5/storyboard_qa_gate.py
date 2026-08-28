@@ -33,6 +33,7 @@ from phases.phase1.storyboard_beats import (
 )
 from runtime.security_boundaries import redact_for_log, redact_text
 from runtime.structured_understanding import (
+    DEFAULT_STRUCTURED_UNDERSTANDING_ATTEMPTS,
     StructuredUnderstandingExhausted,
     execute_structured_understanding,
 )
@@ -1717,6 +1718,9 @@ def run_l3_review(
     character_reference_images: dict[str, list[Path]] | None = None,
     evidence_dir: Path | None = None,
     input_manifest_path: Path | None = None,
+    structured_understanding_max_attempts: int = (
+        DEFAULT_STRUCTURED_UNDERSTANDING_ATTEMPTS
+    ),
 ) -> tuple[list[dict], dict]:
     if not images:
         return [], {"status": "skipped", "skipped_reason": "no storyboard images available"}
@@ -1954,7 +1958,8 @@ def run_l3_review(
                     execution["input_paths"],
                     execution["prompt"],
                     StoryboardVisualUnderstanding,
-                )
+                ),
+                max_attempts=structured_understanding_max_attempts,
             )
             parsed = typed_review.model_dump()
             raw_issue_count += len(parsed["issues"])
@@ -2390,6 +2395,9 @@ def _run_storyboard_adjudication_review(
     storyboard_ids: list[str],
     *,
     multimodal_client: ArkMultimodalClient | None = None,
+    structured_understanding_max_attempts: int = (
+        DEFAULT_STRUCTURED_UNDERSTANDING_ATTEMPTS
+    ),
 ) -> dict[str, Any]:
     """Run one strict L3-only review against the exact disputed Pxx pixels."""
     output_dir = Path(output_dir)
@@ -2441,6 +2449,9 @@ def _run_storyboard_adjudication_review(
             evidence_dir=output_dir / "phase5_review_adjudication_evidence",
             input_manifest_path=(
                 output_dir / "phase5_review_adjudication_inputs.json"
+            ),
+            structured_understanding_max_attempts=(
+                structured_understanding_max_attempts
             ),
         )
         grade = grade_issues(issues)
