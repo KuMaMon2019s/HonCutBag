@@ -8,6 +8,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -16,6 +17,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterator
 from unittest import mock
+
+from PIL import Image, ImageDraw
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -43,6 +46,114 @@ class OfflineExecutionStats:
     generated_chunks: int = 0
     reused_chunks: int = 0
     provider_requests: int = 0
+
+
+class OfflineImageFixtureClient:
+    """Test-only local image adapter for the Phase 2/4 production owners."""
+
+    model = "offline-image-fixture-v1"
+
+    def __init__(self) -> None:
+        self.local_fixture_renders = 0
+
+    def _render(self, prompt: str, output_path: str) -> str:
+        target = Path(output_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        annotated_grid = "九宫格剧情演绎故事板" in prompt
+        token = int(
+            hashlib.sha256(f"{target.name}\n{prompt}".encode("utf-8")).hexdigest()[:8],
+            16,
+        )
+        image = Image.new(
+            "RGB",
+            (1536, 864),
+            (226, 232, 240)
+            if annotated_grid
+            else (20 + token % 20, 32 + token % 24, 48 + token % 28),
+        )
+        draw = ImageDraw.Draw(image)
+        if annotated_grid:
+            match = re.search(r"导演级镜头\s+(S[^\s]+)", prompt)
+            shot_id = match.group(1) if match else "SXX"
+            for index in range(9):
+                row, column = divmod(index, 3)
+                left = column * 512
+                top = row * 288
+                right = left + 511
+                bottom = top + 287
+                shade = 205 + (index % 3) * 8
+                draw.rectangle(
+                    (left, top, right, bottom),
+                    fill=(shade, shade, shade),
+                    outline=(20, 20, 20),
+                    width=5,
+                )
+                draw.text(
+                    (left + 24, top + 18),
+                    f"{shot_id}_G{index + 1:02d}",
+                    fill=(12, 12, 12),
+                )
+                draw.line(
+                    (left + 85, top + 150, left + 300, top + 150),
+                    fill=(220, 30, 30),
+                    width=12,
+                )
+                draw.polygon(
+                    (
+                        (left + 300, top + 150),
+                        (left + 270, top + 132),
+                        (left + 270, top + 168),
+                    ),
+                    fill=(220, 30, 30),
+                )
+                draw.arc(
+                    (left + 120, top + 80, left + 390, top + 250),
+                    190,
+                    335,
+                    fill=(30, 90, 220),
+                    width=10,
+                )
+                draw.ellipse(
+                    (left + 222, top + 116, left + 254, top + 148),
+                    outline=(35, 35, 35),
+                    width=5,
+                )
+        else:
+            # Cinematic/Pxx fixtures remain deliberately free of labels,
+            # arrows, borders, and grid lines.
+            draw.rectangle((0, 520, 1536, 864), fill=(12, 24, 36))
+            offset = token % 180
+            draw.ellipse(
+                (480 + offset, 170, 870 + offset, 780),
+                fill=(95 + token % 28, 108 + token % 24, 122 + token % 20),
+            )
+            draw.polygon(
+                ((0, 560), (650, 330), (1536, 610), (1536, 864), (0, 864)),
+                fill=(24, 55, 75),
+            )
+        image.save(target, format="PNG", optimize=True)
+        self.local_fixture_renders += 1
+        return f"offline://image-fixture/{target.name}"
+
+    def text_to_image(
+        self,
+        prompt: str,
+        output_path: str,
+        size: str,
+        timeout: int,
+    ) -> str:
+        del size, timeout
+        return self._render(prompt, output_path)
+
+    def image_to_image(
+        self,
+        prompt: str,
+        ref_image: str | list[str],
+        output_path: str,
+        size: str,
+    ) -> str:
+        del ref_image, size
+        return self._render(prompt, output_path)
 
 
 def _utc_now() -> str:
@@ -394,6 +505,87 @@ def _initial_receipt(output_dir: Path) -> dict[str, Any]:
     }
 
 
+def _prepare_test_only_phase2_phase4(output_dir: Path) -> dict[str, Any]:
+    """Populate current media contracts through their real owners, locally."""
+    from phases.phase2.shot_storyboards import (
+        generate_shot_storyboards,
+        validate_shot_storyboard_artifacts,
+    )
+    from phases.phase4.cinematic_first_frames import (
+        generate_cinematic_first_frames,
+        validate_cinematic_first_frame_artifacts,
+    )
+    from phases.phase4.continuity_plan import write_continuity_plan
+    from phases.phase5.storyboard_qa_gate import run_storyboard_qa_with_correction
+
+    storyboard = _read_json(output_dir / "STORYBOARD.json")
+    characters_payload = _read_json(output_dir / "CHARACTERS.json")
+    characters = [
+        item
+        for item in (characters_payload.get("characters") or [])
+        if isinstance(item, dict)
+    ]
+    scene_path = output_dir / "SCENE_CONSISTENCY.json"
+    scene_consistency = _read_json(scene_path) if scene_path.is_file() else {}
+    image_client = OfflineImageFixtureClient()
+
+    phase2 = generate_shot_storyboards(
+        output_dir,
+        storyboard,
+        characters,
+        client=image_client,
+    )
+    if phase2.get("status") != "done":
+        raise RuntimeError(f"test-only Phase 2 fixture failed: {phase2}")
+    phase2_errors = validate_shot_storyboard_artifacts(output_dir, storyboard)
+    if phase2_errors:
+        raise RuntimeError(
+            "test-only Phase 2 fixture is invalid: " + "; ".join(phase2_errors)
+        )
+
+    phase4 = generate_cinematic_first_frames(
+        output_dir,
+        storyboard,
+        characters,
+        scene_consistency,
+        client=image_client,
+    )
+    if phase4.get("status") != "done":
+        raise RuntimeError(f"test-only Phase 4 fixture failed: {phase4}")
+    phase4_errors = validate_cinematic_first_frame_artifacts(
+        output_dir,
+        storyboard,
+    )
+    if phase4_errors:
+        raise RuntimeError(
+            "test-only Phase 4 fixture is invalid: " + "; ".join(phase4_errors)
+        )
+
+    _atomic_write_json(output_dir / "STORYBOARD.json", storyboard)
+    plan = write_continuity_plan(
+        output_dir / "CONTINUITY_PLAN.json",
+        storyboard,
+        scene_consistency,
+    )
+    qa = run_storyboard_qa_with_correction(output_dir, dry_run=True)
+    if qa.get("status") != "done" or qa.get("gate_passed") is not True:
+        raise RuntimeError(
+            "test-only Phase 5 structural recheck failed: "
+            + str(qa.get("error") or qa.get("grade") or qa)
+        )
+    return {
+        "test_only": True,
+        "image_adapter": image_client.model,
+        "local_fixture_renders": image_client.local_fixture_renders,
+        "provider_requests": 0,
+        "shot_storyboards_schema": phase2.get("kind"),
+        "cinematic_first_frames_schema": phase4.get("kind"),
+        "continuity_plan_version": plan.version,
+        "continuity_chunks": sum(len(shot.chunks) for shot in plan.shots),
+        "qa_grade": qa.get("grade"),
+    }
+
+
 def _prepare_phase1_to_phase5(output_dir: Path) -> dict[str, Any]:
     from runtime.pipeline_execution import run_pipeline
 
@@ -417,6 +609,7 @@ def _prepare_phase1_to_phase5(output_dir: Path) -> dict[str, Any]:
             "Phase 1-5 dry-run preparation failed: "
             + str(result.get("error") or result.get("status"))
         )
+    result["offline_fixture_media"] = _prepare_test_only_phase2_phase4(output_dir)
     return result
 
 
@@ -524,6 +717,10 @@ def run_acceptance(output_dir: Path, *, resume: bool = False) -> dict[str, Any]:
             if not resume:
                 prepared = _prepare_phase1_to_phase5(output_dir)
                 invocation["phase1_5"] = {"status": prepared["status"]}
+                if "offline_fixture_media" in prepared:
+                    invocation["phase1_5"]["offline_fixture_media"] = prepared[
+                        "offline_fixture_media"
+                    ]
 
             storyboard = _read_json(output_dir / "STORYBOARD.json")
             from phases.phase6.phase6_video_gen import run_phase6

@@ -90,6 +90,11 @@ def _portable_path(output_dir: Path, path: Path) -> str:
     return str(path.relative_to(output_dir)) if path.is_relative_to(output_dir) else str(path)
 
 
+def _artifact_path(output_dir: Path, value: Any) -> Path:
+    path = Path(str(value or ""))
+    return path if path.is_absolute() else output_dir / path
+
+
 def _shot_id(shot: dict[str, Any], index: int) -> str:
     raw = shot.get("shot_id") or shot.get("id") or shot.get("shot_order") or index
     text = str(raw).strip().upper()
@@ -703,6 +708,122 @@ def generate_cinematic_first_frames(
         manifest["error"] = str(exc)
         _write_json(manifest_path, manifest)
         raise
+
+
+def migrate_cinematic_first_frames(
+    output_dir: Path,
+    storyboard: dict[str, Any],
+) -> dict[str, Any]:
+    """Upgrade verified v1 frames by retaining only each Sxx P01 contract.
+
+    P02+ files remain on disk for audit but lose every production reference.
+    No pixels are generated, copied, or deleted and no Provider is contacted.
+    """
+    output_dir = Path(output_dir)
+    manifest_path = output_dir / "CINEMATIC_FIRST_FRAMES.json"
+    raw_manifest = manifest_path.read_bytes()
+    manifest = json.loads(raw_manifest.decode("utf-8"))
+    kind = str(manifest.get("kind") or "")
+    if kind == CINEMATIC_FIRST_FRAMES_SCHEMA:
+        errors = validate_cinematic_first_frame_artifacts(output_dir, storyboard)
+        if errors:
+            raise RuntimeError(
+                "current cinematic first frames failed validation: "
+                + "; ".join(errors[:8])
+            )
+        return manifest
+    if kind != "honcut.cinematic-first-frames.v1" or int(manifest.get("version") or 0) != 1:
+        raise RuntimeError(f"unsupported cinematic migration source: {kind or '<missing>'}")
+    if manifest.get("status") != "done":
+        raise RuntimeError("cinematic migration requires a completed v1 manifest")
+
+    records_by_beat: dict[str, list[dict[str, Any]]] = {}
+    for record in manifest.get("frames") or []:
+        if isinstance(record, dict):
+            records_by_beat.setdefault(str(record.get("beat_id") or ""), []).append(record)
+    retained: list[dict[str, Any]] = []
+    legacy_files: list[str] = []
+    retained_hashes: dict[str, str] = {}
+    for shot_index, shot in enumerate(storyboard.get("shots") or [], 1):
+        if not isinstance(shot, dict):
+            continue
+        shot_id = _shot_id(shot, shot_index)
+        beats = [
+            beat
+            for beat in (shot.get("storyboard_beats") or [])
+            if isinstance(beat, dict)
+        ]
+        if not beats:
+            continue
+        for beat_index, beat in enumerate(beats, 1):
+            beat_id = str(beat.get("beat_id") or f"{shot_id}_P{beat_index:02d}")
+            records = records_by_beat.get(beat_id) or []
+            if len(records) != 1:
+                raise RuntimeError(f"{beat_id} must resolve to one v1 cinematic record")
+            record = records[0]
+            if beat_index > 1:
+                legacy_files.append(str(record.get("image") or ""))
+                beat.pop("video_first_frame", None)
+                beat.pop("video_first_frame_kind", None)
+                beat.pop("video_first_frame_receipt", None)
+                continue
+            image_value = str(record.get("image") or "")
+            image_path = _artifact_path(output_dir, image_value)
+            receipt_value = str(beat.get("video_first_frame_receipt") or "")
+            receipt_path = _artifact_path(output_dir, receipt_value)
+            try:
+                _validate_image(image_path)
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                image_sha256 = hashlib.sha256(image_path.read_bytes()).hexdigest()
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError(f"{beat_id} v1 cinematic frame is invalid: {exc}") from exc
+            if (
+                record.get("kind") != CINEMATIC_FIRST_FRAME_SCHEMA
+                or record.get("status") != "done"
+                or record.get("shot_id") != shot_id
+                or record.get("image_sha256") != image_sha256
+                or receipt.get("kind") != CINEMATIC_FIRST_FRAME_SCHEMA
+                or receipt.get("status") != "done"
+                or receipt.get("image_sha256") != image_sha256
+            ):
+                raise RuntimeError(f"{beat_id} v1 cinematic receipt/hash mismatch")
+            beat.update({
+                "video_first_frame": image_value,
+                "video_first_frame_kind": CINEMATIC_FIRST_FRAME_SCHEMA,
+                "video_first_frame_receipt": receipt_value,
+            })
+            retained.append(record)
+            retained_hashes[beat_id] = image_sha256
+
+    if len(retained) != sum(
+        1
+        for shot in storyboard.get("shots") or []
+        if isinstance(shot, dict) and (shot.get("storyboard_beats") or [])
+    ):
+        raise RuntimeError("cinematic v1 migration did not retain exactly one P01 per Sxx")
+    manifest.update({
+        "kind": CINEMATIC_FIRST_FRAMES_SCHEMA,
+        "version": 2,
+        "frames": retained,
+        "frame_count": len(retained),
+        "migration": {
+            "from_kind": "honcut.cinematic-first-frames.v1",
+            "source_manifest_sha256": hashlib.sha256(raw_manifest).hexdigest(),
+            "policy": "reuse_p01_per_sxx_preserve_but_disable_p02_plus",
+            "provider_request_count": 0,
+            "retained_p01_sha256": retained_hashes,
+            "disabled_legacy_files": legacy_files,
+        },
+    })
+    _write_json(output_dir / "STORYBOARD.json", storyboard)
+    _write_json(manifest_path, manifest)
+    errors = validate_cinematic_first_frame_artifacts(output_dir, storyboard)
+    if errors:
+        raise RuntimeError(
+            "migrated cinematic first frames failed validation: "
+            + "; ".join(errors[:8])
+        )
+    return manifest
 
 
 def validate_cinematic_first_frame_artifacts(

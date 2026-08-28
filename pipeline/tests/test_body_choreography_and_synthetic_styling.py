@@ -611,6 +611,9 @@ def test_inner_beat_group_context_omits_primary_shot_end_and_later_action():
     assert "右腿扫过正前方" in prompt
     assert "铁山靠" not in prompt
     assert "整镜起点" not in prompt
+    assert "only the current 1-2 actions" in prompt
+    assert "No later/earlier Pxx" in prompt
+    assert len(prompt) <= 300
 
 
 def test_phase1_event_llm_view_excludes_derived_duplicate_contract_fields():

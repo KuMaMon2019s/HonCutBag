@@ -51,6 +51,9 @@ CONTINUITY_BRIDGE_MODES = {"off", "auto"}
 SEAM_DECISIONS_KIND = "honcut.continuity_seam_decisions.v1"
 SEEDANCE_MAX_REFERENCE_IMAGES = SEEDANCE_2_CAPABILITIES.max_reference_images or 9
 CONTINUITY_ANCHOR_FRAME_COUNT = SEEDANCE_2_CAPABILITIES.continuity_anchor_frame_count
+STORYBOARD_GUIDE_BASE_IMAGE_BUDGET = (
+    SEEDANCE_MAX_REFERENCE_IMAGES - CONTINUITY_ANCHOR_FRAME_COUNT
+)
 SEEDANCE_MIN_IMAGE_ASPECT = 0.40
 SEEDANCE_MAX_IMAGE_ASPECT = 2.50
 SEEDANCE_IMAGE_ASPECT_MARGIN = 0.01
@@ -447,19 +450,11 @@ def _storyboard_group_prompt(
         return "\n".join(
             (
                 f"[storyboard group {group.get('group_id')}; step {position + 1}/{len(beats)}]",
-                (
-                    "The text-only group contract is a chronological narrative map. "
-                    "Render only the authoritative current Pxx beat below, never another panel."
-                ),
-                f"Current beat starting state: {chunk.start_state or 'continue the supplied state'}",
-                "The authoritative Pxx contract below defines the only action to execute now.",
-                f"Current beat required result: {chunk.end_state or 'complete the current beat action'}",
-                (
-                    "Describe this Pxx with physically specific limbs, contact force, "
-                    "center of gravity, weight transfer, resistance, and inertia; keep "
-                    "the motion humanly executable and limited to the current 1-2 actions."
-                ),
-                "Do not jump to a later panel, combine later actions, replay an earlier panel, or render a collage.",
+                "Text map only; render the authoritative current Pxx beat.",
+                f"Start: {chunk.start_state or 'continue the supplied state'}",
+                f"End: {chunk.end_state or 'complete the current beat action'}",
+                "Use credible body mechanics for only the current 1-2 actions.",
+                "No later/earlier Pxx, combined action, replay, or collage.",
             )
         )
     actions = " -> ".join(str(value) for value in current.get("generation_actions", []))
@@ -935,6 +930,13 @@ def _base_content(
                 request.chunk.storyboard_narrative_guide_receipt
             ),
         })
+    if request.chunk.storyboard_beat_id:
+        # Keep the mandatory cinematic/identity/guide set, then admit optional
+        # detail assets only up to the same six-image base budget used before
+        # the three P02+ tail anchors are appended. This deterministic priority
+        # bound also prevents optional media descriptions from exhausting the
+        # Seedance prompt budget.
+        content_meta["_max_reference_images"] = STORYBOARD_GUIDE_BASE_IMAGE_BUDGET
     if request.chunk.mode == "native_extend":
         content_meta["_max_reference_images"] = (
             SEEDANCE_MAX_REFERENCE_IMAGES
@@ -1278,6 +1280,20 @@ def _provider_content(
             raise RuntimeError(f"{request.resource_id} has no predecessor video")
         content = _extension_content(content, request.previous_output_path)
     content, _media_manifest = _bind_final_media_index_prompt(content, request)
+    prompt = "\n".join(
+        str(item.get("text") or "")
+        for item in content
+        if item.get("type") == "text"
+    )
+    from utils.config import SEEDANCE_MODEL
+    from utils.prompt_budget import enforce_prompt_budget
+
+    enforce_prompt_budget(
+        prompt,
+        provider="seedance",
+        model=SEEDANCE_MODEL,
+        purpose="video_generation",
+    )
     return content, shot_meta, _generation_seed(request), _chunk_duration(request)
 
 

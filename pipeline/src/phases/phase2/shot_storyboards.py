@@ -1663,6 +1663,162 @@ def _character_reference_paths(
     return references
 
 
+def migrate_shot_storyboard_narrative_guides(
+    output_dir: Path,
+    storyboard: dict[str, Any],
+) -> dict[str, Any]:
+    """Upgrade a verified v2 Sxx board locally into the v3 guide contract.
+
+    Existing board and Pxx PREVIS pixels are immutable inputs. Only the Gxx
+    semantic binding, locally cropped/recomposed guides, JSON-safe lineage,
+    and canonical STORYBOARD fields are added. No Provider client is created.
+    """
+    output_dir = Path(output_dir)
+    manifest_path = output_dir / "SHOT_STORYBOARDS.json"
+    raw_manifest = manifest_path.read_bytes()
+    manifest = json.loads(raw_manifest.decode("utf-8"))
+    kind = str(manifest.get("kind") or "")
+    if kind == SHOT_STORYBOARDS_SCHEMA:
+        errors = validate_shot_storyboard_artifacts(output_dir, storyboard)
+        if errors:
+            raise RuntimeError(
+                "current narrative-guide artifacts failed validation: "
+                + "; ".join(errors[:8])
+            )
+        return manifest
+    if kind != "honcut.shot_storyboards.v2" or int(manifest.get("version") or 0) != 2:
+        raise RuntimeError(f"unsupported storyboard migration source: {kind or '<missing>'}")
+    if manifest.get("status") != "done":
+        raise RuntimeError("storyboard migration requires a completed v2 manifest")
+
+    records_by_shot = {
+        str(record.get("shot_id") or ""): record
+        for record in (manifest.get("shots") or [])
+        if isinstance(record, dict) and record.get("shot_id")
+    }
+    migrated_records: list[dict[str, Any]] = []
+    for shot_index, shot in enumerate(storyboard.get("shots") or [], 1):
+        if not isinstance(shot, dict):
+            continue
+        shot_id = _shot_id(shot, shot_index)
+        record = records_by_shot.get(shot_id)
+        if record is None or record.get("status") != "done":
+            raise RuntimeError(f"{shot_id} has no completed v2 storyboard record")
+        board_path = _artifact_path(output_dir, record.get("board"))
+        try:
+            with Image.open(board_path) as image:
+                image.verify()
+            board_sha256 = hashlib.sha256(board_path.read_bytes()).hexdigest()
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"{shot_id} v2 storyboard board is invalid: {exc}") from exc
+        if board_sha256 != str(record.get("board_sha256") or ""):
+            raise RuntimeError(f"{shot_id} v2 storyboard board hash mismatch")
+
+        beats = [
+            beat
+            for beat in (shot.get("storyboard_beats") or [])
+            if isinstance(beat, dict)
+        ]
+        narrative_grid = _narrative_grid_contract(shot, shot_id, beats)
+        grid_contract = _bind_narrative_grid_contract(
+            dict(record.get("grid_contract") or {}),
+            narrative_grid,
+        )
+        assignments = _beat_cell_assignments(narrative_grid)
+        guides = _derive_narrative_guides(
+            output_dir,
+            board_path,
+            grid_contract,
+            assignments,
+        )
+        guides_by_beat = {str(guide["beat_id"]): guide for guide in guides}
+        panels_by_beat = {
+            str(panel.get("beat_id") or ""): panel
+            for panel in (record.get("panels") or [])
+            if isinstance(panel, dict)
+        }
+        for beat in beats:
+            beat_id = str(beat.get("beat_id") or "")
+            guide = guides_by_beat.get(beat_id)
+            if guide is None:
+                raise RuntimeError(f"{beat_id} has no deterministic Gxx assignment")
+            beat.update({
+                "storyboard_narrative_guide": guide["image"],
+                "storyboard_narrative_guide_kind": guide["kind"],
+                "storyboard_narrative_guide_usage": guide["usage"],
+                "storyboard_narrative_guide_cell_ids": guide["cell_ids"],
+                "storyboard_narrative_guide_sha256": guide["image_sha256"],
+                "storyboard_narrative_guide_source_board": guide["source_board"],
+                "storyboard_narrative_guide_source_board_sha256": guide[
+                    "source_board_sha256"
+                ],
+                "storyboard_narrative_guide_receipt": guide["receipt"],
+            })
+            panel = panels_by_beat.get(beat_id)
+            if panel is not None:
+                panel["storyboard_narrative_guide"] = {
+                    key: guide[key]
+                    for key in (
+                        "kind",
+                        "usage",
+                        "image",
+                        "image_sha256",
+                        "source_board",
+                        "source_board_sha256",
+                        "cell_ids",
+                        "receipt",
+                    )
+                }
+                panel_sidecar = output_dir / "storyboard_beats" / f"{beat_id}.json"
+                if panel_sidecar.is_file():
+                    sidecar = json.loads(panel_sidecar.read_text(encoding="utf-8"))
+                    sidecar["storyboard_narrative_guide"] = dict(
+                        panel["storyboard_narrative_guide"]
+                    )
+                    _write_json(panel_sidecar, sidecar)
+        record.update({
+            "usage": STORYBOARD_NARRATIVE_GUIDE_USAGE,
+            "narrative_grid": narrative_grid,
+            "grid_contract": grid_contract,
+            "beat_cell_assignments": assignments,
+            "narrative_guides": guides,
+            "board_sha256": board_sha256,
+        })
+        shot["storyboard_board"] = record["board"]
+        shot["storyboard_beats"] = beats
+        _write_json(output_dir / "shot_storyboards" / f"{shot_id}.json", record)
+        migrated_records.append(record)
+
+    if set(records_by_shot) != {
+        str(record.get("shot_id") or "") for record in migrated_records
+    }:
+        raise RuntimeError("v2 storyboard manifest contains unowned shot records")
+    manifest.update({
+        "kind": SHOT_STORYBOARDS_SCHEMA,
+        "version": 3,
+        "shots": migrated_records,
+        "total_boards": len(migrated_records),
+        "total_panels": sum(
+            int(record.get("panel_count") or 0) for record in migrated_records
+        ),
+        "migration": {
+            "from_kind": "honcut.shot_storyboards.v2",
+            "source_manifest_sha256": hashlib.sha256(raw_manifest).hexdigest(),
+            "policy": "reuse_verified_sxx_board_derive_pxx_guides_locally",
+            "provider_request_count": 0,
+        },
+    })
+    _write_json(output_dir / "STORYBOARD.json", storyboard)
+    _write_json(manifest_path, manifest)
+    errors = validate_shot_storyboard_artifacts(output_dir, storyboard)
+    if errors:
+        raise RuntimeError(
+            "migrated narrative-guide artifacts failed validation: "
+            + "; ".join(errors[:8])
+        )
+    return manifest
+
+
 def validate_shot_storyboard_artifacts(
     output_dir: Path,
     storyboard: dict[str, Any],

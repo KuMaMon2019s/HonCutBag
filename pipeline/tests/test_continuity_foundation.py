@@ -3959,9 +3959,11 @@ def test_fresh_provider_does_not_mix_first_frame_with_group_board(monkeypatch, t
         }],
     }), encoding="utf-8")
     uploaded = []
-    monkeypatch.setattr(
-        "tools.asset_packager.build_content_for_shot",
-        lambda **kwargs: [
+    observed = {}
+
+    def fake_build_content(**kwargs):
+        observed["max_images"] = kwargs["shot_meta"].get("_max_reference_images")
+        return [
             {"type": "text", "text": kwargs["shot_meta"]["prompt"]},
             {
                 "type": "image_url",
@@ -3969,7 +3971,11 @@ def test_fresh_provider_does_not_mix_first_frame_with_group_board(monkeypatch, t
                 "role": "first_frame",
             },
             _narrative_guide_media("S01_P01"),
-        ],
+        ]
+
+    monkeypatch.setattr(
+        "tools.asset_packager.build_content_for_shot",
+        fake_build_content,
     )
     monkeypatch.setattr(
         "clients.tos_uploader.upload_image",
@@ -4003,6 +4009,7 @@ def test_fresh_provider_does_not_mix_first_frame_with_group_board(monkeypatch, t
         "reference_image",
     ]
     assert uploaded == []
+    assert observed["max_images"] == 6
     assert "storyboard group CG001; step 1/1" in content[0]["text"]
 
 

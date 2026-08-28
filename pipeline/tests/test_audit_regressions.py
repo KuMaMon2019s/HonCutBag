@@ -61,12 +61,15 @@ from phases.phase2.shot_storyboards import (
     _render_correction_contract,
     build_shot_storyboard_prompt,
     generate_shot_storyboards,
+    migrate_shot_storyboard_narrative_guides,
+    validate_shot_storyboard_artifacts,
 )
 from phases.phase3 import character_factory
 from phases.phase4.continuity_plan import build_continuity_plan
 from phases.phase4.cinematic_first_frames import (
     CINEMATIC_FIRST_FRAME_SCHEMA,
     generate_cinematic_first_frames,
+    migrate_cinematic_first_frames,
     validate_cinematic_first_frame_artifacts,
 )
 from phases.phase4.scene_consistency import generate_scene_consistency
@@ -6559,6 +6562,123 @@ def test_phase6_live_acceptance_preflight_is_zero_submit(tmp_path):
     assert result["gates"]["live_paid_provider"]["status"] == "pending"
 
 
+def test_phase6_live_acceptance_refuses_changed_saved_preflight(tmp_path):
+    phase6_storyboard_guide_live_acceptance.run_acceptance(
+        tmp_path,
+        submit=False,
+        preflight_builder=lambda *_args, **kwargs: (
+            _phase6_live_acceptance_preflight(tmp_path, **kwargs)
+        ),
+    )
+
+    def changed_preflight(*_args, **kwargs):
+        preflight, runtime = _phase6_live_acceptance_preflight(tmp_path, **kwargs)
+        preflight["prompt_sha256"] = "c" * 64
+        return preflight, runtime
+
+    with pytest.raises(RuntimeError, match="saved no-submit preflight changed"):
+        phase6_storyboard_guide_live_acceptance.run_acceptance(
+            tmp_path,
+            submit=True,
+            preflight_builder=changed_preflight,
+        )
+    receipt = json.loads(
+        (tmp_path / phase6_storyboard_guide_live_acceptance.RECEIPT_NAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert receipt["submitted"] is False
+    assert receipt["provider_request_count"] == 0
+
+
+def test_phase6_live_acceptance_refreshes_changed_zero_request_preflight(
+    tmp_path,
+):
+    phase6_storyboard_guide_live_acceptance.run_acceptance(
+        tmp_path,
+        submit=False,
+        preflight_builder=lambda *_args, **kwargs: (
+            _phase6_live_acceptance_preflight(tmp_path, **kwargs)
+        ),
+    )
+
+    def changed_preflight(*_args, **kwargs):
+        preflight, runtime = _phase6_live_acceptance_preflight(tmp_path, **kwargs)
+        preflight["prompt_sha256"] = "c" * 64
+        runtime["payload"]["input_fingerprint"] = "d" * 64
+        return preflight, runtime
+
+    refreshed = phase6_storyboard_guide_live_acceptance.run_acceptance(
+        tmp_path,
+        submit=False,
+        preflight_builder=changed_preflight,
+    )
+
+    assert refreshed["status"] == "pending_live_acceptance"
+    assert refreshed["submitted"] is False
+    assert refreshed["provider_request_count"] == 0
+    assert refreshed["preflight"]["prompt_sha256"] == "c" * 64
+    assert refreshed["task_payload"]["input_fingerprint"] == "d" * 64
+    assert refreshed["preflight_revisions"] == [{
+        "reason": "unsubmitted_zero_request_preflight_refresh",
+        "source_git_commit": "f" * 40,
+        "prompt_sha256": "a" * 64,
+        "provider_request_count": 0,
+        "refreshed_at": refreshed["preflight_revisions"][0]["refreshed_at"],
+    }]
+
+
+def test_phase6_live_acceptance_releases_proven_zero_request_preflight_failure(
+    monkeypatch,
+    tmp_path,
+):
+    from utils.prompt_budget import PromptBudgetExceededError
+
+    monkeypatch.setattr(
+        phase6_storyboard_guide_live_acceptance,
+        "get_api_key",
+        lambda _name: "test-key",
+    )
+    monkeypatch.setattr(
+        phase6_storyboard_guide_live_acceptance.seedance_client,
+        "submit_content",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            PromptBudgetExceededError("local prompt budget failure")
+        ),
+    )
+    with pytest.raises(PromptBudgetExceededError, match="local prompt budget failure"):
+        phase6_storyboard_guide_live_acceptance.run_acceptance(
+            tmp_path,
+            submit=True,
+            preflight_builder=lambda *_args, **kwargs: (
+                _phase6_live_acceptance_preflight(tmp_path, **kwargs)
+            ),
+        )
+
+    receipt_path = (
+        tmp_path / phase6_storyboard_guide_live_acceptance.RECEIPT_NAME
+    )
+    failed = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert failed["status"] == "preflight_failed"
+    assert failed["submitted"] is False
+    assert failed["provider_request_count"] == 0
+    assert failed["provider_request_attempt_count"] == 0
+    assert failed["logical_submit_count"] == 0
+    assert len(failed["preflight_failures"]) == 1
+
+    recovered = phase6_storyboard_guide_live_acceptance.run_acceptance(
+        tmp_path,
+        submit=False,
+        preflight_builder=lambda *_args, **kwargs: (
+            _phase6_live_acceptance_preflight(tmp_path, **kwargs)
+        ),
+    )
+    assert recovered["status"] == "pending_live_acceptance"
+    assert recovered["submitted"] is False
+    assert recovered["provider_request_count"] == 0
+    assert len(recovered["preflight_failures"]) == 1
+
+
 def test_phase6_live_acceptance_submits_once_refuses_replay_and_needs_both_gates(
     monkeypatch,
     tmp_path,
@@ -6621,6 +6741,15 @@ def test_phase6_live_acceptance_submits_once_refuses_replay_and_needs_both_gates
         lambda _name: "test-key",
     )
 
+    preflight = phase6_storyboard_guide_live_acceptance.run_acceptance(
+        tmp_path,
+        submit=False,
+        preflight_builder=lambda *_args, **kwargs: (
+            _phase6_live_acceptance_preflight(tmp_path, **kwargs)
+        ),
+    )
+    assert preflight["submitted"] is False
+
     result = phase6_storyboard_guide_live_acceptance.run_acceptance(
         tmp_path,
         submit=True,
@@ -6632,6 +6761,7 @@ def test_phase6_live_acceptance_submits_once_refuses_replay_and_needs_both_gates
     assert raw_posts == [True]
     assert result["provider_request_count"] == 1
     assert result["logical_submit_count"] == 1
+    assert result["preflight_revalidated_at"]
     assert result["status"] == "pending_business_verdict"
     assert result["gates"]["live_paid_provider"]["call_chain_status"] == "passed"
     with pytest.raises(RuntimeError, match="already consumed"):
@@ -8412,6 +8542,226 @@ def test_phase5_real_redraw_reuses_generator_and_archives_failed_shot(tmp_path):
     assert json.loads(cinematic_alias_receipt.read_text(encoding="utf-8"))[
         "kind"
     ] == CINEMATIC_FIRST_FRAME_SCHEMA
+
+
+def test_phase2_v2_migration_derives_guides_without_provider_calls(tmp_path):
+    from PIL import Image
+
+    storyboard = {
+        "shots": [{
+            "id": "S01",
+            "where": "雨夜站台",
+            "storyboard_beats": [
+                {
+                    "beat_id": "S01_P01",
+                    "duration_s": 5,
+                    "generation_mode": "fresh",
+                    "action": "角色抬头",
+                    "end_state": "角色看向列车",
+                },
+                {
+                    "beat_id": "S01_P02",
+                    "duration_s": 5,
+                    "generation_mode": "extend",
+                    "action": "角色走向列车",
+                    "end_state": "角色抵达车门",
+                },
+            ],
+        }],
+    }
+    calls = []
+
+    class FakeClient:
+        model = "fake-seedream"
+
+        def text_to_image(self, prompt, output_path, size, timeout):
+            del prompt, size, timeout
+            calls.append(Path(output_path).name)
+            Image.effect_noise((640, 360), 40 + len(calls)).convert("RGB").save(
+                output_path
+            )
+            return "https://image.invalid/fixture.png"
+
+        def image_to_image(self, prompt, ref_image, output_path, size):
+            del prompt, ref_image, size
+            calls.append(Path(output_path).name)
+            Image.effect_noise((640, 360), 40 + len(calls)).convert("RGB").save(
+                output_path
+            )
+            return "https://image.invalid/fixture.png"
+
+    generate_shot_storyboards(
+        tmp_path,
+        storyboard,
+        [],
+        client=FakeClient(),
+        director_storyboard_path=tmp_path / "missing.png",
+    )
+    manifest_path = tmp_path / "SHOT_STORYBOARDS.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    board_sha256 = manifest["shots"][0]["board_sha256"]
+    manifest.update(kind="honcut.shot_storyboards.v2", version=2)
+    for record in manifest["shots"]:
+        record.pop("beat_cell_assignments", None)
+        record.pop("narrative_guides", None)
+        record["grid_contract"]["schema"] = "honcut.shot-storyboard-grid.v1"
+    guide_fields = (
+        "storyboard_narrative_guide",
+        "storyboard_narrative_guide_kind",
+        "storyboard_narrative_guide_usage",
+        "storyboard_narrative_guide_cell_ids",
+        "storyboard_narrative_guide_sha256",
+        "storyboard_narrative_guide_source_board",
+        "storyboard_narrative_guide_source_board_sha256",
+        "storyboard_narrative_guide_receipt",
+    )
+    for beat in storyboard["shots"][0]["storyboard_beats"]:
+        for field in guide_fields:
+            beat.pop(field, None)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps(storyboard), encoding="utf-8"
+    )
+    provider_calls_before = list(calls)
+
+    migrated = migrate_shot_storyboard_narrative_guides(tmp_path, storyboard)
+    first_hashes = [
+        beat["storyboard_narrative_guide_sha256"]
+        for beat in storyboard["shots"][0]["storyboard_beats"]
+    ]
+    repeated = migrate_shot_storyboard_narrative_guides(tmp_path, storyboard)
+
+    assert calls == provider_calls_before
+    assert migrated["kind"] == "honcut.shot_storyboards.v3"
+    assert migrated["migration"]["provider_request_count"] == 0
+    assert migrated["shots"][0]["board_sha256"] == board_sha256
+    assert migrated["shots"][0]["beat_cell_assignments"] == [
+        {"beat_id": "S01_P01", "cell_ids": [
+            "S01_G01", "S01_G02", "S01_G03", "S01_G04", "S01_G05"
+        ]},
+        {"beat_id": "S01_P02", "cell_ids": [
+            "S01_G06", "S01_G07", "S01_G08", "S01_G09"
+        ]},
+    ]
+    assert repeated == migrated
+    assert first_hashes == [
+        beat["storyboard_narrative_guide_sha256"]
+        for beat in storyboard["shots"][0]["storyboard_beats"]
+    ]
+    assert validate_shot_storyboard_artifacts(tmp_path, storyboard) == []
+    manifest_path.write_text(
+        json.dumps({**migrated, "kind": "honcut.shot_storyboards.v99", "version": 99}),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="unsupported storyboard migration source"):
+        migrate_shot_storyboard_narrative_guides(tmp_path, storyboard)
+
+
+def test_phase4_v1_migration_reuses_p01_and_disables_p02(tmp_path):
+    from PIL import Image
+
+    previs_dir = tmp_path / "storyboard_beats"
+    previs_dir.mkdir()
+    Image.effect_noise((640, 360), 30).convert("RGB").save(
+        previs_dir / "S01_P01.png"
+    )
+    Image.effect_noise((640, 360), 45).convert("RGB").save(
+        previs_dir / "S01_P02.png"
+    )
+    storyboard = {
+        "shots": [{
+            "id": "S01",
+            "where": "车站入口",
+            "storyboard_beats": [
+                {
+                    "beat_id": "S01_P01",
+                    "action": "角色进入车站",
+                    "storyboard_image": "storyboard_beats/S01_P01.png",
+                },
+                {
+                    "beat_id": "S01_P02",
+                    "action": "角色继续前行",
+                    "storyboard_image": "storyboard_beats/S01_P02.png",
+                },
+            ],
+        }],
+    }
+    calls = []
+
+    class FakeClient:
+        model = "fake-seedream"
+
+        def text_to_image(self, prompt, output_path, size, timeout):
+            del prompt, size, timeout
+            calls.append(Path(output_path).name)
+            Image.effect_noise((640, 360), 70).convert("RGB").save(output_path)
+            return "https://image.invalid/cinematic.png"
+
+        def image_to_image(self, **_kwargs):
+            pytest.fail("fixture has no image references")
+
+    current = generate_cinematic_first_frames(
+        tmp_path,
+        storyboard,
+        [],
+        client=FakeClient(),
+    )
+    p01_record = current["frames"][0]
+    p02_path = tmp_path / "video_first_frames/S01_P02.png"
+    Image.effect_noise((640, 360), 85).convert("RGB").save(p02_path)
+    p02_sha256 = hashlib.sha256(p02_path.read_bytes()).hexdigest()
+    p02_record = {
+        **p01_record,
+        "beat_id": "S01_P02",
+        "image": "video_first_frames/S01_P02.png",
+        "image_sha256": p02_sha256,
+    }
+    (tmp_path / "video_first_frames/S01_P02.json").write_text(
+        json.dumps(p02_record), encoding="utf-8"
+    )
+    storyboard["shots"][0]["storyboard_beats"][1].update({
+        "video_first_frame": "video_first_frames/S01_P02.png",
+        "video_first_frame_kind": CINEMATIC_FIRST_FRAME_SCHEMA,
+        "video_first_frame_receipt": "video_first_frames/S01_P02.json",
+    })
+    current.update({
+        "kind": "honcut.cinematic-first-frames.v1",
+        "version": 1,
+        "frames": [p01_record, p02_record],
+        "frame_count": 2,
+    })
+    (tmp_path / "CINEMATIC_FIRST_FRAMES.json").write_text(
+        json.dumps(current), encoding="utf-8"
+    )
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps(storyboard), encoding="utf-8"
+    )
+
+    migrated = migrate_cinematic_first_frames(tmp_path, storyboard)
+    p02 = storyboard["shots"][0]["storyboard_beats"][1]
+
+    assert calls == ["S01_P01.png"]
+    assert migrated["kind"] == "honcut.cinematic-first-frames.v2"
+    assert migrated["frame_count"] == 1
+    assert migrated["migration"]["provider_request_count"] == 0
+    assert migrated["migration"]["disabled_legacy_files"] == [
+        "video_first_frames/S01_P02.png"
+    ]
+    assert p02_path.is_file()
+    assert "video_first_frame" not in p02
+    assert "video_first_frame_kind" not in p02
+    assert "video_first_frame_receipt" not in p02
+    assert validate_cinematic_first_frame_artifacts(tmp_path, storyboard) == []
+    (tmp_path / "CINEMATIC_FIRST_FRAMES.json").write_text(
+        json.dumps({
+            **migrated,
+            "kind": "honcut.cinematic-first-frames.v99",
+            "version": 99,
+        }),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="unsupported cinematic migration source"):
+        migrate_cinematic_first_frames(tmp_path, storyboard)
 
 
 def test_phase5_correction_redraws_only_evidenced_pxx_with_identity_references(
