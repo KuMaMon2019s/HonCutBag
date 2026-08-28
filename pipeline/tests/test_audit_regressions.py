@@ -29,6 +29,8 @@ if str(SCRIPTS) not in sys.path:
 
 import detached_pipeline_launch
 import phase_orchestrator
+import phase5_adjudication_live_acceptance
+import phase5_correction_resume_live_acceptance
 import pipeline_runner as pipeline_runner_cli
 from phases import pipeline_core
 from phases.phase1 import (
@@ -4564,34 +4566,49 @@ def test_phase2_bridge_panel_is_not_treated_as_the_last_story_beat():
     assert "绝不能把不同参考图复制成多个实体" in bridge_prompt
 
 
-def test_phase2_panel_prompt_turns_phase5_evidence_into_negative_constraints():
+def test_phase2_panel_prompt_projects_phase5_evidence_without_raw_observation():
+    beat = {
+        "beat_id": "S06_P02",
+        "generation_mode": "extend",
+        "start_state": "保安飞向观察窗",
+        "action": "Agent 恢复稳定姿态",
+        "end_state": "观察窗保持完整，Agent 定格",
+    }
+    issue = storyboard_qa_gate._issue(
+        "L3",
+        "severe",
+        "R4",
+        "观察窗状态错误",
+        ["S06"],
+        storyboard_ids=["S06_P02"],
+        mismatch_type="end_state",
+        expected="观察窗保持完整，Agent 稳定定格",
+        observed="保安撞破观察窗飞入太空",
+        panel_evidence=[{
+            "shot_id": "S06_P02",
+            "observed": "保安撞破观察窗飞入太空",
+        }],
+    )
     prompt = _build_panel_prompt(
         {"who": ["agent", "guard"], "where": "透明观察窗前"},
-        {
-            "beat_id": "S06_P02",
-            "generation_mode": "extend",
-            "start_state": "保安飞向观察窗",
-            "action": "Agent 恢复稳定姿态",
-            "end_state": "观察窗保持完整，Agent 定格",
-        },
+        beat,
         2,
         2,
         [
             {"id": "agent", "appearance": {"summary": "深灰色战术服"}},
             {"id": "guard", "appearance": {"summary": "藏蓝色保安制服"}},
         ],
-        correction_contract=(
-            "这是第 1 轮自动纠偏，只修复 S06。\n"
-            "- 纠偏项 1（R4）：必须满足=观察窗保持完整；"
-            "已观察到且禁止复现=保安撞破观察窗飞入太空。"
+        correction_contract=_render_correction_contract(
+            _panel_correction_directives([issue], beat, "S06_P02"),
+            attempt=1,
         ),
     )
 
     assert "Phase 5 定向纠偏合同" in prompt
     assert "观察窗保持完整" in prompt
-    assert "保安撞破观察窗飞入太空" in prompt
-    assert "禁止复现的负面约束，不是要继续画入画面的剧情" in prompt
-    assert "不得通过增加破坏、伤亡、道具或画外事件来规避问题" in prompt
+    assert "保安撞破观察窗飞入太空" not in prompt
+    assert "QA 的 expected/observed 原文只保留在审计收据" in prompt
+    assert "不得新增角色、动作、道具、破坏、伤亡" in prompt
 
 
 def test_phase2_panel_correction_directive_is_scoped_to_one_pxx():
@@ -4630,9 +4647,10 @@ def test_phase2_panel_correction_directive_is_scoped_to_one_pxx():
         "source_expected_context": "P01 后仰抓扶手；P02 踢腕后将敌人甩向座椅",
         "source_storyboard_ids": ["S02_P01", "S02_P02"],
     }]
-    assert "当前格权威动作=男子踢中敌人手腕并将第二名敌人甩向座椅" in contract
-    assert "当前格权威终态=第二名敌人落向座椅，男子保持平衡" in contract
-    assert "必须消除的本格可见错误=仍复制 P01 后仰姿态" in contract
+    assert "动作与终态只读取本格主合同" in contract
+    assert "男子踢中敌人手腕并将第二名敌人甩向座椅" not in contract
+    assert "第二名敌人落向座椅，男子保持平衡" not in contract
+    assert "仍复制 P01 后仰姿态" not in contract
     assert "尚未抓住扶手" not in contract
     assert "P01 后仰抓扶手；P02" not in contract
 
@@ -4666,8 +4684,60 @@ def test_phase2_correction_keeps_only_negative_clauses_for_provider():
     contract = _render_correction_contract(directives, attempt=1)
 
     assert directives[0]["observed_error"] == "Guard still holds the device;"
-    assert "Guard still holds the device" in contract
+    assert "Guard still holds the device" not in contract
     assert "matching the required end state" not in contract
+
+
+def test_phase2_correction_prompt_is_deduplicated_and_safe_on_first_request():
+    action = (
+        "第二名敌人侧身冲向年轻男性；年轻男性双臂格挡后控制其手臂，"
+        "列车启动，双方随惯性后仰。"
+    )
+    beat = {
+        "beat_id": "S01_P02",
+        "generation_mode": "tail_video_extend",
+        "start_state": "第一名敌人的攻势已经结束",
+        "action": action,
+        "end_state": "年轻男性完成格挡，列车已经启动",
+        "body_action_contract": {
+            "required": False,
+            "prompt": action,
+            "beats": [{"micro_action": action}],
+        },
+    }
+    directives = [{
+        "schema": "honcut.storyboard-panel-correction.v1",
+        "target_board_id": "S01_P02",
+        "issue_code": "R4",
+        "mismatch_type": "action",
+        "required_action": action,
+        "required_end_state": beat["end_state"],
+        "observed_error": (
+            "a third armored enemy outside the train fires energy blasts"
+        ),
+        "source_expected_context": "only the canonical cast is present",
+        "source_storyboard_ids": ["S01_P02"],
+    }]
+
+    prompt = _build_panel_prompt(
+        {"who": ["年轻男性", "第二名敌人"], "where": "列车车厢"},
+        beat,
+        2,
+        3,
+        [
+            {"id": "lead", "name": "年轻男性", "description": "黑色长风衣"},
+            {"id": "enemy_2", "name": "第二名敌人", "description": "黑色装甲"},
+        ],
+        correction_contract=_render_correction_contract(directives, attempt=2),
+        referenced_character_ids={"lead", "enemy_2"},
+    )
+
+    assert prompt.count(action) == 1
+    assert "a third armored enemy" not in prompt
+    assert "首请求安全表现合同" in prompt
+    assert "受控格挡与控制动作" in prompt
+    assert "不得改变角色、攻守关系、动作顺序或结束状态" in prompt
+    assert "身份由已绑定的 canonical 参考图锁定" in prompt
 
 
 def test_phase2_panel_prompt_does_not_activate_declared_capabilities_early():
@@ -5844,11 +5914,13 @@ def test_phase5_adjudicates_unchanged_l3_flip_after_cinematic_correction(
             "status": "error", "grade": "C", "gate_passed": False,
             "issues": [l3_flip], "failed_shot_ids": ["S01"],
         },
-        {  # tie-break: unchanged P01 passes, so pass/fail/pass wins
-            "status": "done", "grade": "A", "gate_passed": True,
-            "issues": [], "failed_shot_ids": [],
-        },
     ])
+    confirmation_result = {
+        # tie-break: unchanged P01 passes, so pass/fail/pass wins
+        "status": "done", "grade": "A", "gate_passed": True,
+        "issues": [], "failed_shot_ids": [],
+        "layers": {"L3": {"status": "completed"}},
+    }
     cinematic_calls = []
 
     def redraw_cinematic(_output_dir, frame_ids, _issues, attempt):
@@ -5859,6 +5931,11 @@ def test_phase5_adjudicates_unchanged_l3_flip_after_cinematic_correction(
         tmp_path,
         max_correction_attempts=2,
         qa_runner=lambda _output_dir: next(qa_results),
+        adjudication_runner=lambda _output_dir, storyboard_ids: (
+            confirmation_result
+            if storyboard_ids == ["S01_P01"]
+            else pytest.fail("unexpected adjudication scope")
+        ),
         redraw_runner=lambda *_args: pytest.fail(
             "L3 adjudication after L4 correction must not start a second family"
         ),
@@ -6242,12 +6319,6 @@ def test_phase5_uses_two_of_three_for_unchanged_panel_verdict_flip(tmp_path):
             "gate_passed": False,
             "issues": [p01_issue, p02_flip],
         },
-        {  # tie-break: unchanged P02 passes, so pass/fail/pass wins
-            "status": "error",
-            "grade": "C",
-            "gate_passed": False,
-            "issues": [p01_issue],
-        },
         {
             "status": "done",
             "grade": "A",
@@ -6255,6 +6326,14 @@ def test_phase5_uses_two_of_three_for_unchanged_panel_verdict_flip(tmp_path):
             "issues": [],
         },
     ])
+    confirmation_result = {
+        # tie-break: unchanged P02 passes, so pass/fail/pass wins
+        "status": "error",
+        "grade": "C",
+        "gate_passed": False,
+        "issues": [p01_issue],
+        "layers": {"L3": {"status": "completed"}},
+    }
     redraw_calls = []
 
     def redraw(_output_dir, _shot_ids, issues, attempt):
@@ -6269,6 +6348,11 @@ def test_phase5_uses_two_of_three_for_unchanged_panel_verdict_flip(tmp_path):
         tmp_path,
         max_correction_attempts=2,
         qa_runner=lambda _output_dir: next(qa_results),
+        adjudication_runner=lambda _output_dir, storyboard_ids: (
+            confirmation_result
+            if storyboard_ids == ["S01_P02"]
+            else pytest.fail("unexpected adjudication scope")
+        ),
         redraw_runner=redraw,
     )
 
@@ -6288,6 +6372,1698 @@ def test_phase5_uses_two_of_three_for_unchanged_panel_verdict_flip(tmp_path):
     assert (
         tmp_path / "phase5_review_adjudication_report.json"
     ).is_file()
+
+
+def test_phase5_adjudication_review_scopes_l3_to_disputed_panels(
+    monkeypatch,
+    tmp_path,
+):
+    from PIL import Image
+
+    storyboard = {
+        "shots": [
+            {
+                "id": "S01",
+                "storyboard_beats": [
+                    {
+                        "beat_id": "S01_P01",
+                        "character_ids": ["agent"],
+                        "storyboard_image": "storyboard_beats/S01_P01.png",
+                    },
+                    {
+                        "beat_id": "S01_P02",
+                        "character_ids": ["agent"],
+                        "storyboard_image": "storyboard_beats/S01_P02.png",
+                    },
+                ],
+            },
+            {
+                "id": "S02",
+                "storyboard_beats": [
+                    {
+                        "beat_id": "S02_P01",
+                        "character_ids": ["agent"],
+                        "storyboard_image": "storyboard_beats/S02_P01.png",
+                    },
+                ],
+            },
+        ],
+    }
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps(storyboard), encoding="utf-8"
+    )
+    (tmp_path / "CHARACTERS.json").write_text(
+        json.dumps({"characters": [{"id": "agent"}]}), encoding="utf-8"
+    )
+    (tmp_path / "visual-style.md").write_text(
+        "cinematic blue train interior", encoding="utf-8"
+    )
+    beat_dir = tmp_path / "storyboard_beats"
+    beat_dir.mkdir()
+    for index, storyboard_id in enumerate(("S01_P01", "S01_P02", "S02_P01")):
+        Image.effect_noise((128, 72), 40 + index * 20).convert("RGB").save(
+            beat_dir / f"{storyboard_id}.png"
+        )
+
+    captured = {}
+
+    def l3_review(
+        scoped_storyboard,
+        characters,
+        visual_style,
+        images,
+        grid_path,
+        client=None,
+        **kwargs,
+    ):
+        captured.update(
+            storyboard=scoped_storyboard,
+            characters=characters,
+            visual_style=visual_style,
+            images=images,
+            grid_path=grid_path,
+            client=client,
+            kwargs=kwargs,
+        )
+        return [], {
+            "status": "completed",
+            "request_count": 1,
+            "provider_request_count": 1,
+        }
+
+    monkeypatch.setattr(storyboard_qa_gate, "run_l3_review", l3_review)
+    for owner_name in (
+        "run_l1_checks",
+        "run_l2_checks",
+        "run_l4_first_frame_review",
+    ):
+        monkeypatch.setattr(
+            storyboard_qa_gate,
+            owner_name,
+            lambda *_args, _owner_name=owner_name, **_kwargs: pytest.fail(
+                f"narrow adjudication called unrelated {_owner_name} owner"
+            ),
+        )
+
+    result = storyboard_qa_gate._run_storyboard_adjudication_review(
+        tmp_path,
+        ["S01_P02"],
+        multimodal_client=object(),
+    )
+
+    assert result["status"] == "done"
+    assert result["gate_passed"] is True
+    assert list(captured["images"]) == ["S01_P02"]
+    assert [shot["id"] for shot in captured["storyboard"]["shots"]] == ["S01"]
+    assert [
+        beat["beat_id"]
+        for beat in captured["storyboard"]["shots"][0]["storyboard_beats"]
+    ] == ["S01_P02"]
+    assert captured["grid_path"].name == "phase5_review_adjudication_grid.jpg"
+    assert captured["kwargs"]["input_manifest_path"].name == (
+        "phase5_review_adjudication_inputs.json"
+    )
+    assert captured["kwargs"]["evidence_dir"].name == (
+        "phase5_review_adjudication_evidence"
+    )
+
+
+def _phase5_live_acceptance_preflight(tmp_path):
+    return {
+        "output_dir": str(tmp_path),
+        "storyboard_ids": ["S01_P02", "S01_P03"],
+        "parent_shot_ids": ["S01"],
+        "asset_sha256": {"S01_P02": "a" * 64, "S01_P03": "b" * 64},
+        "pending_receipt_schema": "honcut.phase5-review-adjudication.v1",
+        "pending_receipt_status": "blocked_unavailable",
+        "legacy_reconstructed": False,
+        "credentials": {
+            "ark_agent_credential_source": "test",
+            "tos_media_upload_configured": True,
+        },
+    }
+
+
+def test_phase1_through_phase9_repair_acceptance_contract_is_persisted():
+    agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    architecture = (ROOT / "docs/HONCUT_ARCHITECTURE.md").read_text(
+        encoding="utf-8"
+    )
+
+    for document in (agents, architecture):
+        assert "Phase 1～Phase 9" in document
+        assert "regression" in document
+        assert "live_paid_provider" in document
+        assert "两门都通过" in document
+
+
+def test_phase5_live_acceptance_preflight_is_zero_request(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        phase5_adjudication_live_acceptance,
+        "_pending_preflight",
+        lambda *_args, **_kwargs: _phase5_live_acceptance_preflight(tmp_path),
+    )
+
+    result = phase5_adjudication_live_acceptance.run_acceptance(
+        tmp_path,
+        submit=False,
+        expected_storyboard_ids=["S01_P02", "S01_P03"],
+        client_factory=lambda: pytest.fail(
+            "zero-request preflight must not construct a Provider client"
+        ),
+        resume_runner=lambda *_args, **_kwargs: pytest.fail(
+            "zero-request preflight must not enter Phase 5 resume"
+        ),
+    )
+
+    assert result["status"] == "preflight_passed"
+    assert result["submitted"] is False
+    assert result["acceptance_gate"] == "live_paid_provider"
+    assert result["required_acceptance_gates"] == [
+        "regression",
+        "live_paid_provider",
+    ]
+    assert result["provider_request_limit"] == 1
+    assert result["provider_request_count"] == 0
+    persisted = json.loads(
+        (tmp_path / "phase5_adjudication_live_acceptance.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert persisted == result
+
+
+def test_phase5_live_acceptance_allows_one_request_and_refuses_replay(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(
+        phase5_adjudication_live_acceptance,
+        "_pending_preflight",
+        lambda *_args, **_kwargs: _phase5_live_acceptance_preflight(tmp_path),
+    )
+
+    class FakeResponses:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, *_args, **_kwargs):
+            self.calls += 1
+            return {"strict": "dto"}
+
+    class FakeArkClient:
+        def __init__(self):
+            self.client = SimpleNamespace(responses=FakeResponses())
+
+        def review_structured(self, *_args, **_kwargs):
+            return self.client.responses.create()
+
+    raw_client = FakeArkClient()
+
+    def adjudication_review(
+        output_dir,
+        storyboard_ids,
+        *,
+        multimodal_client,
+        structured_understanding_max_attempts,
+    ):
+        assert output_dir == tmp_path.resolve()
+        assert storyboard_ids == ["S01_P02", "S01_P03"]
+        assert structured_understanding_max_attempts == 1
+        multimodal_client.review_structured([], "strict prompt", object)
+        return {
+            "status": "error",
+            "gate_passed": False,
+            "layers": {"L3": {"status": "completed"}},
+        }
+
+    def resume_runner(
+        output_dir,
+        *,
+        resume_pending_adjudication,
+        adjudication_runner,
+    ):
+        assert output_dir == tmp_path.resolve()
+        assert resume_pending_adjudication is True
+        confirmation = adjudication_runner(
+            output_dir,
+            ["S01_P02", "S01_P03"],
+        )
+        assert confirmation["layers"]["L3"]["status"] == "completed"
+        return {
+            "status": "error",
+            "grade": "C",
+            "gate_passed": False,
+            "review_adjudications": [{
+                "status": "completed",
+                "decisions": {"S01_P02": "blocked", "S01_P03": "passed"},
+            }],
+        }
+
+    result = phase5_adjudication_live_acceptance.run_acceptance(
+        tmp_path,
+        submit=True,
+        expected_storyboard_ids=["S01_P02", "S01_P03"],
+        client_factory=lambda: raw_client,
+        resume_runner=resume_runner,
+        adjudication_review=adjudication_review,
+    )
+
+    assert result["status"] == "passed"
+    assert result["submitted"] is True
+    assert result["provider_request_count"] == 1
+    assert result["provider_request_attempt_count"] == 1
+    assert result["phase5"]["gate_passed"] is False
+    assert raw_client.client.responses._delegate.calls == 1
+    with pytest.raises(RuntimeError, match="already consumed or attempted"):
+        phase5_adjudication_live_acceptance.run_acceptance(
+            tmp_path,
+            submit=True,
+            client_factory=lambda: pytest.fail("must refuse before client creation"),
+        )
+
+
+def test_phase5_live_acceptance_blocks_second_provider_request_at_transport():
+    class FakeResponses:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, *_args, **_kwargs):
+            self.calls += 1
+            return {"strict": "dto"}
+
+    class FakeArkClient:
+        def __init__(self):
+            self.client = SimpleNamespace(responses=FakeResponses())
+
+        def review_structured(self, *_args, **_kwargs):
+            return self.client.responses.create()
+
+    raw_client = FakeArkClient()
+    guarded = phase5_adjudication_live_acceptance.SinglePaidRequestReviewClient(
+        raw_client
+    )
+
+    assert guarded.review_structured([], "strict prompt", object) == {
+        "strict": "dto"
+    }
+    with pytest.raises(
+        phase5_adjudication_live_acceptance.ProviderRequestLimitError,
+        match="exactly one paid Provider request",
+    ):
+        guarded.review_structured([], "strict prompt", object)
+
+    assert raw_client.client.responses._delegate.calls == 1
+    assert guarded.provider_request_count == 1
+    assert guarded.blocked_provider_request_count == 1
+
+
+def _phase5_correction_live_preflight(tmp_path, target_sha256, protected_sha256):
+    provider_prompt_sha256 = hashlib.sha256(b"strict correction").hexdigest()
+    return {
+        "output_dir": str(tmp_path.resolve()),
+        "storyboard_id": "S01_P02",
+        "available_storyboard_ids": ["S01_P02"],
+        "parent_shot_id": "S01",
+        "correction_attempt": 2,
+        "asset_sha256": target_sha256,
+        "protected_panel_sha256": {"S01_P01": protected_sha256},
+        "protected_sidecar_sha256": {},
+        "canonical_asset_sha256": (
+            phase5_correction_resume_live_acceptance._canonical_asset_hashes(
+                tmp_path
+            )
+        ),
+        "acceptance_artifact": (
+            "live_acceptance/phase5_correction/S01_P02.png"
+        ),
+        "credentials": {"ark_agent_credential_source": "test"},
+        "prompt_projection": {
+            "panel_prompt_template_id": "honcut.storyboard-panel-prompt",
+            "panel_prompt_template_version": "2",
+            "correction_prompt_policy": "canonical-positive-projection-v2",
+            "first_request_safety_policy": None,
+            "prompt_optimization": {"mode": "standard"},
+            "image_request_parameters": {
+                "size": "2K",
+                "response_format": "url",
+                "output_format": "png",
+                "watermark": False,
+                "sequential_image_generation": "disabled",
+                "stream": False,
+                "optimize_prompt_options": {"mode": "standard"},
+            },
+            "provider_prompt_guidance": {
+                "sha256": provider_prompt_sha256,
+            },
+            "transport_prompt_guidance": {
+                "sha256": provider_prompt_sha256,
+            },
+            "ip_filtered_term_count": 0,
+            "reference_count": 0,
+            "reference_roles": [],
+            "reference_image_sha256": [],
+            "checks": {
+                "canonical_action_once": True,
+                "raw_observed_excluded": True,
+                "correction_policy_current": True,
+            },
+        },
+    }
+
+
+def _phase5_correction_live_request(preflight):
+    return {
+        "provider_prompt": "strict correction",
+        "reference_paths": [],
+        "size": "2K",
+        "model": "doubao-seedream-5.0-lite",
+        "request_parameters": preflight["prompt_projection"][
+            "image_request_parameters"
+        ],
+        "projection": preflight["prompt_projection"],
+    }
+
+
+def test_phase5_correction_live_preflight_is_zero_request(monkeypatch, tmp_path):
+    preflight = _phase5_correction_live_preflight(
+        tmp_path, "a" * 64, "b" * 64
+    )
+    monkeypatch.setattr(
+        phase5_correction_resume_live_acceptance,
+        "_continuation_preflight",
+        lambda *_args, **_kwargs: preflight,
+    )
+
+    result = phase5_correction_resume_live_acceptance.run_acceptance(
+        tmp_path,
+        submit=False,
+        expected_storyboard_id="S01_P02",
+        client_factory=lambda: pytest.fail(
+            "zero-request preflight must not construct a Provider client"
+        ),
+    )
+
+    assert result["status"] == "pending_live_acceptance"
+    assert result["submitted"] is False
+    assert result["preflight_status"] == "passed"
+    assert result["provider_request_limit"] == 1
+    assert result["provider_request_count"] == 0
+    persisted = json.loads(
+        (
+            tmp_path / "phase5_correction_resume_live_acceptance.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert persisted == result
+
+
+def test_phase5_correction_live_preflight_projects_exact_safe_prompt(tmp_path):
+    storyboard = {
+        "aspect_ratio": "16:9",
+        "shots": [{
+            "id": "S01",
+            "who": [],
+            "where": "训练车厢",
+            "storyboard_beats": [{
+                "beat_id": "S01_P02",
+                "character_ids": [],
+                "start_state": "来袭者接近",
+                "action": "Agent 格挡来袭者并控制其手臂",
+                "end_state": "Agent 完成格挡，双方稳定",
+            }],
+        }],
+    }
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps(storyboard, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (tmp_path / "CHARACTERS.json").write_text(
+        '{"characters":[]}',
+        encoding="utf-8",
+    )
+    (tmp_path / "SHOT_STORYBOARDS.json").write_text(
+        '{"aspect_ratio":"16:9","size_requested":"2K"}',
+        encoding="utf-8",
+    )
+    issue = storyboard_qa_gate._issue(
+        "L3",
+        "moderate",
+        "R4",
+        "action mismatch",
+        ["S01"],
+        storyboard_ids=["S01_P02"],
+        mismatch_type="action",
+        expected="Agent completes the block",
+        observed="an extra attacker fires from outside",
+        confidence=0.95,
+        panel_evidence=[{
+            "shot_id": "S01_P02",
+            "observed": "an extra attacker fires from outside",
+        }],
+    )
+
+    projection = (
+        phase5_correction_resume_live_acceptance._prompt_projection_preflight(
+            tmp_path,
+            state={"result": {"issues": [issue]}},
+            storyboard_id="S01_P02",
+            correction_attempt=2,
+        )
+    )
+
+    assert projection["panel_prompt_template_version"] == "2"
+    assert projection["correction_prompt_policy"] == (
+        "canonical-positive-projection-v2"
+    )
+    assert projection["first_request_safety_policy"] == (
+        "non_graphic_staged_conflict_v1"
+    )
+    assert projection["prompt_optimization"] == {"mode": "standard"}
+    assert projection["transport_prompt_guidance"]["sha256"]
+    assert projection["reference_roles"] == []
+    assert projection["reference_image_sha256"] == []
+    assert all(projection["checks"].values())
+
+
+def test_phase5_correction_live_acceptance_allows_one_request_and_refuses_replay(
+    monkeypatch,
+    tmp_path,
+):
+    from PIL import Image
+
+    beat_dir = tmp_path / "storyboard_beats"
+    beat_dir.mkdir()
+    storyboard = {
+        "shots": [{
+            "id": "S01",
+            "storyboard_beats": [
+                {
+                    "beat_id": "S01_P01",
+                    "storyboard_image": "storyboard_beats/S01_P01.png",
+                },
+                {
+                    "beat_id": "S01_P02",
+                    "storyboard_image": "storyboard_beats/S01_P02.png",
+                },
+            ],
+        }],
+    }
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps(storyboard), encoding="utf-8"
+    )
+    Image.effect_noise((128, 72), 80).convert("RGB").save(
+        beat_dir / "S01_P01.png"
+    )
+    Image.effect_noise((128, 72), 120).convert("RGB").save(
+        beat_dir / "S01_P02.png"
+    )
+    initial_hashes = storyboard_qa_gate._storyboard_panel_hashes(tmp_path)
+    preflight = _phase5_correction_live_preflight(
+        tmp_path,
+        initial_hashes["S01_P02"],
+        initial_hashes["S01_P01"],
+    )
+    monkeypatch.setattr(
+        phase5_correction_resume_live_acceptance,
+        "_continuation_preflight",
+        lambda *_args, **_kwargs: preflight,
+    )
+    monkeypatch.setattr(
+        phase5_correction_resume_live_acceptance,
+        "_build_exact_pxx_request",
+        lambda *_args, **_kwargs: _phase5_correction_live_request(preflight),
+    )
+    issue = storyboard_qa_gate._issue(
+        "L3", "moderate", "R4", "action mismatch", ["S01"],
+        storyboard_ids=["S01_P02"], mismatch_type="action",
+        expected="complete", observed="incomplete", confidence=0.95,
+        panel_evidence=[{
+            "shot_id": "S01_P02",
+            "observed": "incomplete",
+        }],
+    )
+    monkeypatch.setattr(
+        phase5_correction_resume_live_acceptance.storyboard_qa_gate,
+        "_load_completed_adjudication_correction",
+        lambda *_args, **_kwargs: {
+            "continuable": True,
+            "result": {"issues": [issue]},
+            "correction": {"attempts_used": 1, "max_attempts": 2},
+            "receipts": [],
+        },
+    )
+    raw_post_calls = []
+
+    def raw_post(*_args, **_kwargs):
+        raw_post_calls.append(True)
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        phase5_correction_resume_live_acceptance.seedream_client.requests,
+        "post",
+        raw_post,
+    )
+
+    class FakeImageClient:
+        model = "doubao-seedream-5.0-lite"
+
+        def text_to_image(self, prompt, output_path, *, size, timeout):
+            assert timeout == 180
+            phase5_correction_resume_live_acceptance.seedream_client.requests.post(
+                "https://example.invalid/images",
+                json={
+                    "model": self.model,
+                    "prompt": prompt,
+                    "size": size,
+                    "optimize_prompt_options": {"mode": "standard"},
+                    "response_format": "url",
+                    "sequential_image_generation": "disabled",
+                    "output_format": "png",
+                    "stream": False,
+                    "watermark": False,
+                },
+            )
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            Image.effect_noise((128, 72), 20).convert("RGB").save(output_path)
+            return "https://example.invalid/result.png"
+
+    result = phase5_correction_resume_live_acceptance.run_acceptance(
+        tmp_path,
+        submit=True,
+        expected_storyboard_id="S01_P02",
+        client_factory=FakeImageClient,
+    )
+
+    assert result["status"] == "passed"
+    assert result["provider_request_count"] == 1
+    assert result["provider_request_attempt_count"] == 1
+    assert result["image_operation_count"] == 1
+    assert result["image_operation_attempt_count"] == 1
+    assert result["provider_call_chain"]["status"] == "passed"
+    assert result["model_business_verdict"]["status"] == "not_provided"
+    assert all(result["business_assertions"].values())
+    assert len(raw_post_calls) == 1
+    assert (
+        tmp_path / "live_acceptance/phase5_correction/S01_P02.png"
+    ).is_file()
+    assert storyboard_qa_gate._storyboard_panel_hashes(tmp_path) == initial_hashes
+    with pytest.raises(RuntimeError, match="already consumed or attempted"):
+        phase5_correction_resume_live_acceptance.run_acceptance(
+            tmp_path,
+            submit=True,
+            expected_storyboard_id="S01_P02",
+            client_factory=lambda: pytest.fail(
+                "replay must fail before Provider client creation"
+            ),
+        )
+
+
+def test_phase5_correction_live_acceptance_blocks_second_raw_request(
+    monkeypatch,
+):
+    raw_calls = []
+
+    def raw_post(*_args, **_kwargs):
+        raw_calls.append(True)
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        phase5_correction_resume_live_acceptance.seedream_client.requests,
+        "post",
+        raw_post,
+    )
+    guard = phase5_correction_resume_live_acceptance.SinglePaidRequestTransport()
+    with guard:
+        assert (
+            phase5_correction_resume_live_acceptance.seedream_client.requests.post(
+                "https://example.invalid/images"
+            )
+            == {"ok": True}
+        )
+        with pytest.raises(
+            phase5_correction_resume_live_acceptance.ProviderRequestLimitError,
+            match="exactly one paid Provider request",
+        ):
+            phase5_correction_resume_live_acceptance.seedream_client.requests.post(
+                "https://example.invalid/images"
+            )
+
+    assert len(raw_calls) == 1
+    assert guard.provider_request_count == 1
+    assert guard.blocked_provider_request_count == 1
+
+
+def test_phase5_correction_live_acceptance_blocks_second_image_operation():
+    class FakeImageClient:
+        def text_to_image(self, *_args, **_kwargs):
+            return "https://example.invalid/result.png"
+
+    guard = (
+        phase5_correction_resume_live_acceptance.SinglePaidRequestImageClient(
+            FakeImageClient()
+        )
+    )
+
+    assert guard.text_to_image("first") == "https://example.invalid/result.png"
+    with pytest.raises(
+        phase5_correction_resume_live_acceptance.ProviderRequestLimitError,
+        match="exactly one Seedream image operation",
+    ):
+        guard.text_to_image("second")
+
+    assert guard.image_operation_count == 1
+    assert guard.image_operation_attempt_count == 2
+    assert guard.blocked_image_operation_count == 1
+
+
+def test_phase5_correction_live_acceptance_rejects_consumed_v2_receipt(
+    tmp_path,
+):
+    receipt_path = (
+        tmp_path / "phase5_correction_resume_live_acceptance.json"
+    )
+    receipt_path.write_text(
+        json.dumps({
+            "schema": "honcut.phase5-correction-resume-live-acceptance.v2",
+            "status": "live_acceptance_failed",
+            "submitted": True,
+            "provider_request_count": 1,
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="unknown .* receipt schema"):
+        phase5_correction_resume_live_acceptance.run_acceptance(
+            tmp_path,
+            submit=True,
+            expected_storyboard_id="S01_P02",
+            client_factory=lambda: pytest.fail(
+                "a consumed v2 receipt must fail before client construction"
+            ),
+        )
+
+
+def test_phase5_correction_live_receipt_keeps_first_provider_rejection(
+    monkeypatch,
+    tmp_path,
+):
+    from PIL import Image
+
+    beat_dir = tmp_path / "storyboard_beats"
+    beat_dir.mkdir()
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps({
+            "shots": [{
+                "id": "S01",
+                "storyboard_beats": [
+                    {
+                        "beat_id": "S01_P01",
+                        "storyboard_image": "storyboard_beats/S01_P01.png",
+                    },
+                    {
+                        "beat_id": "S01_P02",
+                        "storyboard_image": "storyboard_beats/S01_P02.png",
+                    },
+                ],
+            }],
+        }),
+        encoding="utf-8",
+    )
+    Image.effect_noise((128, 72), 80).convert("RGB").save(
+        beat_dir / "S01_P01.png"
+    )
+    Image.effect_noise((128, 72), 120).convert("RGB").save(
+        beat_dir / "S01_P02.png"
+    )
+    initial_hashes = storyboard_qa_gate._storyboard_panel_hashes(tmp_path)
+    preflight = _phase5_correction_live_preflight(
+        tmp_path,
+        initial_hashes["S01_P02"],
+        initial_hashes["S01_P01"],
+    )
+    monkeypatch.setattr(
+        phase5_correction_resume_live_acceptance,
+        "_continuation_preflight",
+        lambda *_args, **_kwargs: preflight,
+    )
+    monkeypatch.setattr(
+        phase5_correction_resume_live_acceptance,
+        "_build_exact_pxx_request",
+        lambda *_args, **_kwargs: _phase5_correction_live_request(preflight),
+    )
+    issue = storyboard_qa_gate._issue(
+        "L3", "moderate", "R4", "action mismatch", ["S01"],
+        storyboard_ids=["S01_P02"], mismatch_type="action",
+        expected="complete", observed="incomplete", confidence=0.95,
+        panel_evidence=[{
+            "shot_id": "S01_P02",
+            "observed": "incomplete",
+        }],
+    )
+    monkeypatch.setattr(
+        phase5_correction_resume_live_acceptance.storyboard_qa_gate,
+        "_load_completed_adjudication_correction",
+        lambda *_args, **_kwargs: {
+            "continuable": True,
+            "result": {"issues": [issue]},
+            "correction": {"attempts_used": 1, "max_attempts": 2},
+            "receipts": [],
+        },
+    )
+    raw_post_calls = []
+
+    def raw_post(*_args, **_kwargs):
+        raw_post_calls.append(True)
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        phase5_correction_resume_live_acceptance.seedream_client.requests,
+        "post",
+        raw_post,
+    )
+
+    class OutputSafetyRejection(RuntimeError):
+        status_code = 400
+        provider_code = "OutputImageSensitiveContentDetected"
+        request_id = "request-output-sensitive-123"
+
+    class RejectingImageClient:
+        model = "doubao-seedream-5.0-lite"
+
+        def text_to_image(self, prompt, output_path, *, size, timeout):
+            phase5_correction_resume_live_acceptance.seedream_client.requests.post(
+                "https://example.invalid/images",
+                json={
+                    "model": self.model,
+                    "prompt": prompt,
+                    "size": size,
+                    "optimize_prompt_options": {"mode": "standard"},
+                },
+            )
+            raise OutputSafetyRejection("output image rejected")
+
+    result = phase5_correction_resume_live_acceptance.run_acceptance(
+        tmp_path,
+        submit=True,
+        expected_storyboard_id="S01_P02",
+        client_factory=RejectingImageClient,
+    )
+
+    assert result["status"] == "live_acceptance_failed"
+    assert result["provider_request_count"] == 1
+    assert result["provider_request_attempt_count"] == 1
+    assert result["image_operation_count"] == 1
+    assert result["image_operation_attempt_count"] == 1
+    assert result["blocked_image_operation_count"] == 0
+    assert result["first_provider_error"] == {
+        "type": "OutputSafetyRejection",
+        "status_code": 400,
+        "provider_code": "OutputImageSensitiveContentDetected",
+        "request_id": "request-output-sensitive-123",
+        "message_sha256": hashlib.sha256(
+            b"OutputSafetyRejection: output image rejected"
+        ).hexdigest(),
+    }
+    assert len(raw_post_calls) == 1
+
+
+def test_phase5_persists_safe_receipt_when_adjudication_is_unavailable(tmp_path):
+    from PIL import Image
+
+    storyboard = {
+        "shots": [{
+            "id": "S01",
+            "storyboard_beats": [
+                {
+                    "beat_id": "S01_P01",
+                    "storyboard_image": "storyboard_beats/S01_P01.png",
+                },
+                {
+                    "beat_id": "S01_P02",
+                    "storyboard_image": "storyboard_beats/S01_P02.png",
+                },
+            ],
+        }],
+    }
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps(storyboard), encoding="utf-8"
+    )
+    beat_dir = tmp_path / "storyboard_beats"
+    beat_dir.mkdir()
+    Image.effect_noise((128, 72), 80).convert("RGB").save(
+        beat_dir / "S01_P01.png"
+    )
+    Image.effect_noise((128, 72), 120).convert("RGB").save(
+        beat_dir / "S01_P02.png"
+    )
+
+    def issue(storyboard_id):
+        return storyboard_qa_gate._issue(
+            "L3", "moderate", "R4", f"{storyboard_id} action mismatch", ["S01"],
+            storyboard_ids=[storyboard_id],
+            mismatch_type="action",
+            expected="actor reaches the canonical end state",
+            observed="actor remains in the wrong action",
+            confidence=0.95,
+            panel_evidence=[{
+                "shot_id": storyboard_id,
+                "observed": "actor remains in the wrong action",
+            }],
+        )
+
+    qa_calls = 0
+    qa_results = iter([
+        {
+            "status": "error", "grade": "C", "gate_passed": False,
+            "issues": [issue("S01_P01")],
+        },
+        {
+            "status": "error", "grade": "C", "gate_passed": False,
+            "issues": [issue("S01_P02")],
+        },
+    ])
+
+    def qa(_output_dir):
+        nonlocal qa_calls
+        qa_calls += 1
+        return next(qa_results)
+
+    def redraw(_output_dir, _shot_ids, _issues, attempt):
+        Image.effect_noise((128, 72), 40).convert("RGB").save(
+            beat_dir / "S01_P01.png"
+        )
+        return {"status": "redrawn", "attempt": attempt}
+
+    confirmation_calls = []
+
+    def unavailable(_output_dir, storyboard_ids):
+        confirmation_calls.append(storyboard_ids)
+        return {
+            "status": "error",
+            "grade": "D",
+            "gate_passed": False,
+            "issues": [storyboard_qa_gate._issue(
+                "L3",
+                "severe",
+                "storyboard_visual_review_unavailable",
+                "confirmation unavailable",
+                ["S01"],
+            )],
+            "layers": {
+                "L3": {
+                    "status": "error",
+                    "input_manifest_path": str(
+                        tmp_path / "phase5_review_adjudication_inputs.json"
+                    ),
+                    "request_count": 1,
+                    "provider_request_count": 1,
+                    "structured_review_batches": [{
+                        "request_id": "l3-s01",
+                        "shot_id": "S01",
+                        "status": "error",
+                        "error": "TimeoutError: token=supersecret",
+                    }],
+                }
+            },
+        }
+
+    result = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        max_correction_attempts=1,
+        qa_runner=qa,
+        redraw_runner=redraw,
+        adjudication_runner=unavailable,
+    )
+
+    assert result["status"] == "error"
+    assert qa_calls == 2
+    assert confirmation_calls == [["S01_P02"]]
+    report_text = (
+        tmp_path / "phase5_review_adjudication_report.json"
+    ).read_text(encoding="utf-8")
+    assert "supersecret" not in report_text
+    report = json.loads(report_text)
+    assert report["status"] == "blocked_unavailable"
+    pending = report["adjudications"][-1]
+    assert pending["schema"] == "honcut.phase5-review-adjudication.v1"
+    assert pending["status"] == "blocked_unavailable"
+    assert pending["storyboard_ids"] == ["S01_P02"]
+    assert pending["asset_sha256"]["S01_P02"] == hashlib.sha256(
+        (beat_dir / "S01_P02.png").read_bytes()
+    ).hexdigest()
+    assert "TimeoutError" in pending["safe_error"]
+    assert "[REDACTED]" in pending["safe_error"]
+    assert pending["report_snapshots"]["previous"]["sha256"]
+    assert pending["report_snapshots"]["current"]["sha256"]
+
+
+def test_phase5_explicit_resume_retries_only_pending_adjudication(tmp_path):
+    from PIL import Image
+
+    storyboard = {
+        "shots": [{
+            "id": "S01",
+            "storyboard_beats": [
+                {
+                    "beat_id": "S01_P01",
+                    "storyboard_image": "storyboard_beats/S01_P01.png",
+                },
+                {
+                    "beat_id": "S01_P02",
+                    "storyboard_image": "storyboard_beats/S01_P02.png",
+                },
+            ],
+        }],
+    }
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps(storyboard), encoding="utf-8"
+    )
+    beat_dir = tmp_path / "storyboard_beats"
+    beat_dir.mkdir()
+    for noise, storyboard_id in ((80, "S01_P01"), (120, "S01_P02")):
+        Image.effect_noise((128, 72), noise).convert("RGB").save(
+            beat_dir / f"{storyboard_id}.png"
+        )
+
+    def issue(storyboard_id):
+        return storyboard_qa_gate._issue(
+            "L3", "moderate", "R4", f"{storyboard_id} action mismatch", ["S01"],
+            storyboard_ids=[storyboard_id],
+            mismatch_type="action",
+            expected="actor reaches the canonical end state",
+            observed="actor remains in the wrong action",
+            confidence=0.95,
+            panel_evidence=[{
+                "shot_id": storyboard_id,
+                "observed": "actor remains in the wrong action",
+            }],
+        )
+
+    qa_results = iter([
+        {
+            "status": "error", "grade": "C", "gate_passed": False,
+            "issues": [issue("S01_P01")],
+        },
+        {
+            "status": "error", "grade": "C", "gate_passed": False,
+            "issues": [issue("S01_P02")],
+        },
+    ])
+
+    def redraw(_output_dir, _shot_ids, _issues, attempt):
+        Image.effect_noise((128, 72), 40).convert("RGB").save(
+            beat_dir / "S01_P01.png"
+        )
+        return {"status": "redrawn", "attempt": attempt}
+
+    failed = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        max_correction_attempts=1,
+        qa_runner=lambda _output_dir: next(qa_results),
+        redraw_runner=redraw,
+        adjudication_runner=lambda *_args: {
+            "status": "error",
+            "gate_passed": False,
+            "issues": [storyboard_qa_gate._issue(
+                "L3", "severe", "storyboard_visual_review_unavailable",
+                "temporary timeout", ["S01"],
+            )],
+            "layers": {"L3": {"status": "error", "error": "timeout"}},
+        },
+    )
+    assert failed["status"] == "error"
+
+    confirmation_calls = []
+
+    def confirmation(_output_dir, storyboard_ids):
+        confirmation_calls.append(storyboard_ids)
+        return {
+            "status": "done",
+            "grade": "A",
+            "gate_passed": True,
+            "issues": [],
+            "layers": {"L3": {"status": "completed"}},
+        }
+
+    resumed = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        max_correction_attempts=1,
+        qa_runner=lambda *_args: pytest.fail(
+            "explicit adjudication resume must not rerun full QA"
+        ),
+        redraw_runner=lambda *_args: pytest.fail(
+            "explicit adjudication resume must not redraw or call Seedream"
+        ),
+        adjudication_runner=confirmation,
+        resume_pending_adjudication=True,
+    )
+
+    assert confirmation_calls == [["S01_P02"]]
+    assert resumed["status"] == "done"
+    assert resumed["gate_passed"] is True
+    assert resumed["correction"]["final_gate_passed"] is True
+    assert resumed["correction"]["history"][-1]["status"] == "passed"
+    report = json.loads(
+        (tmp_path / "phase5_review_adjudication_report.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert report["status"] == "completed"
+    assert report["adjudications"][-1]["decisions"] == {
+        "S01_P02": "passed"
+    }
+
+
+def test_phase5_completed_blocking_adjudication_continues_remaining_previs_attempt(
+    tmp_path,
+):
+    from PIL import Image
+
+    storyboard = {
+        "shots": [{
+            "id": "S01",
+            "storyboard_beats": [
+                {
+                    "beat_id": "S01_P01",
+                    "storyboard_image": "storyboard_beats/S01_P01.png",
+                },
+                {
+                    "beat_id": "S01_P02",
+                    "storyboard_image": "storyboard_beats/S01_P02.png",
+                },
+            ],
+        }],
+    }
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps(storyboard), encoding="utf-8"
+    )
+    beat_dir = tmp_path / "storyboard_beats"
+    beat_dir.mkdir()
+    for noise, storyboard_id in ((80, "S01_P01"), (120, "S01_P02")):
+        Image.effect_noise((128, 72), noise).convert("RGB").save(
+            beat_dir / f"{storyboard_id}.png"
+        )
+
+    def issue(storyboard_id):
+        return storyboard_qa_gate._issue(
+            "L3", "moderate", "R4", f"{storyboard_id} action mismatch", ["S01"],
+            storyboard_ids=[storyboard_id],
+            mismatch_type="action",
+            expected="actor reaches the canonical end state",
+            observed="actor remains in the wrong action",
+            confidence=0.95,
+            panel_evidence=[{
+                "shot_id": storyboard_id,
+                "observed": "actor remains in the wrong action",
+            }],
+        )
+
+    first_qa_results = iter([
+        {
+            "status": "error", "grade": "C", "gate_passed": False,
+            "issues": [issue("S01_P01")],
+        },
+        {
+            "status": "error", "grade": "C", "gate_passed": False,
+            "issues": [issue("S01_P02")],
+        },
+    ])
+
+    def first_redraw(_output_dir, _shot_ids, _issues, attempt):
+        assert attempt == 1
+        Image.effect_noise((128, 72), 40).convert("RGB").save(
+            beat_dir / "S01_P01.png"
+        )
+        return {"status": "redrawn", "attempt": attempt}
+
+    failed = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        max_correction_attempts=2,
+        qa_runner=lambda _output_dir: next(first_qa_results),
+        redraw_runner=first_redraw,
+        adjudication_runner=lambda *_args: {
+            "status": "error",
+            "gate_passed": False,
+            "issues": [storyboard_qa_gate._issue(
+                "L3", "severe", "storyboard_visual_review_unavailable",
+                "temporary timeout", ["S01"],
+            )],
+            "layers": {"L3": {"status": "error", "error": "timeout"}},
+        },
+    )
+    assert failed["correction"]["attempts_used"] == 1
+
+    blocked = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        max_correction_attempts=2,
+        qa_runner=lambda *_args: pytest.fail(
+            "adjudication recovery must not rerun full QA"
+        ),
+        redraw_runner=lambda *_args: pytest.fail(
+            "adjudication recovery must not redraw"
+        ),
+        adjudication_runner=lambda _output_dir, storyboard_ids: {
+            "status": "error",
+            "grade": "C",
+            "gate_passed": False,
+            "storyboard_ids": storyboard_ids,
+            "issues": [issue("S01_P02")],
+            "layers": {"L3": {"status": "completed"}},
+        },
+        resume_pending_adjudication=True,
+    )
+    assert blocked["gate_passed"] is False
+    assert blocked["correction"]["attempts_used"] == 1
+    assert blocked["correction"]["history"][-1]["status"] == "rejected"
+
+    p02_bytes = (beat_dir / "S01_P02.png").read_bytes()
+    Image.effect_noise((128, 72), 15).convert("RGB").save(
+        beat_dir / "S01_P02.png"
+    )
+    refused = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        max_correction_attempts=2,
+        qa_runner=lambda *_args: pytest.fail(
+            "changed adjudication evidence must not rerun full QA"
+        ),
+        redraw_runner=lambda *_args: pytest.fail(
+            "changed adjudication evidence must not redraw"
+        ),
+        adjudication_runner=lambda *_args: pytest.fail(
+            "completed adjudication must not call the Provider again"
+        ),
+        resume_pending_adjudication=True,
+    )
+    assert refused["status"] == "error"
+    assert refused["correction"]["attempts_used"] == 1
+    assert "pixels changed" in refused["error"]
+    (beat_dir / "S01_P02.png").write_bytes(p02_bytes)
+
+    redraw_calls = []
+    qa_calls = 0
+
+    def remaining_redraw(_output_dir, _shot_ids, issues, attempt):
+        assert attempt == 2
+        target_ids = storyboard_qa_gate._correctable_storyboard_ids(issues)
+        redraw_calls.append((attempt, target_ids))
+        Image.effect_noise((128, 72), 20).convert("RGB").save(
+            beat_dir / "S01_P02.png"
+        )
+        return {"status": "redrawn", "attempt": attempt}
+
+    def final_qa(_output_dir):
+        nonlocal qa_calls
+        qa_calls += 1
+        assert redraw_calls == [(2, ["S01_P02"])]
+        return {
+            "status": "done", "grade": "A", "gate_passed": True,
+            "issues": [],
+        }
+
+    completed = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        max_correction_attempts=2,
+        qa_runner=final_qa,
+        redraw_runner=remaining_redraw,
+        adjudication_runner=lambda *_args: pytest.fail(
+            "completed adjudication must not spend a second confirmation request"
+        ),
+        resume_pending_adjudication=True,
+    )
+
+    assert completed["gate_passed"] is True
+    assert qa_calls == 1
+    assert redraw_calls == [(2, ["S01_P02"])]
+    assert completed["correction"]["attempts_used"] == 2
+    assert [
+        entry["attempt"] for entry in completed["correction"]["history"]
+    ] == [1, 2]
+    assert completed["correction"]["review_adjudications"][-1]["decisions"] == {
+        "S01_P02": "blocked"
+    }
+
+
+def test_phase5_pending_adjudication_resume_rejects_changed_pixels(tmp_path):
+    from PIL import Image
+
+    storyboard = {
+        "shots": [{
+            "id": "S01",
+            "storyboard_beats": [
+                {
+                    "beat_id": "S01_P01",
+                    "storyboard_image": "storyboard_beats/S01_P01.png",
+                },
+                {
+                    "beat_id": "S01_P02",
+                    "storyboard_image": "storyboard_beats/S01_P02.png",
+                },
+            ],
+        }],
+    }
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps(storyboard), encoding="utf-8"
+    )
+    beat_dir = tmp_path / "storyboard_beats"
+    beat_dir.mkdir()
+    for noise, storyboard_id in ((80, "S01_P01"), (120, "S01_P02")):
+        Image.effect_noise((128, 72), noise).convert("RGB").save(
+            beat_dir / f"{storyboard_id}.png"
+        )
+
+    def issue(storyboard_id):
+        return storyboard_qa_gate._issue(
+            "L3", "moderate", "R4", "action mismatch", ["S01"],
+            storyboard_ids=[storyboard_id], mismatch_type="action",
+            expected="complete", observed="incomplete", confidence=0.95,
+            panel_evidence=[{
+                "shot_id": storyboard_id,
+                "observed": "incomplete",
+            }],
+        )
+
+    qa_results = iter([
+        {"status": "error", "grade": "C", "gate_passed": False,
+         "issues": [issue("S01_P01")]},
+        {"status": "error", "grade": "C", "gate_passed": False,
+         "issues": [issue("S01_P02")]},
+    ])
+
+    def redraw(_output_dir, _shot_ids, _issues, attempt):
+        Image.effect_noise((128, 72), 40).convert("RGB").save(
+            beat_dir / "S01_P01.png"
+        )
+        return {"status": "redrawn", "attempt": attempt}
+
+    storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        max_correction_attempts=1,
+        qa_runner=lambda _output_dir: next(qa_results),
+        redraw_runner=redraw,
+        adjudication_runner=lambda *_args: {
+            "status": "error",
+            "gate_passed": False,
+            "issues": [storyboard_qa_gate._issue(
+                "L3", "severe", "storyboard_visual_review_unavailable",
+                "temporary timeout", ["S01"],
+            )],
+            "layers": {"L3": {"status": "error"}},
+        },
+    )
+    Image.effect_noise((128, 72), 15).convert("RGB").save(
+        beat_dir / "S01_P02.png"
+    )
+
+    resumed = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        qa_runner=lambda *_args: pytest.fail("must not rerun full QA"),
+        redraw_runner=lambda *_args: pytest.fail("must not redraw"),
+        adjudication_runner=lambda *_args: pytest.fail(
+            "changed evidence must be rejected before confirmation"
+        ),
+        resume_pending_adjudication=True,
+    )
+
+    assert resumed["status"] == "error"
+    assert resumed["gate_passed"] is False
+    report = json.loads(
+        (tmp_path / "phase5_review_adjudication_report.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert report["status"] == "blocked_evidence_changed"
+
+
+def test_phase5_pending_adjudication_resume_rejects_unknown_schema(tmp_path):
+    (tmp_path / "phase5_review_adjudication_report.json").write_text(
+        json.dumps({
+            "schema": "honcut.phase5-review-adjudications.v999",
+            "status": "blocked_unavailable",
+            "adjudications": [],
+        }),
+        encoding="utf-8",
+    )
+
+    result = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        qa_runner=lambda *_args: pytest.fail("unknown schema must not rerun QA"),
+        redraw_runner=lambda *_args: pytest.fail("unknown schema must not redraw"),
+        adjudication_runner=lambda *_args: pytest.fail(
+            "unknown schema must not call the Provider"
+        ),
+        resume_pending_adjudication=True,
+    )
+
+    assert result["status"] == "error"
+    assert result["gate_passed"] is False
+    assert "unknown Phase 5 review adjudication report schema" in result["error"]
+
+
+@pytest.mark.parametrize("layer", [{"status": "skipped"}, {}])
+def test_phase5_adjudication_requires_completed_l3_receipt(tmp_path, layer):
+    from PIL import Image
+
+    storyboard = {
+        "shots": [{
+            "id": "S01",
+            "storyboard_beats": [{
+                "beat_id": "S01_P01",
+                "storyboard_image": "storyboard_beats/S01_P01.png",
+            }],
+        }],
+    }
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps(storyboard), encoding="utf-8"
+    )
+    beat_dir = tmp_path / "storyboard_beats"
+    beat_dir.mkdir()
+    Image.effect_noise((128, 72), 80).convert("RGB").save(
+        beat_dir / "S01_P01.png"
+    )
+    panel_hashes = storyboard_qa_gate._storyboard_panel_hashes(tmp_path)
+    issue = storyboard_qa_gate._issue(
+        "L3", "moderate", "R4", "action mismatch", ["S01"],
+        storyboard_ids=["S01_P01"], mismatch_type="action",
+        expected="complete", observed="incomplete", confidence=0.95,
+        panel_evidence=[{"shot_id": "S01_P01", "observed": "incomplete"}],
+    )
+
+    with pytest.raises(
+        storyboard_qa_gate._ReviewAdjudicationBlocked
+    ) as blocked:
+        storyboard_qa_gate._adjudicate_unchanged_panel_flips(
+            tmp_path,
+            {"issues": []},
+            panel_hashes,
+            {"issues": [issue]},
+            panel_hashes,
+            lambda *_args: {
+                "status": "done",
+                "gate_passed": True,
+                "issues": [],
+                "layers": {"L3": layer},
+            },
+        )
+
+    assert blocked.value.receipt["status"] == "blocked_unavailable"
+
+
+def test_phase5_adjudication_exhaustion_fails_closed_without_confirmation(
+    tmp_path,
+):
+    from PIL import Image
+
+    storyboard = {
+        "shots": [{
+            "id": "S01",
+            "storyboard_beats": [{
+                "beat_id": "S01_P01",
+                "storyboard_image": "storyboard_beats/S01_P01.png",
+            }],
+        }],
+    }
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps(storyboard), encoding="utf-8"
+    )
+    beat_dir = tmp_path / "storyboard_beats"
+    beat_dir.mkdir()
+    Image.effect_noise((128, 72), 80).convert("RGB").save(
+        beat_dir / "S01_P01.png"
+    )
+    panel_hashes = storyboard_qa_gate._storyboard_panel_hashes(tmp_path)
+    issue = storyboard_qa_gate._issue(
+        "L3", "moderate", "R4", "action mismatch", ["S01"],
+        storyboard_ids=["S01_P01"], mismatch_type="action",
+        expected="complete", observed="incomplete", confidence=0.95,
+        panel_evidence=[{"shot_id": "S01_P01", "observed": "incomplete"}],
+    )
+
+    with pytest.raises(
+        storyboard_qa_gate._ReviewAdjudicationBlocked
+    ) as blocked:
+        storyboard_qa_gate._adjudicate_unchanged_panel_flips(
+            tmp_path,
+            {"issues": []},
+            panel_hashes,
+            {"issues": [issue]},
+            panel_hashes,
+            lambda *_args: pytest.fail(
+                "exhausted adjudication must not call confirmation"
+            ),
+            confirmation_allowed=False,
+        )
+
+    assert blocked.value.receipt["status"] == "blocked_exhausted"
+    report = json.loads(
+        (tmp_path / "phase5_review_adjudication_report.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert report["status"] == "blocked_exhausted"
+
+
+def test_phase5_explicit_resume_reconstructs_legacy_adjudication_failure(
+    tmp_path,
+):
+    from PIL import Image
+
+    storyboard = {
+        "shots": [{
+            "id": "S01",
+            "storyboard_beats": [
+                {
+                    "beat_id": "S01_P01",
+                    "storyboard_image": "storyboard_beats/S01_P01.png",
+                },
+                {
+                    "beat_id": "S01_P02",
+                    "storyboard_image": "storyboard_beats/S01_P02.png",
+                },
+            ],
+        }],
+    }
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps(storyboard), encoding="utf-8"
+    )
+    current_dir = tmp_path / "storyboard_beats"
+    archive = tmp_path / "phase5_corrections" / "attempt_01" / "before"
+    archived_beats = archive / "storyboard_beats"
+    current_dir.mkdir()
+    archived_beats.mkdir(parents=True)
+    Image.effect_noise((128, 72), 80).convert("RGB").save(
+        archived_beats / "S01_P01.png"
+    )
+    Image.effect_noise((128, 72), 40).convert("RGB").save(
+        current_dir / "S01_P01.png"
+    )
+    Image.effect_noise((128, 72), 120).convert("RGB").save(
+        archived_beats / "S01_P02.png"
+    )
+    (current_dir / "S01_P02.png").write_bytes(
+        (archived_beats / "S01_P02.png").read_bytes()
+    )
+
+    def issue(storyboard_id):
+        return storyboard_qa_gate._issue(
+            "L3", "moderate", "R4", "action mismatch", ["S01"],
+            storyboard_ids=[storyboard_id], mismatch_type="action",
+            expected="complete", observed="incomplete", confidence=0.95,
+            panel_evidence=[{
+                "shot_id": storyboard_id,
+                "observed": "incomplete",
+            }],
+        )
+
+    previous = {
+        "status": "error", "grade": "C", "gate_passed": False,
+        "issues": [issue("S01_P01")],
+    }
+    correction = {
+        "enabled": True,
+        "max_attempts": 1,
+        "attempts_used": 1,
+        "correction_family": "storyboard_previs",
+        "history": [{
+            "attempt": 1,
+            "status": "adjudication_error",
+            "correction_family": "storyboard_previs",
+            "shot_ids": ["S01"],
+            "storyboard_ids": ["S01_P01"],
+            "before_grade": "C",
+            "after_grade": "C",
+            "redraw": {
+                "archive": {
+                    "archive_dir": "phase5_corrections/attempt_01",
+                }
+            },
+            "error": (
+                "Phase 5 tie-break visual review is unavailable; refusing to "
+                "adjudicate unchanged pixels"
+            ),
+        }],
+        "review_adjudications": [],
+        "final_gate_passed": False,
+    }
+    current = {
+        "status": "error", "grade": "C", "gate_passed": False,
+        "issues": [issue("S01_P02")],
+        "correction": correction,
+        "error": "Phase 5 automatic correction failed: unavailable",
+    }
+    (archive / "storyboard_qa_report.json").write_text(
+        json.dumps(previous), encoding="utf-8"
+    )
+    (tmp_path / "storyboard_qa_report.json").write_text(
+        json.dumps(current), encoding="utf-8"
+    )
+    (tmp_path / "phase5_correction_report.json").write_text(
+        json.dumps(correction), encoding="utf-8"
+    )
+
+    resumed = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        qa_runner=lambda *_args: pytest.fail("legacy resume must not rerun QA"),
+        redraw_runner=lambda *_args: pytest.fail("legacy resume must not redraw"),
+        adjudication_runner=lambda _output_dir, storyboard_ids: {
+            "status": "done",
+            "grade": "A",
+            "gate_passed": True,
+            "storyboard_ids": storyboard_ids,
+            "issues": [],
+            "layers": {"L3": {"status": "completed"}},
+        },
+        resume_pending_adjudication=True,
+    )
+
+    assert resumed["status"] == "done"
+    report = json.loads(
+        (tmp_path / "phase5_review_adjudication_report.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert report["status"] == "completed"
+    assert report["adjudications"][0]["legacy_reconstructed"] is True
+    assert report["adjudications"][0]["storyboard_ids"] == ["S01_P02"]
+    assert report["adjudications"][-1]["decisions"] == {
+        "S01_P02": "passed"
+    }
+
+
+def test_sequential_phase5_forwards_explicit_adjudication_resume(
+    monkeypatch,
+    tmp_path,
+):
+    from runtime import pipeline_execution, run_manifest
+    from utils import artifact_chain
+
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps({"shots": []}), encoding="utf-8"
+    )
+    (tmp_path / "CHARACTERS.json").write_text(
+        json.dumps({"characters": []}), encoding="utf-8"
+    )
+    monkeypatch.setattr(artifact_chain, "can_resume_from", lambda *_args: True)
+    monkeypatch.setattr(
+        artifact_chain,
+        "invalidate_checkpoints_from",
+        lambda *_args: [],
+    )
+    monkeypatch.setattr(
+        pipeline_execution,
+        "invalidate_stage_checkpoint",
+        lambda *_args: [],
+    )
+    monkeypatch.setattr(
+        run_manifest,
+        "prepare_run_manifest",
+        lambda *_args, **_kwargs: {"run_fingerprint": "phase5-resume-test"},
+    )
+    captured = {}
+
+    def qa_with_correction(output_dir, **kwargs):
+        captured.update(output_dir=output_dir, kwargs=kwargs)
+        return {
+            "status": "error",
+            "grade": "D",
+            "gate_passed": False,
+            "error": "expected test stop",
+            "issues": [],
+        }
+
+    monkeypatch.setattr(
+        storyboard_qa_gate,
+        "run_storyboard_qa_with_correction",
+        qa_with_correction,
+    )
+    unused = lambda *_args, **_kwargs: pytest.fail(
+        "resume-from phase5 touched an out-of-scope Phase owner"
+    )
+    phase_owner = SimpleNamespace(
+        run_phase1=unused,
+        run_phase2=unused,
+        run_phase3=unused,
+        run_phase4=unused,
+        run_phase6=unused,
+        run_phase7=unused,
+        run_phase8=unused,
+        run_phase9=unused,
+        _run_storyboard_supervision=unused,
+    )
+
+    result = pipeline_execution._run_pipeline(
+        text="offline Phase 5 resume contract",
+        output_dir=str(tmp_path),
+        resume_from="phase5",
+        skip_phase=[6, 7, 8, 9, 9.5],
+        _phase_owner=phase_owner,
+        _force_sequential=True,
+    )
+
+    assert result["status"] == "failed"
+    assert captured["output_dir"] == tmp_path
+    assert captured["kwargs"]["resume_pending_adjudication"] is True
+
+
+def test_graph_phase5_forwards_explicit_adjudication_resume(
+    monkeypatch,
+    tmp_path,
+):
+    from graph import composition
+
+    captured = {}
+
+    def qa_with_correction(output_dir, **kwargs):
+        captured.update(output_dir=output_dir, kwargs=kwargs)
+        return {
+            "status": "error",
+            "gate_passed": False,
+            "error": "expected test stop",
+        }
+
+    monkeypatch.setattr(
+        storyboard_qa_gate,
+        "run_storyboard_qa_with_correction",
+        qa_with_correction,
+    )
+    composition.node_phase5_quality(
+        {
+            "output_dir": str(tmp_path),
+            "resume_from": "phase5",
+            "dry_run": False,
+            "storyboard": {"shots": []},
+            "phase_results": {},
+            "completed_phases": [],
+            "skip_phase": [],
+        },
+        phase_owner=SimpleNamespace(
+            _run_storyboard_supervision=lambda *_args: pytest.fail(
+                "failed Phase 5 must not reach supervision"
+            )
+        ),
+    )
+
+    assert captured["output_dir"] == tmp_path
+    assert captured["kwargs"]["resume_pending_adjudication"] is True
 
 
 def test_phase5_real_redraw_reuses_generator_and_archives_failed_shot(tmp_path):
@@ -6395,6 +8171,14 @@ def test_phase5_real_redraw_reuses_generator_and_archives_failed_shot(tmp_path):
             "observed": "保安撞破观察窗飞入太空",
         }],
     )
+    acceptance_request = (
+        phase5_correction_resume_live_acceptance._build_exact_pxx_request(
+            tmp_path,
+            state={"result": {"issues": [issue]}},
+            storyboard_id="S02_P01",
+            correction_attempt=1,
+        )
+    )
 
     receipt = storyboard_qa_gate._redraw_failed_storyboards(
         tmp_path,
@@ -6406,9 +8190,10 @@ def test_phase5_real_redraw_reuses_generator_and_archives_failed_shot(tmp_path):
 
     assert len(generated_prompts) == 6
     correction_prompt = generated_prompts[-2]
+    assert correction_prompt == acceptance_request["provider_prompt"]
     assert "Phase 5 定向纠偏合同" in correction_prompt
     assert "观察窗保持完整，Agent 稳定定格" in correction_prompt
-    assert "保安撞破观察窗飞入太空" in correction_prompt
+    assert "保安撞破观察窗飞入太空" not in correction_prompt
     archive = tmp_path / receipt["archive"]["archive_dir"] / "before"
     assert (archive / "storyboard_beats/S02_P01.png").is_file()
     assert (archive / "storyboard_qa_report.json").is_file()
@@ -6422,6 +8207,24 @@ def test_phase5_real_redraw_reuses_generator_and_archives_failed_shot(tmp_path):
         "regenerated_storyboard_ids": ["S02_P01"],
         "preserved_storyboard_ids": [],
     }
+    assert manifest["panel_prompt_template_id"] == (
+        "honcut.storyboard-panel-prompt"
+    )
+    assert manifest["panel_prompt_template_version"] == "2"
+    assert manifest["prompt_optimization"] == {"mode": "standard"}
+    target_sidecar = json.loads(
+        (tmp_path / "storyboard_beats/S02_P01.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert target_sidecar["panel_prompt_template_version"] == "2"
+    assert target_sidecar["prompt_optimization"] == {"mode": "standard"}
+    assert target_sidecar["correction_prompt_policy"] == (
+        "canonical-positive-projection-v2"
+    )
+    assert target_sidecar["first_request_safety_policy"] == (
+        "non_graphic_staged_conflict_v1"
+    )
     assert receipt["restored_cinematic_aliases"] == ["S02"]
     assert hashlib.sha256(cinematic_alias.read_bytes()).hexdigest() == alias_sha256
     assert json.loads(cinematic_alias_receipt.read_text(encoding="utf-8"))[

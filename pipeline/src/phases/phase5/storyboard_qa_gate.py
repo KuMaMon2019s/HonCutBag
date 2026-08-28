@@ -31,7 +31,9 @@ from phases.phase1.storyboard_beats import (
     secondary_storyboard_contract_errors,
     secondary_storyboard_requirements,
 )
+from runtime.security_boundaries import redact_for_log, redact_text
 from runtime.structured_understanding import (
+    DEFAULT_STRUCTURED_UNDERSTANDING_ATTEMPTS,
     StructuredUnderstandingExhausted,
     execute_structured_understanding,
 )
@@ -50,6 +52,17 @@ MAX_REVIEW_ADJUDICATIONS = 2
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
 PHASE5_DRY_RUN_RECEIPT_SCHEMA = "honcut.phase5-dry-run-receipt.v1"
 PHASE5_DRY_RUN_RECEIPT_NAME = "phase5_dry_run_receipt.json"
+PHASE5_REVIEW_ADJUDICATION_SCHEMA = "honcut.phase5-review-adjudication.v1"
+PHASE5_REVIEW_ADJUDICATIONS_SCHEMA = "honcut.phase5-review-adjudications.v1"
+PHASE5_REVIEW_ADJUDICATION_REPORT_NAME = (
+    "phase5_review_adjudication_report.json"
+)
+PHASE5_REVIEW_ADJUDICATION_PREVIOUS_REPORT_NAME = (
+    "phase5_review_adjudication_previous_report.json"
+)
+PHASE5_REVIEW_ADJUDICATION_CURRENT_REPORT_NAME = (
+    "phase5_review_adjudication_current_report.json"
+)
 PHASE5_DRY_RUN_SKIPPED_OPERATIONS = (
     "storyboard_pixel_artifact_validation",
     "embedding_review",
@@ -1703,6 +1716,11 @@ def run_l3_review(
     client: ArkMultimodalClient | None = None,
     *,
     character_reference_images: dict[str, list[Path]] | None = None,
+    evidence_dir: Path | None = None,
+    input_manifest_path: Path | None = None,
+    structured_understanding_max_attempts: int = (
+        DEFAULT_STRUCTURED_UNDERSTANDING_ATTEMPTS
+    ),
 ) -> tuple[list[dict], dict]:
     if not images:
         return [], {"status": "skipped", "skipped_reason": "no storyboard images available"}
@@ -1746,7 +1764,7 @@ def run_l3_review(
                 "path": str(path),
                 "sha256": _sha256_file(path),
             })
-    evidence_dir = grid_path.parent / "phase5_reference_boards"
+    evidence_dir = evidence_dir or grid_path.parent / "phase5_reference_boards"
     shot_boards = create_storyboard_shot_boards(
         storyboard,
         images,
@@ -1896,7 +1914,7 @@ def run_l3_review(
         })
 
     input_manifest_path = _write_l3_batched_input_manifest(
-        grid_path.parent / "storyboard_qa_inputs.json",
+        input_manifest_path or grid_path.parent / "storyboard_qa_inputs.json",
         input_records,
         requests,
     )
@@ -1940,7 +1958,8 @@ def run_l3_review(
                     execution["input_paths"],
                     execution["prompt"],
                     StoryboardVisualUnderstanding,
-                )
+                ),
+                max_attempts=structured_understanding_max_attempts,
             )
             parsed = typed_review.model_dump()
             raw_issue_count += len(parsed["issues"])
@@ -2312,6 +2331,160 @@ def run_storyboard_qa_gate(output_dir: Path, similarity_threshold: float | None 
         if any(issue.get("layer") == "L4" for issue in blocking_issues(issues)):
             report["recommended_restart_phase"] = "phase4"
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    return report
+
+
+def _storyboard_adjudication_scope(
+    storyboard: dict[str, Any],
+    storyboard_ids: list[str],
+) -> dict[str, Any]:
+    """Project canonical story data onto only the disputed Pxx evidence."""
+    targets = set(storyboard_ids)
+    scoped_shots: list[dict[str, Any]] = []
+    for shot_index, shot in enumerate(storyboard.get("shots") or []):
+        if not isinstance(shot, dict):
+            continue
+        shot_id = _shot_id(shot, shot_index)
+        scoped_beats = []
+        for position, beat in enumerate(shot.get("storyboard_beats") or [], 1):
+            if not isinstance(beat, dict):
+                continue
+            beat_id = str(beat.get("beat_id") or f"{shot_id}_P{position:02d}")
+            if beat_id in targets:
+                scoped_beats.append(copy.deepcopy(beat))
+        if not scoped_beats:
+            continue
+        scoped_shot = copy.deepcopy(shot)
+        scoped_shot["storyboard_beats"] = scoped_beats
+        scoped_shots.append(scoped_shot)
+    return {"shots": scoped_shots}
+
+
+def _adjudication_unavailable_report(
+    storyboard_ids: list[str],
+    error: BaseException | str,
+) -> dict[str, Any]:
+    safe_error = redact_text(str(error))
+    shot_ids = sorted({_parent_shot_id(value) for value in storyboard_ids})
+    issue = _issue(
+        "L3",
+        "severe",
+        "storyboard_visual_review_unavailable",
+        f"Narrow storyboard adjudication is unavailable: {safe_error}",
+        shot_ids,
+    )
+    return {
+        "status": "error",
+        "grade": "D",
+        "gate_passed": False,
+        "issues": [issue],
+        "failed_shot_ids": shot_ids,
+        "layers": {
+            "L3": {
+                "status": "error",
+                "request_count": 0,
+                "provider_request_count": 0,
+                "error": safe_error,
+            }
+        },
+    }
+
+
+def _run_storyboard_adjudication_review(
+    output_dir: Path,
+    storyboard_ids: list[str],
+    *,
+    multimodal_client: ArkMultimodalClient | None = None,
+    structured_understanding_max_attempts: int = (
+        DEFAULT_STRUCTURED_UNDERSTANDING_ATTEMPTS
+    ),
+) -> dict[str, Any]:
+    """Run one strict L3-only review against the exact disputed Pxx pixels."""
+    output_dir = Path(output_dir)
+    targets = sorted(dict.fromkeys(str(value) for value in storyboard_ids if value))
+    try:
+        storyboard = json.loads(
+            (output_dir / "STORYBOARD.json").read_text(encoding="utf-8")
+        )
+        characters_path = output_dir / "CHARACTERS.json"
+        characters = (
+            json.loads(characters_path.read_text(encoding="utf-8"))
+            if characters_path.is_file()
+            else {"characters": []}
+        )
+        style_path = output_dir / "visual-style.md"
+        visual_style = (
+            style_path.read_text(encoding="utf-8") if style_path.is_file() else ""
+        )
+        scoped_storyboard = _storyboard_adjudication_scope(storyboard, targets)
+        images = {
+            storyboard_id: path
+            for storyboard_id, path in find_storyboard_beat_images(
+                output_dir, storyboard
+            ).items()
+            if storyboard_id in set(targets)
+        }
+        scoped_ids = {
+            str(beat.get("beat_id") or "")
+            for shot in scoped_storyboard.get("shots") or []
+            for beat in shot.get("storyboard_beats") or []
+            if isinstance(beat, dict)
+        }
+        if not targets or scoped_ids != set(targets) or set(images) != set(targets):
+            raise ValueError(
+                "disputed storyboard IDs do not resolve to exact canonical Pxx pixels"
+            )
+        character_reference_images = find_character_reference_images(
+            output_dir,
+            characters,
+        )
+        issues, layer = run_l3_review(
+            scoped_storyboard,
+            characters,
+            visual_style,
+            images,
+            output_dir / "phase5_review_adjudication_grid.jpg",
+            multimodal_client,
+            character_reference_images=character_reference_images,
+            evidence_dir=output_dir / "phase5_review_adjudication_evidence",
+            input_manifest_path=(
+                output_dir / "phase5_review_adjudication_inputs.json"
+            ),
+            structured_understanding_max_attempts=(
+                structured_understanding_max_attempts
+            ),
+        )
+        grade = grade_issues(issues)
+        gate_passed = grade in {"A", "B"} and layer.get("status") == "completed"
+        report = {
+            "status": "done" if gate_passed else "error",
+            "grade": grade,
+            "gate_passed": gate_passed,
+            "scope": "unchanged_panel_adjudication_l3_only",
+            "storyboard_ids": targets,
+            "issues": issues,
+            "failed_shot_ids": sorted({
+                shot_id
+                for issue in blocking_issues(issues)
+                for shot_id in issue.get("shot_ids") or []
+            }),
+            "layers": {"L3": layer},
+            "outputs": [
+                "phase5_review_adjudication_confirmation.json",
+                "phase5_review_adjudication_inputs.json",
+                "phase5_review_adjudication_grid.jpg",
+            ],
+        }
+        if not gate_passed:
+            report["error"] = (
+                "Narrow Phase 5 L3 adjudication did not produce a passing verdict"
+            )
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        report = _adjudication_unavailable_report(targets, exc)
+    _atomic_json(
+        output_dir / "phase5_review_adjudication_confirmation.json",
+        report,
+    )
     return report
 
 
@@ -2699,6 +2872,14 @@ def _storyboard_panel_hashes(output_dir: Path) -> dict[str, str]:
         )
     except (OSError, json.JSONDecodeError):
         return {}
+    return _storyboard_panel_hashes_for_storyboard(output_dir, storyboard)
+
+
+def _storyboard_panel_hashes_for_storyboard(
+    output_dir: Path,
+    storyboard: dict[str, Any],
+) -> dict[str, str]:
+    """Hash Pxx evidence from an explicit root, including immutable archives."""
     return {
         storyboard_id: _sha256_file(path)
         for storyboard_id, path in find_storyboard_beat_images(
@@ -2773,13 +2954,191 @@ def _recompute_qa_verdict(
     return reconciled
 
 
+class _ReviewAdjudicationBlocked(RuntimeError):
+    """Carry the persisted fail-closed receipt to the Phase 5 correction owner."""
+
+    def __init__(self, message: str, receipt: dict[str, Any]):
+        super().__init__(message)
+        self.receipt = receipt
+
+
+def _adjudication_snapshot(
+    output_dir: Path,
+    name: str,
+    report: dict[str, Any],
+) -> dict[str, str]:
+    path = output_dir / name
+    _atomic_json(path, report)
+    return {"path": name, "sha256": _sha256_file(path)}
+
+
+def _adjudication_confirmation_audit(
+    output_dir: Path,
+    confirmation: dict[str, Any],
+) -> tuple[dict[str, Any], str]:
+    """Keep request/error receipts while excluding prompts and raw responses."""
+    layers = confirmation.get("layers")
+    layer = layers.get("L3") if isinstance(layers, dict) else {}
+    layer = layer if isinstance(layer, dict) else {}
+    audit: dict[str, Any] = {
+        key: copy.deepcopy(layer[key])
+        for key in (
+            "status",
+            "request_count",
+            "provider_request_count",
+            "input_count",
+            "provider_input_count",
+            "raw_issue_count",
+            "filtered_non_issue_count",
+            "accepted_issue_count",
+            "skipped_reason",
+        )
+        if key in layer
+    }
+    errors: list[str] = []
+    for key in ("error", "skipped_reason"):
+        value = layer.get(key)
+        if value:
+            errors.append(str(value))
+    batches = []
+    for batch in layer.get("structured_review_batches") or []:
+        if not isinstance(batch, dict):
+            continue
+        selected = {
+            key: copy.deepcopy(batch[key])
+            for key in (
+                "request_id",
+                "shot_id",
+                "status",
+                "input_count",
+                "raw_issue_count",
+                "error",
+                "structured_review_execution",
+            )
+            if key in batch
+        }
+        if selected.get("error"):
+            errors.append(str(selected["error"]))
+        batches.append(redact_for_log(selected))
+    if batches:
+        audit["structured_review_batches"] = batches
+    manifest_value = layer.get("input_manifest_path")
+    if manifest_value:
+        manifest_path = Path(str(manifest_value))
+        try:
+            manifest_path.resolve().relative_to(output_dir.resolve())
+        except (OSError, ValueError):
+            manifest_path = Path()
+        if manifest_path.is_file():
+            audit["input_manifest"] = {
+                "path": manifest_path.name,
+                "sha256": _sha256_file(manifest_path),
+            }
+    if not errors and confirmation.get("error"):
+        errors.append(str(confirmation["error"]))
+    safe_error = redact_text("; ".join(errors) or "visual confirmation unavailable")
+    return redact_for_log(audit), safe_error
+
+
+def _write_review_adjudication_report(
+    output_dir: Path,
+    receipts: list[dict[str, Any]],
+) -> None:
+    status = str(receipts[-1].get("status") or "error") if receipts else "error"
+    _atomic_json(
+        output_dir / PHASE5_REVIEW_ADJUDICATION_REPORT_NAME,
+        {
+            "schema": PHASE5_REVIEW_ADJUDICATIONS_SCHEMA,
+            "status": status,
+            "adjudications": receipts,
+        },
+    )
+
+
+def _pending_adjudication_receipt(
+    output_dir: Path,
+    previous: dict[str, Any],
+    current: dict[str, Any],
+    disputed: list[str],
+    current_hashes: dict[str, str],
+    *,
+    status: str,
+    safe_error: str,
+    confirmation: dict[str, Any] | None,
+    after_correction_attempt: int | None,
+    legacy_reconstructed: bool = False,
+) -> dict[str, Any]:
+    previous_map = _blocking_storyboard_issue_map(previous)
+    current_map = _blocking_storyboard_issue_map(current)
+    confirmation_map = (
+        _blocking_storyboard_issue_map(confirmation)
+        if isinstance(confirmation, dict)
+        else {}
+    )
+    confirmation_audit: dict[str, Any] = {}
+    if isinstance(confirmation, dict):
+        confirmation_audit, audited_error = _adjudication_confirmation_audit(
+            output_dir, confirmation
+        )
+        safe_error = audited_error or safe_error
+    receipt: dict[str, Any] = {
+        "schema": PHASE5_REVIEW_ADJUDICATION_SCHEMA,
+        "status": status,
+        "reason": "unchanged_panel_verdict_flip",
+        "storyboard_ids": disputed,
+        "asset_sha256": {
+            storyboard_id: current_hashes[storyboard_id]
+            for storyboard_id in disputed
+            if storyboard_id in current_hashes
+        },
+        "input_artifacts": _phase5_input_artifacts(output_dir),
+        "votes": {
+            storyboard_id: {
+                "previous_blocked": storyboard_id in previous_map,
+                "current_blocked": storyboard_id in current_map,
+                "confirmation_blocked": (
+                    storyboard_id in confirmation_map
+                    if confirmation is not None
+                    and status not in {"blocked_unavailable", "blocked_evidence_changed"}
+                    else None
+                ),
+            }
+            for storyboard_id in disputed
+        },
+        "decisions": {storyboard_id: "unresolved" for storyboard_id in disputed},
+        "safe_error": redact_text(safe_error),
+        "confirmation": confirmation_audit,
+        "report_snapshots": {
+            "previous": _adjudication_snapshot(
+                output_dir,
+                PHASE5_REVIEW_ADJUDICATION_PREVIOUS_REPORT_NAME,
+                previous,
+            ),
+            "current": _adjudication_snapshot(
+                output_dir,
+                PHASE5_REVIEW_ADJUDICATION_CURRENT_REPORT_NAME,
+                current,
+            ),
+        },
+    }
+    if after_correction_attempt is not None:
+        receipt["after_correction_attempt"] = after_correction_attempt
+    if legacy_reconstructed:
+        receipt["legacy_reconstructed"] = True
+    return receipt
+
+
 def _adjudicate_unchanged_panel_flips(
     output_dir: Path,
     previous: dict[str, Any],
     previous_hashes: dict[str, str],
     current: dict[str, Any],
     current_hashes: dict[str, str],
-    qa: Callable[[Path], dict[str, Any]],
+    confirmation_runner: Callable[[Path, list[str]], dict[str, Any]],
+    *,
+    after_correction_attempt: int | None = None,
+    prior_receipts: list[dict[str, Any]] | None = None,
+    confirmation_allowed: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Use one bounded tie-break review when unchanged pixels flip verdict.
 
@@ -2798,24 +3157,89 @@ def _adjudicate_unchanged_panel_flips(
     if not disputed:
         return current, None
 
-    confirmation = qa(output_dir)
+    if not confirmation_allowed:
+        receipt = _pending_adjudication_receipt(
+            output_dir,
+            previous,
+            current,
+            disputed,
+            current_hashes,
+            status="blocked_exhausted",
+            safe_error="Phase 5 review adjudication budget is exhausted",
+            confirmation=None,
+            after_correction_attempt=after_correction_attempt,
+        )
+        _write_review_adjudication_report(
+            output_dir, [*(prior_receipts or []), receipt]
+        )
+        raise _ReviewAdjudicationBlocked(
+            "Phase 5 review adjudication budget is exhausted",
+            receipt,
+        )
+
+    try:
+        confirmation = confirmation_runner(output_dir, disputed)
+    except Exception as exc:
+        confirmation = _adjudication_unavailable_report(
+            disputed,
+            f"{type(exc).__name__}: {redact_text(str(exc))}",
+        )
+    if not isinstance(confirmation, dict):
+        confirmation = _adjudication_unavailable_report(
+            disputed,
+            "confirmation runner returned a non-object result",
+        )
     confirmation_hashes = _storyboard_panel_hashes(output_dir)
     if any(
         confirmation_hashes.get(storyboard_id) != current_hashes.get(storyboard_id)
         for storyboard_id in disputed
     ):
-        raise RuntimeError(
-            "Phase 5 QA mutated Pxx pixels during verdict adjudication"
+        receipt = _pending_adjudication_receipt(
+            output_dir,
+            previous,
+            current,
+            disputed,
+            current_hashes,
+            status="blocked_evidence_changed",
+            safe_error="Pxx pixels changed during verdict adjudication",
+            confirmation=confirmation,
+            after_correction_attempt=after_correction_attempt,
+        )
+        _write_review_adjudication_report(
+            output_dir, [*(prior_receipts or []), receipt]
+        )
+        raise _ReviewAdjudicationBlocked(
+            "Phase 5 QA mutated Pxx pixels during verdict adjudication",
+            receipt,
         )
     confirmation_map = _blocking_storyboard_issue_map(confirmation)
+    confirmation_layer = (confirmation.get("layers") or {}).get("L3", {})
     unavailable = any(
         str(issue.get("code") or "") == "storyboard_visual_review_unavailable"
         for issue in confirmation.get("issues") or []
-    )
+    ) or str(confirmation_layer.get("status") or "") != "completed"
     if unavailable:
-        raise RuntimeError(
+        _, safe_error = _adjudication_confirmation_audit(
+            output_dir, confirmation
+        )
+        receipt = _pending_adjudication_receipt(
+            output_dir,
+            previous,
+            current,
+            disputed,
+            current_hashes,
+            status="blocked_unavailable",
+            safe_error=safe_error,
+            confirmation=confirmation,
+            after_correction_attempt=after_correction_attempt,
+        )
+        _write_review_adjudication_report(
+            output_dir, [*(prior_receipts or []), receipt]
+        )
+        raise _ReviewAdjudicationBlocked(
             "Phase 5 tie-break visual review is unavailable; refusing to "
-            "adjudicate unchanged pixels"
+            f"adjudicate unchanged pixels: {receipt['safe_error']}",
+            receipt,
         )
 
     decisions: dict[str, bool] = {}
@@ -2868,7 +3292,7 @@ def _adjudicate_unchanged_panel_flips(
 
     reconciled = _recompute_qa_verdict(current, issues)
     receipt = {
-        "schema": "honcut.phase5-review-adjudication.v1",
+        "schema": PHASE5_REVIEW_ADJUDICATION_SCHEMA,
         "status": "completed",
         "reason": "unchanged_panel_verdict_flip",
         "storyboard_ids": disputed,
@@ -2883,6 +3307,11 @@ def _adjudicate_unchanged_panel_flips(
         },
         "confirmation_layers": copy.deepcopy(confirmation.get("layers") or {}),
     }
+    if after_correction_attempt is not None:
+        receipt["after_correction_attempt"] = after_correction_attempt
+    _write_review_adjudication_report(
+        output_dir, [*(prior_receipts or []), receipt]
+    )
     return reconciled, receipt
 
 
@@ -3310,15 +3739,439 @@ def _redraw_failed_storyboards(
     return receipt
 
 
+def _read_json_object(path: Path) -> dict[str, Any]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"{path.name} must contain one JSON object")
+    return value
+
+
+def _load_adjudication_snapshot(
+    output_dir: Path,
+    reference: dict[str, Any],
+    expected_name: str,
+) -> dict[str, Any]:
+    if str(reference.get("path") or "") != expected_name:
+        raise ValueError(f"adjudication snapshot must be {expected_name}")
+    path = output_dir / expected_name
+    if not path.is_file() or _sha256_file(path) != reference.get("sha256"):
+        raise ValueError(f"adjudication snapshot {expected_name} is missing or changed")
+    return _read_json_object(path)
+
+
+def _reconstruct_legacy_pending_adjudication(
+    output_dir: Path,
+) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+    """Recover the pre-receipt failure shape without rerunning image generation."""
+    correction_path = output_dir / "phase5_correction_report.json"
+    current_path = output_dir / "storyboard_qa_report.json"
+    storyboard_path = output_dir / "STORYBOARD.json"
+    if not (
+        correction_path.is_file()
+        and current_path.is_file()
+        and storyboard_path.is_file()
+    ):
+        return None
+    correction = _read_json_object(correction_path)
+    history = correction.get("history")
+    if not isinstance(history, list) or not history:
+        return None
+    last = history[-1]
+    if not isinstance(last, dict) or last.get("status") != "adjudication_error":
+        return None
+    error = str(last.get("error") or "")
+    if "tie-break visual review is unavailable" not in error:
+        return None
+    archive_dir = str(
+        (((last.get("redraw") or {}).get("archive") or {}).get("archive_dir"))
+        or ""
+    )
+    previous_path = output_dir / archive_dir / "before" / "storyboard_qa_report.json"
+    try:
+        previous_path.resolve().relative_to(output_dir.resolve())
+    except (OSError, ValueError):
+        raise ValueError("legacy adjudication archive escapes the run directory")
+    if not previous_path.is_file():
+        raise ValueError("legacy adjudication archive is incomplete")
+    previous = _read_json_object(previous_path)
+    current = _read_json_object(current_path)
+    storyboard = _read_json_object(storyboard_path)
+    previous_hashes = _storyboard_panel_hashes_for_storyboard(
+        previous_path.parent,
+        storyboard,
+    )
+    current_hashes = _storyboard_panel_hashes_for_storyboard(
+        output_dir,
+        storyboard,
+    )
+    previous_map = _blocking_storyboard_issue_map(previous)
+    current_map = _blocking_storyboard_issue_map(current)
+    disputed = sorted(
+        storyboard_id
+        for storyboard_id in set(previous_map) ^ set(current_map)
+        if previous_hashes.get(storyboard_id)
+        and previous_hashes.get(storyboard_id) == current_hashes.get(storyboard_id)
+    )
+    if not disputed:
+        raise ValueError(
+            "legacy adjudication failure has no unchanged disputed Pxx evidence"
+        )
+    receipt = _pending_adjudication_receipt(
+        output_dir,
+        previous,
+        current,
+        disputed,
+        current_hashes,
+        status="blocked_unavailable",
+        safe_error=(
+            f"{error}; original confirmation transport details were not retained"
+        ),
+        confirmation=None,
+        after_correction_attempt=int(last.get("attempt") or 0) or None,
+        legacy_reconstructed=True,
+    )
+    _write_review_adjudication_report(output_dir, [receipt])
+    return receipt, [receipt]
+
+
+def _load_pending_adjudication(
+    output_dir: Path,
+) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+    report_path = output_dir / PHASE5_REVIEW_ADJUDICATION_REPORT_NAME
+    if not report_path.is_file():
+        return _reconstruct_legacy_pending_adjudication(output_dir)
+    report = _read_json_object(report_path)
+    if report.get("schema") != PHASE5_REVIEW_ADJUDICATIONS_SCHEMA:
+        raise ValueError("unknown Phase 5 review adjudication report schema")
+    receipts = report.get("adjudications")
+    if not isinstance(receipts, list) or not receipts:
+        raise ValueError("Phase 5 review adjudication report has no receipts")
+    if report.get("status") == "completed":
+        return None
+    pending = receipts[-1]
+    if not isinstance(pending, dict):
+        raise ValueError("Phase 5 review adjudication receipt must be an object")
+    if pending.get("schema") != PHASE5_REVIEW_ADJUDICATION_SCHEMA:
+        raise ValueError("unknown Phase 5 review adjudication receipt schema")
+    return pending, copy.deepcopy(receipts)
+
+
+def _load_completed_adjudication_correction(
+    output_dir: Path,
+) -> dict[str, Any] | None:
+    """Load a completed tie-break without resetting its correction budget."""
+    adjudication_path = output_dir / PHASE5_REVIEW_ADJUDICATION_REPORT_NAME
+    if not adjudication_path.is_file():
+        return None
+    report = _read_json_object(adjudication_path)
+    if report.get("schema") != PHASE5_REVIEW_ADJUDICATIONS_SCHEMA:
+        raise ValueError("unknown Phase 5 review adjudication report schema")
+    if report.get("status") != "completed":
+        return None
+    receipts = report.get("adjudications")
+    if not isinstance(receipts, list) or not receipts:
+        raise ValueError("completed Phase 5 adjudication report has no receipts")
+    completed = receipts[-1]
+    if not isinstance(completed, dict):
+        raise ValueError("completed Phase 5 adjudication receipt must be an object")
+    if completed.get("schema") != PHASE5_REVIEW_ADJUDICATION_SCHEMA:
+        raise ValueError("unknown Phase 5 review adjudication receipt schema")
+    if completed.get("status") != "completed":
+        raise ValueError("Phase 5 adjudication report status disagrees with its receipt")
+
+    qa_path = output_dir / "storyboard_qa_report.json"
+    correction_path = output_dir / "phase5_correction_report.json"
+    if not qa_path.is_file() or not correction_path.is_file():
+        raise ValueError("completed Phase 5 adjudication has incomplete correction state")
+    result = _read_json_object(qa_path)
+    correction = _read_json_object(correction_path)
+    if result.get("correction") != correction:
+        raise ValueError("Phase 5 correction report disagrees with the QA report")
+    if result.get("review_adjudications") != receipts:
+        raise ValueError("Phase 5 QA report lost adjudication history")
+    if correction.get("review_adjudications") != receipts:
+        raise ValueError("Phase 5 correction report lost adjudication history")
+
+    history = correction.get("history")
+    if not isinstance(history, list) or not history:
+        raise ValueError("completed Phase 5 adjudication has no correction history")
+    attempts_used = correction.get("attempts_used")
+    if isinstance(attempts_used, bool) or not isinstance(attempts_used, int):
+        raise ValueError("Phase 5 correction attempt count is invalid")
+    if attempts_used != len(history):
+        raise ValueError("Phase 5 correction attempt count disagrees with history")
+    if any(
+        not isinstance(entry, dict) or entry.get("attempt") != index
+        for index, entry in enumerate(history, 1)
+    ):
+        raise ValueError("Phase 5 correction attempt history is not contiguous")
+    after_attempt = completed.get("after_correction_attempt")
+    if (
+        isinstance(after_attempt, bool)
+        or not isinstance(after_attempt, int)
+        or after_attempt < 1
+        or after_attempt > attempts_used
+    ):
+        raise ValueError("completed Phase 5 adjudication attempt lineage changed")
+    if history[after_attempt - 1].get("review_adjudication") != completed:
+        raise ValueError("completed Phase 5 adjudication is not bound to correction history")
+
+    decisions = completed.get("decisions")
+    if not isinstance(decisions, dict) or not decisions:
+        raise ValueError("completed Phase 5 adjudication has no decisions")
+    if any(value not in {"passed", "blocked"} for value in decisions.values()):
+        raise ValueError("completed Phase 5 adjudication has an unknown decision")
+    continuable = after_attempt == attempts_used
+    if continuable:
+        asset_hashes = completed.get("asset_sha256")
+        if (
+            not isinstance(asset_hashes, dict)
+            or sorted(asset_hashes) != sorted(decisions)
+        ):
+            raise ValueError("completed Phase 5 adjudication asset scope changed")
+        current_hashes = _storyboard_panel_hashes(output_dir)
+        if any(
+            current_hashes.get(storyboard_id) != asset_hashes.get(storyboard_id)
+            for storyboard_id in decisions
+        ):
+            raise ValueError("completed Phase 5 adjudication pixels changed")
+
+        lineage_receipt = next(
+            (
+                receipt
+                for receipt in reversed(receipts)
+                if isinstance(receipt, dict)
+                and isinstance(receipt.get("input_artifacts"), list)
+            ),
+            None,
+        )
+        if (
+            lineage_receipt is None
+            or lineage_receipt.get("input_artifacts")
+            != _phase5_input_artifacts(output_dir)
+        ):
+            raise ValueError("completed Phase 5 adjudication input lineage changed")
+
+        issue_map = _blocking_storyboard_issue_map(result)
+        for storyboard_id, decision in decisions.items():
+            if decision == "blocked" and storyboard_id not in issue_map:
+                raise ValueError("blocked adjudication decision lost its QA evidence")
+            if decision == "passed" and storyboard_id in issue_map:
+                raise ValueError("passed adjudication decision still has blocking QA evidence")
+    return {
+        "result": copy.deepcopy(result),
+        "correction": copy.deepcopy(correction),
+        "receipts": copy.deepcopy(receipts),
+        "continuable": continuable,
+    }
+
+
+def _adjudication_resume_result(
+    output_dir: Path,
+    base_result: dict[str, Any],
+    correction: dict[str, Any],
+    receipts: list[dict[str, Any]],
+    *,
+    error: str | None = None,
+) -> dict[str, Any]:
+    result = copy.deepcopy(base_result)
+    result["correction"] = correction
+    result["review_adjudications"] = copy.deepcopy(receipts)
+    outputs = list(result.get("outputs") or [])
+    for name in (
+        PHASE5_REVIEW_ADJUDICATION_REPORT_NAME,
+        "phase5_correction_report.json",
+    ):
+        if name not in outputs:
+            outputs.append(name)
+    result["outputs"] = outputs
+    if error:
+        result.update(status="error", gate_passed=False, error=error)
+    _atomic_json(output_dir / "phase5_correction_report.json", correction)
+    _atomic_json(output_dir / "storyboard_qa_report.json", result)
+    return result
+
+
+def _resume_pending_review_adjudication(
+    output_dir: Path,
+    confirmation_runner: Callable[[Path, list[str]], dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Resume only an exact failed confirmation; never rerun QA or redraw."""
+    try:
+        loaded = _load_pending_adjudication(output_dir)
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        result = {
+            "status": "error",
+            "grade": "D",
+            "gate_passed": False,
+            "issues": [],
+            "failed_shot_ids": [],
+            "error": f"Phase 5 adjudication resume refused: {redact_text(str(exc))}",
+        }
+        _atomic_json(output_dir / "storyboard_qa_report.json", result)
+        return result
+    if loaded is None:
+        return None
+    pending, prior_receipts = loaded
+    try:
+        snapshots = pending.get("report_snapshots")
+        if not isinstance(snapshots, dict):
+            raise ValueError("pending adjudication has no report snapshots")
+        previous = _load_adjudication_snapshot(
+            output_dir,
+            snapshots.get("previous") or {},
+            PHASE5_REVIEW_ADJUDICATION_PREVIOUS_REPORT_NAME,
+        )
+        current = _load_adjudication_snapshot(
+            output_dir,
+            snapshots.get("current") or {},
+            PHASE5_REVIEW_ADJUDICATION_CURRENT_REPORT_NAME,
+        )
+        base_result = _read_json_object(output_dir / "storyboard_qa_report.json")
+        expected_inputs = pending.get("input_artifacts")
+        if expected_inputs != _phase5_input_artifacts(output_dir):
+            raise ValueError("Phase 5 input artifact lineage changed")
+        disputed = pending.get("storyboard_ids")
+        if not isinstance(disputed, list) or not disputed:
+            raise ValueError("pending adjudication has no disputed storyboard IDs")
+        disputed = [str(value) for value in disputed]
+        current_hashes = _storyboard_panel_hashes(output_dir)
+        asset_hashes = pending.get("asset_sha256")
+        if not isinstance(asset_hashes, dict) or any(
+            current_hashes.get(storyboard_id) != asset_hashes.get(storyboard_id)
+            for storyboard_id in disputed
+        ):
+            changed = copy.deepcopy(pending)
+            changed.update(
+                status="blocked_evidence_changed",
+                safe_error="Pxx pixels changed before explicit adjudication resume",
+                observed_asset_sha256={
+                    storyboard_id: current_hashes.get(storyboard_id)
+                    for storyboard_id in disputed
+                },
+            )
+            receipts = [*prior_receipts, changed]
+            _write_review_adjudication_report(output_dir, receipts)
+            correction = copy.deepcopy(base_result.get("correction") or {})
+            correction.update(
+                final_gate_passed=False,
+                review_adjudications=receipts,
+            )
+            return _adjudication_resume_result(
+                output_dir,
+                base_result,
+                correction,
+                receipts,
+                error=(
+                    "Phase 5 adjudication resume refused because disputed Pxx "
+                    "pixels changed"
+                ),
+            )
+        expected_disputed = sorted(
+            storyboard_id
+            for storyboard_id in (
+                set(_blocking_storyboard_issue_map(previous))
+                ^ set(_blocking_storyboard_issue_map(current))
+            )
+            if storyboard_id in asset_hashes
+        )
+        if expected_disputed != sorted(disputed):
+            raise ValueError("pending adjudication vote lineage changed")
+        if pending.get("status") != "blocked_unavailable":
+            raise ValueError(
+                f"pending adjudication status {pending.get('status')} is not resumable"
+            )
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        base_result = locals().get("base_result") or {
+            "status": "error",
+            "grade": "D",
+            "gate_passed": False,
+            "issues": [],
+        }
+        correction = copy.deepcopy(base_result.get("correction") or {})
+        correction.update(
+            final_gate_passed=False,
+            review_adjudications=prior_receipts,
+        )
+        return _adjudication_resume_result(
+            output_dir,
+            base_result,
+            correction,
+            prior_receipts,
+            error=f"Phase 5 adjudication resume refused: {redact_text(str(exc))}",
+        )
+
+    attempt = pending.get("after_correction_attempt")
+    try:
+        reconciled, completed = _adjudicate_unchanged_panel_flips(
+            output_dir,
+            previous,
+            {storyboard_id: asset_hashes[storyboard_id] for storyboard_id in disputed},
+            current,
+            current_hashes,
+            confirmation_runner,
+            after_correction_attempt=(int(attempt) if attempt is not None else None),
+            prior_receipts=prior_receipts,
+        )
+    except _ReviewAdjudicationBlocked as exc:
+        receipts = [*prior_receipts, exc.receipt]
+        correction = copy.deepcopy(base_result.get("correction") or {})
+        correction.update(
+            final_gate_passed=False,
+            review_adjudications=receipts,
+        )
+        history = correction.get("history")
+        if isinstance(history, list) and history:
+            history[-1].update(
+                status="adjudication_error",
+                error=str(exc),
+                review_adjudication=exc.receipt,
+            )
+        return _adjudication_resume_result(
+            output_dir,
+            base_result,
+            correction,
+            receipts,
+            error=f"Phase 5 automatic correction failed: {exc}",
+        )
+
+    if completed is None:
+        return None
+    receipts = [*prior_receipts, completed]
+    correction = copy.deepcopy(base_result.get("correction") or {})
+    history = correction.get("history")
+    if isinstance(history, list) and history:
+        history[-1].update(
+            status="passed" if reconciled.get("gate_passed") is True else "rejected",
+            after_grade=reconciled.get("grade"),
+            review_adjudication=completed,
+        )
+        history[-1].pop("error", None)
+    correction.update(
+        final_gate_passed=reconciled.get("gate_passed") is True,
+        review_adjudications=receipts,
+    )
+    return _adjudication_resume_result(
+        output_dir,
+        reconciled,
+        correction,
+        receipts,
+    )
+
+
 def run_storyboard_qa_with_correction(
     output_dir: Path,
     *,
     max_correction_attempts: int | None = None,
     qa_runner: Callable[[Path], dict[str, Any]] | None = None,
+    adjudication_runner: Callable[
+        [Path, list[str]], dict[str, Any]
+    ] | None = None,
     redraw_runner: Callable[[Path, list[str], list[dict[str, Any]], int], dict[str, Any]] | None = None,
     cinematic_redraw_runner: Callable[[Path, list[str], list[dict[str, Any]], int], dict[str, Any]] | None = None,
     image_client: Any = None,
     dry_run: bool = False,
+    resume_pending_adjudication: bool = False,
 ) -> dict[str, Any]:
     """Run Phase 5 with one bounded correction family and recheck loop."""
     output_dir = Path(output_dir)
@@ -3326,14 +4179,89 @@ def run_storyboard_qa_with_correction(
         return _run_storyboard_qa_dry_run(output_dir)
     attempts_allowed = _resolved_correction_attempts(max_correction_attempts)
     qa = qa_runner or run_storyboard_qa_gate
-    result = qa(output_dir)
-    history: list[dict[str, Any]] = []
-    adjudications: list[dict[str, Any]] = []
+    confirmation = adjudication_runner or _run_storyboard_adjudication_review
+    completed_correction: dict[str, Any] | None = None
+    if resume_pending_adjudication:
+        resumed = _resume_pending_review_adjudication(output_dir, confirmation)
+        if resumed is not None:
+            return resumed
+        try:
+            completed_correction = _load_completed_adjudication_correction(
+                output_dir
+            )
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            try:
+                result = _read_json_object(
+                    output_dir / "storyboard_qa_report.json"
+                )
+            except (OSError, json.JSONDecodeError, ValueError):
+                result = {
+                    "grade": "D",
+                    "issues": [],
+                    "failed_shot_ids": [],
+                }
+            result.update(
+                status="error",
+                gate_passed=False,
+                error=(
+                    "Phase 5 completed adjudication continuation refused: "
+                    f"{redact_text(str(exc))}"
+                ),
+            )
+            _atomic_json(output_dir / "storyboard_qa_report.json", result)
+            return result
+    if completed_correction is None:
+        result = qa(output_dir)
+        history: list[dict[str, Any]] = []
+        adjudications: list[dict[str, Any]] = []
+        first_attempt = 1
+        attempt_limit = attempts_allowed
+        correction_family = (
+            "cinematic_first_frame"
+            if _correctable_cinematic_issues(result)
+            else "storyboard_previs"
+        )
+    else:
+        result = completed_correction["result"]
+        persisted_correction = completed_correction["correction"]
+        if completed_correction["continuable"] is not True:
+            return result
+        history = copy.deepcopy(persisted_correction["history"])
+        adjudications = completed_correction["receipts"]
+        persisted_limit = persisted_correction.get("max_attempts")
+        if isinstance(persisted_limit, bool) or not isinstance(persisted_limit, int):
+            result.update(
+                status="error",
+                gate_passed=False,
+                error="Phase 5 completed adjudication correction limit is invalid",
+            )
+            _atomic_json(output_dir / "storyboard_qa_report.json", result)
+            return result
+        attempt_limit = min(attempts_allowed, persisted_limit)
+        first_attempt = len(history) + 1
+        correction_family = str(
+            persisted_correction.get("correction_family") or ""
+        )
+        if correction_family != "storyboard_previs":
+            return result
+        if result.get("gate_passed") is True or first_attempt > attempt_limit:
+            return result
     previous_result = copy.deepcopy(result)
     previous_hashes = _storyboard_panel_hashes(output_dir)
 
     global_issues = _global_uncorrectable_issues(result)
     if result.get("gate_passed") is not True and global_issues:
+        if completed_correction is not None:
+            result.update(
+                status="error",
+                gate_passed=False,
+                error=(
+                    "Phase 5 completed adjudication cannot change correction "
+                    "family; restart from the owner recorded by the QA issues"
+                ),
+            )
+            _atomic_json(output_dir / "storyboard_qa_report.json", result)
+            return result
         from phases.phase5.replanning import (
             build_padding_screenplay_rewrite_request,
         )
@@ -3386,12 +4314,7 @@ def run_storyboard_qa_with_correction(
         _atomic_json(output_dir / "storyboard_qa_report.json", result)
         return result
 
-    correction_family = (
-        "cinematic_first_frame"
-        if _correctable_cinematic_issues(result)
-        else "storyboard_previs"
-    )
-    for attempt in range(1, attempts_allowed + 1):
+    for attempt in range(first_attempt, attempt_limit + 1):
         if result.get("gate_passed") is True or result.get("status") != "error":
             break
         if _global_uncorrectable_issues(result):
@@ -3458,16 +4381,27 @@ def run_storyboard_qa_with_correction(
         result = qa(output_dir)
         adjudication = None
         try:
-            if len(adjudications) < MAX_REVIEW_ADJUDICATIONS:
-                result, adjudication = _adjudicate_unchanged_panel_flips(
-                    output_dir,
-                    previous_result,
-                    previous_hashes,
-                    result,
-                    current_hashes,
-                    qa,
-                )
+            result, adjudication = _adjudicate_unchanged_panel_flips(
+                output_dir,
+                previous_result,
+                previous_hashes,
+                result,
+                current_hashes,
+                confirmation,
+                after_correction_attempt=attempt,
+                prior_receipts=adjudications,
+                confirmation_allowed=(
+                    len(adjudications) < MAX_REVIEW_ADJUDICATIONS
+                ),
+            )
         except Exception as exc:
+            failed_adjudication = (
+                exc.receipt
+                if isinstance(exc, _ReviewAdjudicationBlocked)
+                else None
+            )
+            if failed_adjudication is not None:
+                adjudications.append(failed_adjudication)
             history.append({
                 "attempt": attempt,
                 "status": "adjudication_error",
@@ -3478,6 +4412,11 @@ def run_storyboard_qa_with_correction(
                 "after_grade": result.get("grade"),
                 "redraw": redraw_receipt,
                 "error": str(exc),
+                **(
+                    {"review_adjudication": failed_adjudication}
+                    if failed_adjudication is not None
+                    else {}
+                ),
             })
             result = {
                 **result,
@@ -3485,25 +4424,19 @@ def run_storyboard_qa_with_correction(
                 "gate_passed": False,
                 "error": f"Phase 5 automatic correction failed: {exc}",
             }
+            if failed_adjudication is not None:
+                outputs = list(result.get("outputs") or [])
+                if PHASE5_REVIEW_ADJUDICATION_REPORT_NAME not in outputs:
+                    outputs.append(PHASE5_REVIEW_ADJUDICATION_REPORT_NAME)
+                result["outputs"] = outputs
             break
         if adjudication is not None:
-            adjudication["after_correction_attempt"] = attempt
             adjudications.append(adjudication)
             result["review_adjudications"] = copy.deepcopy(adjudications)
             outputs = list(result.get("outputs") or [])
-            if "phase5_review_adjudication_report.json" not in outputs:
-                outputs.append("phase5_review_adjudication_report.json")
+            if PHASE5_REVIEW_ADJUDICATION_REPORT_NAME not in outputs:
+                outputs.append(PHASE5_REVIEW_ADJUDICATION_REPORT_NAME)
             result["outputs"] = outputs
-            _atomic_json(
-                output_dir / "phase5_review_adjudication_report.json",
-                {
-                    "schema": "honcut.phase5-review-adjudications.v1",
-                    "status": "completed",
-                    "adjudications": adjudications,
-                },
-            )
-            # The confirmation QA writes its raw report.  Restore the
-            # reconciled two-out-of-three verdict before a later archive.
             _atomic_json(output_dir / "storyboard_qa_report.json", result)
         history.append({
             "attempt": attempt,
@@ -3522,8 +4455,8 @@ def run_storyboard_qa_with_correction(
 
     if history:
         correction = {
-            "enabled": attempts_allowed > 0,
-            "max_attempts": attempts_allowed,
+            "enabled": attempt_limit > 0,
+            "max_attempts": attempt_limit,
             "attempts_used": len(history),
             "correction_family": correction_family,
             "history": history,
@@ -3539,7 +4472,7 @@ def run_storyboard_qa_with_correction(
             "Phase 5 automatic correction failed:"
         )
         if result.get("gate_passed") is not True and not automatic_failure:
-            if len(history) < attempts_allowed:
+            if len(history) < attempt_limit:
                 result["error"] = (
                     "Storyboard QA still blocks Phase 6 after completing the "
                     f"{correction_family} correction family; no second correction "
@@ -3548,7 +4481,7 @@ def run_storyboard_qa_with_correction(
             else:
                 result["error"] = (
                     "Storyboard QA still blocks Phase 6 after "
-                    f"{len(history)}/{attempts_allowed} automatic correction attempt(s)"
+                    f"{len(history)}/{attempt_limit} automatic correction attempt(s)"
                 )
         _atomic_json(output_dir / "phase5_correction_report.json", correction)
         _atomic_json(output_dir / "storyboard_qa_report.json", result)

@@ -22,7 +22,17 @@ class FakeResponses:
 
     def create(self, **kwargs):
         self.kwargs = kwargs
-        return SimpleNamespace(output_text=self.content, output=[])
+        return SimpleNamespace(
+            status="completed",
+            error=None,
+            incomplete_details=None,
+            output=[SimpleNamespace(
+                type="message",
+                role="assistant",
+                status="completed",
+                content=[SimpleNamespace(type="output_text", text=self.content)],
+            )],
+        )
 
 
 def test_ark_client_constructs_one_request_with_multiple_images(tmp_path):

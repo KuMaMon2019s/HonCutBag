@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import mimetypes
 import os
 import queue
 import threading
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable, TypeVar
+from typing import Any, TypeVar
 
 from openai import DefaultHttpxClient, OpenAI
 from pydantic import BaseModel
@@ -16,7 +19,6 @@ from schemas.understanding import (
     native_json_schema_format,
     parse_structured_output,
 )
-
 from utils.config import (
     ARK_RESPONSES_BASE_URL,
     DEFAULT_MULTIMODAL_MODEL,
@@ -24,8 +26,166 @@ from utils.config import (
 )
 from utils.prompt_budget import enforce_prompt_budget
 
-
 StructuredReviewT = TypeVar("StructuredReviewT", bound=BaseModel)
+_ENVELOPE_AUDIT_LIMIT = 8
+_SAFE_ENVELOPE_TOKENS = frozenset({
+    "assistant",
+    "cancelled",
+    "completed",
+    "failed",
+    "in_progress",
+    "incomplete",
+    "message",
+    "output_text",
+    "queued",
+    "reasoning",
+    "refusal",
+})
+
+
+def _response_field(value: Any, name: str, default: Any = None) -> Any:
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _safe_envelope_token(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return f"<{type(value).__name__}>"
+    return value if value in _SAFE_ENVELOPE_TOKENS else "<unknown>"
+
+
+def _response_envelope_audit(response: Any) -> dict[str, Any]:
+    """Describe the response shape without retaining Provider text."""
+
+    output = _response_field(response, "output")
+    output_items = list(output) if isinstance(output, (list, tuple)) else []
+    inspected_items = output_items[:_ENVELOPE_AUDIT_LIMIT]
+    messages = [
+        item
+        for item in inspected_items
+        if _response_field(item, "type") == "message"
+    ]
+    content_blocks: list[Any] = []
+    for message in messages:
+        content = _response_field(message, "content")
+        if isinstance(content, (list, tuple)):
+            content_blocks.extend(content[:_ENVELOPE_AUDIT_LIMIT])
+    output_texts = [
+        _response_field(block, "text")
+        for block in content_blocks
+        if _response_field(block, "type") == "output_text"
+    ]
+    return {
+        "response_status": _safe_envelope_token(
+            _response_field(response, "status")
+        ),
+        "error_present": _response_field(response, "error") is not None,
+        "incomplete_details_present": (
+            _response_field(response, "incomplete_details") is not None
+        ),
+        "output_is_sequence": isinstance(output, (list, tuple)),
+        "output_count": len(output_items),
+        "output_types": [
+            _safe_envelope_token(_response_field(item, "type"))
+            for item in inspected_items
+        ],
+        "message_roles": [
+            _safe_envelope_token(_response_field(message, "role"))
+            for message in messages
+        ],
+        "message_statuses": [
+            _safe_envelope_token(_response_field(message, "status"))
+            for message in messages
+        ],
+        "content_block_count": len(content_blocks),
+        "content_types": [
+            _safe_envelope_token(_response_field(block, "type"))
+            for block in content_blocks
+        ],
+        "output_text_count": len(output_texts),
+        "output_text_utf8_lengths": [
+            len(text.encode("utf-8")) if isinstance(text, str) else None
+            for text in output_texts
+        ],
+        "output_text_sha256": [
+            hashlib.sha256(text.encode("utf-8")).hexdigest()
+            if isinstance(text, str)
+            else None
+            for text in output_texts
+        ],
+        "audit_truncated": (
+            len(output_items) > _ENVELOPE_AUDIT_LIMIT
+            or len(content_blocks) > _ENVELOPE_AUDIT_LIMIT
+        ),
+    }
+
+
+def _reject_response_envelope(reason: str, response: Any) -> None:
+    audit = json.dumps(
+        _response_envelope_audit(response),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    raise json.JSONDecodeError(
+        f"ARK multimodal response envelope rejected: {reason}; envelope={audit}",
+        "",
+        0,
+    )
+
+
+def _extract_single_completed_output_text(response: Any) -> str:
+    """Return one authoritative message block without SDK aggregation."""
+
+    if _response_field(response, "status") != "completed":
+        _reject_response_envelope("response status must be completed", response)
+    if _response_field(response, "error") is not None:
+        _reject_response_envelope(
+            "completed response must not contain error",
+            response,
+        )
+    if _response_field(response, "incomplete_details") is not None:
+        _reject_response_envelope(
+            "completed response must not contain incomplete details",
+            response,
+        )
+
+    output = _response_field(response, "output")
+    if not isinstance(output, (list, tuple)) or len(output) != 1:
+        _reject_response_envelope(
+            "expected exactly one assistant message output item",
+            response,
+        )
+    message = output[0]
+    if _response_field(message, "type") != "message":
+        _reject_response_envelope(
+            "expected exactly one assistant message output item",
+            response,
+        )
+    if _response_field(message, "role") != "assistant":
+        _reject_response_envelope("message role must be assistant", response)
+    if _response_field(message, "status") != "completed":
+        _reject_response_envelope("message status must be completed", response)
+
+    content = _response_field(message, "content")
+    if not isinstance(content, (list, tuple)) or len(content) != 1:
+        _reject_response_envelope(
+            "expected exactly one output_text content block",
+            response,
+        )
+    block = content[0]
+    if _response_field(block, "type") != "output_text":
+        _reject_response_envelope(
+            "expected exactly one output_text content block",
+            response,
+        )
+    text = _response_field(block, "text")
+    if not isinstance(text, str) or not text.strip():
+        _reject_response_envelope("output_text must be non-empty", response)
+    return text
 
 
 def review_as(
@@ -232,37 +392,4 @@ class ArkMultimodalClient:
             ) from exc
         if not succeeded:
             raise payload
-        response = payload
-        result = getattr(response, "output_text", None)
-        if not isinstance(result, str) or not result.strip():
-            fragments: list[str] = []
-            for item in getattr(response, "output", []) or []:
-                item_type = getattr(item, "type", None)
-                if item_type is None and isinstance(item, dict):
-                    item_type = item.get("type")
-                if item_type != "message":
-                    continue
-                item_content = (
-                    item.get("content", [])
-                    if isinstance(item, dict)
-                    else getattr(item, "content", [])
-                )
-                for block in item_content or []:
-                    block_type = (
-                        block.get("type")
-                        if isinstance(block, dict)
-                        else getattr(block, "type", None)
-                    )
-                    if block_type != "output_text":
-                        continue
-                    text = (
-                        block.get("text")
-                        if isinstance(block, dict)
-                        else getattr(block, "text", None)
-                    )
-                    if isinstance(text, str) and text.strip():
-                        fragments.append(text)
-            result = "\n".join(fragments)
-        if not isinstance(result, str) or not result.strip():
-            raise RuntimeError("ARK multimodal review returned empty content")
-        return result
+        return _extract_single_completed_output_text(payload)

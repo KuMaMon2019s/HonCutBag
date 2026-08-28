@@ -97,6 +97,9 @@ def node_phase5_quality(
                 output_dir,
                 qa_runner=storyboard_qa_gate.run_storyboard_qa_gate,
                 dry_run=bool(state.get("dry_run")),
+                resume_pending_adjudication=(
+                    state.get("resume_from") == "phase5"
+                ),
             )
         ),
         supervision_runner=owner._run_storyboard_supervision,

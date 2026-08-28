@@ -1085,6 +1085,7 @@ def _run_pipeline(
             output_path,
             qa_runner=storyboard_qa_gate.run_storyboard_qa_gate,
             dry_run=dry_run,
+            resume_pending_adjudication=resume_from == "phase5",
         )
         report["phases"]["phase5"] = p4_5
         reporter.phase_done("phase5", f"分镜质检 {p4_5.get('grade', '?')} 级", duration_s=p4_5.get("duration_s"))
