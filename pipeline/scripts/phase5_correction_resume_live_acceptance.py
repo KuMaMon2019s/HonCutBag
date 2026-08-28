@@ -5,7 +5,10 @@
 Run this only against an isolated copy of a production run.  Without
 ``--submit`` it performs a zero-request preflight.  A submitted receipt is
 permanently capped at one Seedream operation and one raw image-generation
-POST for one explicitly pinned Pxx.
+POST for one explicitly pinned Pxx.  The live artifact is written outside
+the canonical Phase 2/5 artifact tree: a complete correction also regenerates
+its model-authored Sxx board and therefore cannot fit inside this one-request
+acceptance boundary.
 """
 
 from __future__ import annotations
@@ -13,11 +16,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import subprocess
 import sys
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from PIL import Image
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PIPELINE_SRC = REPO_ROOT / "pipeline" / "src"
@@ -38,8 +44,10 @@ from runtime.security_boundaries import redact_text
 from tools.character_reference_board import character_reference_role
 from utils.config import ARK_AGENT_CREDENTIAL_SOURCE, get_api_key
 
-RECEIPT_SCHEMA = "honcut.phase5-correction-resume-live-acceptance.v2"
+RECEIPT_SCHEMA = "honcut.phase5-correction-resume-live-acceptance.v3"
 RECEIPT_NAME = "phase5_correction_resume_live_acceptance.json"
+ARTIFACT_SCHEMA = "honcut.phase5-correction-live-artifact.v1"
+ARTIFACT_DIRECTORY = Path("live_acceptance") / "phase5_correction"
 MAX_PAID_PROVIDER_REQUESTS = 1
 REQUIRED_ACCEPTANCE_GATES = ["regression", "live_paid_provider"]
 
@@ -100,6 +108,7 @@ class SinglePaidRequestTransport:
         self.provider_request_attempt_count = 0
         self.provider_request_count = 0
         self.blocked_provider_request_count = 0
+        self.request_contract: dict[str, Any] | None = None
         self._original_post: Callable[..., Any] | None = None
 
     def __enter__(self) -> SinglePaidRequestTransport:
@@ -121,6 +130,31 @@ class SinglePaidRequestTransport:
             )
         if self._original_post is None:
             raise RuntimeError("Seedream transport guard is not active")
+        payload = kwargs.get("json")
+        if isinstance(payload, dict):
+            prompt = str(payload.get("prompt") or "")
+            self.request_contract = {
+                "model": payload.get("model"),
+                "size": payload.get("size"),
+                "prompt_sha256": hashlib.sha256(
+                    prompt.encode("utf-8")
+                ).hexdigest(),
+                "optimize_prompt_options": payload.get(
+                    "optimize_prompt_options"
+                ),
+                "response_format": payload.get("response_format"),
+                "sequential_image_generation": payload.get(
+                    "sequential_image_generation"
+                ),
+                "output_format": payload.get("output_format"),
+                "stream": payload.get("stream"),
+                "watermark": payload.get("watermark"),
+                "reference_count": (
+                    len(payload.get("image"))
+                    if isinstance(payload.get("image"), list)
+                    else 1 if payload.get("image") else 0
+                ),
+            }
         self.provider_request_count += 1
         return self._original_post(*args, **kwargs)
 
@@ -163,10 +197,64 @@ def _panel_sidecar_hashes(
     return hashes
 
 
+def _canonical_asset_hashes(output_dir: Path) -> dict[str, str]:
+    """Hash the Phase 2/5 artifact surface that a live probe must not mutate."""
+    paths: set[Path] = set()
+    for name in ("STORYBOARD.json", "CHARACTERS.json", "SHOT_STORYBOARDS.json"):
+        candidate = output_dir / name
+        if candidate.is_file():
+            paths.add(candidate)
+    for directory_name in (
+        "storyboard_beats",
+        "shot_storyboards",
+        "storyboard_images",
+    ):
+        directory = output_dir / directory_name
+        if directory.is_dir():
+            paths.update(path for path in directory.rglob("*") if path.is_file())
+    return {
+        str(path.relative_to(output_dir)): _sha256_file(path)
+        for path in sorted(paths)
+    }
+
+
+def _acceptance_artifact_paths(
+    output_dir: Path,
+    storyboard_id: str,
+) -> tuple[Path, Path]:
+    artifact_dir = output_dir / ARTIFACT_DIRECTORY
+    return (
+        artifact_dir / f"{storyboard_id}.png",
+        artifact_dir / f"{storyboard_id}.json",
+    )
+
+
 def _credential_readiness() -> dict[str, Any]:
     if not get_api_key("ARK_AGENT_API_KEY"):
         raise RuntimeError("ARK_AGENT_API_KEY is not configured")
     return {"ark_agent_credential_source": ARK_AGENT_CREDENTIAL_SOURCE}
+
+
+def _source_identity() -> dict[str, Any]:
+    revision = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if status:
+        raise RuntimeError(
+            "live acceptance requires a committed, clean source worktree"
+        )
+    return {"git_commit": revision, "worktree_clean": True}
 
 
 def _continuation_preflight(
@@ -212,6 +300,13 @@ def _continuation_preflight(
         "protected_sidecar_sha256": _panel_sidecar_hashes(
             output_dir, protected_ids
         ),
+        "canonical_asset_sha256": _canonical_asset_hashes(output_dir),
+        "acceptance_artifact": str(
+            _acceptance_artifact_paths(
+                output_dir, expected_storyboard_id
+            )[0].relative_to(output_dir)
+        ),
+        "source": _source_identity(),
         "credentials": _credential_readiness(),
     }
     preflight["prompt_projection"] = _prompt_projection_preflight(
@@ -239,14 +334,14 @@ def _issues_for_storyboard_id(
     return issues
 
 
-def _prompt_projection_preflight(
+def _build_exact_pxx_request(
     output_dir: Path,
     *,
     state: dict[str, Any],
     storyboard_id: str,
     correction_attempt: int,
 ) -> dict[str, Any]:
-    """Rebuild the exact next Provider Prompt without making a request."""
+    """Build the exact next Pxx request without entering the multi-asset Phase."""
     storyboard = _read_json_object(output_dir / "STORYBOARD.json")
     characters_path = output_dir / "CHARACTERS.json"
     characters_payload = (
@@ -352,12 +447,17 @@ def _prompt_projection_preflight(
     request_parameters = single_image_request_parameters(
         str(manifest.get("size_requested") or shot_storyboards.SHOT_STORYBOARD_SIZE)
     )
+    transport_prompt, filtered_terms = seedream_client.sanitize_prompt(
+        provider_prompt
+    )
+    if not transport_prompt.strip():
+        raise RuntimeError("live acceptance Prompt is empty after IP filtering")
     safety_policy = (
         "non_graphic_staged_conflict_v1"
         if shot_storyboards._first_request_safety_contract(beat)
         else None
     )
-    return {
+    projection = {
         "panel_prompt_template_id": shot_storyboards.PANEL_PROMPT_TEMPLATE_ID,
         "panel_prompt_template_version": (
             shot_storyboards.PANEL_PROMPT_TEMPLATE_VERSION
@@ -367,8 +467,17 @@ def _prompt_projection_preflight(
         ),
         "first_request_safety_policy": safety_policy,
         "prompt_optimization": request_parameters["optimize_prompt_options"],
+        "image_request_parameters": request_parameters,
         "provider_prompt_guidance": prompt_guidance_metrics(provider_prompt),
+        "transport_prompt_guidance": prompt_guidance_metrics(transport_prompt),
+        "ip_filtered_term_count": len(filtered_terms),
         "reference_count": len(character_references),
+        "reference_roles": [
+            character_reference_role(path) for path in character_references
+        ],
+        "reference_image_sha256": [
+            _sha256_file(path) for path in character_references
+        ],
         "action_sha256": hashlib.sha256(
             action_projection.encode("utf-8")
         ).hexdigest(),
@@ -378,6 +487,54 @@ def _prompt_projection_preflight(
         ],
         "checks": checks,
     }
+    return {
+        "provider_prompt": provider_prompt,
+        "reference_paths": character_references,
+        "size": str(
+            manifest.get("size_requested")
+            or shot_storyboards.SHOT_STORYBOARD_SIZE
+        ),
+        "model": str(
+            manifest.get("model")
+            or seedream_client.DEFAULT_MODEL
+        ),
+        "request_parameters": request_parameters,
+        "projection": projection,
+    }
+
+
+def _prompt_projection_preflight(
+    output_dir: Path,
+    *,
+    state: dict[str, Any],
+    storyboard_id: str,
+    correction_attempt: int,
+) -> dict[str, Any]:
+    """Project the exact next Provider request into receipt-safe metadata."""
+    return _build_exact_pxx_request(
+        output_dir,
+        state=state,
+        storyboard_id=storyboard_id,
+        correction_attempt=correction_attempt,
+    )["projection"]
+
+
+def _image_artifact_contract(path: Path) -> dict[str, Any]:
+    if not path.is_file() or path.stat().st_size == 0:
+        raise RuntimeError("Seedream live acceptance returned no image artifact")
+    with Image.open(path) as image:
+        image.verify()
+    with Image.open(path) as image:
+        width, height = image.size
+        image_format = str(image.format or "").upper()
+    return {
+        "sha256": _sha256_file(path),
+        "bytes": path.stat().st_size,
+        "width": width,
+        "height": height,
+        "format": image_format,
+        "decodable": True,
+    }
 
 
 def run_acceptance(
@@ -386,11 +543,8 @@ def run_acceptance(
     submit: bool,
     expected_storyboard_id: str,
     client_factory: Callable[[], SeedreamClient] = SeedreamClient,
-    redraw_runner: Callable[..., dict[str, Any]] = (
-        storyboard_qa_gate._redraw_failed_storyboards
-    ),
 ) -> dict[str, Any]:
-    """Preflight or execute one live, exact-Pxx PREVIS correction."""
+    """Preflight or execute one isolated live exact-Pxx Provider request."""
     output_dir = Path(output_dir).resolve()
     receipt_path = output_dir / RECEIPT_NAME
     if receipt_path.is_file():
@@ -431,6 +585,25 @@ def run_acceptance(
     )
     if current_preflight != preflight:
         raise RuntimeError("Phase 5 correction evidence changed after preflight")
+    target = str(preflight["storyboard_id"])
+    artifact_path, artifact_sidecar_path = _acceptance_artifact_paths(
+        output_dir, target
+    )
+    if artifact_path.exists() or artifact_sidecar_path.exists():
+        raise RuntimeError("live acceptance artifact already exists")
+    state = storyboard_qa_gate._load_completed_adjudication_correction(
+        output_dir
+    )
+    if state is None or state.get("continuable") is not True:
+        raise RuntimeError("Phase 5 correction continuation disappeared")
+    exact_request = _build_exact_pxx_request(
+        output_dir,
+        state=state,
+        storyboard_id=target,
+        correction_attempt=int(preflight["correction_attempt"]),
+    )
+    if exact_request["projection"] != preflight.get("prompt_projection"):
+        raise RuntimeError("exact Pxx request changed after preflight")
     receipt.update(
         status="submission_uncertain",
         submitted=True,
@@ -441,74 +614,107 @@ def run_acceptance(
     limited_client: SinglePaidRequestImageClient | None = None
     transport: SinglePaidRequestTransport | None = None
     try:
-        state = storyboard_qa_gate._load_completed_adjudication_correction(
-            output_dir
-        )
-        if state is None or state.get("continuable") is not True:
-            raise RuntimeError("Phase 5 correction continuation disappeared")
-        target = str(preflight["storyboard_id"])
-        issues = _issues_for_storyboard_id(state["result"], target)
-        limited_client = SinglePaidRequestImageClient(client_factory())
-        transport = SinglePaidRequestTransport()
-        with transport:
-            redraw = redraw_runner(
-                output_dir,
-                [str(preflight["parent_shot_id"])],
-                issues,
-                int(preflight["correction_attempt"]),
-                image_client=limited_client,
+        delegate = client_factory()
+        observed_model = str(getattr(delegate, "model", "") or "")
+        if observed_model != exact_request["model"]:
+            raise RuntimeError(
+                "live acceptance client model does not match the preflighted model"
             )
+        limited_client = SinglePaidRequestImageClient(delegate)
+        transport = SinglePaidRequestTransport()
+        reference_paths = list(exact_request["reference_paths"])
+        with transport:
+            if reference_paths:
+                result_url = limited_client.image_to_image(
+                    prompt=str(exact_request["provider_prompt"]),
+                    ref_image=(
+                        str(reference_paths[0])
+                        if len(reference_paths) == 1
+                        else [str(path) for path in reference_paths]
+                    ),
+                    output_path=str(artifact_path),
+                    size=str(exact_request["size"]),
+                )
+            else:
+                result_url = limited_client.text_to_image(
+                    prompt=str(exact_request["provider_prompt"]),
+                    output_path=str(artifact_path),
+                    size=str(exact_request["size"]),
+                    timeout=180,
+                )
 
-        panel_hashes = storyboard_qa_gate._storyboard_panel_hashes(output_dir)
-        protected_panel_hashes = preflight["protected_panel_sha256"]
-        protected_sidecars = preflight["protected_sidecar_sha256"]
-        current_sidecars = {
-            relative_path: _sha256_file(output_dir / relative_path)
-            for relative_path in protected_sidecars
-            if (output_dir / relative_path).is_file()
-        }
-        target_sidecar_path = (
-            output_dir / "storyboard_beats" / f"{target}.json"
-        )
-        target_sidecar = (
-            _read_json_object(target_sidecar_path)
-            if target_sidecar_path.is_file()
-            else {}
-        )
+        artifact = _image_artifact_contract(artifact_path)
         prompt_projection = preflight.get("prompt_projection") or {}
+        result_source = "base64" if str(result_url).startswith("b64://") else "url"
+        artifact_sidecar = {
+            "schema": ARTIFACT_SCHEMA,
+            "storyboard_id": target,
+            "correction_attempt": int(preflight["correction_attempt"]),
+            "image": str(artifact_path.relative_to(output_dir)),
+            "image_sha256": artifact["sha256"],
+            "image_bytes": artifact["bytes"],
+            "image_width": artifact["width"],
+            "image_height": artifact["height"],
+            "image_format": artifact["format"],
+            "provider_result_source": result_source,
+            "provider_result_locator_sha256": hashlib.sha256(
+                str(result_url).encode("utf-8")
+            ).hexdigest(),
+            "model": exact_request["model"],
+            "size_requested": exact_request["size"],
+            "provider_prompt_sha256": (
+                prompt_projection.get("provider_prompt_guidance") or {}
+            ).get("sha256"),
+            "transport_prompt_sha256": (
+                prompt_projection.get("transport_prompt_guidance") or {}
+            ).get("sha256"),
+            "prompt_optimization": prompt_projection.get(
+                "prompt_optimization"
+            ),
+            "reference_roles": prompt_projection.get("reference_roles"),
+            "reference_image_sha256": prompt_projection.get(
+                "reference_image_sha256"
+            ),
+            "created_at": _utc_now(),
+        }
+        _atomic_write_json(artifact_sidecar_path, artifact_sidecar)
+        canonical_assets_after = _canonical_asset_hashes(output_dir)
+        transport_contract = transport.request_contract or {}
         business_assertions = {
-            "exact_storyboard_scope": redraw.get("storyboard_ids") == [target],
-            "single_panel_regenerated": redraw.get("regenerated_panel_count") == 1,
-            "target_pixel_changed": (
-                panel_hashes.get(target) != preflight["asset_sha256"]
+            "exact_storyboard_scope": artifact_sidecar["storyboard_id"] == target,
+            "generated_artifact_valid": artifact["decodable"] is True,
+            "generated_pixel_differs_from_canonical": (
+                artifact["sha256"] != preflight["asset_sha256"]
             ),
-            "protected_panel_pixels_unchanged": all(
-                panel_hashes.get(storyboard_id) == digest
-                for storyboard_id, digest in protected_panel_hashes.items()
-            ),
-            "protected_panel_sidecars_unchanged": (
-                current_sidecars == protected_sidecars
+            "canonical_assets_unchanged": (
+                canonical_assets_after == preflight["canonical_asset_sha256"]
             ),
             "prompt_projection_preflight_passed": bool(
                 prompt_projection.get("checks")
             ) and all((prompt_projection.get("checks") or {}).values()),
-            "target_prompt_matches_preflight": (
-                target_sidecar.get("provider_prompt_sha256")
-                == (prompt_projection.get("provider_prompt_guidance") or {}).get(
+            "transport_prompt_matches_preflight": (
+                transport_contract.get("prompt_sha256")
+                == (prompt_projection.get("transport_prompt_guidance") or {}).get(
                     "sha256"
                 )
             ),
-            "target_prompt_policy_current": (
-                target_sidecar.get("panel_prompt_template_id")
-                == prompt_projection.get("panel_prompt_template_id")
-                and target_sidecar.get("panel_prompt_template_version")
-                == prompt_projection.get("panel_prompt_template_version")
-                and target_sidecar.get("correction_prompt_policy")
-                == prompt_projection.get("correction_prompt_policy")
-                and target_sidecar.get("first_request_safety_policy")
-                == prompt_projection.get("first_request_safety_policy")
-                and target_sidecar.get("prompt_optimization")
-                == prompt_projection.get("prompt_optimization")
+            "transport_contract_matches_preflight": (
+                transport_contract.get("model") == exact_request["model"]
+                and all(
+                    transport_contract.get(field)
+                    == exact_request["request_parameters"].get(field)
+                    for field in (
+                        "size",
+                        "response_format",
+                        "output_format",
+                        "watermark",
+                        "sequential_image_generation",
+                        "stream",
+                        "optimize_prompt_options",
+                    )
+                )
+                and transport_contract.get("reference_count")
+                == prompt_projection.get("reference_count")
             ),
         }
         receipt.update(
@@ -523,7 +729,20 @@ def run_acceptance(
                 limited_client.blocked_image_operation_count
             ),
             first_provider_error=limited_client.first_provider_error,
-            redraw=redraw,
+            provider_call_chain={
+                "status": "passed",
+                "strict_response_envelope": "validated_by_seedream_client",
+                "artifact_download": "completed",
+                "transport_contract": transport_contract,
+            },
+            model_business_verdict={
+                "status": "not_provided",
+                "reason": (
+                    "Seedream generation returns an artifact, not a semantic "
+                    "pass/block verdict"
+                ),
+            },
+            artifact=artifact_sidecar,
             business_assertions=business_assertions,
             completed_at=_utc_now(),
         )
@@ -543,7 +762,7 @@ def run_acceptance(
         receipt["status"] = "passed" if accepted else "live_acceptance_failed"
         if not accepted:
             receipt["error"] = (
-                "live acceptance did not complete one exact-Pxx correction"
+                "live acceptance did not complete one isolated exact-Pxx request"
             )
     except Exception as exc:
         receipt.update(
@@ -572,6 +791,16 @@ def run_acceptance(
                 ),
                 first_provider_error=limited_client.first_provider_error,
             )
+        receipt["provider_call_chain"] = {
+            "status": "failed",
+            "transport_contract": (
+                transport.request_contract if transport is not None else None
+            ),
+        }
+        receipt["model_business_verdict"] = {
+            "status": "not_provided",
+            "reason": "live Provider request did not complete acceptance",
+        }
     _atomic_write_json(receipt_path, receipt)
     return receipt
 

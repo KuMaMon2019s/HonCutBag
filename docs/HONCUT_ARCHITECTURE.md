@@ -332,6 +332,8 @@ Phase 4 dry-run result 必须显式标记 `evidence_scope=dry_run_structural_onl
 
 默认测试永远不得发起付费请求。Phase 1～Phase 9 的每个独立修复统一采用持久化双门验收，且两门都通过才可宣告验收成功：`regression` 门包含目标回归、完整测试和与改动相应的零请求离线验收；`live_paid_provider` 门只调用与本次修复生产路径直接相关的真实 Provider 接口一次，并要求传输、严格 DTO、Artifact/receipt 和该修复声明的业务断言全部通过。真实 Provider smoke 先运行无 `--submit` 预检，只有用户当次明确批准费用后才能提交。专用 live acceptance 必须从 canonical 待恢复收据和 Artifact hash 解析范围，不接受普通生产 CLI 的假 Provider 开关；每个 acceptance receipt 在调用前原子写入 `submission_uncertain`，并在 Runtime owner 和原始传输边界同时硬限制为最多一次真实请求。失败、进程中断、schema 拒绝或结果不确定均禁止自动重试，须保留收据并由用户另行授权或人工裁决。缺少当次授权时整体状态只能是 `pending_live_acceptance`，真实门失败时只能是 `live_acceptance_failed`，均不得写成验收成功。真实调用链是否完成 strict DTO 验收与模型给出的业务 pass/block verdict 必须分栏记录，禁止把可达性成功伪装成 QA 通过。
 
+当本次修复所属的完整生产 owner 按 canonical 语义必然包含多个独立付费操作时，专用 live acceptance 不得在“一次请求”护栏下调用整个 owner 后把预期的后续操作记成验收失败，也不得为迎合验收而改变生产 cache、fingerprint、Artifact 或 Sxx/Pxx 所有权。此类验收必须只投影与修复直接相关的一个真实请求，复用同一 Phase/domain Prompt、引用职责与请求参数函数，并把结果写入不参与生产恢复的隔离 acceptance Artifact；零请求特征测试负责证明该投影与生产请求一致，调用前后 canonical 生产资产哈希必须完全不变。验收专用窄路径不得暴露为普通 CLI 开关或被生产 Graph/Lifecycle 引用。
+
 ## 8. 安全与可观测性
 
 - 所有用户或 Artifact 路径必须经 workspace containment 校验；符号链接解析后仍须位于 workspace。

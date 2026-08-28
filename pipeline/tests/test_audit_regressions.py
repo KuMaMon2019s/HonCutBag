@@ -6689,6 +6689,14 @@ def _phase5_correction_live_preflight(tmp_path, target_sha256, protected_sha256)
         "asset_sha256": target_sha256,
         "protected_panel_sha256": {"S01_P01": protected_sha256},
         "protected_sidecar_sha256": {},
+        "canonical_asset_sha256": (
+            phase5_correction_resume_live_acceptance._canonical_asset_hashes(
+                tmp_path
+            )
+        ),
+        "acceptance_artifact": (
+            "live_acceptance/phase5_correction/S01_P02.png"
+        ),
         "credentials": {"ark_agent_credential_source": "test"},
         "prompt_projection": {
             "panel_prompt_template_id": "honcut.storyboard-panel-prompt",
@@ -6696,15 +6704,44 @@ def _phase5_correction_live_preflight(tmp_path, target_sha256, protected_sha256)
             "correction_prompt_policy": "canonical-positive-projection-v2",
             "first_request_safety_policy": None,
             "prompt_optimization": {"mode": "standard"},
+            "image_request_parameters": {
+                "size": "2K",
+                "response_format": "url",
+                "output_format": "png",
+                "watermark": False,
+                "sequential_image_generation": "disabled",
+                "stream": False,
+                "optimize_prompt_options": {"mode": "standard"},
+            },
             "provider_prompt_guidance": {
                 "sha256": provider_prompt_sha256,
             },
+            "transport_prompt_guidance": {
+                "sha256": provider_prompt_sha256,
+            },
+            "ip_filtered_term_count": 0,
+            "reference_count": 0,
+            "reference_roles": [],
+            "reference_image_sha256": [],
             "checks": {
                 "canonical_action_once": True,
                 "raw_observed_excluded": True,
                 "correction_policy_current": True,
             },
         },
+    }
+
+
+def _phase5_correction_live_request(preflight):
+    return {
+        "provider_prompt": "strict correction",
+        "reference_paths": [],
+        "size": "2K",
+        "model": "doubao-seedream-5.0-lite",
+        "request_parameters": preflight["prompt_projection"][
+            "image_request_parameters"
+        ],
+        "projection": preflight["prompt_projection"],
     }
 
 
@@ -6724,9 +6761,6 @@ def test_phase5_correction_live_preflight_is_zero_request(monkeypatch, tmp_path)
         expected_storyboard_id="S01_P02",
         client_factory=lambda: pytest.fail(
             "zero-request preflight must not construct a Provider client"
-        ),
-        redraw_runner=lambda *_args, **_kwargs: pytest.fail(
-            "zero-request preflight must not enter Phase 2 redraw"
         ),
     )
 
@@ -6805,6 +6839,9 @@ def test_phase5_correction_live_preflight_projects_exact_safe_prompt(tmp_path):
         "non_graphic_staged_conflict_v1"
     )
     assert projection["prompt_optimization"] == {"mode": "standard"}
+    assert projection["transport_prompt_guidance"]["sha256"]
+    assert projection["reference_roles"] == []
+    assert projection["reference_image_sha256"] == []
     assert all(projection["checks"].values())
 
 
@@ -6851,6 +6888,11 @@ def test_phase5_correction_live_acceptance_allows_one_request_and_refuses_replay
         "_continuation_preflight",
         lambda *_args, **_kwargs: preflight,
     )
+    monkeypatch.setattr(
+        phase5_correction_resume_live_acceptance,
+        "_build_exact_pxx_request",
+        lambda *_args, **_kwargs: _phase5_correction_live_request(preflight),
+    )
     issue = storyboard_qa_gate._issue(
         "L3", "moderate", "R4", "action mismatch", ["S01"],
         storyboard_ids=["S01_P02"], mismatch_type="action",
@@ -6883,75 +6925,48 @@ def test_phase5_correction_live_acceptance_allows_one_request_and_refuses_replay
     )
 
     class FakeImageClient:
-        def image_to_image(self, *_args, output_path, **_kwargs):
+        model = "doubao-seedream-5.0-lite"
+
+        def text_to_image(self, prompt, output_path, *, size, timeout):
+            assert timeout == 180
             phase5_correction_resume_live_acceptance.seedream_client.requests.post(
-                "https://example.invalid/images"
+                "https://example.invalid/images",
+                json={
+                    "model": self.model,
+                    "prompt": prompt,
+                    "size": size,
+                    "optimize_prompt_options": {"mode": "standard"},
+                    "response_format": "url",
+                    "sequential_image_generation": "disabled",
+                    "output_format": "png",
+                    "stream": False,
+                    "watermark": False,
+                },
             )
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
             Image.effect_noise((128, 72), 20).convert("RGB").save(output_path)
             return "https://example.invalid/result.png"
-
-    def redraw_runner(
-        output_dir,
-        shot_ids,
-        issues,
-        attempt,
-        *,
-        image_client,
-    ):
-        assert output_dir == tmp_path.resolve()
-        assert shot_ids == ["S01"]
-        assert storyboard_qa_gate._correctable_storyboard_ids(issues) == [
-            "S01_P02"
-        ]
-        assert attempt == 2
-        image_client.image_to_image(
-            "strict correction",
-            "reference.png",
-            output_path=str(beat_dir / "S01_P02.png"),
-        )
-        projection = preflight["prompt_projection"]
-        (beat_dir / "S01_P02.json").write_text(
-            json.dumps({
-                "provider_prompt_sha256": projection[
-                    "provider_prompt_guidance"
-                ]["sha256"],
-                "panel_prompt_template_id": projection[
-                    "panel_prompt_template_id"
-                ],
-                "panel_prompt_template_version": projection[
-                    "panel_prompt_template_version"
-                ],
-                "correction_prompt_policy": projection[
-                    "correction_prompt_policy"
-                ],
-                "first_request_safety_policy": projection[
-                    "first_request_safety_policy"
-                ],
-                "prompt_optimization": projection["prompt_optimization"],
-            }),
-            encoding="utf-8",
-        )
-        return {
-            "status": "redrawn",
-            "attempt": attempt,
-            "storyboard_ids": ["S01_P02"],
-            "regenerated_panel_count": 1,
-        }
 
     result = phase5_correction_resume_live_acceptance.run_acceptance(
         tmp_path,
         submit=True,
         expected_storyboard_id="S01_P02",
         client_factory=FakeImageClient,
-        redraw_runner=redraw_runner,
     )
 
     assert result["status"] == "passed"
     assert result["provider_request_count"] == 1
     assert result["provider_request_attempt_count"] == 1
     assert result["image_operation_count"] == 1
+    assert result["image_operation_attempt_count"] == 1
+    assert result["provider_call_chain"]["status"] == "passed"
+    assert result["model_business_verdict"]["status"] == "not_provided"
     assert all(result["business_assertions"].values())
     assert len(raw_post_calls) == 1
+    assert (
+        tmp_path / "live_acceptance/phase5_correction/S01_P02.png"
+    ).is_file()
+    assert storyboard_qa_gate._storyboard_panel_hashes(tmp_path) == initial_hashes
     with pytest.raises(RuntimeError, match="already consumed or attempted"):
         phase5_correction_resume_live_acceptance.run_acceptance(
             tmp_path,
@@ -6998,6 +7013,56 @@ def test_phase5_correction_live_acceptance_blocks_second_raw_request(
     assert guard.blocked_provider_request_count == 1
 
 
+def test_phase5_correction_live_acceptance_blocks_second_image_operation():
+    class FakeImageClient:
+        def text_to_image(self, *_args, **_kwargs):
+            return "https://example.invalid/result.png"
+
+    guard = (
+        phase5_correction_resume_live_acceptance.SinglePaidRequestImageClient(
+            FakeImageClient()
+        )
+    )
+
+    assert guard.text_to_image("first") == "https://example.invalid/result.png"
+    with pytest.raises(
+        phase5_correction_resume_live_acceptance.ProviderRequestLimitError,
+        match="exactly one Seedream image operation",
+    ):
+        guard.text_to_image("second")
+
+    assert guard.image_operation_count == 1
+    assert guard.image_operation_attempt_count == 2
+    assert guard.blocked_image_operation_count == 1
+
+
+def test_phase5_correction_live_acceptance_rejects_consumed_v2_receipt(
+    tmp_path,
+):
+    receipt_path = (
+        tmp_path / "phase5_correction_resume_live_acceptance.json"
+    )
+    receipt_path.write_text(
+        json.dumps({
+            "schema": "honcut.phase5-correction-resume-live-acceptance.v2",
+            "status": "live_acceptance_failed",
+            "submitted": True,
+            "provider_request_count": 1,
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="unknown .* receipt schema"):
+        phase5_correction_resume_live_acceptance.run_acceptance(
+            tmp_path,
+            submit=True,
+            expected_storyboard_id="S01_P02",
+            client_factory=lambda: pytest.fail(
+                "a consumed v2 receipt must fail before client construction"
+            ),
+        )
+
+
 def test_phase5_correction_live_receipt_keeps_first_provider_rejection(
     monkeypatch,
     tmp_path,
@@ -7041,6 +7106,11 @@ def test_phase5_correction_live_receipt_keeps_first_provider_rejection(
         "_continuation_preflight",
         lambda *_args, **_kwargs: preflight,
     )
+    monkeypatch.setattr(
+        phase5_correction_resume_live_acceptance,
+        "_build_exact_pxx_request",
+        lambda *_args, **_kwargs: _phase5_correction_live_request(preflight),
+    )
     issue = storyboard_qa_gate._issue(
         "L3", "moderate", "R4", "action mismatch", ["S01"],
         storyboard_ids=["S01_P02"], mismatch_type="action",
@@ -7078,41 +7148,33 @@ def test_phase5_correction_live_receipt_keeps_first_provider_rejection(
         request_id = "request-output-sensitive-123"
 
     class RejectingImageClient:
-        def image_to_image(self, *_args, **_kwargs):
+        model = "doubao-seedream-5.0-lite"
+
+        def text_to_image(self, prompt, output_path, *, size, timeout):
             phase5_correction_resume_live_acceptance.seedream_client.requests.post(
-                "https://example.invalid/images"
+                "https://example.invalid/images",
+                json={
+                    "model": self.model,
+                    "prompt": prompt,
+                    "size": size,
+                    "optimize_prompt_options": {"mode": "standard"},
+                },
             )
             raise OutputSafetyRejection("output image rejected")
-
-    def redraw_runner(*_args, image_client, **_kwargs):
-        try:
-            image_client.image_to_image(
-                "first request",
-                "reference.png",
-                output_path=str(beat_dir / "S01_P02.png"),
-            )
-        except OutputSafetyRejection:
-            image_client.image_to_image(
-                "semantic safety fallback",
-                "reference.png",
-                output_path=str(beat_dir / "S01_P02.png"),
-            )
-        raise AssertionError("the second image operation must be blocked")
 
     result = phase5_correction_resume_live_acceptance.run_acceptance(
         tmp_path,
         submit=True,
         expected_storyboard_id="S01_P02",
         client_factory=RejectingImageClient,
-        redraw_runner=redraw_runner,
     )
 
     assert result["status"] == "live_acceptance_failed"
     assert result["provider_request_count"] == 1
     assert result["provider_request_attempt_count"] == 1
     assert result["image_operation_count"] == 1
-    assert result["image_operation_attempt_count"] == 2
-    assert result["blocked_image_operation_count"] == 1
+    assert result["image_operation_attempt_count"] == 1
+    assert result["blocked_image_operation_count"] == 0
     assert result["first_provider_error"] == {
         "type": "OutputSafetyRejection",
         "status_code": 400,
@@ -8109,6 +8171,14 @@ def test_phase5_real_redraw_reuses_generator_and_archives_failed_shot(tmp_path):
             "observed": "保安撞破观察窗飞入太空",
         }],
     )
+    acceptance_request = (
+        phase5_correction_resume_live_acceptance._build_exact_pxx_request(
+            tmp_path,
+            state={"result": {"issues": [issue]}},
+            storyboard_id="S02_P01",
+            correction_attempt=1,
+        )
+    )
 
     receipt = storyboard_qa_gate._redraw_failed_storyboards(
         tmp_path,
@@ -8120,6 +8190,7 @@ def test_phase5_real_redraw_reuses_generator_and_archives_failed_shot(tmp_path):
 
     assert len(generated_prompts) == 6
     correction_prompt = generated_prompts[-2]
+    assert correction_prompt == acceptance_request["provider_prompt"]
     assert "Phase 5 定向纠偏合同" in correction_prompt
     assert "观察窗保持完整，Agent 稳定定格" in correction_prompt
     assert "保安撞破观察窗飞入太空" not in correction_prompt
