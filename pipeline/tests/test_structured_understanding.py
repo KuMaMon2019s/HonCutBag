@@ -32,6 +32,33 @@ from schemas.understanding import (  # noqa: E402
 from utils.semantic_contracts import bind_story_semantics  # noqa: E402
 
 
+def _ark_response(
+    *texts: str,
+    response_status: str = "completed",
+    error=None,
+    incomplete_details=None,
+    item_type: str = "message",
+    role: str = "assistant",
+    message_status: str = "completed",
+    block_type: str = "output_text",
+    extra_output=(),
+    output_text: str | None = None,
+):
+    message = SimpleNamespace(
+        type=item_type,
+        role=role,
+        status=message_status,
+        content=[SimpleNamespace(type=block_type, text=text) for text in texts],
+    )
+    return SimpleNamespace(
+        status=response_status,
+        error=error,
+        incomplete_details=incomplete_details,
+        output=[message, *extra_output],
+        output_text="".join(texts) if output_text is None else output_text,
+    )
+
+
 def test_structured_parser_rejects_unknown_fields_and_invalid_enums():
     raw = json.dumps({
         "verdict": "maybe",
@@ -90,14 +117,11 @@ def test_multimodal_client_sends_native_json_schema_and_returns_typed_model(tmp_
     class Responses:
         def create(self, **kwargs):
             captured.update(kwargs)
-            return SimpleNamespace(
-                output_text=json.dumps({
-                    "suggested_order": ["S01", "S02"],
-                    "narrative_consistent": True,
-                    "issues": [],
-                }),
-                output=[],
-            )
+            return _ark_response(json.dumps({
+                "suggested_order": ["S01", "S02"],
+                "narrative_consistent": True,
+                "issues": [],
+            }))
 
     client = ArkMultimodalClient(
         api_key="test",
@@ -116,6 +140,138 @@ def test_multimodal_client_sends_native_json_schema_and_returns_typed_model(tmp_
     assert captured["text"]["format"]["type"] == "json_schema"
     assert captured["text"]["format"]["strict"] is True
     assert captured["text"]["format"]["schema"]["additionalProperties"] is False
+
+
+def test_multimodal_client_ignores_the_sdk_output_text_aggregate(tmp_path):
+    canonical = '{"verdict":"pass","issues":[],"confidence":0.9}'
+
+    class Responses:
+        @staticmethod
+        def create(**_kwargs):
+            return _ark_response(
+                canonical,
+                output_text=canonical + " trailing SDK aggregate",
+            )
+
+    image = tmp_path / "frame.png"
+    image.write_bytes(b"image")
+    client = ArkMultimodalClient(
+        api_key="test",
+        client=SimpleNamespace(responses=Responses()),
+        media_url_resolver=lambda _path: "https://tos.example/frame.png",
+    )
+
+    result = client.review_structured(
+        [image],
+        "Review.",
+        ShotSemanticReview,
+    )
+
+    assert result.verdict == "pass"
+
+
+def test_multimodal_client_rejects_multiple_output_text_blocks_without_raw_text():
+    private_text = "PRIVATE_SECOND_MODEL_BLOCK"
+    response = _ark_response(
+        '{"verdict":"pass","issues":[],"confidence":0.9}',
+        private_text,
+    )
+
+    with pytest.raises(json.JSONDecodeError, match="exactly one output_text") as raised:
+        ark_multimodal_client._extract_single_completed_output_text(response)
+
+    assert private_text not in str(raised.value)
+    assert private_text not in raised.value.doc
+    assert "output_text_utf8_lengths" in str(raised.value)
+    assert "output_text_sha256" in str(raised.value)
+
+
+def test_multimodal_client_accepts_the_documented_dict_envelope_shape():
+    text = '{"verdict":"pass","issues":[],"confidence":0.9}'
+    response = {
+        "status": "completed",
+        "error": None,
+        "incomplete_details": None,
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": text}],
+        }],
+    }
+
+    assert (
+        ark_multimodal_client._extract_single_completed_output_text(response)
+        == text
+    )
+
+
+@pytest.mark.parametrize(
+    ("response", "reason"),
+    [
+        (
+            _ark_response(
+                response_status="incomplete",
+                incomplete_details={"reason": "max_output_tokens"},
+            ),
+            "response status must be completed",
+        ),
+        (
+            _ark_response(
+                error={"message": "PRIVATE_PROVIDER_ERROR"},
+            ),
+            "must not contain error",
+        ),
+        (
+            _ark_response(
+                incomplete_details={"reason": "PRIVATE_INCOMPLETE_DETAIL"},
+            ),
+            "must not contain incomplete details",
+        ),
+        (
+            _ark_response(item_type="reasoning"),
+            "exactly one assistant message",
+        ),
+        (
+            _ark_response(item_type="PRIVATE_PROVIDER_ITEM_TYPE"),
+            "exactly one assistant message",
+        ),
+        (
+            _ark_response(
+                "first",
+                extra_output=(_ark_response("second").output[0],),
+            ),
+            "exactly one assistant message",
+        ),
+        (
+            _ark_response("PRIVATE", role="user"),
+            "message role must be assistant",
+        ),
+        (
+            _ark_response("PRIVATE", message_status="incomplete"),
+            "message status must be completed",
+        ),
+        (
+            _ark_response("PRIVATE", block_type="refusal"),
+            "exactly one output_text",
+        ),
+        (
+            _ark_response("   "),
+            "output_text must be non-empty",
+        ),
+    ],
+)
+def test_multimodal_client_rejects_noncanonical_responses_without_raw_text(
+    response,
+    reason,
+):
+    with pytest.raises(json.JSONDecodeError, match=reason) as raised:
+        ark_multimodal_client._extract_single_completed_output_text(response)
+
+    serialized_error = str(raised.value)
+    assert "PRIVATE" not in serialized_error
+    assert "PRIVATE" not in raised.value.doc
+    assert "output_count" in serialized_error
 
 
 def test_multimodal_client_ignores_ambient_socks_proxy(monkeypatch):
@@ -177,6 +333,35 @@ def test_runtime_replays_one_rejected_structured_value_without_salvaging_json():
         "schema_rejected",
         "succeeded",
     ]
+
+
+def test_runtime_owns_one_replay_for_a_rejected_ark_response_envelope():
+    calls = 0
+
+    def review_operation():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            response = _ark_response(
+                "PRIVATE_REJECTED_MODEL_TEXT",
+                extra_output=(_ark_response(item_type="reasoning").output[0],),
+            )
+        else:
+            response = _ark_response(
+                '{"verdict":"pass","issues":[],"confidence":0.9}'
+            )
+        raw = ark_multimodal_client._extract_single_completed_output_text(response)
+        return parse_structured_output(raw, ShotSemanticReview)
+
+    result, receipt = execute_structured_understanding(review_operation)
+
+    assert result.verdict == "pass"
+    assert calls == 2
+    assert [attempt["status"] for attempt in receipt["attempts"]] == [
+        "schema_rejected",
+        "succeeded",
+    ]
+    assert "PRIVATE_REJECTED_MODEL_TEXT" not in json.dumps(receipt)
 
 
 def test_runtime_does_not_retry_non_schema_understanding_failure():

@@ -2525,9 +2525,14 @@ def test_multimodal_review_uses_responses_contract_and_bounded_output(tmp_path):
         def create(**kwargs):
             observed.update(kwargs)
             return SimpleNamespace(
+                status="completed",
+                error=None,
+                incomplete_details=None,
                 output=[
                     SimpleNamespace(
                         type="message",
+                        role="assistant",
+                        status="completed",
                         content=[SimpleNamespace(type="output_text", text='{"ok": true}')],
                     )
                 ]
@@ -2571,7 +2576,20 @@ def test_multimodal_request_preserves_image_video_document_audio_order(tmp_path)
         @staticmethod
         def create(**kwargs):
             observed.update(kwargs)
-            return SimpleNamespace(output_text='{"ok": true}', output=[])
+            return SimpleNamespace(
+                status="completed",
+                error=None,
+                incomplete_details=None,
+                output=[SimpleNamespace(
+                    type="message",
+                    role="assistant",
+                    status="completed",
+                    content=[SimpleNamespace(
+                        type="output_text",
+                        text='{"ok": true}',
+                    )],
+                )],
+            )
 
     class FakeClient:
         responses = FakeResponses()
