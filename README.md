@@ -180,6 +180,12 @@ uv run --locked --managed-python python pipeline/scripts/phase_orchestrator.py \
   --config config.json --resume-from phase5
 ```
 
+If Phase 5 stopped because an unchanged-panel confirmation was unavailable,
+an explicit `--resume-from phase5` validates the saved input lineage, report
+snapshots, and exact Pxx hashes, then retries only that narrow L3 confirmation.
+It does not rerun full storyboard QA or redraw images; missing or changed
+evidence is rejected.
+
 `uv.lock` and `.python-version` are authoritative. Project commands must use
 `make` or `uv run --locked ...`; bare `python`, `pip`, and `pytest` may resolve
 to an unrelated Conda or system interpreter.
