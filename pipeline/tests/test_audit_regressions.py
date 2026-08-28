@@ -30,6 +30,7 @@ if str(SCRIPTS) not in sys.path:
 import detached_pipeline_launch
 import phase_orchestrator
 import phase5_adjudication_live_acceptance
+import phase5_correction_resume_live_acceptance
 import pipeline_runner as pipeline_runner_cli
 from phases import pipeline_core
 from phases.phase1 import (
@@ -6609,6 +6610,223 @@ def test_phase5_live_acceptance_blocks_second_provider_request_at_transport():
     assert guarded.blocked_provider_request_count == 1
 
 
+def _phase5_correction_live_preflight(tmp_path, target_sha256, protected_sha256):
+    return {
+        "output_dir": str(tmp_path.resolve()),
+        "storyboard_id": "S01_P02",
+        "available_storyboard_ids": ["S01_P02"],
+        "parent_shot_id": "S01",
+        "correction_attempt": 2,
+        "asset_sha256": target_sha256,
+        "protected_panel_sha256": {"S01_P01": protected_sha256},
+        "protected_sidecar_sha256": {},
+        "credentials": {"ark_agent_credential_source": "test"},
+    }
+
+
+def test_phase5_correction_live_preflight_is_zero_request(monkeypatch, tmp_path):
+    preflight = _phase5_correction_live_preflight(
+        tmp_path, "a" * 64, "b" * 64
+    )
+    monkeypatch.setattr(
+        phase5_correction_resume_live_acceptance,
+        "_continuation_preflight",
+        lambda *_args, **_kwargs: preflight,
+    )
+
+    result = phase5_correction_resume_live_acceptance.run_acceptance(
+        tmp_path,
+        submit=False,
+        expected_storyboard_id="S01_P02",
+        client_factory=lambda: pytest.fail(
+            "zero-request preflight must not construct a Provider client"
+        ),
+        redraw_runner=lambda *_args, **_kwargs: pytest.fail(
+            "zero-request preflight must not enter Phase 2 redraw"
+        ),
+    )
+
+    assert result["status"] == "pending_live_acceptance"
+    assert result["submitted"] is False
+    assert result["preflight_status"] == "passed"
+    assert result["provider_request_limit"] == 1
+    assert result["provider_request_count"] == 0
+    persisted = json.loads(
+        (
+            tmp_path / "phase5_correction_resume_live_acceptance.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert persisted == result
+
+
+def test_phase5_correction_live_acceptance_allows_one_request_and_refuses_replay(
+    monkeypatch,
+    tmp_path,
+):
+    from PIL import Image
+
+    beat_dir = tmp_path / "storyboard_beats"
+    beat_dir.mkdir()
+    storyboard = {
+        "shots": [{
+            "id": "S01",
+            "storyboard_beats": [
+                {
+                    "beat_id": "S01_P01",
+                    "storyboard_image": "storyboard_beats/S01_P01.png",
+                },
+                {
+                    "beat_id": "S01_P02",
+                    "storyboard_image": "storyboard_beats/S01_P02.png",
+                },
+            ],
+        }],
+    }
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps(storyboard), encoding="utf-8"
+    )
+    Image.effect_noise((128, 72), 80).convert("RGB").save(
+        beat_dir / "S01_P01.png"
+    )
+    Image.effect_noise((128, 72), 120).convert("RGB").save(
+        beat_dir / "S01_P02.png"
+    )
+    initial_hashes = storyboard_qa_gate._storyboard_panel_hashes(tmp_path)
+    preflight = _phase5_correction_live_preflight(
+        tmp_path,
+        initial_hashes["S01_P02"],
+        initial_hashes["S01_P01"],
+    )
+    monkeypatch.setattr(
+        phase5_correction_resume_live_acceptance,
+        "_continuation_preflight",
+        lambda *_args, **_kwargs: preflight,
+    )
+    issue = storyboard_qa_gate._issue(
+        "L3", "moderate", "R4", "action mismatch", ["S01"],
+        storyboard_ids=["S01_P02"], mismatch_type="action",
+        expected="complete", observed="incomplete", confidence=0.95,
+        panel_evidence=[{
+            "shot_id": "S01_P02",
+            "observed": "incomplete",
+        }],
+    )
+    monkeypatch.setattr(
+        phase5_correction_resume_live_acceptance.storyboard_qa_gate,
+        "_load_completed_adjudication_correction",
+        lambda *_args, **_kwargs: {
+            "continuable": True,
+            "result": {"issues": [issue]},
+            "correction": {"attempts_used": 1, "max_attempts": 2},
+            "receipts": [],
+        },
+    )
+    raw_post_calls = []
+
+    def raw_post(*_args, **_kwargs):
+        raw_post_calls.append(True)
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        phase5_correction_resume_live_acceptance.seedream_client.requests,
+        "post",
+        raw_post,
+    )
+
+    class FakeImageClient:
+        def image_to_image(self, *_args, output_path, **_kwargs):
+            phase5_correction_resume_live_acceptance.seedream_client.requests.post(
+                "https://example.invalid/images"
+            )
+            Image.effect_noise((128, 72), 20).convert("RGB").save(output_path)
+            return "https://example.invalid/result.png"
+
+    def redraw_runner(
+        output_dir,
+        shot_ids,
+        issues,
+        attempt,
+        *,
+        image_client,
+    ):
+        assert output_dir == tmp_path.resolve()
+        assert shot_ids == ["S01"]
+        assert storyboard_qa_gate._correctable_storyboard_ids(issues) == [
+            "S01_P02"
+        ]
+        assert attempt == 2
+        image_client.image_to_image(
+            "strict correction",
+            "reference.png",
+            output_path=str(beat_dir / "S01_P02.png"),
+        )
+        return {
+            "status": "redrawn",
+            "attempt": attempt,
+            "storyboard_ids": ["S01_P02"],
+            "regenerated_panel_count": 1,
+        }
+
+    result = phase5_correction_resume_live_acceptance.run_acceptance(
+        tmp_path,
+        submit=True,
+        expected_storyboard_id="S01_P02",
+        client_factory=FakeImageClient,
+        redraw_runner=redraw_runner,
+    )
+
+    assert result["status"] == "passed"
+    assert result["provider_request_count"] == 1
+    assert result["provider_request_attempt_count"] == 1
+    assert result["image_operation_count"] == 1
+    assert all(result["business_assertions"].values())
+    assert len(raw_post_calls) == 1
+    with pytest.raises(RuntimeError, match="already consumed or attempted"):
+        phase5_correction_resume_live_acceptance.run_acceptance(
+            tmp_path,
+            submit=True,
+            expected_storyboard_id="S01_P02",
+            client_factory=lambda: pytest.fail(
+                "replay must fail before Provider client creation"
+            ),
+        )
+
+
+def test_phase5_correction_live_acceptance_blocks_second_raw_request(
+    monkeypatch,
+):
+    raw_calls = []
+
+    def raw_post(*_args, **_kwargs):
+        raw_calls.append(True)
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        phase5_correction_resume_live_acceptance.seedream_client.requests,
+        "post",
+        raw_post,
+    )
+    guard = phase5_correction_resume_live_acceptance.SinglePaidRequestTransport()
+    with guard:
+        assert (
+            phase5_correction_resume_live_acceptance.seedream_client.requests.post(
+                "https://example.invalid/images"
+            )
+            == {"ok": True}
+        )
+        with pytest.raises(
+            phase5_correction_resume_live_acceptance.ProviderRequestLimitError,
+            match="exactly one paid Provider request",
+        ):
+            phase5_correction_resume_live_acceptance.seedream_client.requests.post(
+                "https://example.invalid/images"
+            )
+
+    assert len(raw_calls) == 1
+    assert guard.provider_request_count == 1
+    assert guard.blocked_provider_request_count == 1
+
+
 def test_phase5_persists_safe_receipt_when_adjudication_is_unavailable(tmp_path):
     from PIL import Image
 
@@ -6853,6 +7071,175 @@ def test_phase5_explicit_resume_retries_only_pending_adjudication(tmp_path):
     assert report["status"] == "completed"
     assert report["adjudications"][-1]["decisions"] == {
         "S01_P02": "passed"
+    }
+
+
+def test_phase5_completed_blocking_adjudication_continues_remaining_previs_attempt(
+    tmp_path,
+):
+    from PIL import Image
+
+    storyboard = {
+        "shots": [{
+            "id": "S01",
+            "storyboard_beats": [
+                {
+                    "beat_id": "S01_P01",
+                    "storyboard_image": "storyboard_beats/S01_P01.png",
+                },
+                {
+                    "beat_id": "S01_P02",
+                    "storyboard_image": "storyboard_beats/S01_P02.png",
+                },
+            ],
+        }],
+    }
+    (tmp_path / "STORYBOARD.json").write_text(
+        json.dumps(storyboard), encoding="utf-8"
+    )
+    beat_dir = tmp_path / "storyboard_beats"
+    beat_dir.mkdir()
+    for noise, storyboard_id in ((80, "S01_P01"), (120, "S01_P02")):
+        Image.effect_noise((128, 72), noise).convert("RGB").save(
+            beat_dir / f"{storyboard_id}.png"
+        )
+
+    def issue(storyboard_id):
+        return storyboard_qa_gate._issue(
+            "L3", "moderate", "R4", f"{storyboard_id} action mismatch", ["S01"],
+            storyboard_ids=[storyboard_id],
+            mismatch_type="action",
+            expected="actor reaches the canonical end state",
+            observed="actor remains in the wrong action",
+            confidence=0.95,
+            panel_evidence=[{
+                "shot_id": storyboard_id,
+                "observed": "actor remains in the wrong action",
+            }],
+        )
+
+    first_qa_results = iter([
+        {
+            "status": "error", "grade": "C", "gate_passed": False,
+            "issues": [issue("S01_P01")],
+        },
+        {
+            "status": "error", "grade": "C", "gate_passed": False,
+            "issues": [issue("S01_P02")],
+        },
+    ])
+
+    def first_redraw(_output_dir, _shot_ids, _issues, attempt):
+        assert attempt == 1
+        Image.effect_noise((128, 72), 40).convert("RGB").save(
+            beat_dir / "S01_P01.png"
+        )
+        return {"status": "redrawn", "attempt": attempt}
+
+    failed = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        max_correction_attempts=2,
+        qa_runner=lambda _output_dir: next(first_qa_results),
+        redraw_runner=first_redraw,
+        adjudication_runner=lambda *_args: {
+            "status": "error",
+            "gate_passed": False,
+            "issues": [storyboard_qa_gate._issue(
+                "L3", "severe", "storyboard_visual_review_unavailable",
+                "temporary timeout", ["S01"],
+            )],
+            "layers": {"L3": {"status": "error", "error": "timeout"}},
+        },
+    )
+    assert failed["correction"]["attempts_used"] == 1
+
+    blocked = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        max_correction_attempts=2,
+        qa_runner=lambda *_args: pytest.fail(
+            "adjudication recovery must not rerun full QA"
+        ),
+        redraw_runner=lambda *_args: pytest.fail(
+            "adjudication recovery must not redraw"
+        ),
+        adjudication_runner=lambda _output_dir, storyboard_ids: {
+            "status": "error",
+            "grade": "C",
+            "gate_passed": False,
+            "storyboard_ids": storyboard_ids,
+            "issues": [issue("S01_P02")],
+            "layers": {"L3": {"status": "completed"}},
+        },
+        resume_pending_adjudication=True,
+    )
+    assert blocked["gate_passed"] is False
+    assert blocked["correction"]["attempts_used"] == 1
+    assert blocked["correction"]["history"][-1]["status"] == "rejected"
+
+    p02_bytes = (beat_dir / "S01_P02.png").read_bytes()
+    Image.effect_noise((128, 72), 15).convert("RGB").save(
+        beat_dir / "S01_P02.png"
+    )
+    refused = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        max_correction_attempts=2,
+        qa_runner=lambda *_args: pytest.fail(
+            "changed adjudication evidence must not rerun full QA"
+        ),
+        redraw_runner=lambda *_args: pytest.fail(
+            "changed adjudication evidence must not redraw"
+        ),
+        adjudication_runner=lambda *_args: pytest.fail(
+            "completed adjudication must not call the Provider again"
+        ),
+        resume_pending_adjudication=True,
+    )
+    assert refused["status"] == "error"
+    assert refused["correction"]["attempts_used"] == 1
+    assert "pixels changed" in refused["error"]
+    (beat_dir / "S01_P02.png").write_bytes(p02_bytes)
+
+    redraw_calls = []
+    qa_calls = 0
+
+    def remaining_redraw(_output_dir, _shot_ids, issues, attempt):
+        assert attempt == 2
+        target_ids = storyboard_qa_gate._correctable_storyboard_ids(issues)
+        redraw_calls.append((attempt, target_ids))
+        Image.effect_noise((128, 72), 20).convert("RGB").save(
+            beat_dir / "S01_P02.png"
+        )
+        return {"status": "redrawn", "attempt": attempt}
+
+    def final_qa(_output_dir):
+        nonlocal qa_calls
+        qa_calls += 1
+        assert redraw_calls == [(2, ["S01_P02"])]
+        return {
+            "status": "done", "grade": "A", "gate_passed": True,
+            "issues": [],
+        }
+
+    completed = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        tmp_path,
+        max_correction_attempts=2,
+        qa_runner=final_qa,
+        redraw_runner=remaining_redraw,
+        adjudication_runner=lambda *_args: pytest.fail(
+            "completed adjudication must not spend a second confirmation request"
+        ),
+        resume_pending_adjudication=True,
+    )
+
+    assert completed["gate_passed"] is True
+    assert qa_calls == 1
+    assert redraw_calls == [(2, ["S01_P02"])]
+    assert completed["correction"]["attempts_used"] == 2
+    assert [
+        entry["attempt"] for entry in completed["correction"]["history"]
+    ] == [1, 2]
+    assert completed["correction"]["review_adjudications"][-1]["decisions"] == {
+        "S01_P02": "blocked"
     }
 
 
