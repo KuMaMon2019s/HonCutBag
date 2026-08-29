@@ -6552,14 +6552,27 @@ def _phase5_live_acceptance_preflight(tmp_path):
 
 
 def _phase6_live_acceptance_preflight(tmp_path, **_kwargs):
-    output_path = tmp_path / "live_acceptance/phase6_storyboard_guide/S01_P01.mp4"
+    output_path = tmp_path / "live_acceptance/phase3_performance_board/S01_P01.mp4"
     preflight = {
         "output_dir": str(tmp_path.resolve()),
         "shot_id": "S01",
         "beat_id": "S01_P01",
         "p_count": 2,
         "visible_character_ids": ["CHAR_01"],
+        "synthetic_identity": {
+            "visual_identity_policy": "synthetic_stylized_character_v3",
+            "identity_contract_complete": True,
+            "character_ids": ["CHAR_01"],
+        },
         "narrative_cell_ids": ["S01_G01", "S01_G02"],
+        "performance_guides": [{
+            "character_id": "CHAR_01",
+            "cell_ids": ["A01"],
+            "source_action_unit_ids": ["AU001"],
+            "prop_ids": ["prop_1"],
+            "guide_sha256": "e" * 64,
+            "source_board_sha256": "d" * 64,
+        }],
         "prompt_sha256": "a" * 64,
         "media_index_manifest": [],
         "image_count": 3,
@@ -6573,10 +6586,10 @@ def _phase6_live_acceptance_preflight(tmp_path, **_kwargs):
             "generation_fingerprint": "b" * 64,
             "input_fingerprint": "b" * 64,
         },
-        "run_id": "fixture:phase6-live",
+        "run_id": "fixture:phase3-performance-live",
         "output_path": output_path,
         "task_store_path": (
-            tmp_path / "live_acceptance/phase6_storyboard_guide/runtime.db"
+            tmp_path / "live_acceptance/phase3_performance_board/runtime.db"
         ),
         "duration": 4,
         "ratio": "16:9",
@@ -6603,6 +6616,33 @@ def test_phase6_live_acceptance_preflight_is_zero_submit(tmp_path):
         "live_paid_provider",
     ]
     assert result["gates"]["regression"]["status"] == "pending"
+    assert result["gates"]["live_paid_provider"]["status"] == "pending"
+
+
+def test_phase6_live_acceptance_persists_regression_before_paid_submit(tmp_path):
+    phase6_storyboard_guide_live_acceptance.run_acceptance(
+        tmp_path,
+        submit=False,
+        preflight_builder=lambda *_args, **kwargs: (
+            _phase6_live_acceptance_preflight(tmp_path, **kwargs)
+        ),
+    )
+    evidence = tmp_path / "regression.json"
+    evidence.write_text(json.dumps({
+        "schema": phase6_storyboard_guide_live_acceptance.REGRESSION_SCHEMA,
+        "status": "passed",
+        "source": {"git_commit": "f" * 40},
+    }), encoding="utf-8")
+
+    result = phase6_storyboard_guide_live_acceptance.run_acceptance(
+        tmp_path,
+        regression_evidence=evidence,
+    )
+
+    assert result["status"] == "pending_live_acceptance"
+    assert result["submitted"] is False
+    assert result["provider_request_count"] == 0
+    assert result["gates"]["regression"]["status"] == "passed"
     assert result["gates"]["live_paid_provider"]["status"] == "pending"
 
 

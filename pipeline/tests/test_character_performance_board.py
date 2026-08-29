@@ -13,6 +13,7 @@ from phases.phase3.performance_reference_board import (
     attach_performance_guides_to_storyboard,
     build_character_performance_plan,
     generate_character_performance_board,
+    performance_prompt_optimization_contract,
     validate_character_performance_board,
     validate_character_performance_guide,
 )
@@ -163,6 +164,25 @@ def test_plan_has_six_ordered_cells_bound_to_real_pxx_action_and_prop():
     assert all(cell["prop_ids"] == ["energy_baton"] for cell in plan["cells"])
 
 
+def test_prompt_optimization_is_frozen_offline_and_covers_every_dimension():
+    first = performance_prompt_optimization_contract()
+    second = performance_prompt_optimization_contract()
+
+    assert first == second
+    assert first["schema"] == "honcut.character-performance-prompt-optimization.v1"
+    assert first["method"] == "offline_contract_candidate_comparison"
+    assert first["provider_request_count"] == 0
+    assert first["production_auto_optimization"] is False
+    assert first["selected_candidate_id"] == "lineage_first_synthetic_v1"
+    selected = next(
+        item
+        for item in first["candidates"]
+        if item["candidate_id"] == first["selected_candidate_id"]
+    )
+    assert selected["covered_dimensions"] == first["evaluation_dimensions"]
+    assert selected["contract_coverage_score"] == 7
+
+
 def test_generate_board_and_current_pxx_guides_are_exactly_cached(tmp_path):
     _write_reference_assets(tmp_path)
     image_client = _ImageClient()
@@ -246,6 +266,26 @@ def test_corrupt_or_future_board_receipt_fails_closed(tmp_path):
     receipt_path = tmp_path / "characters/lead/performance_reference_board.json"
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     receipt["schema"] = "honcut.character-performance-board.v999"
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    assert not validate_character_performance_board(tmp_path, "lead")
+    assert validate_character_performance_guide(tmp_path, "lead", "S01_P01") is None
+
+
+def test_future_prompt_optimization_receipt_cannot_satisfy_cache(tmp_path):
+    _write_reference_assets(tmp_path)
+    generate_character_performance_board(
+        tmp_path,
+        _storyboard(),
+        _character(),
+        image_client=_ImageClient(),
+        review_client=_ReviewClient(),
+    )
+    receipt_path = tmp_path / "characters/lead/performance_reference_board.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["prompt_optimization"]["schema"] = (
+        "honcut.character-performance-prompt-optimization.v999"
+    )
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
 
     assert not validate_character_performance_board(tmp_path, "lead")

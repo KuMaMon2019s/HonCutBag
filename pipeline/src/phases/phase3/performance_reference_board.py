@@ -27,6 +27,13 @@ from quality.character_reference_qa import file_sha256
 
 CHARACTER_PERFORMANCE_BOARD_SCHEMA = "honcut.character-performance-board.v1"
 CHARACTER_PERFORMANCE_GUIDE_SCHEMA = "honcut.character-performance-guide.v1"
+PERFORMANCE_PROMPT_OPTIMIZATION_SCHEMA = (
+    "honcut.character-performance-prompt-optimization.v1"
+)
+PERFORMANCE_PROMPT_TEMPLATE_ID = "honcut.character-performance-board-prompt.v1"
+PERFORMANCE_PROMPT_GUIDANCE_URL = (
+    "https://ark.volcengine.com/region:cn-beijing/docs/82379/1824121?lang=zh"
+)
 PERFORMANCE_BOARD_FILENAME = "performance_reference_board.png"
 PERFORMANCE_BOARD_RECEIPT = "performance_reference_board.json"
 PERFORMANCE_BOARD_QA_RECEIPT = "performance_reference_board_qa.json"
@@ -45,6 +52,38 @@ PERFORMANCE_KEY_POSE_PHASES = (
     "起势：保持当前编剧动作开始时的重心和道具关系",
     "执行峰值：清楚展示当前编剧动作的发力、位移或接触关系",
     "落位：只到达当前编剧动作写明的结束姿态，不追加结果",
+)
+PERFORMANCE_PROMPT_EVALUATION_DIMENSIONS = (
+    "synthetic_recognizability",
+    "aesthetic_quality",
+    "identity_consistency",
+    "pose_clarity",
+    "prop_accuracy",
+    "no_clones",
+    "no_layout_pollution",
+)
+_PERFORMANCE_PROMPT_CANDIDATES = (
+    {
+        "candidate_id": "identity_only_baseline_v1",
+        "covered_dimensions": (
+            "synthetic_recognizability",
+            "aesthetic_quality",
+            "identity_consistency",
+        ),
+    },
+    {
+        "candidate_id": "action_first_v1",
+        "covered_dimensions": (
+            "pose_clarity",
+            "prop_accuracy",
+            "no_clones",
+            "no_layout_pollution",
+        ),
+    },
+    {
+        "candidate_id": "lineage_first_synthetic_v1",
+        "covered_dimensions": PERFORMANCE_PROMPT_EVALUATION_DIMENSIONS,
+    },
 )
 _BEAT_ID_RE = re.compile(r"^S\d+_P\d+$")
 _SOURCE_ACTION_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]*$")
@@ -76,6 +115,51 @@ def _canonical_hash(payload: Any) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def performance_prompt_optimization_contract() -> dict[str, Any]:
+    """Return the frozen, zero-request prompt candidate decision.
+
+    Ark's debug/batch/scoring workflow is used as the design pattern, while the
+    production Runtime never calls a prompt-optimization service. The scores
+    below are deterministic contract-coverage scores, not model quality claims.
+    """
+    dimensions = list(PERFORMANCE_PROMPT_EVALUATION_DIMENSIONS)
+    candidates = []
+    for candidate in _PERFORMANCE_PROMPT_CANDIDATES:
+        covered = list(candidate["covered_dimensions"])
+        candidates.append({
+            "candidate_id": candidate["candidate_id"],
+            "covered_dimensions": covered,
+            "contract_coverage_score": len(covered),
+            "maximum_contract_coverage_score": len(dimensions),
+        })
+    selected = "lineage_first_synthetic_v1"
+    template_contract = {
+        "template_id": PERFORMANCE_PROMPT_TEMPLATE_ID,
+        "selected_candidate_id": selected,
+        "instruction_order": [
+            "identity_and_synthetic_makeup_lock",
+            "canonical_pxx_action_lineage",
+            "prop_ownership",
+            "pixel_and_story_boundary_prohibitions",
+        ],
+        "evaluation_dimensions": dimensions,
+    }
+    return {
+        "schema": PERFORMANCE_PROMPT_OPTIMIZATION_SCHEMA,
+        "status": "selected",
+        "method": "offline_contract_candidate_comparison",
+        "guidance_source": PERFORMANCE_PROMPT_GUIDANCE_URL,
+        "score_kind": "deterministic_contract_coverage",
+        "evaluation_dimensions": dimensions,
+        "candidates": candidates,
+        "selected_candidate_id": selected,
+        "selected_template_id": PERFORMANCE_PROMPT_TEMPLATE_ID,
+        "selected_template_sha256": _canonical_hash(template_contract),
+        "production_auto_optimization": False,
+        "provider_request_count": 0,
+    }
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -406,6 +490,8 @@ def validate_character_performance_board(
         or qa.get("passed") is not True
     ):
         return False
+    if receipt.get("prompt_optimization") != performance_prompt_optimization_contract():
+        return False
     plan = receipt.get("plan")
     if not isinstance(plan, dict) or plan.get("schema") != CHARACTER_PERFORMANCE_BOARD_SCHEMA:
         return False
@@ -603,6 +689,7 @@ def generate_character_performance_board(
         "model": resolved_model,
         "size": PERFORMANCE_BOARD_SIZE,
         "prompt_sha256": prompt_hash,
+        "prompt_optimization": performance_prompt_optimization_contract(),
         "request_fingerprint": request_fingerprint,
         "references": references,
         "image": PERFORMANCE_BOARD_FILENAME,

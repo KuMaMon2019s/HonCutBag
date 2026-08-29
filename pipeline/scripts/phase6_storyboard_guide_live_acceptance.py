@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ruff: noqa: E402
-"""Accept one Phase 6 P01 narrative-guide request against live Seedance.
+"""Accept one Phase 6 P01 narrative/performance-guide request against Seedance.
 
 Without ``--submit`` this command performs the required no-video-submit
 preflight and persists the exact media index, prompt hash, input hashes, and
@@ -37,6 +37,11 @@ from phases.phase4.cinematic_first_frames import (
     validate_cinematic_first_frame_artifacts,
 )
 from phases.phase4.continuity_plan import write_continuity_plan
+from phases.phase3.performance_reference_board import (
+    performance_prompt_optimization_contract,
+    validate_character_performance_board,
+    validate_character_performance_guide,
+)
 from runtime.continuity_chunks import ChunkExecutionRequest
 from runtime.continuity_provider import (
     _media_index_manifest,
@@ -52,11 +57,15 @@ from runtime.seedance_execution import execute_seedance_video_task
 from schemas.continuity import ContinuityPlan, GenerationChunk
 from utils.config import ARK_AGENT_CREDENTIAL_SOURCE, SEEDANCE_MODEL, get_api_key
 from utils.video_validation import is_valid_video
+from utils.privacy_visual_policy import (
+    NO_REAL_PERSON_POLICY,
+    synthetic_character_review_evidence,
+)
 
-RECEIPT_SCHEMA = "honcut.phase6-storyboard-guide-live-acceptance.v1"
-REGRESSION_SCHEMA = "honcut.phase6-storyboard-guide-regression.v1"
-RECEIPT_NAME = "phase6_storyboard_guide_live_acceptance.json"
-ACCEPTANCE_DIRECTORY = Path("live_acceptance") / "phase6_storyboard_guide"
+RECEIPT_SCHEMA = "honcut.phase3-performance-board-live-acceptance.v1"
+REGRESSION_SCHEMA = "honcut.phase3-performance-board-regression.v1"
+RECEIPT_NAME = "phase3_performance_board_live_acceptance.json"
+ACCEPTANCE_DIRECTORY = Path("live_acceptance") / "phase3_performance_board"
 MAX_PAID_PROVIDER_REQUESTS = 1
 REQUIRED_ACCEPTANCE_GATES = ["regression", "live_paid_provider"]
 
@@ -89,7 +98,7 @@ class SinglePaidRequestTransport:
         if self.provider_request_count >= MAX_PAID_PROVIDER_REQUESTS:
             self.blocked_provider_request_count += 1
             raise ProviderRequestLimitError(
-                "Phase 6 live acceptance permits exactly one paid Provider request"
+                "Phase 3 performance live acceptance permits exactly one paid Provider request"
             )
         if self._original_post is None:
             raise RuntimeError("Seedance transport guard is not active")
@@ -221,13 +230,18 @@ def _select_candidate(
             p01.sequence != 1
             or p01.execution_strategy != "multi_image"
             or not p01.storyboard_beat_id
+            or not p01.character_performance_required
+            or not p01.character_performance_guides
+            or not any(guide.prop_ids for guide in p01.character_performance_guides)
         ):
             continue
         candidates.append((shot, p01, [str(value) for value in visible]))
     if not candidates:
         scope = f" {requested_shot_id}" if requested_shot_id else ""
         raise RuntimeError(
-            "no Phase 6 live candidate" + scope + " has >=2 Pxx and 1-2 visible characters"
+            "no Phase 3 performance live candidate"
+            + scope
+            + " has >=2 Pxx, 1-2 visible characters, and a P01 prop-bound action guide"
         )
     if requested_shot_id and len(candidates) != 1:
         raise RuntimeError("explicit live acceptance shot did not resolve uniquely")
@@ -253,6 +267,7 @@ def _preflight_contract(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     output_dir = output_dir.resolve()
     storyboard = _read_json_object(output_dir / "STORYBOARD.json")
+    characters_payload = _read_json_object(output_dir / "CHARACTERS.json")
     phase2_manifest = migrate_shot_storyboard_narrative_guides(
         output_dir,
         storyboard,
@@ -289,6 +304,24 @@ def _preflight_contract(
         plan,
         shot_id,
     )
+    synthetic_evidence = synthetic_character_review_evidence(output_dir)
+    character_records = characters_payload.get("characters") or []
+    if (
+        characters_payload.get("visual_identity_policy") != NO_REAL_PERSON_POLICY
+        or not isinstance(character_records, list)
+        or not character_records
+        or any(
+            not isinstance(character, dict)
+            or character.get("visual_identity_policy") != NO_REAL_PERSON_POLICY
+            for character in character_records
+        )
+        or synthetic_evidence.get("top_level_policy_match") is not True
+        or synthetic_evidence.get("all_characters_policy_tagged") is not True
+        or synthetic_evidence.get("identity_contract_complete") is not True
+    ):
+        raise RuntimeError(
+            "selected run does not satisfy the current synthetic porcelain identity contract"
+        )
     selected_shot_id = str(chunk.storyboard_beat_id).split("_P", 1)[0]
     if not chunk.storyboard_image or not chunk.storyboard_narrative_guide:
         raise RuntimeError("selected P01 lacks cinematic or narrative-guide provenance")
@@ -299,6 +332,54 @@ def _preflight_contract(
         for later in continuity_shot.chunks[1:]
     ):
         raise RuntimeError("selected Sxx still declares a P02+ cinematic frame")
+    performance_guides = []
+    for declared in chunk.character_performance_guides:
+        if declared.character_id not in visible_character_ids:
+            raise RuntimeError(
+                "selected P01 performance guide belongs to a non-visible character"
+            )
+        if not validate_character_performance_board(
+            output_dir,
+            declared.character_id,
+        ):
+            raise RuntimeError(
+                f"{declared.character_id} performance board failed current validation"
+            )
+        validated = validate_character_performance_guide(
+            output_dir,
+            declared.character_id,
+            str(chunk.storyboard_beat_id),
+        )
+        if validated is None:
+            raise RuntimeError(
+                f"{declared.character_id} current-Pxx performance guide is invalid"
+            )
+        expected = declared.model_dump(mode="json")
+        if any(
+            validated.get(field) != expected.get(field)
+            for field in (
+                "character_id",
+                "beat_id",
+                "image",
+                "image_sha256",
+                "cell_ids",
+                "source_action_unit_ids",
+                "prop_ids",
+                "source_board",
+                "source_board_sha256",
+                "source_board_receipt",
+                "source_board_receipt_sha256",
+            )
+        ):
+            raise RuntimeError("selected performance guide differs from continuity provenance")
+        performance_guides.append({
+            "character_id": declared.character_id,
+            "cell_ids": list(declared.cell_ids),
+            "source_action_unit_ids": list(declared.source_action_unit_ids),
+            "prop_ids": list(declared.prop_ids),
+            "guide_sha256": declared.image_sha256,
+            "source_board_sha256": declared.source_board_sha256,
+        })
     acceptance_dir = output_dir / ACCEPTANCE_DIRECTORY
     acceptance_dir.mkdir(parents=True, exist_ok=True)
     prompt_path = acceptance_dir / f"{chunk.storyboard_beat_id}_prompt.txt"
@@ -343,12 +424,27 @@ def _preflight_contract(
         for item in image_media
         if item.get("responsibility") == "character_identity_board"
     ]
+    performance_media = [
+        item
+        for item in image_media
+        if item.get("responsibility") == "character_performance_guide"
+    ]
+    expected_responsibilities = [
+        "cinematic_composition",
+        *(["character_identity_board"] * len(visible_character_ids)),
+        "storyboard_narrative_guide",
+        *(["character_performance_guide"] * len(performance_guides)),
+    ]
     required_prompt_fragments = (
+        "珍珠生体瓷妆",
         "当前剧情导航图是图片",
         "红色箭头表示主体或物体运动方向",
         "蓝色箭头表示摄影机运动",
         "不得提前演绎其他 Gxx 或后续 Pxx",
         "严禁渲染进视频画面",
+        "当前动作姿态图中的多个人形是同一个角色的不同参考姿态",
+        "只执行本次明确列出的 Axx",
+        "不得生成角色克隆、分栏、拼贴、网格、文字、序号、箭头、边框",
     )
     if (
         not image_media
@@ -357,6 +453,9 @@ def _preflight_contract(
         or video_media
         or len(guides) != 1
         or len(character_media) != len(visible_character_ids)
+        or len(performance_media) != len(performance_guides)
+        or [item.get("responsibility") for item in image_media]
+        != expected_responsibilities
         or any(fragment not in prompt for fragment in required_prompt_fragments)
     ):
         raise RuntimeError("selected P01 does not satisfy the final Phase 6 media contract")
@@ -366,11 +465,13 @@ def _preflight_contract(
         "ratio": ratio,
         "resolution": resolution,
         "return_last_frame": True,
-        "seedance_prompt_contract": "all_modal_reference_with_narrative_guide_v2",
+        "seedance_prompt_contract": (
+            "all_modal_reference_with_story_and_performance_guides_v3"
+        ),
         "media_index_manifest": media_manifest,
         "provider_prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
     }
-    run_id = f"{output_dir.name}:phase6-storyboard-guide-live-v1"
+    run_id = f"{output_dir.name}:phase3-performance-board-live-v1"
     payload = _task_payload(
         request,
         model=SEEDANCE_MODEL,
@@ -388,12 +489,24 @@ def _preflight_contract(
         "beat_id": chunk.storyboard_beat_id,
         "p_count": len(shot.get("storyboard_beats") or []),
         "visible_character_ids": visible_character_ids,
+        "synthetic_identity": {
+            "visual_identity_policy": NO_REAL_PERSON_POLICY,
+            "identity_contract_complete": True,
+            "character_ids": [
+                character["id"]
+                for character in synthetic_evidence.get("characters") or []
+            ],
+        },
         "narrative_cell_ids": list(chunk.storyboard_narrative_guide_cell_ids),
         "narrative_guide_sha256": chunk.storyboard_narrative_guide_sha256,
         "narrative_source_board_sha256": (
             chunk.storyboard_narrative_guide_source_board_sha256
         ),
         "cinematic_sha256": _sha256_file(output_dir / chunk.storyboard_image),
+        "performance_guides": performance_guides,
+        "performance_prompt_optimization": (
+            performance_prompt_optimization_contract()
+        ),
         "prompt_path": str(prompt_path.relative_to(output_dir)),
         "prompt_sha256": generation_parameters["provider_prompt_sha256"],
         "media_index_manifest": media_manifest,
@@ -486,6 +599,10 @@ def _apply_regression_evidence(
     expected_commit = ((receipt.get("preflight") or {}).get("source") or {}).get(
         "git_commit"
     )
+    if ((receipt.get("preflight") or {}).get("source") or {}).get(
+        "worktree_clean"
+    ) is not True:
+        raise RuntimeError("regression evidence requires a clean preflight source")
     if (evidence.get("source") or {}).get("git_commit") != expected_commit:
         raise RuntimeError("regression evidence git commit differs from live preflight")
     receipt["gates"]["regression"] = {
@@ -502,10 +619,13 @@ def _preflight_replay_contract(preflight: dict[str, Any]) -> dict[str, Any]:
         "beat_id",
         "p_count",
         "visible_character_ids",
+        "synthetic_identity",
         "narrative_cell_ids",
         "narrative_guide_sha256",
         "narrative_source_board_sha256",
         "cinematic_sha256",
+        "performance_guides",
+        "performance_prompt_optimization",
         "prompt_sha256",
         "media_index_manifest",
         "image_count",
@@ -599,7 +719,7 @@ def run_acceptance(
     receipt_path = output_dir / RECEIPT_NAME
     existing = _read_json_object(receipt_path) if receipt_path.is_file() else None
     if existing is not None and existing.get("schema") != RECEIPT_SCHEMA:
-        raise RuntimeError("unknown Phase 6 live acceptance receipt schema")
+        raise RuntimeError("unknown Phase 3 performance live acceptance receipt schema")
     if existing is not None:
         existing = _reconcile_zero_request_preflight_failure(
             output_dir,
@@ -608,8 +728,10 @@ def run_acceptance(
         )
 
     if business_verdict or regression_evidence is not None:
-        if existing is None or existing.get("submitted") is not True:
-            raise RuntimeError("cannot finalize an unsubmitted live acceptance")
+        if existing is None:
+            raise RuntimeError("cannot update live acceptance before no-submit preflight")
+        if business_verdict and existing.get("submitted") is not True:
+            raise RuntimeError("cannot record a business verdict before live submission")
         if regression_evidence is not None:
             _apply_regression_evidence(existing, regression_evidence)
         if business_verdict:
@@ -627,7 +749,9 @@ def run_acceptance(
 
     if existing is not None and existing.get("submitted") is True and not resume_poll:
         if submit:
-            raise RuntimeError("this Phase 6 acceptance already consumed its live request")
+            raise RuntimeError(
+                "this Phase 3 performance acceptance already consumed its live request"
+            )
         return existing
 
     if resume_poll:
@@ -774,7 +898,7 @@ def run_acceptance(
         logical_submit_attempt_count += 1
         if resume_poll or logical_submit_count >= MAX_PAID_PROVIDER_REQUESTS:
             raise ProviderRequestLimitError(
-                "Phase 6 live acceptance permits exactly one logical submit"
+                "Phase 3 performance live acceptance permits exactly one logical submit"
             )
         task_id = seedance_client.submit_content(
             _provider_ready_content(runtime["content"]),

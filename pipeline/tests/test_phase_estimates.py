@@ -28,10 +28,19 @@ def _structured_inputs() -> tuple[dict, dict]:
         "shots": [
             {
                 "id": 1,
+                "shot_intent": "action",
                 "character_ids": ["hero"],
                 "storyboard_beats": [
-                    {"beat_id": "S01_P01"},
-                    {"beat_id": "S01_P02"},
+                    {
+                        "beat_id": "S01_P01",
+                        "character_ids": ["hero"],
+                        "source_action_unit_ids": ["AU001"],
+                    },
+                    {
+                        "beat_id": "S01_P02",
+                        "character_ids": ["hero"],
+                        "source_action_unit_ids": ["AU002"],
+                    },
                 ],
             }
         ]
@@ -52,9 +61,11 @@ def test_structured_workload_counts_provider_image_requests(tmp_path):
     assert workload.character_count == 1
     assert workload.shot_count == 1
     assert workload.storyboard_beat_count == 2
-    assert workload.character_reference_image_requests == 7
+    # Four views + one prop board + one performance board. Legacy state
+    # variants remain audit-only and do not count as Provider work.
+    assert workload.character_reference_image_requests == 6
     assert workload.phase2_image_requests == 0
-    assert workload.phase3_image_requests == 10
+    assert workload.phase3_image_requests == 9
     assert workload.phase4_image_requests == 1
     assert workload.phase5_max_correction_image_requests == 6
 
@@ -78,12 +89,12 @@ def test_total_estimate_exposes_bounded_phase5_correction_range(monkeypatch, tmp
 
     assert estimate["phases"] == {
         "phase2": 0,
-        "phase3": 1200,
+        "phase3": 1080,
         "phase4": 120,
         "phase5": 10,
     }
-    assert estimate["total"] == 1330
-    assert estimate["upper_total"] == 2050
+    assert estimate["total"] == 1210
+    assert estimate["upper_total"] == 1930
     assert estimate["bounded"] is True
     assert estimate["basis"] == "structured_provider_workload"
 
