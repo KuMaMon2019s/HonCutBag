@@ -185,6 +185,38 @@ class _FailThenPassReviewClient:
         return json.dumps(payload)
 
 
+class _FailTwiceThenPassReviewClient:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def review(self, image_paths, prompt):
+        self.calls.append((list(image_paths), prompt))
+        payload = json.loads(_qa_payload())
+        if len(self.calls) <= 2:
+            payload["passed"] = False
+            payload["cells"][1]["pose_matches_action"] = False
+            payload["cells"][1]["issues"] = [
+                "named stepping foot and prop swing direction are incorrect"
+            ]
+            payload["cells"][2]["pose_matches_action"] = False
+            payload["cells"][2]["issues"] = [
+                "prop is not vertical on the authored defensive side"
+            ]
+            payload["issues"] = ["A02 and A03 action mismatch"]
+        return json.dumps(payload)
+
+
+class _AlwaysFailReviewClient(_FailTwiceThenPassReviewClient):
+    def review(self, image_paths, prompt):
+        self.calls.append((list(image_paths), prompt))
+        payload = json.loads(_qa_payload())
+        payload["passed"] = False
+        payload["cells"][1]["pose_matches_action"] = False
+        payload["cells"][1]["issues"] = ["attack direction remains incorrect"]
+        payload["issues"] = ["A02 action mismatch"]
+        return json.dumps(payload)
+
+
 def test_plan_has_six_ordered_cells_bound_to_real_pxx_action_and_prop():
     plan = build_character_performance_plan(_storyboard(), _character())
 
@@ -353,6 +385,95 @@ def test_failed_whole_board_uses_six_cached_components_then_passes(tmp_path):
     assert [item["cell_id"] for item in receipt["component_cells"]] == list(
         PERFORMANCE_CELL_IDS
     )
+
+
+def test_failed_components_redraw_only_failed_cells_once_with_qa_feedback(tmp_path):
+    _write_reference_assets(tmp_path)
+    image_client = _FallbackImageClient()
+    review_client = _FailTwiceThenPassReviewClient()
+
+    generated = generate_character_performance_board(
+        tmp_path,
+        _storyboard(),
+        _character(),
+        image_client=image_client,
+        review_client=review_client,
+    )
+    reused = generate_character_performance_board(
+        tmp_path,
+        _storyboard(),
+        _character(),
+        image_client=image_client,
+        review_client=review_client,
+    )
+
+    assert generated is not None and generated["provider_requests"] == 9
+    assert reused is not None and reused["provider_requests"] == 0
+    assert len(image_client.calls) == 9
+    assert len(review_client.calls) == 3
+    correction_calls = image_client.calls[-2:]
+    assert all("one allowed correction redraw" in call["prompt"] for call in correction_calls)
+    assert all("anatomical left/right" in call["prompt"] for call in correction_calls)
+    receipt = json.loads(
+        (tmp_path / "characters/lead/performance_reference_board.json").read_text()
+    )
+    assert receipt["generation_mode"] == "per_cell_correction"
+    assert receipt["provider_request_count"] == 9
+    assert receipt["correction_attempts"] == [
+        {
+            **receipt["correction_attempts"][0],
+            "round": 1,
+            "status": "passed",
+            "target_cell_ids": ["A02", "A03"],
+            "provider_requests": 2,
+        }
+    ]
+    by_id = {item["cell_id"]: item for item in receipt["component_cells"]}
+    assert by_id["A01"]["image"].endswith("performance_cells/A01.png")
+    assert by_id["A02"]["image"].endswith(
+        "performance_cells/corrections/round_01/A02.png"
+    )
+    assert by_id["A03"]["image"].endswith(
+        "performance_cells/corrections/round_01/A03.png"
+    )
+    assert (tmp_path / "characters/lead/performance_cells/A02.png").is_file()
+    assert (
+        tmp_path / "characters/lead/performance_reference_board.per_cell_fallback.png"
+    ).is_file()
+
+
+def test_failed_single_correction_round_is_terminal_and_never_replayed(tmp_path):
+    _write_reference_assets(tmp_path)
+    image_client = _FallbackImageClient()
+    review_client = _AlwaysFailReviewClient()
+
+    try:
+        generate_character_performance_board(
+            tmp_path,
+            _storyboard(),
+            _character(),
+            image_client=image_client,
+            review_client=review_client,
+        )
+    except Exception as exc:
+        assert "failed bounded correction QA" in str(exc)
+    else:
+        raise AssertionError("failed bounded correction must block")
+    request_count = len(image_client.calls)
+
+    try:
+        generate_character_performance_board(
+            tmp_path,
+            _storyboard(),
+            _character(),
+            image_client=image_client,
+            review_client=review_client,
+        )
+    except Exception as exc:
+        assert "already failed blocking QA" in str(exc)
+    else:
+        raise AssertionError("consumed correction must remain terminal")
+    assert len(image_client.calls) == request_count == 8
 
 
 def test_wet_or_damaged_state_alone_does_not_create_performance_board():

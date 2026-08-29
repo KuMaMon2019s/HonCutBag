@@ -43,6 +43,7 @@ PERFORMANCE_BOARD_PIXEL_SIZE = (3072, 2048)
 PERFORMANCE_CELL_SIZE = "2048x2048"
 PERFORMANCE_CELL_PIXEL_SIZE = (2048, 2048)
 PERFORMANCE_COMPOSITION_MODE = "locally_feathered_2x3_v2"
+PERFORMANCE_MAX_CELL_CORRECTION_ROUNDS = 1
 PERFORMANCE_CELL_IDS = tuple(f"A{index:02d}" for index in range(1, 7))
 PERFORMANCE_POSE_VOCABULARY = (
     "combat_ready",
@@ -613,6 +614,47 @@ Synthetic styling contract: {json.dumps(styling, ensure_ascii=False, sort_keys=T
 """
 
 
+def build_character_performance_cell_correction_prompt(
+    character: Mapping[str, Any],
+    cell: Mapping[str, Any],
+    qa_feedback: list[str],
+) -> str:
+    """Project one failed cell into a single bounded, QA-guided redraw prompt."""
+    if not qa_feedback or any(not str(item).strip() for item in qa_feedback):
+        raise CharacterPerformanceQAError("performance cell correction requires QA feedback")
+    feedback = "\n".join(f"- {str(item).strip()}" for item in qa_feedback)
+    role = str(cell.get("pose_category") or "").strip()
+    pose_directive = {
+        "attack": (
+            "Freeze at the authored attack peak, with the named stepping foot visibly advanced "
+            "and the complete weapon frozen on the authored diagonal swing path."
+        ),
+        "block": (
+            "Freeze only after the authored foot has retracted and place the complete weapon "
+            "at the exact declared defensive side and orientation."
+        ),
+        "evade": (
+            "Freeze after the authored lateral displacement with the named foot moved, center "
+            "of gravity lowered and torso visibly leaning in the authored direction."
+        ),
+        "prop_hold": "Freeze a readable authored hold with both hands and the full prop visible.",
+        "prop_use": "Freeze the authored prop-use peak; do not replace it with a neutral hold.",
+        "combat_ready": "Freeze the exact authored ready stance, not a neutral standing portrait.",
+    }.get(role, "Freeze the exact authored action at its most readable key pose.")
+    return f"""{build_character_performance_cell_prompt(character, cell)}
+
+This is the one allowed correction redraw for internal cell {cell['cell_id']}. The previous image
+failed strict action QA for these exact reasons:
+{feedback}
+
+Correct every listed failure and nothing else. {pose_directive}
+Left/right is always the character's anatomical left/right, not the viewer's: in a front-facing
+pose, character-left appears on viewer-right and character-right appears on viewer-left. Make the
+foot placement and prop direction unmistakable in silhouette. Do not print this feedback or the
+internal cell ID in the image.
+"""
+
+
 def _reference_records(output_dir: Path, character: Mapping[str, Any]) -> list[dict[str, str]]:
     character_id = str(character.get("id") or "").strip()
     character_dir = output_dir / "characters" / character_id
@@ -819,6 +861,8 @@ def _generate_performance_cell_components(
     *,
     image_client: PerformanceBoardImageClient,
     resolved_model: str,
+    correction_round: int = 0,
+    correction_feedback: Mapping[str, list[str]] | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     character_id = str(character.get("id") or "").strip()
     component_dir = output_dir / "characters" / character_id / "performance_cells"
@@ -830,14 +874,83 @@ def _generate_performance_cell_components(
     ]
     results: list[dict[str, Any]] = []
     provider_requests = 0
+    feedback_by_cell = dict(correction_feedback or {})
+    if correction_round not in {0, 1}:
+        raise CharacterPerformanceQAError("performance cell correction round is out of bounds")
+    if correction_round == 0 and feedback_by_cell:
+        raise CharacterPerformanceQAError("base performance cells cannot carry correction feedback")
+    if correction_round > 0 and not feedback_by_cell:
+        raise CharacterPerformanceQAError("performance correction requires failed cell feedback")
+    unknown_feedback = set(feedback_by_cell).difference(PERFORMANCE_CELL_IDS)
+    if unknown_feedback:
+        raise CharacterPerformanceQAError("performance correction references unknown cells")
     for cell in plan["cells"]:
         cell_id = str(cell["cell_id"])
-        image_path = component_dir / f"{cell_id}.png"
-        receipt_path = component_dir / f"{cell_id}.json"
-        prompt = bind_reference_roles(
-            build_character_performance_cell_prompt(character, cell),
-            roles,
-        )
+        is_correction_target = correction_round > 0 and cell_id in feedback_by_cell
+        if correction_round > 0 and not is_correction_target:
+            image_path = component_dir / f"{cell_id}.png"
+            receipt_path = component_dir / f"{cell_id}.json"
+            base_prompt = bind_reference_roles(
+                build_character_performance_cell_prompt(character, cell),
+                roles,
+            )
+            base_prompt_hash = hashlib.sha256(base_prompt.encode("utf-8")).hexdigest()
+            base_request_fingerprint = image_request_fingerprint(
+                prompt=base_prompt,
+                model=resolved_model,
+                size=PERFORMANCE_CELL_SIZE,
+                reference_image_sha256=[record["sha256"] for record in references],
+            )
+            base_expected = {
+                "schema": CHARACTER_PERFORMANCE_CELL_SCHEMA,
+                "status": "passed",
+                "character_id": character_id,
+                "cell_id": cell_id,
+                "cell_sha256": _canonical_hash(cell),
+                "model": resolved_model,
+                "size": PERFORMANCE_CELL_SIZE,
+                "prompt_sha256": base_prompt_hash,
+                "request_fingerprint": base_request_fingerprint,
+                "references": references,
+                "image": image_path.relative_to(output_dir).as_posix(),
+            }
+            cached = _load_json(receipt_path)
+            if (
+                cached is None
+                or any(cached.get(key) != value for key, value in base_expected.items())
+                or not image_path.is_file()
+                or cached.get("image_sha256") != file_sha256(image_path)
+            ):
+                raise CharacterPerformanceQAError(
+                    f"{character_id} {cell_id} base component cannot support correction"
+                )
+            try:
+                with Image.open(image_path) as image:
+                    image.verify()
+                    if image.size != PERFORMANCE_CELL_PIXEL_SIZE:
+                        raise CharacterPerformanceQAError(
+                            f"{character_id} {cell_id} base component has invalid size"
+                        )
+            except (OSError, ValueError) as exc:
+                raise CharacterPerformanceQAError(
+                    f"{character_id} {cell_id} base component is not a valid image"
+                ) from exc
+            results.append(dict(cached))
+            continue
+        if is_correction_target:
+            correction_dir = component_dir / "corrections" / f"round_{correction_round:02d}"
+            image_path = correction_dir / f"{cell_id}.png"
+            receipt_path = correction_dir / f"{cell_id}.json"
+            raw_prompt = build_character_performance_cell_correction_prompt(
+                character,
+                cell,
+                feedback_by_cell[cell_id],
+            )
+        else:
+            image_path = component_dir / f"{cell_id}.png"
+            receipt_path = component_dir / f"{cell_id}.json"
+            raw_prompt = build_character_performance_cell_prompt(character, cell)
+        prompt = bind_reference_roles(raw_prompt, roles)
         prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         request_fingerprint = image_request_fingerprint(
             prompt=prompt,
@@ -858,6 +971,11 @@ def _generate_performance_cell_components(
             "references": references,
             "image": image_path.relative_to(output_dir).as_posix(),
         }
+        if is_correction_target:
+            expected.update({
+                "correction_round": correction_round,
+                "qa_feedback": feedback_by_cell[cell_id],
+            })
         cached = _load_json(receipt_path)
         cache_valid = bool(
             cached is not None
@@ -930,6 +1048,49 @@ def _compose_performance_cell_components(
             feather_mask,
         )
     _atomic_png(destination, board)
+
+
+def _failed_performance_cell_feedback(
+    qa_result: Mapping[str, Any],
+) -> dict[str, list[str]]:
+    """Return only cell-scoped failures eligible for one bounded redraw."""
+    cells = qa_result.get("cells")
+    if not isinstance(cells, list):
+        raise CharacterPerformanceQAError("performance QA omitted cell verdicts")
+    by_id = {
+        str(item.get("cell_id") or ""): item
+        for item in cells
+        if isinstance(item, Mapping)
+    }
+    if set(by_id) != set(PERFORMANCE_CELL_IDS):
+        raise CharacterPerformanceQAError("performance QA cell verdicts are incomplete")
+    feedback: dict[str, list[str]] = {}
+    boolean_checks = (
+        "same_character",
+        "pose_matches_action",
+        "pose_distinct",
+        "clothing_consistent",
+        "makeup_consistent",
+        "healthy_beautiful_synthetic_styling",
+        "no_uncanny_or_corpse_like_styling",
+        "prop_ownership_correct",
+        "no_extra_character",
+        "no_text_or_layout_marks",
+    )
+    for cell_id in PERFORMANCE_CELL_IDS:
+        verdict = by_id[cell_id]
+        failed_checks = [key for key in boolean_checks if verdict.get(key) is not True]
+        if not failed_checks:
+            continue
+        issues = [
+            str(item).strip()
+            for item in verdict.get("issues") or []
+            if str(item).strip()
+        ]
+        if not issues:
+            issues = ["Failed strict checks: " + ", ".join(failed_checks)]
+        feedback[cell_id] = issues
+    return feedback
 
 
 def generate_character_performance_board(
@@ -1010,15 +1171,20 @@ def generate_character_performance_board(
     )
     if (
         previous_exact_failure
-        and previous_mode == "per_cell_fallback"
+        and previous_mode == "per_cell_correction"
         and previous_receipt.get("composition_mode") == PERFORMANCE_COMPOSITION_MODE
     ):
         raise CharacterPerformanceQAError(
-            f"{character_id} exact per-cell performance fallback already failed blocking QA"
+            f"{character_id} bounded performance cell correction already failed blocking QA"
         )
     attempts = [
         dict(item)
         for item in (previous_receipt or {}).get("attempts") or []
+        if isinstance(item, Mapping)
+    ]
+    correction_attempts = [
+        dict(item)
+        for item in (previous_receipt or {}).get("correction_attempts") or []
         if isinstance(item, Mapping)
     ]
     if previous_exact_failure and previous_mode == "whole_board" and not attempts:
@@ -1053,6 +1219,7 @@ def generate_character_performance_board(
             else "whole_board"
         ),
         "attempts": attempts,
+        "correction_attempts": correction_attempts,
     }
     _atomic_json(receipt_path, pending)
     appearance = character.get("appearance")
@@ -1131,21 +1298,115 @@ def generate_character_performance_board(
         )
         current_provider_requests += component_requests
         _compose_performance_cell_components(output_dir, components, image_path)
-        qa_result, image_hash = review_current_board()
+        resume_failed_fallback = bool(
+            previous_exact_failure
+            and previous_mode == "per_cell_fallback"
+            and previous_qa is not None
+            and previous_receipt is not None
+            and previous_receipt.get("image_sha256") == file_sha256(image_path)
+            and previous_qa.get("image_sha256") == file_sha256(image_path)
+        )
+        if resume_failed_fallback:
+            qa_result = dict(previous_qa)
+            image_hash = file_sha256(image_path)
+        else:
+            qa_result, image_hash = review_current_board()
         if not qa_result["passed"]:
-            failed = {
-                **pending,
-                "status": "failed",
-                "image_sha256": image_hash,
-                "component_cells": components,
-                "provider_request_count": sum(
-                    int(item.get("provider_requests") or 0) for item in attempts
-                ) + len(components),
-            }
-            _atomic_json(receipt_path, failed)
-            raise CharacterPerformanceQAError(
-                f"{character_id} performance board failed blocking pixel QA"
+            feedback = _failed_performance_cell_feedback(qa_result)
+            archived_qa = character_dir / "performance_reference_board_qa.per_cell_fallback.json"
+            _atomic_json(archived_qa, _load_json(qa_path) or dict(qa_result))
+            archived_board = character_dir / "performance_reference_board.per_cell_fallback.png"
+            with Image.open(image_path) as failed_board:
+                _atomic_png(archived_board, failed_board.convert("RGB"))
+            if not any(
+                item.get("mode") == "per_cell_fallback"
+                for item in attempts
+            ):
+                attempts.append({
+                    "mode": "per_cell_fallback",
+                    "status": "failed",
+                    "provider_requests": len(components),
+                    "image_sha256": image_hash,
+                    "image": archived_board.name,
+                    "qa_receipt": archived_qa.name,
+                    "qa_receipt_sha256": file_sha256(archived_qa),
+                })
+            if not feedback:
+                failed = {
+                    **pending,
+                    "status": "failed",
+                    "generation_mode": "per_cell_fallback",
+                    "attempts": attempts,
+                    "image_sha256": image_hash,
+                    "component_cells": components,
+                    "provider_request_count": sum(
+                        int(item.get("provider_requests") or 0) for item in attempts
+                    ),
+                }
+                _atomic_json(receipt_path, failed)
+                raise CharacterPerformanceQAError(
+                    f"{character_id} performance board has no cell-scoped correction target"
+                )
+            if correction_attempts:
+                raise CharacterPerformanceQAError(
+                    f"{character_id} performance cell correction history is already consumed"
+                )
+            correction_components, correction_requests = (
+                _generate_performance_cell_components(
+                    output_dir,
+                    character,
+                    plan,
+                    references,
+                    image_client=image_client,
+                    resolved_model=resolved_model,
+                    correction_round=PERFORMANCE_MAX_CELL_CORRECTION_ROUNDS,
+                    correction_feedback=feedback,
+                )
             )
+            current_provider_requests += correction_requests
+            _compose_performance_cell_components(
+                output_dir,
+                correction_components,
+                image_path,
+            )
+            corrected_qa, corrected_hash = review_current_board()
+            correction_attempt = {
+                "round": PERFORMANCE_MAX_CELL_CORRECTION_ROUNDS,
+                "status": "passed" if corrected_qa["passed"] else "failed",
+                "target_cell_ids": list(feedback),
+                "qa_feedback": feedback,
+                "provider_requests": len(feedback),
+                "image_sha256": corrected_hash,
+                "qa_receipt": PERFORMANCE_BOARD_QA_RECEIPT,
+                "qa_receipt_sha256": file_sha256(qa_path),
+            }
+            correction_attempts.append(correction_attempt)
+            components = correction_components
+            qa_result = corrected_qa
+            image_hash = corrected_hash
+            pending = {
+                **pending,
+                "generation_mode": "per_cell_correction",
+                "attempts": attempts,
+                "correction_attempts": correction_attempts,
+            }
+            if not qa_result["passed"]:
+                failed = {
+                    **pending,
+                    "status": "failed",
+                    "image_sha256": image_hash,
+                    "component_cells": components,
+                    "provider_request_count": sum(
+                        int(item.get("provider_requests") or 0) for item in attempts
+                    ) + sum(
+                        int(item.get("provider_requests") or 0)
+                        for item in correction_attempts
+                    ),
+                }
+                _atomic_json(receipt_path, failed)
+                raise CharacterPerformanceQAError(
+                    f"{character_id} performance board failed bounded correction QA"
+                )
     complete = {
         **pending,
         "status": "passed",
@@ -1155,7 +1416,15 @@ def generate_character_performance_board(
         "component_cells": components,
         "provider_request_count": sum(
             int(item.get("provider_requests") or 0) for item in attempts
-        ) + (len(components) if components else 1),
+        ) + sum(
+            int(item.get("provider_requests") or 0)
+            for item in correction_attempts
+        ) + (
+            len(components)
+            if components
+            and not any(item.get("mode") == "per_cell_fallback" for item in attempts)
+            else 1 if not components and not attempts else 0
+        ),
     }
     _atomic_json(receipt_path, complete)
     guides = _materialize_performance_guides(output_dir, character_id, plan)
