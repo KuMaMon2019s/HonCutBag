@@ -299,6 +299,26 @@ class _AlwaysFailReviewClient(_FailTwiceThenPassReviewClient):
         return json.dumps(payload)
 
 
+class _InterruptDuringComponentQAReviewClient:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def review(self, image_paths, prompt):
+        self.calls.append((list(image_paths), prompt))
+        if "single performance-cell inspector" in prompt:
+            raise RuntimeError("simulated interruption after all components were generated")
+        payload = json.loads(_qa_payload())
+        payload["passed"] = False
+        payload["cells"][0]["action_semantics_match"] = False
+        payload["cells"][0]["action_semantics_confidence"] = 0.95
+        payload["cells"][0]["action_semantics_evidence"] = [
+            "the visible pose is a neutral portrait"
+        ]
+        payload["cells"][0]["issues"] = ["whole board action mismatch"]
+        payload["issues"] = ["whole board action mismatch"]
+        return json.dumps(payload)
+
+
 def test_plan_has_six_ordered_cells_bound_to_real_pxx_action_and_prop():
     plan = build_character_performance_plan(_storyboard(), _character())
 
@@ -812,6 +832,43 @@ def test_failed_whole_board_uses_six_cached_components_then_passes(tmp_path):
         assert pose_receipt["schema"] == "honcut.character-performance-pose-guide.v2"
         assert pose_receipt["provider_requests"] == 0
         assert (tmp_path / component["image"]).with_suffix(".qa.json").is_file()
+
+
+def test_pending_component_qa_resume_reuses_all_images_without_whole_board_replay(
+    tmp_path,
+):
+    _write_reference_assets(tmp_path)
+    image_client = _FallbackImageClient()
+    try:
+        generate_character_performance_board(
+            tmp_path,
+            _storyboard(),
+            _character(),
+            image_client=image_client,
+            review_client=_InterruptDuringComponentQAReviewClient(),
+        )
+    except RuntimeError as exc:
+        assert "simulated interruption" in str(exc)
+    else:
+        raise AssertionError("component-QA interruption must propagate")
+    receipt = json.loads(
+        (tmp_path / "characters/lead/performance_reference_board.json").read_text()
+    )
+    assert receipt["status"] == "pending"
+    assert receipt["generation_mode"] == "per_cell_fallback"
+    assert len(image_client.calls) == 7
+
+    recovered = generate_character_performance_board(
+        tmp_path,
+        _storyboard(),
+        _character(),
+        image_client=image_client,
+        review_client=_ReviewClient(),
+    )
+
+    assert recovered is not None
+    assert recovered["provider_requests"] == 0
+    assert len(image_client.calls) == 7
 
 
 def test_failed_components_redraw_only_failed_cells_once_with_qa_feedback(tmp_path):

@@ -1909,7 +1909,10 @@ def generate_character_performance_board(
     previous_cell_fallback = bool(
         previous_exact_contract
         and previous_mode == "per_cell_fallback"
-        and isinstance(previous_receipt.get("component_cells"), list)
+        and (
+            isinstance(previous_receipt.get("component_cells"), list)
+            or previous_receipt.get("status") == "pending"
+        )
     )
     if (
         previous_exact_failure
