@@ -242,18 +242,6 @@ def _prop_ids_for_action(
     return matched
 
 
-def _generation_units_for_source(
-    beat: Mapping[str, Any], source_action_unit_id: str
-) -> list[dict[str, Any]]:
-    return [
-        dict(unit)
-        for unit in beat.get("generation_action_units") or []
-        if isinstance(unit, Mapping)
-        and str(unit.get("source_action_unit_id") or "").strip()
-        == source_action_unit_id
-    ]
-
-
 def _source_bindings_for_beat(beat: Mapping[str, Any], beat_id: str) -> list[dict[str, Any]]:
     units = [
         dict(unit)
@@ -296,13 +284,19 @@ def _source_bindings_for_beat(beat: Mapping[str, Any], beat_id: str) -> list[dic
         ):
             raise ValueError(f"{beat_id} has inconsistent source action-unit lineage")
         effective_source_ids = declared_source_ids or discovered_source_ids
+        if set(unit_source_ids) != set(effective_source_ids):
+            raise ValueError(f"{beat_id} has inconsistent source action-unit lineage")
         return [
             {
-                "source_action_unit_id": source_id,
+                "source_action_unit_id": str(unit["source_action_unit_id"]).strip(),
                 "source_lineage_kind": "source_action_unit",
-                "units": _generation_units_for_source(beat, source_id),
+                # A generation unit is already the canonical static-action
+                # granularity.  One authored AU may span several temporal
+                # sub-actions; merging those sub-actions here would create an
+                # impossible single-pose contract (for example attack+block).
+                "units": [unit],
             }
-            for source_id in effective_source_ids
+            for unit in units
         ]
 
     assignments = [
@@ -609,12 +603,16 @@ def build_character_performance_plan(
             "beat_id": beat["beat_id"],
             "parent_shot_id": beat["parent_shot_id"],
         })
-    selected_keys = {
-        (binding["beat_id"], binding["source_action_unit_id"])
-        for binding in selected
-    }
+    def binding_key(binding: Mapping[str, Any]) -> tuple[str, str, tuple[str, ...]]:
+        return (
+            str(binding["beat_id"]),
+            str(binding["source_action_unit_id"]),
+            tuple(str(value) for value in binding["generation_action_unit_ids"]),
+        )
+
+    selected_keys = {binding_key(binding) for binding in selected}
     for candidate in candidates:
-        key = (candidate["beat_id"], candidate["source_action_unit_id"])
+        key = binding_key(candidate)
         if len(selected) >= len(PERFORMANCE_CELL_IDS):
             break
         if key not in selected_keys:
@@ -695,13 +693,13 @@ def build_character_performance_plan(
         cursor += 1
 
     cells = []
-    occurrence_by_binding: dict[tuple[str, str], int] = {}
+    occurrence_by_binding: dict[tuple[str, str, tuple[str, ...]], int] = {}
     for index, (cell_id, binding) in enumerate(
         zip(PERFORMANCE_CELL_IDS, selected, strict=True)
     ):
-        binding_key = (binding["beat_id"], binding["source_action_unit_id"])
-        occurrence = occurrence_by_binding.get(binding_key, 0)
-        occurrence_by_binding[binding_key] = occurrence + 1
+        current_binding_key = binding_key(binding)
+        occurrence = occurrence_by_binding.get(current_binding_key, 0)
+        occurrence_by_binding[current_binding_key] = occurrence + 1
         cells.append({
             "cell_id": cell_id,
             "grid_position": {"row": index // 3 + 1, "column": index % 3 + 1},
@@ -742,10 +740,17 @@ def build_character_performance_prompt(
         "top-left", "top-center", "top-right",
         "bottom-left", "bottom-center", "bottom-right",
     )
-    binding_ids: dict[tuple[str, str], str] = {}
+    def cell_binding_key(cell: Mapping[str, Any]) -> tuple[str, str, tuple[str, ...]]:
+        return (
+            str(cell["beat_id"]),
+            str(cell["source_action_unit_id"]),
+            tuple(str(value) for value in cell["generation_action_unit_ids"]),
+        )
+
+    binding_ids: dict[tuple[str, str, tuple[str, ...]], str] = {}
     binding_facts: list[str] = []
     for cell in plan["cells"]:
-        key = (str(cell["beat_id"]), str(cell["source_action_unit_id"]))
+        key = cell_binding_key(cell)
         if key in binding_ids:
             continue
         binding_id = f"B{len(binding_ids) + 1:02d}"
@@ -754,7 +759,7 @@ def build_character_performance_prompt(
     cell_instructions = "\n".join(
         (
             f"- {position}: "
-            f"fact={binding_ids[(str(cell['beat_id']), str(cell['source_action_unit_id']))]}; "
+            f"fact={binding_ids[cell_binding_key(cell)]}; "
             f"role={cell['pose_category']}; key_pose={cell['pose_focus']}; "
             f"constraints={_compact_pose_constraints_text(cell['pose_constraints'])}."
         )
@@ -1198,6 +1203,31 @@ def validate_character_performance_board(
         or receipt.get("composition_mode") != PERFORMANCE_COMPOSITION_MODE
     ):
         return False
+    qa_cells = qa.get("cells")
+    if (
+        qa.get("board_blocking_fields") != []
+        or qa.get("pose_diversity_status")
+        not in {"passed", "diagnostic_uncertain"}
+        or isinstance(qa.get("pose_diversity_confidence"), bool)
+        or not isinstance(qa.get("pose_diversity_confidence"), (int, float))
+        or not 0.0 <= float(qa["pose_diversity_confidence"]) <= 1.0
+        or not isinstance(qa.get("pose_diversity_evidence"), list)
+        or not isinstance(qa_cells, list)
+        or [item.get("cell_id") for item in qa_cells if isinstance(item, dict)]
+        != list(PERFORMANCE_CELL_IDS)
+        or any(
+            not isinstance(item, dict)
+            or item.get("blocking_fields") != []
+            or item.get("action_semantics_status")
+            not in {"passed", "diagnostic_uncertain"}
+            or isinstance(item.get("action_semantics_confidence"), bool)
+            or not isinstance(item.get("action_semantics_confidence"), (int, float))
+            or not 0.0 <= float(item["action_semantics_confidence"]) <= 1.0
+            or not isinstance(item.get("action_semantics_evidence"), list)
+            for item in qa_cells
+        )
+    ):
+        return False
     if receipt.get("prompt_optimization") != performance_prompt_optimization_contract():
         return False
     prompt_guidance = receipt.get("prompt_guidance")
@@ -1294,6 +1324,24 @@ def validate_character_performance_board(
                 != CHARACTER_PERFORMANCE_CELL_QA_SCHEMA
                 or component_qa.get("status") != "passed"
                 or component_qa.get("passed") is not True
+                or component_qa.get("blocking_fields") != []
+                or component_qa.get("action_semantics_status")
+                not in {"passed", "diagnostic_uncertain"}
+                or isinstance(
+                    component_qa.get("action_semantics_confidence"),
+                    bool,
+                )
+                or not isinstance(
+                    component_qa.get("action_semantics_confidence"),
+                    (int, float),
+                )
+                or not 0.0
+                <= float(component_qa["action_semantics_confidence"])
+                <= 1.0
+                or not isinstance(
+                    component_qa.get("action_semantics_evidence"),
+                    list,
+                )
                 or component_qa.get("image_sha256") != file_sha256(component_path)
             ):
                 return False
@@ -1613,7 +1661,7 @@ def _compose_performance_cell_components(
 def _failed_performance_cell_feedback(
     qa_result: Mapping[str, Any],
 ) -> dict[str, list[str]]:
-    """Return only cell-scoped failures eligible for one bounded redraw."""
+    """Return only evidence-backed blocking failures eligible for one redraw."""
     cells = qa_result.get("cells")
     if not isinstance(cells, list):
         raise CharacterPerformanceQAError("performance QA omitted cell verdicts")
@@ -1625,22 +1673,17 @@ def _failed_performance_cell_feedback(
     if set(by_id) != set(PERFORMANCE_CELL_IDS):
         raise CharacterPerformanceQAError("performance QA cell verdicts are incomplete")
     feedback: dict[str, list[str]] = {}
-    boolean_checks = (
-        "same_character",
-        "action_semantics_match",
-        "pose_distinct",
-        "clothing_consistent",
-        "makeup_consistent",
-        "healthy_beautiful_synthetic_styling",
-        "no_uncanny_or_corpse_like_styling",
-        "prop_ownership_correct",
-        "no_extra_character",
-        "no_text_or_layout_marks",
-    )
     for cell_id in PERFORMANCE_CELL_IDS:
         verdict = by_id[cell_id]
-        failed_checks = [key for key in boolean_checks if verdict.get(key) is not True]
-        if not failed_checks:
+        blocking_fields = verdict.get("blocking_fields")
+        if not isinstance(blocking_fields, list) or any(
+            not isinstance(value, str) or not value.strip()
+            for value in blocking_fields
+        ):
+            raise CharacterPerformanceQAError(
+                f"performance QA {cell_id} omitted blocking-field policy"
+            )
+        if not blocking_fields:
             continue
         issues = [
             str(item).strip()
@@ -1648,7 +1691,7 @@ def _failed_performance_cell_feedback(
             if str(item).strip()
         ]
         if not issues:
-            issues = ["Failed strict checks: " + ", ".join(failed_checks)]
+            issues = ["Failed blocking checks: " + ", ".join(blocking_fields)]
         feedback[cell_id] = issues
     return feedback
 
@@ -1689,6 +1732,10 @@ def _review_performance_cell_components(
         "cell_id",
         "same_character",
         "action_semantics_match",
+        "action_semantics_confidence",
+        "action_semantics_evidence",
+        "action_semantics_status",
+        "blocking_fields",
         "fine_direction_match",
         "pose_distinct",
         "clothing_consistent",

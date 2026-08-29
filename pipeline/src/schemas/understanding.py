@@ -425,6 +425,8 @@ class CharacterPerformanceCellUnderstanding(StrictUnderstandingModel):
     cell_id: Literal["A01", "A02", "A03", "A04", "A05", "A06"]
     same_character: bool
     action_semantics_match: bool
+    action_semantics_confidence: float = Field(ge=0.0, le=1.0)
+    action_semantics_evidence: list[str]
     fine_direction_match: bool
     pose_distinct: bool
     clothing_consistent: bool
@@ -442,6 +444,8 @@ class CharacterPerformanceBoardUnderstanding(StrictUnderstandingModel):
     cells: list[CharacterPerformanceCellUnderstanding]
     same_single_character: bool
     six_distinct_poses: bool
+    pose_diversity_confidence: float = Field(ge=0.0, le=1.0)
+    pose_diversity_evidence: list[str]
     clothing_makeup_consistent: bool
     healthy_beautiful_synthetic_styling: bool
     props_correct: bool

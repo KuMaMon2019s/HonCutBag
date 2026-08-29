@@ -24,6 +24,7 @@ from phases.phase3.performance_reference_board import (
 from prompt.seedream_image_prompt import bind_reference_roles, prompt_guidance_metrics
 from quality.character_performance_qa import (
     CharacterPerformanceQAError,
+    review_character_performance_board,
     review_character_performance_cell,
 )
 
@@ -107,6 +108,10 @@ def _qa_payload() -> str:
                 "cell_id": cell_id,
                 "same_character": True,
                 "action_semantics_match": True,
+                "action_semantics_confidence": 0.95,
+                "action_semantics_evidence": [
+                    "the body and prop show the declared major action relationship"
+                ],
                 "fine_direction_match": True,
                 "pose_distinct": True,
                 "clothing_consistent": True,
@@ -122,6 +127,10 @@ def _qa_payload() -> str:
         ],
         "same_single_character": True,
         "six_distinct_poses": True,
+        "pose_diversity_confidence": 0.95,
+        "pose_diversity_evidence": [
+            "the six silhouettes use different weight shifts and prop relationships"
+        ],
         "clothing_makeup_consistent": True,
         "healthy_beautiful_synthetic_styling": True,
         "props_correct": True,
@@ -135,15 +144,22 @@ def _cell_qa_payload(
     cell_id: str,
     *,
     passed: bool = True,
+    action_confidence: float = 0.95,
+    action_evidence: list[str] | None = None,
     fine_direction_match: bool = True,
+    pose_distinct: bool = True,
     issue: str = "",
 ) -> str:
     payload = {
         "cell_id": cell_id,
         "same_character": True,
         "action_semantics_match": passed,
+        "action_semantics_confidence": action_confidence,
+        "action_semantics_evidence": action_evidence or [
+            "the visible body and prop relationship supports this action verdict"
+        ],
         "fine_direction_match": fine_direction_match,
-        "pose_distinct": True,
+        "pose_distinct": pose_distinct,
         "clothing_consistent": True,
         "makeup_consistent": True,
         "healthy_beautiful_synthetic_styling": True,
@@ -429,6 +445,99 @@ def test_fine_direction_is_diagnostic_when_action_semantics_match(tmp_path):
     assert result["fine_direction_match"] is False
 
 
+def test_low_confidence_action_mismatch_is_diagnostic_not_redraw_evidence(tmp_path):
+    _write_reference_assets(tmp_path)
+    pose_path = tmp_path / "pose.png"
+    Image.new("RGB", (2048, 2048), (160, 170, 180)).save(pose_path)
+    plan = build_character_performance_plan(_storyboard(), _character())
+    assert plan is not None
+
+    class _UncertainReviewer:
+        def review(self, image_paths, prompt):
+            return _cell_qa_payload(
+                _prompt_cell_id(prompt),
+                passed=False,
+                action_confidence=0.62,
+                action_evidence=["the rear hand is partly occluded in the three-quarter view"],
+                issue="camera angle leaves the exact action family ambiguous",
+            )
+
+    result = review_character_performance_cell(
+        _UncertainReviewer(),
+        pose_path,
+        identity_path=tmp_path / "characters/lead/reference_board.png",
+        prop_path=tmp_path / "characters/lead/prop_detail_board.png",
+        character_id="lead",
+        cell=plan["cells"][0],
+        synthetic_styling=_character()["appearance"]["synthetic_styling"],
+    )
+
+    assert result["passed"] is True
+    assert result["action_semantics_status"] == "diagnostic_uncertain"
+    assert result["blocking_fields"] == []
+
+
+def test_isolated_pose_distinct_is_diagnostic_because_board_owns_diversity(tmp_path):
+    _write_reference_assets(tmp_path)
+    pose_path = tmp_path / "pose.png"
+    Image.new("RGB", (2048, 2048), (160, 170, 180)).save(pose_path)
+    plan = build_character_performance_plan(_storyboard(), _character())
+    assert plan is not None
+
+    class _SingleCellReviewer:
+        def review(self, image_paths, prompt):
+            return _cell_qa_payload(
+                _prompt_cell_id(prompt),
+                pose_distinct=False,
+                issue="a single isolated image cannot establish six-pose diversity",
+            )
+
+    result = review_character_performance_cell(
+        _SingleCellReviewer(),
+        pose_path,
+        identity_path=tmp_path / "characters/lead/reference_board.png",
+        prop_path=tmp_path / "characters/lead/prop_detail_board.png",
+        character_id="lead",
+        cell=plan["cells"][0],
+        synthetic_styling=_character()["appearance"]["synthetic_styling"],
+    )
+
+    assert result["passed"] is True
+    assert result["pose_distinct"] is False
+    assert result["blocking_fields"] == []
+
+
+def test_low_confidence_board_pose_similarity_is_diagnostic(tmp_path):
+    board_path = tmp_path / "board.png"
+    Image.new("RGB", (3072, 2048), (160, 170, 180)).save(board_path)
+    plan = build_character_performance_plan(_storyboard(), _character())
+    assert plan is not None
+
+    class _UncertainBoardReviewer:
+        def review(self, image_paths, prompt):
+            payload = json.loads(_qa_payload())
+            payload["passed"] = False
+            payload["six_distinct_poses"] = False
+            payload["pose_diversity_confidence"] = 0.58
+            payload["pose_diversity_evidence"] = [
+                "two upper-body silhouettes look similar at this resolution"
+            ]
+            payload["issues"] = ["pose diversity is visually ambiguous"]
+            return json.dumps(payload)
+
+    result = review_character_performance_board(
+        _UncertainBoardReviewer(),
+        board_path,
+        character_id="lead",
+        cells=plan["cells"],
+        synthetic_styling=_character()["appearance"]["synthetic_styling"],
+    )
+
+    assert result["passed"] is True
+    assert result["pose_diversity_status"] == "diagnostic_uncertain"
+    assert result["board_blocking_fields"] == []
+
+
 def test_plan_normalizes_numeric_production_shot_id_to_canonical_beat_parent():
     storyboard = _storyboard()
     storyboard["shots"][0]["id"] = 1
@@ -470,6 +579,16 @@ def test_plan_accepts_complete_unit_lineage_when_split_beat_summary_is_empty():
     p02_cells = [cell for cell in plan["cells"] if cell["beat_id"] == "S01_P02"]
     assert p02_cells
     assert {cell["source_action_unit_id"] for cell in p02_cells} == {"AU001"}
+    assert {tuple(cell["generation_action_unit_ids"]) for cell in p02_cells} >= {
+        ("GAU002",),
+        ("GAU003",),
+    }
+    actions_by_unit = {
+        tuple(cell["generation_action_unit_ids"]): cell["action_description"]
+        for cell in p02_cells
+    }
+    assert "格挡" not in actions_by_unit[("GAU002",)]
+    assert "挥动" not in actions_by_unit[("GAU003",)]
     assert all(
         cell["source_lineage_kind"] == "source_action_unit"
         for cell in p02_cells

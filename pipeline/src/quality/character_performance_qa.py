@@ -11,9 +11,10 @@ from schemas.understanding import CharacterPerformanceBoardUnderstanding
 from schemas.understanding import CharacterPerformanceCellUnderstanding
 
 
-CHARACTER_PERFORMANCE_QA_SCHEMA = "honcut.character-performance-board-qa.v4"
-CHARACTER_PERFORMANCE_CELL_QA_SCHEMA = "honcut.character-performance-cell-qa.v2"
+CHARACTER_PERFORMANCE_QA_SCHEMA = "honcut.character-performance-board-qa.v5"
+CHARACTER_PERFORMANCE_CELL_QA_SCHEMA = "honcut.character-performance-cell-qa.v3"
 PERFORMANCE_CELL_IDS = tuple(f"A{index:02d}" for index in range(1, 7))
+ACTION_SEMANTICS_BLOCKING_CONFIDENCE = 0.85
 
 
 class CharacterPerformanceReviewer(Protocol):
@@ -24,10 +25,8 @@ class CharacterPerformanceQAError(RuntimeError):
     """Raised when a performance board cannot satisfy its blocking contract."""
 
 
-_CELL_FIELDS = (
+_HARD_CELL_FIELDS = (
     "same_character",
-    "action_semantics_match",
-    "pose_distinct",
     "clothing_consistent",
     "makeup_consistent",
     "healthy_beautiful_synthetic_styling",
@@ -37,7 +36,16 @@ _CELL_FIELDS = (
     "no_text_or_layout_marks",
 )
 
-_BOARD_FIELDS = (
+_HARD_BOARD_FIELDS = (
+    "same_single_character",
+    "clothing_makeup_consistent",
+    "healthy_beautiful_synthetic_styling",
+    "props_correct",
+    "no_extra_characters",
+    "no_text_or_layout_marks",
+)
+
+_BOARD_OUTPUT_FIELDS = (
     "same_single_character",
     "six_distinct_poses",
     "clothing_makeup_consistent",
@@ -46,6 +54,68 @@ _BOARD_FIELDS = (
     "no_extra_characters",
     "no_text_or_layout_marks",
 )
+
+
+def _normalized_cell_verdict(
+    payload: dict[str, Any],
+    *,
+    expected_cell_id: str | None = None,
+) -> dict[str, Any]:
+    """Apply deterministic policy to one probabilistic semantic review."""
+    blocking_fields = [
+        field for field in _HARD_CELL_FIELDS if payload.get(field) is not True
+    ]
+    confidence = float(payload.get("action_semantics_confidence", 0.0))
+    evidence = [
+        str(item).strip()
+        for item in payload.get("action_semantics_evidence") or []
+        if str(item).strip()
+    ]
+    if payload.get("action_semantics_match") is True:
+        action_status = "passed"
+    elif confidence >= ACTION_SEMANTICS_BLOCKING_CONFIDENCE and evidence:
+        action_status = "blocking"
+        blocking_fields.append("action_semantics_match")
+    else:
+        action_status = "diagnostic_uncertain"
+    if expected_cell_id is not None and payload.get("cell_id") != expected_cell_id:
+        blocking_fields.append("cell_id")
+    return {
+        **payload,
+        "action_semantics_confidence": confidence,
+        "action_semantics_evidence": evidence,
+        "action_semantics_status": action_status,
+        "blocking_fields": list(dict.fromkeys(blocking_fields)),
+        "passed": not blocking_fields,
+    }
+
+
+def _normalized_board_verdict(payload: dict[str, Any]) -> dict[str, Any]:
+    """Keep deterministic board invariants hard and calibrate pose diversity."""
+    blocking_fields = [
+        field for field in _HARD_BOARD_FIELDS if payload.get(field) is not True
+    ]
+    confidence = float(payload.get("pose_diversity_confidence", 0.0))
+    evidence = [
+        str(item).strip()
+        for item in payload.get("pose_diversity_evidence") or []
+        if str(item).strip()
+    ]
+    if payload.get("six_distinct_poses") is True:
+        diversity_status = "passed"
+    elif confidence >= ACTION_SEMANTICS_BLOCKING_CONFIDENCE and evidence:
+        diversity_status = "blocking"
+        blocking_fields.append("six_distinct_poses")
+    else:
+        diversity_status = "diagnostic_uncertain"
+    return {
+        **payload,
+        "pose_diversity_confidence": confidence,
+        "pose_diversity_evidence": evidence,
+        "pose_diversity_status": diversity_status,
+        "board_blocking_fields": list(dict.fromkeys(blocking_fields)),
+        "passed": not blocking_fields,
+    }
 
 
 def build_character_performance_cell_qa_prompt(
@@ -77,11 +147,21 @@ fine_direction_match and issues instead. Also require the same one character, co
 and warm beautiful synthetic porcelain makeup, correct declared prop, no extra character and no
 text/labels/arrows/borders/grid/UI.
 
+Set action_semantics_confidence to your calibrated confidence in action_semantics_match from the
+visible pixels, from 0.0 to 1.0. Use 0.90 or above only when the action family and major prop/body
+relationship are plainly visible enough to support the verdict; use 0.50-0.80 for an ambiguous
+camera, hidden joint, transitional pose or plausible alternative reading. Put only concrete visible
+facts in action_semantics_evidence, not a repetition of the authored contract. A low-confidence
+negative is a diagnostic uncertainty, not proof that a paid redraw is needed. pose_distinct is
+diagnostic in this isolated single-cell review because six-pose diversity belongs to whole-board QA.
+
 Return exactly one JSON object matching this schema:
 {{
   "cell_id": "{cell['cell_id']}",
   "same_character": true,
   "action_semantics_match": true,
+  "action_semantics_confidence": 0.95,
+  "action_semantics_evidence": ["weight is shifted and the prop crosses the torso defensively"],
   "fine_direction_match": true,
   "pose_distinct": true,
   "clothing_consistent": true,
@@ -120,14 +200,12 @@ def review_character_performance_cell(
         prompt,
         CharacterPerformanceCellUnderstanding,
     )
-    payload = result.model_dump(mode="json")
-    passed = (
-        payload.get("cell_id") == cell.get("cell_id")
-        and all(payload.get(field) is True for field in _CELL_FIELDS)
+    payload = _normalized_cell_verdict(
+        result.model_dump(mode="json"),
+        expected_cell_id=str(cell.get("cell_id") or ""),
     )
     return {
         "schema": CHARACTER_PERFORMANCE_CELL_QA_SCHEMA,
-        "passed": passed,
         **payload,
         "issues": [str(item) for item in payload.get("issues") or []],
     }
@@ -141,13 +219,16 @@ def combine_character_performance_qa(
     ids = [str(item.get("cell_id") or "") for item in cell_results]
     cells_passed = (
         ids == list(PERFORMANCE_CELL_IDS)
-        and all(
-            item.get("passed") is True
-            and all(item.get(field) is True for field in _CELL_FIELDS)
-            for item in cell_results
-        )
+        and all(item.get("passed") is True for item in cell_results)
     )
-    board_passed = all(board_result.get(field) is True for field in _BOARD_FIELDS)
+    # Once isolated cell verdicts exist, whole-board action-cell verdicts are
+    # deliberately superseded.  Retain only true board-global blockers.
+    board_blocking_fields = [
+        str(field)
+        for field in board_result.get("board_blocking_fields") or []
+        if str(field) != "cells"
+    ]
+    board_passed = not board_blocking_fields
     issues = (
         [str(item) for item in board_result.get("issues") or []]
         if not board_passed
@@ -162,7 +243,11 @@ def combine_character_performance_qa(
             {key: value for key, value in item.items() if key not in {"schema", "passed"}}
             for item in cell_results
         ],
-        **{field: board_result.get(field) is True for field in _BOARD_FIELDS},
+        **{field: board_result.get(field) is True for field in _BOARD_OUTPUT_FIELDS},
+        "pose_diversity_confidence": board_result.get("pose_diversity_confidence"),
+        "pose_diversity_evidence": board_result.get("pose_diversity_evidence") or [],
+        "pose_diversity_status": board_result.get("pose_diversity_status"),
+        "board_blocking_fields": board_blocking_fields,
         "issues": list(dict.fromkeys(issues)),
         "action_verdict_source": "isolated_persisted_cells",
         "board_verdict_source": "whole_board_global_fields_only",
@@ -194,6 +279,10 @@ Blocking requirements:
 - action_semantics_match judges the declared action family and major body/prop relationship;
   fine_direction_match records exact anatomical-side or diagonal details but is diagnostic because
   a 3/4 camera or mirrored screen direction cannot reliably block a correct action family;
+- action_semantics_confidence is confidence in that semantic verdict, not image quality. Use 0.90+
+  only for a plainly visible action match/mismatch, and 0.50-0.80 for occlusion, camera ambiguity,
+  a transitional pose or a plausible alternative reading. action_semantics_evidence contains only
+  concrete visible facts. A low-confidence negative is diagnostic, not redraw evidence;
 - outfit, face identity, synthetic porcelain makeup, colors and proportions stay identical;
 - the complexion stays warm, healthy and elegant; eyes have pupils, iris detail and catchlights;
   lips and cheeks retain coordinated living color; no cell looks gray, bloodless, waxy,
@@ -201,6 +290,10 @@ Blocking requirements:
 - only the declared prop belongs to this character and its geometry/material are correct;
 - no extra character appears;
 - pixels contain no text, Axx labels, numbers, arrows, panel borders, grid lines, captions or UI.
+
+Set pose_diversity_confidence with the same calibration rule and list concrete visual comparisons in
+pose_diversity_evidence. Use a high-confidence negative only when cells visibly repeat essentially
+the same silhouette/weight/prop relationship; small stylistic similarity is allowed.
 
 Return exactly one JSON object with this schema:
 {{
@@ -210,6 +303,8 @@ Return exactly one JSON object with this schema:
       "cell_id": "A01",
       "same_character": true,
       "action_semantics_match": true,
+      "action_semantics_confidence": 0.95,
+      "action_semantics_evidence": ["the prop and body form the declared defensive relationship"],
       "fine_direction_match": true,
       "pose_distinct": true,
       "clothing_consistent": true,
@@ -224,6 +319,8 @@ Return exactly one JSON object with this schema:
   ],
   "same_single_character": true,
   "six_distinct_poses": true,
+  "pose_diversity_confidence": 0.95,
+  "pose_diversity_evidence": ["the six silhouettes use visibly different weight and prop states"],
   "clothing_makeup_consistent": true,
   "healthy_beautiful_synthetic_styling": true,
   "props_correct": true,
@@ -255,20 +352,31 @@ def review_character_performance_board(
         CharacterPerformanceBoardUnderstanding,
     )
     payload = result.model_dump(mode="json")
-    reviewed_cells = payload.get("cells") or []
+    reviewed_cells = [
+        _normalized_cell_verdict(dict(cell))
+        for cell in payload.get("cells") or []
+    ]
     ids = [str(cell.get("cell_id") or "") for cell in reviewed_cells]
-    cells_passed = (
-        ids == list(PERFORMANCE_CELL_IDS)
-        and all(
-            all(cell.get(field) is True for field in _CELL_FIELDS)
-            for cell in reviewed_cells
-        )
-    )
-    passed = cells_passed and all(payload.get(field) is True for field in _BOARD_FIELDS)
+    normalized = _normalized_board_verdict({
+        **payload,
+        "cells": reviewed_cells,
+    })
+    if ids != list(PERFORMANCE_CELL_IDS) or any(
+        cell.get("passed") is not True for cell in reviewed_cells
+    ):
+        normalized["board_blocking_fields"] = list(dict.fromkeys([
+            *normalized["board_blocking_fields"],
+            "cells",
+        ]))
+        normalized["passed"] = False
     return {
         "schema": CHARACTER_PERFORMANCE_QA_SCHEMA,
-        "passed": passed,
         "cells": reviewed_cells,
-        **{field: payload.get(field) is True for field in _BOARD_FIELDS},
+        **{field: normalized.get(field) is True for field in _BOARD_OUTPUT_FIELDS},
+        "pose_diversity_confidence": normalized["pose_diversity_confidence"],
+        "pose_diversity_evidence": normalized["pose_diversity_evidence"],
+        "pose_diversity_status": normalized["pose_diversity_status"],
+        "board_blocking_fields": normalized["board_blocking_fields"],
+        "passed": normalized["passed"],
         "issues": [str(item) for item in payload.get("issues") or []],
     }
