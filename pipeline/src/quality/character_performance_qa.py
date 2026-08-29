@@ -11,10 +11,12 @@ from schemas.understanding import CharacterPerformanceBoardUnderstanding
 from schemas.understanding import CharacterPerformanceCellUnderstanding
 
 
-CHARACTER_PERFORMANCE_QA_SCHEMA = "honcut.character-performance-board-qa.v5"
-CHARACTER_PERFORMANCE_CELL_QA_SCHEMA = "honcut.character-performance-cell-qa.v3"
+CHARACTER_PERFORMANCE_QA_SCHEMA = "honcut.character-performance-board-qa.v6"
+CHARACTER_PERFORMANCE_CELL_QA_SCHEMA = "honcut.character-performance-cell-qa.v4"
 PERFORMANCE_CELL_IDS = tuple(f"A{index:02d}" for index in range(1, 7))
-ACTION_SEMANTICS_BLOCKING_CONFIDENCE = 0.85
+SEMANTIC_ACCEPTANCE_CONFIDENCE = 0.65
+SEMANTIC_REJECTION_CONFIDENCE = 0.85
+CONFIDENCE_QA_POLICY = "honcut.confidence-tolerant-visual-qa.v1"
 
 
 class CharacterPerformanceReviewer(Protocol):
@@ -72,8 +74,12 @@ def _normalized_cell_verdict(
         if str(item).strip()
     ]
     if payload.get("action_semantics_match") is True:
-        action_status = "passed"
-    elif confidence >= ACTION_SEMANTICS_BLOCKING_CONFIDENCE and evidence:
+        action_status = (
+            "passed"
+            if confidence >= SEMANTIC_ACCEPTANCE_CONFIDENCE
+            else "diagnostic_uncertain"
+        )
+    elif confidence >= SEMANTIC_REJECTION_CONFIDENCE and evidence:
         action_status = "blocking"
         blocking_fields.append("action_semantics_match")
     else:
@@ -86,6 +92,9 @@ def _normalized_cell_verdict(
         "action_semantics_evidence": evidence,
         "action_semantics_status": action_status,
         "blocking_fields": list(dict.fromkeys(blocking_fields)),
+        "confidence_qa_policy": CONFIDENCE_QA_POLICY,
+        "semantic_acceptance_confidence": SEMANTIC_ACCEPTANCE_CONFIDENCE,
+        "semantic_rejection_confidence": SEMANTIC_REJECTION_CONFIDENCE,
         "passed": not blocking_fields,
     }
 
@@ -102,8 +111,12 @@ def _normalized_board_verdict(payload: dict[str, Any]) -> dict[str, Any]:
         if str(item).strip()
     ]
     if payload.get("six_distinct_poses") is True:
-        diversity_status = "passed"
-    elif confidence >= ACTION_SEMANTICS_BLOCKING_CONFIDENCE and evidence:
+        diversity_status = (
+            "passed"
+            if confidence >= SEMANTIC_ACCEPTANCE_CONFIDENCE
+            else "diagnostic_uncertain"
+        )
+    elif confidence >= SEMANTIC_REJECTION_CONFIDENCE and evidence:
         diversity_status = "blocking"
         blocking_fields.append("six_distinct_poses")
     else:
@@ -114,6 +127,9 @@ def _normalized_board_verdict(payload: dict[str, Any]) -> dict[str, Any]:
         "pose_diversity_evidence": evidence,
         "pose_diversity_status": diversity_status,
         "board_blocking_fields": list(dict.fromkeys(blocking_fields)),
+        "confidence_qa_policy": CONFIDENCE_QA_POLICY,
+        "semantic_acceptance_confidence": SEMANTIC_ACCEPTANCE_CONFIDENCE,
+        "semantic_rejection_confidence": SEMANTIC_REJECTION_CONFIDENCE,
         "passed": not blocking_fields,
     }
 
@@ -148,7 +164,8 @@ and warm beautiful synthetic porcelain makeup, correct declared prop, no extra c
 text/labels/arrows/borders/grid/UI.
 
 Set action_semantics_confidence to your calibrated confidence in action_semantics_match from the
-visible pixels, from 0.0 to 1.0. Use 0.90 or above only when the action family and major prop/body
+visible pixels, from 0.0 to 1.0. A recognizable match at 0.65 or above is accepted. Use 0.90 or
+above only when the action family and major prop/body
 relationship are plainly visible enough to support the verdict; use 0.50-0.80 for an ambiguous
 camera, hidden joint, transitional pose or plausible alternative reading. Put only concrete visible
 facts in action_semantics_evidence, not a repetition of the authored contract. A low-confidence
@@ -248,6 +265,9 @@ def combine_character_performance_qa(
         "pose_diversity_evidence": board_result.get("pose_diversity_evidence") or [],
         "pose_diversity_status": board_result.get("pose_diversity_status"),
         "board_blocking_fields": board_blocking_fields,
+        "confidence_qa_policy": CONFIDENCE_QA_POLICY,
+        "semantic_acceptance_confidence": SEMANTIC_ACCEPTANCE_CONFIDENCE,
+        "semantic_rejection_confidence": SEMANTIC_REJECTION_CONFIDENCE,
         "issues": list(dict.fromkeys(issues)),
         "action_verdict_source": "isolated_persisted_cells",
         "board_verdict_source": "whole_board_global_fields_only",
@@ -279,8 +299,9 @@ Blocking requirements:
 - action_semantics_match judges the declared action family and major body/prop relationship;
   fine_direction_match records exact anatomical-side or diagonal details but is diagnostic because
   a 3/4 camera or mirrored screen direction cannot reliably block a correct action family;
-- action_semantics_confidence is confidence in that semantic verdict, not image quality. Use 0.90+
-  only for a plainly visible action match/mismatch, and 0.50-0.80 for occlusion, camera ambiguity,
+- action_semantics_confidence is confidence in that semantic verdict, not image quality. A positive
+  semantic match at 0.65 or above is accepted. Use 0.90+ only for a plainly visible action
+  match/mismatch, and 0.50-0.80 for occlusion, camera ambiguity,
   a transitional pose or a plausible alternative reading. action_semantics_evidence contains only
   concrete visible facts. A low-confidence negative is diagnostic, not redraw evidence;
 - outfit, face identity, synthetic porcelain makeup, colors and proportions stay identical;
@@ -377,6 +398,9 @@ def review_character_performance_board(
         "pose_diversity_evidence": normalized["pose_diversity_evidence"],
         "pose_diversity_status": normalized["pose_diversity_status"],
         "board_blocking_fields": normalized["board_blocking_fields"],
+        "confidence_qa_policy": CONFIDENCE_QA_POLICY,
+        "semantic_acceptance_confidence": SEMANTIC_ACCEPTANCE_CONFIDENCE,
+        "semantic_rejection_confidence": SEMANTIC_REJECTION_CONFIDENCE,
         "passed": normalized["passed"],
         "issues": [str(item) for item in payload.get("issues") or []],
     }

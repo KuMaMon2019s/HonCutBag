@@ -477,6 +477,36 @@ def test_low_confidence_action_mismatch_is_diagnostic_not_redraw_evidence(tmp_pa
     assert result["blocking_fields"] == []
 
 
+def test_sixty_five_percent_positive_action_confidence_is_accepted(tmp_path):
+    _write_reference_assets(tmp_path)
+    pose_path = tmp_path / "pose.png"
+    Image.new("RGB", (2048, 2048), (160, 170, 180)).save(pose_path)
+    plan = build_character_performance_plan(_storyboard(), _character())
+    assert plan is not None
+
+    class _BoundaryReviewer:
+        def review(self, image_paths, prompt):
+            return _cell_qa_payload(
+                _prompt_cell_id(prompt),
+                action_confidence=0.65,
+                action_evidence=["the major body and prop relationship is recognizable"],
+            )
+
+    result = review_character_performance_cell(
+        _BoundaryReviewer(),
+        pose_path,
+        identity_path=tmp_path / "characters/lead/reference_board.png",
+        prop_path=tmp_path / "characters/lead/prop_detail_board.png",
+        character_id="lead",
+        cell=plan["cells"][0],
+        synthetic_styling=_character()["appearance"]["synthetic_styling"],
+    )
+
+    assert result["passed"] is True
+    assert result["action_semantics_status"] == "passed"
+    assert result["semantic_acceptance_confidence"] == 0.65
+
+
 def test_isolated_pose_distinct_is_diagnostic_because_board_owns_diversity(tmp_path):
     _write_reference_assets(tmp_path)
     pose_path = tmp_path / "pose.png"

@@ -21,6 +21,9 @@ from prompt.seedream_image_prompt import (
 from quality.character_performance_qa import (
     CHARACTER_PERFORMANCE_CELL_QA_SCHEMA,
     CHARACTER_PERFORMANCE_QA_SCHEMA,
+    CONFIDENCE_QA_POLICY,
+    SEMANTIC_ACCEPTANCE_CONFIDENCE,
+    SEMANTIC_REJECTION_CONFIDENCE,
     CharacterPerformanceQAError,
     combine_character_performance_qa,
     review_character_performance_board,
@@ -1201,6 +1204,11 @@ def validate_character_performance_board(
         or qa.get("character_id") != character_id
         or qa.get("passed") is not True
         or receipt.get("composition_mode") != PERFORMANCE_COMPOSITION_MODE
+        or qa.get("confidence_qa_policy") != CONFIDENCE_QA_POLICY
+        or qa.get("semantic_acceptance_confidence")
+        != SEMANTIC_ACCEPTANCE_CONFIDENCE
+        or qa.get("semantic_rejection_confidence")
+        != SEMANTIC_REJECTION_CONFIDENCE
     ):
         return False
     qa_cells = qa.get("cells")
@@ -1736,6 +1744,9 @@ def _review_performance_cell_components(
         "action_semantics_evidence",
         "action_semantics_status",
         "blocking_fields",
+        "confidence_qa_policy",
+        "semantic_acceptance_confidence",
+        "semantic_rejection_confidence",
         "fine_direction_match",
         "pose_distinct",
         "clothing_consistent",
