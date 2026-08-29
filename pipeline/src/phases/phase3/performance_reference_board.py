@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Protocol
 
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFilter
 
 from prompt.seedream_image_prompt import (
     bind_reference_roles,
@@ -27,6 +27,7 @@ from quality.character_reference_qa import file_sha256
 
 CHARACTER_PERFORMANCE_BOARD_SCHEMA = "honcut.character-performance-board.v1"
 CHARACTER_PERFORMANCE_GUIDE_SCHEMA = "honcut.character-performance-guide.v1"
+CHARACTER_PERFORMANCE_CELL_SCHEMA = "honcut.character-performance-cell.v1"
 PERFORMANCE_PROMPT_OPTIMIZATION_SCHEMA = (
     "honcut.character-performance-prompt-optimization.v1"
 )
@@ -39,6 +40,9 @@ PERFORMANCE_BOARD_RECEIPT = "performance_reference_board.json"
 PERFORMANCE_BOARD_QA_RECEIPT = "performance_reference_board_qa.json"
 PERFORMANCE_BOARD_SIZE = "3072x2048"
 PERFORMANCE_BOARD_PIXEL_SIZE = (3072, 2048)
+PERFORMANCE_CELL_SIZE = "2048x2048"
+PERFORMANCE_CELL_PIXEL_SIZE = (2048, 2048)
+PERFORMANCE_COMPOSITION_MODE = "locally_feathered_2x3_v2"
 PERFORMANCE_CELL_IDS = tuple(f"A{index:02d}" for index in range(1, 7))
 PERFORMANCE_POSE_VOCABULARY = (
     "combat_ready",
@@ -49,9 +53,9 @@ PERFORMANCE_POSE_VOCABULARY = (
     "prop_use",
 )
 PERFORMANCE_KEY_POSE_PHASES = (
-    "起势：保持当前编剧动作开始时的重心和道具关系",
+    "动作识别姿态：用最有辨识度的关键帧清楚呈现当前编剧动作",
     "执行峰值：清楚展示当前编剧动作的发力、位移或接触关系",
-    "落位：只到达当前编剧动作写明的结束姿态，不追加结果",
+    "动作落位：清楚保持当前动作写明的结束姿态，不追加结果",
 )
 PERFORMANCE_PROMPT_EVALUATION_DIMENSIONS = (
     "synthetic_recognizability",
@@ -141,6 +145,7 @@ def performance_prompt_optimization_contract() -> dict[str, Any]:
         "instruction_order": [
             "identity_and_synthetic_makeup_lock",
             "canonical_pxx_action_lineage",
+            "recognizable_action_key_pose",
             "prop_ownership",
             "pixel_and_story_boundary_prohibitions",
         ],
@@ -239,6 +244,83 @@ def _generation_units_for_source(
     ]
 
 
+def _source_bindings_for_beat(beat: Mapping[str, Any], beat_id: str) -> list[dict[str, Any]]:
+    units = [
+        dict(unit)
+        for unit in beat.get("generation_action_units") or []
+        if isinstance(unit, Mapping)
+    ]
+    unit_ids = [str(unit.get("unit_id") or "").strip() for unit in units]
+    if (
+        not units
+        or any(not _SOURCE_ACTION_ID_RE.fullmatch(unit_id) for unit_id in unit_ids)
+        or len(set(unit_ids)) != len(unit_ids)
+    ):
+        raise ValueError(f"{beat_id} lacks canonical generation action-unit lineage")
+
+    declared_source_ids = list(dict.fromkeys(
+        str(value).strip()
+        for value in beat.get("source_action_unit_ids") or []
+        if str(value).strip()
+    ))
+    discovered_source_ids = list(dict.fromkeys(
+        str(unit.get("source_action_unit_id") or "").strip()
+        for unit in units
+        if str(unit.get("source_action_unit_id") or "").strip()
+    ))
+    if declared_source_ids or discovered_source_ids:
+        if (
+            declared_source_ids != discovered_source_ids
+            or any(not _SOURCE_ACTION_ID_RE.fullmatch(value) for value in declared_source_ids)
+        ):
+            raise ValueError(f"{beat_id} has inconsistent source action-unit lineage")
+        return [
+            {
+                "source_action_unit_id": source_id,
+                "source_lineage_kind": "source_action_unit",
+                "units": _generation_units_for_source(beat, source_id),
+            }
+            for source_id in declared_source_ids
+        ]
+
+    assignments = [
+        dict(item)
+        for item in beat.get("timeline_assignments") or []
+        if isinstance(item, Mapping)
+    ]
+    assignment_ids = [
+        str(value).strip()
+        for value in beat.get("timeline_assignment_ids") or []
+        if str(value).strip()
+    ]
+    embedded_assignment_ids = [
+        str(item.get("assignment_id") or "").strip() for item in assignments
+    ]
+    if (
+        len(assignments) != len(units)
+        or assignment_ids != embedded_assignment_ids
+        or any(not _SOURCE_ACTION_ID_RE.fullmatch(value) for value in assignment_ids)
+        or len(set(assignment_ids)) != len(assignment_ids)
+    ):
+        raise ValueError(f"{beat_id} lacks canonical source action-unit lineage")
+    bindings = []
+    for assignment_id, assignment, unit in zip(
+        assignment_ids, assignments, units, strict=True
+    ):
+        if (
+            assignment.get("source_event_id") != unit.get("source_event_id")
+            or assignment.get("source_generation_unit_indexes")
+            != unit.get("source_generation_unit_indexes")
+        ):
+            raise ValueError(f"{beat_id} timeline assignment lineage is inconsistent")
+        bindings.append({
+            "source_action_unit_id": assignment_id,
+            "source_lineage_kind": "timeline_assignment",
+            "units": [unit],
+        })
+    return bindings
+
+
 def _unit_action_text(units: list[dict[str, Any]], beat: Mapping[str, Any]) -> str:
     parts: list[str] = []
     for unit in units:
@@ -253,15 +335,32 @@ def _unit_action_text(units: list[dict[str, Any]], beat: Mapping[str, Any]) -> s
     return "；".join(part for part in parts if part and not (part in seen or seen.add(part)))
 
 
+def _unit_source_fact_text(units: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for unit in units:
+        values = unit.get("source_fact_echoes") or []
+        if isinstance(values, str):
+            values = [values]
+        parts.extend(str(value).strip() for value in values if str(value).strip())
+    seen: set[str] = set()
+    return "；".join(part for part in parts if not (part in seen or seen.add(part)))
+
+
 def _pose_category(action_text: str, prop_ids: list[str]) -> str:
     folded = action_text.casefold()
     classifications = (
         ("prop_use", ("使用", "操作", "启动", "发射", "use", "operate", "activate", "fire")),
         ("block", ("格挡", "抵挡", "防御", "架住", "block", "guard", "parry")),
-        ("evade", ("闪避", "躲", "后仰", "侧身", "evade", "dodge", "avoid")),
+        (
+            "evade",
+            (
+                "闪避", "躲", "后仰", "后倾", "侧身", "侧滑", "降低重心",
+                "evade", "dodge", "avoid",
+            ),
+        ),
         ("attack", ("攻击", "挥", "砍", "刺", "踢", "击", "attack", "strike", "kick", "swing")),
-        ("prop_hold", ("持", "握", "拿", "举", "hold", "wield", "carry")),
         ("combat_ready", ("戒备", "准备", "对峙", "ready", "stance")),
+        ("prop_hold", ("持", "握", "拿", "举", "hold", "wield", "carry")),
     )
     for category, markers in classifications:
         if any(marker in folded for marker in markers):
@@ -286,6 +385,15 @@ def _eligible_beat(shot: Mapping[str, Any], beat: Mapping[str, Any], props: list
     )
 
 
+def _canonical_shot_id(shot: Mapping[str, Any], index: int) -> str:
+    """Use the same canonical Sxx identity written by the storyboard owner."""
+    raw = shot.get("shot_id") or shot.get("id") or shot.get("shot_order") or index
+    text = str(raw).strip()
+    if re.fullmatch(r"[Ss]?\d+", text):
+        return f"S{int(text.lstrip('Ss')):02d}"
+    return text or f"S{index:02d}"
+
+
 def build_character_performance_plan(
     storyboard: Mapping[str, Any],
     character: Mapping[str, Any],
@@ -296,10 +404,10 @@ def build_character_performance_plan(
         raise ValueError("performance board character ID is missing")
     props = _character_props(character)
     beat_bindings: list[dict[str, Any]] = []
-    for shot in storyboard.get("shots") or []:
+    for shot_index, shot in enumerate(storyboard.get("shots") or [], start=1):
         if not isinstance(shot, Mapping):
             continue
-        shot_id = str(shot.get("id") or "").strip()
+        shot_id = _canonical_shot_id(shot, shot_index)
         for beat in shot.get("storyboard_beats") or []:
             if not isinstance(beat, Mapping):
                 continue
@@ -310,25 +418,17 @@ def build_character_performance_plan(
             beat_id = str(beat.get("beat_id") or "").strip()
             if not _BEAT_ID_RE.fullmatch(beat_id) or not beat_id.startswith(f"{shot_id}_"):
                 raise ValueError(f"invalid canonical performance beat ID: {beat_id!r}")
-            source_ids = [
-                str(value).strip()
-                for value in beat.get("source_action_unit_ids") or []
-                if str(value).strip()
-            ]
-            if not source_ids or any(not _SOURCE_ACTION_ID_RE.fullmatch(value) for value in source_ids):
-                raise ValueError(f"{beat_id} lacks canonical source action-unit lineage")
             source_bindings = []
-            for source_id in source_ids:
-                units = _generation_units_for_source(beat, source_id)
-                if not units:
-                    raise ValueError(
-                        f"{beat_id} source action unit {source_id} has no generation lineage"
-                    )
+            for lineage in _source_bindings_for_beat(beat, beat_id):
+                source_id = lineage["source_action_unit_id"]
+                units = lineage["units"]
                 action_text = _unit_action_text(units, beat)
                 if not action_text:
                     raise ValueError(f"{beat_id} has an empty authored action")
+                category_text = _unit_source_fact_text(units) or action_text
                 source_bindings.append({
                     "source_action_unit_id": source_id,
+                    "source_lineage_kind": lineage["source_lineage_kind"],
                     "generation_action_unit_ids": [
                         str(unit.get("unit_id") or "").strip()
                         for unit in units
@@ -336,6 +436,10 @@ def build_character_performance_plan(
                     ],
                     "action_description": action_text,
                     "prop_ids": _prop_ids_for_action(props, action_text),
+                    "pose_category": _pose_category(
+                        category_text,
+                        _prop_ids_for_action(props, action_text),
+                    ),
                 })
             beat_bindings.append({
                 "beat_id": beat_id,
@@ -362,9 +466,38 @@ def build_character_performance_plan(
             "beat_id": beat["beat_id"],
             "parent_shot_id": beat["parent_shot_id"],
         })
+    selected_keys = {
+        (binding["beat_id"], binding["source_action_unit_id"])
+        for binding in selected
+    }
+    for candidate in candidates:
+        key = (candidate["beat_id"], candidate["source_action_unit_id"])
+        if len(selected) >= len(PERFORMANCE_CELL_IDS):
+            break
+        if key not in selected_keys:
+            selected.append(dict(candidate))
+            selected_keys.add(key)
     cursor = 0
     while len(selected) < len(PERFORMANCE_CELL_IDS):
-        selected.append(dict(candidates[cursor % len(candidates)]))
+        missing_categories = [
+            category
+            for category in PERFORMANCE_POSE_VOCABULARY
+            if category not in {binding["pose_category"] for binding in selected}
+        ]
+        candidate = candidates[cursor % len(candidates)]
+        if missing_categories and missing_categories[0] == "prop_use":
+            prop_candidates = [
+                item for item in candidates
+                if item["prop_ids"]
+                and item["pose_category"] in {"attack", "block", "prop_hold"}
+            ]
+            if prop_candidates:
+                candidate = next(
+                    (item for item in prop_candidates if item["pose_category"] == "attack"),
+                    prop_candidates[0],
+                )
+                candidate = {**candidate, "pose_category": "prop_use"}
+        selected.append(dict(candidate))
         cursor += 1
 
     cells = []
@@ -375,10 +508,6 @@ def build_character_performance_plan(
         binding_key = (binding["beat_id"], binding["source_action_unit_id"])
         occurrence = occurrence_by_binding.get(binding_key, 0)
         occurrence_by_binding[binding_key] = occurrence + 1
-        category = _pose_category(
-            binding["action_description"],
-            binding["prop_ids"],
-        )
         cells.append({
             "cell_id": cell_id,
             "grid_position": {"row": index // 3 + 1, "column": index % 3 + 1},
@@ -386,9 +515,10 @@ def build_character_performance_plan(
             "parent_shot_id": binding["parent_shot_id"],
             "beat_id": binding["beat_id"],
             "source_action_unit_id": binding["source_action_unit_id"],
+            "source_lineage_kind": binding["source_lineage_kind"],
             "generation_action_unit_ids": binding["generation_action_unit_ids"],
             "prop_ids": binding["prop_ids"],
-            "pose_category": category,
+            "pose_category": binding["pose_category"],
             "pose_focus": PERFORMANCE_KEY_POSE_PHASES[
                 occurrence % len(PERFORMANCE_KEY_POSE_PHASES)
             ],
@@ -410,6 +540,18 @@ def build_character_performance_prompt(
 ) -> str:
     appearance = character.get("appearance")
     styling = appearance.get("synthetic_styling") if isinstance(appearance, Mapping) else None
+    positions = (
+        "top-left", "top-center", "top-right",
+        "bottom-left", "bottom-center", "bottom-right",
+    )
+    cell_instructions = "\n".join(
+        (
+            f"- {position} (internal {cell['cell_id']}; never print the ID): "
+            f"role={cell['pose_category']}; exact authored action={cell['action_description']}; "
+            f"required key pose={cell['pose_focus']}."
+        )
+        for position, cell in zip(positions, plan["cells"], strict=True)
+    )
     return f"""Create one clean 3:2 character performance reference image containing six evenly
 spaced full-body poses of the same single character, arranged conceptually as 2 rows x 3 columns.
 There are no visible cell dividers: use one seamless neutral light-gray studio background.
@@ -419,16 +561,46 @@ makeup, narrow temple-to-cheek iridescent circuit stripe, luminous iris ring, ha
 proportions, outfit, colors and character-specific makeup design across all six poses.
 Image 2, when present, supplies declared prop geometry/material/color only.
 
-Internal authoring order (never print these IDs in pixels):
-{json.dumps(plan['cells'], ensure_ascii=False, sort_keys=True)}
+Follow these six positions exactly:
+{cell_instructions}
 
-For each position, express only its bound authored action and pose focus. Do not invent an attack,
-outcome, injury, wet clothing, torn clothing, dirt or later story state. A declared prop may appear
-only in cells whose prop_ids include it and must remain owned by this character.
+Every position must visibly perform its exact action, not a generic standing guard. An evade must
+show the specified displaced foot, lowered center of gravity and torso lean. An attack must show the
+specified stepping foot and exact prop swing direction. A block must show the declared defensive
+prop placement. Keep the entire body and prop visible with enough empty space to read the silhouette.
+Do not invent an attack, outcome, injury, wet clothing, torn clothing, dirt or later story state.
+A declared prop may appear only in cells whose prop_ids include it and must remain owned by this
+character.
 
 Pixel prohibitions: no text, no letters, no numbers, no Axx labels, no arrows, no captions, no UI,
 no panel borders, no grid lines. Do not add another character. This is a pose reference sheet, not a
 storyboard and not a finished cinematic frame.
+Synthetic styling contract: {json.dumps(styling, ensure_ascii=False, sort_keys=True)}
+"""
+
+
+def build_character_performance_cell_prompt(
+    character: Mapping[str, Any],
+    cell: Mapping[str, Any],
+) -> str:
+    appearance = character.get("appearance")
+    styling = appearance.get("synthetic_styling") if isinstance(appearance, Mapping) else None
+    return f"""Create one square full-body character action reference on a seamless neutral
+light-gray studio background. Show exactly one character and exactly one clearly readable pose.
+
+Identity is locked by Image 1. Preserve the exact face, pearl bio-ceramic synthetic porcelain
+makeup, circuit stripe, luminous iris ring, hair, proportions, outfit and colors. Image 2, when
+present, supplies the declared prop geometry/material/color only.
+
+Exact authored action: {cell['action_description']}
+Required action role: {cell['pose_category']}
+Required key pose: {cell['pose_focus']}
+
+The pose must visibly perform the exact authored action, not a generic guard. Preserve every stated
+left/right foot placement, center-of-gravity change, torso lean, prop orientation and swing direction.
+Keep the entire body, both feet, both hands and the complete prop visible with clear negative space.
+Do not add a second person, a later action, an outcome, injury, wet clothing, torn clothing or dirt.
+No text, letters, numbers, labels, arrows, captions, UI, borders or grid lines.
 Synthetic styling contract: {json.dumps(styling, ensure_ascii=False, sort_keys=True)}
 """
 
@@ -488,6 +660,7 @@ def validate_character_performance_board(
         or qa.get("status") != "passed"
         or qa.get("character_id") != character_id
         or qa.get("passed") is not True
+        or receipt.get("composition_mode") != PERFORMANCE_COMPOSITION_MODE
     ):
         return False
     if receipt.get("prompt_optimization") != performance_prompt_optimization_contract():
@@ -582,7 +755,9 @@ def _materialize_performance_guides(
                 "source_board_receipt": board_receipt_path.relative_to(output_dir).as_posix(),
                 "source_board_receipt_sha256": board_receipt_hash,
                 "cell_ids": [cell["cell_id"] for cell in selected],
-                "source_action_unit_ids": [cell["source_action_unit_id"] for cell in selected],
+                "source_action_unit_ids": list(dict.fromkeys(
+                    cell["source_action_unit_id"] for cell in selected
+                )),
                 "prop_ids": list(dict.fromkeys(
                     prop_id for cell in selected for prop_id in cell["prop_ids"]
                 )),
@@ -626,6 +801,127 @@ def validate_character_performance_guide(
     ):
         return None
     return receipt
+
+
+def _generate_performance_cell_components(
+    output_dir: Path,
+    character: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    references: list[dict[str, str]],
+    *,
+    image_client: PerformanceBoardImageClient,
+    resolved_model: str,
+) -> tuple[list[dict[str, Any]], int]:
+    character_id = str(character.get("id") or "").strip()
+    component_dir = output_dir / "characters" / character_id / "performance_cells"
+    component_dir.mkdir(parents=True, exist_ok=True)
+    reference_paths = [str(output_dir / record["path"]) for record in references]
+    roles = [
+        "character_identity_board_only",
+        *(["character_prop_detail_only"] if len(references) > 1 else []),
+    ]
+    results: list[dict[str, Any]] = []
+    provider_requests = 0
+    for cell in plan["cells"]:
+        cell_id = str(cell["cell_id"])
+        image_path = component_dir / f"{cell_id}.png"
+        receipt_path = component_dir / f"{cell_id}.json"
+        prompt = bind_reference_roles(
+            build_character_performance_cell_prompt(character, cell),
+            roles,
+        )
+        prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        request_fingerprint = image_request_fingerprint(
+            prompt=prompt,
+            model=resolved_model,
+            size=PERFORMANCE_CELL_SIZE,
+            reference_image_sha256=[record["sha256"] for record in references],
+        )
+        expected = {
+            "schema": CHARACTER_PERFORMANCE_CELL_SCHEMA,
+            "status": "passed",
+            "character_id": character_id,
+            "cell_id": cell_id,
+            "cell_sha256": _canonical_hash(cell),
+            "model": resolved_model,
+            "size": PERFORMANCE_CELL_SIZE,
+            "prompt_sha256": prompt_hash,
+            "request_fingerprint": request_fingerprint,
+            "references": references,
+            "image": image_path.relative_to(output_dir).as_posix(),
+        }
+        cached = _load_json(receipt_path)
+        cache_valid = bool(
+            cached is not None
+            and all(cached.get(key) == value for key, value in expected.items())
+            and image_path.is_file()
+            and cached.get("image_sha256") == file_sha256(image_path)
+        )
+        if cache_valid:
+            try:
+                with Image.open(image_path) as image:
+                    image.verify()
+                    cache_valid = image.size == PERFORMANCE_CELL_PIXEL_SIZE
+            except (OSError, ValueError):
+                cache_valid = False
+        if not cache_valid:
+            _atomic_json(receipt_path, {**expected, "status": "pending"})
+            image_client.image_to_image(
+                prompt=prompt,
+                ref_image=reference_paths,
+                output_path=str(image_path),
+                size=PERFORMANCE_CELL_SIZE,
+            )
+            provider_requests += 1
+            try:
+                with Image.open(image_path) as image:
+                    image.verify()
+                    if image.size != PERFORMANCE_CELL_PIXEL_SIZE:
+                        raise CharacterPerformanceQAError(
+                            f"{character_id} {cell_id} component has invalid size {image.size}"
+                        )
+            except (OSError, ValueError) as exc:
+                raise CharacterPerformanceQAError(
+                    f"{character_id} {cell_id} component is not a valid image"
+                ) from exc
+            cached = {**expected, "image_sha256": file_sha256(image_path)}
+            _atomic_json(receipt_path, cached)
+        results.append(dict(cached))
+    return results, provider_requests
+
+
+def _compose_performance_cell_components(
+    output_dir: Path,
+    components: list[dict[str, Any]],
+    destination: Path,
+) -> None:
+    if [item.get("cell_id") for item in components] != list(PERFORMANCE_CELL_IDS):
+        raise CharacterPerformanceQAError("performance components are incomplete or unordered")
+    board = Image.new("RGB", PERFORMANCE_BOARD_PIXEL_SIZE, (232, 235, 238))
+    pose_size = 940
+    pose_inset = (1024 - pose_size) // 2
+    feather_mask = Image.new("L", (pose_size, pose_size), 0)
+    ImageDraw.Draw(feather_mask).rectangle(
+        (48, 48, pose_size - 49, pose_size - 49),
+        fill=255,
+    )
+    feather_mask = feather_mask.filter(ImageFilter.GaussianBlur(radius=32))
+    for index, component in enumerate(components):
+        image_path = output_dir / str(component["image"])
+        with Image.open(image_path) as raw:
+            pose = raw.convert("RGB").resize(
+                (pose_size, pose_size),
+                Image.Resampling.LANCZOS,
+            )
+        board.paste(
+            pose,
+            (
+                (index % 3) * 1024 + pose_inset,
+                (index // 3) * 1024 + pose_inset,
+            ),
+            feather_mask,
+        )
+    _atomic_png(destination, board)
 
 
 def generate_character_performance_board(
@@ -680,12 +976,61 @@ def generate_character_performance_board(
     image_path = character_dir / PERFORMANCE_BOARD_FILENAME
     receipt_path = character_dir / PERFORMANCE_BOARD_RECEIPT
     qa_path = character_dir / PERFORMANCE_BOARD_QA_RECEIPT
+    plan_hash = _canonical_hash(plan)
+    previous_receipt = _load_json(receipt_path)
+    previous_qa = _load_json(qa_path)
+    previous_exact_contract = bool(
+        previous_receipt is not None
+        and previous_receipt.get("plan") == plan
+        and previous_receipt.get("plan_sha256") == plan_hash
+        and previous_receipt.get("model") == resolved_model
+        and previous_receipt.get("prompt_sha256") == prompt_hash
+        and previous_receipt.get("references") == references
+    )
+    previous_exact_failure = bool(
+        previous_exact_contract and previous_receipt.get("status") == "failed"
+    )
+    previous_mode = (
+        str(previous_receipt.get("generation_mode") or "whole_board")
+        if previous_receipt is not None
+        else "whole_board"
+    )
+    previous_cell_fallback = bool(
+        previous_exact_contract
+        and previous_mode == "per_cell_fallback"
+        and isinstance(previous_receipt.get("component_cells"), list)
+    )
+    if (
+        previous_exact_failure
+        and previous_mode == "per_cell_fallback"
+        and previous_receipt.get("composition_mode") == PERFORMANCE_COMPOSITION_MODE
+    ):
+        raise CharacterPerformanceQAError(
+            f"{character_id} exact per-cell performance fallback already failed blocking QA"
+        )
+    attempts = [
+        dict(item)
+        for item in (previous_receipt or {}).get("attempts") or []
+        if isinstance(item, Mapping)
+    ]
+    if previous_exact_failure and previous_mode == "whole_board" and not attempts:
+        if previous_qa is not None:
+            archived_qa = character_dir / "performance_reference_board_qa.whole_board.json"
+            _atomic_json(archived_qa, previous_qa)
+            attempts.append({
+                "mode": "whole_board",
+                "status": "failed",
+                "provider_requests": 1,
+                "image_sha256": previous_receipt.get("image_sha256"),
+                "qa_receipt": archived_qa.name,
+                "qa_receipt_sha256": file_sha256(archived_qa),
+            })
     pending = {
         "schema": CHARACTER_PERFORMANCE_BOARD_SCHEMA,
         "status": "pending",
         "character_id": character_id,
         "plan": plan,
-        "plan_sha256": _canonical_hash(plan),
+        "plan_sha256": plan_hash,
         "model": resolved_model,
         "size": PERFORMANCE_BOARD_SIZE,
         "prompt_sha256": prompt_hash,
@@ -693,55 +1038,116 @@ def generate_character_performance_board(
         "request_fingerprint": request_fingerprint,
         "references": references,
         "image": PERFORMANCE_BOARD_FILENAME,
+        "composition_mode": PERFORMANCE_COMPOSITION_MODE,
+        "generation_mode": (
+            "per_cell_fallback"
+            if previous_exact_failure or previous_cell_fallback
+            else "whole_board"
+        ),
+        "attempts": attempts,
     }
     _atomic_json(receipt_path, pending)
-    image_client.image_to_image(
-        prompt=bound_prompt,
-        ref_image=[str(output_dir / record["path"]) for record in references],
-        output_path=str(image_path),
-        size=PERFORMANCE_BOARD_SIZE,
-    )
-    try:
-        with Image.open(image_path) as generated:
-            generated.verify()
-            if generated.size != PERFORMANCE_BOARD_PIXEL_SIZE:
-                raise CharacterPerformanceQAError(
-                    f"{character_id} performance board has invalid size {generated.size}"
-                )
-    except (OSError, ValueError) as exc:
-        raise CharacterPerformanceQAError(
-            f"{character_id} performance board is not a valid image"
-        ) from exc
     appearance = character.get("appearance")
     styling = appearance.get("synthetic_styling") if isinstance(appearance, Mapping) else None
-    qa_result = review_character_performance_board(
-        review_client,
-        image_path,
-        character_id=character_id,
-        cells=plan["cells"],
-        synthetic_styling=styling if isinstance(styling, dict) else None,
-    )
-    image_hash = file_sha256(image_path)
-    qa_receipt = {
-        **qa_result,
-        "status": "passed" if qa_result["passed"] else "failed",
-        "character_id": character_id,
-        "image": PERFORMANCE_BOARD_FILENAME,
-        "image_sha256": image_hash,
-        "plan_sha256": _canonical_hash(plan),
-    }
-    _atomic_json(qa_path, qa_receipt)
-    if not qa_result["passed"]:
-        _atomic_json(receipt_path, {**pending, "status": "failed", "image_sha256": image_hash})
-        raise CharacterPerformanceQAError(
-            f"{character_id} performance board failed blocking pixel QA"
+    current_provider_requests = 0
+
+    def review_current_board() -> tuple[dict[str, Any], str]:
+        try:
+            with Image.open(image_path) as generated:
+                generated.verify()
+                if generated.size != PERFORMANCE_BOARD_PIXEL_SIZE:
+                    raise CharacterPerformanceQAError(
+                        f"{character_id} performance board has invalid size {generated.size}"
+                    )
+        except (OSError, ValueError) as exc:
+            raise CharacterPerformanceQAError(
+                f"{character_id} performance board is not a valid image"
+            ) from exc
+        qa_result = review_character_performance_board(
+            review_client,
+            image_path,
+            character_id=character_id,
+            cells=plan["cells"],
+            synthetic_styling=styling if isinstance(styling, dict) else None,
         )
+        image_hash = file_sha256(image_path)
+        qa_receipt = {
+            **qa_result,
+            "status": "passed" if qa_result["passed"] else "failed",
+            "character_id": character_id,
+            "image": PERFORMANCE_BOARD_FILENAME,
+            "image_sha256": image_hash,
+            "plan_sha256": plan_hash,
+        }
+        _atomic_json(qa_path, qa_receipt)
+        return qa_result, image_hash
+
+    use_cell_fallback = previous_exact_failure or previous_cell_fallback
+    if not use_cell_fallback:
+        image_client.image_to_image(
+            prompt=bound_prompt,
+            ref_image=[str(output_dir / record["path"]) for record in references],
+            output_path=str(image_path),
+            size=PERFORMANCE_BOARD_SIZE,
+        )
+        current_provider_requests += 1
+        qa_result, image_hash = review_current_board()
+        if not qa_result["passed"]:
+            archived_qa = character_dir / "performance_reference_board_qa.whole_board.json"
+            _atomic_json(archived_qa, _load_json(qa_path) or {})
+            attempts.append({
+                "mode": "whole_board",
+                "status": "failed",
+                "provider_requests": 1,
+                "image_sha256": image_hash,
+                "qa_receipt": archived_qa.name,
+                "qa_receipt_sha256": file_sha256(archived_qa),
+            })
+            use_cell_fallback = True
+
+    components: list[dict[str, Any]] = []
+    if use_cell_fallback:
+        pending = {
+            **pending,
+            "generation_mode": "per_cell_fallback",
+            "attempts": attempts,
+        }
+        _atomic_json(receipt_path, pending)
+        components, component_requests = _generate_performance_cell_components(
+            output_dir,
+            character,
+            plan,
+            references,
+            image_client=image_client,
+            resolved_model=resolved_model,
+        )
+        current_provider_requests += component_requests
+        _compose_performance_cell_components(output_dir, components, image_path)
+        qa_result, image_hash = review_current_board()
+        if not qa_result["passed"]:
+            failed = {
+                **pending,
+                "status": "failed",
+                "image_sha256": image_hash,
+                "component_cells": components,
+                "provider_request_count": sum(
+                    int(item.get("provider_requests") or 0) for item in attempts
+                ) + len(components),
+            }
+            _atomic_json(receipt_path, failed)
+            raise CharacterPerformanceQAError(
+                f"{character_id} performance board failed blocking pixel QA"
+            )
     complete = {
         **pending,
         "status": "passed",
         "image_sha256": image_hash,
         "qa_receipt": PERFORMANCE_BOARD_QA_RECEIPT,
         "qa_receipt_sha256": file_sha256(qa_path),
+        "component_cells": components,
+        "provider_request_count": sum(
+            int(item.get("provider_requests") or 0) for item in attempts
+        ) + (len(components) if components else 1),
     }
     _atomic_json(receipt_path, complete)
     guides = _materialize_performance_guides(output_dir, character_id, plan)
@@ -750,7 +1156,7 @@ def generate_character_performance_board(
         "reused": False,
         "board": image_path.relative_to(output_dir).as_posix(),
         "guides": guides,
-        "provider_requests": 1,
+        "provider_requests": current_provider_requests,
     }
 
 

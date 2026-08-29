@@ -151,6 +151,37 @@ class _ReviewClient:
         return _qa_payload()
 
 
+class _FallbackImageClient(_ImageClient):
+    def image_to_image(self, *, prompt, ref_image, output_path, size):
+        self.calls.append({
+            "prompt": prompt,
+            "ref_image": list(ref_image),
+            "output_path": output_path,
+            "size": size,
+        })
+        dimensions = (2048, 2048) if size == "2048x2048" else (3072, 2048)
+        Image.new("RGB", dimensions, (100 + len(self.calls), 130, 180)).save(
+            output_path,
+            format="PNG",
+        )
+        return "https://provider.invalid/performance.png"
+
+
+class _FailThenPassReviewClient:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def review(self, image_paths, prompt):
+        self.calls.append((list(image_paths), prompt))
+        payload = json.loads(_qa_payload())
+        if len(self.calls) == 1:
+            payload["passed"] = False
+            payload["cells"][0]["pose_matches_action"] = False
+            payload["cells"][0]["issues"] = ["generic guard pose"]
+            payload["issues"] = ["A01 action mismatch"]
+        return json.dumps(payload)
+
+
 def test_plan_has_six_ordered_cells_bound_to_real_pxx_action_and_prop():
     plan = build_character_performance_plan(_storyboard(), _character())
 
@@ -162,6 +193,56 @@ def test_plan_has_six_ordered_cells_bound_to_real_pxx_action_and_prop():
     ]
     assert {cell["source_action_unit_id"] for cell in plan["cells"]} == {"AU001", "AU002"}
     assert all(cell["prop_ids"] == ["energy_baton"] for cell in plan["cells"])
+
+
+def test_plan_normalizes_numeric_production_shot_id_to_canonical_beat_parent():
+    storyboard = _storyboard()
+    storyboard["shots"][0]["id"] = 1
+    first = storyboard["shots"][0]["storyboard_beats"][0]
+    first["source_action_unit_ids"] = []
+    first["generation_action_units"][0].pop("source_action_unit_id")
+    first["generation_action_units"][0].update({
+        "source_event_id": 1,
+        "source_generation_unit_indexes": [1],
+    })
+    first["timeline_assignment_ids"] = ["TA001"]
+    first["timeline_assignments"] = [{
+        "assignment_id": "TA001",
+        "source_event_id": 1,
+        "source_generation_unit_indexes": [1],
+    }]
+
+    plan = build_character_performance_plan(storyboard, _character())
+
+    assert plan is not None
+    assert {cell["parent_shot_id"] for cell in plan["cells"]} == {"S01"}
+    assert plan["cells"][0]["beat_id"] == "S01_P01"
+    assert plan["cells"][0]["source_action_unit_id"] == "TA001"
+    assert plan["cells"][0]["source_lineage_kind"] == "timeline_assignment"
+
+
+def test_plan_rejects_mismatched_timeline_assignment_fallback():
+    storyboard = _storyboard()
+    first = storyboard["shots"][0]["storyboard_beats"][0]
+    first["source_action_unit_ids"] = []
+    first["generation_action_units"][0].pop("source_action_unit_id")
+    first["generation_action_units"][0].update({
+        "source_event_id": 1,
+        "source_generation_unit_indexes": [1],
+    })
+    first["timeline_assignment_ids"] = ["TA001"]
+    first["timeline_assignments"] = [{
+        "assignment_id": "TA001",
+        "source_event_id": 2,
+        "source_generation_unit_indexes": [1],
+    }]
+
+    try:
+        build_character_performance_plan(storyboard, _character())
+    except ValueError as exc:
+        assert "timeline assignment lineage is inconsistent" in str(exc)
+    else:
+        raise AssertionError("mismatched canonical lineage must fail closed")
 
 
 def test_prompt_optimization_is_frozen_offline_and_covers_every_dimension():
@@ -219,6 +300,8 @@ def test_generate_board_and_current_pxx_guides_are_exactly_cached(tmp_path):
     assert p01["provider_requests"] == p02["provider_requests"] == 0
     assert set(p01["source_action_unit_ids"]) == {"AU001"}
     assert set(p02["source_action_unit_ids"]) == {"AU002"}
+    assert len(p01["source_action_unit_ids"]) == len(set(p01["source_action_unit_ids"]))
+    assert len(p02["source_action_unit_ids"]) == len(set(p02["source_action_unit_ids"]))
 
     storyboard = _storyboard()
     attach_performance_guides_to_storyboard(storyboard, [first])
@@ -230,6 +313,43 @@ def test_generate_board_and_current_pxx_guides_are_exactly_cached(tmp_path):
     assert beats[1]["character_performance_guides"][0]["cell_ids"] == [
         "A02", "A04", "A06"
     ]
+
+
+def test_failed_whole_board_uses_six_cached_components_then_passes(tmp_path):
+    _write_reference_assets(tmp_path)
+    image_client = _FallbackImageClient()
+    review_client = _FailThenPassReviewClient()
+
+    generated = generate_character_performance_board(
+        tmp_path,
+        _storyboard(),
+        _character(),
+        image_client=image_client,
+        review_client=review_client,
+    )
+    reused = generate_character_performance_board(
+        tmp_path,
+        _storyboard(),
+        _character(),
+        image_client=image_client,
+        review_client=review_client,
+    )
+
+    assert generated is not None and generated["provider_requests"] == 7
+    assert reused is not None and reused["provider_requests"] == 0
+    assert len(image_client.calls) == 7
+    assert [call["size"] for call in image_client.calls] == [
+        "3072x2048",
+        *("2048x2048" for _ in range(6)),
+    ]
+    receipt = json.loads(
+        (tmp_path / "characters/lead/performance_reference_board.json").read_text()
+    )
+    assert receipt["generation_mode"] == "per_cell_fallback"
+    assert receipt["provider_request_count"] == 7
+    assert [item["cell_id"] for item in receipt["component_cells"]] == list(
+        PERFORMANCE_CELL_IDS
+    )
 
 
 def test_wet_or_damaged_state_alone_does_not_create_performance_board():

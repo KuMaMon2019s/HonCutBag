@@ -121,7 +121,7 @@ Graph node 必须只完成三件事：读取 State、调用一个窄 owner、返
 |---|---|---|
 | 1 | 文本解析、源事件发现、按 sequence 的导演意图、角色发现、`SEMANTIC_LEDGER.json`、时长缩放后的 `SCREENPLAY_PLAN.json` 与 canonical `STORYBOARD.json` / `CHARACTERS.json` | 输入/LLM/结构无效即停止；子阶段 checkpoint 可复用 |
 | 2 | Pxx PREVIS、每个 Sxx 独有的带标识 3×3 剧情九宫格、Gxx→Pxx 导航图与端帧契约 | 生产图片、格子分配或其验证证据缺失时 fail closed |
-| 3 | 角色卡、四视图、单图四视图参考板、变体、身份锁定，以及显式项目角色库的精确导入/批准 | 生产模式要求真实四视图 QA；参考板只能由已验收四视图确定性派生；角色库证据缺失、篡改或冲突时 fail closed；dry-run 只写明确的 dry-run receipt |
+| 3 | 角色卡、四视图、单图四视图参考板、道具细节板、run-local 多姿态动作板、身份锁定，以及显式项目角色库的精确导入/批准 | 生产模式要求真实四视图/动作板 QA；参考板只能由已验收四视图确定性派生；旧 `variant_*` 仅审计；角色库证据缺失、篡改或冲突时 fail closed；dry-run 只写明确的 dry-run receipt |
 | 4 | 原生 shot 目录与 `SHOT_META.json`、场景一致性、continuity plan、每个 Sxx 唯一 cinematic first-frame | P02+ 不得生成或声明新的 cinematic frame；Phase 4 不运行视频生成子进程 |
 | 5 | storyboard QA、生成容量、variation/slideshow、监督与进入视频生成前的硬门 | C/D 或 blocking supervision 阻止 Phase 6；dry-run 不做像素/模型监督 |
 | 6 | 视频生成与 continuity chunk 执行 | 所有长请求经过 Runtime task ledger；相同输入恢复不得重复提交 |
@@ -300,7 +300,7 @@ Phase 3 的四张 canonical 角色图 `face_closeup/full_body/side/back` 继续�
 
 新生产角色的视觉身份合同固定为 `synthetic_stylized_character_v3` / `honcut.synthetic-styling.v3`，唯一面部模式是 `synthetic_porcelain_makeup`：珍珠陶瓷合成皮肤、太阳穴到颧骨的细窄虹彩电路妆纹和柔和发光虹膜环必须可见，面部完整无遮挡且五官协调自然；真人皮肤/肖像、面纱、遮脸面具、粗大机械板、裂纹、伤疤和恐怖化均为阻断项。同一妆造类型的配色、纹路和识别码由角色 ID 确定性派生。静态参考合同为 v6，四视图 QA 为 v3；角色卡、妆造、生成 Prompt、模型、参考图或合同哈希任一变化都必须形成新缓存身份，不能仅凭文件大小复用。v2 仅可审计读取，未知未来合同继续 fail closed。
 
-Phase 3 还拥有 run-local `honcut.character-performance-board.v1`：只有角色在 canonical Storyboard/Pxx 中存在结构化战斗或持/用道具动作时，才生成一张无文字、序号、箭头、边框和网格的 2×3 `performance_reference_board.png`。收据中的 A01～A06 依次绑定角色 ID、当前 Pxx、canonical `source_action_unit_id`、格位、道具 ID 和原编剧动作，禁止重新编剧情；六格不足时只能对既有动作取起势/峰值/落位关键姿态，禁止发明后续结果。Phase 3 对整板执行同角色、六种差异姿态、服装妆造一致、道具归属、无额外角色和无版式污染的阻断 QA，再在本地零请求裁切当前 Pxx 导航图并写 `honcut.character-performance-guide.v1`。整板、局部图、收据和源哈希任一缺失、损坏、旧版或未来版都必须 fail closed。淋湿、破损和泥污只保存在 Pxx start/end state 与连续性 Prompt 中，不再生产或消费 `variant_*.png`。
+Phase 3 还拥有 run-local `honcut.character-performance-board.v1`：只有角色在 canonical Storyboard/Pxx 中存在结构化战斗或持/用道具动作时，才生成一张无文字、序号、箭头、边框和网格的 2×3 `performance_reference_board.png`。收据中的 A01～A06 依次绑定角色 ID、当前 Pxx、canonical `source_action_unit_id`、格位、道具 ID 和原编剧动作，禁止重新编剧情；生产 Storyboard 的数值 shot ID 必须按既有 Sxx 规则规范化，显式 action-unit 缺席时只允许用已验证、同序且血缘一致的 canonical timeline assignment 作为 source-action 身份，任何冲突都 fail closed。六格不足时只能对既有动作取可辨识关键姿态、发力峰值或动作落位，禁止把普通起始站姿冒充当前动作或发明后续结果。Phase 3 对整板执行同角色、六种差异姿态、服装妆造一致、道具归属、无额外角色和无版式污染的阻断 QA；整板一次生成失败时，唯一允许的有界纠偏是按相同 A01～A06 合同生成六个可恢复的 `honcut.character-performance-cell.v1` 中间组件并在本地合成同一完整动作板，随后再次执行整板阻断 QA，第二级失败不得继续付费重试。组件不进入 Phase 6，Phase 3 只在本地零请求裁切当前 Pxx 导航图并写 `honcut.character-performance-guide.v1`。整板、组件、局部图、收据和源哈希任一缺失、损坏、旧版或未来版都必须 fail closed。淋湿、破损和泥污只保存在 Pxx start/end state 与连续性 Prompt 中，不再生产或消费 `variant_*.png`。
 
 动作板 Prompt 固定使用 `honcut.character-performance-board-prompt.v1`。其候选选择按火山方舟 Prompt 调优的调试、批量与评分思路做离线合同覆盖比较，维度固定为合成人辨识度、美观度、身份一致性、姿态清晰度、道具准确度、无克隆和无版式污染；选定模板、候选覆盖分、版本和 SHA-256 写入动作板收据。该比较的 `provider_request_count=0` 且 `production_auto_optimization=false`，生产 Runtime 不调用 Prompt 调优服务；它不能替代 Phase 3 像素 QA、Provider 隐私审核或 live acceptance。
 
