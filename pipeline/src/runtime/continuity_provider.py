@@ -369,6 +369,12 @@ def _validate_seedance_continuity_plan(plan: ContinuityPlan) -> None:
                 errors.append(
                     f"{chunk.chunk_id} has no validated storyboard narrative guide"
                 )
+            if chunk.character_performance_required and not (
+                chunk.character_performance_guides
+            ):
+                errors.append(
+                    f"{chunk.chunk_id} has no validated character performance guide"
+                )
             if chunk.sequence == 1 and chunk.execution_strategy == "multi_image":
                 if not chunk.storyboard_image:
                     errors.append(
@@ -930,13 +936,20 @@ def _base_content(
                 request.chunk.storyboard_narrative_guide_receipt
             ),
         })
+        content_meta["_character_performance_required"] = (
+            request.chunk.character_performance_required
+        )
+        content_meta["_character_performance_guides"] = [
+            guide.model_dump(mode="json")
+            for guide in request.chunk.character_performance_guides
+        ]
     if request.chunk.storyboard_beat_id:
         # Keep the mandatory cinematic/identity/guide set, then admit optional
         # detail assets only up to the same six-image base budget used before
         # the three P02+ tail anchors are appended. This deterministic priority
         # bound also prevents optional media descriptions from exhausting the
         # Seedance prompt budget.
-        content_meta["_max_reference_images"] = STORYBOARD_GUIDE_BASE_IMAGE_BUDGET
+        content_meta["_max_reference_images"] = SEEDANCE_MAX_REFERENCE_IMAGES
     if request.chunk.mode == "native_extend":
         content_meta["_max_reference_images"] = (
             SEEDANCE_MAX_REFERENCE_IMAGES
@@ -1072,6 +1085,19 @@ def _media_index_manifest(content: Sequence[dict[str, Any]]) -> list[dict[str, A
             "character_id": item.get("_character_id"),
             "narrative_beat_id": item.get("_narrative_beat_id"),
             "narrative_cell_ids": list(item.get("_narrative_cell_ids") or []),
+            "performance_beat_id": item.get("_performance_beat_id"),
+            "performance_cell_ids": list(
+                item.get("_performance_cell_ids") or []
+            ),
+            "performance_source_action_unit_ids": list(
+                item.get("_performance_source_action_unit_ids") or []
+            ),
+            "performance_prop_ids": list(
+                item.get("_performance_prop_ids") or []
+            ),
+            "performance_source_board_sha256": item.get(
+                "_performance_source_board_sha256"
+            ),
             "mandatory": item.get("_mandatory_reference") is True
             or bool(item.get("_continuity_role")),
         })
@@ -1087,10 +1113,15 @@ def _bind_final_media_index_prompt(
     manifest = _media_index_manifest(normalized)
     if request.chunk.execution_strategy == "first_last_frame_bridge":
         if any(
-            item.get("responsibility") == "storyboard_narrative_guide"
+            item.get("responsibility") in {
+                "storyboard_narrative_guide",
+                "character_performance_guide",
+            }
             for item in manifest
         ):
-            raise ValueError("cross-primary bridge must not contain a narrative guide")
+            raise ValueError(
+                "cross-primary bridge must not contain narrative or performance guides"
+            )
         return normalized, manifest
 
     guides = [
@@ -1111,6 +1142,38 @@ def _bind_final_media_index_prompt(
         ):
             raise ValueError(
                 f"{request.resource_id} narrative guide does not match its persisted Gxx assignment"
+            )
+    performance_guides = [
+        item
+        for item in manifest
+        if item.get("responsibility") == "character_performance_guide"
+    ]
+    expected_performance = request.chunk.character_performance_guides
+    if bool(performance_guides) != request.chunk.character_performance_required:
+        raise ValueError(
+            f"{request.resource_id} performance-guide requirement is not satisfied"
+        )
+    if len(performance_guides) != len(expected_performance):
+        raise ValueError(
+            f"{request.resource_id} performance-guide count does not match its plan"
+        )
+    for observed, expected in zip(
+        performance_guides,
+        expected_performance,
+        strict=True,
+    ):
+        if (
+            observed.get("character_id") != expected.character_id
+            or observed.get("performance_beat_id") != expected.beat_id
+            or observed.get("performance_cell_ids") != expected.cell_ids
+            or observed.get("performance_source_action_unit_ids")
+            != expected.source_action_unit_ids
+            or observed.get("performance_prop_ids") != expected.prop_ids
+            or observed.get("performance_source_board_sha256")
+            != expected.source_board_sha256
+        ):
+            raise ValueError(
+                f"{request.resource_id} performance guide does not match persisted Axx lineage"
             )
     if (
         request.chunk.sequence == 1
@@ -1155,10 +1218,28 @@ def _bind_final_media_index_prompt(
             "Gxx 序号、文字、箭头、轨迹线、指示标识、边框和九宫格只供理解，"
             "严禁渲染进视频画面。"
         )
+    performance_contract = ""
+    if performance_guides:
+        directives = []
+        for guide in performance_guides:
+            cells = [str(value) for value in guide["performance_cell_ids"]]
+            directives.append(
+                f"{guide['prompt_index']}是角色{guide['character_id']}在当前"
+                f"{guide['performance_beat_id']}的动作姿态图，只允许参考"
+                + "→".join(cells)
+            )
+        performance_contract = (
+            "\n当前动作姿态图中的多个人形是同一个角色的不同参考姿态，不是多个角色。"
+            + "；".join(directives)
+            + "。只执行本次明确列出的 Axx，不得提前执行其他 Axx 或后续 Pxx；"
+            "不得生成角色克隆、分栏、拼贴、网格、文字、序号、箭头、边框或参考板布局。"
+            "道具只属于其绑定角色，并保持声明的几何、材质、颜色与握持关系。"
+        )
     prefix = (
         "【参考素材索引｜顺序不可交换】\n"
         + "\n".join(index_lines)
         + guide_contract
+        + performance_contract
         + "\n"
     )
     text_item = next(
@@ -1371,6 +1452,13 @@ def _task_payload(
         "storyboard_narrative_guide_receipt": (
             request.chunk.storyboard_narrative_guide_receipt
         ),
+        "character_performance_required": (
+            request.chunk.character_performance_required
+        ),
+        "character_performance_guides": [
+            guide.model_dump(mode="json")
+            for guide in request.chunk.character_performance_guides
+        ],
         "duration": duration,
         "provider_request_duration_s": duration,
         "effective_story_duration_s": round(unique_duration, 6),
@@ -1422,6 +1510,7 @@ def _provider_input_context(
     storyboard_image: str | None = None,
     storyboard_narrative_guide: str | None = None,
     storyboard_narrative_guide_cell_ids: Sequence[str] = (),
+    character_performance_guides: Sequence[Any] = (),
     bridge_target_storyboard_image: str | None = None,
 ) -> dict[str, Any]:
     shot_meta = output_dir / "shots" / shot_id / "SHOT_META.json"
@@ -1467,6 +1556,18 @@ def _provider_input_context(
         "storyboard_narrative_guide_cell_ids": list(
             storyboard_narrative_guide_cell_ids
         ),
+        "character_performance_guides": [
+            {
+                "character_id": guide.character_id,
+                "beat_id": guide.beat_id,
+                "image_sha256": optional_hash(guide.image),
+                "cell_ids": list(guide.cell_ids),
+                "source_action_unit_ids": list(guide.source_action_unit_ids),
+                "prop_ids": list(guide.prop_ids),
+                "source_board_sha256": optional_hash(guide.source_board),
+            }
+            for guide in character_performance_guides
+        ],
         "bridge_target_storyboard_image_sha256": optional_hash(
             bridge_target_storyboard_image
         ),
@@ -2836,6 +2937,7 @@ def execute_phase6_auto_continuity(
             storyboard_narrative_guide_cell_ids=(
                 chunk.storyboard_narrative_guide_cell_ids
             ),
+            character_performance_guides=chunk.character_performance_guides,
             bridge_target_storyboard_image=chunk.bridge_target_storyboard_image,
         ),
         seam_calibration=(

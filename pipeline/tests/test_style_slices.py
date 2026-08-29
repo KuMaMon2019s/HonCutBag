@@ -135,6 +135,7 @@ def test_phase3_dry_run_writes_hashed_receipt_without_production_calls(
     assert receipt["skipped_operations"] == [
         "character_reference_image_generation",
         "character_reference_semantic_qa",
+        "character_performance_board_generation",
         "character_locked_storyboard_refresh",
     ]
     source_hashes = {

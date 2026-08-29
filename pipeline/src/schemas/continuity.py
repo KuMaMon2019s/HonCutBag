@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -15,6 +16,40 @@ ChunkExecutionStrategy = Literal[
     "tail_video_extend",
     "first_last_frame_bridge",
 ]
+
+
+class CharacterPerformanceGuide(BaseModel):
+    """One validated, current-Pxx, locally derived character pose guide."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["honcut.character-performance-guide.v1"]
+    usage: Literal["current_pxx_motion_reference_only"]
+    character_id: str = Field(min_length=1)
+    beat_id: str = Field(pattern=r"^S\d+_P\d+$")
+    image: str = Field(min_length=1)
+    image_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    receipt: str = Field(min_length=1)
+    cell_ids: list[str] = Field(min_length=1, max_length=6)
+    source_action_unit_ids: list[str] = Field(min_length=1)
+    prop_ids: list[str] = Field(default_factory=list)
+    source_board: str = Field(min_length=1)
+    source_board_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_board_receipt: str = Field(min_length=1)
+    source_board_receipt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def cell_order_is_canonical(self) -> CharacterPerformanceGuide:
+        numbers = []
+        for cell_id in self.cell_ids:
+            if not re.fullmatch(r"A0[1-6]", cell_id):
+                raise ValueError("performance guide cell IDs must be A01-A06")
+            numbers.append(int(cell_id[1:]))
+        if numbers != sorted(set(numbers)):
+            raise ValueError("performance guide cell IDs must be unique and ordered")
+        if len(self.source_action_unit_ids) != len(set(self.source_action_unit_ids)):
+            raise ValueError("performance guide source action IDs must be unique")
+        return self
 
 
 class ContinuityAnchors(BaseModel):
@@ -88,6 +123,13 @@ class GenerationChunk(BaseModel):
     )
     storyboard_narrative_guide_receipt: str | None = Field(
         default=None, exclude_if=lambda value: value is None
+    )
+    character_performance_required: bool = Field(
+        default=False, exclude_if=lambda value: value is False
+    )
+    character_performance_guides: list[CharacterPerformanceGuide] = Field(
+        default_factory=list,
+        exclude_if=lambda value: not value,
     )
     bridge_target_shot_id: str | None = Field(
         default=None, exclude_if=lambda value: value is None
@@ -174,6 +216,26 @@ class GenerationChunk(BaseModel):
                 expected_numbers.append(int(suffix))
             if expected_numbers != sorted(set(expected_numbers)):
                 raise ValueError("narrative guide cell IDs must be unique and ordered")
+        if self.character_performance_required != bool(
+            self.character_performance_guides
+        ):
+            raise ValueError(
+                "character performance requirement and guide list must agree"
+            )
+        if self.character_performance_guides:
+            if not self.storyboard_beat_id:
+                raise ValueError("character performance guides require storyboard_beat_id")
+            character_ids = []
+            for guide in self.character_performance_guides:
+                if guide.beat_id != self.storyboard_beat_id:
+                    raise ValueError(
+                        "character performance guide must belong to the current Pxx"
+                    )
+                character_ids.append(guide.character_id)
+            if len(character_ids) != len(set(character_ids)):
+                raise ValueError(
+                    "one Pxx may contain at most one guide per character"
+                )
         return self
 
 
@@ -301,7 +363,7 @@ class ContinuityPlan(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    version: Literal[2] = 2
+    version: Literal[3] = 3
     provider_chunk_limit_s: float = Field(gt=0)
     timeline_fps: int = Field(default=24, gt=0)
     shots: list[ContinuityShot] = Field(default_factory=list)
@@ -313,10 +375,10 @@ class ContinuityPlan(BaseModel):
     def migrate_known_v1(cls, value: Any) -> Any:
         if not isinstance(value, dict):
             return value
-        version = value.get("version", 2)
+        version = value.get("version", 3)
         if version == 1:
             migrated = dict(value)
-            migrated["version"] = 2
+            migrated["version"] = 3
             migrated["migrated_from_version"] = 1
             migrated_shots = []
             for shot in value.get("shots") or []:
@@ -340,6 +402,11 @@ class ContinuityPlan(BaseModel):
                 migrated_shot["chunks"] = migrated_chunks
                 migrated_shots.append(migrated_shot)
             migrated["shots"] = migrated_shots
+            return migrated
+        if version == 2:
+            migrated = dict(value)
+            migrated["version"] = 3
+            migrated["migrated_from_version"] = 2
             return migrated
         return value
 

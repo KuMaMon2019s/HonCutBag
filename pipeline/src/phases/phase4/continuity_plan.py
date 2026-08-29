@@ -596,6 +596,12 @@ def build_continuity_plan(
                         str(beat.get("storyboard_narrative_guide_receipt") or "")
                         or None
                     ),
+                    character_performance_required=bool(
+                        beat.get("character_performance_required")
+                    ),
+                    character_performance_guides=list(
+                        beat.get("character_performance_guides") or []
+                    ),
                     bridge_target_shot_id=(
                         str(beat.get("bridge_target_shot_id") or "") or None
                     ),

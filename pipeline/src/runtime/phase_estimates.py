@@ -166,8 +166,12 @@ def build_pipeline_workload(
         identity_props = appearance.get("identity_props") or []
         if not isinstance(identity_props, list):
             raise ValueError(f"character {identity} appearance.identity_props must be an array")
-        identity_detail = root / "characters" / identity / "identity_detail.png" if root else None
-        if identity_props and not (identity_detail and identity_detail.is_file()):
+        prop_detail = (
+            root / "characters" / identity / "prop_detail_board.png"
+            if root
+            else None
+        )
+        if identity_props and not (prop_detail and prop_detail.is_file()):
             character_reference_requests += 1
 
         variants = appearance.get("variants") or []
@@ -176,17 +180,34 @@ def build_pipeline_workload(
         for variant in variants:
             if not isinstance(variant, dict):
                 raise ValueError(f"character {identity} variant must be an object")
-            description = str(variant.get("description") or "").strip()
-            if not description:
-                continue
-            state_name = str(variant.get("state_name") or "unknown")
-            variant_path = (
-                root / "characters" / identity / f"variant_{state_name}.png"
-                if root
-                else None
+
+    performance_character_ids: set[str] = set()
+    for shot in shots:
+        shot_action = str(shot.get("shot_intent") or "").casefold() == "action"
+        for beat in _dict_records(
+            shot.get("storyboard_beats"),
+            field="STORYBOARD.shots[].storyboard_beats",
+        ):
+            body_contract = beat.get("body_action_contract")
+            relevant = shot_action or (
+                isinstance(body_contract, dict)
+                and body_contract.get("required") is True
             )
-            if not (variant_path and variant_path.is_file()):
-                character_reference_requests += 1
+            if not relevant or not beat.get("source_action_unit_ids"):
+                continue
+            performance_character_ids.update(
+                str(value)
+                for value in beat.get("character_ids") or []
+                if str(value) in characters_by_id
+            )
+    for character_id in performance_character_ids:
+        board = (
+            root / "characters" / character_id / "performance_reference_board.png"
+            if root
+            else None
+        )
+        if not (board and board.is_file()):
+            character_reference_requests += 1
 
     beat_count = 0
     has_deferred_character_shot = False

@@ -33,13 +33,18 @@ PERFORMANCE_BOARD_QA_RECEIPT = "performance_reference_board_qa.json"
 PERFORMANCE_BOARD_SIZE = "3072x2048"
 PERFORMANCE_BOARD_PIXEL_SIZE = (3072, 2048)
 PERFORMANCE_CELL_IDS = tuple(f"A{index:02d}" for index in range(1, 7))
-PERFORMANCE_POSE_FOCI = (
-    "战斗戒备：以当前编剧动作的起势保持清晰重心",
-    "攻击：仅表现当前动作中已写明的攻击或主动发力姿态",
-    "闪避：仅表现当前动作中已写明的让位、后仰或侧闪姿态",
-    "格挡：仅表现当前动作中已写明的防御、接触或止挡姿态",
-    "持道具：按角色所有权清楚展示当前道具的正确握持关系",
-    "使用道具：仅表现当前动作中已写明的道具操作，不追加结果",
+PERFORMANCE_POSE_VOCABULARY = (
+    "combat_ready",
+    "attack",
+    "evade",
+    "block",
+    "prop_hold",
+    "prop_use",
+)
+PERFORMANCE_KEY_POSE_PHASES = (
+    "起势：保持当前编剧动作开始时的重心和道具关系",
+    "执行峰值：清楚展示当前编剧动作的发力、位移或接触关系",
+    "落位：只到达当前编剧动作写明的结束姿态，不追加结果",
 )
 _BEAT_ID_RE = re.compile(r"^S\d+_P\d+$")
 _SOURCE_ACTION_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]*$")
@@ -164,6 +169,22 @@ def _unit_action_text(units: list[dict[str, Any]], beat: Mapping[str, Any]) -> s
     return "；".join(part for part in parts if part and not (part in seen or seen.add(part)))
 
 
+def _pose_category(action_text: str, prop_ids: list[str]) -> str:
+    folded = action_text.casefold()
+    classifications = (
+        ("prop_use", ("使用", "操作", "启动", "发射", "use", "operate", "activate", "fire")),
+        ("block", ("格挡", "抵挡", "防御", "架住", "block", "guard", "parry")),
+        ("evade", ("闪避", "躲", "后仰", "侧身", "evade", "dodge", "avoid")),
+        ("attack", ("攻击", "挥", "砍", "刺", "踢", "击", "attack", "strike", "kick", "swing")),
+        ("prop_hold", ("持", "握", "拿", "举", "hold", "wield", "carry")),
+        ("combat_ready", ("戒备", "准备", "对峙", "ready", "stance")),
+    )
+    for category, markers in classifications:
+        if any(marker in folded for marker in markers):
+            return category
+    return "prop_hold" if prop_ids else "combat_ready"
+
+
 def _eligible_beat(shot: Mapping[str, Any], beat: Mapping[str, Any], props: list[dict[str, Any]]) -> bool:
     text = " ".join(
         str(value or "")
@@ -263,9 +284,17 @@ def build_character_performance_plan(
         cursor += 1
 
     cells = []
-    for index, (cell_id, focus, binding) in enumerate(
-        zip(PERFORMANCE_CELL_IDS, PERFORMANCE_POSE_FOCI, selected, strict=True)
+    occurrence_by_binding: dict[tuple[str, str], int] = {}
+    for index, (cell_id, binding) in enumerate(
+        zip(PERFORMANCE_CELL_IDS, selected, strict=True)
     ):
+        binding_key = (binding["beat_id"], binding["source_action_unit_id"])
+        occurrence = occurrence_by_binding.get(binding_key, 0)
+        occurrence_by_binding[binding_key] = occurrence + 1
+        category = _pose_category(
+            binding["action_description"],
+            binding["prop_ids"],
+        )
         cells.append({
             "cell_id": cell_id,
             "grid_position": {"row": index // 3 + 1, "column": index % 3 + 1},
@@ -275,13 +304,17 @@ def build_character_performance_plan(
             "source_action_unit_id": binding["source_action_unit_id"],
             "generation_action_unit_ids": binding["generation_action_unit_ids"],
             "prop_ids": binding["prop_ids"],
-            "pose_focus": focus,
+            "pose_category": category,
+            "pose_focus": PERFORMANCE_KEY_POSE_PHASES[
+                occurrence % len(PERFORMANCE_KEY_POSE_PHASES)
+            ],
             "action_description": binding["action_description"],
         })
     return {
         "schema": CHARACTER_PERFORMANCE_BOARD_SCHEMA,
         "character_id": character_id,
         "usage": "run_local_video_motion_reference_only",
+        "pose_vocabulary": list(PERFORMANCE_POSE_VOCABULARY),
         "layout": {"rows": 2, "columns": 3, "cell_order": list(PERFORMANCE_CELL_IDS)},
         "cells": cells,
     }
@@ -654,3 +687,57 @@ def generate_performance_reference_boards(
         if result is not None:
             results.append(result)
     return results
+
+
+def attach_performance_guides_to_storyboard(
+    storyboard: dict[str, Any],
+    generated_boards: list[dict[str, Any]],
+) -> None:
+    """Persist canonical run-local guide provenance on its owning Pxx beat."""
+    by_beat: dict[str, list[dict[str, Any]]] = {}
+    for board in generated_boards:
+        for receipt in board.get("guides") or []:
+            if not isinstance(receipt, dict):
+                raise ValueError("performance guide receipt must be a mapping")
+            beat_id = str(receipt.get("beat_id") or "").strip()
+            by_beat.setdefault(beat_id, []).append({
+                "kind": CHARACTER_PERFORMANCE_GUIDE_SCHEMA,
+                "usage": "current_pxx_motion_reference_only",
+                "character_id": receipt["character_id"],
+                "beat_id": beat_id,
+                "image": receipt["image"],
+                "image_sha256": receipt["image_sha256"],
+                "receipt": str(Path(receipt["image"]).with_suffix(".json")),
+                "cell_ids": list(receipt["cell_ids"]),
+                "source_action_unit_ids": list(
+                    receipt["source_action_unit_ids"]
+                ),
+                "prop_ids": list(receipt["prop_ids"]),
+                "source_board": receipt["source_board"],
+                "source_board_sha256": receipt["source_board_sha256"],
+                "source_board_receipt": receipt["source_board_receipt"],
+                "source_board_receipt_sha256": (
+                    receipt["source_board_receipt_sha256"]
+                ),
+            })
+    observed_beats: set[str] = set()
+    for shot in storyboard.get("shots") or []:
+        if not isinstance(shot, dict):
+            continue
+        for beat in shot.get("storyboard_beats") or []:
+            if not isinstance(beat, dict):
+                continue
+            beat_id = str(beat.get("beat_id") or "").strip()
+            guides = sorted(
+                by_beat.get(beat_id, []),
+                key=lambda item: item["character_id"],
+            )
+            beat["character_performance_required"] = bool(guides)
+            beat["character_performance_guides"] = guides
+            if guides:
+                observed_beats.add(beat_id)
+    unknown = sorted(set(by_beat) - observed_beats)
+    if unknown:
+        raise ValueError(
+            "performance guides reference unknown Pxx beats: " + ", ".join(unknown)
+        )

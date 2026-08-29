@@ -1119,7 +1119,7 @@ def test_video_prompt_locks_named_cast_iphone_prop_and_observable_camera_path():
             {
                 "id": "lead",
                 "name": "女主",
-                "visual_identity_policy": "synthetic_faceless_android_v1",
+                "visual_identity_policy": "synthetic_stylized_character_v3",
                 "appearance": {},
             },
             {
@@ -2607,7 +2607,7 @@ def test_phase8_vlm_switches_to_synthetic_structure_contract_from_artifacts(
                     {
                         "id": "photographer",
                         "name": "摄影师",
-                        "visual_identity_policy": "synthetic_faceless_android_v1",
+                        "visual_identity_policy": "synthetic_stylized_character_v3",
                     }
                 ],
             }
@@ -2628,9 +2628,9 @@ def test_phase8_vlm_switches_to_synthetic_structure_contract_from_artifacts(
     result = reviewer([frame], {"shot_id": "S01", "who": ["摄影师"]})
 
     assert result["qa_contract"] == "synthetic_character_styling_consistency_v3"
-    assert "Declared veils/masks, graphic makeup, facial tattoos" in captured["prompt"]
-    assert "must never be copied onto every role" in captured["prompt"]
-    assert "not human-anatomy defects" in captured["prompt"]
+    assert "beautiful pearl bio-ceramic porcelain makeup" in captured["prompt"]
+    assert "complete unobscured face" in captured["prompt"]
+    assert "Veils, face masks, coarse mechanical plates" in captured["prompt"]
     assert "Judge synthetic-character consistency" in captured["prompt"]
     assert "Detect broken anatomy" not in captured["prompt"]
     assert "background extras must not duplicate a canonical identity" in captured["prompt"]

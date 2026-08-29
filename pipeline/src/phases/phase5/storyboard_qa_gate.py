@@ -835,6 +835,26 @@ def run_l4_first_frame_review(
     ]
     input_manifest = output_dir / "first_frame_qa_inputs.json"
     _write_l3_input_manifest(input_manifest, records)
+    try:
+        characters_payload = json.loads(
+            (output_dir / "CHARACTERS.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        characters_payload = {}
+    synthetic_makeup_contract = [
+        {
+            "character_id": character.get("id"),
+            "synthetic_styling": character.get("appearance", {}).get(
+                "synthetic_styling"
+            ),
+        }
+        for character in characters_payload.get("characters") or []
+        if isinstance(character, dict)
+        and isinstance(character.get("appearance"), dict)
+        and isinstance(
+            character.get("appearance", {}).get("synthetic_styling"), dict
+        )
+    ]
     if client is None and not os.environ.get("ARK_AGENT_API_KEY"):
         shot_ids = sorted({_parent_shot_id(frame_id) for frame_id in ordered_ids})
         return [
@@ -854,19 +874,22 @@ def run_l4_first_frame_review(
         }
     prompt = f"""Review every supplied image as a video-bound cinematic first frame. Each image is attached in ascending input_index order and mapped to an exact frame_id below.
 
-Three fail-closed checks apply independently:
+Four fail-closed checks apply independently:
 1. ANNOTATION_CONTAMINATION: report any visible action/camera arrow, trajectory or helper line, Sxx/Pxx/Gxx label, letter, number, subtitle, watermark, UI, panel border, split-screen, contact sheet, storyboard grid, handwritten note, or other production annotation.
 2. STYLE_MISMATCH: compare the visible palette, materials, rendering medium, stage/environment structure, lighting, and finish against VISUAL STYLE. Report a mismatch when the frame is visibly PREVIS, pencil/charcoal/line-art, generic CGI/photography that contradicts the authored medium, or omits a defining environment such as a stage/curtain explicitly required by the style. Do not report minor composition differences.
 3. SUBJECT_DUPLICATION: report an unintended duplicate, translucent copy, double exposure, repeated face/body, or extra instance of the same authored subject. Do not report multiple distinct characters when the scene calls for them.
+4. SYNTHETIC_MAKEUP_MISMATCH: when a synthetic makeup contract is supplied below, require the same beautiful, unobscured pearl bio-ceramic porcelain makeup, character-specific narrow temple-to-cheek circuit stripe and luminous iris ring in every face-visible frame. Report untreated human skin, a veil/mask, coarse mechanical face plate, crack, scar, horror distortion, makeup color/pattern drift, or performance-board clone/layout contamination.
 
 Inspect each frame independently. Never copy one observation across multiple IDs. Every issue needs concrete visible evidence, expected, observed, and confidence >= 0.75. Annotation contamination, subject duplication, and material style mismatch are severe because these pixels are about to enter paid video generation.
 
-Return JSON only: {{"issues":[{{"code":"ANNOTATION_CONTAMINATION|STYLE_MISMATCH|SUBJECT_DUPLICATION","severity":"severe|moderate|minor","frame_ids":["S01_P01"],"message":"...","expected":"...","observed":"...","confidence":0.95,"frame_evidence":[{{"frame_id":"S01_P01","observed":"specific visible evidence"}}]}}]}}.
+Return JSON only: {{"issues":[{{"code":"ANNOTATION_CONTAMINATION|STYLE_MISMATCH|SUBJECT_DUPLICATION|SYNTHETIC_MAKEUP_MISMATCH","severity":"severe|moderate|minor","frame_ids":["S01_P01"],"message":"...","expected":"...","observed":"...","confidence":0.95,"frame_evidence":[{{"frame_id":"S01_P01","observed":"specific visible evidence"}}]}}]}}.
 Use only these frame IDs: {json.dumps(ordered_ids, ensure_ascii=False)}.
 INPUTS:
 {json.dumps(records, ensure_ascii=False)}
 VISUAL STYLE:
-{visual_style}"""
+{visual_style}
+SYNTHETIC MAKEUP CONTRACTS:
+{json.dumps(synthetic_makeup_contract, ensure_ascii=False, sort_keys=True)}"""
     input_paths = [images[frame_id] for frame_id in ordered_ids]
     try:
         from clients.ark_multimodal_client import review_as
@@ -892,6 +915,7 @@ VISUAL STYLE:
                 "ANNOTATION_CONTAMINATION",
                 "STYLE_MISMATCH",
                 "SUBJECT_DUPLICATION",
+                "SYNTHETIC_MAKEUP_MISMATCH",
             }:
                 continue
             frame_ids = [

@@ -313,6 +313,7 @@ class FirstFrameIssue(StrictUnderstandingModel):
         "ANNOTATION_CONTAMINATION",
         "STYLE_MISMATCH",
         "SUBJECT_DUPLICATION",
+        "SYNTHETIC_MAKEUP_MISMATCH",
     ]
     severity: Literal["severe", "moderate", "minor"]
     frame_ids: list[str]

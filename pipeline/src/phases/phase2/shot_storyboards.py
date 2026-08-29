@@ -1651,7 +1651,6 @@ def _character_reference_paths(
                         character_dir / "front.png",
                         character_dir / "side.png",
                         character_dir / "back.png",
-                        *sorted(character_dir.glob("variant_*.png")),
                     )
                     if path.is_file() and path.stat().st_size > 0
                 ][:2]

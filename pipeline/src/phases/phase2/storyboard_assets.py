@@ -748,9 +748,9 @@ def _generate_shot_images(
                         output_dir / "characters" / "characters" / char["id"],
                     ):
                         candidates = [
+                            char_dir / "reference_board.png",
                             char_dir / "face_closeup.png",
                             char_dir / "full_body.png",
-                            *sorted(char_dir.glob("variant_*.png")),
                             char_dir / "front.png",  # legacy fallback
                         ]
                         reference_path = next(

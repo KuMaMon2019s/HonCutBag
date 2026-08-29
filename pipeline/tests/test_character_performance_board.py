@@ -10,6 +10,7 @@ from PIL import Image
 from phases.phase3.performance_reference_board import (
     CHARACTER_PERFORMANCE_BOARD_SCHEMA,
     PERFORMANCE_CELL_IDS,
+    attach_performance_guides_to_storyboard,
     build_character_performance_plan,
     generate_character_performance_board,
     validate_character_performance_board,
@@ -198,6 +199,17 @@ def test_generate_board_and_current_pxx_guides_are_exactly_cached(tmp_path):
     assert p01["provider_requests"] == p02["provider_requests"] == 0
     assert set(p01["source_action_unit_ids"]) == {"AU001"}
     assert set(p02["source_action_unit_ids"]) == {"AU002"}
+
+    storyboard = _storyboard()
+    attach_performance_guides_to_storyboard(storyboard, [first])
+    beats = storyboard["shots"][0]["storyboard_beats"]
+    assert all(beat["character_performance_required"] is True for beat in beats)
+    assert beats[0]["character_performance_guides"][0]["cell_ids"] == [
+        "A01", "A03", "A05"
+    ]
+    assert beats[1]["character_performance_guides"][0]["cell_ids"] == [
+        "A02", "A04", "A06"
+    ]
 
 
 def test_wet_or_damaged_state_alone_does_not_create_performance_board():

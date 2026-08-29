@@ -162,6 +162,56 @@ def _narrative_guide_media(
     }
 
 
+def _performance_guide_fields(
+    beat_id: str,
+    cell_ids: tuple[str, ...] = ("A01", "A03", "A05"),
+) -> dict[str, object]:
+    character_id = "lead"
+    return {
+        "character_performance_required": True,
+        "character_performance_guides": [{
+            "kind": "honcut.character-performance-guide.v1",
+            "usage": "current_pxx_motion_reference_only",
+            "character_id": character_id,
+            "beat_id": beat_id,
+            "image": f"performance_guides/{beat_id}/{character_id}.png",
+            "image_sha256": "c" * 64,
+            "receipt": f"performance_guides/{beat_id}/{character_id}.json",
+            "cell_ids": list(cell_ids),
+            "source_action_unit_ids": ["AU001"],
+            "prop_ids": ["energy_baton"],
+            "source_board": (
+                f"characters/{character_id}/performance_reference_board.png"
+            ),
+            "source_board_sha256": "d" * 64,
+            "source_board_receipt": (
+                f"characters/{character_id}/performance_reference_board.json"
+            ),
+            "source_board_receipt_sha256": "e" * 64,
+        }],
+    }
+
+
+def _performance_guide_media(
+    beat_id: str,
+    cell_ids: tuple[str, ...] = ("A01", "A03", "A05"),
+) -> dict[str, object]:
+    return {
+        "type": "image_url",
+        "image_url": {"url": f"https://image.test/{beat_id}-lead-performance.png"},
+        "role": "reference_image",
+        "_reference_kind": "character_performance_guide",
+        "_reference_description": f"{beat_id} lead current performance guide",
+        "_character_id": "lead",
+        "_performance_beat_id": beat_id,
+        "_performance_cell_ids": list(cell_ids),
+        "_performance_source_action_unit_ids": ["AU001"],
+        "_performance_prop_ids": ["energy_baton"],
+        "_performance_source_board_sha256": "d" * 64,
+        "_mandatory_reference": True,
+    }
+
+
 def _write_grid_image(
     path: Path,
     *,
@@ -336,7 +386,7 @@ def test_planner_splits_long_shot_and_preserves_explicit_anchors(tmp_path):
         "S02_C01", "S03_C01", "S03_C02"
     ]
     persisted = json.loads((tmp_path / "CONTINUITY_PLAN.json").read_text())
-    assert persisted["version"] == 2
+    assert persisted["version"] == 3
     assert persisted["timeline_fps"] == 24
     assert persisted["shots"][1]["chunks"][2]["mode"] == "native_extend"
 
@@ -372,7 +422,7 @@ def test_continuity_v1_migration_reuses_only_p01_cinematic_and_future_fails_clos
 
     migrated = ContinuityPlan.model_validate(payload)
 
-    assert migrated.version == 2
+    assert migrated.version == 3
     assert migrated.migrated_from_version == 1
     assert migrated.shots[0].chunks[0].storyboard_image == (
         "video_first_frames/S01_P01.png"
@@ -2232,6 +2282,7 @@ def test_p02_media_indices_bind_after_predecessor_character_guide_and_tail_order
             storyboard_beat_id="S01_P02",
             action_prompt="只完成第二段动作",
             **_narrative_guide_fields("S01_P02", cells),
+            **_performance_guide_fields("S01_P02"),
         ),
         anchors={},
         output_path=Path("S01_C02.mp4"),
@@ -2260,6 +2311,7 @@ def test_p02_media_indices_bind_after_predecessor_character_guide_and_tail_order
                 "_mandatory_reference": True,
             },
             _narrative_guide_media("S01_P02", cells),
+            _performance_guide_media("S01_P02"),
             {
                 "type": "image_url",
                 "image_url": {"url": "https://image.test/tail.jpg"},
@@ -2276,6 +2328,7 @@ def test_p02_media_indices_bind_after_predecessor_character_guide_and_tail_order
         "predecessor_tail_video",
         "character_identity_board",
         "storyboard_narrative_guide",
+        "character_performance_guide",
         "ordered_tail_frame",
     ]
     assert [item["prompt_index"] for item in manifest] == [
@@ -2283,10 +2336,15 @@ def test_p02_media_indices_bind_after_predecessor_character_guide_and_tail_order
         "图片1",
         "图片2",
         "图片3",
+        "图片4",
     ]
     prompt = content[0]["text"]
     assert "视频1：上一 Pxx 已完成视频的末段" in prompt
     assert "当前剧情导航图是图片2" in prompt
+    assert "图片3是角色lead" in prompt
+    assert "A01→A03→A05" in prompt
+    assert "同一个角色的不同参考姿态" in prompt
+    assert "不得生成角色克隆、分栏、拼贴、网格" in prompt
     assert "S01_G06→S01_G07→S01_G08→S01_G09" in prompt
     assert "不得提前演绎其他 Gxx 或后续 Pxx" in prompt
     assert "严禁渲染进视频画面" in prompt
@@ -2485,7 +2543,8 @@ def test_provider_prepends_no_real_person_visual_contract(monkeypatch, tmp_path)
 
     assert content[0]["text"].startswith("【非真人视觉硬约束】")
     assert content[0]["text"].count("【非真人视觉硬约束】") == 1
-    assert "面纱/遮罩、图形化妆、面部纹样、机械拼接纹理" in content[0]["text"]
+    assert "珍珠生体瓷妆" in content[0]["text"]
+    assert "完整无遮挡的协调五官" in content[0]["text"]
     assert "不得把不同角色统一改成同款头盔" in content[0]["text"]
 
 
@@ -4009,7 +4068,7 @@ def test_fresh_provider_does_not_mix_first_frame_with_group_board(monkeypatch, t
         "reference_image",
     ]
     assert uploaded == []
-    assert observed["max_images"] == 6
+    assert observed["max_images"] == 9
     assert "storyboard group CG001; step 1/1" in content[0]["text"]
 
 

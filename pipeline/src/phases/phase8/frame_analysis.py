@@ -414,9 +414,9 @@ def _character_reference_paths(
                 (
                     path
                     for path in (
+                        character_dir / "reference_board.png",
                         character_dir / "face_closeup.png",
                         character_dir / "full_body.png",
-                        *sorted(character_dir.glob("variant_*.png")),
                         character_dir / "front.png",
                     )
                     if path.is_file() and path.stat().st_size > 0
@@ -425,11 +425,35 @@ def _character_reference_paths(
             )
             if reference is not None:
                 references.append((character_id, reference))
-                identity_detail = character_dir / "identity_detail.png"
-                if identity_detail.is_file() and identity_detail.stat().st_size > 0:
-                    references.append(
-                        (f"{character_id}:identity_detail", identity_detail)
-                    )
+                from phases.phase3.performance_reference_board import (
+                    validate_character_performance_guide,
+                )
+
+                for beat in shot_meta.get("storyboard_beats") or []:
+                    if not isinstance(beat, dict):
+                        continue
+                    beat_id = str(beat.get("beat_id") or "").strip()
+                    for guide in beat.get("character_performance_guides") or []:
+                        if (
+                            not isinstance(guide, dict)
+                            or guide.get("character_id") != character_id
+                        ):
+                            continue
+                        receipt = validate_character_performance_guide(
+                            output_dir,
+                            character_id,
+                            beat_id,
+                        )
+                        if receipt is None:
+                            raise ValueError(
+                                f"Phase 8 received a stale performance guide for {beat_id}/{character_id}"
+                            )
+                        guide_path = output_dir / receipt["image"]
+                        references.append((
+                            f"{character_id}:performance:{beat_id}:"
+                            + ",".join(receipt["cell_ids"]),
+                            guide_path,
+                        ))
                 break
     return references
 
@@ -482,18 +506,17 @@ def _automatic_semantic_reviewer(
         review_paths = [path for _character_id, path in character_references] + frame_paths
         structure_contract = (
             (
-                "This project intentionally uses fully synthetic stylized CGI characters. Declared veils/masks, "
-                "graphic makeup, facial tattoos, mechanical seams, porcelain/crystalline synthetic surfaces, "
-                "designed hair/head silhouettes and other non-human materials are required identity styling, "
-                "not human-anatomy defects. A helmet is optional and must never be copied onto every role. Do not "
-                "reject a shot merely because a character is veiled, masked, robotic, graphically made up, "
-                "faceless, or unlike a normal human. Judge synthetic-character consistency against the canonical "
-                "references: part count, attachment continuity, silhouette, styling-anchor geometry, costume, "
-                "color blocks, non-human material and identity markers must remain stable, with at least two "
-                "declared styling anchors visibly preserved per character whenever framing permits. Reject an "
-                "untreated natural human face or visible positive evidence of an "
+                "This project intentionally uses fully synthetic stylized CGI characters. The only allowed face "
+                "treatment is the declared beautiful pearl bio-ceramic porcelain makeup with a complete unobscured "
+                "face, narrow iridescent temple-to-cheek circuit stripe, and soft luminous iris ring. Veils, face "
+                "masks, coarse mechanical plates, cracks, scars, horror effects, or untreated human skin are "
+                "failures. Judge synthetic-character consistency against the canonical references: face makeup, "
+                "silhouette, styling-anchor geometry, costume, color blocks, non-human material and identity "
+                "markers must remain stable. Reject visible positive evidence of an "
                 "unintended break, detachment, merge, extra/missing part, impossible self-intersection, or "
-                "reference-inconsistent deformation. "
+                "reference-inconsistent deformation. A reference label containing ':performance:Pxx:Axx' is a "
+                "current-Pxx pose/prop comparison for the same character; assess only those listed Axx against "
+                "that Pxx and never interpret other board poses as additional plot requirements or clones. "
             )
             if synthetic_review
             else (

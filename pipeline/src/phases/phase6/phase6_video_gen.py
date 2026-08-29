@@ -94,6 +94,24 @@ def run_phase6(
             "duration_s": _elapsed(start),
         }
 
+    performance_required = any(
+        isinstance(beat, dict)
+        and beat.get("character_performance_required") is True
+        for shot in (storyboard_data or {}).get("shots", [])
+        if isinstance(shot, dict)
+        for beat in shot.get("storyboard_beats") or []
+    )
+    if performance_required and continuity_runtime["mode"] != "auto":
+        return {
+            "status": "error",
+            "error": (
+                "Phase 6 character performance guides require continuity mode auto; "
+                "the fallback route cannot silently discard current-Pxx Axx lineage"
+            ),
+            "duration_s": _elapsed(start),
+            "continuity_runtime": continuity_runtime,
+        }
+
     if continuity_runtime["mode"] == "auto":
         try:
             from quality.seam_calibration import load_seam_calibration

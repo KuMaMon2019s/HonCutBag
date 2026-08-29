@@ -480,9 +480,9 @@ def _run_phase6_fallback(
                 output_dir / "characters" / "characters" / char["id"],
             ):
                 candidates = [
+                    char_dir / "reference_board.png",
                     char_dir / "face_closeup.png",
                     char_dir / "full_body.png",
-                    *sorted(char_dir.glob("variant_*.png")),
                     char_dir / "front.png",  # legacy fallback
                 ]
                 reference_path = next((path for path in candidates if path.exists()), None)
@@ -508,7 +508,7 @@ def _run_phase6_fallback(
         if missing_character_fronts:
             print(
                 "  ⚠ Phase 6 前置检查: 缺少角色参考图 "
-                "(face_closeup.png/full_body.png/variant_*.png): "
+                "(reference_board.png 或 canonical views): "
                 + ", ".join(sorted(missing_character_fronts)),
                 flush=True,
             )
@@ -673,7 +673,7 @@ def _run_phase6_fallback(
             missing_ids = missing_for_shot or missing_character_fronts
             print(
                 f"    ✗ {shot_dir.name}: 缺少角色参考图 "
-                "characters/*/{face_closeup.png,full_body.png,variant_*.png} "
+                "characters/*/{reference_board.png,canonical views} "
                 f"({', '.join(sorted(missing_ids))})，跳过镜头",
                 flush=True,
             )
@@ -696,25 +696,12 @@ def _run_phase6_fallback(
             first_frame_b64 = _b64.b64encode(shot_image.read_bytes()).decode()
             print(f"    [M2] 注入逐镜分镜图: {shot_image.name}")
 
-        # --- P0-C: HonCut 资产ID绑定匹配（associateAssetsIds）---
-        # --- P1-A4: 衍生参考图匹配（char:id:state → variant_state.png）---
+        # --- P0-C: HonCut 静态身份资产ID绑定匹配（associateAssetsIds）---
         associate_assets = meta.get("associate_assets", [])
         if associate_assets and first_frame_b64 is None:
             for asset_id in associate_assets:
                 if asset_id.startswith("char:"):
-                    parts = asset_id[5:].split(":")
-                    char_id = parts[0]
-                    variant_state = parts[1] if len(parts) > 1 else None
-
-                    if variant_state:
-                        # 衍生参考图匹配（P1-A4）
-                        variant_png = output_dir / "characters" / char_id / f"variant_{variant_state}.png"
-                        if not variant_png.exists():
-                            variant_png = output_dir / "characters" / "characters" / char_id / f"variant_{variant_state}.png"
-                        if variant_png.exists():
-                            first_frame_b64 = _b64.b64encode(variant_png.read_bytes()).decode()
-                            print(f"    [P1-A] 衍生参考图匹配: {char_id}:{variant_state}")
-                            break
+                    char_id = asset_id[5:].split(":", 1)[0]
 
                     # 基准参考图匹配（新资产优先，旧 front.png 仅兼容）
                     reference_path = None
@@ -723,9 +710,9 @@ def _run_phase6_fallback(
                         output_dir / "characters" / "characters" / char_id,
                     ):
                         candidates = [
+                            char_dir / "reference_board.png",
                             char_dir / "face_closeup.png",
                             char_dir / "full_body.png",
-                            *sorted(char_dir.glob("variant_*.png")),
                             char_dir / "front.png",
                         ]
                         reference_path = next(

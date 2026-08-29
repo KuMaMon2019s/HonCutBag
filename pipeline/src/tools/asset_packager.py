@@ -25,6 +25,8 @@ from tools.character_reference_board import (
 CINEMATIC_FIRST_FRAME_SCHEMA = "honcut.cinematic-first-frame.v1"
 STORYBOARD_NARRATIVE_GUIDE_SCHEMA = "honcut.storyboard-narrative-guide.v1"
 STORYBOARD_NARRATIVE_GUIDE_USAGE = "phase6_story_narrative_guide_not_output_pixels"
+CHARACTER_PERFORMANCE_GUIDE_SCHEMA = "honcut.character-performance-guide.v1"
+CHARACTER_PERFORMANCE_GUIDE_USAGE = "current_pxx_motion_reference_only"
 PREVIS_FRAME_PATH_PARTS = frozenset({
     "director_panels",
     "storyboard_beats",
@@ -135,6 +137,61 @@ def _assert_narrative_guide_provenance(
     return receipt
 
 
+def _assert_performance_guide_provenance(
+    path: Path,
+    *,
+    declared: Any,
+    declared_beat_id: Any,
+    output_dir: Path,
+) -> dict[str, Any]:
+    """Validate one current-Pxx pose guide and every source-board hash."""
+    if not isinstance(declared, dict):
+        raise ValueError("character performance guide declaration is invalid")
+    character_id = str(declared.get("character_id") or "").strip()
+    beat_id = str(declared_beat_id or "").strip()
+    if (
+        declared.get("kind") != CHARACTER_PERFORMANCE_GUIDE_SCHEMA
+        or declared.get("usage") != CHARACTER_PERFORMANCE_GUIDE_USAGE
+        or declared.get("beat_id") != beat_id
+        or not character_id
+    ):
+        raise ValueError("character performance guide has an unsafe contract")
+    from phases.phase3.performance_reference_board import (
+        validate_character_performance_guide,
+    )
+
+    receipt = validate_character_performance_guide(
+        output_dir,
+        character_id,
+        beat_id,
+    )
+    if receipt is None:
+        raise ValueError("character performance guide receipt is missing or stale")
+    expected = {
+        "image": receipt["image"],
+        "image_sha256": receipt["image_sha256"],
+        "cell_ids": receipt["cell_ids"],
+        "source_action_unit_ids": receipt["source_action_unit_ids"],
+        "prop_ids": receipt["prop_ids"],
+        "source_board": receipt["source_board"],
+        "source_board_sha256": receipt["source_board_sha256"],
+        "source_board_receipt": receipt["source_board_receipt"],
+        "source_board_receipt_sha256": receipt[
+            "source_board_receipt_sha256"
+        ],
+    }
+    if any(declared.get(key) != value for key, value in expected.items()):
+        raise ValueError("character performance guide declaration does not match receipt")
+    receipt_path = output_dir / str(declared.get("receipt") or "")
+    if (
+        path != output_dir / receipt["image"]
+        or receipt_path != path.with_suffix(".json")
+        or not receipt_path.is_file()
+    ):
+        raise ValueError("character performance guide path binding is invalid")
+    return receipt
+
+
 def package_shot_assets(
     output_dir: Path,
     shot_id: str,
@@ -156,7 +213,7 @@ def package_shot_assets(
     Zip structure:
         assets.zip
         ├─ meta.json
-        ├─ character_refs/      (reference_board/identity_detail/variant_*.png)
+        ├─ character_refs/      (static reference_board or canonical views)
         └─ shot_frames/         (Phase 4 cinematic storyboard_images/{shot_id}.png)
     
     meta.json structure:
@@ -202,10 +259,6 @@ def package_shot_assets(
                             char_dir / "full_body.png",
                         ]
                     )
-                    reference_paths.extend([
-                        char_dir / "identity_detail.png",
-                        *sorted(char_dir.glob("variant_*.png")),
-                    ])
                     for reference_path in reference_paths:
                         if reference_path.exists():
                             assets.append({
@@ -859,7 +912,6 @@ def build_content_for_shot(
                 image_assets.extend(character_assets)
         else:
             primary_character_assets: list[dict] = []
-            optional_character_assets: list[dict] = []
             for character_id in expected_characters:
                 candidates = by_character.get(character_id, [])
                 if not candidates:
@@ -874,11 +926,6 @@ def build_content_for_shot(
                     candidates[0],
                 )
                 primary_character_assets.append({**primary, "mandatory": True})
-                optional_character_assets.extend(
-                    {**asset, "mandatory": False}
-                    for asset in candidates
-                    if asset is not primary
-                )
             image_assets.extend(primary_character_assets)
             guide_path = Path(guide_value)
             if not guide_path.is_absolute():
@@ -922,7 +969,55 @@ def build_content_for_shot(
                     "文字、箭头、边框、网格和指示标识不得渲染进视频"
                 ),
             })
-            image_assets.extend(optional_character_assets)
+            performance_guides = shot_meta.get("_character_performance_guides") or []
+            performance_required = bool(
+                shot_meta.get("_character_performance_required")
+            )
+            if performance_required != bool(performance_guides):
+                raise ValueError(
+                    f"{shot_id} performance-guide requirement is incomplete"
+                )
+            for declared in performance_guides:
+                guide_value = str(
+                    declared.get("image") if isinstance(declared, dict) else ""
+                ).strip()
+                performance_path = Path(guide_value)
+                if not performance_path.is_absolute():
+                    performance_path = output_dir / performance_path
+                performance_receipt = _assert_performance_guide_provenance(
+                    performance_path,
+                    declared=declared,
+                    declared_beat_id=shot_meta.get("_storyboard_beat_id"),
+                    output_dir=output_dir,
+                )
+                performance_cells = list(performance_receipt["cell_ids"])
+                image_assets.append({
+                    "path": performance_path,
+                    "role": "reference_image",
+                    "priority": "high",
+                    "bind_subject": False,
+                    "mandatory": True,
+                    "reference_kind": "character_performance_guide",
+                    "char_id": performance_receipt["character_id"],
+                    "performance_beat_id": performance_receipt["beat_id"],
+                    "performance_cell_ids": performance_cells,
+                    "performance_source_action_unit_ids": list(
+                        performance_receipt["source_action_unit_ids"]
+                    ),
+                    "performance_prop_ids": list(
+                        performance_receipt["prop_ids"]
+                    ),
+                    "performance_source_board_sha256": (
+                        performance_receipt["source_board_sha256"]
+                    ),
+                    "reference_description": (
+                        f"{performance_receipt['beat_id']}中"
+                        f"{performance_receipt['character_id']}的当前动作姿态图，仅按"
+                        + "→".join(performance_cells)
+                        + "理解同一角色的姿态与道具握持；不得生成克隆、分栏、"
+                        "网格或板中其他动作"
+                    ),
+                })
         if not image_assets:
             raise FileNotFoundError(
                 "Phantom references missing for shot "
@@ -1015,6 +1110,15 @@ def build_content_for_shot(
             "_character_id": asset.get("char_id"),
             "_narrative_cell_ids": asset.get("narrative_cell_ids"),
             "_narrative_beat_id": asset.get("narrative_beat_id"),
+            "_performance_beat_id": asset.get("performance_beat_id"),
+            "_performance_cell_ids": asset.get("performance_cell_ids"),
+            "_performance_source_action_unit_ids": asset.get(
+                "performance_source_action_unit_ids"
+            ),
+            "_performance_prop_ids": asset.get("performance_prop_ids"),
+            "_performance_source_board_sha256": asset.get(
+                "performance_source_board_sha256"
+            ),
             "_mandatory_reference": asset.get("mandatory") is True,
             "_reference_path": (
                 str(asset["path"].relative_to(output_dir))

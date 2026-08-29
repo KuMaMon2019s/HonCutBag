@@ -54,10 +54,6 @@ def _copy_image(source: Path, destination: Path) -> Path:
     return destination
 
 
-def _variant_name(source: Path, index: int, total: int) -> str:
-    return "变体.png" if total == 1 else f"变体_{index}.png"
-
-
 def build_task_dir(output_dir, shot_ids: Sequence[str], meta: Mapping) -> Path:
     """Assemble a local task tree matching contract v2.0 sections 2.1–2.4."""
     output_dir = Path(output_dir)
@@ -118,7 +114,7 @@ def build_task_dir(output_dir, shot_ids: Sequence[str], meta: Mapping) -> Path:
             raise FileNotFoundError(
                 "Phantom character references missing for shot "
                 f"{shot_id}; expected reference_board.png, legacy canonical "
-                "views, identity_detail.png, or variant_*.png"
+                "views"
             )
         assets = []
         if strategy == "phantom" and cinematic_frame:
@@ -137,11 +133,6 @@ def build_task_dir(output_dir, shot_ids: Sequence[str], meta: Mapping) -> Path:
             })
         if strategy == "phantom":
             assets.extend(phantom_identity_assets)
-        variant_totals = {}
-        for asset in assets:
-            if asset["path"].name.startswith("variant_"):
-                variant_totals[asset["char_id"]] = variant_totals.get(asset["char_id"], 0) + 1
-        variant_indexes = {}
         for index, asset in enumerate(assets, start=1):
             source = asset["path"]
             if asset.get("reference_kind") == "cinematic_composition":
@@ -153,9 +144,7 @@ def build_task_dir(output_dir, shot_ids: Sequence[str], meta: Mapping) -> Path:
             elif source.name == "full_body.png":
                 filename = "全身照.png"
             else:
-                char_id = asset["char_id"]
-                variant_indexes[char_id] = variant_indexes.get(char_id, 0) + 1
-                filename = _variant_name(source, variant_indexes[char_id], variant_totals[char_id])
+                filename = "静态身份参考.png"
             if asset.get("reference_kind") != "cinematic_composition":
                 destination = _copy_image(source, shot_dir / asset["char_id"] / filename)
                 relative = destination.relative_to(shot_dir).as_posix()

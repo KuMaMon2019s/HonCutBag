@@ -578,6 +578,7 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
             # after canonical Pxx action lineage and static v6 identities have
             # both passed their owners; never promote them into the registry.
             from phases.phase3.performance_reference_board import (
+                attach_performance_guides_to_storyboard,
                 build_character_performance_plan,
                 generate_performance_reference_boards,
             )
@@ -603,6 +604,14 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
                     for board in performance_boards
                     if board.get("board")
                 )
+            attach_performance_guides_to_storyboard(
+                storyboard,
+                performance_boards,
+            )
+            storyboard_path.write_text(
+                json.dumps(storyboard, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
         result = {
             "status": "done",
