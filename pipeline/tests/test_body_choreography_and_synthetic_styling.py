@@ -7,6 +7,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / "pipeline" / "src"
@@ -33,6 +35,7 @@ from runtime.continuity_provider import (
     _storyboard_group_prompt,
 )
 from schemas.continuity import GenerationChunk
+from utils import privacy_visual_policy
 from utils.body_action_contracts import (
     apply_body_action_contract,
     body_action_contract_errors,
@@ -42,9 +45,12 @@ from utils.body_action_contracts import (
 )
 from utils.privacy_visual_policy import (
     NO_REAL_PERSON_POLICY,
+    SYNTHETIC_MAKEUP_PROFILE_ID,
     apply_no_real_person_character_policy,
     no_real_person_prompt_contract,
     synthetic_character_review_evidence,
+    synthetic_makeup_aesthetic_profile,
+    synthetic_makeup_profile_sha256,
 )
 from utils.prompt_budget import enforce_prompt_budget
 
@@ -713,10 +719,12 @@ def test_final_video_qa_only_sends_current_batch_characters_and_props(tmp_path):
                 "face": f"{name}专属面部纹样",
                 "clothing": f"{name}专属服装",
                 "identity_props": [{"id": prop, "name": prop, "owner": char_id}],
-                "synthetic_styling": {
-                    "schema": "honcut.synthetic-styling.v3",
-                    "mode": "synthetic_porcelain_makeup",
-                    "makeup_design_id": f"porcelain-{char_id}",
+                    "synthetic_styling": {
+                        "schema": "honcut.synthetic-styling.v3",
+                        "mode": "synthetic_porcelain_makeup",
+                        "aesthetic_profile_id": SYNTHETIC_MAKEUP_PROFILE_ID,
+                        "aesthetic_profile_sha256": synthetic_makeup_profile_sha256(),
+                        "makeup_design_id": f"porcelain-{char_id}",
                     "non_human_material": "pearl bio-ceramic complexion",
                     "visible_anchors": [
                         "narrow iridescent circuit stripe from temple to cheekbone",
@@ -803,7 +811,20 @@ def test_no_real_person_policy_assigns_one_persistent_porcelain_makeup_language(
     )
     assert all("面纱" not in character["appearance"]["face"] for character in characters)
     assert all("珍珠" in character["appearance"]["face"] for character in characters)
+    assert all("面颊暖意" in character["appearance"]["face"] for character in characters)
+    assert all("眼神光" in character["appearance"]["face"] for character in characters)
+    assert all(
+        character["appearance"]["synthetic_styling"]["aesthetic_profile_id"]
+        == SYNTHETIC_MAKEUP_PROFILE_ID
+        for character in characters
+    )
+    assert all(
+        character["appearance"]["synthetic_styling"]["aesthetic_profile_sha256"]
+        == synthetic_makeup_profile_sha256()
+        for character in characters
+    )
     assert "面部必须完整可见" in no_real_person_prompt_contract()
+    assert "尸体般灰白" in no_real_person_prompt_contract()
 
     (tmp_path / "CHARACTERS.json").write_text(
         json.dumps(rewritten, ensure_ascii=False), encoding="utf-8"
@@ -813,6 +834,85 @@ def test_no_real_person_policy_assigns_one_persistent_porcelain_makeup_language(
     assert all(character["synthetic_styling"] for character in evidence["characters"])
 
     assert apply_no_real_person_character_policy(rewritten) == rewritten
+
+
+def test_checked_in_makeup_visual_corpus_is_structured_audit_only():
+    profile = synthetic_makeup_aesthetic_profile()
+
+    assert profile["profile_id"] == SYNTHETIC_MAKEUP_PROFILE_ID
+    assert profile["instruction_boundary"] == {
+        "images_are_instructions": False,
+        "production_uses_structured_prompt_only": True,
+        "provider_media_reference_forbidden": True,
+        "identity_or_likeness_copy_forbidden": True,
+        "watermark_text_logo_copy_forbidden": True,
+    }
+    assert len(profile["references"]) == 8
+    assert len({item["sha256"] for item in profile["references"]}) == 8
+    assert all(item["visual_understanding"]["usable_cues"] for item in profile["references"])
+    assert all(item["visual_understanding"]["excluded_cues"] for item in profile["references"])
+    prompt = no_real_person_prompt_contract()
+    assert "温润透亮" in prompt
+    assert "清晰瞳孔" in prompt
+    assert "reference_01" not in prompt
+    assert ".png" not in prompt
+
+
+def test_future_makeup_visual_profile_schema_fails_closed(tmp_path, monkeypatch):
+    future_profile = tmp_path / "visual_understanding.json"
+    future_profile.write_text(
+        json.dumps({
+            "schema": "honcut.synthetic-makeup-aesthetic-profile.v99",
+            "profile_id": SYNTHETIC_MAKEUP_PROFILE_ID,
+        }),
+        encoding="utf-8",
+    )
+    privacy_visual_policy._load_synthetic_makeup_aesthetic_profile.cache_clear()
+    monkeypatch.setattr(
+        privacy_visual_policy,
+        "_SYNTHETIC_MAKEUP_PROFILE_PATH",
+        future_profile,
+    )
+
+    with pytest.raises(
+        privacy_visual_policy.SyntheticMakeupProfileError,
+        match="unsupported",
+    ):
+        privacy_visual_policy.synthetic_makeup_profile_sha256()
+
+    privacy_visual_policy._load_synthetic_makeup_aesthetic_profile.cache_clear()
+
+
+def test_old_v3_makeup_profile_is_rewritten_to_current_aesthetic():
+    source = {
+        "visual_identity_policy": NO_REAL_PERSON_POLICY,
+        "characters": [{
+            "id": "lead",
+            "name": "主角",
+            "visual_identity_policy": NO_REAL_PERSON_POLICY,
+            "appearance": {
+                "gender": "synthetic",
+                "face": "冷银无血色珍珠陶瓷皮肤",
+                "clothing": "银灰长衣",
+                "synthetic_styling": {
+                    "schema": "honcut.synthetic-styling.v3",
+                    "mode": "synthetic_porcelain_makeup",
+                    "makeup_design_id": "porcelain-old",
+                    "non_human_material": "冷银陶瓷",
+                    "visible_anchors": ["冷银陶瓷", "电路妆纹"],
+                },
+            },
+        }],
+    }
+
+    rewritten = apply_no_real_person_character_policy(source)
+
+    styling = rewritten["characters"][0]["appearance"]["synthetic_styling"]
+    face = rewritten["characters"][0]["appearance"]["face"]
+    assert styling["aesthetic_profile_id"] == SYNTHETIC_MAKEUP_PROFILE_ID
+    assert styling["aesthetic_profile_sha256"] == synthetic_makeup_profile_sha256()
+    assert "冷银无血色" not in face
+    assert "温润透亮" in face
 
 
 def test_legacy_v2_synthetic_styling_is_audit_only_not_current_identity_evidence(tmp_path):

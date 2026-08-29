@@ -17,7 +17,10 @@ from utils.temporal_visual_contracts import (
     temporal_visual_qa_instruction,
 )
 from utils.body_action_contracts import body_action_qa_instruction
-from utils.privacy_visual_policy import SYNTHETIC_QA_CONTRACT
+from utils.privacy_visual_policy import (
+    SYNTHETIC_QA_CONTRACT,
+    synthetic_makeup_qa_requirements,
+)
 
 
 SemanticReviewer = Callable[[list[Path], dict[str, Any]], dict[str, Any]]
@@ -508,7 +511,10 @@ def _automatic_semantic_reviewer(
             (
                 "This project intentionally uses fully synthetic stylized CGI characters. The only allowed face "
                 "treatment is the declared beautiful pearl bio-ceramic porcelain makeup with a complete unobscured "
-                "face, narrow iridescent temple-to-cheek circuit stripe, and soft luminous iris ring. Veils, face "
+                "face, narrow iridescent temple-to-cheek circuit stripe, and soft luminous iris ring around a clear "
+                "pupil, layered iris and catchlights. Complexion must stay warm and healthy with coordinated cheek "
+                "and lip color; gray, blue-gray, bloodless, waxy, corpse-like, haunted or uncanny styling is a "
+                "failure. Veils, face "
                 "masks, coarse mechanical plates, cracks, scars, horror effects, or untreated human skin are "
                 "failures. Judge synthetic-character consistency against the canonical references: face makeup, "
                 "silhouette, styling-anchor geometry, costume, color blocks, non-human material and identity "
@@ -517,6 +523,8 @@ def _automatic_semantic_reviewer(
                 "reference-inconsistent deformation. A reference label containing ':performance:Pxx:Axx' is a "
                 "current-Pxx pose/prop comparison for the same character; assess only those listed Axx against "
                 "that Pxx and never interpret other board poses as additional plot requirements or clones. "
+                "Structured aesthetic QA requirements: "
+                f"{json.dumps(synthetic_makeup_qa_requirements(), ensure_ascii=False)}. "
             )
             if synthetic_review
             else (

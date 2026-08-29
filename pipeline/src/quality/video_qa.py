@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from utils.privacy_visual_policy import (
     SYNTHETIC_QA_CONTRACT,
     synthetic_character_review_evidence,
+    synthetic_makeup_qa_requirements,
 )
 from utils.body_action_contracts import body_action_qa_instruction
 from utils.temporal_visual_contracts import apply_temporal_visual_contract
@@ -959,7 +960,10 @@ def _vlm_semantic_check(
             "All characters in this project are intentionally synthetic stylized CGI characters. "
             "Their only allowed facial treatment is the declared synthetic porcelain makeup: a beautiful "
             "pearl bio-ceramic complexion, one narrow iridescent circuit stripe from temple to cheekbone, "
-            "and a soft luminous iris ring. The complete face must stay visible, harmonious, clean, and "
+            "and a soft luminous iris ring around a clear pupil, layered iris and bright catchlights. The "
+            "complexion must remain warm, healthy and elegant with coordinated living cheek and lip color, "
+            "never gray, blue-gray, bloodless, waxy, corpse-like, haunted or uncanny. The complete face must "
+            "stay visible, harmonious, clean, and "
             "recognizably synthetic; veils, face masks, coarse mechanical plates, cracks, scars, and horror "
             "effects are failures. Never flag the declared pearl bio-ceramic material merely for not matching "
             "natural human skin. Judge structural and styling consistency instead: each visible character "
@@ -967,9 +971,12 @@ def _vlm_semantic_check(
             "untreated natural human face is a failure. Require visible "
             "positive evidence of an unintended break, detachment, merge, extra/missing component, "
             "impossible self-intersection, or reference-inconsistent deformation. Continue to detect "
-            "face-styling/material color drift, identity-marker drift, grotesque damage, action discontinuity, "
+            "face-styling/material color drift, loss of living eye/cheek/lip color, corpse-like or uncanny "
+            "styling, identity-marker drift, grotesque damage, action discontinuity, "
             "and wrong spatial order. Storyboard or performance-board grids, labels, arrows, split panels, "
             "or cloned copies of one character must not appear in the final video. "
+            "Structured aesthetic QA requirements: "
+            f"{json.dumps(synthetic_makeup_qa_requirements(), ensure_ascii=False)}. "
         )
         if synthetic_review
         else (

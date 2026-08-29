@@ -1,0 +1,117 @@
+{
+  "schema": "honcut.synthetic-makeup-aesthetic-profile.v1",
+  "profile_id": "synthetic_porcelain_makeup_beauty_v1",
+  "created_from": "user_supplied_visual_references_2026-08-29",
+  "instruction_boundary": {
+    "images_are_instructions": false,
+    "production_uses_structured_prompt_only": true,
+    "provider_media_reference_forbidden": true,
+    "identity_or_likeness_copy_forbidden": true,
+    "watermark_text_logo_copy_forbidden": true
+  },
+  "production_prompt": {
+    "positive": [
+      "高成本风格化三维 CGI 数字角色，面部统一采用珍珠生体瓷妆，明确是合成人，同时健康、优雅、亲和且美观",
+      "温润透亮的暖象牙、蜜桃、蜂蜜米、玫瑰贝母或琥珀乳瓷底色；珍珠生体陶瓷质感清晰但保留自然的面颊暖意与唇色",
+      "眼睛保留清晰瞳孔、虹膜层次和明亮眼神光，只在虹膜外缘形成柔和非自然光环，目光清醒有生命感",
+      "从太阳穴到颧骨使用纤细、对称、首饰般精致的虹彩电路妆纹；妆纹贴合面部如高级彩妆，不像切口、裂缝或手术缝线",
+      "完整无遮挡的协调五官，神情自然放松；灯光柔和通透，避免从下方打出的恐怖光"
+    ],
+    "negative": [
+      "尸体般灰白或青灰肤色、无血色面颊、灰黑嘴唇、蜡像尸蜡感、腐败感、病态苍白",
+      "死鱼眼、空洞眼神、纯色发光眼球、没有瞳孔或眼神光、僵硬木偶表情、恐怖谷凝视",
+      "面部切割线、开裂陶瓷、缝合线、伤疤、粗大机械面板、裸露机械骨骼、恐怖义体",
+      "阴间妆、尸妆、鬼妆、恐怖片美术、低角度阴影、惨绿或青蓝病态面光",
+      "真人、真人实拍、写真人脸、未经妆造的自然人脸、照片级人类皮肤、自然人类眼睛、名人或具体人物复刻、肖像摄影、换脸、live-action、photorealistic human、real person、natural human skin、面纱、遮脸面具、文字、编号、箭头、边框、网格、Logo、水印"
+    ],
+    "qa_requirements": [
+      "肤色呈温暖健康的珍珠陶瓷色调，不得灰白、青灰或无血色",
+      "双眼有瞳孔、虹膜层次与眼神光，神态清醒自然，不得空洞僵死",
+      "嘴唇和面颊保留协调暖色，但不得因此退化为未经妆造的真人皮肤",
+      "电路妆纹纤细、干净、对称且像高级彩妆，不得像伤口、裂缝或手术线",
+      "整体第一观感必须是美观的风格化合成人，而不是尸体、鬼怪、蜡像或恐怖机器人"
+    ]
+  },
+  "references": [
+    {
+      "asset": "reference_01_cyber_beauty.png",
+      "sha256": "24960d8d157b82314957686ea9fd54735a9de6f1d1cee855ab25a56967808fa9",
+      "pixel_width": 554,
+      "pixel_height": 554,
+      "visual_understanding": {
+        "usable_cues": ["温润面部底色", "清晰瞳孔与眼神光", "精细对称的面部科技纹样", "柔和亮泽唇色"],
+        "excluded_cues": ["具体人物外貌", "真人皮肤复刻", "水印", "脸部切割线"]
+      }
+    },
+    {
+      "asset": "reference_02_luminous_cyber_makeup.png",
+      "sha256": "bcec5a78fe8bcece59f68563b3c365157ca56448078b57279a4384a64c7b70b5",
+      "pixel_width": 597,
+      "pixel_height": 335,
+      "visual_understanding": {
+        "usable_cues": ["暖粉肤色与冷色科技光的平衡", "明亮虹膜层次", "妆纹可作为装饰性锚点"],
+        "excluded_cues": ["具体人物外貌", "大号编号文字", "拼贴构图", "面部裂缝"]
+      }
+    },
+    {
+      "asset": "reference_03_warm_ornamental_veil.png",
+      "sha256": "5ca3e9f35d36d7dd6d58b900f42af06af81c7daeb2ee8b5fcfa4298a46dfdb53",
+      "pixel_width": 447,
+      "pixel_height": 447,
+      "visual_understanding": {
+        "usable_cues": ["暖金环境光", "精致首饰般的妆造层次", "自然清醒的眼神"],
+        "excluded_cues": ["具体人物外貌", "真人肖像", "遮面面纱", "首饰复制"]
+      }
+    },
+    {
+      "asset": "reference_04_jewelry_veil.png",
+      "sha256": "a425107eaf08f7fb3c3ac5fa6a56dc2a75f2d284d81de15005494c39370cf9b1",
+      "pixel_width": 300,
+      "pixel_height": 300,
+      "visual_understanding": {
+        "usable_cues": ["纤细垂坠装饰的节奏", "暖暗背景中的面部亮度", "优雅而非恐怖的神态"],
+        "excluded_cues": ["具体人物外貌", "遮脸珠帘", "真人肖像", "场景复刻"]
+      }
+    },
+    {
+      "asset": "reference_05_graphic_face_markings.png",
+      "sha256": "5a980a0d91981a4765597d43c93764aee26a0070ad620da1c853ac64b2dc56d4",
+      "pixel_width": 224,
+      "pixel_height": 224,
+      "visual_understanding": {
+        "usable_cues": ["深色肤色也可承载清晰图形妆纹", "角色专属标记应有稳定走向"],
+        "excluded_cues": ["具体人物外貌", "真人纹身", "身体文字", "裸露造型", "水印"]
+      }
+    },
+    {
+      "asset": "reference_06_soft_fantasy_styling.png",
+      "sha256": "61b3deeef4205779b275f7372ede1d77b97851395a68e1ebea19bcde70eb1495",
+      "pixel_width": 447,
+      "pixel_height": 447,
+      "visual_understanding": {
+        "usable_cues": ["柔和亲和的角色神态", "暖色健康肤感", "设计化发束与轮廓"],
+        "excluded_cues": ["具体人物外貌", "遮眼发型", "兽耳造型复制", "文字与水印"]
+      }
+    },
+    {
+      "asset": "reference_07_temple_ornament.png",
+      "sha256": "5afee06969cb9064e6808714c2ddcb1d11ec9d63b746ad1884294dfae0dca801",
+      "pixel_width": 194,
+      "pixel_height": 259,
+      "visual_understanding": {
+        "usable_cues": ["太阳穴局部的精致几何装饰", "浅色头发与暖金服装的协调"],
+        "excluded_cues": ["具体人物外貌", "游戏角色复刻", "Logo", "遮眼构图"]
+      }
+    },
+    {
+      "asset": "reference_08_combat_pose.png",
+      "sha256": "fe1124da57771c4466ced4a53e590dd95b2856b773ed1eb6e2f80ef54594b9e5",
+      "pixel_width": 225,
+      "pixel_height": 225,
+      "visual_understanding": {
+        "usable_cues": ["战斗姿态的重心", "双手持道具的力线", "清晰动作剪影"],
+        "excluded_cues": ["蒙面造型", "具体服装", "具体武器", "真人动作身份"]
+      }
+    }
+  ]
+}

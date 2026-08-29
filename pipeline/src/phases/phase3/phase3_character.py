@@ -222,25 +222,25 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
 
         chars_dir = _ensure_dir(output_dir / "characters")
         from utils.privacy_visual_policy import (
-            NO_REAL_PERSON_POLICY,
             apply_no_real_person_character_policy,
             is_no_real_person_enabled,
         )
 
-        if (
-            is_no_real_person_enabled()
-            and characters_data.get("visual_identity_policy")
-            != NO_REAL_PERSON_POLICY
-        ):
-            characters_data = apply_no_real_person_character_policy(characters_data)
-            characters_path = output_dir / "CHARACTERS.json"
-            characters_temporary = characters_path.with_suffix(".json.tmp")
-            characters_temporary.write_text(
-                json.dumps(characters_data, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            os.replace(characters_temporary, characters_path)
-            print("  🛡 非真人模式：角色身份已锁定为多样化非真人妆造（每人至少两个可见锚点）")
+        if is_no_real_person_enabled():
+            rewritten_characters = apply_no_real_person_character_policy(characters_data)
+            if rewritten_characters != characters_data:
+                characters_data = rewritten_characters
+                characters_path = output_dir / "CHARACTERS.json"
+                characters_temporary = characters_path.with_suffix(".json.tmp")
+                characters_temporary.write_text(
+                    json.dumps(characters_data, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                os.replace(characters_temporary, characters_path)
+                print(
+                    "  🛡 非真人模式：角色身份已锁定为温暖美观的合成人妆造"
+                    "（每人至少两个可见锚点）"
+                )
 
         characters_list = characters_data.get("characters", [])
 

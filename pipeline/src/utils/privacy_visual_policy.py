@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import copy
+from functools import lru_cache
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 from typing import Any
 
 NO_REAL_PERSON_ENV = "HONCUT_NO_REAL_PERSON"
@@ -18,27 +20,171 @@ LEGACY_NO_REAL_PERSON_POLICIES = frozenset({
 SUPPORTED_NO_REAL_PERSON_POLICIES = frozenset(
     {NO_REAL_PERSON_POLICY, *LEGACY_NO_REAL_PERSON_POLICIES}
 )
-SYNTHETIC_QA_CONTRACT = "synthetic_character_styling_consistency_v3"
-
-SYNTHETIC_STYLE_CONTRACT = (
-    "高成本风格化三维 CGI 动画，所有角色都是完全虚构的数字角色；"
-    "面部统一采用精致的珍珠生体瓷妆：完整无遮挡的协调五官、珍珠陶瓷合成皮肤、"
-    "从太阳穴延伸到颧骨的细窄虹彩电路妆纹、柔和发光虹膜环与设计化纤维发丝；"
-    "每个角色使用独立且逐镜持久的配色、妆纹走向和识别码，至少两个合成人锚点清晰可见；"
-    "整体优雅克制、干净美观、明确属于数字合成人，不是真人实拍，不模仿任何现实人物"
+SYNTHETIC_QA_CONTRACT = "synthetic_character_styling_consistency_v4"
+SYNTHETIC_MAKEUP_PROFILE_SCHEMA = "honcut.synthetic-makeup-aesthetic-profile.v1"
+SYNTHETIC_MAKEUP_PROFILE_ID = "synthetic_porcelain_makeup_beauty_v1"
+_SYNTHETIC_MAKEUP_PROFILE_DIR = (
+    Path(__file__).resolve().parents[3]
+    / "assets"
+    / "visual_references"
+    / SYNTHETIC_MAKEUP_PROFILE_ID
+)
+_SYNTHETIC_MAKEUP_PROFILE_PATH = (
+    _SYNTHETIC_MAKEUP_PROFILE_DIR / "visual_understanding.json"
 )
 
-SYNTHETIC_NEGATIVE_CONTRACT = (
-    "真人，真人实拍，写真人脸，未经妆造的自然人脸，照片级人类皮肤，自然人类眼睛，"
-    "自然裸露皮肤，普通真人发丝，名人，现实人物，身份证照片，肖像摄影，换脸，live-action，"
-    "photorealistic human，real person，natural human skin，面纱，遮脸面具，统一头盔，统一面甲，"
-    "粗大机械面板，破裂面孔，伤疤，恐怖化，畸形五官，廉价塑料感"
-)
+
+class SyntheticMakeupProfileError(RuntimeError):
+    """Raised when the checked-in synthetic-makeup profile is unverifiable."""
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _string_list(value: Any, *, field: str) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise SyntheticMakeupProfileError(f"{field} must be a non-empty list")
+    normalized = [str(item).strip() for item in value]
+    if any(not item for item in normalized):
+        raise SyntheticMakeupProfileError(f"{field} contains an empty value")
+    return normalized
+
+
+@lru_cache(maxsize=1)
+def _load_synthetic_makeup_aesthetic_profile() -> tuple[dict[str, Any], str]:
+    """Load the structured prompt profile and verify every audit-only image.
+
+    Reference pixels are deliberately never returned as Provider media. Their
+    hashes only prove that the human-readable visual corpus and its structured
+    interpretation still describe the same checked-in evidence.
+    """
+    try:
+        payload = json.loads(_SYNTHETIC_MAKEUP_PROFILE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SyntheticMakeupProfileError(
+            "synthetic makeup aesthetic profile is missing or invalid"
+        ) from error
+    if not isinstance(payload, dict):
+        raise SyntheticMakeupProfileError("synthetic makeup aesthetic profile must be an object")
+    if payload.get("schema") != SYNTHETIC_MAKEUP_PROFILE_SCHEMA:
+        raise SyntheticMakeupProfileError("unsupported synthetic makeup aesthetic profile schema")
+    if payload.get("profile_id") != SYNTHETIC_MAKEUP_PROFILE_ID:
+        raise SyntheticMakeupProfileError("synthetic makeup aesthetic profile ID mismatch")
+
+    boundary = payload.get("instruction_boundary")
+    expected_boundary = {
+        "images_are_instructions": False,
+        "production_uses_structured_prompt_only": True,
+        "provider_media_reference_forbidden": True,
+        "identity_or_likeness_copy_forbidden": True,
+        "watermark_text_logo_copy_forbidden": True,
+    }
+    if boundary != expected_boundary:
+        raise SyntheticMakeupProfileError("synthetic makeup instruction boundary is invalid")
+
+    prompt = payload.get("production_prompt")
+    if not isinstance(prompt, dict):
+        raise SyntheticMakeupProfileError("synthetic makeup production prompt is missing")
+    for key in ("positive", "negative", "qa_requirements"):
+        _string_list(prompt.get(key), field=f"production_prompt.{key}")
+
+    references = payload.get("references")
+    if not isinstance(references, list) or len(references) != 8:
+        raise SyntheticMakeupProfileError("synthetic makeup profile must declare eight references")
+    seen_assets: set[str] = set()
+    for item in references:
+        if not isinstance(item, dict):
+            raise SyntheticMakeupProfileError("synthetic makeup reference must be an object")
+        asset = str(item.get("asset") or "").strip()
+        expected_hash = str(item.get("sha256") or "").strip().lower()
+        understanding = item.get("visual_understanding")
+        if (
+            not asset
+            or Path(asset).name != asset
+            or asset in seen_assets
+            or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None
+            or not isinstance(understanding, dict)
+        ):
+            raise SyntheticMakeupProfileError("synthetic makeup reference metadata is invalid")
+        _string_list(understanding.get("usable_cues"), field=f"{asset}.usable_cues")
+        _string_list(understanding.get("excluded_cues"), field=f"{asset}.excluded_cues")
+        asset_path = _SYNTHETIC_MAKEUP_PROFILE_DIR / asset
+        if not asset_path.is_file() or _file_sha256(asset_path) != expected_hash:
+            raise SyntheticMakeupProfileError(
+                f"synthetic makeup reference is missing or changed: {asset}"
+            )
+        seen_assets.add(asset)
+    return payload, _canonical_json_sha256(payload)
+
+
+def synthetic_makeup_aesthetic_profile() -> dict[str, Any]:
+    """Return a defensive copy of the verified structured aesthetic profile."""
+    payload, _profile_sha256 = _load_synthetic_makeup_aesthetic_profile()
+    return copy.deepcopy(payload)
+
+
+def synthetic_makeup_profile_sha256() -> str:
+    """Return the exact structured profile hash used in cache identities."""
+    _payload, profile_sha256 = _load_synthetic_makeup_aesthetic_profile()
+    return profile_sha256
+
+
+def synthetic_makeup_qa_requirements() -> tuple[str, ...]:
+    """Return the verified profile's blocking visual-review requirements."""
+    _positive, _negative, qa_requirements = _synthetic_makeup_prompt_lists()
+    return tuple(qa_requirements)
+
+
+def _synthetic_makeup_prompt_lists() -> tuple[list[str], list[str], list[str]]:
+    payload, _profile_sha256 = _load_synthetic_makeup_aesthetic_profile()
+    prompt = payload["production_prompt"]
+    return (
+        list(prompt["positive"]),
+        list(prompt["negative"]),
+        list(prompt["qa_requirements"]),
+    )
+
+
+def _synthetic_style_contract() -> str:
+    positive, _negative, _qa_requirements = _synthetic_makeup_prompt_lists()
+    return "；".join(positive)
+
+
+def _synthetic_negative_contract() -> str:
+    _positive, negative, _qa_requirements = _synthetic_makeup_prompt_lists()
+    return "，".join(negative)
 
 
 def is_synthetic_visual_identity_policy(value: Any) -> bool:
     """Accept the current diverse styling policy and durable legacy artifacts."""
     return str(value or "").strip() in SUPPORTED_NO_REAL_PERSON_POLICIES
+
+
+def is_current_synthetic_styling(value: Any) -> bool:
+    """Return whether one styling record binds the current aesthetic profile."""
+    return bool(
+        isinstance(value, dict)
+        and value.get("schema") == "honcut.synthetic-styling.v3"
+        and value.get("mode") == "synthetic_porcelain_makeup"
+        and value.get("aesthetic_profile_id") == SYNTHETIC_MAKEUP_PROFILE_ID
+        and value.get("aesthetic_profile_sha256")
+        == synthetic_makeup_profile_sha256()
+    )
 
 
 def is_no_real_person_enabled() -> bool:
@@ -163,8 +309,7 @@ def synthetic_character_review_evidence(
         styling = character.get("synthetic_styling") or {}
         anchors = styling.get("visible_anchors") or []
         return bool(
-            styling.get("schema") == "honcut.synthetic-styling.v3"
-            and styling.get("mode") == "synthetic_porcelain_makeup"
+            is_current_synthetic_styling(styling)
             and styling.get("makeup_design_id")
             and styling.get("non_human_material")
             and isinstance(anchors, list)
@@ -201,8 +346,8 @@ def no_real_person_prompt_contract() -> str:
     """Prompt block shared by image and video generation paths."""
     return (
         "【非真人视觉硬约束】"
-        f"{SYNTHETIC_STYLE_CONTRACT}。"
-        f"负面约束：{SYNTHETIC_NEGATIVE_CONTRACT}。"
+        f"{_synthetic_style_contract()}。"
+        f"负面约束：{_synthetic_negative_contract()}。"
         "男性/女性等词只表示服装与表演呈现，不得恢复自然真人生物特征；剧情中的脸、头发描述"
         "必须经过该角色已声明的非真人妆造合同重解释。面部必须完整可见，以角色自己的妆造锚点"
         "为最高优先级，不得把不同角色统一改成同款头盔、面甲或机器人。"
@@ -221,11 +366,11 @@ def _synthetic_identity(character: dict[str, Any], index: int) -> dict[str, Any]
     )
     digest = hashlib.sha256(stable_key.encode("utf-8")).digest()
     palette = (
-        ("钴蓝", "荧光洋红", "冷银"),
-        ("孔雀绿", "熔岩橙", "石墨黑"),
-        ("群青", "酸性黄", "乳白瓷"),
-        ("深紫", "冰青", "暗金"),
-        ("朱红", "电光蓝", "钛灰"),
+        ("钴蓝", "荧光洋红", "暖象牙瓷"),
+        ("孔雀绿", "熔岩橙", "蜂蜜米瓷"),
+        ("群青", "柔金", "蜜桃珍珠"),
+        ("深紫", "冰青", "玫瑰贝母"),
+        ("朱红", "电光蓝", "琥珀乳瓷"),
     )[digest[0] % 5]
     primary, accent, material_color = palette
 
@@ -242,9 +387,11 @@ def _synthetic_identity(character: dict[str, Any], index: int) -> dict[str, Any]
             "不是自然真人发丝"
         ),
         "face": (
-            f"面部完整无遮挡，五官比例协调、表情自然且{presentation}；表面为{material_color}珍珠陶瓷"
-            f"合成皮肤，无真人毛孔；从太阳穴到颧骨只有一条{accent}细窄虹彩电路妆纹，"
-            f"虹膜保留一圈柔和{primary}非自然光环；妆造编号{design_id}，不是人类皮肤或真人肖像"
+            f"面部完整无遮挡，五官比例协调、表情自然且{presentation}，目光清醒并有明亮眼神光；"
+            f"表面为温润透亮的{material_color}珍珠陶瓷合成皮肤，无真人毛孔，同时保留协调的"
+            f"面颊暖意与珊瑚唇色；从太阳穴到颧骨只有一条{accent}纤细、对称、首饰般的虹彩"
+            f"电路妆纹，像高级彩妆而不是裂缝；虹膜保留清晰瞳孔与层次，只在外缘形成柔和"
+            f"{primary}非自然光环；妆造编号{design_id}，不是人类皮肤或真人肖像"
         ),
         "anchors": [
             f"{material_color}珍珠陶瓷合成皮肤",
@@ -288,6 +435,14 @@ def apply_no_real_person_character_policy(
             .get("synthetic_styling", {})
             .get("schema")
             == "honcut.synthetic-styling.v3"
+            and (character.get("appearance") or {})
+            .get("synthetic_styling", {})
+            .get("aesthetic_profile_id")
+            == SYNTHETIC_MAKEUP_PROFILE_ID
+            and (character.get("appearance") or {})
+            .get("synthetic_styling", {})
+            .get("aesthetic_profile_sha256")
+            == synthetic_makeup_profile_sha256()
             for character in characters
         )
     ):
@@ -314,6 +469,8 @@ def apply_no_real_person_character_policy(
                 "synthetic_styling": {
                     "schema": "honcut.synthetic-styling.v3",
                     "mode": identity["mode"],
+                    "aesthetic_profile_id": SYNTHETIC_MAKEUP_PROFILE_ID,
+                    "aesthetic_profile_sha256": synthetic_makeup_profile_sha256(),
                     "makeup_design_id": identity["makeup_design_id"],
                     "non_human_material": identity["material"],
                     "visible_anchors": list(identity["anchors"]),
@@ -330,10 +487,10 @@ def apply_no_real_person_character_policy(
                 ),
             }
         )
-        character["style"] = SYNTHETIC_STYLE_CONTRACT
+        character["style"] = _synthetic_style_contract()
         old_negative = str(character.get("negative") or "").strip()
         character["negative"] = "，".join(
-            part for part in (SYNTHETIC_NEGATIVE_CONTRACT, old_negative) if part
+            part for part in (_synthetic_negative_contract(), old_negative) if part
         )
         character["visual_identity_policy"] = NO_REAL_PERSON_POLICY
         character["distinguishing_features"] = [
@@ -350,13 +507,15 @@ def apply_no_real_person_character_policy(
         existing_guardrails = str(character.get("negative_guardrails") or "").strip()
         character["negative_guardrails"] = "，".join(
             part
-            for part in (SYNTHETIC_NEGATIVE_CONTRACT, existing_guardrails)
+            for part in (_synthetic_negative_contract(), existing_guardrails)
             if part
         )
     rewritten["visual_identity_policy"] = NO_REAL_PERSON_POLICY
     rewritten["synthetic_styling_policy"] = {
         "schema": "honcut.synthetic-styling-policy.v3",
         "allowed_mode": "synthetic_porcelain_makeup",
+        "aesthetic_profile_id": SYNTHETIC_MAKEUP_PROFILE_ID,
+        "aesthetic_profile_sha256": synthetic_makeup_profile_sha256(),
         "minimum_visible_anchors_per_character": 2,
         "same_headgear_for_every_character_forbidden": True,
         "natural_human_face_without_declared_styling_forbidden": True,

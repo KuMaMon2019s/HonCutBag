@@ -694,6 +694,7 @@ def run_phase1_screenwriter(
             NO_REAL_PERSON_POLICY,
             apply_no_real_person_character_policy,
             is_no_real_person_enabled,
+            synthetic_makeup_profile_sha256,
         )
 
         characters_input_hash = _phase1_input_hash([
@@ -703,6 +704,11 @@ def run_phase1_screenwriter(
                 "no_real_person": is_no_real_person_enabled(),
                 "no_real_person_policy": (
                     NO_REAL_PERSON_POLICY if is_no_real_person_enabled() else None
+                ),
+                "synthetic_makeup_profile_sha256": (
+                    synthetic_makeup_profile_sha256()
+                    if is_no_real_person_enabled()
+                    else None
                 ),
             }
         ])
@@ -739,24 +745,22 @@ def run_phase1_screenwriter(
                 collection_key="characters",
                 input_hash=characters_input_hash,
             )
-        if (
-            is_no_real_person_enabled()
-            and characters_result.get("visual_identity_policy")
-            != NO_REAL_PERSON_POLICY
-        ):
-            characters_result = apply_no_real_person_character_policy(
+        if is_no_real_person_enabled():
+            rewritten_characters = apply_no_real_person_character_policy(
                 characters_result
             )
-            characters_result["source_text_hash"] = characters_input_hash
-            characters_result.setdefault(
-                "total_characters", len(characters_result.get("characters", []))
-            )
-            _atomic_write_phase1_json(
-                characters_checkpoint,
-                characters_result,
-                collection_key="characters",
-                input_hash=characters_input_hash,
-            )
+            if rewritten_characters != characters_result:
+                characters_result = rewritten_characters
+                characters_result["source_text_hash"] = characters_input_hash
+                characters_result.setdefault(
+                    "total_characters", len(characters_result.get("characters", []))
+                )
+                _atomic_write_phase1_json(
+                    characters_checkpoint,
+                    characters_result,
+                    collection_key="characters",
+                    input_hash=characters_input_hash,
+                )
         characters_list = characters_result.get("characters", [])
         print(f"    ✓ 发现 {len(characters_list)} 个角色")
         if reporter:

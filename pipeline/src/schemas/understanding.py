@@ -382,6 +382,10 @@ class CharacterReferenceViewUnderstanding(StrictUnderstandingModel):
     face_unobscured: bool | None = None
     makeup_clean_and_harmonious: bool | None = None
     no_grotesque_damage: bool | None = None
+    healthy_warm_complexion: bool | None = None
+    lively_eyes_with_catchlights: bool | None = None
+    living_color_in_cheeks_and_lips: bool | None = None
+    no_uncanny_or_corpse_like_styling: bool | None = None
     issues: list[str]
 
 
@@ -419,6 +423,8 @@ class CharacterPerformanceCellUnderstanding(StrictUnderstandingModel):
     pose_distinct: bool
     clothing_consistent: bool
     makeup_consistent: bool
+    healthy_beautiful_synthetic_styling: bool
+    no_uncanny_or_corpse_like_styling: bool
     prop_ownership_correct: bool
     no_extra_character: bool
     no_text_or_layout_marks: bool
@@ -431,6 +437,7 @@ class CharacterPerformanceBoardUnderstanding(StrictUnderstandingModel):
     same_single_character: bool
     six_distinct_poses: bool
     clothing_makeup_consistent: bool
+    healthy_beautiful_synthetic_styling: bool
     props_correct: bool
     no_extra_characters: bool
     no_text_or_layout_marks: bool

@@ -19,7 +19,7 @@ from utils.character_reference_contracts import (
     identity_detail_prompt_items,
 )
 
-CHARACTER_REFERENCE_QA_SCHEMA = "honcut.character-reference-qa.v3"
+CHARACTER_REFERENCE_QA_SCHEMA = "honcut.character-reference-qa.v4"
 SEEDANCE_REFERENCE_VIEWS = ("face_closeup", "full_body", "side", "back")
 
 
@@ -74,12 +74,20 @@ def build_character_reference_qa_prompt(
     )
     synthetic_contract = ""
     if synthetic_styling:
+        from utils.privacy_visual_policy import synthetic_makeup_qa_requirements
+
         synthetic_contract = f"""
 Synthetic face contract (blocking):
 {json.dumps(synthetic_styling, ensure_ascii=False, sort_keys=True)}
+Structured aesthetic QA requirements:
+{json.dumps(synthetic_makeup_qa_requirements(), ensure_ascii=False)}
 Every face-visible view must show the same declared synthetic porcelain makeup, keep the
 whole face unobscured, preserve clean harmonious facial anatomy, and contain no grotesque
-damage. Photoreal untreated human skin or a hidden face is a failure. The back view is exempt
+damage. The pearl ceramic complexion must look warm, healthy and elegant rather than gray,
+blue-gray, bloodless, waxy or corpse-like. Eyes must retain clear pupils, layered irises and
+bright catchlights instead of a blank solid glow; cheeks and lips must keep coordinated living
+color. Circuit makeup must look like fine decorative cosmetics, never cuts, cracks or surgical
+seams. Photoreal untreated human skin or a hidden face is a failure. The back view is exempt
 from face visibility but must preserve the same hair and rear identity design.
 """
     return f"""You are the blocking Phase 3 character-reference inspector.
@@ -119,6 +127,10 @@ Return one JSON object only:
       "face_unobscured": true,
       "makeup_clean_and_harmonious": true,
       "no_grotesque_damage": true,
+      "healthy_warm_complexion": true,
+      "lively_eyes_with_catchlights": true,
+      "living_color_in_cheeks_and_lips": true,
+      "no_uncanny_or_corpse_like_styling": true,
       "issues": []
     }}
   }},
@@ -259,6 +271,10 @@ def parse_character_reference_qa(
             "face_unobscured",
             "makeup_clean_and_harmonious",
             "no_grotesque_damage",
+            "healthy_warm_complexion",
+            "lively_eyes_with_catchlights",
+            "living_color_in_cheeks_and_lips",
+            "no_uncanny_or_corpse_like_styling",
         )
         if require_synthetic and name != "back":
             passed = passed and all(

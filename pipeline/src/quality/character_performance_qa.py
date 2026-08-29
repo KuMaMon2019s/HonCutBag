@@ -10,7 +10,7 @@ from clients.ark_multimodal_client import review_as
 from schemas.understanding import CharacterPerformanceBoardUnderstanding
 
 
-CHARACTER_PERFORMANCE_QA_SCHEMA = "honcut.character-performance-board-qa.v1"
+CHARACTER_PERFORMANCE_QA_SCHEMA = "honcut.character-performance-board-qa.v2"
 PERFORMANCE_CELL_IDS = tuple(f"A{index:02d}" for index in range(1, 7))
 
 
@@ -28,12 +28,16 @@ def build_character_performance_qa_prompt(
     cells: list[dict[str, Any]],
     synthetic_styling: dict[str, Any] | None,
 ) -> str:
+    from utils.privacy_visual_policy import synthetic_makeup_qa_requirements
+
     return f"""You are the blocking Phase 3 performance-reference-board inspector.
 The single input is a clean 2x3 image read left-to-right, top-to-bottom as A01-A06.
 The Axx identifiers exist only in this inspection contract and must NOT be printed in pixels.
 
 Character ID: {character_id}
 Synthetic styling: {json.dumps(synthetic_styling, ensure_ascii=False, sort_keys=True)}
+Structured aesthetic QA requirements:
+{json.dumps(synthetic_makeup_qa_requirements(), ensure_ascii=False)}
 Authored cell bindings (do not invent or extend story action):
 {json.dumps(cells, ensure_ascii=False, sort_keys=True)}
 
@@ -41,6 +45,9 @@ Blocking requirements:
 - all six cells depict the same one character, never six people or clones;
 - six clearly different practical body poses are visible;
 - outfit, face identity, synthetic porcelain makeup, colors and proportions stay identical;
+- the complexion stays warm, healthy and elegant; eyes have pupils, iris detail and catchlights;
+  lips and cheeks retain coordinated living color; no cell looks gray, bloodless, waxy,
+  corpse-like, haunted, uncanny or horror-styled;
 - only the declared prop belongs to this character and its geometry/material are correct;
 - no extra character appears;
 - pixels contain no text, Axx labels, numbers, arrows, panel borders, grid lines, captions or UI.
@@ -56,6 +63,8 @@ Return exactly one JSON object with this schema:
       "pose_distinct": true,
       "clothing_consistent": true,
       "makeup_consistent": true,
+      "healthy_beautiful_synthetic_styling": true,
+      "no_uncanny_or_corpse_like_styling": true,
       "prop_ownership_correct": true,
       "no_extra_character": true,
       "no_text_or_layout_marks": true,
@@ -65,6 +74,7 @@ Return exactly one JSON object with this schema:
   "same_single_character": true,
   "six_distinct_poses": true,
   "clothing_makeup_consistent": true,
+  "healthy_beautiful_synthetic_styling": true,
   "props_correct": true,
   "no_extra_characters": true,
   "no_text_or_layout_marks": true,
@@ -102,6 +112,8 @@ def review_character_performance_board(
         "pose_distinct",
         "clothing_consistent",
         "makeup_consistent",
+        "healthy_beautiful_synthetic_styling",
+        "no_uncanny_or_corpse_like_styling",
         "prop_ownership_correct",
         "no_extra_character",
         "no_text_or_layout_marks",
@@ -117,6 +129,7 @@ def review_character_performance_board(
         "same_single_character",
         "six_distinct_poses",
         "clothing_makeup_consistent",
+        "healthy_beautiful_synthetic_styling",
         "props_correct",
         "no_extra_characters",
         "no_text_or_layout_marks",

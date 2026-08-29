@@ -59,7 +59,9 @@ from utils.config import ARK_AGENT_CREDENTIAL_SOURCE, SEEDANCE_MODEL, get_api_ke
 from utils.video_validation import is_valid_video
 from utils.privacy_visual_policy import (
     NO_REAL_PERSON_POLICY,
+    SYNTHETIC_MAKEUP_PROFILE_ID,
     synthetic_character_review_evidence,
+    synthetic_makeup_profile_sha256,
 )
 
 RECEIPT_SCHEMA = "honcut.phase3-performance-board-live-acceptance.v1"
@@ -437,6 +439,8 @@ def _preflight_contract(
     ]
     required_prompt_fragments = (
         "珍珠生体瓷妆",
+        "温润透亮",
+        "尸体般灰白",
         "当前剧情导航图是图片",
         "红色箭头表示主体或物体运动方向",
         "蓝色箭头表示摄影机运动",
@@ -491,6 +495,8 @@ def _preflight_contract(
         "visible_character_ids": visible_character_ids,
         "synthetic_identity": {
             "visual_identity_policy": NO_REAL_PERSON_POLICY,
+            "aesthetic_profile_id": SYNTHETIC_MAKEUP_PROFILE_ID,
+            "aesthetic_profile_sha256": synthetic_makeup_profile_sha256(),
             "identity_contract_complete": True,
             "character_ids": [
                 character["id"]

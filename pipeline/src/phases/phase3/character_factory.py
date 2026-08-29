@@ -378,9 +378,24 @@ def _reference_rendering_clause(style: str) -> str:
 
 
 def build_model_reference_prompts(
-    character_desc: str, style: str = "", target_model: str = "seedance"
+    character_desc: str,
+    style: str = "",
+    target_model: str = "seedance",
+    synthetic_styling: dict[str, Any] | None = None,
 ) -> dict:
     """Build separated reference prompts for Seedance or Kling."""
+    aesthetic_contract = ""
+    if synthetic_styling:
+        from utils.privacy_visual_policy import (
+            is_current_synthetic_styling,
+            no_real_person_prompt_contract,
+        )
+
+        if not is_current_synthetic_styling(synthetic_styling):
+            raise ValueError(
+                "synthetic character reference generation requires the current aesthetic profile"
+            )
+        aesthetic_contract = no_real_person_prompt_contract()
     fictional_decl = (
         "This is a fully fictional AI-generated character (virtual avatar), "
         "not a real person; the entire visual identity is a designed digital creation "
@@ -388,7 +403,7 @@ def build_model_reference_prompts(
     )
     rendering = _reference_rendering_clause(style)
     identity = (
-        f"{fictional_decl}. Static identity facts only: {character_desc}. "
+        f"{fictional_decl}. {aesthetic_contract} Static identity facts only: {character_desc}. "
         f"Asset boundary: {STATIC_REFERENCE_ASSET_POLICY} "
         f"Rendering medium only: {rendering}. Neutral expression. The project style is not "
         "permission to add its story location, crowd, camera movement, pose or action. "
@@ -1065,7 +1080,10 @@ def generate_character(
     )
     if not skip_images:
         reference_prompts = build_model_reference_prompts(
-            description, style, target_model
+            description,
+            style,
+            target_model,
+            synthetic_styling=synthetic_styling,
         )
         generation_contract = build_reference_generation_contract(
             prompts=reference_prompts,
@@ -1197,7 +1215,15 @@ def generate_character(
             )
     else:
         print("[Step 1/3] Skipping image generation (--skip-images)")
-        views = {name: None for name in build_model_reference_prompts(description, style, target_model)}
+        views = {
+            name: None
+            for name in build_model_reference_prompts(
+                description,
+                style,
+                target_model,
+                synthetic_styling=synthetic_styling,
+            )
+        }
         qa_receipt = None
 
     # Step 2: Create character_card.json

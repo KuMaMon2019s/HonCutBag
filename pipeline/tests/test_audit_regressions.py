@@ -101,6 +101,10 @@ from utils.artifact_chain import get_resumable_phase, invalidate_checkpoints_fro
 from utils.shot_embedder import compute_transition_similarity
 from utils.video_capabilities import get_video_capabilities
 from utils.video_geometry import resolve_video_geometry
+from utils.privacy_visual_policy import (
+    SYNTHETIC_MAKEUP_PROFILE_ID,
+    synthetic_makeup_profile_sha256,
+)
 from utils.clip_interrogator_rank import rank_label_scores
 from utils.clip_style_classifier import validate_clip_model
 from utils.visual_style_contract import (
@@ -2094,10 +2098,12 @@ def test_final_vlm_uses_persisted_synthetic_contract_after_env_is_gone(
                     "face": "珍珠生体瓷合成肤质，藏蓝 #1B2A41 虹彩电路妆纹，深红柔光虹膜环，面部完整可见",
                     "clothing": "黑色摄影背心，银色肩章",
                     "distinguishing": "胸前冷白相机编号灯",
-                    "synthetic_styling": {
-                        "schema": "honcut.synthetic-styling.v3",
-                        "mode": "synthetic_porcelain_makeup",
-                        "makeup_design_id": "porcelain-photographer",
+                        "synthetic_styling": {
+                            "schema": "honcut.synthetic-styling.v3",
+                            "mode": "synthetic_porcelain_makeup",
+                            "aesthetic_profile_id": SYNTHETIC_MAKEUP_PROFILE_ID,
+                            "aesthetic_profile_sha256": synthetic_makeup_profile_sha256(),
+                            "makeup_design_id": "porcelain-photographer",
                         "non_human_material": "pearl bio-ceramic complexion",
                         "visible_anchors": [
                             "藏蓝 #1B2A41 虹彩电路妆纹",
@@ -2131,7 +2137,7 @@ def test_final_vlm_uses_persisted_synthetic_contract_after_env_is_gone(
         output_dir=tmp_path,
     )
 
-    assert result["qa_contract"] == "synthetic_character_styling_consistency_v3"
+    assert result["qa_contract"] == "synthetic_character_styling_consistency_v4"
     assert "pearl bio-ceramic complexion" in prompts[0]
     assert "complete face must stay visible" in prompts[0]
     assert "untreated natural human face is a failure" in prompts[0]
@@ -2162,7 +2168,7 @@ def test_final_vlm_uses_live_synthetic_policy_without_character_artifact(
 
     result = video_qa._vlm_semantic_check(FakeClient(), frames, None)
 
-    assert result["qa_contract"] == "synthetic_character_styling_consistency_v3"
+    assert result["qa_contract"] == "synthetic_character_styling_consistency_v4"
 
 
 def test_final_vlm_blocks_incomplete_synthetic_identity_evidence(
@@ -2627,7 +2633,7 @@ def test_phase8_vlm_switches_to_synthetic_structure_contract_from_artifacts(
 
     result = reviewer([frame], {"shot_id": "S01", "who": ["摄影师"]})
 
-    assert result["qa_contract"] == "synthetic_character_styling_consistency_v3"
+    assert result["qa_contract"] == "synthetic_character_styling_consistency_v4"
     assert "beautiful pearl bio-ceramic porcelain makeup" in captured["prompt"]
     assert "complete unobscured face" in captured["prompt"]
     assert "Veils, face masks, coarse mechanical plates" in captured["prompt"]
@@ -4059,6 +4065,10 @@ def test_character_reference_qa_requires_visible_harmonious_synthetic_makeup():
         "face_unobscured": True,
         "makeup_clean_and_harmonious": True,
         "no_grotesque_damage": True,
+        "healthy_warm_complexion": True,
+        "lively_eyes_with_catchlights": True,
+        "living_color_in_cheeks_and_lips": True,
+        "no_uncanny_or_corpse_like_styling": True,
         "issues": [],
     }
     payload = {
@@ -4094,6 +4104,65 @@ def test_character_reference_qa_requires_visible_harmonious_synthetic_makeup():
 
     assert review["passed"] is False
     assert review["failed_views"] == ["face_closeup"]
+
+
+def test_character_reference_qa_rejects_corpse_like_synthetic_makeup():
+    passing_view = {
+        "passed": True,
+        "view_match": True,
+        "framing_match": True,
+        "neutral_pose": True,
+        "hands_empty": True,
+        "plain_background": True,
+        "single_character": True,
+        "face_visible": True,
+        "both_eyes_visible": True,
+        "synthetic_makeup_visible": True,
+        "synthetic_profile_match": True,
+        "face_unobscured": True,
+        "makeup_clean_and_harmonious": True,
+        "no_grotesque_damage": True,
+        "healthy_warm_complexion": True,
+        "lively_eyes_with_catchlights": True,
+        "living_color_in_cheeks_and_lips": True,
+        "no_uncanny_or_corpse_like_styling": True,
+        "issues": [],
+    }
+    payload = {
+        "views": {
+            "face_closeup": {
+                **passing_view,
+                "healthy_warm_complexion": False,
+                "no_uncanny_or_corpse_like_styling": False,
+                "issues": ["gray bloodless corpse-like complexion"],
+            },
+            "full_body": passing_view,
+            "side": {**passing_view, "both_eyes_visible": False},
+            "back": {
+                **passing_view,
+                "face_visible": False,
+                "both_eyes_visible": False,
+            },
+        },
+        "cross_view": {
+            "passed": True,
+            "identity_consistent": True,
+            "outfit_consistent": True,
+            "body_proportions_consistent": True,
+            "synthetic_makeup_consistent": True,
+            "issues": [],
+        },
+        "failed_views": [],
+    }
+
+    review = parse_character_reference_qa(
+        json.dumps(payload),
+        require_synthetic=True,
+    )
+
+    assert review["passed"] is False
+    assert review["failed_views"] == ["face_closeup"]
+    assert review["views"]["face_closeup"]["healthy_warm_complexion"] is False
 
 
 def test_character_discovery_body_contract_is_prompted_and_normalized(monkeypatch):
@@ -6561,6 +6630,8 @@ def _phase6_live_acceptance_preflight(tmp_path, **_kwargs):
         "visible_character_ids": ["CHAR_01"],
         "synthetic_identity": {
             "visual_identity_policy": "synthetic_stylized_character_v3",
+            "aesthetic_profile_id": SYNTHETIC_MAKEUP_PROFILE_ID,
+            "aesthetic_profile_sha256": synthetic_makeup_profile_sha256(),
             "identity_contract_complete": True,
             "character_ids": ["CHAR_01"],
         },

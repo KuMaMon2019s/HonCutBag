@@ -540,6 +540,9 @@ def build_character_performance_prompt(
 ) -> str:
     appearance = character.get("appearance")
     styling = appearance.get("synthetic_styling") if isinstance(appearance, Mapping) else None
+    from utils.privacy_visual_policy import no_real_person_prompt_contract
+
+    aesthetic_contract = no_real_person_prompt_contract() if styling else ""
     positions = (
         "top-left", "top-center", "top-right",
         "bottom-left", "bottom-center", "bottom-right",
@@ -560,6 +563,7 @@ Identity is locked by Image 1. Preserve the exact face, pearl bio-ceramic synthe
 makeup, narrow temple-to-cheek iridescent circuit stripe, luminous iris ring, hair, body
 proportions, outfit, colors and character-specific makeup design across all six poses.
 Image 2, when present, supplies declared prop geometry/material/color only.
+{aesthetic_contract}
 
 Follow these six positions exactly:
 {cell_instructions}
@@ -585,12 +589,16 @@ def build_character_performance_cell_prompt(
 ) -> str:
     appearance = character.get("appearance")
     styling = appearance.get("synthetic_styling") if isinstance(appearance, Mapping) else None
+    from utils.privacy_visual_policy import no_real_person_prompt_contract
+
+    aesthetic_contract = no_real_person_prompt_contract() if styling else ""
     return f"""Create one square full-body character action reference on a seamless neutral
 light-gray studio background. Show exactly one character and exactly one clearly readable pose.
 
 Identity is locked by Image 1. Preserve the exact face, pearl bio-ceramic synthetic porcelain
 makeup, circuit stripe, luminous iris ring, hair, proportions, outfit and colors. Image 2, when
 present, supplies the declared prop geometry/material/color only.
+{aesthetic_contract}
 
 Exact authored action: {cell['action_description']}
 Required action role: {cell['pose_category']}
