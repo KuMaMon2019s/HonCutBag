@@ -452,6 +452,43 @@ def test_plan_normalizes_numeric_production_shot_id_to_canonical_beat_parent():
     assert plan["cells"][0]["source_lineage_kind"] == "timeline_assignment"
 
 
+def test_plan_accepts_complete_unit_lineage_when_split_beat_summary_is_empty():
+    storyboard = _storyboard()
+    second = storyboard["shots"][0]["storyboard_beats"][1]
+    second["source_action_unit_ids"] = []
+    second["generation_action_units"] = [
+        _unit("GAU002", "AU001", "领队左脚向前跨步并挥动蓝色能量短棍"),
+        _unit("GAU003", "AU001", "领队竖直举起同一根蓝色能量短棍格挡"),
+    ]
+
+    plan = build_character_performance_plan(storyboard, _character())
+
+    assert plan is not None
+    p02_cells = [cell for cell in plan["cells"] if cell["beat_id"] == "S01_P02"]
+    assert p02_cells
+    assert {cell["source_action_unit_id"] for cell in p02_cells} == {"AU001"}
+    assert all(
+        cell["source_lineage_kind"] == "source_action_unit"
+        for cell in p02_cells
+    )
+
+
+def test_plan_rejects_partially_missing_unit_lineage_even_without_summary():
+    storyboard = _storyboard()
+    second = storyboard["shots"][0]["storyboard_beats"][1]
+    second["source_action_unit_ids"] = []
+    second["generation_action_units"].append(
+        {"unit_id": "GAU003", "source_fact_echoes": ["领队竖直举棍格挡"]}
+    )
+
+    try:
+        build_character_performance_plan(storyboard, _character())
+    except ValueError as exc:
+        assert "inconsistent source action-unit lineage" in str(exc)
+    else:
+        raise AssertionError("partial unit lineage must fail closed")
+
+
 def test_plan_rejects_mismatched_timeline_assignment_fallback():
     storyboard = _storyboard()
     first = storyboard["shots"][0]["storyboard_beats"][0]

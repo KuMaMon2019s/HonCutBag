@@ -272,24 +272,36 @@ def _source_bindings_for_beat(beat: Mapping[str, Any], beat_id: str) -> list[dic
         for value in beat.get("source_action_unit_ids") or []
         if str(value).strip()
     ))
+    unit_source_ids = [
+        str(unit.get("source_action_unit_id") or "").strip() for unit in units
+    ]
     discovered_source_ids = list(dict.fromkeys(
-        str(unit.get("source_action_unit_id") or "").strip()
-        for unit in units
-        if str(unit.get("source_action_unit_id") or "").strip()
+        source_id for source_id in unit_source_ids if source_id
     ))
     if declared_source_ids or discovered_source_ids:
         if (
-            declared_source_ids != discovered_source_ids
-            or any(not _SOURCE_ACTION_ID_RE.fullmatch(value) for value in declared_source_ids)
+            any(
+                not source_id or not _SOURCE_ACTION_ID_RE.fullmatch(source_id)
+                for source_id in unit_source_ids
+            )
+            or any(
+                not _SOURCE_ACTION_ID_RE.fullmatch(value)
+                for value in declared_source_ids
+            )
+            or (
+                bool(declared_source_ids)
+                and declared_source_ids != discovered_source_ids
+            )
         ):
             raise ValueError(f"{beat_id} has inconsistent source action-unit lineage")
+        effective_source_ids = declared_source_ids or discovered_source_ids
         return [
             {
                 "source_action_unit_id": source_id,
                 "source_lineage_kind": "source_action_unit",
                 "units": _generation_units_for_source(beat, source_id),
             }
-            for source_id in declared_source_ids
+            for source_id in effective_source_ids
         ]
 
     assignments = [
