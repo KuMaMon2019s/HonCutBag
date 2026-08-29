@@ -12,7 +12,7 @@ from typing import Any, Mapping
 
 GENERATION_FINGERPRINT_SCHEMA = "honcut.generation-fingerprint.v1"
 PHASE6_VIDEO_PROMPT_TEMPLATE_ID = "honcut.phase6.video"
-PHASE6_VIDEO_PROMPT_TEMPLATE_VERSION = "1"
+PHASE6_VIDEO_PROMPT_TEMPLATE_VERSION = "2"
 
 _SECRET_KEY_NAMES = {
     "access_token",

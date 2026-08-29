@@ -2348,6 +2348,14 @@ def test_p02_media_indices_bind_after_predecessor_character_guide_and_tail_order
     assert "S01_G06→S01_G07→S01_G08→S01_G09" in prompt
     assert "不得提前演绎其他 Gxx 或后续 Pxx" in prompt
     assert "严禁渲染进视频画面" in prompt
+    assert "[honcut.phase6-media-role-isolation.v1]" in prompt
+    assert "图片2只负责 Gxx 动作顺序" in prompt
+    assert "人物脸、头发长度与发型轮廓" in prompt
+    assert "道具外形、总长度、端部数量" in prompt
+    assert "角色身份外观只以图片1为权威" in prompt
+    assert "当前姿态、握持关系和道具几何只以图片3" in prompt
+    assert "发生冲突时必须按上述职责覆盖图片2" in prompt
+    assert "禁止生长、缩短、变形、增减端部" in prompt
 
 
 def test_seedance_transport_contract_rejects_invalid_limits(monkeypatch):

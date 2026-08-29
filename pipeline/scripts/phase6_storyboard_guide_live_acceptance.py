@@ -44,6 +44,8 @@ from phases.phase3.performance_reference_board import (
 )
 from runtime.continuity_chunks import ChunkExecutionRequest
 from runtime.continuity_provider import (
+    MEDIA_ROLE_ISOLATION_CONTRACT,
+    SEEDANCE_ALL_MODAL_PROMPT_CONTRACT,
     _media_index_manifest,
     _provider_content,
     _provider_ready_content,
@@ -449,6 +451,11 @@ def _preflight_contract(
         "当前动作姿态图中的多个人形是同一个角色的不同参考姿态",
         "只执行本次明确列出的 Axx",
         "不得生成角色克隆、分栏、拼贴、网格、文字、序号、箭头、边框",
+        MEDIA_ROLE_ISOLATION_CONTRACT,
+        "人物脸、头发长度与发型轮廓",
+        "道具外形、总长度、端部数量",
+        "严禁带入成片",
+        "禁止生长、缩短、变形、增减端部",
     )
     if (
         not image_media
@@ -469,9 +476,7 @@ def _preflight_contract(
         "ratio": ratio,
         "resolution": resolution,
         "return_last_frame": True,
-        "seedance_prompt_contract": (
-            "all_modal_reference_with_story_and_performance_guides_v3"
-        ),
+        "seedance_prompt_contract": SEEDANCE_ALL_MODAL_PROMPT_CONTRACT,
         "media_index_manifest": media_manifest,
         "provider_prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
     }

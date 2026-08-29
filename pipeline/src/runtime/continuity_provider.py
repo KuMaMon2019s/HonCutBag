@@ -61,6 +61,10 @@ MAX_COPYRIGHT_POLICY_REPAIRS = 2
 COPYRIGHT_POLICY_REPAIR_VERSION = "original_audio_frame_fallback_v1"
 MAX_PRIVACY_POLICY_REPAIRS = SEEDANCE_MAX_REFERENCE_IMAGES + 1
 PRIVACY_POLICY_REPAIR_VERSION = "provider_indexed_media_fallback_v2"
+MEDIA_ROLE_ISOLATION_CONTRACT = "honcut.phase6-media-role-isolation.v1"
+SEEDANCE_ALL_MODAL_PROMPT_CONTRACT = (
+    "all_modal_reference_with_role_isolation_v4"
+)
 _COPYRIGHT_SAFE_AUDIO_CONTRACT = (
     "[copyright-safe audio contract] Generate original ambient location sounds only: "
     "natural footsteps, clothing movement, crowd presence, and location ambience. "
@@ -1235,11 +1239,57 @@ def _bind_final_media_index_prompt(
             "不得生成角色克隆、分栏、拼贴、网格、文字、序号、箭头、边框或参考板布局。"
             "道具只属于其绑定角色，并保持声明的几何、材质、颜色与握持关系。"
         )
+    role_isolation_contract = ""
+    if guides:
+        narrative_index = guides[0]["prompt_index"]
+        identity_indices = [
+            item["prompt_index"]
+            for item in manifest
+            if item.get("responsibility") == "character_identity_board"
+        ]
+        performance_indices = [
+            item["prompt_index"] for item in performance_guides
+        ]
+        boundary_indices = [
+            item["prompt_index"]
+            for item in manifest
+            if item.get("responsibility") in {
+                "cinematic_composition",
+                "predecessor_tail_video",
+                "ordered_tail_frame",
+            }
+        ]
+        identity_authority = (
+            "、".join(identity_indices) if identity_indices else "结构化角色合同"
+        )
+        performance_authority = (
+            "、".join(performance_indices)
+            if performance_indices
+            else "结构化动作与道具合同"
+        )
+        boundary_authority = (
+            "、".join(boundary_indices)
+            if boundary_indices
+            else "结构化起始状态"
+        )
+        role_isolation_contract = (
+            f"\n[{MEDIA_ROLE_ISOLATION_CONTRACT}] "
+            f"{narrative_index}只负责 Gxx 动作顺序、关节与重心轨迹、红蓝箭头和空间关系；"
+            "其中的人物脸、头发长度与发型轮廓、妆造、服装、身体比例，以及道具外形、"
+            "总长度、端部数量、握柄/刃部结构、颜色和材质都是非权威占位像素，严禁带入成片。"
+            f"角色身份外观只以{identity_authority}为权威；开场构图与连续状态只以"
+            f"{boundary_authority}为权威；当前姿态、握持关系和道具几何只以"
+            f"{performance_authority}及结构化文字合同为权威。发生冲突时必须按上述职责覆盖"
+            f"{narrative_index}，不得折中混合。逐帧保持角色头发长度、发型外轮廓、分缝和发束"
+            "数量不变；逐帧保持同一道具的总长度、端部数量、握柄与发光部位分段不变；"
+            "禁止生长、缩短、变形、增减端部或在参考职责之间渐变。"
+        )
     prefix = (
         "【参考素材索引｜顺序不可交换】\n"
         + "\n".join(index_lines)
         + guide_contract
         + performance_contract
+        + role_isolation_contract
         + "\n"
     )
     text_item = next(
@@ -2005,7 +2055,7 @@ def _direct_seedance_executor(
                 if request.chunk.execution_strategy == "first_last_frame_bridge"
                 else "video1_tail_extend_v1"
                 if request.chunk.execution_strategy == "tail_video_extend"
-                else "all_modal_reference_with_narrative_guide_v2"
+                else SEEDANCE_ALL_MODAL_PROMPT_CONTRACT
             ),
         }
         repairs: list[dict[str, Any]] = []

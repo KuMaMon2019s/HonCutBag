@@ -286,3 +286,5 @@ def test_previs_pixels_are_separated_end_to_end_before_video_transport(
     assert "红色箭头表示主体或物体运动方向" in prompt
     assert "蓝色箭头表示摄影机运动" in prompt
     assert "严禁渲染进视频画面" in prompt
+    assert "honcut.phase6-media-role-isolation.v1" in prompt
+    assert "剧情导航图" in prompt and "非权威占位像素" in prompt
