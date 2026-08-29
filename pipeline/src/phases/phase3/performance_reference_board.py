@@ -16,6 +16,7 @@ from PIL import Image, ImageDraw, ImageFilter
 from prompt.seedream_image_prompt import (
     bind_reference_roles,
     image_request_fingerprint,
+    prompt_guidance_metrics,
 )
 from quality.character_performance_qa import (
     CHARACTER_PERFORMANCE_CELL_QA_SCHEMA,
@@ -36,9 +37,9 @@ CHARACTER_PERFORMANCE_POSE_CONSTRAINTS_SCHEMA = (
     "honcut.character-performance-pose-constraints.v1"
 )
 PERFORMANCE_PROMPT_OPTIMIZATION_SCHEMA = (
-    "honcut.character-performance-prompt-optimization.v2"
+    "honcut.character-performance-prompt-optimization.v3"
 )
-PERFORMANCE_PROMPT_TEMPLATE_ID = "honcut.character-performance-board-prompt.v2"
+PERFORMANCE_PROMPT_TEMPLATE_ID = "honcut.character-performance-board-prompt.v3"
 PERFORMANCE_PROMPT_GUIDANCE_URL = (
     "https://ark.volcengine.com/region:cn-beijing/docs/82379/1824121?lang=zh"
 )
@@ -752,21 +753,19 @@ def build_character_performance_prompt(
         binding_facts.append(f"- {binding_id}: {cell['action_description']}")
     cell_instructions = "\n".join(
         (
-            f"- {position} (internal {cell['cell_id']}; never print the ID): "
-            f"action={binding_ids[(str(cell['beat_id']), str(cell['source_action_unit_id']))]}; "
+            f"- {position}: "
+            f"fact={binding_ids[(str(cell['beat_id']), str(cell['source_action_unit_id']))]}; "
             f"role={cell['pose_category']}; key_pose={cell['pose_focus']}; "
             f"constraints={_compact_pose_constraints_text(cell['pose_constraints'])}."
         )
         for position, cell in zip(positions, plan["cells"], strict=True)
     )
-    return f"""Create one clean 3:2 character performance reference image containing six evenly
-spaced full-body poses of the same single character, arranged conceptually as 2 rows x 3 columns.
-There are no visible cell dividers: use one seamless neutral light-gray studio background.
+    return f"""Create one clean 3:2 image with six full-body poses of the same character in two rows
+of three. Use a seamless neutral light-gray studio background without visible dividers.
 
-Identity is locked by Image 1. Preserve the exact face, pearl bio-ceramic synthetic porcelain
-makeup, narrow temple-to-cheek iridescent circuit stripe, luminous iris ring, hair, body
-proportions, outfit, colors and character-specific makeup design across all six poses.
-Image 2, when present, supplies declared prop geometry/material/color only.
+Image 1 locks the face, pearl bio-ceramic porcelain makeup, temple-to-cheek circuit stripe,
+luminous iris ring, hair, proportions, outfit, colors and makeup design across every pose.
+Image 2, if present, supplies only declared prop geometry, material and color.
 {aesthetic_contract}
 
 Canonical authored action facts:
@@ -775,17 +774,14 @@ Canonical authored action facts:
 Follow these six positions exactly:
 {cell_instructions}
 
-Every position must visibly perform its exact action, not a generic standing guard. An evade must
-show the specified displaced foot, lowered center of gravity and torso lean. An attack must show the
-specified stepping foot and exact prop swing direction. A block must show the declared defensive
-prop placement. Keep the entire body and prop visible with enough empty space to read the silhouette.
-Do not invent an attack, outcome, injury, wet clothing, torn clothing, dirt or later story state.
-A declared prop may appear only in cells whose prop_ids include it and must remain owned by this
-character.
+Each position must perform its exact action, never a generic guard. Show an evade's displaced foot,
+lowered center and torso lean; an attack's stepping foot and prop swing; a block's defensive prop
+placement. Keep the complete body and prop visible with readable negative space. Never invent an
+attack, outcome, injury, wet/torn/dirty clothing or later state. Show declared props only where
+assigned and keep their ownership.
 
-Pixel prohibitions: no text, no letters, no numbers, no Axx labels, no arrows, no captions, no UI,
-no panel borders, no grid lines. Do not add another character. This is a pose reference sheet, not a
-storyboard and not a finished cinematic frame.
+No text, letters, numbers, labels, arrows, captions, UI, borders or grid lines. No other character.
+This is a pose reference, not a storyboard or cinematic frame.
 """
 
 
@@ -827,6 +823,17 @@ def _compact_pose_constraints_text(constraints: Any) -> str:
         if str(constraints.get(key) or "unspecified") not in {"unspecified", "neutral"}
     ]
     return ",".join(declared) or "no additional directional fact"
+
+
+def _require_performance_prompt_guidance(prompt: str, *, context: str) -> dict[str, Any]:
+    """Fail before a paid image call when a Phase 3 prompt exceeds Ark guidance."""
+    metrics = prompt_guidance_metrics(prompt)
+    if metrics["over_recommended_length"] is True:
+        raise CharacterPerformanceQAError(
+            f"{context} exceeds Ark prompt guidance before Provider submission: "
+            f"cjk={metrics['cjk_characters']} english_words={metrics['english_words']}"
+        )
+    return metrics
 
 
 def build_character_performance_cell_prompt(
@@ -1193,6 +1200,13 @@ def validate_character_performance_board(
         return False
     if receipt.get("prompt_optimization") != performance_prompt_optimization_contract():
         return False
+    prompt_guidance = receipt.get("prompt_guidance")
+    if (
+        not isinstance(prompt_guidance, dict)
+        or prompt_guidance.get("over_recommended_length") is not False
+        or prompt_guidance.get("sha256") != receipt.get("prompt_sha256")
+    ):
+        return False
     plan = receipt.get("plan")
     if not isinstance(plan, dict) or plan.get("schema") != CHARACTER_PERFORMANCE_BOARD_SCHEMA:
         return False
@@ -1430,6 +1444,10 @@ def _generate_performance_cell_components(
                 build_character_performance_cell_prompt(character, cell),
                 roles,
             )
+            base_prompt_metrics = _require_performance_prompt_guidance(
+                base_prompt,
+                context=f"{character_id} {cell_id} base performance-cell prompt",
+            )
             base_prompt_hash = hashlib.sha256(base_prompt.encode("utf-8")).hexdigest()
             base_request_fingerprint = image_request_fingerprint(
                 prompt=base_prompt,
@@ -1446,6 +1464,7 @@ def _generate_performance_cell_components(
                 "model": resolved_model,
                 "size": PERFORMANCE_CELL_SIZE,
                 "prompt_sha256": base_prompt_hash,
+                "prompt_guidance": base_prompt_metrics,
                 "request_fingerprint": base_request_fingerprint,
                 "references": cell_references,
                 "image": image_path.relative_to(output_dir).as_posix(),
@@ -1487,6 +1506,10 @@ def _generate_performance_cell_components(
             receipt_path = component_dir / f"{cell_id}.json"
             raw_prompt = build_character_performance_cell_prompt(character, cell)
         prompt = bind_reference_roles(raw_prompt, roles)
+        prompt_metrics = _require_performance_prompt_guidance(
+            prompt,
+            context=f"{character_id} {cell_id} performance-cell prompt",
+        )
         prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         request_fingerprint = image_request_fingerprint(
             prompt=prompt,
@@ -1503,6 +1526,7 @@ def _generate_performance_cell_components(
             "model": resolved_model,
             "size": PERFORMANCE_CELL_SIZE,
             "prompt_sha256": prompt_hash,
+            "prompt_guidance": prompt_metrics,
             "request_fingerprint": request_fingerprint,
             "references": cell_references,
             "image": image_path.relative_to(output_dir).as_posix(),
@@ -1760,6 +1784,10 @@ def generate_character_performance_board(
         *(["character_prop_detail_only"] if len(references) > 1 else []),
     ]
     bound_prompt = bind_reference_roles(prompt, roles)
+    prompt_metrics = _require_performance_prompt_guidance(
+        bound_prompt,
+        context=f"{character_id} performance-board prompt",
+    )
     prompt_hash = hashlib.sha256(bound_prompt.encode("utf-8")).hexdigest()
     resolved_model = str(model or getattr(image_client, "model", "") or "doubao-seedream-5.0-lite")
     request_fingerprint = image_request_fingerprint(
@@ -1851,6 +1879,7 @@ def generate_character_performance_board(
         "model": resolved_model,
         "size": PERFORMANCE_BOARD_SIZE,
         "prompt_sha256": prompt_hash,
+        "prompt_guidance": prompt_metrics,
         "prompt_optimization": performance_prompt_optimization_contract(),
         "request_fingerprint": request_fingerprint,
         "references": references,

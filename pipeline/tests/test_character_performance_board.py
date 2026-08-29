@@ -22,7 +22,10 @@ from phases.phase3.performance_reference_board import (
     validate_character_performance_guide,
 )
 from prompt.seedream_image_prompt import bind_reference_roles, prompt_guidance_metrics
-from quality.character_performance_qa import review_character_performance_cell
+from quality.character_performance_qa import (
+    CharacterPerformanceQAError,
+    review_character_performance_cell,
+)
 
 
 def _character() -> dict:
@@ -518,7 +521,7 @@ def test_prompt_optimization_is_frozen_offline_and_covers_every_dimension():
     second = performance_prompt_optimization_contract()
 
     assert first == second
-    assert first["schema"] == "honcut.character-performance-prompt-optimization.v2"
+    assert first["schema"] == "honcut.character-performance-prompt-optimization.v3"
     assert first["method"] == "offline_contract_candidate_comparison"
     assert first["provider_request_count"] == 0
     assert first["production_auto_optimization"] is False
@@ -530,6 +533,30 @@ def test_prompt_optimization_is_frozen_offline_and_covers_every_dimension():
     )
     assert selected["covered_dimensions"] == first["evaluation_dimensions"]
     assert selected["contract_coverage_score"] == 7
+
+
+def test_over_guidance_board_prompt_fails_before_paid_image_call(tmp_path):
+    _write_reference_assets(tmp_path)
+    storyboard = _storyboard()
+    storyboard["shots"][0]["storyboard_beats"][0]["generation_action_units"][0][
+        "source_fact_echoes"
+    ] = ["attack " * 700]
+    image_client = _ImageClient()
+
+    try:
+        generate_character_performance_board(
+            tmp_path,
+            storyboard,
+            _character(),
+            image_client=image_client,
+            review_client=_ReviewClient(),
+        )
+    except CharacterPerformanceQAError as exc:
+        assert "exceeds Ark prompt guidance before Provider submission" in str(exc)
+    else:
+        raise AssertionError("over-guidance prompt must fail closed")
+
+    assert image_client.calls == []
 
 
 def test_generate_board_and_current_pxx_guides_are_exactly_cached(tmp_path):
@@ -556,8 +583,13 @@ def test_generate_board_and_current_pxx_guides_are_exactly_cached(tmp_path):
     assert second is not None and second["provider_requests"] == 0
     assert len(image_client.calls) == 1
     assert len(review_client.calls) == 1
-    assert "no text" in image_client.calls[0]["prompt"]
-    assert "wet clothing" in image_client.calls[0]["prompt"]
+    receipt = json.loads(
+        (tmp_path / "characters/lead/performance_reference_board.json").read_text()
+    )
+    assert receipt["prompt_guidance"]["over_recommended_length"] is False
+    assert receipt["prompt_guidance"]["sha256"] == receipt["prompt_sha256"]
+    assert "no text" in image_client.calls[0]["prompt"].casefold()
+    assert "wet/torn/dirty clothing" in image_client.calls[0]["prompt"]
     assert image_client.calls[0]["size"] == "3072x2048"
     assert validate_character_performance_board(tmp_path, "lead")
 
