@@ -30,6 +30,23 @@
       "嘴唇和面颊保留协调暖色，但不得因此退化为未经妆造的真人皮肤",
       "电路妆纹纤细、干净、对称且像高级彩妆，不得像伤口、裂缝或手术线",
       "整体第一观感必须是美观的风格化合成人，而不是尸体、鬼怪、蜡像或恐怖机器人"
+    ],
+    "phase3_reference_priority": [
+      "Premium stylized 3D CGI synthetic identity; warm, healthy and beautiful; face unobscured",
+      "Show the declared pearl ceramic complexion, warm cheeks, coral lips, dark pupils, layered irises and catchlights",
+      "Run one fine symmetric circuit-cosmetic stripe from each temple to its upper cheekbone, away from eyelids and lower face",
+      "Inside each iris, show a thin luminous ring around the dark pupil, visibly separate from eyelashes and eyeliner",
+      "Keep declared outfit, hair, colors and marks; never invent a required collar, seam or ornament"
+    ],
+    "phase3_reference_negative": [
+      "real person or likeness, natural human skin, veil, mask, corpse-gray skin, blank solid-glow eyes, missing pupil or catchlight",
+      "crack, scar, suture, face plate, eyeliner used as iris ring, circuit stripe below upper cheekbone, text, grid, logo or watermark"
+    ],
+    "phase3_reference_qa": [
+      "只依据明确声明的静态身份事实判定；不得发明领型、开口、缝线、首饰或其他未声明细节",
+      "长袖上衣不等于高领上衣；合同没有声明领型时，圆领、高领或其他整洁领型均不得单独导致失败",
+      "每个露脸视图分别核验珍珠陶瓷材质、太阳穴至上颧骨妆纹、虹膜内部发光环，三项不得合并成含糊的整体印象",
+      "最终通过与否必须由逐项结构化证据重算，模型给出的 passed、failed_views 和自然语言 issues 只作诊断，不得覆盖逐项证据"
     ]
   },
   "references": [

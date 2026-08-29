@@ -88,7 +88,7 @@ def _write_approved_pack(output_dir: Path, character: dict) -> Path:
     }
     generation_contract = {
         "schema": "honcut.character-reference-generation.v1",
-        "reference_contract_version": 6,
+        "reference_contract_version": 7,
         "model": "doubao-seedream-5.0-lite",
         "prompt_sha256": {view: "a" * 64 for view in VIEWS},
         "synthetic_styling_sha256": None,
@@ -111,7 +111,7 @@ def _write_approved_pack(output_dir: Path, character: dict) -> Path:
         "id": char_id,
         "name": character["name"],
         "description": character["description"],
-        "reference_contract_version": 6,
+        "reference_contract_version": 7,
         "reference_generation_contract": generation_contract,
         "synthetic_styling": None,
         "reference_images": {view: f"characters/{char_id}/{view}.png" for view in VIEWS},

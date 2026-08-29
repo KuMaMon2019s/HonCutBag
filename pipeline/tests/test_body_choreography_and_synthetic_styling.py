@@ -24,6 +24,7 @@ from phases.phase1.adaptation_engine import (
     _event_llm_view,
 )
 from phases.phase2.shot_storyboards import build_shot_storyboard_prompt
+from phases.phase3 import character_factory
 from phases.phase5.storyboard_qa_gate import run_generation_capacity_checks
 from phases.phase6.video_generator import build_video_prompt
 from quality import video_qa
@@ -35,6 +36,7 @@ from runtime.continuity_provider import (
     _storyboard_group_prompt,
 )
 from schemas.continuity import GenerationChunk
+from prompt.seedream_image_prompt import bind_reference_roles, prompt_guidance_metrics
 from utils import privacy_visual_policy
 from utils.body_action_contracts import (
     apply_body_action_contract,
@@ -42,6 +44,10 @@ from utils.body_action_contracts import (
     body_action_prompt,
     build_body_action_contract,
     is_mechanically_specific_action,
+)
+from utils.character_body_contracts import (
+    apply_adult_lead_body_contracts,
+    character_reference_identity_description,
 )
 from utils.privacy_visual_policy import (
     NO_REAL_PERSON_POLICY,
@@ -51,6 +57,8 @@ from utils.privacy_visual_policy import (
     synthetic_character_review_evidence,
     synthetic_makeup_aesthetic_profile,
     synthetic_makeup_profile_sha256,
+    synthetic_makeup_reference_prompt_contract,
+    synthetic_makeup_reference_qa_requirements,
 )
 from utils.prompt_budget import enforce_prompt_budget
 
@@ -851,11 +859,63 @@ def test_checked_in_makeup_visual_corpus_is_structured_audit_only():
     assert len({item["sha256"] for item in profile["references"]}) == 8
     assert all(item["visual_understanding"]["usable_cues"] for item in profile["references"])
     assert all(item["visual_understanding"]["excluded_cues"] for item in profile["references"])
+    assert profile["production_prompt"]["phase3_reference_priority"]
+    assert profile["production_prompt"]["phase3_reference_negative"]
+    assert profile["production_prompt"]["phase3_reference_qa"]
     prompt = no_real_person_prompt_contract()
     assert "温润透亮" in prompt
     assert "清晰瞳孔" in prompt
     assert "reference_01" not in prompt
     assert ".png" not in prompt
+
+
+def test_phase3_synthetic_reference_prompt_prioritizes_exact_face_geometry():
+    source_character = {
+        "id": "lead",
+        "name": "主角",
+        "role": "protagonist",
+        "appearance": {
+            "gender": "female",
+            "age_range": "adult 24-30",
+            "clothing": "deep gray long-sleeved training top",
+        },
+    }
+    apply_adult_lead_body_contracts([source_character])
+    character = apply_no_real_person_character_policy({
+        "characters": [source_character],
+    })["characters"][0]
+    styling = character["appearance"]["synthetic_styling"]
+    contract = synthetic_makeup_reference_prompt_contract(styling)
+
+    assert contract.startswith("[PHASE 3 SYNTHETIC IDENTITY — TOP PRIORITY]")
+    assert all(anchor in contract for anchor in styling["visible_anchors"])
+    assert "Inside each iris" in contract
+    assert "visibly separate from eyelashes and eyeliner" in contract
+    assert "长袖上衣不等于高领上衣" in " ".join(
+        synthetic_makeup_reference_qa_requirements()
+    )
+
+    prompts = character_factory.build_model_reference_prompts(
+        character_reference_identity_description(character),
+        style="high-end stylized CGI",
+        synthetic_styling=styling,
+    )
+    for view_name, prompt in prompts.items():
+        assert prompt.index("TOP PRIORITY") < prompt.index("Static identity facts")
+        assert "never invent a collar" in prompt
+        assert "reference_01" not in prompt
+        assert ".png" not in prompt
+        transport_prompt = (
+            prompt
+            if view_name == "face_closeup"
+            else bind_reference_roles(
+                f"{character_factory.REFERENCE_WEIGHT_NOTE}. {prompt}",
+                ["character_identity_only"],
+            )
+        )
+        assert prompt_guidance_metrics(transport_prompt)[
+            "over_recommended_length"
+        ] is False
 
 
 def test_future_makeup_visual_profile_schema_fails_closed(tmp_path, monkeypatch):

@@ -262,6 +262,55 @@ def body_contract_forbidden(character: dict[str, Any]) -> list[str]:
     )
 
 
+def _reference_body_contract_prompt(character: dict[str, Any]) -> str:
+    """Render the same structured body facts in a compact Phase 3 form."""
+    appearance = character.get("appearance")
+    contract = appearance.get("body_contract") if isinstance(appearance, dict) else None
+    if not isinstance(contract, dict):
+        return ""
+    details = [
+        f"height exactly {contract.get('height_cm')} cm",
+        f"exactly {contract.get('head_to_body_ratio')} heads tall",
+        f"{contract.get('build')} build",
+    ]
+    for key in (
+        "shoulders",
+        "shoulders_and_hips",
+        "leg_proportion",
+        "waistline",
+        "body_fat",
+        "posture",
+    ):
+        value = str(contract.get(key) or "").strip()
+        if value:
+            details.append(value)
+    common = contract.get("human_proportion_constraints")
+    if isinstance(common, dict):
+        max_width = common.get("max_head_width_to_shoulder_width")
+        details.extend(
+            str(value).strip()
+            for value in (
+                common.get("anatomy"),
+                common.get("shoulder_head_relation"),
+                (
+                    f"head width at most {float(max_width) * 100:g}% of shoulder width"
+                    if isinstance(max_width, (int, float))
+                    else ""
+                ),
+                common.get("extremity_scale"),
+            )
+            if value
+        )
+    forbidden = body_contract_forbidden(character)
+    forbidden_clause = f" Avoid: {', '.join(forbidden)}." if forbidden else ""
+    return (
+        "Phase 3 body lock: "
+        + "; ".join(details)
+        + "; identical in front, side and back views."
+        + forbidden_clause
+    )
+
+
 def character_visual_description(
     character: dict[str, Any],
     fallback: str = "",
@@ -314,14 +363,25 @@ def character_reference_identity_description(
         "face": "face",
         "clothing": "clothing and static accessories",
     }
+    synthetic_styling = appearance.get("synthetic_styling")
+    compact_synthetic_face = bool(
+        isinstance(synthetic_styling, dict)
+        and synthetic_styling.get("schema") == "honcut.synthetic-styling.v3"
+        and synthetic_styling.get("mode") == "synthetic_porcelain_makeup"
+    )
     static_details = []
     for key, label in labels.items():
+        # Phase 3 receives the exact synthetic face material and three visual
+        # anchors through its verified, high-priority aesthetic profile.  Do
+        # not repeat the long prose face summary and bury those exact facts.
+        if key == "face" and compact_synthetic_face:
+            continue
         value = str(appearance.get(key) or "").strip()
         if key == "clothing":
             value = static_reference_identity_text(value)
         if value:
             static_details.append(f"{label}: {value}")
-    contract = body_contract_prompt(character)
+    contract = _reference_body_contract_prompt(character)
     parts = [
         contract,
         "Static authored identity: " + "; ".join(static_details)

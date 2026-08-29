@@ -37,7 +37,7 @@ CHARACTER_SPEC_SCHEMA = "honcut.character-library-spec.v2"
 CHARACTER_APPROVAL_SCHEMA = "honcut.character-library-approval.v1"
 CHARACTER_REGISTRY_RECEIPT_SCHEMA = "honcut.character-registry-receipt.v1"
 CANONICAL_STATUS = "canonical_approved"
-CURRENT_REFERENCE_CONTRACT_VERSION = 6
+CURRENT_REFERENCE_CONTRACT_VERSION = 7
 
 
 class CharacterRegistryError(RuntimeError):

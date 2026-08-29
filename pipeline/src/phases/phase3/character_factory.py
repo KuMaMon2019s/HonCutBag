@@ -53,7 +53,6 @@ from utils.character_reference_contracts import (
 )
 from utils.character_body_contracts import character_visual_description
 from utils.camera_motion_contracts import (
-    HUMAN_PERSPECTIVE_CONTRACT,
     HUMAN_PERSPECTIVE_NEGATIVE,
 )
 
@@ -282,37 +281,28 @@ STYLE_MODIFIERS = {
 # only that pose-free identity anchor for each body view (image-to-image).
 
 REFERENCE_WEIGHT_NOTE = (
-    "Use the supplied image only for the same fictional identity, face design, hair, "
-    "body proportions, outfit details and color palette. Discard and do not copy its "
-    "pose, gesture, camera angle, framing, background, scenery, text, logos, props or "
-    "other people. The requested view contract below has absolute priority"
+    "Use the supplied image only for the fictional identity: face, hair, proportions, "
+    "outfit and colors. Ignore its pose, camera, framing, background, text, props and "
+    "people; the requested view wins"
 )
 
 SOURCE_IMAGE_RULES = (
-    "one character only, strict straight-on camera, head and shoulders only from crown "
-    "through clavicles, face occupies at least 60 percent and no more than 75 percent of "
-    "the frame, centered neutral "
-    "expression, plain neutral gray studio background, flat even reference lighting, "
-    "no full body, no action, no performance, no scenery, no street, no shop, no crowd, "
-    "no text, no signage, no logo, no hand-supported or operated object in frame, "
-    f"{HUMAN_PERSPECTIVE_CONTRACT}"
+    "one character; strict straight-on head-and-shoulders view from crown through "
+    "clavicles; face fills 60–75%; centered neutral expression; plain gray studio; even "
+    "light; no full body, action, scene, crowd, text, logo or hand-operated object; "
+    "50–85mm natural perspective; no wide-angle distortion"
 )
 
 FULL_BODY_IMAGE_RULES = (
-    "vertical 9:16 character reference, camera pulled far back, straight-on standing pose, "
-    "entire body visible from the top of the hair to the soles of both shoes, both feet fully "
-    "inside the frame, generous empty margin above the hair and below the shoes, character "
-    "occupies no more than 75 percent of canvas height, plain neutral gray studio background, "
-    "upright anatomical reference stance, arms relaxed straight down, hands open and empty, "
-    "no item held, gripped, carried by hand, raised, used or operated, feet parallel "
-    "and hip-width, weight balanced evenly, no dance, no performance, no action gesture, no "
-    "scenery, no street, no shop, no crowd, no extra person, no text, no signage, no logo, no "
-    "undeclared prop, no crop, no close-up, no medium shot, no knees or feet outside frame, "
-    f"{HUMAN_PERSPECTIVE_CONTRACT}"
+    "vertical 9:16 full-body identity reference; hair top and both shoe soles visible with "
+    "clear margins; subject uses at most 75% of canvas height; plain gray studio; upright "
+    "neutral stance; arms down, hands open and empty, feet parallel and hip-width, balanced "
+    "weight; no held item, action, scene, crowd, extra person, text, logo or crop; 50–85mm "
+    "natural perspective; no wide-angle distortion"
 )
 
 FULL_BODY_REFERENCE_SIZE = "2K"
-REFERENCE_CONTRACT_VERSION = 6
+REFERENCE_CONTRACT_VERSION = 7
 REFERENCE_GENERATION_CONTRACT_SCHEMA = "honcut.character-reference-generation.v1"
 PROP_DETAIL_QA_SCHEMA = "honcut.prop-detail-board-qa.v1"
 
@@ -388,25 +378,33 @@ def build_model_reference_prompts(
     if synthetic_styling:
         from utils.privacy_visual_policy import (
             is_current_synthetic_styling,
-            no_real_person_prompt_contract,
+            synthetic_makeup_reference_prompt_contract,
         )
 
         if not is_current_synthetic_styling(synthetic_styling):
             raise ValueError(
                 "synthetic character reference generation requires the current aesthetic profile"
             )
-        aesthetic_contract = no_real_person_prompt_contract()
+        aesthetic_contract = synthetic_makeup_reference_prompt_contract(
+            synthetic_styling
+        )
     fictional_decl = (
         "This is a fully fictional AI-generated character (virtual avatar), "
         "not a real person; the entire visual identity is a designed digital creation "
         "with no real-person likeness"
     )
     rendering = _reference_rendering_clause(style)
+    asset_boundary = (
+        ""
+        if STATIC_REFERENCE_ASSET_POLICY in character_desc
+        else f"Asset boundary: {STATIC_REFERENCE_ASSET_POLICY} "
+    )
     identity = (
-        f"{fictional_decl}. {aesthetic_contract} Static identity facts only: {character_desc}. "
-        f"Asset boundary: {STATIC_REFERENCE_ASSET_POLICY} "
-        f"Rendering medium only: {rendering}. Neutral expression. The project style is not "
-        "permission to add its story location, crowd, camera movement, pose or action. "
+        f"{aesthetic_contract}\n{fictional_decl}. "
+        f"Static identity facts only: {character_desc}. {asset_boundary}"
+        f"Rendering medium only: {rendering}. Neutral expression. Use only explicitly "
+        "declared identity facts; never invent a collar, opening, seam, ornament, prop, "
+        "location, crowd, camera movement, pose or action. "
         f"Avoid: {HUMAN_PERSPECTIVE_NEGATIVE}"
     )
     if "kling" in target_model.lower():
@@ -423,22 +421,17 @@ def build_model_reference_prompts(
         ),
         "full_body": (
             f"{identity}. VIEW CONTRACT — FRONT FULL BODY: {FULL_BODY_IMAGE_RULES}. "
-            "Face, chest, knees and toes point directly toward camera; complete outfit and "
-            "footwear visible; same identity and clothing as the supplied face reference"
+            "Face, chest, knees and toes face camera; show the complete matching outfit and footwear"
         ),
         "side": (
             f"{identity}. VIEW CONTRACT — STRICT 90-DEGREE LEFT SIDE: {FULL_BODY_IMAGE_RULES}. "
-            "Nose, chin, shoulders, torso, hips, knees and both toes point left; only one eye "
-            "is visible; no head turn and no eye contact with camera. Complete outfit and "
-            "footwear visible; same identity, proportions, clothing and accessories as the "
-            "supplied face reference"
+            "Nose, torso, hips, knees and toes point left; one eye visible; no head turn; show "
+            "the complete matching identity, proportions, outfit and footwear"
         ),
         "back": (
             f"{identity}. VIEW CONTRACT — STRICT 180-DEGREE BACK: {FULL_BODY_IMAGE_RULES}. "
-            "Camera sees only the back of the head, rear hair, both shoulder blades, spine, "
-            "rear outfit, backs of legs and heels. Face, eyes, nose, mouth, chest and front of "
-            "torso must be completely invisible; do not turn the head. Same identity, "
-            "proportions, clothing and accessories as the supplied face reference"
+            "Show rear hair, shoulders, spine, outfit, legs and heels; face and front torso "
+            "fully hidden; no head turn; match identity, proportions and outfit"
         ),
     }
 
@@ -887,18 +880,77 @@ def _archive_reference_attempt(
             shutil.copy2(path, archive / f"{name}.png")
 
 
-def _view_correction(review: dict[str, Any], view_name: str) -> str:
+def _view_correction(
+    review: dict[str, Any],
+    view_name: str,
+    *,
+    require_synthetic: bool,
+) -> str:
+    """Render only evidence-backed correction directives.
+
+    Reviewer prose is diagnostic and may invent details that are absent from
+    the authored contract.  Mapping failed evidence fields to fixed directives
+    prevents those hallucinations from being promoted into the next paid image
+    prompt.
+    """
     view = review.get("views", {}).get(view_name, {})
-    issues = [str(item) for item in view.get("issues", []) if str(item).strip()]
+    directives: list[str] = []
+    field_directives = {
+        "view_match": "obey the exact requested camera angle",
+        "framing_match": "obey the exact requested framing and show every required body edge",
+        "neutral_pose": "use the neutral anatomical identity stance, not an action pose",
+        "plain_background": "use one plain neutral gray studio background",
+        "single_character": "show exactly one character with no duplicate or extra person",
+        "declared_identity_match": "match the declared face, hair, proportions, colors and identity marks",
+        "declared_outfit_match": "match only the explicitly declared outfit and footwear",
+    }
+    for field, directive in field_directives.items():
+        if view.get(field) is not True:
+            directives.append(directive)
+    if view_name in {"full_body", "side", "back"} and view.get("hands_empty") is not True:
+        directives.append("keep both hands open and empty with no held or operated item")
+    if view_name == "side" and view.get("both_eyes_visible") is not False:
+        directives.append("show a strict left profile with exactly one eye visible")
+    if view_name == "back" and (
+        view.get("face_visible") is not False
+        or view.get("both_eyes_visible") is not False
+    ):
+        directives.append("show a strict rear view with the entire face invisible")
+    if require_synthetic and view_name != "back":
+        synthetic_directives = {
+            "synthetic_makeup_visible": "make the declared synthetic porcelain makeup clearly visible",
+            "synthetic_material_anchor_match": "show the exact declared warm pearl-ceramic face material",
+            "circuit_makeup_anchor_match": "place the exact fine circuit stripes from both temples to upper cheekbones, away from eyelids",
+            "iris_ring_anchor_match": "put a thin luminous ring inside each iris around its dark pupil, separate from eyeliner",
+            "face_unobscured": "keep the complete face unobscured",
+            "makeup_clean_and_harmonious": "keep the makeup clean, harmonious and cosmetic",
+            "no_grotesque_damage": "remove cracks, scars, seams and grotesque mechanical damage",
+            "healthy_warm_complexion": "restore a warm healthy complexion with living cheek color",
+            "lively_eyes_with_catchlights": "show clear pupils, layered irises and bright catchlights",
+            "living_color_in_cheeks_and_lips": "restore coordinated warm cheek and coral lip color",
+            "no_uncanny_or_corpse_like_styling": "remove corpse-like, waxy or horror styling",
+        }
+        for field, directive in synthetic_directives.items():
+            if view.get(field) is not True:
+                directives.append(directive)
     cross = review.get("cross_view", {})
-    issues.extend(
-        str(item) for item in cross.get("issues", []) if str(item).strip()
-    )
-    if not issues:
-        issues.append(
+    cross_directives = {
+        "identity_consistent": "match the same identity across all four views",
+        "outfit_consistent": "match the same declared outfit across all four views",
+        "body_proportions_consistent": "match the same body proportions across all four views",
+    }
+    if require_synthetic:
+        cross_directives["synthetic_makeup_consistent"] = (
+            "match the same synthetic makeup geometry and colors across all face-visible views"
+        )
+    for field, directive in cross_directives.items():
+        if cross.get(field) is not True:
+            directives.append(directive)
+    if not directives:
+        directives.append(
             "wrong view angle, framing, neutral stance, studio background, or cross-view identity"
         )
-    return "; ".join(dict.fromkeys(issues))
+    return "; ".join(dict.fromkeys(directives))
 
 
 def _quality_control_reference_views(
@@ -1017,7 +1069,11 @@ def _quality_control_reference_views(
                 output_path=view_paths[name],
                 size=_reference_view_size(name, default_size),
                 identity_anchor=identity_anchor,
-                correction=_view_correction(result, name),
+                correction=_view_correction(
+                    result,
+                    name,
+                    require_synthetic=bool(synthetic_styling),
+                ),
             )
 
     raise AssertionError("unreachable character reference QA state")

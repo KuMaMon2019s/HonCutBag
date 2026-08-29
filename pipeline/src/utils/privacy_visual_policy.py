@@ -100,7 +100,14 @@ def _load_synthetic_makeup_aesthetic_profile() -> tuple[dict[str, Any], str]:
     prompt = payload.get("production_prompt")
     if not isinstance(prompt, dict):
         raise SyntheticMakeupProfileError("synthetic makeup production prompt is missing")
-    for key in ("positive", "negative", "qa_requirements"):
+    for key in (
+        "positive",
+        "negative",
+        "qa_requirements",
+        "phase3_reference_priority",
+        "phase3_reference_negative",
+        "phase3_reference_qa",
+    ):
         _string_list(prompt.get(key), field=f"production_prompt.{key}")
 
     references = payload.get("references")
@@ -150,6 +157,17 @@ def synthetic_makeup_qa_requirements() -> tuple[str, ...]:
     return tuple(qa_requirements)
 
 
+def synthetic_makeup_reference_qa_requirements() -> tuple[str, ...]:
+    """Return Phase 3 evidence rules grounded in the checked-in visual profile."""
+    payload, _profile_sha256 = _load_synthetic_makeup_aesthetic_profile()
+    return tuple(
+        _string_list(
+            payload["production_prompt"]["phase3_reference_qa"],
+            field="production_prompt.phase3_reference_qa",
+        )
+    )
+
+
 def _synthetic_makeup_prompt_lists() -> tuple[list[str], list[str], list[str]]:
     payload, _profile_sha256 = _load_synthetic_makeup_aesthetic_profile()
     prompt = payload["production_prompt"]
@@ -184,6 +202,51 @@ def is_current_synthetic_styling(value: Any) -> bool:
         and value.get("aesthetic_profile_id") == SYNTHETIC_MAKEUP_PROFILE_ID
         and value.get("aesthetic_profile_sha256")
         == synthetic_makeup_profile_sha256()
+    )
+
+
+def synthetic_makeup_reference_prompt_contract(
+    styling: dict[str, Any],
+) -> str:
+    """Build the compact, high-priority Phase 3 makeup prompt.
+
+    The checked-in visual-understanding profile owns aesthetic language.  The
+    character record owns deterministic colors and anchors.  Keeping this
+    Phase 3 block concise prevents the exact eye and cheek geometry from being
+    buried under the wider video/privacy negative contract.
+    """
+    if not is_current_synthetic_styling(styling):
+        raise SyntheticMakeupProfileError(
+            "Phase 3 synthetic reference prompt requires current styling"
+        )
+    anchors = styling.get("visible_anchors")
+    if not isinstance(anchors, list) or len(anchors) != 3:
+        raise SyntheticMakeupProfileError(
+            "Phase 3 synthetic reference prompt requires exactly three anchors"
+        )
+    normalized_anchors = [str(value).strip() for value in anchors]
+    if any(not value for value in normalized_anchors):
+        raise SyntheticMakeupProfileError(
+            "Phase 3 synthetic reference prompt contains an empty anchor"
+        )
+    payload, _profile_sha256 = _load_synthetic_makeup_aesthetic_profile()
+    production_prompt = payload["production_prompt"]
+    priority = _string_list(
+        production_prompt["phase3_reference_priority"],
+        field="production_prompt.phase3_reference_priority",
+    )
+    negative = _string_list(
+        production_prompt["phase3_reference_negative"],
+        field="production_prompt.phase3_reference_negative",
+    )
+    return "\n".join(
+        [
+            "[PHASE 3 SYNTHETIC IDENTITY — TOP PRIORITY]",
+            "All three declared face anchors are mandatory in every face-visible reference:",
+            *(f"- {index}. {value}" for index, value in enumerate(normalized_anchors, 1)),
+            *(f"- {value}" for value in priority),
+            "Avoid: " + "；".join(negative),
+        ]
     )
 
 
@@ -389,9 +452,10 @@ def _synthetic_identity(character: dict[str, Any], index: int) -> dict[str, Any]
         "face": (
             f"面部完整无遮挡，五官比例协调、表情自然且{presentation}，目光清醒并有明亮眼神光；"
             f"表面为温润透亮的{material_color}珍珠陶瓷合成皮肤，无真人毛孔，同时保留协调的"
-            f"面颊暖意与珊瑚唇色；从太阳穴到颧骨只有一条{accent}纤细、对称、首饰般的虹彩"
-            f"电路妆纹，像高级彩妆而不是裂缝；虹膜保留清晰瞳孔与层次，只在外缘形成柔和"
-            f"{primary}非自然光环；妆造编号{design_id}，不是人类皮肤或真人肖像"
+            f"面颊暖意与珊瑚唇色；两侧太阳穴各起一条{accent}纤细、对称、首饰般的虹彩"
+            f"电路妆纹，在两侧上颧骨结束且不贴眼睑；每只眼睛的虹膜内部保留清晰深色瞳孔与"
+            f"层次，并有一圈与眼线分离的柔和{primary}非自然光环；妆造编号{design_id}，"
+            "不是人类皮肤或真人肖像"
         ),
         "anchors": [
             f"{material_color}珍珠陶瓷合成皮肤",

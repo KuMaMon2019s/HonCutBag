@@ -19,7 +19,7 @@ from utils.character_reference_contracts import (
     identity_detail_prompt_items,
 )
 
-CHARACTER_REFERENCE_QA_SCHEMA = "honcut.character-reference-qa.v4"
+CHARACTER_REFERENCE_QA_SCHEMA = "honcut.character-reference-qa.v5"
 SEEDANCE_REFERENCE_VIEWS = ("face_closeup", "full_body", "side", "back")
 
 
@@ -74,13 +74,18 @@ def build_character_reference_qa_prompt(
     )
     synthetic_contract = ""
     if synthetic_styling:
-        from utils.privacy_visual_policy import synthetic_makeup_qa_requirements
+        from utils.privacy_visual_policy import (
+            synthetic_makeup_qa_requirements,
+            synthetic_makeup_reference_qa_requirements,
+        )
 
         synthetic_contract = f"""
 Synthetic face contract (blocking):
 {json.dumps(synthetic_styling, ensure_ascii=False, sort_keys=True)}
 Structured aesthetic QA requirements:
 {json.dumps(synthetic_makeup_qa_requirements(), ensure_ascii=False)}
+Phase 3 evidence discipline:
+{json.dumps(synthetic_makeup_reference_qa_requirements(), ensure_ascii=False)}
 Every face-visible view must show the same declared synthetic porcelain makeup, keep the
 whole face unobscured, preserve clean harmonious facial anatomy, and contain no grotesque
 damage. The pearl ceramic complexion must look warm, healthy and elegant rather than gray,
@@ -89,6 +94,10 @@ bright catchlights instead of a blank solid glow; cheeks and lips must keep coor
 color. Circuit makeup must look like fine decorative cosmetics, never cuts, cracks or surgical
 seams. Photoreal untreated human skin or a hidden face is a failure. The back view is exempt
 from face visibility but must preserve the same hair and rear identity design.
+For each face-visible view, report three independent anchor facts: the declared pearl-ceramic
+material, the declared temple-to-upper-cheekbone circuit makeup, and the declared luminous ring
+inside the iris around a dark pupil. An iris ring is not eyeliner: it must be visibly separated
+from the eyelid and eyelashes. Do not collapse these facts into synthetic_profile_match.
 """
     return f"""You are the blocking Phase 3 character-reference inspector.
 The input images are ordered and labelled by filename. Judge geometry and semantics, not beauty.
@@ -108,6 +117,11 @@ background. No street, shop, crowd, scenery, performance, dance pose, action pos
 prop, text, watermark or logo is allowed. Full-body views must use the same neutral anatomical
 reference stance. Body-worn or fastened wardrobe/accessories, face, hair, apparent age, head
 scale and body proportions must remain the same across views.
+Judge only the static facts explicitly written above. Never invent an undeclared collar, neckline,
+opening, seam, ornament or accessory. In particular, "long-sleeved top" does not mean "high-neck
+top"; when no neckline is declared, a clean round neck or high neck is not a mismatch. The model's
+passed, failed_views and prose issues are diagnostic only; HonCut recomputes the verdict from the
+individual evidence booleans below.
 
 Return one JSON object only:
 {{
@@ -122,8 +136,13 @@ Return one JSON object only:
       "single_character": true,
       "face_visible": true,
       "both_eyes_visible": false,
+      "declared_identity_match": true,
+      "declared_outfit_match": true,
       "synthetic_makeup_visible": true,
       "synthetic_profile_match": true,
+      "synthetic_material_anchor_match": true,
+      "circuit_makeup_anchor_match": true,
+      "iris_ring_anchor_match": true,
       "face_unobscured": true,
       "makeup_clean_and_harmonious": true,
       "no_grotesque_damage": true,
@@ -252,8 +271,13 @@ def parse_character_reference_qa(
             raise CharacterReferenceQAError(f"character reference QA omitted {name}")
         issues = evidence.get("issues")
         issues = issues if isinstance(issues, list) else [str(issues or "")]
-        passed = evidence.get("passed") is True and all(
-            evidence.get(field) is True for field in boolean_fields
+        authored_fields = (
+            "declared_identity_match",
+            "declared_outfit_match",
+        )
+        passed = all(
+            evidence.get(field) is True
+            for field in (*boolean_fields, *authored_fields)
         )
         if name == "back":
             passed = (
@@ -268,6 +292,9 @@ def parse_character_reference_qa(
         synthetic_fields = (
             "synthetic_makeup_visible",
             "synthetic_profile_match",
+            "synthetic_material_anchor_match",
+            "circuit_makeup_anchor_match",
+            "iris_ring_anchor_match",
             "face_unobscured",
             "makeup_clean_and_harmonious",
             "no_grotesque_damage",
@@ -279,12 +306,14 @@ def parse_character_reference_qa(
         if require_synthetic and name != "back":
             passed = passed and all(
                 evidence.get(field) is True for field in synthetic_fields
+                if field != "synthetic_profile_match"
             )
         if not passed:
             failed.add(name)
         normalized_views[name] = {
             "passed": passed,
             **{field: evidence.get(field) is True for field in boolean_fields},
+            **{field: evidence.get(field) is True for field in authored_fields},
             "face_visible": evidence.get("face_visible") is True,
             "both_eyes_visible": evidence.get("both_eyes_visible") is True,
             "hands_empty": evidence.get("hands_empty") is True,
@@ -300,16 +329,13 @@ def parse_character_reference_qa(
         "outfit_consistent",
         "body_proportions_consistent",
     )
-    cross_passed = cross.get("passed") is True and all(
+    cross_passed = all(
         cross.get(field) is True for field in cross_fields
     )
     if require_synthetic:
         cross_passed = (
             cross_passed and cross.get("synthetic_makeup_consistent") is True
         )
-    declared_failed = payload.get("failed_views")
-    if isinstance(declared_failed, list):
-        failed.update(str(name) for name in declared_failed if name in view_names)
     if not cross_passed and not failed:
         failed.update(view_names)
 

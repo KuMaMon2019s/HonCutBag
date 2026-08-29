@@ -235,6 +235,8 @@ def test_phase3_derives_prop_board_and_disables_state_variant_pixels(
                 "single_character": True,
                 "face_visible": True,
                 "both_eyes_visible": True,
+                "declared_identity_match": True,
+                "declared_outfit_match": True,
                 "issues": [],
             }
             return json.dumps({

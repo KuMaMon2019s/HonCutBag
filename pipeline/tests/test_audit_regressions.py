@@ -3676,6 +3676,8 @@ def test_phase3_reference_generation_uses_face_only_as_identity_anchor(
                 "single_character": True,
                 "face_visible": True,
                 "both_eyes_visible": True,
+                "declared_identity_match": True,
+                "declared_outfit_match": True,
                 "issues": [],
             }
             back = {
@@ -3741,9 +3743,9 @@ def test_phase3_reference_generation_uses_face_only_as_identity_anchor(
     assert all("7-Eleven" not in call[1] for call in calls)
     assert all("cheering crowd" not in call[1] for call in calls)
     assert "strict 90-degree left side" in calls[2][1].lower()
-    assert "face, eyes, nose, mouth" in calls[3][1].lower()
+    assert "face and front torso fully hidden" in calls[3][1].lower()
     assert "previous back failed blocking view qa" in calls[4][1].lower()
-    assert "front-facing face is visible" in calls[4][1].lower()
+    assert "strict rear view with the entire face invisible" in calls[4][1].lower()
     assert (tmp_path / "characters/agent/reference_qa_attempts/attempt_01/back.png").is_file()
     assert (tmp_path / "characters/agent/reference_board.png").is_file()
     assert (tmp_path / "characters/agent/reference_board.json").is_file()
@@ -3753,7 +3755,7 @@ def test_phase3_reference_generation_uses_face_only_as_identity_anchor(
     assert card["reference_board_receipt"] == (
         "characters/agent/reference_board.json"
     )
-    assert card["reference_contract_version"] == 6
+    assert card["reference_contract_version"] == 7
     assert card["reference_generation_contract"]["schema"] == (
         "honcut.character-reference-generation.v1"
     )
@@ -3980,6 +3982,8 @@ def test_character_reference_qa_recomputes_wrong_view_verdict():
         "single_character": True,
         "face_visible": True,
         "both_eyes_visible": False,
+        "declared_identity_match": True,
+        "declared_outfit_match": True,
         "issues": [],
     }
     payload = {
@@ -4019,6 +4023,8 @@ def test_character_reference_qa_requires_empty_hands_in_seedance_body_views():
         "single_character": True,
         "face_visible": True,
         "both_eyes_visible": True,
+        "declared_identity_match": True,
+        "declared_outfit_match": True,
         "issues": [],
     }
     payload = {
@@ -4060,8 +4066,13 @@ def test_character_reference_qa_requires_visible_harmonious_synthetic_makeup():
         "single_character": True,
         "face_visible": True,
         "both_eyes_visible": True,
+        "declared_identity_match": True,
+        "declared_outfit_match": True,
         "synthetic_makeup_visible": True,
         "synthetic_profile_match": True,
+        "synthetic_material_anchor_match": True,
+        "circuit_makeup_anchor_match": True,
+        "iris_ring_anchor_match": True,
         "face_unobscured": True,
         "makeup_clean_and_harmonious": True,
         "no_grotesque_damage": True,
@@ -4117,8 +4128,13 @@ def test_character_reference_qa_rejects_corpse_like_synthetic_makeup():
         "single_character": True,
         "face_visible": True,
         "both_eyes_visible": True,
+        "declared_identity_match": True,
+        "declared_outfit_match": True,
         "synthetic_makeup_visible": True,
         "synthetic_profile_match": True,
+        "synthetic_material_anchor_match": True,
+        "circuit_makeup_anchor_match": True,
+        "iris_ring_anchor_match": True,
         "face_unobscured": True,
         "makeup_clean_and_harmonious": True,
         "no_grotesque_damage": True,
@@ -4163,6 +4179,121 @@ def test_character_reference_qa_rejects_corpse_like_synthetic_makeup():
     assert review["passed"] is False
     assert review["failed_views"] == ["face_closeup"]
     assert review["views"]["face_closeup"]["healthy_warm_complexion"] is False
+
+
+def test_character_reference_qa_recomputes_evidence_without_invented_neckline():
+    passing_view = {
+        # The reviewer-level verdict and prose are deliberately wrong.  The
+        # individual contract facts remain the only acceptance evidence.
+        "passed": False,
+        "view_match": True,
+        "framing_match": True,
+        "neutral_pose": True,
+        "hands_empty": True,
+        "plain_background": True,
+        "single_character": True,
+        "face_visible": True,
+        "both_eyes_visible": True,
+        "declared_identity_match": True,
+        "declared_outfit_match": True,
+        "synthetic_makeup_visible": True,
+        "synthetic_profile_match": False,
+        "synthetic_material_anchor_match": True,
+        "circuit_makeup_anchor_match": True,
+        "iris_ring_anchor_match": True,
+        "face_unobscured": True,
+        "makeup_clean_and_harmonious": True,
+        "no_grotesque_damage": True,
+        "healthy_warm_complexion": True,
+        "lively_eyes_with_catchlights": True,
+        "living_color_in_cheeks_and_lips": True,
+        "no_uncanny_or_corpse_like_styling": True,
+        "issues": ["round neck, but an undeclared high neck was expected"],
+    }
+    payload = {
+        "views": {
+            "face_closeup": passing_view,
+            "full_body": passing_view,
+            "side": {**passing_view, "both_eyes_visible": False},
+            "back": {
+                **passing_view,
+                "face_visible": False,
+                "both_eyes_visible": False,
+            },
+        },
+        "cross_view": {
+            "passed": False,
+            "identity_consistent": True,
+            "outfit_consistent": True,
+            "body_proportions_consistent": True,
+            "synthetic_makeup_consistent": True,
+            "issues": ["invented neckline requirement"],
+        },
+        "failed_views": ["face_closeup", "full_body", "side", "back"],
+        "summary": "wrong aggregate verdict",
+    }
+
+    review = parse_character_reference_qa(
+        json.dumps(payload),
+        require_synthetic=True,
+    )
+
+    assert review["passed"] is True
+    assert review["failed_views"] == []
+
+
+def test_character_reference_qa_requires_each_declared_face_anchor():
+    passing = {
+        "passed": True,
+        "view_match": True,
+        "framing_match": True,
+        "neutral_pose": True,
+        "hands_empty": True,
+        "plain_background": True,
+        "single_character": True,
+        "face_visible": True,
+        "both_eyes_visible": True,
+        "declared_identity_match": True,
+        "declared_outfit_match": True,
+        "synthetic_makeup_visible": True,
+        "synthetic_profile_match": True,
+        "synthetic_material_anchor_match": True,
+        "circuit_makeup_anchor_match": True,
+        "iris_ring_anchor_match": True,
+        "face_unobscured": True,
+        "makeup_clean_and_harmonious": True,
+        "no_grotesque_damage": True,
+        "healthy_warm_complexion": True,
+        "lively_eyes_with_catchlights": True,
+        "living_color_in_cheeks_and_lips": True,
+        "no_uncanny_or_corpse_like_styling": True,
+        "issues": [],
+    }
+    payload = {
+        "views": {
+            "face_closeup": {**passing, "iris_ring_anchor_match": False},
+            "full_body": passing,
+            "side": {**passing, "both_eyes_visible": False},
+            "back": {**passing, "face_visible": False, "both_eyes_visible": False},
+        },
+        "cross_view": {
+            "passed": True,
+            "identity_consistent": True,
+            "outfit_consistent": True,
+            "body_proportions_consistent": True,
+            "synthetic_makeup_consistent": True,
+            "issues": [],
+        },
+        "failed_views": [],
+    }
+
+    review = parse_character_reference_qa(
+        json.dumps(payload),
+        require_synthetic=True,
+    )
+
+    assert review["passed"] is False
+    assert review["failed_views"] == ["face_closeup"]
 
 
 def test_character_discovery_body_contract_is_prompted_and_normalized(monkeypatch):

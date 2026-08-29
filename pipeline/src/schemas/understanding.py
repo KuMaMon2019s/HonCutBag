@@ -377,8 +377,13 @@ class CharacterReferenceViewUnderstanding(StrictUnderstandingModel):
     single_character: bool
     face_visible: bool
     both_eyes_visible: bool
+    declared_identity_match: bool | None = None
+    declared_outfit_match: bool | None = None
     synthetic_makeup_visible: bool | None = None
     synthetic_profile_match: bool | None = None
+    synthetic_material_anchor_match: bool | None = None
+    circuit_makeup_anchor_match: bool | None = None
+    iris_ring_anchor_match: bool | None = None
     face_unobscured: bool | None = None
     makeup_clean_and_harmonious: bool | None = None
     no_grotesque_damage: bool | None = None
