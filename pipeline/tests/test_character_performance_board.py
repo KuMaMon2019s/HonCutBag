@@ -18,6 +18,7 @@ from phases.phase3.performance_reference_board import (
     build_character_performance_prompt,
     generate_character_performance_board,
     performance_prompt_optimization_contract,
+    _review_performance_cell_components,
     validate_character_performance_board,
     validate_character_performance_guide,
 )
@@ -972,6 +973,43 @@ def test_old_board_and_cell_qa_schemas_fail_closed(tmp_path):
     qa_path.write_text(json.dumps(qa), encoding="utf-8")
     assert not validate_character_performance_board(tmp_path, "lead")
 
+
+def test_known_legacy_cell_qa_is_audited_then_rereviewed_without_image_call(tmp_path):
+    _write_reference_assets(tmp_path)
+    image_client = _FallbackImageClient()
+    generate_character_performance_board(
+        tmp_path,
+        _storyboard(),
+        _character(),
+        image_client=image_client,
+        review_client=_FailThenPassReviewClient(),
+    )
+    board_receipt = json.loads(
+        (tmp_path / "characters/lead/performance_reference_board.json").read_text()
+    )
+    components = board_receipt["component_cells"]
+    qa_path = (tmp_path / components[0]["image"]).with_suffix(".qa.json")
+    legacy = json.loads(qa_path.read_text())
+    legacy["schema"] = "honcut.character-performance-cell-qa.v3"
+    qa_path.write_text(json.dumps(legacy))
+    review_client = _ReviewClient()
+    image_call_count = len(image_client.calls)
+
+    results = _review_performance_cell_components(
+        tmp_path,
+        "lead",
+        board_receipt["plan"],
+        components,
+        board_receipt["references"],
+        review_client=review_client,
+        synthetic_styling=_character()["appearance"]["synthetic_styling"],
+    )
+
+    assert len(results) == 6
+    assert all(result["passed"] is True for result in results)
+    assert len(image_client.calls) == image_call_count
+    assert len(review_client.calls) == 1
+    assert qa_path.with_name("A01.qa.audit.v3.json").is_file()
 
 def test_missing_pose_guide_or_future_cell_qa_fails_closed(tmp_path):
     _write_reference_assets(tmp_path)

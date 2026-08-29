@@ -56,6 +56,11 @@ PERFORMANCE_CELL_PIXEL_SIZE = (2048, 2048)
 PERFORMANCE_POSE_GUIDE_PIXEL_SIZE = (1024, 1024)
 PERFORMANCE_COMPOSITION_MODE = "locally_feathered_2x3_v2"
 PERFORMANCE_MAX_CELL_CORRECTION_ROUNDS = 1
+LEGACY_PERFORMANCE_CELL_QA_SCHEMAS = frozenset({
+    "honcut.character-performance-cell-qa.v1",
+    "honcut.character-performance-cell-qa.v2",
+    "honcut.character-performance-cell-qa.v3",
+})
 PERFORMANCE_CELL_IDS = tuple(f"A{index:02d}" for index in range(1, 7))
 PERFORMANCE_POSE_VOCABULARY = (
     "combat_ready",
@@ -1782,9 +1787,17 @@ def _review_performance_cell_components(
         if qa_path.is_file() and cached is None:
             raise CharacterPerformanceQAError(f"{character_id} {cell_id} QA receipt is corrupt")
         if cached is not None and cached.get("schema") != CHARACTER_PERFORMANCE_CELL_QA_SCHEMA:
-            raise CharacterPerformanceQAError(
-                f"{character_id} {cell_id} QA receipt schema is unknown"
+            legacy_schema = str(cached.get("schema") or "")
+            if legacy_schema not in LEGACY_PERFORMANCE_CELL_QA_SCHEMAS:
+                raise CharacterPerformanceQAError(
+                    f"{character_id} {cell_id} QA receipt schema is unknown"
+                )
+            legacy_version = legacy_schema.rsplit(".", 1)[-1]
+            audit_path = qa_path.with_name(
+                f"{qa_path.stem}.audit.{legacy_version}.json"
             )
+            _atomic_json(audit_path, cached)
+            cached = None
         cache_valid = bool(
             cached is not None
             and all(cached.get(key) == value for key, value in expected.items())
