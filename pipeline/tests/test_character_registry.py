@@ -86,10 +86,18 @@ def _write_approved_pack(output_dir: Path, character: dict) -> Path:
         "failed_views": [],
         "summary": "all canonical views passed",
     }
+    generation_contract = {
+        "schema": "honcut.character-reference-generation.v1",
+        "reference_contract_version": 6,
+        "model": "doubao-seedream-5.0-lite",
+        "prompt_sha256": {view: "a" * 64 for view in VIEWS},
+        "synthetic_styling_sha256": None,
+    }
     qa_receipt = build_character_reference_qa_receipt(
         char_id=char_id,
         view_paths=view_paths,
         attempts=[attempt],
+        generation_contract=generation_contract,
     )
     (char_dir / "character_reference_qa.json").write_text(
         json.dumps(qa_receipt, ensure_ascii=False), encoding="utf-8"
@@ -103,7 +111,9 @@ def _write_approved_pack(output_dir: Path, character: dict) -> Path:
         "id": char_id,
         "name": character["name"],
         "description": character["description"],
-        "reference_contract_version": 5,
+        "reference_contract_version": 6,
+        "reference_generation_contract": generation_contract,
+        "synthetic_styling": None,
         "reference_images": {view: f"characters/{char_id}/{view}.png" for view in VIEWS},
         "reference_qa_report": (f"characters/{char_id}/character_reference_qa.json"),
         "reference_board": f"characters/{char_id}/reference_board.png",

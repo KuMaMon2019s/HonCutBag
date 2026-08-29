@@ -351,7 +351,20 @@ def _check_red_line(rule_id: str, output_dir: Path,
             report_path = Path(str(report_value))
             if not report_path.is_absolute():
                 report_path = output_dir / report_path
-            if not validate_character_reference_qa_receipt(report_path, view_paths):
+            if not validate_character_reference_qa_receipt(
+                report_path,
+                view_paths,
+                synthetic_styling=(
+                    card.get("synthetic_styling")
+                    if isinstance(card.get("synthetic_styling"), dict)
+                    else None
+                ),
+                generation_contract=(
+                    card.get("reference_generation_contract")
+                    if isinstance(card.get("reference_generation_contract"), dict)
+                    else None
+                ),
+            ):
                 return False
             identity_props = card.get("identity_props")
             if isinstance(identity_props, list) and identity_props:

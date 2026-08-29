@@ -2085,13 +2085,25 @@ def test_final_vlm_uses_persisted_synthetic_contract_after_env_is_gone(
     monkeypatch.delenv("HONCUT_NO_REAL_PERSON", raising=False)
     (tmp_path / "CHARACTERS.json").write_text(
         json.dumps({
+            "visual_identity_policy": "synthetic_stylized_character_v3",
             "characters": [{
                 "id": "photographer",
+                "visual_identity_policy": "synthetic_stylized_character_v3",
                 "appearance": {
                     "gender": "synthetic",
-                    "face": "哑光藏蓝 #1B2A41 全封闭机械头盔，深红面甲",
+                    "face": "珍珠生体瓷合成肤质，藏蓝 #1B2A41 虹彩电路妆纹，深红柔光虹膜环，面部完整可见",
                     "clothing": "黑色摄影背心，银色肩章",
                     "distinguishing": "胸前冷白相机编号灯",
+                    "synthetic_styling": {
+                        "schema": "honcut.synthetic-styling.v3",
+                        "mode": "synthetic_porcelain_makeup",
+                        "makeup_design_id": "porcelain-photographer",
+                        "non_human_material": "pearl bio-ceramic complexion",
+                        "visible_anchors": [
+                            "藏蓝 #1B2A41 虹彩电路妆纹",
+                            "深红柔光虹膜环",
+                        ],
+                    },
                 },
                 "distinguishing_features": ["摄影背心", "冷白相机编号灯"],
             }],
@@ -2119,12 +2131,13 @@ def test_final_vlm_uses_persisted_synthetic_contract_after_env_is_gone(
         output_dir=tmp_path,
     )
 
-    assert result["qa_contract"] == "synthetic_character_styling_consistency_v2"
-    assert "not human-anatomy defects" in prompts[0]
+    assert result["qa_contract"] == "synthetic_character_styling_consistency_v3"
+    assert "pearl bio-ceramic complexion" in prompts[0]
+    assert "complete face must stay visible" in prompts[0]
     assert "untreated natural human face is a failure" in prompts[0]
     assert "face-styling/material color drift" in prompts[0]
     assert "藏蓝 #1B2A41" in prompts[0]
-    assert "深红面甲" in prompts[0]
+    assert "深红柔光虹膜环" in prompts[0]
     assert "Shared styling families do not permit identity merging" in prompts[0]
     evidence = result["qa_contract_evidence"]
     assert evidence["identity_contract_complete"] is True
@@ -2149,7 +2162,7 @@ def test_final_vlm_uses_live_synthetic_policy_without_character_artifact(
 
     result = video_qa._vlm_semantic_check(FakeClient(), frames, None)
 
-    assert result["qa_contract"] == "synthetic_character_styling_consistency_v2"
+    assert result["qa_contract"] == "synthetic_character_styling_consistency_v3"
 
 
 def test_final_vlm_blocks_incomplete_synthetic_identity_evidence(
@@ -2614,7 +2627,7 @@ def test_phase8_vlm_switches_to_synthetic_structure_contract_from_artifacts(
 
     result = reviewer([frame], {"shot_id": "S01", "who": ["摄影师"]})
 
-    assert result["qa_contract"] == "synthetic_character_styling_consistency_v2"
+    assert result["qa_contract"] == "synthetic_character_styling_consistency_v3"
     assert "Declared veils/masks, graphic makeup, facial tattoos" in captured["prompt"]
     assert "must never be copied onto every role" in captured["prompt"]
     assert "not human-anatomy defects" in captured["prompt"]
@@ -3734,11 +3747,14 @@ def test_phase3_reference_generation_uses_face_only_as_identity_anchor(
     assert card["reference_board_receipt"] == (
         "characters/agent/reference_board.json"
     )
-    assert card["reference_contract_version"] == 5
+    assert card["reference_contract_version"] == 6
+    assert card["reference_generation_contract"]["schema"] == (
+        "honcut.character-reference-generation.v1"
+    )
     assert run_quality_check("phase3", tmp_path).passed is True
 
 
-def test_phase3_existing_pack_retries_review_without_regenerating_images(
+def test_phase3_exact_contract_pack_reuses_without_provider_requests(
     monkeypatch, tmp_path
 ):
     from PIL import Image
@@ -3749,10 +3765,31 @@ def test_phase3_existing_pack_retries_review_without_regenerating_images(
         Image.effect_noise((512, 512), 24 * index).convert("RGB").save(
             char_dir / f"{name}.png"
         )
+    prompts = character_factory.build_model_reference_prompts(
+        "adult woman; neutral identity reference",
+        target_model="seedance",
+    )
+    generation_contract = character_factory.build_reference_generation_contract(
+        prompts=prompts,
+        model="doubao-seedream-5.0-lite",
+        synthetic_styling=None,
+    )
+    view_paths = {
+        name: char_dir / f"{name}.png" for name in prompts
+    }
+    exact_receipt = build_character_reference_qa_receipt(
+        char_id="agent",
+        view_paths=view_paths,
+        attempts=[{"attempt": 1, "passed": True, "failed_views": []}],
+        generation_contract=generation_contract,
+    )
+    (char_dir / "character_reference_qa.json").write_text(
+        json.dumps(exact_receipt), encoding="utf-8"
+    )
 
     class ImageClient:
         def __init__(self, **_kwargs):
-            pass
+            pytest.fail("an exact contract pack must not create an image client")
 
         def text_to_image(self, **_kwargs):
             pytest.fail("a complete existing pack must be reviewed before regeneration")
@@ -3761,72 +3798,26 @@ def test_phase3_existing_pack_retries_review_without_regenerating_images(
             pytest.fail("a parse retry must not regenerate images")
 
     class Reviewer:
-        def __init__(self):
-            self.calls = 0
-
         def review(self, _paths, _prompt):
-            self.calls += 1
-            if self.calls == 1:
-                return "```json\n{\"views\": "
-            common = {
-                "passed": True,
-                "view_match": True,
-                "framing_match": True,
-                "neutral_pose": True,
-                "hands_empty": True,
-                "plain_background": True,
-                "single_character": True,
-                "face_visible": True,
-                "both_eyes_visible": True,
-                "issues": [],
-            }
-            payload = {
-                "views": {
-                    "face_closeup": common,
-                    "full_body": common,
-                    "side": {**common, "both_eyes_visible": False},
-                    "back": {
-                        **common,
-                        "face_visible": False,
-                        "both_eyes_visible": False,
-                    },
-                },
-                "cross_view": {
-                    "passed": True,
-                    "identity_consistent": True,
-                    "outfit_consistent": True,
-                    "body_proportions_consistent": True,
-                    "issues": [],
-                },
-                "failed_views": [],
-                "summary": "all contracts pass",
-            }
-            # Native structured output returns exactly one complete value;
-            # trailing prose/objects are contract violations, not evidence.
-            return json.dumps(payload)
+            pytest.fail("an exact contract pack must not be re-reviewed")
 
     monkeypatch.setattr(character_factory, "SeedreamClient", ImageClient)
-    reviewer = Reviewer()
     result = character_factory.generate_character(
         char_id="agent",
         name="Agent",
         description="adult woman; neutral identity reference",
         output_dir=str(tmp_path),
-        review_client=reviewer,
+        review_client=Reviewer(),
         view_qa_max_retries=0,
         review_qa_max_retries=1,
     )
 
-    assert reviewer.calls == 2
     assert not (char_dir / "reference_qa_attempts").exists()
     receipt = json.loads(
         (char_dir / "character_reference_qa.json").read_text(encoding="utf-8")
     )
     assert receipt["status"] == "passed"
-    assert [item["attempt_kind"] for item in receipt["attempts"]] == [
-        "review_error",
-        "semantic_review",
-    ]
+    assert receipt["generation_contract"] == generation_contract
     assert Path(result["card"]).is_file()
 
 
@@ -4050,6 +4041,59 @@ def test_character_reference_qa_requires_empty_hands_in_seedance_body_views():
     assert review["passed"] is False
     assert review["failed_views"] == ["full_body"]
     assert review["views"]["full_body"]["hands_empty"] is False
+
+
+def test_character_reference_qa_requires_visible_harmonious_synthetic_makeup():
+    passing_view = {
+        "passed": True,
+        "view_match": True,
+        "framing_match": True,
+        "neutral_pose": True,
+        "hands_empty": True,
+        "plain_background": True,
+        "single_character": True,
+        "face_visible": True,
+        "both_eyes_visible": True,
+        "synthetic_makeup_visible": True,
+        "synthetic_profile_match": True,
+        "face_unobscured": True,
+        "makeup_clean_and_harmonious": True,
+        "no_grotesque_damage": True,
+        "issues": [],
+    }
+    payload = {
+        "views": {
+            "face_closeup": {
+                **passing_view,
+                "synthetic_makeup_visible": False,
+                "issues": ["untreated photoreal human skin"],
+            },
+            "full_body": passing_view,
+            "side": {**passing_view, "both_eyes_visible": False},
+            "back": {
+                **passing_view,
+                "face_visible": False,
+                "both_eyes_visible": False,
+            },
+        },
+        "cross_view": {
+            "passed": True,
+            "identity_consistent": True,
+            "outfit_consistent": True,
+            "body_proportions_consistent": True,
+            "synthetic_makeup_consistent": True,
+            "issues": [],
+        },
+        "failed_views": [],
+    }
+
+    review = parse_character_reference_qa(
+        json.dumps(payload),
+        require_synthetic=True,
+    )
+
+    assert review["passed"] is False
+    assert review["failed_views"] == ["face_closeup"]
 
 
 def test_character_discovery_body_contract_is_prompted_and_normalized(monkeypatch):

@@ -376,6 +376,11 @@ class CharacterReferenceViewUnderstanding(StrictUnderstandingModel):
     single_character: bool
     face_visible: bool
     both_eyes_visible: bool
+    synthetic_makeup_visible: bool | None = None
+    synthetic_profile_match: bool | None = None
+    face_unobscured: bool | None = None
+    makeup_clean_and_harmonious: bool | None = None
+    no_grotesque_damage: bool | None = None
     issues: list[str]
 
 
@@ -384,6 +389,7 @@ class CharacterCrossViewUnderstanding(StrictUnderstandingModel):
     identity_consistent: bool
     outfit_consistent: bool
     body_proportions_consistent: bool
+    synthetic_makeup_consistent: bool | None = None
     issues: list[str]
 
 

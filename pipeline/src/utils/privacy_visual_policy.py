@@ -10,25 +10,29 @@ from pathlib import Path
 from typing import Any
 
 NO_REAL_PERSON_ENV = "HONCUT_NO_REAL_PERSON"
-NO_REAL_PERSON_POLICY = "synthetic_stylized_character_v2"
-LEGACY_NO_REAL_PERSON_POLICIES = frozenset({"synthetic_faceless_android_v1"})
+NO_REAL_PERSON_POLICY = "synthetic_stylized_character_v3"
+LEGACY_NO_REAL_PERSON_POLICIES = frozenset({
+    "synthetic_faceless_android_v1",
+    "synthetic_stylized_character_v2",
+})
 SUPPORTED_NO_REAL_PERSON_POLICIES = frozenset(
     {NO_REAL_PERSON_POLICY, *LEGACY_NO_REAL_PERSON_POLICIES}
 )
-SYNTHETIC_QA_CONTRACT = "synthetic_character_styling_consistency_v2"
+SYNTHETIC_QA_CONTRACT = "synthetic_character_styling_consistency_v3"
 
 SYNTHETIC_STYLE_CONTRACT = (
     "高成本风格化三维 CGI 动画，所有角色都是完全虚构的数字角色；"
-    "每个角色必须拥有独立且逐镜持久的非真人妆造组合，例如面纱/遮罩、图形化妆、面部纹样、"
-    "机械拼接纹理、瓷质或晶体合成皮肤、非人眼部设计与设计化发丝；"
-    "每人至少保留两个可见妆造锚点和一种明确非人材质，不要求也禁止默认给所有角色套同一种头盔；"
-    "材质、轮廓与面部设计明确属于数字角色，不是真人实拍，不模仿任何现实人物"
+    "面部统一采用精致的珍珠生体瓷妆：完整无遮挡的协调五官、珍珠陶瓷合成皮肤、"
+    "从太阳穴延伸到颧骨的细窄虹彩电路妆纹、柔和发光虹膜环与设计化纤维发丝；"
+    "每个角色使用独立且逐镜持久的配色、妆纹走向和识别码，至少两个合成人锚点清晰可见；"
+    "整体优雅克制、干净美观、明确属于数字合成人，不是真人实拍，不模仿任何现实人物"
 )
 
 SYNTHETIC_NEGATIVE_CONTRACT = (
     "真人，真人实拍，写真人脸，未经妆造的自然人脸，照片级人类皮肤，自然人类眼睛，"
     "自然裸露皮肤，普通真人发丝，名人，现实人物，身份证照片，肖像摄影，换脸，live-action，"
-    "photorealistic human，real person，natural human skin，所有角色同款头盔，统一面甲"
+    "photorealistic human，real person，natural human skin，面纱，遮脸面具，统一头盔，统一面甲，"
+    "粗大机械面板，破裂面孔，伤疤，恐怖化，畸形五官，廉价塑料感"
 )
 
 
@@ -155,12 +159,13 @@ def synthetic_character_review_evidence(
         if not base:
             return False
         if character["visual_identity_policy"] != NO_REAL_PERSON_POLICY:
-            return True
+            return False
         styling = character.get("synthetic_styling") or {}
         anchors = styling.get("visible_anchors") or []
         return bool(
-            styling.get("schema") == "honcut.synthetic-styling.v2"
-            and styling.get("mode")
+            styling.get("schema") == "honcut.synthetic-styling.v3"
+            and styling.get("mode") == "synthetic_porcelain_makeup"
+            and styling.get("makeup_design_id")
             and styling.get("non_human_material")
             and isinstance(anchors, list)
             and len([anchor for anchor in anchors if str(anchor).strip()]) >= 2
@@ -199,13 +204,13 @@ def no_real_person_prompt_contract() -> str:
         f"{SYNTHETIC_STYLE_CONTRACT}。"
         f"负面约束：{SYNTHETIC_NEGATIVE_CONTRACT}。"
         "男性/女性等词只表示服装与表演呈现，不得恢复自然真人生物特征；剧情中的脸、头发描述"
-        "必须经过该角色已声明的非真人妆造合同重解释。以角色自己的妆造锚点为最高优先级，"
-        "不得把不同角色统一改成同款头盔、面甲或机器人。"
+        "必须经过该角色已声明的非真人妆造合同重解释。面部必须完整可见，以角色自己的妆造锚点"
+        "为最高优先级，不得把不同角色统一改成同款头盔、面甲或机器人。"
     )
 
 
 def _synthetic_identity(character: dict[str, Any], index: int) -> dict[str, Any]:
-    """Choose a deterministic, visibly non-human styling route per character."""
+    """Build one deterministic porcelain-makeup language per character."""
     appearance = character.get("appearance")
     appearance = appearance if isinstance(appearance, dict) else {}
     source_gender = str(
@@ -224,60 +229,30 @@ def _synthetic_identity(character: dict[str, Any], index: int) -> dict[str, Any]
     )[digest[0] % 5]
     primary, accent, material_color = palette
 
-    female_presenting = any(
-        token in source_gender
-        for token in ("female", "woman", "girl", "女")
-    )
-    mode_index = index % 4
-    if female_presenting:
-        mode_index = 0
-    modes: tuple[dict[str, Any], ...] = (
-        {
-            "mode": "veiled_graphic_couture",
-            "kind": "完全虚构的面纱图形妆数字角色",
-            "hair": f"{material_color}设计化纤维发束，边缘呈规则切面高光，不是自然真人发丝",
-            "face": (
-                f"{primary}不透明薄纱面纱固定遮住鼻梁以下，额头与眼周覆盖{accent}非对称几何彩妆和"
-                f"发光面部纹样；可见区域是{material_color}哑光瓷质合成表面，不是人类皮肤"
-            ),
-            "anchors": [f"{primary}不透明面纱", f"{accent}发光眼周纹样", f"{material_color}瓷质表面"],
-            "material": f"{material_color}哑光瓷质合成表面",
-        },
-        {
-            "mode": "biomechanical_face_seams",
-            "kind": "完全虚构的生物机械妆数字角色",
-            "hair": f"{primary}硬质纤维束发型，发梢带{accent}导光丝，不是自然头发",
-            "face": (
-                f"脸颊和太阳穴嵌入{material_color}机械拼接板与可见接缝，眉骨下是{accent}图形光带，"
-                "表面为设计化合成材质，无照片级人类皮肤"
-            ),
-            "anchors": [f"{material_color}脸颊机械拼接板", f"{accent}眉骨光带", f"{primary}导光纤维发束"],
-            "material": f"{material_color}机械陶瓷与导光纤维",
-        },
-        {
-            "mode": "tattoo_editorial_makeup",
-            "kind": "完全虚构的纹样特效妆数字角色",
-            "hair": f"{material_color}雕塑感整块发型，带{primary}印刷网点纹理，不是自然发丝",
-            "face": (
-                f"整张脸覆盖{primary}/{accent}高对比编辑彩妆与跨越鼻梁的电路式面部纹身，"
-                f"底层是{material_color}丝绒合成皮肤并带规则微网格，不是自然人类皮肤"
-            ),
-            "anchors": [f"{primary}/{accent}跨鼻梁电路纹身", f"{material_color}微网格合成皮肤", "雕塑感印刷发型"],
-            "material": f"{material_color}丝绒微网格合成皮肤",
-        },
-        {
-            "mode": "crystalline_facial_texture",
-            "kind": "完全虚构的晶体纹理数字角色",
-            "hair": f"{primary}半透明片状头饰与短纤维冠，边缘发出{accent}冷光",
-            "face": (
-                f"面部由{material_color}半透明晶体纹理与{primary}放射状裂纹构成，颧骨有{accent}金属箔妆，"
-                "眼部为抽象图形光孔，不是自然眼睛或皮肤"
-            ),
-            "anchors": [f"{primary}放射晶体裂纹", f"{accent}颧骨金属箔妆", "抽象图形光孔"],
-            "material": f"{material_color}半透明晶体合成材质",
-        },
-    )
-    identity = dict(modes[mode_index])
+    presentation = "柔和利落" if any(
+        token in source_gender for token in ("female", "woman", "girl", "女")
+    ) else "克制利落"
+    design_id = f"porcelain-{digest[1]:02x}{digest[2]:02x}{digest[3]:02x}"
+    identity = {
+        "mode": "synthetic_porcelain_makeup",
+        "makeup_design_id": design_id,
+        "kind": "完全虚构的珍珠生体瓷妆数字角色",
+        "hair": (
+            f"{primary}设计化纤维发束，发梢带极细{accent}导光丝与规则切面高光，"
+            "不是自然真人发丝"
+        ),
+        "face": (
+            f"面部完整无遮挡，五官比例协调、表情自然且{presentation}；表面为{material_color}珍珠陶瓷"
+            f"合成皮肤，无真人毛孔；从太阳穴到颧骨只有一条{accent}细窄虹彩电路妆纹，"
+            f"虹膜保留一圈柔和{primary}非自然光环；妆造编号{design_id}，不是人类皮肤或真人肖像"
+        ),
+        "anchors": [
+            f"{material_color}珍珠陶瓷合成皮肤",
+            f"{accent}太阳穴至颧骨细窄电路妆纹",
+            f"{primary}柔和发光虹膜环",
+        ],
+        "material": f"{material_color}珍珠陶瓷合成皮肤",
+    }
     identity["mark"] = (
         f"锁骨位置保留{accent}短横识别灯，服装左侧有仅属于该角色的"
         f"{digest[1]:02X}{digest[2]:02X}几何编号章"
@@ -292,8 +267,8 @@ def apply_no_real_person_character_policy(
 
     The transform intentionally preserves names, roles, relationships, costume
     colors, and story semantics while replacing natural biometric cues with
-    persistent veil/makeup/tattoo/mechanical/material anchors that cannot be
-    mistaken for an untreated real-person likeness.
+    persistent porcelain-makeup anchors that cannot be mistaken for an
+    untreated real-person likeness.
     """
     rewritten = copy.deepcopy(characters_data)
     characters = rewritten.get("characters")
@@ -312,7 +287,7 @@ def apply_no_real_person_character_policy(
             and (character.get("appearance") or {})
             .get("synthetic_styling", {})
             .get("schema")
-            == "honcut.synthetic-styling.v2"
+            == "honcut.synthetic-styling.v3"
             for character in characters
         )
     ):
@@ -337,8 +312,9 @@ def apply_no_real_person_character_policy(
                 "clothing": clothing,
                 "distinguishing": identity["mark"],
                 "synthetic_styling": {
-                    "schema": "honcut.synthetic-styling.v2",
+                    "schema": "honcut.synthetic-styling.v3",
                     "mode": identity["mode"],
+                    "makeup_design_id": identity["makeup_design_id"],
                     "non_human_material": identity["material"],
                     "visible_anchors": list(identity["anchors"]),
                     "minimum_visible_anchors_per_shot": 2,
@@ -379,7 +355,8 @@ def apply_no_real_person_character_policy(
         )
     rewritten["visual_identity_policy"] = NO_REAL_PERSON_POLICY
     rewritten["synthetic_styling_policy"] = {
-        "schema": "honcut.synthetic-styling-policy.v2",
+        "schema": "honcut.synthetic-styling-policy.v3",
+        "allowed_mode": "synthetic_porcelain_makeup",
         "minimum_visible_anchors_per_character": 2,
         "same_headgear_for_every_character_forbidden": True,
         "natural_human_face_without_declared_styling_forbidden": True,

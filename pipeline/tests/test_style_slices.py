@@ -237,9 +237,10 @@ def test_phase3_persists_and_generates_from_no_real_person_contract(tmp_path, mo
 
     persisted = json.loads((tmp_path / "CHARACTERS.json").read_text(encoding="utf-8"))
     assert result["status"] == "done"
-    assert persisted["visual_identity_policy"] == "synthetic_stylized_character_v2"
+    assert persisted["visual_identity_policy"] == "synthetic_stylized_character_v3"
     styling = persisted["characters"][0]["appearance"]["synthetic_styling"]
-    assert styling["schema"] == "honcut.synthetic-styling.v2"
+    assert styling["schema"] == "honcut.synthetic-styling.v3"
+    assert styling["mode"] == "synthetic_porcelain_makeup"
     assert len(styling["visible_anchors"]) >= 2
     assert "全封闭机械头盔" not in captured[0]["description"]
     assert "风格化三维 CGI" in captured[0]["style"]

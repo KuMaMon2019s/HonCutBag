@@ -714,10 +714,14 @@ def test_final_video_qa_only_sends_current_batch_characters_and_props(tmp_path):
                 "clothing": f"{name}专属服装",
                 "identity_props": [{"id": prop, "name": prop, "owner": char_id}],
                 "synthetic_styling": {
-                    "schema": "honcut.synthetic-styling.v2",
-                    "mode": "mechanical_makeup",
-                    "non_human_material": "porcelain composite",
-                    "visible_anchors": ["face tattoo", "mechanical seam"],
+                    "schema": "honcut.synthetic-styling.v3",
+                    "mode": "synthetic_porcelain_makeup",
+                    "makeup_design_id": f"porcelain-{char_id}",
+                    "non_human_material": "pearl bio-ceramic complexion",
+                    "visible_anchors": [
+                        "narrow iridescent circuit stripe from temple to cheekbone",
+                        "soft luminous iris ring",
+                    ],
                 },
             },
         }
@@ -772,7 +776,7 @@ def test_final_video_qa_only_sends_current_batch_characters_and_props(tmp_path):
     assert "黑曜石长枪" not in captured[0]
 
 
-def test_no_real_person_policy_assigns_diverse_persistent_styling_not_uniform_helmets(tmp_path):
+def test_no_real_person_policy_assigns_one_persistent_porcelain_makeup_language(tmp_path):
     source = {
         "characters": [
             {"id": "lead", "name": "女主", "role": "protagonist", "appearance": {"gender": "female", "clothing": "银灰长衣"}},
@@ -785,16 +789,21 @@ def test_no_real_person_policy_assigns_diverse_persistent_styling_not_uniform_he
     rewritten = apply_no_real_person_character_policy(source)
     characters = rewritten["characters"]
     modes = [character["appearance"]["synthetic_styling"]["mode"] for character in characters]
+    makeup_ids = [
+        character["appearance"]["synthetic_styling"]["makeup_design_id"]
+        for character in characters
+    ]
 
     assert rewritten["visual_identity_policy"] == NO_REAL_PERSON_POLICY
-    assert modes[0] == "veiled_graphic_couture"
-    assert len(set(modes)) == 4
+    assert set(modes) == {"synthetic_porcelain_makeup"}
+    assert len(set(makeup_ids)) == 4
     assert all(
         len(character["appearance"]["synthetic_styling"]["visible_anchors"]) >= 2
         for character in characters
     )
-    assert all("全封闭机械头盔" not in character["appearance"]["face"] for character in characters)
-    assert "不得把不同角色统一改成同款头盔" in no_real_person_prompt_contract()
+    assert all("面纱" not in character["appearance"]["face"] for character in characters)
+    assert all("珍珠" in character["appearance"]["face"] for character in characters)
+    assert "面部必须完整可见" in no_real_person_prompt_contract()
 
     (tmp_path / "CHARACTERS.json").write_text(
         json.dumps(rewritten, ensure_ascii=False), encoding="utf-8"
@@ -802,6 +811,38 @@ def test_no_real_person_policy_assigns_diverse_persistent_styling_not_uniform_he
     evidence = synthetic_character_review_evidence(tmp_path)
     assert evidence["identity_contract_complete"] is True
     assert all(character["synthetic_styling"] for character in evidence["characters"])
+
+    assert apply_no_real_person_character_policy(rewritten) == rewritten
+
+
+def test_legacy_v2_synthetic_styling_is_audit_only_not_current_identity_evidence(tmp_path):
+    payload = {
+        "visual_identity_policy": "synthetic_stylized_character_v2",
+        "characters": [{
+            "id": "lead",
+            "name": "主角",
+            "visual_identity_policy": "synthetic_stylized_character_v2",
+            "appearance": {
+                "gender": "synthetic",
+                "face": "旧版机械妆",
+                "clothing": "银灰长衣",
+                "synthetic_styling": {
+                    "schema": "honcut.synthetic-styling.v2",
+                    "mode": "mechanical_makeup",
+                    "non_human_material": "porcelain composite",
+                    "visible_anchors": ["face tattoo", "mechanical seam"],
+                },
+            },
+        }],
+    }
+    (tmp_path / "CHARACTERS.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
+
+    evidence = synthetic_character_review_evidence(tmp_path)
+
+    assert evidence["enabled"] is True
+    assert evidence["identity_contract_complete"] is False
 
 
 def test_current_synthetic_policy_fails_evidence_when_styling_anchors_are_missing(tmp_path):

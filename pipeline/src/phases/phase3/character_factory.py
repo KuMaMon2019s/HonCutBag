@@ -16,6 +16,7 @@ Usage:
 import os
 import sys
 import json
+import hashlib
 import argparse
 import shutil
 import subprocess
@@ -42,6 +43,7 @@ from quality.character_reference_qa import (
     file_sha256,
     review_character_reference_pack,
     review_identity_detail_reference,
+    validate_character_reference_qa_receipt,
 )
 from utils.character_reference_contracts import (
     IDENTITY_DETAIL_ASSET_POLICY,
@@ -310,6 +312,41 @@ FULL_BODY_IMAGE_RULES = (
 )
 
 FULL_BODY_REFERENCE_SIZE = "2K"
+REFERENCE_CONTRACT_VERSION = 6
+REFERENCE_GENERATION_CONTRACT_SCHEMA = "honcut.character-reference-generation.v1"
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def build_reference_generation_contract(
+    *,
+    prompts: dict[str, str],
+    model: str,
+    synthetic_styling: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Build the exact cache input for canonical character-reference pixels."""
+    return {
+        "schema": REFERENCE_GENERATION_CONTRACT_SCHEMA,
+        "reference_contract_version": REFERENCE_CONTRACT_VERSION,
+        "model": model,
+        "prompt_sha256": {
+            name: hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+            for name, prompt in prompts.items()
+        },
+        "synthetic_styling_sha256": (
+            _canonical_json_sha256(synthetic_styling)
+            if synthetic_styling
+            else None
+        ),
+    }
 
 
 def _reference_rendering_clause(style: str) -> str:
@@ -830,6 +867,8 @@ def _quality_control_reference_views(
     default_size: str,
     max_retries: int,
     review_max_retries: int,
+    synthetic_styling: dict[str, Any] | None,
+    generation_contract: dict[str, Any],
 ) -> dict[str, Any]:
     """Review all views together and regenerate only the implicated views."""
     if max_retries < 0 or max_retries > 2:
@@ -850,6 +889,7 @@ def _quality_control_reference_views(
                     review_client,
                     view_paths,
                     character_description,
+                    synthetic_styling,
                 )
                 successful_review_attempt = review_attempt
                 break
@@ -869,6 +909,8 @@ def _quality_control_reference_views(
                     char_id=char_id,
                     view_paths=view_paths,
                     attempts=attempts,
+                    synthetic_styling=synthetic_styling,
+                    generation_contract=generation_contract,
                 )
                 _write_json_atomic(report_path, receipt)
                 if review_attempt <= review_max_retries:
@@ -895,6 +937,8 @@ def _quality_control_reference_views(
             char_id=char_id,
             view_paths=view_paths,
             attempts=attempts,
+            synthetic_styling=synthetic_styling,
+            generation_contract=generation_contract,
         )
         _write_json_atomic(report_path, receipt)
         if result["passed"]:
@@ -945,6 +989,7 @@ def generate_character(
     skip_images: bool = False,
     variants: Optional[list] = None,
     identity_props: Optional[list] = None,
+    synthetic_styling: Optional[dict[str, Any]] = None,
     review_client: Any | None = None,
     view_qa_max_retries: int = 2,
     review_qa_max_retries: int = 2,
@@ -991,32 +1036,42 @@ def generate_character(
         reference_prompts = build_model_reference_prompts(
             description, style, target_model
         )
+        generation_contract = build_reference_generation_contract(
+            prompts=reference_prompts,
+            model=seedream_model,
+            synthetic_styling=synthetic_styling,
+        )
         expected_views = {
             view_name: Path(char_dir) / f"{view_name}.png"
             for view_name in reference_prompts
         }
-        existing_pack_complete = all(
-            path.is_file() and path.stat().st_size > 10_240
-            for path in expected_views.values()
+        report_path = Path(char_dir) / "character_reference_qa.json"
+        existing_pack_complete = validate_character_reference_qa_receipt(
+            report_path,
+            expected_views,
+            synthetic_styling=synthetic_styling,
+            generation_contract=generation_contract,
         )
         if existing_pack_complete:
             print(
-                f"[Step 1/3] Re-reviewing existing {target_model} references; "
-                "no image regeneration before semantic QA..."
+                f"[Step 1/3] Reusing exact {target_model} reference contract; "
+                "zero image and review Provider requests..."
             )
         else:
             print(f"[Step 1/3] Generating separated {target_model} references...")
-        _write_json_atomic(
-            Path(char_dir) / "character_reference_qa.json",
-            {
-                "schema": CHARACTER_REFERENCE_QA_SCHEMA,
-                "character_id": char_id,
-                "status": "pending",
-                "inputs": {},
-                "attempts": [],
-            },
-        )
-        client = SeedreamClient(model=seedream_model)
+            _write_json_atomic(
+                report_path,
+                {
+                    "schema": CHARACTER_REFERENCE_QA_SCHEMA,
+                    "character_id": char_id,
+                    "status": "pending",
+                    "inputs": {},
+                    "synthetic_styling": synthetic_styling,
+                    "generation_contract": generation_contract,
+                    "attempts": [],
+                },
+            )
+            client = SeedreamClient(model=seedream_model)
         views = {name: str(path) for name, path in expected_views.items()}
         if not existing_pack_complete:
             views = {}
@@ -1052,27 +1107,38 @@ def generate_character(
 
         if not all(isinstance(path, str) and Path(path).is_file() for path in views.values()):
             raise RuntimeError(f"{char_id} reference generation produced an incomplete pack")
-        if review_client is None:
-            from clients.ark_multimodal_client import ArkMultimodalClient
+        if existing_pack_complete:
+            qa_receipt = json.loads(report_path.read_text(encoding="utf-8"))
+        else:
+            if review_client is None:
+                from clients.ark_multimodal_client import ArkMultimodalClient
 
-            review_client = ArkMultimodalClient()
-        qa_receipt = _quality_control_reference_views(
-            char_id=char_id,
-            character_description=description,
-            char_dir=Path(char_dir),
-            prompts=reference_prompts,
-            view_paths={name: Path(path) for name, path in views.items()},
-            image_client=client,
-            review_client=review_client,
-            default_size=size,
-            max_retries=view_qa_max_retries,
-            review_max_retries=review_qa_max_retries,
-        )
+                review_client = ArkMultimodalClient()
+            qa_receipt = _quality_control_reference_views(
+                char_id=char_id,
+                character_description=description,
+                char_dir=Path(char_dir),
+                prompts=reference_prompts,
+                view_paths={name: Path(path) for name, path in views.items()},
+                image_client=client,
+                review_client=review_client,
+                default_size=size,
+                max_retries=view_qa_max_retries,
+                review_max_retries=review_qa_max_retries,
+                synthetic_styling=synthetic_styling,
+                generation_contract=generation_contract,
+            )
         reference_board_path = ensure_character_reference_board(
             Path(char_dir),
             character_id=char_id,
         )
         if normalized_identity_props:
+            if client is None:
+                client = SeedreamClient(model=seedream_model)
+            if review_client is None:
+                from clients.ark_multimodal_client import ArkMultimodalClient
+
+                review_client = ArkMultimodalClient()
             identity_detail_path = Path(char_dir) / "identity_detail.png"
             detail_face_view = (
                 "face_closeup"
@@ -1133,7 +1199,11 @@ def generate_character(
         else "seedance_four_views"
     )
     card["source_image_rules"] = SOURCE_IMAGE_RULES
-    card["reference_contract_version"] = 5
+    card["reference_contract_version"] = REFERENCE_CONTRACT_VERSION
+    card["reference_generation_contract"] = (
+        generation_contract if not skip_images else None
+    )
+    card["synthetic_styling"] = synthetic_styling
     card["reference_board"] = (
         f"characters/{char_id}/reference_board.png"
         if reference_board_path is not None
@@ -1292,6 +1362,7 @@ def batch_generate(characters: list, output_dir: str, **kwargs) -> list:
                 skip_images=kwargs.get("skip_images", False),
                 variants=char.get("appearance", {}).get("variants", []),
                 identity_props=char.get("appearance", {}).get("identity_props", []),
+                synthetic_styling=char.get("appearance", {}).get("synthetic_styling"),
                 review_client=kwargs.get("review_client"),
                 view_qa_max_retries=kwargs.get("view_qa_max_retries", 2),
                 review_qa_max_retries=kwargs.get("review_qa_max_retries", 2),

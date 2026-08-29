@@ -957,16 +957,19 @@ def _vlm_semantic_check(
     structure_contract = (
         (
             "All characters in this project are intentionally synthetic stylized CGI characters. "
-            "Declared veils/masks, graphic makeup, facial tattoos, mechanical seams, porcelain/crystalline "
-            "surfaces, designed hair/head silhouettes, joints and other non-human materials are required "
-            "identity styling, not human-anatomy defects. Helmets are optional and one generic helmet must "
-            "not replace the cast's distinct styling. Never flag a declared non-human head/neck/material "
-            "merely for not matching a natural human. Judge structural and styling consistency instead: "
-            "each visible character must preserve at least two declared styling anchors; an untreated "
-            "natural human face is a failure. Require visible "
+            "Their only allowed facial treatment is the declared synthetic porcelain makeup: a beautiful "
+            "pearl bio-ceramic complexion, one narrow iridescent circuit stripe from temple to cheekbone, "
+            "and a soft luminous iris ring. The complete face must stay visible, harmonious, clean, and "
+            "recognizably synthetic; veils, face masks, coarse mechanical plates, cracks, scars, and horror "
+            "effects are failures. Never flag the declared pearl bio-ceramic material merely for not matching "
+            "natural human skin. Judge structural and styling consistency instead: each visible character "
+            "must preserve the declared makeup design, colors, iris ring, clothing, and identity markers; an "
+            "untreated natural human face is a failure. Require visible "
             "positive evidence of an unintended break, detachment, merge, extra/missing component, "
             "impossible self-intersection, or reference-inconsistent deformation. Continue to detect "
-            "face-styling/material color drift, identity-marker drift, action discontinuity, and wrong spatial order. "
+            "face-styling/material color drift, identity-marker drift, grotesque damage, action discontinuity, "
+            "and wrong spatial order. Storyboard or performance-board grids, labels, arrows, split panels, "
+            "or cloned copies of one character must not appear in the final video. "
         )
         if synthetic_review
         else (

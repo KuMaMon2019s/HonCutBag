@@ -19,7 +19,7 @@ from utils.character_reference_contracts import (
     identity_detail_prompt_items,
 )
 
-CHARACTER_REFERENCE_QA_SCHEMA = "honcut.character-reference-qa.v2"
+CHARACTER_REFERENCE_QA_SCHEMA = "honcut.character-reference-qa.v3"
 SEEDANCE_REFERENCE_VIEWS = ("face_closeup", "full_body", "side", "back")
 
 
@@ -42,6 +42,7 @@ def file_sha256(path: Path) -> str:
 def build_character_reference_qa_prompt(
     character_description: str,
     view_names: tuple[str, ...] = SEEDANCE_REFERENCE_VIEWS,
+    synthetic_styling: dict[str, Any] | None = None,
 ) -> str:
     """Ask a VLM to verify view semantics rather than image attractiveness."""
     requirements = {
@@ -71,6 +72,16 @@ def build_character_reference_qa_prompt(
         f"- {name}: {requirements.get(name, 'match the filename view exactly')}"
         for name in view_names
     )
+    synthetic_contract = ""
+    if synthetic_styling:
+        synthetic_contract = f"""
+Synthetic face contract (blocking):
+{json.dumps(synthetic_styling, ensure_ascii=False, sort_keys=True)}
+Every face-visible view must show the same declared synthetic porcelain makeup, keep the
+whole face unobscured, preserve clean harmonious facial anatomy, and contain no grotesque
+damage. Photoreal untreated human skin or a hidden face is a failure. The back view is exempt
+from face visibility but must preserve the same hair and rear identity design.
+"""
     return f"""You are the blocking Phase 3 character-reference inspector.
 The input images are ordered and labelled by filename. Judge geometry and semantics, not beauty.
 
@@ -79,6 +90,7 @@ Static identity contract:
 
 Asset-boundary contract:
 {STATIC_REFERENCE_QA_POLICY}
+{synthetic_contract}
 
 Per-view contracts:
 {ordered}
@@ -102,6 +114,11 @@ Return one JSON object only:
       "single_character": true,
       "face_visible": true,
       "both_eyes_visible": false,
+      "synthetic_makeup_visible": true,
+      "synthetic_profile_match": true,
+      "face_unobscured": true,
+      "makeup_clean_and_harmonious": true,
+      "no_grotesque_damage": true,
       "issues": []
     }}
   }},
@@ -110,6 +127,7 @@ Return one JSON object only:
     "identity_consistent": true,
     "outfit_consistent": true,
     "body_proportions_consistent": true,
+    "synthetic_makeup_consistent": true,
     "issues": []
   }},
   "failed_views": [],
@@ -191,6 +209,8 @@ def review_identity_detail_reference(
 def parse_character_reference_qa(
     raw: str,
     view_names: tuple[str, ...] = SEEDANCE_REFERENCE_VIEWS,
+    *,
+    require_synthetic: bool = False,
 ) -> dict[str, Any]:
     """Normalize a review and recompute the verdict from its evidence fields."""
     payload = parse_structured_output(
@@ -233,6 +253,17 @@ def parse_character_reference_qa(
             passed = passed and evidence.get("both_eyes_visible") is False
         if seedance_pack and name in {"full_body", "side", "back"}:
             passed = passed and evidence.get("hands_empty") is True
+        synthetic_fields = (
+            "synthetic_makeup_visible",
+            "synthetic_profile_match",
+            "face_unobscured",
+            "makeup_clean_and_harmonious",
+            "no_grotesque_damage",
+        )
+        if require_synthetic and name != "back":
+            passed = passed and all(
+                evidence.get(field) is True for field in synthetic_fields
+            )
         if not passed:
             failed.add(name)
         normalized_views[name] = {
@@ -241,6 +272,10 @@ def parse_character_reference_qa(
             "face_visible": evidence.get("face_visible") is True,
             "both_eyes_visible": evidence.get("both_eyes_visible") is True,
             "hands_empty": evidence.get("hands_empty") is True,
+            **{
+                field: evidence.get(field) is True
+                for field in synthetic_fields
+            },
             "issues": [str(item) for item in issues if str(item).strip()],
         }
 
@@ -252,6 +287,10 @@ def parse_character_reference_qa(
     cross_passed = cross.get("passed") is True and all(
         cross.get(field) is True for field in cross_fields
     )
+    if require_synthetic:
+        cross_passed = (
+            cross_passed and cross.get("synthetic_makeup_consistent") is True
+        )
     declared_failed = payload.get("failed_views")
     if isinstance(declared_failed, list):
         failed.update(str(name) for name in declared_failed if name in view_names)
@@ -265,6 +304,9 @@ def parse_character_reference_qa(
         "cross_view": {
             "passed": cross_passed,
             **{field: cross.get(field) is True for field in cross_fields},
+            "synthetic_makeup_consistent": (
+                cross.get("synthetic_makeup_consistent") is True
+            ),
             "issues": [
                 str(item)
                 for item in (
@@ -284,16 +326,25 @@ def review_character_reference_pack(
     reviewer: CharacterReferenceReviewer,
     view_paths: dict[str, Path],
     character_description: str,
+    synthetic_styling: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     view_names = tuple(view_paths)
-    prompt = build_character_reference_qa_prompt(character_description, view_names)
+    prompt = build_character_reference_qa_prompt(
+        character_description,
+        view_names,
+        synthetic_styling,
+    )
     result = review_as(
         reviewer,
         [view_paths[name] for name in view_names],
         prompt,
         CharacterReferenceUnderstanding,
     )
-    return parse_character_reference_qa(result.model_dump_json(), view_names)
+    return parse_character_reference_qa(
+        result.model_dump_json(),
+        view_names,
+        require_synthetic=bool(synthetic_styling),
+    )
 
 
 def build_character_reference_qa_receipt(
@@ -301,6 +352,8 @@ def build_character_reference_qa_receipt(
     char_id: str,
     view_paths: dict[str, Path],
     attempts: list[dict[str, Any]],
+    synthetic_styling: dict[str, Any] | None = None,
+    generation_contract: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     final = attempts[-1] if attempts else {"passed": False, "failed_views": list(view_paths)}
     return {
@@ -312,6 +365,8 @@ def build_character_reference_qa_receipt(
             for name, path in view_paths.items()
             if path.is_file()
         },
+        "synthetic_styling": synthetic_styling,
+        "generation_contract": generation_contract,
         "attempts": attempts,
         "final": final,
     }
@@ -320,11 +375,18 @@ def build_character_reference_qa_receipt(
 def validate_character_reference_qa_receipt(
     report_path: Path,
     view_paths: dict[str, Path],
+    *,
+    synthetic_styling: dict[str, Any] | None = None,
+    generation_contract: dict[str, Any] | None = None,
 ) -> bool:
     """Reject missing, failed, incomplete, or stale semantic QA receipts."""
     try:
         report = json.loads(report_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
+        return False
+    if report.get("synthetic_styling") != synthetic_styling:
+        return False
+    if generation_contract is not None and report.get("generation_contract") != generation_contract:
         return False
     if (
         report.get("schema") != CHARACTER_REFERENCE_QA_SCHEMA

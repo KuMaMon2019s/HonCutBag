@@ -33,11 +33,11 @@ from tools.character_reference_board import (
 )
 
 CHARACTER_REGISTRY_SCHEMA_VERSION = 1
-CHARACTER_SPEC_SCHEMA = "honcut.character-library-spec.v1"
+CHARACTER_SPEC_SCHEMA = "honcut.character-library-spec.v2"
 CHARACTER_APPROVAL_SCHEMA = "honcut.character-library-approval.v1"
 CHARACTER_REGISTRY_RECEIPT_SCHEMA = "honcut.character-registry-receipt.v1"
 CANONICAL_STATUS = "canonical_approved"
-CURRENT_REFERENCE_CONTRACT_VERSION = 5
+CURRENT_REFERENCE_CONTRACT_VERSION = 6
 
 
 class CharacterRegistryError(RuntimeError):
@@ -132,6 +132,7 @@ def character_spec_payload(character: Mapping[str, Any]) -> dict[str, Any]:
         "style": str(character.get("style") or "").strip(),
         "negative": str(character.get("negative") or "").strip(),
         "identity_props": appearance.get("identity_props") or [],
+        "synthetic_styling": appearance.get("synthetic_styling"),
         "visual_identity_policy": character.get("visual_identity_policy"),
         "reference_contract_version": CURRENT_REFERENCE_CONTRACT_VERSION,
         "reference_qa_schema": CHARACTER_REFERENCE_QA_SCHEMA,
@@ -179,7 +180,30 @@ def _asset_records(output_dir: Path, character: Mapping[str, Any]) -> list[tuple
     }
     qa_value = str(card.get("reference_qa_report") or "")
     qa_path = _resolve_run_file(output_dir, qa_value)
-    if not validate_character_reference_qa_receipt(qa_path, view_paths):
+    synthetic_styling = card.get("synthetic_styling")
+    if synthetic_styling is not None and not isinstance(synthetic_styling, dict):
+        raise CharacterRegistryError("character card synthetic styling is invalid")
+    generation_contract = card.get("reference_generation_contract")
+    if not isinstance(generation_contract, dict):
+        raise CharacterRegistryError("character reference generation contract is missing")
+    prompt_hashes = generation_contract.get("prompt_sha256")
+    if (
+        generation_contract.get("schema")
+        != "honcut.character-reference-generation.v1"
+        or generation_contract.get("reference_contract_version")
+        != CURRENT_REFERENCE_CONTRACT_VERSION
+        or not str(generation_contract.get("model") or "").strip()
+        or not isinstance(prompt_hashes, dict)
+        or set(SEEDANCE_REFERENCE_VIEWS) - set(prompt_hashes)
+        or any(not _is_sha256(prompt_hashes.get(view)) for view in SEEDANCE_REFERENCE_VIEWS)
+    ):
+        raise CharacterRegistryError("character reference generation contract is invalid")
+    if not validate_character_reference_qa_receipt(
+        qa_path,
+        view_paths,
+        synthetic_styling=synthetic_styling,
+        generation_contract=generation_contract,
+    ):
         raise CharacterRegistryError("character reference QA receipt is missing, stale, or failed")
     if not validate_character_reference_board(char_dir, character_id=char_id):
         raise CharacterRegistryError("character reference board receipt is missing or stale")
