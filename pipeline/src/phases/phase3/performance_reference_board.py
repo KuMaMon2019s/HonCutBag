@@ -18,9 +18,12 @@ from prompt.seedream_image_prompt import (
     image_request_fingerprint,
 )
 from quality.character_performance_qa import (
+    CHARACTER_PERFORMANCE_CELL_QA_SCHEMA,
     CHARACTER_PERFORMANCE_QA_SCHEMA,
     CharacterPerformanceQAError,
+    combine_character_performance_qa,
     review_character_performance_board,
+    review_character_performance_cell,
 )
 from quality.character_reference_qa import file_sha256
 
@@ -28,6 +31,7 @@ from quality.character_reference_qa import file_sha256
 CHARACTER_PERFORMANCE_BOARD_SCHEMA = "honcut.character-performance-board.v1"
 CHARACTER_PERFORMANCE_GUIDE_SCHEMA = "honcut.character-performance-guide.v1"
 CHARACTER_PERFORMANCE_CELL_SCHEMA = "honcut.character-performance-cell.v1"
+CHARACTER_PERFORMANCE_POSE_GUIDE_SCHEMA = "honcut.character-performance-pose-guide.v1"
 PERFORMANCE_PROMPT_OPTIMIZATION_SCHEMA = (
     "honcut.character-performance-prompt-optimization.v1"
 )
@@ -42,6 +46,7 @@ PERFORMANCE_BOARD_SIZE = "3072x2048"
 PERFORMANCE_BOARD_PIXEL_SIZE = (3072, 2048)
 PERFORMANCE_CELL_SIZE = "2048x2048"
 PERFORMANCE_CELL_PIXEL_SIZE = (2048, 2048)
+PERFORMANCE_POSE_GUIDE_PIXEL_SIZE = (1024, 1024)
 PERFORMANCE_COMPOSITION_MODE = "locally_feathered_2x3_v2"
 PERFORMANCE_MAX_CELL_CORRECTION_ROUNDS = 1
 PERFORMANCE_CELL_IDS = tuple(f"A{index:02d}" for index in range(1, 7))
@@ -598,7 +603,9 @@ light-gray studio background. Show exactly one character and exactly one clearly
 
 Identity is locked by Image 1. Preserve the exact face, pearl bio-ceramic synthetic porcelain
 makeup, circuit stripe, luminous iris ring, hair, proportions, outfit and colors. Image 2, when
-present, supplies the declared prop geometry/material/color only.
+present, supplies the declared prop geometry/material/color only. The final action-pose schematic
+reference supplies body-joint, anatomical-side and prop-line geometry only. Match its silhouette
+and limb topology, but render the finished character rather than diagram lines or colored joints.
 {aesthetic_contract}
 
 Exact authored action: {cell['action_description']}
@@ -653,6 +660,172 @@ pose, character-left appears on viewer-right and character-right appears on view
 foot placement and prop direction unmistakable in silhouette. Do not print this feedback or the
 internal cell ID in the image.
 """
+
+
+def _pose_guide_geometry(cell: Mapping[str, Any]) -> dict[str, Any]:
+    """Project one authored action into a deterministic front-facing pose skeleton."""
+    role = str(cell.get("pose_category") or "combat_ready")
+    geometry: dict[str, Any] = {
+        "head": (512, 150),
+        "neck": (512, 225),
+        "left_shoulder": (610, 275),
+        "right_shoulder": (414, 275),
+        "left_elbow": (650, 430),
+        "right_elbow": (374, 430),
+        "left_hand": (620, 545),
+        "right_hand": (404, 545),
+        "left_hip": (570, 530),
+        "right_hip": (454, 530),
+        "left_knee": (620, 710),
+        "right_knee": (404, 710),
+        "left_foot": (660, 900),
+        "right_foot": (364, 900),
+        "prop": ((405, 570), (725, 300)),
+        "emphasis": (),
+    }
+    if role == "evade":
+        geometry.update({
+            "head": (600, 190),
+            "neck": (570, 255),
+            "left_shoulder": (650, 300),
+            "right_shoulder": (470, 330),
+            "left_elbow": (715, 450),
+            "right_elbow": (410, 455),
+            "left_hand": (680, 565),
+            "right_hand": (375, 560),
+            "left_hip": (590, 555),
+            "right_hip": (480, 575),
+            "left_knee": (660, 720),
+            "right_knee": (340, 735),
+            "left_foot": (700, 885),
+            "right_foot": (225, 900),
+            "prop": ((370, 575), (690, 420)),
+            "emphasis": ("right_hip", "right_knee", "right_foot"),
+        })
+    elif role in {"attack", "prop_use"}:
+        geometry.update({
+            "left_elbow": (590, 410),
+            "right_elbow": (465, 465),
+            "left_hand": (555, 500),
+            "right_hand": (475, 535),
+            "left_knee": (645, 725),
+            "right_knee": (410, 700),
+            "left_foot": (700, 925),
+            "right_foot": (360, 855),
+            "prop": ((330, 720), (760, 255)),
+            "emphasis": ("left_hip", "left_knee", "left_foot"),
+        })
+    elif role == "block":
+        geometry.update({
+            "left_elbow": (650, 390),
+            "right_elbow": (500, 435),
+            "left_hand": (690, 470),
+            "right_hand": (650, 555),
+            "left_knee": (600, 690),
+            "right_knee": (420, 725),
+            "left_foot": (610, 835),
+            "right_foot": (375, 915),
+            "prop": ((705, 715), (705, 235)),
+            "emphasis": ("left_hand", "left_knee", "left_foot"),
+        })
+    elif role == "prop_hold":
+        geometry.update({
+            "left_hand": (585, 500),
+            "right_hand": (455, 500),
+            "prop": ((360, 520), (690, 520)),
+            "emphasis": ("left_hand", "right_hand"),
+        })
+    return geometry
+
+
+def _ensure_performance_pose_guide(
+    output_dir: Path,
+    character_id: str,
+    cell: Mapping[str, Any],
+) -> dict[str, str]:
+    """Create a text-free, zero-provider pose schematic and strict hash receipt."""
+    cell_id = str(cell.get("cell_id") or "")
+    guide_dir = output_dir / "characters" / character_id / "performance_pose_guides"
+    guide_path = guide_dir / f"{cell_id}.png"
+    receipt_path = guide_dir / f"{cell_id}.json"
+    cell_hash = _canonical_hash(cell)
+    geometry = _pose_guide_geometry(cell)
+    geometry_hash = _canonical_hash(geometry)
+    expected = {
+        "schema": CHARACTER_PERFORMANCE_POSE_GUIDE_SCHEMA,
+        "status": "done",
+        "character_id": character_id,
+        "cell_id": cell_id,
+        "cell_sha256": cell_hash,
+        "geometry_sha256": geometry_hash,
+        "generator": "honcut.front-facing-action-skeleton.v1",
+        "image": guide_path.relative_to(output_dir).as_posix(),
+        "provider_requests": 0,
+    }
+    cached = _load_json(receipt_path)
+    if receipt_path.is_file() and cached is None:
+        raise CharacterPerformanceQAError(f"{character_id} {cell_id} pose receipt is corrupt")
+    if cached is not None and cached.get("schema") != CHARACTER_PERFORMANCE_POSE_GUIDE_SCHEMA:
+        raise CharacterPerformanceQAError(f"{character_id} {cell_id} pose receipt schema is unknown")
+    if (
+        cached is not None
+        and all(cached.get(key) == value for key, value in expected.items())
+        and guide_path.is_file()
+        and cached.get("image_sha256") == file_sha256(guide_path)
+    ):
+        try:
+            with Image.open(guide_path) as image:
+                image.verify()
+                if image.size == PERFORMANCE_POSE_GUIDE_PIXEL_SIZE:
+                    return {
+                        "path": expected["image"],
+                        "sha256": str(cached["image_sha256"]),
+                        "kind": "action_pose_schematic",
+                    }
+        except (OSError, ValueError):
+            pass
+
+    canvas = Image.new("RGB", PERFORMANCE_POSE_GUIDE_PIXEL_SIZE, (24, 28, 36))
+    draw = ImageDraw.Draw(canvas)
+    line_color = (226, 232, 240)
+    joint_color = (255, 184, 76)
+    prop_color = (70, 220, 255)
+    width = 24
+    head_x, head_y = geometry["head"]
+    draw.ellipse(
+        (head_x - 60, head_y - 60, head_x + 60, head_y + 60),
+        outline=line_color,
+        width=width,
+    )
+    pairs = (
+        ("neck", "left_shoulder"), ("neck", "right_shoulder"),
+        ("neck", "left_hip"), ("neck", "right_hip"),
+        ("left_shoulder", "left_elbow"), ("left_elbow", "left_hand"),
+        ("right_shoulder", "right_elbow"), ("right_elbow", "right_hand"),
+        ("left_hip", "right_hip"),
+        ("left_hip", "left_knee"), ("left_knee", "left_foot"),
+        ("right_hip", "right_knee"), ("right_knee", "right_foot"),
+    )
+    for start, end in pairs:
+        draw.line((geometry[start], geometry[end]), fill=line_color, width=width)
+    for key in (
+        "neck", "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
+        "left_hand", "right_hand", "left_hip", "right_hip", "left_knee",
+        "right_knee", "left_foot", "right_foot",
+    ):
+        x, y = geometry[key]
+        radius = 18 if key not in geometry["emphasis"] else 28
+        color = joint_color if key in geometry["emphasis"] else line_color
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=color)
+    draw.line(geometry["prop"], fill=prop_color, width=34)
+    _atomic_png(guide_path, canvas)
+    receipt = {**expected, "image_sha256": file_sha256(guide_path)}
+    _atomic_json(receipt_path, receipt)
+    return {
+        "path": expected["image"],
+        "sha256": str(receipt["image_sha256"]),
+        "kind": "action_pose_schematic",
+    }
 
 
 def _reference_records(output_dir: Path, character: Mapping[str, Any]) -> list[dict[str, str]]:
@@ -759,6 +932,55 @@ def validate_character_performance_board(
                 return False
     except (OSError, ValueError):
         return False
+    components = receipt.get("component_cells") or []
+    if components:
+        if (
+            not isinstance(components, list)
+            or [item.get("cell_id") for item in components if isinstance(item, dict)]
+            != list(PERFORMANCE_CELL_IDS)
+            or qa.get("action_verdict_source") != "isolated_persisted_cells"
+            or qa.get("board_verdict_source") != "whole_board_global_fields_only"
+        ):
+            return False
+        cells_by_id = {str(cell["cell_id"]): cell for cell in cells}
+        for component in components:
+            if not isinstance(component, dict):
+                return False
+            cell_id = str(component.get("cell_id") or "")
+            component_path = output_dir / str(component.get("image") or "")
+            component_qa = _load_json(component_path.with_suffix(".qa.json"))
+            component_references = component.get("references")
+            if (
+                component.get("schema") != CHARACTER_PERFORMANCE_CELL_SCHEMA
+                or component.get("status") != "passed"
+                or component.get("character_id") != character_id
+                or component.get("cell_sha256")
+                != _canonical_hash(cells_by_id.get(cell_id))
+                or not component_path.is_file()
+                or component.get("image_sha256") != file_sha256(component_path)
+                or not isinstance(component_references, list)
+                or not any(
+                    item.get("kind") == "action_pose_schematic"
+                    for item in component_references
+                    if isinstance(item, dict)
+                )
+                or component_qa is None
+                or component_qa.get("schema")
+                != CHARACTER_PERFORMANCE_CELL_QA_SCHEMA
+                or component_qa.get("status") != "passed"
+                or component_qa.get("passed") is not True
+                or component_qa.get("image_sha256") != file_sha256(component_path)
+            ):
+                return False
+            for reference in component_references:
+                if not isinstance(reference, dict):
+                    return False
+                reference_path = output_dir / str(reference.get("path") or "")
+                if (
+                    not reference_path.is_file()
+                    or reference.get("sha256") != file_sha256(reference_path)
+                ):
+                    return False
     return True
 
 
@@ -867,8 +1089,7 @@ def _generate_performance_cell_components(
     character_id = str(character.get("id") or "").strip()
     component_dir = output_dir / "characters" / character_id / "performance_cells"
     component_dir.mkdir(parents=True, exist_ok=True)
-    reference_paths = [str(output_dir / record["path"]) for record in references]
-    roles = [
+    base_roles = [
         "character_identity_board_only",
         *(["character_prop_detail_only"] if len(references) > 1 else []),
     ]
@@ -886,6 +1107,10 @@ def _generate_performance_cell_components(
         raise CharacterPerformanceQAError("performance correction references unknown cells")
     for cell in plan["cells"]:
         cell_id = str(cell["cell_id"])
+        pose_guide = _ensure_performance_pose_guide(output_dir, character_id, cell)
+        cell_references = [*references, pose_guide]
+        reference_paths = [str(output_dir / record["path"]) for record in cell_references]
+        roles = [*base_roles, "action_pose_schematic_only"]
         is_correction_target = correction_round > 0 and cell_id in feedback_by_cell
         if correction_round > 0 and not is_correction_target:
             image_path = component_dir / f"{cell_id}.png"
@@ -899,7 +1124,7 @@ def _generate_performance_cell_components(
                 prompt=base_prompt,
                 model=resolved_model,
                 size=PERFORMANCE_CELL_SIZE,
-                reference_image_sha256=[record["sha256"] for record in references],
+                reference_image_sha256=[record["sha256"] for record in cell_references],
             )
             base_expected = {
                 "schema": CHARACTER_PERFORMANCE_CELL_SCHEMA,
@@ -911,7 +1136,7 @@ def _generate_performance_cell_components(
                 "size": PERFORMANCE_CELL_SIZE,
                 "prompt_sha256": base_prompt_hash,
                 "request_fingerprint": base_request_fingerprint,
-                "references": references,
+                "references": cell_references,
                 "image": image_path.relative_to(output_dir).as_posix(),
             }
             cached = _load_json(receipt_path)
@@ -956,7 +1181,7 @@ def _generate_performance_cell_components(
             prompt=prompt,
             model=resolved_model,
             size=PERFORMANCE_CELL_SIZE,
-            reference_image_sha256=[record["sha256"] for record in references],
+            reference_image_sha256=[record["sha256"] for record in cell_references],
         )
         expected = {
             "schema": CHARACTER_PERFORMANCE_CELL_SCHEMA,
@@ -968,7 +1193,7 @@ def _generate_performance_cell_components(
             "size": PERFORMANCE_CELL_SIZE,
             "prompt_sha256": prompt_hash,
             "request_fingerprint": request_fingerprint,
-            "references": references,
+            "references": cell_references,
             "image": image_path.relative_to(output_dir).as_posix(),
         }
         if is_correction_target:
@@ -1091,6 +1316,112 @@ def _failed_performance_cell_feedback(
             issues = ["Failed strict checks: " + ", ".join(failed_checks)]
         feedback[cell_id] = issues
     return feedback
+
+
+def _review_performance_cell_components(
+    output_dir: Path,
+    character_id: str,
+    plan: Mapping[str, Any],
+    components: list[dict[str, Any]],
+    references: list[dict[str, str]],
+    *,
+    review_client: Any,
+    synthetic_styling: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Persist one immutable action verdict per component image hash."""
+    cells = {
+        str(cell.get("cell_id") or ""): dict(cell)
+        for cell in plan.get("cells") or []
+        if isinstance(cell, Mapping)
+    }
+    if [item.get("cell_id") for item in components] != list(PERFORMANCE_CELL_IDS):
+        raise CharacterPerformanceQAError("performance components are incomplete for cell QA")
+    identity_record = next(
+        (item for item in references if item.get("kind") == "character_identity_board"),
+        None,
+    )
+    prop_record = next(
+        (item for item in references if item.get("kind") == "prop_detail_board"),
+        None,
+    )
+    if identity_record is None:
+        raise CharacterPerformanceQAError("performance cell QA has no identity reference")
+    identity_path = output_dir / identity_record["path"]
+    prop_path = output_dir / prop_record["path"] if prop_record is not None else None
+    styling_hash = _canonical_hash(synthetic_styling or {})
+    results: list[dict[str, Any]] = []
+    verdict_fields = (
+        "cell_id",
+        "same_character",
+        "pose_matches_action",
+        "pose_distinct",
+        "clothing_consistent",
+        "makeup_consistent",
+        "healthy_beautiful_synthetic_styling",
+        "no_uncanny_or_corpse_like_styling",
+        "prop_ownership_correct",
+        "no_extra_character",
+        "no_text_or_layout_marks",
+        "issues",
+    )
+    for component in components:
+        cell_id = str(component["cell_id"])
+        cell = cells.get(cell_id)
+        if cell is None:
+            raise CharacterPerformanceQAError(f"performance cell QA cannot resolve {cell_id}")
+        image_path = output_dir / str(component["image"])
+        qa_path = image_path.with_suffix(".qa.json")
+        expected = {
+            "schema": CHARACTER_PERFORMANCE_CELL_QA_SCHEMA,
+            "character_id": character_id,
+            "cell_id": cell_id,
+            "cell_sha256": _canonical_hash(cell),
+            "image": image_path.relative_to(output_dir).as_posix(),
+            "image_sha256": file_sha256(image_path),
+            "identity_reference_sha256": identity_record["sha256"],
+            "prop_reference_sha256": (
+                prop_record["sha256"] if prop_record is not None else None
+            ),
+            "synthetic_styling_sha256": styling_hash,
+        }
+        cached = _load_json(qa_path)
+        if qa_path.is_file() and cached is None:
+            raise CharacterPerformanceQAError(f"{character_id} {cell_id} QA receipt is corrupt")
+        if cached is not None and cached.get("schema") != CHARACTER_PERFORMANCE_CELL_QA_SCHEMA:
+            raise CharacterPerformanceQAError(
+                f"{character_id} {cell_id} QA receipt schema is unknown"
+            )
+        cache_valid = bool(
+            cached is not None
+            and all(cached.get(key) == value for key, value in expected.items())
+            and cached.get("status") in {"passed", "failed"}
+            and isinstance(cached.get("passed"), bool)
+            and all(field in cached for field in verdict_fields)
+        )
+        if cache_valid:
+            results.append({
+                "schema": CHARACTER_PERFORMANCE_CELL_QA_SCHEMA,
+                "passed": bool(cached["passed"]),
+                **{field: cached[field] for field in verdict_fields},
+            })
+            continue
+        qa_result = review_character_performance_cell(
+            review_client,
+            image_path,
+            identity_path=identity_path,
+            prop_path=prop_path,
+            character_id=character_id,
+            cell=cell,
+            synthetic_styling=synthetic_styling,
+        )
+        receipt = {
+            **expected,
+            **qa_result,
+            "status": "passed" if qa_result["passed"] else "failed",
+        }
+        _atomic_json(qa_path, receipt)
+        results.append(qa_result)
+    return results
 
 
 def generate_character_performance_board(
@@ -1226,7 +1557,9 @@ def generate_character_performance_board(
     styling = appearance.get("synthetic_styling") if isinstance(appearance, Mapping) else None
     current_provider_requests = 0
 
-    def review_current_board() -> tuple[dict[str, Any], str]:
+    def review_current_board(
+        component_records: list[dict[str, Any]] | None = None,
+    ) -> tuple[dict[str, Any], str]:
         try:
             with Image.open(image_path) as generated:
                 generated.verify()
@@ -1238,13 +1571,26 @@ def generate_character_performance_board(
             raise CharacterPerformanceQAError(
                 f"{character_id} performance board is not a valid image"
             ) from exc
-        qa_result = review_character_performance_board(
+        board_result = review_character_performance_board(
             review_client,
             image_path,
             character_id=character_id,
             cells=plan["cells"],
             synthetic_styling=styling if isinstance(styling, dict) else None,
         )
+        if component_records:
+            cell_results = _review_performance_cell_components(
+                output_dir,
+                character_id,
+                plan,
+                component_records,
+                references,
+                review_client=review_client,
+                synthetic_styling=styling if isinstance(styling, dict) else None,
+            )
+            qa_result = combine_character_performance_qa(board_result, cell_results)
+        else:
+            qa_result = board_result
         image_hash = file_sha256(image_path)
         qa_receipt = {
             **qa_result,
@@ -1310,7 +1656,7 @@ def generate_character_performance_board(
             qa_result = dict(previous_qa)
             image_hash = file_sha256(image_path)
         else:
-            qa_result, image_hash = review_current_board()
+            qa_result, image_hash = review_current_board(components)
         if not qa_result["passed"]:
             feedback = _failed_performance_cell_feedback(qa_result)
             archived_qa = character_dir / "performance_reference_board_qa.per_cell_fallback.json"
@@ -1369,7 +1715,7 @@ def generate_character_performance_board(
                 correction_components,
                 image_path,
             )
-            corrected_qa, corrected_hash = review_current_board()
+            corrected_qa, corrected_hash = review_current_board(correction_components)
             correction_attempt = {
                 "round": PERFORMANCE_MAX_CELL_CORRECTION_ROUNDS,
                 "status": "passed" if corrected_qa["passed"] else "failed",

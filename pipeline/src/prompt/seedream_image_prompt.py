@@ -49,6 +49,11 @@ _REFERENCE_ROLE_INSTRUCTIONS = {
         "declared prop geometry, material, color, markings and ownership only; do not "
         "copy its isolated layout, background, labels or scale; never create a new subject"
     ),
+    "action_pose_schematic_only": (
+        "text-free abstract action skeleton only; match its joint topology, anatomical "
+        "left/right foot placement, torso lean and prop-line direction; never render diagram "
+        "lines, colored joints, arrows, labels, dark background or a second subject"
+    ),
     "character_performance_board_only": (
         "one 2x3 pose board showing six poses of the same single character; use only "
         "the explicitly selected current pose as motion guidance; never create clones, "

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from PIL import Image
@@ -121,6 +122,30 @@ def _qa_payload() -> str:
     })
 
 
+def _cell_qa_payload(cell_id: str, *, passed: bool = True, issue: str = "") -> str:
+    payload = {
+        "cell_id": cell_id,
+        "same_character": True,
+        "pose_matches_action": passed,
+        "pose_distinct": True,
+        "clothing_consistent": True,
+        "makeup_consistent": True,
+        "healthy_beautiful_synthetic_styling": True,
+        "no_uncanny_or_corpse_like_styling": True,
+        "prop_ownership_correct": True,
+        "no_extra_character": True,
+        "no_text_or_layout_marks": True,
+        "issues": [issue] if issue else [],
+    }
+    return json.dumps(payload)
+
+
+def _prompt_cell_id(prompt: str) -> str:
+    match = re.search(r'"cell_id":\s*"(A\d{2})"', prompt)
+    assert match is not None
+    return match.group(1)
+
+
 class _ImageClient:
     model = "doubao-seedream-5.0-lite"
 
@@ -151,6 +176,8 @@ class _ReviewClient:
 
     def review(self, image_paths, prompt):
         self.calls.append((list(image_paths), prompt))
+        if "single performance-cell inspector" in prompt:
+            return _cell_qa_payload(_prompt_cell_id(prompt))
         return _qa_payload()
 
 
@@ -176,6 +203,8 @@ class _FailThenPassReviewClient:
 
     def review(self, image_paths, prompt):
         self.calls.append((list(image_paths), prompt))
+        if "single performance-cell inspector" in prompt:
+            return _cell_qa_payload(_prompt_cell_id(prompt))
         payload = json.loads(_qa_payload())
         if len(self.calls) == 1:
             payload["passed"] = False
@@ -191,29 +220,49 @@ class _FailTwiceThenPassReviewClient:
 
     def review(self, image_paths, prompt):
         self.calls.append((list(image_paths), prompt))
+        if "single performance-cell inspector" in prompt:
+            cell_id = _prompt_cell_id(prompt)
+            is_correction = "corrections" in str(image_paths[0])
+            if cell_id in {"A02", "A03"} and not is_correction:
+                return _cell_qa_payload(
+                    cell_id,
+                    passed=False,
+                    issue="authored foot and prop direction are incorrect",
+                )
+            return _cell_qa_payload(cell_id)
         payload = json.loads(_qa_payload())
-        if len(self.calls) <= 2:
+        if len(self.calls) == 1:
             payload["passed"] = False
-            payload["cells"][1]["pose_matches_action"] = False
-            payload["cells"][1]["issues"] = [
-                "named stepping foot and prop swing direction are incorrect"
-            ]
-            payload["cells"][2]["pose_matches_action"] = False
-            payload["cells"][2]["issues"] = [
-                "prop is not vertical on the authored defensive side"
-            ]
-            payload["issues"] = ["A02 and A03 action mismatch"]
+            payload["cells"][0]["pose_matches_action"] = False
+            payload["cells"][0]["issues"] = ["whole board action mismatch"]
+            payload["issues"] = ["whole board action mismatch"]
+        else:
+            payload["passed"] = False
+            for item in payload["cells"]:
+                item["pose_matches_action"] = False
+                item["issues"] = ["whole-board action verdict is intentionally unstable"]
+            payload["issues"] = ["whole-board action verdict is intentionally unstable"]
         return json.dumps(payload)
 
 
 class _AlwaysFailReviewClient(_FailTwiceThenPassReviewClient):
     def review(self, image_paths, prompt):
         self.calls.append((list(image_paths), prompt))
+        if "single performance-cell inspector" in prompt:
+            cell_id = _prompt_cell_id(prompt)
+            if cell_id == "A02":
+                return _cell_qa_payload(
+                    cell_id,
+                    passed=False,
+                    issue="attack direction remains incorrect",
+                )
+            return _cell_qa_payload(cell_id)
         payload = json.loads(_qa_payload())
-        payload["passed"] = False
-        payload["cells"][1]["pose_matches_action"] = False
-        payload["cells"][1]["issues"] = ["attack direction remains incorrect"]
-        payload["issues"] = ["A02 action mismatch"]
+        if len(self.calls) == 1:
+            payload["passed"] = False
+            payload["cells"][0]["pose_matches_action"] = False
+            payload["cells"][0]["issues"] = ["whole board action mismatch"]
+            payload["issues"] = ["whole board action mismatch"]
         return json.dumps(payload)
 
 
@@ -385,6 +434,18 @@ def test_failed_whole_board_uses_six_cached_components_then_passes(tmp_path):
     assert [item["cell_id"] for item in receipt["component_cells"]] == list(
         PERFORMANCE_CELL_IDS
     )
+    for component in receipt["component_cells"]:
+        pose_reference = next(
+            item
+            for item in component["references"]
+            if item["kind"] == "action_pose_schematic"
+        )
+        pose_receipt = json.loads(
+            (tmp_path / pose_reference["path"]).with_suffix(".json").read_text()
+        )
+        assert pose_receipt["schema"] == "honcut.character-performance-pose-guide.v1"
+        assert pose_receipt["provider_requests"] == 0
+        assert (tmp_path / component["image"]).with_suffix(".qa.json").is_file()
 
 
 def test_failed_components_redraw_only_failed_cells_once_with_qa_feedback(tmp_path):
@@ -410,7 +471,7 @@ def test_failed_components_redraw_only_failed_cells_once_with_qa_feedback(tmp_pa
     assert generated is not None and generated["provider_requests"] == 9
     assert reused is not None and reused["provider_requests"] == 0
     assert len(image_client.calls) == 9
-    assert len(review_client.calls) == 3
+    assert len(review_client.calls) == 11
     correction_calls = image_client.calls[-2:]
     assert all("one allowed correction redraw" in call["prompt"] for call in correction_calls)
     assert all("anatomical left/right" in call["prompt"] for call in correction_calls)
@@ -419,6 +480,12 @@ def test_failed_components_redraw_only_failed_cells_once_with_qa_feedback(tmp_pa
     )
     assert receipt["generation_mode"] == "per_cell_correction"
     assert receipt["provider_request_count"] == 9
+    final_qa = json.loads(
+        (tmp_path / "characters/lead/performance_reference_board_qa.json").read_text()
+    )
+    assert final_qa["action_verdict_source"] == "isolated_persisted_cells"
+    assert final_qa["board_verdict_source"] == "whole_board_global_fields_only"
+    assert final_qa["passed"] is True
     assert receipt["correction_attempts"] == [
         {
             **receipt["correction_attempts"][0],
@@ -514,6 +581,48 @@ def test_corrupt_or_future_board_receipt_fails_closed(tmp_path):
 
     assert not validate_character_performance_board(tmp_path, "lead")
     assert validate_character_performance_guide(tmp_path, "lead", "S01_P01") is None
+
+
+def test_missing_pose_guide_or_future_cell_qa_fails_closed(tmp_path):
+    _write_reference_assets(tmp_path)
+    generate_character_performance_board(
+        tmp_path,
+        _storyboard(),
+        _character(),
+        image_client=_FallbackImageClient(),
+        review_client=_FailThenPassReviewClient(),
+    )
+    board_receipt = json.loads(
+        (tmp_path / "characters/lead/performance_reference_board.json").read_text()
+    )
+    first_component = board_receipt["component_cells"][0]
+    pose_reference = next(
+        item
+        for item in first_component["references"]
+        if item["kind"] == "action_pose_schematic"
+    )
+    pose_path = tmp_path / pose_reference["path"]
+    pose_path.unlink()
+    assert not validate_character_performance_board(tmp_path, "lead")
+
+    # Restore exact local pose evidence, then prove an unknown future cell-QA
+    # schema still cannot satisfy the production cache.
+    pose_receipt_path = pose_path.with_suffix(".json")
+    pose_receipt_path.unlink()
+    generate_character_performance_board(
+        tmp_path,
+        _storyboard(),
+        _character(),
+        image_client=_FallbackImageClient(),
+        review_client=_ReviewClient(),
+    )
+    cell_qa_path = (
+        tmp_path / first_component["image"]
+    ).with_suffix(".qa.json")
+    cell_qa = json.loads(cell_qa_path.read_text())
+    cell_qa["schema"] = "honcut.character-performance-cell-qa.v999"
+    cell_qa_path.write_text(json.dumps(cell_qa))
+    assert not validate_character_performance_board(tmp_path, "lead")
 
 
 def test_future_prompt_optimization_receipt_cannot_satisfy_cache(tmp_path):
