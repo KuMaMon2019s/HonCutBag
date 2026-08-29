@@ -12,12 +12,17 @@ from phases.phase3.performance_reference_board import (
     CHARACTER_PERFORMANCE_BOARD_SCHEMA,
     PERFORMANCE_CELL_IDS,
     attach_performance_guides_to_storyboard,
+    build_character_performance_cell_correction_prompt,
+    build_character_performance_cell_prompt,
     build_character_performance_plan,
+    build_character_performance_prompt,
     generate_character_performance_board,
     performance_prompt_optimization_contract,
     validate_character_performance_board,
     validate_character_performance_guide,
 )
+from prompt.seedream_image_prompt import bind_reference_roles, prompt_guidance_metrics
+from quality.character_performance_qa import review_character_performance_cell
 
 
 def _character() -> dict:
@@ -98,7 +103,8 @@ def _qa_payload() -> str:
             {
                 "cell_id": cell_id,
                 "same_character": True,
-                "pose_matches_action": True,
+                "action_semantics_match": True,
+                "fine_direction_match": True,
                 "pose_distinct": True,
                 "clothing_consistent": True,
                 "makeup_consistent": True,
@@ -122,11 +128,18 @@ def _qa_payload() -> str:
     })
 
 
-def _cell_qa_payload(cell_id: str, *, passed: bool = True, issue: str = "") -> str:
+def _cell_qa_payload(
+    cell_id: str,
+    *,
+    passed: bool = True,
+    fine_direction_match: bool = True,
+    issue: str = "",
+) -> str:
     payload = {
         "cell_id": cell_id,
         "same_character": True,
-        "pose_matches_action": passed,
+        "action_semantics_match": passed,
+        "fine_direction_match": fine_direction_match,
         "pose_distinct": True,
         "clothing_consistent": True,
         "makeup_consistent": True,
@@ -208,7 +221,7 @@ class _FailThenPassReviewClient:
         payload = json.loads(_qa_payload())
         if len(self.calls) == 1:
             payload["passed"] = False
-            payload["cells"][0]["pose_matches_action"] = False
+            payload["cells"][0]["action_semantics_match"] = False
             payload["cells"][0]["issues"] = ["generic guard pose"]
             payload["issues"] = ["A01 action mismatch"]
         return json.dumps(payload)
@@ -233,13 +246,13 @@ class _FailTwiceThenPassReviewClient:
         payload = json.loads(_qa_payload())
         if len(self.calls) == 1:
             payload["passed"] = False
-            payload["cells"][0]["pose_matches_action"] = False
+            payload["cells"][0]["action_semantics_match"] = False
             payload["cells"][0]["issues"] = ["whole board action mismatch"]
             payload["issues"] = ["whole board action mismatch"]
         else:
             payload["passed"] = False
             for item in payload["cells"]:
-                item["pose_matches_action"] = False
+                item["action_semantics_match"] = False
                 item["issues"] = ["whole-board action verdict is intentionally unstable"]
             payload["issues"] = ["whole-board action verdict is intentionally unstable"]
         return json.dumps(payload)
@@ -260,7 +273,7 @@ class _AlwaysFailReviewClient(_FailTwiceThenPassReviewClient):
         payload = json.loads(_qa_payload())
         if len(self.calls) == 1:
             payload["passed"] = False
-            payload["cells"][0]["pose_matches_action"] = False
+            payload["cells"][0]["action_semantics_match"] = False
             payload["cells"][0]["issues"] = ["whole board action mismatch"]
             payload["issues"] = ["whole board action mismatch"]
         return json.dumps(payload)
@@ -277,6 +290,140 @@ def test_plan_has_six_ordered_cells_bound_to_real_pxx_action_and_prop():
     ]
     assert {cell["source_action_unit_id"] for cell in plan["cells"]} == {"AU001", "AU002"}
     assert all(cell["prop_ids"] == ["energy_baton"] for cell in plan["cells"])
+
+
+def test_plan_prefers_source_facts_and_projects_generic_pose_constraints():
+    storyboard = _storyboard()
+    first = storyboard["shots"][0]["storyboard_beats"][0]
+    first["generation_action_units"][0]["source_fact_echoes"] = [
+        "领队双脚前后分开、双膝微屈站稳成战斗步架"
+    ]
+    first["generation_action_units"][0]["actions"] = [
+        "这是一段重复同一事实并增加许多摄影、环境和结果描述的生成展开，不应进入动作板事实合同"
+    ]
+    second = storyboard["shots"][0]["storyboard_beats"][1]
+    second["generation_action_units"][0]["source_fact_echoes"] = [
+        "领队左脚向前跨出，双手将蓝色能量短棍从身体右下方向左上方挥出"
+    ]
+
+    plan = build_character_performance_plan(storyboard, _character())
+
+    assert plan is not None
+    ready = plan["cells"][0]
+    attack = plan["cells"][1]
+    assert ready["action_description"] == "领队双脚前后分开、双膝微屈站稳成战斗步架"
+    assert "摄影" not in ready["action_description"]
+    assert ready["pose_category"] == "combat_ready"
+    assert ready["pose_constraints"]["stance"] == "staggered"
+    assert ready["pose_constraints"]["knees"] == "bent"
+    assert attack["pose_constraints"]["lead_foot"] == "left"
+    assert attack["pose_constraints"]["prop_start"] == "right_lower"
+    assert attack["pose_constraints"]["prop_end"] == "left_upper"
+
+
+def test_six_pose_roles_specialize_only_existing_prop_action_lineage():
+    storyboard = {
+        "shots": [{
+            "id": "S01",
+            "shot_intent": "action",
+            "storyboard_beats": [
+                {
+                    "beat_id": "S01_P01",
+                    "character_ids": ["lead"],
+                    "source_action_unit_ids": ["AU001", "AU002"],
+                    "generation_action_units": [
+                        _unit("GAU001", "AU001", "领队双脚前后分开站稳成战斗步架"),
+                        _unit("GAU002", "AU002", "领队双手横握蓝色能量短棍进入戒备"),
+                    ],
+                },
+                {
+                    "beat_id": "S01_P02",
+                    "character_ids": ["lead"],
+                    "source_action_unit_ids": ["AU003"],
+                    "generation_action_units": [
+                        _unit("GAU003", "AU003", "领队右脚侧滑并后倾闪避")
+                    ],
+                },
+                {
+                    "beat_id": "S01_P03",
+                    "character_ids": ["lead"],
+                    "source_action_unit_ids": ["AU004", "AU005"],
+                    "generation_action_units": [
+                        _unit("GAU004", "AU004", "领队挥动蓝色能量短棍攻击"),
+                        _unit("GAU005", "AU005", "领队竖直举棍格挡"),
+                    ],
+                },
+            ],
+        }],
+    }
+
+    plan = build_character_performance_plan(storyboard, _character())
+
+    assert plan is not None
+    assert [cell["pose_category"] for cell in plan["cells"]] == [
+        "combat_ready", "evade", "attack", "prop_hold", "block", "prop_use"
+    ]
+    assert {cell["source_action_unit_id"] for cell in plan["cells"]} <= {
+        "AU001", "AU002", "AU003", "AU004", "AU005"
+    }
+    assert plan["cells"][5]["source_action_unit_id"] == "AU004"
+    assert plan["cells"][5]["action_description"] == "领队挥动蓝色能量短棍攻击"
+
+
+def test_performance_prompts_stay_within_official_length_guidance():
+    plan = build_character_performance_plan(_storyboard(), _character())
+    assert plan is not None
+    roles = [
+        "character_identity_board_only",
+        "character_prop_detail_only",
+        "action_pose_schematic_only",
+    ]
+    board_prompt = bind_reference_roles(
+        build_character_performance_prompt(_character(), plan), roles[:2]
+    )
+    assert prompt_guidance_metrics(board_prompt)["over_recommended_length"] is False
+    for cell in plan["cells"]:
+        base = bind_reference_roles(
+            build_character_performance_cell_prompt(_character(), cell), roles
+        )
+        correction = bind_reference_roles(
+            build_character_performance_cell_correction_prompt(
+                _character(), cell, ["major action family is not readable"]
+            ),
+            roles,
+        )
+        assert prompt_guidance_metrics(base)["over_recommended_length"] is False
+        assert prompt_guidance_metrics(correction)["over_recommended_length"] is False
+
+
+def test_fine_direction_is_diagnostic_when_action_semantics_match(tmp_path):
+    _write_reference_assets(tmp_path)
+    pose_path = tmp_path / "pose.png"
+    Image.new("RGB", (2048, 2048), (160, 170, 180)).save(pose_path)
+    plan = build_character_performance_plan(_storyboard(), _character())
+    assert plan is not None
+
+    class _DiagnosticReviewer:
+        def review(self, image_paths, prompt):
+            return _cell_qa_payload(
+                _prompt_cell_id(prompt),
+                fine_direction_match=False,
+                issue="camera angle makes exact anatomical side ambiguous",
+            )
+
+    result = review_character_performance_cell(
+        _DiagnosticReviewer(),
+        pose_path,
+        identity_path=tmp_path / "characters/lead/reference_board.png",
+        prop_path=tmp_path / "characters/lead/prop_detail_board.png",
+        character_id="lead",
+        cell=plan["cells"][0],
+        synthetic_styling=_character()["appearance"]["synthetic_styling"],
+    )
+
+    assert result["passed"] is True
+    assert result["action_semantics_match"] is True
+    assert result["fine_direction_match"] is False
 
 
 def test_plan_normalizes_numeric_production_shot_id_to_canonical_beat_parent():
@@ -334,7 +481,7 @@ def test_prompt_optimization_is_frozen_offline_and_covers_every_dimension():
     second = performance_prompt_optimization_contract()
 
     assert first == second
-    assert first["schema"] == "honcut.character-performance-prompt-optimization.v1"
+    assert first["schema"] == "honcut.character-performance-prompt-optimization.v2"
     assert first["method"] == "offline_contract_candidate_comparison"
     assert first["provider_request_count"] == 0
     assert first["production_auto_optimization"] is False
@@ -443,7 +590,7 @@ def test_failed_whole_board_uses_six_cached_components_then_passes(tmp_path):
         pose_receipt = json.loads(
             (tmp_path / pose_reference["path"]).with_suffix(".json").read_text()
         )
-        assert pose_receipt["schema"] == "honcut.character-performance-pose-guide.v1"
+        assert pose_receipt["schema"] == "honcut.character-performance-pose-guide.v2"
         assert pose_receipt["provider_requests"] == 0
         assert (tmp_path / component["image"]).with_suffix(".qa.json").is_file()
 
@@ -474,7 +621,7 @@ def test_failed_components_redraw_only_failed_cells_once_with_qa_feedback(tmp_pa
     assert len(review_client.calls) == 11
     correction_calls = image_client.calls[-2:]
     assert all("one allowed correction redraw" in call["prompt"] for call in correction_calls)
-    assert all("anatomical left/right" in call["prompt"] for call in correction_calls)
+    assert all("Anatomical" in call["prompt"] for call in correction_calls)
     receipt = json.loads(
         (tmp_path / "characters/lead/performance_reference_board.json").read_text()
     )
@@ -581,6 +728,31 @@ def test_corrupt_or_future_board_receipt_fails_closed(tmp_path):
 
     assert not validate_character_performance_board(tmp_path, "lead")
     assert validate_character_performance_guide(tmp_path, "lead", "S01_P01") is None
+
+
+def test_old_board_and_cell_qa_schemas_fail_closed(tmp_path):
+    _write_reference_assets(tmp_path)
+    generate_character_performance_board(
+        tmp_path,
+        _storyboard(),
+        _character(),
+        image_client=_FallbackImageClient(),
+        review_client=_FailThenPassReviewClient(),
+    )
+    receipt_path = tmp_path / "characters/lead/performance_reference_board.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    current_receipt = dict(receipt)
+    receipt["schema"] = "honcut.character-performance-board.v1"
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    assert not validate_character_performance_board(tmp_path, "lead")
+
+    receipt_path.write_text(json.dumps(current_receipt), encoding="utf-8")
+    first_component = current_receipt["component_cells"][0]
+    qa_path = (tmp_path / first_component["image"]).with_suffix(".qa.json")
+    qa = json.loads(qa_path.read_text(encoding="utf-8"))
+    qa["schema"] = "honcut.character-performance-cell-qa.v1"
+    qa_path.write_text(json.dumps(qa), encoding="utf-8")
+    assert not validate_character_performance_board(tmp_path, "lead")
 
 
 def test_missing_pose_guide_or_future_cell_qa_fails_closed(tmp_path):

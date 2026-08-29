@@ -11,8 +11,8 @@ from schemas.understanding import CharacterPerformanceBoardUnderstanding
 from schemas.understanding import CharacterPerformanceCellUnderstanding
 
 
-CHARACTER_PERFORMANCE_QA_SCHEMA = "honcut.character-performance-board-qa.v3"
-CHARACTER_PERFORMANCE_CELL_QA_SCHEMA = "honcut.character-performance-cell-qa.v1"
+CHARACTER_PERFORMANCE_QA_SCHEMA = "honcut.character-performance-board-qa.v4"
+CHARACTER_PERFORMANCE_CELL_QA_SCHEMA = "honcut.character-performance-cell-qa.v2"
 PERFORMANCE_CELL_IDS = tuple(f"A{index:02d}" for index in range(1, 7))
 
 
@@ -26,7 +26,7 @@ class CharacterPerformanceQAError(RuntimeError):
 
 _CELL_FIELDS = (
     "same_character",
-    "pose_matches_action",
+    "action_semantics_match",
     "pose_distinct",
     "clothing_consistent",
     "makeup_consistent",
@@ -67,16 +67,22 @@ Synthetic styling: {json.dumps(synthetic_styling, ensure_ascii=False, sort_keys=
 Structured aesthetic QA requirements:
 {json.dumps(synthetic_makeup_qa_requirements(), ensure_ascii=False)}
 
-Require the exact authored foot placement, anatomical left/right, torso lean, center-of-gravity,
-prop side/orientation and swing direction. A generic guard or merely similar action fails. Also
-require the same one character, consistent outfit and warm beautiful synthetic porcelain makeup,
-correct declared prop, no extra character and no text/labels/arrows/borders/grid/UI.
+Set action_semantics_match from the stable action family and major physical relationship: the
+declared ready/attack/evade/block/hold/use action, its visible weight shift or torso state, and the
+declared prop relationship must be recognizable. A neutral portrait or wrong action family fails.
+Set fine_direction_match separately for exact anatomical left/right foot, screen-sensitive
+diagonal endpoint and minor orientation. Camera mirroring or an ambiguous 3/4 view must not by
+itself turn a recognizable correct action into action_semantics_match=false; report it through
+fine_direction_match and issues instead. Also require the same one character, consistent outfit
+and warm beautiful synthetic porcelain makeup, correct declared prop, no extra character and no
+text/labels/arrows/borders/grid/UI.
 
 Return exactly one JSON object matching this schema:
 {{
   "cell_id": "{cell['cell_id']}",
   "same_character": true,
-  "pose_matches_action": true,
+  "action_semantics_match": true,
+  "fine_direction_match": true,
   "pose_distinct": true,
   "clothing_consistent": true,
   "makeup_consistent": true,
@@ -185,6 +191,9 @@ Authored cell bindings (do not invent or extend story action):
 Blocking requirements:
 - all six cells depict the same one character, never six people or clones;
 - six clearly different practical body poses are visible;
+- action_semantics_match judges the declared action family and major body/prop relationship;
+  fine_direction_match records exact anatomical-side or diagonal details but is diagnostic because
+  a 3/4 camera or mirrored screen direction cannot reliably block a correct action family;
 - outfit, face identity, synthetic porcelain makeup, colors and proportions stay identical;
 - the complexion stays warm, healthy and elegant; eyes have pupils, iris detail and catchlights;
   lips and cheeks retain coordinated living color; no cell looks gray, bloodless, waxy,
@@ -200,7 +209,8 @@ Return exactly one JSON object with this schema:
     {{
       "cell_id": "A01",
       "same_character": true,
-      "pose_matches_action": true,
+      "action_semantics_match": true,
+      "fine_direction_match": true,
       "pose_distinct": true,
       "clothing_consistent": true,
       "makeup_consistent": true,

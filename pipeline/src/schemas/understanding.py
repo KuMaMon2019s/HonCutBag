@@ -424,7 +424,8 @@ class IdentityDetailUnderstanding(StrictUnderstandingModel):
 class CharacterPerformanceCellUnderstanding(StrictUnderstandingModel):
     cell_id: Literal["A01", "A02", "A03", "A04", "A05", "A06"]
     same_character: bool
-    pose_matches_action: bool
+    action_semantics_match: bool
+    fine_direction_match: bool
     pose_distinct: bool
     clothing_consistent: bool
     makeup_consistent: bool

@@ -28,14 +28,17 @@ from quality.character_performance_qa import (
 from quality.character_reference_qa import file_sha256
 
 
-CHARACTER_PERFORMANCE_BOARD_SCHEMA = "honcut.character-performance-board.v1"
+CHARACTER_PERFORMANCE_BOARD_SCHEMA = "honcut.character-performance-board.v2"
 CHARACTER_PERFORMANCE_GUIDE_SCHEMA = "honcut.character-performance-guide.v1"
-CHARACTER_PERFORMANCE_CELL_SCHEMA = "honcut.character-performance-cell.v1"
-CHARACTER_PERFORMANCE_POSE_GUIDE_SCHEMA = "honcut.character-performance-pose-guide.v1"
-PERFORMANCE_PROMPT_OPTIMIZATION_SCHEMA = (
-    "honcut.character-performance-prompt-optimization.v1"
+CHARACTER_PERFORMANCE_CELL_SCHEMA = "honcut.character-performance-cell.v2"
+CHARACTER_PERFORMANCE_POSE_GUIDE_SCHEMA = "honcut.character-performance-pose-guide.v2"
+CHARACTER_PERFORMANCE_POSE_CONSTRAINTS_SCHEMA = (
+    "honcut.character-performance-pose-constraints.v1"
 )
-PERFORMANCE_PROMPT_TEMPLATE_ID = "honcut.character-performance-board-prompt.v1"
+PERFORMANCE_PROMPT_OPTIMIZATION_SCHEMA = (
+    "honcut.character-performance-prompt-optimization.v2"
+)
+PERFORMANCE_PROMPT_TEMPLATE_ID = "honcut.character-performance-board-prompt.v2"
 PERFORMANCE_PROMPT_GUIDANCE_URL = (
     "https://ark.volcengine.com/region:cn-beijing/docs/82379/1824121?lang=zh"
 )
@@ -59,9 +62,9 @@ PERFORMANCE_POSE_VOCABULARY = (
     "prop_use",
 )
 PERFORMANCE_KEY_POSE_PHASES = (
-    "动作识别姿态：用最有辨识度的关键帧清楚呈现当前编剧动作",
-    "执行峰值：清楚展示当前编剧动作的发力、位移或接触关系",
-    "动作落位：清楚保持当前动作写明的结束姿态，不追加结果",
+    "recognizable authored key pose",
+    "peak force, displacement or contact",
+    "authored end pose without a later result",
 )
 PERFORMANCE_PROMPT_EVALUATION_DIMENSIONS = (
     "synthetic_recognizability",
@@ -328,13 +331,15 @@ def _source_bindings_for_beat(beat: Mapping[str, Any], beat_id: str) -> list[dic
 
 
 def _unit_action_text(units: list[dict[str, Any]], beat: Mapping[str, Any]) -> str:
+    """Return canonical source facts without repeating generated prose."""
     parts: list[str] = []
     for unit in units:
-        for field in ("source_fact_echoes", "actions"):
-            values = unit.get(field) or []
-            if isinstance(values, str):
-                values = [values]
-            parts.extend(str(value).strip() for value in values if str(value).strip())
+        values = unit.get("source_fact_echoes") or []
+        if not values:
+            values = unit.get("actions") or []
+        if isinstance(values, str):
+            values = [values]
+        parts.extend(str(value).strip() for value in values if str(value).strip())
     if not parts:
         parts.append(str(beat.get("action") or "").strip())
     seen: set[str] = set()
@@ -365,13 +370,132 @@ def _pose_category(action_text: str, prop_ids: list[str]) -> str:
             ),
         ),
         ("attack", ("攻击", "挥", "砍", "刺", "踢", "击", "attack", "strike", "kick", "swing")),
-        ("combat_ready", ("戒备", "准备", "对峙", "ready", "stance")),
+        (
+            "combat_ready",
+            (
+                "戒备", "准备", "对峙", "步架", "架势", "站稳",
+                "ready", "stance", "footwork base",
+            ),
+        ),
         ("prop_hold", ("持", "握", "拿", "举", "hold", "wield", "carry")),
     )
     for category, markers in classifications:
         if any(marker in folded for marker in markers):
             return category
     return "prop_hold" if prop_ids else "combat_ready"
+
+
+def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
+    folded = text.casefold()
+    return any(marker.casefold() in folded for marker in markers)
+
+
+def _pose_constraints(action_text: str, pose_category: str) -> dict[str, str]:
+    """Project authored facts into a compact, zero-provider pose contract."""
+    text = str(action_text).strip()
+    lead_foot = "unspecified"
+    if _contains_any(text, (
+        "左脚向前", "左脚前跨", "左脚在前", "左腿在前",
+        "left foot forward", "lead with the left foot", "left leg forward",
+    )):
+        lead_foot = "left"
+    elif _contains_any(text, (
+        "右脚向前", "右脚前跨", "右脚在前", "右腿在前",
+        "right foot forward", "lead with the right foot", "right leg forward",
+    )):
+        lead_foot = "right"
+
+    moving_foot = "unspecified"
+    if _contains_any(text, ("左脚向", "左脚滑", "左脚跨", "收回左脚", "left foot")):
+        moving_foot = "left"
+    elif _contains_any(text, ("右脚向", "右脚滑", "右脚跨", "收回右脚", "right foot")):
+        moving_foot = "right"
+
+    movement_direction = "unspecified"
+    if _contains_any(text, ("向左侧", "向左方", "向左滑", "leftward", "to the left")):
+        movement_direction = "left"
+    elif _contains_any(text, ("向右侧", "向右方", "向右滑", "rightward", "to the right")):
+        movement_direction = "right"
+    elif _contains_any(text, ("向前", "前跨", "前进", "forward")):
+        movement_direction = "forward"
+    elif _contains_any(text, ("向后", "后撤", "后退", "backward", "back step")):
+        movement_direction = "backward"
+
+    stance = "neutral"
+    if _contains_any(text, ("双脚前后", "前后步", "步架", "弓步", "staggered", "split stance")):
+        stance = "staggered"
+    elif _contains_any(text, ("侧滑", "侧移", "向左侧", "向右侧", "lateral", "side step")):
+        stance = "lateral"
+    elif pose_category in {"attack", "evade", "block", "combat_ready"}:
+        stance = "action"
+
+    knees = (
+        "bent"
+        if _contains_any(text, ("屈膝", "膝微屈", "弯膝", "bent knee", "knees bent"))
+        else "unspecified"
+    )
+    center_of_gravity = (
+        "lowered"
+        if _contains_any(text, (
+            "重心下沉", "降低身体重心", "降低重心", "低重心", "沉髋", "压低重心",
+            "lower center", "lowered center", "drop the center",
+        ))
+        else "unspecified"
+    )
+    torso_lean = "unspecified"
+    if _contains_any(text, ("后倾", "后仰", "lean back", "lean backward")):
+        torso_lean = "backward"
+    elif _contains_any(text, ("向左倾", "左倾", "lean left")):
+        torso_lean = "left"
+    elif _contains_any(text, ("向右倾", "右倾", "lean right")):
+        torso_lean = "right"
+    elif _contains_any(text, ("中正", "直立", "upright")):
+        torso_lean = "upright"
+
+    prop_orientation = "unspecified"
+    if _contains_any(text, ("横握", "横向", "水平", "horizontal")):
+        prop_orientation = "horizontal"
+    elif _contains_any(text, ("竖直", "垂直", "vertical")):
+        prop_orientation = "vertical"
+    elif _contains_any(text, ("斜", "对角", "diagonal")):
+        prop_orientation = "diagonal"
+
+    prop_start = "unspecified"
+    prop_end = "unspecified"
+    direction_pairs = (
+        ("right_lower", "left_upper", ("右下方向左上", "右下至左上", "lower right to upper left")),
+        ("left_lower", "right_upper", ("左下方向右上", "左下至右上", "lower left to upper right")),
+        ("right_upper", "left_lower", ("右上方向左下", "右上至左下", "upper right to lower left")),
+        ("left_upper", "right_lower", ("左上方向右下", "左上至右下", "upper left to lower right")),
+    )
+    for start, end, markers in direction_pairs:
+        if _contains_any(text, markers):
+            prop_start, prop_end = start, end
+            prop_orientation = "diagonal"
+            break
+
+    prop_side = "unspecified"
+    if _contains_any(text, ("身体左前", "身前左侧", "character's left", "body left")):
+        prop_side = "left"
+    elif _contains_any(text, ("身体右前", "身前右侧", "character's right", "body right")):
+        prop_side = "right"
+    elif _contains_any(text, ("身前", "in front of the body")):
+        prop_side = "front"
+
+    return {
+        "schema": CHARACTER_PERFORMANCE_POSE_CONSTRAINTS_SCHEMA,
+        "stance": stance,
+        "knees": knees,
+        "center_of_gravity": center_of_gravity,
+        "torso_lean": torso_lean,
+        "lead_foot": lead_foot,
+        "moving_foot": moving_foot,
+        "movement_direction": movement_direction,
+        "prop_orientation": prop_orientation,
+        "prop_side": prop_side,
+        "prop_start": prop_start,
+        "prop_end": prop_end,
+    }
 
 
 def _eligible_beat(shot: Mapping[str, Any], beat: Mapping[str, Any], props: list[dict[str, Any]]) -> bool:
@@ -483,6 +607,31 @@ def build_character_performance_plan(
         if key not in selected_keys:
             selected.append(dict(candidate))
             selected_keys.add(key)
+
+    # Specialize duplicate prop-bearing action families without changing their
+    # canonical source-action lineage or inventing a new story action.
+    seen_categories: set[str] = set()
+    for index, binding in enumerate(selected):
+        category = str(binding["pose_category"])
+        if category not in seen_categories:
+            seen_categories.add(category)
+            continue
+        if not binding["prop_ids"]:
+            continue
+        specialized = ""
+        if (
+            category in {"combat_ready", "prop_hold"}
+            and "prop_hold" not in seen_categories
+        ):
+            specialized = "prop_hold"
+        elif (
+            category in {"attack", "block", "prop_use"}
+            and "prop_use" not in seen_categories
+        ):
+            specialized = "prop_use"
+        if specialized:
+            selected[index] = {**binding, "pose_category": specialized}
+            seen_categories.add(specialized)
     cursor = 0
     while len(selected) < len(PERFORMANCE_CELL_IDS):
         missing_categories = [
@@ -490,19 +639,45 @@ def build_character_performance_plan(
             for category in PERFORMANCE_POSE_VOCABULARY
             if category not in {binding["pose_category"] for binding in selected}
         ]
-        candidate = candidates[cursor % len(candidates)]
-        if missing_categories and missing_categories[0] == "prop_use":
-            prop_candidates = [
-                item for item in candidates
-                if item["prop_ids"]
-                and item["pose_category"] in {"attack", "block", "prop_hold"}
-            ]
-            if prop_candidates:
-                candidate = next(
-                    (item for item in prop_candidates if item["pose_category"] == "attack"),
-                    prop_candidates[0],
-                )
-                candidate = {**candidate, "pose_category": "prop_use"}
+        candidate: dict[str, Any] | None = None
+        for missing_category in missing_categories:
+            if missing_category == "prop_hold":
+                compatible = [
+                    item
+                    for item in candidates
+                    if item["prop_ids"]
+                    and item["pose_category"] in {
+                        "prop_hold", "combat_ready", "block", "attack",
+                    }
+                ]
+            elif missing_category == "prop_use":
+                prop_actions = [item for item in candidates if item["prop_ids"]]
+                compatible = [
+                    item
+                    for item in prop_actions
+                    if _contains_any(
+                        item["action_description"],
+                        (
+                            "使用", "操作", "启动", "发射", "挥", "砍", "刺", "击",
+                            "use", "operate", "activate", "fire", "swing", "strike",
+                        ),
+                    )
+                ] or [
+                    item
+                    for item in prop_actions
+                    if item["pose_category"] in {"prop_use", "attack", "block"}
+                ]
+            else:
+                compatible = [
+                    item
+                    for item in candidates
+                    if item["pose_category"] == missing_category
+                ]
+            if compatible:
+                candidate = {**compatible[0], "pose_category": missing_category}
+                break
+        if candidate is None:
+            candidate = dict(candidates[cursor % len(candidates)])
         selected.append(dict(candidate))
         cursor += 1
 
@@ -529,6 +704,9 @@ def build_character_performance_plan(
                 occurrence % len(PERFORMANCE_KEY_POSE_PHASES)
             ],
             "action_description": binding["action_description"],
+            "pose_constraints": _pose_constraints(
+                binding["action_description"], binding["pose_category"]
+            ),
         })
     return {
         "schema": CHARACTER_PERFORMANCE_BOARD_SCHEMA,
@@ -546,18 +724,26 @@ def build_character_performance_prompt(
 ) -> str:
     appearance = character.get("appearance")
     styling = appearance.get("synthetic_styling") if isinstance(appearance, Mapping) else None
-    from utils.privacy_visual_policy import no_real_person_prompt_contract
-
-    aesthetic_contract = no_real_person_prompt_contract() if styling else ""
+    aesthetic_contract = _compact_performance_styling_contract(styling)
     positions = (
         "top-left", "top-center", "top-right",
         "bottom-left", "bottom-center", "bottom-right",
     )
+    binding_ids: dict[tuple[str, str], str] = {}
+    binding_facts: list[str] = []
+    for cell in plan["cells"]:
+        key = (str(cell["beat_id"]), str(cell["source_action_unit_id"]))
+        if key in binding_ids:
+            continue
+        binding_id = f"B{len(binding_ids) + 1:02d}"
+        binding_ids[key] = binding_id
+        binding_facts.append(f"- {binding_id}: {cell['action_description']}")
     cell_instructions = "\n".join(
         (
             f"- {position} (internal {cell['cell_id']}; never print the ID): "
-            f"role={cell['pose_category']}; exact authored action={cell['action_description']}; "
-            f"required key pose={cell['pose_focus']}."
+            f"action={binding_ids[(str(cell['beat_id']), str(cell['source_action_unit_id']))]}; "
+            f"role={cell['pose_category']}; key_pose={cell['pose_focus']}; "
+            f"constraints={_compact_pose_constraints_text(cell['pose_constraints'])}."
         )
         for position, cell in zip(positions, plan["cells"], strict=True)
     )
@@ -570,6 +756,9 @@ makeup, narrow temple-to-cheek iridescent circuit stripe, luminous iris ring, ha
 proportions, outfit, colors and character-specific makeup design across all six poses.
 Image 2, when present, supplies declared prop geometry/material/color only.
 {aesthetic_contract}
+
+Canonical authored action facts:
+{chr(10).join(binding_facts)}
 
 Follow these six positions exactly:
 {cell_instructions}
@@ -585,8 +774,47 @@ character.
 Pixel prohibitions: no text, no letters, no numbers, no Axx labels, no arrows, no captions, no UI,
 no panel borders, no grid lines. Do not add another character. This is a pose reference sheet, not a
 storyboard and not a finished cinematic frame.
-Synthetic styling contract: {json.dumps(styling, ensure_ascii=False, sort_keys=True)}
 """
+
+
+def _compact_performance_styling_contract(styling: Any) -> str:
+    """Keep identity anchors without repeating the complete video policy."""
+    if not isinstance(styling, Mapping):
+        return ""
+    anchors = [
+        str(value).strip()
+        for value in styling.get("visible_anchors") or []
+        if str(value).strip()
+    ]
+    design_id = str(styling.get("makeup_design_id") or "").strip()
+    material = str(styling.get("non_human_material") or "").strip()
+    pieces = [
+        f"makeup_design_id={design_id}" if design_id else "",
+        f"material={material}" if material else "",
+        "anchors=" + " | ".join(anchors) if anchors else "",
+    ]
+    identity = "; ".join(piece for piece in pieces if piece)
+    return (
+        "Synthetic identity lock: " + identity + ". Keep a warm, healthy, elegant "
+        "complexion with clear pupils and catchlights; never corpse-like, "
+        "horror-styled, masked or photoreal."
+    )
+
+
+def _compact_pose_constraints_text(constraints: Any) -> str:
+    if not isinstance(constraints, Mapping):
+        raise CharacterPerformanceQAError("performance prompt lacks pose constraints")
+    ordered_keys = (
+        "stance", "knees", "center_of_gravity", "torso_lean", "lead_foot",
+        "moving_foot", "movement_direction", "prop_orientation", "prop_side",
+        "prop_start", "prop_end",
+    )
+    declared = [
+        f"{key}={constraints.get(key)}"
+        for key in ordered_keys
+        if str(constraints.get(key) or "unspecified") not in {"unspecified", "neutral"}
+    ]
+    return ",".join(declared) or "no additional directional fact"
 
 
 def build_character_performance_cell_prompt(
@@ -595,9 +823,7 @@ def build_character_performance_cell_prompt(
 ) -> str:
     appearance = character.get("appearance")
     styling = appearance.get("synthetic_styling") if isinstance(appearance, Mapping) else None
-    from utils.privacy_visual_policy import no_real_person_prompt_contract
-
-    aesthetic_contract = no_real_person_prompt_contract() if styling else ""
+    aesthetic_contract = _compact_performance_styling_contract(styling)
     return f"""Create one square full-body character action reference on a seamless neutral
 light-gray studio background. Show exactly one character and exactly one clearly readable pose.
 
@@ -611,13 +837,13 @@ and limb topology, but render the finished character rather than diagram lines o
 Exact authored action: {cell['action_description']}
 Required action role: {cell['pose_category']}
 Required key pose: {cell['pose_focus']}
+Deterministic pose constraints: {_compact_pose_constraints_text(cell['pose_constraints'])}
 
 The pose must visibly perform the exact authored action, not a generic guard. Preserve every stated
 left/right foot placement, center-of-gravity change, torso lean, prop orientation and swing direction.
 Keep the entire body, both feet, both hands and the complete prop visible with clear negative space.
 Do not add a second person, a later action, an outcome, injury, wet clothing, torn clothing or dirt.
 No text, letters, numbers, labels, arrows, captions, UI, borders or grid lines.
-Synthetic styling contract: {json.dumps(styling, ensure_ascii=False, sort_keys=True)}
 """
 
 
@@ -655,16 +881,22 @@ failed strict action QA for these exact reasons:
 {feedback}
 
 Correct every listed failure and nothing else. {pose_directive}
-Left/right is always the character's anatomical left/right, not the viewer's: in a front-facing
-pose, character-left appears on viewer-right and character-right appears on viewer-left. Make the
-foot placement and prop direction unmistakable in silhouette. Do not print this feedback or the
-internal cell ID in the image.
+Use the deterministic pose constraints and the final schematic as the geometry authority.
+Anatomical left/right belongs to the character, not the viewer; never infer it from a camera
+label. Make the major action, weight shift and prop relationship unmistakable. Do not print this
+feedback or the internal cell ID in the image.
 """
 
 
 def _pose_guide_geometry(cell: Mapping[str, Any]) -> dict[str, Any]:
     """Project one authored action into a deterministic front-facing pose skeleton."""
     role = str(cell.get("pose_category") or "combat_ready")
+    constraints = cell.get("pose_constraints")
+    if (
+        not isinstance(constraints, Mapping)
+        or constraints.get("schema") != CHARACTER_PERFORMANCE_POSE_CONSTRAINTS_SCHEMA
+    ):
+        raise CharacterPerformanceQAError("performance cell lacks current pose constraints")
     geometry: dict[str, Any] = {
         "head": (512, 150),
         "neck": (512, 225),
@@ -735,6 +967,66 @@ def _pose_guide_geometry(cell: Mapping[str, Any]) -> dict[str, Any]:
             "prop": ((360, 520), (690, 520)),
             "emphasis": ("left_hand", "right_hand"),
         })
+
+    # Anatomical left appears on viewer-right in this front-facing schematic.
+    if constraints.get("stance") == "staggered":
+        geometry.update({
+            "left_knee": (585, 715),
+            "right_knee": (430, 675),
+            "left_foot": (620, 930),
+            "right_foot": (385, 840),
+        })
+    if constraints.get("lead_foot") == "left":
+        geometry.update({
+            "left_knee": (620, 730),
+            "right_knee": (420, 675),
+            "left_foot": (675, 930),
+            "right_foot": (385, 835),
+        })
+    elif constraints.get("lead_foot") == "right":
+        geometry.update({
+            "left_knee": (600, 675),
+            "right_knee": (400, 730),
+            "left_foot": (640, 835),
+            "right_foot": (350, 930),
+        })
+    if (
+        constraints.get("movement_direction") == "right"
+        and constraints.get("moving_foot") == "right"
+    ):
+        geometry.update({"right_knee": (335, 735), "right_foot": (205, 910)})
+    elif (
+        constraints.get("movement_direction") == "left"
+        and constraints.get("moving_foot") == "left"
+    ):
+        geometry.update({"left_knee": (690, 735), "left_foot": (820, 910)})
+    if constraints.get("knees") == "bent":
+        geometry.update({
+            "left_knee": (
+                geometry["left_knee"][0] + 25,
+                min(770, geometry["left_knee"][1] + 25),
+            ),
+            "right_knee": (
+                geometry["right_knee"][0] - 25,
+                min(770, geometry["right_knee"][1] + 25),
+            ),
+        })
+
+    prop_points = {
+        "right_lower": (330, 740),
+        "left_lower": (694, 740),
+        "right_upper": (330, 245),
+        "left_upper": (694, 245),
+    }
+    prop_start = str(constraints.get("prop_start") or "unspecified")
+    prop_end = str(constraints.get("prop_end") or "unspecified")
+    if prop_start in prop_points and prop_end in prop_points:
+        geometry["prop"] = (prop_points[prop_start], prop_points[prop_end])
+    elif constraints.get("prop_orientation") == "horizontal":
+        geometry["prop"] = ((330, 520), (694, 520))
+    elif constraints.get("prop_orientation") == "vertical":
+        prop_x = 700 if constraints.get("prop_side") == "left" else 324
+        geometry["prop"] = ((prop_x, 740), (prop_x, 245))
     return geometry
 
 
@@ -757,8 +1049,9 @@ def _ensure_performance_pose_guide(
         "character_id": character_id,
         "cell_id": cell_id,
         "cell_sha256": cell_hash,
+        "pose_constraints_sha256": _canonical_hash(cell["pose_constraints"]),
         "geometry_sha256": geometry_hash,
-        "generator": "honcut.front-facing-action-skeleton.v1",
+        "generator": "honcut.front-facing-action-skeleton.v2",
         "image": guide_path.relative_to(output_dir).as_posix(),
         "provider_requests": 0,
     }
@@ -898,6 +1191,12 @@ def validate_character_performance_board(
         or [cell.get("cell_id") for cell in cells]
         != list(PERFORMANCE_CELL_IDS)
         or any(cell.get("character_id") != character_id for cell in cells)
+        or any(
+            not isinstance(cell.get("pose_constraints"), dict)
+            or cell["pose_constraints"].get("schema")
+            != CHARACTER_PERFORMANCE_POSE_CONSTRAINTS_SCHEMA
+            for cell in cells
+        )
     ):
         return False
     plan_hash = _canonical_hash(plan)
@@ -1292,7 +1591,7 @@ def _failed_performance_cell_feedback(
     feedback: dict[str, list[str]] = {}
     boolean_checks = (
         "same_character",
-        "pose_matches_action",
+        "action_semantics_match",
         "pose_distinct",
         "clothing_consistent",
         "makeup_consistent",
@@ -1353,7 +1652,8 @@ def _review_performance_cell_components(
     verdict_fields = (
         "cell_id",
         "same_character",
-        "pose_matches_action",
+        "action_semantics_match",
+        "fine_direction_match",
         "pose_distinct",
         "clothing_consistent",
         "makeup_consistent",
