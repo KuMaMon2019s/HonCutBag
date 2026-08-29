@@ -23,6 +23,7 @@ PHASE3_DRY_RUN_RECEIPT_NAME = "phase3_dry_run_receipt.json"
 PHASE3_DRY_RUN_SKIPPED_OPERATIONS = (
     "character_reference_image_generation",
     "character_reference_semantic_qa",
+    "character_performance_board_generation",
     "character_locked_storyboard_refresh",
 )
 
@@ -506,6 +507,8 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
                 "registry_provider_requests": 0,
             }
 
+        performance_boards: list[dict] = []
+
         # Phase 3 owns the first point at which character reference packs are
         # guaranteed to exist. Regenerate the canonical Pxx chain here so the
         # continuity runtime and ordinary Sxx path consume the same identity-
@@ -571,6 +574,36 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
                     "duration_s": _elapsed(start),
                 }
 
+            # Performance boards are run-local story assets. Build them only
+            # after canonical Pxx action lineage and static v6 identities have
+            # both passed their owners; never promote them into the registry.
+            from phases.phase3.performance_reference_board import (
+                build_character_performance_plan,
+                generate_performance_reference_boards,
+            )
+
+            performance_characters = [
+                character
+                for character in characters_list
+                if build_character_performance_plan(storyboard, character) is not None
+            ]
+            if performance_characters:
+                from clients.ark_multimodal_client import ArkMultimodalClient
+                from clients.seedream_client import SeedreamClient
+
+                performance_boards = generate_performance_reference_boards(
+                    output_dir,
+                    storyboard,
+                    performance_characters,
+                    image_client=SeedreamClient(),
+                    review_client=ArkMultimodalClient(),
+                )
+                outputs.extend(
+                    str(board["board"])
+                    for board in performance_boards
+                    if board.get("board")
+                )
+
         result = {
             "status": "done",
             "duration_s": _elapsed(start),
@@ -580,6 +613,16 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
         }
         if registry_summary is not None:
             result["character_registry"] = registry_summary
+        result["performance_boards"] = {
+            "count": len(performance_boards),
+            "provider_requests": sum(
+                int(board.get("provider_requests") or 0)
+                for board in performance_boards
+            ),
+            "characters": [
+                board.get("character_id") for board in performance_boards
+            ],
+        }
         return result
 
     except ImportError as e:

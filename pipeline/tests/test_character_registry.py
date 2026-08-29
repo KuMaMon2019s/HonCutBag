@@ -119,8 +119,8 @@ def _write_approved_pack(output_dir: Path, character: dict) -> Path:
         "reference_board": f"characters/{char_id}/reference_board.png",
         "reference_board_receipt": f"characters/{char_id}/reference_board.json",
         "identity_props": [],
-        "identity_detail_reference": None,
-        "identity_detail_qa_report": None,
+        "prop_detail_board": None,
+        "prop_detail_board_qa_report": None,
     }
     (char_dir / "character_card.json").write_text(
         json.dumps(card, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -264,7 +264,7 @@ def test_registry_rejects_db_metadata_that_disagrees_with_approval(tmp_path):
         registry.find_exact(spec)
 
 
-def test_registry_excludes_state_variants_and_unsafe_character_ids(tmp_path):
+def test_registry_ignores_legacy_state_metadata_and_rejects_unsafe_character_ids(tmp_path):
     spec = _phase3_spec(_character())
     source = tmp_path / "source"
     _write_approved_pack(source, spec)
@@ -273,8 +273,10 @@ def test_registry_excludes_state_variants_and_unsafe_character_ids(tmp_path):
     variant["appearance"]["variants"] = [{"id": "battle-damaged"}]
 
     assert registry.find_exact(variant) is None
-    with pytest.raises(CharacterRegistryError, match="state variants"):
-        registry.promote_from_run(source, variant, quality_grade="A", source_run_id="run-a")
+    approved = registry.promote_from_run(
+        source, variant, quality_grade="A", source_run_id="run-a"
+    )
+    assert registry.find_exact(variant).version_id == approved.version_id
     with pytest.raises(CharacterRegistryError, match="safe path component"):
         character_spec_fingerprint({**spec, "id": "../escape"})
 

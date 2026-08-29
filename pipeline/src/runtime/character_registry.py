@@ -116,9 +116,8 @@ def _normalized_approval_assets(payload: Any) -> list[dict[str, Any]] | None:
 
 
 def character_has_unapproved_variants(character: Mapping[str, Any]) -> bool:
-    """Return whether the character requests state assets outside v1 approval."""
-    appearance = character.get("appearance")
-    return bool(isinstance(appearance, Mapping) and appearance.get("variants"))
+    """Legacy state metadata never creates or blocks a static v6 identity pack."""
+    return False
 
 
 def character_spec_payload(character: Mapping[str, Any]) -> dict[str, Any]:
@@ -219,23 +218,26 @@ def _asset_records(output_dir: Path, character: Mapping[str, Any]) -> list[tuple
     identity_props = card.get("identity_props")
     if isinstance(identity_props, list) and identity_props:
         detail_path = _resolve_run_file(
-            output_dir, str(card.get("identity_detail_reference") or "")
+            output_dir, str(card.get("prop_detail_board") or "")
         )
         detail_qa_path = _resolve_run_file(
-            output_dir, str(card.get("identity_detail_qa_report") or "")
+            output_dir, str(card.get("prop_detail_board_qa_report") or "")
         )
         try:
             detail_qa = json.loads(detail_qa_path.read_text(encoding="utf-8"))
-            detail_input = detail_qa["inputs"]["identity_detail"]
+            detail_input = detail_qa["inputs"]["prop_detail_board"]
         except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
-            raise CharacterRegistryError("identity-detail QA receipt is invalid") from error
+            raise CharacterRegistryError("prop-detail-board QA receipt is invalid") from error
         if (
-            detail_qa.get("schema") != "honcut.identity-detail-qa.v1"
+            detail_qa.get("schema") != "honcut.prop-detail-board-qa.v1"
             or detail_qa.get("status") != "passed"
             or detail_input.get("sha256") != file_sha256(detail_path)
         ):
-            raise CharacterRegistryError("identity-detail QA receipt is stale or failed")
-        records.extend([("identity_detail", detail_path), ("identity_detail_qa", detail_qa_path)])
+            raise CharacterRegistryError("prop-detail-board QA receipt is stale or failed")
+        records.extend([
+            ("prop_detail_board", detail_path),
+            ("prop_detail_board_qa", detail_qa_path),
+        ])
 
     for _role, path in records:
         if not path.is_file():

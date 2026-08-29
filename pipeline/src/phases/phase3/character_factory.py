@@ -314,6 +314,7 @@ FULL_BODY_IMAGE_RULES = (
 FULL_BODY_REFERENCE_SIZE = "2K"
 REFERENCE_CONTRACT_VERSION = 6
 REFERENCE_GENERATION_CONTRACT_SCHEMA = "honcut.character-reference-generation.v1"
+PROP_DETAIL_QA_SCHEMA = "honcut.prop-detail-board-qa.v1"
 
 
 def _canonical_json_sha256(value: Any) -> str:
@@ -769,17 +770,49 @@ def _quality_control_identity_detail(
     max_retries: int,
 ) -> dict[str, Any]:
     """Block Phase 3 until the supplemental item board matches the four views."""
-    report_path = char_dir / "identity_detail_qa.json"
+    report_path = char_dir / "prop_detail_board_qa.json"
+    input_contract = {
+        "schema": "honcut.prop-detail-board-input.v1",
+        "character_description_sha256": hashlib.sha256(
+            character_description.encode("utf-8")
+        ).hexdigest(),
+        "prompt_sha256": hashlib.sha256(
+            build_identity_detail_prompt(
+                character_description,
+                identity_props,
+                style,
+            ).encode("utf-8")
+        ).hexdigest(),
+        "identity_props_sha256": _canonical_json_sha256(identity_props),
+        "canonical_references": [
+            {"path": path.name, "sha256": file_sha256(path)}
+            for path in canonical_paths
+        ],
+    }
+    try:
+        cached = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        cached = None
+    if (
+        isinstance(cached, dict)
+        and cached.get("schema") == PROP_DETAIL_QA_SCHEMA
+        and cached.get("status") == "passed"
+        and cached.get("input_contract") == input_contract
+        and detail_path.is_file()
+        and cached.get("inputs", {}).get("prop_detail_board", {}).get("sha256")
+        == file_sha256(detail_path)
+    ):
+        print(f"  [prop-detail-qa] {char_id} ✓ exact cache, zero Provider requests")
+        return cached
     attempts: list[dict[str, Any]] = []
-    if not detail_path.is_file() or detail_path.stat().st_size <= 10_240:
-        _generate_identity_detail(
-            image_client,
-            character_description=character_description,
-            identity_props=identity_props,
-            style=style,
-            canonical_paths=canonical_paths,
-            output_path=detail_path,
-        )
+    _generate_identity_detail(
+        image_client,
+        character_description=character_description,
+        identity_props=identity_props,
+        style=style,
+        canonical_paths=canonical_paths,
+        output_path=detail_path,
+    )
     for attempt in range(1, max_retries + 2):
         result = review_identity_detail_reference(
             review_client,
@@ -789,16 +822,14 @@ def _quality_control_identity_detail(
         )
         attempts.append({"attempt": attempt, **result})
         receipt = {
-            "schema": "honcut.identity-detail-qa.v1",
+            "schema": PROP_DETAIL_QA_SCHEMA,
             "character_id": char_id,
             "status": "passed" if result["passed"] else "failed",
             "identity_props": identity_props,
+            "input_contract": input_contract,
             "inputs": {
-                "canonical_references": [
-                    {"path": path.name, "sha256": file_sha256(path)}
-                    for path in canonical_paths
-                ],
-                "identity_detail": {
+                "canonical_references": input_contract["canonical_references"],
+                "prop_detail_board": {
                     "path": detail_path.name,
                     "sha256": file_sha256(detail_path),
                 },
@@ -807,14 +838,14 @@ def _quality_control_identity_detail(
         }
         _write_json_atomic(report_path, receipt)
         if result["passed"]:
-            print(f"  [identity-detail-qa] {char_id} ✓ attempt {attempt}")
+            print(f"  [prop-detail-qa] {char_id} ✓ attempt {attempt}")
             return receipt
         if attempt > max_retries:
             raise CharacterReferenceQAError(
                 f"{char_id} identity detail failed after {attempt} QA attempt(s): "
                 + "; ".join(result.get("issues") or ["detail contract violation"])
             )
-        archive = char_dir / "identity_detail_qa_attempts" / f"attempt_{attempt:02d}"
+        archive = char_dir / "prop_detail_board_qa_attempts" / f"attempt_{attempt:02d}"
         archive.mkdir(parents=True, exist_ok=True)
         shutil.copy2(detail_path, archive / detail_path.name)
         _generate_identity_detail(
@@ -826,7 +857,7 @@ def _quality_control_identity_detail(
             output_path=detail_path,
             correction="; ".join(result.get("issues") or ["item or identity mismatch"]),
         )
-    raise AssertionError("unreachable identity-detail QA state")
+    raise AssertionError("unreachable prop-detail QA state")
 
 
 def _archive_reference_attempt(
@@ -1013,8 +1044,8 @@ def generate_character(
     char_dir = os.path.join(output_dir, "characters", char_id)
     os.makedirs(char_dir, exist_ok=True)
     normalized_identity_props = normalize_identity_props(identity_props or [])
-    identity_detail_path: Path | None = None
-    identity_detail_receipt: dict[str, Any] | None = None
+    prop_detail_board_path: Path | None = None
+    prop_detail_board_receipt: dict[str, Any] | None = None
     reference_board_path: Path | None = None
 
     print(f"\n{'='*60}")
@@ -1139,7 +1170,7 @@ def generate_character(
                 from clients.ark_multimodal_client import ArkMultimodalClient
 
                 review_client = ArkMultimodalClient()
-            identity_detail_path = Path(char_dir) / "identity_detail.png"
+            prop_detail_board_path = Path(char_dir) / "prop_detail_board.png"
             detail_face_view = (
                 "face_closeup"
                 if "face_closeup" in views
@@ -1152,14 +1183,14 @@ def generate_character(
                 Path(views[detail_face_view]),
                 Path(views[detail_body_view]),
             ]
-            identity_detail_receipt = _quality_control_identity_detail(
+            prop_detail_board_receipt = _quality_control_identity_detail(
                 char_id=char_id,
                 character_description=description,
                 identity_props=normalized_identity_props,
                 style=style,
                 char_dir=Path(char_dir),
                 canonical_paths=canonical_paths,
-                detail_path=identity_detail_path,
+                detail_path=prop_detail_board_path,
                 image_client=client,
                 review_client=review_client,
                 max_retries=view_qa_max_retries,
@@ -1215,14 +1246,14 @@ def generate_character(
         else None
     )
     card["identity_props"] = normalized_identity_props
-    card["identity_detail_reference"] = (
-        f"characters/{char_id}/identity_detail.png"
+    card["prop_detail_board"] = (
+        f"characters/{char_id}/prop_detail_board.png"
         if normalized_identity_props
         else None
     )
-    card["identity_detail_qa_report"] = (
-        f"characters/{char_id}/identity_detail_qa.json"
-        if identity_detail_receipt is not None
+    card["prop_detail_board_qa_report"] = (
+        f"characters/{char_id}/prop_detail_board_qa.json"
+        if prop_detail_board_receipt is not None
         else None
     )
     card["reference_qa_report"] = (
@@ -1246,11 +1277,6 @@ def generate_character(
             "侧面/行走/奔跑": "side.png",
             "背面/远去/离开": "back.png",
             "面部/情绪/泪水": f"{face_view}.png",
-            **(
-                {"身份道具/材质/标记细节": "identity_detail.png"}
-                if normalized_identity_props
-                else {}
-            ),
         },
     )
     angle_path = os.path.join(char_dir, "angle_map.json")
@@ -1258,67 +1284,9 @@ def generate_character(
         json.dump(angle_map, f, ensure_ascii=False, indent=2)
     print(f"  ✓ {angle_path}")
 
-    # Step 4: Generate variant images (P1-A3: 衍生参考图)
-    variant_paths = {}
-    if variants and not skip_images and client is not None:
-        print(f"\n[Step 4] Generating {len(variants)} variant reference(s)...")
-        for variant in variants:
-            state_name = variant.get("state_name", "unknown")
-            variant_desc = variant.get("description", "")
-            if not variant_desc:
-                print(f"  [variant] Skipping {state_name}: no description")
-                continue
-            
-            variant_filename = f"variant_{state_name}.png"
-            variant_path = os.path.join(char_dir, variant_filename)
-            
-            # Skip if already exists
-            if os.path.exists(variant_path):
-                print(f"  [variant] {variant_filename} already exists, skipping")
-                variant_paths[state_name] = variant_path
-                continue
-            
-            try:
-                # Build variant prompt: base appearance + state change
-                # Emphasize face must remain identical
-                rendering = _reference_rendering_clause(style)
-                variant_prompt = (
-                    f"Character reference sheet, same person as base reference. "
-                    f"State change: {variant_desc}. "
-                    f"CRITICAL: facial features, bone structure, and identity must remain "
-                    f"100% identical to the base character. Only modify clothing, hair condition, "
-                    f"or add props as described in the state change. "
-                    f"{rendering}, front view, full body, white background, consistent lighting."
-                )
-                
-                print(f"  [variant] Generating {variant_filename}...")
-                canonical_variant_references = [
-                    str(Path(char_dir) / f"{face_view}.png"),
-                    str(Path(char_dir) / f"{body_view}.png"),
-                ]
-                url = client.image_to_image(
-                    prompt=bind_reference_roles(
-                        variant_prompt,
-                        [
-                            "character_face_identity_only",
-                            "character_body_identity_only",
-                        ],
-                    ),
-                    ref_image=canonical_variant_references,
-                    output_path=variant_path,
-                    size=size,
-                )
-                print(f"  [variant] ✓ {variant_filename}")
-                variant_paths[state_name] = variant_path
-                
-            except Exception as e:
-                print(f"  [variant] ✗ Failed to generate {variant_filename}: {e}")
-                # Continue with other variants (graceful degradation)
-                continue
-    elif skip_images:
-        print("\n[Step 4] Skipping variant generation (--skip-images)")
-    else:
-        print("\n[Step 4] No variants to generate")
+    # Old variant_*.png files are intentionally untouched for audit only. Plot
+    # state such as wet clothing, dirt, or damage remains in Pxx start/end state.
+    print("\n[Step 4] Legacy state variants disabled; existing files remain audit-only")
 
     # Summary
     result = {
@@ -1328,8 +1296,10 @@ def generate_character(
         "card": card_path,
         "angle_map": angle_path,
         "views": views,
-        "identity_detail": str(identity_detail_path) if identity_detail_path else None,
-        "variants": variant_paths,
+        "prop_detail_board": (
+            str(prop_detail_board_path) if prop_detail_board_path else None
+        ),
+        "variants": {},
     }
     print(f"\n  ✓ Character '{name}' complete!")
     print(f"  Files: {char_dir}/")

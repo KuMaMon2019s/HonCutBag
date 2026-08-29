@@ -411,6 +411,31 @@ class IdentityDetailUnderstanding(StrictUnderstandingModel):
     issues: list[str]
 
 
+class CharacterPerformanceCellUnderstanding(StrictUnderstandingModel):
+    cell_id: Literal["A01", "A02", "A03", "A04", "A05", "A06"]
+    same_character: bool
+    pose_matches_action: bool
+    pose_distinct: bool
+    clothing_consistent: bool
+    makeup_consistent: bool
+    prop_ownership_correct: bool
+    no_extra_character: bool
+    no_text_or_layout_marks: bool
+    issues: list[str]
+
+
+class CharacterPerformanceBoardUnderstanding(StrictUnderstandingModel):
+    passed: bool
+    cells: list[CharacterPerformanceCellUnderstanding]
+    same_single_character: bool
+    six_distinct_poses: bool
+    clothing_makeup_consistent: bool
+    props_correct: bool
+    no_extra_characters: bool
+    no_text_or_layout_marks: bool
+    issues: list[str]
+
+
 UnderstandingT = TypeVar("UnderstandingT", bound=BaseModel)
 
 

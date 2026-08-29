@@ -45,6 +45,15 @@ _REFERENCE_ROLE_INSTRUCTIONS = {
         "canonical full-body identity only; preserve body proportions, outfit, shoes "
         "and assigned props; ignore pose, framing, background and text"
     ),
+    "character_prop_detail_only": (
+        "declared prop geometry, material, color, markings and ownership only; do not "
+        "copy its isolated layout, background, labels or scale; never create a new subject"
+    ),
+    "character_performance_board_only": (
+        "one 2x3 pose board showing six poses of the same single character; use only "
+        "the explicitly selected current pose as motion guidance; never create clones, "
+        "split panels, grids, labels, arrows or later actions in the finished output"
+    ),
     "prior_storyboard_state": (
         "previous storyboard state; preserve camera axis, screen direction and relative "
         "spatial continuity; do not copy its pose or action progress; advance every subject "

@@ -408,30 +408,9 @@ def collect_character_reference_assets(
         character_identity_props = {}
 
     references = []
-    action_text = " ".join(
-        str(shot_meta.get(key) or "")
-        for key in ("visual", "what", "action_description", "generation_actions", "prompt")
-    ).casefold()
     for char_id in _detect_shot_characters(output_dir, shot_meta):
         character_name = character_names.get(char_id, char_id)
         identity_props = character_identity_props.get(char_id, [])
-        identity_detail_active = any(
-            isinstance(item, dict)
-            and (
-                item.get("persistence") == "always"
-                or item.get("attachment_mode") == "body_attached"
-                or bool(str(item.get("name") or "").strip())
-                and str(item.get("name") or "").casefold() in action_text
-                or (
-                    str(character_name).casefold() in action_text
-                    and any(
-                        marker in action_text
-                        for marker in ("拍摄", "跟拍", "手持", "使用", "操作", "记录")
-                    )
-                )
-            )
-            for item in identity_props
-        )
         char_dir = output_dir / "characters" / char_id
         if not char_dir.exists():
             char_dir = output_dir / "characters" / "characters" / char_id
@@ -444,10 +423,6 @@ def collect_character_reference_assets(
                 char_dir / "full_body.png",
             ]
         )
-        reference_paths.extend([
-            char_dir / "identity_detail.png",
-            *sorted(char_dir.glob("variant_*.png")),
-        ])
         for reference_path in reference_paths:
             if reference_path.exists() and reference_path.stat().st_size > 1024:
                 references.append({
@@ -458,19 +433,12 @@ def collect_character_reference_assets(
                     "role": "reference_image",
                     "priority": "high",
                     "reference_kind": (
-                        "identity_detail"
-                        if reference_path.name == "identity_detail.png"
-                        else "character_identity_board"
+                        "character_identity_board"
                         if reference_path.name == "reference_board.png"
                         else "character_identity"
                     ),
-                    "bind_subject": reference_path.name != "identity_detail.png",
+                    "bind_subject": True,
                     "identity_props": identity_props,
-                    "identity_detail_active": (
-                        identity_detail_active
-                        if reference_path.name == "identity_detail.png"
-                        else False
-                    ),
                     "reference_description": (
                         f"{character_name}的四视图身份参考板（面部特写、正面全身、侧面全身、背面全身）"
                         if reference_path.name == "reference_board.png"
@@ -478,12 +446,7 @@ def collect_character_reference_assets(
                         if reference_path.name == "face_closeup.png"
                         else f"{character_name}的全身照"
                         if reference_path.name == "full_body.png"
-                        else (
-                            f"{character_name}的身份道具与材质细节板；仅锁定声明道具的几何、"
-                            "颜色、材质、标记和佩挂关系，不把板上孤立道具当成新主体"
-                        )
-                        if reference_path.name == "identity_detail.png"
-                        else f"{character_name}的变体图（{reference_path.stem}）"
+                        else f"{character_name}的静态身份参考"
                     ),
                 })
     return references

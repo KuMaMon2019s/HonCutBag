@@ -191,7 +191,7 @@ def test_identity_detail_qa_recomputes_declared_item_failure():
     assert result["declared_items_present"] is False
 
 
-def test_phase3_derives_detail_and_variant_from_approved_four_views(
+def test_phase3_derives_prop_board_and_disables_state_variant_pixels(
     monkeypatch, tmp_path
 ):
     calls: list[dict] = []
@@ -280,27 +280,20 @@ def test_phase3_derives_detail_and_variant_from_approved_four_views(
         review_client=Reviewer(),
     )
 
-    detail_path = tmp_path / "characters/photographer/identity_detail.png"
+    detail_path = tmp_path / "characters/photographer/prop_detail_board.png"
     variant_path = tmp_path / "characters/photographer/variant_rain.png"
     assert detail_path.is_file()
-    assert variant_path.is_file()
+    assert not variant_path.exists()
     detail_call = next(
-        call for call in calls if Path(call["output_path"]).name == ".identity_detail.generating.png"
-    )
-    variant_call = next(
-        call for call in calls if Path(call["output_path"]).name == "variant_rain.png"
+        call for call in calls if Path(call["output_path"]).name == ".prop_detail_board.generating.png"
     )
     assert detail_call["kind"] == "image"
     assert [Path(path).name for path in detail_call["ref_image"]] == [
         "face_closeup.png",
         "full_body.png",
     ]
-    assert variant_call["kind"] == "image"
-    assert [Path(path).name for path in variant_call["ref_image"]] == [
-        "face_closeup.png",
-        "full_body.png",
-    ]
-    assert result["identity_detail"] == str(detail_path)
+    assert not any("variant_" in Path(call["output_path"]).name for call in calls)
+    assert result["prop_detail_board"] == str(detail_path)
     assert run_quality_check("phase3", tmp_path).passed is True
 
     (tmp_path / "CHARACTERS.json").write_text(
@@ -323,11 +316,7 @@ def test_phase3_derives_detail_and_variant_from_approved_four_views(
             "generation_actions": ["摄影师持续跟拍前方人物"],
         },
     )
-    detail_asset = next(
-        asset for asset in references if asset["path"].name == "identity_detail.png"
-    )
-    assert detail_asset["bind_subject"] is False
-    assert detail_asset["identity_detail_active"] is True
+    assert [asset["path"].name for asset in references] == ["reference_board.png"]
     generation_contract = render_video_generation_contract(
         {
             "who": ["摄影师"],

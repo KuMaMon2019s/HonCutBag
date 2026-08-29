@@ -368,8 +368,8 @@ def _check_red_line(rule_id: str, output_dir: Path,
                 return False
             identity_props = card.get("identity_props")
             if isinstance(identity_props, list) and identity_props:
-                detail_value = card.get("identity_detail_reference")
-                detail_report_value = card.get("identity_detail_qa_report")
+                detail_value = card.get("prop_detail_board")
+                detail_report_value = card.get("prop_detail_board_qa_report")
                 if not detail_value or not detail_report_value:
                     return False
                 detail_path = Path(str(detail_value))
@@ -382,12 +382,12 @@ def _check_red_line(rule_id: str, output_dir: Path,
                     detail_report = json.loads(
                         detail_report_path.read_text(encoding="utf-8")
                     )
-                    detail_input = detail_report["inputs"]["identity_detail"]
+                    detail_input = detail_report["inputs"]["prop_detail_board"]
                     canonical_inputs = detail_report["inputs"]["canonical_references"]
                 except (OSError, json.JSONDecodeError, KeyError, TypeError):
                     return False
                 if (
-                    detail_report.get("schema") != "honcut.identity-detail-qa.v1"
+                    detail_report.get("schema") != "honcut.prop-detail-board-qa.v1"
                     or detail_report.get("status") != "passed"
                     or not detail_path.is_file()
                     or detail_input.get("path") != detail_path.name
