@@ -11,6 +11,7 @@ from PIL import Image
 from phases.phase3.performance_reference_board import (
     CHARACTER_PERFORMANCE_BOARD_SCHEMA,
     PERFORMANCE_CELL_IDS,
+    _review_performance_cell_components,
     attach_performance_guides_to_storyboard,
     build_character_performance_cell_correction_prompt,
     build_character_performance_cell_prompt,
@@ -18,7 +19,6 @@ from phases.phase3.performance_reference_board import (
     build_character_performance_prompt,
     generate_character_performance_board,
     performance_prompt_optimization_contract,
-    _review_performance_cell_components,
     validate_character_performance_board,
     validate_character_performance_guide,
 )
@@ -767,6 +767,15 @@ def test_generate_board_and_current_pxx_guides_are_exactly_cached(tmp_path):
     p02 = validate_character_performance_guide(tmp_path, "lead", "S01_P02")
     assert p01 is not None and p01["cell_ids"] == ["A01", "A03", "A05"]
     assert p02 is not None and p02["cell_ids"] == ["A02", "A04", "A06"]
+    assert p01["layout"] == {
+        "kind": "balanced_local_repack",
+        "columns": 2,
+        "rows": 2,
+        "cell_order": ["A01", "A03", "A05"],
+        "empty_slots": 1,
+    }
+    assert p01["pixel_size"] == p02["pixel_size"] == [2048, 2048]
+    assert p01["aspect_ratio"] == p02["aspect_ratio"] == 1.0
     assert p01["provider_requests"] == p02["provider_requests"] == 0
     assert set(p01["source_action_unit_ids"]) == {"AU001"}
     assert set(p02["source_action_unit_ids"]) == {"AU002"}
@@ -783,6 +792,37 @@ def test_generate_board_and_current_pxx_guides_are_exactly_cached(tmp_path):
     assert beats[1]["character_performance_guides"][0]["cell_ids"] == [
         "A02", "A04", "A06"
     ]
+
+
+def test_legacy_or_tampered_performance_guide_fails_closed(tmp_path):
+    _write_reference_assets(tmp_path)
+    generate_character_performance_board(
+        tmp_path,
+        _storyboard(),
+        _character(),
+        image_client=_ImageClient(),
+        review_client=_ReviewClient(),
+    )
+    receipt_path = tmp_path / "performance_guides/S01_P01/lead.json"
+    original = json.loads(receipt_path.read_text(encoding="utf-8"))
+    mutations = (
+        {"schema": "honcut.character-performance-guide.v1"},
+        {"layout": {**original["layout"], "columns": 3}},
+        {"pixel_size": [3072, 1024]},
+        {"aspect_ratio": 3.0},
+        {"cell_ids": ["A01", "A01", "A05"]},
+    )
+
+    for mutation in mutations:
+        receipt_path.write_text(
+            json.dumps({**original, **mutation}),
+            encoding="utf-8",
+        )
+        assert validate_character_performance_guide(
+            tmp_path,
+            "lead",
+            "S01_P01",
+        ) is None
 
 
 def test_failed_whole_board_uses_six_cached_components_then_passes(tmp_path):

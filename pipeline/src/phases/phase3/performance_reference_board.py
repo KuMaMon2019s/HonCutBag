@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import tempfile
@@ -31,9 +32,8 @@ from quality.character_performance_qa import (
 )
 from quality.character_reference_qa import file_sha256
 
-
 CHARACTER_PERFORMANCE_BOARD_SCHEMA = "honcut.character-performance-board.v2"
-CHARACTER_PERFORMANCE_GUIDE_SCHEMA = "honcut.character-performance-guide.v1"
+CHARACTER_PERFORMANCE_GUIDE_SCHEMA = "honcut.character-performance-guide.v2"
 CHARACTER_PERFORMANCE_CELL_SCHEMA = "honcut.character-performance-cell.v2"
 CHARACTER_PERFORMANCE_POSE_GUIDE_SCHEMA = "honcut.character-performance-pose-guide.v2"
 CHARACTER_PERFORMANCE_POSE_CONSTRAINTS_SCHEMA = (
@@ -55,6 +55,9 @@ PERFORMANCE_CELL_SIZE = "2048x2048"
 PERFORMANCE_CELL_PIXEL_SIZE = (2048, 2048)
 PERFORMANCE_POSE_GUIDE_PIXEL_SIZE = (1024, 1024)
 PERFORMANCE_COMPOSITION_MODE = "locally_feathered_2x3_v2"
+PERFORMANCE_GUIDE_LAYOUT = "balanced_local_repack"
+PERFORMANCE_GUIDE_MIN_ASPECT_RATIO = 0.4
+PERFORMANCE_GUIDE_MAX_ASPECT_RATIO = 2.5
 PERFORMANCE_MAX_CELL_CORRECTION_ROUNDS = 1
 LEGACY_PERFORMANCE_CELL_QA_SCHEMAS = frozenset({
     "honcut.character-performance-cell-qa.v1",
@@ -1392,13 +1395,25 @@ def _materialize_performance_guides(
             destination_dir = output_dir / "performance_guides" / beat_id
             destination = destination_dir / f"{character_id}.png"
             receipt_path = destination.with_suffix(".json")
-            guide = Image.new("RGB", (cell_width * len(selected), cell_height))
+            column_count = max(1, min(3, math.ceil(math.sqrt(len(selected)))))
+            row_count = (len(selected) + column_count - 1) // column_count
+            guide = Image.new(
+                "RGB",
+                (cell_width * column_count, cell_height * row_count),
+                (232, 235, 238),
+            )
             for offset, cell in enumerate(selected):
                 position = cell["grid_position"]
                 left = (int(position["column"]) - 1) * cell_width
                 upper = (int(position["row"]) - 1) * cell_height
                 crop = board.crop((left, upper, left + cell_width, upper + cell_height))
-                guide.paste(crop, (offset * cell_width, 0))
+                guide.paste(
+                    crop,
+                    (
+                        (offset % column_count) * cell_width,
+                        (offset // column_count) * cell_height,
+                    ),
+                )
             _atomic_png(destination, guide)
             receipt = {
                 "schema": CHARACTER_PERFORMANCE_GUIDE_SCHEMA,
@@ -1413,6 +1428,15 @@ def _materialize_performance_guides(
                 "source_board_receipt": board_receipt_path.relative_to(output_dir).as_posix(),
                 "source_board_receipt_sha256": board_receipt_hash,
                 "cell_ids": [cell["cell_id"] for cell in selected],
+                "layout": {
+                    "kind": PERFORMANCE_GUIDE_LAYOUT,
+                    "columns": column_count,
+                    "rows": row_count,
+                    "cell_order": [cell["cell_id"] for cell in selected],
+                    "empty_slots": column_count * row_count - len(selected),
+                },
+                "pixel_size": [guide.width, guide.height],
+                "aspect_ratio": guide.width / guide.height,
                 "source_action_unit_ids": list(dict.fromkeys(
                     cell["source_action_unit_id"] for cell in selected
                 )),
@@ -1439,6 +1463,38 @@ def validate_character_performance_guide(
     image_path = output_dir / str(receipt.get("image") or "")
     board_path = output_dir / str(receipt.get("source_board") or "")
     board_receipt_path = output_dir / str(receipt.get("source_board_receipt") or "")
+    cell_ids = receipt.get("cell_ids")
+    layout = receipt.get("layout")
+    pixel_size = receipt.get("pixel_size")
+    valid_cell_ids = (
+        isinstance(cell_ids, list)
+        and bool(cell_ids)
+        and all(cell_id in PERFORMANCE_CELL_IDS for cell_id in cell_ids)
+        and cell_ids == sorted(set(cell_ids), key=PERFORMANCE_CELL_IDS.index)
+    )
+    expected_columns = (
+        max(1, min(3, math.ceil(math.sqrt(len(cell_ids)))))
+        if valid_cell_ids
+        else 0
+    )
+    expected_rows = (
+        (len(cell_ids) + expected_columns - 1) // expected_columns
+        if expected_columns
+        else 0
+    )
+    valid_layout = (
+        isinstance(layout, dict)
+        and layout.get("kind") == PERFORMANCE_GUIDE_LAYOUT
+        and layout.get("columns") == expected_columns
+        and layout.get("rows") == expected_rows
+        and layout.get("cell_order") == cell_ids
+        and layout.get("empty_slots") == expected_columns * expected_rows - len(cell_ids or [])
+    )
+    valid_pixel_size = (
+        isinstance(pixel_size, list)
+        and len(pixel_size) == 2
+        and all(type(dimension) is int and dimension > 0 for dimension in pixel_size)
+    )
     if (
         receipt.get("schema") != CHARACTER_PERFORMANCE_GUIDE_SCHEMA
         or receipt.get("status") != "done"
@@ -1446,9 +1502,14 @@ def validate_character_performance_guide(
         or receipt.get("character_id") != character_id
         or receipt.get("beat_id") != beat_id
         or receipt.get("provider_requests") != 0
-        or not isinstance(receipt.get("cell_ids"), list)
-        or not receipt["cell_ids"]
-        or any(cell_id not in PERFORMANCE_CELL_IDS for cell_id in receipt["cell_ids"])
+        or not valid_cell_ids
+        or not valid_layout
+        or not valid_pixel_size
+        or not isinstance(receipt.get("aspect_ratio"), (int, float))
+        or isinstance(receipt.get("aspect_ratio"), bool)
+        or not PERFORMANCE_GUIDE_MIN_ASPECT_RATIO
+        <= float(receipt["aspect_ratio"])
+        <= PERFORMANCE_GUIDE_MAX_ASPECT_RATIO
         or not image_path.is_file()
         or not board_path.is_file()
         or not board_receipt_path.is_file()
@@ -1457,6 +1518,15 @@ def validate_character_performance_guide(
         or receipt.get("source_board_receipt_sha256") != file_sha256(board_receipt_path)
         or not validate_character_performance_board(output_dir, character_id)
     ):
+        return None
+    try:
+        with Image.open(image_path) as image:
+            image.verify()
+            if list(image.size) != pixel_size:
+                return None
+            if abs(image.width / image.height - float(receipt["aspect_ratio"])) > 1e-9:
+                return None
+    except (OSError, ValueError, ZeroDivisionError):
         return None
     return receipt
 

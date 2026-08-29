@@ -23,7 +23,7 @@ class CharacterPerformanceGuide(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["honcut.character-performance-guide.v1"]
+    kind: Literal["honcut.character-performance-guide.v2"]
     usage: Literal["current_pxx_motion_reference_only"]
     character_id: str = Field(min_length=1)
     beat_id: str = Field(pattern=r"^S\d+_P\d+$")

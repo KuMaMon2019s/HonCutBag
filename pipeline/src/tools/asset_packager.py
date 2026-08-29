@@ -25,7 +25,7 @@ from tools.character_reference_board import (
 CINEMATIC_FIRST_FRAME_SCHEMA = "honcut.cinematic-first-frame.v1"
 STORYBOARD_NARRATIVE_GUIDE_SCHEMA = "honcut.storyboard-narrative-guide.v1"
 STORYBOARD_NARRATIVE_GUIDE_USAGE = "phase6_story_narrative_guide_not_output_pixels"
-CHARACTER_PERFORMANCE_GUIDE_SCHEMA = "honcut.character-performance-guide.v1"
+CHARACTER_PERFORMANCE_GUIDE_SCHEMA = "honcut.character-performance-guide.v2"
 CHARACTER_PERFORMANCE_GUIDE_USAGE = "current_pxx_motion_reference_only"
 PREVIS_FRAME_PATH_PARTS = frozenset({
     "director_panels",

@@ -170,7 +170,7 @@ def _performance_guide_fields(
     return {
         "character_performance_required": True,
         "character_performance_guides": [{
-            "kind": "honcut.character-performance-guide.v1",
+            "kind": "honcut.character-performance-guide.v2",
             "usage": "current_pxx_motion_reference_only",
             "character_id": character_id,
             "beat_id": beat_id,
