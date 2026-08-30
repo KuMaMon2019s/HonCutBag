@@ -421,6 +421,7 @@ def test_resume_resolver_rejects_future_and_cross_project_state(tmp_path):
                         "run_fingerprint": "run-1",
                         "project_id": "project-a",
                         "shot_policy": "continuity",
+                        "character_visual_policy": "source_derived",
                     },
                 )
             ],

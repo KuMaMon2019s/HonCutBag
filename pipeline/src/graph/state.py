@@ -31,6 +31,7 @@ class HonCutState(TypedDict, total=False):
     transition_duration_s: float
     media_profile: str
     project_video_spec: dict[str, Any]
+    character_visual_policy: str
     enable_reshoot: bool
     resume: bool
     resume_from: str | None
@@ -40,6 +41,8 @@ class HonCutState(TypedDict, total=False):
     director_plan: dict[str, Any]
     storyboard: dict[str, Any]
     characters: list[dict[str, Any]]
+    canonical_visual_contract: str
+    canonical_visual_contract_sha256: str
     storyboard_image: str
     shot_ids: list[str]
     generated_shots: list[str]

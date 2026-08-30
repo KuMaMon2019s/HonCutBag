@@ -162,13 +162,11 @@ def _build_seedance2_single(shot_data: dict, assets: list) -> str:
     # project-level plot nouns (future characters, architecture, props) into a
     # scenery-only shot after the safe prompt has already been assembled.
     from utils.privacy_visual_policy import (
-        is_no_real_person_enabled,
         is_synthetic_visual_identity_policy,
     )
 
     synthetic_identity = bool(
-        is_no_real_person_enabled()
-        or is_synthetic_visual_identity_policy(
+        is_synthetic_visual_identity_policy(
             shot_data.get("visual_identity_policy")
         )
     )
@@ -177,7 +175,9 @@ def _build_seedance2_single(shot_data: dict, assets: list) -> str:
     if assets:
         names = [a.get("name", "") for a in assets]
         identity_traits = (
-            "declared veil/mask or face styling, graphic makeup/tattoos, mechanical or non-human material textures, designed hair/head silhouette, costume colors, and identity markers"
+            "declared warm pearl bio-ceramic complexion, clear pupils and layered irises, "
+            "fine symmetric temple-to-upper-cheek circuit cosmetics, unobscured facial geometry, "
+            "designed hair silhouette, costume colors, and identity markers"
             if synthetic_identity
             else "face features, hairstyle, costume details"
         )
@@ -192,9 +192,10 @@ def _build_seedance2_single(shot_data: dict, assets: list) -> str:
     )
     if synthetic_identity and character_requested:
         parts.append(
-            "High-end stylized 3D CGI cinematography with deliberately synthetic materials "
-            "and designed digital geometry. Preserve each character's declared non-human styling anchors; "
-            "no untreated natural human face, photoreal human skin/eyes/hair, or one generic helmet copied to all roles. "
+            "High-end stylized 3D CGI cinematography with beautiful, warm and clearly synthetic "
+            "pearl bio-ceramic facial styling. Preserve each character's declared cosmetic anchors; "
+            "no untreated natural human face, corpse-gray skin, blank glowing eyes, facial cracks, "
+            "coarse mechanical plates, veil, mask, or one generic helmet copied to all roles. "
             "cinematic quality, ultra-fine material detail, ultra-sharp detail, "
             "no subtitles, no Logo, no watermark."
         )

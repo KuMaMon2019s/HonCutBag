@@ -66,6 +66,11 @@ from utils.video_capabilities import (  # noqa: E402
     max_primary_story_duration,
     min_primary_story_duration,
 )
+from utils.canonical_visual_contracts import (  # noqa: E402
+    CHARACTER_VISUAL_POLICIES,
+    SOURCE_DERIVED_POLICY,
+    SYNTHETIC_STYLIZED_POLICY,
+)
 
 
 def _normalize_shot_duration(config: dict) -> int:
@@ -120,6 +125,27 @@ def _normalize_transition_duration(config: dict) -> float:
         raise ValueError("config transition_duration must not be negative")
     config["transition_duration"] = duration
     return duration
+
+
+def _normalize_character_visual_policy(config: dict) -> str:
+    """Migrate an old config boolean at this CLI boundary, then remove it."""
+    explicit = config.get("character_visual_policy")
+    legacy_present = "no_real_person" in config
+    legacy = config.pop("no_real_person", None)
+    if explicit is not None and legacy_present:
+        raise ValueError(
+            "config character_visual_policy conflicts with legacy person flag"
+        )
+    if explicit is None:
+        explicit = (
+            SYNTHETIC_STYLIZED_POLICY
+            if legacy is True
+            else SOURCE_DERIVED_POLICY
+        )
+    if explicit not in CHARACTER_VISUAL_POLICIES:
+        raise ValueError("config character_visual_policy is unsupported")
+    config["character_visual_policy"] = explicit
+    return explicit
 
 
 def _write_progress(progress_file: Path, payload: dict) -> None:
@@ -434,8 +460,12 @@ def run_phase(phase: str, config: dict) -> dict:
         cmd.append("--dry-run")
     if config.get("chain_mode"):
         cmd.append("--chain-mode")
-    if config.get("no_real_person"):
-        cmd.append("--no-real-person")
+    cmd.extend(
+        [
+            "--character-visual-policy",
+            config.get("character_visual_policy", SOURCE_DERIVED_POLICY),
+        ]
+    )
     if config.get("_resume"):
         cmd.append("--resume")
     if config.get("_resume_from"):
@@ -515,6 +545,7 @@ def main() -> None:
         _normalize_chain_mode(config)
         _normalize_enable_reshoot(config)
         _normalize_transition_duration(config)
+        _normalize_character_visual_policy(config)
     except ValueError as error:
         parser.error(str(error))
 

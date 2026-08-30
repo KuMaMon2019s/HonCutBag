@@ -134,13 +134,8 @@ USER_PROMPT_TEMPLATE = (
     "- appearance_count: 出场次数（整数）\n"
     "- relationships: 与其他角色的关系数组（可选），每项含 target_id, type, description\n"
     "所有可选字符串/对象/数组也必须显式输出；无内容时分别使用空字符串、空对象字段值或 []。\n\n"
-    "【衍生状态检测（HonCut derive_assets 规范）】\n"
-    "分析每个角色在故事中是否有明显的状态变化（如淋湿、换装、受伤、变身）。\n"
-    "如果有，在角色输出的 appearance 中增加 variants 字段：\n"
-    "- variants: 数组，每项包含 {{state_name: '淋湿', description: '头发湿透贴在脸上，衬衫被雨淋湿半透明'}}\n"
-    "- 只提取「稳定、可复用、资产级」的状态变化，瞬时表情/局部特写不算\n"
-    "- 常见状态：淋湿、换装、受伤、变身、卸妆、戴帽/摘帽\n"
-    "- 如果没有明显状态变化，variants 可以为空数组 []\n"
+    "人物在剧情中的淋湿、污损、受伤、换装等时序状态不得创建静态身份变体；"
+    "这些变化只由分镜 Pxx 的 start/end continuity state 表达。\n"
     "\n{adult_lead_body_contract}\n"
 )
 

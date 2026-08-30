@@ -229,13 +229,29 @@ def prepare_run_manifest(
     if resume and isinstance(existing.get("resolved_config"), dict):
         stored_config = existing["resolved_config"]
         if (
+            "character_visual_policy" not in stored_config
+            and "no_real_person" in stored_config
+        ):
+            expected_policy = (
+                "synthetic_stylized_character_v3"
+                if bool(stored_config["no_real_person"])
+                else "source_derived"
+            )
+            if normalized_config.get("character_visual_policy") != expected_policy:
+                raise RuntimeError(
+                    "resume refused: legacy visual policy disagrees with canonical policy"
+                )
+            identity_config = dict(normalized_config)
+            identity_config.pop("character_visual_policy", None)
+            identity_config["no_real_person"] = bool(stored_config["no_real_person"])
+        if (
             "shot_policy" not in stored_config
             and normalized_config.get("shot_policy") == "cut-driven"
         ):
             # v1 manifests predate shot_policy. Their historical behavior is
             # deterministically cut-driven, but adding the migration default
             # must not rewrite the stable run fingerprint or task identities.
-            identity_config = dict(normalized_config)
+            identity_config = dict(identity_config)
             identity_config.pop("shot_policy", None)
     identity = {
         "schema_version": RUN_MANIFEST_SCHEMA,

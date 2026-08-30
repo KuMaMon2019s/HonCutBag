@@ -8,7 +8,7 @@ from typing import Any
 from langgraph.types import Command
 from runtime.migration_registry import apply_migration_registry
 
-CURRENT_STATE_SCHEMA_VERSION = 3
+CURRENT_STATE_SCHEMA_VERSION = 4
 SHOT_POLICIES = frozenset({"continuity", "balanced", "cut-driven"})
 LEGACY_STATE_ALIASES = frozenset(
     {
@@ -109,13 +109,40 @@ def _migrate_state_v2_to_v3(state: dict[str, Any]) -> dict[str, Any]:
     return migrated
 
 
-def _canonicalize_v3_state(state: dict[str, Any]) -> dict[str, Any]:
+def _migrate_state_v3_to_v4(state: dict[str, Any]) -> dict[str, Any]:
+    migrated = dict(state)
+    legacy = migrated.pop("no_real_person", None)
+    migrated.setdefault(
+        "character_visual_policy",
+        (
+            "synthetic_stylized_character_v3"
+            if legacy is True
+            else "source_derived"
+        ),
+    )
+    migrated.setdefault("canonical_visual_contract", "")
+    migrated.setdefault("canonical_visual_contract_sha256", "")
+    migrated["state_schema_version"] = 4
+    return migrated
+
+
+def _canonicalize_v4_state(state: dict[str, Any]) -> dict[str, Any]:
     policy = str(state.get("shot_policy") or "").strip().lower()
     if policy not in SHOT_POLICIES:
         raise StateMigrationError(
             "checkpoint state has an invalid or missing shot_policy"
         )
     state["shot_policy"] = policy
+    visual_policy = str(state.get("character_visual_policy") or "").strip()
+    if visual_policy not in {
+        "source_derived",
+        "fictional_cinematic_human_v1",
+        "synthetic_stylized_character_v3",
+    }:
+        raise StateMigrationError(
+            "checkpoint state has an invalid character_visual_policy"
+        )
+    state["character_visual_policy"] = visual_policy
     for field, default in (
         ("max_material_padding_ratio", 0.25),
         ("delivery_overrun_ratio", 0.0),
@@ -144,6 +171,7 @@ STATE_MIGRATIONS = {
     0: _migrate_state_v0_to_v1,
     1: _migrate_state_v1_to_v2,
     2: _migrate_state_v2_to_v3,
+    3: _migrate_state_v3_to_v4,
 }
 
 
@@ -163,7 +191,7 @@ def migrate_state(raw_state: Mapping[str, Any]) -> dict[str, Any]:
         )
     except ValueError as error:
         raise StateMigrationError(str(error)) from error
-    return _canonicalize_v3_state(state)
+    return _canonicalize_v4_state(state)
 
 
 def _canonical_patch(

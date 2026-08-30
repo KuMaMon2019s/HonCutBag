@@ -14,6 +14,7 @@ from queue import Empty
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
@@ -257,21 +258,27 @@ def test_explicit_empty_who_blocks_stale_character_assets(tmp_path):
     ) == []
 
 
-def test_collect_character_references_resolves_explicit_display_names(tmp_path):
-    (tmp_path / "CHARACTERS.json").write_text(
-        json.dumps({
-            "characters": [
-                {"id": "lin", "name": "凛"},
-                {"id": "jin", "name": "烬"},
-            ]
-        }),
-        encoding="utf-8",
-    )
+def _write_character_reference_pack(root: Path, character_id: str) -> None:
+    char_dir = root / "characters" / character_id
+    char_dir.mkdir(parents=True, exist_ok=True)
+    for index, view in enumerate(("face_closeup", "full_body", "side", "back"), 1):
+        Image.new("RGB", (96, 128), (30 * index, 20, 80)).save(
+            char_dir / f"{view}.png"
+        )
+
+
+def test_collect_character_references_resolves_explicit_display_names(
+    tmp_path,
+    canonical_run_contract,
+):
+    canonical_run_contract(tmp_path, {
+        "characters": [
+            {"id": "lin", "name": "凛"},
+            {"id": "jin", "name": "烬"},
+        ]
+    })
     for char_id in ("lin", "jin"):
-        char_dir = tmp_path / "characters" / char_id
-        char_dir.mkdir(parents=True)
-        (char_dir / "face_closeup.png").write_bytes(b"f" * 1025)
-        (char_dir / "full_body.png").write_bytes(b"b" * 1025)
+        _write_character_reference_pack(tmp_path, char_id)
 
     references = asset_packager.collect_character_reference_assets(
         tmp_path, {"_char_ids": ["凛", "烬"]}
@@ -317,15 +324,15 @@ def _write_cinematic_frame(path: Path, marker: bytes = b"s") -> None:
 
 
 def test_phantom_with_cinematic_frame_uses_numbered_omni_references(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, canonical_run_contract
 ):
     _stub_tos_upload(monkeypatch)
     storyboard_dir = tmp_path / "storyboard_images"
     _write_cinematic_frame(storyboard_dir / "S01.png")
-    char_dir = tmp_path / "characters" / "lin"
-    char_dir.mkdir(parents=True)
-    (char_dir / "face_closeup.png").write_bytes(b"f" * 1025)
-    (char_dir / "full_body.png").write_bytes(b"b" * 1025)
+    canonical_run_contract(tmp_path, {
+        "characters": [{"id": "lin", "name": "凛"}],
+    })
+    _write_character_reference_pack(tmp_path, "lin")
 
     content = asset_packager.build_content_for_shot(
         tmp_path,
@@ -338,20 +345,22 @@ def test_phantom_with_cinematic_frame_uses_numbered_omni_references(
         "text",
         "reference_image",
         "reference_image",
-        "reference_image",
     ]
     assert "last_frame" not in roles
     prompt = next(item["text"] for item in content if item["type"] == "text")
-    assert "首帧为图片1" in prompt
-    assert "图片1为S01成片质感第一帧" in prompt
-    assert "lin=<主体1>（图片2）" in prompt
+    assert "首帧为图片2" in prompt
+    assert "图片2为S01成片质感第一帧" in prompt
+    assert "凛=<主体1>（图片1）" in prompt
 
 
-def test_flf2v_content_keeps_first_and_last_frames(tmp_path, monkeypatch):
+def test_flf2v_content_keeps_first_and_last_frames(
+    tmp_path, monkeypatch, canonical_run_contract
+):
     _stub_tos_upload(monkeypatch)
     storyboard_dir = tmp_path / "storyboard_images"
     _write_cinematic_frame(storyboard_dir / "S01.png")
     (storyboard_dir / "S01_end.png").write_bytes(b"e" * 1025)
+    canonical_run_contract(tmp_path, {"characters": []})
 
     content = asset_packager.build_content_for_shot(
         tmp_path,
@@ -369,12 +378,14 @@ def test_flf2v_content_keeps_first_and_last_frames(tmp_path, monkeypatch):
 def test_video_image_packaging_fails_closed_when_any_tos_upload_fails(
     tmp_path,
     monkeypatch,
+    canonical_run_contract,
 ):
     storyboard_dir = tmp_path / "storyboard_images"
     _write_cinematic_frame(storyboard_dir / "S01.png")
     (storyboard_dir / "S01_end.png").write_bytes(b"e" * 1025)
     upload_count = 0
     first_url = _signed_tos_url(monkeypatch, "fixture/first.png")
+    canonical_run_contract(tmp_path, {"characters": []})
 
     def fail_second_upload(_image_data, _content_type):
         nonlocal upload_count
@@ -393,13 +404,14 @@ def test_video_image_packaging_fails_closed_when_any_tos_upload_fails(
     assert upload_count == 2
 
 
-def test_flf2v_injects_text_identity_lock_and_rejects_drifted_relay(tmp_path, monkeypatch):
+def test_flf2v_injects_text_identity_lock_and_rejects_drifted_relay(
+    tmp_path, monkeypatch, canonical_run_contract
+):
     _stub_tos_upload(monkeypatch)
     storyboard_dir = tmp_path / "storyboard_images"
     _write_cinematic_frame(storyboard_dir / "S03.png")
     (storyboard_dir / "S03_end.png").write_bytes(b"e" * 1025)
-    (tmp_path / "CHARACTERS.json").write_text(
-        json.dumps({"characters": [{
+    canonical_run_contract(tmp_path, {"characters": [{
             "id": "rin",
             "name": "凛",
             "appearance": {
@@ -408,9 +420,7 @@ def test_flf2v_injects_text_identity_lock_and_rejects_drifted_relay(tmp_path, mo
                 "clothing": "黑色短外套",
                 "build": "纤细少女体型",
             },
-        }]}),
-        encoding="utf-8",
-    )
+        }]})
 
     content = asset_packager.build_content_for_shot(
         tmp_path,
@@ -1556,7 +1566,7 @@ def test_bridge_succeeded_ledger_recovers_missing_output_by_job_id(tmp_path):
     assert resume_ids == ["bridge-job-1"]
 
 
-def test_bridge_fallback_submit_timeout_becomes_uncertain(tmp_path):
+def test_bridge_fallback_cannot_submit_again_after_provider_acceptance(tmp_path):
     store = GenerationTaskStore(tmp_path / "runtime.db")
     output_path = tmp_path / "output.mp4"
 
@@ -1580,7 +1590,7 @@ def test_bridge_fallback_submit_timeout_becomes_uncertain(tmp_path):
         on_submit_start()
         raise TimeoutError("Wan fallback submit timed out")
 
-    with pytest.raises(TimeoutError, match="fallback submit timed out"):
+    with pytest.raises(RuntimeError, match="cannot reserve submission"):
         execute_bridge_video_task(store, generate=uncertain_fallback, **arguments)
 
     active = store.find_active(
@@ -1590,8 +1600,9 @@ def test_bridge_fallback_submit_timeout_becomes_uncertain(tmp_path):
         provider_id="bridge",
     )
     assert active is not None
-    assert active.status == "submission_uncertain"
+    assert active.status == "running"
     assert active.provider_job_id == "bridge-seedance-job"
+    assert store.submission_attempt_count(task_id=active.task_id) == 1
 
 
 def test_generation_tasks_are_deduped_per_provider(tmp_path):
@@ -1981,7 +1992,11 @@ def test_generation_store_refuses_nonterminal_failure_after_provider_job(tmp_pat
     store = GenerationTaskStore(tmp_path / "runtime.db")
     task = _enqueue_runtime_video(store).task
     store.claim(task.task_id)
-    store.persist_provider_job(
+    store.reserve_submission_attempt(
+        task.task_id,
+        provider_endpoint="https://seedance.test",
+    )
+    store.confirm_provider_job(
         task.task_id,
         provider_job_id="provider-job-1",
         provider_endpoint="https://seedance.test",

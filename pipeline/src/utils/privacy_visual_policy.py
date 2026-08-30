@@ -6,20 +6,14 @@ import copy
 from functools import lru_cache
 import hashlib
 import json
-import os
 from pathlib import Path
 import re
 from typing import Any
 
-NO_REAL_PERSON_ENV = "HONCUT_NO_REAL_PERSON"
-NO_REAL_PERSON_POLICY = "synthetic_stylized_character_v3"
-LEGACY_NO_REAL_PERSON_POLICIES = frozenset({
-    "synthetic_faceless_android_v1",
-    "synthetic_stylized_character_v2",
+SYNTHETIC_STYLIZED_CHARACTER_POLICY = "synthetic_stylized_character_v3"
+SUPPORTED_SYNTHETIC_VISUAL_POLICIES = frozenset({
+    SYNTHETIC_STYLIZED_CHARACTER_POLICY
 })
-SUPPORTED_NO_REAL_PERSON_POLICIES = frozenset(
-    {NO_REAL_PERSON_POLICY, *LEGACY_NO_REAL_PERSON_POLICIES}
-)
 SYNTHETIC_QA_CONTRACT = "synthetic_character_styling_consistency_v4"
 SYNTHETIC_MAKEUP_PROFILE_SCHEMA = "honcut.synthetic-makeup-aesthetic-profile.v1"
 SYNTHETIC_MAKEUP_PROFILE_ID = "synthetic_porcelain_makeup_beauty_v1"
@@ -189,8 +183,8 @@ def _synthetic_negative_contract() -> str:
 
 
 def is_synthetic_visual_identity_policy(value: Any) -> bool:
-    """Accept the current diverse styling policy and durable legacy artifacts."""
-    return str(value or "").strip() in SUPPORTED_NO_REAL_PERSON_POLICIES
+    """Accept only the current production styling policy."""
+    return str(value or "").strip() in SUPPORTED_SYNTHETIC_VISUAL_POLICIES
 
 
 def is_current_synthetic_styling(value: Any) -> bool:
@@ -250,25 +244,14 @@ def synthetic_makeup_reference_prompt_contract(
     )
 
 
-def is_no_real_person_enabled() -> bool:
-    """Return whether the current pipeline process requires synthetic identities."""
-    return os.environ.get(NO_REAL_PERSON_ENV, "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
 def synthetic_character_review_evidence(
     output_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Return auditable runtime/artifact evidence for synthetic-character QA."""
-    env_enabled = is_no_real_person_enabled()
     evidence: dict[str, Any] = {
-        "enabled": env_enabled,
-        "sources": ([f"environment:{NO_REAL_PERSON_ENV}"] if env_enabled else []),
-        "policy": NO_REAL_PERSON_POLICY,
+        "enabled": False,
+        "sources": [],
+        "policy": SYNTHETIC_STYLIZED_CHARACTER_POLICY,
         "artifact": "CHARACTERS.json",
         "artifact_present": False,
         "artifact_valid": False,
@@ -367,7 +350,7 @@ def synthetic_character_review_evidence(
         )
         if not base:
             return False
-        if character["visual_identity_policy"] != NO_REAL_PERSON_POLICY:
+        if character["visual_identity_policy"] != SYNTHETIC_STYLIZED_CHARACTER_POLICY:
             return False
         styling = character.get("synthetic_styling") or {}
         anchors = styling.get("visible_anchors") or []
@@ -379,13 +362,27 @@ def synthetic_character_review_evidence(
             and len([anchor for anchor in anchors if str(anchor).strip()]) >= 2
         )
 
-    identity_complete = bool(characters) and all(
-        complete_identity(character) for character in characters
+    synthetic_characters = [
+        character
+        for character in characters
+        if (
+            is_synthetic_visual_identity_policy(
+                character["visual_identity_policy"]
+            )
+            or character["gender"].casefold() == "synthetic"
+        )
+    ]
+    identity_complete = bool(synthetic_characters) and all(
+        complete_identity(character) for character in synthetic_characters
     )
     evidence.update({
         "top_level_policy_match": top_level_match,
         "all_characters_policy_tagged": all_policy_tagged,
         "all_characters_gender_synthetic": all_gender_synthetic,
+        "synthetic_character_count": len(synthetic_characters),
+        "synthetic_character_ids": [
+            character["id"] for character in synthetic_characters
+        ],
         "identity_contract_complete": identity_complete,
     })
     if top_level_match:
@@ -394,9 +391,9 @@ def synthetic_character_review_evidence(
         evidence["sources"].append("artifact:all_character_policies")
     if all_gender_synthetic:
         evidence["sources"].append("artifact:all_character_genders")
-    evidence["enabled"] = bool(
-        env_enabled or top_level_match or all_policy_tagged or all_gender_synthetic
-    )
+    if synthetic_characters:
+        evidence["sources"].append("artifact:synthetic_character_subset")
+    evidence["enabled"] = bool(synthetic_characters)
     return evidence
 
 
@@ -405,8 +402,8 @@ def uses_synthetic_character_review(output_dir: str | Path | None = None) -> boo
     return bool(synthetic_character_review_evidence(output_dir)["enabled"])
 
 
-def no_real_person_prompt_contract() -> str:
-    """Prompt block shared by image and video generation paths."""
+def synthetic_stylized_prompt_contract() -> str:
+    """Current v3 prompt block shared by image and video generation paths."""
     return (
         "【非真人视觉硬约束】"
         f"{_synthetic_style_contract()}。"
@@ -436,6 +433,12 @@ def _synthetic_identity(character: dict[str, Any], index: int) -> dict[str, Any]
         ("朱红", "电光蓝", "琥珀乳瓷"),
     )[digest[0] % 5]
     primary, accent, material_color = palette
+    source_hair = str(appearance.get("hair") or "").strip()
+    source_hair_lock = (
+        f"保持原设定[{source_hair}]的长度、分缝、束发状态和外轮廓，"
+        if source_hair
+        else "保持该角色确定性分配的发长、分缝和外轮廓，"
+    )
 
     presentation = "柔和利落" if any(
         token in source_gender for token in ("female", "woman", "girl", "女")
@@ -446,7 +449,7 @@ def _synthetic_identity(character: dict[str, Any], index: int) -> dict[str, Any]
         "makeup_design_id": design_id,
         "kind": "完全虚构的珍珠生体瓷妆数字角色",
         "hair": (
-            f"{primary}设计化纤维发束，发梢带极细{accent}导光丝与规则切面高光，"
+            f"{source_hair_lock}{primary}设计化纤维发束，发梢带极细{accent}导光丝与规则切面高光，"
             "不是自然真人发丝"
         ),
         "face": (
@@ -471,7 +474,7 @@ def _synthetic_identity(character: dict[str, Any], index: int) -> dict[str, Any]
     return identity
 
 
-def apply_no_real_person_character_policy(
+def apply_synthetic_stylized_character_policy(
     characters_data: dict[str, Any],
 ) -> dict[str, Any]:
     """Rewrite human identity fields into stable, visibly synthetic styling.
@@ -486,11 +489,12 @@ def apply_no_real_person_character_policy(
     if not isinstance(characters, list):
         return rewritten
     if (
-        rewritten.get("visual_identity_policy") == NO_REAL_PERSON_POLICY
+        rewritten.get("visual_identity_policy") == SYNTHETIC_STYLIZED_CHARACTER_POLICY
         and characters
         and all(
             isinstance(character, dict)
-            and character.get("visual_identity_policy") == NO_REAL_PERSON_POLICY
+            and character.get("visual_identity_policy")
+            == SYNTHETIC_STYLIZED_CHARACTER_POLICY
             and isinstance(
                 (character.get("appearance") or {}).get("synthetic_styling"),
                 dict,
@@ -556,7 +560,7 @@ def apply_no_real_person_character_policy(
         character["negative"] = "，".join(
             part for part in (_synthetic_negative_contract(), old_negative) if part
         )
-        character["visual_identity_policy"] = NO_REAL_PERSON_POLICY
+        character["visual_identity_policy"] = SYNTHETIC_STYLIZED_CHARACTER_POLICY
         character["distinguishing_features"] = [
             clothing,
             identity["face"],
@@ -574,7 +578,7 @@ def apply_no_real_person_character_policy(
             for part in (_synthetic_negative_contract(), existing_guardrails)
             if part
         )
-    rewritten["visual_identity_policy"] = NO_REAL_PERSON_POLICY
+    rewritten["visual_identity_policy"] = SYNTHETIC_STYLIZED_CHARACTER_POLICY
     rewritten["synthetic_styling_policy"] = {
         "schema": "honcut.synthetic-styling-policy.v3",
         "allowed_mode": "synthetic_porcelain_makeup",

@@ -104,6 +104,11 @@ class GraphRunConfig(BaseModel):
     )
     media_profile: str = Field(default="480p", min_length=1)
     project_video_spec: dict[str, Any] = Field(default_factory=dict)
+    character_visual_policy: Literal[
+        "source_derived",
+        "fictional_cinematic_human_v1",
+        "synthetic_stylized_character_v3",
+    ] = "source_derived"
     enable_reshoot: bool = True
     resume: bool = False
     resume_from: str | None = None

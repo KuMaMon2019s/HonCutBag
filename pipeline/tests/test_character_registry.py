@@ -57,7 +57,7 @@ def _phase3_spec(character: dict) -> dict:
         "appearance": character["appearance"],
         "style": character.get("style", ""),
         "negative": character.get("negative", ""),
-        "visual_identity_policy": None,
+        "visual_identity_policy": character.get("visual_identity_policy"),
     }
 
 
@@ -281,16 +281,11 @@ def test_registry_ignores_legacy_state_metadata_and_rejects_unsafe_character_ids
         character_spec_fingerprint({**spec, "id": "../escape"})
 
 
-def test_phase3_exact_reuse_makes_zero_generation_requests(tmp_path, monkeypatch):
+def test_phase3_exact_reuse_makes_zero_generation_requests(
+    tmp_path, monkeypatch, canonical_run_contract
+):
     character = _character()
-    spec = _phase3_spec(character)
     library = tmp_path / "library"
-    source = tmp_path / "source"
-    _write_approved_pack(source, spec)
-    CharacterRegistry(library, project_id="series-a").promote_from_run(
-        source, spec, quality_grade="A", source_run_id="source-run"
-    )
-
     output = tmp_path / "new-run"
     _write_run_manifest(
         output,
@@ -298,15 +293,21 @@ def test_phase3_exact_reuse_makes_zero_generation_requests(tmp_path, monkeypatch
         library_dir=library,
         run_id="new-run",
     )
-    (output / "CHARACTERS.json").write_text(
-        json.dumps({"characters": [character]}, ensure_ascii=False), encoding="utf-8"
+    projected, _contract = canonical_run_contract(
+        output,
+        {"characters": [character]},
     )
-    monkeypatch.setenv("HONCUT_NO_REAL_PERSON", "0")
+    spec = _phase3_spec(projected["characters"][0])
+    source = tmp_path / "source"
+    _write_approved_pack(source, spec)
+    CharacterRegistry(library, project_id="series-a").promote_from_run(
+        source, spec, quality_grade="A", source_run_id="source-run"
+    )
     monkeypatch.setattr(
         "phases.phase3.character_factory.batch_generate",
         lambda *_args, **_kwargs: pytest.fail("exact reuse must not call Seedream"),
     )
-    result = run_phase3(output, {"characters": [character]}, dry_run=False)
+    result = run_phase3(output, projected, dry_run=False)
 
     assert result["status"] == "done"
     assert result["character_registry"]["reused"] == 1

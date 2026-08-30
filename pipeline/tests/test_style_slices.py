@@ -160,7 +160,7 @@ def test_phase3_dry_run_writes_hashed_receipt_without_production_calls(
 
 
 def test_phase3_production_still_fails_closed_without_reference_images(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, canonical_run_contract
 ):
     source = {
         "characters": [
@@ -196,16 +196,18 @@ def test_phase3_production_still_fails_closed_without_reference_images(
         forbidden_cooldown,
     )
 
-    result = pipeline_core.run_phase3(tmp_path, source, dry_run=False)
+    projected, _contract = canonical_run_contract(tmp_path, source)
+    result = pipeline_core.run_phase3(tmp_path, projected, dry_run=False)
 
     assert result["status"] == "error"
     assert "Phase 3 质检未通过" in result["error"]
     assert not (tmp_path / "phase3_dry_run_receipt.json").exists()
 
 
-def test_phase3_persists_and_generates_from_no_real_person_contract(tmp_path, monkeypatch):
+def test_phase3_generates_from_explicit_synthetic_visual_policy(
+    tmp_path, monkeypatch, canonical_run_contract
+):
     captured = []
-    monkeypatch.setenv("HONCUT_NO_REAL_PERSON", "1")
 
     def fake_batch(characters, output_dir, skip_images=False, **_kwargs):
         captured.extend(characters)
@@ -234,11 +236,20 @@ def test_phase3_persists_and_generates_from_no_real_person_contract(tmp_path, mo
         ]
     }
 
-    result = pipeline_core.run_phase3(tmp_path, source, dry_run=True)
+    projected, _contract = canonical_run_contract(
+        tmp_path,
+        source,
+        requested_policy="synthetic_stylized_character_v3",
+    )
+    result = pipeline_core.run_phase3(tmp_path, projected, dry_run=True)
 
     persisted = json.loads((tmp_path / "CHARACTERS.json").read_text(encoding="utf-8"))
     assert result["status"] == "done"
-    assert persisted["visual_identity_policy"] == "synthetic_stylized_character_v3"
+    assert persisted["character_visual_policy"] == "synthetic_stylized_character_v3"
+    assert (
+        persisted["characters"][0]["visual_identity_policy"]
+        == "synthetic_stylized_character_v3"
+    )
     styling = persisted["characters"][0]["appearance"]["synthetic_styling"]
     assert styling["schema"] == "honcut.synthetic-styling.v3"
     assert styling["mode"] == "synthetic_porcelain_makeup"

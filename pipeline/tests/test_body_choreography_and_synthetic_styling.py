@@ -50,10 +50,10 @@ from utils.character_body_contracts import (
     character_reference_identity_description,
 )
 from utils.privacy_visual_policy import (
-    NO_REAL_PERSON_POLICY,
+    SYNTHETIC_STYLIZED_CHARACTER_POLICY,
     SYNTHETIC_MAKEUP_PROFILE_ID,
-    apply_no_real_person_character_policy,
-    no_real_person_prompt_contract,
+    apply_synthetic_stylized_character_policy,
+    synthetic_stylized_prompt_contract,
     synthetic_character_review_evidence,
     synthetic_makeup_aesthetic_profile,
     synthetic_makeup_profile_sha256,
@@ -721,7 +721,7 @@ def test_final_video_qa_only_sends_current_batch_characters_and_props(tmp_path):
             "id": char_id,
             "name": name,
             "aliases": [f"{name}别名"],
-            "visual_identity_policy": NO_REAL_PERSON_POLICY,
+            "visual_identity_policy": SYNTHETIC_STYLIZED_CHARACTER_POLICY,
             "appearance": {
                 "gender": "synthetic",
                 "face": f"{name}专属面部纹样",
@@ -744,7 +744,7 @@ def test_final_video_qa_only_sends_current_batch_characters_and_props(tmp_path):
 
     (tmp_path / "CHARACTERS.json").write_text(
         json.dumps({
-            "visual_identity_policy": NO_REAL_PERSON_POLICY,
+            "visual_identity_policy": SYNTHETIC_STYLIZED_CHARACTER_POLICY,
             "characters": [
                 character("lead", "女主", "银色发簪"),
                 character("support", "支援者", "蓝色护符"),
@@ -802,7 +802,7 @@ def test_no_real_person_policy_assigns_one_persistent_porcelain_makeup_language(
         ]
     }
 
-    rewritten = apply_no_real_person_character_policy(source)
+    rewritten = apply_synthetic_stylized_character_policy(source)
     characters = rewritten["characters"]
     modes = [character["appearance"]["synthetic_styling"]["mode"] for character in characters]
     makeup_ids = [
@@ -810,7 +810,7 @@ def test_no_real_person_policy_assigns_one_persistent_porcelain_makeup_language(
         for character in characters
     ]
 
-    assert rewritten["visual_identity_policy"] == NO_REAL_PERSON_POLICY
+    assert rewritten["visual_identity_policy"] == SYNTHETIC_STYLIZED_CHARACTER_POLICY
     assert set(modes) == {"synthetic_porcelain_makeup"}
     assert len(set(makeup_ids)) == 4
     assert all(
@@ -831,8 +831,8 @@ def test_no_real_person_policy_assigns_one_persistent_porcelain_makeup_language(
         == synthetic_makeup_profile_sha256()
         for character in characters
     )
-    assert "面部必须完整可见" in no_real_person_prompt_contract()
-    assert "尸体般灰白" in no_real_person_prompt_contract()
+    assert "面部必须完整可见" in synthetic_stylized_prompt_contract()
+    assert "尸体般灰白" in synthetic_stylized_prompt_contract()
 
     (tmp_path / "CHARACTERS.json").write_text(
         json.dumps(rewritten, ensure_ascii=False), encoding="utf-8"
@@ -841,7 +841,7 @@ def test_no_real_person_policy_assigns_one_persistent_porcelain_makeup_language(
     assert evidence["identity_contract_complete"] is True
     assert all(character["synthetic_styling"] for character in evidence["characters"])
 
-    assert apply_no_real_person_character_policy(rewritten) == rewritten
+    assert apply_synthetic_stylized_character_policy(rewritten) == rewritten
 
 
 def test_checked_in_makeup_visual_corpus_is_structured_audit_only():
@@ -862,7 +862,7 @@ def test_checked_in_makeup_visual_corpus_is_structured_audit_only():
     assert profile["production_prompt"]["phase3_reference_priority"]
     assert profile["production_prompt"]["phase3_reference_negative"]
     assert profile["production_prompt"]["phase3_reference_qa"]
-    prompt = no_real_person_prompt_contract()
+    prompt = synthetic_stylized_prompt_contract()
     assert "温润透亮" in prompt
     assert "清晰瞳孔" in prompt
     assert "reference_01" not in prompt
@@ -881,7 +881,7 @@ def test_phase3_synthetic_reference_prompt_prioritizes_exact_face_geometry():
         },
     }
     apply_adult_lead_body_contracts([source_character])
-    character = apply_no_real_person_character_policy({
+    character = apply_synthetic_stylized_character_policy({
         "characters": [source_character],
     })["characters"][0]
     styling = character["appearance"]["synthetic_styling"]
@@ -945,11 +945,11 @@ def test_future_makeup_visual_profile_schema_fails_closed(tmp_path, monkeypatch)
 
 def test_old_v3_makeup_profile_is_rewritten_to_current_aesthetic():
     source = {
-        "visual_identity_policy": NO_REAL_PERSON_POLICY,
+        "visual_identity_policy": SYNTHETIC_STYLIZED_CHARACTER_POLICY,
         "characters": [{
             "id": "lead",
             "name": "主角",
-            "visual_identity_policy": NO_REAL_PERSON_POLICY,
+            "visual_identity_policy": SYNTHETIC_STYLIZED_CHARACTER_POLICY,
             "appearance": {
                 "gender": "synthetic",
                 "face": "冷银无血色珍珠陶瓷皮肤",
@@ -965,7 +965,7 @@ def test_old_v3_makeup_profile_is_rewritten_to_current_aesthetic():
         }],
     }
 
-    rewritten = apply_no_real_person_character_policy(source)
+    rewritten = apply_synthetic_stylized_character_policy(source)
 
     styling = rewritten["characters"][0]["appearance"]["synthetic_styling"]
     face = rewritten["characters"][0]["appearance"]["face"]
@@ -1009,11 +1009,11 @@ def test_current_synthetic_policy_fails_evidence_when_styling_anchors_are_missin
     (tmp_path / "CHARACTERS.json").write_text(
         json.dumps(
             {
-                "visual_identity_policy": NO_REAL_PERSON_POLICY,
+                "visual_identity_policy": SYNTHETIC_STYLIZED_CHARACTER_POLICY,
                 "characters": [
                     {
                         "id": "lead",
-                        "visual_identity_policy": NO_REAL_PERSON_POLICY,
+                        "visual_identity_policy": SYNTHETIC_STYLIZED_CHARACTER_POLICY,
                         "appearance": {
                             "gender": "synthetic",
                             "face": "普通自然人脸",

@@ -199,6 +199,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.set_defaults(no_real_person=None)
     parser.add_argument(
+        "--character-visual-policy",
+        choices=(
+            "source_derived",
+            "fictional_cinematic_human_v1",
+            "synthetic_stylized_character_v3",
+        ),
+        default=None,
+        help="canonical 角色视觉策略；旧真人布尔参数仅作入口迁移",
+    )
+    parser.add_argument(
         "--media-profile",
         choices=AVAILABLE_PROFILES,
         default=None,
@@ -273,6 +283,32 @@ def _resolved_run_arguments(args: argparse.Namespace) -> dict:
         explicit = getattr(args, name)
         return explicit if explicit is not None else stored.get(name, fallback)
 
+    explicit_visual_policy = getattr(args, "character_visual_policy", None)
+    legacy_visual_flag = getattr(args, "no_real_person", None)
+    if explicit_visual_policy is not None and legacy_visual_flag is not None:
+        raise ValueError(
+            "--character-visual-policy cannot be combined with legacy person flags"
+        )
+    stored_visual_policy = stored.get("character_visual_policy")
+    if stored_visual_policy is None and "no_real_person" in stored:
+        stored_visual_policy = (
+            "synthetic_stylized_character_v3"
+            if bool(stored["no_real_person"])
+            else "source_derived"
+        )
+    character_visual_policy = (
+        explicit_visual_policy
+        or (
+            "synthetic_stylized_character_v3"
+            if legacy_visual_flag is True
+            else "source_derived"
+            if legacy_visual_flag is False
+            else None
+        )
+        or stored_visual_policy
+        or "source_derived"
+    )
+
     return {
         "project_id": choose("project_id", "local"),
         "duration": choose("duration", 60),
@@ -291,7 +327,7 @@ def _resolved_run_arguments(args: argparse.Namespace) -> dict:
         "transition_duration": choose("transition_duration", 0.5),
         "media_profile": choose("media_profile", DEFAULT_MEDIA_PROFILE),
         "enable_reshoot": choose("enable_reshoot", True),
-        "no_real_person": choose("no_real_person", False),
+        "character_visual_policy": character_visual_policy,
         "character_library_dir": choose("character_library_dir", None),
     }
 
@@ -338,7 +374,7 @@ def main() -> None:
         transition_duration=resolved["transition_duration"],
         media_profile=resolved["media_profile"],
         enable_reshoot=resolved["enable_reshoot"],
-        no_real_person=resolved["no_real_person"],
+        character_visual_policy=resolved["character_visual_policy"],
         resume=args.resume,
         auto_approve=args.auto_approve,
         resume_from=args.resume_from,
