@@ -19,6 +19,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -58,6 +59,7 @@ from runtime.continuity_provider import (
 )
 from runtime.generation_tasks import GenerationTaskStore
 from runtime.pipeline_execution import run_pipeline
+from runtime.provider_attempt_policy import provider_attempt_scope
 from utils.config import (
     ARK_AGENT_CREDENTIAL_SOURCE,
     DEFAULT_MULTIMODAL_MODEL,
@@ -203,6 +205,144 @@ class _SinglePaidRequestGuard:
         return receipt
 
 
+class _BoundedPaidRequestLedger:
+    """Append-only acceptance ledger for a finite family of sync requests."""
+
+    def __init__(self, workspace: Path, name: str, hard_limit: int) -> None:
+        if isinstance(hard_limit, bool) or not isinstance(hard_limit, int) or hard_limit < 1:
+            raise ValueError("paid request ledger hard_limit must be positive")
+        self.workspace = workspace
+        self.name = name
+        self.hard_limit = hard_limit
+        self.path = workspace / LIVE_GATES_DIRECTORY / f"{name}_requests.json"
+        self._lock = threading.Lock()
+        self._in_flight: set[str] = set()
+
+    def _read(self) -> dict[str, Any]:
+        if not self.path.is_file():
+            return {
+                "schema": PAID_REQUEST_GUARD_SCHEMA,
+                "status": "active",
+                "request_name": self.name,
+                "hard_limit": self.hard_limit,
+                "provider_request_count": 0,
+                "attempts": [],
+            }
+        receipt = _read_object(self.path)
+        if (
+            receipt.get("schema") != PAID_REQUEST_GUARD_SCHEMA
+            or receipt.get("request_name") != self.name
+            or receipt.get("hard_limit") != self.hard_limit
+        ):
+            raise RuntimeError(f"{self.name} paid request ledger is incompatible")
+        return receipt
+
+    def before(self, payload: dict[str, Any]) -> str:
+        with self._lock:
+            receipt = self._read()
+            blocked_failures = [
+                attempt
+                for attempt in receipt["attempts"]
+                if attempt.get("status") == "provider_failed"
+            ]
+            unresolved = [
+                attempt
+                for attempt in receipt["attempts"]
+                if (
+                    attempt.get("status") == "submission_uncertain"
+                    and attempt.get("request_id") not in self._in_flight
+                )
+            ]
+            if blocked_failures or unresolved:
+                raise RuntimeError(
+                    f"{self.name} has a failed or unresolved request; "
+                    "automatic resubmission is forbidden"
+                )
+            if receipt["provider_request_count"] >= self.hard_limit:
+                raise RuntimeError(f"{self.name} crossed its paid hard limit")
+            portable = _portable_payload(payload, self.workspace)
+            request_index = receipt["provider_request_count"] + 1
+            token = hashlib.sha256(
+                f"{self.name}:{request_index}:{_canonical_sha256(portable)}".encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+            receipt["attempts"].append({
+                "request_id": token,
+                "request_index": request_index,
+                "request_fingerprint": _canonical_sha256(portable),
+                "payload": portable,
+                "status": "submission_uncertain",
+                "submission_attempted_at": _utc_now(),
+            })
+            receipt["provider_request_count"] = request_index
+            receipt["status"] = "submission_uncertain"
+            _atomic_write_json(self.path, receipt)
+            self._in_flight.add(token)
+            return token
+
+    def after(self, token: str, outcome: dict[str, Any]) -> None:
+        with self._lock:
+            receipt = self._read()
+            matching = [
+                attempt
+                for attempt in receipt["attempts"]
+                if attempt.get("request_id") == token
+            ]
+            if len(matching) != 1 or matching[0].get("status") != "submission_uncertain":
+                raise RuntimeError(f"{self.name} completion token is invalid")
+            matching[0].update({
+                "status": "provider_completed",
+                "provider_completed_at": _utc_now(),
+                "outcome": _portable_payload(outcome, self.workspace),
+            })
+            self._in_flight.discard(token)
+            statuses = {
+                attempt.get("status") for attempt in receipt["attempts"]
+            }
+            receipt["status"] = (
+                "provider_failed"
+                if "provider_failed" in statuses
+                else "submission_uncertain"
+                if "submission_uncertain" in statuses
+                else "provider_completed"
+            )
+            _atomic_write_json(self.path, receipt)
+
+    def failed(self, token: str, outcome: dict[str, Any]) -> None:
+        with self._lock:
+            receipt = self._read()
+            matching = [
+                attempt
+                for attempt in receipt["attempts"]
+                if attempt.get("request_id") == token
+            ]
+            if len(matching) != 1 or matching[0].get("status") != "submission_uncertain":
+                raise RuntimeError(f"{self.name} failure token is invalid")
+            known_rejected = outcome.get("submission_outcome") == "known_rejected"
+            matching[0].update({
+                "status": "provider_failed" if known_rejected else "submission_uncertain",
+                "failed_at": _utc_now(),
+                "failure": _portable_payload(outcome, self.workspace),
+                "automatic_resubmission_forbidden": True,
+            })
+            self._in_flight.discard(token)
+            receipt["status"] = matching[0]["status"]
+            _atomic_write_json(self.path, receipt)
+
+    def settled_receipt(self) -> dict[str, Any]:
+        with self._lock:
+            receipt = self._read()
+            if any(
+                attempt.get("status") in {"submission_uncertain", "provider_failed"}
+                for attempt in receipt["attempts"]
+            ):
+                raise RuntimeError(
+                    f"{self.name} has a failed or unresolved Provider request"
+                )
+            return receipt
+
+
 def _repo_commit() -> str:
     result = subprocess.run(
         ["git", "rev-parse", "HEAD"],
@@ -322,11 +462,20 @@ def build_stage0_preflight(
     max_pxx = max_primary_shots * 4
     # These are deliberately conservative pre-Phase-1 ceilings.  Phase 1 and
     # Phase 5 must replace them with exact frozen lists before later families.
+    phase1_text_request_limit = (
+        len(segments) * (EVENT_EXTRACTOR_MAX_RETRIES + 1)
+        + 2 * math.ceil(max_primary_shots / 3)
+        + 16
+    )
+    phase1_director_storyboard_image_limit = 1
     hard_limits = {
-        "phase1_llm_requests": (
-            len(segments) * (EVENT_EXTRACTOR_MAX_RETRIES + 1)
-            + 2 * math.ceil(max_primary_shots / 3)
-            + 16
+        "phase1_text_requests": phase1_text_request_limit,
+        "phase1_director_storyboard_image_requests": (
+            phase1_director_storyboard_image_limit
+        ),
+        "phase1_provider_requests": (
+            phase1_text_request_limit
+            + phase1_director_storyboard_image_limit
         ),
         "seedream_image_requests": (
             1
@@ -429,8 +578,35 @@ def build_stage0_preflight(
 class _AcceptancePhaseOwner:
     """Narrow test-only injection that keeps every production Phase owner."""
 
+    def __init__(
+        self,
+        workspace: Path,
+        *,
+        phase1_request_limit: int | None = None,
+    ) -> None:
+        self.phase1_request_ledger = (
+            _BoundedPaidRequestLedger(
+                workspace,
+                "phase1_provider",
+                phase1_request_limit,
+            )
+            if phase1_request_limit is not None
+            else None
+        )
+
     def __getattr__(self, name: str) -> Any:
         return getattr(pipeline_lifecycle, name)
+
+    def run_phase1(self, *args: Any, **kwargs: Any) -> dict:
+        if self.phase1_request_ledger is not None:
+            with provider_attempt_scope(
+                max_retries=0,
+                before_provider_request=self.phase1_request_ledger.before,
+                after_provider_request=self.phase1_request_ledger.after,
+                failed_provider_request=self.phase1_request_ledger.failed,
+            ):
+                return pipeline_lifecycle.run_phase1(*args, **kwargs)
+        return pipeline_lifecycle.run_phase1(*args, **kwargs)
 
     @staticmethod
     def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
@@ -489,12 +665,17 @@ def _run_selected_phases(
     phases: set[float | int],
     *,
     resume: bool,
+    phase1_request_limit: int | None = None,
 ) -> dict[str, Any]:
+    owner = _AcceptancePhaseOwner(
+        workspace,
+        phase1_request_limit=phase1_request_limit,
+    )
     result = run_pipeline(
         **_pipeline_arguments(workspace, story_path),
         skip_phase=[phase for phase in ALL_PHASES if phase not in phases],
         resume=resume,
-        _phase_owner=_AcceptancePhaseOwner(),
+        _phase_owner=owner,
     )
     if not isinstance(result, dict) or result.get("status") != "completed":
         raise RuntimeError(
@@ -513,6 +694,10 @@ def _run_selected_phases(
             raise RuntimeError(
                 f"acceptance lifecycle {phase_name} did not complete"
             )
+    if owner.phase1_request_ledger is not None:
+        result["acceptance_provider_ledger"] = (
+            owner.phase1_request_ledger.settled_receipt()
+        )
     return result
 
 
@@ -524,6 +709,82 @@ def _write_live_gate(
     path = workspace / LIVE_GATES_DIRECTORY / f"{name}.json"
     _atomic_write_json(path, payload)
     return path
+
+
+def _paid_request_summary(workspace: Path) -> dict[str, Any]:
+    """Summarize durable paid attempts without copying payloads or secrets."""
+
+    provider_request_count = 0
+    provider_family_counts: dict[str, int] = {}
+    request_receipts: list[dict[str, Any]] = []
+    gate_dir = workspace / LIVE_GATES_DIRECTORY
+    guard_paths = sorted({
+        *gate_dir.glob("*_request.json"),
+        *gate_dir.glob("*_requests.json"),
+    })
+    for path in guard_paths:
+        receipt = _read_object(path)
+        if receipt.get("schema") != PAID_REQUEST_GUARD_SCHEMA:
+            continue
+        count = int(receipt.get("provider_request_count") or 0)
+        provider_request_count += count
+        attempts = receipt.get("attempts")
+        payloads = [
+            attempt.get("payload") or {}
+            for attempt in attempts
+            if isinstance(attempt, dict)
+        ] if isinstance(attempts, list) else []
+        if not payloads:
+            preflight_payload = (
+                receipt.get("zero_submit_preflight") or {}
+            ).get("payload")
+            if isinstance(preflight_payload, dict):
+                payloads = [preflight_payload]
+        counted_families = 0
+        for payload in payloads:
+            family = str(payload.get("provider_family") or "").strip()
+            if not family:
+                continue
+            provider_family_counts[family] = (
+                provider_family_counts.get(family, 0) + 1
+            )
+            counted_families += 1
+        if counted_families < count:
+            family = str(receipt.get("request_name") or "unknown_provider")
+            provider_family_counts[family] = (
+                provider_family_counts.get(family, 0)
+                + count
+                - counted_families
+            )
+        request_receipts.append({
+            "path": path.relative_to(workspace).as_posix(),
+            "sha256": _sha256(path),
+            "status": receipt.get("status"),
+            "provider_request_count": count,
+        })
+
+    task_db = workspace / "runtime.db"
+    if task_db.is_file():
+        video_submissions = GenerationTaskStore(
+            task_db
+        ).submission_attempt_count()
+        provider_request_count += video_submissions
+        provider_family_counts["seedance_video"] = (
+            provider_family_counts.get("seedance_video", 0)
+            + video_submissions
+        )
+        request_receipts.append({
+            "path": task_db.relative_to(workspace).as_posix(),
+            "sha256": _sha256(task_db),
+            "status": "generation_task_store",
+            "provider_request_count": video_submissions,
+        })
+
+    return {
+        "provider_request_count": provider_request_count,
+        "provider_family_counts": dict(sorted(provider_family_counts.items())),
+        "paid_request_receipts": request_receipts,
+    }
 
 
 def _freeze_post_phase1_budget(
@@ -820,7 +1081,10 @@ def execute_paid_full_chain(
     existing = _read_object(receipt_path) if receipt_path.is_file() else None
     if existing and existing.get("status") == "pending_business_verdict":
         return existing
-    if existing and existing.get("status") == "full_chain_failed":
+    if existing and existing.get("status") in {
+        "full_chain_failed",
+        "live_acceptance_failed",
+    }:
         raise RuntimeError(
             "failed paid acceptance is audit-only; automatic paid retry is forbidden"
         )
@@ -852,27 +1116,47 @@ def execute_paid_full_chain(
             ),
             "gates": {},
         }
-    for guard_path in sorted(
-        (workspace / LIVE_GATES_DIRECTORY).glob("*_request.json")
-    ):
+    for guard_path in sorted({
+        *(workspace / LIVE_GATES_DIRECTORY).glob("*_request.json"),
+        *(workspace / LIVE_GATES_DIRECTORY).glob("*_requests.json"),
+    }):
         guard = _read_object(guard_path)
-        if guard.get("status") == "submission_uncertain":
+        if guard.get("status") in {
+            "submission_uncertain",
+            "provider_failed",
+        }:
             raise RuntimeError(
                 "paid acceptance has an unresolved submission_uncertain "
                 f"request: {guard_path.name}"
             )
     _atomic_write_json(receipt_path, started)
-    os.environ["HONCUT_CONTINUITY_MODE"] = "auto"
-    os.environ["HONCUT_CONTINUITY_MAX_REPAIRS"] = "0"
-    os.environ["HONCUT_PHASE5_MAX_CORRECTIONS"] = "0"
-    os.environ["VIDEO_GEN_CONCURRENCY"] = "1"
+    acceptance_environment = {
+        "HONCUT_CONTINUITY_MODE": "auto",
+        "HONCUT_CONTINUITY_MAX_REPAIRS": "0",
+        "HONCUT_PHASE5_MAX_CORRECTIONS": "0",
+        "VIDEO_GEN_CONCURRENCY": "1",
+    }
+    previous_environment = {
+        name: os.environ.get(name) for name in acceptance_environment
+    }
+    os.environ.update(acceptance_environment)
     try:
-        _run_selected_phases(
+        phase1_result = _run_selected_phases(
             workspace,
             story_path,
             {1},
             resume=(workspace / "CANONICAL_VISUAL_CONTRACT.json").is_file(),
+            phase1_request_limit=preflight["authorized_hard_limits"][
+                "phase1_provider_requests"
+            ],
         )
+        phase1_ledger = phase1_result.get("acceptance_provider_ledger") or {}
+        if (
+            phase1_ledger.get("status") != "provider_completed"
+            or int(phase1_ledger.get("provider_request_count") or 0) < 1
+        ):
+            raise RuntimeError("Phase 1 Provider ledger did not settle")
+        _write_live_gate(workspace, "phase1_provider", phase1_ledger)
         post_phase1 = _freeze_post_phase1_budget(workspace, preflight)
 
         characters = _read_object(workspace / "CHARACTERS.json")
@@ -1060,6 +1344,7 @@ def execute_paid_full_chain(
         )
         completed = {
             **started,
+            **_paid_request_summary(workspace),
             "status": "pending_business_verdict",
             "finished_at": _utc_now(),
             "pipeline_status": "completed",
@@ -1080,7 +1365,8 @@ def execute_paid_full_chain(
     except BaseException as error:
         failed = {
             **started,
-            "status": "full_chain_failed",
+            **_paid_request_summary(workspace),
+            "status": "live_acceptance_failed",
             "finished_at": _utc_now(),
             "call_chain_verdict": "failed",
             "business_verdict": "not_evaluated",
@@ -1088,6 +1374,12 @@ def execute_paid_full_chain(
         }
         _atomic_write_json(receipt_path, failed)
         raise
+    finally:
+        for name, previous_value in previous_environment.items():
+            if previous_value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = previous_value
 
 
 def main() -> int:

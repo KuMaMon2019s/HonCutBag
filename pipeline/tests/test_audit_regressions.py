@@ -78,6 +78,7 @@ from phases.phase6.video_generator import build_video_prompt
 from phases.phase8 import duration_gate
 from phases.phase8.edit_decisions import execute_edit_decisions
 from phases.phase8.inventory import Phase8InventoryError, load_phase8_inventory
+from runtime.provider_attempt_policy import provider_attempt_scope
 from phases.phase8.reshoot_transaction import durable_attempt_count
 from phases.phase8.story_order_reviewer import InvalidStoryOrderReview, reorder_shots
 from phases.pipeline_core import _write_project_visual_style
@@ -4481,6 +4482,42 @@ def test_character_discovery_retries_ordinal_identity_collapse(monkeypatch):
         "第二名守卫",
         "第三名守卫",
     }
+
+
+def test_character_discovery_live_scope_disables_identity_resubmission(
+    monkeypatch,
+):
+    calls = 0
+
+    def collapsed_response(_prompt):
+        nonlocal calls
+        calls += 1
+        collapsed = _adult_lead_character(
+            "第一名守卫",
+            "male",
+            "25-35",
+            role="antagonist",
+        )
+        collapsed["aliases"] = ["第二名守卫"]
+        return json.dumps({"characters": [collapsed]}, ensure_ascii=False)
+
+    monkeypatch.setattr(character_discoverer, "_call_llm", collapsed_response)
+    with provider_attempt_scope(max_retries=0):
+        with pytest.raises(ValueError, match="角色发现未产生"):
+            character_discoverer.discover_characters([
+                {
+                    "id": event_id,
+                    "who": [name],
+                    "what": f"{name}进入画面",
+                    "visual": f"{name}单独行动",
+                }
+                for event_id, name in enumerate(
+                    ("第一名守卫", "第二名守卫"),
+                    1,
+                )
+            ])
+
+    assert calls == 1
 
 
 def test_body_contract_reaches_character_storyboard_and_video_prompts():

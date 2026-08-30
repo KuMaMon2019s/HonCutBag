@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import stat
 import sys
@@ -74,6 +75,12 @@ def test_stage0_preflight_is_zero_request_and_has_finite_hard_limits(
         isinstance(value, int) and value > 0
         for value in receipt["authorized_hard_limits"].values()
     )
+    hard_limits = receipt["authorized_hard_limits"]
+    assert hard_limits["phase1_director_storyboard_image_requests"] == 1
+    assert hard_limits["phase1_provider_requests"] == (
+        hard_limits["phase1_text_requests"]
+        + hard_limits["phase1_director_storyboard_image_requests"]
+    )
     assert receipt["configuration"]["automatic_reshoot"] is False
     assert receipt["configuration"]["character_library_configured"] is False
 
@@ -133,6 +140,135 @@ def test_stage0_preflight_rejects_source_reduced_to_zero_events(
     assert receipt["status"] == "preflight_blocked"
     assert "source_structure_has_events" in receipt["missing_configuration"]
     assert receipt["provider_request_count"] == 0
+
+
+def test_phase1_paid_ledger_allows_only_current_process_in_flight_requests(
+    tmp_path,
+):
+    ledger = acceptance._BoundedPaidRequestLedger(
+        tmp_path,
+        "phase1_provider",
+        3,
+    )
+    first = ledger.before({"provider_family": "ark_text", "prompt_sha256": "a"})
+    second = ledger.before({"provider_family": "ark_text", "prompt_sha256": "b"})
+    ledger.after(first, {"transport_status": "stream_accepted"})
+    ledger.after(second, {"transport_status": "stream_accepted"})
+
+    receipt = ledger.settled_receipt()
+
+    assert receipt["status"] == "provider_completed"
+    assert receipt["provider_request_count"] == 2
+    assert [attempt["status"] for attempt in receipt["attempts"]] == [
+        "provider_completed",
+        "provider_completed",
+    ]
+
+
+def test_phase1_paid_ledger_refuses_uncertain_request_after_process_restart(
+    tmp_path,
+):
+    ledger = acceptance._BoundedPaidRequestLedger(
+        tmp_path,
+        "phase1_provider",
+        2,
+    )
+    ledger.before({"provider_family": "ark_text", "prompt_sha256": "a"})
+
+    restored = acceptance._BoundedPaidRequestLedger(
+        tmp_path,
+        "phase1_provider",
+        2,
+    )
+    with pytest.raises(RuntimeError, match="automatic resubmission is forbidden"):
+        restored.before({"provider_family": "ark_text", "prompt_sha256": "b"})
+    with pytest.raises(RuntimeError, match="failed or unresolved"):
+        restored.settled_receipt()
+
+
+def test_paid_request_summary_counts_families_without_copying_payloads(tmp_path):
+    ledger = acceptance._BoundedPaidRequestLedger(
+        tmp_path,
+        "phase1_provider",
+        3,
+    )
+    first = ledger.before({
+        "provider_family": "ark_text",
+        "prompt_sha256": "a" * 64,
+        "secret": "must-not-be-copied",
+    })
+    second = ledger.before({
+        "provider_family": "seedream_image",
+        "prompt_sha256": "b" * 64,
+    })
+    ledger.after(first, {"transport_status": "response_completed"})
+    ledger.after(second, {"transport_status": "response_validated"})
+
+    summary = acceptance._paid_request_summary(tmp_path)
+
+    assert summary["provider_request_count"] == 2
+    assert summary["provider_family_counts"] == {
+        "ark_text": 1,
+        "seedream_image": 1,
+    }
+    assert len(summary["paid_request_receipts"]) == 1
+    serialized = json.dumps(summary, ensure_ascii=False)
+    assert "must-not-be-copied" not in serialized
+    assert "prompt_sha256" not in serialized
+
+
+def test_full_chain_failure_persists_aggregated_paid_request_count(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HONCUT_PHASE5_MAX_CORRECTIONS", "3")
+    story, _expectations = _write_inputs(tmp_path)
+    preflight = {
+        "schema": acceptance.RECEIPT_SCHEMA,
+        "status": "preflight_passed",
+        "provider_request_count": 0,
+        "source": {
+            "git_commit": "a" * 40,
+            "story_sha256": acceptance._sha256(story),
+            "expectations_sha256": "b" * 64,
+        },
+        "authorized_hard_limits": {"phase1_provider_requests": 2},
+    }
+
+    def fail_phase1(workspace, *_args, **_kwargs):
+        ledger = acceptance._BoundedPaidRequestLedger(
+            workspace,
+            "phase1_provider",
+            2,
+        )
+        token = ledger.before({
+            "provider_family": "ark_text",
+            "messages_sha256": "c" * 64,
+        })
+        ledger.failed(token, {
+            "submission_outcome": "known_rejected",
+            "error_type": "FixtureProviderError",
+        })
+        raise RuntimeError("fixture Provider rejection")
+
+    monkeypatch.setattr(acceptance, "_run_selected_phases", fail_phase1)
+    with pytest.raises(RuntimeError, match="fixture Provider rejection"):
+        acceptance.execute_paid_full_chain(tmp_path, story, preflight)
+
+    receipt = json.loads(
+        (tmp_path / acceptance.RECEIPT_NAME).read_text(encoding="utf-8")
+    )
+    assert receipt["status"] == "live_acceptance_failed"
+    assert receipt["provider_request_count"] == 1
+    assert receipt["provider_family_counts"] == {"ark_text": 1}
+    assert receipt["paid_request_receipts"][0]["provider_request_count"] == 1
+    assert "messages_sha256" not in json.dumps(
+        receipt["paid_request_receipts"]
+    )
+    assert os.environ["HONCUT_PHASE5_MAX_CORRECTIONS"] == "3"
+    assert "HONCUT_CONTINUITY_MODE" not in os.environ
+    assert "HONCUT_CONTINUITY_MAX_REPAIRS" not in os.environ
+    assert "VIDEO_GEN_CONCURRENCY" not in os.environ
 
 
 def test_phase3_live_gate_stops_after_one_image_and_persists_partial_resume(

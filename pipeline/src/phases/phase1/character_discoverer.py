@@ -31,6 +31,7 @@ from typing import List, Dict, Any
 from collections import defaultdict
 
 from openai import OpenAI
+from runtime.provider_attempt_policy import effective_provider_retries
 from schemas.understanding import (
     CharacterUnderstandingBatch,
     native_chat_json_schema_format,
@@ -1117,10 +1118,12 @@ def discover_characters(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     )
 
     # 3. 调用 LLM（带重试）
+    retry_limit = effective_provider_retries(MAX_RETRIES)
+    network_retry_limit = effective_provider_retries(1)
     characters = []
     last_error = None
     attempt_prompt = prompt
-    for attempt in range(1 + MAX_RETRIES):
+    for attempt in range(1 + retry_limit):
         try:
             print("调用 LLM 生成角色描述...", file=sys.stderr)
             response = _call_llm(attempt_prompt)
@@ -1134,9 +1137,9 @@ def discover_characters(events: List[Dict[str, Any]]) -> Dict[str, Any]:
             break
         except (json.JSONDecodeError, ValueError) as e:
             last_error = e
-            if attempt < MAX_RETRIES:
+            if attempt < retry_limit:
                 print(
-                    f"  角色结构/身份回验失败，重试 ({attempt+1}/{MAX_RETRIES}): {e}",
+                    f"  角色结构/身份回验失败，重试 ({attempt+1}/{retry_limit}): {e}",
                     file=sys.stderr,
                 )
                 attempt_prompt = (
@@ -1150,8 +1153,12 @@ def discover_characters(events: List[Dict[str, Any]]) -> Dict[str, Any]:
             continue
         except (LLMConnectTimeout, LLMReadTimeout, LLMIdleTimeout, LLMStreamError) as e:
             last_error = e
-            if attempt < 1:
-                print(f"  LLM 流中断，重试 (1/1): {e}", file=sys.stderr)
+            if attempt < network_retry_limit:
+                print(
+                    f"  LLM 流中断，重试 "
+                    f"({attempt + 1}/{network_retry_limit}): {e}",
+                    file=sys.stderr,
+                )
                 time.sleep(1)
                 continue
             break

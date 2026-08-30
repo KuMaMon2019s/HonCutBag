@@ -32,6 +32,12 @@ from prompt.seedream_image_prompt import (
     prompt_guidance_metrics,
     single_image_request_parameters,
 )
+from utils.provider_request_guard import (
+    effective_transport_retries,
+    provider_request_completed,
+    provider_request_failed,
+    provider_request_started,
+)
 from utils.config import ARK_BASE_URL
 from utils.ip_blacklist import sanitize_prompt
 from utils.provider_quota import (
@@ -417,19 +423,50 @@ class SeedreamClient:
 
     def _call_and_save(self, payload: dict, output_path: str, timeout: int = 180) -> str:
         """Call Agent Plan API (synchronous), save result. Returns image URL."""
-        max_quota_retries = 3
+        max_quota_retries = effective_transport_retries(3)
         for quota_retry in range(max_quota_retries + 1):
             with _SEEDREAM_RATE_LIMITER.request_slot():
                 print(
                     f"  [seedream] calling Agent Plan API (timeout={timeout}s)...",
                     flush=True,
                 )
-                resp = requests.post(
-                    IMAGE_ENDPOINT,
-                    json=payload,
-                    headers=self.headers,
-                    timeout=timeout,
+                reference_value = payload.get("image")
+                references = (
+                    reference_value
+                    if isinstance(reference_value, list)
+                    else [reference_value]
+                    if isinstance(reference_value, str)
+                    else []
                 )
+                request_token = provider_request_started({
+                    "provider_family": "seedream_image",
+                    "model": payload.get("model"),
+                    "size": payload.get("size"),
+                    "prompt_sha256": hashlib.sha256(
+                        str(payload.get("prompt") or "").encode("utf-8")
+                    ).hexdigest(),
+                    "reference_count": len(references),
+                    "reference_sha256": [
+                        hashlib.sha256(reference.encode("utf-8")).hexdigest()
+                        for reference in references
+                    ],
+                })
+                try:
+                    resp = requests.post(
+                        IMAGE_ENDPOINT,
+                        json=payload,
+                        headers=self.headers,
+                        timeout=timeout,
+                    )
+                except BaseException as exc:
+                    provider_request_failed(
+                        request_token,
+                        {
+                            "submission_outcome": "unknown",
+                            "error_type": type(exc).__name__,
+                        },
+                    )
+                    raise
                 status_code = getattr(resp, "status_code", 200)
                 diagnostic_headers = {}
                 if status_code != 200:
@@ -459,6 +496,19 @@ class SeedreamClient:
                     )
                     provider_code, provider_message, request_id = (
                         _provider_error_details(resp, diagnostic_headers)
+                    )
+                    provider_request_failed(
+                        request_token,
+                        {
+                            "submission_outcome": "known_rejected",
+                            "http_status": status_code,
+                            "provider_code": provider_code,
+                            "request_id_sha256": (
+                                hashlib.sha256(request_id.encode("utf-8")).hexdigest()
+                                if request_id
+                                else None
+                            ),
+                        },
                     )
                     if (
                         provider_code == "AccountQuotaExceeded"
@@ -496,9 +546,21 @@ class SeedreamClient:
                     ValueError,
                     ValidationError,
                 ) as exc:
+                    provider_request_failed(
+                        request_token,
+                        {
+                            "submission_outcome": "known_rejected",
+                            "http_status": 200,
+                            "error_type": type(exc).__name__,
+                        },
+                    )
                     raise RuntimeError(
                         "Seedream returned an invalid non-streaming image envelope"
                     ) from exc
+                provider_request_completed(
+                    request_token,
+                    {"transport_status": "response_validated", "http_status": 200},
+                )
                 break
 
         # Agent Plan returns a validated data[] array with url or b64_json.

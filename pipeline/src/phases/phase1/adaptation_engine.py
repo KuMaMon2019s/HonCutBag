@@ -48,6 +48,7 @@ from phases.phase1.director_planner import (
     DIRECTOR_INTENT_FIELDS,
     DIRECTOR_PLAN_SCHEMA,
 )
+from runtime.provider_attempt_policy import effective_provider_retries
 from schemas.understanding import (
     DurationScaledActionSelectionBatch,
     SourceIndexedScreenplayRewriteBatch,
@@ -1768,7 +1769,8 @@ def _call_llm_with_timeout_retry(user_prompt: str, max_tokens: int = 32000) -> s
     Raises:
         RuntimeError: 连续超时超过 NETWORK_RETRIES 次
     """
-    for net_attempt in range(NETWORK_RETRIES + 1):
+    network_retry_limit = effective_provider_retries(NETWORK_RETRIES)
+    for net_attempt in range(network_retry_limit + 1):
         try:
             return _call_llm(user_prompt, max_tokens=max_tokens)
         except (
@@ -1778,13 +1780,13 @@ def _call_llm_with_timeout_retry(user_prompt: str, max_tokens: int = 32000) -> s
             LLMIdleTimeout,
             LLMStreamError,
         ) as e:
-            if net_attempt < NETWORK_RETRIES:
+            if net_attempt < network_retry_limit:
                 wait = 15 * (net_attempt + 1)
-                print(f"  ⚠ LLM 网络超时，{wait}s 后重试 ({net_attempt + 1}/{NETWORK_RETRIES})...", file=sys.stderr)
+                print(f"  ⚠ LLM 网络超时，{wait}s 后重试 ({net_attempt + 1}/{network_retry_limit})...", file=sys.stderr)
                 time.sleep(wait)
             else:
                 raise RuntimeError(
-                    f"LLM 调用失败: 连续 {NETWORK_RETRIES} 次网络超时: {e}"
+                    f"LLM 调用失败: 连续 {network_retry_limit} 次网络超时: {e}"
                 ) from e
     raise RuntimeError("LLM 调用失败: 意外退出重试循环")  # 不可达，满足类型检查
 
@@ -5208,7 +5210,8 @@ def _apply_source_indexed_screenplay_rewrite(
     parsed: dict[str, Any] | None = None
     correction = ""
     expected_ids = [record["source_event_id"] for record in rewrite_records]
-    for attempt in range(MAX_RETRIES + 1):
+    retry_limit = effective_provider_retries(MAX_RETRIES)
+    for attempt in range(retry_limit + 1):
         content = call_llm_stream(
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -5265,7 +5268,7 @@ def _apply_source_indexed_screenplay_rewrite(
             parsed = candidate
             break
         except (json.JSONDecodeError, ValidationError, ValueError) as exc:
-            if attempt >= MAX_RETRIES:
+            if attempt >= retry_limit:
                 raise ValueError(
                     f"source-indexed screenplay rewrite failed validation: {exc}"
                 ) from exc
@@ -5454,7 +5457,8 @@ def _apply_director_action_selection(
     records_by_id = {
         record["source_event_id"]: record for record in scaled_records
     }
-    for attempt in range(MAX_RETRIES + 1):
+    retry_limit = effective_provider_retries(MAX_RETRIES)
+    for attempt in range(retry_limit + 1):
         content = call_llm_stream(
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -5517,7 +5521,7 @@ def _apply_director_action_selection(
             parsed = candidate
             break
         except (json.JSONDecodeError, ValidationError, ValueError) as exc:
-            if attempt >= MAX_RETRIES:
+            if attempt >= retry_limit:
                 raise ValueError(
                     f"director-aligned action selection failed validation: {exc}"
                 ) from exc
@@ -6520,8 +6524,9 @@ def _build_canonical_beat_skeleton(
             indent=2,
         ),
     )
+    retry_limit = effective_provider_retries(MAX_RETRIES)
     last_validation_error = ""
-    for attempt in range(1 + MAX_RETRIES):
+    for attempt in range(1 + retry_limit):
         try:
             attempt_prompt = prompt
             if attempt:
@@ -6636,17 +6641,17 @@ def _build_canonical_beat_skeleton(
             return skeleton
         except (json.JSONDecodeError, ValueError) as exc:
             last_validation_error = str(exc)
-            if attempt < MAX_RETRIES:
+            if attempt < retry_limit:
                 print(
                     "canonical 骨架镜头语言解析失败，重试中"
-                    f"（{attempt + 1}/{MAX_RETRIES}）: {exc}",
+                    f"（{attempt + 1}/{retry_limit}）: {exc}",
                     file=sys.stderr,
                 )
                 time.sleep(1)
             else:
                 raise RuntimeError(
                     "canonical 骨架镜头语言响应解析失败"
-                    f"（已重试 {MAX_RETRIES} 次）: {exc}"
+                    f"（已重试 {retry_limit} 次）: {exc}"
                 ) from exc
         except Exception as exc:
             raise RuntimeError(f"canonical 骨架 LLM 调用失败: {exc}") from exc
@@ -6790,8 +6795,9 @@ def _build_beat_skeleton(
             indent=2,
         ),
     )
+    retry_limit = effective_provider_retries(MAX_RETRIES)
     last_validation_error = ""
-    for attempt in range(1 + MAX_RETRIES):
+    for attempt in range(1 + retry_limit):
         try:
             attempt_prompt = prompt
             if attempt:
@@ -6886,11 +6892,11 @@ def _build_beat_skeleton(
             return skeleton
         except (json.JSONDecodeError, ValueError) as e:
             last_validation_error = str(e)
-            if attempt < MAX_RETRIES:
-                print(f"骨架解析失败，重试中（{attempt + 1}/{MAX_RETRIES}）: {e}", file=sys.stderr)
+            if attempt < retry_limit:
+                print(f"骨架解析失败，重试中（{attempt + 1}/{retry_limit}）: {e}", file=sys.stderr)
                 time.sleep(1)
             else:
-                raise RuntimeError(f"骨架响应解析失败（已重试 {MAX_RETRIES} 次）: {e}") from e
+                raise RuntimeError(f"骨架响应解析失败（已重试 {retry_limit} 次）: {e}") from e
         except Exception as e:
             raise RuntimeError(f"骨架 LLM 调用失败: {e}") from e
     raise RuntimeError("骨架 LLM 调用失败：未获得有效响应")
@@ -6954,11 +6960,12 @@ def _expand_beats_to_shots(
             "visual": last.get("visual"),
         }
     first_missing = len(shots)
+    retry_limit = effective_provider_retries(MAX_RETRIES)
     for start in range(first_missing, len(beats), 3):
         batch = beats[start:start + 3]
         prompt = _batch_prompt(batch, characters_summary, target_duration, shot_duration, len(shots), relay)
         parsed = None
-        for attempt in range(1 + MAX_RETRIES):
+        for attempt in range(1 + retry_limit):
             try:
                 response = _call_llm_with_timeout_retry(prompt, max_tokens=16000)
                 parsed = _parse_response(response)
@@ -6994,12 +7001,12 @@ def _expand_beats_to_shots(
                         raise ValueError(f"本批第 {index} 镜 source_events 与 beat 不一致")
                 break
             except (json.JSONDecodeError, ValueError) as e:
-                if attempt < MAX_RETRIES:
-                    print(f"第 {start // 3 + 1} 批解析失败，重试中（{attempt + 1}/{MAX_RETRIES}）: {e}", file=sys.stderr)
+                if attempt < retry_limit:
+                    print(f"第 {start // 3 + 1} 批解析失败，重试中（{attempt + 1}/{retry_limit}）: {e}", file=sys.stderr)
                     time.sleep(1)
                 else:
                     raise RuntimeError(
-                        f"第 {start // 3 + 1} 批响应解析失败（已重试 {MAX_RETRIES} 次）: {e}"
+                        f"第 {start // 3 + 1} 批响应解析失败（已重试 {retry_limit} 次）: {e}"
                     ) from e
             except Exception as e:
                 raise RuntimeError(f"第 {start // 3 + 1} 批 LLM 调用失败: {e}") from e

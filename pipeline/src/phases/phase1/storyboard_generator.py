@@ -36,6 +36,7 @@ from typing import List, Dict, Any, Optional
 from openai import APIConnectionError, OpenAI
 
 from prompt.eight_layer_summary import build_subject_summary
+from runtime.provider_attempt_policy import effective_provider_retries
 from schemas.understanding import (
     StoryboardPromptUnderstanding,
     native_chat_json_schema_format,
@@ -773,9 +774,10 @@ def _generate_single_shot(
         shot, characters, scene_style_map=scene_style_map,
         prev_shot=previous_shot, visual_style_path=visual_style_path,
     )
+    retry_limit = effective_provider_retries(MAX_RETRIES)
     llm_result = None
     last_error = "unknown error"
-    for attempt in range(1 + MAX_RETRIES):
+    for attempt in range(1 + retry_limit):
         if time.monotonic() + LLM_TIMEOUT > shot_deadline:
             print(f"Shot {index} 总时限 {SHOT_WALL_CLOCK_S}s 到，使用降级方案", file=sys.stderr)
             llm_result = {
@@ -789,19 +791,19 @@ def _generate_single_shot(
             break
         except (json.JSONDecodeError, ValueError) as exc:
             last_error = str(exc)
-            if attempt < MAX_RETRIES:
-                print(f"Shot {index} LLM 解析失败，重试中（{attempt + 1}/{MAX_RETRIES}）: {exc}", file=sys.stderr)
+            if attempt < retry_limit:
+                print(f"Shot {index} LLM 解析失败，重试中（{attempt + 1}/{retry_limit}）: {exc}", file=sys.stderr)
                 time.sleep(1)
             else:
                 print(f"Shot {index} LLM 解析失败，使用降级方案: {exc}", file=sys.stderr)
         except Exception as exc:
             last_error = str(exc)
-            if attempt < MAX_RETRIES:
-                print(f"Shot {index} LLM 调用失败，重试中（{attempt + 1}/{MAX_RETRIES}）: {exc}", file=sys.stderr)
+            if attempt < retry_limit:
+                print(f"Shot {index} LLM 调用失败，重试中（{attempt + 1}/{retry_limit}）: {exc}", file=sys.stderr)
                 time.sleep(min(15 * (attempt + 1), 60) if isinstance(exc, (APIConnectionError, TimeoutError, ConnectionError)) else 1)
             else:
                 print(f"Shot {index} LLM 调用失败，使用降级方案: {exc}", file=sys.stderr)
-        if attempt == MAX_RETRIES:
+        if attempt == retry_limit:
             llm_result = {
                 "prompt": f"{fallback_style}, {shot.get('visual', 'scene')}, natural lighting",
                 "caption": shot.get("what", ""),

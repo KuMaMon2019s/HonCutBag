@@ -12,6 +12,7 @@ from prompt.seedream_image_prompt import (
     image_request_fingerprint,
     prompt_guidance_metrics,
 )
+from runtime.provider_attempt_policy import provider_attempt_scope
 
 
 def _capture_payload(client: SeedreamClient, monkeypatch):
@@ -143,6 +144,71 @@ def test_seedream_rejects_invalid_success_envelope_without_writing(
 
     assert not output.exists()
     assert not output.with_suffix(".png.part").exists()
+
+
+def test_seedream_live_scope_records_rejection_and_disables_quota_retry(
+    monkeypatch,
+    tmp_path,
+):
+    calls = 0
+    started = []
+    completed = []
+    failed = []
+
+    class QuotaResponse:
+        status_code = 429
+        headers = {"x-request-id": "provider-request-id"}
+        content = b"quota rejected"
+        text = "AccountQuotaExceeded"
+        request = None
+
+        @staticmethod
+        def json():
+            return {
+                "error": {
+                    "code": "AccountQuotaExceeded",
+                    "message": "temporary account quota exceeded",
+                }
+            }
+
+    def post(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return QuotaResponse()
+
+    monkeypatch.setenv("SEEDREAM_MIN_INTERVAL", "0")
+    monkeypatch.setattr(seedream_client.requests, "post", post)
+    monkeypatch.setattr(
+        seedream_client.time,
+        "sleep",
+        lambda _seconds: pytest.fail("live acceptance must not retry quota errors"),
+    )
+    with provider_attempt_scope(
+        max_retries=0,
+        before_provider_request=lambda payload: (
+            started.append(payload) or "request-1"
+        ),
+        after_provider_request=lambda token, outcome: completed.append(
+            (token, outcome)
+        ),
+        failed_provider_request=lambda token, outcome: failed.append(
+            (token, outcome)
+        ),
+    ):
+        with pytest.raises(seedream_client.AgentPlanQuotaExceededError):
+            SeedreamClient(api_key="agent-plan-test-key").text_to_image(
+                "test",
+                output_path=str(tmp_path / "out.png"),
+            )
+
+    assert calls == 1
+    assert len(started) == 1
+    assert started[0]["provider_family"] == "seedream_image"
+    assert completed == []
+    assert failed[0][0] == "request-1"
+    assert failed[0][1]["submission_outcome"] == "known_rejected"
+    assert failed[0][1]["http_status"] == 429
+    assert failed[0][1]["request_id_sha256"]
 
 
 def test_reference_binding_names_every_input_in_provider_order():

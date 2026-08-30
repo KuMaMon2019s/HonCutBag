@@ -12,6 +12,7 @@ from typing import Any, Protocol
 
 import numpy as np
 from PIL import Image
+from runtime.provider_attempt_policy import effective_provider_attempts
 from prompt.seedream_image_prompt import (
     IMAGE_REQUEST_CONTRACT_ID,
     IMAGE_REQUEST_CONTRACT_VERSION,
@@ -547,9 +548,12 @@ def generate_director_storyboard(
 
             client = SeedreamClient()
             manifest["model"] = client.model
+        effective_layout_attempts = effective_provider_attempts(
+            max_layout_attempts
+        )
         generation_attempts: list[dict[str, Any]] = []
         previous_layout_error = ""
-        for attempt in range(1, max_layout_attempts + 1):
+        for attempt in range(1, effective_layout_attempts + 1):
             attempt_path = output_dir / f".director_storyboard_attempt_{attempt:02d}.png"
             if attempt_path.exists():
                 attempt_path.unlink()
@@ -559,7 +563,7 @@ def generate_director_storyboard(
                 else _build_layout_retry_prompt(
                     prompt,
                     attempt=attempt,
-                    max_attempts=max_layout_attempts,
+                    max_attempts=effective_layout_attempts,
                     previous_error=previous_layout_error,
                 )
             )
@@ -610,10 +614,10 @@ def generate_director_storyboard(
                 previous_layout_error = str(exc)
                 manifest["generation_attempts"] = generation_attempts
                 _write_manifest(manifest_path, manifest)
-                if attempt < max_layout_attempts:
+                if attempt < effective_layout_attempts:
                     print(
                         "  ⚠️ 导演故事板版式审计失败，自动重新生成 "
-                        f"({attempt + 1}/{max_layout_attempts}): {exc}"
+                        f"({attempt + 1}/{effective_layout_attempts}): {exc}"
                     )
                     continue
                 raise

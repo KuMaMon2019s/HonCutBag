@@ -17,6 +17,7 @@ import phases.phase1.storyboard_generator as storyboard_generator
 from phases import pipeline_core
 from phases.phase1.phase1_pipeline import run_phase1
 from prompt import event_extractor, text_parser
+from runtime.provider_attempt_policy import provider_attempt_scope
 from utils import ark_llm
 from utils.config import DEFAULT_TEXT_MODEL
 from utils.progress_reporter import ProgressReporter
@@ -493,6 +494,34 @@ def test_director_planner_propagates_provider_failure(monkeypatch, tmp_path):
         )
 
     assert not (tmp_path / "director_plan.json").exists()
+
+
+def test_director_planner_live_scope_disables_schema_resubmission(
+    monkeypatch,
+    tmp_path,
+):
+    calls = 0
+    monkeypatch.setattr(director_planner, "get_api_key", lambda _name: "test-key")
+    monkeypatch.setattr(
+        director_planner,
+        "create_ark_client",
+        lambda **_kwargs: object(),
+    )
+
+    def invalid_schema(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return "not-json"
+
+    monkeypatch.setattr(director_planner, "call_llm_stream", invalid_schema)
+    with provider_attempt_scope(max_retries=0):
+        with pytest.raises(RuntimeError, match="director planning failed"):
+            director_planner.plan_director(
+                [{"sequence_id": "SEQ001", "what": "fictional scene"}],
+                tmp_path,
+            )
+
+    assert calls == 1
 
 
 def test_storyboard_long_stream_timeout_budget_is_consistent(monkeypatch):

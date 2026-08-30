@@ -26,7 +26,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import Any, Dict, List
 
 from openai import OpenAI
 from schemas.understanding import (
@@ -36,6 +36,7 @@ from schemas.understanding import (
     native_chat_json_schema_format,
     parse_structured_output,
 )
+from runtime.provider_attempt_policy import effective_provider_retries
 from utils.action_units import (
     ACTION_TIMELINE_SCHEMA,
     annotate_event_motion_modes,
@@ -579,8 +580,9 @@ def _extract_events_from_segment(segment: Dict[str, Any]) -> List[Dict[str, Any]
     )
     system_prompt = ACTION_SYSTEM_PROMPT if is_action_format else GENERAL_SYSTEM_PROMPT
 
+    retry_limit = effective_provider_retries(MAX_RETRIES)
     last_error = None
-    for attempt in range(1 + MAX_RETRIES):
+    for attempt in range(1 + retry_limit):
         try:
             attempt_prompt = prompt
             if attempt and last_error:
@@ -612,8 +614,8 @@ def _extract_events_from_segment(segment: Dict[str, Any]) -> List[Dict[str, Any]
             return events
         except (json.JSONDecodeError, ValueError) as e:
             last_error = e
-            if attempt < MAX_RETRIES:
-                print(f"  JSON 解析失败，重试 ({attempt+1}/{MAX_RETRIES}): {e}", file=sys.stderr)
+            if attempt < retry_limit:
+                print(f"  JSON 解析失败，重试 ({attempt+1}/{retry_limit}): {e}", file=sys.stderr)
                 time.sleep(1)
             continue
         except (
@@ -624,8 +626,8 @@ def _extract_events_from_segment(segment: Dict[str, Any]) -> List[Dict[str, Any]
             LLMStreamError,
         ) as e:
             last_error = e
-            if attempt < MAX_RETRIES:
-                print(f"  LLM 流中断，重试 ({attempt+1}/{MAX_RETRIES}): {e}", file=sys.stderr)
+            if attempt < retry_limit:
+                print(f"  LLM 流中断，重试 ({attempt+1}/{retry_limit}): {e}", file=sys.stderr)
                 time.sleep(1)
                 continue
             break
@@ -635,7 +637,7 @@ def _extract_events_from_segment(segment: Dict[str, Any]) -> List[Dict[str, Any]
             ) from e
 
     raise EventExtractionError(
-        f"segment {segment.get('id', '?')} 事件提取失败（已重试 {MAX_RETRIES} 次）: {last_error}"
+        f"segment {segment.get('id', '?')} 事件提取失败（已重试 {retry_limit} 次）: {last_error}"
     ) from last_error
 
 

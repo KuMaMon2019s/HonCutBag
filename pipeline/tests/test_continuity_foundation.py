@@ -992,6 +992,40 @@ def test_director_storyboard_retries_rejected_layout_once(tmp_path):
     assert hashlib.sha256(accepted_prompt.encode()).hexdigest() == cached["prompt_sha256"]
 
 
+def test_director_storyboard_live_scope_disables_layout_regeneration(tmp_path):
+    from runtime.provider_attempt_policy import provider_attempt_scope
+
+    storyboard = {
+        "shots": [
+            {"id": 1, "duration": 4, "generation_actions": ["建立空间"]},
+            {"id": 2, "duration": 4, "generation_actions": ["角色进入"]},
+        ],
+    }
+    calls = []
+
+    class InvalidImageClient:
+        model = "fake-seedream"
+
+        def text_to_image(self, prompt, output_path, size, timeout):
+            calls.append(prompt)
+            Image.new("RGB", (1200, 600), "white").save(output_path)
+            return "https://image.invalid/invalid.png"
+
+    with provider_attempt_scope(max_retries=0):
+        with pytest.raises(RuntimeError, match="vertical divider"):
+            generate_director_storyboard(
+                tmp_path,
+                storyboard,
+                client=InvalidImageClient(),
+                size="1200x600",
+            )
+
+    assert len(calls) == 1
+    manifest = json.loads((tmp_path / "director_storyboard.json").read_text())
+    assert len(manifest["generation_attempts"]) == 1
+    assert manifest["generation_attempts"][0]["status"] == "rejected_layout"
+
+
 def test_director_storyboard_stops_after_layout_retry_limit(tmp_path):
     storyboard = {
         "shots": [

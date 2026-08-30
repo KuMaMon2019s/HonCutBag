@@ -10,6 +10,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import phases.phase1.adaptation_engine as engine
+from runtime.provider_attempt_policy import provider_attempt_scope
 
 
 def _events(count):
@@ -186,6 +187,22 @@ def test_batch_parse_retry_only_retries_failing_batch(monkeypatch):
     assert len(prompts) == 4
     assert prompts[1] == prompts[2]
     assert prompts[0] != prompts[1]
+
+
+def test_live_scope_disables_adaptation_batch_schema_resubmission(monkeypatch):
+    calls = 0
+
+    def invalid_response(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return "not-json"
+
+    monkeypatch.setattr(engine, "_call_llm_with_timeout_retry", invalid_response)
+    with provider_attempt_scope(max_retries=0):
+        with pytest.raises(RuntimeError, match="已重试 0 次"):
+            engine._expand_beats_to_shots([_beat(1)], "- fictional", 12, 12)
+
+    assert calls == 1
 
 
 def test_small_script_automatically_uses_layered(monkeypatch):

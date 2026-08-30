@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import random
 import sys
@@ -18,6 +20,12 @@ from utils.provider_quota import (
 )
 from utils.config import ARK_BASE_URL, DEFAULT_TEXT_MODEL
 from utils.prompt_budget import enforce_prompt_budget
+from utils.provider_request_guard import (
+    effective_transport_retries,
+    provider_request_completed,
+    provider_request_failed,
+    provider_request_started,
+)
 
 _default_heartbeat_callback: Optional[Callable[[], None]] = None
 
@@ -234,6 +242,24 @@ def _attempt_llm_stream(
     idle_monitor.start()
     chunks: list[str] = []
     last_heartbeat_at: Optional[float] = None
+    request_token = None
+    request_finalized = False
+
+    def fail_request(exc: BaseException, *, known_rejected: bool = False) -> None:
+        nonlocal request_finalized
+        if request_token is None or request_finalized:
+            return
+        provider_request_failed(
+            request_token,
+            {
+                "submission_outcome": (
+                    "known_rejected" if known_rejected else "unknown"
+                ),
+                "error_type": type(exc).__name__,
+            },
+        )
+        request_finalized = True
+
     try:
         request = {
             "model": model,
@@ -243,6 +269,33 @@ def _attempt_llm_stream(
         }
         if response_format is not None:
             request["response_format"] = response_format
+        safe_request = {
+            "provider_family": "ark_text",
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages_sha256": hashlib.sha256(
+                json.dumps(
+                    messages,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "response_format_sha256": (
+                hashlib.sha256(
+                    json.dumps(
+                        response_format,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                if response_format is not None
+                else None
+            ),
+            "stream": True,
+        }
+        request_token = provider_request_started(safe_request)
         stream = client.chat.completions.create(**request)
         for chunk in stream:
             now = time.monotonic()
@@ -271,23 +324,28 @@ def _attempt_llm_stream(
             raise LLMWallTimeout(f"LLM wall timeout after {wall_timeout}s")
         if idle_expired.is_set():
             raise LLMIdleTimeout(f"LLM stream idle timeout after {idle_timeout}s")
-    except LLMTimeoutError:
+    except LLMTimeoutError as exc:
+        fail_request(exc)
         raise
     except (httpx.ConnectTimeout,) as exc:
+        fail_request(exc)
         raise LLMConnectTimeout(str(exc)) from exc
     except (httpx.ReadTimeout, APITimeoutError) as exc:
+        fail_request(exc)
         if wall_expired.is_set():
             raise LLMWallTimeout(f"LLM wall timeout after {wall_timeout}s") from exc
         if idle_expired.is_set():
             raise LLMIdleTimeout(f"LLM stream idle timeout after {idle_timeout}s") from exc
         raise LLMReadTimeout(str(exc)) from exc
     except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
+        fail_request(exc)
         if wall_expired.is_set():
             raise LLMWallTimeout(f"LLM wall timeout after {wall_timeout}s") from exc
         if idle_expired.is_set():
             raise LLMIdleTimeout(f"LLM stream idle timeout after {idle_timeout}s") from exc
         raise LLMStreamError(str(exc)) from exc
     except APIConnectionError as exc:
+        fail_request(exc)
         cause = exc.__cause__
         if isinstance(cause, httpx.ConnectTimeout):
             raise LLMConnectTimeout(str(exc)) from exc
@@ -299,12 +357,17 @@ def _attempt_llm_stream(
             raise LLMIdleTimeout(f"LLM stream idle timeout after {idle_timeout}s") from exc
         raise LLMStreamError(str(exc)) from exc
     except APIStatusError as exc:
+        fail_request(exc, known_rejected=True)
         if is_fixed_window_quota_exhaustion(exc):
             raise LLMQuotaExceededError(str(exc)) from exc
         if is_rate_limited_error(exc):
             raise LLMRateLimitedError(str(exc)) from exc
         raise
     except Exception as exc:
+        fail_request(
+            exc,
+            known_rejected=bool(getattr(exc, "status_code", None)),
+        )
         if wall_expired.is_set():
             raise LLMWallTimeout(f"LLM wall timeout after {wall_timeout}s") from exc
         if idle_expired.is_set():
@@ -326,7 +389,17 @@ def _attempt_llm_stream(
 
     content = "".join(chunks)
     if not content.strip():
-        raise LLMEmptyResponse("LLM 返回空内容")
+        empty_error = LLMEmptyResponse("LLM 返回空内容")
+        fail_request(empty_error)
+        raise empty_error
+    provider_request_completed(
+        request_token,
+        {
+            "transport_status": "response_completed",
+            "response_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        },
+    )
+    request_finalized = True
     return content
 
 
@@ -368,6 +441,7 @@ def call_llm_stream(
     client = _client or create_ark_client(connect_timeout, read_timeout)
     _wait_for_launch_slot(stagger)
 
+    retry_limit = effective_transport_retries(rate_limit_retries)
     attempt = 0
     while True:
         try:
@@ -385,7 +459,7 @@ def call_llm_stream(
                 _client=client,
             )
         except LLMRateLimitedError as exc:
-            if attempt >= rate_limit_retries:
+            if attempt >= retry_limit:
                 raise
             wait = min(rate_limit_base_wait * (2 ** attempt), rate_limit_max_wait)
             if rate_limit_jitter > 0:
@@ -393,7 +467,7 @@ def call_llm_stream(
             attempt += 1
             print(
                 f"  LLM 限流/burst 保护，{wait:.1f}s 后指数退避重试 "
-                f"({attempt}/{rate_limit_retries}): {exc}",
+                f"({attempt}/{retry_limit}): {exc}",
                 file=sys.stderr,
             )
             time.sleep(wait)

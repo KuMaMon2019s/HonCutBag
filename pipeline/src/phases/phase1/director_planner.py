@@ -8,6 +8,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from runtime.llm_policy import LLMStreamPolicy
+from runtime.provider_attempt_policy import effective_provider_retries
 from schemas.understanding import (
     DirectorPlanUnderstanding,
     native_chat_json_schema_format,
@@ -155,7 +156,8 @@ def plan_director(
 
         correction = ""
         plan = None
-        for attempt in range(MAX_SCHEMA_CORRECTIONS + 1):
+        correction_limit = effective_provider_retries(MAX_SCHEMA_CORRECTIONS)
+        for attempt in range(correction_limit + 1):
             messages = [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {
@@ -184,7 +186,7 @@ def plan_director(
                 plan = validate_director_plan(parsed, events)
                 break
             except (json.JSONDecodeError, ValidationError, ValueError) as exc:
-                if attempt >= MAX_SCHEMA_CORRECTIONS:
+                if attempt >= correction_limit:
                     raise
                 correction = (
                     "\n\n上次输出未通过导演计划业务校验："
