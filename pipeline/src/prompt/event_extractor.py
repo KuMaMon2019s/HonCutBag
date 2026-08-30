@@ -297,7 +297,7 @@ _NARRATIVE_JUMP_CUES = (
 # caches carried over from earlier run directories — and forces every Phase 1
 # event extraction to re-run (a paid LLM pass). Never bump casually, and never
 # reuse cross-run segment caches from a run produced under a different value.
-EVENT_FLOW_SCHEMA_VERSION = "27.0"
+EVENT_FLOW_SCHEMA_VERSION = "28.0"
 
 _UNKNOWN_ACTION_PERFORMERS = {
     "",
@@ -386,7 +386,12 @@ def _is_global_production_directive(event: Dict[str, Any]) -> bool:
     return is_global_production_directive_text(evidence)
 
 
-def _normalize_event(event: Dict[str, Any], source_content: str = "") -> Dict[str, Any]:
+def _normalize_event(
+    event: Dict[str, Any],
+    source_content: str = "",
+    *,
+    semantic_action_qa_enabled: bool = False,
+) -> Dict[str, Any]:
     who = event.get("who", [])
     if isinstance(who, str):
         who = [who] if who.strip() else []
@@ -490,16 +495,28 @@ def _normalize_event(event: Dict[str, Any], source_content: str = "") -> Dict[st
                 "evidence": str(raw.get("evidence") or "").strip(),
             })
     event["lines"] = normalized_lines
-    timeline = build_event_action_timeline(event)
+    event["semantic_action_qa_enabled"] = semantic_action_qa_enabled
+    timeline = build_event_action_timeline(
+        event,
+        semantic_qa_enabled=semantic_action_qa_enabled,
+    )
     if event["micro_actions"] and timeline is None:
         raise ValueError(
             "action_temporal_relations must cover every micro_action under "
             f"{ACTION_TIMELINE_SCHEMA}"
         )
+    event["action_timeline_qa"] = (
+        dict(timeline.get("semantic_qa") or {}) if timeline else {}
+    )
     return event
 
 
-def _parse_events(response: str, source_content: str = "") -> List[Dict[str, Any]]:
+def _parse_events(
+    response: str,
+    source_content: str = "",
+    *,
+    semantic_action_qa_enabled: bool = False,
+) -> List[Dict[str, Any]]:
     """Validate the complete native ``{"events": [...]}`` response."""
     parsed = parse_structured_output(
         response,
@@ -507,7 +524,11 @@ def _parse_events(response: str, source_content: str = "") -> List[Dict[str, Any
     ).model_dump()["events"]
 
     for event in parsed:
-        _normalize_event(event, source_content)
+        _normalize_event(
+            event,
+            source_content,
+            semantic_action_qa_enabled=semantic_action_qa_enabled,
+        )
 
     # A model may quote only a small visual fragment from a paragraph that is
     # wholly a project-wide production directive.  The fragment then loses the
@@ -547,7 +568,11 @@ def _cached_event_schema_payload(event: object) -> dict[str, Any]:
     return payload
 
 
-def _extract_events_from_segment(segment: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _extract_events_from_segment(
+    segment: Dict[str, Any],
+    *,
+    semantic_action_qa_enabled: bool = False,
+) -> List[Dict[str, Any]]:
     """
     从单个 segment 中提取事件
 
@@ -610,7 +635,11 @@ def _extract_events_from_segment(segment: Dict[str, Any]) -> List[Dict[str, Any]
                     "状态同样使用 sustained_during、performers=[]，角色写入 targets/状态字段。"
                 )
             response = _call_llm(attempt_prompt, system_prompt=system_prompt)
-            events = _parse_events(response, content)
+            events = _parse_events(
+                response,
+                content,
+                semantic_action_qa_enabled=semantic_action_qa_enabled,
+            )
             return events
         except (json.JSONDecodeError, ValueError) as e:
             last_error = e
@@ -646,6 +675,7 @@ def extract_events(
     checkpoint_dir: str | Path | None = None,
     *,
     continuity_mode: str | None = None,
+    semantic_action_qa_enabled: bool = False,
 ) -> Dict[str, Any]:
     """
     核心函数：从 segments 列表中提取所有事件
@@ -659,7 +689,11 @@ def extract_events(
         包含 total_events 和 events 的字典
     """
     if not segments:
-        return {"total_events": 0, "events": []}
+        return {
+            "total_events": 0,
+            "events": [],
+            "semantic_action_qa_enabled": semantic_action_qa_enabled,
+        }
 
     all_events = []
     event_id = 1
@@ -674,6 +708,7 @@ def extract_events(
             json.dumps(
                 {
                     "event_extraction_schema_version": EVENT_FLOW_SCHEMA_VERSION,
+                    "semantic_action_qa_enabled": semantic_action_qa_enabled,
                     "segment": segment,
                 },
                 ensure_ascii=False,
@@ -698,13 +733,22 @@ def extract_events(
                         ensure_ascii=False,
                     ),
                     str(segment.get("content", "")),
+                    semantic_action_qa_enabled=semantic_action_qa_enabled,
                 )
                 print(f"复用 segment {segment_id} 事件缓存...", file=sys.stderr)
                 return segment_id, events
             except (OSError, json.JSONDecodeError, ValueError, TypeError):
                 pass
         print(f"处理 segment {segment_id}...", file=sys.stderr)
-        events = _extract_events_from_segment(segment)
+        if semantic_action_qa_enabled:
+            events = _extract_events_from_segment(
+                segment,
+                semantic_action_qa_enabled=True,
+            )
+        else:
+            # Preserve the established one-argument seam for test and private
+            # dependency-injection adapters when semantic QA is disabled.
+            events = _extract_events_from_segment(segment)
         if cache_path is not None:
             temporary = cache_path.with_suffix(cache_path.suffix + ".tmp")
             temporary.write_text(
@@ -733,6 +777,7 @@ def extract_events(
     ).hexdigest()
     return {
         "schema_version": EVENT_FLOW_SCHEMA_VERSION,
+        "semantic_action_qa_enabled": semantic_action_qa_enabled,
         "continuity_mode": continuity_mode,
         "document_format": next(
             (str(segment.get("format_hint")) for segment in source_segments if segment.get("format_hint")),

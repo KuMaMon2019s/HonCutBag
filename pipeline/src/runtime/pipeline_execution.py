@@ -284,6 +284,7 @@ def run_pipeline(
     media_profile: str = DEFAULT_MEDIA_PROFILE,
     enable_reshoot: bool = True,
     character_visual_policy: str = SOURCE_DERIVED_POLICY,
+    phase1_semantic_qa: bool = False,
     resume: bool = False,
     auto_approve: bool = True,
     resume_from: str = None,
@@ -325,6 +326,7 @@ def run_pipeline(
             media_profile=media_profile,
             enable_reshoot=enable_reshoot,
             character_visual_policy=resolved_visual_policy,
+            phase1_semantic_qa=phase1_semantic_qa,
             resume=resume,
             auto_approve=auto_approve,
             resume_from=resume_from,
@@ -350,6 +352,7 @@ def _run_pipeline(
     media_profile: str = DEFAULT_MEDIA_PROFILE,
     enable_reshoot: bool = True,
     character_visual_policy: str = SOURCE_DERIVED_POLICY,
+    phase1_semantic_qa: bool = False,
     resume: bool = False,
     auto_approve: bool = True,
     resume_from: str = None,
@@ -381,6 +384,7 @@ def _run_pipeline(
         media_profile: 编码配置名称，从 MEDIA_PROFILES 中选择（默认 "480p"）
         enable_reshoot: 视觉缺陷或时长不足时是否允许调用 Phase 6 补录（默认 True，最多两轮）
         character_visual_policy: 角色视觉事实的 canonical 解析策略
+        phase1_semantic_qa: 是否启用会阻断流程的 Phase 1 动作语义 QA
         resume: 从检查点恢复，跳过已完成的 Phase
         accept_code_change_from: 显式接受代码变更并从指定 Phase 继续；其他身份变化仍拒绝
 
@@ -433,6 +437,8 @@ def _run_pipeline(
     character_visual_policy = normalize_character_visual_policy(
         character_visual_policy
     )
+    if not isinstance(phase1_semantic_qa, bool):
+        raise ValueError("phase1_semantic_qa must be a boolean")
 
     if accept_code_change_from is not None:
         from utils.artifact_chain import (
@@ -489,6 +495,7 @@ def _run_pipeline(
         "media_profile": media_profile,
         "enable_reshoot": enable_reshoot,
         "character_visual_policy": character_visual_policy,
+        "phase1_semantic_qa": phase1_semantic_qa,
         "dry_run": dry_run,
         "video_provider": effective_video_provider,
         "video_generation_mode": effective_video_route,
@@ -733,6 +740,7 @@ def _run_pipeline(
                 media_profile=media_profile,
                 project_video_spec=project_video_spec,
                 character_visual_policy=character_visual_policy,
+                phase1_semantic_qa=phase1_semantic_qa,
                 enable_reshoot=enable_reshoot,
                 resume=resume,
                 resume_from=resume_from,
@@ -879,6 +887,8 @@ def _run_pipeline(
             "project_video_spec": project_video_spec,
             "character_visual_policy": character_visual_policy,
         }
+        if phase1_semantic_qa:
+            phase1_kwargs["phase1_semantic_qa"] = True
         if _screenplay_rewrite_request is not None:
             phase1_kwargs["screenplay_rewrite_request"] = (
                 _screenplay_rewrite_request

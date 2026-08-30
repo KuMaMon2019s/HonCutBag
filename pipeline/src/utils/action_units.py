@@ -568,6 +568,7 @@ def build_event_action_timeline(
     *,
     actions: list[str] | None = None,
     seen: set[str] | None = None,
+    semantic_qa_enabled: bool | None = None,
 ) -> dict[str, Any] | None:
     """Build a deterministic per-event causal timeline from strict relations.
 
@@ -575,6 +576,14 @@ def build_event_action_timeline(
     Source actions are never removed: effects and sustained facts remain attached
     to their causal slice while consuming no additional temporal capacity.
     """
+
+    if semantic_qa_enabled is None:
+        stored_semantic_qa = event.get("semantic_action_qa_enabled", False)
+        if not isinstance(stored_semantic_qa, bool):
+            raise ValueError("semantic_action_qa_enabled must be a boolean")
+        semantic_qa_enabled = stored_semantic_qa
+    elif not isinstance(semantic_qa_enabled, bool):
+        raise ValueError("semantic_qa_enabled must be a boolean")
 
     event_actions = event.get("micro_actions") or [] if actions is None else actions
     if isinstance(event_actions, str):
@@ -585,6 +594,14 @@ def build_event_action_timeline(
     if not normalized_actions:
         return {
             "schema": ACTION_TIMELINE_SCHEMA,
+            "semantic_qa": {
+                "enabled": semantic_qa_enabled,
+                "verdict": (
+                    "pass" if semantic_qa_enabled else "diagnostic_only"
+                ),
+                "finding_count": 0,
+                "findings": [],
+            },
             "source_micro_actions": [],
             "actions": [],
             "slices": [],
@@ -598,8 +615,18 @@ def build_event_action_timeline(
     relations_by_index = {
         relation["micro_action_index"]: relation for relation in relations
     }
+    semantic_qa_findings: list[dict[str, Any]] = []
     for relation in relations:
-        _validate_parallel_relation(event, relation, relations_by_index)
+        try:
+            _validate_parallel_relation(event, relation, relations_by_index)
+        except ValueError as exc:
+            if semantic_qa_enabled:
+                raise
+            semantic_qa_findings.append({
+                "category": "parallel_relation",
+                "micro_action_index": relation["micro_action_index"],
+                "message": str(exc),
+            })
 
     prior_event_keys = set(seen or set())
     observed_keys: set[str] = set()
@@ -685,17 +712,28 @@ def build_event_action_timeline(
             relations_by_index[index]
             for index in raw_slice["contribution_action_indexes"]
         ]
-        _validate_slice_contributions(
-            event,
-            list(raw_slice["contribution_action_indexes"]),
-            relations_by_index,
-        )
+        slice_semantics_valid = True
+        try:
+            _validate_slice_contributions(
+                event,
+                list(raw_slice["contribution_action_indexes"]),
+                relations_by_index,
+            )
+        except ValueError as exc:
+            if semantic_qa_enabled:
+                raise
+            slice_semantics_valid = False
+            semantic_qa_findings.append({
+                "category": "slice_contributions",
+                "slice_id": f"TS{slice_index:03d}",
+                "message": str(exc),
+            })
         motion_contribution_keys = {
             (
                 "ensemble",
                 str(relation.get("ensemble_id")),
             )
-            if relation.get("ensemble_id")
+            if relation.get("ensemble_id") and slice_semantics_valid
             else ("action", str(relation["micro_action_index"]))
             for relation in contributions
         }
@@ -742,6 +780,16 @@ def build_event_action_timeline(
     ).hexdigest()
     return {
         "schema": ACTION_TIMELINE_SCHEMA,
+        "semantic_qa": {
+            "enabled": semantic_qa_enabled,
+            "verdict": (
+                "pass"
+                if semantic_qa_enabled
+                else "diagnostic_only"
+            ),
+            "finding_count": len(semantic_qa_findings),
+            "findings": semantic_qa_findings,
+        },
         "source_micro_actions": normalized_actions,
         "actions": [dict(relation) for relation in relations],
         "slices": serialized_slices,

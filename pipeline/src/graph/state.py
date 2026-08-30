@@ -32,6 +32,7 @@ class HonCutState(TypedDict, total=False):
     media_profile: str
     project_video_spec: dict[str, Any]
     character_visual_policy: str
+    phase1_semantic_qa: bool
     enable_reshoot: bool
     resume: bool
     resume_from: str | None

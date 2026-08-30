@@ -27,6 +27,7 @@ def run_phase1(
     max_material_padding_ratio: float = 0.25,
     delivery_overrun_ratio: float = 0.0,
     character_visual_policy: str = SOURCE_DERIVED_POLICY,
+    phase1_semantic_qa: bool = False,
     *,
     _director_runner=None,
     _screenwriter_runner=None,
@@ -67,6 +68,7 @@ def run_phase1(
             max_material_padding_ratio=max_material_padding_ratio,
             delivery_overrun_ratio=delivery_overrun_ratio,
             character_visual_policy=character_visual_policy,
+            phase1_semantic_qa=phase1_semantic_qa,
             _director_runner=director_runner,
         )
     finally:

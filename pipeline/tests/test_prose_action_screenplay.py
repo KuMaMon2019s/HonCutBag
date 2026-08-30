@@ -1134,6 +1134,59 @@ def test_segment_cache_reuses_nonempty_normalized_event(tmp_path, monkeypatch):
     assert second["events"][0]["body_action_contract"]["valid"] is True
 
 
+def test_segment_cache_separates_semantic_qa_modes(tmp_path, monkeypatch):
+    calls = 0
+    content = "男子观察车门。"
+    payload = _event(
+        who=["男子"],
+        what=content,
+        visual=content,
+        source_excerpt=content,
+        micro_actions=["男子观察车门"],
+        action_temporal_relations=[{
+            "micro_action_index": 1,
+            "performers": ["男子"],
+            "targets": ["车门"],
+            "action_kind": "state_change",
+            "temporal_relation": "root",
+            "reference_action_indexes": [],
+            "pace": "slow",
+        }],
+    )
+
+    def fake_call(_prompt: str, system_prompt: str) -> str:
+        nonlocal calls
+        calls += 1
+        assert system_prompt
+        return json.dumps({"events": [payload]}, ensure_ascii=False)
+
+    segment = {
+        "id": 1,
+        "content": content,
+        "format_hint": "general_prose",
+        "context_before": "",
+        "context_after": "",
+    }
+    monkeypatch.setattr("prompt.event_extractor._call_llm", fake_call)
+
+    from prompt import event_extractor
+
+    diagnostic = event_extractor.extract_events(
+        [segment],
+        checkpoint_dir=tmp_path,
+    )
+    strict = event_extractor.extract_events(
+        [segment],
+        checkpoint_dir=tmp_path,
+        semantic_action_qa_enabled=True,
+    )
+
+    assert calls == 2
+    assert diagnostic["semantic_action_qa_enabled"] is False
+    assert strict["semantic_action_qa_enabled"] is True
+    assert len(list((tmp_path / "phase1_event_segments").glob("*.json"))) == 2
+
+
 def test_group_participants_are_not_promoted_to_character_assets():
     payload = [_event(who=["凛", "烬", "数十机械单位"])]
 
@@ -1141,6 +1194,37 @@ def test_group_participants_are_not_promoted_to_character_assets():
 
     assert parsed[0]["who"] == ["凛", "烬"]
     assert parsed[0]["background_groups"] == ["数十机械单位"]
+
+
+def test_event_parser_defaults_semantic_action_qa_to_diagnostic_only():
+    source = "三名未来战斗人员突然从车厢内部出现。"
+    payload = _event(
+        who=["男子", "三名未来战斗人员"],
+        what=source,
+        visual=source,
+        source_excerpt=source,
+        micro_actions=["三名未来战斗人员突然从车厢内部出现"],
+        body_action_choreography=[],
+        action_temporal_relations=[{
+            "micro_action_index": 1,
+            "performers": ["未来战斗人员群体"],
+            "targets": ["男子"],
+            "action_kind": "locomotion",
+            "temporal_relation": "root",
+            "reference_action_indexes": [],
+            "ensemble_id": "enemy_squad",
+            "pace": "fast",
+        }],
+    )
+    response = json.dumps({"events": [payload]}, ensure_ascii=False)
+
+    parsed = _parse_events(response, source)
+
+    assert parsed[0]["semantic_action_qa_enabled"] is False
+    assert parsed[0]["action_timeline_qa"]["verdict"] == "diagnostic_only"
+    assert parsed[0]["action_timeline_qa"]["finding_count"] == 1
+    with pytest.raises(ValueError, match="ensemble contribution requires"):
+        _parse_events(response, source, semantic_action_qa_enabled=True)
 
 
 @pytest.mark.parametrize(

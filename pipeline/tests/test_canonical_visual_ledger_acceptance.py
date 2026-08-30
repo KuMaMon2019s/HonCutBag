@@ -82,6 +82,7 @@ def test_stage0_preflight_is_zero_request_and_has_finite_hard_limits(
         + hard_limits["phase1_director_storyboard_image_requests"]
     )
     assert receipt["configuration"]["automatic_reshoot"] is False
+    assert receipt["configuration"]["phase1_semantic_qa"] is False
     assert receipt["configuration"]["character_library_configured"] is False
 
 

@@ -392,6 +392,7 @@ def test_temporal_timeline_keeps_traversal_control_and_slow_reveal_serial():
 
 def test_temporal_timeline_rejects_same_actor_overlap_without_composite_contract():
     event = {
+        "semantic_action_qa_enabled": True,
         "micro_actions": ["男子快速靠近", "男子同时控制敌人手臂"],
         "action_temporal_relations": [
             {
@@ -421,6 +422,7 @@ def test_temporal_timeline_rejects_same_actor_overlap_without_composite_contract
 
 def test_temporal_timeline_rejects_transitive_same_actor_slice_conflict():
     event = {
+        "semantic_action_qa_enabled": True,
         "micro_actions": [
             "男子穿过余波逼近敌人",
             "敌人同时发动近身攻击",
@@ -557,7 +559,94 @@ def test_ensemble_contribution_requires_explicit_source_coordination():
         ],
     }
 
+    event["semantic_action_qa_enabled"] = True
     with pytest.raises(ValueError, match="ensemble contribution requires"):
+        normalize_event_action_units(event)
+
+
+def test_disabled_semantic_qa_keeps_group_ensemble_as_diagnostic():
+    event = {
+        "what": "三名未来战斗人员突然从车厢内部出现",
+        "source_excerpt": "三名未来战斗人员突然从车厢内部出现。",
+        "micro_actions": ["三名未来战斗人员突然从车厢内部出现"],
+        "semantic_action_qa_enabled": False,
+        "action_temporal_relations": [
+            {
+                "micro_action_index": 1,
+                "performers": ["未来战斗人员群体"],
+                "targets": ["男子"],
+                "action_kind": "locomotion",
+                "temporal_relation": "root",
+                "reference_action_indexes": [],
+                "ensemble_id": "enemy_squad",
+                "pace": "fast",
+            }
+        ],
+    }
+
+    normalized = normalize_event_action_units(event)
+
+    assert normalized["units"] == 1
+    assert normalized["generation_action_units"][0]["motion_load"] == 1
+    semantic_qa = normalized["action_timeline"]["semantic_qa"]
+    assert semantic_qa["enabled"] is False
+    assert semantic_qa["verdict"] == "diagnostic_only"
+    assert semantic_qa["finding_count"] == 1
+    assert semantic_qa["findings"][0]["category"] == "slice_contributions"
+
+
+def test_disabled_semantic_qa_does_not_trust_invalid_ensemble_for_capacity():
+    event = {
+        "source_excerpt": "第一名敌人出现。第二名敌人随后出现。",
+        "micro_actions": ["第一名敌人出现", "第二名敌人出现"],
+        "action_temporal_relations": [
+            {
+                "micro_action_index": 1,
+                "performers": ["第一名敌人"],
+                "targets": ["男子"],
+                "action_kind": "locomotion",
+                "temporal_relation": "root",
+                "reference_action_indexes": [],
+                "ensemble_id": "EN001",
+                "pace": "fast",
+            },
+            {
+                "micro_action_index": 2,
+                "performers": ["第二名敌人"],
+                "targets": ["男子"],
+                "action_kind": "locomotion",
+                "temporal_relation": "overlap",
+                "reference_action_indexes": [1],
+                "ensemble_id": "EN001",
+                "pace": "fast",
+            },
+        ],
+    }
+
+    normalized = normalize_event_action_units(event)
+
+    assert normalized["generation_action_units"][0]["motion_load"] == 2
+    semantic_qa = normalized["action_timeline"]["semantic_qa"]
+    assert semantic_qa["verdict"] == "diagnostic_only"
+    assert semantic_qa["finding_count"] == 1
+
+
+def test_semantic_qa_mode_rejects_non_boolean_event_value():
+    event = {
+        "semantic_action_qa_enabled": "false",
+        "micro_actions": ["男子观察车门"],
+        "action_temporal_relations": [{
+            "micro_action_index": 1,
+            "performers": ["男子"],
+            "targets": ["车门"],
+            "action_kind": "state_change",
+            "temporal_relation": "root",
+            "reference_action_indexes": [],
+            "pace": "slow",
+        }],
+    }
+
+    with pytest.raises(ValueError, match="must be a boolean"):
         normalize_event_action_units(event)
 
 

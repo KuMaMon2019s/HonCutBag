@@ -2404,6 +2404,21 @@ def test_semantic_media_ratios_and_cli_resume_defaults(tmp_path):
     assert pipeline_runner_cli._resolved_run_arguments(fresh_args)[
         "shot_policy"
     ] == "continuity"
+    assert pipeline_runner_cli._resolved_run_arguments(fresh_args)[
+        "phase1_semantic_qa"
+    ] is False
+    strict_args = parser.parse_args(
+        ["--input", "story.txt", "--phase1-semantic-qa"]
+    )
+    assert pipeline_runner_cli._resolved_run_arguments(strict_args)[
+        "phase1_semantic_qa"
+    ] is True
+    diagnostic_args = parser.parse_args(
+        ["--input", "story.txt", "--no-phase1-semantic-qa"]
+    )
+    assert pipeline_runner_cli._resolved_run_arguments(diagnostic_args)[
+        "phase1_semantic_qa"
+    ] is False
     (tmp_path / "RUN_MANIFEST.json").write_text(
         json.dumps(
             {
@@ -2417,6 +2432,7 @@ def test_semantic_media_ratios_and_cli_resume_defaults(tmp_path):
                     "transition_duration": 0.0,
                     "media_profile": "cinematic",
                     "enable_reshoot": False,
+                    "phase1_semantic_qa": True,
                     "no_real_person": True,
                     "character_library_dir": str(tmp_path / "character-library"),
                 }
@@ -2438,6 +2454,9 @@ def test_semantic_media_ratios_and_cli_resume_defaults(tmp_path):
     assert pipeline_runner_cli._resolved_run_arguments(args)[
         "character_visual_policy"
     ] == "synthetic_stylized_character_v3"
+    assert pipeline_runner_cli._resolved_run_arguments(args)[
+        "phase1_semantic_qa"
+    ] is True
     assert pipeline_runner_cli._resolved_run_arguments(args)[
         "character_library_dir"
     ] == str(tmp_path / "character-library")
@@ -2512,6 +2531,7 @@ def test_manifest_records_effective_route_and_phase6_requires_phase5(
     assert manifest["resolved_config"]["character_visual_policy"] == (
         "synthetic_stylized_character_v3"
     )
+    assert manifest["resolved_config"]["phase1_semantic_qa"] is False
 
     (tmp_path / "STORYBOARD.json").write_text(
         json.dumps({"shots": [{"id": "S01", "duration": 5}]}),

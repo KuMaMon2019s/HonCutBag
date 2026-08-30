@@ -209,6 +209,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="canonical 角色视觉策略；旧真人布尔参数仅作入口迁移",
     )
     parser.add_argument(
+        "--phase1-semantic-qa",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Phase 1 动作语义 QA；默认关闭，关闭时概率性语义偏差仅记录诊断"
+        ),
+    )
+    parser.add_argument(
         "--media-profile",
         choices=AVAILABLE_PROFILES,
         default=None,
@@ -328,6 +336,7 @@ def _resolved_run_arguments(args: argparse.Namespace) -> dict:
         "media_profile": choose("media_profile", DEFAULT_MEDIA_PROFILE),
         "enable_reshoot": choose("enable_reshoot", True),
         "character_visual_policy": character_visual_policy,
+        "phase1_semantic_qa": choose("phase1_semantic_qa", False),
         "character_library_dir": choose("character_library_dir", None),
     }
 
@@ -375,6 +384,7 @@ def main() -> None:
         media_profile=resolved["media_profile"],
         enable_reshoot=resolved["enable_reshoot"],
         character_visual_policy=resolved["character_visual_policy"],
+        phase1_semantic_qa=resolved["phase1_semantic_qa"],
         resume=args.resume,
         auto_approve=args.auto_approve,
         resume_from=args.resume_from,

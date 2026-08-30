@@ -109,6 +109,7 @@ class GraphRunConfig(BaseModel):
         "fictional_cinematic_human_v1",
         "synthetic_stylized_character_v3",
     ] = "source_derived"
+    phase1_semantic_qa: bool = False
     enable_reshoot: bool = True
     resume: bool = False
     resume_from: str | None = None

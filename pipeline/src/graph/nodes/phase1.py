@@ -29,6 +29,7 @@ class Phase1Runner(Protocol):
         max_material_padding_ratio: float = ...,
         delivery_overrun_ratio: float = ...,
         character_visual_policy: str = ...,
+        phase1_semantic_qa: bool = ...,
     ) -> dict[str, Any]: ...
 
 
@@ -65,6 +66,8 @@ def phase1_node(
             "character_visual_policy", "source_derived"
         ),
     }
+    if state.get("phase1_semantic_qa", False):
+        runner_kwargs["phase1_semantic_qa"] = True
     previous_phase5 = state.get("phase_results", {}).get("phase5")
     rewrite_request = rewrite_request_from_receipt(previous_phase5)
     correction = (

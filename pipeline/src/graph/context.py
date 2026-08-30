@@ -39,6 +39,7 @@ def initial_state_from_config(
         media_profile=config.media_profile,
         project_video_spec=dict(config.project_video_spec),
         character_visual_policy=config.character_visual_policy,
+        phase1_semantic_qa=config.phase1_semantic_qa,
         enable_reshoot=config.enable_reshoot,
         resume=config.resume,
         resume_from=config.resume_from,

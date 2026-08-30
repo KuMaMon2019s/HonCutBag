@@ -310,6 +310,7 @@ def run_phase1_screenwriter(
     max_material_padding_ratio: float = 0.25,
     delivery_overrun_ratio: float = 0.0,
     character_visual_policy: str = SOURCE_DERIVED_POLICY,
+    phase1_semantic_qa: bool = False,
     *,
     _director_runner=None,
 ) -> dict:
@@ -322,6 +323,8 @@ def run_phase1_screenwriter(
     character_visual_policy = normalize_character_visual_policy(
         character_visual_policy
     )
+    if not isinstance(phase1_semantic_qa, bool):
+        raise ValueError("phase1_semantic_qa must be a boolean")
     director_runner = _director_runner or run_phase1_director
     director: dict[str, Any] | None = None
 
@@ -593,6 +596,7 @@ def run_phase1_screenwriter(
                 "status": "done",
                 "duration_s": _elapsed(start),
                 "outputs": outputs,
+                "phase1_semantic_qa": phase1_semantic_qa,
                 "dry_run_receipt": receipt_path.name,
                 "capacity_plan": capacity_plan,
                 "director": director,
@@ -630,6 +634,7 @@ def run_phase1_screenwriter(
             {
                 "event_flow_schema_version": EVENT_FLOW_SCHEMA_VERSION,
                 "continuity_mode": continuity_mode,
+                "phase1_semantic_qa": phase1_semantic_qa,
             },
             *nonempty_segments,
         ])
@@ -642,6 +647,8 @@ def run_phase1_screenwriter(
         if events_result is not None:
             complete_coverage = (
                 events_result.get("source_segments_hash") == events_input_hash
+                and events_result.get("semantic_action_qa_enabled")
+                is phase1_semantic_qa
                 and events_result.get("source_segment_count") == len(nonempty_segments)
                 and events_result.get("covered_segment_ids") == expected_segment_ids
                 and events_result.get("total_events") == len(events_result["events"])
@@ -655,9 +662,11 @@ def run_phase1_screenwriter(
                 segments,
                 checkpoint_dir=output_dir,
                 continuity_mode=continuity_mode,
+                semantic_action_qa_enabled=phase1_semantic_qa,
             ))
             events_result["schema_version"] = EVENT_FLOW_SCHEMA_VERSION
             events_result["continuity_mode"] = continuity_mode
+            events_result["semantic_action_qa_enabled"] = phase1_semantic_qa
             events_result["source_segments_hash"] = events_input_hash
             events_result.setdefault("source_segment_count", len(nonempty_segments))
             events_result.setdefault("covered_segment_ids", expected_segment_ids)
@@ -990,6 +999,7 @@ def run_phase1_screenwriter(
                 "status": "done",
                 "duration_s": _elapsed(start),
                 "outputs": outputs,
+                "phase1_semantic_qa": phase1_semantic_qa,
                 "_storyboard": storyboard,
                 "_characters": characters_result,
                 "storyboard_review": review,
@@ -1009,6 +1019,7 @@ def run_phase1_screenwriter(
             "status": "done",
             "duration_s": _elapsed(start),
             "outputs": outputs,
+            "phase1_semantic_qa": phase1_semantic_qa,
             "_storyboard": storyboard,
             "_characters": characters_result,
             "director": director,
