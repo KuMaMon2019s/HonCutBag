@@ -153,13 +153,18 @@ def execute_seedance_video_task(
         else:
             task = claimed
     elif enqueued.deduped and task.status == "running" and not task.provider_job_id:
-        task_store.mark_submission_uncertain(
-            task.task_id,
-            "process stopped after claim and before provider job id persistence",
+        legacy_import = any(
+            event.event_type == "LegacySnapshotImported"
+            for event in task_store.events(task.task_id)
         )
-        raise SubmissionUncertainError(
-            f"Seedance submission for {resource_id} may be in flight; refusing to resubmit"
-        )
+        if legacy_import:
+            task_store.mark_submission_uncertain(
+                task.task_id,
+                "legacy running task has no trustworthy pre-submit event history",
+            )
+            raise SubmissionUncertainError(
+                f"Seedance submission for {resource_id} has ambiguous legacy history"
+            )
 
     emit_runtime_event(
         "provider_task_active",
@@ -183,6 +188,10 @@ def execute_seedance_video_task(
         task_store.note_resumable_error(task.task_id, message)
         raise ProviderEndpointChangedError(message)
     if not provider_job_id:
+        task = task_store.reserve_submission_attempt(
+            task.task_id,
+            provider_endpoint=provider_endpoint,
+        )
         try:
             provider_job_id = submit()
         except Exception as error:
@@ -191,7 +200,7 @@ def execute_seedance_video_task(
             else:
                 task_store.mark_submission_uncertain(task.task_id, str(error))
             raise
-        task = task_store.persist_provider_job(
+        task = task_store.confirm_provider_job(
             task.task_id,
             provider_job_id=provider_job_id,
             provider_endpoint=provider_endpoint,

@@ -893,7 +893,7 @@ def run_acceptance(
         existing["gates"]["live_paid_provider"].get("provider_job_id") or ""
     )
     if resume_poll and active is not None and not active.provider_job_id:
-        store.persist_provider_job(
+        store.confirm_provider_job(
             active.task_id,
             provider_job_id=known_job_id,
             provider_endpoint=seedance_client.SUBMIT_ENDPOINT,

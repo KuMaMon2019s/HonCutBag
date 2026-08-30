@@ -72,6 +72,7 @@ from quality.seam_calibration import calibrate_seam_policy, decide_seam
 from runtime.continuity_chunks import (
     ChunkExecutionRequest,
     ChunkExecutionResult,
+    ContinuityExecutionPaused,
     execute_continuity_plan,
     write_shadow_runtime_report,
 )
@@ -118,6 +119,33 @@ def _signed_tos_url(monkeypatch, object_key):
     return tos_uploader.get_signed_url(object_key)
 
 
+def _write_cinematic_first_frame(output_dir: Path, shot_id: str = "S01") -> Path:
+    path = output_dir / "storyboard_images" / f"{shot_id}.png"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.effect_noise((640, 360), 50).convert("RGB").save(path)
+    path.with_suffix(".json").write_text(
+        json.dumps({
+            "kind": "honcut.cinematic-first-frame.v1",
+            "status": "done",
+            "image_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "previs_reference_images": [],
+        }),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _phase6_storyboard_contract(tmp_path, canonical_run_contract):
+    _characters, contract = canonical_run_contract(
+        tmp_path,
+        {"characters": []},
+    )
+    return {
+        "shots": [],
+        "canonical_visual_contract_sha256": contract["contract_sha256"],
+    }
+
+
 def _narrative_guide_fields(
     beat_id: str,
     cell_ids: tuple[str, ...] | None = None,
@@ -127,13 +155,18 @@ def _narrative_guide_fields(
     return {
         "storyboard_narrative_guide": f"storyboard_guides/{beat_id}.png",
         "storyboard_narrative_guide_kind": (
-            "honcut.storyboard-narrative-guide.v1"
+            "honcut.storyboard-narrative-guide.v2"
         ),
         "storyboard_narrative_guide_usage": (
             "phase6_story_narrative_guide_not_output_pixels"
         ),
         "storyboard_narrative_guide_cell_ids": ordered_cells,
         "storyboard_narrative_guide_sha256": "a" * 64,
+        "storyboard_narrative_guide_renderer": (
+            "honcut.identity-neutral-story-guide-renderer.v1"
+        ),
+        "storyboard_narrative_guide_source_pixel_usage": "none",
+        "storyboard_narrative_guide_semantic_payload_sha256": "c" * 64,
         "storyboard_narrative_guide_source_board": (
             f"shot_storyboards/{shot_id}.png"
         ),
@@ -141,6 +174,20 @@ def _narrative_guide_fields(
         "storyboard_narrative_guide_receipt": (
             f"storyboard_guides/{beat_id}.json"
         ),
+        "storyboard_narrative_guide_authority_roles": [
+            "narrative_order",
+            "action_direction",
+            "camera_motion",
+            "spatial_relationship",
+        ],
+        "storyboard_narrative_guide_non_authority_roles": [
+            "character_identity",
+            "face_geometry",
+            "hair_geometry",
+            "wardrobe",
+            "prop_appearance",
+            "cinematic_pixels",
+        ],
     }
 
 
@@ -158,6 +205,21 @@ def _narrative_guide_media(
         "_reference_description": f"{beat_id} current narrative guide",
         "_narrative_beat_id": beat_id,
         "_narrative_cell_ids": ordered_cells,
+        "_authority_roles": [
+            "narrative_order",
+            "action_direction",
+            "camera_motion",
+            "spatial_relationship",
+        ],
+        "_non_authority_roles": [
+            "character_identity",
+            "face_geometry",
+            "hair_geometry",
+            "wardrobe",
+            "prop_appearance",
+            "cinematic_pixels",
+        ],
+        "_semantic_payload_sha256": "c" * 64,
         "_mandatory_reference": True,
     }
 
@@ -386,7 +448,7 @@ def test_planner_splits_long_shot_and_preserves_explicit_anchors(tmp_path):
         "S02_C01", "S03_C01", "S03_C02"
     ]
     persisted = json.loads((tmp_path / "CONTINUITY_PLAN.json").read_text())
-    assert persisted["version"] == 3
+    assert persisted["version"] == 4
     assert persisted["timeline_fps"] == 24
     assert persisted["shots"][1]["chunks"][2]["mode"] == "native_extend"
 
@@ -422,7 +484,7 @@ def test_continuity_v1_migration_reuses_only_p01_cinematic_and_future_fails_clos
 
     migrated = ContinuityPlan.model_validate(payload)
 
-    assert migrated.version == 3
+    assert migrated.version == 4
     assert migrated.migrated_from_version == 1
     assert migrated.shots[0].chunks[0].storyboard_image == (
         "video_first_frames/S01_P01.png"
@@ -1003,6 +1065,7 @@ def test_phase1_registers_director_storyboard_in_text_storyboard(tmp_path):
 def test_phase2_reuses_phase1_model_director_board_without_second_overview_call(
     tmp_path,
     monkeypatch,
+    canonical_run_contract,
 ):
     Image.new("RGB", (2560, 1440), "white").save(
         tmp_path / "director_storyboard.png"
@@ -1015,6 +1078,11 @@ def test_phase2_reuses_phase1_model_director_board_without_second_overview_call(
         },
         "shots": [],
     }
+    characters_data, contract = canonical_run_contract(
+        tmp_path,
+        {"characters": []},
+    )
+    storyboard["canonical_visual_contract_sha256"] = contract["contract_sha256"]
     monkeypatch.setattr(
         pipeline_core,
         "run_quality_check",
@@ -1030,7 +1098,12 @@ def test_phase2_reuses_phase1_model_director_board_without_second_overview_call(
         lambda _seconds: pytest.fail("Phase 2 must not enter overview cooldown"),
     )
 
-    result = pipeline_core.run_phase2(storyboard, {"characters": []}, tmp_path, False)
+    result = pipeline_core.run_phase2(
+        storyboard,
+        characters_data,
+        tmp_path,
+        False,
+    )
 
     assert result["status"] == "done"
     assert result["provider"] == "seedream_shot_storyboards"
@@ -1186,13 +1259,13 @@ def test_complex_shot_maps_to_three_secondary_generation_strategies(tmp_path):
     guide_receipt["image_sha256"] = shot_record["narrative_guides"][0][
         "image_sha256"
     ]
-    guide_receipt["kind"] = "honcut.storyboard-narrative-guide.v2"
+    guide_receipt["kind"] = "honcut.storyboard-narrative-guide.v1"
     guide_receipt_path.write_text(json.dumps(guide_receipt), encoding="utf-8")
     assert any(
         "S01_P01 invalid narrative guide" in error
         for error in validate_shot_storyboard_artifacts(tmp_path, storyboard)
     )
-    guide_receipt["kind"] = "honcut.storyboard-narrative-guide.v1"
+    guide_receipt["kind"] = "honcut.storyboard-narrative-guide.v2"
     guide_receipt_path.write_text(json.dumps(guide_receipt), encoding="utf-8")
     assert validate_shot_storyboard_artifacts(tmp_path, storyboard) == []
     assert (tmp_path / "storyboard_beats/S01_P01.png").is_file()
@@ -2131,7 +2204,9 @@ def test_secondary_first_beat_uses_multi_image_generation(monkeypatch, tmp_path)
 def test_post_primary_bridge_uses_actual_source_tail_and_target_head(
     monkeypatch,
     tmp_path,
+    canonical_run_contract,
 ):
+    canonical_run_contract(tmp_path, {"characters": []})
     shot_dir = tmp_path / "shots/S01"
     shot_dir.mkdir(parents=True)
     (shot_dir / "SHOT_META.json").write_text(
@@ -2294,14 +2369,6 @@ def test_p02_media_indices_bind_after_predecessor_character_guide_and_tail_order
         [
             {"type": "text", "text": "只完成当前 Pxx。"},
             {
-                "type": "video_url",
-                "video_url": {"url": "https://video.test/prior.mp4"},
-                "role": "reference_video",
-                "_reference_kind": "predecessor_tail_video",
-                "_reference_description": "上一 Pxx 已完成视频的末段",
-                "_continuity_role": "tail_window_video",
-            },
-            {
                 "type": "image_url",
                 "image_url": {"url": "https://image.test/character.png"},
                 "role": "reference_image",
@@ -2310,8 +2377,16 @@ def test_p02_media_indices_bind_after_predecessor_character_guide_and_tail_order
                 "_character_id": "CHAR_01",
                 "_mandatory_reference": True,
             },
-            _narrative_guide_media("S01_P02", cells),
+            {
+                "type": "video_url",
+                "video_url": {"url": "https://video.test/prior.mp4"},
+                "role": "reference_video",
+                "_reference_kind": "predecessor_tail_video",
+                "_reference_description": "上一 Pxx 已完成视频的末段",
+                "_continuity_role": "tail_window_video",
+            },
             _performance_guide_media("S01_P02"),
+            _narrative_guide_media("S01_P02", cells),
             {
                 "type": "image_url",
                 "image_url": {"url": "https://image.test/tail.jpg"},
@@ -2325,23 +2400,23 @@ def test_p02_media_indices_bind_after_predecessor_character_guide_and_tail_order
     )
 
     assert [item["responsibility"] for item in manifest] == [
-        "predecessor_tail_video",
         "character_identity_board",
-        "storyboard_narrative_guide",
+        "predecessor_tail_video",
         "character_performance_guide",
+        "storyboard_narrative_guide",
         "ordered_tail_frame",
     ]
     assert [item["prompt_index"] for item in manifest] == [
-        "视频1",
         "图片1",
+        "视频1",
         "图片2",
         "图片3",
         "图片4",
     ]
     prompt = content[0]["text"]
     assert "视频1：上一 Pxx 已完成视频的末段" in prompt
-    assert "当前剧情导航图是图片2" in prompt
-    assert "图片3是角色lead" in prompt
+    assert "当前剧情导航图是图片3" in prompt
+    assert "图片2是角色lead" in prompt
     assert "A01→A03→A05" in prompt
     assert "同一个角色的不同参考姿态" in prompt
     assert "不得生成角色克隆、分栏、拼贴、网格" in prompt
@@ -2349,12 +2424,12 @@ def test_p02_media_indices_bind_after_predecessor_character_guide_and_tail_order
     assert "不得提前演绎其他 Gxx 或后续 Pxx" in prompt
     assert "严禁渲染进视频画面" in prompt
     assert "[honcut.phase6-media-role-isolation.v1]" in prompt
-    assert "图片2只负责 Gxx 动作顺序" in prompt
+    assert "图片3只负责 Gxx 动作顺序" in prompt
     assert "人物脸、头发长度与发型轮廓" in prompt
     assert "道具外形、总长度、端部数量" in prompt
     assert "角色身份外观只以图片1为权威" in prompt
-    assert "当前姿态、握持关系和道具几何只以图片3" in prompt
-    assert "发生冲突时必须按上述职责覆盖图片2" in prompt
+    assert "当前姿态、握持关系和道具几何只以图片2" in prompt
+    assert "发生冲突时必须按上述职责覆盖图片3" in prompt
     assert "禁止生长、缩短、变形、增减端部" in prompt
 
 
@@ -2417,6 +2492,7 @@ def test_seedance_transport_contract_rejects_invalid_limits(monkeypatch):
 def test_phase6_fails_closed_when_mandatory_reference_images_exceed_nine(
     monkeypatch,
     tmp_path,
+    canonical_run_contract,
 ):
     frame = tmp_path / "storyboard_images/S01.png"
     guide = tmp_path / "storyboard_guides/S01_P01.png"
@@ -2425,6 +2501,15 @@ def test_phase6_fails_closed_when_mandatory_reference_images_exceed_nine(
         path.parent.mkdir(parents=True, exist_ok=True)
         Image.effect_noise((320, 180), 50).convert("RGB").save(path)
     character_ids = [f"CHAR_{index:02d}" for index in range(1, 9)]
+    canonical_run_contract(
+        tmp_path,
+        {
+            "characters": [
+                {"id": character_id, "name": character_id}
+                for character_id in character_ids
+            ]
+        },
+    )
     monkeypatch.setattr(
         "tools.asset_packager._assert_video_frame_provenance",
         lambda *_args, **_kwargs: None,
@@ -2453,6 +2538,21 @@ def test_phase6_fails_closed_when_mandatory_reference_images_exceed_nine(
         lambda *_args, **_kwargs: {
             "beat_id": "S01_P01",
             "cell_ids": ["S01_G01"],
+            "authority_roles": [
+                "narrative_order",
+                "action_direction",
+                "camera_motion",
+                "spatial_relationship",
+            ],
+            "non_authority_roles": [
+                "character_identity",
+                "face_geometry",
+                "hair_geometry",
+                "wardrobe",
+                "prop_appearance",
+                "cinematic_pixels",
+            ],
+            "semantic_payload_sha256": "c" * 64,
         },
     )
 
@@ -2471,7 +2571,7 @@ def test_phase6_fails_closed_when_mandatory_reference_images_exceed_nine(
                     "storyboard_guides/S01_P01.png"
                 ),
                 "_storyboard_narrative_guide_kind": (
-                    "honcut.storyboard-narrative-guide.v1"
+                    "honcut.storyboard-narrative-guide.v2"
                 ),
             },
         )
@@ -2527,18 +2627,38 @@ def test_seedance_duration_separates_provider_request_from_effective_story_time(
     assert _chunk_duration(valid_bridge) == 4
 
 
-def test_provider_prepends_no_real_person_visual_contract(monkeypatch, tmp_path):
+def test_provider_uses_canonical_synthetic_policy_not_legacy_environment(
+    monkeypatch,
+    tmp_path,
+    canonical_run_contract,
+):
     shot_dir = tmp_path / "shots/S01"
     shot_dir.mkdir(parents=True)
     (shot_dir / "SHOT_META.json").write_text(
-        json.dumps({"prompt": "写实男性特工近身搏斗", "gen_strategy": "i2v"}),
+        json.dumps({
+            "prompt": "虚构合成人特工近身搏斗",
+            "gen_strategy": "i2v",
+            "who": ["agent"],
+        }),
         encoding="utf-8",
     )
-    monkeypatch.setenv("HONCUT_NO_REAL_PERSON", "1")
-    monkeypatch.setattr(
-        "tools.asset_packager.build_content_for_shot",
-        lambda **kwargs: [{"type": "text", "text": kwargs["shot_meta"]["prompt"]}],
+    canonical_run_contract(
+        tmp_path,
+        {"characters": [{"id": "agent", "name": "特工"}]},
+        requested_policy="synthetic_stylized_character_v3",
     )
+    _write_cinematic_first_frame(tmp_path)
+    monkeypatch.setattr(
+        tos_uploader,
+        "upload_image",
+        lambda *_args, **_kwargs: "https://assets.test/cinematic.png",
+    )
+    monkeypatch.setattr(
+        tos_uploader,
+        "require_tos_url",
+        lambda url, *, label: url,
+    )
+    monkeypatch.setenv("HONCUT_NO_REAL_PERSON", "0")
     request = _fresh_chunk_request(tmp_path)
 
     from runtime.continuity_provider import _base_content
@@ -2549,7 +2669,9 @@ def test_provider_prepends_no_real_person_visual_contract(monkeypatch, tmp_path)
         json.loads((shot_dir / "SHOT_META.json").read_text()),
     )
 
-    assert content[0]["text"].startswith("【非真人视觉硬约束】")
+    assert content[0]["text"].startswith(
+        "[CANONICAL_VISUAL_CONTRACT — HIGHEST IDENTITY AUTHORITY]"
+    )
     assert content[0]["text"].count("【非真人视觉硬约束】") == 1
     assert "珍珠生体瓷妆" in content[0]["text"]
     assert "完整无遮挡的协调五官" in content[0]["text"]
@@ -3133,6 +3255,45 @@ def test_chunk_runtime_serializes_dependencies_but_parallelizes_shots(tmp_path):
     assert (tmp_path / "shots/S01/output.mp4").read_bytes() == b"S01_C01|S01_C02"
     lineage = json.loads((tmp_path / "CONTINUITY_LINEAGE.json").read_text())
     assert lineage["chunks"]["S01_C01"]["copyright_policy_repair_attempts"] == 1
+
+
+def test_chunk_runtime_acceptance_gate_executes_exactly_one_new_chunk(tmp_path):
+    plan = build_continuity_plan(
+        {
+            "shots": [
+                {"id": "S01", "duration": 16},
+                {"id": "S02", "duration": 16},
+            ]
+        }
+    )
+    calls: list[str] = []
+
+    def execute(request):
+        calls.append(request.resource_id)
+        request.output_path.write_bytes(request.resource_id.encode())
+        return ChunkExecutionResult(
+            request.output_path,
+            f"task-{request.resource_id}",
+        )
+
+    with pytest.raises(ContinuityExecutionPaused) as raised:
+        execute_continuity_plan(
+            plan,
+            tmp_path,
+            execute_chunk=execute,
+            inspect_seam=_inspect_test_seam,
+            materialize_shot=_materialize_test_shot,
+            max_workers=4,
+            max_new_chunks=1,
+        )
+
+    assert raised.value.limit == 1
+    assert raised.value.executed_chunks == 1
+    assert calls == ["S01_C01"]
+    lineage = json.loads((tmp_path / "CONTINUITY_LINEAGE.json").read_text())
+    assert lineage["chunks"]["S01_C01"]["status"] == "succeeded"
+    assert "S01_C02" not in lineage["chunks"]
+    assert "S02_C01" not in lineage["chunks"]
 
 
 def test_chunk_runtime_archives_primary_shot_bridge_videos(tmp_path):
@@ -4035,7 +4196,9 @@ def test_fresh_provider_does_not_mix_first_frame_with_group_board(monkeypatch, t
             {
                 "type": "image_url",
                 "image_url": {"url": "https://image.test/S01.png"},
-                "role": "first_frame",
+                "role": "reference_image",
+                "_reference_kind": "cinematic_composition",
+                "_reference_description": "S01成片质感第一帧",
             },
             _narrative_guide_media("S01_P01"),
         ]
@@ -4072,7 +4235,7 @@ def test_fresh_provider_does_not_mix_first_frame_with_group_board(monkeypatch, t
 
     assert [item.get("role") for item in content] == [
         None,
-        "first_frame",
+        "reference_image",
         "reference_image",
     ]
     assert uploaded == []
@@ -4258,10 +4421,12 @@ def _fresh_chunk_request(tmp_path):
 
 def test_continuity_chunk_injects_shared_cast_prop_camera_and_reshoot_contracts(
     tmp_path,
+    monkeypatch,
+    canonical_run_contract,
 ):
-    (tmp_path / "CHARACTERS.json").write_text(
-        json.dumps(
-            {
+    canonical_run_contract(
+        tmp_path,
+        {
                 "characters": [
                     {
                         "id": "photographer",
@@ -4273,9 +4438,18 @@ def test_continuity_chunk_injects_shared_cast_prop_camera_and_reshoot_contracts(
                         },
                     }
                 ]
-            }
-        ),
-        encoding="utf-8",
+            },
+    )
+    _write_cinematic_first_frame(tmp_path)
+    monkeypatch.setattr(
+        tos_uploader,
+        "upload_image",
+        lambda *_args, **_kwargs: "https://assets.test/cinematic.png",
+    )
+    monkeypatch.setattr(
+        tos_uploader,
+        "require_tos_url",
+        lambda url, *, label: url,
     )
     shot_meta = {
         "prompt": "摄影师持 iPhone 向后退步跟拍",
@@ -4300,11 +4474,15 @@ def test_continuity_chunk_injects_shared_cast_prop_camera_and_reshoot_contracts(
     assert prompt.count("[honcut-video-generation-contract-v2]") == 1
 
 
-def test_generation_contract_locks_spatial_order_canonical_colors_and_lookalikes(tmp_path):
+def test_generation_contract_locks_spatial_order_canonical_colors_and_lookalikes(
+    tmp_path,
+    monkeypatch,
+    canonical_run_contract,
+):
     shared_helmet = "哑光藏蓝色全封闭安保头盔，横向不透明深红色机械面甲"
-    (tmp_path / "CHARACTERS.json").write_text(
-        json.dumps(
-            {
+    canonical_run_contract(
+        tmp_path,
+        {
                 "characters": [
                     {
                         "id": "lead",
@@ -4334,9 +4512,18 @@ def test_generation_contract_locks_spatial_order_canonical_colors_and_lookalikes
                         },
                     },
                 ]
-            }
-        ),
-        encoding="utf-8",
+            },
+    )
+    _write_cinematic_first_frame(tmp_path)
+    monkeypatch.setattr(
+        tos_uploader,
+        "upload_image",
+        lambda *_args, **_kwargs: "https://assets.test/cinematic.png",
+    )
+    monkeypatch.setattr(
+        tos_uploader,
+        "require_tos_url",
+        lambda url, *, label: url,
     )
     shot_meta = {
         "prompt": "三名角色沿街道前进\n[honcut-video-generation-contract-v1]\nlegacy contract",
@@ -5478,7 +5665,12 @@ def test_materialize_continuity_shot_concatenates_accepted_chunks(tmp_path):
     shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
     reason="ffmpeg and ffprobe are required",
 )
-def test_phase6_auto_runtime_repairs_real_decoded_seam_before_materializing(monkeypatch, tmp_path):
+def test_phase6_auto_runtime_repairs_real_decoded_seam_before_materializing(
+    monkeypatch,
+    tmp_path,
+    canonical_run_contract,
+):
+    canonical_run_contract(tmp_path, {"characters": []})
     plan = write_continuity_plan(
         tmp_path / "CONTINUITY_PLAN.json",
         {"shots": [{"id": "S01", "duration": 16}]},
@@ -7015,7 +7207,11 @@ def test_phase8_preserves_finalized_continuity_frame_budget(monkeypatch, tmp_pat
     assert decisions["cuts"][0]["continuity_timing"]["final_frames"] == 120
 
 
-def test_phase6_shadow_keeps_the_existing_provider_route(monkeypatch, tmp_path):
+def test_phase6_shadow_keeps_the_existing_provider_route(
+    monkeypatch,
+    tmp_path,
+    canonical_run_contract,
+):
     write_continuity_plan(
         tmp_path / "CONTINUITY_PLAN.json",
         {"shots": [{"id": "S01", "duration": 16}]},
@@ -7036,14 +7232,22 @@ def test_phase6_shadow_keeps_the_existing_provider_route(monkeypatch, tmp_path):
     monkeypatch.setenv("HONCUT_CONTINUITY_MODE", "shadow")
     monkeypatch.setattr(pipeline_core, "_LocalVideoVendorAdapter", FakeAdapter)
 
-    receipt = pipeline_core.run_phase6({"shots": []}, tmp_path, dry_run=False)
+    receipt = pipeline_core.run_phase6(
+        _phase6_storyboard_contract(tmp_path, canonical_run_contract),
+        tmp_path,
+        dry_run=False,
+    )
 
     assert observed["requests"] == 1
     assert receipt["continuity_runtime"]["mode"] == "shadow"
     assert receipt["continuity_runtime"]["execution_enabled"] is False
 
 
-def test_phase6_auto_fails_before_the_provider_route(monkeypatch, tmp_path):
+def test_phase6_auto_fails_before_the_provider_route(
+    monkeypatch,
+    tmp_path,
+    canonical_run_contract,
+):
     class UnexpectedAdapter:
         def __init__(self, models):
             raise AssertionError("provider adapter must not initialize in guarded auto mode")
@@ -7051,13 +7255,21 @@ def test_phase6_auto_fails_before_the_provider_route(monkeypatch, tmp_path):
     monkeypatch.setenv("HONCUT_CONTINUITY_MODE", "auto")
     monkeypatch.setattr(pipeline_core, "_LocalVideoVendorAdapter", UnexpectedAdapter)
 
-    receipt = pipeline_core.run_phase6({"shots": []}, tmp_path, dry_run=False)
+    receipt = pipeline_core.run_phase6(
+        _phase6_storyboard_contract(tmp_path, canonical_run_contract),
+        tmp_path,
+        dry_run=False,
+    )
 
     assert receipt["status"] == "error"
     assert "seam guard" in receipt["error"]
 
 
-def test_phase6_auto_routes_only_through_continuity_runtime(monkeypatch, tmp_path):
+def test_phase6_auto_routes_only_through_continuity_runtime(
+    monkeypatch,
+    tmp_path,
+    canonical_run_contract,
+):
     write_continuity_plan(
         tmp_path / "CONTINUITY_PLAN.json",
         {"shots": [{"id": "S01", "duration": 16}]},
@@ -7098,7 +7310,11 @@ def test_phase6_auto_routes_only_through_continuity_runtime(monkeypatch, tmp_pat
         lambda phase, output_dir: SimpleNamespace(passed=True),
     )
 
-    receipt = pipeline_core.run_phase6({"shots": []}, tmp_path, dry_run=False)
+    receipt = pipeline_core.run_phase6(
+        _phase6_storyboard_contract(tmp_path, canonical_run_contract),
+        tmp_path,
+        dry_run=False,
+    )
 
     assert receipt["status"] == "done"
     assert receipt["continuity_runtime"]["execution_enabled"] is True
@@ -7165,7 +7381,11 @@ def test_phase6_auto_default_route_rejects_unknown_provider(monkeypatch, tmp_pat
         execute_phase6_auto_continuity(tmp_path, plan, None)
 
 
-def test_phase6_owner_forwards_test_continuity_executor(monkeypatch, tmp_path):
+def test_phase6_owner_forwards_test_continuity_executor(
+    monkeypatch,
+    tmp_path,
+    canonical_run_contract,
+):
     from phases.phase6.phase6_video_gen import run_phase6 as run_phase6_owner
 
     write_continuity_plan(
@@ -7198,7 +7418,7 @@ def test_phase6_owner_forwards_test_continuity_executor(monkeypatch, tmp_path):
     )
 
     receipt = run_phase6_owner(
-        {"shots": []},
+        _phase6_storyboard_contract(tmp_path, canonical_run_contract),
         tmp_path,
         dry_run=False,
         _test_continuity_executor_factory=test_factory,
@@ -7214,7 +7434,11 @@ def test_phase6_owner_forwards_test_continuity_executor(monkeypatch, tmp_path):
     }
 
 
-def test_phase6_auto_normalizes_resumed_string_output_dir(monkeypatch, tmp_path):
+def test_phase6_auto_normalizes_resumed_string_output_dir(
+    monkeypatch,
+    tmp_path,
+    canonical_run_contract,
+):
     write_continuity_plan(
         tmp_path / "CONTINUITY_PLAN.json",
         {"shots": [{"id": "S01", "duration": 16}]},
@@ -7243,7 +7467,11 @@ def test_phase6_auto_normalizes_resumed_string_output_dir(monkeypatch, tmp_path)
         lambda phase, output_dir: SimpleNamespace(passed=True),
     )
 
-    receipt = pipeline_core.run_phase6({"shots": []}, str(tmp_path), dry_run=False)
+    receipt = pipeline_core.run_phase6(
+        _phase6_storyboard_contract(tmp_path, canonical_run_contract),
+        str(tmp_path),
+        dry_run=False,
+    )
 
     assert receipt["status"] == "done"
     assert observed == {

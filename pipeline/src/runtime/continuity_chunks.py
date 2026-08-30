@@ -25,6 +25,18 @@ SEAM_DECISIONS_KIND = "honcut.continuity_seam_decisions.v1"
 PRIMARY_SHOT_BRIDGES_KIND = "honcut.primary_shot_bridges.v2"
 
 
+class ContinuityExecutionPaused(RuntimeError):
+    """A durable acceptance limit stopped before the next Provider task."""
+
+    def __init__(self, *, limit: int, executed_chunks: int) -> None:
+        self.limit = limit
+        self.executed_chunks = executed_chunks
+        super().__init__(
+            "continuity execution paused at the configured new-chunk limit: "
+            f"{executed_chunks}/{limit}"
+        )
+
+
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -328,6 +340,7 @@ def execute_continuity_plan(
     max_seam_repairs: int = 1,
     max_duration_topups: int = 3,
     max_workers: int = 1,
+    max_new_chunks: int | None = None,
 ) -> dict[str, Any]:
     """Run each shot's chunks serially while independent shots run concurrently."""
     if max_workers < 1:
@@ -336,6 +349,15 @@ def execute_continuity_plan(
         raise ValueError("max_seam_repairs must not be negative")
     if max_duration_topups < 0:
         raise ValueError("max_duration_topups must not be negative")
+    if (
+        max_new_chunks is not None
+        and (
+            isinstance(max_new_chunks, bool)
+            or not isinstance(max_new_chunks, int)
+            or max_new_chunks < 1
+        )
+    ):
+        raise ValueError("max_new_chunks must be a positive integer or None")
 
     root = Path(output_dir)
     from runtime.continuity_memory import (
@@ -369,6 +391,7 @@ def execute_continuity_plan(
     privacy_policy_repairs = 0
     primary_shot_bridges: list[dict[str, Any]] = []
     totals_lock = threading.Lock()
+    reserved_new_chunks = 0
 
     def run_shot(
         shot: ContinuityShot,
@@ -410,6 +433,15 @@ def execute_continuity_plan(
         ) -> None:
             nonlocal executed_chunks, repair_attempts, copyright_policy_repairs
             nonlocal privacy_policy_repairs
+            nonlocal reserved_new_chunks
+            if attempt == 0 and max_new_chunks is not None:
+                with totals_lock:
+                    if reserved_new_chunks >= max_new_chunks:
+                        raise ContinuityExecutionPaused(
+                            limit=max_new_chunks,
+                            executed_chunks=executed_chunks,
+                        )
+                    reserved_new_chunks += 1
             resource_id = chunk.chunk_id if attempt == 0 else f"{chunk.chunk_id}_R{attempt:02d}"
             request = ChunkExecutionRequest(
                 resource_id=resource_id,
@@ -431,6 +463,8 @@ def execute_continuity_plan(
                     )
                 if not chunk_path.is_file() or chunk_path.stat().st_size == 0:
                     raise RuntimeError(f"{resource_id} produced no video bytes")
+            except ContinuityExecutionPaused:
+                raise
             except Exception as exc:
                 lineage.put_chunk(
                     chunk.chunk_id,
@@ -995,6 +1029,8 @@ def execute_continuity_plan(
                 predecessor = run_shot(shot, predecessor)
                 group_outputs.append(str(predecessor.output_path.relative_to(root)))
             except Exception as exc:
+                if isinstance(exc, ContinuityExecutionPaused):
+                    raise
                 group_errors.append({"shot_id": shot.shot_id, "error": str(exc)})
                 for blocked in group[index + 1 :]:
                     group_errors.append(
@@ -1006,17 +1042,26 @@ def execute_continuity_plan(
                 break
         return group_outputs, group_errors
 
-    worker_count = min(max_workers, max(1, len(groups)))
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        futures = {executor.submit(run_group, group): group for group in groups}
-        for future in as_completed(futures):
-            group = futures[future]
-            try:
-                group_outputs, group_errors = future.result()
-                outputs.extend(group_outputs)
-                errors.extend(group_errors)
-            except Exception as exc:
-                errors.append({"shot_id": group[0].shot_id, "error": str(exc)})
+    if max_new_chunks is not None:
+        # A paid acceptance gate must not enqueue work beyond its durable
+        # submission allowance.  Run groups serially so an already-submitted
+        # future cannot race past the gate while the caller handles the pause.
+        for group in groups:
+            group_outputs, group_errors = run_group(group)
+            outputs.extend(group_outputs)
+            errors.extend(group_errors)
+    else:
+        worker_count = min(max_workers, max(1, len(groups)))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {executor.submit(run_group, group): group for group in groups}
+            for future in as_completed(futures):
+                group = futures[future]
+                try:
+                    group_outputs, group_errors = future.result()
+                    outputs.extend(group_outputs)
+                    errors.extend(group_errors)
+                except Exception as exc:
+                    errors.append({"shot_id": group[0].shot_id, "error": str(exc)})
 
     outputs.sort()
     errors.sort(key=lambda item: item["shot_id"])

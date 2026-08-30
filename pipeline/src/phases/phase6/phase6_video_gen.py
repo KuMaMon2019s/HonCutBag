@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import traceback
 from pathlib import Path
 from typing import Any
@@ -53,6 +54,9 @@ def run_phase6(
     _adapter_cls=None,
     _quality_runner=None,
     _test_continuity_executor_factory=None,
+    _acceptance_max_new_chunks: int | None = None,
+    _acceptance_disable_provider_repairs: bool = False,
+    _acceptance_disable_continuity_repairs: bool = False,
 ) -> dict:
     """Phase 6: video generation through the configured provider route."""
     # The phase orchestrator persists paths as strings when resuming.  Normalize
@@ -75,6 +79,32 @@ def run_phase6(
     if dry_run:
         print("  ⊘ dry-run 模式，跳过视频生成")
         return {"status": "skipped", "reason": "dry-run", "duration_s": _elapsed(start)}
+
+    try:
+        from utils.canonical_visual_contracts import (
+            load_canonical_visual_contract,
+        )
+
+        characters_data = json.loads(
+            (output_dir / "CHARACTERS.json").read_text(encoding="utf-8")
+        )
+        visual_contract = load_canonical_visual_contract(
+            output_dir,
+            characters_data=characters_data,
+        )
+        if (
+            storyboard_data.get("canonical_visual_contract_sha256")
+            != visual_contract["contract_sha256"]
+        ):
+            raise RuntimeError(
+                "Phase 6 storyboard visual contract hash mismatch"
+            )
+    except (OSError, json.JSONDecodeError, RuntimeError, ValueError) as error:
+        return {
+            "status": "error",
+            "error": f"Phase 6 canonical visual contract failed: {error}",
+            "duration_s": _elapsed(start),
+        }
 
     try:
         from runtime.continuity_chunks import write_shadow_runtime_report
@@ -136,6 +166,18 @@ def run_phase6(
                 for parameter in auto_parameters.values()
             ):
                 auto_kwargs["media_profile"] = media_profile
+            if _acceptance_max_new_chunks is not None:
+                auto_kwargs.update(
+                    max_new_chunks=_acceptance_max_new_chunks,
+                    max_workers=1,
+                )
+            if _acceptance_disable_provider_repairs:
+                auto_kwargs["allow_policy_repairs"] = False
+            if _acceptance_disable_continuity_repairs:
+                auto_kwargs.update(
+                    max_seam_repairs=0,
+                    max_duration_topups=0,
+                )
             result = execute_phase6_auto_continuity(
                 output_dir,
                 load_continuity_plan(output_dir / "CONTINUITY_PLAN.json"),
@@ -160,6 +202,17 @@ def run_phase6(
                     }
             return result
         except Exception as error:
+            from runtime.continuity_chunks import ContinuityExecutionPaused
+
+            if isinstance(error, ContinuityExecutionPaused):
+                return {
+                    "status": "acceptance_gate_passed",
+                    "gate": "first_new_continuity_chunk",
+                    "new_chunk_limit": error.limit,
+                    "executed_chunks": error.executed_chunks,
+                    "duration_s": _elapsed(start),
+                    "continuity_runtime": continuity_runtime,
+                }
             return {
                 "status": "error",
                 "error": f"Continuity auto execution failed: {error}",

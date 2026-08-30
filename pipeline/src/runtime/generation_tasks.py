@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 ACTIVE_STATUSES = ("queued", "running", "submission_uncertain")
-GENERATION_TASK_SCHEMA_VERSION = 2
+GENERATION_TASK_SCHEMA_VERSION = 3
 
 
 def _utc_now() -> str:
@@ -94,6 +94,31 @@ class EnqueuedTask:
     deduped: bool
 
 
+@dataclass(frozen=True)
+class GenerationTaskEvent:
+    event_id: str
+    task_id: str
+    run_id: str
+    event_type: str
+    from_status: str | None
+    to_status: str | None
+    details: dict[str, Any]
+    created_at: str
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> GenerationTaskEvent:
+        return cls(
+            event_id=row["event_id"],
+            task_id=row["task_id"],
+            run_id=row["run_id"],
+            event_type=row["event_type"],
+            from_status=row["from_status"],
+            to_status=row["to_status"],
+            details=_decode_json(row["details_json"]),
+            created_at=row["created_at"],
+        )
+
+
 class GenerationTaskStore:
     """Own the small SQLite task ledger for one HonCut output directory."""
 
@@ -106,6 +131,7 @@ class GenerationTaskStore:
         connection = sqlite3.connect(self.database_path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout=30000")
+        connection.execute("PRAGMA foreign_keys=ON")
         return connection
 
     def _initialize(self) -> None:
@@ -143,6 +169,34 @@ class GenerationTaskStore:
                     updated_at TEXT NOT NULL,
                     finished_at TEXT
                 )
+                """
+            )
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS generation_task_events (
+                    event_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL UNIQUE,
+                    task_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    from_status TEXT,
+                    to_status TEXT,
+                    details_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(task_id) REFERENCES generation_tasks(task_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_generation_task_events_task
+                ON generation_task_events(task_id, event_sequence);
+                CREATE INDEX IF NOT EXISTS idx_generation_task_events_run_type
+                ON generation_task_events(run_id, event_type, event_sequence);
+                CREATE TRIGGER IF NOT EXISTS generation_task_events_no_update
+                BEFORE UPDATE ON generation_task_events BEGIN
+                    SELECT RAISE(ABORT, 'generation_task_events is append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS generation_task_events_no_delete
+                BEFORE DELETE ON generation_task_events BEGIN
+                    SELECT RAISE(ABORT, 'generation_task_events is append-only');
+                END;
                 """
             )
             columns = {
@@ -190,6 +244,35 @@ class GenerationTaskStore:
                 ON generation_tasks(status, queued_at)
                 """
             )
+            if version < 3:
+                legacy_rows = connection.execute(
+                    "SELECT * FROM generation_tasks ORDER BY queued_at, task_id"
+                ).fetchall()
+                for legacy_row in legacy_rows:
+                    already_imported = connection.execute(
+                        """
+                        SELECT 1 FROM generation_task_events
+                        WHERE task_id = ? AND event_type = 'LegacySnapshotImported'
+                        """,
+                        (legacy_row["task_id"],),
+                    ).fetchone()
+                    if already_imported is not None:
+                        continue
+                    self._append_event(
+                        connection,
+                        task_id=legacy_row["task_id"],
+                        run_id=legacy_row["run_id"],
+                        event_type="LegacySnapshotImported",
+                        from_status=None,
+                        to_status=legacy_row["status"],
+                        details={
+                            "attempt_count": int(legacy_row["attempt_count"]),
+                            "provider_job_id_present": bool(
+                                legacy_row["provider_job_id"]
+                            ),
+                            "snapshot_status": legacy_row["status"],
+                        },
+                    )
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_generation_tasks_input_fingerprint
@@ -214,6 +297,36 @@ class GenerationTaskStore:
             connection.execute(
                 f"PRAGMA user_version={GENERATION_TASK_SCHEMA_VERSION}"
             )
+
+    @staticmethod
+    def _append_event(
+        connection: sqlite3.Connection,
+        *,
+        task_id: str,
+        run_id: str,
+        event_type: str,
+        from_status: str | None,
+        to_status: str | None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO generation_task_events (
+                event_id, task_id, run_id, event_type, from_status,
+                to_status, details_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                uuid.uuid4().hex,
+                task_id,
+                run_id,
+                event_type,
+                from_status,
+                to_status,
+                _encode_json(details or {}),
+                _utc_now(),
+            ),
+        )
 
     def enqueue(
         self,
@@ -268,6 +381,20 @@ class GenerationTaskStore:
                     now,
                     now,
                 ),
+            )
+            self._append_event(
+                connection,
+                task_id=task_id,
+                run_id=run_id,
+                event_type="TaskQueued",
+                from_status=None,
+                to_status="queued",
+                details={
+                    "input_fingerprint": resolved_fingerprint,
+                    "provider_id": provider_id,
+                    "resource_id": resource_id,
+                    "task_type": task_type,
+                },
             )
             row = connection.execute(
                 "SELECT * FROM generation_tasks WHERE task_id = ?", (task_id,)
@@ -417,13 +544,80 @@ class GenerationTaskStore:
             if cursor.rowcount != 1:
                 connection.rollback()
                 return None
+            claimed_row = connection.execute(
+                "SELECT run_id FROM generation_tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            self._append_event(
+                connection,
+                task_id=task_id,
+                run_id=claimed_row["run_id"],
+                event_type="TaskClaimed",
+                from_status="queued",
+                to_status="running",
+            )
             row = connection.execute(
                 "SELECT * FROM generation_tasks WHERE task_id = ?", (task_id,)
             ).fetchone()
             connection.commit()
         return GenerationTask.from_row(row)
 
-    def persist_provider_job(
+    def reserve_submission_attempt(
+        self,
+        task_id: str,
+        *,
+        provider_endpoint: str,
+    ) -> GenerationTask:
+        """Atomically reserve the one paid submission before network I/O."""
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM generation_tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if row is None or row["status"] != "running" or row["provider_job_id"]:
+                connection.rollback()
+                status = row["status"] if row is not None else "missing"
+                raise RuntimeError(
+                    f"cannot reserve submission for task {task_id}: status={status}"
+                )
+            prior_attempt = connection.execute(
+                """
+                SELECT 1 FROM generation_task_events
+                WHERE task_id = ? AND event_type = 'SubmissionAttempted'
+                """,
+                (task_id,),
+            ).fetchone()
+            if prior_attempt is not None:
+                connection.rollback()
+                raise RuntimeError(
+                    f"submission attempt already exists for task {task_id}"
+                )
+            connection.execute(
+                """
+                UPDATE generation_tasks
+                SET status = 'submission_uncertain', provider_endpoint = ?,
+                    error_message = 'provider submission reserved before network I/O',
+                    updated_at = ?
+                WHERE task_id = ? AND status = 'running'
+                """,
+                (provider_endpoint, now, task_id),
+            )
+            self._append_event(
+                connection,
+                task_id=task_id,
+                run_id=row["run_id"],
+                event_type="SubmissionAttempted",
+                from_status="running",
+                to_status="submission_uncertain",
+                details={"provider_endpoint": provider_endpoint},
+            )
+            updated = connection.execute(
+                "SELECT * FROM generation_tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            connection.commit()
+        return GenerationTask.from_row(updated)
+
+    def confirm_provider_job(
         self,
         task_id: str,
         *,
@@ -432,13 +626,57 @@ class GenerationTaskStore:
     ) -> GenerationTask:
         if not provider_job_id:
             raise ValueError("provider_job_id must not be empty")
-        return self._update_running(
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM generation_tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if row is None or row["status"] != "submission_uncertain":
+                connection.rollback()
+                status = row["status"] if row is not None else "missing"
+                raise RuntimeError(
+                    f"cannot confirm provider job for task {task_id}: status={status}"
+                )
+            connection.execute(
+                """
+                UPDATE generation_tasks
+                SET status = 'running', provider_job_id = ?, provider_endpoint = ?,
+                    error_message = NULL, updated_at = ?
+                WHERE task_id = ? AND status = 'submission_uncertain'
+                """,
+                (provider_job_id, provider_endpoint, now, task_id),
+            )
+            self._append_event(
+                connection,
+                task_id=task_id,
+                run_id=row["run_id"],
+                event_type="ProviderAccepted",
+                from_status="submission_uncertain",
+                to_status="running",
+                details={
+                    "provider_endpoint": provider_endpoint,
+                    "provider_job_id": provider_job_id,
+                },
+            )
+            updated = connection.execute(
+                "SELECT * FROM generation_tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            connection.commit()
+        return GenerationTask.from_row(updated)
+
+    def persist_provider_job(
+        self,
+        task_id: str,
+        *,
+        provider_job_id: str,
+        provider_endpoint: str,
+    ) -> GenerationTask:
+        """Compatibility name for the canonical provider acceptance transition."""
+        return self.confirm_provider_job(
             task_id,
-            """
-            provider_job_id = ?, provider_endpoint = ?, error_message = NULL,
-            updated_at = ?
-            """,
-            (provider_job_id, provider_endpoint, _utc_now()),
+            provider_job_id=provider_job_id,
+            provider_endpoint=provider_endpoint,
         )
 
     def note_resumable_error(self, task_id: str, message: str) -> GenerationTask:
@@ -446,14 +684,49 @@ class GenerationTaskStore:
             task_id,
             "error_message = ?, updated_at = ?",
             (message, _utc_now()),
+            event_type="ResumableErrorRecorded",
+            to_status="running",
+            details={"message": message},
         )
 
     def mark_submission_uncertain(self, task_id: str, message: str) -> GenerationTask:
-        return self._update_running(
-            task_id,
-            "status = 'submission_uncertain', error_message = ?, updated_at = ?",
-            (message, _utc_now()),
-        )
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                "SELECT * FROM generation_tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if current is None or current["status"] not in {
+                "running",
+                "submission_uncertain",
+            }:
+                connection.rollback()
+                status = current["status"] if current is not None else "missing"
+                raise RuntimeError(
+                    f"cannot mark task {task_id} uncertain: status={status}"
+                )
+            connection.execute(
+                """
+                UPDATE generation_tasks
+                SET status = 'submission_uncertain', error_message = ?, updated_at = ?
+                WHERE task_id = ?
+                """,
+                (message, now, task_id),
+            )
+            self._append_event(
+                connection,
+                task_id=task_id,
+                run_id=current["run_id"],
+                event_type="SubmissionOutcomeUncertain",
+                from_status=current["status"],
+                to_status="submission_uncertain",
+                details={"message": message},
+            )
+            row = connection.execute(
+                "SELECT * FROM generation_tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            connection.commit()
+        return GenerationTask.from_row(row)
 
     def mark_succeeded(self, task_id: str, outcome: dict[str, Any]) -> GenerationTask:
         now = _utc_now()
@@ -465,6 +738,12 @@ class GenerationTaskStore:
             updated_at = ?, finished_at = ?
             """,
             (_encode_json(outcome), outcome.get("output_artifact_id"), now, now),
+            event_type="TaskSucceeded",
+            to_status="succeeded",
+            details={
+                "output_artifact_id": outcome.get("output_artifact_id"),
+                "output_sha256": outcome.get("output_sha256"),
+            },
         )
 
     def mark_failed(
@@ -485,12 +764,41 @@ class GenerationTaskStore:
                 f"terminal provider state: task_id={task_id}, "
                 f"provider_job_id={current.provider_job_id}"
             )
+        if current is None or current.status not in {"running", "submission_uncertain"}:
+            status = current.status if current is not None else "missing"
+            raise RuntimeError(f"cannot fail generation task {task_id}: status={status}")
         now = _utc_now()
-        return self._update_running(
-            task_id,
-            "status = 'failed', error_message = ?, updated_at = ?, finished_at = ?",
-            (message, now, now),
-        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE generation_tasks
+                SET status = 'failed', error_message = ?, updated_at = ?, finished_at = ?
+                WHERE task_id = ? AND status = ?
+                """,
+                (message, now, now, task_id, current.status),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                raise RuntimeError(f"generation task {task_id} changed concurrently")
+            self._append_event(
+                connection,
+                task_id=task_id,
+                run_id=current.run_id,
+                event_type=(
+                    "ProviderTerminalFailure"
+                    if current.provider_job_id
+                    else "SubmissionRejected"
+                ),
+                from_status=current.status,
+                to_status="failed",
+                details={"message": message, "provider_terminal": provider_terminal},
+            )
+            row = connection.execute(
+                "SELECT * FROM generation_tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            connection.commit()
+        return GenerationTask.from_row(row)
 
     def resolve_unsubmitted_uncertain_as_failed(
         self, task_id: str, message: str
@@ -523,6 +831,18 @@ class GenerationTaskStore:
                     f"cannot release uncertain task {task_id}: "
                     f"status={current_status}, provider_job_id={provider_job!r}"
                 )
+            current = connection.execute(
+                "SELECT run_id FROM generation_tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            self._append_event(
+                connection,
+                task_id=task_id,
+                run_id=current["run_id"],
+                event_type="SubmissionRejectedAfterReview",
+                from_status="submission_uncertain",
+                to_status="failed",
+                details={"message": message},
+            )
             row = connection.execute(
                 "SELECT * FROM generation_tasks WHERE task_id = ?", (task_id,)
             ).fetchone()
@@ -534,9 +854,16 @@ class GenerationTaskStore:
         task_id: str,
         assignments: str,
         parameters: tuple[Any, ...],
+        *,
+        event_type: str,
+        to_status: str,
+        details: dict[str, Any] | None = None,
     ) -> GenerationTask:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                "SELECT run_id FROM generation_tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
             cursor = connection.execute(
                 f"UPDATE generation_tasks SET {assignments} "
                 "WHERE task_id = ? AND status = 'running'",
@@ -549,8 +876,49 @@ class GenerationTaskStore:
                 raise RuntimeError(
                     f"cannot update generation task {task_id}: status={current_status}"
                 )
+            self._append_event(
+                connection,
+                task_id=task_id,
+                run_id=current["run_id"],
+                event_type=event_type,
+                from_status="running",
+                to_status=to_status,
+                details=details,
+            )
             row = connection.execute(
                 "SELECT * FROM generation_tasks WHERE task_id = ?", (task_id,)
             ).fetchone()
             connection.commit()
         return GenerationTask.from_row(row)
+
+    def events(self, task_id: str) -> list[GenerationTaskEvent]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM generation_task_events
+                WHERE task_id = ? ORDER BY event_sequence
+                """,
+                (task_id,),
+            ).fetchall()
+        return [GenerationTaskEvent.from_row(row) for row in rows]
+
+    def submission_attempt_count(
+        self,
+        *,
+        run_id: str | None = None,
+        task_id: str | None = None,
+    ) -> int:
+        clauses = ["event_type = 'SubmissionAttempted'"]
+        parameters: list[str] = []
+        if run_id is not None:
+            clauses.append("run_id = ?")
+            parameters.append(run_id)
+        if task_id is not None:
+            clauses.append("task_id = ?")
+            parameters.append(task_id)
+        with self._connect() as connection:
+            return int(connection.execute(
+                "SELECT COUNT(*) FROM generation_task_events WHERE "
+                + " AND ".join(clauses),
+                parameters,
+            ).fetchone()[0])

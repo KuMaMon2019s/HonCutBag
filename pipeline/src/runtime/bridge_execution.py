@@ -137,13 +137,18 @@ def execute_bridge_video_task(
         else:
             task = claimed
     elif enqueued.deduped and task.status == "running" and not task.provider_job_id:
-        task_store.mark_submission_uncertain(
-            task.task_id,
-            "process stopped after claim and before Bridge job ID persistence",
+        legacy_import = any(
+            event.event_type == "LegacySnapshotImported"
+            for event in task_store.events(task.task_id)
         )
-        raise SubmissionUncertainError(
-            f"Bridge submission for {resource_id} may be in flight; refusing to resubmit"
-        )
+        if legacy_import:
+            task_store.mark_submission_uncertain(
+                task.task_id,
+                "legacy running task has no trustworthy pre-submit event history",
+            )
+            raise SubmissionUncertainError(
+                f"Bridge submission for {resource_id} has ambiguous legacy history"
+            )
 
     emit_runtime_event(
         "provider_task_active",
@@ -169,14 +174,27 @@ def execute_bridge_video_task(
 
     latest_provider_job_id = provider_job_id
     submission_without_job_id = False
+    submission_reserved = False
 
     def remember_submission_start() -> None:
-        nonlocal submission_without_job_id
+        nonlocal submission_without_job_id, submission_reserved
+        if not submission_reserved:
+            task_store.reserve_submission_attempt(
+                task.task_id,
+                provider_endpoint=provider_endpoint,
+            )
+            submission_reserved = True
         submission_without_job_id = True
 
     def remember_submission(submitted_job_id: str) -> None:
-        nonlocal latest_provider_job_id, submission_without_job_id
-        task_store.persist_provider_job(
+        nonlocal latest_provider_job_id, submission_without_job_id, submission_reserved
+        if not submission_reserved:
+            task_store.reserve_submission_attempt(
+                task.task_id,
+                provider_endpoint=provider_endpoint,
+            )
+            submission_reserved = True
+        task_store.confirm_provider_job(
             task.task_id,
             provider_job_id=submitted_job_id,
             provider_endpoint=provider_endpoint,

@@ -882,22 +882,26 @@ def _base_content(
         _storyboard_group_prompt(group, request.shot_id, request.chunk),
         characters_data,
     )
-    from utils.privacy_visual_policy import (
-        is_no_real_person_enabled,
-        no_real_person_prompt_contract,
-    )
-
-    if is_no_real_person_enabled():
-        privacy_contract = no_real_person_prompt_contract()
-        if privacy_contract not in content_meta["prompt"]:
-            content_meta["prompt"] = (
-                f"{privacy_contract}\n{content_meta['prompt']}"
-            )
     strategy = request.chunk.execution_strategy
     if strategy == "first_last_frame_bridge":
         # Frame roles cannot be mixed with reference media in Seedance.  The
         # bridge helper adds the actual predecessor tail and next P01 below.
-        return [{"type": "text", "text": content_meta["prompt"]}]
+        from utils.canonical_visual_contracts import (
+            load_canonical_visual_contract,
+            render_canonical_visual_prompt_contract,
+        )
+
+        canonical_contract = load_canonical_visual_contract(
+            output_dir,
+            characters_data=characters_data,
+        )
+        canonical_prompt = render_canonical_visual_prompt_contract(
+            canonical_contract,
+        )
+        return [{
+            "type": "text",
+            "text": f"{canonical_prompt}\n{content_meta['prompt']}".strip(),
+        }]
     content_meta["_include_cinematic_frame"] = request.chunk.sequence == 1
     if request.chunk.storyboard_beat_id:
         content_meta["_storyboard_beat_id"] = request.chunk.storyboard_beat_id
@@ -930,6 +934,15 @@ def _base_content(
             "_storyboard_narrative_guide_sha256": (
                 request.chunk.storyboard_narrative_guide_sha256
             ),
+            "_storyboard_narrative_guide_renderer": (
+                request.chunk.storyboard_narrative_guide_renderer
+            ),
+            "_storyboard_narrative_guide_source_pixel_usage": (
+                request.chunk.storyboard_narrative_guide_source_pixel_usage
+            ),
+            "_storyboard_narrative_guide_semantic_payload_sha256": (
+                request.chunk.storyboard_narrative_guide_semantic_payload_sha256
+            ),
             "_storyboard_narrative_guide_source_board": (
                 request.chunk.storyboard_narrative_guide_source_board
             ),
@@ -938,6 +951,12 @@ def _base_content(
             ),
             "_storyboard_narrative_guide_receipt": (
                 request.chunk.storyboard_narrative_guide_receipt
+            ),
+            "_storyboard_narrative_guide_authority_roles": list(
+                request.chunk.storyboard_narrative_guide_authority_roles
+            ),
+            "_storyboard_narrative_guide_non_authority_roles": list(
+                request.chunk.storyboard_narrative_guide_non_authority_roles
             ),
         })
         content_meta["_character_performance_required"] = (
@@ -1026,8 +1045,32 @@ def _extension_content(
     text_item = next((item for item in normalized if item.get("type") == "text"), None)
     if text_item is not None:
         text_item["text"] = f"{directive}{text_item.get('text', '')}"
-    # P02+ ordering is a semantic contract: predecessor video first, then
-    # current-character and narrative-guide images, then local tail anchors.
+    identity_images = [
+        item
+        for item in base_images
+        if item.get("_reference_kind") == "character_identity_board"
+    ]
+    performance_images = [
+        item
+        for item in base_images
+        if item.get("_reference_kind") == "character_performance_guide"
+    ]
+    narrative_images = [
+        item
+        for item in base_images
+        if item.get("_reference_kind") == "storyboard_narrative_guide"
+    ]
+    ordered_ids = {
+        id(item)
+        for item in [*identity_images, *performance_images, *narrative_images]
+    }
+    supplemental_images = [item for item in base_images if id(item) not in ordered_ids]
+    # P02+ authority order: identity boards, predecessor video, current pose,
+    # identity-neutral story guide, optional supplemental images, tail anchors.
+    for item in identity_images:
+        item["role"] = "reference_image"
+        item.pop("priority", None)
+        normalized.append(item)
     normalized.append(
         {
             "type": "video_url",
@@ -1042,7 +1085,7 @@ def _extension_content(
             ).hexdigest(),
         }
     )
-    for item in base_images:
+    for item in [*performance_images, *narrative_images, *supplemental_images]:
         item["role"] = "reference_image"
         item.pop("priority", None)
         normalized.append(item)
@@ -1089,6 +1132,13 @@ def _media_index_manifest(content: Sequence[dict[str, Any]]) -> list[dict[str, A
             "character_id": item.get("_character_id"),
             "narrative_beat_id": item.get("_narrative_beat_id"),
             "narrative_cell_ids": list(item.get("_narrative_cell_ids") or []),
+            "authority_roles": list(item.get("_authority_roles") or []),
+            "non_authority_roles": list(
+                item.get("_non_authority_roles") or []
+            ),
+            "semantic_payload_sha256": item.get(
+                "_semantic_payload_sha256"
+            ),
             "performance_beat_id": item.get("_performance_beat_id"),
             "performance_cell_ids": list(
                 item.get("_performance_cell_ids") or []
@@ -1179,19 +1229,41 @@ def _bind_final_media_index_prompt(
             raise ValueError(
                 f"{request.resource_id} performance guide does not match persisted Axx lineage"
             )
-    if (
-        request.chunk.sequence == 1
-        and request.chunk.execution_strategy == "multi_image"
-        and request.chunk.storyboard_beat_id
-    ):
-        image_items = [
-            item for item in manifest if item.get("media_type") == "image_url"
+    if request.chunk.storyboard_beat_id:
+        responsibilities = [
+            str(item.get("responsibility") or "") for item in manifest
         ]
-        if not image_items or image_items[0].get("responsibility") != (
-            "cinematic_composition"
-        ):
+        if request.chunk.sequence == 1:
+            allowed_rank = {
+                "character_identity_board": 0,
+                "cinematic_composition": 1,
+                "character_performance_guide": 2,
+                "storyboard_narrative_guide": 3,
+            }
+            if responsibilities.count("cinematic_composition") != 1:
+                raise ValueError(
+                    f"{request.resource_id} must contain exactly one cinematic first frame"
+                )
+        else:
+            allowed_rank = {
+                "character_identity_board": 0,
+                "predecessor_tail_video": 1,
+                "character_performance_guide": 2,
+                "storyboard_narrative_guide": 3,
+                "ordered_tail_frame": 4,
+            }
+        if any(role not in allowed_rank for role in responsibilities):
+            unexpected = [
+                role for role in responsibilities if role not in allowed_rank
+            ]
             raise ValueError(
-                f"{request.resource_id} 图片1 must be the primary-shot cinematic composition"
+                f"{request.resource_id} contains non-canonical media roles: "
+                + ", ".join(unexpected)
+            )
+        ranks = [allowed_rank[role] for role in responsibilities]
+        if ranks != sorted(ranks):
+            raise ValueError(
+                f"{request.resource_id} media authority order is not canonical"
             )
     if request.chunk.mode == "native_extend":
         videos = [
@@ -1493,6 +1565,15 @@ def _task_payload(
         "storyboard_narrative_guide_sha256": (
             request.chunk.storyboard_narrative_guide_sha256
         ),
+        "storyboard_narrative_guide_renderer": (
+            request.chunk.storyboard_narrative_guide_renderer
+        ),
+        "storyboard_narrative_guide_source_pixel_usage": (
+            request.chunk.storyboard_narrative_guide_source_pixel_usage
+        ),
+        "storyboard_narrative_guide_semantic_payload_sha256": (
+            request.chunk.storyboard_narrative_guide_semantic_payload_sha256
+        ),
         "storyboard_narrative_guide_source_board_sha256": (
             request.chunk.storyboard_narrative_guide_source_board_sha256
         ),
@@ -1501,6 +1582,12 @@ def _task_payload(
         ),
         "storyboard_narrative_guide_receipt": (
             request.chunk.storyboard_narrative_guide_receipt
+        ),
+        "storyboard_narrative_guide_authority_roles": list(
+            request.chunk.storyboard_narrative_guide_authority_roles
+        ),
+        "storyboard_narrative_guide_non_authority_roles": list(
+            request.chunk.storyboard_narrative_guide_non_authority_roles
         ),
         "character_performance_required": (
             request.chunk.character_performance_required
@@ -1567,10 +1654,9 @@ def _provider_input_context(
     storyboard_frame = output_dir / "storyboard_images" / f"{shot_id}.png"
     group, group_board = _storyboard_group_for_shot(output_dir, shot_id)
     group_contract = output_dir / "STORYBOARD_GROUPS.json"
-    from utils.privacy_visual_policy import (
-        NO_REAL_PERSON_POLICY,
-        is_no_real_person_enabled,
-    )
+    from utils.canonical_visual_contracts import load_canonical_visual_contract
+
+    canonical_contract = load_canonical_visual_contract(output_dir)
 
     def optional_hash(value: str | None) -> str | None:
         if not value:
@@ -1625,9 +1711,9 @@ def _provider_input_context(
         "continuation_contract": "tail_window_ordered_frames_v1",
         "tail_window_seconds": "2.0",
         "ordered_frame_fractions": "0.2,0.6,0.95",
-        "visual_identity_policy": (
-            NO_REAL_PERSON_POLICY if is_no_real_person_enabled() else None
-        ),
+        "canonical_visual_contract_sha256": canonical_contract[
+            "contract_sha256"
+        ],
     }
 
 
@@ -2015,6 +2101,7 @@ def _direct_seedance_executor(
     task_store: GenerationTaskStore,
     *,
     media_profile: str = "480p",
+    allow_policy_repairs: bool = True,
 ) -> Callable[[ChunkExecutionRequest], ChunkExecutionResult]:
     from clients import seedance_client
     from utils.config import SEEDANCE_MODEL, get_api_key_or_raise
@@ -2073,9 +2160,12 @@ def _direct_seedance_executor(
             ):
                 # Terminal provider failures require a new durable task. Privacy and
                 # copyright repairs keep independent bounded budgets below.
-                for _provider_attempt in range(
-                    MAX_COPYRIGHT_POLICY_REPAIRS + MAX_PRIVACY_POLICY_REPAIRS + 1
-                ):
+                repair_attempt_limit = (
+                    MAX_COPYRIGHT_POLICY_REPAIRS + MAX_PRIVACY_POLICY_REPAIRS
+                    if allow_policy_repairs
+                    else 0
+                )
+                for _provider_attempt in range(repair_attempt_limit + 1):
                     try:
                         if content_override is None:
                             content, _shot_meta, _seed, _duration = _provider_content(
@@ -2090,7 +2180,11 @@ def _direct_seedance_executor(
                             f"{request.resource_id}: {exc}"
                         ) from exc
                     if privacy_repair_budget is None:
-                        privacy_repair_budget = _privacy_policy_repair_budget(content)
+                        privacy_repair_budget = (
+                            _privacy_policy_repair_budget(content)
+                            if allow_policy_repairs
+                            else 0
+                        )
                     assert privacy_repair_budget is not None
 
                     media_index_manifest = _media_index_manifest(content)
@@ -2387,6 +2481,7 @@ def _direct_seedance_executor(
                         violation_kind = _copyright_policy_violation_kind(exc)
                         if (
                             violation_kind is None
+                            or not allow_policy_repairs
                             or len(repairs) >= MAX_COPYRIGHT_POLICY_REPAIRS
                         ):
                             raise
@@ -2878,6 +2973,11 @@ def execute_phase6_auto_continuity(
     calibration: SeamCalibration | None,
     *,
     media_profile: str = "480p",
+    max_new_chunks: int | None = None,
+    allow_policy_repairs: bool = True,
+    max_seam_repairs: int | None = None,
+    max_duration_topups: int = 3,
+    max_workers: int | None = None,
     _test_executor_factory: Callable[
         [Path, GenerationTaskStore],
         Callable[[ChunkExecutionRequest], ChunkExecutionResult],
@@ -2896,15 +2996,17 @@ def execute_phase6_auto_continuity(
         if provider == "seedance":
             executor_factory = _direct_seedance_executor
             parameters = inspect.signature(executor_factory).parameters
-            executor_factory_kwargs = (
-                {"media_profile": media_profile}
-                if "media_profile" in parameters
-                or any(
-                    parameter.kind is inspect.Parameter.VAR_KEYWORD
-                    for parameter in parameters.values()
-                )
-                else {}
+            accepts_kwargs = any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
             )
+            executor_factory_kwargs = {}
+            if "media_profile" in parameters or accepts_kwargs:
+                executor_factory_kwargs["media_profile"] = media_profile
+            if "allow_policy_repairs" in parameters or accepts_kwargs:
+                executor_factory_kwargs["allow_policy_repairs"] = (
+                    allow_policy_repairs
+                )
         elif provider == "bridge":
             executor_factory = _bridge_seedance_executor
             executor_factory_kwargs = {}
@@ -2965,10 +3067,20 @@ def execute_phase6_auto_continuity(
     task_store = GenerationTaskStore(root / "runtime.db")
     execute_chunk = executor_factory(root, task_store, **executor_factory_kwargs)
 
-    max_repairs = int(os.environ.get("HONCUT_CONTINUITY_MAX_REPAIRS", "1"))
+    max_repairs = (
+        int(os.environ.get("HONCUT_CONTINUITY_MAX_REPAIRS", "1"))
+        if max_seam_repairs is None
+        else max_seam_repairs
+    )
     if not 0 <= max_repairs <= 3:
         raise ValueError("HONCUT_CONTINUITY_MAX_REPAIRS must be between 0 and 3")
-    workers = max(1, int(os.environ.get("VIDEO_GEN_CONCURRENCY", "1")))
+    workers = (
+        max(1, int(os.environ.get("VIDEO_GEN_CONCURRENCY", "1")))
+        if max_workers is None
+        else max_workers
+    )
+    if workers < 1:
+        raise ValueError("max_workers must be at least 1")
     report = execute_continuity_plan(
         plan,
         root,
@@ -2994,7 +3106,9 @@ def execute_phase6_auto_continuity(
             calibration.model_dump(mode="json") if calibration is not None else None
         ),
         max_seam_repairs=max_repairs,
+        max_duration_topups=max_duration_topups,
         max_workers=workers,
+        max_new_chunks=max_new_chunks,
     )
     report.update(
         {
