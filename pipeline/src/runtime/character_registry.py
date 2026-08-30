@@ -33,7 +33,7 @@ from tools.character_reference_board import (
 )
 
 CHARACTER_REGISTRY_SCHEMA_VERSION = 1
-CHARACTER_SPEC_SCHEMA = "honcut.character-library-spec.v2"
+CHARACTER_SPEC_SCHEMA = "honcut.character-library-spec.v3"
 CHARACTER_APPROVAL_SCHEMA = "honcut.character-library-approval.v1"
 CHARACTER_REGISTRY_RECEIPT_SCHEMA = "honcut.character-registry-receipt.v1"
 CANONICAL_STATUS = "canonical_approved"
@@ -127,6 +127,18 @@ def character_spec_payload(character: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "schema": CHARACTER_SPEC_SCHEMA,
         "character_id": _character_id(character.get("id")),
+        "entity_id": str(character.get("entity_id") or "").strip(),
+        "instance_id": str(character.get("instance_id") or "").strip(),
+        "instance_ordinal": int(character.get("instance_ordinal") or 0),
+        "canonical_visual_contract_sha256": str(
+            (
+                character.get("canonical_visual_contract")
+                if isinstance(character.get("canonical_visual_contract"), Mapping)
+                else {}
+            ).get("contract_sha256")
+            or character.get("canonical_visual_contract_sha256")
+            or ""
+        ).strip(),
         "description": str(character.get("description") or "").strip(),
         "style": str(character.get("style") or "").strip(),
         "negative": str(character.get("negative") or "").strip(),

@@ -20,8 +20,15 @@ from schemas.understanding import CanonicalVisualContractUnderstanding
 from utils.character_reference_contracts import normalize_identity_props
 
 
-CANONICAL_VISUAL_CONTRACT_SCHEMA = "honcut.canonical-visual-contract.v1"
+CANONICAL_VISUAL_CONTRACT_SCHEMA = "honcut.canonical-visual-contract.v2"
+LEGACY_CANONICAL_VISUAL_CONTRACT_SCHEMA = "honcut.canonical-visual-contract.v1"
 CANONICAL_VISUAL_CONTRACT_FILENAME = "CANONICAL_VISUAL_CONTRACT.json"
+CANONICAL_VISUAL_MIGRATION_RECEIPT_FILENAME = (
+    "CANONICAL_VISUAL_CONTRACT_MIGRATION.json"
+)
+CANONICAL_VISUAL_MIGRATION_RECEIPT_SCHEMA = (
+    "honcut.canonical-visual-contract-migration.v1"
+)
 
 SOURCE_DERIVED_POLICY = "source_derived"
 FICTIONAL_CINEMATIC_HUMAN_POLICY = "fictional_cinematic_human_v1"
@@ -368,6 +375,21 @@ def build_canonical_visual_contract(
     if not isinstance(characters, list):
         raise CanonicalVisualContractError("characters payload has no character list")
     source_hash = canonical_json_sha256(characters)
+    roster_hash = str(characters_data.get("character_roster_sha256") or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{64}", roster_hash):
+        # One-to-one programmatic callers predate the roster artifact.  Their
+        # source character hash is a deterministic compatibility roster.  New
+        # Phase 1 output always provides the actual roster hash.
+        if all(
+            isinstance(character, dict)
+            and int(character.get("instance_count") or 1) == 1
+            for character in characters
+        ):
+            roster_hash = source_hash
+        else:
+            raise CanonicalVisualContractError(
+                "multi-instance characters require a verified character roster"
+            )
     records: list[dict[str, Any]] = []
     for index, character in enumerate(characters, 1):
         if not isinstance(character, dict):
@@ -384,6 +406,54 @@ def build_canonical_visual_contract(
             )
         raw_count = character.get("instance_count", 1)
         count = raw_count if isinstance(raw_count, int) and raw_count > 0 else 1
+        raw_instances = character.get("instances")
+        if raw_instances is None and count == 1:
+            raw_instances = [{
+                "instance_id": character_id,
+                "ordinal": 1,
+                "source_mentions": [str(character.get("name") or character_id)],
+                "event_refs": [],
+                "action_unit_refs": [],
+            }]
+        if not isinstance(raw_instances, list) or len(raw_instances) != count:
+            raise CanonicalVisualContractError(
+                f"{character_id} instances do not match instance_count"
+            )
+        instance_records = []
+        for ordinal, instance in enumerate(raw_instances, 1):
+            if not isinstance(instance, dict):
+                raise CanonicalVisualContractError(
+                    f"{character_id} instance must be an object"
+                )
+            instance_id = str(instance.get("instance_id") or "").strip()
+            if not instance_id or int(instance.get("ordinal") or 0) != ordinal:
+                raise CanonicalVisualContractError(
+                    f"{character_id} instances require stable ordered IDs"
+                )
+            instance_records.append({
+                "instance_id": instance_id,
+                "ordinal": ordinal,
+                "source_mentions": [
+                    str(value).strip()
+                    for value in (instance.get("source_mentions") or [])
+                    if str(value).strip()
+                ],
+                "source_event_refs": [
+                    str(value).strip()
+                    for value in (instance.get("event_refs") or [])
+                    if str(value).strip()
+                ],
+                "source_action_unit_refs": [
+                    str(value).strip()
+                    for value in (instance.get("action_unit_refs") or [])
+                    if str(value).strip()
+                ],
+                "face_identity": _fact(
+                    f"stable_fictional_face_{hashlib.sha256((instance_id + ':face').encode('utf-8')).hexdigest()[:12]}",
+                    explicit=False,
+                    source_ref=f"instance:{instance_id}:face",
+                ),
+            })
         props = []
         for prop in normalize_identity_props(appearance.get("identity_props")):
             geometry = _prop_geometry(prop["id"], prop["description"])
@@ -405,11 +475,13 @@ def build_canonical_visual_contract(
             ]
         records.append({
             "character_id": character_id,
+            "entity_id": str(character.get("entity_id") or character_id),
             "instance_count": _fact(
                 count,
                 explicit="instance_count" in character,
                 source_ref=f"character:{character_id}:instance_count",
             ),
+            "instances": instance_records,
             "visual_identity_policy": resolved_policy,
             "hair": _hair_geometry(character_id, appearance.get("hair")),
             "body_build": _fact(
@@ -433,6 +505,7 @@ def build_canonical_visual_contract(
         "schema": CANONICAL_VISUAL_CONTRACT_SCHEMA,
         "requested_policy": policy,
         "source_characters_sha256": source_hash,
+        "character_roster_sha256": roster_hash,
         "characters": records,
     }
     contract = {**unsigned, "contract_sha256": canonical_json_sha256(unsigned)}
@@ -440,7 +513,105 @@ def build_canonical_visual_contract(
     return contract
 
 
+def _migrate_one_to_one_v1_contract(
+    value: dict[str, Any],
+    *,
+    characters_data: dict[str, Any] | None,
+) -> dict[str, Any]:
+    legacy = copy.deepcopy(value)
+    claimed = str(legacy.pop("contract_sha256", ""))
+    if canonical_json_sha256(legacy) != claimed:
+        raise CanonicalVisualContractError("legacy canonical visual contract hash mismatch")
+    records = legacy.get("characters")
+    if not isinstance(records, list):
+        raise CanonicalVisualContractError("legacy canonical contract has no characters")
+    source_characters = (
+        characters_data.get("characters")
+        if isinstance(characters_data, dict)
+        else None
+    )
+    if not isinstance(source_characters, list):
+        raise CanonicalVisualContractError(
+            "legacy canonical contract has no source character lineage; audit-only"
+        )
+    lineage_by_id = {
+        str(character.get("id") or "").strip(): character
+        for character in source_characters
+        if isinstance(character, dict) and str(character.get("id") or "").strip()
+    }
+    migrated_records = []
+    for record in records:
+        if not isinstance(record, dict):
+            raise CanonicalVisualContractError("legacy canonical character is invalid")
+        character_id = str(record.get("character_id") or "").strip()
+        count = record.get("instance_count")
+        if (
+            not character_id
+            or not isinstance(count, dict)
+            or count.get("value") != 1
+        ):
+            raise CanonicalVisualContractError(
+                "legacy grouped canonical contract is audit-only; rerun Phase 1"
+            )
+        source_character = lineage_by_id.get(character_id)
+        identity_evidence = (
+            source_character.get("source_identity_evidence")
+            if isinstance(source_character, dict)
+            else None
+        )
+        source_mentions = (
+            [
+                str(mention).strip()
+                for mention in identity_evidence.get("source_mentions") or []
+                if str(mention).strip()
+            ]
+            if isinstance(identity_evidence, dict)
+            else []
+        )
+        source_event_refs = (
+            [
+                f"event:{int(event_id)}"
+                for event_id in identity_evidence.get("event_ids") or []
+                if isinstance(event_id, int) and not isinstance(event_id, bool)
+            ]
+            if isinstance(identity_evidence, dict)
+            else []
+        )
+        if not source_mentions or not source_event_refs:
+            raise CanonicalVisualContractError(
+                "legacy canonical character lacks source lineage; audit-only"
+            )
+        migrated_records.append({
+            **record,
+            "entity_id": character_id,
+            "instances": [{
+                "instance_id": character_id,
+                "ordinal": 1,
+                "source_mentions": source_mentions,
+                "source_event_refs": source_event_refs,
+                "source_action_unit_refs": [],
+                "face_identity": _fact(
+                    f"stable_fictional_face_{hashlib.sha256((character_id + ':face').encode('utf-8')).hexdigest()[:12]}",
+                    explicit=False,
+                    source_ref=f"instance:{character_id}:face",
+                ),
+            }],
+        })
+    unsigned = {
+        "schema": CANONICAL_VISUAL_CONTRACT_SCHEMA,
+        "requested_policy": legacy.get("requested_policy"),
+        "source_characters_sha256": legacy.get("source_characters_sha256"),
+        "character_roster_sha256": legacy.get("source_characters_sha256"),
+        "characters": migrated_records,
+    }
+    return {**unsigned, "contract_sha256": canonical_json_sha256(unsigned)}
+
+
 def validate_canonical_visual_contract(value: dict[str, Any]) -> dict[str, Any]:
+    if value.get("schema") == LEGACY_CANONICAL_VISUAL_CONTRACT_SCHEMA:
+        raise CanonicalVisualContractError(
+            "legacy canonical contract requires the explicit load migration boundary"
+        )
     parsed = CanonicalVisualContractUnderstanding.model_validate(value)
     payload = parsed.model_dump(by_alias=True)
     claimed = payload.pop("contract_sha256")
@@ -463,11 +634,19 @@ def render_canonical_visual_prompt_contract(
         for value in (character_ids or [])
         if str(value).strip()
     }
-    records = [
-        record
-        for record in validated["characters"]
-        if not filter_requested or record["character_id"] in requested
-    ]
+    records = []
+    for record in validated["characters"]:
+        instance_ids = {
+            str(instance["instance_id"])
+            for instance in record["instances"]
+        }
+        if (
+            not filter_requested
+            or record["character_id"] in requested
+            or record["entity_id"] in requested
+            or bool(instance_ids & requested)
+        ):
+            records.append(record)
 
     def fact(value: dict[str, Any]) -> Any:
         return value["value"]
@@ -476,7 +655,21 @@ def render_canonical_visual_prompt_contract(
     for record in records:
         prompt_records.append({
             "character_id": record["character_id"],
+            "entity_id": record["entity_id"],
             "instance_count": fact(record["instance_count"]),
+            "instances": [
+                {
+                    "instance_id": instance["instance_id"],
+                    "ordinal": instance["ordinal"],
+                    "source_mentions": instance["source_mentions"],
+                    "face_identity": fact(instance["face_identity"]),
+                }
+                for instance in record["instances"]
+                if not filter_requested
+                or record["character_id"] in requested
+                or record["entity_id"] in requested
+                or instance["instance_id"] in requested
+            ],
             "visual_identity_policy": record["visual_identity_policy"],
             "hair": {
                 key: fact(record["hair"][key])
@@ -517,6 +710,7 @@ def render_canonical_visual_prompt_contract(
     payload = {
         "schema": CANONICAL_VISUAL_CONTRACT_SCHEMA,
         "contract_sha256": validated["contract_sha256"],
+        "character_roster_sha256": validated["character_roster_sha256"],
         "characters": prompt_records,
     }
     return (
@@ -530,6 +724,92 @@ def render_canonical_visual_prompt_contract(
         + "\n所有人物身份、实例数、发型几何、体型、脸、服装和道具拓扑只服从该合同；"
         "其他图片只承担其声明职责，不得改写这些事实。"
     )
+
+
+def expand_character_instances(
+    characters_data: dict[str, Any],
+    contract: dict[str, Any],
+) -> dict[str, Any]:
+    """Create the downstream compatibility projection: one asset per instance."""
+
+    validated = validate_canonical_visual_contract(contract)
+    rewritten = copy.deepcopy(characters_data)
+    entities = rewritten.get("characters")
+    if not isinstance(entities, list):
+        raise CanonicalVisualContractError("characters payload has no entity list")
+    contract_by_entity = {
+        str(record["entity_id"]): record for record in validated["characters"]
+    }
+    expanded: list[dict[str, Any]] = []
+    for entity in entities:
+        if not isinstance(entity, dict):
+            raise CanonicalVisualContractError("character entity must be an object")
+        entity_id = str(entity.get("entity_id") or entity.get("id") or "").strip()
+        record = contract_by_entity.get(entity_id)
+        if record is None:
+            raise CanonicalVisualContractError(
+                f"character entity {entity_id} is absent from canonical contract"
+            )
+        raw_instances = entity.get("instances")
+        if not isinstance(raw_instances, list):
+            raise CanonicalVisualContractError(
+                f"character entity {entity_id} has no roster instances"
+            )
+        record_instances = {
+            str(item["instance_id"]): item for item in record["instances"]
+        }
+        for instance in raw_instances:
+            if not isinstance(instance, dict):
+                raise CanonicalVisualContractError("character instance is invalid")
+            instance_id = str(instance.get("instance_id") or "").strip()
+            contract_instance = record_instances.get(instance_id)
+            if contract_instance is None:
+                raise CanonicalVisualContractError(
+                    f"instance {instance_id} is absent from canonical contract"
+                )
+            projected = copy.deepcopy(entity)
+            appearance = projected.get("appearance")
+            appearance = appearance if isinstance(appearance, dict) else {}
+            shared_face = str(appearance.get("face") or "").strip()
+            face_identity = str(contract_instance["face_identity"]["value"])
+            appearance["face"] = ", ".join(filter(None, (
+                shared_face,
+                f"instance-specific identity lock {face_identity}",
+            )))
+            appearance["summary"] = ", ".join(filter(None, (
+                str(appearance.get("summary") or "").strip(),
+                f"unique instance identity {face_identity}",
+            )))
+            source_mentions = [
+                str(value).strip()
+                for value in (instance.get("source_mentions") or [])
+                if str(value).strip()
+            ]
+            projected.update({
+                "id": instance_id,
+                "entity_id": entity_id,
+                "instance_id": instance_id,
+                "instance_ordinal": int(instance.get("ordinal") or 0),
+                "entity_instance_count": int(entity.get("instance_count") or 1),
+                "name": source_mentions[0] if source_mentions else str(entity.get("name") or entity_id),
+                "aliases": source_mentions[1:],
+                "appearance": appearance,
+                "asset_path": f"characters/{instance_id}/",
+                "canonical_visual_contract": {
+                    "artifact": CANONICAL_VISUAL_CONTRACT_FILENAME,
+                    "contract_sha256": validated["contract_sha256"],
+                    "character_id": entity_id,
+                    "entity_id": entity_id,
+                    "instance_id": instance_id,
+                },
+            })
+            expanded.append(projected)
+    rewritten["entities"] = entities
+    rewritten["characters"] = expanded
+    rewritten["total_character_entities"] = len(entities)
+    rewritten["total_characters"] = len(expanded)
+    rewritten["total_character_instances"] = len(expanded)
+    return rewritten
 
 
 def persist_canonical_visual_contract(
@@ -554,6 +834,7 @@ def persist_canonical_visual_contract(
         }
     rewritten["canonical_visual_contract"] = CANONICAL_VISUAL_CONTRACT_FILENAME
     rewritten["canonical_visual_contract_sha256"] = contract_hash
+    rewritten["character_roster_sha256"] = contract["character_roster_sha256"]
     path = root / CANONICAL_VISUAL_CONTRACT_FILENAME
     temporary = path.with_suffix(".json.tmp")
     temporary.write_text(
@@ -579,14 +860,65 @@ def load_canonical_visual_contract(
         ) from error
     if not isinstance(raw, dict):
         raise CanonicalVisualContractError("canonical visual contract must be an object")
-    contract = validate_canonical_visual_contract(raw)
+    migrated_from_v1 = (
+        raw.get("schema") == LEGACY_CANONICAL_VISUAL_CONTRACT_SCHEMA
+    )
+    if migrated_from_v1:
+        source_sha256 = canonical_json_sha256(raw)
+        receipt_path = (
+            Path(output_dir) / CANONICAL_VISUAL_MIGRATION_RECEIPT_FILENAME
+        )
+        try:
+            migrated = _migrate_one_to_one_v1_contract(
+                raw,
+                characters_data=characters_data,
+            )
+        except CanonicalVisualContractError as error:
+            _persist_visual_migration_receipt(
+                receipt_path,
+                {
+                    "schema": CANONICAL_VISUAL_MIGRATION_RECEIPT_SCHEMA,
+                    "status": "audit_only",
+                    "source_schema": LEGACY_CANONICAL_VISUAL_CONTRACT_SCHEMA,
+                    "source_document_sha256": source_sha256,
+                    "reason": str(error),
+                    "provider_request_count": 0,
+                },
+            )
+            raise
+        contract = validate_canonical_visual_contract(migrated)
+        _persist_visual_migration_receipt(
+            receipt_path,
+            {
+                "schema": CANONICAL_VISUAL_MIGRATION_RECEIPT_SCHEMA,
+                "status": "migrated",
+                "source_schema": LEGACY_CANONICAL_VISUAL_CONTRACT_SCHEMA,
+                "source_document_sha256": source_sha256,
+                "migrated_schema": CANONICAL_VISUAL_CONTRACT_SCHEMA,
+                "migrated_contract_sha256": contract["contract_sha256"],
+                "provider_request_count": 0,
+            },
+        )
+    else:
+        contract = validate_canonical_visual_contract(raw)
     if characters_data is not None:
         claimed = str(
             characters_data.get("canonical_visual_contract_sha256") or ""
         )
-        if claimed != contract["contract_sha256"]:
+        allowed_contract_claims = {contract["contract_sha256"]}
+        if migrated_from_v1:
+            allowed_contract_claims.add(str(raw.get("contract_sha256") or ""))
+        if claimed not in allowed_contract_claims:
             raise CanonicalVisualContractError(
                 "CHARACTERS.json canonical visual contract hash mismatch"
+            )
+        roster_claim = str(characters_data.get("character_roster_sha256") or "")
+        allowed_roster_claims = {contract["character_roster_sha256"]}
+        if migrated_from_v1:
+            allowed_roster_claims.add(str(raw.get("source_characters_sha256") or ""))
+        if roster_claim not in allowed_roster_claims:
+            raise CanonicalVisualContractError(
+                "CHARACTERS.json character roster hash mismatch"
             )
         raw_characters = characters_data.get("characters")
         if not isinstance(raw_characters, list):
@@ -596,7 +928,7 @@ def load_canonical_visual_contract(
             for record in contract["characters"]
         }
         actual = {
-            str(character.get("id") or ""): str(
+            str(character.get("entity_id") or character.get("id") or ""): str(
                 character.get("visual_identity_policy") or ""
             )
             for character in raw_characters
@@ -609,8 +941,34 @@ def load_canonical_visual_contract(
     return contract
 
 
+def _persist_visual_migration_receipt(
+    path: Path,
+    receipt: dict[str, Any],
+) -> None:
+    if path.is_file():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise CanonicalVisualContractError(
+                "canonical visual migration receipt is invalid"
+            ) from error
+        if existing != receipt:
+            raise CanonicalVisualContractError(
+                "canonical visual migration receipt conflicts with source evidence"
+            )
+        return
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
 __all__ = [
     "CANONICAL_VISUAL_CONTRACT_FILENAME",
+    "CANONICAL_VISUAL_MIGRATION_RECEIPT_FILENAME",
+    "CANONICAL_VISUAL_MIGRATION_RECEIPT_SCHEMA",
     "CANONICAL_VISUAL_CONTRACT_SCHEMA",
     "CHARACTER_VISUAL_POLICIES",
     "FICTIONAL_CINEMATIC_HUMAN_POLICY",
@@ -619,6 +977,7 @@ __all__ = [
     "CanonicalVisualContractError",
     "apply_character_visual_policy",
     "build_canonical_visual_contract",
+    "expand_character_instances",
     "load_canonical_visual_contract",
     "normalize_character_visual_policy",
     "persist_canonical_visual_contract",

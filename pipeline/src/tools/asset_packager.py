@@ -367,7 +367,7 @@ def package_shot_assets(
 
 
 def _resolve_char_ids(output_dir: Path, raw_ids: List[str]) -> List[str]:
-    """Resolve character display names and aliases to ids, preserving unknown values."""
+    """Resolve source/entity labels to every canonical instance ID."""
     characters_json = Path(output_dir) / "CHARACTERS.json"
     try:
         chars_data = json.loads(characters_json.read_text(encoding="utf-8"))
@@ -376,20 +376,31 @@ def _resolve_char_ids(output_dir: Path, raw_ids: List[str]) -> List[str]:
 
     characters = chars_data.get("characters", [])
     valid_ids = {char.get("id") for char in characters if char.get("id")}
-    name_to_id = {}
+    name_to_ids: dict[str, list[str]] = {}
     for char in characters:
         char_id = char.get("id")
         if not char_id:
             continue
-        for value in (char.get("name"), *char.get("aliases", [])):
+        for value in (
+            char.get("entity_id"),
+            char.get("name"),
+            *char.get("aliases", []),
+        ):
             if value:
-                name_to_id[str(value).casefold()] = char_id
-    return [
-        raw_id
-        if raw_id in valid_ids
-        else name_to_id.get(str(raw_id).casefold(), raw_id)
-        for raw_id in raw_ids
-    ]
+                bucket = name_to_ids.setdefault(str(value).casefold(), [])
+                if char_id not in bucket:
+                    bucket.append(char_id)
+    resolved: list[str] = []
+    for raw_id in raw_ids:
+        candidates = (
+            [raw_id]
+            if raw_id in valid_ids
+            else name_to_ids.get(str(raw_id).casefold(), [raw_id])
+        )
+        for candidate in candidates:
+            if candidate not in resolved:
+                resolved.append(candidate)
+    return resolved
 
 
 def _detect_shot_characters(
@@ -857,6 +868,12 @@ def build_content_for_shot(
         character
         for character in canonical_contract.get("characters", [])
         if character.get("character_id") in selected_character_ids
+        or character.get("entity_id") in selected_character_ids
+        or any(
+            instance.get("instance_id") in selected_character_ids
+            for instance in (character.get("instances") or [])
+            if isinstance(instance, dict)
+        )
     ]
     synthetic_contract = ""
     if selected_contract_characters and all(

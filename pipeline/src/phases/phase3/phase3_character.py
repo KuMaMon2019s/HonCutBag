@@ -238,6 +238,12 @@ def run_phase3(
         for i, c in enumerate(characters_list):
             char_dicts.append({
                 "id": c.get("id", f"char_{i}"),
+                "entity_id": c.get("entity_id"),
+                "instance_id": c.get("instance_id"),
+                "instance_ordinal": c.get("instance_ordinal"),
+                "canonical_visual_contract": c.get(
+                    "canonical_visual_contract"
+                ),
                 "name": c.get("name", f"角色{i}"),
                 "description": character_reference_identity_description(c),
                 "appearance": c.get("appearance", {}),  # 传递完整 appearance dict
