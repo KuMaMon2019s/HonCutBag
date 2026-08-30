@@ -4,7 +4,7 @@
 >
 > 适用基线：`main`，重构验收提交 `1b01741` 及之后版本
 >
-> 更新日期：2026-08-28
+> 更新日期：2026-08-29
 
 本文定义 HonCut 当前生产架构、持久化与恢复契约，以及后续迭代修复必须遵守的边界。实现与本文冲突时，先确认生产执行路径；若实现是有意变更，必须在同一提交中更新本文和相应特征测试。
 
@@ -62,6 +62,7 @@ Schema、State 和纯工具是共享契约，但不得反向触发上层工作�
 | Phase 耗时估算 | `pipeline/src/runtime/phase_estimates.py` | 只消费 canonical 结构与 Provider 工作量；不得用剧本文字长度或固定角色/镜头默认值伪装精确 ETA |
 | 超时、重试、冷却与容量 | `pipeline/src/runtime/provider_policy.py`、`pipeline/src/runtime/llm_policy.py` | Provider、Graph 和 Phase 不得叠加重试；健康 LLM 长流由 idle 与 wall 两个时钟区分 |
 | 长任务账本 | `pipeline/src/runtime/generation_tasks.py` | SQLite 幂等迁移、提交去重、恢复与终态证据 |
+| QA 事实账 | `pipeline/src/runtime/qa_ledger.py`、各 Phase QA owner | VLM 只追加 Observation；纯代码 Policy 追加 Decision，禁止模型直接覆盖 State |
 | 已批准角色资产注册表 | `pipeline/src/runtime/character_registry.py` | 显式项目库、精确规格匹配、QA/审批/内容哈希校验和不可变资产包；向量索引不拥有复用权限 |
 | Artifact 血缘 | `schemas/artifact.py`、`runtime/artifact_manifest.py` | 严格 schema、内容哈希、父资产与原子 manifest |
 | Provider 传输 | `runtime/video_provider.py` 与现有 clients/adapters | submit/status/cancel、能力和错误分类；不决定全局策略 |
@@ -119,9 +120,9 @@ Graph node 必须只完成三件事：读取 State、调用一个窄 owner、返
 
 | Phase | 业务 owner 与输出责任 | 主要失败边界 |
 |---|---|---|
-| 1 | 文本解析、源事件发现、按 sequence 的导演意图、角色发现、`SEMANTIC_LEDGER.json`、时长缩放后的 `SCREENPLAY_PLAN.json` 与 canonical `STORYBOARD.json` / `CHARACTERS.json` | 输入/LLM/结构无效即停止；子阶段 checkpoint 可复用 |
-| 2 | Pxx PREVIS、每个 Sxx 独有的带标识 3×3 剧情九宫格、Gxx→Pxx 导航图与端帧契约 | 生产图片、格子分配或其验证证据缺失时 fail closed |
-| 3 | 角色卡、四视图、单图四视图参考板、道具细节板、run-local 多姿态动作板、身份锁定，以及显式项目角色库的精确导入/批准 | 生产模式要求真实四视图/动作板 QA；参考板只能由已验收四视图确定性派生；旧 `variant_*` 仅审计；角色库证据缺失、篡改或冲突时 fail closed；dry-run 只写明确的 dry-run receipt |
+| 1 | 文本解析、源事件发现、按 sequence 的导演意图、角色发现、`SEMANTIC_LEDGER.json`、时长缩放后的 `SCREENPLAY_PLAN.json`、canonical `STORYBOARD.json` 与唯一视觉事实源 `CANONICAL_VISUAL_CONTRACT.json`；`CHARACTERS.json` 只是其兼容投影 | 输入/LLM/结构无效即停止；零角色合法；必要视觉缺省只允许在此按稳定 ID 补全一次 |
+| 2 | Pxx PREVIS、每个 Sxx 独有的带标识 3×3 审核九宫格、Gxx→Pxx 分配，以及本地绘制的身份中立导航图 v2 | 生产图片、格子分配、canonical hash 或导航血缘证据缺失时 fail closed |
+| 3 | 角色卡、四视图、单图四视图参考板、道具细节板、run-local 多姿态动作板、身份锁定，以及显式项目角色库的精确导入/批准 | 生产模式要求真实四视图/动作板 QA；参考板只能由已验收四视图确定性派生；历史状态图仅审计；角色库证据缺失、篡改或冲突时 fail closed；dry-run 只写明确的 dry-run receipt |
 | 4 | 原生 shot 目录与 `SHOT_META.json`、场景一致性、continuity plan、每个 Sxx 唯一 cinematic first-frame | P02+ 不得生成或声明新的 cinematic frame；Phase 4 不运行视频生成子进程 |
 | 5 | storyboard QA、生成容量、variation/slideshow、监督与进入视频生成前的硬门 | C/D 或 blocking supervision 阻止 Phase 6；dry-run 不做像素/模型监督 |
 | 6 | 视频生成与 continuity chunk 执行 | 所有长请求经过 Runtime task ledger；相同输入恢复不得重复提交 |
@@ -240,8 +241,9 @@ Canonical 字段包括：
 immutable payload + fingerprint
   → enqueue/active dedupe
   → atomic claim
+  → atomic SubmissionAttempted + submission_uncertain
   → provider submit
-  → persist provider_job_id + endpoint
+  → ProviderAccepted + provider_job_id + endpoint
   → poll/download/validate
   → register ArtifactRef
   → succeeded
@@ -249,10 +251,10 @@ immutable payload + fingerprint
 
 任务规则：
 
-- `runtime.db` 使用 WAL 和 `PRAGMA user_version`；当前 schema version 为 2，迁移只能增量且保留旧记录。
+- `runtime.db` 使用 WAL 和 `PRAGMA user_version`；迁移只能增量且保留旧记录。`generation_task_events` 是 append-only 转换历史，新任务依次追加 `TaskQueued`、`TaskClaimed`、`SubmissionAttempted`、`ProviderAccepted` 和终态事件；旧快照只追加 `LegacySnapshotImported`，禁止伪造历史事件。
 - active dedupe key 至少包含 run、task type、resource 和 Provider；已存在 active task 时 payload 必须字节语义一致。
 - successful reuse 要求 Provider、payload、`input_fingerprint`、文件存在性、媒体有效性和已记录哈希全部匹配。
-- claim 后未确认是否提交的进程中断进入 `submission_uncertain`；只能恢复轮询或由人工/确定性证据裁决，不能创建第二个付费请求。
+- claim 后、`SubmissionAttempted` 前的中断可以继续同一任务；网络调用前必须在同一事务追加唯一 `SubmissionAttempted` 并置为 `submission_uncertain`。存在该事件但没有可验证 job ID 时只能恢复轮询或人工/确定性证据裁决，不能创建第二个付费请求。预算只统计唯一提交事件，不使用 claim 或可重置的 attempt counter。
 - 已持久化 job ID 的任务只有在 Provider 明确报告 terminal failure 时才能标 failed。
 - timeout、poll deadline、rate-limit retry、backoff、cooldown 和 capacity 只由 Runtime policy 拥有。Runtime 必须区分可恢复的瞬时 429/burst 与包含明确重置窗口的固定额度耗尽；后者须保留 Provider 原始重置时间并立即 fail closed，禁止退避重试。未知、认证、moderation 和 submission-uncertain 错误不自动重试。
 - Provider 响应先通过 Pydantic envelope 验证；错误信息只保留安全摘要，不落完整响应或密钥。
@@ -261,10 +263,11 @@ immutable payload + fingerprint
 
 本地文件系统仍是媒体内容存储；`ARTIFACT_MANIFEST.json` 是每个 run 的严格元数据索引，不引入对象存储或外部数据库作为正确性前提。
 
-`ArtifactRef` 至少记录 schema version、artifact/run/project ID、类型、内容 SHA-256、相对路径、生产节点/任务、父资产、可选语义 fingerprint 和创建时间。注册与读取规则如下：
+`ArtifactRef` v2 至少记录 schema version、artifact/run/project ID、类型、内容 SHA-256、相对路径、生产节点/任务、canonical visual contract hash、Prompt hash、父资产、受控 `authority_roles` / `non_authority_roles`、可选语义 fingerprint 和创建时间。已知 v1 `video` 与 `character_registry_receipt` 只按固定职责表迁移；其他 v1 类型仅可审计，不能提供生产媒体权威。注册与读取规则如下：
 
 - 路径必须位于 run 目录内并使用相对 POSIX 表示；
 - parent ID 必须存在、唯一且不能自引用；
+- authority 与 non-authority 角色不得重叠，媒体消费方必须验证所需职责；
 - manifest 身份必须与 `RUN_MANIFEST.json` 一致；
 - 注册时校验实际内容哈希，读取 lineage-sensitive 产物时再次验证；
 - manifest 通过同目录临时文件、`fsync` 和 `os.replace` 原子更新；
@@ -298,23 +301,27 @@ Lifecycle 与各 Phase 的 ETA 由 Runtime `phase_estimates` owner 生成。Phas
 
 Phase 3 的四张 canonical 角色图 `face_closeup/full_body/side/back` 继续分别生成并逐视角 QA，它们是身份一致性和视角真实性的事实证据，不得用一张模型直出的拼图替代质检。四图通过后，`tools.character_reference_board` 必须在本地确定性派生一张无文字、无边框的 2×2 `reference_board.png`，固定顺序为左上面部特写、右上正面全身、左下侧面全身、右下背面全身；`honcut.character-reference-board.v1` 收据绑定四张源图哈希、布局、输出哈希与角色 ID，派生过程不得产生 Provider 请求。道具几何、材质和颜色由 `prop_detail_board.png` 单独保存，只服务 Phase 3 生产/QA，不进入 Phase 6。Phase 2/4 的图片角色参考、Phase 5 L3 身份复核和 Phase 6 全模态身份输入对每个角色最多携带一张 `reference_board.png`；`identity_detail` 和旧剧情变体不得进入视频请求。
 
-新生产角色的视觉身份合同固定为 `synthetic_stylized_character_v3` / `honcut.synthetic-styling.v3`，唯一面部模式是 `synthetic_porcelain_makeup`。其审美事实源是仓库静态档案 `assets/visual_references/synthetic_porcelain_makeup_beauty_v1/visual_understanding.json`（`honcut.synthetic-makeup-aesthetic-profile.v1`）：同目录八张用户提供图片只供本地人工复核与结构化视觉理解，含真人外貌、面纱/面具、纹身、文字、编号、Logo 或水印的像素一律不得作为角色身份参考、训练素材或 Provider 媒体输入；生产 owner 只读取哈希校验后的结构化正向、负向和 QA 提示词。档案、图片或哈希缺失/变化以及未知未来 schema 必须在付费调用前 fail closed，审美档案 ID/SHA-256 写入角色妆造和缓存身份。
+Phase 1 的 `character_visual_policy` 只允许 `source_derived`、`fictional_cinematic_human_v1`、`synthetic_stylized_character_v3`，默认 `source_derived`。它按每个角色的显式来源事实解析为原创虚构写实或合成风格，不把“自然皮肤”误改成合成人，也不把明确合成人恢复成真人。`CANONICAL_VISUAL_CONTRACT.json` 为每个稳定角色实例保存人数、发型几何、体型、脸、服装轮廓、视觉策略和道具形状/拓扑/部件/端点/握柄/相对尺寸/材质/颜色/发光位置；每个事实标记 `explicit_source` 或 `deterministic_completion` 及来源索引。Phase 2～6 在任何 Provider 调用前必须验证同一个 canonical hash，禁止重新补全或冲突推断。旧真人布尔值只可在 CLI、旧 State/Run Manifest 与冻结测试门面的明确迁移边界读取；新 State、Run Manifest、Prompt 和环境变量不再写入或依赖该布尔值。
+
+选择 `synthetic_stylized_character_v3` 时，角色视觉身份合同为 `honcut.synthetic-styling.v3`，唯一面部模式是 `synthetic_porcelain_makeup`。其审美事实源是仓库静态档案 `assets/visual_references/synthetic_porcelain_makeup_beauty_v1/visual_understanding.json`（`honcut.synthetic-makeup-aesthetic-profile.v1`）：同目录八张用户提供图片只供本地人工复核与结构化视觉理解，含真人外貌、面纱/面具、纹身、文字、编号、Logo 或水印的像素一律不得作为角色身份参考、训练素材或 Provider 媒体输入；生产 owner 只读取哈希校验后的结构化正向、负向和 QA 提示词。档案、图片或哈希缺失/变化以及未知未来 schema 必须在付费调用前 fail closed，审美档案 ID/SHA-256 写入角色妆造和缓存身份。
 
 珍珠陶瓷合成皮肤必须使用温润透亮的暖象牙、蜜桃、蜂蜜米、玫瑰贝母或琥珀乳瓷底色，保留协调的面颊暖意与唇色；眼睛必须有清晰瞳孔、虹膜层次和明亮眼神光，只在虹膜内部出现与睫毛/眼线分离、完整环绕深色瞳孔的纤细非自然光环；两侧电路妆纹必须分别从太阳穴起笔并在上颧骨结束，纤细、对称且像首饰般高级彩妆，不得贴眼睑冒充眼线、进入中下脸或像切口/裂缝。面部完整无遮挡且五官协调自然；真人皮肤/肖像、面纱、遮脸面具、粗大机械板、裂纹、伤疤、灰白/青灰无血色、灰黑嘴唇、空洞眼神、纯色发光眼球、蜡像尸感、恐怖谷神态和恐怖化光线均为阻断项。同一妆造类型的配色、纹路和识别码由角色 ID 确定性派生。Phase 3 只使用静态档案中的 `phase3_reference_priority/negative/qa` 结构化字段和角色自己的三项锚点构造紧凑高优先级 Prompt；初次四视图实际传输 Prompt 必须处在官方 300 中文字符/600 英文单词建议内，纠偏不得复制 VLM 自然语言 issues，只能把失败证据字段映射成固定指令。静态参考合同为 v7，四视图 QA 为 v5：每个露脸视图分别提交材质、妆纹和虹膜环证据，角色/服装匹配也必须逐视图明确；本地 verdict 只由这些证据、视角/构图/中性姿态及跨视图字段重算，模型汇总 `passed`、`failed_views` 和 prose issues 只作诊断。未声明的领型、缝线、首饰或装饰不得成为失败原因。角色卡、妆造、审美档案、生成 Prompt、模型、参考图或合同哈希任一变化都必须形成新缓存身份，不能仅凭文件大小复用。旧 v3 妆造若没有当前审美档案 ID/哈希只可审计并确定性重写，v2 仅可审计读取，未知未来合同继续 fail closed。
 
 Phase 3 还拥有 run-local `honcut.character-performance-board.v2`：只有角色在 canonical Storyboard/Pxx 中存在结构化战斗或持/用道具动作时，才生成一张无文字、序号、箭头、边框和网格的 2×3 `performance_reference_board.png`。收据中的 A01～A06 依次绑定角色 ID、当前 Pxx、canonical `source_action_unit_id`、canonical `generation_action_unit_ids`、格位、道具 ID 和原编剧动作，禁止重新编剧情；生产 Storyboard 的数值 shot ID 必须按既有 Sxx 规则规范化。Pxx 摘要 `source_action_unit_ids` 已声明时必须与逐 `generation_action_unit.source_action_unit_id` 的有序去重结果完全一致；同一来源 AU 被拆到后续 Pxx 而该摘要合法缺省时，只要该 Pxx 的每个 generation unit 都携带格式合法、可分组的 canonical source-action ID，Phase 3 必须以逐单元血缘为事实源，不得误判为空血缘。一个 AU 内若含多个有先后关系的 generation unit，每个静态 Axx 只能绑定其中一个 generation unit 并保留共同 AU 血缘，禁止把“攻击＋格挡”等时间上分离的子动作重新合并成一张不可满足的静态姿态合同。逐单元 ID 部分缺失、无效或与非空摘要冲突必须 fail closed；所有显式 action-unit 都缺席时，才允许用已验证、同序且血缘一致的 canonical timeline assignment 作为 source-action 身份。动作事实优先读取当前 generation unit 的 canonical `source_fact_echoes`，仅当该 unit 没有 source echo 时才读取生成动作正文，禁止把不同 generation unit 或 source echo/生成正文重复拼接后掩埋姿态信号。六格不足时只能对既有动作取可辨识关键姿态、发力峰值或动作落位，禁止把普通起始站姿冒充当前动作或发明后续结果。每格必须保存零调用、词法确定性的 `honcut.character-performance-pose-constraints.v1`，未声明的脚位、方向和道具关系写成 `unspecified`，不得猜测。逐格生成前，Phase 3 按该约束本地生成无文字的 `honcut.character-performance-pose-guide.v2` 骨架图：它只提供角色自身左右、关节拓扑、脚步、重心和道具线方向，不能作为人物身份、剧情像素或 Phase 6 媒体。
 
-Phase 3 使用 `honcut.character-performance-board-qa.v6`、`honcut.character-performance-cell-qa.v4` 和持久化策略 `honcut.confidence-tolerant-visual-qa.v1`。QA 分为确定性硬约束和概率语义判断：错人物/克隆、服装或妆造漂移、尸感/恐怖谷、错道具归属、额外角色以及文字/序号/箭头/边框/网格污染仍是硬阻断；动作大类及主要身体/道具关系同时写 `action_semantics_match`、0～1 的 `action_semantics_confidence` 和仅描述可见像素事实的 `action_semantics_evidence`。正向动作语义置信度达到 `0.65` 即判为通过；更低置信的正向结果和置信度低于 `0.85` 的否定都写成 `diagnostic_uncertain` 并允许偏差，不触发付费重绘。只有动作否定的置信度不低于 `0.85` 且证据非空时才进入 `blocking_fields` 并允许一次付费纠偏。策略 ID、`0.65` 接受阈值和 `0.85` 否定阻断阈值必须写入 QA 收据，缺失或漂移不得缓存命中。精确角色自身左右脚、镜像敏感对角终点和小幅朝向单独记录为 `fine_direction_match` 诊断；单格 `pose_distinct` 也只作诊断，因为六姿态差异仅归整板 `six_distinct_poses` 判断。整板的六姿态判断同样必须写 `pose_diversity_confidence/evidence`，正向 `0.65` 即通过，仅高置信且有具体重复轮廓/重心/道具关系证据的否定才阻断，小幅姿态相似或低清歧义允许作为诊断偏差。整板全局 QA 只拥有同角色、六姿态差异、妆造/服装、道具、额外角色和版式 verdict；逐格动作语义 verdict 由隔离 QA 固化，后续整板复审不得重新翻转未修改格。整板一次生成失败时，先按相同 A01～A06 合同各生成一个可恢复的 `honcut.character-performance-cell.v2` 中间组件并在本地无边框羽化合成，随后执行逐格和整板阻断 QA。若进程在组件全部生成后、QA 写回前中断，`pending + per_cell_fallback` 恢复必须逐格验证并复用现有组件，Provider 图片请求数为零，禁止重新提交整板或六格。若第二级仅有可定位到具体 Axx 的 `blocking_fields`，Phase 3 最多允许一轮只重画失败格的 QA 反馈纠偏；低置信动作否定和方向诊断不得触发付费纠偏。v1～v3 是已知旧版逐格 QA，只能原子归档为 audit-only 后对当前组件执行零图片调用的 v4 复审，绝不能触发组件重画；未知未来 QA schema 仍必须 fail closed。原组件和失败整板保留审计，成功格不得重画；纠偏后第三次 QA 仍失败即为终止状态，后续恢复只可读取该失败，不得再次付费重试。组件和骨架图不进入 Phase 6，Phase 3 只在本地零请求裁切并按 1～6 格确定性重组当前 Pxx 导航图，写入 `honcut.character-performance-guide.v2`；布局使用最多三列的近方形网格，收据保存行列、格序、空槽、像素尺寸和宽高比，宽高比必须处在 Seedance `0.4～2.5` 输入范围内。整板、组件、骨架、约束、局部图、逐格/整板收据和源哈希任一缺失、损坏或未知未来版都必须 fail closed。淋湿、破损和泥污只保存在 Pxx start/end state 与连续性 Prompt 中，不再生产或消费 `variant_*.png`。
+所有会驱动 Phase 3 身份/动作板、Phase 5 L3/L4 或 Phase 8 视觉裁决的 VLM 结果必须进入 `runtime.db` 的 append-only `qa_observations`，模型只写 Observation，不能直接覆盖 State。Observation ID 由证据、canonical hash、模型、Prompt hash 和 strict DTO schema 确定；相同指纹恢复十次仍只允许一次 VLM 调用。对应 Phase owner 使用纯代码 `honcut.visual-qa-policy.v1` 追加 `qa_decisions`，Decision ID 由 Observation、owner 和 Policy hash 确定；Policy 改变时复用 Observation，并以 `supersedes` 追加新 Decision。决策仅为 `pass`、`acceptable_deviation`、`block`、`manual_review`；只有前两者可自动推进，`manual_review` 必须暂停。语义分数 `>=0.65` 可通过；否定发现只有置信度 `>=0.85`、具体像素证据和 blocking category 同时成立才阻断，其他偏差只诊断。Schema、人数、hash、lineage、媒体职责和预算等确定性错误不受概率阈值影响，始终严格阻断。
+
+Phase 3 使用 `honcut.character-performance-board-qa.v6`、`honcut.character-performance-cell-qa.v4` 和统一 QA Policy。动作大类及主要身体/道具关系同时写 `action_semantics_match`、0～1 的 `action_semantics_confidence` 和仅描述可见像素事实的 `action_semantics_evidence`。低置信否定允许偏差，不触发付费重绘；只有高置信且证据完整的阻断动作才进入 `blocking_fields` 并允许一次付费纠偏。精确角色自身左右脚、镜像敏感对角终点和小幅朝向单独记录为 `fine_direction_match` 诊断；单格 `pose_distinct` 也只作诊断，因为六姿态差异仅归整板 `six_distinct_poses` 判断。整板全局 QA 只拥有同角色、六姿态差异、妆造/服装、道具、额外角色和版式 verdict；逐格动作语义 verdict 由隔离 QA 固化，后续整板复审不得重新翻转未修改格。整板一次生成失败时，先按相同 A01～A06 合同各生成一个可恢复的 `honcut.character-performance-cell.v2` 中间组件并在本地无边框羽化合成，随后执行逐格和整板阻断 QA。若进程在组件全部生成后、QA 写回前中断，`pending + per_cell_fallback` 恢复必须逐格验证并复用现有组件，Provider 图片请求数为零，禁止重新提交整板或六格。若第二级仅有可定位到具体 Axx 的 `blocking_fields`，Phase 3 最多允许一轮只重画失败格的 QA 反馈纠偏。v1～v3 是已知旧版逐格 QA，只能原子归档为 audit-only 后对当前组件执行零图片调用的 v4 复审，绝不能触发组件重画；未知未来 QA schema 仍必须 fail closed。原组件和失败整板保留审计，成功格不得重画；纠偏后第三次 QA 仍失败即为终止状态，后续恢复只可读取该失败，不得再次付费重试。组件和骨架图不进入 Phase 6，Phase 3 只在本地零请求裁切并按 1～6 格确定性重组当前 Pxx 导航图，写入 `honcut.character-performance-guide.v2`；布局使用最多三列的近方形网格，收据保存行列、格序、空槽、像素尺寸和宽高比，宽高比必须处在 Seedance `0.4～2.5` 输入范围内。整板、组件、骨架、约束、局部图、逐格/整板收据和源哈希任一缺失、损坏或未知未来版都必须 fail closed。淋湿、破损和泥污只保存在 Pxx start/end state 与连续性 Prompt 中，不再生产或消费剧情状态图。
 
 动作板 Prompt 固定使用 `honcut.character-performance-board-prompt.v3`。它按 source-action 去重事实，并用紧凑姿态约束与角色自己的妆造 ID/材质/锚点取代完整视频隐私合同和完整 styling JSON 的重复注入；Axx 只保存在结构化收据，不再在整板 Prompt 的六个位置重复说明“内部 ID 不得打印”。普通整板、逐格及纠偏提示词必须在火山方舟官方 300 中文字符/600 英文单词建议内，Phase 3 在任何动作板图片 Provider 调用前写入 Prompt 指标并硬性 fail closed，Transport 继续只负责通用观测而不截断异常长的 canonical 源事实。候选选择按火山方舟 Prompt 调优的调试、批量与评分思路做离线合同覆盖比较，维度固定为合成人辨识度、美观度、身份一致性、姿态清晰度、道具准确度、无克隆和无版式污染；选定模板、候选覆盖分、版本和 SHA-256 写入动作板收据。该比较的 `provider_request_count=0` 且 `production_auto_optimization=false`，生产 Runtime 不调用 Prompt 调优服务；它不能替代 Phase 3 像素 QA、Provider 隐私审核或 live acceptance。
 
-Seedance 2.0 普通主镜头使用固定的全模态参考合同：所有输入图片都写成 `role=reference_image`。P01 的 `content[]` 第一张图片必须是 Phase 4 物化到 `storyboard_images/Sxx.png` 的唯一电影质感首帧，随后依次为该 Pxx 实际出镜角色各一张四视图参考板、当前剧情导航图、当前 Pxx 动作姿态图；必要资产超过九张图片时提交前 fail closed，不得静默裁减。Prompt 必须在最终 `content[]` 顺序确定后使用一基“图片 N”引用，并显式写出“首帧为图片1”。导演总览与导演 Sxx 单格只用于生成该干净首帧，不直接进入 Seedance；Pxx PREVIS 也不进入 Seedance。Phase 2 的剧情九宫格则是独立的 `storyboard_narrative_guide`：它保留 `Sxx_G01～G09`、红色主体/物体动作箭头、蓝色运镜箭头和空间/视线/动作指示标识，只负责指导剧情演绎，Prompt 必须明确这些标记不得成为输出像素。最终索引绑定必须附加 `honcut.phase6-media-role-isolation.v1`：剧情导航图只拥有 Gxx 顺序、关节/重心轨迹、箭头和空间关系，其人物脸、发长/发型轮廓、妆造、服装、身体比例以及道具外形、长度、端部、颜色和材质均为非权威占位像素；角色身份只服从四视图板，开场/连续状态只服从成片首帧或真实前序媒体，当前姿态、握持和道具几何只服从当前动作图及结构化文字。冲突时不得折中混合，发长/轮廓和道具长度/端部结构必须逐帧不变。动作姿态图中的多个人形必须解释为同一角色的参考姿态，只允许执行当前 Pxx 声明的有序 Axx，禁止生成克隆、分栏、网格、文字、序号、箭头、边框或提前演绎后续动作。不得把普通主镜头改回只传 `first_frame`、把角色参考降成纯文本，或混用 `first_frame` 与 `reference_image`。只有需要严格端点像素约束的 FLF2V 与跨镜 bridge 才使用 `first_frame/last_frame`，且该请求不得混入角色参考、剧情导航或动作姿态媒体。该合同依据火山方舟《Doubao Seedance 2.0 系列教程》的全模态参考说明，改变图片职责、提交顺序或 Prompt 编号规则必须同步更新本规范与零请求特征测试；Phase 6 Prompt 模板版本因此升级为 2，旧任务指纹不得缓存命中。
+Seedance 2.0 普通主镜头使用固定的全模态参考合同：canonical visual contract 先作为结构化 Prompt 权威注入；实际媒体顺序为当前 Pxx 可见角色各一张四视图身份板 → P01 的 Phase 4 成片首帧或 P02+ 的真实前序视频 → 当前动作局部图 → 身份中立剧情导航图 → 必要尾帧锚点。所有普通输入图片写为 `role=reference_image`，连续前序媒体写为 `role=reference_video`；必要资产超过九张图片时提交前 fail closed，不得静默裁减。Prompt 必须在最终 `content[]` 顺序确定后再生成一基“图片 N / 视频 N”索引，不假设首帧固定为图片1。导演总览与导演 Sxx 单格只用于生成干净首帧，不直接进入 Seedance；Pxx PREVIS 也不进入 Seedance。Phase 2 的审核九宫格保留 `Sxx_G01～G09`、红色主体/物体动作箭头、蓝色运镜箭头和空间/视线/动作指示标识，但 Phase 6 只接收从结构化合同本地绘制的身份中立 `storyboard_narrative_guide` v2。最终索引绑定必须附加媒体职责：导航图只拥有 Gxx 顺序、几何轨迹、箭头和空间关系，不拥有人物脸、发型、妆造、服装、体型或道具外观；角色身份只服从四视图板，开场/连续状态只服从成片首帧或真实前序媒体，当前姿态、握持和道具几何只服从当前动作图及 canonical 文字。动作姿态图中的多个人形必须解释为同一角色的参考姿态，只允许执行当前 Pxx 声明的有序 Axx，禁止生成克隆、分栏、网格、文字、序号、箭头、边框或提前演绎后续动作。`prop_detail_board`、`identity_detail`、历史剧情状态图和 guide v1 均不得进入视频媒体。authority manifest、最终职责/索引、全部媒体 hash、Prompt hash、Gxx/Axx 和 canonical hash 必须进入任务 fingerprint。只有需要严格端点像素约束的 FLF2V 与跨镜 bridge 才使用 `first_frame/last_frame`，且该请求不得混入角色参考、剧情导航或动作姿态媒体。
 
 同一 Sxx 的二级 Pxx 必须对齐火山方舟的“全模态参考 / 延长视频 / 生成多个连续视频”合同：P01 使用上述首帧、角色板、当前 Pxx 导航图和当前动作姿态图；P02 以后不再携带 cinematic frame，而把上一 Pxx 的已完成视频尾段作为 `role=reference_video` 的“视频1”，随后携带当前角色板、只含当前 Pxx 所分配 Gxx 的剧情导航图、当前动作姿态图及必要有序尾状态帧。Gxx→Pxx 与 Axx→Pxx 都由上游持久化，Phase 6 禁止重算、扩张到后续格/动作或传入整张动作板；Prompt 以“向后延长视频1”起句并禁止重新入画、重播或状态复位。连续生成请求必须设置 `return_last_frame=true`，最终媒体职责/编号清单、导航图哈希、有序 Gxx、动作图/源板哈希、有序 Axx、source action-unit、道具 ID 与 Prompt 哈希必须进入任务 payload 和 generation fingerprint。Phase 4 首帧仍只由导演单格和身份板生成；Phase 5 负责阻断合成人妆造漂移和动作板版式污染；Phase 8 只用当前 Pxx 局部动作图检查姿态/道具，不把板中其他姿态解释为剧情。跨 Sxx bridge 只使用上一主镜真实尾帧和下一主镜真实首帧，分别提交为唯一的 `role=first_frame` / `role=last_frame`，`ratio=adaptive`，不得携带剧情九宫格、角色参考、动作姿态图或其他 `reference_image/reference_video`。该合同分别依据[Seedance 2.0 系列教程](https://console.volcengine.com/ark/region:cn-beijing/docs/82379/2291680?lang=zh)和[视频生成教程](https://console.volcengine.com/ark/region:cn-beijing/docs/82379/2298881?lang=zh)。
 
 Seedance 2.0 Provider 提交前必须执行官方“使用限制”预检：输出时长 4–15 秒；全模态参考图片最多 9 张，参考视频最多 3 段且总时长不超过 15 秒；图片边长 `[300, 6000]`、宽高比 `[0.4, 2.5]`、单张小于 30 MB；参考视频为 MP4/MOV、H.264/H.265、`[24, 60]` FPS、单段 `[2, 15]` 秒且不超过 200 MB；请求体不超过 64 MB。Prompt 引用素材必须使用同类媒体在 `content[]` 中的一基编号“图片 N / 视频 N / 音频 N”，不得使用 Asset ID 或发生上传后重排。任务记录只保存 7 天、结果 URL 只保存 24 小时且最多下载 100 次，因此 Runtime 必须在成功后立即原子下载并登记 Artifact；恢复只信本地产物哈希与任务账，不依赖过期 URL。
 
-Phase 2 的 Pxx、模型绘制 Sxx 九宫格与跨一级镜头 bridge 都必须在相同语义输入的普通重入和 Phase 3 character-lock 刷新中复用。每个 Sxx 九宫格固定 3×3，九个格子依阅读顺序绑定唯一 `Sxx_G01～G09`；Phase 2 按已声明 Pxx 顺序确定性、完整且无重叠地分配九格，无二级拆分时唯一 Pxx 获得全九格，有拆分时本地零请求裁切/重组为每个 Pxx 的 `honcut.storyboard-narrative-guide.v1`。导航收据绑定源板/派生图哈希、有序 Gxx、Pxx 和零 Provider 请求；已知 v2 `SHOT_STORYBOARDS.json` 可在 Phase 2 重入时确定性迁移，未知未来 schema 在覆盖旧证据前 fail closed。Sxx cache 至少绑定当前 Prompt SHA-256、模型、尺寸、宽高比、图片请求合同版本、结构化 Phase 5 纠偏 attempt/issue、可解码文件、内容 SHA-256 与完整 grid receipt；任一项变化或损坏时只重生成该 Sxx，不得连带重提已验证的 Pxx。
+Phase 2 的 Pxx、模型绘制 Sxx 审核九宫格与跨一级镜头 bridge 都必须在相同语义输入的普通重入和 Phase 3 character-lock 刷新中复用。每个 Sxx 九宫格固定 3×3，九个格子依阅读顺序绑定唯一 `Sxx_G01～G09`；Phase 2 按已声明 Pxx 顺序确定性、完整且无重叠地分配九格。随后由固定本地 renderer 仅依据 `grid_contract` 绘制每个 Pxx 的 `honcut.storyboard-narrative-guide.v2`：固定灰色人物占位轮廓、Gxx、红色动作箭头、蓝色运镜箭头及空间/视线/交互符号，不复制审核板源像素，不绘制脸、发型、服装纹理、道具外观或剧情文字。shot-storyboard manifest 必须记录 renderer、语义 payload hash、Gxx→Pxx 分配、源审核板 hash、派生图 hash 与 `source_pixel_usage=none`。guide v1 只有在完整九格合同、源 hash、Pxx 分配和收据全部可验证时才允许零调用重绘为 v2，否则要求从 Phase 2 重建；未知未来 schema fail closed。Sxx cache 至少绑定当前 Prompt SHA-256、模型、尺寸、宽高比、图片请求合同版本、结构化 Phase 5 纠偏 attempt/issue、可解码文件、内容 SHA-256 与完整 grid receipt；任一项变化或损坏时只重生成该 Sxx，不得连带重提已验证的 Pxx。
 
 多模态理解的唯一传输 owner 是 `clients/ark_multimodal_client.py`。它固定让 `ARK_AGENT_API_KEY` 与 Agent Plan `https://ark.cn-beijing.volces.com/api/plan/v3/responses` 成对使用 Responses content schema：图片、视频、PDF、音频分别写为 `input_image.image_url`、`input_video.video_url`、`input_file.file_url`、`input_audio.audio_url`，文本写为 `input_text`；不得把 Agent Plan 凭证发往标准按量 `/api/v3`，也不得把 Chat `image_url` schema 套到理解请求。理解不得读取 Honcho 使用的 `ARK_API_KEY`。本地理解素材也必须先通过 TOS owner 做格式、容量、尺寸/时长预检并上传到配置 bucket；图片 URL 小于 10 MB，视频/PDF URL 小于 50 MB，音频不超过 25 MB 且不超过 120 分钟。默认理解模型为 `doubao-seed-2-0-lite-260428`，图片使用 `detail=high`，视频抽帧默认 `fps=1` 且配置必须在官方 `[0.2, 5]` 范围。所有会驱动角色资产验收、story order、storyboard gate、逐镜 reshoot 或成片 verdict 的请求必须用 Responses 原生 `text.format=json_schema` 和对应 strict DTO；普通 `json_object` 不能作为业务证据。Responses 输出只读取 `message.output_text` 并再次经 Pydantic 验证；额外字段、非法枚举、尾随 prose/第二对象、reasoning、空输出或未知 envelope 均不得解释为成功。Phase 5 的 L3/L4 若且仅若完整响应被 `JSONDecodeError` 或 Pydantic `ValidationError` 拒绝，可由 Runtime `structured_understanding` owner 对完全相同的原生 schema 请求有界重放一次，并持久化不含原始响应的逐次 receipt；认证、网络、超时、未知异常和其他 Provider 错误不得借此自动重试。第二次仍不合格时必须 fail closed，禁止扫描、补括号或修补残缺 JSON。测试替身可通过私有适配器返回文本，但必须经过同一 DTO，不能拥有更宽松的解析规则。
 
@@ -343,6 +350,8 @@ Phase 4 dry-run result 必须显式标记 `evidence_scope=dry_run_structural_onl
 - 已完成验收的恢复运行复用并校验最终媒体，不重新编码后再宣称哈希稳定。
 
 默认测试永远不得发起付费请求。Phase 1～Phase 9 的每个独立修复统一采用持久化双门验收，且两门都通过才可宣告验收成功：`regression` 门包含目标回归、完整测试和与改动相应的零请求离线验收；`live_paid_provider` 门只调用与本次修复生产路径直接相关的真实 Provider 接口一次，并要求传输、严格 DTO、Artifact/receipt 和该修复声明的业务断言全部通过。真实 Provider smoke 先运行无 `--submit` 预检，只有用户当次明确批准费用后才能提交。专用 live acceptance 必须从 canonical 待恢复收据和 Artifact hash 解析范围，不接受普通生产 CLI 的假 Provider 开关；每个 acceptance receipt 在调用前原子写入 `submission_uncertain`，并在 Runtime owner 和原始传输边界同时硬限制为最多一次真实请求。失败、进程中断、schema 拒绝或结果不确定均禁止自动重试，须保留收据并由用户另行授权或人工裁决。缺少当次授权时整体状态只能是 `pending_live_acceptance`，真实门失败时只能是 `live_acceptance_failed`，均不得写成验收成功。真实调用链是否完成 strict DTO 验收与模型给出的业务 pass/block verdict 必须分栏记录，禁止把可达性成功伪装成 QA 通过。
+
+跨 Phase 的 36 秒全链路验收使用全新目录、全新 project/run identity，并把剧情与期望分别放在外部 `input/story.txt` 和 `acceptance_expectations.json`；生产源码不得包含验收剧情字符串。Stage 0 必须通过正式配置 owner 验证 Ark、Seedream、Seedance、TOS、模型能力和媒体上限，要求工作树干净且 regression receipt 绑定当前提交，计算有限的分阶段请求硬上限并写零请求 receipt；配置缺失、源码/回归证据漂移或上限无法有限化时停止且费用为零。Phase 1 后按 canonical 角色/镜头冻结图片与 VLM 上限，Phase 5 后按真实 Pxx/bridge 冻结视频任务列表，不固定为三段十二秒。真实闸门依次为首个 Phase 3 身份图及其一次语义 QA、首个 Phase 5 新 Observation、Phase 6 P01；图片/VLM 闸门在传输前将安全 payload、Prompt/evidence fingerprint 与唯一 `SubmissionAttempted` 原子写成 `submission_uncertain`，视频闸门通过 `GenerationTaskStore` 写同等事件。Phase 3 的单图闸门必须把该视图路径和 hash 写入 pending identity receipt，后续完整 Phase 3 只复用该输入而不能重画；Phase 5 必须在 Observation 与 Decision 已落账后暂停，恢复时复用 Observation；Phase 6 的单 Pxx 闸门在有并发配置时仍须退化为串行执行，避免第二个任务越过一请求限制。任一失败或不确定状态即停止，禁用自动补拍和所有自动 Provider 重试，不得由再次运行 acceptance CLI 覆盖或重提；只有已完成闸门可由同一 source fingerprint 恢复。其余任务只能在对应闸门通过后按冻结清单继续。最终必须严格为目标时长且覆盖必保 Action Unit，并制作独立 immutable source snapshot；Phase 1/3/5/6/8 的副本分别先验证该恢复边界，再以 Provider-deny Phase owner 恢复已完成 checkpoint，要求提交事件不增加且最终视频 SHA-256 不变。`regression`、各 live gate、`full_chain_36s`、恢复矩阵与 Phase 1～9 聚合收据全部通过后才可标记验收成功。
 
 当本次修复所属的完整生产 owner 按 canonical 语义必然包含多个独立付费操作时，专用 live acceptance 不得在“一次请求”护栏下调用整个 owner 后把预期的后续操作记成验收失败，也不得为迎合验收而改变生产 cache、fingerprint、Artifact 或 Sxx/Pxx 所有权。此类验收必须只投影与修复直接相关的一个真实请求，复用同一 Phase/domain Prompt、引用职责与请求参数函数，并把结果写入不参与生产恢复的隔离 acceptance Artifact；零请求特征测试负责证明该投影与生产请求一致，调用前后 canonical 生产资产哈希必须完全不变。验收专用窄路径不得暴露为普通 CLI 开关或被生产 Graph/Lifecycle 引用。
 

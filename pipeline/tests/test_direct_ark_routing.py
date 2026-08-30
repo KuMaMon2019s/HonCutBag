@@ -727,7 +727,7 @@ def test_orchestrator_forwards_reshoot_and_transition_configuration(
         "media_profile": "720p",
         "transition_duration": 0.75,
         "enable_reshoot": enable_reshoot,
-        "no_real_person": True,
+        "character_visual_policy": "synthetic_stylized_character_v3",
     }
 
     phase_orchestrator.run_phase("phase8", config)
@@ -735,7 +735,8 @@ def test_orchestrator_forwards_reshoot_and_transition_configuration(
     command = captured["command"]
     assert command[command.index("--transition-duration") + 1] == "0.75"
     assert expected_flag in command
-    assert "--no-real-person" in command
+    policy_index = command.index("--character-visual-policy")
+    assert command[policy_index + 1] == "synthetic_stylized_character_v3"
     opposite = "--disable-reshoot" if enable_reshoot else "--enable-reshoot"
     assert opposite not in command
 
