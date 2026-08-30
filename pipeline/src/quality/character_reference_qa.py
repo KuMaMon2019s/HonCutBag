@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from clients.ark_multimodal_client import review_as
 from schemas.understanding import (
@@ -150,6 +150,8 @@ Return one JSON object only:
       "lively_eyes_with_catchlights": true,
       "living_color_in_cheeks_and_lips": true,
       "no_uncanny_or_corpse_like_styling": true,
+      "semantic_confidence": 0.95,
+      "semantic_evidence": ["concrete visible fact supporting the booleans"],
       "issues": []
     }}
   }},
@@ -159,12 +161,17 @@ Return one JSON object only:
     "outfit_consistent": true,
     "body_proportions_consistent": true,
     "synthetic_makeup_consistent": true,
+    "semantic_confidence": 0.95,
+    "semantic_evidence": ["concrete cross-view comparison"],
     "issues": []
   }},
   "failed_views": [],
   "summary": "short factual summary"
 }}
 
+Confidence is confidence in the visible evidence, not attractiveness. A semantic match at 0.65
+or above is sufficient. A negative finding can block only at 0.85 or above and must cite a
+concrete visible fact in semantic_evidence. Lower-confidence negatives are diagnostic deviations.
 Set passed=false for any uncertain or violated requirement. hands_empty means that no held,
 hand-carried, raised, used or operated item is visible; it does not require hands to appear in
 the face close-up. For back, face_visible and both_eyes_visible must both be false. For side,
@@ -255,8 +262,11 @@ def parse_character_reference_qa(
             "character reference QA requires views and cross_view objects"
         )
 
+    from quality.visual_qa_policy import decide_visual_qa
+
     normalized_views: dict[str, dict[str, Any]] = {}
     failed: set[str] = set()
+    decisions: list[dict[str, Any]] = []
     seedance_pack = set(SEEDANCE_REFERENCE_VIEWS).issubset(view_names)
     boolean_fields = (
         "view_match",
@@ -308,10 +318,50 @@ def parse_character_reference_qa(
                 evidence.get(field) is True for field in synthetic_fields
                 if field != "synthetic_profile_match"
             )
-        if not passed:
+        confidence = float(evidence.get("semantic_confidence", 1.0))
+        semantic_evidence = [
+            str(item).strip()
+            for item in evidence.get("semantic_evidence") or issues
+            if str(item).strip()
+        ]
+        violated = [
+            field
+            for field in (*boolean_fields, *authored_fields)
+            if evidence.get(field) is not True
+        ]
+        if name == "back" and (
+            evidence.get("face_visible") is not False
+            or evidence.get("both_eyes_visible") is not False
+        ):
+            violated.append("rear_face_visibility")
+        if name == "side" and evidence.get("both_eyes_visible") is not False:
+            violated.append("profile_eye_visibility")
+        if seedance_pack and name in {"full_body", "side", "back"} and evidence.get("hands_empty") is not True:
+            violated.append("hands_empty")
+        if require_synthetic and name != "back":
+            violated.extend(
+                field
+                for field in synthetic_fields
+                if field != "synthetic_profile_match" and evidence.get(field) is not True
+            )
+        policy = decide_visual_qa(
+            semantic_score=confidence,
+            findings=[
+                {
+                    "blocking_category": "character_reference_semantics",
+                    "confidence": confidence,
+                    "evidence": semantic_evidence,
+                    "field": field,
+                }
+                for field in dict.fromkeys(violated)
+            ],
+        )
+        accepted = policy.verdict in {"pass", "acceptable_deviation"}
+        if not accepted:
             failed.add(name)
+        decisions.append({"scope": name, **policy.as_dict()})
         normalized_views[name] = {
-            "passed": passed,
+            "passed": accepted,
             **{field: evidence.get(field) is True for field in boolean_fields},
             **{field: evidence.get(field) is True for field in authored_fields},
             "face_visible": evidence.get("face_visible") is True,
@@ -322,6 +372,9 @@ def parse_character_reference_qa(
                 for field in synthetic_fields
             },
             "issues": [str(item) for item in issues if str(item).strip()],
+            "semantic_confidence": confidence,
+            "semantic_evidence": semantic_evidence,
+            "qa_verdict": policy.verdict,
         }
 
     cross_fields = (
@@ -329,17 +382,47 @@ def parse_character_reference_qa(
         "outfit_consistent",
         "body_proportions_consistent",
     )
-    cross_passed = all(
+    cross_semantics_match = all(
         cross.get(field) is True for field in cross_fields
     )
     if require_synthetic:
-        cross_passed = (
-            cross_passed and cross.get("synthetic_makeup_consistent") is True
+        cross_semantics_match = (
+            cross_semantics_match
+            and cross.get("synthetic_makeup_consistent") is True
         )
+    cross_confidence = float(cross.get("semantic_confidence", 1.0))
+    cross_evidence = [
+        str(item).strip()
+        for item in cross.get("semantic_evidence") or cross.get("issues") or []
+        if str(item).strip()
+    ]
+    cross_policy = decide_visual_qa(
+        semantic_score=cross_confidence,
+        findings=(
+            []
+            if cross_semantics_match
+            else [{
+                "blocking_category": "cross_view_identity",
+                "confidence": cross_confidence,
+                "evidence": cross_evidence,
+            }]
+        ),
+    )
+    cross_passed = cross_policy.verdict in {"pass", "acceptable_deviation"}
+    decisions.append({"scope": "cross_view", **cross_policy.as_dict()})
     if not cross_passed and not failed:
         failed.update(view_names)
 
     passed = not failed and cross_passed
+    overall_verdict = (
+        "block"
+        if any(item["verdict"] == "block" for item in decisions)
+        else "manual_review"
+        if any(item["verdict"] == "manual_review" for item in decisions)
+        else "acceptable_deviation"
+        if any(item["verdict"] == "acceptable_deviation" for item in decisions)
+        else "pass"
+    )
     return {
         "passed": passed,
         "views": normalized_views,
@@ -358,9 +441,14 @@ def parse_character_reference_qa(
                 )
                 if str(item).strip()
             ],
+            "semantic_confidence": cross_confidence,
+            "semantic_evidence": cross_evidence,
+            "qa_verdict": cross_policy.verdict,
         },
         "failed_views": sorted(failed),
         "summary": str(payload.get("summary") or "").strip(),
+        "qa_verdict": overall_verdict,
+        "qa_policy_decisions": decisions,
     }
 
 
@@ -369,6 +457,8 @@ def review_character_reference_pack(
     view_paths: dict[str, Path],
     character_description: str,
     synthetic_styling: dict[str, Any] | None = None,
+    *,
+    before_provider_request: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     view_names = tuple(view_paths)
     prompt = build_character_reference_qa_prompt(
@@ -376,17 +466,92 @@ def review_character_reference_pack(
         view_names,
         synthetic_styling,
     )
-    result = review_as(
-        reviewer,
-        [view_paths[name] for name in view_names],
-        prompt,
-        CharacterReferenceUnderstanding,
+    ordered_paths = [view_paths[name] for name in view_names]
+    output_dir = ordered_paths[0].parent.parent.parent
+    from quality.visual_qa_policy import POLICY_ID, policy_sha256
+    from runtime.qa_ledger import QALedger, observation_fingerprint
+    from utils.canonical_visual_contracts import load_canonical_visual_contract
+
+    contract = load_canonical_visual_contract(output_dir)
+    prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    evaluator_model = str(getattr(reviewer, "model", "unknown-vlm"))
+    evidence = [
+        {"path": path.relative_to(output_dir).as_posix(), "sha256": file_sha256(path)}
+        for path in ordered_paths
+    ]
+    fingerprint = observation_fingerprint(
+        evidence=evidence,
+        canonical_contract_sha256=contract["contract_sha256"],
+        evaluator_model=evaluator_model,
+        prompt_sha256=prompt_sha256,
+        observation_schema="CharacterReferenceUnderstanding.v2",
     )
-    return parse_character_reference_qa(
-        result.model_dump_json(),
+    ledger = QALedger(output_dir / "runtime.db")
+    observation = ledger.find_observation(fingerprint)
+    observation_reused = observation is not None
+    if observation is None:
+        if before_provider_request is not None:
+            before_provider_request({
+                "provider_family": "multimodal_observation",
+                "phase": "phase3",
+                "resource_id": ordered_paths[0].parent.name,
+                "model": evaluator_model,
+                "observation_schema": "CharacterReferenceUnderstanding.v2",
+                "evidence_fingerprint": fingerprint,
+                "prompt_sha256": prompt_sha256,
+                "inputs": evidence,
+            })
+        result = review_as(
+            reviewer,
+            ordered_paths,
+            prompt,
+            CharacterReferenceUnderstanding,
+        )
+        raw_observation = result.model_dump(mode="json")
+        manifest_path = output_dir / "RUN_MANIFEST.json"
+        try:
+            run_id = str(json.loads(manifest_path.read_text(encoding="utf-8"))["run_fingerprint"])
+        except (OSError, json.JSONDecodeError, KeyError, TypeError):
+            run_id = output_dir.name
+        observation, _ = ledger.record_observation(
+            run_id=run_id,
+            phase="phase3",
+            resource_id=ordered_paths[0].parent.name,
+            evidence_fingerprint=fingerprint,
+            canonical_contract_sha256=contract["contract_sha256"],
+            evaluator_model=evaluator_model,
+            prompt_sha256=prompt_sha256,
+            observation_schema="CharacterReferenceUnderstanding.v2",
+            observation=raw_observation,
+        )
+    typed = CharacterReferenceUnderstanding.model_validate(observation.observation)
+    parsed = parse_character_reference_qa(
+        typed.model_dump_json(),
         view_names,
         require_synthetic=bool(synthetic_styling),
     )
+    decision, decision_reused = ledger.record_decision(
+        observation_id=observation.observation_id,
+        phase_owner="phase3.character_reference_qa",
+        policy_id=POLICY_ID,
+        policy_sha256=policy_sha256(),
+        verdict=parsed["qa_verdict"],
+        semantic_score=min(
+            [item["semantic_confidence"] for item in parsed["views"].values()]
+            + [parsed["cross_view"]["semantic_confidence"]]
+        ),
+        decision={
+            "verdict": parsed["qa_verdict"],
+            "scopes": parsed["qa_policy_decisions"],
+        },
+    )
+    parsed.update({
+        "qa_observation_id": observation.observation_id,
+        "qa_observation_reused": observation_reused,
+        "qa_decision_id": decision.decision_id,
+        "qa_decision_reused": decision_reused,
+    })
+    return parsed
 
 
 def build_character_reference_qa_receipt(

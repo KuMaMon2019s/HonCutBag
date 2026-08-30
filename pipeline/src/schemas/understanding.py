@@ -456,6 +456,8 @@ class CharacterReferenceViewUnderstanding(StrictUnderstandingModel):
     lively_eyes_with_catchlights: bool | None = None
     living_color_in_cheeks_and_lips: bool | None = None
     no_uncanny_or_corpse_like_styling: bool | None = None
+    semantic_confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    semantic_evidence: list[str] = Field(default_factory=list)
     issues: list[str]
 
 
@@ -465,6 +467,8 @@ class CharacterCrossViewUnderstanding(StrictUnderstandingModel):
     outfit_consistent: bool
     body_proportions_consistent: bool
     synthetic_makeup_consistent: bool | None = None
+    semantic_confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    semantic_evidence: list[str] = Field(default_factory=list)
     issues: list[str]
 
 

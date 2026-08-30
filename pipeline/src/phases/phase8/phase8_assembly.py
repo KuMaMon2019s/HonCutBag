@@ -455,6 +455,19 @@ def run_phase8(output_dir: Path, dry_run: bool,
     from phases.phase8.frame_analysis import analyze_shot_frames
 
     frame_report = analyze_shot_frames(shots_dir, output_dir / "frame_analysis.json")
+    manual_review_shots = list(
+        frame_report.get("summary", {}).get("manual_review", [])
+    )
+    if manual_review_shots:
+        return {
+            "status": "error",
+            "error": (
+                "Phase 8 visual QA requires manual review; automatic reshoot is paused: "
+                + ", ".join(manual_review_shots)
+            ),
+            "duration_s": _elapsed(start),
+            "frame_analysis": frame_report.get("summary", {}),
+        }
     reshoot_shots = list(frame_report.get("summary", {}).get("reshoot", []))
     if (
         reshoot_shots

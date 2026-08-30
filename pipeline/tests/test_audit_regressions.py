@@ -1129,7 +1129,7 @@ def test_video_prompt_locks_named_cast_iphone_prop_and_observable_camera_path():
             {
                 "id": "photographer",
                 "name": "摄影师",
-                "visual_identity_policy": "synthetic_faceless_android_v1",
+                "visual_identity_policy": "synthetic_stylized_character_v3",
                 "appearance": {
                     "interaction_props": [
                         "手持拍摄设备（iPhone手机，配备手机广角镜头）进行拍摄"
@@ -1173,15 +1173,19 @@ def test_synthetic_seedance_router_does_not_reintroduce_human_skin_or_hair(
 ):
     from prompt.prompt_router import route_prompt
 
-    monkeypatch.setenv("HONCUT_NO_REAL_PERSON", "1")
+    monkeypatch.setenv("HONCUT_NO_REAL_PERSON", "0")
     prompt = route_prompt(
         "doubao-seedance-2.0-mini",
         "single_shot",
-        {"prompt": "合成人向前移动", "who": ["摄影师"]},
+        {
+            "prompt": "合成人向前移动",
+            "who": ["摄影师"],
+            "visual_identity_policy": "synthetic_stylized_character_v3",
+        },
         assets=[{"name": "摄影师", "description": "全封闭机械头盔"}],
     )
 
-    assert "declared veil/mask or face styling" in prompt
+    assert "declared warm pearl bio-ceramic complexion" in prompt
     assert "no untreated natural human face" in prompt
     assert "one generic helmet copied to all roles" in prompt
     assert "High-end stylized 3D CGI" in prompt
@@ -1348,6 +1352,23 @@ def test_phase_orchestrator_propagates_run_identity_and_provider_config(
     )
     assert captured["env"]["VIDEO_PROVIDER"] == "seedance"
     assert captured["env"]["SEEDANCE_MODEL"] == "doubao-seedance-2.0-fast"
+    assert command[command.index("--character-visual-policy") + 1] == "source_derived"
+
+
+def test_phase_orchestrator_migrates_legacy_visual_flag_only_at_entry():
+    config = {"no_real_person": True}
+    assert (
+        phase_orchestrator._normalize_character_visual_policy(config)
+        == "synthetic_stylized_character_v3"
+    )
+    assert "no_real_person" not in config
+    assert config["character_visual_policy"] == "synthetic_stylized_character_v3"
+
+    with pytest.raises(ValueError, match="conflicts"):
+        phase_orchestrator._normalize_character_visual_policy({
+            "character_visual_policy": "source_derived",
+            "no_real_person": False,
+        })
 
 
 def test_phase_orchestrator_admits_code_change_only_for_first_resumed_child(
@@ -2168,7 +2189,7 @@ def test_final_vlm_uses_live_synthetic_policy_without_character_artifact(
 
     result = video_qa._vlm_semantic_check(FakeClient(), frames, None)
 
-    assert result["qa_contract"] == "synthetic_character_styling_consistency_v4"
+    assert result["qa_contract"] == "human_visual_anatomy_v1"
 
 
 def test_final_vlm_blocks_incomplete_synthetic_identity_evidence(
@@ -2178,10 +2199,10 @@ def test_final_vlm_blocks_incomplete_synthetic_identity_evidence(
     monkeypatch.delenv("HONCUT_NO_REAL_PERSON", raising=False)
     (tmp_path / "CHARACTERS.json").write_text(
         json.dumps({
-            "visual_identity_policy": "synthetic_faceless_android_v1",
+            "visual_identity_policy": "synthetic_stylized_character_v3",
             "characters": [{
                 "id": "photographer",
-                "visual_identity_policy": "synthetic_faceless_android_v1",
+                "visual_identity_policy": "synthetic_stylized_character_v3",
             }],
         }),
         encoding="utf-8",
@@ -2413,7 +2434,9 @@ def test_semantic_media_ratios_and_cli_resume_defaults(tmp_path):
     assert pipeline_runner_cli._resolved_run_arguments(args)["media_profile"] == (
         "cinematic"
     )
-    assert pipeline_runner_cli._resolved_run_arguments(args)["no_real_person"] is True
+    assert pipeline_runner_cli._resolved_run_arguments(args)[
+        "character_visual_policy"
+    ] == "synthetic_stylized_character_v3"
     assert pipeline_runner_cli._resolved_run_arguments(args)[
         "character_library_dir"
     ] == str(tmp_path / "character-library")
@@ -2485,7 +2508,9 @@ def test_manifest_records_effective_route_and_phase6_requires_phase5(
 
     assert initial["status"] == "completed"
     assert manifest["resolved_config"]["video_generation_mode"] == "direct"
-    assert manifest["resolved_config"]["no_real_person"] is True
+    assert manifest["resolved_config"]["character_visual_policy"] == (
+        "synthetic_stylized_character_v3"
+    )
 
     (tmp_path / "STORYBOARD.json").write_text(
         json.dumps({"shots": [{"id": "S01", "duration": 5}]}),
@@ -2555,7 +2580,7 @@ def test_phase7_hands_pixel_quality_to_phase8(tmp_path):
 
 
 def test_phase8_vlm_compares_video_frames_with_character_reference(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, canonical_run_contract
 ):
     from PIL import Image
     from phases.phase8 import frame_analysis
@@ -2567,9 +2592,9 @@ def test_phase8_vlm_compares_video_frames_with_character_reference(
     frame.parent.mkdir(parents=True)
     Image.new("RGB", (32, 32), "red").save(character_reference)
     Image.new("RGB", (32, 32), "blue").save(frame)
-    (tmp_path / "CHARACTERS.json").write_text(
-        json.dumps({"characters": [{"id": "CHAR_A", "name": "Character A"}]}),
-        encoding="utf-8",
+    canonical_run_contract(
+        tmp_path,
+        {"characters": [{"id": "CHAR_A", "name": "Character A"}]},
     )
     captured = {}
 
@@ -2596,7 +2621,7 @@ def test_phase8_vlm_compares_video_frames_with_character_reference(
 
 
 def test_phase8_vlm_switches_to_synthetic_structure_contract_from_artifacts(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, canonical_run_contract
 ):
     from PIL import Image
     from phases.phase8 import frame_analysis
@@ -2605,20 +2630,10 @@ def test_phase8_vlm_switches_to_synthetic_structure_contract_from_artifacts(
     frame = tmp_path / "shots/S01/frames/frame_000.jpg"
     frame.parent.mkdir(parents=True)
     Image.new("RGB", (32, 32), "blue").save(frame)
-    (tmp_path / "CHARACTERS.json").write_text(
-        json.dumps(
-            {
-                "visual_identity_policy": "synthetic_faceless_android_v1",
-                "characters": [
-                    {
-                        "id": "photographer",
-                        "name": "摄影师",
-                        "visual_identity_policy": "synthetic_stylized_character_v3",
-                    }
-                ],
-            }
-        ),
-        encoding="utf-8",
+    canonical_run_contract(
+        tmp_path,
+        {"characters": [{"id": "photographer", "name": "摄影师"}]},
+        requested_policy="synthetic_stylized_character_v3",
     )
     captured = {}
 
@@ -3540,7 +3555,11 @@ def test_phase4_renders_one_character_board_into_the_primary_shot_first_frame(
     assert beat["video_first_frame_kind"] == CINEMATIC_FIRST_FRAME_SCHEMA
 
 
-def test_phase2_defers_character_storyboards_until_phase3(monkeypatch, tmp_path):
+def test_phase2_defers_character_storyboards_until_phase3(
+    monkeypatch,
+    tmp_path,
+    canonical_run_contract,
+):
     from PIL import Image
 
     director = tmp_path / "director_storyboard.png"
@@ -3555,6 +3574,11 @@ def test_phase2_defers_character_storyboards_until_phase3(monkeypatch, tmp_path)
             }
         ],
     }
+    characters_data, contract = canonical_run_contract(
+        tmp_path,
+        {"characters": [{"id": "agent", "name": "特工"}]},
+    )
+    storyboard["canonical_visual_contract_sha256"] = contract["contract_sha256"]
     monkeypatch.setattr(
         pipeline_core,
         "run_quality_check",
@@ -3563,7 +3587,7 @@ def test_phase2_defers_character_storyboards_until_phase3(monkeypatch, tmp_path)
 
     result = pipeline_core.run_phase2(
         storyboard,
-        {"characters": [{"id": "agent", "name": "特工"}]},
+        characters_data,
         tmp_path,
         False,
     )
@@ -3634,7 +3658,7 @@ def test_phase3_seedance_contract_and_gate_require_four_views(tmp_path):
 
 
 def test_phase3_reference_generation_uses_face_only_as_identity_anchor(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, canonical_run_contract
 ):
     from PIL import Image
 
@@ -3713,6 +3737,16 @@ def test_phase3_reference_generation_uses_face_only_as_identity_anchor(
             })
 
     monkeypatch.setattr(character_factory, "SeedreamClient", ImageClient)
+    canonical_run_contract(
+        tmp_path,
+        {
+            "characters": [{
+                "id": "agent",
+                "name": "Agent",
+                "description": "adult woman; black ponytail; white shirt; gray trousers",
+            }]
+        },
+    )
     reviewer = Reviewer()
     result = character_factory.generate_character(
         char_id="agent",
@@ -3992,7 +4026,11 @@ def test_character_reference_qa_recomputes_wrong_view_verdict():
             "full_body": {**passing_view, "both_eyes_visible": True},
             "side": passing_view,
             # A model-level passed=true cannot override visible face evidence.
-            "back": {**passing_view, "face_visible": True},
+            "back": {
+                **passing_view,
+                "face_visible": True,
+                "semantic_evidence": ["eyes and nose are visible in the rear-view image"],
+            },
         },
         "cross_view": {
             "passed": True,
@@ -4030,7 +4068,11 @@ def test_character_reference_qa_requires_empty_hands_in_seedance_body_views():
     payload = {
         "views": {
             "face_closeup": passing_view,
-            "full_body": {**passing_view, "hands_empty": False},
+            "full_body": {
+                **passing_view,
+                "hands_empty": False,
+                "semantic_evidence": ["a handheld object is visibly gripped"],
+            },
             "side": {**passing_view, "both_eyes_visible": False},
             "back": {
                 **passing_view,
@@ -4271,7 +4313,11 @@ def test_character_reference_qa_requires_each_declared_face_anchor():
     }
     payload = {
         "views": {
-            "face_closeup": {**passing, "iris_ring_anchor_match": False},
+            "face_closeup": {
+                **passing,
+                "iris_ring_anchor_match": False,
+                "semantic_evidence": ["the iris has no luminous ring around the pupil"],
+            },
             "full_body": passing,
             "side": {**passing, "both_eyes_visible": False},
             "back": {**passing, "face_visible": False, "both_eyes_visible": False},
@@ -4556,8 +4602,8 @@ def test_phase5_systemic_moderate_continuity_issue_blocks_generation():
         )
     ]
 
-    assert storyboard_qa_gate.grade_issues(issues) == "C"
-    assert storyboard_qa_gate.is_blocking_issue(issues[0]) is True
+    assert storyboard_qa_gate.grade_issues(issues) == "A"
+    assert storyboard_qa_gate.is_blocking_issue(issues[0]) is False
 
 
 def test_phase5_separate_moderate_findings_become_systemic_across_shots():
@@ -4568,8 +4614,8 @@ def test_phase5_separate_moderate_findings_become_systemic_across_shots():
         for shot_id in ("S01", "S02", "S03")
     ]
 
-    assert storyboard_qa_gate.grade_issues(issues) == "D"
-    assert storyboard_qa_gate.blocking_issues(issues) == issues
+    assert storyboard_qa_gate.grade_issues(issues) == "B"
+    assert storyboard_qa_gate.blocking_issues(issues) == []
 
 
 def test_phase5_verified_single_shot_end_state_omission_triggers_correction():
@@ -5435,9 +5481,10 @@ def test_phase5_dry_run_still_blocks_structural_grade_c_without_redraw(tmp_path)
 
 
 def test_phase5_production_keeps_missing_pixel_artifacts_blocking(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, canonical_run_contract
 ):
     _write_phase5_dry_run_inputs(tmp_path)
+    canonical_run_contract(tmp_path, {"characters": []})
     monkeypatch.setattr(
         storyboard_qa_gate,
         "run_l2_checks",
@@ -6021,6 +6068,12 @@ def test_phase5_l4_issue_restarts_phase4_without_redrawing_previs(tmp_path):
         frame_ids=["S02_P01"],
         expected="indigo/orange shadow-puppet stage",
         observed="white-paper pencil line art",
+        confidence=0.95,
+        evidence_status="validated",
+        frame_evidence=[{
+            "frame_id": "S02_P01",
+            "observed": "white-paper pencil line art",
+        }],
     )
 
     result = storyboard_qa_gate.run_storyboard_qa_with_correction(
@@ -6414,6 +6467,8 @@ def test_phase5_automatically_redraws_failed_shots_then_rechecks(tmp_path):
             {"shot_id": "S05_P02", "observed": "观察窗破裂"},
             {"shot_id": "S06_P02", "observed": "人物飞入太空"},
         ],
+        confidence=0.92,
+        evidence_status="validated",
     )
     qa_results = iter([
         {
@@ -6469,6 +6524,8 @@ def test_phase5_correction_is_bounded_and_fails_closed(tmp_path):
             "shot_id": "S03_P01",
             "observed": "保安仍持枪射击",
         }],
+        confidence=0.94,
+        evidence_status="validated",
     )
     qa_calls = 0
     redraw_attempts = []
@@ -8768,6 +8825,8 @@ def test_phase5_real_redraw_reuses_generator_and_archives_failed_shot(tmp_path):
             "shot_id": "S02_P01",
             "observed": "保安撞破观察窗飞入太空",
         }],
+        confidence=0.93,
+        evidence_status="validated",
     )
     acceptance_request = (
         phase5_correction_resume_live_acceptance._build_exact_pxx_request(
@@ -8918,7 +8977,8 @@ def test_phase2_v2_migration_derives_guides_without_provider_calls(tmp_path):
     repeated = migrate_shot_storyboard_narrative_guides(tmp_path, storyboard)
 
     assert calls == provider_calls_before
-    assert migrated["kind"] == "honcut.shot_storyboards.v3"
+    assert migrated["kind"] == "honcut.shot_storyboards.v4"
+    assert migrated["migration"]["source_pixel_usage"] == "none"
     assert migrated["migration"]["provider_request_count"] == 0
     assert migrated["shots"][0]["board_sha256"] == board_sha256
     assert migrated["shots"][0]["beat_cell_assignments"] == [
@@ -9640,7 +9700,9 @@ def test_video_transport_rejects_previs_frame_even_when_it_exists(tmp_path):
         _assert_video_frame_provenance(path)
 
 
-def test_phase5_first_frame_review_blocks_style_and_annotation_pollution(tmp_path):
+def test_phase5_first_frame_review_blocks_style_and_annotation_pollution(
+    tmp_path, canonical_run_contract
+):
     from PIL import Image
 
     frame = tmp_path / "S02_P01.png"
@@ -9654,6 +9716,7 @@ def test_phase5_first_frame_review_blocks_style_and_annotation_pollution(tmp_pat
             }],
         }],
     }
+    canonical_run_contract(tmp_path, {"characters": []})
 
     class ReviewClient:
         def review(self, paths, prompt):
@@ -9690,7 +9753,9 @@ def test_phase5_first_frame_review_blocks_style_and_annotation_pollution(tmp_pat
     assert storyboard_qa_gate.is_blocking_issue(issues[0]) is True
 
 
-def test_phase5_first_frame_review_classifies_duplicate_subjects(tmp_path):
+def test_phase5_first_frame_review_classifies_duplicate_subjects(
+    tmp_path, canonical_run_contract
+):
     from PIL import Image
 
     frame = tmp_path / "S04_P01.png"
@@ -9704,6 +9769,7 @@ def test_phase5_first_frame_review_classifies_duplicate_subjects(tmp_path):
             }],
         }],
     }
+    canonical_run_contract(tmp_path, {"characters": []})
 
     class ReviewClient:
         def review(self, paths, prompt):
@@ -9845,6 +9911,66 @@ def test_phase5_positive_clause_does_not_hide_a_contrasted_mismatch(tmp_path):
     assert issues[0]["message"].endswith("violates the proportion lock")
     assert status["filtered_non_issue_count"] == 0
     assert status["accepted_issue_count"] == 1
+
+
+def test_phase5_acceptance_gate_persists_one_observation_and_resume_reuses_it(
+    tmp_path,
+):
+    from PIL import Image
+
+    image = tmp_path / "S01_P01.png"
+    reference = tmp_path / "agent_full_body.png"
+    Image.new("RGB", (160, 90), "gray").save(image)
+    Image.new("RGB", (90, 160), "gray").save(reference)
+    calls = []
+    guarded_requests = []
+
+    class ReviewClient:
+        model = "fixture-vlm"
+
+        def review(self, image_paths, _prompt):
+            calls.append(list(image_paths))
+            return json.dumps({"issues": []})
+
+    kwargs = {
+        "storyboard": {
+            "shots": [{
+                "id": "S01",
+                "character_ids": ["agent"],
+                "storyboard_beats": [{"beat_id": "S01_P01"}],
+            }],
+        },
+        "characters_data": {"characters": [{"id": "agent"}]},
+        "visual_style": "cinematic",
+        "images": {"S01_P01": image},
+        "grid_path": tmp_path / "grid.jpg",
+        "client": ReviewClient(),
+        "character_reference_images": {"agent": [reference]},
+        "structured_understanding_max_attempts": 1,
+        "_acceptance_max_new_observations": 1,
+        "_acceptance_before_provider_request": guarded_requests.append,
+    }
+
+    with pytest.raises(storyboard_qa_gate.QAObservationGatePaused) as raised:
+        storyboard_qa_gate.run_l3_review(**kwargs)
+
+    assert raised.value.provider_request_count == 1
+    assert raised.value.verdict in {"pass", "acceptable_deviation"}
+    assert len(calls) == 1
+    assert len(guarded_requests) == 1
+    assert guarded_requests[0]["provider_family"] == "multimodal_observation"
+    assert guarded_requests[0]["evidence_fingerprint"]
+
+    issues, status = storyboard_qa_gate.run_l3_review(**kwargs)
+
+    assert issues == []
+    assert status["provider_request_count"] == 0
+    assert (
+        status["structured_review_batches"][0]["qa_observation_reused"]
+        is True
+    )
+    assert len(calls) == 1
+    assert len(guarded_requests) == 1
 
 
 def test_phase5_completed_action_sequence_is_not_an_issue():

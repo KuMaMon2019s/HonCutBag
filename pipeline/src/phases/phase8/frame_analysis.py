@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -295,6 +296,18 @@ def decide_shot_action(
             interior_black.append(segment)
 
     semantic_review = semantic_review or {}
+    if semantic_review.get("verdict") == "manual_review":
+        reasons.extend(
+            str(issue)
+            for issue in semantic_review.get("issues", [])
+            or ["semantic visual review requires manual review"]
+        )
+        return {
+            "action": "manual_review",
+            "reasons": reasons,
+            "trim_start_s": 0.0,
+            "trim_end_s": duration,
+        }
     if semantic_review.get("verdict") in {"fail", "reshoot", "unavailable"}:
         reasons.extend(str(issue) for issue in semantic_review.get("issues", []) or ["semantic visual review failed"])
         return {"action": "reshoot", "reasons": reasons, "trim_start_s": 0.0, "trim_end_s": duration}
@@ -482,7 +495,11 @@ def _automatic_semantic_reviewer(
     except Exception:
         return None
 
-    synthetic_review = _uses_synthetic_character_review(output_dir)
+    from utils.privacy_visual_policy import synthetic_character_review_evidence
+
+    synthetic_evidence = synthetic_character_review_evidence(output_dir)
+    synthetic_review = bool(synthetic_evidence["enabled"])
+    synthetic_ids = list(synthetic_evidence.get("synthetic_character_ids") or [])
     qa_contract = (
         SYNTHETIC_QA_CONTRACT
         if synthetic_review
@@ -509,7 +526,10 @@ def _automatic_semantic_reviewer(
         review_paths = [path for _character_id, path in character_references] + frame_paths
         structure_contract = (
             (
-                "This project intentionally uses fully synthetic stylized CGI characters. The only allowed face "
+                "Only the canonical character IDs in this list use synthetic styling: "
+                f"{json.dumps(synthetic_ids, ensure_ascii=False)}. Other canonical characters may retain "
+                "their declared fictional-human visual policy and must not be converted. For the listed "
+                "synthetic characters, the only allowed face "
                 "treatment is the declared beautiful pearl bio-ceramic porcelain makeup with a complete unobscured "
                 "face, narrow iridescent temple-to-cheek circuit stripe, and soft luminous iris ring around a clear "
                 "pupil, layered iris and catchlights. Complexion must stay warm and healthy with coordinated cheek "
@@ -556,13 +576,111 @@ def _automatic_semantic_reviewer(
             "a sustained pull-back, while a fixed shot may contain minor stabilization drift. Return JSON only: "
             '{"verdict":"pass|reshoot","issues":["..."],"confidence":0.0}.'
         )
-        parsed = review_as(
-            client,
-            review_paths,
-            prompt,
-            ShotSemanticReview,
-        ).model_dump()
-        parsed["qa_contract"] = qa_contract
+        if output_dir is None:
+            parsed = review_as(
+                client,
+                review_paths,
+                prompt,
+                ShotSemanticReview,
+            ).model_dump(mode="json")
+            parsed["qa_contract"] = qa_contract
+            parsed["qa_ledger"] = "test_only_unbound"
+            return parsed
+        from quality.visual_qa_policy import (
+            POLICY_ID,
+            decide_visual_qa,
+            policy_sha256,
+        )
+        from runtime.qa_ledger import QALedger, observation_fingerprint
+        from utils.canonical_visual_contracts import load_canonical_visual_contract
+
+        contract = load_canonical_visual_contract(output_dir)
+        prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        evidence = [
+            {
+                "path": path.relative_to(output_dir).as_posix(),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+            for path in review_paths
+        ]
+        evaluator_model = str(getattr(client, "model", "unknown-vlm"))
+        fingerprint = observation_fingerprint(
+            evidence=evidence,
+            canonical_contract_sha256=contract["contract_sha256"],
+            evaluator_model=evaluator_model,
+            prompt_sha256=prompt_sha256,
+            observation_schema="ShotSemanticReview.v2",
+        )
+        ledger = QALedger(output_dir / "runtime.db")
+        observation = ledger.find_observation(fingerprint)
+        observation_reused = observation is not None
+        if observation is None:
+            typed = review_as(client, review_paths, prompt, ShotSemanticReview)
+            manifest_path = output_dir / "RUN_MANIFEST.json"
+            try:
+                run_id = str(
+                    json.loads(manifest_path.read_text(encoding="utf-8"))[
+                        "run_fingerprint"
+                    ]
+                )
+            except (OSError, json.JSONDecodeError, KeyError, TypeError):
+                run_id = output_dir.name
+            observation, _ = ledger.record_observation(
+                run_id=run_id,
+                phase="phase8",
+                resource_id=str(
+                    shot_meta.get("shot_id") or shot_meta.get("id") or "unknown"
+                ),
+                evidence_fingerprint=fingerprint,
+                canonical_contract_sha256=contract["contract_sha256"],
+                evaluator_model=evaluator_model,
+                prompt_sha256=prompt_sha256,
+                observation_schema="ShotSemanticReview.v2",
+                observation=typed.model_dump(mode="json"),
+            )
+        typed = ShotSemanticReview.model_validate(observation.observation)
+        parsed = typed.model_dump(mode="json")
+        raw_verdict = parsed["verdict"]
+        findings = (
+            []
+            if raw_verdict == "pass"
+            else [{
+                "blocking_category": "generated_video_semantics",
+                "confidence": parsed["confidence"],
+                "evidence": parsed["issues"],
+            }]
+        )
+        policy = decide_visual_qa(
+            semantic_score=(
+                parsed["confidence"] if raw_verdict == "pass" else 1.0
+            ),
+            findings=findings,
+        )
+        decision, decision_reused = ledger.record_decision(
+            observation_id=observation.observation_id,
+            phase_owner="phase8.frame_analysis",
+            policy_id=POLICY_ID,
+            policy_sha256=policy_sha256(),
+            verdict=policy.verdict,
+            semantic_score=policy.semantic_score,
+            decision=policy.as_dict(),
+        )
+        parsed.update({
+            "raw_verdict": raw_verdict,
+            "verdict": (
+                "pass"
+                if decision.verdict in {"pass", "acceptable_deviation"}
+                else "reshoot"
+                if decision.verdict == "block"
+                else "manual_review"
+            ),
+            "qa_contract": qa_contract,
+            "qa_observation_id": observation.observation_id,
+            "qa_observation_reused": observation_reused,
+            "qa_decision_id": decision.decision_id,
+            "qa_decision_reused": decision_reused,
+            "qa_verdict": decision.verdict,
+        })
         return parsed
 
     return review
@@ -594,7 +712,7 @@ def analyze_shot_frames(
     report: dict[str, Any] = {
         "shots": {},
         "has_issues": False,
-        "summary": {"keep": [], "trim": [], "reshoot": []},
+        "summary": {"keep": [], "trim": [], "reshoot": [], "manual_review": []},
         "semantic_review": (
             "circuit_open" if circuit_open else "enabled" if reviewer else "unavailable"
         ),

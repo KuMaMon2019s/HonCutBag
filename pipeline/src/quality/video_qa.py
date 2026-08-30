@@ -947,7 +947,7 @@ def _vlm_semantic_check(
             "verdict": "revise",
             "reason": "synthetic character identity evidence is incomplete",
             "issues": [
-                "Synthetic QA requires every character to have an ID, synthetic policy/gender, "
+                "Synthetic QA requires every synthetic character to have an ID, synthetic policy/gender, "
                 "canonical face styling, clothing/identity marker, non-human material, and at least two visible styling anchors"
             ],
             "qa_contract": qa_contract,
@@ -957,8 +957,11 @@ def _vlm_semantic_check(
         }
     structure_contract = (
         (
-            "All characters in this project are intentionally synthetic stylized CGI characters. "
-            "Their only allowed facial treatment is the declared synthetic porcelain makeup: a beautiful "
+            "Only these canonical character IDs use synthetic styling: "
+            f"{json.dumps(review_evidence.get('synthetic_character_ids') or [], ensure_ascii=False)}. "
+            "Other canonical characters may retain their declared fictional-human policy and must not be "
+            "converted. The listed synthetic characters' only allowed facial treatment is the declared "
+            "synthetic porcelain makeup: a beautiful "
             "pearl bio-ceramic complexion, one narrow iridescent circuit stripe from temple to cheekbone, "
             "and a soft luminous iris ring around a clear pupil, layered iris and bright catchlights. The "
             "complexion must remain warm, healthy and elegant with coordinated living cheek and lip color, "

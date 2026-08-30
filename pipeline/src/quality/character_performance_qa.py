@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Protocol
@@ -25,6 +26,82 @@ class CharacterPerformanceReviewer(Protocol):
 
 class CharacterPerformanceQAError(RuntimeError):
     """Raised when a performance board cannot satisfy its blocking contract."""
+
+
+def _run_ledgered_review(
+    reviewer: CharacterPerformanceReviewer,
+    image_paths: list[Path],
+    prompt: str,
+    schema_type,
+    *,
+    observation_schema: str,
+    phase_owner: str,
+    resource_id: str,
+):
+    """Reuse one Phase 3 VLM observation before applying current policy."""
+    from quality.visual_qa_policy import POLICY_ID, decide_visual_qa, policy_sha256
+    from runtime.qa_ledger import QALedger, observation_fingerprint
+    from utils.canonical_visual_contracts import load_canonical_visual_contract
+
+    output_dir = next(
+        (
+            parent
+            for parent in image_paths[0].parents
+            if (parent / "CANONICAL_VISUAL_CONTRACT.json").is_file()
+        ),
+        None,
+    )
+    if output_dir is None:
+        raise CharacterPerformanceQAError(
+            "performance QA cannot resolve the canonical run boundary"
+        )
+    contract = load_canonical_visual_contract(output_dir)
+    prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    evaluator_model = str(getattr(reviewer, "model", "unknown-vlm"))
+    from quality.character_reference_qa import file_sha256
+
+    evidence = [
+        {"path": path.relative_to(output_dir).as_posix(), "sha256": file_sha256(path)}
+        for path in image_paths
+    ]
+    fingerprint = observation_fingerprint(
+        evidence=evidence,
+        canonical_contract_sha256=contract["contract_sha256"],
+        evaluator_model=evaluator_model,
+        prompt_sha256=prompt_sha256,
+        observation_schema=observation_schema,
+    )
+    ledger = QALedger(output_dir / "runtime.db")
+    observation = ledger.find_observation(fingerprint)
+    observation_reused = observation is not None
+    if observation is None:
+        result = review_as(reviewer, image_paths, prompt, schema_type)
+        manifest_path = output_dir / "RUN_MANIFEST.json"
+        try:
+            run_id = str(json.loads(manifest_path.read_text(encoding="utf-8"))["run_fingerprint"])
+        except (OSError, json.JSONDecodeError, KeyError, TypeError):
+            run_id = output_dir.name
+        observation, _ = ledger.record_observation(
+            run_id=run_id,
+            phase="phase3",
+            resource_id=resource_id,
+            evidence_fingerprint=fingerprint,
+            canonical_contract_sha256=contract["contract_sha256"],
+            evaluator_model=evaluator_model,
+            prompt_sha256=prompt_sha256,
+            observation_schema=observation_schema,
+            observation=result.model_dump(mode="json"),
+        )
+    typed = schema_type.model_validate(observation.observation)
+    return (
+        typed,
+        ledger,
+        observation,
+        observation_reused,
+        POLICY_ID,
+        policy_sha256,
+        decide_visual_qa,
+    )
 
 
 _HARD_CELL_FIELDS = (
@@ -211,20 +288,70 @@ def review_character_performance_cell(
     image_paths = [image_path, identity_path]
     if prop_path is not None:
         image_paths.append(prop_path)
-    result = review_as(
+    (
+        result,
+        ledger,
+        observation,
+        observation_reused,
+        policy_id,
+        policy_hash,
+        decide_visual_qa,
+    ) = _run_ledgered_review(
         reviewer,
         image_paths,
         prompt,
         CharacterPerformanceCellUnderstanding,
+        observation_schema="CharacterPerformanceCellUnderstanding.v4",
+        phase_owner="phase3.character_performance_cell_qa",
+        resource_id=f"{character_id}:{cell['cell_id']}",
     )
     payload = _normalized_cell_verdict(
         result.model_dump(mode="json"),
         expected_cell_id=str(cell.get("cell_id") or ""),
     )
+    semantic_findings = [
+            {
+                "blocking_category": "character_performance_cell",
+                "confidence": payload["action_semantics_confidence"],
+                "evidence": payload["action_semantics_evidence"] or payload.get("issues"),
+                "field": field,
+            }
+            for field in payload["blocking_fields"]
+        ]
+    if payload.get("action_semantics_match") is not True:
+        semantic_findings.append({
+            "blocking_category": "character_performance_cell",
+            "confidence": payload["action_semantics_confidence"],
+            "evidence": payload["action_semantics_evidence"] or payload.get("issues"),
+            "field": "action_semantics_match",
+        })
+    policy = decide_visual_qa(
+        semantic_score=(
+            payload["action_semantics_confidence"]
+            if payload.get("action_semantics_match") is True
+            else 1.0
+        ),
+        findings=semantic_findings,
+    )
+    payload["passed"] = policy.verdict in {"pass", "acceptable_deviation"}
+    decision, decision_reused = ledger.record_decision(
+        observation_id=observation.observation_id,
+        phase_owner="phase3.character_performance_cell_qa",
+        policy_id=policy_id,
+        policy_sha256=policy_hash(),
+        verdict=policy.verdict,
+        semantic_score=policy.semantic_score,
+        decision=policy.as_dict(),
+    )
     return {
         "schema": CHARACTER_PERFORMANCE_CELL_QA_SCHEMA,
         **payload,
         "issues": [str(item) for item in payload.get("issues") or []],
+        "qa_observation_id": observation.observation_id,
+        "qa_observation_reused": observation_reused,
+        "qa_decision_id": decision.decision_id,
+        "qa_decision_reused": decision_reused,
+        "qa_verdict": decision.verdict,
     }
 
 
@@ -366,11 +493,22 @@ def review_character_performance_board(
         cells=cells,
         synthetic_styling=synthetic_styling,
     )
-    result = review_as(
+    (
+        result,
+        ledger,
+        observation,
+        observation_reused,
+        policy_id,
+        policy_hash,
+        decide_visual_qa,
+    ) = _run_ledgered_review(
         reviewer,
         [image_path],
         prompt,
         CharacterPerformanceBoardUnderstanding,
+        observation_schema="CharacterPerformanceBoardUnderstanding.v6",
+        phase_owner="phase3.character_performance_board_qa",
+        resource_id=character_id,
     )
     payload = result.model_dump(mode="json")
     reviewed_cells = [
@@ -390,6 +528,40 @@ def review_character_performance_board(
             "cells",
         ]))
         normalized["passed"] = False
+    semantic_findings = [
+            {
+                "blocking_category": "character_performance_board",
+                "confidence": normalized["pose_diversity_confidence"],
+                "evidence": normalized["pose_diversity_evidence"] or payload.get("issues"),
+                "field": field,
+            }
+            for field in normalized["board_blocking_fields"]
+        ]
+    if normalized.get("six_distinct_poses") is not True:
+        semantic_findings.append({
+            "blocking_category": "character_performance_board",
+            "confidence": normalized["pose_diversity_confidence"],
+            "evidence": normalized["pose_diversity_evidence"] or payload.get("issues"),
+            "field": "six_distinct_poses",
+        })
+    policy = decide_visual_qa(
+        semantic_score=(
+            normalized["pose_diversity_confidence"]
+            if normalized.get("six_distinct_poses") is True
+            else 1.0
+        ),
+        findings=semantic_findings,
+    )
+    normalized["passed"] = policy.verdict in {"pass", "acceptable_deviation"}
+    decision, decision_reused = ledger.record_decision(
+        observation_id=observation.observation_id,
+        phase_owner="phase3.character_performance_board_qa",
+        policy_id=policy_id,
+        policy_sha256=policy_hash(),
+        verdict=policy.verdict,
+        semantic_score=policy.semantic_score,
+        decision=policy.as_dict(),
+    )
     return {
         "schema": CHARACTER_PERFORMANCE_QA_SCHEMA,
         "cells": reviewed_cells,
@@ -403,4 +575,9 @@ def review_character_performance_board(
         "semantic_rejection_confidence": SEMANTIC_REJECTION_CONFIDENCE,
         "passed": normalized["passed"],
         "issues": [str(item) for item in payload.get("issues") or []],
+        "qa_observation_id": observation.observation_id,
+        "qa_observation_reused": observation_reused,
+        "qa_decision_id": decision.decision_id,
+        "qa_decision_reused": decision_reused,
+        "qa_verdict": decision.verdict,
     }

@@ -182,7 +182,11 @@ def test_generation_task_store_persists_fingerprint_and_output_artifact(tmp_path
     assert len(enqueued.task.input_fingerprint) == 64
     claimed = store.claim(enqueued.task.task_id)
     assert claimed is not None
-    store.persist_provider_job(
+    store.reserve_submission_attempt(
+        claimed.task_id,
+        provider_endpoint="https://provider.example/jobs",
+    )
+    store.confirm_provider_job(
         claimed.task_id,
         provider_job_id="job-1",
         provider_endpoint="https://provider.example/jobs",

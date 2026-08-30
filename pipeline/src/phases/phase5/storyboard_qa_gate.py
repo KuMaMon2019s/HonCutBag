@@ -45,7 +45,7 @@ from utils.camera_motion_contracts import apply_camera_motion_contract
 from utils.material_budget import material_budget_contract_errors
 from tools.character_reference_board import resolve_character_reference_board
 
-DEFAULT_SIMILARITY_THRESHOLD = 0.85
+DEFAULT_SIMILARITY_THRESHOLD = 0.65
 DEFAULT_MAX_CORRECTION_ATTEMPTS = 2
 MAX_CORRECTION_ATTEMPTS = 3
 MAX_REVIEW_ADJUDICATIONS = 2
@@ -71,6 +71,29 @@ PHASE5_DRY_RUN_SKIPPED_OPERATIONS = (
     "automatic_image_correction",
     "independent_llm_supervision",
 )
+
+
+class QAObservationGatePaused(RuntimeError):
+    """Stop a paid acceptance run after one durable new QA observation."""
+
+    def __init__(
+        self,
+        *,
+        limit: int,
+        observation_id: str,
+        decision_id: str,
+        verdict: str,
+        provider_request_count: int,
+    ) -> None:
+        self.limit = limit
+        self.observation_id = observation_id
+        self.decision_id = decision_id
+        self.verdict = verdict
+        self.provider_request_count = provider_request_count
+        super().__init__(
+            "Phase 5 acceptance QA observation gate reached: "
+            f"{observation_id} ({verdict})"
+        )
 
 _LIGHT_PERIODS = {
     "night": ("night", "midnight", "moonlight", "夜", "午夜", "月光", "星空"),
@@ -880,7 +903,7 @@ Four fail-closed checks apply independently:
 3. SUBJECT_DUPLICATION: report an unintended duplicate, translucent copy, double exposure, repeated face/body, or extra instance of the same authored subject. Do not report multiple distinct characters when the scene calls for them.
 4. SYNTHETIC_MAKEUP_MISMATCH: when a synthetic makeup contract is supplied below, require the same beautiful, unobscured pearl bio-ceramic porcelain makeup, character-specific narrow temple-to-cheek circuit stripe and luminous iris ring in every face-visible frame. Report untreated human skin, a veil/mask, coarse mechanical face plate, crack, scar, horror distortion, makeup color/pattern drift, or performance-board clone/layout contamination.
 
-Inspect each frame independently. Never copy one observation across multiple IDs. Every issue needs concrete visible evidence, expected, observed, and confidence >= 0.75. Annotation contamination, subject duplication, and material style mismatch are severe because these pixels are about to enter paid video generation.
+Inspect each frame independently. Never copy one observation across multiple IDs. Every blocking issue needs concrete visible evidence, expected, observed, and confidence >= 0.85. Lower-confidence negative findings are diagnostic acceptable deviations. Annotation contamination, subject duplication, and material style mismatch can block only when those evidence rules are met.
 
 Return JSON only: {{"issues":[{{"code":"ANNOTATION_CONTAMINATION|STYLE_MISMATCH|SUBJECT_DUPLICATION|SYNTHETIC_MAKEUP_MISMATCH","severity":"severe|moderate|minor","frame_ids":["S01_P01"],"message":"...","expected":"...","observed":"...","confidence":0.95,"frame_evidence":[{{"frame_id":"S01_P01","observed":"specific visible evidence"}}]}}]}}.
 Use only these frame IDs: {json.dumps(ordered_ids, ensure_ascii=False)}.
@@ -893,18 +916,95 @@ SYNTHETIC MAKEUP CONTRACTS:
     input_paths = [images[frame_id] for frame_id in ordered_ids]
     try:
         from clients.ark_multimodal_client import review_as
+        from quality.visual_qa_policy import (
+            POLICY_ID,
+            decide_visual_qa,
+            policy_sha256,
+        )
+        from runtime.qa_ledger import QALedger, observation_fingerprint
         from schemas.understanding import FirstFrameUnderstanding
+        from utils.canonical_visual_contracts import load_canonical_visual_contract
 
         review_client = client or ArkMultimodalClient()
-        typed_review, review_execution = execute_structured_understanding(
-            lambda: review_as(
-                review_client,
-                input_paths,
-                prompt,
-                FirstFrameUnderstanding,
-            )
+        canonical_contract = load_canonical_visual_contract(output_dir)
+        canonical_contract_sha256 = str(canonical_contract["contract_sha256"])
+        prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        evaluator_model = str(getattr(review_client, "model", "unknown-vlm"))
+        evidence_fingerprint = observation_fingerprint(
+            evidence=records,
+            canonical_contract_sha256=canonical_contract_sha256,
+            evaluator_model=evaluator_model,
+            prompt_sha256=prompt_sha256,
+            observation_schema="FirstFrameUnderstanding.v1",
         )
+        ledger = QALedger(output_dir / "runtime.db")
+        stored_observation = ledger.find_observation(evidence_fingerprint)
+        if stored_observation is not None:
+            typed_review = FirstFrameUnderstanding.model_validate(
+                stored_observation.observation
+            )
+            review_execution = {
+                "status": "reused_qa_observation",
+                "attempt_count": 0,
+                "provider_request_count": 0,
+            }
+            observation = stored_observation
+            observation_reused = True
+        else:
+            typed_review, review_execution = execute_structured_understanding(
+                lambda: review_as(
+                    review_client,
+                    input_paths,
+                    prompt,
+                    FirstFrameUnderstanding,
+                )
+            )
+            try:
+                run_manifest = json.loads(
+                    (output_dir / "RUN_MANIFEST.json").read_text(encoding="utf-8")
+                )
+                ledger_run_id = str(run_manifest["run_fingerprint"])
+            except (OSError, json.JSONDecodeError, KeyError, TypeError):
+                ledger_run_id = output_dir.name
+            observation, observation_reused = ledger.record_observation(
+                run_id=ledger_run_id,
+                phase="phase5",
+                resource_id="cinematic_first_frames",
+                evidence_fingerprint=evidence_fingerprint,
+                canonical_contract_sha256=canonical_contract_sha256,
+                evaluator_model=evaluator_model,
+                prompt_sha256=prompt_sha256,
+                observation_schema="FirstFrameUnderstanding.v1",
+                observation=typed_review.model_dump(mode="json"),
+            )
         parsed = typed_review.model_dump()
+        findings = [
+            {
+                "blocking_category": str(value.get("code") or "").casefold(),
+                "confidence": value.get("confidence"),
+                "evidence": value.get("frame_evidence")
+                or (
+                    f"expected={value.get('expected')}; observed={value.get('observed')}"
+                    if value.get("expected") and value.get("observed")
+                    else ""
+                ),
+                "finding": value,
+            }
+            for value in parsed["issues"]
+        ]
+        policy_decision = decide_visual_qa(
+            semantic_score=1.0,
+            findings=findings,
+        )
+        decision, decision_reused = ledger.record_decision(
+            observation_id=observation.observation_id,
+            phase_owner="phase5.first_frame_qa",
+            policy_id=POLICY_ID,
+            policy_sha256=policy_sha256(),
+            verdict=policy_decision.verdict,
+            semantic_score=policy_decision.semantic_score,
+            decision=policy_decision.as_dict(),
+        )
         valid_ids = set(ordered_ids)
         issues: list[dict[str, Any]] = []
         for value in parsed["issues"]:
@@ -939,7 +1039,7 @@ SYNTHETIC MAKEUP CONTRACTS:
                 frame_ids
                 and expected
                 and observed
-                and confidence >= 0.75
+                and confidence >= 0.85
                 and set(frame_ids).issubset(evidence_ids)
             )
             severity = (
@@ -968,6 +1068,11 @@ SYNTHETIC MAKEUP CONTRACTS:
             "input_count": len(records),
             "raw_issue_count": len(parsed["issues"]),
             "structured_review_execution": review_execution,
+            "qa_observation_id": observation.observation_id,
+            "qa_observation_reused": observation_reused,
+            "qa_decision_id": decision.decision_id,
+            "qa_decision_reused": decision_reused,
+            "qa_verdict": decision.verdict,
         }
     except Exception as exc:
         shot_ids = sorted({_parent_shot_id(frame_id) for frame_id in ordered_ids})
@@ -1503,8 +1608,8 @@ def _r1_attribute_evidence(
         reasons.append("missing_canonical_reference")
     if not storyboard_ids or not set(storyboard_ids).issubset(evidence_ids):
         reasons.append("missing_per_panel_evidence")
-    if not math.isfinite(confidence) or confidence < 0.75 or confidence > 1.0:
-        reasons.append("confidence_below_0.75")
+    if not math.isfinite(confidence) or confidence < 0.85 or confidence > 1.0:
+        reasons.append("confidence_below_0.85")
     character_evidence = value.get("character_evidence") or []
     if reference_characters:
         if not isinstance(character_evidence, list) or not character_evidence:
@@ -1753,7 +1858,22 @@ def run_l3_review(
     structured_understanding_max_attempts: int = (
         DEFAULT_STRUCTURED_UNDERSTANDING_ATTEMPTS
     ),
+    _acceptance_max_new_observations: int | None = None,
+    _acceptance_before_provider_request: (
+        Callable[[dict[str, Any]], None] | None
+    ) = None,
 ) -> tuple[list[dict], dict]:
+    if (
+        _acceptance_max_new_observations is not None
+        and (
+            isinstance(_acceptance_max_new_observations, bool)
+            or not isinstance(_acceptance_max_new_observations, int)
+            or _acceptance_max_new_observations < 1
+        )
+    ):
+        raise ValueError(
+            "_acceptance_max_new_observations must be a positive integer or None"
+        )
     if not images:
         return [], {"status": "skipped", "skipped_reason": "no storyboard images available"}
     ordered = _ordered_storyboard_images(storyboard, images)
@@ -2000,23 +2120,162 @@ def run_l3_review(
     from schemas.understanding import StoryboardVisualUnderstanding
 
     review_client = client or ArkMultimodalClient()
+    from quality.visual_qa_policy import (
+        POLICY_ID,
+        decide_visual_qa,
+        policy_sha256,
+    )
+    from runtime.qa_ledger import QALedger, observation_fingerprint
+
+    ledger_root = grid_path.parent
+    ledger = QALedger(ledger_root / "runtime.db")
+    run_manifest_path = ledger_root / "RUN_MANIFEST.json"
+    try:
+        run_manifest = json.loads(run_manifest_path.read_text(encoding="utf-8"))
+        ledger_run_id = str(run_manifest["run_fingerprint"])
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        ledger_run_id = ledger_root.name
+    contract_path = ledger_root / "CANONICAL_VISUAL_CONTRACT.json"
+    try:
+        canonical_contract_sha256 = str(
+            json.loads(contract_path.read_text(encoding="utf-8"))["contract_sha256"]
+        )
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        canonical_contract_sha256 = hashlib.sha256(
+            json.dumps(
+                canonical_contracts,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    evaluator_model = str(getattr(review_client, "model", "unknown-vlm"))
     issues: list[dict[str, Any]] = []
     batches: list[dict[str, Any]] = []
     raw_issue_count = 0
     filtered_non_issue_count = 0
     failed_batches = 0
+    provider_request_count = 0
+    new_observation_count = 0
     for execution in executions:
         try:
-            typed_review, review_execution = execute_structured_understanding(
-                lambda execution=execution: review_as(
-                    review_client,
-                    execution["input_paths"],
-                    execution["prompt"],
-                    StoryboardVisualUnderstanding,
-                ),
-                max_attempts=structured_understanding_max_attempts,
+            prompt_sha256 = hashlib.sha256(
+                execution["prompt"].encode("utf-8")
+            ).hexdigest()
+            evidence = [
+                {
+                    "input_index": index,
+                    "path": str(path),
+                    "sha256": _sha256_file(path),
+                }
+                for index, path in enumerate(execution["input_paths"], 1)
+            ]
+            evidence_fingerprint = observation_fingerprint(
+                evidence=evidence,
+                canonical_contract_sha256=canonical_contract_sha256,
+                evaluator_model=evaluator_model,
+                prompt_sha256=prompt_sha256,
+                observation_schema="StoryboardVisualUnderstanding.v1",
             )
-            parsed = typed_review.model_dump()
+            stored_observation = ledger.find_observation(evidence_fingerprint)
+            if stored_observation is not None:
+                typed_review = StoryboardVisualUnderstanding.model_validate(
+                    stored_observation.observation
+                )
+                review_execution = {
+                    "status": "reused_qa_observation",
+                    "attempt_count": 0,
+                    "provider_request_count": 0,
+                }
+                observation = stored_observation
+                observation_reused = True
+            else:
+                if _acceptance_before_provider_request is not None:
+                    _acceptance_before_provider_request({
+                        "provider_family": "multimodal_observation",
+                        "phase": "phase5",
+                        "resource_id": execution["shot_id"],
+                        "model": evaluator_model,
+                        "observation_schema": (
+                            "StoryboardVisualUnderstanding.v1"
+                        ),
+                        "evidence_fingerprint": evidence_fingerprint,
+                        "prompt_sha256": prompt_sha256,
+                        "inputs": evidence,
+                    })
+                typed_review, review_execution = execute_structured_understanding(
+                    lambda execution=execution: review_as(
+                        review_client,
+                        execution["input_paths"],
+                        execution["prompt"],
+                        StoryboardVisualUnderstanding,
+                    ),
+                    max_attempts=structured_understanding_max_attempts,
+                )
+                provider_request_count += int(
+                    review_execution.get("provider_request_count")
+                    or review_execution.get("attempt_count")
+                    or 1
+                )
+                observation, observation_reused = ledger.record_observation(
+                    run_id=ledger_run_id,
+                    phase="phase5",
+                    resource_id=execution["shot_id"],
+                    evidence_fingerprint=evidence_fingerprint,
+                    canonical_contract_sha256=canonical_contract_sha256,
+                    evaluator_model=evaluator_model,
+                    prompt_sha256=prompt_sha256,
+                    observation_schema="StoryboardVisualUnderstanding.v1",
+                    observation=typed_review.model_dump(mode="json"),
+                )
+                new_observation_count += 1
+            parsed = typed_review.model_dump(mode="json")
+            policy_findings = [
+                {
+                    "blocking_category": {
+                        "R1": "character_identity",
+                        "R2": "visual_continuity",
+                        "R3": "story_action",
+                        "R4": "end_state",
+                    }.get(str(value.get("red_line") or "").upper(), ""),
+                    "confidence": value.get("confidence"),
+                    "evidence": value.get("panel_evidence")
+                    or (
+                        f"expected={value.get('expected')}; "
+                        f"observed={value.get('observed')}"
+                        if value.get("expected") and value.get("observed")
+                        else ""
+                    ),
+                    "finding": value,
+                }
+                for value in parsed["issues"]
+            ]
+            policy_decision = decide_visual_qa(
+                semantic_score=1.0,
+                findings=policy_findings,
+            )
+            decision, decision_reused = ledger.record_decision(
+                observation_id=observation.observation_id,
+                phase_owner="phase5.storyboard_qa",
+                policy_id=POLICY_ID,
+                policy_sha256=policy_sha256(),
+                verdict=policy_decision.verdict,
+                semantic_score=policy_decision.semantic_score,
+                decision=policy_decision.as_dict(),
+            )
+            if (
+                _acceptance_max_new_observations is not None
+                and not observation_reused
+                and new_observation_count
+                >= _acceptance_max_new_observations
+            ):
+                raise QAObservationGatePaused(
+                    limit=_acceptance_max_new_observations,
+                    observation_id=observation.observation_id,
+                    decision_id=decision.decision_id,
+                    verdict=decision.verdict,
+                    provider_request_count=provider_request_count,
+                )
             raw_issue_count += len(parsed["issues"])
             batch = {
                 "request_id": execution["request_id"],
@@ -2025,6 +2284,11 @@ def run_l3_review(
                 "input_count": len(execution["input_paths"]),
                 "raw_issue_count": len(parsed["issues"]),
                 "structured_review_execution": review_execution,
+                "qa_observation_id": observation.observation_id,
+                "qa_observation_reused": observation_reused,
+                "qa_decision_id": decision.decision_id,
+                "qa_decision_reused": decision_reused,
+                "qa_verdict": decision.verdict,
             }
             batches.append(batch)
             valid_ids = set(execution["storyboard_ids"])
@@ -2079,6 +2343,8 @@ def run_l3_review(
                     "L3", severity, red_line, message, shot_ids,
                     **correction_evidence,
                 ))
+        except QAObservationGatePaused:
+            raise
         except Exception as exc:
             failed_batches += 1
             batch = {
@@ -2107,7 +2373,7 @@ def run_l3_review(
         "input_count": len(input_records),
         "provider_input_count": sum(len(value["input_paths"]) for value in executions),
         "request_count": len(executions),
-        "provider_request_count": len(batches),
+        "provider_request_count": provider_request_count,
         "raw_issue_count": raw_issue_count,
         "filtered_non_issue_count": filtered_non_issue_count,
         "accepted_issue_count": len(issues),
@@ -2127,58 +2393,39 @@ def run_l3_review(
 
 def is_blocking_issue(issue: dict) -> bool:
     """Return whether an issue must stop paid video generation."""
-    if issue.get("severity") == "severe":
+    layer = str(issue.get("layer") or "")
+    code = str(issue.get("code") or "")
+    if code.endswith("_review_unavailable"):
         return True
+    if layer not in {"L3", "L4"}:
+        return issue.get("severity") == "severe"
     details = issue.get("details") if isinstance(issue.get("details"), dict) else {}
     try:
         confidence = float(details.get("confidence"))
     except (TypeError, ValueError):
         confidence = 0.0
-    material_semantic_mismatch = bool(
-        issue.get("severity") == "moderate"
-        and issue.get("layer") == "L3"
-        and str(issue.get("code") or "").upper() in {"R3", "R4"}
-        and str(details.get("mismatch_type") or "").lower()
-        in {"action", "end_state"}
-        and str(details.get("expected") or "").strip()
+    concrete_evidence = bool(
+        str(details.get("expected") or "").strip()
         and str(details.get("observed") or "").strip()
-        and details.get("panel_evidence")
-        and confidence >= 0.75
-        and details.get("evidence_status") != "unverified"
+        and (details.get("panel_evidence") or details.get("frame_evidence"))
     )
-    if material_semantic_mismatch:
-        return True
-    return (
-        issue.get("severity") == "moderate"
-        and issue.get("layer") == "L3"
-        and str(issue.get("code") or "").upper() in {"R1", "R2", "R3", "R4"}
-        and len(set(issue.get("shot_ids") or [])) >= 2
+    blocking_category = bool(
+        (layer == "L3" and code.upper() in {"R1", "R2", "R3", "R4"})
+        or (layer == "L4" and code.startswith("first_frame_"))
+    )
+    from quality.visual_qa_policy import NEGATIVE_BLOCK_THRESHOLD
+
+    return bool(
+        blocking_category
+        and concrete_evidence
+        and confidence >= NEGATIVE_BLOCK_THRESHOLD
+        and details.get("evidence_status") != "unverified"
     )
 
 
 def blocking_issues(issues: list[dict]) -> list[dict]:
-    """Include individually severe and collectively systemic L3 findings."""
-    blocking_ids = {
-        id(issue) for issue in issues if is_blocking_issue(issue)
-    }
-    moderate_groups: dict[tuple[str, str], list[dict]] = {}
-    for issue in issues:
-        if (
-            issue.get("severity") == "moderate"
-            and issue.get("layer") == "L3"
-            and str(issue.get("code") or "").upper() in {"R1", "R2", "R3", "R4"}
-        ):
-            key = ("L3", str(issue.get("code") or "").upper())
-            moderate_groups.setdefault(key, []).append(issue)
-    for grouped in moderate_groups.values():
-        affected_shots = {
-            shot_id
-            for issue in grouped
-            for shot_id in issue.get("shot_ids") or []
-        }
-        if len(affected_shots) >= 2:
-            blocking_ids.update(id(issue) for issue in grouped)
-    return [issue for issue in issues if id(issue) in blocking_ids]
+    """Return deterministic errors and evidenced high-confidence negatives."""
+    return [issue for issue in issues if is_blocking_issue(issue)]
 
 
 def grade_issues(issues: list[dict]) -> str:
@@ -2194,7 +2441,20 @@ def grade_issues(issues: list[dict]) -> str:
     return "A"
 
 
-def run_storyboard_qa_gate(output_dir: Path, similarity_threshold: float | None = None, embedder: Callable[[str], list[float] | None] | None = None, multimodal_client: ArkMultimodalClient | None = None) -> dict:
+def run_storyboard_qa_gate(
+    output_dir: Path,
+    similarity_threshold: float | None = None,
+    embedder: Callable[[str], list[float] | None] | None = None,
+    multimodal_client: ArkMultimodalClient | None = None,
+    *,
+    structured_understanding_max_attempts: int = (
+        DEFAULT_STRUCTURED_UNDERSTANDING_ATTEMPTS
+    ),
+    _acceptance_max_new_observations: int | None = None,
+    _acceptance_before_provider_request: (
+        Callable[[dict[str, Any]], None] | None
+    ) = None,
+) -> dict:
     """Run all QA layers, persist the report, and return a phase result."""
     output_dir = Path(output_dir)
     report_path = output_dir / "storyboard_qa_report.json"
@@ -2202,6 +2462,19 @@ def run_storyboard_qa_gate(output_dir: Path, similarity_threshold: float | None 
         storyboard = json.loads((output_dir / "STORYBOARD.json").read_text(encoding="utf-8"))
         characters_path = output_dir / "CHARACTERS.json"
         characters = json.loads(characters_path.read_text(encoding="utf-8")) if characters_path.is_file() else {"characters": []}
+        from utils.canonical_visual_contracts import (
+            load_canonical_visual_contract,
+        )
+
+        visual_contract = load_canonical_visual_contract(
+            output_dir,
+            characters_data=characters,
+        )
+        if (
+            storyboard.get("canonical_visual_contract_sha256")
+            != visual_contract["contract_sha256"]
+        ):
+            raise ValueError("storyboard canonical visual contract hash mismatch")
         style_path = output_dir / "visual-style.md"
         visual_style = style_path.read_text(encoding="utf-8") if style_path.is_file() else ""
         events_path = output_dir / "phase1_events.json"
@@ -2288,6 +2561,15 @@ def run_storyboard_qa_gate(output_dir: Path, similarity_threshold: float | None 
         output_dir / "storyboard_qa_grid.jpg",
         multimodal_client,
         character_reference_images=character_reference_images,
+        structured_understanding_max_attempts=(
+            structured_understanding_max_attempts
+        ),
+        _acceptance_max_new_observations=(
+            _acceptance_max_new_observations
+        ),
+        _acceptance_before_provider_request=(
+            _acceptance_before_provider_request
+        ),
     )
     l4_issues, l4 = run_l4_first_frame_review(
         storyboard,

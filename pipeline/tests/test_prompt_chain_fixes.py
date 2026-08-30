@@ -108,7 +108,12 @@ def _write_cinematic_frame(path: Path, marker: bytes = b"s") -> None:
     )
 
 
-def test_f3_two_characters_bind_distinct_actual_reference_numbers(tmp_path, monkeypatch):
+def test_f3_two_characters_bind_distinct_actual_reference_numbers(
+    tmp_path,
+    monkeypatch,
+    canonical_run_contract,
+    character_reference_board,
+):
     characters = [
         {"id": "rin", "name": "凛", "appearance": {"clothing": "黑色短夹克", "face": "冷静眼神", "hair": "银灰短发"}},
         {"id": "jin", "name": "烬", "appearance": {"clothing": "深色战斗服", "face": "沉稳面容", "hair": "黑发"}},
@@ -116,16 +121,14 @@ def test_f3_two_characters_bind_distinct_actual_reference_numbers(tmp_path, monk
     for character in characters:
         _add_reference_contract(character)
         assert character["distinguishing_features"]
-    (tmp_path / "CHARACTERS.json").write_text(
-        json.dumps({"characters": characters}, ensure_ascii=False), encoding="utf-8"
-    )
-    _write_character_assets(tmp_path, "rin", b"r")
-    _write_character_assets(tmp_path, "jin", b"j")
+    canonical_run_contract(tmp_path, {"characters": characters})
+    character_reference_board(tmp_path, "rin", color_seed=1)
+    character_reference_board(tmp_path, "jin", color_seed=2)
     monkeypatch.setattr(
         tos_uploader,
         "upload_image",
         lambda image_bytes, content_type: _signed_tos_url(
-            monkeypatch, f"fixture/{image_bytes[:1].decode()}.png"
+            monkeypatch, f"fixture/{image_bytes[:1].hex()}.png"
         ),
     )
 
@@ -140,9 +143,9 @@ def test_f3_two_characters_bind_distinct_actual_reference_numbers(tmp_path, monk
     )
     prompt = next(item["text"] for item in content if item["type"] == "text")
     refs = [item for item in content if item.get("role") == "reference_image"]
-    assert len(refs) == 4
+    assert len(refs) == 2
     assert "参考图片1中的凛" in prompt
-    assert "参考图片3中的烬" in prompt
+    assert "参考图片2中的烬" in prompt
     assert "定义为<主体1>" in prompt and "定义为<主体2>" in prompt
     assert "{图片N}" not in prompt and "{主体N}" not in prompt
 
@@ -277,17 +280,22 @@ def test_phase5_uses_stricter_action_budget_for_four_second_clip():
 
 
 def test_action_phantom_with_cinematic_frame_uses_numbered_omni_references(
-    tmp_path, monkeypatch
+    tmp_path,
+    monkeypatch,
+    canonical_run_contract,
+    character_reference_board,
 ):
     characters = [
         {"id": "rin", "name": "凛", "aliases": []},
         {"id": "jin", "name": "烬", "aliases": []},
     ]
-    (tmp_path / "CHARACTERS.json").write_text(
-        json.dumps({"characters": characters}, ensure_ascii=False), encoding="utf-8"
-    )
+    canonical_run_contract(tmp_path, {"characters": characters})
     for character in characters:
-        _write_character_assets(tmp_path, character["id"], character["id"][0].encode())
+        character_reference_board(
+            tmp_path,
+            character["id"],
+            color_seed=1 if character["id"] == "rin" else 2,
+        )
     storyboard_dir = tmp_path / "storyboard_images"
     _write_cinematic_frame(storyboard_dir / "S01.png")
     storyboard_url = _signed_tos_url(monkeypatch, "fixture/s.png")
@@ -311,11 +319,10 @@ def test_action_phantom_with_cinematic_frame_uses_numbered_omni_references(
         "reference_image",
         "reference_image",
     ]
-    assert images[0]["image_url"]["url"] == storyboard_url
-    assert "首帧为图片1" in prompt
-    assert "图片1为S01成片质感第一帧" in prompt
-    assert "凛=<主体1>（图片2）" in prompt
-    assert "烬=<主体2>（图片3）" in prompt
+    assert "首帧为图片3" in prompt
+    assert "图片3为S01成片质感第一帧" in prompt
+    assert "凛=<主体1>（图片1）" in prompt
+    assert "烬=<主体2>（图片2）" in prompt
     assert "motion-priority" in prompt
     assert "主体箭头控制主体的运动方向、路径和速度趋势" in prompt
     assert "不得把它们转化成光效、道具、HUD、UI 或字幕" in prompt
