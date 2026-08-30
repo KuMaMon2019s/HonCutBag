@@ -56,7 +56,7 @@ def test_cache_identity_fails_closed_instead_of_using_a_weaker_key():
 
 
 def test_state_migration_registry_upgrades_v0_and_rejects_future_versions():
-    assert set(STATE_MIGRATIONS) == {0, 1, 2}
+    assert set(STATE_MIGRATIONS) == {0, 1, 2, 3}
     migrated = migrate_state(
         {
             "text": "story",
@@ -65,20 +65,21 @@ def test_state_migration_registry_upgrades_v0_and_rejects_future_versions():
             "error": "legacy failure",
         }
     )
-    assert migrated["state_schema_version"] == 3
+    assert migrated["state_schema_version"] == 4
     assert migrated["shot_policy"] == "cut-driven"
     assert migrated["max_material_padding_ratio"] == 0.25
     assert migrated["delivery_overrun_ratio"] == 0.0
+    assert migrated["character_visual_policy"] == "source_derived"
     assert migrated["input_text"] == "story"
     assert migrated["target_duration_s"] == 30
     assert migrated["shot_ids"] == ["S01"]
     assert "text" not in migrated
     with pytest.raises(StateMigrationError, match="newer than supported"):
-        migrate_state({"state_schema_version": 4})
+        migrate_state({"state_schema_version": 5})
 
 
 def test_artifact_migration_registry_upgrades_known_v0_manifest(tmp_path):
-    assert set(ARTIFACT_MANIFEST_MIGRATIONS) == {0}
+    assert set(ARTIFACT_MANIFEST_MIGRATIONS) == {0, 1}
     artifact = tmp_path / "story.txt"
     artifact.write_text("story", encoding="utf-8")
     import hashlib
@@ -109,8 +110,9 @@ def test_artifact_migration_registry_upgrades_known_v0_manifest(tmp_path):
     store = ArtifactManifestStore(tmp_path, run_id="run-1", project_id="project-1")
 
     migrated = store.load()
-    assert migrated.schema_version == 1
-    assert migrated.artifacts[0].schema_version == 1
+    assert migrated.schema_version == 2
+    assert migrated.artifacts[0].schema_version == 2
+    assert migrated.artifacts[0].migration_status == "audit_only_unknown_v1"
     assert store.resolve("artifact-legacy").relative_path == "story.txt"
 
 
@@ -118,7 +120,7 @@ def test_artifact_migration_registry_rejects_unknown_future_version(tmp_path):
     (tmp_path / "ARTIFACT_MANIFEST.json").write_text(
         json.dumps(
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "run_id": "run-1",
                 "project_id": "project-1",
                 "artifacts": [],

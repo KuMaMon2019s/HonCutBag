@@ -27,7 +27,11 @@ def _image(path: Path, marker: bytes) -> None:
     path.write_bytes(marker * 2048)
 
 
-def _multi_character_project(tmp_path: Path) -> dict:
+def _multi_character_project(
+    tmp_path: Path,
+    canonical_run_contract,
+    character_reference_board,
+) -> dict:
     frame = tmp_path / "video_first_frames" / "S02_P01.png"
     _image(frame, b"s")
     frame.with_suffix(".json").write_text(
@@ -39,18 +43,16 @@ def _multi_character_project(tmp_path: Path) -> dict:
         }),
         encoding="utf-8",
     )
-    for char_id, marker in (("black_merc", b"b"), ("silver_tech", b"t")):
-        char_dir = tmp_path / "characters" / char_id
-        _image(char_dir / "face_closeup.png", marker)
-        _image(char_dir / "full_body.png", marker.upper())
+    character_reference_board(tmp_path, "black_merc", color_seed=1)
+    character_reference_board(tmp_path, "silver_tech", color_seed=2)
     _image(tmp_path / "characters" / "black_merc" / "variant_b.png", b"2")
     _image(tmp_path / "characters" / "black_merc" / "variant_a.png", b"1")
-    (tmp_path / "CHARACTERS.json").write_text(
-        json.dumps({"characters": [
+    canonical_run_contract(
+        tmp_path,
+        {"characters": [
             {"id": "black_merc", "name": "黑色佣兵"},
             {"id": "silver_tech", "name": "银色技师"},
-        ]}),
-        encoding="utf-8",
+        ]},
     )
     return {
         "shot_id": "S02",
@@ -67,9 +69,11 @@ def _multi_character_project(tmp_path: Path) -> dict:
 
 
 def test_task_dir_and_content_share_numbered_omni_reference_contract(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, canonical_run_contract, character_reference_board
 ):
-    shot_meta = _multi_character_project(tmp_path)
+    shot_meta = _multi_character_project(
+        tmp_path, canonical_run_contract, character_reference_board
+    )
     monkeypatch.setattr(
         tos_uploader,
         "upload_image",
@@ -90,21 +94,26 @@ def test_task_dir_and_content_share_numbered_omni_reference_contract(
     assert set(image_roles) == {"reference_image"}
     assert manifest["strategy"] == "phantom"
     assert manifest["first_frame"] is None
-    assert manifest["references"][0]["path"] == "分镜/分镜图.png"
+    assert manifest["references"][0]["path"] == "black_merc/四视图身份参考板.png"
+    assert manifest["references"][2]["path"] == "分镜/分镜图.png"
     assert [item["label"] for item in manifest["references"]] == [
         f"图片{index}"
         for index in range(1, len(manifest["references"]) + 1)
     ]
-    assert "首帧为图片1" in prompt
+    assert "首帧为图片3" in prompt
     assert "构图、角色站位、场景结构、项目美术风格、时间天气和光影" in prompt
-    assert "首帧为图片1" in content_prompt
-    assert "图片1为S02成片质感第一帧" in content_prompt
+    assert "首帧为图片3" in content_prompt
+    assert "图片3为S02成片质感第一帧" in content_prompt
     assert (task_dir / "S02" / "black_merc").is_dir()
     assert (task_dir / "S02" / "silver_tech").is_dir()
 
 
-def test_task_directory_matches_contract_structure(tmp_path):
-    shot_meta = _multi_character_project(tmp_path)
+def test_task_directory_matches_contract_structure(
+    tmp_path, canonical_run_contract, character_reference_board
+):
+    shot_meta = _multi_character_project(
+        tmp_path, canonical_run_contract, character_reference_board
+    )
     task_dir = task_dir_exporter.build_task_dir(tmp_path, ["S02"], shot_meta)
     required = [
         "task_manifest.json",
@@ -128,8 +137,12 @@ def test_task_directory_matches_contract_structure(tmp_path):
     }
 
 
-def test_upload_preserves_utf8_object_keys_without_network(tmp_path, monkeypatch):
-    shot_meta = _multi_character_project(tmp_path)
+def test_upload_preserves_utf8_object_keys_without_network(
+    tmp_path, monkeypatch, canonical_run_contract, character_reference_board
+):
+    shot_meta = _multi_character_project(
+        tmp_path, canonical_run_contract, character_reference_board
+    )
     task_dir = task_dir_exporter.build_task_dir(tmp_path, ["S02"], shot_meta)
     uploads = []
 
@@ -144,8 +157,7 @@ def test_upload_preserves_utf8_object_keys_without_network(tmp_path, monkeypatch
     keys = [key for key, _ in uploads]
     assert f"tasks/{task_id}/S02/提示词/提示词.txt" in keys
     assert f"tasks/{task_id}/S02/分镜/分镜图.png" in keys
-    assert any("大头照" in key for key in keys)
-    assert any("全身照" in key for key in keys)
+    assert sum("四视图身份参考板" in key for key in keys) == 2
     assert all("%" not in key for key in keys)
 
 

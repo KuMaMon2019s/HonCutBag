@@ -9,8 +9,21 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-ARTIFACT_SCHEMA_VERSION = 1
-ARTIFACT_MANIFEST_SCHEMA_VERSION = 1
+ARTIFACT_SCHEMA_VERSION = 2
+ARTIFACT_MANIFEST_SCHEMA_VERSION = 2
+
+ArtifactAuthorityRole = Literal[
+    "character_identity",
+    "hair_geometry",
+    "body_geometry",
+    "wardrobe",
+    "prop_geometry",
+    "current_visual_state",
+    "story_action",
+    "camera_motion",
+    "spatial_relation",
+    "continuity_anchor",
+]
 
 
 class ArtifactRef(BaseModel):
@@ -23,7 +36,7 @@ class ArtifactRef(BaseModel):
         strict=True,
     )
 
-    schema_version: Literal[1] = ARTIFACT_SCHEMA_VERSION
+    schema_version: Literal[2] = ARTIFACT_SCHEMA_VERSION
     artifact_id: str = Field(min_length=1)
     run_id: str = Field(min_length=1)
     project_id: str = Field(min_length=1)
@@ -33,6 +46,21 @@ class ArtifactRef(BaseModel):
         default=None,
         pattern=r"^[0-9a-f]{64}$",
     )
+    canonical_contract_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    prompt_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    authority_roles: tuple[ArtifactAuthorityRole, ...] = ()
+    non_authority_roles: tuple[ArtifactAuthorityRole, ...] = ()
+    migration_status: Literal[
+        "current",
+        "mapped_known_v1",
+        "audit_only_unknown_v1",
+    ] = "current"
     relative_path: str = Field(min_length=1)
     producer_node: str = Field(min_length=1)
     producer_task_id: str | None = Field(default=None, min_length=1)
@@ -72,13 +100,27 @@ class ArtifactRef(BaseModel):
             raise ValueError("parent artifact IDs must be unique")
         return value
 
+    @model_validator(mode="after")
+    def validate_authority_roles(self) -> "ArtifactRef":
+        if len(set(self.authority_roles)) != len(self.authority_roles):
+            raise ValueError("artifact authority roles must be unique")
+        if len(set(self.non_authority_roles)) != len(self.non_authority_roles):
+            raise ValueError("artifact non-authority roles must be unique")
+        overlap = set(self.authority_roles) & set(self.non_authority_roles)
+        if overlap:
+            raise ValueError(
+                "artifact authority and non-authority roles overlap: "
+                + ", ".join(sorted(overlap))
+            )
+        return self
+
 
 class ArtifactManifest(BaseModel):
     """Versioned, project-bound registry for one run's artifacts."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: Literal[1] = ARTIFACT_MANIFEST_SCHEMA_VERSION
+    schema_version: Literal[2] = ARTIFACT_MANIFEST_SCHEMA_VERSION
     run_id: str = Field(min_length=1)
     project_id: str = Field(min_length=1)
     artifacts: tuple[ArtifactRef, ...] = ()
@@ -99,6 +141,26 @@ class ArtifactManifest(BaseModel):
                 raise ValueError(
                     "artifact references missing parents: " + ", ".join(sorted(missing))
                 )
+        parents_by_id = {
+            artifact.artifact_id: set(artifact.parent_artifact_ids)
+            for artifact in self.artifacts
+        }
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(artifact_id: str) -> None:
+            if artifact_id in visiting:
+                raise ValueError("artifact lineage contains a cycle")
+            if artifact_id in visited:
+                return
+            visiting.add(artifact_id)
+            for parent_id in parents_by_id[artifact_id]:
+                visit(parent_id)
+            visiting.remove(artifact_id)
+            visited.add(artifact_id)
+
+        for artifact_id in identifiers:
+            visit(artifact_id)
         return self
 
 
@@ -106,5 +168,6 @@ __all__ = [
     "ARTIFACT_MANIFEST_SCHEMA_VERSION",
     "ARTIFACT_SCHEMA_VERSION",
     "ArtifactManifest",
+    "ArtifactAuthorityRole",
     "ArtifactRef",
 ]

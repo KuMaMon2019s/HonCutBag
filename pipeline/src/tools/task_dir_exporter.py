@@ -113,10 +113,11 @@ def build_task_dir(output_dir, shot_ids: Sequence[str], meta: Mapping) -> Path:
         if expected_characters and not phantom_identity_assets:
             raise FileNotFoundError(
                 "Phantom character references missing for shot "
-                f"{shot_id}; expected reference_board.png, legacy canonical "
-                "views"
+                f"{shot_id}; expected a verified reference_board.png"
             )
         assets = []
+        if strategy == "phantom":
+            assets.extend(phantom_identity_assets)
         if strategy == "phantom" and cinematic_frame:
             assets.append({
                 "path": first_source,
@@ -131,8 +132,6 @@ def build_task_dir(output_dir, shot_ids: Sequence[str], meta: Mapping) -> Path:
                     "该资产已经过无文字、无箭头、无分格的像素洁净检查"
                 ),
             })
-        if strategy == "phantom":
-            assets.extend(phantom_identity_assets)
         for index, asset in enumerate(assets, start=1):
             source = asset["path"]
             if asset.get("reference_kind") == "cinematic_composition":

@@ -184,6 +184,71 @@ class CharacterVariantUnderstanding(StrictUnderstandingModel):
     description: str
 
 
+class CanonicalVisualFactUnderstanding(StrictUnderstandingModel):
+    value: str | int | float | bool | list[str]
+    origin: Literal["explicit_source", "deterministic_completion"]
+    source_refs: list[str] = Field(default_factory=list)
+
+
+class HairGeometryUnderstanding(StrictUnderstandingModel):
+    color: CanonicalVisualFactUnderstanding
+    length_class: CanonicalVisualFactUnderstanding
+    silhouette: CanonicalVisualFactUnderstanding
+    parting: CanonicalVisualFactUnderstanding
+    texture: CanonicalVisualFactUnderstanding
+    tie_state: CanonicalVisualFactUnderstanding
+
+
+class IdentityPropGeometryUnderstanding(StrictUnderstandingModel):
+    topology: CanonicalVisualFactUnderstanding
+    shape_family: CanonicalVisualFactUnderstanding
+    component_count: CanonicalVisualFactUnderstanding
+    active_end_count: CanonicalVisualFactUnderstanding
+    handle_count: CanonicalVisualFactUnderstanding
+    relative_scale: CanonicalVisualFactUnderstanding
+    material: CanonicalVisualFactUnderstanding
+    colors: CanonicalVisualFactUnderstanding
+    emissive_regions: CanonicalVisualFactUnderstanding
+    forbidden_topology_changes: list[str] = Field(default_factory=list)
+
+
+class CanonicalIdentityPropContractUnderstanding(StrictUnderstandingModel):
+    prop_id: str
+    name: str
+    geometry: IdentityPropGeometryUnderstanding
+
+
+class CanonicalCharacterVisualContractUnderstanding(StrictUnderstandingModel):
+    character_id: str
+    instance_count: CanonicalVisualFactUnderstanding
+    visual_identity_policy: Literal[
+        "fictional_cinematic_human_v1",
+        "synthetic_stylized_character_v3",
+    ]
+    hair: HairGeometryUnderstanding
+    body_build: CanonicalVisualFactUnderstanding
+    face: CanonicalVisualFactUnderstanding
+    wardrobe: CanonicalVisualFactUnderstanding
+    identity_props: list[CanonicalIdentityPropContractUnderstanding] = Field(
+        default_factory=list
+    )
+
+
+class CanonicalVisualContractUnderstanding(StrictUnderstandingModel):
+    contract_schema: Literal["honcut.canonical-visual-contract.v1"] = Field(
+        alias="schema",
+        serialization_alias="schema",
+    )
+    requested_policy: Literal[
+        "source_derived",
+        "fictional_cinematic_human_v1",
+        "synthetic_stylized_character_v3",
+    ]
+    source_characters_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    characters: list[CanonicalCharacterVisualContractUnderstanding]
+    contract_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class IdentityPropUnderstanding(StrictUnderstandingModel):
     id: str
     name: str
@@ -641,6 +706,10 @@ def native_chat_json_schema_format(
 
 
 __all__ = [
+    "CanonicalCharacterVisualContractUnderstanding",
+    "CanonicalIdentityPropContractUnderstanding",
+    "CanonicalVisualFactUnderstanding",
+    "CanonicalVisualContractUnderstanding",
     "CharacterUnderstandingBatch",
     "CharacterReferenceUnderstanding",
     "DirectorPlanUnderstanding",
@@ -648,6 +717,8 @@ __all__ = [
     "SourceIndexedScreenplayRewriteBatch",
     "FirstFrameUnderstanding",
     "IdentityDetailUnderstanding",
+    "HairGeometryUnderstanding",
+    "IdentityPropGeometryUnderstanding",
     "EventUnderstandingBatch",
     "ShotSemanticReview",
     "StoryboardPromptUnderstanding",

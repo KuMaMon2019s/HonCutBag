@@ -372,7 +372,11 @@ def _offline_executor_factory(
             f"offline-{request.resource_id}-{task.task_id[:12]}"
         )
         if not task.provider_job_id:
-            task_store.persist_provider_job(
+            task_store.reserve_submission_attempt(
+                task.task_id,
+                provider_endpoint=OFFLINE_PROVIDER_ENDPOINT,
+            )
+            task_store.confirm_provider_job(
                 task.task_id,
                 provider_job_id=provider_job_id,
                 provider_endpoint=OFFLINE_PROVIDER_ENDPOINT,
@@ -601,7 +605,7 @@ def _prepare_phase1_to_phase5(output_dir: Path) -> dict[str, Any]:
         transition_duration=0.0,
         media_profile=MEDIA_PROFILE,
         enable_reshoot=False,
-        no_real_person=False,
+        character_visual_policy="source_derived",
         auto_approve=True,
     )
     if result.get("status") != "completed":

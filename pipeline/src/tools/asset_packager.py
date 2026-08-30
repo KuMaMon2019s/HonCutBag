@@ -23,8 +23,11 @@ from tools.character_reference_board import (
 )
 
 CINEMATIC_FIRST_FRAME_SCHEMA = "honcut.cinematic-first-frame.v1"
-STORYBOARD_NARRATIVE_GUIDE_SCHEMA = "honcut.storyboard-narrative-guide.v1"
+STORYBOARD_NARRATIVE_GUIDE_SCHEMA = "honcut.storyboard-narrative-guide.v2"
 STORYBOARD_NARRATIVE_GUIDE_USAGE = "phase6_story_narrative_guide_not_output_pixels"
+STORYBOARD_NARRATIVE_GUIDE_RENDERER = (
+    "honcut.identity-neutral-story-guide-renderer.v1"
+)
 CHARACTER_PERFORMANCE_GUIDE_SCHEMA = "honcut.character-performance-guide.v2"
 CHARACTER_PERFORMANCE_GUIDE_USAGE = "current_pxx_motion_reference_only"
 PREVIS_FRAME_PATH_PARTS = frozenset({
@@ -88,9 +91,14 @@ def _assert_narrative_guide_provenance(
     declared_usage: Any,
     declared_cell_ids: Any,
     declared_sha256: Any,
+    declared_renderer: Any,
+    declared_source_pixel_usage: Any,
+    declared_semantic_payload_sha256: Any,
     declared_source_board: Any,
     declared_source_board_sha256: Any,
     declared_receipt: Any,
+    declared_authority_roles: Any,
+    declared_non_authority_roles: Any,
     declared_beat_id: Any,
     output_dir: Path,
 ) -> dict[str, Any]:
@@ -117,12 +125,33 @@ def _assert_narrative_guide_provenance(
     beat_id = str(declared_beat_id or "").strip()
     if not cell_ids or len(cell_ids) != len(set(cell_ids)):
         raise ValueError("storyboard narrative guide needs ordered unique Gxx cells")
+    semantic_payload = receipt.get("semantic_payload")
+    if not isinstance(semantic_payload, dict):
+        raise ValueError("storyboard narrative guide semantic payload is missing")
+    semantic_observed = hashlib.sha256(
+        json.dumps(
+            semantic_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    authority_roles = [str(value) for value in (declared_authority_roles or [])]
+    non_authority_roles = [
+        str(value) for value in (declared_non_authority_roles or [])
+    ]
     if (
         str(declared_sha256 or "") != observed
+        or str(declared_renderer or "") != STORYBOARD_NARRATIVE_GUIDE_RENDERER
+        or str(declared_source_pixel_usage or "") != "none"
+        or str(declared_semantic_payload_sha256 or "") != semantic_observed
         or str(declared_source_board_sha256 or "") != source_observed
         or receipt.get("kind") != STORYBOARD_NARRATIVE_GUIDE_SCHEMA
-        or receipt.get("version") != 1
+        or receipt.get("version") != 2
         or receipt.get("usage") != STORYBOARD_NARRATIVE_GUIDE_USAGE
+        or receipt.get("renderer") != STORYBOARD_NARRATIVE_GUIDE_RENDERER
+        or receipt.get("source_pixel_usage") != "none"
+        or receipt.get("semantic_payload_sha256") != semantic_observed
         or receipt.get("status") != "done"
         or receipt.get("beat_id") != beat_id
         or receipt.get("primary_shot_id") != beat_id.split("_P", 1)[0]
@@ -131,6 +160,15 @@ def _assert_narrative_guide_provenance(
         or receipt.get("image_sha256") != observed
         or receipt.get("source_board_sha256") != source_observed
         or receipt.get("cell_ids") != cell_ids
+        or receipt.get("authority_roles") != authority_roles
+        or receipt.get("non_authority_roles") != non_authority_roles
+        or authority_roles != [
+            "narrative_order",
+            "action_direction",
+            "camera_motion",
+            "spatial_relationship",
+        ]
+        or "character_identity" not in non_authority_roles
         or int(receipt.get("provider_request_count") or 0) != 0
     ):
         raise ValueError("storyboard narrative guide receipt/hash/cell binding mismatch")
@@ -468,14 +506,7 @@ def collect_character_reference_assets(
         if not char_dir.exists():
             char_dir = output_dir / "characters" / "characters" / char_id
         identity_reference = resolve_character_reference_board(output_dir, char_id)
-        reference_paths = (
-            [identity_reference]
-            if identity_reference is not None
-            else [
-                char_dir / "face_closeup.png",
-                char_dir / "full_body.png",
-            ]
-        )
+        reference_paths = [identity_reference] if identity_reference is not None else []
         for reference_path in reference_paths:
             if reference_path.exists() and reference_path.stat().st_size > 1024:
                 references.append({
@@ -503,6 +534,25 @@ def collect_character_reference_assets(
                     ),
                 })
     return references
+
+
+_CANONICAL_PROMPT_MARKER = (
+    "[CANONICAL_VISUAL_CONTRACT — HIGHEST IDENTITY AUTHORITY]"
+)
+_CANONICAL_PROMPT_SUFFIX = "其他图片只承担其声明职责，不得改写这些事实。"
+
+
+def _insert_after_canonical_authority(prompt_text: str, instruction: str) -> str:
+    """Keep the Phase 1 authority first while adding downstream instructions."""
+    if prompt_text.startswith(_CANONICAL_PROMPT_MARKER):
+        boundary = prompt_text.find(_CANONICAL_PROMPT_SUFFIX)
+        if boundary >= 0:
+            boundary += len(_CANONICAL_PROMPT_SUFFIX)
+            return (
+                f"{prompt_text[:boundary]}\n{instruction}"
+                f"{prompt_text[boundary:]}"
+            )
+    return f"{instruction}{prompt_text}"
 
 
 def inject_reference_instruction(prompt_text: str, descriptions: List[Any]) -> str:
@@ -628,7 +678,10 @@ def inject_reference_instruction(prompt_text: str, descriptions: List[Any]) -> s
             prompt_text,
             count=1,
         )
-    return f"元素参考：{instruction}{prompt_text}"
+    return _insert_after_canonical_authority(
+        prompt_text,
+        f"元素参考：{instruction}",
+    )
 
 
 def inject_omni_reference_instruction(
@@ -648,15 +701,15 @@ def inject_omni_reference_instruction(
     )
     if cinematic_number is None:
         return prompt_text
-    return (
+    instruction = (
         "全模态参考首帧合同："
         f"首帧为图片{cinematic_number}。"
         f"图片{cinematic_number}锁定开场构图、角色站位、场景结构、"
         "项目美术风格、时间天气和光影；其余图片只按各自编号锁定"
         "角色身份、服装、身体比例、道具或明确声明的参考职责。"
         f"不得把图片{cinematic_number}中的单一姿态冻结为全片动作。"
-        f"{prompt_text}"
     )
+    return _insert_after_canonical_authority(prompt_text, instruction)
 
 
 def inject_flf2v_identity_lock(
@@ -741,11 +794,10 @@ def build_content_for_shot(
             {"type": "image_url", "image_url": {"url": "https://..."}, "role": "reference_image", "priority": "high"}
         ]
 
-    Standard Seedance generation uses numbered ``reference_image`` inputs.  A
-    Phase 4 cinematic frame is image 1 and the prompt explicitly asks the model
-    to use image 1 as the first frame; canonical character boards follow it in
-    the same all-modal reference request.  FLF2V alone keeps explicit
-    ``first_frame`` / ``last_frame`` endpoint control.
+    Standard Seedance generation uses numbered ``reference_image`` inputs.
+    Canonical character boards precede the Phase 4 cinematic frame, and the
+    prompt binds the frame's final media index as the requested first frame.
+    FLF2V alone keeps explicit ``first_frame`` / ``last_frame`` endpoint control.
 
     Legacy paths (zip/base64) are preserved for backward compatibility but not
     used in the primary content[] workflow.
@@ -787,12 +839,43 @@ def build_content_for_shot(
         shot_meta,
         characters_data,
     )
+    from utils.canonical_visual_contracts import (
+        load_canonical_visual_contract,
+        render_canonical_visual_prompt_contract,
+    )
+
+    canonical_contract = load_canonical_visual_contract(
+        output_dir,
+        characters_data=characters_data,
+    )
+    canonical_prompt = render_canonical_visual_prompt_contract(
+        canonical_contract,
+        character_ids=_detect_shot_characters(output_dir, shot_meta),
+    )
+    selected_character_ids = set(_detect_shot_characters(output_dir, shot_meta))
+    selected_contract_characters = [
+        character
+        for character in canonical_contract.get("characters", [])
+        if character.get("character_id") in selected_character_ids
+    ]
+    synthetic_contract = ""
+    if selected_contract_characters and all(
+        character.get("visual_identity_policy")
+        == "synthetic_stylized_character_v3"
+        for character in selected_contract_characters
+    ):
+        from utils.privacy_visual_policy import synthetic_stylized_prompt_contract
+
+        synthetic_contract = synthetic_stylized_prompt_contract()
+    prompt_text = "\n".join(
+        part for part in (canonical_prompt, synthetic_contract, prompt_text) if part
+    ).strip()
     if prompt_text:
         content.append({"type": "text", "text": prompt_text})
 
-    # The Phase 4 cinematic frame is the first numbered all-modal reference for
-    # ordinary generation.  The prompt binds it as the requested first frame;
-    # canonical character boards can therefore travel in the same request.
+    # The Phase 4 cinematic frame is a numbered all-modal reference for ordinary
+    # generation. Identity boards precede it; the prompt binds its final index
+    # as the requested first frame.
     # Strict frame roles are reserved for FLF2V endpoints. Director/PREVIS
     # pixels are rejected at this boundary even when an old continuity plan
     # points at them.
@@ -811,6 +894,7 @@ def build_content_for_shot(
         else storyboard_images_dir / f"{shot_id}.png"
     )
     image_assets = []
+    cinematic_assets = []
     include_cinematic_frame = shot_meta.get("_include_cinematic_frame", True) is not False
     if (
         include_cinematic_frame
@@ -827,7 +911,7 @@ def build_content_for_shot(
             if beat_label
             else f"{shot_id}成片质感第一帧"
         )
-        image_assets.append({
+        cinematic_assets.append({
             "path": shot_frame_path,
             "role": (
                 "first_frame"
@@ -846,6 +930,7 @@ def build_content_for_shot(
         })
 
     if strategy == "flf2v":
+        image_assets.extend(cinematic_assets)
         end_frame_path = storyboard_images_dir / f"{shot_id}_end.png"
         if end_frame_path.exists() and end_frame_path.stat().st_size > 1024:
             image_assets.append({
@@ -860,6 +945,12 @@ def build_content_for_shot(
         else:
             raise FileNotFoundError(
                 f"FLF2V end frame missing or too small: {end_frame_path}"
+            )
+    elif strategy == "i2v":
+        image_assets.extend(cinematic_assets)
+        if not image_assets:
+            raise FileNotFoundError(
+                f"I2V cinematic first frame missing or too small: {shot_frame_path}"
             )
     elif strategy == "phantom":
         character_assets = collect_character_reference_assets(output_dir, shot_meta)
@@ -910,6 +1001,7 @@ def build_content_for_shot(
                 image_assets.extend(selected_characters)
             else:
                 image_assets.extend(character_assets)
+            image_assets.extend(cinematic_assets)
         else:
             primary_character_assets: list[dict] = []
             for character_id in expected_characters:
@@ -927,6 +1019,7 @@ def build_content_for_shot(
                 )
                 primary_character_assets.append({**primary, "mandatory": True})
             image_assets.extend(primary_character_assets)
+            image_assets.extend(cinematic_assets)
             guide_path = Path(guide_value)
             if not guide_path.is_absolute():
                 guide_path = output_dir / guide_path
@@ -940,6 +1033,15 @@ def build_content_for_shot(
                 declared_sha256=shot_meta.get(
                     "_storyboard_narrative_guide_sha256"
                 ),
+                declared_renderer=shot_meta.get(
+                    "_storyboard_narrative_guide_renderer"
+                ),
+                declared_source_pixel_usage=shot_meta.get(
+                    "_storyboard_narrative_guide_source_pixel_usage"
+                ),
+                declared_semantic_payload_sha256=shot_meta.get(
+                    "_storyboard_narrative_guide_semantic_payload_sha256"
+                ),
                 declared_source_board=shot_meta.get(
                     "_storyboard_narrative_guide_source_board"
                 ),
@@ -949,11 +1051,17 @@ def build_content_for_shot(
                 declared_receipt=shot_meta.get(
                     "_storyboard_narrative_guide_receipt"
                 ),
+                declared_authority_roles=shot_meta.get(
+                    "_storyboard_narrative_guide_authority_roles"
+                ),
+                declared_non_authority_roles=shot_meta.get(
+                    "_storyboard_narrative_guide_non_authority_roles"
+                ),
                 declared_beat_id=shot_meta.get("_storyboard_beat_id"),
                 output_dir=output_dir,
             )
             cell_ids = list(guide_receipt["cell_ids"])
-            image_assets.append({
+            narrative_asset = {
                 "path": guide_path,
                 "role": "reference_image",
                 "priority": "high",
@@ -962,13 +1070,20 @@ def build_content_for_shot(
                 "reference_kind": "storyboard_narrative_guide",
                 "narrative_cell_ids": cell_ids,
                 "narrative_beat_id": guide_receipt["beat_id"],
+                "authority_roles": list(guide_receipt["authority_roles"]),
+                "non_authority_roles": list(
+                    guide_receipt["non_authority_roles"]
+                ),
+                "semantic_payload_sha256": guide_receipt[
+                    "semantic_payload_sha256"
+                ],
                 "reference_description": (
                     f"{guide_receipt['beat_id']}剧情导航图，只按"
                     + "→".join(cell_ids)
                     + "理解剧情、动作方向、运镜和空间关系；图中序号、"
                     "文字、箭头、边框、网格和指示标识不得渲染进视频"
                 ),
-            })
+            }
             performance_guides = shot_meta.get("_character_performance_guides") or []
             performance_required = bool(
                 shot_meta.get("_character_performance_required")
@@ -1018,6 +1133,7 @@ def build_content_for_shot(
                         "网格或板中其他动作"
                     ),
                 })
+            image_assets.append(narrative_asset)
         if not image_assets:
             raise FileNotFoundError(
                 "Phantom references missing for shot "
@@ -1054,7 +1170,7 @@ def build_content_for_shot(
     ]
     if len(optional_assets) > optional_capacity:
         print(
-            "  [assets] omitted optional identity detail/variant references: "
+            "  [assets] omitted optional supplemental references: "
             f"{len(optional_assets) - optional_capacity}"
         )
 
@@ -1110,6 +1226,11 @@ def build_content_for_shot(
             "_character_id": asset.get("char_id"),
             "_narrative_cell_ids": asset.get("narrative_cell_ids"),
             "_narrative_beat_id": asset.get("narrative_beat_id"),
+            "_authority_roles": asset.get("authority_roles"),
+            "_non_authority_roles": asset.get("non_authority_roles"),
+            "_semantic_payload_sha256": asset.get(
+                "semantic_payload_sha256"
+            ),
             "_performance_beat_id": asset.get("performance_beat_id"),
             "_performance_cell_ids": asset.get("performance_cell_ids"),
             "_performance_source_action_unit_ids": asset.get(

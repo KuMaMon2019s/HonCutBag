@@ -60,7 +60,7 @@ from schemas.continuity import ContinuityPlan, GenerationChunk
 from utils.config import ARK_AGENT_CREDENTIAL_SOURCE, SEEDANCE_MODEL, get_api_key
 from utils.video_validation import is_valid_video
 from utils.privacy_visual_policy import (
-    NO_REAL_PERSON_POLICY,
+    SYNTHETIC_STYLIZED_CHARACTER_POLICY,
     SYNTHETIC_MAKEUP_PROFILE_ID,
     synthetic_character_review_evidence,
     synthetic_makeup_profile_sha256,
@@ -311,12 +311,14 @@ def _preflight_contract(
     synthetic_evidence = synthetic_character_review_evidence(output_dir)
     character_records = characters_payload.get("characters") or []
     if (
-        characters_payload.get("visual_identity_policy") != NO_REAL_PERSON_POLICY
+        characters_payload.get("visual_identity_policy")
+        != SYNTHETIC_STYLIZED_CHARACTER_POLICY
         or not isinstance(character_records, list)
         or not character_records
         or any(
             not isinstance(character, dict)
-            or character.get("visual_identity_policy") != NO_REAL_PERSON_POLICY
+            or character.get("visual_identity_policy")
+            != SYNTHETIC_STYLIZED_CHARACTER_POLICY
             for character in character_records
         )
         or synthetic_evidence.get("top_level_policy_match") is not True
@@ -499,7 +501,7 @@ def _preflight_contract(
         "p_count": len(shot.get("storyboard_beats") or []),
         "visible_character_ids": visible_character_ids,
         "synthetic_identity": {
-            "visual_identity_policy": NO_REAL_PERSON_POLICY,
+            "visual_identity_policy": SYNTHETIC_STYLIZED_CHARACTER_POLICY,
             "aesthetic_profile_id": SYNTHETIC_MAKEUP_PROFILE_ID,
             "aesthetic_profile_sha256": synthetic_makeup_profile_sha256(),
             "identity_contract_complete": True,

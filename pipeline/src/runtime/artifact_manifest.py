@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,7 +13,7 @@ from typing import Iterable
 
 from runtime.artifact_migrations import migrate_artifact_manifest
 from runtime.security_boundaries import resolve_within_workspace
-from schemas.artifact import ArtifactManifest, ArtifactRef
+from schemas.artifact import ArtifactAuthorityRole, ArtifactManifest, ArtifactRef
 
 
 ARTIFACT_MANIFEST_FILENAME = "ARTIFACT_MANIFEST.json"
@@ -31,6 +32,10 @@ def _artifact_id(
     relative_path: str,
     content_sha256: str,
     semantic_fingerprint: str | None,
+    canonical_contract_sha256: str | None,
+    prompt_sha256: str | None,
+    authority_roles: tuple[str, ...],
+    non_authority_roles: tuple[str, ...],
 ) -> str:
     identity = {
         "project_id": project_id,
@@ -41,6 +46,12 @@ def _artifact_id(
     }
     if semantic_fingerprint is not None:
         identity["semantic_fingerprint"] = semantic_fingerprint
+    if canonical_contract_sha256 is not None:
+        identity["canonical_contract_sha256"] = canonical_contract_sha256
+    if prompt_sha256 is not None:
+        identity["prompt_sha256"] = prompt_sha256
+    identity["authority_roles"] = list(authority_roles)
+    identity["non_authority_roles"] = list(non_authority_roles)
     semantic_identity = json.dumps(
         identity,
         ensure_ascii=False,
@@ -115,6 +126,10 @@ class ArtifactManifestStore:
         parent_artifact_ids: Iterable[str] = (),
         expected_sha256: str | None = None,
         semantic_fingerprint: str | None = None,
+        canonical_contract_sha256: str | None = None,
+        prompt_sha256: str | None = None,
+        authority_roles: Iterable[ArtifactAuthorityRole] = (),
+        non_authority_roles: Iterable[ArtifactAuthorityRole] = (),
     ) -> ArtifactRef:
         source = resolve_within_workspace(
             self.run_directory,
@@ -128,6 +143,28 @@ class ArtifactManifestStore:
         if expected_sha256 is not None and content_sha256 != expected_sha256:
             raise RuntimeError("artifact content hash does not match the expected hash")
         parents = tuple(parent_artifact_ids)
+        resolved_authority_roles = tuple(authority_roles)
+        resolved_non_authority_roles = tuple(non_authority_roles)
+        if not resolved_authority_roles and artifact_type == "video":
+            resolved_authority_roles = (
+                "current_visual_state",
+                "continuity_anchor",
+            )
+        if canonical_contract_sha256 is None:
+            contract_path = self.run_directory / "CANONICAL_VISUAL_CONTRACT.json"
+            if contract_path.is_file():
+                try:
+                    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+                    candidate = str(contract.get("contract_sha256") or "")
+                except (OSError, json.JSONDecodeError, AttributeError):
+                    candidate = ""
+                if re.fullmatch(r"[0-9a-f]{64}", candidate):
+                    canonical_contract_sha256 = candidate
+                elif resolved_authority_roles:
+                    raise RuntimeError(
+                        "authoritative artifact registration requires a valid "
+                        "canonical visual contract"
+                    )
         manifest = self.load()
         known = {artifact.artifact_id: artifact for artifact in manifest.artifacts}
         missing = set(parents) - set(known)
@@ -136,6 +173,18 @@ class ArtifactManifestStore:
                 "artifact registration references missing parents: "
                 + ", ".join(sorted(missing))
             )
+        if parents:
+            incompatible = [
+                parent_id
+                for parent_id in parents
+                if known[parent_id].canonical_contract_sha256
+                != canonical_contract_sha256
+            ]
+            if incompatible:
+                raise RuntimeError(
+                    "artifact parent canonical lineage mismatch: "
+                    + ", ".join(sorted(incompatible))
+                )
         artifact_id = _artifact_id(
             project_id=self.project_id,
             run_id=self.run_id,
@@ -143,6 +192,10 @@ class ArtifactManifestStore:
             relative_path=relative_path,
             content_sha256=content_sha256,
             semantic_fingerprint=semantic_fingerprint,
+            canonical_contract_sha256=canonical_contract_sha256,
+            prompt_sha256=prompt_sha256,
+            authority_roles=resolved_authority_roles,
+            non_authority_roles=resolved_non_authority_roles,
         )
         existing = known.get(artifact_id)
         if existing is not None:
@@ -151,6 +204,12 @@ class ArtifactManifestStore:
                 or existing.producer_task_id != producer_task_id
                 or existing.parent_artifact_ids != parents
                 or existing.semantic_fingerprint != semantic_fingerprint
+                or existing.canonical_contract_sha256
+                != canonical_contract_sha256
+                or existing.prompt_sha256 != prompt_sha256
+                or existing.authority_roles != resolved_authority_roles
+                or existing.non_authority_roles
+                != resolved_non_authority_roles
             ):
                 raise RuntimeError("artifact ID collides with different provenance")
             return self.resolve(existing.artifact_id)
@@ -161,6 +220,11 @@ class ArtifactManifestStore:
             type=artifact_type,
             content_sha256=content_sha256,
             semantic_fingerprint=semantic_fingerprint,
+            canonical_contract_sha256=canonical_contract_sha256,
+            prompt_sha256=prompt_sha256,
+            authority_roles=resolved_authority_roles,
+            non_authority_roles=resolved_non_authority_roles,
+            migration_status="current",
             relative_path=relative_path,
             producer_node=producer_node,
             producer_task_id=producer_task_id,
@@ -175,7 +239,13 @@ class ArtifactManifestStore:
         self._write_atomic(updated)
         return artifact
 
-    def resolve(self, artifact_id: str, *, verify_content: bool = True) -> ArtifactRef:
+    def resolve(
+        self,
+        artifact_id: str,
+        *,
+        verify_content: bool = True,
+        required_authority_roles: Iterable[ArtifactAuthorityRole] = (),
+    ) -> ArtifactRef:
         manifest = self.load()
         artifact = next(
             (item for item in manifest.artifacts if item.artifact_id == artifact_id),
@@ -183,20 +253,65 @@ class ArtifactManifestStore:
         )
         if artifact is None:
             raise KeyError(f"unknown artifact ID: {artifact_id}")
-        if verify_content:
-            try:
-                path = resolve_within_workspace(
-                    self.run_directory,
-                    artifact.relative_path,
-                )
-            except ValueError as error:
-                raise RuntimeError("artifact path escapes its run directory") from error
-            if not path.is_file():
-                raise RuntimeError(f"artifact file is missing: {artifact.relative_path}")
-            if file_sha256(path) != artifact.content_sha256:
+        required_roles = set(required_authority_roles)
+        if required_roles:
+            if artifact.migration_status == "audit_only_unknown_v1":
                 raise RuntimeError(
-                    f"artifact content hash mismatch: {artifact.relative_path}"
+                    "audit-only legacy artifact cannot satisfy production authority"
                 )
+            missing_roles = required_roles - set(artifact.authority_roles)
+            if missing_roles:
+                raise RuntimeError(
+                    "artifact is missing required authority roles: "
+                    + ", ".join(sorted(missing_roles))
+                )
+            contract_path = self.run_directory / "CANONICAL_VISUAL_CONTRACT.json"
+            try:
+                current_contract = json.loads(
+                    contract_path.read_text(encoding="utf-8")
+                )
+                current_contract_sha256 = str(
+                    current_contract["contract_sha256"]
+                )
+            except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
+                raise RuntimeError(
+                    "production authority resolution requires a valid canonical contract"
+                ) from error
+            if (
+                not re.fullmatch(r"[0-9a-f]{64}", current_contract_sha256)
+                or artifact.canonical_contract_sha256
+                != current_contract_sha256
+            ):
+                raise RuntimeError(
+                    "artifact canonical contract does not match the current run"
+                )
+        if verify_content:
+            by_id = {item.artifact_id: item for item in manifest.artifacts}
+            pending = [artifact]
+            checked: set[str] = set()
+            while pending:
+                current = pending.pop()
+                if current.artifact_id in checked:
+                    continue
+                checked.add(current.artifact_id)
+                try:
+                    path = resolve_within_workspace(
+                        self.run_directory,
+                        current.relative_path,
+                    )
+                except ValueError as error:
+                    raise RuntimeError(
+                        "artifact path escapes its run directory"
+                    ) from error
+                if not path.is_file():
+                    raise RuntimeError(
+                        f"artifact file is missing: {current.relative_path}"
+                    )
+                if file_sha256(path) != current.content_sha256:
+                    raise RuntimeError(
+                        f"artifact content hash mismatch: {current.relative_path}"
+                    )
+                pending.extend(by_id[parent] for parent in current.parent_artifact_ids)
         return artifact
 
     def _write_atomic(self, manifest: ArtifactManifest) -> None:
