@@ -3901,6 +3901,20 @@ def _adult_lead_character(name, gender, age_range, role="protagonist"):
     }
 
 
+def _character_roster_observation(prompt, characters):
+    marker = '"roster_sha256":"'
+    start = prompt.rindex(marker) + len(marker)
+    roster_sha256 = prompt[start:start + 64]
+    return json.dumps(
+        {
+            "schema": "honcut.character-roster-observation.v1",
+            "roster_sha256": roster_sha256,
+            "characters": characters,
+        },
+        ensure_ascii=False,
+    )
+
+
 def test_adult_lead_body_contracts_are_exact_and_scoped():
     male = _adult_lead_character("LIN", "male", "25-30")
     female = _adult_lead_character("SU", "female", "22-28")
@@ -4364,15 +4378,14 @@ def test_character_reference_qa_requires_each_declared_face_anchor():
 
 
 def test_character_discovery_body_contract_is_prompted_and_normalized(monkeypatch):
-    response = json.dumps(
-        {"characters": [_adult_lead_character("LIN", "male", "25-30")]},
-        ensure_ascii=False,
-    )
     captured = {}
 
     def fake_call(prompt):
         captured["prompt"] = prompt
-        return response
+        return _character_roster_observation(
+            prompt,
+            [_adult_lead_character("LIN", "male", "25-30")],
+        )
 
     monkeypatch.setattr(character_discoverer, "_call_llm", fake_call)
     result = character_discoverer.discover_characters([{
@@ -4388,7 +4401,7 @@ def test_character_discovery_body_contract_is_prompted_and_normalized(monkeypatc
     assert "head_to_body_ratio=7.6" in captured["prompt"]
     assert "头宽不得超过肩宽的 43%" in captured["prompt"]
     assert ADULT_LEAD_DISCOVERY_INSTRUCTIONS in character_discoverer.SYSTEM_PROMPT
-    assert character_discoverer.CHARACTER_CONTEXT_SCHEMA_VERSION == 11
+    assert character_discoverer.CHARACTER_CONTEXT_SCHEMA_VERSION == 13
     assert "interaction_props" in captured["prompt"]
     assert "bodybuilder physique" in discovered["negative_guardrails"]
     assert "Body-proportion lock" in discovered["prompt_definition"]
@@ -4411,10 +4424,7 @@ def test_character_discovery_binds_attribute_and_referential_mentions_to_one_id(
     monkeypatch.setattr(
         character_discoverer,
         "_call_llm",
-        lambda _prompt: json.dumps(
-            {"characters": [lead, enemy]},
-            ensure_ascii=False,
-        ),
+        lambda prompt: _character_roster_observation(prompt, [lead, enemy]),
     )
     events = [
         {
@@ -4440,7 +4450,7 @@ def test_character_discovery_binds_attribute_and_referential_mentions_to_one_id(
     result = character_discoverer.discover_characters(events)
     characters = result["characters"]
     discovered_lead = next(
-        character for character in characters if character["id"] == "lead_01"
+        character for character in characters if character["name"] == "男子"
     )
     ledger = bind_story_semantics(events, characters)
 
@@ -4450,10 +4460,12 @@ def test_character_discovery_binds_attribute_and_referential_mentions_to_one_id(
         "source_mentions": ["男子", "男性"],
         "inferred_aliases": [],
     }
+    lead_instance_id = discovered_lead["instances"][0]["instance_id"]
+    assert discovered_lead["model_observation_id"] == "lead_01"
     assert [event["character_ids"][0] for event in events] == [
-        "lead_01",
-        "lead_01",
-        "lead_01",
+        lead_instance_id,
+        lead_instance_id,
+        lead_instance_id,
     ]
     assert {item["text"] for item in ledger["source_mentions"]} >= {
         "男性",
@@ -4461,24 +4473,16 @@ def test_character_discovery_binds_attribute_and_referential_mentions_to_one_id(
     }
 
 
-def test_character_discovery_retries_ordinal_identity_collapse(monkeypatch):
+def test_character_discovery_repairs_ordinal_identity_collapse_by_default(monkeypatch):
     collapsed = _adult_lead_character(
         "第一名守卫", "male", "25-35", role="antagonist"
     )
     collapsed["aliases"] = ["第二名守卫", "第三名守卫"]
-    corrected = [
-        _adult_lead_character(name, "male", "25-35", role="antagonist")
-        for name in ("第一名守卫", "第二名守卫", "第三名守卫")
-    ]
-    responses = iter((
-        json.dumps({"characters": [collapsed]}, ensure_ascii=False),
-        json.dumps({"characters": corrected}, ensure_ascii=False),
-    ))
     prompts = []
 
     def fake_call(prompt):
         prompts.append(prompt)
-        return next(responses)
+        return _character_roster_observation(prompt, [collapsed])
 
     monkeypatch.setattr(character_discoverer, "_call_llm", fake_call)
     monkeypatch.setattr(character_discoverer.time, "sleep", lambda _seconds: None)
@@ -4495,13 +4499,16 @@ def test_character_discovery_retries_ordinal_identity_collapse(monkeypatch):
         )
     ])
 
-    assert len(prompts) == 2
-    assert "互斥序号来源身份不得映射到同一角色" in prompts[1]
+    assert len(prompts) == 1
     assert {character["name"] for character in result["characters"]} == {
         "第一名守卫",
         "第二名守卫",
         "第三名守卫",
     }
+    assert any(
+        diagnostic["code"] == "model_entity_merge"
+        for diagnostic in result["semantic_diagnostics"]
+    )
 
 
 def test_character_discovery_live_scope_disables_identity_resubmission(
@@ -4509,7 +4516,7 @@ def test_character_discovery_live_scope_disables_identity_resubmission(
 ):
     calls = 0
 
-    def collapsed_response(_prompt):
+    def collapsed_response(prompt):
         nonlocal calls
         calls += 1
         collapsed = _adult_lead_character(
@@ -4519,25 +4526,26 @@ def test_character_discovery_live_scope_disables_identity_resubmission(
             role="antagonist",
         )
         collapsed["aliases"] = ["第二名守卫"]
-        return json.dumps({"characters": [collapsed]}, ensure_ascii=False)
+        return _character_roster_observation(prompt, [collapsed])
 
     monkeypatch.setattr(character_discoverer, "_call_llm", collapsed_response)
     with provider_attempt_scope(max_retries=0):
-        with pytest.raises(ValueError, match="角色发现未产生"):
-            character_discoverer.discover_characters([
-                {
-                    "id": event_id,
-                    "who": [name],
-                    "what": f"{name}进入画面",
-                    "visual": f"{name}单独行动",
-                }
-                for event_id, name in enumerate(
-                    ("第一名守卫", "第二名守卫"),
-                    1,
-                )
-            ])
+        result = character_discoverer.discover_characters([
+            {
+                "id": event_id,
+                "who": [name],
+                "what": f"{name}进入画面",
+                "visual": f"{name}单独行动",
+            }
+            for event_id, name in enumerate(
+                ("第一名守卫", "第二名守卫"),
+                1,
+            )
+        ])
 
     assert calls == 1
+    assert len(result["characters"]) == 2
+    assert result["semantic_diagnostics"]
 
 
 def test_body_contract_reaches_character_storyboard_and_video_prompts():

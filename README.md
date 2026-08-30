@@ -198,6 +198,16 @@ the Runtime and Responses boundary at one request, and never retries after
 failure or an uncertain interruption. Transport/schema acceptance and the
 model's QA verdict are recorded separately.
 
+Phase 1 Character Roster changes use
+`pipeline/scripts/character_roster_live_acceptance.py`. Its zero-submit
+preflight verifies a hashed external event contract, source-driven character
+expectations, the current clean commit, and its zero-request regression
+receipt. The submitted form requires a separate explicit fee authorization,
+allows one Ark character Observation request, persists `submission_uncertain`
+before transport, and cannot resume or retry a failed or uncertain attempt.
+This single-request gate does not authorize the separate 36-second full-chain
+acceptance.
+
 `uv.lock` and `.python-version` are authoritative. Project commands must use
 `make` or `uv run --locked ...`; bare `python`, `pip`, and `pytest` may resolve
 to an unrelated Conda or system interpreter.

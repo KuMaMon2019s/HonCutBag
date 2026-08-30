@@ -23,6 +23,29 @@ from utils.config import DEFAULT_TEXT_MODEL
 from utils.progress_reporter import ProgressReporter
 
 
+def _deterministic_character_fixture(events):
+    from phases.phase1.character_roster import (
+        compile_character_roster,
+        reconcile_character_observations,
+    )
+
+    roster = compile_character_roster(events)
+    characters, diagnostics = reconcile_character_observations(
+        [], roster, semantic_qa_enabled=False
+    )
+    return {
+        "characters": characters,
+        "total_characters": len(characters),
+        "total_character_instances": sum(
+            character["instance_count"] for character in characters
+        ),
+        "character_roster": roster,
+        "character_roster_sha256": roster["roster_sha256"],
+        "semantic_qa_enabled": False,
+        "semantic_diagnostics": diagnostics,
+    }
+
+
 def _chunk(content):
     return SimpleNamespace(
         choices=[SimpleNamespace(delta=SimpleNamespace(content=content))]
@@ -838,7 +861,7 @@ def test_phase1_checkpoints_are_written_and_reused(monkeypatch, tmp_path):
     events_payload = {
         "events": [{"id": 1, "sequence_id": "SEQ001", "who": []}]
     }
-    characters_payload = {"characters": []}
+    characters_payload = _deterministic_character_fixture(events_payload["events"])
 
     def director_with_body_repair(events, *_args, **_kwargs):
         events[0]["body_action_director_repairs"] = [
@@ -860,7 +883,7 @@ def test_phase1_checkpoints_are_written_and_reused(monkeypatch, tmp_path):
             calls.__setitem__("events", calls["events"] + 1) or events_payload
         ),
     )
-    monkeypatch.setattr(character_discoverer, "discover_characters", lambda _events: (calls.__setitem__("characters", calls["characters"] + 1) or characters_payload))
+    monkeypatch.setattr(character_discoverer, "discover_characters", lambda _events, **_kwargs: (calls.__setitem__("characters", calls["characters"] + 1) or characters_payload))
     monkeypatch.setattr(
         adaptation_engine,
         "adapt_events",
@@ -927,7 +950,7 @@ def test_phase1_production_route_preserves_canonical_four_plus_three_layout(
     monkeypatch.setattr(
         character_discoverer,
         "discover_characters",
-        lambda _events: {"characters": [], "total_characters": 0},
+        lambda _events, **_kwargs: _deterministic_character_fixture(_events),
     )
     monkeypatch.setattr(
         adaptation_engine,
@@ -1033,10 +1056,7 @@ def test_phase1_legacy_checkpoint_is_regenerated(monkeypatch, tmp_path):
     monkeypatch.setattr(
         character_discoverer,
         "discover_characters",
-        lambda _events: {
-            "characters": [{"id": "rin", "name": "凛", "aliases": []}],
-            "total_characters": 1,
-        },
+        lambda _events, **_kwargs: _deterministic_character_fixture(_events),
     )
     monkeypatch.setattr(
         adaptation_engine,

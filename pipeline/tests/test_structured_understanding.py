@@ -446,7 +446,7 @@ def test_text_semantic_ledger_binds_mentions_to_stable_character_ids():
 
     ledger = bind_story_semantics(events, characters)
 
-    assert ledger["schema"] == "honcut.semantic-understanding.v2"
+    assert ledger["schema"] == "honcut.semantic-understanding.v3"
     assert events[0]["character_ids"] == ["operator", "intruder_3"]
     assert events[1]["character_ids"] == ["operator", "intruder_3"]
     assert events[0]["participant_refs"][1]["ref_id"] == (
@@ -461,12 +461,16 @@ def test_text_semantic_ledger_binds_mentions_to_stable_character_ids():
             "text": "操作员",
             "language": "zh",
             "character_id": "operator",
+            "entity_id": "operator",
+            "instance_id": "operator",
         },
         {
             "ref_id": events[0]["participant_refs"][1]["ref_id"],
             "text": "第三名入侵者",
             "language": "zh",
             "character_id": "intruder_3",
+            "entity_id": "intruder_3",
+            "instance_id": "intruder_3",
         },
     ]
     assert ledger["entities"][0]["machine_semantics"] == {
@@ -505,6 +509,8 @@ def test_text_semantic_ledger_keeps_dialogue_verbatim_and_uses_controlled_enums(
         "text": "男性",
         "language": "zh",
         "character_id": "lead_01",
+        "entity_id": "lead_01",
+        "instance_id": "lead_01",
     }]
     assert ledger["entities"][0]["machine_semantics"] == {
         "entity_type": "character",

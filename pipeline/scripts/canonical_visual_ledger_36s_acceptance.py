@@ -67,11 +67,13 @@ from utils.config import (
     get_api_key,
     validate_config,
 )
+from utils.canonical_visual_contracts import load_canonical_visual_contract
+from phases.phase1.character_roster import validate_character_roster
 from utils.video_capabilities import get_video_capabilities
 
 
 RECEIPT_SCHEMA = "honcut.canonical-visual-ledger-full-chain-acceptance.v1"
-EXPECTATIONS_SCHEMA = "honcut.full-chain-acceptance-expectations.v1"
+EXPECTATIONS_SCHEMA = "honcut.full-chain-acceptance-expectations.v2"
 RECEIPT_NAME = "canonical_visual_ledger_36s_acceptance.json"
 REGRESSION_SCHEMA = "honcut.canonical-visual-ledger-regression.v1"
 REGRESSION_RECEIPT_NAME = "canonical_visual_ledger_regression.json"
@@ -421,7 +423,78 @@ def _expectation_counts(expectations: dict[str, Any]) -> tuple[int, int]:
         raise RuntimeError("acceptance required_events must be a list")
     if not isinstance(expectations.get("visual_facts"), dict):
         raise RuntimeError("acceptance visual_facts must be an object")
+    entity_expectations = expectations.get("entity_expectations")
+    if (
+        not isinstance(entity_expectations, list)
+        or len(entity_expectations) != entity_count
+    ):
+        raise RuntimeError(
+            "acceptance entity_expectations must match the expected entity count"
+        )
+    expected_instances = 0
+    expectation_ids: set[str] = set()
+    for item in entity_expectations:
+        if not isinstance(item, dict):
+            raise RuntimeError("acceptance entity expectation must be an object")
+        expectation_id = str(item.get("expectation_id") or "").strip()
+        source_mentions = item.get("source_mentions_any")
+        count = item.get("instance_count")
+        if (
+            not expectation_id
+            or expectation_id in expectation_ids
+            or not isinstance(source_mentions, list)
+            or not source_mentions
+            or any(not str(value or "").strip() for value in source_mentions)
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 1
+            or not isinstance(item.get("visual_facts", {}), dict)
+        ):
+            raise RuntimeError("acceptance entity expectation is invalid")
+        expectation_ids.add(expectation_id)
+        expected_instances += count
+    if expected_instances != instance_count:
+        raise RuntimeError(
+            "acceptance entity expectations do not sum to the instance count"
+        )
     return entity_count, instance_count
+
+
+def _normalized_source_text(value: Any) -> str:
+    return "".join(str(value or "").casefold().split())
+
+
+def _validate_expectation_source_anchors(
+    story: str,
+    expectations: dict[str, Any],
+) -> None:
+    normalized_story = _normalized_source_text(story)
+    required_anchors = [
+        str(value or "").strip()
+        for value in expectations.get("required_events") or []
+    ]
+    missing = [
+        anchor
+        for anchor in required_anchors
+        if not anchor or _normalized_source_text(anchor) not in normalized_story
+    ]
+    for item in expectations.get("entity_expectations") or []:
+        if not isinstance(item, dict):
+            continue
+        aliases = [
+            str(value or "").strip()
+            for value in item.get("source_mentions_any") or []
+        ]
+        if not any(
+            alias and _normalized_source_text(alias) in normalized_story
+            for alias in aliases
+        ):
+            missing.append(str(item.get("expectation_id") or "entity"))
+    if missing:
+        raise RuntimeError(
+            "acceptance expectations contain source anchors absent from the story: "
+            + ", ".join(sorted(set(missing)))
+        )
 
 
 def build_stage0_preflight(
@@ -438,6 +511,7 @@ def build_stage0_preflight(
         raise RuntimeError("acceptance story is empty")
     expectations = _read_object(expectations_path)
     character_entities, character_instances = _expectation_counts(expectations)
+    _validate_expectation_source_anchors(story, expectations)
     parsed = parse_text(story)
     segments = list(parsed.get("segments") or [])
     if not segments:
@@ -480,10 +554,10 @@ def build_stage0_preflight(
         "seedream_image_requests": (
             1
             + max_primary_shots * 6
-            + character_entities * 6
+            + character_instances * 6
         ),
         "multimodal_observation_requests": (
-            character_entities * 8
+            character_instances * 8
             + max_primary_shots * 2
             + max_pxx
         ),
@@ -789,21 +863,196 @@ def _paid_request_summary(workspace: Path) -> dict[str, Any]:
     }
 
 
+def _fact_value(value: Any) -> Any:
+    if isinstance(value, dict) and set(value) >= {"value", "origin", "source_refs"}:
+        return value["value"]
+    if isinstance(value, dict):
+        return {key: _fact_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_fact_value(item) for item in value]
+    return value
+
+
+def _expectation_matches(actual: Any, expected: Any) -> bool:
+    actual = _fact_value(actual)
+    if isinstance(expected, dict):
+        return isinstance(actual, dict) and all(
+            key in actual and _expectation_matches(actual[key], value)
+            for key, value in expected.items()
+        )
+    if isinstance(expected, list):
+        if not isinstance(actual, list):
+            return False
+        return all(
+            any(_expectation_matches(candidate, value) for candidate in actual)
+            for value in expected
+        )
+    if isinstance(expected, str):
+        return _normalized_source_text(expected) in _normalized_source_text(
+            json.dumps(actual, ensure_ascii=False, sort_keys=True)
+            if not isinstance(actual, str)
+            else actual
+        )
+    return actual == expected
+
+
+def validate_post_phase1_expectations(
+    workspace: Path,
+    preflight: dict[str, Any],
+) -> dict[str, Any]:
+    """Verify the external source anchors against current Phase 1 artifacts."""
+
+    source = preflight.get("source") or {}
+    expectations_path = _inside(
+        workspace / str(source.get("expectations_path") or ""),
+        workspace,
+    )
+    expectations = _read_object(expectations_path)
+    expected_entities, expected_instances = _expectation_counts(expectations)
+    characters = _read_object(workspace / "CHARACTERS.json")
+    canonical = load_canonical_visual_contract(
+        workspace,
+        characters_data=characters,
+    )
+    roster = validate_character_roster(
+        _read_object(workspace / "CHARACTER_ROSTER.json")
+    )
+    if canonical["character_roster_sha256"] != roster["roster_sha256"]:
+        raise RuntimeError("Phase 1 canonical contract and roster hash disagree")
+    records = canonical.get("characters") or []
+    actual_instances = sum(
+        len(record.get("instances") or [])
+        for record in records
+        if isinstance(record, dict)
+    )
+    if len(records) != expected_entities or actual_instances != expected_instances:
+        raise RuntimeError(
+            "Phase 1 character cardinality disagrees with acceptance expectations"
+        )
+    policy = (expectations.get("visual_facts") or {}).get(
+        "character_visual_policy"
+    )
+    if policy and canonical.get("requested_policy") != policy:
+        raise RuntimeError("Phase 1 character visual policy is not the expected policy")
+
+    entity_matches: dict[str, str] = {}
+    matched_entity_ids: set[str] = set()
+    for item in expectations.get("entity_expectations") or []:
+        anchors = {
+            _normalized_source_text(value)
+            for value in item["source_mentions_any"]
+        }
+        candidates = []
+        for record in records:
+            record_source = [
+                str(value or "")
+                for instance in record.get("instances") or []
+                for value in instance.get("source_mentions") or []
+            ]
+            roster_record = next(
+                (
+                    entity
+                    for entity in roster["entities"]
+                    if entity["entity_id"] == record["entity_id"]
+                ),
+                None,
+            )
+            if roster_record is not None:
+                record_source.extend(
+                    evidence["source_excerpt"]
+                    for evidence in roster_record["source_visual_evidence"]
+                )
+            normalized_source = _normalized_source_text(" ".join(record_source))
+            if any(anchor in normalized_source for anchor in anchors):
+                candidates.append(record)
+        if len(candidates) != 1:
+            raise RuntimeError(
+                "acceptance entity source anchors do not resolve uniquely: "
+                + item["expectation_id"]
+            )
+        record = candidates[0]
+        if record["entity_id"] in matched_entity_ids:
+            raise RuntimeError("acceptance entity expectations overlap")
+        if _fact_value(record["instance_count"]) != item["instance_count"]:
+            raise RuntimeError(
+                "acceptance entity instance count mismatch: "
+                + item["expectation_id"]
+            )
+        if not _expectation_matches(record, item.get("visual_facts") or {}):
+            raise RuntimeError(
+                "acceptance entity visual facts mismatch: "
+                + item["expectation_id"]
+            )
+        matched_entity_ids.add(record["entity_id"])
+        entity_matches[item["expectation_id"]] = record["entity_id"]
+
+    events_document = _read_object(workspace / "phase1_events.json")
+    semantic = _read_object(workspace / "SEMANTIC_LEDGER.json")
+    semantic_event_ids = {
+        int(event["event_id"])
+        for event in semantic.get("events") or []
+        if isinstance(event, dict) and isinstance(event.get("event_id"), int)
+    }
+    required_event_matches: dict[str, int] = {}
+    for required in expectations.get("required_events") or []:
+        normalized_required = _normalized_source_text(required)
+        candidates = []
+        for position, event in enumerate(events_document.get("events") or [], 1):
+            if not isinstance(event, dict):
+                continue
+            source_text = " ".join(
+                str(event.get(field) or "")
+                for field in ("source_excerpt", "what", "visual")
+            )
+            event_id = int(event.get("event_id") or event.get("id") or position)
+            if (
+                normalized_required in _normalized_source_text(source_text)
+                and event_id in semantic_event_ids
+            ):
+                candidates.append(event_id)
+        if not candidates:
+            raise RuntimeError(
+                "required source event is absent from the semantic ledger: "
+                + str(required)
+            )
+        required_event_matches[str(required)] = min(candidates)
+
+    return {
+        "status": "passed",
+        "canonical_visual_contract_sha256": canonical["contract_sha256"],
+        "character_roster_sha256": roster["roster_sha256"],
+        "character_entities": len(records),
+        "character_instances": actual_instances,
+        "entity_matches": entity_matches,
+        "required_event_matches": required_event_matches,
+    }
+
+
 def _freeze_post_phase1_budget(
     workspace: Path,
     preflight: dict[str, Any],
 ) -> dict[str, Any]:
+    expectation_validation = validate_post_phase1_expectations(
+        workspace,
+        preflight,
+    )
     canonical = _read_object(workspace / "CANONICAL_VISUAL_CONTRACT.json")
     storyboard = _read_object(workspace / "STORYBOARD.json")
     characters = canonical.get("characters") or []
+    character_instances = sum(
+        len(character.get("instances") or [])
+        for character in characters
+        if isinstance(character, dict)
+    )
     shots = [value for value in storyboard.get("shots") or [] if isinstance(value, dict)]
     pxx = sum(len(shot.get("storyboard_beats") or []) for shot in shots)
     exact_upper_bounds = {
         "character_entities": len(characters),
+        "character_instances": character_instances,
         "primary_shots": len(shots),
         "pxx": pxx,
-        "remaining_seedream_image_requests": len(characters) * 6 + len(shots) * 6,
-        "remaining_multimodal_observation_requests": len(characters) * 8 + len(shots) * 2 + pxx,
+        "remaining_seedream_image_requests": character_instances * 6 + len(shots) * 6,
+        "remaining_multimodal_observation_requests": character_instances * 8 + len(shots) * 2 + pxx,
     }
     initial = preflight["authorized_hard_limits"]
     if (
@@ -819,6 +1068,7 @@ def _freeze_post_phase1_budget(
         "stage": "post_phase1_budget",
         "created_at": _utc_now(),
         "canonical_visual_contract_sha256": canonical.get("contract_sha256"),
+        "expectation_validation": expectation_validation,
         "exact_upper_bounds": exact_upper_bounds,
         "provider_request_count": 0,
     }

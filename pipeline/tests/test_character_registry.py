@@ -52,6 +52,12 @@ def _character() -> dict:
 def _phase3_spec(character: dict) -> dict:
     return {
         "id": character["id"],
+        "entity_id": character.get("entity_id"),
+        "instance_id": character.get("instance_id"),
+        "instance_ordinal": character.get("instance_ordinal"),
+        "canonical_visual_contract": character.get(
+            "canonical_visual_contract"
+        ),
         "name": character["name"],
         "description": character_reference_identity_description(character),
         "appearance": character["appearance"],
@@ -189,6 +195,34 @@ def test_registry_exact_lookup_is_project_scoped_and_spec_exact(tmp_path):
     changed = {**spec, "style": "ink wash animation"}
     assert registry.find_exact(changed) is None
     assert CharacterRegistry(library, project_id="series-b").find_exact(spec) is None
+
+
+def test_registry_fingerprint_separates_instances_and_canonical_lineage():
+    base = _phase3_spec(_character())
+    base.update({
+        "id": "guards_I01",
+        "entity_id": "guards",
+        "instance_id": "guards_I01",
+        "instance_ordinal": 1,
+        "canonical_visual_contract": {"contract_sha256": "a" * 64},
+    })
+    second_instance = {
+        **base,
+        "id": "guards_I02",
+        "instance_id": "guards_I02",
+        "instance_ordinal": 2,
+    }
+    changed_contract = {
+        **base,
+        "canonical_visual_contract": {"contract_sha256": "b" * 64},
+    }
+
+    assert character_spec_fingerprint(base) != character_spec_fingerprint(
+        second_instance
+    )
+    assert character_spec_fingerprint(base) != character_spec_fingerprint(
+        changed_contract
+    )
 
 
 def test_registry_refuses_two_pixel_versions_for_one_exact_spec(tmp_path):

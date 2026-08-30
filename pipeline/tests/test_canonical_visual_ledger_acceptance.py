@@ -15,6 +15,17 @@ if str(SCRIPTS) not in sys.path:
 
 import canonical_visual_ledger_36s_acceptance as acceptance
 from phases.phase3.phase3_character import run_phase3
+from phases.phase1.character_roster import (
+    CHARACTER_ROSTER_FILENAME,
+    compile_character_roster,
+    persist_character_roster,
+    reconcile_character_observations,
+)
+from utils.canonical_visual_contracts import (
+    expand_character_instances,
+    persist_canonical_visual_contract,
+)
+from utils.semantic_contracts import bind_story_semantics
 
 
 def _write_inputs(workspace):
@@ -25,12 +36,20 @@ def _write_inputs(workspace):
     expectations = workspace / "acceptance_expectations.json"
     expectations.write_text(
         json.dumps({
-            "schema": "honcut.full-chain-acceptance-expectations.v1",
+            "schema": "honcut.full-chain-acceptance-expectations.v2",
             "expected_duration_s": 36,
             "expected_character_entities": 1,
             "expected_character_instances": 1,
-            "required_events": ["enter", "inspect"],
-            "visual_facts": {"character": ["fictional"]},
+            "entity_expectations": [{
+                "expectation_id": "lead",
+                "source_mentions_any": ["原创人物"],
+                "instance_count": 1,
+                "visual_facts": {},
+            }],
+            "required_events": ["进入车站", "观察手中装置"],
+            "visual_facts": {
+                "character_visual_policy": "fictional_cinematic_human_v1"
+            },
         }),
         encoding="utf-8",
     )
@@ -106,6 +125,112 @@ def test_stage0_preflight_rejects_input_outside_workspace(tmp_path):
 
     with pytest.raises(RuntimeError, match="escapes workspace"):
         acceptance.build_stage0_preflight(workspace, outside, expectations)
+
+
+def test_stage0_rejects_expectation_anchors_absent_from_source(
+    tmp_path,
+    monkeypatch,
+):
+    story, expectations = _write_inputs(tmp_path)
+    payload = json.loads(expectations.read_text(encoding="utf-8"))
+    payload["required_events"] = ["不存在的来源事件"]
+    expectations.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="source anchors absent"):
+        acceptance.build_stage0_preflight(tmp_path, story, expectations)
+
+
+def test_source_mentions_any_accepts_one_matching_alias(tmp_path, monkeypatch):
+    story, expectations = _write_inputs(tmp_path)
+    payload = json.loads(expectations.read_text(encoding="utf-8"))
+    payload["entity_expectations"][0]["source_mentions_any"] = [
+        "absent alias",
+        "原创人物",
+    ]
+    expectations.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(acceptance, "get_api_key", lambda _name: "configured")
+    monkeypatch.setattr(acceptance, "is_media_upload_configured", lambda: True)
+    monkeypatch.setattr(
+        acceptance,
+        "_repo_source_identity",
+        lambda: {"git_commit": "a" * 40, "worktree_clean": True},
+    )
+    monkeypatch.setattr(
+        acceptance,
+        "_regression_evidence",
+        lambda _workspace, _commit: {"status": "passed"},
+    )
+    monkeypatch.setattr(
+        acceptance,
+        "validate_config",
+        lambda _required: {"valid": True, "missing": []},
+    )
+
+    receipt = acceptance.build_stage0_preflight(
+        tmp_path,
+        story,
+        expectations,
+    )
+
+    assert receipt["status"] == "preflight_passed"
+
+
+def test_post_phase1_expectations_match_source_roster_and_semantic_ledger(
+    tmp_path,
+):
+    events = [{
+        "id": 1,
+        "sequence_id": "SEQ001",
+        "who": ["原创人物"],
+        "source_excerpt": "原创人物进入车站并观察手中装置。",
+        "what": "原创人物进入车站并观察手中装置",
+    }]
+    roster = persist_character_roster(
+        tmp_path / CHARACTER_ROSTER_FILENAME,
+        compile_character_roster(events),
+    )
+    entities, _diagnostics = reconcile_character_observations(
+        [],
+        roster,
+        semantic_qa_enabled=False,
+    )
+    entity_payload = {
+        "characters": entities,
+        "character_roster": roster,
+        "character_roster_sha256": roster["roster_sha256"],
+    }
+    projected, contract = persist_canonical_visual_contract(
+        tmp_path,
+        entity_payload,
+        requested_policy="fictional_cinematic_human_v1",
+    )
+    semantic = bind_story_semantics(events, projected["characters"])
+    projected = expand_character_instances(projected, contract)
+    (tmp_path / "CHARACTERS.json").write_text(
+        json.dumps(projected),
+        encoding="utf-8",
+    )
+    (tmp_path / "SEMANTIC_LEDGER.json").write_text(
+        json.dumps(semantic),
+        encoding="utf-8",
+    )
+    (tmp_path / "phase1_events.json").write_text(
+        json.dumps({"events": events}),
+        encoding="utf-8",
+    )
+    _story, expectations = _write_inputs(tmp_path)
+
+    evidence = acceptance.validate_post_phase1_expectations(
+        tmp_path,
+        {"source": {"expectations_path": expectations.name}},
+    )
+
+    assert evidence["status"] == "passed"
+    assert evidence["character_entities"] == 1
+    assert evidence["character_instances"] == 1
+    assert evidence["entity_matches"]["lead"] == contract["characters"][0][
+        "entity_id"
+    ]
 
 
 def test_stage0_preflight_rejects_source_reduced_to_zero_events(

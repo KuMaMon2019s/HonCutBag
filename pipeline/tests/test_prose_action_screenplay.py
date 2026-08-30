@@ -1231,25 +1231,31 @@ def test_event_parser_defaults_semantic_action_qa_to_diagnostic_only():
     ("event_role", "dramatic_turn"),
     [("action_chain", True), ("turning_point", False)],
 )
-def test_event_parser_rejects_role_and_dramatic_turn_conflicts(
+def test_event_parser_diagnoses_role_and_dramatic_turn_conflicts_by_default(
     event_role,
     dramatic_turn,
 ):
     payload = [_event(event_role=event_role, dramatic_turn=dramatic_turn)]
 
+    parsed = _parse_events(json.dumps({"events": payload}, ensure_ascii=False))
+    assert parsed[0]["dramatic_turn"] is (event_role == "turning_point")
+    assert parsed[0]["semantic_diagnostics"][0]["category"] == (
+        "dramatic_role_consistency"
+    )
     with pytest.raises(ValueError, match="event_role.*dramatic_turn"):
-        _parse_events(json.dumps({"events": payload}, ensure_ascii=False))
+        _parse_events(
+            json.dumps({"events": payload}, ensure_ascii=False),
+            semantic_action_qa_enabled=True,
+        )
 
 
-def test_event_extractor_retries_role_and_dramatic_turn_conflict(monkeypatch):
+def test_event_extractor_repairs_role_and_dramatic_turn_without_retry(monkeypatch):
     calls = []
     invalid = _event(event_role="action_chain", dramatic_turn=True)
-    corrected = _event(event_role="action_chain", dramatic_turn=False)
 
     def fake_call(prompt, **_kwargs):
         calls.append(prompt)
-        payload = invalid if len(calls) == 1 else corrected
-        return json.dumps({"events": [payload]}, ensure_ascii=False)
+        return json.dumps({"events": [invalid]}, ensure_ascii=False)
 
     monkeypatch.setattr("prompt.event_extractor._call_llm", fake_call)
     monkeypatch.setattr("prompt.event_extractor.time.sleep", lambda _seconds: None)
@@ -1264,9 +1270,9 @@ def test_event_extractor_retries_role_and_dramatic_turn_conflict(monkeypatch):
         }
     )
 
-    assert len(calls) == 2
-    assert "event_role 与 dramatic_turn" in calls[1]
+    assert len(calls) == 1
     assert events[0]["dramatic_turn"] is False
+    assert events[0]["semantic_diagnostics"]
 
 
 def test_adaptation_inherits_source_evidence_and_repairs_dialogue_speaker():

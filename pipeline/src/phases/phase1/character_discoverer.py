@@ -2,23 +2,23 @@
 """
 角色发现器 - Phase 1 编剧引擎的角色发现模块
 
-从 event_extractor.py 输出的 events 中发现所有角色，生成 CHARACTERS.json。
+从 event_extractor.py 输出的 events 中观察名册角色的视觉事实。
 
 输入：event_extractor.py 的输出 JSON（events 列表，每个 event 有 who[] 字段）
 输出：CHARACTERS.json（符合 PIPELINE.md schema）
 
 逻辑：
-1. 从所有 events 的 who[] 中收集所有角色名
-2. 去重 + 合并别名（"艾米"和"小女孩"可能是同一人）
-3. 调用 LLM 为每个角色生成：
+1. Character Roster owner 从 events 中确定 entity、instance、数量和来源血缘
+2. 在模型调用前原子持久化 CHARACTER_ROSTER.json
+3. 调用一次 LLM，为名册中的既有 entity 补充：
    - appearance（外貌描述，用于 Seedream 生成三视图）
    - role（protagonist/antagonist/supporting/extra）
    - aliases（别名列表）
    - personality（性格特征）
    - style（推荐画风）
    - negative（负面提示词）
-4. 统计每个角色的出场次数
-5. 生成 id（拼音或英文缩写，用于目录名）
+4. Character Roster owner 确定性 reconciliation，模型不得改变人数或归属
+5. 输出 entity 级观察，后续由 Phase 1 展开为 instance 级视觉合同
 """
 
 import json
@@ -790,11 +790,6 @@ def _post_filter_characters(
         and char.get("name") not in GENERIC_BACKGROUND_CHARACTER_NAMES
     ]
 
-    # 限制最多 5 个角色
-    if len(filtered) > 5:
-        print(f"  角色数量超限 ({len(filtered)} > 5)，只保留前 5 个", file=sys.stderr)
-        filtered = filtered[:5]
-    
     return filtered
 
 

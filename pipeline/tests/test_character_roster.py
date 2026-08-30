@@ -1,0 +1,331 @@
+from __future__ import annotations
+
+import copy
+import inspect
+import json
+
+import pytest
+
+from phases.phase1.character_roster import (
+    CHARACTER_ROSTER_FILENAME,
+    CharacterRosterError,
+    compile_character_roster,
+    persist_character_roster,
+    reconcile_character_observations,
+    validate_character_roster,
+)
+from phases.phase1 import character_discoverer
+from tools.asset_packager import _resolve_char_ids
+from utils.semantic_contracts import bind_story_semantics
+
+
+def _event(
+    event_id: int,
+    who: list[str],
+    source_excerpt: str,
+    *,
+    sequence_id: str = "SEQ001",
+    action_unit_id: str = "",
+) -> dict:
+    return {
+        "id": event_id,
+        "sequence_id": sequence_id,
+        "action_unit_id": action_unit_id,
+        "who": who,
+        "source_excerpt": source_excerpt,
+        "what": source_excerpt,
+    }
+
+
+def _observation(name: str, character_id: str, aliases: list[str] | None = None) -> dict:
+    return {
+        "id": character_id,
+        "name": name,
+        "aliases": aliases or [],
+        "role": "antagonist" if "敌" in name else "protagonist",
+        "appearance": {
+            "gender": "unknown",
+            "age_range": "adult",
+            "height": "average",
+            "build": "athletic",
+            "hair": "short dark hair",
+            "face": "fictional balanced facial geometry",
+            "clothing": "dark practical clothing",
+            "interaction_props": [],
+            "identity_props": [],
+            "distinguishing": "",
+            "summary": "stable fictional adult character",
+            "variants": [],
+        },
+        "personality": {"traits": [], "speech_style": "", "motivation": ""},
+        "style": "cinematic realism",
+        "negative": "",
+        "size": "2K",
+        "first_appearance": 1,
+        "appearance_count": 1,
+        "relationships": [],
+    }
+
+
+def test_roster_compiles_one_group_entity_with_three_stable_instances():
+    events = [
+        _event(1, ["男子"], "年轻男子站在车门前。"),
+        _event(
+            2,
+            ["男子"],
+            "三名未来战斗人员突然出现，身穿相同黑色装甲。",
+            action_unit_id="AU001",
+        ),
+        _event(3, ["男子", "第一名敌人"], "第一名敌人挥砍。", action_unit_id="AU002"),
+        _event(4, ["男子", "第二名敌人"], "第二名敌人突袭。", action_unit_id="AU003"),
+        _event(5, ["男子", "第三名敌人"], "第三名敌人跃下。", action_unit_id="AU004"),
+    ]
+
+    first = compile_character_roster(events)
+    second = compile_character_roster(copy.deepcopy(events))
+
+    assert first == second
+    assert first["schema"] == "honcut.character-roster.v1"
+    assert len(first["entities"]) == 2
+    group = next(entity for entity in first["entities"] if entity["instance_count"] == 3)
+    assert group["display_name"] == "未来战斗人员"
+    assert group["reconciliation_origin"] == "deterministic_group_completion"
+    assert [instance["ordinal"] for instance in group["instances"]] == [1, 2, 3]
+    assert [instance["source_mentions"] for instance in group["instances"]] == [
+        ["第一名敌人"],
+        ["第二名敌人"],
+        ["第三名敌人"],
+    ]
+    assert len({instance["instance_id"] for instance in group["instances"]}) == 3
+    assert validate_character_roster(first) == first
+
+
+def test_roster_keeps_ordinal_people_independent_without_group_evidence():
+    roster = compile_character_roster([
+        _event(1, ["第一名守卫"], "第一名守卫进入。"),
+        _event(2, ["第二名守卫"], "第二名守卫进入。"),
+    ])
+
+    assert len(roster["entities"]) == 2
+    assert [entity["instance_count"] for entity in roster["entities"]] == [1, 1]
+    assert all(
+        entity["reconciliation_origin"] == "explicit_source"
+        for entity in roster["entities"]
+    )
+
+
+def test_roster_rejects_group_count_conflict():
+    with pytest.raises(CharacterRosterError, match="count"):
+        compile_character_roster([
+            _event(1, [], "三名守卫进入。"),
+            _event(2, ["第一名守卫"], "第一名守卫警戒。"),
+            _event(3, ["第二名守卫"], "第二名守卫警戒。"),
+        ])
+
+
+def test_roster_rejects_competing_groups_for_the_same_numbered_instances():
+    with pytest.raises(CharacterRosterError, match="ambiguous"):
+        compile_character_roster([
+            _event(1, [], "三名守卫进入，三名佣兵随后出现。"),
+            _event(2, ["第一名敌人"], "第一名敌人攻击。"),
+            _event(3, ["第二名敌人"], "第二名敌人攻击。"),
+            _event(4, ["第三名敌人"], "第三名敌人攻击。"),
+        ])
+
+
+def test_roster_allows_zero_characters_without_inventing_one():
+    roster = compile_character_roster([
+        _event(1, [], "暴雨落在空站台。"),
+    ])
+
+    assert roster["entities"] == []
+    assert validate_character_roster(roster) == roster
+
+
+def test_roster_hash_and_future_schema_fail_closed():
+    roster = compile_character_roster([
+        _event(1, ["Mira"], "Mira enters the station."),
+    ])
+    tampered = copy.deepcopy(roster)
+    tampered["entities"][0]["display_name"] = "Other"
+    with pytest.raises(CharacterRosterError, match="hash mismatch"):
+        validate_character_roster(tampered)
+
+    future = copy.deepcopy(roster)
+    future["schema"] = "honcut.character-roster.v99"
+    with pytest.raises(CharacterRosterError):
+        validate_character_roster(future)
+
+
+def test_roster_is_atomically_persisted_and_round_trips(tmp_path):
+    roster = compile_character_roster([
+        _event(1, ["Mira"], "Mira enters."),
+    ])
+    path = tmp_path / CHARACTER_ROSTER_FILENAME
+
+    persisted = persist_character_roster(path, roster)
+
+    assert persisted == roster
+    assert json.loads(path.read_text(encoding="utf-8")) == roster
+    assert not path.with_suffix(".json.tmp").exists()
+
+
+def test_character_observation_requires_the_current_roster_hash():
+    response = json.dumps({
+        "schema": "honcut.character-roster-observation.v1",
+        "roster_sha256": "a" * 64,
+        "characters": [_observation("Mira", "Mira")],
+    })
+
+    assert character_discoverer._parse_characters(
+        response,
+        expected_roster_sha256="a" * 64,
+    )[0]["name"] == "Mira"
+    with pytest.raises(ValueError, match="hash mismatch"):
+        character_discoverer._parse_characters(
+            response,
+            expected_roster_sha256="b" * 64,
+        )
+
+
+def test_discoverer_persists_roster_before_the_single_observation_call(
+    tmp_path,
+    monkeypatch,
+):
+    roster_path = tmp_path / CHARACTER_ROSTER_FILENAME
+    calls = 0
+
+    def fake_call(prompt):
+        nonlocal calls
+        calls += 1
+        persisted = validate_character_roster(
+            json.loads(roster_path.read_text(encoding="utf-8"))
+        )
+        return json.dumps({
+            "schema": "honcut.character-roster-observation.v1",
+            "roster_sha256": persisted["roster_sha256"],
+            "characters": [_observation("Mira", persisted["entities"][0]["entity_id"])],
+        })
+
+    monkeypatch.setattr(character_discoverer, "_call_llm", fake_call)
+    result = character_discoverer.discover_characters(
+        [_event(1, ["Mira"], "Mira enters.")],
+        roster_output_path=roster_path,
+    )
+
+    assert calls == 1
+    assert result["character_roster_sha256"] == json.loads(
+        roster_path.read_text(encoding="utf-8")
+    )["roster_sha256"]
+
+
+def test_default_reconciliation_repairs_missing_group_without_another_model_call():
+    events = [
+        _event(1, ["男子"], "年轻男子站在门前。"),
+        _event(2, ["男子"], "三名未来战斗人员突然出现。"),
+        _event(3, ["男子", "第一名敌人"], "第一名敌人攻击。"),
+        _event(4, ["男子", "第二名敌人"], "第二名敌人攻击。"),
+        _event(5, ["男子", "第三名敌人"], "第三名敌人攻击。"),
+    ]
+    roster = compile_character_roster(events)
+
+    characters, diagnostics = reconcile_character_observations(
+        [_observation("男子", "model_lead")],
+        roster,
+        semantic_qa_enabled=False,
+    )
+
+    assert len(characters) == 2
+    assert sum(character["instance_count"] for character in characters) == 4
+    assert all(character["entity_id"] == character["id"] for character in characters)
+    group = next(character for character in characters if character["instance_count"] == 3)
+    assert group["name"] == "未来战斗人员"
+    assert group["appearance"]["summary"]
+    assert any(item["code"] == "model_entity_missing" for item in diagnostics)
+
+
+def test_strict_reconciliation_blocks_the_same_missing_entity():
+    events = [
+        _event(1, ["男子"], "男子站立。"),
+        _event(2, [], "两名守卫进入。"),
+    ]
+    roster = compile_character_roster(events)
+
+    with pytest.raises(ValueError, match="strict character roster semantic QA"):
+        reconcile_character_observations(
+            [_observation("男子", "model_lead")],
+            roster,
+            semantic_qa_enabled=True,
+        )
+
+
+def test_semantic_ledger_v3_binds_each_source_mention_to_one_instance():
+    events = [
+        _event(1, ["男子"], "男子站立。"),
+        _event(2, ["男子"], "三名战斗人员出现。"),
+        _event(3, ["第一名敌人"], "第一名敌人攻击。"),
+        _event(4, ["第二名敌人"], "第二名敌人攻击。"),
+        _event(5, ["第三名敌人"], "第三名敌人攻击。"),
+    ]
+    roster = compile_character_roster(events)
+    characters, _diagnostics = reconcile_character_observations(
+        [], roster, semantic_qa_enabled=False
+    )
+
+    ledger = bind_story_semantics(events, characters)
+
+    assert ledger["schema"] == "honcut.semantic-understanding.v3"
+    assert len(ledger["entities"]) == 2
+    assert sorted(len(entity["instance_ids"]) for entity in ledger["entities"]) == [1, 3]
+    enemy_instance_ids = [events[index]["character_ids"][0] for index in (2, 3, 4)]
+    assert len(set(enemy_instance_ids)) == 3
+    assert all(
+        mention["character_id"] == mention["instance_id"]
+        for mention in ledger["source_mentions"]
+    )
+
+
+def test_phase6_source_group_label_resolves_to_every_instance(tmp_path):
+    (tmp_path / "CHARACTERS.json").write_text(
+        json.dumps({
+            "characters": [
+                {
+                    "id": f"guards_I{ordinal:02d}",
+                    "entity_id": "guards",
+                    "instance_id": f"guards_I{ordinal:02d}",
+                    "name": "守卫",
+                    "aliases": [],
+                }
+                for ordinal in range(1, 4)
+            ]
+        }),
+        encoding="utf-8",
+    )
+
+    assert _resolve_char_ids(tmp_path, ["守卫"]) == [
+        "guards_I01",
+        "guards_I02",
+        "guards_I03",
+    ]
+    assert _resolve_char_ids(tmp_path, ["guards"]) == [
+        "guards_I01",
+        "guards_I02",
+        "guards_I03",
+    ]
+
+
+def test_character_discoverer_keeps_cardinality_out_of_the_model_owner():
+    prompt = (
+        character_discoverer.SYSTEM_PROMPT
+        + character_discoverer.USER_PROMPT_TEMPLATE
+    )
+    source = inspect.getsource(character_discoverer.discover_characters)
+
+    assert "最多保留5个主要角色" not in prompt
+    assert "只保留前 5 个" not in inspect.getsource(character_discoverer)
+    assert "compile_character_roster" in source
+    assert "persist_roster(compile_character_roster" in source
+    assert "reconcile_character_observations" in source
+    assert reconcile_character_observations.__module__.endswith(
+        "phase1.character_roster"
+    )

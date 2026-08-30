@@ -8,9 +8,13 @@ import pytest
 
 from utils.canonical_visual_contracts import (
     CANONICAL_VISUAL_CONTRACT_FILENAME,
+    CANONICAL_VISUAL_MIGRATION_RECEIPT_FILENAME,
     CanonicalVisualContractError,
     apply_character_visual_policy,
     build_canonical_visual_contract,
+    canonical_json_sha256,
+    expand_character_instances,
+    load_canonical_visual_contract,
     persist_canonical_visual_contract,
     validate_canonical_visual_contract,
 )
@@ -124,8 +128,18 @@ def test_contract_preserves_explicit_character_instance_count(instance_count):
         prop_description="single metal tool",
     )
     character["instance_count"] = instance_count
+    character["instances"] = [
+        {
+            "instance_id": f"group_I{ordinal:02d}",
+            "ordinal": ordinal,
+            "source_mentions": [f"group {ordinal}"],
+            "event_refs": [f"event:{ordinal}"],
+            "action_unit_refs": [],
+        }
+        for ordinal in range(1, instance_count + 1)
+    ]
     rewritten = apply_character_visual_policy(
-        {"characters": [character]},
+        {"characters": [character], "character_roster_sha256": "a" * 64},
         "fictional_cinematic_human_v1",
     )
 
@@ -140,6 +154,52 @@ def test_contract_preserves_explicit_character_instance_count(instance_count):
         "origin": "explicit_source",
         "source_refs": ["character:group:instance_count"],
     }
+    assert contract["schema"] == "honcut.canonical-visual-contract.v2"
+    assert [
+        instance["instance_id"]
+        for instance in contract["characters"][0]["instances"]
+    ] == [f"group_I{ordinal:02d}" for ordinal in range(1, instance_count + 1)]
+
+
+def test_character_projection_creates_one_distinct_asset_identity_per_instance():
+    character = _character(
+        "guards",
+        hair="short dark hair",
+        prop_description="single metal tool",
+    )
+    character.update({
+        "entity_id": "guards",
+        "instance_count": 3,
+        "instances": [
+            {
+                "instance_id": f"guards_I{ordinal:02d}",
+                "ordinal": ordinal,
+                "source_mentions": [f"guard {ordinal}"],
+                "event_refs": [f"event:{ordinal}"],
+                "action_unit_refs": [],
+            }
+            for ordinal in range(1, 4)
+        ],
+    })
+    rewritten = apply_character_visual_policy(
+        {"characters": [character], "character_roster_sha256": "b" * 64},
+        "fictional_cinematic_human_v1",
+    )
+    contract = build_canonical_visual_contract(
+        rewritten,
+        requested_policy="fictional_cinematic_human_v1",
+    )
+    projected = expand_character_instances(rewritten, contract)
+
+    assert len(projected["entities"]) == 1
+    assert [item["id"] for item in projected["characters"]] == [
+        "guards_I01",
+        "guards_I02",
+        "guards_I03",
+    ]
+    assert len({
+        item["appearance"]["face"] for item in projected["characters"]
+    }) == 3
 
 
 def test_source_derived_policy_is_per_character():
@@ -208,6 +268,84 @@ def test_contract_hash_tampering_fails_closed():
     contract["characters"][0]["hair"]["length_class"]["value"] = "long"
     with pytest.raises(CanonicalVisualContractError, match="hash mismatch"):
         validate_canonical_visual_contract(contract)
+
+
+def _legacy_v1_contract(character: dict) -> tuple[dict, dict]:
+    rewritten = apply_character_visual_policy(
+        {"characters": [character]},
+        "fictional_cinematic_human_v1",
+    )
+    current = build_canonical_visual_contract(
+        rewritten,
+        requested_policy="fictional_cinematic_human_v1",
+    )
+    record = copy.deepcopy(current["characters"][0])
+    record.pop("entity_id")
+    record.pop("instances")
+    unsigned = {
+        "schema": "honcut.canonical-visual-contract.v1",
+        "requested_policy": current["requested_policy"],
+        "source_characters_sha256": current["source_characters_sha256"],
+        "characters": [record],
+    }
+    legacy = {**unsigned, "contract_sha256": canonical_json_sha256(unsigned)}
+    rewritten["canonical_visual_contract_sha256"] = legacy["contract_sha256"]
+    rewritten["character_roster_sha256"] = current["source_characters_sha256"]
+    rewritten["characters"][0]["source_identity_evidence"] = {
+        "event_ids": [1],
+        "source_mentions": [character["name"]],
+        "inferred_aliases": [],
+    }
+    return legacy, rewritten
+
+
+def test_legacy_one_to_one_contract_migrates_with_a_zero_request_receipt(tmp_path):
+    legacy, characters = _legacy_v1_contract(
+        _character("agent", hair="short hair", prop_description="tool")
+    )
+    (tmp_path / CANONICAL_VISUAL_CONTRACT_FILENAME).write_text(
+        json.dumps(legacy),
+        encoding="utf-8",
+    )
+
+    migrated = load_canonical_visual_contract(
+        tmp_path,
+        characters_data=characters,
+    )
+
+    assert migrated["schema"] == "honcut.canonical-visual-contract.v2"
+    assert migrated["characters"][0]["entity_id"] == "agent"
+    assert migrated["characters"][0]["instances"][0]["instance_id"] == "agent"
+    assert json.loads(
+        (tmp_path / CANONICAL_VISUAL_MIGRATION_RECEIPT_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )["status"] == "migrated"
+    assert json.loads(
+        (tmp_path / CANONICAL_VISUAL_CONTRACT_FILENAME).read_text(encoding="utf-8")
+    ) == legacy
+
+
+def test_legacy_contract_without_source_lineage_is_audit_only(tmp_path):
+    legacy, characters = _legacy_v1_contract(
+        _character("agent", hair="short hair", prop_description="tool")
+    )
+    characters["characters"][0].pop("source_identity_evidence")
+    (tmp_path / CANONICAL_VISUAL_CONTRACT_FILENAME).write_text(
+        json.dumps(legacy),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(CanonicalVisualContractError, match="audit-only"):
+        load_canonical_visual_contract(tmp_path, characters_data=characters)
+
+    receipt = json.loads(
+        (tmp_path / CANONICAL_VISUAL_MIGRATION_RECEIPT_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert receipt["status"] == "audit_only"
+    assert receipt["provider_request_count"] == 0
 
 
 def test_legacy_synthetic_policy_cannot_satisfy_production_gate():
