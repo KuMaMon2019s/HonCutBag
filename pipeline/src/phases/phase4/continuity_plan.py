@@ -576,6 +576,24 @@ def build_continuity_plan(
                         str(beat.get("storyboard_narrative_guide_sha256") or "")
                         or None
                     ),
+                    storyboard_narrative_guide_renderer=(
+                        beat.get("storyboard_narrative_guide_renderer") or None
+                    ),
+                    storyboard_narrative_guide_source_pixel_usage=(
+                        beat.get(
+                            "storyboard_narrative_guide_source_pixel_usage"
+                        )
+                        or None
+                    ),
+                    storyboard_narrative_guide_semantic_payload_sha256=(
+                        str(
+                            beat.get(
+                                "storyboard_narrative_guide_semantic_payload_sha256"
+                            )
+                            or ""
+                        )
+                        or None
+                    ),
                     storyboard_narrative_guide_source_board=(
                         str(
                             beat.get("storyboard_narrative_guide_source_board")
@@ -595,6 +613,15 @@ def build_continuity_plan(
                     storyboard_narrative_guide_receipt=(
                         str(beat.get("storyboard_narrative_guide_receipt") or "")
                         or None
+                    ),
+                    storyboard_narrative_guide_authority_roles=list(
+                        beat.get("storyboard_narrative_guide_authority_roles") or []
+                    ),
+                    storyboard_narrative_guide_non_authority_roles=list(
+                        beat.get(
+                            "storyboard_narrative_guide_non_authority_roles"
+                        )
+                        or []
                     ),
                     character_performance_required=bool(
                         beat.get("character_performance_required")
@@ -734,6 +761,9 @@ def build_continuity_plan(
             )
         )
     return ContinuityPlan(
+        canonical_visual_contract_sha256=(
+            str(storyboard.get("canonical_visual_contract_sha256") or "") or None
+        ),
         provider_chunk_limit_s=provider_chunk_limit_s,
         timeline_fps=timeline_fps,
         shots=planned_shots,

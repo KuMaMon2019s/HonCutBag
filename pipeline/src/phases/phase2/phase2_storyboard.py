@@ -36,6 +36,22 @@ def run_phase2(storyboard_data: dict, characters_data: dict, output_dir: Path, d
         print("  ⊘ dry-run 模式，跳过故事板图片生成")
         return {"status": "skipped", "reason": "dry-run", "duration_s": _elapsed(start)}
 
+    from utils.canonical_visual_contracts import (
+        load_canonical_visual_contract,
+    )
+
+    visual_contract = load_canonical_visual_contract(
+        output_dir,
+        characters_data=characters_data,
+    )
+    if (
+        storyboard_data.get("canonical_visual_contract_sha256")
+        != visual_contract["contract_sha256"]
+    ):
+        raise RuntimeError(
+            "Phase 2 storyboard visual contract hash disagrees with Phase 1"
+        )
+
     video_width, video_height, aspect_ratio = _storyboard_canvas(storyboard_data)
     phase2_workload = build_pipeline_workload(
         characters_data,

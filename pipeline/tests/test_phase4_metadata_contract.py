@@ -143,6 +143,7 @@ def test_setup_shot_dirs_writes_generation_contract(tmp_path):
 def test_phase4_preflights_continuity_before_cinematic_provider_calls(
     monkeypatch,
     tmp_path,
+    canonical_run_contract,
 ):
     storyboard = {
         "shots": [{
@@ -164,10 +165,7 @@ def test_phase4_preflights_continuity_before_cinematic_provider_calls(
         json.dumps(storyboard),
         encoding="utf-8",
     )
-    (tmp_path / "CHARACTERS.json").write_text(
-        json.dumps({"characters": []}),
-        encoding="utf-8",
-    )
+    canonical_run_contract(tmp_path, {"characters": []})
 
     monkeypatch.setattr(
         "phases.phase2.shot_storyboards.validate_shot_storyboard_artifacts",

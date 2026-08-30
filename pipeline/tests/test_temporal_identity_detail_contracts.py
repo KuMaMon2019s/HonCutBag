@@ -192,7 +192,7 @@ def test_identity_detail_qa_recomputes_declared_item_failure():
 
 
 def test_phase3_derives_prop_board_and_disables_state_variant_pixels(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, canonical_run_contract
 ):
     calls: list[dict] = []
 
@@ -272,6 +272,17 @@ def test_phase3_derives_prop_board_and_disables_state_variant_pixels(
         }
     ]
     monkeypatch.setattr(character_factory, "SeedreamClient", ImageClient)
+    canonical_run_contract(
+        tmp_path,
+        {
+            "characters": [{
+                "id": "photographer",
+                "name": "摄影师",
+                "description": "藏蓝头盔、米色摄影背心、深色长裤",
+                "appearance": {"identity_props": identity_props},
+            }]
+        },
+    )
     result = character_factory.generate_character(
         char_id="photographer",
         name="摄影师",

@@ -28,6 +28,7 @@ class Phase1Runner(Protocol):
         shot_policy: str = ...,
         max_material_padding_ratio: float = ...,
         delivery_overrun_ratio: float = ...,
+        character_visual_policy: str = ...,
     ) -> dict[str, Any]: ...
 
 
@@ -60,6 +61,9 @@ def phase1_node(
             "max_material_padding_ratio", 0.25
         ),
         "delivery_overrun_ratio": state.get("delivery_overrun_ratio", 0.0),
+        "character_visual_policy": state.get(
+            "character_visual_policy", "source_derived"
+        ),
     }
     previous_phase5 = state.get("phase_results", {}).get("phase5")
     rewrite_request = rewrite_request_from_receipt(previous_phase5)
@@ -84,6 +88,13 @@ def phase1_node(
     update: dict[str, Any] = {
         "storyboard": storyboard or {},
         "characters": characters.get("characters", []) if characters else [],
+        "canonical_visual_contract": (
+            characters.get("canonical_visual_contract", "") if characters else ""
+        ),
+        "canonical_visual_contract_sha256": (
+            characters.get("canonical_visual_contract_sha256", "")
+            if characters else ""
+        ),
         "phase_results": {
             **state.get("phase_results", {}),
             "phase1": phase_receipt,

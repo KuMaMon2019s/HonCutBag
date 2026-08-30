@@ -107,6 +107,27 @@ def run_phase4(output_dir: Path, dry_run: bool) -> dict:
         from phases.phase4.scene_consistency import write_scene_consistency
 
         storyboard_for_consistency = json.loads(storyboard_path.read_text(encoding="utf-8"))
+        if not dry_run:
+            from utils.canonical_visual_contracts import (
+                load_canonical_visual_contract,
+            )
+
+            characters_data = json.loads(
+                (output_dir / "CHARACTERS.json").read_text(encoding="utf-8")
+            )
+            visual_contract = load_canonical_visual_contract(
+                output_dir,
+                characters_data=characters_data,
+            )
+            if (
+                storyboard_for_consistency.get(
+                    "canonical_visual_contract_sha256"
+                )
+                != visual_contract["contract_sha256"]
+            ):
+                raise RuntimeError(
+                    "Phase 4 storyboard visual contract hash mismatch"
+                )
         from phases.phase2.shot_storyboards import validate_shot_storyboard_artifacts
 
         storyboard_artifact_errors = (

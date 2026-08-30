@@ -11,6 +11,7 @@ from phases.phase1.phase1_screenwriter import run_phase1_screenwriter
 from runtime.phase_timing import _elapsed, _now
 from utils.ark_llm import configure_heartbeat_callback
 from utils.progress_reporter import ProgressReporter
+from utils.canonical_visual_contracts import SOURCE_DERIVED_POLICY
 
 
 def run_phase1(
@@ -25,6 +26,7 @@ def run_phase1(
     shot_policy: str = DEFAULT_SHOT_POLICY,
     max_material_padding_ratio: float = 0.25,
     delivery_overrun_ratio: float = 0.0,
+    character_visual_policy: str = SOURCE_DERIVED_POLICY,
     *,
     _director_runner=None,
     _screenwriter_runner=None,
@@ -64,6 +66,7 @@ def run_phase1(
             shot_policy=shot_policy,
             max_material_padding_ratio=max_material_padding_ratio,
             delivery_overrun_ratio=delivery_overrun_ratio,
+            character_visual_policy=character_visual_policy,
             _director_runner=director_runner,
         )
     finally:

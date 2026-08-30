@@ -28,6 +28,12 @@ from utils.ark_llm import call_llm_stream, configure_heartbeat_callback
 from utils.media_profiles import _project_video_spec
 from utils.progress_reporter import ProgressReporter
 from utils.storyboard_geometry import _storyboard_canvas, _storyboard_image_size
+from utils.canonical_visual_contracts import (
+    CANONICAL_VISUAL_CONTRACT_FILENAME,
+    SOURCE_DERIVED_POLICY,
+    normalize_character_visual_policy,
+    persist_canonical_visual_contract,
+)
 
 STYLE_SUMMARY_WALL_TIMEOUT = 180.0
 STYLE_SUMMARY_IDLE_TIMEOUT = 75.0
@@ -303,6 +309,7 @@ def run_phase1_screenwriter(
     shot_policy: str = DEFAULT_SHOT_POLICY,
     max_material_padding_ratio: float = 0.25,
     delivery_overrun_ratio: float = 0.0,
+    character_visual_policy: str = SOURCE_DERIVED_POLICY,
     *,
     _director_runner=None,
 ) -> dict:
@@ -312,6 +319,9 @@ def run_phase1_screenwriter(
     _p2_est = estimate_phase_duration("phase1")
     print(f"  ⏱ Phase 1 开始 (预估 ~{int(_p2_est)}s)")
     output_dir = Path(output_dir)
+    character_visual_policy = normalize_character_visual_policy(
+        character_visual_policy
+    )
     director_runner = _director_runner or run_phase1_director
     director: dict[str, Any] | None = None
 
@@ -690,26 +700,11 @@ def run_phase1_screenwriter(
         if reporter:
             reporter.step("phase1", "发现角色", progress_pct=50)
         characters_checkpoint = output_dir / "phase1_characters.json"
-        from utils.privacy_visual_policy import (
-            NO_REAL_PERSON_POLICY,
-            apply_no_real_person_character_policy,
-            is_no_real_person_enabled,
-            synthetic_makeup_profile_sha256,
-        )
-
         characters_input_hash = _phase1_input_hash([
             {
                 "character_context_schema": CHARACTER_CONTEXT_SCHEMA_VERSION,
                 "events": events,
-                "no_real_person": is_no_real_person_enabled(),
-                "no_real_person_policy": (
-                    NO_REAL_PERSON_POLICY if is_no_real_person_enabled() else None
-                ),
-                "synthetic_makeup_profile_sha256": (
-                    synthetic_makeup_profile_sha256()
-                    if is_no_real_person_enabled()
-                    else None
-                ),
+                "character_visual_policy": character_visual_policy,
             }
         ])
         characters_result = _load_phase1_checkpoint(
@@ -745,22 +740,23 @@ def run_phase1_screenwriter(
                 collection_key="characters",
                 input_hash=characters_input_hash,
             )
-        if is_no_real_person_enabled():
-            rewritten_characters = apply_no_real_person_character_policy(
-                characters_result
+        characters_result, canonical_visual_contract = (
+            persist_canonical_visual_contract(
+                output_dir,
+                characters_result,
+                requested_policy=character_visual_policy,
             )
-            if rewritten_characters != characters_result:
-                characters_result = rewritten_characters
-                characters_result["source_text_hash"] = characters_input_hash
-                characters_result.setdefault(
-                    "total_characters", len(characters_result.get("characters", []))
-                )
-                _atomic_write_phase1_json(
-                    characters_checkpoint,
-                    characters_result,
-                    collection_key="characters",
-                    input_hash=characters_input_hash,
-                )
+        )
+        characters_result["source_text_hash"] = characters_input_hash
+        characters_result.setdefault(
+            "total_characters", len(characters_result.get("characters", []))
+        )
+        _atomic_write_phase1_json(
+            characters_checkpoint,
+            characters_result,
+            collection_key="characters",
+            input_hash=characters_input_hash,
+        )
         characters_list = characters_result.get("characters", [])
         print(f"    ✓ 发现 {len(characters_list)} 个角色")
         if reporter:
@@ -925,6 +921,12 @@ def run_phase1_screenwriter(
             "ledger": semantic_ledger_path.name,
             "source_events_hash": events_input_hash,
         }
+        storyboard["canonical_visual_contract"] = (
+            CANONICAL_VISUAL_CONTRACT_FILENAME
+        )
+        storyboard["canonical_visual_contract_sha256"] = (
+            canonical_visual_contract["contract_sha256"]
+        )
         plan_storyboard_beats(storyboard)
         material_budget = storyboard.get("material_budget") or {}
         print(
@@ -960,7 +962,8 @@ def run_phase1_screenwriter(
         characters_path.write_text(json.dumps(characters_result, ensure_ascii=False, indent=2))
 
         outputs = [
-            "STORYBOARD.json", "CHARACTERS.json", "SEMANTIC_LEDGER.json",
+            "STORYBOARD.json", "CHARACTERS.json",
+            CANONICAL_VISUAL_CONTRACT_FILENAME, "SEMANTIC_LEDGER.json",
             "SCREENPLAY_PLAN.json",
             "director_storyboard.png", "director_storyboard_prompt.txt",
             "director_storyboard.json",
