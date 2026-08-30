@@ -144,117 +144,82 @@ def _write_phase3_dry_run_receipt(
 
 
 def detect_derive_assets(characters_data: dict) -> list:
-    """按 HonCut 规范检测衍生资产。
+    """Frozen test-facade compatibility symbol; production variants are retired.
 
-    读取 CHARACTERS.json，检测角色是否有变身/换装描述，
-    返回衍生资产列表。
-
-    规则（精简版）:
-    - 角色: 仅变身状态（服装/变身特效/变形）
-    - 场景: 仅时间变体（日景→夜景）
-    - 道具: 不衍生
-
-    Returns:
-        list of dict: [{"parent_id": "char_001", "name": "战斗服", "desc": "...", "type": "role"}, ...]
+    Runtime appearance changes belong to the Pxx continuity contract.  The
+    compatibility facade still imports this name, so keep a side-effect-free
+    boundary until that facade can be versioned independently.
     """
-    derive_assets = []
-    # 兼容 dict（含 "characters" key）和直接 list 两种输入
-    if isinstance(characters_data, list):
-        characters_list = characters_data
-    else:
-        characters_list = characters_data.get("characters", [])
-
-    # 变身/换装关键词（中文 + 英文）
-    transformation_keywords = [
-        "变身", "换装", "战斗服", "礼服", "盔甲", "兽化", "巨大化", "变形",
-        "能量", "光效", "transform", "costume", "armor", "beast", "giant",
-        "battle", "ceremony", "formal", "magic", "power"
-    ]
-
-    for char in characters_list:
-        char_id = char.get("id", "")
-        char_name = char.get("name", "")
-        description = char.get("description", "")
-        appearance = char.get("appearance", {})
-        summary = appearance.get("summary", "")
-        clothing = appearance.get("clothing", "")
-
-        # 合并所有文本字段进行检测
-        all_text = f"{description} {summary} {clothing}".lower()
-
-        # 检测是否包含变身/换装关键词
-        detected_keywords = [kw for kw in transformation_keywords if kw.lower() in all_text]
-
-        if detected_keywords:
-            # 为每个检测到的变身状态创建衍生资产
-            for keyword in detected_keywords[:3]:  # 限制每个角色最多3个衍生
-                # 生成衍生资产名称（2-6字）
-                derive_name = keyword if len(keyword) <= 6 else keyword[:6]
-
-                # 生成描述
-                derive_desc = f"{char_name}的{keyword}形态 · 与默认态有明显视觉差异"
-
-                derive_assets.append({
-                    "parent_id": char_id,
-                    "parent_name": char_name,
-                    "name": derive_name,
-                    "desc": derive_desc,
-                    "type": "role",
-                    "keyword": keyword,
-                })
-
-    return derive_assets
+    del characters_data
+    return []
 
 
-def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
-    """Phase 3: character_factory — 生成角色四视图 + 衍生资产检测"""
-    _banner(3, 9, "角色工厂 (Character Factory + Derive Assets)", dry_run)
+def run_phase3(
+    output_dir: Path,
+    characters_data: dict,
+    dry_run: bool,
+    *,
+    _acceptance_character_limit: int | None = None,
+    _acceptance_max_new_image_requests: int | None = None,
+    _acceptance_disable_provider_retries: bool = False,
+    _acceptance_before_provider_request=None,
+) -> dict:
+    """Phase 3: generate canonical character identity and performance assets."""
+    _banner(3, 9, "角色工厂 (Character Factory)", dry_run)
     start = _now()
     outputs = []
     output_dir = Path(output_dir)
 
     try:
-        from phases.phase3.character_factory import batch_generate
+        from phases.phase3.character_factory import (
+            CharacterReferenceGenerationPaused,
+            batch_generate,
+        )
         from quality.character_reference_qa import (
             SEEDANCE_REFERENCE_VIEWS,
             CharacterReferenceQAError,
         )
 
         chars_dir = _ensure_dir(output_dir / "characters")
-        from utils.privacy_visual_policy import (
-            apply_no_real_person_character_policy,
-            is_no_real_person_enabled,
-        )
-
-        if is_no_real_person_enabled():
-            rewritten_characters = apply_no_real_person_character_policy(characters_data)
-            if rewritten_characters != characters_data:
-                characters_data = rewritten_characters
-                characters_path = output_dir / "CHARACTERS.json"
-                characters_temporary = characters_path.with_suffix(".json.tmp")
-                characters_temporary.write_text(
-                    json.dumps(characters_data, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-                os.replace(characters_temporary, characters_path)
-                print(
-                    "  🛡 非真人模式：角色身份已锁定为温暖美观的合成人妆造"
-                    "（每人至少两个可见锚点）"
-                )
-
         characters_list = characters_data.get("characters", [])
+
+        if (
+            _acceptance_character_limit is not None
+            and (
+                isinstance(_acceptance_character_limit, bool)
+                or not isinstance(_acceptance_character_limit, int)
+                or _acceptance_character_limit < 1
+            )
+        ):
+            raise ValueError(
+                "_acceptance_character_limit must be a positive integer or None"
+            )
+        if (
+            _acceptance_max_new_image_requests is not None
+            and (
+                isinstance(_acceptance_max_new_image_requests, bool)
+                or not isinstance(_acceptance_max_new_image_requests, int)
+                or _acceptance_max_new_image_requests < 1
+            )
+        ):
+            raise ValueError(
+                "_acceptance_max_new_image_requests must be a positive "
+                "integer or None"
+            )
 
         if not characters_list:
             print("  ⊘ 无角色数据，跳过")
             return {"status": "skipped", "reason": "no characters", "duration_s": _elapsed(start)}
 
-        # Step 3.1: HonCut 衍生资产检测
-        print("  → 检测衍生资产（变身/换装状态）...")
-        derive_assets = detect_derive_assets(characters_data)
-        if derive_assets:
-            print(f"    ✓ 检测到 {len(derive_assets)} 个衍生资产:")
-            for da in derive_assets:
-                print(f"      - {da['parent_name']}·{da['name']}: {da['desc']}")
+        if not dry_run:
+            from utils.canonical_visual_contracts import (
+                load_canonical_visual_contract,
+            )
+
+            load_canonical_visual_contract(
+                output_dir,
+                characters_data=characters_data,
+            )
 
         # Step 3.2: 生成基础角色四视图
         visual_style_path = output_dir / "visual-style.md"
@@ -276,9 +241,7 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
                 "name": c.get("name", f"角色{i}"),
                 "description": character_reference_identity_description(c),
                 "appearance": c.get("appearance", {}),  # 传递完整 appearance dict
-                "visual_identity_policy": characters_data.get(
-                    "visual_identity_policy"
-                ),
+                "visual_identity_policy": c.get("visual_identity_policy"),
                 "style": "\n\n".join(
                     part for part in (c.get("style", ""), character_style) if part
                 ),
@@ -351,9 +314,18 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
         # Use retry policy for each character generation
         results = list(reused_results)
         _p3_char_start = _now()
-        for i, char_dict in enumerate(generation_queue):
+        acceptance_generation_queue = (
+            generation_queue[:_acceptance_character_limit]
+            if _acceptance_character_limit is not None
+            else generation_queue
+        )
+        generated_character_ids: list[str] = []
+        for i, char_dict in enumerate(acceptance_generation_queue):
             char_name = char_dict.get("name", f"角色{i}")
-            print(f"    → [{i+1}/{len(generation_queue)}] {char_name}...")
+            print(
+                f"    → [{i+1}/{len(acceptance_generation_queue)}] "
+                f"{char_name}..."
+            )
             _char_t0 = _now()
 
             def _gen_char(_character=char_dict):
@@ -363,22 +335,166 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
                     str(output_dir),
                     skip_images=dry_run,
                     raise_on_error=True,
+                    view_qa_max_retries=(
+                        0 if _acceptance_disable_provider_retries else 2
+                    ),
+                    review_qa_max_retries=(
+                        0 if _acceptance_disable_provider_retries else 2
+                    ),
+                    max_new_image_requests=(
+                        _acceptance_max_new_image_requests
+                    ),
+                    before_provider_request=(
+                        _acceptance_before_provider_request
+                    ),
                 )
 
             try:
                 result = _retry_with_policy(
                     _gen_char,
-                    max_attempts=3,
+                    max_attempts=(
+                        1 if _acceptance_disable_provider_retries else 3
+                    ),
                     backoff_factor=2.0,
-                    non_retryable_exceptions=(CharacterReferenceQAError,),
+                    non_retryable_exceptions=(
+                        CharacterReferenceQAError,
+                        CharacterReferenceGenerationPaused,
+                    ),
                 )
                 results.extend(result or [])
+                generated_character_ids.append(str(char_dict["id"]))
+            except CharacterReferenceGenerationPaused as paused:
+                if _acceptance_max_new_image_requests is None:
+                    raise
+                from clients.ark_multimodal_client import ArkMultimodalClient
+                from quality.character_reference_qa import (
+                    review_character_reference_pack,
+                )
+
+                review = review_character_reference_pack(
+                    ArkMultimodalClient(),
+                    {paused.view_name: paused.view_path},
+                    paused.character_description,
+                    paused.synthetic_styling,
+                    before_provider_request=(
+                        _acceptance_before_provider_request
+                    ),
+                )
+                if review.get("passed") is not True or review.get(
+                    "qa_verdict"
+                ) not in {"pass", "acceptable_deviation"}:
+                    raise RuntimeError(
+                        "Phase 3 first identity image failed semantic QA"
+                    )
+                return {
+                    "status": "acceptance_gate_passed",
+                    "gate": "first_character_identity_image",
+                    "character_id": paused.character_id,
+                    "view_name": paused.view_name,
+                    "view_path": paused.view_path.relative_to(
+                        output_dir
+                    ).as_posix(),
+                    "view_sha256": _hashed_artifact(
+                        output_dir,
+                        paused.view_path,
+                    )["sha256"],
+                    "image_provider_request_count": 1,
+                    "qa_provider_request_count": 1,
+                    "qa_observation_id": review.get(
+                        "qa_observation_id"
+                    ),
+                    "qa_decision_id": review.get("qa_decision_id"),
+                    "qa_verdict": review.get("qa_verdict"),
+                    "provider_retry_policy": "disabled",
+                    "duration_s": _elapsed(start),
+                }
             except Exception as e:
                 print(f"    ✗ {char_name} 生成失败: {e}")
+                if _acceptance_disable_provider_retries:
+                    raise
                 results.append(None)
             _char_elapsed = round(_now() - _char_t0, 1)
             _char_cumulative = round(_now() - _p3_char_start, 1)
             print(f"  ⏱ {char_name} 完成 (耗时 {_char_elapsed}s, 累计 {_char_cumulative}s / 预估 {int(_p3_est)}s)")
+
+        if _acceptance_character_limit is not None:
+            if len(generated_character_ids) != _acceptance_character_limit:
+                raise RuntimeError(
+                    "Phase 3 acceptance gate did not generate the exact configured "
+                    "number of fresh character packs"
+                )
+            from quality.character_reference_qa import (
+                validate_character_reference_qa_receipt,
+            )
+
+            result_by_id = {
+                str(item.get("char_id") or ""): item
+                for item in results
+                if isinstance(item, dict)
+            }
+            character_by_id = {
+                str(item.get("id") or ""): item
+                for item in characters_list
+                if isinstance(item, dict)
+            }
+            for character_id in generated_character_ids:
+                generated = result_by_id.get(character_id)
+                character = character_by_id.get(character_id)
+                if generated is None or character is None:
+                    raise RuntimeError(
+                        f"Phase 3 acceptance gate lost result for {character_id}"
+                    )
+                view_paths = {
+                    name: Path(str(path))
+                    for name, path in (generated.get("views") or {}).items()
+                    if isinstance(path, str) and path
+                }
+                card_path = Path(str(generated.get("card") or ""))
+                try:
+                    card = json.loads(card_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as error:
+                    raise RuntimeError(
+                        f"Phase 3 acceptance card is invalid for {character_id}"
+                    ) from error
+                appearance = character.get("appearance")
+                synthetic_styling = (
+                    appearance.get("synthetic_styling")
+                    if isinstance(appearance, dict)
+                    else None
+                )
+                report_path = (
+                    output_dir
+                    / "characters"
+                    / character_id
+                    / "character_reference_qa.json"
+                )
+                if not validate_character_reference_qa_receipt(
+                    report_path,
+                    view_paths,
+                    synthetic_styling=(
+                        synthetic_styling
+                        if isinstance(synthetic_styling, dict)
+                        else None
+                    ),
+                    generation_contract=card.get(
+                        "reference_generation_contract"
+                    ),
+                ):
+                    raise RuntimeError(
+                        f"Phase 3 acceptance QA receipt is invalid for {character_id}"
+                    )
+            return {
+                "status": "acceptance_gate_passed",
+                "gate": "first_fresh_character_identity_pack",
+                "generated_character_ids": generated_character_ids,
+                "new_character_limit": _acceptance_character_limit,
+                "provider_retry_policy": (
+                    "disabled"
+                    if _acceptance_disable_provider_retries
+                    else "production_default"
+                ),
+                "duration_s": _elapsed(start),
+            }
 
         # 统计输出
         for r in (results or []):
@@ -394,7 +510,7 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
                 if d.is_dir():
                     outputs.append(f"characters/{d.name}/")
 
-        print(f"  ✓ Phase 3 完成: {len(outputs)} 角色卡 + {len(derive_assets)} 衍生资产")
+        print(f"  ✓ Phase 3 完成: {len(outputs)} 角色卡")
 
         if dry_run:
             receipt_path = _write_phase3_dry_run_receipt(
@@ -413,8 +529,6 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
                 "dry_run_receipt": receipt_path.name,
                 "duration_s": _elapsed(start),
                 "outputs": outputs,
-                "derive_assets_count": len(derive_assets),
-                "derive_assets": derive_assets,
             }
 
         # Quality gate: Phase 3 (CRITICAL — blocks pipeline if character images missing)
@@ -598,6 +712,9 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
                     performance_characters,
                     image_client=SeedreamClient(),
                     review_client=ArkMultimodalClient(),
+                    allow_provider_corrections=(
+                        not _acceptance_disable_provider_retries
+                    ),
                 )
                 outputs.extend(
                     str(board["board"])
@@ -617,8 +734,6 @@ def run_phase3(output_dir: Path, characters_data: dict, dry_run: bool) -> dict:
             "status": "done",
             "duration_s": _elapsed(start),
             "outputs": outputs or ["characters/"],
-            "derive_assets_count": len(derive_assets),
-            "derive_assets": derive_assets,
         }
         if registry_summary is not None:
             result["character_registry"] = registry_summary

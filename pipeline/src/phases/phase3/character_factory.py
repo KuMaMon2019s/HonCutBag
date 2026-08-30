@@ -22,7 +22,7 @@ import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional, Tuple, List
+from typing import Any, Callable, Optional, Tuple, List
 
 # Import seedream client from same directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -55,6 +55,29 @@ from utils.character_body_contracts import character_visual_description
 from utils.camera_motion_contracts import (
     HUMAN_PERSPECTIVE_NEGATIVE,
 )
+
+
+class CharacterReferenceGenerationPaused(RuntimeError):
+    """A durable acceptance limit stopped after one new identity image."""
+
+    def __init__(
+        self,
+        *,
+        character_id: str,
+        view_name: str,
+        view_path: Path,
+        character_description: str,
+        synthetic_styling: dict[str, Any] | None,
+    ) -> None:
+        self.character_id = character_id
+        self.view_name = view_name
+        self.view_path = view_path
+        self.character_description = character_description
+        self.synthetic_styling = synthetic_styling
+        super().__init__(
+            "character reference generation paused after one durable image: "
+            f"{character_id}/{view_name}"
+        )
 
 
 # =============================================================================
@@ -692,6 +715,7 @@ def _generate_reference_view(
     size: str,
     identity_anchor: Path | None,
     correction: str = "",
+    before_provider_request: Callable[[dict[str, Any]], None] | None = None,
 ) -> None:
     """Generate one view atomically without letting an anchor dictate its pose."""
     final_prompt = prompt
@@ -704,16 +728,41 @@ def _generate_reference_view(
     temporary = output_path.with_name(f".{output_path.stem}.generating{output_path.suffix}")
     try:
         if identity_anchor is not None and hasattr(client, "image_to_image"):
+            provider_prompt = bind_reference_roles(
+                f"{REFERENCE_WEIGHT_NOTE}. {final_prompt}",
+                ["character_identity_only"],
+            )
+            if before_provider_request is not None:
+                before_provider_request({
+                    "provider_family": "seedream_image",
+                    "request_mode": "image_to_image",
+                    "view_name": view_name,
+                    "model": str(getattr(client, "model", "unknown-image-model")),
+                    "size": size,
+                    "prompt_sha256": hashlib.sha256(
+                        provider_prompt.encode("utf-8")
+                    ).hexdigest(),
+                    "reference_sha256": file_sha256(identity_anchor),
+                })
             client.image_to_image(
-                prompt=bind_reference_roles(
-                    f"{REFERENCE_WEIGHT_NOTE}. {final_prompt}",
-                    ["character_identity_only"],
-                ),
+                prompt=provider_prompt,
                 ref_image=str(identity_anchor),
                 output_path=str(temporary),
                 size=size,
             )
         else:
+            if before_provider_request is not None:
+                before_provider_request({
+                    "provider_family": "seedream_image",
+                    "request_mode": "text_to_image",
+                    "view_name": view_name,
+                    "model": str(getattr(client, "model", "unknown-image-model")),
+                    "size": size,
+                    "prompt_sha256": hashlib.sha256(
+                        final_prompt.encode("utf-8")
+                    ).hexdigest(),
+                    "reference_sha256": None,
+                })
             client.text_to_image(
                 prompt=final_prompt,
                 output_path=str(temporary),
@@ -1025,6 +1074,10 @@ def _quality_control_reference_views(
 
         if result is None:
             raise AssertionError("character reference review retry loop returned no result")
+        if result.get("qa_verdict") == "manual_review":
+            raise CharacterReferenceQAError(
+                f"{char_id} reference QA requires manual review; no image retry was submitted"
+            )
         attempts.append({
             "attempt": attempt,
             "review_attempt": successful_review_attempt,
@@ -1095,6 +1148,8 @@ def generate_character(
     review_client: Any | None = None,
     view_qa_max_retries: int = 2,
     review_qa_max_retries: int = 2,
+    max_new_image_requests: int | None = None,
+    before_provider_request: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict:
     """Generate complete character asset set.
 
@@ -1118,6 +1173,17 @@ def generate_character(
     prop_detail_board_path: Path | None = None
     prop_detail_board_receipt: dict[str, Any] | None = None
     reference_board_path: Path | None = None
+    if (
+        max_new_image_requests is not None
+        and (
+            isinstance(max_new_image_requests, bool)
+            or not isinstance(max_new_image_requests, int)
+            or max_new_image_requests < 1
+        )
+    ):
+        raise ValueError(
+            "max_new_image_requests must be a positive integer or None"
+        )
 
     print(f"\n{'='*60}")
     print(f"  Character Factory: {name} ({char_id})")
@@ -1127,8 +1193,9 @@ def generate_character(
     # Initialize client (may be None if skip_images=True)
     client = None
 
-    # Step 1: Generate separated references. The legacy combined sheet remains
-    # available as a graceful fallback for providers that reject this route.
+    # Step 1: Generate separated references.  A failed request must remain a
+    # failed request; silently switching to the retired combined sheet changes
+    # the paid payload, geometry contract, and cache lineage.
     target_model = "kling" if model and "kling" in model.lower() else "seedance"
     seedream_model = (
         model if model and "seedream" in model.lower()
@@ -1164,9 +1231,25 @@ def generate_character(
             )
         else:
             print(f"[Step 1/3] Generating separated {target_model} references...")
-            _write_json_atomic(
-                report_path,
-                {
+            try:
+                pending_receipt = json.loads(
+                    report_path.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                pending_receipt = None
+            pending_is_current = bool(
+                isinstance(pending_receipt, dict)
+                and pending_receipt.get("schema")
+                == CHARACTER_REFERENCE_QA_SCHEMA
+                and pending_receipt.get("status") == "pending"
+                and pending_receipt.get("synthetic_styling")
+                == synthetic_styling
+                and pending_receipt.get("generation_contract")
+                == generation_contract
+                and isinstance(pending_receipt.get("inputs"), dict)
+            )
+            if not pending_is_current:
+                pending_receipt = {
                     "schema": CHARACTER_REFERENCE_QA_SCHEMA,
                     "character_id": char_id,
                     "status": "pending",
@@ -1174,41 +1257,66 @@ def generate_character(
                     "synthetic_styling": synthetic_styling,
                     "generation_contract": generation_contract,
                     "attempts": [],
-                },
-            )
+                }
+                _write_json_atomic(report_path, pending_receipt)
             client = SeedreamClient(model=seedream_model)
         views = {name: str(path) for name, path in expected_views.items()}
         if not existing_pack_complete:
             views = {}
-            try:
-                identity_anchor = None
-                for view_name, reference_prompt in reference_prompts.items():
-                    view_path = expected_views[view_name]
-                    _generate_reference_view(
-                        client,
-                        view_name=view_name,
-                        prompt=reference_prompt,
-                        output_path=view_path,
-                        size=_reference_view_size(view_name, size),
-                        identity_anchor=identity_anchor,
-                    )
-                    identity_anchor = identity_anchor or view_path
+            identity_anchor = None
+            new_image_requests = 0
+            for view_name, reference_prompt in reference_prompts.items():
+                view_path = expected_views[view_name]
+                pending_input = (pending_receipt.get("inputs") or {}).get(
+                    view_name
+                )
+                if (
+                    isinstance(pending_input, dict)
+                    and pending_input.get("path") == view_path.name
+                    and view_path.is_file()
+                    and pending_input.get("sha256") == file_sha256(view_path)
+                ):
                     views[view_name] = str(view_path)
-                    print(f"  [{view_name}] ✓ → {view_path}")
-            except Exception as exc:
-                if target_model != "seedance":
-                    raise
-                print(
-                    f"  ⚠ separated references failed ({exc}); "
-                    "using legacy combined sheet fallback"
+                    identity_anchor = identity_anchor or view_path
+                    print(f"  [{view_name}] ♻ durable partial reference reused")
+                    continue
+                if (
+                    max_new_image_requests is not None
+                    and new_image_requests >= max_new_image_requests
+                ):
+                    raise RuntimeError(
+                        "character reference generation crossed its configured "
+                        "new-image request limit"
+                    )
+                _generate_reference_view(
+                    client,
+                    view_name=view_name,
+                    prompt=reference_prompt,
+                    output_path=view_path,
+                    size=_reference_view_size(view_name, size),
+                    identity_anchor=identity_anchor,
+                    before_provider_request=before_provider_request,
                 )
-                sheet_path = os.path.join(char_dir, "character_sheet.png")
-                client.text_to_image(
-                    prompt=build_combined_sheet_prompt(description, style),
-                    output_path=sheet_path,
-                    size="2K",
-                )
-                views = crop_character_sheet(sheet_path, char_dir, num_views=4)
+                identity_anchor = identity_anchor or view_path
+                views[view_name] = str(view_path)
+                new_image_requests += 1
+                pending_receipt["inputs"][view_name] = {
+                    "path": view_path.name,
+                    "sha256": file_sha256(view_path),
+                }
+                _write_json_atomic(report_path, pending_receipt)
+                print(f"  [{view_name}] ✓ → {view_path}")
+                if (
+                    max_new_image_requests is not None
+                    and new_image_requests >= max_new_image_requests
+                ):
+                    raise CharacterReferenceGenerationPaused(
+                        character_id=char_id,
+                        view_name=view_name,
+                        view_path=view_path,
+                        character_description=description,
+                        synthetic_styling=synthetic_styling,
+                    )
 
         if not all(isinstance(path, str) and Path(path).is_file() for path in views.values()):
             raise RuntimeError(f"{char_id} reference generation produced an incomplete pack")
@@ -1366,7 +1474,7 @@ def generate_character(
         json.dump(angle_map, f, ensure_ascii=False, indent=2)
     print(f"  ✓ {angle_path}")
 
-    # Old variant_*.png files are intentionally untouched for audit only. Plot
+    # Historical state-specific image files are intentionally untouched for audit only. Plot
     # state such as wet clothing, dirt, or damage remains in Pxx start/end state.
     print("\n[Step 4] Legacy state variants disabled; existing files remain audit-only")
 
@@ -1418,6 +1526,8 @@ def batch_generate(characters: list, output_dir: str, **kwargs) -> list:
                 review_client=kwargs.get("review_client"),
                 view_qa_max_retries=kwargs.get("view_qa_max_retries", 2),
                 review_qa_max_retries=kwargs.get("review_qa_max_retries", 2),
+                max_new_image_requests=kwargs.get("max_new_image_requests"),
+                before_provider_request=kwargs.get("before_provider_request"),
             )
             results.append(result)
         except Exception as e:

@@ -39,7 +39,6 @@ from utils.video_generation_contracts import (
     DUPLICATE_IDENTITY_NEGATIVE,
     SPATIAL_IDENTITY_NEGATIVE,
     ensure_video_generation_contract,
-    has_synthetic_identity_policy,
 )
 from utils.video_geometry import resolve_video_geometry
 from utils.visual_style_contract import BASE_STYLE_SCHEMA
@@ -372,19 +371,20 @@ def build_video_prompt(
         + f"约束条件：{BASE_NEGATIVE_PROMPT}"
     )
     prompt = append_storyboard_motion_policy("。".join(parts))
-    from utils.privacy_visual_policy import (
-        NO_REAL_PERSON_POLICY,
-        is_no_real_person_enabled,
-    )
+    from utils.privacy_visual_policy import is_synthetic_visual_identity_policy
 
     synthetic_identity = bool(selected) and (
-        has_synthetic_identity_policy(characters) or is_no_real_person_enabled()
+        all(
+            is_synthetic_visual_identity_policy(
+                character.get("visual_identity_policy")
+            )
+            for character in selected
+        )
     )
     if synthetic_identity:
-        from utils.privacy_visual_policy import no_real_person_prompt_contract
+        from utils.privacy_visual_policy import synthetic_stylized_prompt_contract
 
-        shot_meta["visual_identity_policy"] = NO_REAL_PERSON_POLICY
-        prompt = f"{no_real_person_prompt_contract()}\n{prompt}"
+        prompt = f"{synthetic_stylized_prompt_contract()}\n{prompt}"
     prompt = ensure_video_generation_contract(prompt, shot_meta, characters)
     if explicit_scenery:
         scenery_lock = (
@@ -396,9 +396,10 @@ def build_video_prompt(
     if "kling" in model.lower():
         return {"prompt": f"{fictional_decl}。{prompt}", "negative_prompt": negative_prompt}
     identity_lock = (
-        "synthetic-identity-lock/synthetic-styling-lock：保持参考图中每个角色各自的面纱/遮罩、图形化妆、面部纹样、"
-        "机械纹理、非人材质、设计化头发/头饰、服装类别与主色不变；每人至少两个妆造锚点可见；"
-        "不得恢复未经妆造的自然真人脸，也不得把所有角色替换成同款头盔或面甲"
+        "synthetic-identity-lock/synthetic-styling-lock：保持参考图中每个角色自己的温暖珍珠陶瓷肤色、"
+        "清晰瞳孔与虹膜层次、太阳穴至上颧骨的纤细电路彩妆、完整无遮挡五官、发型、服装类别与主色；"
+        "整体必须健康、美观、清醒且明确为风格化合成人，禁止尸妆、鬼妆、面部裂纹、粗大机械面板、"
+        "面纱、面具或同款头盔替换"
         if synthetic_identity
         else "identity-lock：保持参考图中的面部骨骼、发型、服装类别与主色不变"
     )

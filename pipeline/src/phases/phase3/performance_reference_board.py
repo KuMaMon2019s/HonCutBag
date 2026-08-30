@@ -1832,6 +1832,11 @@ def _review_performance_cell_components(
         "no_extra_character",
         "no_text_or_layout_marks",
         "issues",
+        "qa_observation_id",
+        "qa_observation_reused",
+        "qa_decision_id",
+        "qa_decision_reused",
+        "qa_verdict",
     )
     for component in components:
         cell_id = str(component["cell_id"])
@@ -1909,6 +1914,7 @@ def generate_character_performance_board(
     image_client: PerformanceBoardImageClient,
     review_client: Any,
     model: str | None = None,
+    allow_provider_corrections: bool = True,
 ) -> dict[str, Any] | None:
     """Generate or exactly reuse one performance board, then derive Pxx guides locally."""
     output_dir = Path(output_dir)
@@ -2109,6 +2115,21 @@ def generate_character_performance_board(
                 "qa_receipt": archived_qa.name,
                 "qa_receipt_sha256": file_sha256(archived_qa),
             })
+            if not allow_provider_corrections:
+                failed = {
+                    **pending,
+                    "status": "failed",
+                    "generation_mode": "whole_board",
+                    "attempts": attempts,
+                    "image_sha256": image_hash,
+                    "provider_request_count": 1,
+                    "provider_corrections": "disabled",
+                }
+                _atomic_json(receipt_path, failed)
+                raise CharacterPerformanceQAError(
+                    f"{character_id} performance board failed QA and "
+                    "Provider corrections are disabled"
+                )
             use_cell_fallback = True
 
     components: list[dict[str, Any]] = []
@@ -2275,6 +2296,7 @@ def generate_performance_reference_boards(
     *,
     image_client: PerformanceBoardImageClient,
     review_client: Any,
+    allow_provider_corrections: bool = True,
 ) -> list[dict[str, Any]]:
     results = []
     for character in characters:
@@ -2284,6 +2306,7 @@ def generate_performance_reference_boards(
             character,
             image_client=image_client,
             review_client=review_client,
+            allow_provider_corrections=allow_provider_corrections,
         )
         if result is not None:
             results.append(result)

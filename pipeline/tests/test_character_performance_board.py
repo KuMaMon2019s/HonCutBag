@@ -6,6 +6,7 @@ import json
 import re
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 from phases.phase3.performance_reference_board import (
@@ -28,6 +29,7 @@ from quality.character_performance_qa import (
     review_character_performance_board,
     review_character_performance_cell,
 )
+from utils.canonical_visual_contracts import persist_canonical_visual_contract
 
 
 def _character() -> dict:
@@ -91,6 +93,15 @@ def _storyboard() -> dict:
 
 
 def _write_reference_assets(output_dir: Path) -> None:
+    projected, _contract = persist_canonical_visual_contract(
+        output_dir,
+        {"characters": [_character()]},
+        requested_policy="synthetic_stylized_character_v3",
+    )
+    (output_dir / "CHARACTERS.json").write_text(
+        json.dumps(projected, ensure_ascii=False),
+        encoding="utf-8",
+    )
     character_dir = output_dir / "characters" / "lead"
     character_dir.mkdir(parents=True)
     Image.new("RGB", (1536, 1536), (190, 200, 220)).save(
@@ -559,6 +570,7 @@ def test_isolated_pose_distinct_is_diagnostic_because_board_owns_diversity(tmp_p
 
 
 def test_low_confidence_board_pose_similarity_is_diagnostic(tmp_path):
+    _write_reference_assets(tmp_path)
     board_path = tmp_path / "board.png"
     Image.new("RGB", (3072, 2048), (160, 170, 180)).save(board_path)
     plan = build_character_performance_plan(_storyboard(), _character())
@@ -874,6 +886,35 @@ def test_failed_whole_board_uses_six_cached_components_then_passes(tmp_path):
         assert (tmp_path / component["image"]).with_suffix(".qa.json").is_file()
 
 
+def test_acceptance_mode_stops_after_failed_whole_board_without_correction(
+    tmp_path,
+):
+    _write_reference_assets(tmp_path)
+    image_client = _FallbackImageClient()
+
+    with pytest.raises(
+        CharacterPerformanceQAError,
+        match="Provider corrections are disabled",
+    ):
+        generate_character_performance_board(
+            tmp_path,
+            _storyboard(),
+            _character(),
+            image_client=image_client,
+            review_client=_FailThenPassReviewClient(),
+            allow_provider_corrections=False,
+        )
+
+    assert len(image_client.calls) == 1
+    receipt = json.loads(
+        (tmp_path / "characters/lead/performance_reference_board.json").read_text()
+    )
+    assert receipt["status"] == "failed"
+    assert receipt["generation_mode"] == "whole_board"
+    assert receipt["provider_request_count"] == 1
+    assert receipt["provider_corrections"] == "disabled"
+
+
 def test_pending_component_qa_resume_reuses_all_images_without_whole_board_replay(
     tmp_path,
 ):
@@ -1105,7 +1146,8 @@ def test_known_legacy_cell_qa_is_audited_then_rereviewed_without_image_call(tmp_
     assert len(results) == 6
     assert all(result["passed"] is True for result in results)
     assert len(image_client.calls) == image_call_count
-    assert len(review_client.calls) == 1
+    assert len(review_client.calls) == 0
+    assert results[0]["qa_observation_reused"] is True
     assert qa_path.with_name("A01.qa.audit.v3.json").is_file()
 
 def test_missing_pose_guide_or_future_cell_qa_fails_closed(tmp_path):

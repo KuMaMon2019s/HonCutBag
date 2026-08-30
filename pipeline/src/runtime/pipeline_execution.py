@@ -62,6 +62,10 @@ from utils.media_profiles import (
 )
 from utils.progress_reporter import ProgressReporter
 from utils.source_paths import PROJECT_ROOT
+from utils.canonical_visual_contracts import (
+    SOURCE_DERIVED_POLICY,
+    normalize_character_visual_policy,
+)
 
 
 _GRAPH_PROGRESS_PHASES = {
@@ -279,7 +283,7 @@ def run_pipeline(
     transition_duration: float = 0.5,
     media_profile: str = DEFAULT_MEDIA_PROFILE,
     enable_reshoot: bool = True,
-    no_real_person: bool = False,
+    character_visual_policy: str = SOURCE_DERIVED_POLICY,
     resume: bool = False,
     auto_approve: bool = True,
     resume_from: str = None,
@@ -288,11 +292,21 @@ def run_pipeline(
     character_library_dir: str | None = None,
     *,
     _phase_owner=None,
+    **legacy_options,
 ) -> dict:
-    """Run the pipeline without leaking its privacy mode into later runs."""
-    previous_no_real_person = os.environ.get("HONCUT_NO_REAL_PERSON")
-    try:
-        return _run_pipeline(
+    """Run the pipeline with one canonical visual policy."""
+    from runtime.legacy_visual_policy_migration import (
+        migrate_legacy_visual_policy_options,
+    )
+
+    resolved_visual_policy = normalize_character_visual_policy(
+        character_visual_policy
+    )
+    resolved_visual_policy = migrate_legacy_visual_policy_options(
+        legacy_options,
+        character_visual_policy=resolved_visual_policy,
+    )
+    return _run_pipeline(
             text=text,
             input_file=input_file,
             duration=duration,
@@ -310,18 +324,13 @@ def run_pipeline(
             transition_duration=transition_duration,
             media_profile=media_profile,
             enable_reshoot=enable_reshoot,
-            no_real_person=no_real_person,
+            character_visual_policy=resolved_visual_policy,
             resume=resume,
             auto_approve=auto_approve,
             resume_from=resume_from,
             accept_code_change_from=accept_code_change_from,
             _phase_owner=_phase_owner,
         )
-    finally:
-        if previous_no_real_person is None:
-            os.environ.pop("HONCUT_NO_REAL_PERSON", None)
-        else:
-            os.environ["HONCUT_NO_REAL_PERSON"] = previous_no_real_person
 
 
 def _run_pipeline(
@@ -340,7 +349,7 @@ def _run_pipeline(
     transition_duration: float = 0.5,
     media_profile: str = DEFAULT_MEDIA_PROFILE,
     enable_reshoot: bool = True,
-    no_real_person: bool = False,
+    character_visual_policy: str = SOURCE_DERIVED_POLICY,
     resume: bool = False,
     auto_approve: bool = True,
     resume_from: str = None,
@@ -371,7 +380,7 @@ def _run_pipeline(
         transition_duration: Phase 8 转场时长（秒），默认 0.5
         media_profile: 编码配置名称，从 MEDIA_PROFILES 中选择（默认 "480p"）
         enable_reshoot: 视觉缺陷或时长不足时是否允许调用 Phase 6 补录（默认 True，最多两轮）
-        no_real_person: 将所有角色锁定为带多样化可见妆造锚点的虚构 CGI 设计
+        character_visual_policy: 角色视觉事实的 canonical 解析策略
         resume: 从检查点恢复，跳过已完成的 Phase
         accept_code_change_from: 显式接受代码变更并从指定 Phase 继续；其他身份变化仍拒绝
 
@@ -421,7 +430,9 @@ def _run_pipeline(
                 "character library must be outside and non-overlapping with the run directory"
             )
         resolved_character_library_dir = str(character_library_path)
-    os.environ["HONCUT_NO_REAL_PERSON"] = "1" if no_real_person else "0"
+    character_visual_policy = normalize_character_visual_policy(
+        character_visual_policy
+    )
 
     if accept_code_change_from is not None:
         from utils.artifact_chain import (
@@ -477,7 +488,7 @@ def _run_pipeline(
         "transition_duration": transition_duration,
         "media_profile": media_profile,
         "enable_reshoot": enable_reshoot,
-        "no_real_person": no_real_person,
+        "character_visual_policy": character_visual_policy,
         "dry_run": dry_run,
         "video_provider": effective_video_provider,
         "video_generation_mode": effective_video_route,
@@ -721,6 +732,7 @@ def _run_pipeline(
                 transition_duration_s=transition_duration,
                 media_profile=media_profile,
                 project_video_spec=project_video_spec,
+                character_visual_policy=character_visual_policy,
                 enable_reshoot=enable_reshoot,
                 resume=resume,
                 resume_from=resume_from,
@@ -865,6 +877,7 @@ def _run_pipeline(
             "max_material_padding_ratio": max_material_padding_ratio,
             "delivery_overrun_ratio": delivery_overrun_ratio,
             "project_video_spec": project_video_spec,
+            "character_visual_policy": character_visual_policy,
         }
         if _screenplay_rewrite_request is not None:
             phase1_kwargs["screenplay_rewrite_request"] = (
@@ -1081,9 +1094,19 @@ def _run_pipeline(
         from phases.phase5 import storyboard_qa_gate
 
         reporter.phase_start("phase5", "分镜质检闸门")
-        p4_5 = storyboard_qa_gate.run_storyboard_qa_with_correction(
+        qa_gate_runner = getattr(
+            phase_owner,
+            "run_storyboard_qa_gate",
+            storyboard_qa_gate.run_storyboard_qa_gate,
+        )
+        qa_correction_runner = getattr(
+            phase_owner,
+            "run_storyboard_qa_with_correction",
+            storyboard_qa_gate.run_storyboard_qa_with_correction,
+        )
+        p4_5 = qa_correction_runner(
             output_path,
-            qa_runner=storyboard_qa_gate.run_storyboard_qa_gate,
+            qa_runner=qa_gate_runner,
             dry_run=dry_run,
             resume_pending_adjudication=resume_from == "phase5",
         )
@@ -1127,7 +1150,7 @@ def _run_pipeline(
                     transition_duration=transition_duration,
                     media_profile=media_profile,
                     enable_reshoot=enable_reshoot,
-                    no_real_person=no_real_person,
+                    character_visual_policy=character_visual_policy,
                     resume=False,
                     auto_approve=auto_approve,
                     project_id=project_id,
