@@ -656,7 +656,7 @@ def _pipeline_arguments(workspace: Path, story_path: Path) -> dict[str, Any]:
         "character_visual_policy": VISUAL_POLICY,
         "phase1_semantic_qa": False,
         "auto_approve": True,
-        "project_id": "canonical-visual-ledger-36s-run-01",
+        "project_id": workspace.resolve().name,
         "character_library_dir": None,
     }
 
@@ -888,7 +888,7 @@ def _freeze_phase6_tasks(
         model=SEEDANCE_MODEL,
         provider_id="seedance",
         provider_version="ark-agent-plan-v3",
-        project_id="canonical-visual-ledger-36s-run-01",
+        project_id=workspace.resolve().name,
         run_id=workspace.name,
         duration=duration,
         seed=seed,

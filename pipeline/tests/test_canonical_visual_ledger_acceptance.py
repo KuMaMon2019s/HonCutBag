@@ -86,6 +86,16 @@ def test_stage0_preflight_is_zero_request_and_has_finite_hard_limits(
     assert receipt["configuration"]["character_library_configured"] is False
 
 
+def test_acceptance_project_identity_is_derived_from_fresh_workspace(tmp_path):
+    workspace = tmp_path / "honcut-canonical-visual-ledger-36s-run-03"
+    arguments = acceptance._pipeline_arguments(
+        workspace,
+        workspace / "input" / "story.txt",
+    )
+
+    assert arguments["project_id"] == workspace.name
+
+
 def test_stage0_preflight_rejects_input_outside_workspace(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
