@@ -615,6 +615,12 @@ def run_phase1_screenwriter(
                 _is_human_character,
                 discover_characters,
             )
+            from phases.phase1.character_roster import (
+                CHARACTER_ROSTER_FILENAME,
+                CharacterRosterError,
+                persist_character_roster,
+                validate_character_roster,
+            )
             from phases.phase1.adaptation_engine import adapt_events
             from phases.phase1.storyboard_generator import generate_storyboard
             from prompt.event_extractor import EVENT_FLOW_SCHEMA_VERSION, extract_events
@@ -714,6 +720,7 @@ def run_phase1_screenwriter(
                 "character_context_schema": CHARACTER_CONTEXT_SCHEMA_VERSION,
                 "events": events,
                 "character_visual_policy": character_visual_policy,
+                "phase1_semantic_qa": phase1_semantic_qa,
             }
         ])
         characters_result = _load_phase1_checkpoint(
@@ -726,6 +733,8 @@ def run_phase1_screenwriter(
             valid_characters = (
                 characters_result.get("source_text_hash") == characters_input_hash
                 and characters_result.get("total_characters") == len(characters)
+                and characters_result.get("semantic_qa_enabled") is phase1_semantic_qa
+                and bool(characters_result.get("character_roster_sha256"))
                 and all(
                     isinstance(character, dict)
                     and bool(str(character.get("name", "")).strip())
@@ -735,10 +744,32 @@ def run_phase1_screenwriter(
             )
             if not valid_characters:
                 characters_result = None
+            else:
+                try:
+                    cached_roster = validate_character_roster(
+                        characters_result.get("character_roster") or {}
+                    )
+                except CharacterRosterError:
+                    characters_result = None
+                else:
+                    if (
+                        cached_roster["roster_sha256"]
+                        != characters_result["character_roster_sha256"]
+                    ):
+                        characters_result = None
+                    else:
+                        persist_character_roster(
+                            output_dir / CHARACTER_ROSTER_FILENAME,
+                            cached_roster,
+                        )
         if characters_result is not None:
             print("    ↻ 复用 phase1_characters.json，跳过角色发现")
         else:
-            characters_result = dict(discover_characters(events))
+            characters_result = dict(discover_characters(
+                events,
+                semantic_qa_enabled=phase1_semantic_qa,
+                roster_output_path=output_dir / CHARACTER_ROSTER_FILENAME,
+            ))
             characters_result["source_text_hash"] = characters_input_hash
             characters_result.setdefault(
                 "total_characters", len(characters_result.get("characters", []))
@@ -749,6 +780,20 @@ def run_phase1_screenwriter(
                 collection_key="characters",
                 input_hash=characters_input_hash,
             )
+        character_roster = validate_character_roster(
+            characters_result.get("character_roster") or {}
+        )
+        if (
+            character_roster["roster_sha256"]
+            != characters_result.get("character_roster_sha256")
+        ):
+            raise CharacterRosterError(
+                "Phase 1 character roster hash disagrees with character output"
+            )
+        persist_character_roster(
+            output_dir / CHARACTER_ROSTER_FILENAME,
+            character_roster,
+        )
         characters_result, canonical_visual_contract = (
             persist_canonical_visual_contract(
                 output_dir,
@@ -788,6 +833,13 @@ def run_phase1_screenwriter(
         characters_result = dict(characters_result)
         characters_result["characters"] = characters_list
         characters_result["semantic_ledger"] = semantic_ledger_path.name
+        from utils.canonical_visual_contracts import expand_character_instances
+
+        characters_result = expand_character_instances(
+            characters_result,
+            canonical_visual_contract,
+        )
+        characters_list = characters_result["characters"]
 
         # Step 2.4: adaptation_engine → adapted shots list
         print("  → adaptation_engine: 影视化改编...")
@@ -972,6 +1024,7 @@ def run_phase1_screenwriter(
 
         outputs = [
             "STORYBOARD.json", "CHARACTERS.json",
+            CHARACTER_ROSTER_FILENAME,
             CANONICAL_VISUAL_CONTRACT_FILENAME, "SEMANTIC_LEDGER.json",
             "SCREENPLAY_PLAN.json",
             "director_storyboard.png", "director_storyboard_prompt.txt",

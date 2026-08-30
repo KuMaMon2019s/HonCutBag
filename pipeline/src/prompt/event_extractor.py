@@ -468,9 +468,17 @@ def _normalize_event(
         raise ValueError("dramatic_turn 必须是 JSON 布尔值")
     expected_turn = role == "turning_point"
     if dramatic_turn is not expected_turn:
-        raise ValueError(
-            "event_role 与 dramatic_turn 冲突：只有 turning_point 可以为 true"
-        )
+        if semantic_action_qa_enabled:
+            raise ValueError(
+                "event_role 与 dramatic_turn 冲突：只有 turning_point 可以为 true"
+            )
+        event.setdefault("semantic_diagnostics", []).append({
+            "category": "dramatic_role_consistency",
+            "observed_event_role": role,
+            "observed_dramatic_turn": dramatic_turn,
+            "normalized_dramatic_turn": expected_turn,
+        })
+        dramatic_turn = expected_turn
     event["dramatic_turn"] = dramatic_turn
 
     lines = event.get("lines", [])

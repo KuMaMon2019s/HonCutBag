@@ -27,13 +27,14 @@ import argparse
 import re
 import time
 import hashlib
+from pathlib import Path
 from typing import List, Dict, Any
 from collections import defaultdict
 
 from openai import OpenAI
 from runtime.provider_attempt_policy import effective_provider_retries
 from schemas.understanding import (
-    CharacterUnderstandingBatch,
+    CharacterRosterObservationBatch,
     native_chat_json_schema_format,
     parse_structured_output,
 )
@@ -66,22 +67,11 @@ from utils.character_reference_contracts import (
 # ─── LLM 配置 ───────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = (
-    "你是角色设计师。根据故事事件中的角色信息，为每个角色生成视觉描述。"
-    "描述必须足够详细，能让 AI 图片生成器画出一致的角色。"
-    "输出严格 JSON 对象，顶层只有 characters 数组，不要输出任何解释文字。"
-    "\n\n重要过滤规则：只提取有具体外貌、动作、对话的人物角色。"
-    "必须排除以下类型：天气现象（如'冷空气'、'风'）、动物（如'鸡'、'狗'）、"
-    "未被来源原文明示为代号、化名、姓名或昵称的抽象指代"
-    "（如'说话者'、'观察者'、'记录者'、'思考者'、'行走者'、'试验者'、'打探人员'）、"
-    "复数群体（如'保安们'应合并为'保安'）、物品、概念。"
-    "只有确指同一人的职业称呼和通用指代才能合并为一个对象："
-    "保留最具体的主名，其余写入 aliases；来源以不同序号明确区分的个体必须分别输出，"
-    "禁止把第一/第二/第三或 first/second/third 等互斥身份放进同一 aliases；"
-    "禁止将'主角'、'他'、'她'单独输出为角色。"
-    "方括号中的来源称呼可能混有服装、年龄、伤势、动作或地点修饰；name 必须是可跨镜头复用的"
-    "稳定身份名，aliases 必须逐字收录所有属于该角色的来源称呼，瞬时修饰只能进入 appearance/variants。"
-    "不得因为来源称呼使用中文、英文、编号、职业名或多词名称而丢弃角色，也不得凭子串把两个角色合并。"
-    "最多保留5个主要人物角色。"
+    "你是角色视觉观察员。确定性角色名册已经拥有全部人物 entity、instance 数量和来源称呼。"
+    "你只能为名册中的既有 entity_id 补充共享视觉事实、服装、角色定位和人物设计描述；"
+    "不得新增、删除、合并、拆分或重新计数人物。"
+    "响应必须是 honcut.character-roster-observation.v1 的严格 JSON 对象，"
+    "原样回传输入的 roster_sha256，不要输出解释文字。"
     "\n\n外貌描述具体化要求：\n"
     "- hair 必须写明发色+发长+发型（如'黑色长直发及肩'），不能只写'长发'\n"
     "- clothing 必须具体到单品（上装+下装+鞋+配饰），不能只写'通勤装'、'休闲服'\n"
@@ -95,22 +85,17 @@ SYSTEM_PROMPT = (
 SYSTEM_PROMPT = f"{SYSTEM_PROMPT}\n\n{ADULT_LEAD_DISCOVERY_INSTRUCTIONS}"
 
 USER_PROMPT_TEMPLATE = (
-    "以下是故事中的角色列表和出现的事件：\n\n"
+    "以下上下文只用于补充名册中既有人物的视觉事实：\n\n"
     "{character_context}\n\n"
-    "注意：只提取有具体外貌、动作、对话的人物角色。排除：天气现象、动物、"
-    "未被来源原文明示为代号、化名、姓名或昵称的抽象指代（如'说话者'、'观察者'）、复数群体。"
-    "同一实体的职业/主角指代只输出一个对象，其余称呼放入 aliases；"
-    "不同来源序号明确区分不同个体，必须分别输出，绝不能互作 aliases；"
-    "'主角'、'他'、'她'不得独立成条。最多保留5个主要角色。\n\n"
-    "身份归一化硬约束：每个【来源称呼】必须被审计。若称呼带有服装、年龄、伤势、动作或地点修饰，"
-    "从中提取稳定身份作为 name，并把完整【来源称呼】逐字放入 aliases；若它只是物品、环境或群众描述，"
-    "则不得生成角色。禁止按语言或字母类型区别处理，禁止把多词姓名截成最后一个词，禁止以模糊子串合并。\n\n"
+    "人数、entity_id、instance_count 和来源称呼均由随后给出的名册锁定；"
+    "不要做人物发现或身份归并。允许遗漏没有把握的视觉观察，代码会依据来源证据确定性补全。\n\n"
     "忠实度要求：事件上下文中明确出现的服装颜色、层次、材质、发型和配饰必须逐项保留；"
     "只能补全未指定的细节，不能把淡粉改成月白、把轻纱改成其他面料或擅自换装。\n\n"
-    "输出 {{\"characters\":[...]}}。每个角色对象包含：\n"
-    "- id: 英文标识（拼音或英文缩写，用于目录名，如 amy, wolf, old_man）\n"
-    "- name: 角色名称（中文）\n"
-    "- aliases: 别名数组（如 [\"小女孩\", \"她\"]）\n"
+    "输出 {{\"schema\":\"honcut.character-roster-observation.v1\","
+    "\"roster_sha256\":\"输入名册哈希\",\"characters\":[...]}}。每个角色对象包含：\n"
+    "- id: 必须等于输入名册的 entity_id\n"
+    "- name: 名册 display_name\n"
+    "- aliases: 观察到的来源称呼数组；遗漏不会改变名册\n"
     "- role: 角色定位，枚举值 protagonist/antagonist/supporting/extra\n"
     "- appearance: 外貌对象，包含：\n"
     "  - gender: male/female/nonbinary/unknown\n"
@@ -142,8 +127,6 @@ USER_PROMPT_TEMPLATE = (
 
 LLM_TIMEOUT = 600
 LLM_IDLE_TIMEOUT = 75
-MAX_RETRIES = 3  # 解析失败重试次数
-
 ENTITY_SUFFIXES = (
     "机器人", "号", "型", "级", "者", "员", "师", "家", "王", "后",
     "公主", "王子", "先生", "小姐", "佣兵", "机械体", "合成人", "复制体",
@@ -153,7 +136,7 @@ ENTITY_SUFFIXES = (
 )
 MAX_ENTITY_NAME_CHINESE_CHARS = 12
 GENERIC_CHARACTER_NAMES = {"主角", "主人公", "男主", "女主", "人物", "他", "她", "它"}
-CHARACTER_CONTEXT_SCHEMA_VERSION = 11
+CHARACTER_CONTEXT_SCHEMA_VERSION = 13
 
 GENERIC_BACKGROUND_CHARACTER_NAMES = {
     "路人", "行人", "游客", "观众", "听众", "读者",
@@ -214,19 +197,26 @@ def _call_llm(prompt: str) -> str:
         wall_timeout=LLM_TIMEOUT,
         idle_timeout=LLM_IDLE_TIMEOUT,
         response_format=native_chat_json_schema_format(
-            CharacterUnderstandingBatch
+            CharacterRosterObservationBatch
         ),
         _client=client,
     )
 
 
-def _parse_characters(response: str) -> List[Dict[str, Any]]:
+def _parse_characters(
+    response: str,
+    *,
+    expected_roster_sha256: str,
+) -> List[Dict[str, Any]]:
     """Validate one complete native structured-output response."""
 
-    return parse_structured_output(
+    observation = parse_structured_output(
         response,
-        CharacterUnderstandingBatch,
-    ).model_dump()["characters"]
+        CharacterRosterObservationBatch,
+    ).model_dump(by_alias=True)
+    if observation["roster_sha256"] != expected_roster_sha256:
+        raise ValueError("character roster observation hash mismatch")
+    return observation["characters"]
 
 
 def _collect_character_stats(events: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -1055,7 +1045,12 @@ def _attach_source_identity_evidence(
         }
 
 
-def discover_characters(events: List[Dict[str, Any]]) -> Dict[str, Any]:
+def discover_characters(
+    events: List[Dict[str, Any]],
+    *,
+    semantic_qa_enabled: bool = False,
+    roster_output_path: str | Path | None = None,
+) -> Dict[str, Any]:
     """
     核心函数：从事件列表中发现所有角色并生成 CHARACTERS.json
 
@@ -1065,92 +1060,176 @@ def discover_characters(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     Returns:
         符合 PIPELINE.md schema 的 CHARACTERS.json 字典
     """
+    if not isinstance(semantic_qa_enabled, bool):
+        raise ValueError("semantic_qa_enabled must be a boolean")
+    from phases.phase1.character_roster import (
+        compile_character_roster,
+        persist_character_roster,
+        reconcile_character_observations,
+    )
+
+    def persist_roster(roster: Dict[str, Any]) -> Dict[str, Any]:
+        if roster_output_path is None:
+            return roster
+        return persist_character_roster(roster_output_path, roster)
+
     if not events:
+        roster = persist_roster(compile_character_roster([]))
         return {
             "version": "1.0",
             "source_text_hash": "",
             "total_characters": 0,
             "characters": [],
+            "character_roster": roster,
+            "character_roster_sha256": roster["roster_sha256"],
+            "semantic_qa_enabled": semantic_qa_enabled,
+            "semantic_diagnostics": [],
         }
+
+    provisional_roster = compile_character_roster(events)
+
+    def roster_stats() -> Dict[str, Dict[str, Any]]:
+        projected: Dict[str, Dict[str, Any]] = {}
+        for entity in provisional_roster["entities"]:
+            event_ids = [
+                int(evidence["event_ref"].removeprefix("event:"))
+                for evidence in entity["source_visual_evidence"]
+                if evidence["event_ref"].removeprefix("event:").isdigit()
+            ]
+            aliases = list(dict.fromkeys(
+                mention
+                for instance in entity["instances"]
+                for mention in instance["source_mentions"]
+                if mention != entity["display_name"]
+            ))
+            projected[entity["display_name"]] = {
+                "events": event_ids,
+                "contexts": [
+                    f"事件{event_id}: 来源名册视觉证据"
+                    for event_id in event_ids
+                ],
+                "dialogue_count": 0,
+                "source_excerpts": [
+                    evidence["source_excerpt"]
+                    for evidence in entity["source_visual_evidence"]
+                    if evidence["source_excerpt"]
+                ],
+                "source_aliases": aliases,
+            }
+        return projected
 
     # 1. 收集角色统计
     stats = _collect_character_stats(events)
     if not stats:
-        print("警告：未从事件中发现任何角色", file=sys.stderr)
-        return {
-            "version": "1.0",
-            "source_text_hash": _compute_text_hash(events),
-            "total_characters": 0,
-            "characters": [],
-        }
+        stats = roster_stats()
+        if not stats:
+            provisional_roster = persist_roster(provisional_roster)
+            print("警告：未从事件中发现任何角色", file=sys.stderr)
+            return {
+                "version": "1.0",
+                "source_text_hash": _compute_text_hash(events),
+                "total_characters": 0,
+                "characters": [],
+                "character_roster": provisional_roster,
+                "character_roster_sha256": provisional_roster["roster_sha256"],
+                "semantic_qa_enabled": semantic_qa_enabled,
+                "semantic_diagnostics": [],
+            }
 
     print(f"发现 {len(stats)} 个角色名: {list(stats.keys())}", file=sys.stderr)
 
     # 1.5 预过滤：移除明显的非人物角色
     stats = _filter_non_human_characters(stats)
     if not stats:
-        print("警告：过滤后未剩任何人物角色", file=sys.stderr)
-        return {
-            "version": "1.0",
-            "source_text_hash": _compute_text_hash(events),
-            "total_characters": 0,
-            "characters": [],
-        }
+        stats = roster_stats()
 
     # 1.6 过滤描述性短语（非真实角色名）
     stats = _filter_descriptive_phrases(stats)
     if not stats:
+        stats = roster_stats()
+    if not stats:
+        provisional_roster = persist_roster(provisional_roster)
         print("警告：过滤描述性短语后未剩任何角色", file=sys.stderr)
         return {
             "version": "1.0",
             "source_text_hash": _compute_text_hash(events),
             "total_characters": 0,
             "characters": [],
+            "character_roster": provisional_roster,
+            "character_roster_sha256": provisional_roster["roster_sha256"],
+            "semantic_qa_enabled": semantic_qa_enabled,
+            "semantic_diagnostics": [],
         }
 
     print(f"过滤后保留 {len(stats)} 个角色名: {list(stats.keys())}", file=sys.stderr)
 
-    # 2. 构建 LLM prompt
+    roster = persist_roster(compile_character_roster(events, source_stats=stats))
+
+    # 2. 构建 LLM prompt.  The roster is the cardinality authority; the model
+    # may only supply visual observations for these existing entity IDs.
     character_context = _build_character_context(stats)
     prompt = USER_PROMPT_TEMPLATE.format(
         character_context=character_context,
         adult_lead_body_contract=ADULT_LEAD_DISCOVERY_INSTRUCTIONS,
     )
+    roster_observation_contract = {
+        "schema": roster["schema"],
+        "roster_sha256": roster["roster_sha256"],
+        "semantic_qa_enabled": semantic_qa_enabled,
+        "entities": [
+            {
+                "entity_id": entity["entity_id"],
+                "display_name": entity["display_name"],
+                "instance_count": entity["instance_count"],
+                "source_mentions": list(dict.fromkeys(
+                    mention
+                    for instance in entity["instances"]
+                    for mention in instance["source_mentions"]
+                )),
+                "source_visual_evidence": entity["source_visual_evidence"],
+            }
+            for entity in roster["entities"]
+        ],
+    }
+    prompt = (
+        f"{prompt}\n\n【确定性角色名册 — 人数与归属事实源】\n"
+        + json.dumps(
+            roster_observation_contract,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n你只能为名册中的既有 entity_id 补充视觉、服装、角色定位和共享特征；"
+        "不得新增、删除、拆分或合并实体，也不得改变 instance_count。每个输出对象的 id 必须等于 entity_id。"
+    )
 
-    # 3. 调用 LLM（带重试）
-    retry_limit = effective_provider_retries(MAX_RETRIES)
+    # 3. 调用 LLM。结构或名册绑定失败不重提；仅 Runtime 可允许一次网络恢复。
     network_retry_limit = effective_provider_retries(1)
     characters = []
+    semantic_diagnostics: List[Dict[str, Any]] = []
     last_error = None
     attempt_prompt = prompt
-    for attempt in range(1 + retry_limit):
+    for attempt in range(1 + network_retry_limit):
         try:
             print("调用 LLM 生成角色描述...", file=sys.stderr)
             response = _call_llm(attempt_prompt)
-            candidate_characters = _parse_characters(response)
-            candidate_characters = _post_filter_characters(
-                candidate_characters,
-                stats,
+            candidate_characters = _parse_characters(
+                response,
+                expected_roster_sha256=roster["roster_sha256"],
             )
-            _attach_source_identity_evidence(candidate_characters, stats)
-            characters = candidate_characters
+            characters, semantic_diagnostics = reconcile_character_observations(
+                candidate_characters,
+                roster,
+                semantic_qa_enabled=semantic_qa_enabled,
+            )
             break
         except (json.JSONDecodeError, ValueError) as e:
             last_error = e
-            if attempt < retry_limit:
-                print(
-                    f"  角色结构/身份回验失败，重试 ({attempt+1}/{retry_limit}): {e}",
-                    file=sys.stderr,
-                )
-                attempt_prompt = (
-                    f"{prompt}\n\n"
-                    "【上一响应未通过身份回验】\n"
-                    f"{e}\n"
-                    "请重新输出完整 characters JSON；保留全部来源人物，"
-                    "互斥身份必须拆成不同对象，不得互作 aliases。"
-                )
-                time.sleep(1)
-            continue
+            print(
+                f"  角色结构/身份回验失败（禁止自动重提）: {e}",
+                file=sys.stderr,
+            )
+            break
         except (LLMConnectTimeout, LLMReadTimeout, LLMIdleTimeout, LLMStreamError) as e:
             last_error = e
             if attempt < network_retry_limit:
@@ -1198,7 +1277,15 @@ def discover_characters(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         "version": "1.0",
         "source_text_hash": _compute_text_hash(events),
         "total_characters": len(characters),
+        "total_character_instances": sum(
+            int(character.get("instance_count") or 1)
+            for character in characters
+        ),
         "characters": characters,
+        "character_roster": roster,
+        "character_roster_sha256": roster["roster_sha256"],
+        "semantic_qa_enabled": semantic_qa_enabled,
+        "semantic_diagnostics": semantic_diagnostics,
     }
 
     return result
