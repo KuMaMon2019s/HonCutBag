@@ -218,9 +218,20 @@ class CanonicalIdentityPropContractUnderstanding(StrictUnderstandingModel):
     geometry: IdentityPropGeometryUnderstanding
 
 
+class CanonicalCharacterInstanceUnderstanding(StrictUnderstandingModel):
+    instance_id: str
+    ordinal: int = Field(ge=1)
+    source_mentions: list[str]
+    source_event_refs: list[str]
+    source_action_unit_refs: list[str] = Field(default_factory=list)
+    face_identity: CanonicalVisualFactUnderstanding
+
+
 class CanonicalCharacterVisualContractUnderstanding(StrictUnderstandingModel):
     character_id: str
+    entity_id: str
     instance_count: CanonicalVisualFactUnderstanding
+    instances: list[CanonicalCharacterInstanceUnderstanding]
     visual_identity_policy: Literal[
         "fictional_cinematic_human_v1",
         "synthetic_stylized_character_v3",
@@ -235,7 +246,7 @@ class CanonicalCharacterVisualContractUnderstanding(StrictUnderstandingModel):
 
 
 class CanonicalVisualContractUnderstanding(StrictUnderstandingModel):
-    contract_schema: Literal["honcut.canonical-visual-contract.v1"] = Field(
+    contract_schema: Literal["honcut.canonical-visual-contract.v2"] = Field(
         alias="schema",
         serialization_alias="schema",
     )
@@ -245,6 +256,7 @@ class CanonicalVisualContractUnderstanding(StrictUnderstandingModel):
         "synthetic_stylized_character_v3",
     ]
     source_characters_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    character_roster_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     characters: list[CanonicalCharacterVisualContractUnderstanding]
     contract_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
@@ -308,6 +320,52 @@ class CharacterUnderstandingBatch(StrictUnderstandingModel):
     characters: list[CharacterUnderstanding]
 
 
+class CharacterRosterObservationBatch(StrictUnderstandingModel):
+    observation_schema: Literal[
+        "honcut.character-roster-observation.v1"
+    ] = Field(alias="schema", serialization_alias="schema")
+    roster_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    characters: list[CharacterUnderstanding]
+
+
+class CharacterRosterEvidenceUnderstanding(StrictUnderstandingModel):
+    event_ref: str
+    sequence_id: str
+    source_excerpt: str
+    source_excerpt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class CharacterRosterInstanceUnderstanding(StrictUnderstandingModel):
+    instance_id: str
+    ordinal: int = Field(ge=1)
+    source_mentions: list[str]
+    event_refs: list[str]
+    action_unit_refs: list[str] = Field(default_factory=list)
+
+
+class CharacterRosterEntityUnderstanding(StrictUnderstandingModel):
+    entity_id: str
+    display_name: str
+    instance_count: int = Field(ge=1)
+    instances: list[CharacterRosterInstanceUnderstanding]
+    source_visual_evidence: list[CharacterRosterEvidenceUnderstanding]
+    reconciliation_origin: Literal[
+        "explicit_source",
+        "model_observation",
+        "deterministic_group_completion",
+    ]
+
+
+class CharacterRosterUnderstanding(StrictUnderstandingModel):
+    roster_schema: Literal["honcut.character-roster.v1"] = Field(
+        alias="schema",
+        serialization_alias="schema",
+    )
+    source_events_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    entities: list[CharacterRosterEntityUnderstanding]
+    roster_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class StoryboardPromptUnderstanding(StrictUnderstandingModel):
     prompt: str
     caption: str
@@ -327,6 +385,8 @@ class SemanticMachineSemantics(StrictUnderstandingModel):
 
 class SemanticEntityRecord(StrictUnderstandingModel):
     character_id: str
+    entity_id: str
+    instance_ids: list[str]
     display_name: str
     source_identity_ref_ids: list[str]
     machine_semantics: SemanticMachineSemantics
@@ -337,6 +397,8 @@ class SemanticSourceMentionRecord(StrictUnderstandingModel):
     text: str
     language: Literal["zh", "en", "mixed", "und"]
     character_id: str
+    entity_id: str
+    instance_id: str
 
 
 class SemanticEventRecord(StrictUnderstandingModel):
@@ -344,10 +406,12 @@ class SemanticEventRecord(StrictUnderstandingModel):
     action_unit_id: str
     participant_ref_ids: list[str]
     character_ids: list[str]
+    entity_ids: list[str]
+    instance_ids: list[str]
 
 
 class SemanticUnderstandingLedger(StrictUnderstandingModel):
-    semantic_schema: Literal["honcut.semantic-understanding.v2"] = Field(
+    semantic_schema: Literal["honcut.semantic-understanding.v3"] = Field(
         alias="schema",
         serialization_alias="schema",
     )
@@ -714,6 +778,8 @@ __all__ = [
     "CanonicalIdentityPropContractUnderstanding",
     "CanonicalVisualFactUnderstanding",
     "CanonicalVisualContractUnderstanding",
+    "CharacterRosterObservationBatch",
+    "CharacterRosterUnderstanding",
     "CharacterUnderstandingBatch",
     "CharacterReferenceUnderstanding",
     "DirectorPlanUnderstanding",
