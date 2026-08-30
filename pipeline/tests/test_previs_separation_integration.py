@@ -114,6 +114,7 @@ class _CompatibleStyleClassifier:
 def test_previs_pixels_are_separated_end_to_end_before_video_transport(
     tmp_path,
     monkeypatch,
+    canonical_run_contract,
 ):
     client = _DeterministicImageClient()
     pipeline_core._write_project_visual_style(
@@ -127,6 +128,12 @@ def test_previs_pixels_are_separated_end_to_end_before_video_transport(
     )
     Image.effect_noise((640, 960), 80).convert("RGB").save(
         character_dir / "full_body.png"
+    )
+    Image.effect_noise((640, 960), 70).convert("RGB").save(
+        character_dir / "side.png"
+    )
+    Image.effect_noise((640, 960), 75).convert("RGB").save(
+        character_dir / "back.png"
     )
     characters = [{
         "id": "puppet",
@@ -153,10 +160,11 @@ def test_previs_pixels_are_separated_end_to_end_before_video_transport(
         }],
     }
     plan_storyboard_beats(storyboard)
-    (tmp_path / "CHARACTERS.json").write_text(
-        json.dumps({"characters": characters}, ensure_ascii=False),
-        encoding="utf-8",
+    characters_data, _contract = canonical_run_contract(
+        tmp_path,
+        {"characters": characters},
     )
+    characters = characters_data["characters"]
 
     # This deliberately annotated director cell is a legal Phase 4 composition
     # input, but it must be transformed into a clean cinematic frame before the
@@ -179,7 +187,17 @@ def test_previs_pixels_are_separated_end_to_end_before_video_transport(
     assert phase2_alias_receipt["status"] == "previs_only"
 
     (tmp_path / "STORYBOARD.json").write_text(
-        json.dumps(storyboard, ensure_ascii=False, indent=2),
+        json.dumps(
+            {
+                **storyboard,
+                "canonical_visual_contract": "CANONICAL_VISUAL_CONTRACT.json",
+                "canonical_visual_contract_sha256": _contract[
+                    "contract_sha256"
+                ],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
         encoding="utf-8",
     )
     monkeypatch.setattr(seedream_client, "SeedreamClient", lambda: client)
@@ -270,7 +288,14 @@ def test_previs_pixels_are_separated_end_to_end_before_video_transport(
     ]
     assert image_roles
     assert set(image_roles) == {"reference_image"}
-    assert uploaded_sha256[0] == cinematic_sha256
+    identity_board_sha256 = _sha256(
+        tmp_path / "characters" / "puppet" / "reference_board.png"
+    )
+    assert uploaded_sha256[:3] == [
+        identity_board_sha256,
+        cinematic_sha256,
+        narrative_guide_sha256,
+    ]
     assert cinematic_sha256 in uploaded_sha256
     assert narrative_guide_sha256 in uploaded_sha256
     assert director_sha256 not in uploaded_sha256
@@ -279,7 +304,7 @@ def test_previs_pixels_are_separated_end_to_end_before_video_transport(
     assert chunk["storyboard_narrative_guide_source_board_sha256"] == (
         nine_grid_sha256
     )
-    assert "首帧为图片1" in prompt
+    assert "首帧为图片2" in prompt
     assert "成片质感第一帧" in prompt
     assert "当前剧情导航图是图片" in prompt
     assert "S02_G01→S02_G02→S02_G03" in prompt

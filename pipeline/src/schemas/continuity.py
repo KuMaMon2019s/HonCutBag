@@ -99,7 +99,7 @@ class GenerationChunk(BaseModel):
         default=None, exclude_if=lambda value: value is None
     )
     storyboard_narrative_guide_kind: Literal[
-        "honcut.storyboard-narrative-guide.v1"
+        "honcut.storyboard-narrative-guide.v2"
     ] | None = Field(default=None, exclude_if=lambda value: value is None)
     storyboard_narrative_guide_usage: Literal[
         "phase6_story_narrative_guide_not_output_pixels"
@@ -109,6 +109,17 @@ class GenerationChunk(BaseModel):
         exclude_if=lambda value: not value,
     )
     storyboard_narrative_guide_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+        exclude_if=lambda value: value is None,
+    )
+    storyboard_narrative_guide_renderer: Literal[
+        "honcut.identity-neutral-story-guide-renderer.v1"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    storyboard_narrative_guide_source_pixel_usage: Literal["none"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    storyboard_narrative_guide_semantic_payload_sha256: str | None = Field(
         default=None,
         pattern=r"^[0-9a-f]{64}$",
         exclude_if=lambda value: value is None,
@@ -123,6 +134,14 @@ class GenerationChunk(BaseModel):
     )
     storyboard_narrative_guide_receipt: str | None = Field(
         default=None, exclude_if=lambda value: value is None
+    )
+    storyboard_narrative_guide_authority_roles: list[str] = Field(
+        default_factory=list,
+        exclude_if=lambda value: not value,
+    )
+    storyboard_narrative_guide_non_authority_roles: list[str] = Field(
+        default_factory=list,
+        exclude_if=lambda value: not value,
     )
     character_performance_required: bool = Field(
         default=False, exclude_if=lambda value: value is False
@@ -190,16 +209,23 @@ class GenerationChunk(BaseModel):
             self.storyboard_narrative_guide_kind,
             self.storyboard_narrative_guide_usage,
             self.storyboard_narrative_guide_sha256,
+            self.storyboard_narrative_guide_renderer,
+            self.storyboard_narrative_guide_source_pixel_usage,
+            self.storyboard_narrative_guide_semantic_payload_sha256,
             self.storyboard_narrative_guide_source_board,
             self.storyboard_narrative_guide_source_board_sha256,
             self.storyboard_narrative_guide_receipt,
         )
         guide_declared = any(value is not None for value in guide_fields) or bool(
             self.storyboard_narrative_guide_cell_ids
+            or self.storyboard_narrative_guide_authority_roles
+            or self.storyboard_narrative_guide_non_authority_roles
         )
         if guide_declared and (
             any(value is None for value in guide_fields)
             or not self.storyboard_narrative_guide_cell_ids
+            or not self.storyboard_narrative_guide_authority_roles
+            or not self.storyboard_narrative_guide_non_authority_roles
         ):
             raise ValueError("narrative guide provenance fields must be declared together")
         if self.storyboard_narrative_guide_cell_ids:
@@ -216,6 +242,19 @@ class GenerationChunk(BaseModel):
                 expected_numbers.append(int(suffix))
             if expected_numbers != sorted(set(expected_numbers)):
                 raise ValueError("narrative guide cell IDs must be unique and ordered")
+            if self.storyboard_narrative_guide_authority_roles != [
+                "narrative_order",
+                "action_direction",
+                "camera_motion",
+                "spatial_relationship",
+            ]:
+                raise ValueError("narrative guide authority roles are not canonical")
+            if "character_identity" not in (
+                self.storyboard_narrative_guide_non_authority_roles
+            ):
+                raise ValueError(
+                    "narrative guide must be non-authoritative for character identity"
+                )
         if self.character_performance_required != bool(
             self.character_performance_guides
         ):
@@ -363,7 +402,12 @@ class ContinuityPlan(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    version: Literal[3] = 3
+    version: Literal[4] = 4
+    canonical_visual_contract_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+        exclude_if=lambda value: value is None,
+    )
     provider_chunk_limit_s: float = Field(gt=0)
     timeline_fps: int = Field(default=24, gt=0)
     shots: list[ContinuityShot] = Field(default_factory=list)
@@ -375,10 +419,10 @@ class ContinuityPlan(BaseModel):
     def migrate_known_v1(cls, value: Any) -> Any:
         if not isinstance(value, dict):
             return value
-        version = value.get("version", 3)
+        version = value.get("version", 4)
         if version == 1:
             migrated = dict(value)
-            migrated["version"] = 3
+            migrated["version"] = 4
             migrated["migrated_from_version"] = 1
             migrated_shots = []
             for shot in value.get("shots") or []:
@@ -405,8 +449,24 @@ class ContinuityPlan(BaseModel):
             return migrated
         if version == 2:
             migrated = dict(value)
-            migrated["version"] = 3
+            migrated["version"] = 4
             migrated["migrated_from_version"] = 2
+            return migrated
+        if version == 3:
+            for shot in value.get("shots") or []:
+                for chunk in (shot.get("chunks") or []) if isinstance(shot, dict) else []:
+                    if (
+                        isinstance(chunk, dict)
+                        and chunk.get("storyboard_narrative_guide_kind")
+                        == "honcut.storyboard-narrative-guide.v1"
+                    ):
+                        raise ValueError(
+                            "continuity plan v3 contains identity-bearing guide v1; "
+                            "rerun Phase 2 and Phase 4"
+                        )
+            migrated = dict(value)
+            migrated["version"] = 4
+            migrated["migrated_from_version"] = 3
             return migrated
         return value
 
