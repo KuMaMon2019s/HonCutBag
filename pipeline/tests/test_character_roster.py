@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import inspect
 import json
 
@@ -10,6 +11,7 @@ from phases.phase1.character_roster import (
     CHARACTER_ROSTER_FILENAME,
     CharacterRosterError,
     compile_character_roster,
+    migrate_character_roster_v1,
     persist_character_roster,
     reconcile_character_observations,
     validate_character_roster,
@@ -26,6 +28,7 @@ def _event(
     *,
     sequence_id: str = "SEQ001",
     action_unit_id: str = "",
+    continuity_before: str = "continuous",
 ) -> dict:
     return {
         "id": event_id,
@@ -34,6 +37,7 @@ def _event(
         "who": who,
         "source_excerpt": source_excerpt,
         "what": source_excerpt,
+        "continuity_before": continuity_before,
     }
 
 
@@ -85,7 +89,7 @@ def test_roster_compiles_one_group_entity_with_three_stable_instances():
     second = compile_character_roster(copy.deepcopy(events))
 
     assert first == second
-    assert first["schema"] == "honcut.character-roster.v1"
+    assert first["schema"] == "honcut.character-roster.v2"
     assert len(first["entities"]) == 2
     group = next(entity for entity in first["entities"] if entity["instance_count"] == 3)
     assert group["display_name"] == "未来战斗人员"
@@ -98,6 +102,66 @@ def test_roster_compiles_one_group_entity_with_three_stable_instances():
     ]
     assert len({instance["instance_id"] for instance in group["instances"]}) == 3
     assert validate_character_roster(first) == first
+
+
+def test_roster_reconciles_one_source_proven_qualified_human_alias():
+    events = [
+        _event(1, ["年轻男性"], "年轻男性站在入口。", continuity_before="cut"),
+        _event(2, ["年轻男性"], "三名战斗人员同时出现。"),
+        _event(3, ["年轻男性", "第一名敌人"], "第一名敌人向年轻男性逼近。"),
+        _event(4, ["年轻男性", "第二名敌人"], "第二名敌人突袭，男子立即格挡。"),
+        _event(5, ["男子", "第三名敌人"], "第三名敌人跃下，男子连续闪避。"),
+    ]
+
+    roster = compile_character_roster(events)
+
+    assert len(roster["entities"]) == 2
+    assert sum(item["instance_count"] for item in roster["entities"]) == 4
+    lead = next(item for item in roster["entities"] if item["instance_count"] == 1)
+    assert lead["instances"][0]["source_mentions"] == ["年轻男性", "男子"]
+    assert lead["instances"][0]["identity_reconciliations"] == [
+        {
+            "canonical_mention": "年轻男性",
+            "source_mention": "男子",
+            "sequence_id": "SEQ001",
+            "event_refs": ["event:4", "event:5"],
+            "evidence_kind": "continuous_source_cross_reference",
+            "controlled_gender": "male",
+            "evidence_sha256": lead["instances"][0]["identity_reconciliations"][0][
+                "evidence_sha256"
+            ],
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("events", "expected_entities"),
+    [
+        (
+            [
+                _event(1, ["年轻男性", "男子"], "年轻男性与男子同时出现。"),
+            ],
+            2,
+        ),
+        (
+            [
+                _event(1, ["年轻男性"], "年轻男性进入。", continuity_before="cut"),
+                _event(2, ["高个男性"], "高个男性进入。"),
+            ],
+            2,
+        ),
+        (
+            [
+                _event(1, ["年轻男性"], "年轻男性进入。", continuity_before="cut"),
+                _event(2, ["男子"], "另一名男子进入。", continuity_before="cut"),
+            ],
+            2,
+        ),
+    ],
+)
+def test_roster_does_not_guess_ambiguous_human_aliases(events, expected_entities):
+    roster = compile_character_roster(events)
+    assert len(roster["entities"]) == expected_entities
 
 
 def test_roster_keeps_ordinal_people_independent_without_group_evidence():
@@ -168,6 +232,69 @@ def test_roster_is_atomically_persisted_and_round_trips(tmp_path):
     assert persisted == roster
     assert json.loads(path.read_text(encoding="utf-8")) == roster
     assert not path.with_suffix(".json.tmp").exists()
+
+
+def _legacy_v1(roster: dict) -> dict:
+    legacy = copy.deepcopy(roster)
+    legacy["schema"] = "honcut.character-roster.v1"
+    for entity in legacy["entities"]:
+        for instance in entity["instances"]:
+            instance.pop("identity_reconciliations", None)
+    legacy.pop("roster_sha256", None)
+    legacy["roster_sha256"] = hashlib.sha256(
+        json.dumps(
+            legacy,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return legacy
+
+
+def test_roster_v1_migrates_from_hash_verified_original_events(tmp_path):
+    events = [_event(1, ["Mira"], "Mira enters.", continuity_before="cut")]
+    legacy = _legacy_v1(compile_character_roster(events))
+    receipt_path = tmp_path / "CHARACTER_ROSTER_MIGRATION.json"
+
+    migrated, receipt = migrate_character_roster_v1(
+        legacy,
+        events,
+        receipt_path=receipt_path,
+    )
+
+    assert migrated["schema"] == "honcut.character-roster.v2"
+    assert receipt["downstream_reuse_allowed"] is True
+    assert receipt["legacy_artifact_preserved"] is True
+    assert json.loads(receipt_path.read_text(encoding="utf-8")) == receipt
+
+
+def test_roster_v1_migration_quarantines_changed_identity_ids():
+    events = [_event(1, ["Mira"], "Mira enters.", continuity_before="cut")]
+    legacy = _legacy_v1(compile_character_roster(events))
+    legacy["entities"][0]["entity_id"] = "legacy_polluted_entity"
+    legacy["entities"][0]["instances"][0]["instance_id"] = "legacy_polluted_instance"
+    legacy.pop("roster_sha256")
+    legacy["roster_sha256"] = hashlib.sha256(
+        json.dumps(
+            legacy,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+    _migrated, receipt = migrate_character_roster_v1(legacy, events)
+
+    assert receipt["downstream_reuse_allowed"] is False
+
+
+def test_roster_v1_migration_rejects_missing_source_lineage():
+    events = [_event(1, ["Mira"], "Mira enters.", continuity_before="cut")]
+    legacy = _legacy_v1(compile_character_roster(events))
+
+    with pytest.raises(CharacterRosterError, match="source lineage"):
+        migrate_character_roster_v1(legacy, [_event(2, ["Mira"], "Mira leaves.")])
 
 
 def test_character_observation_requires_the_current_roster_hash():
@@ -324,7 +451,7 @@ def test_character_discoverer_keeps_cardinality_out_of_the_model_owner():
     assert "最多保留5个主要角色" not in prompt
     assert "只保留前 5 个" not in inspect.getsource(character_discoverer)
     assert "compile_character_roster" in source
-    assert "persist_roster(compile_character_roster" in source
+    assert "roster = persist_roster(provisional_roster)" in source
     assert "reconcile_character_observations" in source
     assert reconcile_character_observations.__module__.endswith(
         "phase1.character_roster"

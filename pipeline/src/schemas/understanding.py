@@ -335,12 +335,56 @@ class CharacterRosterEvidenceUnderstanding(StrictUnderstandingModel):
     source_excerpt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class CharacterRosterV1InstanceUnderstanding(StrictUnderstandingModel):
+    instance_id: str
+    ordinal: int = Field(ge=1)
+    source_mentions: list[str]
+    event_refs: list[str]
+    action_unit_refs: list[str] = Field(default_factory=list)
+
+
+class CharacterRosterV1EntityUnderstanding(StrictUnderstandingModel):
+    entity_id: str
+    display_name: str
+    instance_count: int = Field(ge=1)
+    instances: list[CharacterRosterV1InstanceUnderstanding]
+    source_visual_evidence: list[CharacterRosterEvidenceUnderstanding]
+    reconciliation_origin: Literal[
+        "explicit_source",
+        "model_observation",
+        "deterministic_group_completion",
+    ]
+
+
+class CharacterRosterV1Understanding(StrictUnderstandingModel):
+    roster_schema: Literal["honcut.character-roster.v1"] = Field(
+        alias="schema",
+        serialization_alias="schema",
+    )
+    source_events_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    entities: list[CharacterRosterV1EntityUnderstanding]
+    roster_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class CharacterRosterInstanceUnderstanding(StrictUnderstandingModel):
     instance_id: str
     ordinal: int = Field(ge=1)
     source_mentions: list[str]
     event_refs: list[str]
     action_unit_refs: list[str] = Field(default_factory=list)
+    identity_reconciliations: list[
+        "CharacterIdentityReconciliationUnderstanding"
+    ] = Field(default_factory=list)
+
+
+class CharacterIdentityReconciliationUnderstanding(StrictUnderstandingModel):
+    canonical_mention: str
+    source_mention: str
+    sequence_id: str
+    event_refs: list[str] = Field(min_length=2, max_length=2)
+    evidence_kind: Literal["continuous_source_cross_reference"]
+    controlled_gender: Literal["male", "female"]
+    evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class CharacterRosterEntityUnderstanding(StrictUnderstandingModel):
@@ -357,7 +401,7 @@ class CharacterRosterEntityUnderstanding(StrictUnderstandingModel):
 
 
 class CharacterRosterUnderstanding(StrictUnderstandingModel):
-    roster_schema: Literal["honcut.character-roster.v1"] = Field(
+    roster_schema: Literal["honcut.character-roster.v2"] = Field(
         alias="schema",
         serialization_alias="schema",
     )

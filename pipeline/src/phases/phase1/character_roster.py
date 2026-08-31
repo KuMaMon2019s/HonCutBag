@@ -18,14 +18,23 @@ from typing import Any, Iterable
 
 from pydantic import ValidationError
 
-from schemas.understanding import CharacterRosterUnderstanding
+from schemas.understanding import (
+    CharacterRosterUnderstanding,
+    CharacterRosterV1Understanding,
+)
 from utils.character_identity import (
+    character_reference_is_explicit,
+    compatible_human_reference_descriptors,
     human_gender_descriptor,
+    is_gender_attribute_reference,
     normalize_character_reference,
+    parse_human_reference_descriptor,
 )
 
-CHARACTER_ROSTER_SCHEMA = "honcut.character-roster.v1"
+CHARACTER_ROSTER_SCHEMA = "honcut.character-roster.v2"
 CHARACTER_ROSTER_FILENAME = "CHARACTER_ROSTER.json"
+CHARACTER_ROSTER_MIGRATION_SCHEMA = "honcut.character-roster-migration.v1"
+CHARACTER_ROSTER_MIGRATION_FILENAME = "CHARACTER_ROSTER_MIGRATION.json"
 
 
 class CharacterRosterError(ValueError):
@@ -120,6 +129,10 @@ _EN_GROUP_PATTERN = re.compile(
     r"(?P<label>[A-Za-z][A-Za-z -]{1,40}?)"
     r"(?=\s+(?:appear|arrive|enter|rush|wear|carry|attack|move|stand)\b|[,.;]|$)",
     re.IGNORECASE,
+)
+_DISTINCT_REFERENCE_PATTERNS = (
+    r"(?:另一|另一个|另外一|新来的|新出现的|一名新)\s*{label}",
+    r"\b(?:another|a new|newly arrived)\s+{label}\b",
 )
 
 
@@ -221,6 +234,243 @@ def _source_evidence(event: dict[str, Any], position: int) -> dict[str, str]:
     }
 
 
+def _event_source_text(event: dict[str, Any]) -> str:
+    return " ".join(
+        str(event.get(field) or "")
+        for field in ("source_excerpt", "what", "start_state", "causal_link")
+    )
+
+
+def _source_introduces_distinct_reference(evidence: str, label: str) -> bool:
+    escaped = re.escape(str(label or "").strip())
+    if not escaped:
+        return False
+    return any(
+        re.search(pattern.format(label=escaped), evidence, flags=re.IGNORECASE)
+        for pattern in _DISTINCT_REFERENCE_PATTERNS
+    )
+
+
+def _continuous_alias_reconciliations(
+    events: list[dict[str, Any]],
+) -> tuple[dict[str, str], dict[str, list[str]], dict[str, list[dict[str, Any]]]]:
+    """Prove conservative source aliases before entity cardinality is compiled."""
+
+    first_position: dict[str, int] = {}
+    event_positions: dict[str, set[int]] = defaultdict(set)
+    edges: list[tuple[str, str, dict[str, Any]]] = []
+    for position, event in enumerate(events, 1):
+        raw_who = event.get("who") or []
+        if isinstance(raw_who, str):
+            raw_who = [raw_who]
+        model_who = event.get("model_who") or []
+        if isinstance(model_who, str):
+            model_who = [model_who]
+        for value in [*raw_who, *model_who]:
+            mention = str(value or "").strip()
+            if mention:
+                first_position.setdefault(mention, position)
+        for value in raw_who:
+            mention = str(value or "").strip()
+            if mention:
+                event_positions[mention].add(position)
+
+        legacy_forward_mappings = (
+            []
+            if event.get("who_identity_reconciliations")
+            else event.get("who_reconciled_from_forward_continuity") or []
+        )
+        for mapping in legacy_forward_mappings:
+            if not isinstance(mapping, dict):
+                continue
+            model_label = str(mapping.get("model_label") or "").strip()
+            source_identity = str(mapping.get("source_identity") or "").strip()
+            if not compatible_human_reference_descriptors(model_label, source_identity):
+                continue
+            evidence = _event_source_text(event)
+            if not character_reference_is_explicit(source_identity, evidence):
+                continue
+            descriptor = parse_human_reference_descriptor(model_label)
+            following_position = min(position + 1, len(events))
+            edges.append((model_label, source_identity, {
+                "canonical_mention": model_label,
+                "source_mention": source_identity,
+                "sequence_id": str(event.get("sequence_id") or "__unspecified__"),
+                "event_refs": [
+                    _event_ref(event, position),
+                    _event_ref(events[following_position - 1], following_position),
+                ],
+                "evidence_kind": "continuous_source_cross_reference",
+                "controlled_gender": descriptor.gender if descriptor else "male",
+                "evidence_sha256": hashlib.sha256(
+                    evidence.encode("utf-8")
+                ).hexdigest(),
+            }))
+        for mapping in event.get("who_identity_reconciliations") or []:
+            if not isinstance(mapping, dict):
+                continue
+            model_label = str(mapping.get("model_label") or "").strip()
+            source_identity = str(mapping.get("source_identity") or "").strip()
+            if not compatible_human_reference_descriptors(model_label, source_identity):
+                continue
+            direction = str(mapping.get("direction") or "").strip()
+            if direction == "forward":
+                adjacent_position = min(position + 1, len(events))
+            elif direction == "backward":
+                adjacent_position = max(position - 1, 1)
+            else:
+                continue
+            descriptor = parse_human_reference_descriptor(model_label)
+            edges.append((model_label, source_identity, {
+                "canonical_mention": model_label,
+                "source_mention": source_identity,
+                "sequence_id": str(event.get("sequence_id") or "__unspecified__"),
+                "event_refs": [
+                    _event_ref(events[adjacent_position - 1], adjacent_position),
+                    _event_ref(event, position),
+                ],
+                "evidence_kind": "continuous_source_cross_reference",
+                "controlled_gender": descriptor.gender if descriptor else "male",
+                "evidence_sha256": str(mapping.get("evidence_sha256") or ""),
+            }))
+
+    for position in range(1, len(events)):
+        previous = events[position - 1]
+        current = events[position]
+        if str(previous.get("sequence_id") or "__unspecified__") != str(
+            current.get("sequence_id") or "__unspecified__"
+        ):
+            continue
+        if str(current.get("continuity_before") or "cut").strip().casefold() != "continuous":
+            continue
+        previous_who = _ordered_unique(
+            str(value or "").strip() for value in (previous.get("who") or [])
+        )
+        current_who = _ordered_unique(
+            str(value or "").strip() for value in (current.get("who") or [])
+        )
+        shared = set(previous_who) & set(current_who)
+        candidates: list[tuple[str, str]] = []
+        for previous_label in previous_who:
+            if previous_label in shared or _identity_ordinal(previous_label) is not None:
+                continue
+            for current_label in current_who:
+                if current_label in shared or _identity_ordinal(current_label) is not None:
+                    continue
+                if not compatible_human_reference_descriptors(
+                    previous_label,
+                    current_label,
+                ):
+                    continue
+                if event_positions[previous_label] & event_positions[current_label]:
+                    continue
+                previous_evidence = _event_source_text(previous)
+                current_evidence = _event_source_text(current)
+                if not (
+                    character_reference_is_explicit(current_label, previous_evidence)
+                    or character_reference_is_explicit(previous_label, current_evidence)
+                ):
+                    continue
+                if _source_introduces_distinct_reference(
+                    current_evidence,
+                    current_label,
+                ):
+                    continue
+                candidates.append((previous_label, current_label))
+        if len(candidates) != 1:
+            continue
+        previous_label, current_label = candidates[0]
+        descriptor = parse_human_reference_descriptor(previous_label)
+        evidence = {
+            "previous": _event_source_text(previous),
+            "current": _event_source_text(current),
+        }
+        edges.append((previous_label, current_label, {
+            "canonical_mention": previous_label,
+            "source_mention": current_label,
+            "sequence_id": str(current.get("sequence_id") or "__unspecified__"),
+            "event_refs": [
+                _event_ref(previous, position),
+                _event_ref(current, position + 1),
+            ],
+            "evidence_kind": "continuous_source_cross_reference",
+            "controlled_gender": descriptor.gender if descriptor else "male",
+            "evidence_sha256": _canonical_json_sha256(evidence),
+        }))
+
+    parent = {mention: mention for mention in first_position}
+
+    def preferred_mention(values: Iterable[str]) -> str:
+        return min(
+            values,
+            key=lambda mention: (
+                is_gender_attribute_reference(mention),
+                first_position.get(mention, 10**9),
+                mention,
+            ),
+        )
+
+    def find(value: str) -> str:
+        parent.setdefault(value, value)
+        while parent[value] != value:
+            parent[value] = parent[parent[value]]
+            value = parent[value]
+        return value
+
+    def union(left: str, right: str) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root == right_root:
+            return
+        members = [
+            mention
+            for mention in parent
+            if find(mention) in {left_root, right_root}
+        ]
+        qualified_count = sum(
+            1
+            for mention in members
+            if (
+                (descriptor := parse_human_reference_descriptor(mention))
+                and descriptor.kind == "qualified"
+            )
+        )
+        if qualified_count > 1:
+            return
+        canonical_root = preferred_mention((left_root, right_root))
+        other_root = right_root if canonical_root == left_root else left_root
+        parent[other_root] = canonical_root
+
+    for left, right, _record in edges:
+        union(left, right)
+
+    aliases_by_canonical: dict[str, list[str]] = defaultdict(list)
+    alias_to_canonical: dict[str, str] = {}
+    for mention in sorted(first_position, key=lambda item: (first_position[item], item)):
+        root = find(mention)
+        members = [candidate for candidate in first_position if find(candidate) == root]
+        canonical = preferred_mention(members)
+        alias_to_canonical[mention] = canonical
+        aliases_by_canonical[canonical].append(mention)
+    for canonical, aliases in list(aliases_by_canonical.items()):
+        aliases_by_canonical[canonical] = [
+            canonical,
+            *(mention for mention in aliases if mention != canonical),
+        ]
+
+    reconciliations: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for left, right, record in edges:
+        canonical = alias_to_canonical.get(left, left)
+        if alias_to_canonical.get(right, right) != canonical:
+            continue
+        item = dict(record)
+        item["canonical_mention"] = canonical
+        item["source_mention"] = right if right != canonical else left
+        if item not in reconciliations[canonical]:
+            reconciliations[canonical].append(item)
+    return alias_to_canonical, dict(aliases_by_canonical), dict(reconciliations)
+
+
 def _plausible_group_label(label: str) -> bool:
     normalized = str(label or "").strip().casefold()
     return bool(normalized) and normalized.endswith(_GROUP_PERSON_ENDINGS)
@@ -260,6 +510,7 @@ def _entity_record(
     mention_events: dict[str, list[tuple[int, dict[str, Any]]]],
     declaration_events: list[tuple[int, dict[str, Any]]] | None = None,
     origin: str,
+    mention_reconciliations: dict[str, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     normalized_mentions = [
         _ordered_unique(str(value).strip() for value in mentions)
@@ -288,6 +539,11 @@ def _entity_record(
             "source_mentions": mentions or [display_name],
             "event_refs": event_refs,
             "action_unit_refs": action_refs,
+            "identity_reconciliations": _ordered_unique_reconciliations(
+                reconciliation
+                for mention in mentions
+                for reconciliation in (mention_reconciliations or {}).get(mention, [])
+            ),
         })
         for position, event in event_pairs:
             item = _source_evidence(event, position)
@@ -305,16 +561,30 @@ def _entity_record(
     }
 
 
+def _ordered_unique_reconciliations(
+    values: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    result: list[dict[str, Any]] = []
+    for value in values:
+        key = _canonical_json_sha256(value)
+        if key not in seen:
+            seen.add(key)
+            result.append(copy.deepcopy(value))
+    return result
+
+
 def compile_character_roster(
     events: list[dict[str, Any]],
-    *,
-    source_stats: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Compile cardinality and identity ownership without a Provider call."""
 
     if not isinstance(events, list) or any(not isinstance(event, dict) for event in events):
         raise CharacterRosterError("character roster events must be an object array")
     source_hash = _canonical_json_sha256(events)
+    alias_to_canonical, proven_aliases, mention_reconciliations = (
+        _continuous_alias_reconciliations(events)
+    )
     mention_events: dict[str, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
     mention_aliases: dict[str, list[str]] = {}
     mentions_by_sequence: dict[str, list[str]] = defaultdict(list)
@@ -329,47 +599,14 @@ def compile_character_roster(
             mention = str(value or "").strip()
             if not mention or mention.casefold() in _GENERIC_SOURCE_REFERENCES:
                 continue
-            mention_events[mention].append((position, event))
-            mention_aliases.setdefault(mention, [mention])
-            if mention not in mentions_by_sequence[sequence_id]:
-                mentions_by_sequence[sequence_id].append(mention)
-
-    if source_stats is not None:
-        if not isinstance(source_stats, dict):
-            raise CharacterRosterError("character roster source_stats must be an object")
-        event_by_id = {
-            str(event.get("event_id") or event.get("id") or position): (position, event)
-            for position, event in enumerate(events, 1)
-        }
-        compiled_mentions: dict[str, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
-        compiled_sequences: dict[str, list[str]] = defaultdict(list)
-        compiled_aliases: dict[str, list[str]] = {}
-        for canonical, info in source_stats.items():
-            canonical = str(canonical or "").strip()
-            if not canonical or not isinstance(info, dict):
-                raise CharacterRosterError("source_stats identity is invalid")
-            aliases = _ordered_unique([
-                canonical,
-                *(
-                    str(alias or "").strip()
-                    for alias in (info.get("source_aliases") or [])
-                ),
+            canonical = alias_to_canonical.get(mention, mention)
+            mention_events[canonical].append((position, event))
+            mention_aliases[canonical] = _ordered_unique([
+                *mention_aliases.get(canonical, []),
+                *proven_aliases.get(canonical, [mention]),
             ])
-            compiled_aliases[canonical] = aliases
-            pairs = [
-                event_by_id[str(event_id)]
-                for event_id in (info.get("events") or [])
-                if str(event_id) in event_by_id
-            ]
-            pairs.sort(key=lambda pair: pair[0])
-            compiled_mentions[canonical].extend(pairs)
-            for _position, event in pairs:
-                sequence_id = str(event.get("sequence_id") or "__unspecified__")
-                if canonical not in compiled_sequences[sequence_id]:
-                    compiled_sequences[sequence_id].append(canonical)
-        mention_events = compiled_mentions
-        mentions_by_sequence = compiled_sequences
-        mention_aliases = compiled_aliases
+            if canonical not in mentions_by_sequence[sequence_id]:
+                mentions_by_sequence[sequence_id].append(canonical)
 
     declarations = _group_declarations(events)
     grouped_mentions: set[str] = set()
@@ -436,6 +673,7 @@ def compile_character_roster(
             mention_events=mention_events,
             declaration_events=[declaration_pair],
             origin="deterministic_group_completion",
+            mention_reconciliations=mention_reconciliations,
         ))
         grouped_mentions.update(
             mention for mentions in instance_mentions for mention in mentions
@@ -454,6 +692,7 @@ def compile_character_roster(
             instance_mentions=[mention_aliases.get(mention, [mention])],
             mention_events=mention_events,
             origin="explicit_source",
+            mention_reconciliations=mention_reconciliations,
         ))
 
     # An explicit counted group without numbered member labels still preserves
@@ -487,6 +726,7 @@ def compile_character_roster(
             mention_events=mention_events,
             declaration_events=declaration_pairs,
             origin="explicit_source",
+            mention_reconciliations=mention_reconciliations,
         ))
         used_group_names.add(declaration["label"])
 
@@ -555,6 +795,77 @@ def persist_character_roster(
     )
     os.replace(temporary, target)
     return validated
+
+
+def migrate_character_roster_v1(
+    value: dict[str, Any],
+    events: list[dict[str, Any]],
+    *,
+    receipt_path: str | Path | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Recompile a hash-verified v1 roster from its original source events."""
+
+    if not isinstance(value, dict) or value.get("schema") != "honcut.character-roster.v1":
+        raise CharacterRosterError("only character roster v1 can migrate")
+    unsigned = copy.deepcopy(value)
+    claimed = str(unsigned.pop("roster_sha256", ""))
+    if _canonical_json_sha256(unsigned) != claimed:
+        raise CharacterRosterError("legacy character roster hash mismatch")
+    try:
+        CharacterRosterV1Understanding.model_validate(value)
+    except ValidationError as error:
+        raise CharacterRosterError("invalid legacy character roster schema") from error
+    events_sha256 = _canonical_json_sha256(events)
+    if events_sha256 != value.get("source_events_sha256"):
+        raise CharacterRosterError("legacy character roster source lineage mismatch")
+
+    migrated = compile_character_roster(events)
+    legacy_entity_ids = [
+        str(entity.get("entity_id") or "") for entity in value.get("entities") or []
+    ]
+    migrated_entity_ids = [
+        str(entity.get("entity_id") or "") for entity in migrated["entities"]
+    ]
+    legacy_instance_ids = [
+        str(instance.get("instance_id") or "")
+        for entity in value.get("entities") or []
+        for instance in entity.get("instances") or []
+    ]
+    migrated_instance_ids = [
+        str(instance.get("instance_id") or "")
+        for entity in migrated["entities"]
+        for instance in entity["instances"]
+    ]
+    downstream_reuse_allowed = (
+        legacy_entity_ids == migrated_entity_ids
+        and legacy_instance_ids == migrated_instance_ids
+    )
+    receipt = {
+        "schema": CHARACTER_ROSTER_MIGRATION_SCHEMA,
+        "status": "migrated",
+        "source_schema": "honcut.character-roster.v1",
+        "target_schema": CHARACTER_ROSTER_SCHEMA,
+        "source_roster_sha256": claimed,
+        "target_roster_sha256": migrated["roster_sha256"],
+        "source_events_sha256": events_sha256,
+        "legacy_entity_count": len(legacy_entity_ids),
+        "target_entity_count": len(migrated_entity_ids),
+        "legacy_instance_count": len(legacy_instance_ids),
+        "target_instance_count": len(migrated_instance_ids),
+        "downstream_reuse_allowed": downstream_reuse_allowed,
+        "legacy_artifact_preserved": True,
+    }
+    receipt["receipt_sha256"] = _canonical_json_sha256(receipt)
+    if receipt_path is not None:
+        target = Path(receipt_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, target)
+    return migrated, receipt
 
 
 def _stable_completion(
@@ -838,9 +1149,12 @@ def reconcile_character_observations(
 __all__ = [
     "CHARACTER_ROSTER_SCHEMA",
     "CHARACTER_ROSTER_FILENAME",
+    "CHARACTER_ROSTER_MIGRATION_SCHEMA",
+    "CHARACTER_ROSTER_MIGRATION_FILENAME",
     "CharacterRosterError",
     "compile_character_roster",
     "persist_character_roster",
+    "migrate_character_roster_v1",
     "reconcile_character_observations",
     "validate_character_roster",
 ]

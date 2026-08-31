@@ -46,11 +46,6 @@ from utils.ark_llm import (
     call_llm_stream,
     create_ark_client,
 )
-from utils.character_identity import (
-    equivalent_human_descriptors,
-    is_gender_attribute_reference,
-    resolve_character_name,
-)
 from utils.character_body_contracts import (
     ADULT_LEAD_DISCOVERY_INSTRUCTIONS,
     apply_adult_lead_body_contracts,
@@ -136,7 +131,7 @@ ENTITY_SUFFIXES = (
 )
 MAX_ENTITY_NAME_CHINESE_CHARS = 12
 GENERIC_CHARACTER_NAMES = {"主角", "主人公", "男主", "女主", "人物", "他", "她", "它"}
-CHARACTER_CONTEXT_SCHEMA_VERSION = 13
+CHARACTER_CONTEXT_SCHEMA_VERSION = 14
 
 GENERIC_BACKGROUND_CHARACTER_NAMES = {
     "路人", "行人", "游客", "观众", "听众", "读者",
@@ -152,12 +147,6 @@ NON_CHARACTER_IDENTITY_SUFFIXES = (
     "刀", "剑", "枪", "武器", "门", "窗", "墙", "灯", "光",
     "云海", "山脉", "河流", "道路", "车辆", "建筑", "房间", "走廊",
 )
-RELATIONAL_CHARACTER_LABELS = {
-    "父亲", "母亲", "爸爸", "妈妈", "丈夫", "妻子", "哥哥", "姐姐",
-    "弟弟", "妹妹", "儿子", "女儿",
-}
-MAX_QUALIFIER_CHINESE_CHARS = 16
-
 ABSTRACT_CHARACTER_NAMES = {
     "说话者", "观察者", "记录者", "思考者", "行走者", "试验者", "打探人员",
 }
@@ -408,50 +397,6 @@ def _qualified_mention_tail(name: str) -> tuple[str, str] | None:
     return (qualifier, candidate) if qualifier and candidate else None
 
 
-def _looks_like_stable_identity(
-    candidate: str,
-    known_mentions: set[str],
-) -> bool:
-    """Conservatively recognize a reusable identity at a qualified tail."""
-    if candidate in known_mentions:
-        return True
-    if candidate in GENERIC_BACKGROUND_CHARACTER_NAMES:
-        return False
-    if candidate in RELATIONAL_CHARACTER_LABELS:
-        # A relational role needs its owner (for example whose father) unless
-        # the same label is independently established elsewhere.
-        return False
-    if any(candidate.endswith(suffix) for suffix in NON_CHARACTER_IDENTITY_SUFFIXES):
-        return False
-    if not _is_human_character(candidate):
-        return False
-
-    latin_name = re.fullmatch(
-        r"[A-Za-z][A-Za-z0-9]*(?:[\s_-]+[A-Za-z0-9]+)*",
-        candidate,
-    )
-    if latin_name:
-        return True
-    if any(candidate.endswith(suffix) for suffix in ENTITY_SUFFIXES):
-        return True
-    chinese_chars = [char for char in candidate if "\u4e00" <= char <= "\u9fff"]
-    return len(chinese_chars) == len(candidate) and 2 <= len(chinese_chars) <= 4
-
-
-def _stable_identity_from_qualified_mention(
-    name: str,
-    known_mentions: set[str],
-) -> str | None:
-    split = _qualified_mention_tail(name)
-    if split is None:
-        return None
-    qualifier, candidate = split
-    qualifier_length = sum("\u4e00" <= char <= "\u9fff" for char in qualifier)
-    if qualifier_length > MAX_QUALIFIER_CHINESE_CHARS:
-        return None
-    return candidate if _looks_like_stable_identity(candidate, known_mentions) else None
-
-
 def _qualified_tail_is_non_character(name: str) -> bool:
     split = _qualified_mention_tail(name)
     if split is None:
@@ -480,79 +425,7 @@ def _filter_descriptive_phrases(stats: Dict[str, Dict[str, Any]]) -> Dict[str, D
         过滤后的角色统计字典
     """
     filtered = {}
-    
-    def merge_info(target: Dict[str, Any], source: Dict[str, Any]) -> None:
-        for key in ("events", "contexts", "source_excerpts"):
-            combined = [*(target.get(key) or []), *(source.get(key) or [])]
-            target[key] = list(dict.fromkeys(combined))
-        target["dialogue_count"] = int(target.get("dialogue_count") or 0) + int(
-            source.get("dialogue_count") or 0
-        )
-        target["source_aliases"] = list(dict.fromkeys([
-            *(target.get("source_aliases") or []),
-            *(source.get("source_aliases") or []),
-        ]))
-
-    # Gender adjectives are source presentation, not identity.  Preserve one as
-    # an alias only when the same source ledger contains exactly one referential
-    # descriptor with the same controlled gender and the two never co-occur.
-    # Ambiguity is intentionally left unresolved for the semantic gate.
-    normalized_stats = {
-        name: {
-            key: list(value) if isinstance(value, list) else value
-            for key, value in info.items()
-        }
-        for name, info in stats.items()
-    }
-    for attribute_name, attribute_info in stats.items():
-        if not is_gender_attribute_reference(attribute_name):
-            continue
-        candidates = [
-            candidate
-            for candidate in stats
-            if candidate != attribute_name
-            and not is_gender_attribute_reference(candidate)
-            and equivalent_human_descriptors(attribute_name, candidate)
-            and not _source_identities_cooccur(attribute_name, candidate, stats)
-        ]
-        if len(candidates) != 1:
-            continue
-        canonical_name = candidates[0]
-        alias_info = {
-            **attribute_info,
-            "source_aliases": list(dict.fromkeys([
-                *(attribute_info.get("source_aliases") or []),
-                attribute_name,
-            ])),
-        }
-        merge_info(normalized_stats[canonical_name], alias_info)
-        normalized_stats.pop(attribute_name, None)
-        print(
-            f"  归一化性别属性称呼: {attribute_name} → {canonical_name}",
-            file=sys.stderr,
-        )
-
-    stats = normalized_stats
-
-    known_mentions = {str(name).strip() for name in stats if str(name).strip()}
     for name, info in stats.items():
-        canonical_name = _stable_identity_from_qualified_mention(name, known_mentions)
-        if canonical_name:
-            normalized_info = dict(info)
-            normalized_info["source_aliases"] = list(dict.fromkeys([
-                *(normalized_info.get("source_aliases") or []),
-                name,
-            ]))
-            if canonical_name in filtered:
-                merge_info(filtered[canonical_name], normalized_info)
-            else:
-                filtered[canonical_name] = normalized_info
-            print(
-                f"  归一化限定角色名: {name} → {canonical_name}",
-                file=sys.stderr,
-            )
-            continue
-
         if _qualified_tail_is_non_character(name):
             print(f"  过滤非角色限定短语: {name}", file=sys.stderr)
             continue
@@ -566,230 +439,11 @@ def _filter_descriptive_phrases(stats: Dict[str, Dict[str, Any]]) -> Dict[str, D
         
         # 实体后缀允许较长的复合名称，如“白色金属AI巡检机器人”。
         chinese_chars = [c for c in name if '\u4e00' <= c <= '\u9fff']
-        is_entity = any(name.endswith(suffix) for suffix in ENTITY_SUFFIXES)
         if len(chinese_chars) > MAX_ENTITY_NAME_CHINESE_CHARS:
             print(f"  过滤超长实体名称: {name} ({len(chinese_chars)} 字)", file=sys.stderr)
             continue
-        if not is_entity and len(chinese_chars) > 6:
-            print(f"  过滤过长名称: {name} ({len(chinese_chars)} 字)", file=sys.stderr)
-            continue
-        
-        if name in filtered:
-            merge_info(filtered[name], info)
-        else:
-            filtered[name] = info
+        filtered[name] = info
     
-    return filtered
-
-
-def _source_identities_cooccur(
-    left_name: str,
-    right_name: str,
-    stats: Dict[str, Dict[str, Any]] | None,
-) -> bool:
-    """Return whether two explicit source labels participate in one event."""
-    if not stats or left_name == right_name:
-        return False
-    left_events = set((stats.get(left_name) or {}).get("events") or [])
-    right_events = set((stats.get(right_name) or {}).get("events") or [])
-    return bool(left_events & right_events)
-
-
-_ENGLISH_ORDINAL_VALUES = {
-    "first": 1,
-    "second": 2,
-    "third": 3,
-    "fourth": 4,
-    "fifth": 5,
-    "sixth": 6,
-    "seventh": 7,
-    "eighth": 8,
-    "ninth": 9,
-    "tenth": 10,
-}
-_CHINESE_DIGIT_VALUES = {
-    "零": 0,
-    "〇": 0,
-    "一": 1,
-    "二": 2,
-    "两": 2,
-    "三": 3,
-    "四": 4,
-    "五": 5,
-    "六": 6,
-    "七": 7,
-    "八": 8,
-    "九": 9,
-}
-_CHINESE_UNIT_VALUES = {"十": 10, "百": 100, "千": 1000}
-
-
-def _chinese_ordinal_value(value: str) -> int | None:
-    """Parse one bounded Chinese numeral used as an identity ordinal."""
-
-    if not value:
-        return None
-    if value.isdigit():
-        return int(value)
-    total = 0
-    digit = 0
-    found = False
-    for character in value:
-        if character in _CHINESE_DIGIT_VALUES:
-            digit = _CHINESE_DIGIT_VALUES[character]
-            found = True
-            continue
-        unit = _CHINESE_UNIT_VALUES.get(character)
-        if unit is None:
-            return None
-        total += (digit or 1) * unit
-        digit = 0
-        found = True
-    return total + digit if found else None
-
-
-def _explicit_identity_ordinals(label: str) -> set[int]:
-    """Extract explicit person/entity ordinals without interpreting role prose."""
-
-    text = str(label or "").strip()
-    values: set[int] = set()
-    for match in re.finditer(
-        r"第\s*([零〇一二两三四五六七八九十百千0-9]+)\s*(?:名|位|个|号)",
-        text,
-    ):
-        if (value := _chinese_ordinal_value(match.group(1))) is not None:
-            values.add(value)
-    for match in re.finditer(
-        r"([零〇一二两三四五六七八九十百千0-9]+)\s*号",
-        text,
-    ):
-        if (value := _chinese_ordinal_value(match.group(1))) is not None:
-            values.add(value)
-    for match in re.finditer(
-        r"\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|"
-        r"[0-9]+(?:st|nd|rd|th))\b",
-        text.casefold(),
-    ):
-        token = match.group(1)
-        value = _ENGLISH_ORDINAL_VALUES.get(token)
-        values.add(value if value is not None else int(token[:-2]))
-    for match in re.finditer(r"(?:#|\bno\.?\s*)([0-9]+)\b", text.casefold()):
-        values.add(int(match.group(1)))
-    return values
-
-
-def _source_identities_have_conflicting_ordinals(
-    left_name: str,
-    right_name: str,
-) -> bool:
-    """Return true when source labels explicitly identify different ordinals."""
-
-    left = _explicit_identity_ordinals(left_name)
-    right = _explicit_identity_ordinals(right_name)
-    return bool(left and right and left.isdisjoint(right))
-
-
-def _post_filter_characters(
-    characters: List[Dict[str, Any]],
-    stats: Dict[str, Dict[str, Any]] | None = None,
-) -> List[Dict[str, Any]]:
-    """
-    后处理过滤：移除 LLM 可能错误包含的非人物角色
-    
-    Args:
-        characters: LLM 返回的角色列表
-        
-    Returns:
-        过滤后的角色列表
-    """
-    filtered = []
-    for char in characters:
-        name = char.get("name", "")
-        if _is_human_character(name) or _has_explicit_identity_declaration(
-            name,
-            (stats or {}).get(name),
-        ):
-            filtered.append(char)
-        else:
-            print(f"  后处理过滤非人物角色: {name}", file=sys.stderr)
-    
-    # LLM 有时会把同一角色的主名、职业和通用指代分成多条。
-    # 优先使用显式 aliases 合并；“银白色机械技师/机械技师”这类同定位修饰名也合并。
-    merged: List[Dict[str, Any]] = []
-    for char in filtered:
-        name = str(char.get("name", "")).strip()
-        aliases = {str(alias).strip() for alias in char.get("aliases", []) if str(alias).strip()}
-        target = None
-        for existing in merged:
-            existing_name = str(existing.get("name", "")).strip()
-            if _source_identities_cooccur(name, existing_name, stats):
-                # Source co-occurrence is stronger identity evidence than an
-                # LLM-generated alias.  Keep both canonical objects and remove
-                # only the contradictory cross-alias so downstream resolution
-                # remains unambiguous.
-                char["aliases"] = [
-                    alias
-                    for alias in char.get("aliases", [])
-                    if str(alias).strip() != existing_name
-                ]
-                existing["aliases"] = [
-                    alias
-                    for alias in existing.get("aliases", [])
-                    if str(alias).strip() != name
-                ]
-                aliases.discard(existing_name)
-                continue
-            existing_aliases = {
-                str(alias).strip() for alias in existing.get("aliases", []) if str(alias).strip()
-            }
-            explicit_alias_match = (
-                name in existing_aliases
-                or existing_name in aliases
-                or bool(aliases & existing_aliases)
-            )
-            qualified_name_match = (
-                char.get("role") == existing.get("role")
-                and min(len(name), len(existing_name)) >= 2
-                and (name.endswith(existing_name) or existing_name.endswith(name))
-            )
-            generic_role_match = (
-                char.get("role") == existing.get("role")
-                and (name in GENERIC_CHARACTER_NAMES or existing_name in GENERIC_CHARACTER_NAMES)
-            )
-            if explicit_alias_match or qualified_name_match or generic_role_match:
-                target = existing
-                break
-
-        if target is None:
-            merged.append(char)
-            continue
-
-        target_name = str(target.get("name", "")).strip()
-        # Prefer a concrete, more specific canonical name over a generic or shortened name.
-        if target_name in GENERIC_CHARACTER_NAMES or (
-            name not in GENERIC_CHARACTER_NAMES and name.endswith(target_name)
-        ):
-            char, target = target, char
-            merged[merged.index(char)] = target
-            name, target_name = target_name, name
-
-        combined_aliases = list(dict.fromkeys(
-            [*target.get("aliases", []), target_name, name, *char.get("aliases", [])]
-        ))
-        target["aliases"] = [
-            alias for alias in combined_aliases if alias and alias != target.get("name")
-        ]
-
-    # 无法归并的通用指代和背景占位词不能单独成为角色资产。来源统计在
-    # LLM 调用前已经执行同一规则；这里必须对模型输出再次执行，避免模型
-    # 凭事件 prose 补出一个没有来源身份锚点、且每次运行可能不同的角色。
-    filtered = [
-        char
-        for char in merged
-        if char.get("name") not in GENERIC_CHARACTER_NAMES
-        and char.get("name") not in GENERIC_BACKGROUND_CHARACTER_NAMES
-    ]
-
     return filtered
 
 
@@ -852,192 +506,6 @@ def _add_reference_contract(character: Dict[str, Any]) -> None:
             str(character.get("negative", "")).strip(),
         ))),
     )
-
-
-def _attach_source_identity_evidence(
-    characters: List[Dict[str, Any]],
-    stats: Dict[str, Dict[str, Any]],
-) -> None:
-    """Reconcile every retained source label with one canonical character.
-
-    The LLM is asked to preserve all source aliases, but that instruction is not
-    a contract boundary: a valid JSON response may still omit one.  Directly
-    resolvable source labels therefore establish deterministic identity anchors.
-    A still-unresolved generic label (for example a lead/pronoun reference) may
-    be attached only when exactly one anchored character remains after excluding
-    characters that co-occur with it.  Co-occurrence is negative identity
-    evidence: two labels in the same event normally describe two participants.
-
-    Any remaining ambiguity is rejected here, before storyboard review or paid
-    generation.  Silently skipping an unresolved label would recreate the alias
-    drift this function is intended to prevent.
-    """
-    characters_by_name = {
-        str(character.get("name") or "").strip(): character
-        for character in characters
-        if str(character.get("name") or "").strip()
-    }
-    if stats and not characters_by_name:
-        raise ValueError("角色身份回验失败：来源称呼存在，但规范角色列表为空")
-
-    evidence: Dict[str, Dict[str, Any]] = {
-        name: {"events": set(), "aliases": [], "inferred_aliases": []}
-        for name in characters_by_name
-    }
-
-    def source_mentions(stat_name: str, stat_info: Dict[str, Any]) -> List[str]:
-        return list(dict.fromkeys([
-            str(stat_name).strip(),
-            *(
-                str(alias).strip()
-                for alias in (stat_info.get("source_aliases") or [])
-                if str(alias).strip()
-            ),
-        ]))
-
-    # First pass: only accept mappings already supported by the LLM's canonical
-    # name/id/aliases.  One resolved mention is sufficient to anchor its sibling
-    # qualified source aliases, but conflicting resolutions are never merged.
-    unresolved_stats: List[tuple[str, Dict[str, Any], List[str]]] = []
-    for stat_name, stat_info in stats.items():
-        mentions = source_mentions(stat_name, stat_info)
-        resolved = {
-            canonical
-            for mention in mentions
-            if (canonical := resolve_character_name(mention, characters))
-        }
-        if len(resolved) > 1:
-            raise ValueError(
-                "角色身份回验失败：同一来源身份映射到多个角色："
-                f"{stat_name} -> {sorted(resolved)}"
-            )
-        if not resolved:
-            unresolved_stats.append((stat_name, stat_info, mentions))
-            continue
-
-        canonical = next(iter(resolved))
-        character = characters_by_name[canonical]
-        source_events = set(stat_info.get("events") or [])
-        overlapping_events = source_events & evidence[canonical]["events"]
-        if overlapping_events:
-            prior_mentions = list(dict.fromkeys(evidence[canonical]["aliases"]))
-            raise ValueError(
-                "角色身份回验失败：共现来源身份不得映射到同一角色："
-                f"{prior_mentions} + {mentions} -> {canonical}; "
-                f"events={sorted(overlapping_events, key=str)}"
-            )
-        ordinal_conflicts = [
-            (prior_mention, mention)
-            for prior_mention in evidence[canonical]["aliases"]
-            for mention in mentions
-            if _source_identities_have_conflicting_ordinals(
-                prior_mention,
-                mention,
-            )
-        ]
-        if ordinal_conflicts:
-            raise ValueError(
-                "角色身份回验失败：互斥序号来源身份不得映射到同一角色："
-                f"{ordinal_conflicts} -> {canonical}"
-            )
-        character["aliases"] = list(dict.fromkeys([
-            *(character.get("aliases") or []),
-            *(mention for mention in mentions if mention and mention != canonical),
-        ]))
-        evidence[canonical]["events"].update(stat_info.get("events") or [])
-        evidence[canonical]["aliases"].extend(mentions)
-
-    # A generic source reference can be recovered without guessing when its
-    # events rule out every anchored character except one.  Importantly, this
-    # does not use script vocabulary, descriptions, LLM ordering, or a
-    # "most-overlap" score; all of those can silently join distinct people.
-    anchored_names = {
-        canonical
-        for canonical, identity_evidence in evidence.items()
-        if identity_evidence["events"]
-    }
-    for stat_name, stat_info, mentions in unresolved_stats:
-        if stat_name not in GENERIC_CHARACTER_NAMES:
-            continue
-        source_events = set(stat_info.get("events") or [])
-        candidates = sorted(
-            canonical
-            for canonical in anchored_names
-            if not (source_events & evidence[canonical]["events"])
-        )
-        if len(candidates) != 1:
-            continue
-
-        canonical = candidates[0]
-        character = characters_by_name[canonical]
-        character["aliases"] = list(dict.fromkeys([
-            *(character.get("aliases") or []),
-            *(mention for mention in mentions if mention and mention != canonical),
-        ]))
-        evidence[canonical]["inferred_aliases"].extend(mentions)
-
-    # Final pass: recompute from the repaired roster and enforce the actual
-    # postcondition.  Every retained source mention must now resolve, and all
-    # mentions grouped under one source statistic must resolve to the same name.
-    evidence = {
-        name: {
-            "events": set(),
-            "aliases": [],
-            "inferred_aliases": list(identity_evidence["inferred_aliases"]),
-        }
-        for name, identity_evidence in evidence.items()
-    }
-    failures: List[str] = []
-
-    for stat_name, stat_info in stats.items():
-        mentions = source_mentions(stat_name, stat_info)
-        resolved_by_mention = {
-            mention: resolve_character_name(mention, characters)
-            for mention in mentions
-        }
-        unresolved = [
-            mention for mention, canonical in resolved_by_mention.items() if canonical is None
-        ]
-        if unresolved:
-            failures.append(f"{stat_name}: 未解析 {unresolved}")
-            continue
-        resolved = set(resolved_by_mention.values())
-        if len(resolved) != 1:
-            failures.append(f"{stat_name}: 映射冲突 {resolved_by_mention}")
-            continue
-        canonical = next(iter(resolved))
-        if canonical not in evidence:
-            failures.append(f"{stat_name}: 规范角色不存在 {canonical}")
-            continue
-        evidence[canonical]["events"].update(stat_info.get("events") or [])
-        evidence[canonical]["aliases"].extend(mentions)
-
-    if failures:
-        raise ValueError(
-            "角色身份回验失败：所有过滤后来源称呼必须唯一映射到规范角色；"
-            + "；".join(failures)
-        )
-
-    for canonical, character in characters_by_name.items():
-        event_ids = sorted(evidence[canonical]["events"])
-        character["first_appearance"] = event_ids[0] if event_ids else 0
-        character["appearance_count"] = len(event_ids)
-        aliases = list(dict.fromkeys([
-            *(character.get("aliases") or []),
-            *evidence[canonical]["aliases"],
-        ]))
-        character["aliases"] = [
-            alias
-            for alias in aliases
-            if alias and alias != canonical
-        ]
-        character["source_identity_evidence"] = {
-            "event_ids": event_ids,
-            "source_mentions": list(dict.fromkeys(evidence[canonical]["aliases"])),
-            "inferred_aliases": list(dict.fromkeys(
-                evidence[canonical]["inferred_aliases"]
-            )),
-        }
 
 
 def discover_characters(
@@ -1158,7 +626,7 @@ def discover_characters(
 
     print(f"过滤后保留 {len(stats)} 个角色名: {list(stats.keys())}", file=sys.stderr)
 
-    roster = persist_roster(compile_character_roster(events, source_stats=stats))
+    roster = persist_roster(provisional_roster)
 
     # 2. 构建 LLM prompt.  The roster is the cardinality authority; the model
     # may only supply visual observations for these existing entity IDs.
