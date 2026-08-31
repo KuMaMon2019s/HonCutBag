@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from dataclasses import dataclass
 from typing import Any, Literal
 
 GENERIC_CHARACTER_REFERENCES = {
@@ -23,6 +24,17 @@ GENERIC_CHARACTER_REFERENCES = {
 }
 
 HumanGender = Literal["male", "female"]
+HumanReferenceKind = Literal["exact", "qualified"]
+
+
+@dataclass(frozen=True)
+class HumanReferenceDescriptor:
+    """Machine meaning of one source-level human descriptor."""
+
+    gender: HumanGender
+    kind: HumanReferenceKind
+    base_label: str
+    qualifier: str
 
 # Source prose may alternate between a gender adjective and a referential noun.
 # Keep those presentation labels language-aware while reducing their machine
@@ -55,6 +67,101 @@ def human_gender_descriptor(value: Any) -> HumanGender | None:
         if key in labels:
             return gender
     return None
+
+
+def parse_human_reference_descriptor(
+    value: Any,
+) -> HumanReferenceDescriptor | None:
+    """Parse exact or qualified human descriptors without inventing identity.
+
+    The result is only presentation semantics.  A caller still needs sequence,
+    source, co-occurrence, and uniqueness evidence before treating two labels as
+    one person.
+    """
+
+    raw = unicodedata.normalize("NFKC", str(value or "")).casefold().strip()
+    if not raw:
+        return None
+    exact_gender = human_gender_descriptor(raw)
+    if exact_gender is not None:
+        return HumanReferenceDescriptor(
+            gender=exact_gender,
+            kind="exact",
+            base_label=normalize_character_reference(raw),
+            qualifier="",
+        )
+
+    if re.search(r"[\u3400-\u9fff]", raw):
+        key = normalize_character_reference(raw)
+        candidates: list[HumanReferenceDescriptor] = []
+        for gender, labels in _HUMAN_GENDER_DESCRIPTOR_GROUPS.items():
+            for label in labels:
+                label_key = normalize_character_reference(label)
+                if not re.search(r"[\u3400-\u9fff]", label) or not key.endswith(label_key):
+                    continue
+                qualifier = key[:-len(label_key)]
+                if qualifier:
+                    candidates.append(HumanReferenceDescriptor(
+                        gender=gender,
+                        kind="qualified",
+                        base_label=label_key,
+                        qualifier=qualifier,
+                    ))
+        return max(candidates, key=lambda item: len(item.base_label), default=None)
+
+    tokens = _latin_tokens(raw)
+    if len(tokens) < 2:
+        return None
+    base = tokens[-1]
+    for gender, labels in _HUMAN_GENDER_DESCRIPTOR_GROUPS.items():
+        if base in labels:
+            return HumanReferenceDescriptor(
+                gender=gender,
+                kind="qualified",
+                base_label=base,
+                qualifier=" ".join(tokens[:-1]),
+            )
+    return None
+
+
+def compatible_human_reference_descriptors(left: Any, right: Any) -> bool:
+    """Return whether two labels may be the same human presentation.
+
+    Two qualified descriptions are deliberately not compatible: without one
+    exact source descriptor, merging them would turn shared gender into identity.
+    """
+
+    left_descriptor = parse_human_reference_descriptor(left)
+    right_descriptor = parse_human_reference_descriptor(right)
+    return bool(
+        left_descriptor
+        and right_descriptor
+        and left_descriptor.gender == right_descriptor.gender
+        and (
+            left_descriptor.kind == "exact"
+            or right_descriptor.kind == "exact"
+        )
+    )
+
+
+def character_reference_is_explicit(reference: Any, evidence: Any) -> bool:
+    """Match one complete source reference in bounded source evidence."""
+
+    label = str(reference or "").strip()
+    text = str(evidence or "")
+    if not label or not text:
+        return False
+    if re.search(r"[\u3400-\u9fff]", label):
+        return normalize_character_reference(label) in normalize_character_reference(text)
+    tokens = _latin_tokens(label)
+    evidence_tokens = _latin_tokens(text)
+    if not tokens or len(tokens) > len(evidence_tokens):
+        return False
+    width = len(tokens)
+    return any(
+        evidence_tokens[index:index + width] == tokens
+        for index in range(len(evidence_tokens) - width + 1)
+    )
 
 
 def is_gender_attribute_reference(value: Any) -> bool:

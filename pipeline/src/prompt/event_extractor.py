@@ -48,7 +48,7 @@ from utils.body_action_contracts import (
     normalize_body_action_choreography,
     requires_explicit_body_choreography,
 )
-from utils.character_identity import equivalent_human_descriptors
+from utils.character_identity import compatible_human_reference_descriptors
 from utils.ark_llm import (
     LLMConnectTimeout,
     LLMIdleTimeout,
@@ -297,7 +297,7 @@ _NARRATIVE_JUMP_CUES = (
 # caches carried over from earlier run directories — and forces every Phase 1
 # event extraction to re-run (a paid LLM pass). Never bump casually, and never
 # reuse cross-run segment caches from a run produced under a different value.
-EVENT_FLOW_SCHEMA_VERSION = "28.0"
+EVENT_FLOW_SCHEMA_VERSION = "29.0"
 
 _UNKNOWN_ACTION_PERFORMERS = {
     "",
@@ -310,7 +310,7 @@ _UNKNOWN_ACTION_PERFORMERS = {
     "它",
 }
 def _equivalent_human_descriptor(left: str, right: str) -> bool:
-    return equivalent_human_descriptors(left, right)
+    return compatible_human_reference_descriptors(left, right)
 
 
 def _reconcile_structured_action_performers(event: Dict[str, Any]) -> None:
@@ -997,6 +997,12 @@ def _repair_source_proven_forward_participant(
         "model_label": model_label,
         "source_identity": source_identity,
     }]
+    current["who_identity_reconciliations"] = [{
+        "model_label": model_label,
+        "source_identity": source_identity,
+        "direction": "forward",
+        "evidence_sha256": hashlib.sha256(evidence.encode("utf-8")).hexdigest(),
+    }]
     current["who_repair_reason"] = (
         "current source identity is confirmed by the following continuous event"
     )
@@ -1076,6 +1082,12 @@ def _repair_continuous_generic_participant(
                 previous_label if value == generic_label else value
                 for value in current_who
             ))
+            current["who_identity_reconciliations"] = [{
+                "model_label": generic_label,
+                "source_identity": previous_label,
+                "direction": "backward",
+                "evidence_sha256": hashlib.sha256(evidence.encode("utf-8")).hexdigest(),
+            }]
             current["who_repair_reason"] = (
                 "continuous equivalent participant inherits the adjacent identity"
                 if descriptor_equivalent

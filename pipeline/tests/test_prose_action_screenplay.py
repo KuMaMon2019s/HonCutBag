@@ -880,6 +880,31 @@ def test_global_flow_resolves_equivalent_human_descriptor_in_continuity():
     )
 
 
+def test_global_flow_resolves_qualified_descriptor_during_ordinal_cast_change():
+    events = [
+        _event(
+            who=["年轻男性", "第二名敌人"],
+            source_excerpt="第二名敌人突袭，男子快速格挡。",
+            continuity_before="cut",
+        ),
+        _event(
+            who=["男子", "第三名敌人"],
+            source_excerpt="第三名敌人跃下，男子连续闪避。",
+            continuity_before="continuous",
+        ),
+    ]
+
+    _annotate_global_event_flow(events)
+
+    assert events[0]["who"] == ["男子", "第二名敌人"]
+    assert events[0]["model_who"] == ["年轻男性", "第二名敌人"]
+    assert events[0]["who_reconciled_from_forward_continuity"] == [{
+        "model_label": "年轻男性",
+        "source_identity": "男子",
+    }]
+    assert events[0]["who_identity_reconciliations"][0]["direction"] == "forward"
+
+
 def test_global_flow_resolves_source_proven_forward_identity_in_continuity():
     events = [
         _event(
