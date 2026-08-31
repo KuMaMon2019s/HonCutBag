@@ -181,7 +181,7 @@ Phase 5 对标识的判定必须拆成两个互不替代的规则：L3 把当前
 
 当 duration-scaled event plan 在同一来源事件内仅保留部分 micro action 时，未选择的动作只能保留在 `production_action_selection`、来源哈希和审计账中。生产 beat 与 canonical shot 的 `what/visual/texture_keywords`、`honcut.production-director-intent.v1` 以及后续 QA/Provider Prompt 只能重新投影已选择动作；禁止从来源事件的宽泛 `what/visual` 或 sequence 级 Director 文案恢复被省略动作。选择索引、生产动作和来源血缘不一致时必须 fail closed。
 
-Phase 1 的 adaptation 对任意事件数量都固定执行分层骨架与分批镜头展开；生产路径不存在按事件数回退为单次 Prompt 的分支，也不得通过环境变量重新启用旧单次调用路径。分层 checkpoint 是唯一可恢复的 adaptation 中间状态；当前 schema 为 `honcut.layered-adaptation.v18`，fingerprint 必须包含 `shot_policy`、`honcut.primary-shot-layout.v2`、duration plan v4、action timeline、timeline binding（含零时事实附着）与 rewrite request。旧版不得跨导演意图、生产 Director 投影、机位角度、生产事件动作账、生产剧本账、语义容量、连续前置闭包、布局策略或事件顺序规则复用。
+Phase 1 的 adaptation 对任意事件数量都固定执行分层骨架与分批镜头展开；生产路径不存在按事件数回退为单次 Prompt 的分支，也不得通过环境变量重新启用旧单次调用路径。来源索引重写的模型返回若重复 `source_event_id`，Adaptation owner 只允许确定性折叠相邻且 authority lineage 完全等价的重复项：每个重复项自身必须通过事件 ID、组数、`production_action_index`、有序 `source_micro_action_indexes`、非空动作文本和三项语义字段校验；保留第一项，不拼接 prose，并写入 `honcut.source-indexed-screenplay-rewrite-reconciliation.v1` 的位置与哈希审计记录。非相邻重复、未知/缺失事件、血缘或组数变化、顺序变化继续 fail closed。分层 checkpoint 是唯一可恢复的 adaptation 中间状态；当前 schema 为 `honcut.layered-adaptation.v19`，fingerprint 必须包含上述 reconciliation policy hash、`shot_policy`、`honcut.primary-shot-layout.v2`、duration plan v4、action timeline、timeline binding（含零时事实附着）与 rewrite request。已完整验证且 fingerprint/血缘一致的 v18 checkpoint 可在不覆盖原文件的前提下零请求迁移并写 `honcut.layered-adaptation-checkpoint-migration.v1`；不完整或不匹配的 v18 只能 audit-only，未来版本 fail closed。其他旧版不得跨导演意图、生产 Director 投影、机位角度、生产事件动作账、生产剧本账、语义容量、连续前置闭包、布局策略或事件顺序规则复用。
 
 Phase 间调用原则上通过 Graph/Lifecycle。唯一允许的业务闭环是已建模且有限的修复路径，例如 Phase 8 调用注入的 Phase 6 生成 callable；该依赖必须可测试注入，并在所有递归轮次中保持一致。
 

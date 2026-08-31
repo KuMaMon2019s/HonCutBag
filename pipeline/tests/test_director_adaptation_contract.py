@@ -287,3 +287,178 @@ def test_duration_scaling_uses_strict_source_indexed_screenplay_rewrite(
     assert selected_plan["events"][0]["narrative_purpose"] == (
         "保留由受压到主动的因果端点"
     )
+
+
+def test_source_indexed_rewrite_collapses_adjacent_lineage_equivalent_duplicate(
+    monkeypatch,
+):
+    events = [{
+        "sequence_id": "SEQ001",
+        "event_role": "turning_point",
+        "dramatic_turn": True,
+        "what": "来源事件1",
+        "start_state": "受压",
+        "end_state": "稳定",
+        "micro_actions": [f"事件1动作{index}" for index in range(1, 8)],
+    }]
+    director_plan = {
+        "schema": "honcut.director-plan.v1",
+        "sequences": [{
+            "sequence_id": "SEQ001",
+            "scene_goal": "保留来源因果",
+            "emotion_arc": "受压 → 稳定",
+            "visual_focus": "动作落点",
+            "spatial_intent": "连续空间",
+            "transition_intent": "动作承接",
+        }],
+    }
+    production_events, scaling_plan = (
+        adaptation_engine._build_duration_scaled_event_plan(
+            events,
+            target_duration=6,
+            beat_count=1,
+            effective_shot_duration=6,
+        )
+    )
+    monkeypatch.setattr(
+        adaptation_engine,
+        "create_ark_client",
+        lambda **_kwargs: object(),
+    )
+
+    def observation(event_id, *, suffix):
+        groups = production_events[event_id - 1][
+            "production_action_rewrite"
+        ]["groups"]
+        return {
+            "source_event_id": event_id,
+            "production_actions": [
+                {
+                    "production_action_index": group[
+                        "production_action_index"
+                    ],
+                    "source_micro_action_indexes": group[
+                        "source_micro_action_indexes"
+                    ],
+                    "rewritten_micro_action": (
+                        f"{suffix}：" + "；".join(group["source_actions"])
+                    ),
+                }
+                for group in groups
+            ],
+            "narrative_purpose": f"目的{suffix}",
+            "emotional_beat": f"情绪{suffix}",
+            "director_alignment": f"导演对齐{suffix}",
+        }
+
+    monkeypatch.setattr(
+        adaptation_engine,
+        "call_llm_stream",
+        lambda **_kwargs: json.dumps(
+            {
+                "schema": "honcut.source-indexed-screenplay-rewrite.v1",
+                "events": [
+                    observation(1, suffix="保留版本"),
+                    observation(1, suffix="重复版本"),
+                ],
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    selected_events, selected_plan = (
+        adaptation_engine._apply_director_action_selection(
+            events,
+            production_events,
+            scaling_plan,
+            director_plan,
+        )
+    )
+
+    assert selected_events[0]["micro_actions"][0].startswith("保留版本：")
+    reconciliation = selected_plan[
+        "source_indexed_rewrite_reconciliation"
+    ]
+    assert reconciliation["schema"] == (
+        "honcut.source-indexed-screenplay-rewrite-reconciliation.v1"
+    )
+    assert reconciliation["original_source_event_ids"] == [1, 1]
+    assert reconciliation["reconciled_source_event_ids"] == [1]
+    assert reconciliation["duplicate_count"] == 1
+    assert reconciliation["source_fact_loss_count"] == 0
+    assert reconciliation["provider_request_count"] == 0
+    assert reconciliation["duplicates"][0]["retained_position"] == 1
+    assert reconciliation["duplicates"][0]["dropped_position"] == 2
+    assert "rewritten_micro_action" not in json.dumps(
+        reconciliation,
+        ensure_ascii=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "returned_order",
+    [
+        [1, 2, 1],
+        [1, 1],
+        [1, 3, 2],
+    ],
+)
+def test_source_indexed_rewrite_rejects_non_equivalent_event_coverage(
+    returned_order,
+):
+    expected_groups = {
+        event_id: [{
+            "production_action_index": 1,
+            "source_micro_action_indexes": [1, 2],
+        }]
+        for event_id in (1, 2)
+    }
+
+    def observation(event_id):
+        return {
+            "source_event_id": event_id,
+            "production_actions": [{
+                "production_action_index": 1,
+                "source_micro_action_indexes": [1, 2],
+                "rewritten_micro_action": "保持全部来源动作",
+            }],
+            "narrative_purpose": "保持目的",
+            "emotional_beat": "保持情绪",
+            "director_alignment": "保持导演意图",
+        }
+
+    with pytest.raises(ValueError, match="coverage/order mismatch"):
+        adaptation_engine._reconcile_source_indexed_rewrite_observations(
+            [observation(event_id) for event_id in returned_order],
+            [1, 2],
+            expected_groups,
+        )
+
+
+def test_source_indexed_rewrite_rejects_adjacent_duplicate_lineage_change():
+    expected_groups = {
+        1: [{
+            "production_action_index": 1,
+            "source_micro_action_indexes": [1, 2],
+        }]
+    }
+
+    def observation(source_indexes):
+        return {
+            "source_event_id": 1,
+            "production_actions": [{
+                "production_action_index": 1,
+                "source_micro_action_indexes": source_indexes,
+                "rewritten_micro_action": "保持全部来源动作",
+            }],
+            "narrative_purpose": "保持目的",
+            "emotional_beat": "保持情绪",
+            "director_alignment": "保持导演意图",
+        }
+
+    with pytest.raises(ValueError, match="changed lineage"):
+        adaptation_engine._reconcile_source_indexed_rewrite_observations(
+            [observation([1, 2]), observation([1])],
+            [1],
+            expected_groups,
+        )

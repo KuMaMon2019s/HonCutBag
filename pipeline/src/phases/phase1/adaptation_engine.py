@@ -90,6 +90,39 @@ SHOT_POLICIES = (
     SHOT_POLICY_BALANCED,
     SHOT_POLICY_CUT_DRIVEN,
 )
+
+SOURCE_INDEXED_REWRITE_RECONCILIATION_SCHEMA = (
+    "honcut.source-indexed-screenplay-rewrite-reconciliation.v1"
+)
+SOURCE_INDEXED_REWRITE_RECONCILIATION_POLICY = (
+    "honcut.source-indexed-screenplay-rewrite-reconciliation-policy.v1"
+)
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+SOURCE_INDEXED_REWRITE_RECONCILIATION_POLICY_SHA256 = (
+    _canonical_json_sha256({
+        "policy": SOURCE_INDEXED_REWRITE_RECONCILIATION_POLICY,
+        "duplicate_scope": "adjacent_only",
+        "authority": [
+            "source_event_id",
+            "production_action_index",
+            "source_micro_action_indexes",
+        ],
+        "retention": "first_observation",
+        "prose_merge": "forbidden",
+    })
+)
 DEFAULT_SHOT_POLICY = SHOT_POLICY_CONTINUITY
 PRIMARY_SHOT_LAYOUT_SCHEMA = "honcut.primary-shot-layout.v2"
 MAX_CONTINUITY_CONTENT_BEATS_PER_PRIMARY_SHOT = 4
@@ -5118,6 +5151,125 @@ def _bind_action_timeline_to_primary_layout(
     }
 
 
+def _validate_source_indexed_rewrite_observation(
+    item: dict[str, Any],
+    expected_groups: dict[int, list[dict[str, Any]]],
+) -> str:
+    event_id = item["source_event_id"]
+    groups = expected_groups.get(event_id)
+    if groups is None:
+        raise ValueError(
+            "source-indexed rewrite event coverage/order mismatch; "
+            f"unexpected source_event_id={event_id}"
+        )
+    actions = item["production_actions"]
+    if len(actions) != len(groups):
+        raise ValueError(
+            f"source-indexed rewrite event {event_id} changed group count"
+        )
+    structural_actions: list[dict[str, Any]] = []
+    for action, group in zip(actions, groups, strict=True):
+        action_index = action["production_action_index"]
+        source_indexes = action["source_micro_action_indexes"]
+        if (
+            action_index != group["production_action_index"]
+            or source_indexes != group["source_micro_action_indexes"]
+            or not str(action["rewritten_micro_action"]).strip()
+        ):
+            raise ValueError(
+                f"source-indexed rewrite event {event_id} changed lineage"
+            )
+        structural_actions.append({
+            "production_action_index": action_index,
+            "source_micro_action_indexes": source_indexes,
+        })
+    for field in (
+        "narrative_purpose",
+        "emotional_beat",
+        "director_alignment",
+    ):
+        if not str(item.get(field) or "").strip():
+            raise ValueError(
+                f"source-indexed rewrite event {event_id} has empty {field}"
+            )
+    return _canonical_json_sha256({
+        "source_event_id": event_id,
+        "production_actions": structural_actions,
+    })
+
+
+def _reconcile_source_indexed_rewrite_observations(
+    returned: list[dict[str, Any]],
+    expected_ids: list[int],
+    expected_groups: dict[int, list[dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Collapse only adjacent duplicates with identical authority lineage."""
+    if len(set(expected_ids)) != len(expected_ids):
+        raise ValueError("source-indexed rewrite expected ids are not unique")
+    original_ids = [item["source_event_id"] for item in returned]
+    reconciled: list[dict[str, Any]] = []
+    reconciled_signatures: list[str] = []
+    reconciled_positions: list[int] = []
+    duplicates: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+    for position, item in enumerate(returned, start=1):
+        event_id = item["source_event_id"]
+        signature = _validate_source_indexed_rewrite_observation(
+            item,
+            expected_groups,
+        )
+        if reconciled and reconciled[-1]["source_event_id"] == event_id:
+            if reconciled_signatures[-1] != signature:
+                raise ValueError(
+                    "source-indexed rewrite adjacent duplicate changed lineage; "
+                    f"source_event_id={event_id}"
+                )
+            duplicates.append({
+                "source_event_id": event_id,
+                "retained_position": reconciled_positions[-1],
+                "dropped_position": position,
+                "structural_signature_sha256": signature,
+                "retained_observation_sha256": _canonical_json_sha256(
+                    reconciled[-1]
+                ),
+                "dropped_observation_sha256": _canonical_json_sha256(item),
+            })
+            continue
+        if event_id in seen_ids:
+            raise ValueError(
+                "source-indexed rewrite event coverage/order mismatch; "
+                f"non-adjacent duplicate source_event_id={event_id}"
+            )
+        seen_ids.add(event_id)
+        reconciled.append(item)
+        reconciled_signatures.append(signature)
+        reconciled_positions.append(position)
+    reconciled_ids = [item["source_event_id"] for item in reconciled]
+    if reconciled_ids != expected_ids:
+        raise ValueError(
+            "source-indexed rewrite event coverage/order mismatch; "
+            f"expected={expected_ids}, actual={original_ids}, "
+            f"reconciled={reconciled_ids}"
+        )
+    receipt = {
+        "schema": SOURCE_INDEXED_REWRITE_RECONCILIATION_SCHEMA,
+        "policy": SOURCE_INDEXED_REWRITE_RECONCILIATION_POLICY,
+        "policy_sha256": (
+            SOURCE_INDEXED_REWRITE_RECONCILIATION_POLICY_SHA256
+        ),
+        "expected_source_event_ids": expected_ids,
+        "original_source_event_ids": original_ids,
+        "reconciled_source_event_ids": reconciled_ids,
+        "original_event_count": len(returned),
+        "reconciled_event_count": len(reconciled),
+        "duplicate_count": len(duplicates),
+        "duplicates": duplicates,
+        "source_fact_loss_count": 0,
+        "provider_request_count": 0,
+    }
+    return reconciled, receipt
+
+
 def _apply_source_indexed_screenplay_rewrite(
     source_events: List[Dict[str, Any]],
     production_events: List[Dict[str, Any]],
@@ -5231,40 +5383,15 @@ def _apply_source_indexed_screenplay_rewrite(
                 SourceIndexedScreenplayRewriteBatch,
             ).model_dump(by_alias=True)
             returned = candidate["events"]
-            returned_ids = [item["source_event_id"] for item in returned]
-            if returned_ids != expected_ids:
-                raise ValueError(
-                    "source-indexed rewrite event coverage/order mismatch; "
-                    f"expected={expected_ids}, actual={returned_ids}"
+            returned, reconciliation = (
+                _reconcile_source_indexed_rewrite_observations(
+                    returned,
+                    expected_ids,
+                    expected_groups,
                 )
-            for item in returned:
-                event_id = item["source_event_id"]
-                groups = expected_groups[event_id]
-                actions = item["production_actions"]
-                if len(actions) != len(groups):
-                    raise ValueError(
-                        f"source-indexed rewrite event {event_id} changed group count"
-                    )
-                for action, group in zip(actions, groups, strict=True):
-                    if (
-                        action["production_action_index"]
-                        != group["production_action_index"]
-                        or action["source_micro_action_indexes"]
-                        != group["source_micro_action_indexes"]
-                        or not str(action["rewritten_micro_action"]).strip()
-                    ):
-                        raise ValueError(
-                            f"source-indexed rewrite event {event_id} changed lineage"
-                        )
-                for field in (
-                    "narrative_purpose",
-                    "emotional_beat",
-                    "director_alignment",
-                ):
-                    if not str(item.get(field) or "").strip():
-                        raise ValueError(
-                            f"source-indexed rewrite event {event_id} has empty {field}"
-                        )
+            )
+            candidate["events"] = returned
+            plan["source_indexed_rewrite_reconciliation"] = reconciliation
             parsed = candidate
             break
         except (json.JSONDecodeError, ValidationError, ValueError) as exc:
@@ -7078,7 +7205,11 @@ LEGACY_SCREENPLAY_PLAN_SCHEMAS = frozenset({
     "honcut.screenplay-plan.v5",
     "honcut.screenplay-plan.v6",
 })
-LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v18"
+LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v19"
+LEGACY_LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v18"
+LAYERED_CHECKPOINT_MIGRATION_SCHEMA = (
+    "honcut.layered-adaptation-checkpoint-migration.v1"
+)
 
 
 def migrate_screenplay_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
@@ -7738,10 +7869,11 @@ def _layered_input_fingerprint(
     source_action_timeline: Optional[Dict[str, Any]] = None,
     production_action_timeline: Optional[Dict[str, Any]] = None,
     timeline_layout_binding: Optional[Dict[str, Any]] = None,
+    checkpoint_schema: str = LAYERED_CHECKPOINT_SCHEMA,
 ) -> str:
     """Bind layered checkpoints to the complete semantic adaptation input."""
     contract = {
-        "schema": LAYERED_CHECKPOINT_SCHEMA,
+        "schema": checkpoint_schema,
         "events": events,
         "characters_summary": characters_summary,
         "target_duration": target_duration,
@@ -7757,6 +7889,10 @@ def _layered_input_fingerprint(
         "production_action_timeline": production_action_timeline,
         "timeline_layout_binding": timeline_layout_binding,
     }
+    if checkpoint_schema == LAYERED_CHECKPOINT_SCHEMA:
+        contract[
+            "source_indexed_rewrite_reconciliation_policy_sha256"
+        ] = SOURCE_INDEXED_REWRITE_RECONCILIATION_POLICY_SHA256
     encoded = json.dumps(
         contract,
         ensure_ascii=False,
@@ -7767,12 +7903,63 @@ def _layered_input_fingerprint(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _checkpoint_matches(value: Any, input_fingerprint: str) -> bool:
+class UnsupportedLayeredCheckpointSchemaError(ValueError):
+    """A future layered checkpoint must never trigger a silent rebuild."""
+
+
+def _checkpoint_match_kind(
+    value: Any,
+    input_fingerprint: str,
+    legacy_input_fingerprint: str | None = None,
+) -> str:
     metadata = value.get("_checkpoint") if isinstance(value, dict) else None
-    return bool(
-        isinstance(metadata, dict)
-        and metadata.get("schema") == LAYERED_CHECKPOINT_SCHEMA
-        and metadata.get("input_fingerprint") == input_fingerprint
+    if not isinstance(metadata, dict):
+        return "invalid"
+    schema = str(metadata.get("schema") or "").strip()
+    fingerprint = str(metadata.get("input_fingerprint") or "").strip()
+    if schema == LAYERED_CHECKPOINT_SCHEMA:
+        return "current" if fingerprint == input_fingerprint else "invalid"
+    if schema == LEGACY_LAYERED_CHECKPOINT_SCHEMA:
+        if legacy_input_fingerprint and fingerprint == legacy_input_fingerprint:
+            return "legacy_v18"
+        return "legacy_v18_audit_only"
+    version_match = re.fullmatch(r"honcut\.layered-adaptation\.v(\d+)", schema)
+    if version_match and int(version_match.group(1)) > 19:
+        raise UnsupportedLayeredCheckpointSchemaError(
+            f"layered checkpoint schema {schema} is newer than supported "
+            f"version {LAYERED_CHECKPOINT_SCHEMA}"
+        )
+    return "invalid"
+
+
+def _checkpoint_matches(value: Any, input_fingerprint: str) -> bool:
+    return _checkpoint_match_kind(value, input_fingerprint) == "current"
+
+
+def _write_layered_checkpoint_migration_receipt(
+    output_dir: Path,
+    *,
+    status: str,
+    input_fingerprint: str,
+    legacy_input_fingerprint: str | None,
+    artifacts: list[dict[str, Any]],
+    reason: str | None = None,
+) -> None:
+    receipt = {
+        "schema": LAYERED_CHECKPOINT_MIGRATION_SCHEMA,
+        "status": status,
+        "from_schema": LEGACY_LAYERED_CHECKPOINT_SCHEMA,
+        "to_schema": LAYERED_CHECKPOINT_SCHEMA,
+        "input_fingerprint": input_fingerprint,
+        "legacy_input_fingerprint": legacy_input_fingerprint,
+        "artifacts": artifacts,
+        "provider_request_count": 0,
+    }
+    if reason:
+        receipt["reason"] = reason
+    _atomic_write_json(
+        output_dir / "layered_checkpoint_migration_v18_to_v19.json",
+        receipt,
     )
 
 
@@ -7782,6 +7969,7 @@ def _load_layered_checkpoints(
     expected_beats: int,
     input_fingerprint: str,
     *,
+    legacy_input_fingerprint: str | None = None,
     max_content_beats_per_primary_shot: int = (
         MAX_CONTENT_BEATS_PER_PRIMARY_SHOT
     ),
@@ -7791,11 +7979,32 @@ def _load_layered_checkpoints(
 ) -> tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
     """Load only valid, contiguous layered checkpoints."""
     skeleton = None
+    migrated_artifacts: list[dict[str, Any]] = []
     skeleton_path = output_dir / "beat_skeleton.json"
     if skeleton_path.exists():
         try:
             candidate = json.loads(skeleton_path.read_text(encoding="utf-8"))
-            if not _checkpoint_matches(candidate, input_fingerprint):
+            match_kind = _checkpoint_match_kind(
+                candidate,
+                input_fingerprint,
+                legacy_input_fingerprint,
+            )
+            if match_kind == "legacy_v18_audit_only":
+                _write_layered_checkpoint_migration_receipt(
+                    output_dir,
+                    status="audit_only",
+                    input_fingerprint=input_fingerprint,
+                    legacy_input_fingerprint=legacy_input_fingerprint,
+                    artifacts=[{
+                        "path": skeleton_path.name,
+                        "sha256": hashlib.sha256(
+                            skeleton_path.read_bytes()
+                        ).hexdigest(),
+                    }],
+                    reason="legacy checkpoint fingerprint or lineage mismatch",
+                )
+                raise ValueError("legacy layered skeleton is audit-only")
+            if match_kind not in {"current", "legacy_v18"}:
                 raise ValueError("layered skeleton belongs to a different input")
             _parse_beat_skeleton(json.dumps(candidate, ensure_ascii=False), expected_beats, len(events))
             _validate_beat_action_capacity(
@@ -7834,8 +8043,21 @@ def _load_layered_checkpoints(
             event_by_id = {i: dict(event, event_id=i) for i, event in enumerate(events, 1)}
             for beat in candidate["beats"]:
                 beat["_source_event_details"] = [event_by_id[event_id] for event_id in beat["source_events"]]
+            if match_kind == "legacy_v18":
+                migrated_artifacts.append({
+                    "path": skeleton_path.name,
+                    "sha256": hashlib.sha256(
+                        skeleton_path.read_bytes()
+                    ).hexdigest(),
+                })
+                candidate["_checkpoint"] = {
+                    "schema": LAYERED_CHECKPOINT_SCHEMA,
+                    "input_fingerprint": input_fingerprint,
+                }
             skeleton = candidate
             print(f"  ↺ Reusing layered checkpoint: {skeleton_path}")
+        except UnsupportedLayeredCheckpointSchemaError:
+            raise
         except (OSError, json.JSONDecodeError, ValueError, TypeError):
             skeleton = None
 
@@ -7844,7 +8066,14 @@ def _load_layered_checkpoints(
     if skeleton is not None and partial_path.exists():
         try:
             partial = json.loads(partial_path.read_text(encoding="utf-8"))
-            if not _checkpoint_matches(partial, input_fingerprint):
+            match_kind = _checkpoint_match_kind(
+                partial,
+                input_fingerprint,
+                legacy_input_fingerprint,
+            )
+            if match_kind == "legacy_v18_audit_only":
+                raise ValueError("legacy partial checkpoint is audit-only")
+            if match_kind not in {"current", "legacy_v18"}:
                 raise ValueError("partial shots belong to a different input")
             candidate_shots = partial.get("shots", [])
             completed = partial.get("completed_batches", [])
@@ -7859,10 +8088,27 @@ def _load_layered_checkpoints(
                 candidate_shots,
                 skeleton["beats"],
             )
+            if match_kind == "legacy_v18":
+                migrated_artifacts.append({
+                    "path": partial_path.name,
+                    "sha256": hashlib.sha256(
+                        partial_path.read_bytes()
+                    ).hexdigest(),
+                })
             shots = candidate_shots
             print(f"  ↺ Reusing {len(completed)} completed layered batch(es): {partial_path}")
+        except UnsupportedLayeredCheckpointSchemaError:
+            raise
         except (OSError, json.JSONDecodeError, ValueError, TypeError):
             shots = []
+    if migrated_artifacts:
+        _write_layered_checkpoint_migration_receipt(
+            output_dir,
+            status="migrated",
+            input_fingerprint=input_fingerprint,
+            legacy_input_fingerprint=legacy_input_fingerprint,
+            artifacts=migrated_artifacts,
+        )
     return skeleton, shots
 
 
@@ -8065,6 +8311,21 @@ def adapt_events(
             timeline_layout_binding=timeline_layout_binding,
             **fingerprint_kwargs,
         )
+        legacy_layered_fingerprint = _layered_input_fingerprint(
+            production_events,
+            characters_summary,
+            material_duration,
+            effective_shot_duration,
+            max_shots,
+            director_plan,
+            shot_policy=shot_policy,
+            primary_shot_layout=primary_shot_layout,
+            source_action_timeline=source_action_timeline,
+            production_action_timeline=production_action_timeline,
+            timeline_layout_binding=timeline_layout_binding,
+            checkpoint_schema=LEGACY_LAYERED_CHECKPOINT_SCHEMA,
+            **fingerprint_kwargs,
+        )
         skeleton = None
         resumed_shots: List[Dict[str, Any]] = []
         if checkpoint_dir is not None:
@@ -8073,6 +8334,7 @@ def adapt_events(
                 production_events,
                 max_shots,
                 layered_fingerprint,
+                legacy_input_fingerprint=legacy_layered_fingerprint,
                 max_content_beats_per_primary_shot=(
                     max_content_beats_per_primary_shot
                 ),

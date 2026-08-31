@@ -581,3 +581,79 @@ def test_layered_resume_skips_cached_skeleton_and_batches(monkeypatch, tmp_path)
     assert result["strategy"] == "cached strategy"
     assert [shot["shot_order"] for shot in result["shots"]] == list(range(1, 7))
     assert json.loads((tmp_path / "shots_partial.json").read_text())["completed_batches"] == [1, 2]
+
+
+def test_v18_layered_checkpoints_migrate_without_overwriting_source(tmp_path):
+    public_beat = _beat(1)
+    public_beat.pop("_source_event_details")
+    legacy_metadata = {
+        "schema": engine.LEGACY_LAYERED_CHECKPOINT_SCHEMA,
+        "input_fingerprint": "legacy-input",
+    }
+    skeleton_path = tmp_path / "beat_skeleton.json"
+    partial_path = tmp_path / "shots_partial.json"
+    skeleton_path.write_text(
+        json.dumps({
+            "_checkpoint": legacy_metadata,
+            "strategy": "legacy verified strategy",
+            "beats": [public_beat],
+        }),
+        encoding="utf-8",
+    )
+    cached_shot = _shot(1)
+    cached_shot.pop("beat_order")
+    partial_path.write_text(
+        json.dumps({
+            "_checkpoint": legacy_metadata,
+            "completed_batches": [1],
+            "shots": [cached_shot],
+        }),
+        encoding="utf-8",
+    )
+
+    skeleton, shots = engine._load_layered_checkpoints(
+        tmp_path,
+        _events(1),
+        1,
+        "current-input",
+        legacy_input_fingerprint="legacy-input",
+    )
+
+    assert skeleton is not None
+    assert skeleton["_checkpoint"] == {
+        "schema": engine.LAYERED_CHECKPOINT_SCHEMA,
+        "input_fingerprint": "current-input",
+    }
+    assert len(shots) == 1
+    assert json.loads(skeleton_path.read_text())["_checkpoint"] == (
+        legacy_metadata
+    )
+    assert json.loads(partial_path.read_text())["_checkpoint"] == (
+        legacy_metadata
+    )
+    receipt = json.loads(
+        (tmp_path / "layered_checkpoint_migration_v18_to_v19.json").read_text()
+    )
+    assert receipt["status"] == "migrated"
+    assert receipt["provider_request_count"] == 0
+    assert [item["path"] for item in receipt["artifacts"]] == [
+        "beat_skeleton.json",
+        "shots_partial.json",
+    ]
+
+
+def test_future_layered_checkpoint_schema_fails_closed():
+    with pytest.raises(
+        engine.UnsupportedLayeredCheckpointSchemaError,
+        match="newer than supported",
+    ):
+        engine._checkpoint_match_kind(
+            {
+                "_checkpoint": {
+                    "schema": "honcut.layered-adaptation.v20",
+                    "input_fingerprint": "future",
+                }
+            },
+            "current",
+            "legacy",
+        )
