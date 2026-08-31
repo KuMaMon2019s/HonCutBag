@@ -944,11 +944,6 @@ def validate_post_phase1_expectations(
         }
         candidates = []
         for record in records:
-            record_source = [
-                str(value or "")
-                for instance in record.get("instances") or []
-                for value in instance.get("source_mentions") or []
-            ]
             roster_record = next(
                 (
                     entity
@@ -957,13 +952,35 @@ def validate_post_phase1_expectations(
                 ),
                 None,
             )
-            if roster_record is not None:
-                record_source.extend(
-                    evidence["source_excerpt"]
-                    for evidence in roster_record["source_visual_evidence"]
+            if roster_record is None:
+                raise RuntimeError(
+                    "canonical character is absent from the validated roster: "
+                    + str(record.get("entity_id") or "<missing>")
                 )
-            normalized_source = _normalized_source_text(" ".join(record_source))
-            if any(anchor in normalized_source for anchor in anchors):
+            # Identity anchors may only consume labels that Character Roster
+            # bound to this entity. Narrative excerpts commonly describe
+            # several co-present characters and are visual-fact evidence,
+            # never an alias pool.
+            record_source = [
+                str(roster_record.get("display_name") or ""),
+                *(
+                    str(value or "")
+                    for instance in roster_record.get("instances") or []
+                    for value in instance.get("source_mentions") or []
+                ),
+            ]
+            normalized_references = {
+                _normalized_source_text(value)
+                for value in record_source
+                if str(value or "").strip()
+            }
+            if any(
+                anchor == reference
+                or anchor in reference
+                or reference in anchor
+                for anchor in anchors
+                for reference in normalized_references
+            ):
                 candidates.append(record)
         if len(candidates) != 1:
             raise RuntimeError(
@@ -1024,6 +1041,9 @@ def validate_post_phase1_expectations(
         "character_entities": len(records),
         "character_instances": actual_instances,
         "entity_matches": entity_matches,
+        "entity_source_anchor_authority": (
+            "character_roster_display_and_instance_mentions"
+        ),
         "required_event_matches": required_event_matches,
     }
 

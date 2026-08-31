@@ -56,6 +56,42 @@ def _write_inputs(workspace):
     return story, expectations
 
 
+def _persist_phase1_identity_artifacts(workspace, events):
+    roster = persist_character_roster(
+        workspace / CHARACTER_ROSTER_FILENAME,
+        compile_character_roster(events),
+    )
+    entities, _diagnostics = reconcile_character_observations(
+        [],
+        roster,
+        semantic_qa_enabled=False,
+    )
+    projected, contract = persist_canonical_visual_contract(
+        workspace,
+        {
+            "characters": entities,
+            "character_roster": roster,
+            "character_roster_sha256": roster["roster_sha256"],
+        },
+        requested_policy="fictional_cinematic_human_v1",
+    )
+    semantic = bind_story_semantics(events, projected["characters"])
+    projected = expand_character_instances(projected, contract)
+    (workspace / "CHARACTERS.json").write_text(
+        json.dumps(projected),
+        encoding="utf-8",
+    )
+    (workspace / "SEMANTIC_LEDGER.json").write_text(
+        json.dumps(semantic),
+        encoding="utf-8",
+    )
+    (workspace / "phase1_events.json").write_text(
+        json.dumps({"events": events}),
+        encoding="utf-8",
+    )
+    return roster, contract
+
+
 def test_stage0_preflight_is_zero_request_and_has_finite_hard_limits(
     tmp_path, monkeypatch
 ):
@@ -185,39 +221,7 @@ def test_post_phase1_expectations_match_source_roster_and_semantic_ledger(
         "source_excerpt": "原创人物进入车站并观察手中装置。",
         "what": "原创人物进入车站并观察手中装置",
     }]
-    roster = persist_character_roster(
-        tmp_path / CHARACTER_ROSTER_FILENAME,
-        compile_character_roster(events),
-    )
-    entities, _diagnostics = reconcile_character_observations(
-        [],
-        roster,
-        semantic_qa_enabled=False,
-    )
-    entity_payload = {
-        "characters": entities,
-        "character_roster": roster,
-        "character_roster_sha256": roster["roster_sha256"],
-    }
-    projected, contract = persist_canonical_visual_contract(
-        tmp_path,
-        entity_payload,
-        requested_policy="fictional_cinematic_human_v1",
-    )
-    semantic = bind_story_semantics(events, projected["characters"])
-    projected = expand_character_instances(projected, contract)
-    (tmp_path / "CHARACTERS.json").write_text(
-        json.dumps(projected),
-        encoding="utf-8",
-    )
-    (tmp_path / "SEMANTIC_LEDGER.json").write_text(
-        json.dumps(semantic),
-        encoding="utf-8",
-    )
-    (tmp_path / "phase1_events.json").write_text(
-        json.dumps({"events": events}),
-        encoding="utf-8",
-    )
+    _roster, contract = _persist_phase1_identity_artifacts(tmp_path, events)
     _story, expectations = _write_inputs(tmp_path)
 
     evidence = acceptance.validate_post_phase1_expectations(
@@ -231,6 +235,122 @@ def test_post_phase1_expectations_match_source_roster_and_semantic_ledger(
     assert evidence["entity_matches"]["lead"] == contract["characters"][0][
         "entity_id"
     ]
+
+
+def test_entity_anchors_ignore_cross_character_narrative_evidence(tmp_path):
+    events = [
+        {
+            "id": 1,
+            "sequence_id": "SEQ001",
+            "who": ["林夏"],
+            "source_excerpt": "林夏看到顾北并停下脚步。",
+            "what": "林夏看到顾北",
+        },
+        {
+            "id": 2,
+            "sequence_id": "SEQ001",
+            "who": ["顾北"],
+            "source_excerpt": "顾北阻挡林夏继续前进。",
+            "what": "顾北阻挡林夏",
+        },
+    ]
+    _persist_phase1_identity_artifacts(tmp_path, events)
+    expectations = tmp_path / "acceptance_expectations.json"
+    expectations.write_text(
+        json.dumps({
+            "schema": "honcut.full-chain-acceptance-expectations.v2",
+            "expected_duration_s": 36,
+            "expected_character_entities": 2,
+            "expected_character_instances": 2,
+            "entity_expectations": [
+                {
+                    "expectation_id": "lead",
+                    "source_mentions_any": ["林夏"],
+                    "instance_count": 1,
+                    "visual_facts": {},
+                },
+                {
+                    "expectation_id": "guard",
+                    "source_mentions_any": ["顾北"],
+                    "instance_count": 1,
+                    "visual_facts": {},
+                },
+            ],
+            "required_events": ["林夏看到顾北", "顾北阻挡林夏"],
+            "visual_facts": {
+                "character_visual_policy": "fictional_cinematic_human_v1",
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    evidence = acceptance.validate_post_phase1_expectations(
+        tmp_path,
+        {"source": {"expectations_path": expectations.name}},
+    )
+
+    assert evidence["status"] == "passed"
+    assert evidence["entity_source_anchor_authority"] == (
+        "character_roster_display_and_instance_mentions"
+    )
+    assert set(evidence["entity_matches"]) == {"lead", "guard"}
+    assert len(set(evidence["entity_matches"].values())) == 2
+
+
+def test_entity_anchor_still_fails_closed_when_roster_labels_are_ambiguous(
+    tmp_path,
+):
+    events = [
+        {
+            "id": 1,
+            "sequence_id": "SEQ001",
+            "who": ["年轻男子甲"],
+            "source_excerpt": "年轻男子甲独自进入房间。",
+            "what": "年轻男子甲进入房间",
+        },
+        {
+            "id": 2,
+            "sequence_id": "SEQ001",
+            "who": ["年轻男子乙"],
+            "source_excerpt": "年轻男子乙随后进入房间。",
+            "what": "年轻男子乙进入房间",
+        },
+    ]
+    _persist_phase1_identity_artifacts(tmp_path, events)
+    expectations = tmp_path / "acceptance_expectations.json"
+    expectations.write_text(
+        json.dumps({
+            "schema": "honcut.full-chain-acceptance-expectations.v2",
+            "expected_duration_s": 36,
+            "expected_character_entities": 2,
+            "expected_character_instances": 2,
+            "entity_expectations": [
+                {
+                    "expectation_id": "underspecified_lead",
+                    "source_mentions_any": ["年轻男子"],
+                    "instance_count": 1,
+                    "visual_facts": {},
+                },
+                {
+                    "expectation_id": "second_lead",
+                    "source_mentions_any": ["年轻男子乙"],
+                    "instance_count": 1,
+                    "visual_facts": {},
+                },
+            ],
+            "required_events": [],
+            "visual_facts": {
+                "character_visual_policy": "fictional_cinematic_human_v1",
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="do not resolve uniquely"):
+        acceptance.validate_post_phase1_expectations(
+            tmp_path,
+            {"source": {"expectations_path": expectations.name}},
+        )
 
 
 def test_stage0_preflight_rejects_source_reduced_to_zero_events(
