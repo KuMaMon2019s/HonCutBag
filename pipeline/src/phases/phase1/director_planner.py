@@ -113,6 +113,30 @@ def _atomic_write_json(path: Path, value: Any) -> None:
     os.replace(temporary, path)
 
 
+def _build_director_request(
+    events: list[dict[str, Any]],
+    correction: str = "",
+) -> dict[str, Any]:
+    """Build the one Director transport request owned by this phase."""
+    _sequence_ids(events)
+    user_prompt = USER_PROMPT_TEMPLATE.format(
+        events_json=json.dumps(events, ensure_ascii=False, indent=2)
+    )
+    return {
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt + correction},
+        ],
+        "model": DEFAULT_TEXT_MODEL,
+        "max_tokens": DIRECTOR_LLM_POLICY.max_tokens,
+        "wall_timeout": DIRECTOR_LLM_POLICY.wall_timeout_seconds,
+        "idle_timeout": DIRECTOR_LLM_POLICY.idle_timeout_seconds,
+        "response_format": native_chat_json_schema_format(
+            DirectorPlanUnderstanding
+        ),
+    }
+
+
 def _validate_director_sequence_observation(
     sequence: dict[str, Any],
     position: int,
@@ -259,33 +283,21 @@ def plan_director(
             raise RuntimeError("director planning requires ARK_AGENT_API_KEY")
 
         client = create_ark_client(read_timeout=LLM_IDLE_TIMEOUT)
-        _sequence_ids(events)
-        user_prompt = USER_PROMPT_TEMPLATE.format(
-            events_json=json.dumps(events, ensure_ascii=False, indent=2)
-        )
-
         correction = ""
         plan = None
         reconciliation = None
         accepted_messages = None
         correction_limit = effective_provider_retries(MAX_SCHEMA_CORRECTIONS)
         for attempt in range(correction_limit + 1):
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": user_prompt + correction,
-                },
-            ]
+            request = _build_director_request(events, correction)
+            messages = request["messages"]
             content = call_llm_stream(
                 messages=messages,
-                model=DEFAULT_TEXT_MODEL,
-                max_tokens=DIRECTOR_LLM_POLICY.max_tokens,
-                wall_timeout=DIRECTOR_LLM_POLICY.wall_timeout_seconds,
-                idle_timeout=DIRECTOR_LLM_POLICY.idle_timeout_seconds,
-                response_format=native_chat_json_schema_format(
-                    DirectorPlanUnderstanding
-                ),
+                model=request["model"],
+                max_tokens=request["max_tokens"],
+                wall_timeout=request["wall_timeout"],
+                idle_timeout=request["idle_timeout"],
+                response_format=request["response_format"],
                 _client=client,
             )
             if not content:
@@ -311,14 +323,11 @@ def plan_director(
         if plan is None or reconciliation is None or accepted_messages is None:
             raise ValueError("director planning did not produce a validated plan")
 
-        response_format = native_chat_json_schema_format(
-            DirectorPlanUnderstanding
-        )
         reconciliation.update({
             "model": DEFAULT_TEXT_MODEL,
             "prompt_sha256": _canonical_json_sha256(accepted_messages),
             "response_format_sha256": _canonical_json_sha256(
-                response_format
+                request["response_format"]
             ),
         })
         _atomic_write_json(plan_path, plan)
