@@ -98,22 +98,27 @@ def _match_roster_expectations(
             full_chain_acceptance._normalized_source_text(value)
             for value in item["source_mentions_any"]
         }
-        candidates = []
+        direct_candidates = []
+        evidence_candidates = []
         for entity in entities:
-            source_text = " ".join([
-                *(
+            direct_text = full_chain_acceptance._normalized_source_text(
+                " ".join(
                     str(mention)
                     for instance in entity["instances"]
                     for mention in instance["source_mentions"]
-                ),
-                *(
+                )
+            )
+            evidence_text = full_chain_acceptance._normalized_source_text(
+                " ".join(
                     evidence["source_excerpt"]
                     for evidence in entity["source_visual_evidence"]
-                ),
-            ])
-            normalized = full_chain_acceptance._normalized_source_text(source_text)
-            if any(anchor in normalized for anchor in anchors):
-                candidates.append(entity)
+                )
+            )
+            if any(anchor in direct_text for anchor in anchors):
+                direct_candidates.append(entity)
+            elif any(anchor in evidence_text for anchor in anchors):
+                evidence_candidates.append(entity)
+        candidates = direct_candidates or evidence_candidates
         if len(candidates) != 1:
             raise RuntimeError(
                 "Character Roster live source anchors do not resolve uniquely: "
@@ -124,6 +129,27 @@ def _match_roster_expectations(
             raise RuntimeError("Character Roster live expectations overlap")
         if entity["instance_count"] != item["instance_count"]:
             raise RuntimeError("Character Roster live instance count mismatch")
+        required_same_instance = [
+            full_chain_acceptance._normalized_source_text(value)
+            for value in item.get("same_instance_mentions") or []
+            if str(value or "").strip()
+        ]
+        if required_same_instance:
+            matching_instances = [
+                instance
+                for instance in entity["instances"]
+                if all(
+                    required in full_chain_acceptance._normalized_source_text(
+                        " ".join(instance["source_mentions"])
+                    )
+                    for required in required_same_instance
+                )
+            ]
+            if len(matching_instances) != 1:
+                raise RuntimeError(
+                    "Character Roster live aliases do not bind one instance: "
+                    + item["expectation_id"]
+                )
         used.add(entity["entity_id"])
         matches[item["expectation_id"]] = entity["entity_id"]
     return matches
@@ -328,6 +354,11 @@ def execute_single_observation(
         "character_entities": len(roster["entities"]),
         "character_instances": sum(
             entity["instance_count"] for entity in roster["entities"]
+        ),
+        "identity_reconciliation_count": sum(
+            len(instance.get("identity_reconciliations") or [])
+            for entity in roster["entities"]
+            for instance in entity["instances"]
         ),
         "semantic_diagnostic_codes": sorted({
             str(item.get("code") or "")

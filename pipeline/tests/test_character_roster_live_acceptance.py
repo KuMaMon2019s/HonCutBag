@@ -26,13 +26,15 @@ def _write_inputs(workspace: Path) -> tuple[Path, Path]:
         {
             "id": 1,
             "sequence_id": "SEQ001",
-            "who": ["旅人"],
-            "source_excerpt": "旅人停在入口。",
-            "what": "旅人停在入口",
+            "continuity_before": "cut",
+            "who": ["年轻男性"],
+            "source_excerpt": "年轻男性停在入口。",
+            "what": "年轻男性停在入口",
         },
         {
             "id": 2,
             "sequence_id": "SEQ001",
+            "continuity_before": "continuous",
             "who": [],
             "source_excerpt": "三名守卫同时出现。",
             "what": "三名守卫同时出现",
@@ -41,8 +43,16 @@ def _write_inputs(workspace: Path) -> tuple[Path, Path]:
             {
                 "id": ordinal + 2,
                 "sequence_id": "SEQ001",
-                "who": [f"第{label}名守卫"],
-                "source_excerpt": f"第{label}名守卫保持警戒。",
+                "continuity_before": "continuous",
+                "who": [
+                    "男子" if ordinal == 3 else "年轻男性",
+                    f"第{label}名守卫",
+                ],
+                "source_excerpt": (
+                    f"第{label}名守卫靠近，男子保持警戒。"
+                    if ordinal >= 2
+                    else f"第{label}名守卫靠近年轻男性。"
+                ),
                 "what": f"第{label}名守卫保持警戒",
             }
             for ordinal, label in enumerate(("一", "二", "三"), 1)
@@ -66,8 +76,9 @@ def _write_inputs(workspace: Path) -> tuple[Path, Path]:
             "expected_character_instances": 4,
             "entity_expectations": [
                 {
-                    "expectation_id": "traveler",
-                    "source_mentions_any": ["旅人"],
+                    "expectation_id": "lead",
+                    "source_mentions_any": ["年轻男性", "男子"],
+                    "same_instance_mentions": ["年轻男性", "男子"],
                     "instance_count": 1,
                     "visual_facts": {},
                 },
@@ -125,7 +136,7 @@ def test_preflight_validates_source_driven_two_entity_four_instance_roster(
     assert receipt["status"] == "preflight_passed"
     assert receipt["provider_request_count"] == 0
     assert receipt["exact_request_limit"] == 1
-    assert set(receipt["entity_matches"]) == {"traveler", "guards"}
+    assert set(receipt["entity_matches"]) == {"lead", "guards"}
 
 
 def test_preflight_rejects_tampered_external_event_contract(
@@ -253,4 +264,5 @@ def test_single_observation_accepts_deterministic_missing_entity_repair(
     )
     assert evidence["character_entities"] == 2
     assert evidence["character_instances"] == 4
+    assert evidence["identity_reconciliation_count"] == 1
     assert "model_entity_missing" in evidence["semantic_diagnostic_codes"]
