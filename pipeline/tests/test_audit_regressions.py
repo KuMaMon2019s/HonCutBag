@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import subprocess
@@ -2976,95 +2977,18 @@ def test_phase1_keeps_qualified_profession_characters():
     assert set(filtered) == {"Agent", "敌方保安"}
 
 
-def test_phase1_normalizes_visual_description_around_explicit_agent_name():
+def test_phase1_filter_preserves_identity_mentions_without_merging_them():
     stats = {
-        "身穿深灰色战术服的Agent": {
-            "events": [1, 2],
-            "contexts": ["事件1", "事件2"],
-            "dialogue_count": 0,
-        },
-        "敌方保安": {
-            "events": [2],
-            "contexts": ["事件2"],
-            "dialogue_count": 0,
-        },
+        "身穿深灰色战术服的Agent": {"events": [1], "contexts": []},
+        "Agent": {"events": [2], "contexts": []},
     }
 
     filtered = character_discoverer._filter_descriptive_phrases(stats)
 
-    assert set(filtered) == {"Agent", "敌方保安"}
-    assert filtered["Agent"]["events"] == [1, 2]
-    assert filtered["Agent"]["source_aliases"] == ["身穿深灰色战术服的Agent"]
+    assert set(filtered) == set(stats)
 
 
-def test_phase1_normalizes_qualified_identities_without_script_language_bias():
-    stats = {
-        "头戴护目镜的Mira Chen": {"events": [1], "contexts": []},
-        "身披红色斗篷的机械师": {"events": [2], "contexts": []},
-        "受伤的林岚": {"events": [3], "contexts": []},
-        "未来战士": {"events": [4], "contexts": []},
-    }
-
-    filtered = character_discoverer._filter_descriptive_phrases(stats)
-
-    assert set(filtered) == {"Mira Chen", "机械师", "林岚", "未来战士"}
-    assert filtered["Mira Chen"]["source_aliases"] == ["头戴护目镜的Mira Chen"]
-    assert filtered["机械师"]["source_aliases"] == ["身披红色斗篷的机械师"]
-    assert filtered["林岚"]["source_aliases"] == ["受伤的林岚"]
-
-
-@pytest.mark.parametrize(
-    ("attribute_label", "stable_label"),
-    [
-        ("男性", "男子"),
-        ("女性", "女子"),
-        ("male", "man"),
-        ("female", "woman"),
-    ],
-)
-def test_phase1_preserves_gender_attribute_mentions_as_source_aliases(
-    attribute_label,
-    stable_label,
-):
-    stats = {
-        attribute_label: {
-            "events": [2],
-            "contexts": [f"{attribute_label} stands at the train door"],
-            "source_excerpts": [f"{attribute_label} stands at the train door"],
-            "dialogue_count": 0,
-        },
-        stable_label: {
-            "events": [3, 4],
-            "contexts": [f"{stable_label} enters the train"],
-            "source_excerpts": [f"{stable_label} enters the train"],
-            "dialogue_count": 0,
-        },
-    }
-
-    filtered = character_discoverer._filter_descriptive_phrases(stats)
-
-    assert set(filtered) == {stable_label}
-    assert filtered[stable_label]["events"] == [3, 4, 2]
-    assert filtered[stable_label]["source_aliases"] == [attribute_label]
-
-
-def test_phase1_does_not_guess_ambiguous_gender_attribute_identity():
-    stats = {
-        "男性": {"events": [1], "contexts": [], "source_excerpts": []},
-        "男子": {"events": [2], "contexts": [], "source_excerpts": []},
-        "男人": {"events": [3], "contexts": [], "source_excerpts": []},
-    }
-
-    filtered = character_discoverer._filter_descriptive_phrases(stats)
-
-    assert set(filtered) == {"男子", "男人"}
-    assert all(
-        "男性" not in (info.get("source_aliases") or [])
-        for info in filtered.values()
-    )
-
-
-def test_phase1_does_not_promote_qualified_objects_or_merge_relational_roles():
+def test_phase1_filter_only_removes_non_character_descriptive_tails():
     stats = {
         "穿着漂亮的红裙": {"events": [1], "contexts": []},
         "金色夕阳下的无边云海": {"events": [1], "contexts": []},
@@ -3076,200 +3000,18 @@ def test_phase1_does_not_promote_qualified_objects_or_merge_relational_roles():
     assert set(filtered) == {"小明的父亲"}
 
 
-def test_phase1_character_filter_does_not_confuse_role_vocabulary_with_objects():
+def test_phase1_character_filter_does_not_confuse_roles_with_objects():
     for name in ("持枪的枪手", "背剑的剑客", "职业车手", "宇航员", "林海"):
         assert character_discoverer._is_human_character(name)
-
     for name in ("两把金属刀具", "断裂的车门", "无边云海", "冷空气"):
         assert not character_discoverer._is_human_character(name)
 
 
-def test_phase1_source_identity_evidence_aggregates_aliases_and_events():
-    characters = [{
-        "id": "mira_chen",
-        "name": "米拉",
-        "aliases": ["Mira Chen"],
-        "role": "protagonist",
-    }]
-    stats = {
-        "Mira Chen": {
-            "events": [1, 2],
-            "contexts": [],
-            "source_aliases": ["头戴护目镜的Mira Chen"],
-        },
-        "米拉": {"events": [3], "contexts": []},
-    }
-
-    character_discoverer._attach_source_identity_evidence(characters, stats)
-
-    assert characters[0]["first_appearance"] == 1
-    assert characters[0]["appearance_count"] == 3
-    assert characters[0]["aliases"] == [
-        "Mira Chen",
-        "头戴护目镜的Mira Chen",
-    ]
-    assert characters[0]["source_identity_evidence"] == {
-        "event_ids": [1, 2, 3],
-        "source_mentions": ["Mira Chen", "头戴护目镜的Mira Chen", "米拉"],
-        "inferred_aliases": [],
-    }
-
-
-def test_phase1_post_filter_does_not_merge_cooccurring_source_identities():
-    characters = [
-        {
-            "id": "maintenance_engineer",
-            "name": "维修员",
-            "aliases": ["破坏者甲"],
-            "role": "protagonist",
-        },
-        {
-            "id": "saboteur_alpha",
-            "name": "破坏者甲",
-            "aliases": ["一号入侵者"],
-            "role": "antagonist",
-        },
-    ]
-    stats = {
-        "维修员": {"events": [1, 2], "contexts": []},
-        "破坏者甲": {"events": [2], "contexts": []},
-    }
-
-    filtered = character_discoverer._post_filter_characters(characters, stats)
-
-    assert [character["name"] for character in filtered] == ["维修员", "破坏者甲"]
-    assert "破坏者甲" not in filtered[0]["aliases"]
-    assert filtered[1]["aliases"] == ["一号入侵者"]
-
-
-def test_phase1_rejects_cooccurring_source_identities_collapsed_by_alias():
-    characters = [{
-        "id": "maintenance_engineer",
-        "name": "维修员",
-        "aliases": ["破坏者甲"],
-        "role": "protagonist",
-    }]
-    stats = {
-        "维修员": {"events": [1, 2], "contexts": []},
-        "破坏者甲": {"events": [2], "contexts": []},
-    }
-
-    with pytest.raises(ValueError, match="共现来源身份不得映射到同一角色"):
-        character_discoverer._attach_source_identity_evidence(characters, stats)
-
-
-def test_phase1_rejects_distinct_ordinal_source_identities_collapsed_by_alias():
-    characters = [{
-        "id": "first_guard",
-        "name": "第一名守卫",
-        "aliases": ["第二名守卫", "third guard"],
-        "role": "antagonist",
-    }]
-    stats = {
-        "第一名守卫": {"events": [1], "contexts": []},
-        "第二名守卫": {"events": [2], "contexts": []},
-        "third guard": {"events": [3], "contexts": []},
-    }
-
-    with pytest.raises(ValueError, match="互斥序号来源身份不得映射到同一角色"):
-        character_discoverer._attach_source_identity_evidence(characters, stats)
-
-
-def test_phase1_accepts_equivalent_multilingual_ordinal_aliases():
-    characters = [{
-        "id": "first_guard",
-        "name": "第一名守卫",
-        "aliases": ["first guard", "guard #1"],
-        "role": "antagonist",
-    }]
-    stats = {
-        "第一名守卫": {
-            "events": [1],
-            "contexts": [],
-            "source_aliases": ["first guard", "guard #1"],
-        },
-    }
-
-    character_discoverer._attach_source_identity_evidence(characters, stats)
-
-    assert characters[0]["source_identity_evidence"]["event_ids"] == [1]
-
-
-def test_phase1_does_not_treat_occurrence_order_as_character_identity():
-    assert not character_discoverer._source_identities_have_conflicting_ordinals(
-        "第一次值班的守卫",
-        "第二次值班的守卫",
-    )
-
-
-def test_phase1_recovers_generic_alias_from_unique_non_cooccurring_identity():
-    characters = [
-        {
-            "id": "chief_researcher",
-            "name": "首席研究员",
-            "aliases": [],
-            "role": "supporting",
-        },
-        {
-            "id": "documentarian",
-            "name": "记录员",
-            "aliases": [],
-            "role": "supporting",
-        },
-    ]
-    stats = {
-        "首席研究员": {"events": [1], "contexts": []},
-        "女主": {"events": [2, 3], "contexts": []},
-        "记录员": {"events": [3], "contexts": []},
-    }
-
-    character_discoverer._attach_source_identity_evidence(characters, stats)
-
-    researcher = characters[0]
-    documentarian = characters[1]
-    assert "女主" in researcher["aliases"]
-    assert researcher["appearance_count"] == 3
-    assert researcher["source_identity_evidence"]["inferred_aliases"] == ["女主"]
-    assert "女主" not in documentarian["aliases"]
-    assert documentarian["appearance_count"] == 1
-
-
-def test_phase1_rejects_ambiguous_generic_alias_instead_of_guessing():
-    characters = [
-        {"id": "one", "name": "研究员甲", "aliases": []},
-        {"id": "two", "name": "研究员乙", "aliases": []},
-    ]
-    stats = {
-        "研究员甲": {"events": [1], "contexts": []},
-        "研究员乙": {"events": [2], "contexts": []},
-        "主角": {"events": [3], "contexts": []},
-    }
-
-    with pytest.raises(ValueError, match="主角: 未解析"):
-        character_discoverer._attach_source_identity_evidence(characters, stats)
-
-
-def test_phase1_rejects_unanchored_concrete_source_label():
-    characters = [{"id": "one", "name": "研究员甲", "aliases": []}]
-    stats = {
-        "研究员甲": {"events": [1], "contexts": []},
-        "神秘旅人": {"events": [2], "contexts": []},
-    }
-
-    with pytest.raises(ValueError, match="神秘旅人: 未解析"):
-        character_discoverer._attach_source_identity_evidence(characters, stats)
-
-
-def test_phase1_post_filter_drops_llm_invented_background_placeholder():
-    characters = [{
-        "id": "passerby",
-        "name": "路人",
-        "aliases": [],
-        "role": "extra",
-    }]
-
-    assert character_discoverer._post_filter_characters(characters) == []
-
+def test_phase1_identity_merge_legacy_helpers_are_removed():
+    source = inspect.getsource(character_discoverer)
+    assert "_post_filter_characters" not in source
+    assert "_attach_source_identity_evidence" not in source
+    assert "_stable_identity_from_qualified_mention" not in source
 
 def test_character_identity_resolution_is_token_safe_and_unambiguous():
     from utils.character_identity import resolve_character_name
@@ -4401,7 +4143,7 @@ def test_character_discovery_body_contract_is_prompted_and_normalized(monkeypatc
     assert "head_to_body_ratio=7.6" in captured["prompt"]
     assert "头宽不得超过肩宽的 43%" in captured["prompt"]
     assert ADULT_LEAD_DISCOVERY_INSTRUCTIONS in character_discoverer.SYSTEM_PROMPT
-    assert character_discoverer.CHARACTER_CONTEXT_SCHEMA_VERSION == 13
+    assert character_discoverer.CHARACTER_CONTEXT_SCHEMA_VERSION == 14
     assert "interaction_props" in captured["prompt"]
     assert "bodybuilder physique" in discovered["negative_guardrails"]
     assert "Body-proportion lock" in discovered["prompt_definition"]
@@ -4429,18 +4171,24 @@ def test_character_discovery_binds_attribute_and_referential_mentions_to_one_id(
     events = [
         {
             "id": 1,
+            "sequence_id": "SEQ001",
+            "continuity_before": "cut",
             "who": ["男性"],
             "source_excerpt": "年轻男性站在列车门前。",
             "what": "男性等待列车",
         },
         {
             "id": 2,
+            "sequence_id": "SEQ001",
+            "continuity_before": "continuous",
             "who": ["男性", "第一名敌人"],
-            "source_excerpt": "第一名敌人冲向男性。",
+            "source_excerpt": "第一名敌人冲向男子，男子准备格挡。",
             "what": "第一名敌人发动攻击",
         },
         {
             "id": 3,
+            "sequence_id": "SEQ001",
+            "continuity_before": "continuous",
             "who": ["男子", "第一名敌人"],
             "source_excerpt": "男子格挡第一名敌人。",
             "what": "男子完成格挡",
