@@ -2462,14 +2462,102 @@ def _canonicalize_shot_characters(
     shots: List[Dict[str, Any]],
     characters: Optional[List[Dict[str, Any]]],
 ) -> List[Dict[str, Any]]:
-    """Canonicalize ``who`` while retaining original source mentions for audit."""
+    """Canonicalize ``who`` while retaining original source mentions for audit.
+
+    New Phase 1 runs bind every source mention to instance IDs before
+    Adaptation.  Those IDs are the authority: a group display mention can map
+    to several instances and therefore cannot be reconstructed from an
+    instance-level compatibility projection by matching display names again.
+    Name resolution remains only as a legacy path for inputs that have not yet
+    been bound by the semantic ledger.
+    """
     if not characters:
+        for shot in shots:
+            shot.pop("_semantic_character_binding_verified", None)
         return shots
+    characters_by_id: Dict[str, Dict[str, Any]] = {}
+    for character in characters:
+        character_id = str(character.get("id") or "").strip()
+        if not character_id or character_id in characters_by_id:
+            raise ValueError(
+                "canonical characters require unique non-empty instance ids"
+            )
+        characters_by_id[character_id] = character
+
     for shot in shots:
         raw_who = shot.get("who") or []
         if isinstance(raw_who, str):
             raw_who = [raw_who]
         original = [str(name).strip() for name in raw_who if str(name).strip()]
+
+        semantic_binding_verified = bool(
+            shot.pop("_semantic_character_binding_verified", False)
+        )
+        prebound = shot.get("character_ids")
+        if semantic_binding_verified:
+            if not isinstance(prebound, list):
+                raise ValueError("shot canonical character_ids must be an array")
+            character_ids = list(dict.fromkeys(
+                str(value).strip() for value in prebound if str(value).strip()
+            ))
+            unknown_ids = [
+                character_id
+                for character_id in character_ids
+                if character_id not in characters_by_id
+            ]
+            if unknown_ids:
+                raise ValueError(
+                    "shot contains an unknown canonical character id: "
+                    f"{unknown_ids}"
+                )
+            canonical_character_names = [
+                str(characters_by_id[character_id].get("name") or "").strip()
+                for character_id in character_ids
+            ]
+            if any(not name for name in canonical_character_names):
+                raise ValueError(
+                    "canonical character instance is missing its display name"
+                )
+
+            source_mentions: List[str] = []
+            for reference in (shot.get("participant_refs") or []):
+                if not isinstance(reference, dict):
+                    continue
+                instance_id = str(
+                    reference.get("instance_id")
+                    or reference.get("character_id")
+                    or ""
+                ).strip()
+                if instance_id not in characters_by_id:
+                    raise ValueError(
+                        "shot participant reference contains an unknown "
+                        f"canonical character id: {instance_id or '<missing>'}"
+                    )
+                if instance_id not in character_ids:
+                    raise ValueError(
+                        "shot participant reference is outside the canonical cast: "
+                        f"{instance_id}"
+                    )
+                mention = str(reference.get("mention") or "").strip()
+                if mention and mention not in source_mentions:
+                    source_mentions.append(mention)
+
+            non_character_participants = list(dict.fromkeys(
+                str(value).strip()
+                for value in (shot.get("non_character_participants") or [])
+                if str(value).strip()
+            ))
+            canonical = list(dict.fromkeys([
+                *canonical_character_names,
+                *non_character_participants,
+            ]))
+            if canonical != original:
+                if source_mentions:
+                    shot["source_character_mentions"] = source_mentions
+            shot["who"] = canonical
+            shot["character_ids"] = character_ids
+            continue
+
         canonical = list(
             dict.fromkeys(
                 _canonical_character_name(name, characters) for name in original
@@ -2731,6 +2819,24 @@ def _inherit_event_semantics(
                 str(reference["ref_id"]): reference
                 for reference in participant_refs
             }.values())
+            non_character_participants = list(dict.fromkeys(
+                str(value).strip()
+                for event in details
+                for value in (event.get("non_character_participants") or [])
+                if str(value).strip()
+            ))
+            if non_character_participants:
+                shot["non_character_participants"] = non_character_participants
+            else:
+                shot.pop("non_character_participants", None)
+            shot["_semantic_character_binding_verified"] = all(
+                isinstance(event.get("character_ids"), list)
+                and event.get("character_instance_ids")
+                == event.get("character_ids")
+                and isinstance(event.get("character_entity_ids"), list)
+                and isinstance(event.get("participant_refs"), list)
+                for event in details
+            )
 
         excerpts = [str(event.get("source_excerpt") or "").strip() for event in details]
         excerpts = [excerpt for excerpt in excerpts if excerpt]

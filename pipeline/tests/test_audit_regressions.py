@@ -977,6 +977,7 @@ def test_source_event_identity_overrides_llm_character_synonyms():
     adaptation_engine._inherit_event_semantics(shots, events)
 
     assert shots[0]["who"] == ["Agent", "敌方保安"]
+    assert "_semantic_character_binding_verified" not in shots[0]
 
 
 def test_source_event_identity_resolves_qualified_alias_to_character_asset():
@@ -1010,6 +1011,157 @@ def test_source_event_identity_resolves_qualified_alias_to_character_asset():
         "source_event_id": 1,
         "character_ids": ["agent", "security_guard"],
     }]
+
+
+def test_adaptation_uses_source_instance_ids_for_group_and_member_mentions():
+    lead_id = "ENTITY_LEAD_I01"
+    member_ids = [
+        "ENTITY_TEAM_I01",
+        "ENTITY_TEAM_I02",
+        "ENTITY_TEAM_I03",
+    ]
+    characters = [
+        {
+            "id": lead_id,
+            "entity_id": "ENTITY_LEAD",
+            "instance_id": lead_id,
+            "name": "年轻男性",
+            "aliases": ["男子"],
+        },
+        *[
+            {
+                "id": member_id,
+                "entity_id": "ENTITY_TEAM",
+                "instance_id": member_id,
+                "name": f"第{ordinal}名敌人",
+                "aliases": [],
+            }
+            for ordinal, member_id in zip("一二三", member_ids, strict=True)
+        ],
+    ]
+
+    def event(
+        event_id: int,
+        who: list[str],
+        character_ids: list[str],
+    ) -> dict:
+        entity_ids = list(dict.fromkeys(
+            "ENTITY_LEAD" if character_id == lead_id else "ENTITY_TEAM"
+            for character_id in character_ids
+        ))
+        return {
+            "event_id": event_id,
+            "sequence_id": "SEQ001",
+            "who": who,
+            "character_ids": character_ids,
+            "character_instance_ids": character_ids,
+            "character_entity_ids": entity_ids,
+            "participant_refs": [
+                {
+                    "ref_id": f"REF_{event_id}_{position}",
+                    "mention": mention,
+                    "character_id": character_id,
+                    "instance_id": character_id,
+                }
+                for position, (mention, character_id) in enumerate(
+                    zip(
+                        (
+                            [who[0]] * len(character_ids)
+                            if len(who) == 1
+                            else who
+                        ),
+                        character_ids,
+                        strict=True,
+                    ),
+                    1,
+                )
+            ],
+            "where": "同一空间",
+            "what": "连续动作",
+            "micro_actions": [f"动作{event_id}"],
+        }
+
+    events = [
+        event(1, ["未来战斗人员"], member_ids),
+        event(2, ["年轻男性", "第一名敌人"], [lead_id, member_ids[0]]),
+        event(3, ["男子", "第二名敌人"], [lead_id, member_ids[1]]),
+        event(4, ["年轻男性", "第三名敌人"], [lead_id, member_ids[2]]),
+    ]
+    shots = [{
+        "source_events": [1, 2, 3, 4],
+        "who": ["模型改写的群体称呼"],
+        "where": "同一空间",
+        "what": "模型摘要",
+    }]
+
+    adaptation_engine._inherit_event_semantics(shots, events, characters)
+
+    assert shots[0]["who"] == [
+        "第一名敌人",
+        "第二名敌人",
+        "第三名敌人",
+        "年轻男性",
+    ]
+    assert shots[0]["character_ids"] == [*member_ids, lead_id]
+    assert shots[0]["source_character_mentions"] == [
+        "未来战斗人员",
+        "年轻男性",
+        "第一名敌人",
+        "男子",
+        "第二名敌人",
+        "第三名敌人",
+    ]
+    assert shots[0]["source_event_casts"] == [
+        {"source_event_id": 1, "character_ids": member_ids},
+        {
+            "source_event_id": 2,
+            "character_ids": [lead_id, member_ids[0]],
+        },
+        {
+            "source_event_id": 3,
+            "character_ids": [lead_id, member_ids[1]],
+        },
+        {
+            "source_event_id": 4,
+            "character_ids": [lead_id, member_ids[2]],
+        },
+    ]
+
+
+def test_adaptation_rejects_unknown_prebound_character_instance_id():
+    events = [{
+        "event_id": 1,
+        "sequence_id": "SEQ001",
+        "who": ["观察员"],
+        "character_ids": ["UNKNOWN_I01"],
+        "character_instance_ids": ["UNKNOWN_I01"],
+        "character_entity_ids": ["UNKNOWN"],
+        "participant_refs": [{
+            "ref_id": "REF_1_1",
+            "mention": "观察员",
+            "character_id": "UNKNOWN_I01",
+            "instance_id": "UNKNOWN_I01",
+        }],
+        "where": "控制室",
+        "what": "观察员查看屏幕",
+        "micro_actions": ["查看屏幕"],
+    }]
+    shots = [{
+        "source_events": [1],
+        "who": ["观察员"],
+        "where": "控制室",
+        "what": "观察员查看屏幕",
+    }]
+    characters = [{
+        "id": "OBSERVER_I01",
+        "entity_id": "OBSERVER",
+        "instance_id": "OBSERVER_I01",
+        "name": "观察员",
+        "aliases": [],
+    }]
+
+    with pytest.raises(ValueError, match="unknown canonical character id"):
+        adaptation_engine._inherit_event_semantics(shots, events, characters)
 
 
 def test_event_extractor_selects_a_generic_or_action_contract(monkeypatch):
