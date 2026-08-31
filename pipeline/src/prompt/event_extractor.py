@@ -36,6 +36,7 @@ from schemas.understanding import (
     native_chat_json_schema_format,
     parse_structured_output,
 )
+from runtime.llm_policy import LLMStreamPolicy
 from runtime.provider_attempt_policy import effective_provider_retries
 from utils.action_units import (
     ACTION_TIMELINE_SCHEMA,
@@ -93,6 +94,16 @@ ACTION_SYSTEM_PROMPT = (
 # Backward-compatible export for integrations that imported the old constant.
 SYSTEM_PROMPT = GENERAL_SYSTEM_PROMPT
 
+BOUNDED_OUTPUT_CONTRACT = (
+    "【有界结构化输出】\n"
+    "1. 同一事实只写一次：source_excerpt 保存逐字来源，what/visual/start_state/end_state/"
+    "causal_link 只写各自职责所需的最短信息，不要在多个字段同义复述整段来源。\n"
+    "2. micro_actions、body_action_choreography 与 action_temporal_relations 必须完整覆盖来源，"
+    "但每项使用可执行的最短短语；不得用形容词、摄影润色或背景复述扩写结构字段。\n"
+    "3. 不得删减来源动作、人物、道具、因果、对白或状态变化来缩短响应；一个 target "
+    "不得拆成额外请求。只通过去重和简洁措辞控制输出规模。"
+)
+
 USER_PROMPT_TEMPLATE = (
     "文档类型：{format_hint}\n\n"
     "以下前后文只用于判断人物、对白归属和动作承接，严禁从前后文重复提取事件：\n"
@@ -143,7 +154,8 @@ USER_PROMPT_TEMPLATE = (
     "剧本对白可能写作 角色名：\"台词\" 或 角色名:\"台词\"，全角/半角冒号与引号均可能出现。"
     "只有证据充分才填写角色名；若只能猜测，speaker 写‘未知’并降低 confidence，禁止为了完整而编造。\n\n"
     "{format_contract}\n\n"
-    "{semantic_timeline_contract}"
+    "{semantic_timeline_contract}\n\n"
+    "【有界结构化输出】\n{bounded_output_contract}"
 )
 
 
@@ -213,8 +225,10 @@ ACTION_SCREENPLAY_CONTRACT = (
     "不得为它们输出 scene_setup/character_state/transition，也不得把已发生的剧情再提取一遍。"
 )
 
-LLM_TIMEOUT = 900  # 健康大段落长流可超过 300s；空闲停滞仍由 75s 独立阈值处理
-LLM_IDLE_TIMEOUT = 75
+EVENT_EXTRACTION_LLM_POLICY = LLMStreamPolicy.long_structured_output(max_tokens=32000)
+# Compatibility exports for integrations that imported the former constants.
+LLM_TIMEOUT = EVENT_EXTRACTION_LLM_POLICY.wall_timeout_seconds
+LLM_IDLE_TIMEOUT = EVENT_EXTRACTION_LLM_POLICY.idle_timeout_seconds
 MAX_RETRIES = 1  # 解析失败重试次数
 
 
@@ -257,9 +271,9 @@ def _call_llm(prompt: str, system_prompt: str = GENERAL_SYSTEM_PROMPT) -> str:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ],
-        max_tokens=16000,
-        wall_timeout=LLM_TIMEOUT,
-        idle_timeout=LLM_IDLE_TIMEOUT,
+        max_tokens=EVENT_EXTRACTION_LLM_POLICY.max_tokens,
+        wall_timeout=EVENT_EXTRACTION_LLM_POLICY.wall_timeout_seconds,
+        idle_timeout=EVENT_EXTRACTION_LLM_POLICY.idle_timeout_seconds,
         response_format=native_chat_json_schema_format(EventUnderstandingBatch),
         _client=client,
     )
@@ -297,7 +311,7 @@ _NARRATIVE_JUMP_CUES = (
 # caches carried over from earlier run directories — and forces every Phase 1
 # event extraction to re-run (a paid LLM pass). Never bump casually, and never
 # reuse cross-run segment caches from a run produced under a different value.
-EVENT_FLOW_SCHEMA_VERSION = "29.0"
+EVENT_FLOW_SCHEMA_VERSION = "30.0"
 
 _UNKNOWN_ACTION_PERFORMERS = {
     "",
@@ -610,6 +624,9 @@ def _extract_events_from_segment(
             ACTION_SCREENPLAY_CONTRACT if is_action_format else GENERAL_PROSE_CONTRACT
         ),
         semantic_timeline_contract=SEMANTIC_TIMELINE_CONTRACT,
+        bounded_output_contract=BOUNDED_OUTPUT_CONTRACT.removeprefix(
+            "【有界结构化输出】\n"
+        ),
     )
     system_prompt = ACTION_SYSTEM_PROMPT if is_action_format else GENERAL_SYSTEM_PROMPT
 

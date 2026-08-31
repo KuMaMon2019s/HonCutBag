@@ -56,6 +56,33 @@ def test_provider_attempt_scope_disables_event_schema_resubmission(monkeypatch):
     assert calls == 1
 
 
+def test_provider_attempt_scope_rejects_truncated_event_value_without_resubmission(
+    monkeypatch,
+):
+    calls = 0
+
+    def truncated_response(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return '{"events":[{"who":["character"],"where":"unfinished'
+
+    monkeypatch.setattr(event_extractor, "_call_llm", truncated_response)
+    with provider_attempt_scope(max_retries=0):
+        with pytest.raises(
+            event_extractor.EventExtractionError,
+            match="ends inside a string",
+        ):
+            event_extractor._extract_events_from_segment({
+                "id": 5,
+                "content": (
+                    "A fictional character completes several linked actions."
+                ),
+                "format_hint": "general_prose",
+            })
+
+    assert calls == 1
+
+
 def test_provider_transports_do_not_reverse_import_runtime_policy():
     repository = Path(__file__).resolve().parents[2]
     for relative in (

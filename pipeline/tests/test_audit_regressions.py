@@ -1203,11 +1203,26 @@ def test_event_extractor_allows_healthy_long_streams_but_keeps_idle_guard(
 
     assert event_extractor._call_llm("提取事件") == "[]"
     assert captured["_client"] is client
-    assert captured["wall_timeout"] == event_extractor.LLM_TIMEOUT == 900
-    assert captured["idle_timeout"] == event_extractor.LLM_IDLE_TIMEOUT == 75
-    assert event_extractor.LLM_TIMEOUT > event_extractor.LLM_IDLE_TIMEOUT
+    policy = event_extractor.EVENT_EXTRACTION_LLM_POLICY
+    assert captured["wall_timeout"] == policy.wall_timeout_seconds == 900
+    assert captured["idle_timeout"] == policy.idle_timeout_seconds == 75
+    assert captured["max_tokens"] == policy.max_tokens == 32000
+    assert (
+        policy.wall_timeout_seconds
+        > policy.idle_timeout_seconds
+    )
     assert captured["response_format"]["type"] == "json_schema"
     assert captured["response_format"]["json_schema"]["strict"] is True
+
+
+def test_event_extractor_requests_bounded_nonduplicative_structured_output():
+    contract = event_extractor.BOUNDED_OUTPUT_CONTRACT
+
+    assert "同一事实只写一次" in contract
+    assert "不得删减来源动作" in contract
+    assert "不得拆成额外请求" in contract
+    assert "有界结构化输出" in event_extractor.USER_PROMPT_TEMPLATE
+    assert event_extractor.EVENT_FLOW_SCHEMA_VERSION == "30.0"
 
 
 def test_director_uses_runtime_long_structured_stream_policy():
