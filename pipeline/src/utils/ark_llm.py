@@ -11,7 +11,7 @@ import threading
 import time
 from typing import Any, Callable, Optional
 
-import httpx
+import httpx2 as httpx
 from openai import APIConnectionError, APIStatusError, APITimeoutError, DefaultHttpxClient, OpenAI
 
 from utils.provider_quota import (

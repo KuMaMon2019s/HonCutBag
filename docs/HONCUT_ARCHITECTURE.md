@@ -114,7 +114,7 @@ Phase 5 的路由优先级固定为：当前 receipt 明确写入 `correction.st
 
 Graph node 必须只完成三件事：读取 State、调用一个窄 owner、返回 State patch。节点不得直接读写媒体、运行 subprocess、调用网络/模型或实现重试。
 
-流式 LLM 的 idle timeout 与 wall timeout 是两个不同合同：idle 只检测连续无 chunk 的停滞，wall 才是活动流的绝对安全上限。导演规划、事件提取和 adaptation 这类有界结构化长输出不得使用短于健康历史流的 Phase 本地硬墙；其限制由 Runtime LLM policy 提供，Phase 只选择工作负载 profile。超时后仍 fail closed，禁止在 Graph 或 Phase 外层盲目重提。
+流式 LLM 的 idle timeout 与 wall timeout 是两个不同合同：idle 只检测连续无 chunk 的停滞，wall 才是活动流的绝对安全上限。导演规划、事件提取和 adaptation 这类有界结构化长输出不得使用短于健康历史流的 Phase 本地硬墙；其限制由 Runtime LLM policy 提供，Phase 只选择工作负载 profile。Adaptation 的推理型结构化长流使用 240 秒 idle、900 秒 wall；SDK transport read 必须晚于 wall watchdog，避免传输层先抛出未分类超时。该 transport grace 不增加重试次数，超时后仍 fail closed，禁止在 Graph 或 Phase 外层盲目重提。
 
 ### 3.3 Phase 所有权
 

@@ -48,6 +48,7 @@ from phases.phase1.director_planner import (
     DIRECTOR_INTENT_FIELDS,
     DIRECTOR_PLAN_SCHEMA,
 )
+from runtime.llm_policy import LLMStreamPolicy
 from runtime.provider_attempt_policy import effective_provider_retries
 from schemas.understanding import (
     DurationScaledActionSelectionBatch,
@@ -424,8 +425,15 @@ def determine_gen_strategy(shot: Dict[str, Any]) -> str:
         return "phantom"
     return "i2v"
 
-LLM_TIMEOUT = 900  # 135 个事件的健康流实测超过 240 秒；保留 15 分钟绝对安全上限
-LLM_IDLE_TIMEOUT = 75  # 只在流连续 75 秒没有任何 chunk 时判定停滞
+ADAPTATION_LLM_POLICY = LLMStreamPolicy.adaptation_structured_output(
+    max_tokens=32000,
+)
+# Compatibility aliases for integrations that inspect the Phase 1 limits.
+LLM_TIMEOUT = ADAPTATION_LLM_POLICY.wall_timeout_seconds
+LLM_IDLE_TIMEOUT = ADAPTATION_LLM_POLICY.idle_timeout_seconds
+LLM_TRANSPORT_READ_TIMEOUT = (
+    ADAPTATION_LLM_POLICY.transport_read_timeout_seconds
+)
 MAX_RETRIES = 1  # 解析失败重试次数
 NETWORK_RETRIES = 2  # 网络超时自动重试次数（2026-08-09 R7: 70事件大prompt一次超时即死太脆）
 AVG_SHOT_DURATION = 12  # 默认每镜时长（秒）
@@ -1744,13 +1752,15 @@ def normalize_shot_durations(
 
 # ─── LLM 客户端 ─────────────────────────────────────────────────────────────
 
-def _get_client() -> OpenAI:
+def _get_client(policy: LLMStreamPolicy = ADAPTATION_LLM_POLICY) -> OpenAI:
     """
     创建 OpenAI 客户端
 
     API Key: ARK_AGENT_API_KEY (火山方舟 Agent Plan)
     """
-    return create_ark_client(read_timeout=LLM_IDLE_TIMEOUT)
+    return create_ark_client(
+        read_timeout=policy.transport_read_timeout_seconds,
+    )
 
 
 def _call_llm(user_prompt: str, max_tokens: int = 32000) -> str:
@@ -1766,11 +1776,14 @@ def _call_llm(user_prompt: str, max_tokens: int = 32000) -> str:
     Raises:
         Exception: API 调用失败时抛出
     """
-    client = _get_client()
+    policy = LLMStreamPolicy.adaptation_structured_output(
+        max_tokens=max_tokens,
+    )
+    client = _get_client(policy)
 
     # 2026-08-09 R8 教训：70事件→15镜大JSON非流式调用，turbo生成完整响应
-    # 远超 240s timeout（R7/R8 共 6 次超时实锤）。改流式后 timeout 语义变为
-    # "等下一个数据块"，turbo 推理模型先吐 reasoning 再吐 content，数据流不断即不断连。
+    # 远超 240s timeout（R7/R8 共 6 次超时实锤）。流式响应仍可能在模型推理时
+    # 长时间没有 content chunk，因此由 Runtime profile 分离 idle、wall 与 SDK read。
     # 2026-08-09 R9 教训：不设 max_tokens 时用默认输出上限，15镜×18字段 JSON
     # 在 char 8354/9433 被截断（JSONDecodeError: Unterminated string）。
     # 探针实锤 max_tokens=16000/32000 均被 Agent Plan 端点接受（HTTP 200），
@@ -1780,9 +1793,10 @@ def _call_llm(user_prompt: str, max_tokens: int = 32000) -> str:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
-        max_tokens=max_tokens,
-        wall_timeout=LLM_TIMEOUT,
-        idle_timeout=LLM_IDLE_TIMEOUT,
+        max_tokens=policy.max_tokens,
+        wall_timeout=policy.wall_timeout_seconds,
+        read_timeout=policy.transport_read_timeout_seconds,
+        idle_timeout=policy.idle_timeout_seconds,
         _client=client,
     )
 
@@ -5465,7 +5479,12 @@ def _apply_source_indexed_screenplay_rewrite(
         "并行攻击/反应/效果写在同一故事时刻，串行动作保持先后。每组只能得到一个连续动作段。\n\n"
         f"输入：\n{json.dumps(inputs, ensure_ascii=False, indent=2)}"
     )
-    client = create_ark_client(read_timeout=LLM_IDLE_TIMEOUT)
+    stream_policy = LLMStreamPolicy.adaptation_structured_output(
+        max_tokens=12000,
+    )
+    client = create_ark_client(
+        read_timeout=stream_policy.transport_read_timeout_seconds,
+    )
     parsed: dict[str, Any] | None = None
     correction = ""
     expected_ids = [record["source_event_id"] for record in rewrite_records]
@@ -5476,9 +5495,10 @@ def _apply_source_indexed_screenplay_rewrite(
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": base_prompt + correction},
             ],
-            max_tokens=12000,
-            wall_timeout=LLM_TIMEOUT,
-            idle_timeout=LLM_IDLE_TIMEOUT,
+            max_tokens=stream_policy.max_tokens,
+            wall_timeout=stream_policy.wall_timeout_seconds,
+            read_timeout=stream_policy.transport_read_timeout_seconds,
+            idle_timeout=stream_policy.idle_timeout_seconds,
             response_format=native_chat_json_schema_format(
                 SourceIndexedScreenplayRewriteBatch
             ),
@@ -5684,7 +5704,12 @@ def _apply_director_action_selection(
         "director_alignment 说明它如何服务既有五项导演意图。\n\n"
         f"输入：\n{json.dumps(selection_inputs, ensure_ascii=False, indent=2)}"
     )
-    client = create_ark_client(read_timeout=LLM_IDLE_TIMEOUT)
+    stream_policy = LLMStreamPolicy.adaptation_structured_output(
+        max_tokens=8000,
+    )
+    client = create_ark_client(
+        read_timeout=stream_policy.transport_read_timeout_seconds,
+    )
     parsed: dict[str, Any] | None = None
     correction = ""
     expected_ids = [record["source_event_id"] for record in scaled_records]
@@ -5698,9 +5723,10 @@ def _apply_director_action_selection(
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": base_prompt + correction},
             ],
-            max_tokens=8000,
-            wall_timeout=LLM_TIMEOUT,
-            idle_timeout=LLM_IDLE_TIMEOUT,
+            max_tokens=stream_policy.max_tokens,
+            wall_timeout=stream_policy.wall_timeout_seconds,
+            read_timeout=stream_policy.transport_read_timeout_seconds,
+            idle_timeout=stream_policy.idle_timeout_seconds,
             response_format=native_chat_json_schema_format(
                 DurationScaledActionSelectionBatch
             ),

@@ -36,5 +36,36 @@ class LLMStreamPolicy:
             max_tokens=max_tokens,
         )
 
+    @classmethod
+    def adaptation_structured_output(
+        cls,
+        *,
+        max_tokens: int,
+    ) -> "LLMStreamPolicy":
+        """Policy for Adaptation's bounded, reasoning-heavy JSON streams.
+
+        Ark may pause content chunks while the model is still reasoning. A
+        four-minute idle window tolerates that behavior while the existing
+        fifteen-minute wall remains the absolute single-request ceiling.
+        """
+
+        return cls(
+            wall_timeout_seconds=900.0,
+            idle_timeout_seconds=240.0,
+            max_tokens=max_tokens,
+        )
+
+    @property
+    def transport_read_timeout_seconds(self) -> float:
+        """Keep the SDK socket timeout behind Runtime's wall watchdog.
+
+        The SDK transport must not race the idle/wall monitors or leak its own
+        unclassified timeout first. Runtime closes the stream when either
+        policy clock expires; this small grace only gives that close a chance
+        to win the classification race.
+        """
+
+        return self.wall_timeout_seconds + 30.0
+
 
 __all__ = ["LLMStreamPolicy"]

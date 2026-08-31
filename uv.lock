@@ -399,6 +399,7 @@ source = { editable = "." }
 dependencies = [
     { name = "arq" },
     { name = "ffmpeg-python" },
+    { name = "httpx2" },
     { name = "json-repair" },
     { name = "langchain-core" },
     { name = "langgraph" },
@@ -454,6 +455,7 @@ requires-dist = [
     { name = "fastapi", marker = "extra == 'sam3'", specifier = ">=0.115" },
     { name = "ffmpeg-python", specifier = ">=0.2.0" },
     { name = "ftfy", marker = "extra == 'sam3'", specifier = "==6.1.1" },
+    { name = "httpx2", specifier = ">=2.12.0,<3" },
     { name = "huggingface-hub", marker = "extra == 'sam3'" },
     { name = "iopath", marker = "extra == 'sam3'", specifier = ">=0.1.10" },
     { name = "json-repair", specifier = ">=0.63.4" },
