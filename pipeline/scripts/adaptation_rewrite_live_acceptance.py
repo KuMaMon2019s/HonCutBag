@@ -22,9 +22,9 @@ from runtime.provider_attempt_policy import provider_attempt_scope
 from utils.config import get_api_key, validate_config
 
 
-INPUT_SCHEMA = "honcut.adaptation-rewrite-live-input.v1"
-REGRESSION_SCHEMA = "honcut.adaptation-rewrite-regression.v1"
-RECEIPT_SCHEMA = "honcut.adaptation-rewrite-live-acceptance.v1"
+INPUT_SCHEMA = "honcut.adaptation-rewrite-live-input.v2"
+REGRESSION_SCHEMA = "honcut.adaptation-rewrite-regression.v2"
+RECEIPT_SCHEMA = "honcut.adaptation-rewrite-live-acceptance.v2"
 RECEIPT_NAME = "adaptation_rewrite_live_acceptance.json"
 LIVE_DIRECTORY = Path("live_acceptance") / "adaptation_rewrite"
 REQUEST_RECEIPT_NAME = "adaptation_rewrite_request.json"
@@ -148,13 +148,40 @@ def _build_rewrite_contract(
         for record in duration_plan["events"]
         if record.get("scaling") == "rewrite"
     ]
+    static_ids = [
+        record["source_event_id"]
+        for record in duration_plan["events"]
+        if int(record.get("source_generation_action_units") or 0) == 0
+    ]
     if not rewrite_ids:
         raise RuntimeError("Adaptation live input does not require a rewrite")
+    if not static_ids:
+        raise RuntimeError(
+            "Adaptation live input does not exercise static pass-through"
+        )
     if any(
         record.get("scaling") == "representative"
         for record in duration_plan["events"]
     ):
         raise RuntimeError("Adaptation live input has mixed scaling generations")
+    records_by_id = {
+        int(record["source_event_id"]): record
+        for record in duration_plan["events"]
+    }
+    for event_id in static_ids:
+        record = records_by_id[event_id]
+        rewrite = production_events[event_id - 1].get(
+            "production_action_rewrite"
+        )
+        if (
+            record.get("scaling") != "full"
+            or int(record.get("production_generation_action_units") or 0) != 0
+            or not isinstance(rewrite, dict)
+            or rewrite.get("groups") != []
+        ):
+            raise RuntimeError(
+                "Adaptation static source event entered the rewrite path"
+            )
     projection = {
         "schema": INPUT_SCHEMA,
         "source_events_sha256": _canonical_sha256(events),
@@ -162,6 +189,11 @@ def _build_rewrite_contract(
         "production_events_sha256": _canonical_sha256(production_events),
         "duration_plan_sha256": _canonical_sha256(duration_plan),
         "rewrite_source_event_ids": rewrite_ids,
+        "static_pass_through_source_event_ids": static_ids,
+        "static_pass_through_events_sha256": {
+            str(event_id): _canonical_sha256(production_events[event_id - 1])
+            for event_id in static_ids
+        },
         "target_duration_s": target_duration,
         "material_duration_s": material_duration,
         "primary_shots": primary_shots,
@@ -340,6 +372,13 @@ def execute_single_rewrite(
         or reconciliation.get("provider_request_count") != 0
     ):
         raise RuntimeError("Adaptation live reconciliation verdict failed")
+    static_ids = projection["static_pass_through_source_event_ids"]
+    static_hashes_after = {
+        str(event_id): _canonical_sha256(selected_events[event_id - 1])
+        for event_id in static_ids
+    }
+    if static_hashes_after != projection["static_pass_through_events_sha256"]:
+        raise RuntimeError("Adaptation live rewrite changed a static source event")
     evidence_path = workspace / LIVE_DIRECTORY / EVIDENCE_NAME
     full_chain_acceptance._atomic_write_json(evidence_path, {
         "schema": RECEIPT_SCHEMA,
@@ -349,6 +388,8 @@ def execute_single_rewrite(
         ],
         "selected_events_sha256": _canonical_sha256(selected_events),
         "rewrite_source_event_ids": expected_ids,
+        "static_pass_through_source_event_ids": static_ids,
+        "static_pass_through_events_sha256": static_hashes_after,
         "original_source_event_ids": reconciliation[
             "original_source_event_ids"
         ],

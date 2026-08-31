@@ -18,7 +18,12 @@ from utils.provider_request_guard import (
 
 
 def _write_input(workspace: Path) -> tuple[Path, Path]:
-    events = [
+    events = [{
+        "sequence_id": "SEQ001",
+        "event_role": "character_state",
+        "what": "角色保持观察状态",
+        "micro_actions": [],
+    }, *[
         {
             "sequence_id": "SEQ001",
             "event_role": "turning_point",
@@ -32,7 +37,7 @@ def _write_input(workspace: Path) -> tuple[Path, Path]:
             ],
         }
         for event_id in range(1, 12)
-    ]
+    ]]
     director_plan = {
         "schema": "honcut.director-plan.v1",
         "sequences": [{
@@ -106,8 +111,11 @@ def test_preflight_freezes_one_rewrite_request_without_provider(
     assert receipt["provider_request_count"] == 0
     assert receipt["exact_request_limit"] == 1
     assert receipt["projection"]["rewrite_source_event_ids"] == list(
-        range(1, 12)
+        range(2, 13)
     )
+    assert receipt["projection"][
+        "static_pass_through_source_event_ids"
+    ] == [1]
 
 
 def test_single_rewrite_uses_owner_once_and_persists_only_hash_evidence(
@@ -139,7 +147,8 @@ def test_single_rewrite_uses_owner_once_and_persists_only_hash_evidence(
             "schema": "honcut.source-indexed-screenplay-rewrite.v1",
             "events": [],
         }
-        for event_id, event in enumerate(production_events, start=1):
+        for event_id in _projection["rewrite_source_event_ids"]:
+            event = production_events[event_id - 1]
             groups = event["production_action_rewrite"]["groups"]
             response["events"].append({
                 "source_event_id": event_id,
@@ -187,6 +196,9 @@ def test_single_rewrite_uses_owner_once_and_persists_only_hash_evidence(
     assert calls == 1
     assert receipt["status"] == "passed"
     assert receipt["provider_request_count"] == 1
+    assert receipt["projection"][
+        "static_pass_through_source_event_ids"
+    ] == [1]
     evidence_text = (
         tmp_path / acceptance.LIVE_DIRECTORY / acceptance.EVIDENCE_NAME
     ).read_text(encoding="utf-8")
