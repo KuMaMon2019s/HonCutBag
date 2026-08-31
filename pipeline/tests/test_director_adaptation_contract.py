@@ -382,6 +382,105 @@ def test_duration_scaling_uses_strict_source_indexed_screenplay_rewrite(
     )
 
 
+def test_duration_scaling_excludes_zero_action_static_event_from_rewrite(
+    monkeypatch,
+):
+    events = [
+        {
+            "sequence_id": "SEQ001",
+            "event_role": "character_state",
+            "what": "角色停在入口前观察环境",
+            "micro_actions": [],
+        },
+        {
+            "sequence_id": "SEQ001",
+            "event_role": "turning_point",
+            "dramatic_turn": True,
+            "what": "角色识破威胁并完成反制",
+            "micro_actions": [
+                f"依次完成来源动作{index}" for index in range(1, 8)
+            ],
+        },
+    ]
+    director_plan = {
+        "schema": "honcut.director-plan.v1",
+        "sequences": [{
+            "sequence_id": "SEQ001",
+            "scene_goal": "保留观察到反制的完整因果",
+            "emotion_arc": "警觉 → 决断",
+            "visual_focus": "观察后的连续反制",
+            "spatial_intent": "保持连续空间",
+            "transition_intent": "以反制结果收束",
+        }],
+    }
+    production_events, scaling_plan = (
+        adaptation_engine._build_duration_scaled_event_plan(
+            events,
+            target_duration=6,
+            beat_count=1,
+            effective_shot_duration=6,
+        )
+    )
+
+    assert [
+        record["scaling"] for record in scaling_plan["events"]
+    ] == ["full", "rewrite"]
+    assert production_events[0]["production_action_rewrite"]["groups"] == []
+
+    calls = 0
+    monkeypatch.setattr(
+        adaptation_engine,
+        "create_ark_client",
+        lambda **_kwargs: object(),
+    )
+
+    def fake_stream(*, messages, **_kwargs):
+        nonlocal calls
+        calls += 1
+        assert "角色停在入口前观察环境" not in messages[1]["content"]
+        groups = production_events[1]["production_action_rewrite"]["groups"]
+        return json.dumps({
+            "schema": "honcut.source-indexed-screenplay-rewrite.v1",
+            "events": [{
+                "source_event_id": 2,
+                "production_actions": [
+                    {
+                        "production_action_index": group[
+                            "production_action_index"
+                        ],
+                        "source_micro_action_indexes": group[
+                            "source_micro_action_indexes"
+                        ],
+                        "rewritten_micro_action": (
+                            "连续保全：" + "；".join(group["source_actions"])
+                        ),
+                    }
+                    for group in groups
+                ],
+                "narrative_purpose": "保留观察后的反制因果",
+                "emotional_beat": "警觉转为决断",
+                "director_alignment": "对齐连续反制与收束",
+            }],
+        }, ensure_ascii=False)
+
+    monkeypatch.setattr(adaptation_engine, "call_llm_stream", fake_stream)
+
+    selected_events, selected_plan = (
+        adaptation_engine._apply_director_action_selection(
+            events,
+            production_events,
+            scaling_plan,
+            director_plan,
+        )
+    )
+
+    assert calls == 1
+    assert selected_events[0]["micro_actions"] == []
+    assert selected_plan["semantic_selection_status"] == (
+        "source_indexed_rewrite"
+    )
+
+
 def test_source_indexed_rewrite_collapses_adjacent_lineage_equivalent_duplicate(
     monkeypatch,
 ):

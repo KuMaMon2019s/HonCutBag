@@ -4512,14 +4512,15 @@ def _build_duration_scaled_event_plan(
         production_counts = _event_generation_action_unit_counts(production_events)
         for record in records:
             event_id = record["source_event_id"]
+            planned_event = production_events[event_id - 1]
             record["production_micro_action_count"] = len(
-                production_events[event_id - 1].get("micro_actions") or []
+                planned_event.get("micro_actions") or []
             )
             record["production_generation_action_units"] = production_counts[
                 event_id
             ]
             rewrite_groups = (
-                production_event.get("production_action_rewrite", {}).get(
+                planned_event.get("production_action_rewrite", {}).get(
                     "groups"
                 )
                 or []
@@ -7218,6 +7219,23 @@ def migrate_screenplay_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("screenplay plan must be an object")
     schema = str(plan.get("schema") or "").strip()
     if schema == SCREENPLAY_PLAN_SCHEMA:
+        event_scaling = plan.get("event_action_scaling")
+        records = (
+            event_scaling.get("events")
+            if isinstance(event_scaling, dict)
+            else None
+        )
+        for record in records or []:
+            if not isinstance(record, dict):
+                continue
+            if (
+                record.get("scaling") == "rewrite"
+                and int(record.get("source_generation_action_units") or 0)
+                == 0
+            ):
+                raise ValueError(
+                    "screenplay plan marks a zero-action event as rewrite"
+                )
         return copy.deepcopy(plan)
     match = re.fullmatch(r"honcut\.screenplay-plan\.v(\d+)", schema)
     if match and int(match.group(1)) > int(SCREENPLAY_PLAN_SCHEMA.rsplit("v", 1)[1]):

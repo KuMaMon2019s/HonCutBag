@@ -3035,6 +3035,24 @@ def test_screenplay_plan_future_schema_fails_closed():
         engine.migrate_screenplay_plan({"schema": "honcut.screenplay-plan.v99"})
 
 
+def test_screenplay_plan_rejects_legacy_zero_action_rewrite_pollution():
+    polluted = {
+        "schema": engine.SCREENPLAY_PLAN_SCHEMA,
+        "event_action_scaling": {
+            "schema": engine.DURATION_SCALED_EVENT_PLAN_SCHEMA,
+            "events": [{
+                "source_event_id": 1,
+                "source_generation_action_units": 0,
+                "production_generation_action_units": 0,
+                "scaling": "rewrite",
+            }],
+        },
+    }
+
+    with pytest.raises(ValueError, match="zero-action event as rewrite"):
+        engine.migrate_screenplay_plan(polluted)
+
+
 @pytest.mark.parametrize(
     ("duration", "source_actions", "expected_content_beats"),
     [(8, 2, 1), (12, 4, 2), (18, 6, 3)],
