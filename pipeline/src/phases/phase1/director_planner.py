@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Sequence-aware director intent planning for Phase 1."""
 
+import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +28,16 @@ LLM_WALL_TIMEOUT = DIRECTOR_LLM_POLICY.wall_timeout_seconds
 LLM_IDLE_TIMEOUT = DIRECTOR_LLM_POLICY.idle_timeout_seconds
 
 DIRECTOR_PLAN_SCHEMA = "honcut.director-plan.v1"
+DIRECTOR_PLAN_RECONCILIATION_SCHEMA = (
+    "honcut.director-plan-reconciliation.v1"
+)
+DIRECTOR_PLAN_RECONCILIATION_POLICY = (
+    "adjacent_duplicate_sequence_observation_keep_first_v1"
+)
+DIRECTOR_PLAN_RECONCILIATION_POLICY_SHA256 = hashlib.sha256(
+    DIRECTOR_PLAN_RECONCILIATION_POLICY.encode("utf-8")
+).hexdigest()
+DIRECTOR_PLAN_RECONCILIATION_NAME = "director_plan_reconciliation.json"
 DIRECTOR_INTENT_FIELDS = (
     "scene_goal",
     "emotion_arc",
@@ -81,39 +93,136 @@ def _sequence_ids(events: list[dict[str, Any]]) -> list[str]:
     return sequence_ids
 
 
+def _canonical_json_sha256(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _atomic_write_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def _validate_director_sequence_observation(
+    sequence: dict[str, Any],
+    position: int,
+    expected_ids: list[str],
+) -> str:
+    sequence_id = str(sequence.get("sequence_id") or "").strip()
+    if not sequence_id:
+        raise ValueError(f"director sequence {position} has empty sequence_id")
+    if sequence_id not in expected_ids:
+        raise ValueError(
+            "director sequence observation has unexpected sequence_id; "
+            f"position={position}, sequence_id={sequence_id}"
+        )
+    for field in DIRECTOR_INTENT_FIELDS:
+        value = sequence.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                f"director sequence {sequence_id} has empty {field}"
+            )
+    return sequence_id
+
+
+def _reconcile_director_sequence_observations(
+    plan: object,
+    events: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Collapse adjacent alternative intents without changing source authority."""
+    observation = DirectorPlanUnderstanding.model_validate(plan).model_dump(
+        by_alias=True
+    )
+    returned = observation["sequences"]
+    expected_ids = _sequence_ids(events)
+    reconciled: list[dict[str, Any]] = []
+    retained_positions: list[int] = []
+    duplicates: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    original_ids: list[str] = []
+
+    for position, sequence in enumerate(returned, start=1):
+        sequence_id = _validate_director_sequence_observation(
+            sequence,
+            position,
+            expected_ids,
+        )
+        original_ids.append(sequence_id)
+        if reconciled and reconciled[-1]["sequence_id"] == sequence_id:
+            duplicates.append({
+                "sequence_id": sequence_id,
+                "retained_position": retained_positions[-1],
+                "dropped_position": position,
+                "retained_observation_sha256": _canonical_json_sha256(
+                    reconciled[-1]
+                ),
+                "dropped_observation_sha256": _canonical_json_sha256(
+                    sequence
+                ),
+            })
+            continue
+        if sequence_id in seen_ids:
+            raise ValueError(
+                "director sequence observation has non-adjacent duplicate; "
+                f"sequence_id={sequence_id}"
+            )
+        seen_ids.add(sequence_id)
+        reconciled.append(sequence)
+        retained_positions.append(position)
+
+    reconciled_ids = [item["sequence_id"] for item in reconciled]
+    if reconciled_ids != expected_ids:
+        missing = [value for value in expected_ids if value not in reconciled_ids]
+        raise ValueError(
+            "director sequence coverage/order mismatch; "
+            f"expected={expected_ids}, original={original_ids}, "
+            f"reconciled={reconciled_ids}, missing={missing}"
+        )
+
+    canonical_plan = {
+        "schema": DIRECTOR_PLAN_SCHEMA,
+        "sequences": reconciled,
+    }
+    receipt = {
+        "schema": DIRECTOR_PLAN_RECONCILIATION_SCHEMA,
+        "policy": DIRECTOR_PLAN_RECONCILIATION_POLICY,
+        "policy_sha256": DIRECTOR_PLAN_RECONCILIATION_POLICY_SHA256,
+        "source_events_sha256": _canonical_json_sha256(events),
+        "observation_sha256": _canonical_json_sha256(observation),
+        "canonical_plan_sha256": _canonical_json_sha256(canonical_plan),
+        "expected_sequence_ids": expected_ids,
+        "original_sequence_ids": original_ids,
+        "reconciled_sequence_ids": reconciled_ids,
+        "original_sequence_count": len(returned),
+        "reconciled_sequence_count": len(reconciled),
+        "duplicate_count": len(duplicates),
+        "duplicates": duplicates,
+        "source_sequence_loss_count": 0,
+        "provider_request_count": 0,
+    }
+    return canonical_plan, receipt
+
+
 def validate_director_plan(
     plan: object,
     events: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Validate exact event-ledger coverage and the narrow intent contract."""
-    plan = DirectorPlanUnderstanding.model_validate(plan).model_dump(by_alias=True)
-    sequences = plan.get("sequences")
-
-    expected_ids = _sequence_ids(events)
-    actual_ids: list[str] = []
-    for index, sequence in enumerate(sequences, 1):
-        sequence_id = str(sequence.get("sequence_id") or "").strip()
-        if not sequence_id:
-            raise ValueError(f"director sequence {index} has empty sequence_id")
-        if sequence_id in actual_ids:
-            raise ValueError(f"director sequence_id is duplicated: {sequence_id}")
-        actual_ids.append(sequence_id)
-        for field in DIRECTOR_INTENT_FIELDS:
-            value = sequence.get(field)
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError(
-                    f"director sequence {sequence_id} has empty {field}"
-                )
-
-    if actual_ids != expected_ids:
-        missing = [value for value in expected_ids if value not in actual_ids]
-        unknown = [value for value in actual_ids if value not in expected_ids]
-        raise ValueError(
-            "director sequence coverage/order mismatch; "
-            f"expected={expected_ids}, actual={actual_ids}, "
-            f"missing={missing}, unknown={unknown}"
-        )
-    return plan
+    canonical_plan, _receipt = _reconcile_director_sequence_observations(
+        plan,
+        events,
+    )
+    return canonical_plan
 
 
 def plan_director(
@@ -135,6 +244,7 @@ def plan_director(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     plan_path = output_dir / "director_plan.json"
+    reconciliation_path = output_dir / DIRECTOR_PLAN_RECONCILIATION_NAME
 
     if dry_run:
         print("  ⊘ dry-run 模式，跳过导演规划")
@@ -156,6 +266,8 @@ def plan_director(
 
         correction = ""
         plan = None
+        reconciliation = None
+        accepted_messages = None
         correction_limit = effective_provider_retries(MAX_SCHEMA_CORRECTIONS)
         for attempt in range(correction_limit + 1):
             messages = [
@@ -183,7 +295,10 @@ def plan_director(
                     content,
                     DirectorPlanUnderstanding,
                 ).model_dump(by_alias=True)
-                plan = validate_director_plan(parsed, events)
+                plan, reconciliation = (
+                    _reconcile_director_sequence_observations(parsed, events)
+                )
+                accepted_messages = messages
                 break
             except (json.JSONDecodeError, ValidationError, ValueError) as exc:
                 if attempt >= correction_limit:
@@ -193,11 +308,21 @@ def plan_director(
                     f"{exc}。请重新输出完整 JSON，严格覆盖全部 sequence_id，"
                     "保持原顺序且不要增加任何 shot 字段。"
                 )
-        if plan is None:
+        if plan is None or reconciliation is None or accepted_messages is None:
             raise ValueError("director planning did not produce a validated plan")
 
-        # 写入文件
-        plan_path.write_text(json.dumps(plan, indent=2, ensure_ascii=False), encoding="utf-8")
+        response_format = native_chat_json_schema_format(
+            DirectorPlanUnderstanding
+        )
+        reconciliation.update({
+            "model": DEFAULT_TEXT_MODEL,
+            "prompt_sha256": _canonical_json_sha256(accepted_messages),
+            "response_format_sha256": _canonical_json_sha256(
+                response_format
+            ),
+        })
+        _atomic_write_json(plan_path, plan)
+        _atomic_write_json(reconciliation_path, reconciliation)
 
         sequences = plan["sequences"]
         print(f"  ✓ [M1] 导演意图完成: {len(sequences)} 个 sequence")
@@ -207,8 +332,15 @@ def plan_director(
                 f"({sequence['emotion_arc']})"
             )
 
-        return {"status": "done", "plan": plan, "output": str(plan_path)}
+        return {
+            "status": "done",
+            "plan": plan,
+            "output": str(plan_path),
+            "reconciliation": reconciliation,
+            "reconciliation_output": str(reconciliation_path),
+        }
 
     except Exception as exc:
         plan_path.unlink(missing_ok=True)
+        reconciliation_path.unlink(missing_ok=True)
         raise RuntimeError(f"director planning failed: {exc}") from exc

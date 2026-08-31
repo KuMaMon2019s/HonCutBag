@@ -122,6 +122,16 @@ def test_director_planner_consumes_sequences_and_rejects_missing_coverage(
     assert schema["strict"] is True
     assert schema["schema"]["additionalProperties"] is False
     assert result["plan"] == _director_plan()
+    reconciliation = json.loads(
+        (tmp_path / "director_plan_reconciliation.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert reconciliation["schema"] == (
+        director_planner.DIRECTOR_PLAN_RECONCILIATION_SCHEMA
+    )
+    assert reconciliation["duplicate_count"] == 0
+    assert reconciliation["source_sequence_loss_count"] == 0
 
     incomplete = _director_plan()
     incomplete["sequences"] = incomplete["sequences"][:1]
@@ -135,6 +145,89 @@ def test_director_planner_consumes_sequences_and_rejects_missing_coverage(
             with_extra_shot_field,
             _events(),
         )
+
+
+def test_director_planner_reconciles_adjacent_duplicate_sequence_observations(
+    monkeypatch,
+    tmp_path,
+):
+    duplicate = _director_plan()
+    alternate = {
+        **duplicate["sequences"][0],
+        "scene_goal": "另一个不具来源权威的导演提案",
+        "emotion_arc": "紧张 → 更紧张",
+    }
+    duplicate["sequences"].insert(1, alternate)
+    calls = 0
+    monkeypatch.setattr(director_planner, "get_api_key", lambda _name: "test-key")
+    monkeypatch.setattr(
+        director_planner,
+        "create_ark_client",
+        lambda **_kwargs: object(),
+    )
+
+    def fake_stream(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return json.dumps(duplicate, ensure_ascii=False)
+
+    monkeypatch.setattr(director_planner, "call_llm_stream", fake_stream)
+
+    result = director_planner.plan_director(_events(), tmp_path)
+
+    assert calls == 1
+    assert result["plan"] == _director_plan()
+    receipt = json.loads(
+        (tmp_path / "director_plan_reconciliation.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert receipt["expected_sequence_ids"] == ["SEQ001", "SEQ002"]
+    assert receipt["original_sequence_ids"] == [
+        "SEQ001",
+        "SEQ001",
+        "SEQ002",
+    ]
+    assert receipt["reconciled_sequence_ids"] == ["SEQ001", "SEQ002"]
+    assert receipt["duplicate_count"] == 1
+    assert receipt["duplicates"][0]["retained_position"] == 1
+    assert receipt["duplicates"][0]["dropped_position"] == 2
+    assert receipt["source_sequence_loss_count"] == 0
+    receipt_text = json.dumps(receipt, ensure_ascii=False)
+    assert "另一个不具来源权威的导演提案" not in receipt_text
+    assert "建立人物孤独感" not in receipt_text
+
+
+@pytest.mark.parametrize(
+    ("sequence_ids", "message"),
+    [
+        (["SEQ001", "SEQ002", "SEQ001"], "non-adjacent duplicate"),
+        (["SEQ001", "SEQ003", "SEQ002"], "unexpected sequence_id"),
+        (["SEQ002", "SEQ001"], "coverage/order mismatch"),
+        (["SEQ001"], "coverage/order mismatch"),
+    ],
+)
+def test_director_planner_reconciliation_rejects_authority_changes(
+    sequence_ids,
+    message,
+):
+    templates = {
+        item["sequence_id"]: item for item in _director_plan()["sequences"]
+    }
+    unknown = {
+        **templates["SEQ002"],
+        "sequence_id": "SEQ003",
+    }
+    plan = {
+        "schema": director_planner.DIRECTOR_PLAN_SCHEMA,
+        "sequences": [
+            dict(templates.get(sequence_id, unknown))
+            for sequence_id in sequence_ids
+        ],
+    }
+
+    with pytest.raises(ValueError, match=message):
+        director_planner.validate_director_plan(plan, _events())
 
 
 def test_director_planner_retries_one_invalid_complete_response(

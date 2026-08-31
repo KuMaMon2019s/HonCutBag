@@ -51,6 +51,9 @@ def run_phase1_director(
     _banner("1", 9, "导演规划 (Director Planner)", dry_run)
     start = _now()
     plan_path = Path(output_dir) / "director_plan.json"
+    reconciliation_path = (
+        Path(output_dir) / "director_plan_reconciliation.json"
+    )
     try:
         from phases.phase1.director_planner import plan_director
         result = plan_director(events, output_dir, dry_run)
@@ -85,6 +88,7 @@ def run_phase1_director(
         return result
     except Exception as exc:
         plan_path.unlink(missing_ok=True)
+        reconciliation_path.unlink(missing_ok=True)
         if isinstance(exc, DirectorPlanningError):
             raise
         raise DirectorPlanningError(str(exc)) from exc

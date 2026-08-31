@@ -27,6 +27,7 @@ _RUN_OWNED_MARKERS = (
     "CHARACTERS.json",
     "PROJECT_VIDEO_SPEC.json",
     "director_plan.json",
+    "director_plan_reconciliation.json",
     "director_storyboard.json",
     "director_storyboard.png",
     "storyboard.png",
