@@ -612,7 +612,6 @@ def run_phase1_screenwriter(
         try:
             from phases.phase1.character_discoverer import (
                 CHARACTER_CONTEXT_SCHEMA_VERSION,
-                _is_human_character,
                 discover_characters,
             )
             from phases.phase1.character_roster import (
@@ -738,7 +737,6 @@ def run_phase1_screenwriter(
                 and all(
                     isinstance(character, dict)
                     and bool(str(character.get("name", "")).strip())
-                    and _is_human_character(str(character.get("name", "")).strip())
                     for character in characters
                 )
             )
@@ -752,9 +750,20 @@ def run_phase1_screenwriter(
                 except CharacterRosterError:
                     characters_result = None
                 else:
+                    roster_instance_counts = {
+                        str(entity["entity_id"]): int(entity["instance_count"])
+                        for entity in cached_roster["entities"]
+                    }
+                    cached_character_counts = {
+                        str(character.get("entity_id") or character.get("id") or ""):
+                        int(character.get("instance_count") or 1)
+                        for character in characters
+                    }
                     if (
                         cached_roster["roster_sha256"]
                         != characters_result["character_roster_sha256"]
+                        or len(cached_character_counts) != len(characters)
+                        or cached_character_counts != roster_instance_counts
                     ):
                         characters_result = None
                     else:

@@ -52,11 +52,96 @@ _HUMAN_GENDER_ATTRIBUTE_REFERENCES = frozenset({
     "female",
 })
 
+# These are identity categories, not screenplay participants.  Event ``who``
+# may legitimately contain a vehicle, weather system, prop, or environment
+# object because it owns an action.  Such a participant must remain in the
+# source event while staying out of the character-asset roster.
+_INTELLIGENT_CHARACTER_MARKERS = (
+    "无人机", "机器人", "机械臂", "传感器", "合成人", "复制体",
+    "android", "robot", "drone", "synthetic being",
+)
+_CHARACTER_ROLE_SUFFIXES = (
+    "机器人", "号", "型", "级", "者", "员", "师", "家", "王", "后",
+    "公主", "王子", "先生", "小姐", "佣兵", "机械体", "合成人", "复制体",
+    "复制品", "生命体", "机甲", "战士", "卫兵", "执法体", "仙女", "女子",
+    "少女", "女人", "男子", "男人", "女孩", "男孩", "姑娘", "妇人",
+    "夫人", "老者", "枪手", "剑客", "车手",
+)
+_NON_CHARACTER_EXACT_REFERENCES = frozenset({
+    "冷空气", "风", "雨", "雪", "雷", "电", "鸡", "鸭", "狗", "猫",
+    "鸟", "鱼", "桌子", "椅子", "车", "书", "刀", "剑", "枪", "武器",
+    "积水", "路面", "钢梁", "混凝土", "高楼", "玻璃", "灰尘",
+})
+_NON_CHARACTER_SUFFIXES = (
+    "霓虹牌", "电缆", "路面", "钢梁", "混凝土", "高楼", "塑料布",
+    "纸屑", "玻璃", "水浪", "灰尘", "碎石", "残骸", "护臂", "手掌",
+    "手指", "车门", "刀具", "武器", "护甲", "铠甲", "弓箭", "云海",
+    "山脉", "河流", "道路", "车辆", "建筑", "房间", "走廊", "列车",
+    "火车", "汽车", "卡车", "电车", "地铁", "飞船", "飞机", "舰船",
+    "轮船", "船只", "train", "vehicle", "car", "truck", "tram",
+    "subway", "aircraft", "spaceship", "ship",
+)
+_ABSTRACT_IDENTITY_REFERENCES = frozenset({
+    "说话者", "观察者", "记录者", "思考者", "行走者", "试验者", "打探人员",
+})
+_EXPLICIT_IDENTITY_MARKER = re.compile(
+    r"(?:代号|化名|名为|名叫|昵称(?:是|为)?|codename|alias(?:ed)?(?:\s+as)?)",
+    re.IGNORECASE,
+)
+
 
 def normalize_character_reference(value: Any) -> str:
     """Normalize presentation differences without erasing word boundaries."""
     text = unicodedata.normalize("NFKC", str(value or "")).casefold().strip()
     return re.sub(r"[\s·•_\-]+", "", text)
+
+
+def character_identity_is_explicitly_declared(
+    reference: Any,
+    evidence: Any,
+) -> bool:
+    """Return whether source prose explicitly promotes a label to identity."""
+
+    label = str(reference or "").strip()
+    text = str(evidence or "")
+    if not label or not text or not _EXPLICIT_IDENTITY_MARKER.search(text):
+        return False
+    marker_then_label = re.compile(
+        rf"{_EXPLICIT_IDENTITY_MARKER.pattern}\s*[：:]?\s*"
+        rf"[\"'“”‘’「」『』]?{re.escape(label)}[\"'“”‘’「」『』]?",
+        re.IGNORECASE,
+    )
+    return bool(marker_then_label.search(text))
+
+
+def is_character_identity_candidate(value: Any) -> bool:
+    """Classify whether a source participant requires a character asset.
+
+    This intentionally answers only clear identity-vs-object cases.  Unknown
+    labels remain candidates and are resolved fail-closed by Character Roster;
+    clear vehicles and environment objects remain event facts without becoming
+    faces, identity boards, or Phase 6 character references.
+    """
+
+    label = str(value or "").strip()
+    if not label or label.endswith("们"):
+        return False
+    lowered = label.casefold()
+    if any(marker in lowered for marker in _INTELLIGENT_CHARACTER_MARKERS):
+        return True
+    if label in _ABSTRACT_IDENTITY_REFERENCES:
+        return False
+    if any(label.endswith(suffix) for suffix in _CHARACTER_ROLE_SUFFIXES):
+        return True
+    if label in _NON_CHARACTER_EXACT_REFERENCES:
+        return False
+    for suffix in _NON_CHARACTER_SUFFIXES:
+        if re.fullmatch(r"[a-z ]+", suffix):
+            if re.search(rf"(?:^|[\s_-]){re.escape(suffix)}$", lowered):
+                return False
+        elif lowered.endswith(suffix):
+            return False
+    return True
 
 
 def human_gender_descriptor(value: Any) -> HumanGender | None:

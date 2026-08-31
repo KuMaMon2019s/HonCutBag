@@ -17,6 +17,7 @@ from phases.phase1.character_roster import (
     validate_character_roster,
 )
 from phases.phase1 import character_discoverer
+from phases.phase1 import phase1_screenwriter
 from tools.asset_packager import _resolve_char_ids
 from utils.semantic_contracts import bind_story_semantics
 
@@ -102,6 +103,131 @@ def test_roster_compiles_one_group_entity_with_three_stable_instances():
     ]
     assert len({instance["instance_id"] for instance in group["instances"]}) == 3
     assert validate_character_roster(first) == first
+
+
+def test_roster_excludes_non_character_action_subjects_without_erasing_events():
+    events = [
+        _event(1, ["磁悬浮列车"], "磁悬浮列车缓缓驶入站台。"),
+        _event(2, ["年轻男性"], "年轻男性站在车门前。"),
+    ]
+
+    roster = compile_character_roster(events)
+
+    assert [entity["display_name"] for entity in roster["entities"]] == [
+        "年轻男性"
+    ]
+    assert events[0]["who"] == ["磁悬浮列车"]
+    characters, _diagnostics = reconcile_character_observations(
+        [], roster, semantic_qa_enabled=False
+    )
+    ledger = bind_story_semantics(events, characters)
+    assert ledger["events"][0]["character_ids"] == []
+    assert events[0]["non_character_participants"] == ["磁悬浮列车"]
+
+
+def test_roster_classifies_english_vehicle_tokens_without_substring_collisions():
+    roster = compile_character_roster([
+        _event(1, ["future maglev train"], "A future maglev train enters."),
+        _event(2, ["Oscar"], "Oscar waits on the platform."),
+    ])
+
+    assert [entity["display_name"] for entity in roster["entities"]] == ["Oscar"]
+
+
+def test_roster_allows_an_explicitly_named_nonhuman_character():
+    roster = compile_character_roster([
+        _event(1, ["列车"], "代号“列车”的合成人走进站台。"),
+    ])
+
+    assert [entity["display_name"] for entity in roster["entities"]] == ["列车"]
+
+
+def test_roster_reconciles_unique_post_declaration_group_generic_alias():
+    events = [
+        _event(1, ["年轻男性"], "年轻男性站在车门前。", continuity_before="cut"),
+        _event(2, ["年轻男性"], "三名未来战斗人员突然出现。"),
+        _event(3, ["年轻男性", "第一名敌人"], "第一名敌人发动攻击。"),
+        _event(4, ["年轻男性", "第二名敌人"], "第二名敌人从侧面突袭。"),
+        _event(5, ["年轻男性", "第三名敌人"], "第三名敌人从顶部跃下。"),
+        _event(6, ["敌人", "年轻男性"], "敌人释放电磁冲击，年轻男性举起芯片。"),
+        _event(7, ["敌人", "年轻男性"], "年轻男性反击并控制敌人的手臂。"),
+    ]
+
+    roster = compile_character_roster(events)
+
+    assert len(roster["entities"]) == 2
+    assert sum(entity["instance_count"] for entity in roster["entities"]) == 4
+    group = next(entity for entity in roster["entities"] if entity["instance_count"] == 3)
+    assert all(
+        "敌人" in instance["source_mentions"]
+        for instance in group["instances"]
+    )
+    assert {
+        ref
+        for instance in group["instances"]
+        for ref in instance["event_refs"]
+    } >= {"event:6", "event:7"}
+
+    characters, _diagnostics = reconcile_character_observations(
+        [], roster, semantic_qa_enabled=False
+    )
+    ledger = bind_story_semantics(events, characters)
+    group_entity = next(
+        entity for entity in ledger["entities"] if len(entity["instance_ids"]) == 3
+    )
+    assert events[5]["character_instance_ids"][:3] == group_entity["instance_ids"]
+
+
+def test_roster_reconciles_english_group_generic_alias_deterministically():
+    events = [
+        _event(1, [], "Three fighters enter the compartment."),
+        _event(2, ["first enemy"], "The first enemy attacks."),
+        _event(3, ["second enemy"], "The second enemy blocks the exit."),
+        _event(4, ["third enemy"], "The third enemy drops from above."),
+        _event(5, ["enemy"], "The enemy releases an electromagnetic pulse."),
+    ]
+
+    roster = compile_character_roster(events)
+
+    assert len(roster["entities"]) == 1
+    assert roster["entities"][0]["instance_count"] == 3
+    assert all(
+        "enemy" in instance["source_mentions"]
+        for instance in roster["entities"][0]["instances"]
+    )
+
+
+@pytest.mark.parametrize("events", [
+    [
+        _event(1, [], "三名守卫进入，三名佣兵随后出现。"),
+        _event(2, ["第一名敌人"], "第一名敌人攻击。"),
+        _event(3, ["第二名敌人"], "第二名敌人攻击。"),
+        _event(4, ["第三名敌人"], "第三名敌人攻击。"),
+        _event(5, ["敌人"], "敌人继续逼近。"),
+    ],
+    [
+        _event(1, [], "三名战斗人员进入。"),
+        _event(2, ["第一名敌人"], "第一名敌人警戒。"),
+        _event(3, ["第二名敌人"], "第二名敌人警戒。"),
+        _event(4, ["第三名敌人"], "第三名敌人警戒。"),
+        _event(5, ["敌人", "第一名敌人"], "敌人与第一名敌人同时出现。"),
+    ],
+])
+def test_roster_fails_closed_on_ambiguous_group_generic_aliases(events):
+    with pytest.raises(CharacterRosterError):
+        compile_character_roster(events)
+
+
+def test_roster_keeps_explicit_prior_individual_separate_from_later_group():
+    roster = compile_character_roster([
+        _event(1, ["守卫"], "另一名守卫进入。", continuity_before="cut"),
+        _event(2, [], "三名守卫随后出现。"),
+        _event(3, ["第一名守卫"], "第一名守卫警戒。"),
+        _event(4, ["第二名守卫"], "第二名守卫警戒。"),
+        _event(5, ["第三名守卫"], "第三名守卫警戒。"),
+    ])
+
+    assert sorted(entity["instance_count"] for entity in roster["entities"]) == [1, 3]
 
 
 def test_roster_reconciles_one_source_proven_qualified_human_alias():
@@ -456,3 +582,4 @@ def test_character_discoverer_keeps_cardinality_out_of_the_model_owner():
     assert reconcile_character_observations.__module__.endswith(
         "phase1.character_roster"
     )
+    assert "_is_human_character" not in inspect.getsource(phase1_screenwriter)

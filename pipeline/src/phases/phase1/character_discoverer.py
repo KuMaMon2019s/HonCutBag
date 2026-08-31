@@ -57,6 +57,10 @@ from utils.character_reference_contracts import (
     identity_detail_prompt_items,
     normalize_character_reference_assets,
 )
+from utils.character_identity import (
+    character_identity_is_explicitly_declared,
+    is_character_identity_candidate,
+)
 
 
 # ─── LLM 配置 ───────────────────────────────────────────────────────────────
@@ -122,16 +126,9 @@ USER_PROMPT_TEMPLATE = (
 
 LLM_TIMEOUT = 600
 LLM_IDLE_TIMEOUT = 75
-ENTITY_SUFFIXES = (
-    "机器人", "号", "型", "级", "者", "员", "师", "家", "王", "后",
-    "公主", "王子", "先生", "小姐", "佣兵", "机械体", "合成人", "复制体",
-    "复制品", "生命体", "机甲", "战士", "卫兵", "执法体",
-    "仙女", "女子", "少女", "女人", "男子", "男人", "女孩", "男孩",
-    "姑娘", "妇人", "夫人", "老者",
-)
 MAX_ENTITY_NAME_CHINESE_CHARS = 12
 GENERIC_CHARACTER_NAMES = {"主角", "主人公", "男主", "女主", "人物", "他", "她", "它"}
-CHARACTER_CONTEXT_SCHEMA_VERSION = 14
+CHARACTER_CONTEXT_SCHEMA_VERSION = 15
 
 GENERIC_BACKGROUND_CHARACTER_NAMES = {
     "路人", "行人", "游客", "观众", "听众", "读者",
@@ -147,23 +144,6 @@ NON_CHARACTER_IDENTITY_SUFFIXES = (
     "刀", "剑", "枪", "武器", "门", "窗", "墙", "灯", "光",
     "云海", "山脉", "河流", "道路", "车辆", "建筑", "房间", "走廊",
 )
-ABSTRACT_CHARACTER_NAMES = {
-    "说话者", "观察者", "记录者", "思考者", "行走者", "试验者", "打探人员",
-}
-NON_HUMAN_EXACT_NAMES = {
-    "冷空气", "风", "雨", "雪", "雷", "电",
-    "鸡", "鸭", "狗", "猫", "鸟", "鱼",
-    "桌子", "椅子", "车", "书", "刀", "剑", "枪", "武器",
-    "积水", "路面", "钢梁", "混凝土", "高楼", "玻璃", "灰尘",
-}
-NON_HUMAN_ENTITY_SUFFIXES = (
-    "霓虹牌", "电缆", "路面", "钢梁", "混凝土", "高楼", "塑料布",
-    "纸屑", "玻璃", "水浪", "灰尘", "碎石", "残骸", "护臂", "手掌",
-    "手指", "车门", "刀具", "武器", "护甲", "铠甲", "弓箭",
-    "云海", "山脉", "河流", "道路", "车辆", "建筑", "房间", "走廊",
-)
-
-
 def _get_client() -> OpenAI:
     """
     创建 OpenAI 客户端
@@ -303,20 +283,10 @@ def _has_explicit_identity_declaration(
 ) -> bool:
     """Promote a generic label only when the source explicitly names it."""
 
-    label = str(name or "").strip()
-    if not label or not info:
+    if not info:
         return False
-    marker = (
-        r"(?:代号|化名|名为|名叫|昵称(?:是|为)?|"
-        r"codename|alias(?:ed)?(?:\s+as)?)"
-    )
-    declaration = re.compile(
-        rf"{marker}\s*[：:]?\s*[\"'“”‘’「」『』]?{re.escape(label)}"
-        r"[\"'“”‘’「」『』]?",
-        re.IGNORECASE,
-    )
     return any(
-        declaration.search(str(excerpt or ""))
+        character_identity_is_explicitly_declared(name, excerpt)
         for excerpt in (info.get("source_excerpts") or [])
     )
 
@@ -336,35 +306,7 @@ def _is_human_character(name: str) -> bool:
     - 无人机、机器人等智能设备（可作为主角）
     - 工程师、运维员等职业角色
     """
-    name = str(name or "").strip()
-    if not name:
-        return False
-
-    # 排除复数群体
-    if name.endswith("们"):
-        return False
-    
-    # 白名单：无人机、机器人等智能设备可作为主角
-    robot_whitelist = ["无人机", "机器人", "机械臂", "传感器"]
-    if any(keyword in name for keyword in robot_whitelist):
-        return True
-    
-    # Suffixes such as “员/者/师” are commonly active occupations and may not
-    # be rejected generically. Only exact abstract placeholders are excluded.
-    if name in ABSTRACT_CHARACTER_NAMES:
-        return False
-
-    # A declared character/entity suffix wins over an object word elsewhere
-    # in the label (for example a weapon-carrying fighter or racing driver).
-    if any(name.endswith(suffix) for suffix in ENTITY_SUFFIXES):
-        return True
-
-    if name in NON_HUMAN_EXACT_NAMES:
-        return False
-    if any(name.endswith(suffix) for suffix in NON_HUMAN_ENTITY_SUFFIXES):
-        return False
-    
-    return True
+    return is_character_identity_candidate(name)
 
 
 def _filter_non_human_characters(stats: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:

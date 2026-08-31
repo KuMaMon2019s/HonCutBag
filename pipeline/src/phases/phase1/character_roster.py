@@ -23,9 +23,11 @@ from schemas.understanding import (
     CharacterRosterV1Understanding,
 )
 from utils.character_identity import (
+    character_identity_is_explicitly_declared,
     character_reference_is_explicit,
     compatible_human_reference_descriptors,
     human_gender_descriptor,
+    is_character_identity_candidate,
     is_gender_attribute_reference,
     normalize_character_reference,
     parse_human_reference_descriptor,
@@ -486,7 +488,13 @@ def _group_declarations(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for match in sorted(matches, key=lambda item: item.start()):
             count = _positive_integer(match.group("count"))
             label = re.sub(r"\s+", " ", match.group("label")).strip(" ,，。；;.-")
-            if count is None or not _plausible_group_label(label):
+            introduction_prefix = excerpt[max(0, match.start() - 3):match.start()]
+            if (
+                count is None
+                or count < 2
+                or re.search(r"(?:另|另外|新)$", introduction_prefix)
+                or not _plausible_group_label(label)
+            ):
                 continue
             declarations.append({
                 "count": count,
@@ -599,6 +607,13 @@ def compile_character_roster(
             mention = str(value or "").strip()
             if not mention or mention.casefold() in _GENERIC_SOURCE_REFERENCES:
                 continue
+            if not is_character_identity_candidate(mention) and not (
+                character_identity_is_explicitly_declared(
+                    mention,
+                    _event_source_text(event),
+                )
+            ):
+                continue
             canonical = alias_to_canonical.get(mention, mention)
             mention_events[canonical].append((position, event))
             mention_aliases[canonical] = _ordered_unique([
@@ -663,6 +678,61 @@ def compile_character_roster(
             )
             for ordinal in expected
         ]
+        ordinal_source_mentions = {
+            alias
+            for names in ordinal_mentions.values()
+            for name in names
+            for alias in mention_aliases.get(name, [name])
+        }
+        group_generic_aliases: list[str] = []
+        for mention in sequence_mentions:
+            if (
+                _identity_ordinal(mention) is not None
+                or mention == declaration["label"]
+                or _ordinal_base(mention) not in bases
+            ):
+                continue
+            event_pairs = mention_events.get(mention, [])
+            # A label that existed before the counted group is an independent
+            # source identity, not a retroactive alias of the group.
+            if not event_pairs or any(
+                position <= declaration["event_position"]
+                for position, _event in event_pairs
+            ):
+                continue
+            if any(
+                _source_introduces_distinct_reference(
+                    _event_source_text(event),
+                    mention,
+                )
+                for _position, event in event_pairs
+            ):
+                continue
+            for position, event in event_pairs:
+                source_text = _event_source_text(event)
+                if not character_reference_is_explicit(mention, source_text):
+                    raise CharacterRosterError(
+                        f"group generic reference lacks source evidence in "
+                        f"{_event_ref(event, position)}: {mention}"
+                    )
+                raw_who = event.get("who") or []
+                if isinstance(raw_who, str):
+                    raw_who = [raw_who]
+                if any(
+                    source_mention in raw_who
+                    for source_mention in ordinal_source_mentions
+                ):
+                    raise CharacterRosterError(
+                        f"group generic reference co-occurs with a numbered "
+                        f"member in {_event_ref(event, position)}: {mention}"
+                    )
+            group_generic_aliases.append(mention)
+
+        if group_generic_aliases:
+            instance_mentions = [
+                _ordered_unique([*mentions, *group_generic_aliases])
+                for mentions in instance_mentions
+            ]
         declaration_pair = (
             declaration["event_position"],
             events[declaration["event_position"] - 1],
@@ -682,10 +752,23 @@ def compile_character_roster(
     # Explicit numbered people without a proven group remain separate.  Plain
     # repeated mentions form one independent entity with one instance.
     declared_group_labels = {declaration["label"] for declaration in declarations}
+    first_group_declaration_position = {
+        label: min(
+            declaration["event_position"]
+            for declaration in declarations
+            if declaration["label"] == label
+        )
+        for label in declared_group_labels
+    }
     for mention, event_pairs in sorted(
         mention_events.items(), key=lambda item: item[1][0][0]
     ):
-        if mention in grouped_mentions or mention in declared_group_labels:
+        if mention in grouped_mentions:
+            continue
+        if mention in declared_group_labels and not any(
+            position < first_group_declaration_position[mention]
+            for position, _event in event_pairs
+        ):
             continue
         records.append(_entity_record(
             display_name=mention,

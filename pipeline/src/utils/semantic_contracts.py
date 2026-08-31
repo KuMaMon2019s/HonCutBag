@@ -8,6 +8,8 @@ from typing import Any
 
 from schemas.understanding import SemanticUnderstandingLedger
 from utils.character_identity import (
+    character_identity_is_explicitly_declared,
+    is_character_identity_candidate,
     normalize_character_reference,
     resolve_character_id,
 )
@@ -140,9 +142,28 @@ def bind_story_semantics(
         participant_refs: list[dict[str, str]] = []
         character_ids: list[str] = []
         entity_ids: list[str] = []
+        non_character_participants: list[str] = []
         for mention in mentions:
             entity_id = _character_id_for_mention(mention, characters)
             if entity_id is None:
+                source_evidence = " ".join(
+                    str(event.get(field) or "")
+                    for field in (
+                        "source_excerpt",
+                        "what",
+                        "start_state",
+                        "causal_link",
+                    )
+                )
+                if (
+                    not is_character_identity_candidate(mention)
+                    and not character_identity_is_explicitly_declared(
+                        mention,
+                        source_evidence,
+                    )
+                ):
+                    non_character_participants.append(mention)
+                    continue
                 raise ValueError(
                     f"unbound participant {mention!r} in event "
                     f"{event_id}"
@@ -190,6 +211,12 @@ def bind_story_semantics(
         event["character_ids"] = character_ids
         event["character_instance_ids"] = character_ids
         event["character_entity_ids"] = entity_ids
+        if non_character_participants:
+            event["non_character_participants"] = list(dict.fromkeys(
+                non_character_participants
+            ))
+        else:
+            event.pop("non_character_participants", None)
         event_records.append({
             "event_id": event_id,
             "action_unit_id": str(event.get("action_unit_id") or ""),
