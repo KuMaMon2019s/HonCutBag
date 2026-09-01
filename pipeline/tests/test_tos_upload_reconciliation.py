@@ -32,6 +32,29 @@ def _configure_tos(monkeypatch) -> None:
     )
 
 
+def test_tos_loader_uses_canonical_project_env_without_overriding_process(
+    monkeypatch, tmp_path
+):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "TOS_ACCESS_KEY=project-ak\n"
+        "TOS_SECRET_KEY=project-sk\n"
+        "TOS_BUCKET=project-bucket\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(tos_uploader, "resolve_project_env_file", lambda: env_file)
+    monkeypatch.setenv("TOS_ACCESS_KEY", "explicit-ak")
+    monkeypatch.delenv("TOS_SECRET_KEY", raising=False)
+    monkeypatch.delenv("TOS_BUCKET", raising=False)
+
+    resolved = tos_uploader._load_env_file()
+
+    assert resolved == env_file
+    assert tos_uploader.os.environ["TOS_ACCESS_KEY"] == "explicit-ak"
+    assert tos_uploader.os.environ["TOS_SECRET_KEY"] == "project-sk"
+    assert tos_uploader.os.environ["TOS_BUCKET"] == "project-bucket"
+
+
 class _FakeTOSClient:
     def __init__(self, *, head_responses, put_response=None, put_error=None):
         self.head_responses = list(head_responses)

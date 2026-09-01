@@ -20,7 +20,9 @@ from pathlib import Path
 from typing import Optional
 
 import httpx2 as httpx
+from dotenv import load_dotenv
 
+from utils.config import resolve_project_env_file
 from utils.provider_request_guard import (
     MediaUploadTimeouts,
     effective_media_upload_timeouts,
@@ -48,45 +50,17 @@ IMAGE_TRANSPORT_METADATA = {
 TOS_CONTENT_SHA256_METADATA = "x-tos-meta-honcut-sha256"
 
 
-# ─── .env loading (same pattern as config.py) ────────────────────────────────
+# ─── Canonical project environment loading ──────────────────────────────────
 
-def _load_env_file():
-    """Load .env from project root (pipeline/.env), matching config.py behavior."""
-    env_file = Path(__file__).parent.parent.parent / ".env"
-    if not env_file.exists():
-        # Also try pipeline/.env as fallback
-        env_file = Path(__file__).parent.parent / ".env"
-    if not env_file.exists():
-        return
-    try:
-        with open(env_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "=" in line:
-                    key, value = line.split("=", 1)
-                    key = key.strip()
-                    value = value.strip()
-                    # Strip quotes
-                    if value and value[0] in ('"', "'") and value[-1] == value[0]:
-                        value = value[1:-1]
-                    if key and key not in os.environ:
-                        os.environ[key] = value
-    except Exception:
-        pass
+def _load_env_file() -> Path:
+    """Load the canonical checkout or shared-worktree project environment."""
+    env_file = resolve_project_env_file()
+    if env_file.is_file():
+        load_dotenv(env_file, override=False)
+    return env_file
 
 
 _load_env_file()
-
-# Also try python-dotenv if available
-try:
-    from dotenv import load_dotenv
-    _env_file = Path(__file__).parent.parent / ".env"
-    if _env_file.exists():
-        load_dotenv(_env_file, override=False)
-except ImportError:
-    pass
 
 
 # ─── TOS config ───────────────────────────────────────────────────────────────
