@@ -11,6 +11,7 @@ from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx2 as httpx
 import numpy as np
 import pytest
 from PIL import Image
@@ -2274,7 +2275,10 @@ def test_post_primary_bridge_uses_actual_source_tail_and_target_head(
         uploaded.append(len(uploaded) + 1)
         return (first_url, second_url)[uploaded[-1] - 1]
 
-    monkeypatch.setattr("clients.tos_uploader.upload_image", fake_upload)
+    monkeypatch.setattr(
+        "clients.tos_uploader.upload_image_required",
+        fake_upload,
+    )
     monkeypatch.setattr(
         "tools.asset_packager.build_content_for_shot",
         lambda **_kwargs: pytest.fail("first/last bridge must not upload reference media"),
@@ -2965,11 +2969,35 @@ def test_seedance_upload_preserves_webp_transport_metadata(monkeypatch):
         },
     )
 
-    def fake_put(url, data, headers, timeout):
-        observed.update(url=url, data=data, headers=headers, timeout=timeout)
-        return SimpleNamespace(status_code=200, text="")
+    uploaded = False
 
-    monkeypatch.setattr(tos_uploader.requests, "put", fake_put)
+    def handle(request):
+        nonlocal uploaded
+        if request.method == "HEAD":
+            if not uploaded:
+                return httpx.Response(404)
+            return httpx.Response(
+                200,
+                headers={
+                    "Content-Length": str(len(image_buffer.getvalue())),
+                    tos_uploader.TOS_CONTENT_SHA256_METADATA: hashlib.sha256(
+                        image_buffer.getvalue()
+                    ).hexdigest(),
+                },
+            )
+        uploaded = True
+        observed.update(
+            url=str(request.url),
+            data=request.content,
+            headers=request.headers,
+        )
+        return httpx.Response(200)
+
+    monkeypatch.setattr(
+        tos_uploader,
+        "_new_tos_http_client",
+        lambda _timeouts: httpx.Client(transport=httpx.MockTransport(handle)),
+    )
 
     tos_uploader.upload_image(image_buffer.getvalue(), "image/png")
 
@@ -2994,22 +3022,22 @@ def test_content_addressed_tos_upload_reuses_confirmed_remote_object(monkeypatch
         },
     )
 
-    def fake_head(url, headers, timeout):
-        assert url.endswith(object_key)
-        assert headers["Authorization"].startswith("TOS4-HMAC-SHA256 ")
-        assert timeout == 10
-        return SimpleNamespace(
-            status_code=200,
-            headers={"Content-Length": str(len(payload))},
+    def handle(request):
+        assert request.method == "HEAD"
+        assert str(request.url).endswith(object_key)
+        assert request.headers["Authorization"].startswith("TOS4-HMAC-SHA256 ")
+        return httpx.Response(
+            200,
+            headers={
+                "Content-Length": str(len(payload)),
+                tos_uploader.TOS_CONTENT_SHA256_METADATA: payload_sha256,
+            },
         )
 
-    monkeypatch.setattr(tos_uploader.requests, "head", fake_head)
     monkeypatch.setattr(
-        tos_uploader.requests,
-        "put",
-        lambda *_args, **_kwargs: pytest.fail(
-            "confirmed content-addressed object must not be uploaded again"
-        ),
+        tos_uploader,
+        "_new_tos_http_client",
+        lambda _timeouts: httpx.Client(transport=httpx.MockTransport(handle)),
     )
 
     signed_url = tos_uploader.upload_file(
@@ -3128,8 +3156,8 @@ def test_video_extension_uses_reference_video_with_persistent_image_anchors(monk
 
     monkeypatch.setattr(
         tos_uploader,
-        "upload_media_file",
-        lambda path, prefix: chunk_url,
+        "upload_media_file_required",
+        lambda path, prefix, **_kwargs: chunk_url,
     )
 
     def fake_submit(content, **kwargs):
@@ -4089,8 +4117,8 @@ def test_extension_provider_content_keeps_images_as_anchors_and_adds_video(monke
         ],
     )
     monkeypatch.setattr(
-        "clients.tos_uploader.upload_media_file",
-        fake_media_upload,
+        "clients.tos_uploader.upload_media_file_required",
+        lambda path, prefix, **_kwargs: fake_media_upload(path, prefix),
     )
     monkeypatch.setattr(
         "clients.tos_uploader.upload_image",
@@ -4364,8 +4392,11 @@ def test_extension_provider_content_never_exceeds_seedance_image_budget(monkeypa
 
     monkeypatch.setattr("tools.asset_packager.build_content_for_shot", fake_build)
     monkeypatch.setattr(
-        "clients.tos_uploader.upload_media_file",
-        lambda path, prefix: _signed_tos_url(monkeypatch, f"fixture/{Path(path).name}"),
+        "clients.tos_uploader.upload_media_file_required",
+        lambda path, prefix, **_kwargs: _signed_tos_url(
+            monkeypatch,
+            f"fixture/{Path(path).name}",
+        ),
     )
     monkeypatch.setattr(
         "quality.continuity_seam.extract_video_tail_window",

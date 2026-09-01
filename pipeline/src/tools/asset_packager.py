@@ -1229,10 +1229,7 @@ def build_content_for_shot(
         else:
             img_data = asset["path"].read_bytes()
 
-        tos_url = tos_uploader.require_tos_url(
-            tos_uploader.upload_image(img_data, "image/png"),
-            label=f"{asset['role']} image {asset['path'].name}",
-        )
+        tos_url = tos_uploader.upload_image_required(img_data, "image/png")
         content_item = {
             "type": "image_url",
             "image_url": {"url": tos_url},

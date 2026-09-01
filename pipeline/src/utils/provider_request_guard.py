@@ -16,6 +16,32 @@ from typing import Any, Callable, Iterator
 BeforeProviderRequest = Callable[[dict[str, Any]], Any]
 AfterProviderRequest = Callable[[Any, dict[str, Any]], None]
 FailedProviderRequest = Callable[[Any, dict[str, Any]], None]
+PrepareMediaUpload = Callable[[dict[str, Any]], tuple[Any, str]]
+MediaUploadTransition = Callable[[Any, dict[str, Any]], None]
+MediaUploadTimeoutResolver = Callable[[int], "MediaUploadTimeouts"]
+
+
+@dataclass(frozen=True)
+class MediaUploadTimeouts:
+    """Primitive timeout values passed from Runtime to a media transport."""
+
+    connect_seconds: float
+    read_seconds: float
+    write_seconds: float
+    pool_seconds: float
+    reconciliation_seconds: float
+
+    def __post_init__(self) -> None:
+        for name in (
+            "connect_seconds",
+            "read_seconds",
+            "write_seconds",
+            "pool_seconds",
+            "reconciliation_seconds",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+                raise ValueError(f"{name} must be greater than zero")
 
 
 @dataclass(frozen=True)
@@ -26,8 +52,19 @@ class _ProviderRequestGuard:
     failed_provider_request: FailedProviderRequest | None
 
 
+@dataclass(frozen=True)
+class _MediaUploadGuard:
+    timeout_resolver: MediaUploadTimeoutResolver
+    prepare_upload: PrepareMediaUpload | None
+    submission_started: MediaUploadTransition | None
+    upload_completed: MediaUploadTransition | None
+    upload_failed: MediaUploadTransition | None
+
+
 _guard_lock = threading.RLock()
 _active_guard: _ProviderRequestGuard | None = None
+_media_guard_lock = threading.RLock()
+_active_media_guard: _MediaUploadGuard | None = None
 
 
 @contextmanager
@@ -41,13 +78,8 @@ def provider_request_guard_scope(
     """Install one transport guard for the isolated acceptance process."""
 
     global _active_guard
-    if (
-        max_retries is not None
-        and (
-            isinstance(max_retries, bool)
-            or not isinstance(max_retries, int)
-            or max_retries < 0
-        )
+    if max_retries is not None and (
+        isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 0
     ):
         raise ValueError("transport max_retries must be a non-negative integer")
     guard = _ProviderRequestGuard(
@@ -72,6 +104,94 @@ def provider_request_guard_scope(
 def _current_guard() -> _ProviderRequestGuard | None:
     with _guard_lock:
         return _active_guard
+
+
+@contextmanager
+def media_upload_guard_scope(
+    *,
+    timeout_resolver: MediaUploadTimeoutResolver,
+    prepare_upload: PrepareMediaUpload | None = None,
+    submission_started: MediaUploadTransition | None = None,
+    upload_completed: MediaUploadTransition | None = None,
+    upload_failed: MediaUploadTransition | None = None,
+) -> Iterator[None]:
+    """Install one Runtime-owned upload policy for all worker threads."""
+
+    global _active_media_guard
+    guard = _MediaUploadGuard(
+        timeout_resolver=timeout_resolver,
+        prepare_upload=prepare_upload,
+        submission_started=submission_started,
+        upload_completed=upload_completed,
+        upload_failed=upload_failed,
+    )
+    with _media_guard_lock:
+        if _active_media_guard is not None:
+            raise RuntimeError("a media upload guard is already active")
+        _active_media_guard = guard
+    try:
+        yield
+    finally:
+        with _media_guard_lock:
+            if _active_media_guard is not guard:
+                raise RuntimeError("media upload guard ownership changed")
+            _active_media_guard = None
+
+
+def _current_media_guard() -> _MediaUploadGuard | None:
+    with _media_guard_lock:
+        return _active_media_guard
+
+
+def effective_media_upload_timeouts(
+    payload_bytes: int,
+    *,
+    fallback: MediaUploadTimeouts,
+) -> MediaUploadTimeouts:
+    """Resolve payload-aware timeouts from the active Runtime policy."""
+
+    if isinstance(payload_bytes, bool) or not isinstance(payload_bytes, int) or payload_bytes < 0:
+        raise ValueError("payload_bytes must be a non-negative integer")
+    guard = _current_media_guard()
+    if guard is None:
+        return fallback
+    return guard.timeout_resolver(payload_bytes)
+
+
+def media_upload_prepared(payload: dict[str, Any]) -> tuple[Any, str]:
+    """Read or create a durable upload record before any network operation."""
+
+    guard = _current_media_guard()
+    if guard is None or guard.prepare_upload is None:
+        return None, "prepared"
+    return guard.prepare_upload(payload)
+
+
+def media_upload_submission_started(token: Any, payload: dict[str, Any]) -> None:
+    """Persist submission uncertainty immediately before the authoritative PUT."""
+
+    guard = _current_media_guard()
+    if guard is None or guard.submission_started is None or token is None:
+        return
+    guard.submission_started(token, payload)
+
+
+def media_upload_completed(token: Any, outcome: dict[str, Any]) -> None:
+    """Settle a verified upload or content-addressed reconciliation."""
+
+    guard = _current_media_guard()
+    if guard is None or guard.upload_completed is None or token is None:
+        return
+    guard.upload_completed(token, outcome)
+
+
+def media_upload_failed(token: Any, outcome: dict[str, Any]) -> None:
+    """Persist a known rejection or unresolved upload without resubmitting."""
+
+    guard = _current_media_guard()
+    if guard is None or guard.upload_failed is None or token is None:
+        return
+    guard.upload_failed(token, outcome)
 
 
 def effective_transport_retries(default_retries: int) -> int:

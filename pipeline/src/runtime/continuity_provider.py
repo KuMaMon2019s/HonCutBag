@@ -1381,7 +1381,7 @@ def _first_last_bridge_content(
     target_output_path: Path,
 ) -> list[dict[str, Any]]:
     """Bind a transition to completed source-tail and target-head frames."""
-    from clients.tos_uploader import require_tos_url, upload_image
+    from clients.tos_uploader import upload_image_required
     from quality.continuity_seam import (
         extract_video_head_frame,
         extract_video_tail_frame,
@@ -1412,13 +1412,13 @@ def _first_last_bridge_content(
 
     first_payload, first_content_type = _seedance_reference_image_payload(tail_frame)
     last_payload, last_content_type = _seedance_reference_image_payload(head_frame)
-    first_url = require_tos_url(
-        upload_image(first_payload, first_content_type),
-        label="secondary-storyboard first-frame image",
+    first_url = upload_image_required(
+        first_payload,
+        first_content_type,
     )
-    last_url = require_tos_url(
-        upload_image(last_payload, last_content_type),
-        label="secondary-storyboard last-frame image",
+    last_url = upload_image_required(
+        last_payload,
+        last_content_type,
     )
     directive = (
         "图片1来自已完成的上一一级分镜视频真实尾帧，必须作为新视频第一帧；"

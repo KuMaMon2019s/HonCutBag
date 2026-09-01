@@ -126,7 +126,7 @@ def test_f3_two_characters_bind_distinct_actual_reference_numbers(
     character_reference_board(tmp_path, "jin", color_seed=2)
     monkeypatch.setattr(
         tos_uploader,
-        "upload_image",
+        "upload_image_required",
         lambda image_bytes, content_type: _signed_tos_url(
             monkeypatch, f"fixture/{image_bytes[:1].hex()}.png"
         ),
@@ -301,7 +301,7 @@ def test_action_phantom_with_cinematic_frame_uses_numbered_omni_references(
     storyboard_url = _signed_tos_url(monkeypatch, "fixture/s.png")
     monkeypatch.setattr(
         tos_uploader,
-        "upload_image",
+        "upload_image_required",
         lambda image_bytes, content_type: storyboard_url,
     )
 

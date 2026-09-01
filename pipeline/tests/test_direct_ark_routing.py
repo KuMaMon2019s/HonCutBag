@@ -294,7 +294,7 @@ def _stub_tos_upload(monkeypatch):
     monkeypatch.setenv("TOS_BUCKET", "honcut-fixtures")
     monkeypatch.setenv("TOS_ENDPOINT", "tos-cn-beijing.volces.com")
     monkeypatch.setattr(
-        "clients.tos_uploader.upload_image",
+        "clients.tos_uploader.upload_image_required",
         lambda image_data, content_type: tos_uploader.get_signed_url(
             f"fixture/{len(image_data)}.png"
         ),
@@ -390,9 +390,15 @@ def test_video_image_packaging_fails_closed_when_any_tos_upload_fails(
     def fail_second_upload(_image_data, _content_type):
         nonlocal upload_count
         upload_count += 1
-        return first_url if upload_count == 1 else None
+        if upload_count == 1:
+            return first_url
+        raise RuntimeError("TOS upload failed for last_frame")
 
-    monkeypatch.setattr(tos_uploader, "upload_image", fail_second_upload)
+    monkeypatch.setattr(
+        tos_uploader,
+        "upload_image_required",
+        fail_second_upload,
+    )
 
     with pytest.raises(RuntimeError, match="TOS upload failed.*last_frame"):
         asset_packager.build_content_for_shot(
@@ -465,8 +471,8 @@ def test_chain_relay_uploads_the_image_to_tos(monkeypatch):
     relay_url = _signed_tos_url(monkeypatch, "fixture/relay.jpg")
     monkeypatch.setattr(
         tos_uploader,
-        "base64_to_signed_url",
-        lambda value: observed.append(value) or relay_url,
+        "base64_image_to_signed_url_required",
+        lambda value, **_kwargs: observed.append(value) or relay_url,
     )
 
     relayed = pipeline_core._apply_chain_relay(content, "relay-data", "S01")
@@ -477,7 +483,13 @@ def test_chain_relay_uploads_the_image_to_tos(monkeypatch):
 
 
 def test_chain_relay_fails_closed_when_tos_upload_fails(monkeypatch):
-    monkeypatch.setattr(tos_uploader, "base64_to_signed_url", lambda _value: None)
+    monkeypatch.setattr(
+        tos_uploader,
+        "base64_image_to_signed_url_required",
+        lambda _value, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("TOS upload failed for chain relay")
+        ),
+    )
 
     with pytest.raises(RuntimeError, match="TOS upload failed.*chain relay"):
         pipeline_core._apply_chain_relay(
@@ -977,8 +989,10 @@ def test_seedance_direct_first_frame_is_uploaded_to_tos_before_submit(monkeypatc
 
     monkeypatch.setattr(
         tos_uploader,
-        "base64_to_signed_url",
-        lambda value: first_frame_url if value == "first-frame-b64" else None,
+        "base64_image_to_signed_url_required",
+        lambda value, **_kwargs: (
+            first_frame_url if value == "first-frame-b64" else None
+        ),
     )
     monkeypatch.setattr(
         seedance_client.requests,
@@ -1006,17 +1020,17 @@ def test_seedance_direct_first_frame_is_uploaded_to_tos_before_submit(monkeypatc
     [
         (
             {"first_frame_base64": "first-frame"},
-            "base64_to_signed_url",
+            "base64_image_to_signed_url_required",
             "first-frame image",
         ),
         (
             {"reference_image_base64": "reference-image"},
-            "base64_to_signed_url",
+            "base64_image_to_signed_url_required",
             "reference image",
         ),
         (
             {"reference_video_base64": "reference-video"},
-            "base64_video_to_signed_url",
+            "base64_video_to_signed_url_required",
             "reference video",
         ),
     ],
@@ -1027,7 +1041,13 @@ def test_seedance_direct_media_upload_failure_never_reaches_provider(
     uploader_name,
     message,
 ):
-    monkeypatch.setattr(tos_uploader, uploader_name, lambda _value: None)
+    monkeypatch.setattr(
+        tos_uploader,
+        uploader_name,
+        lambda _value, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError(f"TOS upload failed for {message}")
+        ),
+    )
     monkeypatch.setattr(
         seedance_client.requests,
         "post",

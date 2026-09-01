@@ -244,7 +244,11 @@ online video generation also requires `TOS_ACCESS_KEY`, `TOS_SECRET_KEY`, and
 `TOS_BUCKET`; upload failure stops before the Provider call rather than
 silently degrading to text-only generation. Generated videos are downloaded
 directly from the Provider; they are uploaded to TOS only when reused as input
-material for extension, editing, or reference generation.
+material for extension, editing, or reference generation. TOS object keys bind
+the final transmitted bytes, and `TOS_UPLOAD_LEDGER.json` records the single
+authoritative PUT before network submission. A write timeout triggers one
+read-only HEAD reconciliation; it never triggers a second PUT. An unverified
+outcome remains `submission_uncertain` and blocks automatic resume.
 
 ## Development
 

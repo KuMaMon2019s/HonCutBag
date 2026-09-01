@@ -136,6 +136,12 @@ def test_stage0_preflight_is_zero_request_and_has_finite_hard_limits(
         hard_limits["phase1_text_requests"]
         + hard_limits["phase1_director_storyboard_image_requests"]
     )
+    assert hard_limits["tos_put_attempts"] == (
+        hard_limits["multimodal_observation_requests"]
+        * hard_limits["max_tos_inputs_per_multimodal_request"]
+        + hard_limits["seedance_video_submissions"]
+        * hard_limits["max_tos_inputs_per_video_submission"]
+    )
     assert receipt["configuration"]["automatic_reshoot"] is False
     assert receipt["configuration"]["phase1_semantic_qa"] is False
     assert receipt["configuration"]["character_library_configured"] is False
@@ -488,7 +494,10 @@ def test_full_chain_failure_persists_aggregated_paid_request_count(
             "story_sha256": acceptance._sha256(story),
             "expectations_sha256": "b" * 64,
         },
-        "authorized_hard_limits": {"phase1_provider_requests": 2},
+        "authorized_hard_limits": {
+            "phase1_provider_requests": 2,
+            "tos_put_attempts": 1,
+        },
     }
 
     def fail_phase1(workspace, *_args, **_kwargs):

@@ -60,6 +60,11 @@ from runtime.continuity_provider import (
 from runtime.generation_tasks import GenerationTaskStore
 from runtime.pipeline_execution import run_pipeline
 from runtime.provider_attempt_policy import provider_attempt_scope
+from runtime.tos_uploads import (
+    TOS_UPLOAD_LEDGER_NAME,
+    TOS_UPLOAD_LEDGER_SCHEMA,
+    tos_upload_execution_scope,
+)
 from utils.config import (
     ARK_AGENT_CREDENTIAL_SOURCE,
     DEFAULT_MULTIMODAL_MODEL,
@@ -542,6 +547,19 @@ def build_stage0_preflight(
         + 16
     )
     phase1_director_storyboard_image_limit = 1
+    seedream_image_request_limit = (
+        1
+        + max_primary_shots * 6
+        + character_instances * 6
+    )
+    multimodal_observation_request_limit = (
+        character_instances * 8
+        + max_primary_shots * 2
+        + max_pxx
+    )
+    seedance_video_submission_limit = max_pxx + max(0, max_primary_shots - 1)
+    max_tos_inputs_per_multimodal_request = 9
+    max_tos_inputs_per_video_submission = caps.max_reference_images + 1
     hard_limits = {
         "phase1_text_requests": phase1_text_request_limit,
         "phase1_director_storyboard_image_requests": (
@@ -551,17 +569,21 @@ def build_stage0_preflight(
             phase1_text_request_limit
             + phase1_director_storyboard_image_limit
         ),
-        "seedream_image_requests": (
-            1
-            + max_primary_shots * 6
-            + character_instances * 6
+        "seedream_image_requests": seedream_image_request_limit,
+        "multimodal_observation_requests": multimodal_observation_request_limit,
+        "seedance_video_submissions": seedance_video_submission_limit,
+        "tos_put_attempts": (
+            multimodal_observation_request_limit
+            * max_tos_inputs_per_multimodal_request
+            + seedance_video_submission_limit
+            * max_tos_inputs_per_video_submission
         ),
-        "multimodal_observation_requests": (
-            character_instances * 8
-            + max_primary_shots * 2
-            + max_pxx
+        "max_tos_inputs_per_multimodal_request": (
+            max_tos_inputs_per_multimodal_request
         ),
-        "seedance_video_submissions": max_pxx + max(0, max_primary_shots - 1),
+        "max_tos_inputs_per_video_submission": (
+            max_tos_inputs_per_video_submission
+        ),
     }
     source_identity = _repo_source_identity()
     regression = _regression_evidence(
@@ -742,6 +764,7 @@ def _run_selected_phases(
     *,
     resume: bool,
     phase1_request_limit: int | None = None,
+    tos_upload_hard_limit: int | None = None,
 ) -> dict[str, Any]:
     owner = _AcceptancePhaseOwner(
         workspace,
@@ -752,6 +775,7 @@ def _run_selected_phases(
         skip_phase=[phase for phase in ALL_PHASES if phase not in phases],
         resume=resume,
         _phase_owner=owner,
+        _tos_upload_hard_limit=tos_upload_hard_limit,
     )
     if not isinstance(result, dict) or result.get("status") != "completed":
         raise RuntimeError(
@@ -854,6 +878,23 @@ def _paid_request_summary(workspace: Path) -> dict[str, Any]:
             "sha256": _sha256(task_db),
             "status": "generation_task_store",
             "provider_request_count": video_submissions,
+        })
+
+    tos_ledger_path = workspace / TOS_UPLOAD_LEDGER_NAME
+    if tos_ledger_path.is_file():
+        tos_ledger = _read_object(tos_ledger_path)
+        if tos_ledger.get("schema") != TOS_UPLOAD_LEDGER_SCHEMA:
+            raise RuntimeError("TOS upload ledger schema is incompatible")
+        tos_submissions = int(tos_ledger.get("submission_attempt_count") or 0)
+        provider_request_count += tos_submissions
+        provider_family_counts["tos_media_upload"] = (
+            provider_family_counts.get("tos_media_upload", 0) + tos_submissions
+        )
+        request_receipts.append({
+            "path": tos_ledger_path.relative_to(workspace).as_posix(),
+            "sha256": _sha256(tos_ledger_path),
+            "status": "tos_upload_ledger",
+            "provider_request_count": tos_submissions,
         })
 
     return {
@@ -1066,13 +1107,27 @@ def _freeze_post_phase1_budget(
     )
     shots = [value for value in storyboard.get("shots") or [] if isinstance(value, dict)]
     pxx = sum(len(shot.get("storyboard_beats") or []) for shot in shots)
+    remaining_multimodal_requests = character_instances * 8 + len(shots) * 2 + pxx
+    video_submission_limit = preflight["authorized_hard_limits"][
+        "seedance_video_submissions"
+    ]
     exact_upper_bounds = {
         "character_entities": len(characters),
         "character_instances": character_instances,
         "primary_shots": len(shots),
         "pxx": pxx,
         "remaining_seedream_image_requests": character_instances * 6 + len(shots) * 6,
-        "remaining_multimodal_observation_requests": character_instances * 8 + len(shots) * 2 + pxx,
+        "remaining_multimodal_observation_requests": remaining_multimodal_requests,
+        "remaining_tos_put_attempts": (
+            remaining_multimodal_requests
+            * preflight["authorized_hard_limits"][
+                "max_tos_inputs_per_multimodal_request"
+            ]
+            + video_submission_limit
+            * preflight["authorized_hard_limits"][
+                "max_tos_inputs_per_video_submission"
+            ]
+        ),
     }
     initial = preflight["authorized_hard_limits"]
     if (
@@ -1080,6 +1135,8 @@ def _freeze_post_phase1_budget(
         > initial["seedream_image_requests"]
         or exact_upper_bounds["remaining_multimodal_observation_requests"]
         > initial["multimodal_observation_requests"]
+        or exact_upper_bounds["remaining_tos_put_attempts"]
+        > initial["tos_put_attempts"]
     ):
         raise RuntimeError("post-Phase-1 exact workload exceeds the authorized hard limit")
     receipt = {
@@ -1401,6 +1458,32 @@ def execute_paid_full_chain(
                 "paid acceptance has an unresolved submission_uncertain "
                 f"request: {guard_path.name}"
             )
+    tos_ledger_path = workspace / TOS_UPLOAD_LEDGER_NAME
+    if tos_ledger_path.is_file():
+        tos_ledger = _read_object(tos_ledger_path)
+        if tos_ledger.get("schema") != TOS_UPLOAD_LEDGER_SCHEMA:
+            raise RuntimeError("paid acceptance TOS upload ledger is incompatible")
+        uploads = tos_ledger.get("uploads")
+        if not isinstance(uploads, list):
+            raise RuntimeError("paid acceptance TOS upload records are invalid")
+        unresolved = [
+            upload
+            for upload in uploads
+            if isinstance(upload, dict)
+            and upload.get("status") in {
+                "submission_uncertain",
+                "provider_rejected",
+            }
+        ]
+        if unresolved:
+            raise RuntimeError(
+                "paid acceptance has an unresolved or rejected TOS upload; "
+                "automatic resubmission is forbidden"
+            )
+        if int(tos_ledger.get("submission_attempt_count") or 0) > int(
+            preflight["authorized_hard_limits"]["tos_put_attempts"]
+        ):
+            raise RuntimeError("paid acceptance crossed its TOS PUT hard limit")
     _atomic_write_json(receipt_path, started)
     acceptance_environment = {
         "HONCUT_CONTINUITY_MODE": "auto",
@@ -1413,6 +1496,9 @@ def execute_paid_full_chain(
     }
     os.environ.update(acceptance_environment)
     try:
+        tos_upload_hard_limit = preflight["authorized_hard_limits"][
+            "tos_put_attempts"
+        ]
         phase1_result = _run_selected_phases(
             workspace,
             story_path,
@@ -1421,6 +1507,7 @@ def execute_paid_full_chain(
             phase1_request_limit=preflight["authorized_hard_limits"][
                 "phase1_provider_requests"
             ],
+            tos_upload_hard_limit=tos_upload_hard_limit,
         )
         phase1_ledger = phase1_result.get("acceptance_provider_ledger") or {}
         if (
@@ -1456,14 +1543,18 @@ def execute_paid_full_chain(
                         f"unexpected Phase 3 paid Provider family: {family}"
                     )
 
-            phase3_gate = run_phase3_owner(
+            with tos_upload_execution_scope(
                 workspace,
-                characters,
-                False,
-                _acceptance_max_new_image_requests=1,
-                _acceptance_disable_provider_retries=True,
-                _acceptance_before_provider_request=_phase3_request_hook,
-            )
+                max_submissions=tos_upload_hard_limit,
+            ):
+                phase3_gate = run_phase3_owner(
+                    workspace,
+                    characters,
+                    False,
+                    _acceptance_max_new_image_requests=1,
+                    _acceptance_disable_provider_retries=True,
+                    _acceptance_before_provider_request=_phase3_request_hook,
+                )
             if (
                 phase3_gate.get("status") != "acceptance_gate_passed"
                 or phase3_gate.get("image_provider_request_count") != 1
@@ -1500,9 +1591,27 @@ def execute_paid_full_chain(
             started["gates"]["phase3"] = phase3_gate
             _atomic_write_json(receipt_path, started)
 
-        _run_selected_phases(workspace, story_path, {2}, resume=True)
-        _run_selected_phases(workspace, story_path, {3}, resume=True)
-        _run_selected_phases(workspace, story_path, {4}, resume=True)
+        _run_selected_phases(
+            workspace,
+            story_path,
+            {2},
+            resume=True,
+            tos_upload_hard_limit=tos_upload_hard_limit,
+        )
+        _run_selected_phases(
+            workspace,
+            story_path,
+            {3},
+            resume=True,
+            tos_upload_hard_limit=tos_upload_hard_limit,
+        )
+        _run_selected_phases(
+            workspace,
+            story_path,
+            {4},
+            resume=True,
+            tos_upload_hard_limit=tos_upload_hard_limit,
+        )
 
         phase5_gate = started["gates"].get("phase5")
         if not isinstance(phase5_gate, dict):
@@ -1511,12 +1620,16 @@ def execute_paid_full_chain(
                 "phase5_observation",
             )
             try:
-                run_storyboard_qa_gate(
+                with tos_upload_execution_scope(
                     workspace,
-                    structured_understanding_max_attempts=1,
-                    _acceptance_max_new_observations=1,
-                    _acceptance_before_provider_request=phase5_guard,
-                )
+                    max_submissions=tos_upload_hard_limit,
+                ):
+                    run_storyboard_qa_gate(
+                        workspace,
+                        structured_understanding_max_attempts=1,
+                        _acceptance_max_new_observations=1,
+                        _acceptance_before_provider_request=phase5_guard,
+                    )
             except QAObservationGatePaused as paused:
                 if (
                     paused.provider_request_count != 1
@@ -1549,20 +1662,30 @@ def execute_paid_full_chain(
             started["gates"]["phase5"] = phase5_gate
             _atomic_write_json(receipt_path, started)
 
-        _run_selected_phases(workspace, story_path, {5}, resume=True)
+        _run_selected_phases(
+            workspace,
+            story_path,
+            {5},
+            resume=True,
+            tos_upload_hard_limit=tos_upload_hard_limit,
+        )
         phase6_preflight = _freeze_phase6_tasks(workspace, preflight)
         phase6_gate = started["gates"].get("phase6")
         if not isinstance(phase6_gate, dict):
-            phase6_gate = run_phase6_owner(
-                _read_object(workspace / "STORYBOARD.json"),
+            with tos_upload_execution_scope(
                 workspace,
-                False,
-                chain_mode=True,
-                media_profile=MEDIA_PROFILE,
-                _acceptance_max_new_chunks=1,
-                _acceptance_disable_provider_repairs=True,
-                _acceptance_disable_continuity_repairs=True,
-            )
+                max_submissions=tos_upload_hard_limit,
+            ):
+                phase6_gate = run_phase6_owner(
+                    _read_object(workspace / "STORYBOARD.json"),
+                    workspace,
+                    False,
+                    chain_mode=True,
+                    media_profile=MEDIA_PROFILE,
+                    _acceptance_max_new_chunks=1,
+                    _acceptance_disable_provider_repairs=True,
+                    _acceptance_disable_continuity_repairs=True,
+                )
             if phase6_gate.get("status") != "acceptance_gate_passed":
                 raise RuntimeError("Phase 6 P01 single-submit live gate did not pass")
             submission_count = GenerationTaskStore(
@@ -1586,7 +1709,13 @@ def execute_paid_full_chain(
             started["gates"]["phase6"] = phase6_gate
             _atomic_write_json(receipt_path, started)
 
-        _run_selected_phases(workspace, story_path, {6}, resume=True)
+        _run_selected_phases(
+            workspace,
+            story_path,
+            {6},
+            resume=True,
+            tos_upload_hard_limit=tos_upload_hard_limit,
+        )
         total_submissions = GenerationTaskStore(
             workspace / "runtime.db"
         ).submission_attempt_count()
@@ -1599,6 +1728,7 @@ def execute_paid_full_chain(
             story_path,
             {7, 8, 9, 9.5},
             resume=True,
+            tos_upload_hard_limit=tos_upload_hard_limit,
         )
 
         final_video = workspace / "polished.mp4"

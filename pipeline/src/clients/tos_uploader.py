@@ -8,6 +8,7 @@ import os
 import hashlib
 import hmac
 import base64
+import binascii
 import json
 import mimetypes
 import requests
@@ -17,6 +18,17 @@ from urllib.parse import parse_qs, quote, urlparse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+import httpx2 as httpx
+
+from utils.provider_request_guard import (
+    MediaUploadTimeouts,
+    effective_media_upload_timeouts,
+    media_upload_completed,
+    media_upload_failed,
+    media_upload_prepared,
+    media_upload_submission_started,
+)
 
 
 SEEDANCE_MAX_IMAGE_BYTES = 30 * 1024 * 1024
@@ -98,6 +110,31 @@ def is_media_upload_configured() -> bool:
 
 class TOSMediaUploadError(RuntimeError):
     """A required Provider media input could not be persisted to TOS."""
+
+
+class TOSConfigurationError(TOSMediaUploadError):
+    """Required TOS configuration is incomplete."""
+
+
+class TOSUploadRejected(TOSMediaUploadError):
+    """TOS returned a definitive HTTP rejection for the authoritative PUT."""
+
+    def __init__(self, status_code: int | None) -> None:
+        self.status_code = status_code
+        detail = f" with HTTP {status_code}" if status_code is not None else ""
+        super().__init__(f"TOS upload was rejected{detail}")
+
+
+class TOSUploadTimeout(TOSMediaUploadError):
+    """The upload transport exceeded its Runtime-owned time budget."""
+
+
+class TOSUploadOutcomeUnknown(TOSUploadTimeout):
+    """The PUT may have reached TOS but exact remote bytes are unverified."""
+
+
+class TOSReceiptMismatch(TOSMediaUploadError):
+    """A completed local receipt no longer matches the remote object."""
 
 
 def require_tos_url(url: str | None, *, label: str) -> str:
@@ -501,64 +538,313 @@ def validate_multimodal_media_file(path: str | Path) -> str:
     raise ValueError(f"unsupported multimodal input format: {source.name}")
 
 
-def upload_image(image_data: bytes, content_type: str = "image/png") -> Optional[str]:
-    """Upload image to TOS and return pre-signed URL.
+_COMPATIBILITY_UPLOAD_TIMEOUTS = MediaUploadTimeouts(
+    connect_seconds=10.0,
+    read_seconds=30.0,
+    write_seconds=120.0,
+    pool_seconds=10.0,
+    reconciliation_seconds=10.0,
+)
 
-    Args:
-        image_data: Raw image bytes
-        content_type: MIME type
 
-    Returns:
-        Pre-signed URL (valid 7200s) or None on failure
-    """
-    config = _get_tos_config()
-    if not all([config["ak"], config["sk"], config["bucket"]]):
-        print("  [tos] TOS config incomplete (need TOS_ACCESS_KEY, TOS_SECRET_KEY, TOS_BUCKET), skipping upload")
-        return None
+def _new_tos_http_client(timeouts: MediaUploadTimeouts):
+    """Build a direct-routed client with a real write timeout."""
 
-    # Seedance accepts images up to 30 MB. Preserve source bytes and detail
-    # unless that provider limit actually requires recompression.
-    image_data = compress_image_bytes(image_data)
-    image_format, _width, _height = _validate_seedance_image(image_data)
-    content_type, suffix = IMAGE_TRANSPORT_METADATA[image_format]
+    return httpx.Client(
+        timeout=httpx.Timeout(
+            connect=timeouts.connect_seconds,
+            read=timeouts.read_seconds,
+            write=timeouts.write_seconds,
+            pool=timeouts.pool_seconds,
+        ),
+        trust_env=False,
+    )
 
-    # Object key with content hash for dedup
-    content_hash = hashlib.sha256(image_data).hexdigest()
-    object_key = f"volcengine/image/{content_hash}{suffix}"
 
-    host = f"{config['bucket']}.{config['endpoint']}"
-    now = datetime.now(timezone.utc)
-    timestamp = now.strftime("%Y%m%dT%H%M%SZ")
-    payload_hash = hashlib.sha256(image_data).hexdigest()
+def _tos_host(config: dict) -> str:
+    endpoint = str(config.get("endpoint") or "").strip().rstrip("/")
+    if "://" in endpoint:
+        endpoint = urlparse(endpoint).netloc
+    if not endpoint:
+        raise TOSConfigurationError("TOS endpoint is missing")
+    return f"{config['bucket']}.{endpoint}"
 
-    # PUT upload with V4 signature
+
+def _content_addressed_key(
+    object_key: str,
+    *,
+    payload_hash: str,
+    suffix: str | None = None,
+) -> str:
+    path = Path(object_key)
+    if len(path.stem) == 64 and all(
+        character in "0123456789abcdef" for character in path.stem
+    ):
+        path = path.with_name(f"{payload_hash}{suffix or path.suffix}")
+    elif suffix is not None:
+        path = path.with_suffix(suffix)
+    return path.as_posix()
+
+
+def _head_object(
+    client,
+    *,
+    object_key: str,
+    payload_hash: str,
+    payload_bytes: int,
+    config: dict,
+    timeout_seconds: float,
+    require_hash_metadata: bool,
+) -> dict:
+    host = _tos_host(config)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    empty_payload_hash = hashlib.sha256(b"").hexdigest()
     headers = {
-        "Content-Type": content_type,
         "Host": host,
-        "x-tos-content-sha256": payload_hash,
+        "x-tos-content-sha256": empty_payload_hash,
         "x-tos-date": timestamp,
     }
-
-    authorization = _sign("PUT", object_key, headers, payload_hash, timestamp, config)
-    headers["Authorization"] = authorization
-
+    headers["Authorization"] = _sign(
+        "HEAD",
+        object_key,
+        headers,
+        empty_payload_hash,
+        timestamp,
+        config,
+    )
     try:
-        resp = requests.put(
-            f"https://{host}/{object_key}",
-            data=image_data,
+        response = client.head(
+            f"https://{host}/{quote(object_key, safe='/')}",
             headers=headers,
-            timeout=30,
+            timeout=httpx.Timeout(timeout_seconds),
         )
-        if resp.status_code not in (200, 201):
-            print(f"  [tos] Upload failed: HTTP {resp.status_code} — {resp.text[:200]}")
-            return None
-        print(f"  [tos] Uploaded: {object_key} ({len(image_data)} bytes)")
-    except Exception as e:
-        print(f"  [tos] Upload error: {e}")
-        return None
+    except (httpx.RequestError, OSError) as exc:
+        return {
+            "status": "unavailable",
+            "error_type": type(exc).__name__,
+        }
+    status_code = int(response.status_code)
+    if status_code == 404:
+        return {"status": "missing", "http_status": status_code}
+    if status_code != 200:
+        return {"status": "unavailable", "http_status": status_code}
+    headers_by_name = {
+        str(key).casefold(): str(value) for key, value in response.headers.items()
+    }
+    declared_length = headers_by_name.get("content-length")
+    declared_hash = headers_by_name.get(TOS_CONTENT_SHA256_METADATA)
+    try:
+        length_matches = (
+            declared_length is not None and int(declared_length) == payload_bytes
+        )
+    except ValueError:
+        length_matches = False
+    hash_matches = declared_hash == payload_hash if declared_hash else not require_hash_metadata
+    return {
+        "status": "match" if length_matches and hash_matches else "mismatch",
+        "http_status": status_code,
+        "length_matches": length_matches,
+        "hash_metadata_present": declared_hash is not None,
+        "hash_matches": hash_matches,
+    }
 
-    # Generate pre-signed GET URL (7200s = 2 hours)
-    return get_signed_url(object_key, expires=7200)
+
+def _prepared_image_payload(
+    payload: bytes,
+    content_type: str,
+) -> tuple[bytes, str, str | None]:
+    if not content_type.startswith("image/"):
+        return payload, content_type, None
+    prepared = compress_image_bytes(payload)
+    if prepared.startswith(b"\xff\xd8\xff"):
+        return prepared, "image/jpeg", ".jpg"
+    if prepared.startswith(b"\x89PNG\r\n\x1a\n"):
+        return prepared, "image/png", ".png"
+    if prepared.startswith(b"RIFF") and prepared[8:12] == b"WEBP":
+        return prepared, "image/webp", ".webp"
+    return prepared, content_type, None
+
+
+def upload_file_required(
+    payload: bytes,
+    object_key: str,
+    content_type: str = "image/png",
+) -> str:
+    """Persist one exact payload with one PUT and deterministic HEAD recovery."""
+
+    config = _get_tos_config()
+    if not all((config.get("ak"), config.get("sk"), config.get("bucket"))):
+        raise TOSConfigurationError(
+            "TOS config is incomplete: access key, secret key, and bucket are required"
+        )
+    payload, content_type, suffix = _prepared_image_payload(payload, content_type)
+    payload_hash = hashlib.sha256(payload).hexdigest()
+    object_key = _content_addressed_key(
+        object_key,
+        payload_hash=payload_hash,
+        suffix=suffix,
+    )
+    is_content_addressed = Path(object_key).stem == payload_hash
+    safe_payload = {
+        "provider_family": "tos_media_upload",
+        "object_key": object_key,
+        "payload_sha256": payload_hash,
+        "payload_bytes": len(payload),
+        "content_type": content_type,
+    }
+    token, prior_status = media_upload_prepared(safe_payload)
+    timeouts = effective_media_upload_timeouts(
+        len(payload),
+        fallback=_COMPATIBILITY_UPLOAD_TIMEOUTS,
+    )
+    host = _tos_host(config)
+    encoded_key = quote(object_key, safe="/")
+
+    with _new_tos_http_client(timeouts) as client:
+        if is_content_addressed:
+            existing = _head_object(
+                client,
+                object_key=object_key,
+                payload_hash=payload_hash,
+                payload_bytes=len(payload),
+                config=config,
+                timeout_seconds=timeouts.reconciliation_seconds,
+                require_hash_metadata=True,
+            )
+            if existing["status"] == "match":
+                completion_kind = (
+                    "reconciled"
+                    if prior_status == "submission_uncertain"
+                    else "reused"
+                )
+                media_upload_completed(
+                    token,
+                    {
+                        "completion_kind": completion_kind,
+                        "http_status": existing.get("http_status"),
+                        "verification": "content_length_and_hash",
+                    },
+                )
+                print(f"  [tos] Reused: {object_key} ({len(payload)} bytes)")
+                return get_signed_url(object_key, expires=7200)
+
+        if prior_status in {
+            "provider_completed",
+            "reconciled_completed",
+            "reused_completed",
+        }:
+            raise TOSReceiptMismatch(
+                "completed TOS receipt does not match the configured remote object"
+            )
+        if prior_status == "submission_uncertain":
+            raise TOSUploadOutcomeUnknown(
+                "previous TOS PUT remains unverified; automatic resubmission is forbidden"
+            )
+        if prior_status == "provider_rejected":
+            raise TOSUploadRejected(None)
+
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        headers = {
+            "Content-Type": content_type,
+            "Host": host,
+            "x-tos-content-sha256": payload_hash,
+            "x-tos-date": timestamp,
+            TOS_CONTENT_SHA256_METADATA: payload_hash,
+        }
+        headers["Authorization"] = _sign(
+            "PUT", object_key, headers, payload_hash, timestamp, config
+        )
+        media_upload_submission_started(token, safe_payload)
+        try:
+            response = client.put(
+                f"https://{host}/{encoded_key}",
+                content=payload,
+                headers=headers,
+            )
+        except (httpx.RequestError, OSError) as exc:
+            reconciled = _head_object(
+                client,
+                object_key=object_key,
+                payload_hash=payload_hash,
+                payload_bytes=len(payload),
+                config=config,
+                timeout_seconds=timeouts.reconciliation_seconds,
+                require_hash_metadata=True,
+            )
+            if reconciled["status"] == "match":
+                media_upload_completed(
+                    token,
+                    {
+                        "completion_kind": "reconciled",
+                        "http_status": reconciled.get("http_status"),
+                        "verification": "content_length_and_hash_metadata",
+                    },
+                )
+                return get_signed_url(object_key, expires=7200)
+            media_upload_failed(
+                token,
+                {
+                    "submission_outcome": "unknown",
+                    "error_type": type(exc).__name__,
+                    "http_status": reconciled.get("http_status"),
+                },
+            )
+            raise TOSUploadOutcomeUnknown(
+                "TOS PUT outcome is unknown after one read-only reconciliation"
+            ) from exc
+        except BaseException as exc:
+            media_upload_failed(
+                token,
+                {
+                    "submission_outcome": "unknown",
+                    "error_type": type(exc).__name__,
+                },
+            )
+            raise
+
+        status_code = int(response.status_code)
+        if status_code not in (200, 201):
+            media_upload_failed(
+                token,
+                {
+                    "submission_outcome": "known_rejected",
+                    "error_type": "TOSUploadRejected",
+                    "http_status": status_code,
+                },
+            )
+            raise TOSUploadRejected(status_code)
+
+        verified = _head_object(
+            client,
+            object_key=object_key,
+            payload_hash=payload_hash,
+            payload_bytes=len(payload),
+            config=config,
+            timeout_seconds=timeouts.reconciliation_seconds,
+            require_hash_metadata=True,
+        )
+        if verified["status"] != "match":
+            media_upload_failed(
+                token,
+                {
+                    "submission_outcome": "unknown",
+                    "error_type": "TOSPostUploadVerificationError",
+                    "http_status": verified.get("http_status"),
+                },
+            )
+            raise TOSUploadOutcomeUnknown(
+                "TOS accepted the PUT but exact remote bytes could not be verified"
+            )
+        media_upload_completed(
+            token,
+            {
+                "completion_kind": "provider",
+                "http_status": status_code,
+                "verification": "content_length_and_hash_metadata",
+            },
+        )
+        print(f"  [tos] Uploaded: {object_key} ({len(payload)} bytes)")
+        return get_signed_url(object_key, expires=7200)
 
 
 def upload_file(
@@ -566,99 +852,46 @@ def upload_file(
     object_key: str,
     content_type: str = "image/png",
 ) -> Optional[str]:
-    """Upload bytes to an explicit TOS object key, preserving its directories."""
-    config = _get_tos_config()
-    if not all([config["ak"], config["sk"], config["bucket"]]):
-        print("  [tos] TOS config incomplete (need TOS_ACCESS_KEY, TOS_SECRET_KEY, TOS_BUCKET), skipping upload")
-        return None
-
-    if content_type.startswith("image/"):
-        image_data = compress_image_bytes(image_data)
-        if image_data.startswith(b"\xff\xd8\xff"):
-            content_type = "image/jpeg"
-            object_key = str(Path(object_key).with_suffix(".jpg"))
-        elif image_data.startswith(b"\x89PNG\r\n\x1a\n"):
-            content_type = "image/png"
-            object_key = str(Path(object_key).with_suffix(".png"))
-
-    host = f"{config['bucket']}.{config['endpoint']}"
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    payload_hash = hashlib.sha256(image_data).hexdigest()
-    encoded_key = quote(object_key, safe="/")
-    if Path(object_key).stem == payload_hash:
-        empty_payload_hash = hashlib.sha256(b"").hexdigest()
-        head_headers = {
-            "Host": host,
-            "x-tos-content-sha256": empty_payload_hash,
-            "x-tos-date": timestamp,
-        }
-        head_headers["Authorization"] = _sign(
-            "HEAD",
-            object_key,
-            head_headers,
-            empty_payload_hash,
-            timestamp,
-            config,
-        )
-        try:
-            existing = requests.head(
-                f"https://{host}/{encoded_key}",
-                headers=head_headers,
-                timeout=10,
-            )
-            existing_headers = {
-                str(key).casefold(): str(value)
-                for key, value in existing.headers.items()
-            }
-            declared_hash = existing_headers.get(TOS_CONTENT_SHA256_METADATA)
-            declared_length = existing_headers.get("content-length")
-            if (
-                existing.status_code == 200
-                and declared_length is not None
-                and int(declared_length) == len(image_data)
-                and (not declared_hash or declared_hash == payload_hash)
-            ):
-                print(f"  [tos] Reused: {object_key} ({len(image_data)} bytes)")
-                return get_signed_url(object_key, expires=7200)
-        except (OSError, ValueError, requests.RequestException):
-            # A presence check is advisory. The authoritative PUT below still
-            # decides whether this required input has been persisted.
-            pass
-    headers = {
-        "Content-Type": content_type,
-        "Host": host,
-        "x-tos-content-sha256": payload_hash,
-        "x-tos-date": timestamp,
-        TOS_CONTENT_SHA256_METADATA: payload_hash,
-    }
-    headers["Authorization"] = _sign(
-        "PUT", object_key, headers, payload_hash, timestamp, config
-    )
+    """Compatibility uploader; required production paths use the strict API."""
 
     try:
-        resp = requests.put(
-            f"https://{host}/{encoded_key}",
-            data=image_data,
-            headers=headers,
-            timeout=30,
-        )
-        if resp.status_code not in (200, 201):
-            print(f"  [tos] Upload failed: HTTP {resp.status_code} — {resp.text[:200]}")
-            return None
-        print(f"  [tos] Uploaded: {object_key} ({len(image_data)} bytes)")
-    except Exception as exc:
+        return upload_file_required(image_data, object_key, content_type)
+    except TOSMediaUploadError as exc:
         print(f"  [tos] Upload error for {object_key}: {exc}")
         return None
-    return get_signed_url(object_key, expires=7200)
 
 
-def upload_media_file(
+def upload_image_required(
+    image_data: bytes,
+    content_type: str = "image/png",
+) -> str:
+    """Upload one required image without swallowing transport evidence."""
+
+    source_hash = hashlib.sha256(image_data).hexdigest()
+    source_suffix = mimetypes.guess_extension(content_type) or ".bin"
+    return upload_file_required(
+        image_data,
+        f"volcengine/image/{source_hash}{source_suffix}",
+        content_type,
+    )
+
+
+def upload_image(image_data: bytes, content_type: str = "image/png") -> Optional[str]:
+    """Upload an image through the compatibility boundary."""
+
+    try:
+        return upload_image_required(image_data, content_type)
+    except TOSMediaUploadError as exc:
+        print(f"  [tos] Image upload error: {exc}")
+        return None
+
+
+def _prepared_media_file(
     path: str | Path,
     *,
-    prefix: str = "volcengine/media",
     contract: str = "seedance",
-) -> str | None:
-    """Preflight and upload one local provider input."""
+) -> tuple[bytes, str, str]:
+    """Return validated final bytes, MIME type, and suffix for one input."""
     source = Path(path)
     if not source.is_file():
         raise FileNotFoundError(f"media file not found: {source}")
@@ -668,12 +901,7 @@ def upload_media_file(
             image_data = compress_image_bytes(source.read_bytes())
             image_format, _width, _height = _validate_seedance_image(image_data)
             content_type, suffix = IMAGE_TRANSPORT_METADATA[image_format]
-            content_hash = hashlib.sha256(image_data).hexdigest()
-            return upload_file(
-                image_data,
-                f"{prefix.rstrip('/')}/{content_hash}{suffix}",
-                content_type,
-            )
+            return image_data, content_type, suffix
         if content_type.startswith("video/"):
             _validate_seedance_video(source)
         else:
@@ -683,8 +911,20 @@ def upload_media_file(
     else:
         raise ValueError(f"unknown media upload contract: {contract}")
     media_data = source.read_bytes()
-    content_hash = hashlib.sha256(media_data).hexdigest()
     suffix = source.suffix.lower() or ".bin"
+    return media_data, content_type, suffix
+
+
+def upload_media_file(
+    path: str | Path,
+    *,
+    prefix: str = "volcengine/media",
+    contract: str = "seedance",
+) -> str | None:
+    """Preflight and upload one local provider input through compatibility."""
+
+    media_data, content_type, suffix = _prepared_media_file(path, contract=contract)
+    content_hash = hashlib.sha256(media_data).hexdigest()
     return upload_file(
         media_data,
         f"{prefix.rstrip('/')}/{content_hash}{suffix}",
@@ -699,8 +939,17 @@ def upload_media_file_required(
     label: str = "media",
 ) -> str:
     """Upload a local image/video and require a TOS URL result."""
+    media_data, content_type, suffix = _prepared_media_file(
+        path,
+        contract="seedance",
+    )
+    content_hash = hashlib.sha256(media_data).hexdigest()
     return require_tos_url(
-        upload_media_file(path, prefix=prefix),
+        upload_file_required(
+            media_data,
+            f"{prefix.rstrip('/')}/{content_hash}{suffix}",
+            content_type,
+        ),
         label=label,
     )
 
@@ -712,8 +961,17 @@ def upload_multimodal_media_file_required(
     label: str = "multimodal input",
 ) -> str:
     """Preflight an Ark understanding input, upload it, and require provenance."""
+    media_data, content_type, suffix = _prepared_media_file(
+        path,
+        contract="multimodal",
+    )
+    content_hash = hashlib.sha256(media_data).hexdigest()
     return require_tos_url(
-        upload_media_file(path, prefix=prefix, contract="multimodal"),
+        upload_file_required(
+            media_data,
+            f"{prefix.rstrip('/')}/{content_hash}{suffix}",
+            content_type,
+        ),
         label=label,
     )
 
@@ -788,7 +1046,28 @@ def base64_image_to_signed_url_required(
     label: str = "image",
 ) -> str:
     """Upload a Base64 image and require a TOS URL result."""
-    return require_tos_url(base64_to_signed_url(base64_data), label=label)
+    content_type = "image/png"
+    if "," in base64_data:
+        header, base64_data = base64_data.split(",", 1)
+        if header.startswith("data:image/") and ";" in header:
+            content_type = header[5:].split(";", 1)[0]
+    try:
+        image_data = base64.b64decode(base64_data, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError("required image contains invalid Base64 data") from exc
+    prepared, prepared_type, suffix = _prepared_image_payload(
+        image_data,
+        content_type,
+    )
+    payload_hash = hashlib.sha256(prepared).hexdigest()
+    return require_tos_url(
+        upload_file_required(
+            prepared,
+            f"volcengine/image/{payload_hash}{suffix or '.bin'}",
+            prepared_type,
+        ),
+        label=label,
+    )
 
 
 def base64_video_to_signed_url_required(
@@ -797,4 +1076,29 @@ def base64_video_to_signed_url_required(
     label: str = "video",
 ) -> str:
     """Upload a Base64 video and require a TOS URL result."""
-    return require_tos_url(base64_video_to_signed_url(base64_data), label=label)
+    content_type = "video/mp4"
+    suffix = ".mp4"
+    if "," in base64_data:
+        header, base64_data = base64_data.split(",", 1)
+        if header.startswith("data:video/") and ";" in header:
+            content_type = header[5:].split(";", 1)[0]
+            suffix = mimetypes.guess_extension(content_type) or suffix
+    try:
+        video_data = base64.b64decode(base64_data, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError("required video contains invalid Base64 data") from exc
+    if not video_data:
+        raise ValueError("required video Base64 payload is empty")
+    with tempfile.NamedTemporaryFile(suffix=suffix) as temporary:
+        temporary.write(video_data)
+        temporary.flush()
+        _validate_seedance_video(Path(temporary.name))
+    payload_hash = hashlib.sha256(video_data).hexdigest()
+    return require_tos_url(
+        upload_file_required(
+            video_data,
+            f"volcengine/video/{payload_hash}{suffix}",
+            content_type,
+        ),
+        label=label,
+    )

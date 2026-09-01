@@ -14,6 +14,7 @@ from typing import Any, Callable, TypeVar
 
 from runtime.capacity import CapacityTable
 from runtime.video_provider import ProviderErrorKind, classify_provider_error
+from utils.provider_request_guard import MediaUploadTimeouts
 
 
 T = TypeVar("T")
@@ -184,6 +185,90 @@ class ProviderExecutionPolicy:
         return poll
 
 
+@dataclass(frozen=True)
+class TOSUploadExecutionPolicy:
+    """Runtime-owned time budget for one content-addressed TOS PUT."""
+
+    connect_timeout_seconds: float = 10.0
+    read_timeout_seconds: float = 30.0
+    minimum_write_timeout_seconds: float = 60.0
+    maximum_write_timeout_seconds: float = 180.0
+    write_overhead_seconds: float = 15.0
+    minimum_upload_bytes_per_second: float = 64 * 1024
+    pool_timeout_seconds: float = 10.0
+    reconciliation_timeout_seconds: float = 10.0
+
+    def __post_init__(self) -> None:
+        for name in (
+            "connect_timeout_seconds",
+            "read_timeout_seconds",
+            "minimum_write_timeout_seconds",
+            "maximum_write_timeout_seconds",
+            "write_overhead_seconds",
+            "minimum_upload_bytes_per_second",
+            "pool_timeout_seconds",
+            "reconciliation_timeout_seconds",
+        ):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be greater than zero")
+        if self.maximum_write_timeout_seconds < self.minimum_write_timeout_seconds:
+            raise ValueError(
+                "maximum_write_timeout_seconds must not be below the minimum"
+            )
+
+    @classmethod
+    def from_environment(cls) -> "TOSUploadExecutionPolicy":
+        return cls(
+            connect_timeout_seconds=_positive_float(
+                "HONCUT_TOS_CONNECT_TIMEOUT_SECONDS", 10.0
+            ),
+            read_timeout_seconds=_positive_float(
+                "HONCUT_TOS_READ_TIMEOUT_SECONDS", 30.0
+            ),
+            minimum_write_timeout_seconds=_positive_float(
+                "HONCUT_TOS_MIN_WRITE_TIMEOUT_SECONDS", 60.0
+            ),
+            maximum_write_timeout_seconds=_positive_float(
+                "HONCUT_TOS_MAX_WRITE_TIMEOUT_SECONDS", 180.0
+            ),
+            write_overhead_seconds=_positive_float(
+                "HONCUT_TOS_WRITE_OVERHEAD_SECONDS", 15.0
+            ),
+            minimum_upload_bytes_per_second=_positive_float(
+                "HONCUT_TOS_MIN_UPLOAD_BYTES_PER_SECOND", 64 * 1024
+            ),
+            pool_timeout_seconds=_positive_float(
+                "HONCUT_TOS_POOL_TIMEOUT_SECONDS", 10.0
+            ),
+            reconciliation_timeout_seconds=_positive_float(
+                "HONCUT_TOS_RECONCILIATION_TIMEOUT_SECONDS", 10.0
+            ),
+        )
+
+    def timeouts_for_payload(self, payload_bytes: int) -> MediaUploadTimeouts:
+        if (
+            isinstance(payload_bytes, bool)
+            or not isinstance(payload_bytes, int)
+            or payload_bytes < 0
+        ):
+            raise ValueError("payload_bytes must be a non-negative integer")
+        estimated_write_seconds = (
+            payload_bytes / self.minimum_upload_bytes_per_second
+            + self.write_overhead_seconds
+        )
+        write_seconds = min(
+            self.maximum_write_timeout_seconds,
+            max(self.minimum_write_timeout_seconds, estimated_write_seconds),
+        )
+        return MediaUploadTimeouts(
+            connect_seconds=self.connect_timeout_seconds,
+            read_seconds=self.read_timeout_seconds,
+            write_seconds=write_seconds,
+            pool_seconds=self.pool_timeout_seconds,
+            reconciliation_seconds=self.reconciliation_timeout_seconds,
+        )
+
+
 def provider_cooldown_state(
     database_path: str | Path,
     resource_id: str,
@@ -234,5 +319,6 @@ def provider_cooldown_state(
 __all__ = [
     "ProviderExecutionPolicy",
     "ProviderRetryDecision",
+    "TOSUploadExecutionPolicy",
     "provider_cooldown_state",
 ]

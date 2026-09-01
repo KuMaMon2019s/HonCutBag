@@ -76,7 +76,7 @@ def test_task_dir_and_content_share_numbered_omni_reference_contract(
     )
     monkeypatch.setattr(
         tos_uploader,
-        "upload_image",
+        "upload_image_required",
         lambda image_data, content_type: _signed_tos_url(
             monkeypatch, f"fixture/{image_data[:1].hex()}.png"
         ),

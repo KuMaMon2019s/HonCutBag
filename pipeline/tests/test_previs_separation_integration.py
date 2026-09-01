@@ -266,7 +266,11 @@ def test_previs_pixels_are_separated_end_to_end_before_video_transport(
         uploaded_sha256.append(digest)
         return _signed_tos_url(monkeypatch, f"fixture/{digest}.png")
 
-    monkeypatch.setattr(tos_uploader, "upload_image", _record_upload)
+    monkeypatch.setattr(
+        tos_uploader,
+        "upload_image_required",
+        _record_upload,
+    )
     continuity_plan = ContinuityPlan.model_validate(continuity)
     continuity_chunk = continuity_plan.shots[0].chunks[0]
     content, *_ = _provider_content(

@@ -293,6 +293,7 @@ def run_pipeline(
     character_library_dir: str | None = None,
     *,
     _phase_owner=None,
+    _tos_upload_hard_limit: int | None = None,
     **legacy_options,
 ) -> dict:
     """Run the pipeline with one canonical visual policy."""
@@ -307,7 +308,13 @@ def run_pipeline(
         legacy_options,
         character_visual_policy=resolved_visual_policy,
     )
-    return _run_pipeline(
+    from runtime.tos_uploads import tos_upload_execution_scope
+
+    with tos_upload_execution_scope(
+        output_dir,
+        max_submissions=_tos_upload_hard_limit,
+    ):
+        return _run_pipeline(
             text=text,
             input_file=input_file,
             duration=duration,
