@@ -1,3 +1,4 @@
+import copy
 import json
 import sys
 from pathlib import Path
@@ -551,6 +552,276 @@ def test_event_parser_keeps_ambiguous_choreography_ownership_strict():
     ):
         _parse_events(
             json.dumps({"events": payload}, ensure_ascii=False),
+            source,
+        )
+
+
+@pytest.mark.parametrize("missing_indexes", [[1], [2], [3], [1, 3]])
+def test_event_parser_materializes_partially_missing_choreography_without_retry(
+    missing_indexes,
+):
+    source = "参与者连续侧身闪避、抬臂格挡并转身撤步。"
+    actions = ["参与者侧身闪避", "参与者抬臂格挡", "参与者转身撤步"]
+    relations = [
+        {
+            "micro_action_index": index,
+            "performers": ["参与者"],
+            "targets": ["来袭物体"],
+            "action_kind": "defense" if index < 3 else "locomotion",
+            "temporal_relation": "root" if index == 1 else "after",
+            "reference_action_indexes": [] if index == 1 else [index - 1],
+            "pace": "fast",
+        }
+        for index in range(1, 4)
+    ]
+
+    def complete_beat(index):
+        return {
+            "micro_action_index": index,
+            "performer": "参与者",
+            "technique": f"完整动作{index}",
+            "side": "右侧",
+            "limbs": ["双腿", "躯干", "双臂"],
+            "footwork": "双脚稳定移动",
+            "torso": "躯干协同转动",
+            "weight_shift": "重心稳定转移",
+            "direction": "沿来源动作方向",
+            "contact": "按来源动作保持接触关系",
+            "end_pose": "稳定终态",
+        }
+
+    existing = [
+        complete_beat(index)
+        for index in range(1, 4)
+        if index not in missing_indexes
+    ]
+    payload = _event(
+        who=["参与者"],
+        what=source,
+        visual=source,
+        source_excerpt=source,
+        micro_actions=actions,
+        body_action_choreography=existing,
+        action_temporal_relations=relations,
+    )
+
+    parsed = _parse_events(
+        json.dumps({"events": [payload]}, ensure_ascii=False),
+        source,
+    )[0]
+
+    assert [
+        beat["micro_action_index"]
+        for beat in parsed["body_action_choreography"]
+    ] == [1, 2, 3]
+    for beat in parsed["body_action_choreography"]:
+        if beat["micro_action_index"] not in missing_indexes:
+            assert beat["technique"] == (
+                f"完整动作{beat['micro_action_index']}"
+            )
+    diagnostic = next(
+        item
+        for item in parsed["semantic_diagnostics"]
+        if item.get("reason") == "model_choreography_partially_missing"
+    )
+    assert diagnostic["micro_action_indexes"] == missing_indexes
+    assert diagnostic["schema"] == (
+        "honcut.body-action-placeholder-reconciliation.v1"
+    )
+    assert len(diagnostic["source_evidence_sha256"]) == 64
+    assert len(diagnostic["policy_sha256"]) == 64
+    assert [
+        item["micro_action_index"]
+        for item in parsed["body_action_director_repairs_pending"]
+        if item["micro_action_index"] in missing_indexes
+    ] == missing_indexes
+
+    completed = copy.deepcopy(parsed)
+    repairs = complete_director_owned_body_action_contract(completed)
+    assert repairs == completed["body_action_director_repairs"]
+    assert completed["body_action_contract"]["valid"] is True
+
+    with pytest.raises(ValueError, match="body choreography"):
+        _parse_events(
+            json.dumps({"events": [payload]}, ensure_ascii=False),
+            source,
+            semantic_action_qa_enabled=True,
+        )
+
+
+def test_event_extractor_repairs_partial_choreography_in_one_model_request(
+    monkeypatch,
+):
+    source = "参与者侧身闪避，随后抬臂格挡。"
+    payload = _event(
+        who=["参与者"],
+        what=source,
+        visual=source,
+        source_excerpt=source,
+        micro_actions=["参与者侧身闪避", "参与者抬臂格挡"],
+        body_action_choreography=[{
+            "micro_action_index": 1,
+            "performer": "参与者",
+            "technique": "侧身闪避",
+            "side": "左侧",
+            "limbs": ["双腿", "躯干"],
+            "footwork": "左脚撤步",
+            "torso": "躯干左倾",
+            "weight_shift": "重心移至右腿",
+            "direction": "向左后方",
+            "contact": "无目标接触",
+            "end_pose": "低位闪避终态",
+        }],
+        action_temporal_relations=[
+            {
+                "micro_action_index": 1,
+                "performers": ["参与者"],
+                "targets": [],
+                "action_kind": "defense",
+                "temporal_relation": "root",
+                "reference_action_indexes": [],
+                "pace": "fast",
+            },
+            {
+                "micro_action_index": 2,
+                "performers": ["参与者"],
+                "targets": ["来袭物体"],
+                "action_kind": "defense",
+                "temporal_relation": "after",
+                "reference_action_indexes": [1],
+                "pace": "fast",
+            },
+        ],
+    )
+    calls = []
+
+    def fake_call(prompt, **_kwargs):
+        calls.append(prompt)
+        return json.dumps({"events": [payload]}, ensure_ascii=False)
+
+    monkeypatch.setattr("prompt.event_extractor._call_llm", fake_call)
+
+    from prompt import event_extractor
+
+    parsed = event_extractor._extract_events_from_segment({
+        "id": 1,
+        "content": source,
+        "format_hint": "general_prose",
+    })
+
+    assert len(calls) == 1
+    assert [
+        beat["micro_action_index"]
+        for beat in parsed[0]["body_action_choreography"]
+    ] == [1, 2]
+    assert any(
+        item.get("reason") == "model_choreography_partially_missing"
+        for item in parsed[0]["semantic_diagnostics"]
+    )
+
+
+def test_partially_missing_choreography_keeps_ambiguous_performer_strict():
+    source = "两名参与者近身格斗，甲侧身闪避，随后有人抬臂格挡。"
+    payload = _event(
+        who=["参与者甲", "参与者乙"],
+        what=source,
+        visual=source,
+        source_excerpt=source,
+        micro_actions=["参与者甲侧身闪避", "抬臂格挡"],
+        body_action_choreography=[{
+            "micro_action_index": 1,
+            "performer": "参与者甲",
+            "technique": "侧身闪避",
+            "side": "左侧",
+            "limbs": ["双腿", "躯干"],
+            "footwork": "左脚撤步",
+            "torso": "躯干左倾",
+            "weight_shift": "重心移至右腿",
+            "direction": "向左后方",
+            "contact": "无目标接触",
+            "end_pose": "低位闪避终态",
+        }],
+        action_temporal_relations=[
+            {
+                "micro_action_index": 1,
+                "performers": ["参与者甲"],
+                "targets": [],
+                "action_kind": "defense",
+                "temporal_relation": "root",
+                "reference_action_indexes": [],
+                "pace": "fast",
+            },
+            {
+                "micro_action_index": 2,
+                "performers": [],
+                "targets": [],
+                "action_kind": "defense",
+                "temporal_relation": "after",
+                "reference_action_indexes": [1],
+                "pace": "fast",
+            },
+        ],
+    )
+
+    with pytest.raises(ValueError, match="body choreography"):
+        _parse_events(
+            json.dumps({"events": [payload]}, ensure_ascii=False),
+            source,
+        )
+
+
+@pytest.mark.parametrize("invalid_indexes", [[4], [1, 1]])
+def test_partial_choreography_keeps_invalid_or_duplicate_indexes_strict(
+    invalid_indexes,
+):
+    source = "参与者在格斗中侧身闪避并抬臂格挡。"
+    beat = {
+        "performer": "参与者",
+        "technique": "侧身闪避",
+        "side": "左侧",
+        "limbs": ["双腿", "躯干"],
+        "footwork": "左脚撤步",
+        "torso": "躯干左倾",
+        "weight_shift": "重心移至右腿",
+        "direction": "向左后方",
+        "contact": "无目标接触",
+        "end_pose": "低位闪避终态",
+    }
+    payload = _event(
+        who=["参与者"],
+        what=source,
+        visual=source,
+        source_excerpt=source,
+        micro_actions=["参与者侧身闪避", "参与者抬臂格挡"],
+        body_action_choreography=[
+            dict(beat, micro_action_index=index)
+            for index in invalid_indexes
+        ],
+        action_temporal_relations=[
+            {
+                "micro_action_index": 1,
+                "performers": ["参与者"],
+                "targets": [],
+                "action_kind": "defense",
+                "temporal_relation": "root",
+                "reference_action_indexes": [],
+                "pace": "fast",
+            },
+            {
+                "micro_action_index": 2,
+                "performers": ["参与者"],
+                "targets": [],
+                "action_kind": "defense",
+                "temporal_relation": "after",
+                "reference_action_indexes": [1],
+                "pace": "fast",
+            },
+        ],
+    )
+
+    with pytest.raises(ValueError, match="unique valid micro-action indexes"):
+        _parse_events(
+            json.dumps({"events": [payload]}, ensure_ascii=False),
             source,
         )
 

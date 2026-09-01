@@ -736,6 +736,121 @@ def test_passive_environment_effect_is_reconciled_by_default_and_strict_on_deman
 
 
 @pytest.mark.parametrize(
+    ("action_kind", "temporal_relation", "performers"),
+    [
+        ("environment_effect", "effect_of", []),
+        ("state_change", "overlap", ["第三参与者"]),
+    ],
+)
+def test_disabled_semantic_qa_attaches_multi_slice_references_to_latest_slice(
+    action_kind,
+    temporal_relation,
+    performers,
+):
+    event = {
+        "source_excerpt": "第一动作完成，第二动作随后完成，第三事实同时关联两者。",
+        "micro_actions": ["第一动作", "第二动作", "第三事实"],
+        "action_temporal_relations": [
+            {
+                "micro_action_index": 1,
+                "performers": ["第一参与者"],
+                "targets": [],
+                "action_kind": "state_change",
+                "temporal_relation": "root",
+                "reference_action_indexes": [],
+                "pace": "normal",
+            },
+            {
+                "micro_action_index": 2,
+                "performers": ["第二参与者"],
+                "targets": [],
+                "action_kind": "state_change",
+                "temporal_relation": "after",
+                "reference_action_indexes": [1],
+                "pace": "normal",
+            },
+            {
+                "micro_action_index": 3,
+                "performers": performers,
+                "targets": ["空间"],
+                "action_kind": action_kind,
+                "temporal_relation": temporal_relation,
+                "reference_action_indexes": [1, 2],
+                "pace": "slow",
+            },
+        ],
+    }
+
+    normalized = normalize_event_action_units(copy.deepcopy(event))
+    timeline = normalized["action_timeline"]
+
+    assert [item["source_micro_action_indexes"] for item in timeline["slices"]] == [
+        [1],
+        [2, 3],
+    ]
+    reconciliation = timeline["temporal_reconciliations"][-1]
+    assert reconciliation["field"] == "scheduling_reference_action_index"
+    assert reconciliation["observed"] == [1, 2]
+    assert reconciliation["normalized"] == 2
+    assert reconciliation["reason"] == (
+        "multi_slice_reference_attached_to_latest_materialized_slice"
+    )
+    repeated = normalize_event_action_units(copy.deepcopy(event))
+    assert repeated["action_timeline"]["temporal_reconciliations"] == (
+        timeline["temporal_reconciliations"]
+    )
+
+    strict = copy.deepcopy(event)
+    strict["semantic_action_qa_enabled"] = True
+    with pytest.raises(ValueError, match="must reference one temporal slice"):
+        normalize_event_action_units(strict)
+
+
+def test_multi_reference_actions_already_in_one_slice_need_no_reconciliation():
+    event = {
+        "micro_actions": ["第一动作", "第二动作", "环境反馈"],
+        "action_temporal_relations": [
+            {
+                "micro_action_index": 1,
+                "performers": ["参与者甲"],
+                "targets": [],
+                "action_kind": "state_change",
+                "temporal_relation": "root",
+                "reference_action_indexes": [],
+                "pace": "normal",
+            },
+            {
+                "micro_action_index": 2,
+                "performers": ["参与者乙"],
+                "targets": [],
+                "action_kind": "state_change",
+                "temporal_relation": "overlap",
+                "reference_action_indexes": [1],
+                "pace": "normal",
+            },
+            {
+                "micro_action_index": 3,
+                "performers": [],
+                "targets": ["空间"],
+                "action_kind": "environment_effect",
+                "temporal_relation": "effect_of",
+                "reference_action_indexes": [1, 2],
+                "pace": "slow",
+            },
+        ],
+    }
+
+    timeline = normalize_event_action_units(event)["action_timeline"]
+
+    assert len(timeline["slices"]) == 1
+    assert timeline["slices"][0]["source_micro_action_indexes"] == [1, 2, 3]
+    assert not any(
+        item["field"] == "scheduling_reference_action_index"
+        for item in timeline["temporal_reconciliations"]
+    )
+
+
+@pytest.mark.parametrize(
     "action_kind",
     [
         "locomotion",

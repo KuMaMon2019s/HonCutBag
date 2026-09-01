@@ -73,6 +73,7 @@ _TEMPORAL_RECONCILIATION_POLICY = {
     "active_zero_time": "after",
     "performed_passive_zero_time": "after",
     "unperformed_passive_zero_time": "move_performers_to_targets",
+    "multi_slice_reference_attachment": "latest_materialized_slice",
 }
 ACTION_TEMPORAL_RECONCILIATION_POLICY_SHA256 = hashlib.sha256(
     json.dumps(
@@ -800,18 +801,50 @@ def build_event_action_timeline(
         action_index = relation["micro_action_index"]
         temporal_relation = relation["temporal_relation"]
         if temporal_relation in _OVERLAP_RELATIONS | _ZERO_TEMPORAL_RELATIONS:
-            referenced_slices = {
-                slice_by_action_index[index]
+            reference_slice_by_index = {
+                index: slice_by_action_index[index]
                 for index in relation["reference_action_indexes"]
             }
+            referenced_slices = set(reference_slice_by_index.values())
             if len(referenced_slices) != 1:
-                raise ValueError(
-                    f"micro action {action_index} must reference one temporal slice: "
-                    f"{normalized_actions[action_index - 1]}; references="
-                    f"{relation['reference_action_indexes']} map to slices="
-                    f"{sorted(referenced_slices)}"
+                if semantic_qa_enabled:
+                    raise ValueError(
+                        f"micro action {action_index} must reference one temporal slice: "
+                        f"{normalized_actions[action_index - 1]}; references="
+                        f"{relation['reference_action_indexes']} map to slices="
+                        f"{sorted(referenced_slices)}"
+                    )
+                slice_index = max(referenced_slices)
+                scheduling_reference = max(
+                    index
+                    for index, referenced_slice in (
+                        reference_slice_by_index.items()
+                    )
+                    if referenced_slice == slice_index
                 )
-            slice_index = next(iter(referenced_slices))
+                reconciliation = _temporal_reconciliation_record(
+                    event=event,
+                    actions=normalized_actions,
+                    raw_relation=relation,
+                    action_index=action_index,
+                    field="scheduling_reference_action_index",
+                    observed=list(relation["reference_action_indexes"]),
+                    normalized=scheduling_reference,
+                    reason=(
+                        "multi_slice_reference_attached_to_latest_"
+                        "materialized_slice"
+                    ),
+                )
+                temporal_reconciliations.append(reconciliation)
+                semantic_qa_findings.append({
+                    "category": "temporal_relation_reconciliation",
+                    "micro_action_index": action_index,
+                    "field": reconciliation["field"],
+                    "reason": reconciliation["reason"],
+                    "evidence_sha256": reconciliation["evidence_sha256"],
+                })
+            else:
+                slice_index = next(iter(referenced_slices))
         else:
             # A root or explicit after relation starts a new globally ordered
             # slice. Parallel branches must be declared as overlap instead of

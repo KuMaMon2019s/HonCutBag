@@ -46,7 +46,7 @@ from utils.action_units import (
 from utils.body_action_contracts import (
     apply_body_action_contract,
     deferred_director_body_action_repairs,
-    director_repairable_body_action_placeholders,
+    materialize_missing_director_body_action_placeholders,
     normalize_body_action_choreography,
     requires_explicit_body_choreography,
 )
@@ -312,7 +312,7 @@ _NARRATIVE_JUMP_CUES = (
 # caches carried over from earlier run directories — and forces every Phase 1
 # event extraction to re-run (a paid LLM pass). Never bump casually, and never
 # reuse cross-run segment caches from a run produced under a different value.
-EVENT_FLOW_SCHEMA_VERSION = "31.0"
+EVENT_FLOW_SCHEMA_VERSION = "32.0"
 
 _UNKNOWN_ACTION_PERFORMERS = {
     "",
@@ -437,31 +437,36 @@ def _normalize_event(
         event.get("body_action_choreography") or event.get("action_choreography"),
         micro_actions=event["micro_actions"],
     )
+    model_supplied_choreography = bool(event["body_action_choreography"])
     _reconcile_structured_action_performers(event)
     requires_choreography = requires_explicit_body_choreography(event)
-    if requires_choreography and not event["body_action_choreography"]:
-        if semantic_action_qa_enabled:
+    if requires_choreography:
+        if semantic_action_qa_enabled and not event["body_action_choreography"]:
             raise ValueError(
                 "body choreography is required for dance/combat/martial-arts events"
             )
-        placeholders = director_repairable_body_action_placeholders(event)
-        if not placeholders:
-            raise ValueError(
-                "body choreography performer ownership cannot be determined "
-                "from source-indexed actions"
+        if not semantic_action_qa_enabled:
+            placeholder_reconciliation = (
+                materialize_missing_director_body_action_placeholders(event)
             )
-        event["body_action_choreography"] = normalize_body_action_choreography(
-            placeholders,
-            micro_actions=event["micro_actions"],
-        )
-        event.setdefault("semantic_diagnostics", []).append({
-            "category": "body_choreography_staging_completed_by_director",
-            "reason": "model_choreography_missing",
-            "micro_action_indexes": [
-                int(item["micro_action_index"])
-                for item in placeholders
-            ],
-        })
+            if placeholder_reconciliation:
+                event.setdefault("semantic_diagnostics", []).append({
+                    "category": (
+                        "body_choreography_staging_completed_by_director"
+                    ),
+                    "reason": (
+                        "model_choreography_partially_missing"
+                        if model_supplied_choreography
+                        else "model_choreography_missing"
+                    ),
+                    **placeholder_reconciliation,
+                })
+            if not event["body_action_choreography"]:
+                raise ValueError(
+                    "body choreography performer ownership cannot be determined "
+                    "from source-indexed actions"
+                )
+            _reconcile_structured_action_performers(event)
     choreography_contract = apply_body_action_contract(event)
     if (
         requires_choreography

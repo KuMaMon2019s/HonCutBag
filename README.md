@@ -106,7 +106,7 @@ Phases use contiguous integer IDs (`phase1`–`phase9`); every phase writes a ch
 - **Eight-layer prompt framework** — every shot prompt is assembled from eight structured layers (element reference, shot summary, audio, style anchor, quality suffix, negative guardrails), balancing concise shot descriptions with full constraint coverage.
 - **Seedance-first with graceful fallback** — shots are generated via Seedance online API by default; on timeout or stall the pipeline falls back to local Wan2.2 generation through the Windows Bridge with explicit duration-loss logging.
 - **Continuity-group generation** — the screenwriter labels real action continuations; each group begins from canonical multi-image references and subsequent shots extend the preceding video. Scene changes start fresh and remain eligible for editorial transitions.
-- **Prose-action screenplay understanding** — Phase 1 recognizes scene-state prose, character damage/wardrobe state, unlabelled quoted dialogue, causal attack/counter chains, physical consequences, and relationship reversals. Neighboring text is supplied as read-only context, exact dialogue is confidence-attributed, and deterministic `sequence_id` / `action_unit_id` metadata survives into storyboard generation. Source-semantic gaps still fail closed, while at most two missing Director-owned staging details per covered body beat are completed deterministically and audited instead of triggering a duplicate paid extraction.
+- **Prose-action screenplay understanding** — Phase 1 recognizes scene-state prose, character damage/wardrobe state, unlabelled quoted dialogue, causal attack/counter chains, physical consequences, and relationship reversals. Neighboring text is supplied as read-only context, exact dialogue is confidence-attributed, and deterministic `sequence_id` / `action_unit_id` metadata survives into storyboard generation. Probabilistic action semantics are diagnostic by default: structurally valid temporal variants are reconciled deterministically, and wholly or partially omitted Director-owned body staging is completed from source-indexed performer ownership without a duplicate paid extraction. Invalid schema, action coverage/indexes, source lineage, identity cardinality, hashes, and budgets still fail closed. Pass `--phase1-semantic-qa` only when strict semantic blocking is explicitly required.
 - **Continuity-first primary-shot layout** — the default `continuity` policy preserves the executable semantic beat/action ledger inside model and 25% Provider-padding limits, then minimizes Sxx count and boundaries. It repacks ordered content beats instead of deleting later short shots: a long Sxx carries one continuous causal segment through one to four scoped Pxx requests, each still limited to 1–2 action units. `SCREENPLAY_PLAN.json` is the sole layout authority for new runs; its per-shot Pxx counts, story/request durations, action capacities and hash are bound into the storyboard before Pxx planning, so a lost or drifted projection fails before image/video spend instead of silently falling back to three Pxx. `balanced` follows the requested average more closely, while `cut-driven` preserves the historical short-shot algorithm.
 - **Official Seedance continuity contract** — P01 uses numbered all-modal references, later Pxx requests explicitly extend `视频1` and request the Provider tail frame, and cross-Sxx bridges use only strict `first_frame/last_frame` endpoints with `ratio=adaptive`. The client rejects requests outside Seedance 2.0's 4–15 second output window or 9-image/3-video reference limits before a paid submission; media dimensions, codecs, FPS, size and duration are preflighted before TOS upload.
 - **Narrative-order verification (Phase 8)** — before assembly, storyboard images are reviewed against the full script with a multimodal LLM; extracted frames are scanned for black/still frames; a duration gate compares actual vs. target runtime and can trigger a bounded reshoot loop.
@@ -175,6 +175,9 @@ uv run --locked --managed-python python pipeline/src/pipeline_runner.py \
   --shot-policy continuity --max-material-padding-ratio 0.25 \
   --delivery-overrun-ratio 0
 
+# Optional strict mode: make probabilistic Phase 1 semantic findings blocking
+# by adding --phase1-semantic-qa to the command above.
+
 # Resume from a checkpoint (e.g. after a single shot failure)
 uv run --locked --managed-python python pipeline/scripts/phase_orchestrator.py \
   --config config.json --resume-from phase5
@@ -207,6 +210,11 @@ allows one Ark character Observation request, persists `submission_uncertain`
 before transport, and cannot resume or retry a failed or uncertain attempt.
 This single-request gate does not authorize the separate 36-second full-chain
 acceptance.
+
+Event Flow schema v32 changes the deterministic scheduling and body-staging
+reconciliation contract. Phase 1 segment caches produced by v31 or earlier are
+audit-only for this path and are not reused by a new production run; budget the
+new run for fresh event extraction instead of copying an old segment cache.
 
 `uv.lock` and `.python-version` are authoritative. Project commands must use
 `make` or `uv run --locked ...`; bare `python`, `pip`, and `pytest` may resolve

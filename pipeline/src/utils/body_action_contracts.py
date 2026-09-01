@@ -11,10 +11,14 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import re
 from typing import Any, Iterable
 
 BODY_ACTION_CONTRACT_SCHEMA = "honcut.body-action-choreography.v1"
+BODY_ACTION_PLACEHOLDER_RECONCILIATION_SCHEMA = (
+    "honcut.body-action-placeholder-reconciliation.v1"
+)
 
 _CHOREOGRAPHY_DOMAIN = re.compile(
     r"舞蹈|舞步|街舞|齐舞|群舞|breaking|breakdance|hip[ -]?hop|dance|"
@@ -103,6 +107,24 @@ _STRUCTURED_MECHANICS_FIELDS = (
 _DIRECTOR_REPAIRABLE_MECHANICS_FIELDS = frozenset(
     set(_STRUCTURED_MECHANICS_FIELDS) - {"performer"}
 )
+_BODY_ACTION_PLACEHOLDER_POLICY = {
+    "schema": BODY_ACTION_PLACEHOLDER_RECONCILIATION_SCHEMA,
+    "coverage_identity": "micro_action_index",
+    "performer_authority": [
+        "action_temporal_relation",
+        "source_action_mention",
+        "single_event_participant",
+    ],
+    "production_fields": sorted(_DIRECTOR_REPAIRABLE_MECHANICS_FIELDS),
+}
+BODY_ACTION_PLACEHOLDER_POLICY_SHA256 = hashlib.sha256(
+    json.dumps(
+        _BODY_ACTION_PLACEHOLDER_POLICY,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+).hexdigest()
 MAX_DIRECTOR_REPAIR_FIELDS_PER_BEAT = len(
     _DIRECTOR_REPAIRABLE_MECHANICS_FIELDS
 )
@@ -187,70 +209,154 @@ def requires_explicit_body_choreography(record: dict[str, Any]) -> bool:
     return bool(_CHOREOGRAPHY_DOMAIN.search(text))
 
 
-def director_repairable_body_action_placeholders(
+def _body_action_relations_by_index(
     record: dict[str, Any],
-) -> list[dict[str, Any]]:
-    """Project missing model choreography from immutable action ownership.
-
-    The model is not authoritative for production staging details.  When an
-    executable action already has one or more explicit performers in the
-    temporal ledger, the Director can complete mechanics deterministically
-    without another extraction request.  Missing performer ownership remains
-    a structural error and is not guessed from genre prose.
-    """
-
-    actions = _string_list(record.get("micro_actions"))
-    if not actions:
-        actions = _string_list(record.get("generation_actions"))
-    relations = {
+) -> dict[int, dict[str, Any]]:
+    return {
         int(raw.get("micro_action_index") or 0): raw
         for raw in record.get("action_temporal_relations") or []
         if isinstance(raw, dict)
         and isinstance(raw.get("micro_action_index"), int)
         and not isinstance(raw.get("micro_action_index"), bool)
     }
-    placeholders: list[dict[str, Any]] = []
-    for position, action in enumerate(actions, 1):
-        if not _record_action_requires_body_beat(record, action, position):
-            continue
-        relation = relations.get(position, {})
+
+
+def _director_repairable_body_action_placeholder(
+    record: dict[str, Any],
+    *,
+    action: str,
+    position: int,
+    relation: dict[str, Any],
+) -> dict[str, Any] | None:
+    performers = list(dict.fromkeys(
+        str(value).strip()
+        for value in relation.get("performers") or []
+        if str(value).strip()
+    ))
+    if not performers:
         performers = list(dict.fromkeys(
             str(value).strip()
-            for value in relation.get("performers") or []
+            for value in record.get("who") or []
+            if str(value).strip() and str(value).strip() in action
+        ))
+    if not performers:
+        event_participants = list(dict.fromkeys(
+            str(value).strip()
+            for value in record.get("who") or []
             if str(value).strip()
         ))
-        if not performers:
-            source_mentions = list(dict.fromkeys(
-                str(value).strip()
-                for value in record.get("who") or []
-                if str(value).strip() and str(value).strip() in action
-            ))
-            performers = source_mentions
-        if not performers:
-            event_participants = list(dict.fromkeys(
-                str(value).strip()
-                for value in record.get("who") or []
-                if str(value).strip()
-            ))
-            if len(event_participants) == 1:
-                performers = event_participants
-        if not performers:
-            return []
-        placeholders.append({
-            "micro_action_index": position,
-            "micro_action": action,
-            "performer": "、".join(performers),
-            "technique": "",
-            "side": "",
-            "limbs": [],
-            "footwork": "",
-            "torso": "",
-            "weight_shift": "",
-            "direction": "",
-            "contact": "",
-            "end_pose": "",
-        })
-    return placeholders
+        if len(event_participants) == 1:
+            performers = event_participants
+    if not performers:
+        return None
+    return {
+        "micro_action_index": position,
+        "micro_action": action,
+        "performer": "、".join(performers),
+        "technique": "",
+        "side": "",
+        "limbs": [],
+        "footwork": "",
+        "torso": "",
+        "weight_shift": "",
+        "direction": "",
+        "contact": "",
+        "end_pose": "",
+    }
+
+
+def materialize_missing_director_body_action_placeholders(
+    record: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Add only omitted source-indexed body beats and return an audit record.
+
+    Existing model beats remain authoritative observations.  This function
+    creates placeholders solely for uncovered body actions whose performer is
+    already determined by the temporal/source ledger.  Invalid or duplicate
+    indexes and ambiguous performer ownership remain structural failures.
+    """
+
+    actions = _string_list(record.get("micro_actions"))
+    if not actions:
+        actions = _string_list(record.get("generation_actions"))
+    existing = normalize_body_action_choreography(
+        record.get("body_action_choreography")
+        or record.get("action_choreography"),
+        micro_actions=actions,
+    )
+    existing_indexes = [
+        int(beat.get("micro_action_index") or 0)
+        for beat in existing
+    ]
+    if any(not 1 <= index <= len(actions) for index in existing_indexes) or (
+        len(existing_indexes) != len(set(existing_indexes))
+    ):
+        raise ValueError(
+            "body choreography must use unique valid micro-action indexes"
+        )
+
+    relations = _body_action_relations_by_index(record)
+    existing_index_set = set(existing_indexes)
+    missing_indexes = [
+        position
+        for position, action in enumerate(actions, 1)
+        if _record_action_requires_body_beat(record, action, position)
+        and position not in existing_index_set
+    ]
+    if not missing_indexes:
+        record["body_action_choreography"] = existing
+        return None
+
+    placeholders: list[dict[str, Any]] = []
+    for position in missing_indexes:
+        placeholder = _director_repairable_body_action_placeholder(
+            record,
+            action=actions[position - 1],
+            position=position,
+            relation=relations.get(position, {}),
+        )
+        if placeholder is None:
+            raise ValueError(
+                "body choreography performer ownership cannot be determined "
+                f"for micro action {position}"
+            )
+        placeholders.append(placeholder)
+
+    combined = sorted(
+        [dict(item) for item in existing + placeholders],
+        key=lambda item: int(item.get("micro_action_index") or 0),
+    )
+    record["body_action_choreography"] = [
+        dict(item, beat=beat_index)
+        for beat_index, item in enumerate(combined, 1)
+    ]
+    evidence_payload = {
+        "micro_actions": actions,
+        "who": _string_list(record.get("who")),
+        "source_excerpt": str(record.get("source_excerpt") or ""),
+        "action_ownership": [
+            {
+                "micro_action_index": position,
+                "performers": _string_list(
+                    relations.get(position, {}).get("performers")
+                ),
+            }
+            for position in missing_indexes
+        ],
+    }
+    return {
+        "schema": BODY_ACTION_PLACEHOLDER_RECONCILIATION_SCHEMA,
+        "policy_sha256": BODY_ACTION_PLACEHOLDER_POLICY_SHA256,
+        "micro_action_indexes": missing_indexes,
+        "source_evidence_sha256": hashlib.sha256(
+            json.dumps(
+                evidence_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
 
 
 def _action_requires_body_beat(action: str) -> bool:
