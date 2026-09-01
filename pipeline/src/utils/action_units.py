@@ -28,6 +28,9 @@ from typing import Any
 
 
 ACTION_TIMELINE_SCHEMA = "honcut.action-timeline.v1"
+ACTION_TEMPORAL_RECONCILIATION_SCHEMA = (
+    "honcut.action-temporal-reconciliation.v1"
+)
 SOURCE_INDEXED_SCREENPLAY_REWRITE_SCHEMA = (
     "honcut.source-indexed-screenplay-rewrite.v1"
 )
@@ -54,6 +57,31 @@ _PACES = {"fast", "normal", "slow"}
 _ZERO_TEMPORAL_RELATIONS = {"effect_of", "sustained_during"}
 _OVERLAP_RELATIONS = {"overlap", "reaction_overlap"}
 _PACE_WEIGHTS = {"fast": 1, "normal": 2, "slow": 3}
+_PASSIVE_ACTION_KINDS = {"environment_effect", "sustained"}
+_ZERO_TIME_ACTION_KINDS = {
+    "impact",
+    "state_change",
+    "environment_effect",
+    "sustained",
+}
+_TEMPORAL_RECONCILIATION_POLICY = {
+    "schema": ACTION_TEMPORAL_RECONCILIATION_SCHEMA,
+    "passive_overlap": {
+        "environment_effect": "effect_of",
+        "sustained": "sustained_during",
+    },
+    "active_zero_time": "after",
+    "performed_passive_zero_time": "after",
+    "unperformed_passive_zero_time": "move_performers_to_targets",
+}
+ACTION_TEMPORAL_RECONCILIATION_POLICY_SHA256 = hashlib.sha256(
+    json.dumps(
+        _TEMPORAL_RECONCILIATION_POLICY,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+).hexdigest()
 _ENSEMBLE_SOURCE_CUE = re.compile(
     r"同时|同一时刻|同一瞬间|同步|协同|共同|一起|一同|全体|"
     r"(?<![第十])[两二三四五六七八九十]+(?:名|人|位|个)|"
@@ -354,17 +382,57 @@ def _choreography_performers_by_action(event: dict[str, Any]) -> dict[int, list[
     }
 
 
+def _temporal_reconciliation_record(
+    *,
+    event: dict[str, Any],
+    actions: list[str],
+    raw_relation: dict[str, Any],
+    action_index: int,
+    field: str,
+    observed: Any,
+    normalized: Any,
+    reason: str,
+) -> dict[str, Any]:
+    evidence_payload = {
+        "action": actions[action_index - 1],
+        "source_excerpt": str(event.get("source_excerpt") or ""),
+        "what": str(event.get("what") or ""),
+        "raw_relation": raw_relation,
+    }
+    return {
+        "schema": ACTION_TEMPORAL_RECONCILIATION_SCHEMA,
+        "policy_sha256": ACTION_TEMPORAL_RECONCILIATION_POLICY_SHA256,
+        "micro_action_index": action_index,
+        "field": field,
+        "observed": observed,
+        "normalized": normalized,
+        "reason": reason,
+        "evidence_sha256": hashlib.sha256(
+            json.dumps(
+                evidence_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
 def _normalized_temporal_relations(
     event: dict[str, Any],
     actions: list[str],
-) -> list[dict[str, Any]]:
+    *,
+    semantic_qa_enabled: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     raw_relations = event.get("action_temporal_relations") or []
     if not raw_relations:
-        return []
+        return [], [], []
     if not isinstance(raw_relations, list):
         raise ValueError("action_temporal_relations must be a list")
     choreography_performers = _choreography_performers_by_action(event)
     normalized: list[dict[str, Any]] = []
+    reconciliations: list[dict[str, Any]] = []
+    semantic_findings: list[dict[str, Any]] = []
     observed_indexes: set[int] = set()
     for raw in raw_relations:
         if not isinstance(raw, dict):
@@ -410,39 +478,114 @@ def _normalized_temporal_relations(
             raise ValueError(
                 f"micro action {action_index} temporal relation requires a reference"
             )
-        if temporal_relation in _ZERO_TEMPORAL_RELATIONS and action_kind not in {
-            "impact",
-            "state_change",
-            "environment_effect",
-            "sustained",
-        }:
-            raise ValueError(
-                f"micro action {action_index} cannot be a zero-time actor action: "
-                f"{actions[action_index - 1]}"
-            )
         performers = _clean_string_list(raw.get("performers"))
+        choreography_owned = bool(choreography_performers.get(action_index))
         if not performers:
             performers = choreography_performers.get(action_index, [])
-        if temporal_relation in _ZERO_TEMPORAL_RELATIONS and performers:
-            raise ValueError(
-                "passive effect/sustained actions cannot claim an independent "
-                "performer: "
-                f"micro_action_index={action_index}, "
-                f"action_kind={action_kind}, temporal_relation={temporal_relation}, "
-                f"performers={performers}, action={actions[action_index - 1]}"
-            )
-        if (
-            action_kind in {"environment_effect", "sustained"}
-            and temporal_relation in _OVERLAP_RELATIONS
-        ):
-            raise ValueError(
-                "passive environment/sustained actions must use effect_of or "
-                "sustained_during, never actor overlap: "
-                f"micro_action_index={action_index}, "
-                f"action_kind={action_kind}, temporal_relation={temporal_relation}, "
-                f"performers={performers}, action={actions[action_index - 1]}"
-            )
         targets = _clean_string_list(raw.get("targets"))
+        if semantic_qa_enabled:
+            if (
+                temporal_relation in _ZERO_TEMPORAL_RELATIONS
+                and action_kind not in _ZERO_TIME_ACTION_KINDS
+            ):
+                raise ValueError(
+                    f"micro action {action_index} cannot be a zero-time actor action: "
+                    f"{actions[action_index - 1]}"
+                )
+            if temporal_relation in _ZERO_TEMPORAL_RELATIONS and performers:
+                raise ValueError(
+                    "passive effect/sustained actions cannot claim an independent "
+                    "performer: "
+                    f"micro_action_index={action_index}, "
+                    f"action_kind={action_kind}, temporal_relation={temporal_relation}, "
+                    f"performers={performers}, action={actions[action_index - 1]}"
+                )
+            if (
+                action_kind in _PASSIVE_ACTION_KINDS
+                and temporal_relation in _OVERLAP_RELATIONS
+            ):
+                raise ValueError(
+                    "passive environment/sustained actions must use effect_of or "
+                    "sustained_during, never actor overlap: "
+                    f"micro_action_index={action_index}, "
+                    f"action_kind={action_kind}, temporal_relation={temporal_relation}, "
+                    f"performers={performers}, action={actions[action_index - 1]}"
+                )
+        else:
+            if (
+                temporal_relation in _ZERO_TEMPORAL_RELATIONS
+                and action_kind not in _ZERO_TIME_ACTION_KINDS
+            ):
+                observed_relation = temporal_relation
+                temporal_relation = "after"
+                reconciliations.append(_temporal_reconciliation_record(
+                    event=event,
+                    actions=actions,
+                    raw_relation=raw,
+                    action_index=action_index,
+                    field="temporal_relation",
+                    observed=observed_relation,
+                    normalized=temporal_relation,
+                    reason="active_zero_time_relation_promoted_to_ordered_slice",
+                ))
+            if (
+                action_kind in _PASSIVE_ACTION_KINDS
+                and temporal_relation in _OVERLAP_RELATIONS
+            ):
+                observed_relation = temporal_relation
+                temporal_relation = (
+                    "after"
+                    if choreography_owned
+                    else _TEMPORAL_RECONCILIATION_POLICY["passive_overlap"][
+                        action_kind
+                    ]
+                )
+                reconciliations.append(_temporal_reconciliation_record(
+                    event=event,
+                    actions=actions,
+                    raw_relation=raw,
+                    action_index=action_index,
+                    field="temporal_relation",
+                    observed=observed_relation,
+                    normalized=temporal_relation,
+                    reason=(
+                        "choreography_owned_passive_relation_promoted_to_ordered_slice"
+                        if choreography_owned
+                        else "passive_overlap_attached_as_zero_story_time"
+                    ),
+                ))
+            if temporal_relation in _ZERO_TEMPORAL_RELATIONS and performers:
+                if action_kind in _PASSIVE_ACTION_KINDS and not choreography_owned:
+                    observed_performers = list(performers)
+                    targets = list(dict.fromkeys(targets + performers))
+                    performers = []
+                    reconciliations.append(_temporal_reconciliation_record(
+                        event=event,
+                        actions=actions,
+                        raw_relation=raw,
+                        action_index=action_index,
+                        field="performers",
+                        observed=observed_performers,
+                        normalized=[],
+                        reason=(
+                            "passive_zero_time_performers_reclassified_as_targets"
+                        ),
+                    ))
+                else:
+                    observed_relation = temporal_relation
+                    temporal_relation = "after"
+                    reconciliations.append(_temporal_reconciliation_record(
+                        event=event,
+                        actions=actions,
+                        raw_relation=raw,
+                        action_index=action_index,
+                        field="temporal_relation",
+                        observed=observed_relation,
+                        normalized=temporal_relation,
+                        reason=(
+                            "performed_zero_time_relation_promoted_to_ordered_slice"
+                        ),
+                    ))
         normalized.append({
             "micro_action_index": action_index,
             "performers": performers,
@@ -460,7 +603,15 @@ def _normalized_temporal_relations(
             "action temporal relations must cover every micro action exactly once"
         )
     normalized.sort(key=lambda item: item["micro_action_index"])
-    return normalized
+    for reconciliation in reconciliations:
+        semantic_findings.append({
+            "category": "temporal_relation_reconciliation",
+            "micro_action_index": reconciliation["micro_action_index"],
+            "field": reconciliation["field"],
+            "reason": reconciliation["reason"],
+            "evidence_sha256": reconciliation["evidence_sha256"],
+        })
+    return normalized, reconciliations, semantic_findings
 
 
 def _validate_parallel_relation(
@@ -594,6 +745,13 @@ def build_event_action_timeline(
     if not normalized_actions:
         return {
             "schema": ACTION_TIMELINE_SCHEMA,
+            "temporal_reconciliation_schema": (
+                ACTION_TEMPORAL_RECONCILIATION_SCHEMA
+            ),
+            "temporal_reconciliation_policy_sha256": (
+                ACTION_TEMPORAL_RECONCILIATION_POLICY_SHA256
+            ),
+            "temporal_reconciliations": [],
             "semantic_qa": {
                 "enabled": semantic_qa_enabled,
                 "verdict": (
@@ -609,13 +767,19 @@ def build_event_action_timeline(
             "temporal_slice_count": 0,
             "maximum_motion_load": 0,
         }
-    relations = _normalized_temporal_relations(event, normalized_actions)
+    relations, temporal_reconciliations, relation_findings = (
+        _normalized_temporal_relations(
+            event,
+            normalized_actions,
+            semantic_qa_enabled=semantic_qa_enabled,
+        )
+    )
     if not relations:
         return None
     relations_by_index = {
         relation["micro_action_index"]: relation for relation in relations
     }
-    semantic_qa_findings: list[dict[str, Any]] = []
+    semantic_qa_findings: list[dict[str, Any]] = list(relation_findings)
     for relation in relations:
         try:
             _validate_parallel_relation(event, relation, relations_by_index)
@@ -780,6 +944,13 @@ def build_event_action_timeline(
     ).hexdigest()
     return {
         "schema": ACTION_TIMELINE_SCHEMA,
+        "temporal_reconciliation_schema": (
+            ACTION_TEMPORAL_RECONCILIATION_SCHEMA
+        ),
+        "temporal_reconciliation_policy_sha256": (
+            ACTION_TEMPORAL_RECONCILIATION_POLICY_SHA256
+        ),
+        "temporal_reconciliations": temporal_reconciliations,
         "semantic_qa": {
             "enabled": semantic_qa_enabled,
             "verdict": (

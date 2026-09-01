@@ -1222,7 +1222,7 @@ def test_event_extractor_requests_bounded_nonduplicative_structured_output():
     assert "不得删减来源动作" in contract
     assert "不得拆成额外请求" in contract
     assert "有界结构化输出" in event_extractor.USER_PROMPT_TEMPLATE
-    assert event_extractor.EVENT_FLOW_SCHEMA_VERSION == "30.0"
+    assert event_extractor.EVENT_FLOW_SCHEMA_VERSION == "31.0"
 
 
 def test_director_uses_runtime_long_structured_stream_policy():

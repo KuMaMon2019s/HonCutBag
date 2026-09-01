@@ -46,6 +46,7 @@ from utils.action_units import (
 from utils.body_action_contracts import (
     apply_body_action_contract,
     deferred_director_body_action_repairs,
+    director_repairable_body_action_placeholders,
     normalize_body_action_choreography,
     requires_explicit_body_choreography,
 )
@@ -311,7 +312,7 @@ _NARRATIVE_JUMP_CUES = (
 # caches carried over from earlier run directories — and forces every Phase 1
 # event extraction to re-run (a paid LLM pass). Never bump casually, and never
 # reuse cross-run segment caches from a run produced under a different value.
-EVENT_FLOW_SCHEMA_VERSION = "30.0"
+EVENT_FLOW_SCHEMA_VERSION = "31.0"
 
 _UNKNOWN_ACTION_PERFORMERS = {
     "",
@@ -439,9 +440,28 @@ def _normalize_event(
     _reconcile_structured_action_performers(event)
     requires_choreography = requires_explicit_body_choreography(event)
     if requires_choreography and not event["body_action_choreography"]:
-        raise ValueError(
-            "body choreography is required for dance/combat/martial-arts events"
+        if semantic_action_qa_enabled:
+            raise ValueError(
+                "body choreography is required for dance/combat/martial-arts events"
+            )
+        placeholders = director_repairable_body_action_placeholders(event)
+        if not placeholders:
+            raise ValueError(
+                "body choreography performer ownership cannot be determined "
+                "from source-indexed actions"
+            )
+        event["body_action_choreography"] = normalize_body_action_choreography(
+            placeholders,
+            micro_actions=event["micro_actions"],
         )
+        event.setdefault("semantic_diagnostics", []).append({
+            "category": "body_choreography_staging_completed_by_director",
+            "reason": "model_choreography_missing",
+            "micro_action_indexes": [
+                int(item["micro_action_index"])
+                for item in placeholders
+            ],
+        })
     choreography_contract = apply_body_action_contract(event)
     if (
         requires_choreography
@@ -457,8 +477,13 @@ def _normalize_event(
             event,
             choreography_contract,
         )
-        if deferred_repairs:
+        if deferred_repairs and not semantic_action_qa_enabled:
             event["body_action_director_repairs_pending"] = deferred_repairs
+            event.setdefault("semantic_diagnostics", []).append({
+                "category": "body_choreography_staging_completed_by_director",
+                "reason": "model_staging_fields_incomplete",
+                "repairs": [dict(item) for item in deferred_repairs],
+            })
         else:
             raise ValueError(
                 "body choreography failed executable mechanics validation: "
@@ -529,6 +554,25 @@ def _normalize_event(
         )
     event["action_timeline_qa"] = (
         dict(timeline.get("semantic_qa") or {}) if timeline else {}
+    )
+    event["action_temporal_reconciliation_schema"] = (
+        str(timeline.get("temporal_reconciliation_schema") or "")
+        if timeline
+        else ""
+    )
+    event["action_temporal_reconciliation_policy_sha256"] = (
+        str(timeline.get("temporal_reconciliation_policy_sha256") or "")
+        if timeline
+        else ""
+    )
+    event["action_temporal_reconciliations"] = (
+        [
+            dict(item)
+            for item in timeline.get("temporal_reconciliations") or []
+            if isinstance(item, dict)
+        ]
+        if timeline
+        else []
     )
     return event
 

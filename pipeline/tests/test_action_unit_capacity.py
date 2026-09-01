@@ -650,7 +650,7 @@ def test_semantic_qa_mode_rejects_non_boolean_event_value():
         normalize_event_action_units(event)
 
 
-def test_passive_environment_effect_has_no_actor_overlap_or_fake_performer():
+def test_passive_environment_effect_is_reconciled_by_default_and_strict_on_demand():
     overlap_event = {
         "micro_actions": ["冲击波席卷车厢", "玻璃震动", "雨滴被气流卷起"],
         "action_temporal_relations": [
@@ -684,22 +684,124 @@ def test_passive_environment_effect_has_no_actor_overlap_or_fake_performer():
         ],
     }
 
+    normalized = normalize_event_action_units(overlap_event)
+
+    assert normalized["units"] == 1
+    timeline = normalized["action_timeline"]
+    repaired = timeline["actions"][2]
+    assert repaired["temporal_relation"] == "effect_of"
+    assert repaired["performers"] == []
+    assert repaired["targets"] == ["雨滴", "环境"]
+    assert timeline["semantic_qa"]["verdict"] == "diagnostic_only"
+    assert timeline["semantic_qa"]["finding_count"] == 2
+    assert [
+        item["reason"] for item in timeline["temporal_reconciliations"]
+    ] == [
+        "passive_overlap_attached_as_zero_story_time",
+        "passive_zero_time_performers_reclassified_as_targets",
+    ]
+    repeated = normalize_event_action_units(copy.deepcopy(overlap_event))
+    assert repeated["action_timeline"]["temporal_reconciliations"] == (
+        timeline["temporal_reconciliations"]
+    )
+    assert repeated["action_timeline"][
+        "temporal_reconciliation_policy_sha256"
+    ] == timeline["temporal_reconciliation_policy_sha256"]
+
+    strict_overlap_event = copy.deepcopy(overlap_event)
+    strict_overlap_event["semantic_action_qa_enabled"] = True
     with pytest.raises(
         ValueError,
         match="passive environment/sustained actions must use effect_of",
     ):
-        normalize_event_action_units(overlap_event)
+        normalize_event_action_units(strict_overlap_event)
 
     fake_performer_event = copy.deepcopy(overlap_event)
     fake_performer_event["action_temporal_relations"][2]["temporal_relation"] = (
         "effect_of"
     )
 
+    normalized_fake_performer = normalize_event_action_units(fake_performer_event)
+    repaired_fake_performer = normalized_fake_performer["action_timeline"]["actions"][2]
+    assert repaired_fake_performer["temporal_relation"] == "effect_of"
+    assert repaired_fake_performer["performers"] == []
+    assert repaired_fake_performer["targets"] == ["雨滴", "环境"]
+
+    fake_performer_event["semantic_action_qa_enabled"] = True
     with pytest.raises(
         ValueError,
         match="passive effect/sustained actions cannot claim an independent performer",
     ):
         normalize_event_action_units(fake_performer_event)
+
+
+@pytest.mark.parametrize(
+    "action_kind",
+    [
+        "locomotion",
+        "attack",
+        "defense",
+        "control",
+        "impact",
+        "state_change",
+        "environment_effect",
+        "sustained",
+    ],
+)
+@pytest.mark.parametrize(
+    "temporal_relation",
+    [
+        "root",
+        "after",
+        "overlap",
+        "reaction_overlap",
+        "effect_of",
+        "sustained_during",
+    ],
+)
+@pytest.mark.parametrize("performers", [[], ["参与者乙"]])
+def test_default_semantic_mode_accepts_every_structurally_valid_relation_combination(
+    action_kind,
+    temporal_relation,
+    performers,
+):
+    references = [] if temporal_relation == "root" else [1]
+    event = {
+        "who": ["参与者甲", "参与者乙"],
+        "source_excerpt": "参与者甲完成第一步；另一项可见变化与其相邻发生。",
+        "micro_actions": ["参与者甲完成第一步", "另一项可见变化"],
+        "action_temporal_relations": [
+            {
+                "micro_action_index": 1,
+                "performers": ["参与者甲"],
+                "targets": [],
+                "action_kind": "locomotion",
+                "temporal_relation": "root",
+                "reference_action_indexes": [],
+                "pace": "normal",
+            },
+            {
+                "micro_action_index": 2,
+                "performers": performers,
+                "targets": [],
+                "action_kind": action_kind,
+                "temporal_relation": temporal_relation,
+                "reference_action_indexes": references,
+                "pace": "normal",
+            },
+        ],
+    }
+
+    normalized = normalize_event_action_units(event)
+
+    timeline = normalized["action_timeline"]
+    covered_indexes = sorted(
+        index
+        for timeline_slice in timeline["slices"]
+        for index in timeline_slice["source_micro_action_indexes"]
+    )
+    assert covered_indexes == [1, 2]
+    assert timeline["source_micro_actions"] == event["micro_actions"]
 
 
 def test_canonical_action_timeline_records_model_motion_capacity():

@@ -103,7 +103,9 @@ _STRUCTURED_MECHANICS_FIELDS = (
 _DIRECTOR_REPAIRABLE_MECHANICS_FIELDS = frozenset(
     set(_STRUCTURED_MECHANICS_FIELDS) - {"performer"}
 )
-MAX_DIRECTOR_REPAIR_FIELDS_PER_BEAT = 2
+MAX_DIRECTOR_REPAIR_FIELDS_PER_BEAT = len(
+    _DIRECTOR_REPAIRABLE_MECHANICS_FIELDS
+)
 
 
 def _text_values(record: dict[str, Any], fields: Iterable[str]) -> str:
@@ -183,6 +185,72 @@ def requires_explicit_body_choreography(record: dict[str, Any]) -> bool:
             ),
         )
     return bool(_CHOREOGRAPHY_DOMAIN.search(text))
+
+
+def director_repairable_body_action_placeholders(
+    record: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Project missing model choreography from immutable action ownership.
+
+    The model is not authoritative for production staging details.  When an
+    executable action already has one or more explicit performers in the
+    temporal ledger, the Director can complete mechanics deterministically
+    without another extraction request.  Missing performer ownership remains
+    a structural error and is not guessed from genre prose.
+    """
+
+    actions = _string_list(record.get("micro_actions"))
+    if not actions:
+        actions = _string_list(record.get("generation_actions"))
+    relations = {
+        int(raw.get("micro_action_index") or 0): raw
+        for raw in record.get("action_temporal_relations") or []
+        if isinstance(raw, dict)
+        and isinstance(raw.get("micro_action_index"), int)
+        and not isinstance(raw.get("micro_action_index"), bool)
+    }
+    placeholders: list[dict[str, Any]] = []
+    for position, action in enumerate(actions, 1):
+        if not _record_action_requires_body_beat(record, action, position):
+            continue
+        relation = relations.get(position, {})
+        performers = list(dict.fromkeys(
+            str(value).strip()
+            for value in relation.get("performers") or []
+            if str(value).strip()
+        ))
+        if not performers:
+            source_mentions = list(dict.fromkeys(
+                str(value).strip()
+                for value in record.get("who") or []
+                if str(value).strip() and str(value).strip() in action
+            ))
+            performers = source_mentions
+        if not performers:
+            event_participants = list(dict.fromkeys(
+                str(value).strip()
+                for value in record.get("who") or []
+                if str(value).strip()
+            ))
+            if len(event_participants) == 1:
+                performers = event_participants
+        if not performers:
+            return []
+        placeholders.append({
+            "micro_action_index": position,
+            "micro_action": action,
+            "performer": "、".join(performers),
+            "technique": "",
+            "side": "",
+            "limbs": [],
+            "footwork": "",
+            "torso": "",
+            "weight_shift": "",
+            "direction": "",
+            "contact": "",
+            "end_pose": "",
+        })
+    return placeholders
 
 
 def _action_requires_body_beat(action: str) -> bool:
@@ -285,7 +353,8 @@ def deferred_director_body_action_repairs(
     Event extraction owns source facts: performer identity, action indexes and
     temporal relations.  A paid response that preserves those facts should not
     be regenerated solely because one or two production-staging fields are
-    absent.  Sparse choreography and any missing performer remain hard errors.
+    absent.  Missing performer ownership remains a hard error; all other
+    production-staging fields are deterministically repairable.
     """
 
     contract = contract or build_body_action_contract(record)

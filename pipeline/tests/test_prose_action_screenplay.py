@@ -43,7 +43,10 @@ from utils.camera_motion_contracts import (
     apply_camera_motion_contract,
     camera_motion_prompt,
 )
-from utils.body_action_contracts import build_body_action_contract
+from utils.body_action_contracts import (
+    build_body_action_contract,
+    complete_director_owned_body_action_contract,
+)
 from utils.action_units import build_action_timeline
 
 
@@ -437,7 +440,7 @@ def test_event_parser_defers_two_director_owned_body_details():
     ]
 
 
-def test_event_parser_still_rejects_sparse_body_choreography():
+def test_event_parser_defers_all_director_owned_body_details_by_default():
     payload = [_event(
         what="男子在车厢内与敌人格斗",
         visual="男子连续闪避敌人的格斗攻击",
@@ -458,10 +461,97 @@ def test_event_parser_still_rejects_sparse_body_choreography():
         }],
     )]
 
+    parsed = _parse_events(
+        json.dumps({"events": payload}, ensure_ascii=False),
+        "男子在车厢内连续闪避敌人攻击。",
+    )
+
+    assert parsed[0]["body_action_director_repairs_pending"] == [{
+        "micro_action_index": 1,
+        "fields": ["footwork", "limbs", "torso"],
+    }]
+    assert parsed[0]["semantic_diagnostics"][-1]["reason"] == (
+        "model_staging_fields_incomplete"
+    )
+
     with pytest.raises(ValueError, match="body choreography"):
         _parse_events(
             json.dumps({"events": payload}, ensure_ascii=False),
             "男子在车厢内连续闪避敌人攻击。",
+            semantic_action_qa_enabled=True,
+        )
+
+
+def test_event_parser_materializes_missing_choreography_without_retry():
+    source = "参与者在格斗中向左侧身闪避来袭物体。"
+    payload = [_event(
+        who=["参与者"],
+        what=source,
+        visual=source,
+        source_excerpt=source,
+        micro_actions=["参与者在格斗中向左侧身闪避来袭物体"],
+        body_action_choreography=[],
+        action_temporal_relations=[{
+            "micro_action_index": 1,
+            "performers": ["参与者"],
+            "targets": ["来袭物体"],
+            "action_kind": "defense",
+            "temporal_relation": "root",
+            "reference_action_indexes": [],
+            "pace": "fast",
+        }],
+    )]
+
+    parsed = _parse_events(
+        json.dumps({"events": payload}, ensure_ascii=False),
+        source,
+    )
+
+    event = parsed[0]
+    assert event["body_action_choreography"][0]["performer"] == "参与者"
+    assert event["body_action_director_repairs_pending"][0][
+        "micro_action_index"
+    ] == 1
+    assert event["semantic_diagnostics"][-2]["reason"] == (
+        "model_choreography_missing"
+    )
+    assert event["semantic_diagnostics"][-1]["reason"] == (
+        "model_staging_fields_incomplete"
+    )
+
+    repairs = complete_director_owned_body_action_contract(event)
+    assert repairs == event["body_action_director_repairs"]
+    assert event["body_action_contract"]["valid"] is True
+    assert "body_action_director_repairs_pending" not in event
+
+
+def test_event_parser_keeps_ambiguous_choreography_ownership_strict():
+    source = "两名参与者近身格斗，其中一人侧身闪避。"
+    payload = [_event(
+        who=["参与者甲", "参与者乙"],
+        what=source,
+        visual=source,
+        source_excerpt=source,
+        micro_actions=["侧身闪避"],
+        body_action_choreography=[],
+        action_temporal_relations=[{
+            "micro_action_index": 1,
+            "performers": [],
+            "targets": [],
+            "action_kind": "defense",
+            "temporal_relation": "root",
+            "reference_action_indexes": [],
+            "pace": "fast",
+        }],
+    )]
+
+    with pytest.raises(
+        ValueError,
+        match="performer ownership cannot be determined",
+    ):
+        _parse_events(
+            json.dumps({"events": payload}, ensure_ascii=False),
+            source,
         )
 
 
@@ -1298,6 +1388,63 @@ def test_event_extractor_repairs_role_and_dramatic_turn_without_retry(monkeypatc
     assert len(calls) == 1
     assert events[0]["dramatic_turn"] is False
     assert events[0]["semantic_diagnostics"]
+
+
+def test_event_extractor_reconciles_passive_overlap_without_retry(monkeypatch):
+    source = "演示装置开始运转，室内主灯持续照亮桌面。"
+    payload = _event(
+        who=[],
+        where="室内",
+        what=source,
+        visual=source,
+        source_excerpt=source,
+        micro_actions=["演示装置开始运转", "室内主灯持续照亮桌面"],
+        body_action_choreography=[],
+        action_temporal_relations=[
+            {
+                "micro_action_index": 1,
+                "performers": ["演示装置"],
+                "targets": [],
+                "action_kind": "state_change",
+                "temporal_relation": "root",
+                "reference_action_indexes": [],
+                "pace": "normal",
+            },
+            {
+                "micro_action_index": 2,
+                "performers": [],
+                "targets": ["桌面"],
+                "action_kind": "environment_effect",
+                "temporal_relation": "overlap",
+                "reference_action_indexes": [1],
+                "pace": "slow",
+            },
+        ],
+    )
+    calls = []
+
+    def fake_call(prompt, **_kwargs):
+        calls.append(prompt)
+        return json.dumps({"events": [payload]}, ensure_ascii=False)
+
+    monkeypatch.setattr("prompt.event_extractor._call_llm", fake_call)
+
+    from prompt import event_extractor
+
+    events = event_extractor._extract_events_from_segment({
+        "id": 1,
+        "content": source,
+        "format_hint": "general_prose",
+    })
+
+    assert len(calls) == 1
+    assert events[0]["action_temporal_relations"][1]["temporal_relation"] == (
+        "overlap"
+    )
+    assert events[0]["action_temporal_reconciliations"][0]["normalized"] == (
+        "effect_of"
+    )
+    assert events[0]["action_timeline_qa"]["verdict"] == "diagnostic_only"
 
 
 def test_adaptation_inherits_source_evidence_and_repairs_dialogue_speaker():
