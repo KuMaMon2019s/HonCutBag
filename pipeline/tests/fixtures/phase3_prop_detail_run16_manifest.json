@@ -1,0 +1,39 @@
+{
+  "schema": "honcut.prop-detail-preserved-evidence-manifest.v1",
+  "source_run_id": "honcut-canonical-visual-ledger-36s-run-16",
+  "source_run_fingerprint": "148add0286372c29ef51299bbb103fdebc3acbd8f95a4018a1d1477badf94f8a",
+  "source_git_commit": "2702b6dda00f2d17ce3b9c6a30d97ecac514caff",
+  "historical_status": "live_acceptance_failed",
+  "character_id": "ENTITY_0b4ba006e589caa3_I01",
+  "canonical_contract_sha256": "acde11c2eff70d86c420357594577d31814e6be140ba83c60d1a5ad0b954397c",
+  "artifacts": {
+    "run_manifest": {
+      "path": "RUN_MANIFEST.json",
+      "sha256": "e39f1bd86b45e340e080a925fb6342436ead10d8ebdb7638f811a670b9ab65c7"
+    },
+    "failed_acceptance": {
+      "path": "canonical_visual_ledger_36s_acceptance.json",
+      "sha256": "8a1551d5a8e734293d3bb98c34c9f90658eef6042dcbcdf51845fd38e6b64e3c"
+    },
+    "canonical_contract": {
+      "path": "CANONICAL_VISUAL_CONTRACT.json",
+      "sha256": "e9b07e4faf7e463a83decea2ba95885ab75b21a2185a325cdb0c5eefc6e400fd"
+    },
+    "face_reference": {
+      "path": "characters/ENTITY_0b4ba006e589caa3_I01/face_closeup.png",
+      "sha256": "233da5ef8ede32f464b488526a5f90daa654c0e760abdce33556b384ecb46b29"
+    },
+    "body_reference": {
+      "path": "characters/ENTITY_0b4ba006e589caa3_I01/full_body.png",
+      "sha256": "1d6046052a0866ea51ac1c449785f57562f0309094b85a3cec32820febae4ada"
+    },
+    "prop_detail_board": {
+      "path": "characters/ENTITY_0b4ba006e589caa3_I01/prop_detail_board.png",
+      "sha256": "40acc68334f45240c12503a798eed2fe858de88de9ba81bd9794c78765b937f0"
+    },
+    "legacy_qa_receipt": {
+      "path": "characters/ENTITY_0b4ba006e589caa3_I01/prop_detail_board_qa.json",
+      "sha256": "340f91580e63b6b60736b215ca1d23b8be68252bb65fe63eceff21c9520fd42a"
+    }
+  }
+}
