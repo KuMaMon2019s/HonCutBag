@@ -105,6 +105,145 @@ def test_roster_compiles_one_group_entity_with_three_stable_instances():
     assert validate_character_roster(first) == first
 
 
+def test_roster_reconciles_chinese_and_arabic_ordinal_notation_within_one_group():
+    events = [
+        _event(1, [], "三名巡查人员同时进入。", continuity_before="cut"),
+        _event(2, ["队员1", "队员2", "队员3"], "三名巡查人员分散警戒。"),
+        _event(3, ["第一名队员"], "第一名队员检查入口。"),
+        _event(4, ["第二名队员"], "第二名队员检查通道。"),
+        _event(5, ["第三名队员"], "第三名队员检查出口。"),
+    ]
+
+    first = compile_character_roster(events)
+    second = compile_character_roster(copy.deepcopy(events))
+
+    assert first == second
+    assert len(first["entities"]) == 1
+    group = first["entities"][0]
+    assert group["instance_count"] == 3
+    assert [instance["source_mentions"] for instance in group["instances"]] == [
+        ["队员1", "第一名队员"],
+        ["队员2", "第二名队员"],
+        ["队员3", "第三名队员"],
+    ]
+    assert [
+        reconciliation["evidence_kind"]
+        for instance in group["instances"]
+        for reconciliation in instance["identity_reconciliations"]
+    ] == ["ordinal_notation_equivalence"] * 3
+
+
+def test_roster_anonymized_mixed_ordinal_fixture_has_stable_cardinality():
+    events = [
+        _event(1, ["研究员"], "研究员进入大厅。", continuity_before="cut"),
+        _event(2, ["研究员", "队员1", "队员2", "队员3"], "三名巡查人员同时进入。"),
+        _event(3, ["研究员", "第一名队员"], "第一名队员检查入口。"),
+        _event(4, ["研究员", "第二名队员"], "第二名队员检查通道。"),
+        _event(5, ["研究员", "第三名队员"], "第三名队员检查出口。"),
+    ]
+
+    roster = compile_character_roster(events)
+
+    assert len(roster["entities"]) == 2
+    assert sum(entity["instance_count"] for entity in roster["entities"]) == 4
+    group = next(entity for entity in roster["entities"] if entity["instance_count"] == 3)
+    assert [instance["source_mentions"] for instance in group["instances"]] == [
+        ["队员1", "第一名队员"],
+        ["队员2", "第二名队员"],
+        ["队员3", "第三名队员"],
+    ]
+
+
+def test_roster_reconciles_chinese_and_prefixed_arabic_ordinals():
+    roster = compile_character_roster([
+        _event(1, [], "两名巡查人员进入。", continuity_before="cut"),
+        _event(2, ["第1名队员"], "第1名队员检查入口。"),
+        _event(3, ["第一名队员"], "第一名队员继续值守。"),
+        _event(4, ["第2名队员"], "第2名队员检查出口。"),
+        _event(5, ["第二名队员"], "第二名队员继续值守。"),
+    ])
+
+    assert len(roster["entities"]) == 1
+    assert roster["entities"][0]["instance_count"] == 2
+    assert all(
+        instance["identity_reconciliations"][0]["evidence_kind"]
+        == "ordinal_notation_equivalence"
+        for instance in roster["entities"][0]["instances"]
+    )
+
+
+def test_roster_accepts_complete_arabic_suffix_ordinals_for_a_counted_group():
+    roster = compile_character_roster([
+        _event(1, [], "三名巡查人员同时进入。", continuity_before="cut"),
+        _event(2, ["队员1", "队员2", "队员3"], "三名巡查人员分散警戒。"),
+    ])
+
+    assert len(roster["entities"]) == 1
+    assert roster["entities"][0]["instance_count"] == 3
+    assert [instance["source_mentions"] for instance in roster["entities"][0]["instances"]] == [
+        ["队员1"],
+        ["队员2"],
+        ["队员3"],
+    ]
+
+
+def test_roster_normalizes_fullwidth_arabic_suffix_ordinals():
+    roster = compile_character_roster([
+        _event(1, [], "两名巡查人员同时进入。", continuity_before="cut"),
+        _event(2, ["队员１", "队员２"], "两名巡查人员分散警戒。"),
+        _event(3, ["第一名队员"], "第一名队员检查入口。"),
+        _event(4, ["第二名队员"], "第二名队员检查出口。"),
+    ])
+
+    assert len(roster["entities"]) == 1
+    assert roster["entities"][0]["instance_count"] == 2
+
+
+@pytest.mark.parametrize(
+    ("events", "error"),
+    [
+        (
+            [
+                _event(1, [], "三名巡查人员进入，三名护卫随后进入。"),
+                _event(2, ["队员1", "队员2", "队员3"], "三名人员分散警戒。"),
+            ],
+            "ambiguous",
+        ),
+        (
+            [
+                _event(1, [], "三名巡查人员进入。"),
+                _event(2, ["队员1", "队员2"], "两名队员分散警戒。"),
+            ],
+            "count",
+        ),
+        (
+            [
+                _event(1, [], "三名巡查人员进入。"),
+                _event(2, ["队员1", "第一名队员"], "队员1与第一名队员同时警戒。"),
+                _event(3, ["队员2"], "队员2检查通道。"),
+                _event(4, ["队员3"], "队员3检查出口。"),
+            ],
+            "co-occur",
+        ),
+    ],
+)
+def test_roster_rejects_unsafe_arabic_suffix_ordinal_merges(events, error):
+    with pytest.raises(CharacterRosterError, match=error):
+        compile_character_roster(events)
+
+
+def test_roster_does_not_retroactively_merge_a_numbered_identity_before_group_declaration():
+    roster = compile_character_roster([
+        _event(1, ["队员1"], "另一名队员1单独值守。", continuity_before="cut"),
+        _event(2, [], "三名巡查人员随后进入。", continuity_before="cut"),
+        _event(3, ["第一名队员"], "第一名队员检查入口。"),
+        _event(4, ["第二名队员"], "第二名队员检查通道。"),
+        _event(5, ["第三名队员"], "第三名队员检查出口。"),
+    ])
+
+    assert sorted(entity["instance_count"] for entity in roster["entities"]) == [1, 3]
+
+
 def test_roster_excludes_non_character_action_subjects_without_erasing_events():
     events = [
         _event(1, ["磁悬浮列车"], "磁悬浮列车缓缓驶入站台。"),

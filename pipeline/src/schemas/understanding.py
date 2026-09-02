@@ -382,8 +382,11 @@ class CharacterIdentityReconciliationUnderstanding(StrictUnderstandingModel):
     source_mention: str
     sequence_id: str
     event_refs: list[str] = Field(min_length=2, max_length=2)
-    evidence_kind: Literal["continuous_source_cross_reference"]
-    controlled_gender: Literal["male", "female"]
+    evidence_kind: Literal[
+        "continuous_source_cross_reference",
+        "ordinal_notation_equivalence",
+    ]
+    controlled_gender: Literal["male", "female", "unknown"]
     evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 

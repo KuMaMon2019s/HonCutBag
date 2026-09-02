@@ -35,7 +35,7 @@ def _write_inputs(workspace: Path) -> tuple[Path, Path]:
             "id": 2,
             "sequence_id": "SEQ001",
             "continuity_before": "continuous",
-            "who": [],
+            "who": ["守卫1", "守卫2", "守卫3"],
             "source_excerpt": "三名守卫同时出现。",
             "what": "三名守卫同时出现",
         },
@@ -264,5 +264,5 @@ def test_single_observation_accepts_deterministic_missing_entity_repair(
     )
     assert evidence["character_entities"] == 2
     assert evidence["character_instances"] == 4
-    assert evidence["identity_reconciliation_count"] == 1
+    assert evidence["identity_reconciliation_count"] == 4
     assert "model_entity_missing" in evidence["semantic_diagnostic_codes"]

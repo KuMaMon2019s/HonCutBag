@@ -4310,7 +4310,7 @@ def test_character_discovery_body_contract_is_prompted_and_normalized(monkeypatc
     assert "head_to_body_ratio=7.6" in captured["prompt"]
     assert "头宽不得超过肩宽的 43%" in captured["prompt"]
     assert ADULT_LEAD_DISCOVERY_INSTRUCTIONS in character_discoverer.SYSTEM_PROMPT
-    assert character_discoverer.CHARACTER_CONTEXT_SCHEMA_VERSION == 15
+    assert character_discoverer.CHARACTER_CONTEXT_SCHEMA_VERSION == 16
     assert "interaction_props" in captured["prompt"]
     assert "bodybuilder physique" in discovered["negative_guardrails"]
     assert "Body-proportion lock" in discovered["prompt_definition"]

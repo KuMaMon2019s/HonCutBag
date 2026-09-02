@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import unicodedata
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
@@ -177,7 +178,7 @@ def _positive_integer(value: str) -> int | None:
 
 
 def _identity_ordinal(label: Any) -> int | None:
-    text = str(label or "").strip()
+    text = unicodedata.normalize("NFKC", str(label or "")).strip()
     values: set[int] = set()
     for match in re.finditer(
         r"第\s*([零〇一二两三四五六七八九十百千0-9]+)\s*(?:名|位|个|号)",
@@ -200,8 +201,26 @@ def _identity_ordinal(label: Any) -> int | None:
     return next(iter(values), None)
 
 
-def _ordinal_base(label: Any) -> str:
-    text = str(label or "").strip().casefold()
+def _arabic_suffix_identity_ordinal(label: Any) -> tuple[int, str] | None:
+    """Parse a bounded CJK role label ending in an Arabic ordinal.
+
+    A bare numeric suffix is not authoritative by itself.  The roster compiler
+    only activates this parse when a complete, unique counted group proves the
+    cardinality and sequence context.
+    """
+
+    normalized = normalize_character_reference(label)
+    match = re.fullmatch(
+        r"(?P<base>[\u3400-\u9fff]{2,24})(?P<ordinal>[1-9][0-9]{0,2})",
+        normalized,
+    )
+    if not match:
+        return None
+    return int(match.group("ordinal")), match.group("base")
+
+
+def _ordinal_base(label: Any, *, include_arabic_suffix: bool = False) -> str:
+    text = unicodedata.normalize("NFKC", str(label or "")).strip().casefold()
     text = re.sub(
         r"^第\s*[零〇一二两三四五六七八九十百千0-9]+\s*(?:名|位|个|号)\s*",
         "",
@@ -214,7 +233,33 @@ def _ordinal_base(label: Any) -> str:
         text,
     )
     text = re.sub(r"^(?:#|no\.?\s*)[0-9]+\s*", "", text)
-    return re.sub(r"[\s_-]+", "", text)
+    normalized = re.sub(r"[\s_-]+", "", text)
+    if include_arabic_suffix:
+        suffix = _arabic_suffix_identity_ordinal(normalized)
+        if suffix is not None:
+            return suffix[1]
+    return normalized
+
+
+def _ordinal_notation_kind(label: Any) -> str | None:
+    text = unicodedata.normalize("NFKC", str(label or "")).strip().casefold()
+    match = re.match(
+        r"^第\s*([零〇一二两三四五六七八九十百千0-9]+)\s*(?:名|位|个|号)",
+        text,
+    )
+    if match:
+        return "arabic_prefix" if match.group(1).isdigit() else "chinese_prefix"
+    if re.match(
+        r"^(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|"
+        r"[0-9]+(?:st|nd|rd|th))\b",
+        text,
+    ):
+        return "english_prefix"
+    if re.match(r"^(?:#|no\.?\s*)[0-9]+\b", text):
+        return "arabic_prefix"
+    if _arabic_suffix_identity_ordinal(text) is not None:
+        return "arabic_suffix"
+    return None
 
 
 def _event_ref(event: dict[str, Any], position: int) -> str:
@@ -582,6 +627,108 @@ def _ordered_unique_reconciliations(
     return result
 
 
+def _record_ordinal_notation_reconciliations(
+    *,
+    names: list[str],
+    ordinal: int,
+    sequence_id: str,
+    declaration: dict[str, Any],
+    mention_events: dict[str, list[tuple[int, dict[str, Any]]]],
+    mention_reconciliations: dict[str, list[dict[str, Any]]],
+) -> None:
+    """Audit equivalent ordinal spellings after group identity is proven."""
+
+    if len(names) < 2:
+        return
+    positions = {
+        name: {position for position, _event in mention_events.get(name, [])}
+        for name in names
+    }
+    for index, left in enumerate(names):
+        for right in names[index + 1:]:
+            if positions[left] & positions[right]:
+                raise CharacterRosterError(
+                    f"ordinal aliases co-occur in {sequence_id}: {left}, {right}"
+                )
+
+    notation_priority = {
+        "chinese_prefix": 0,
+        "arabic_prefix": 1,
+        "english_prefix": 2,
+        "arabic_suffix": 3,
+    }
+    canonical = min(
+        names,
+        key=lambda name: (
+            notation_priority.get(_ordinal_notation_kind(name) or "", 99),
+            min(positions[name], default=10**9),
+            name,
+        ),
+    )
+    canonical_pair = min(
+        mention_events.get(canonical, []),
+        key=lambda pair: pair[0],
+        default=None,
+    )
+    if canonical_pair is None:
+        raise CharacterRosterError(
+            f"ordinal alias lacks event lineage in {sequence_id}: {canonical}"
+        )
+    canonical_position, canonical_event = canonical_pair
+    canonical_kind = _ordinal_notation_kind(canonical)
+    for alias in names:
+        alias_kind = _ordinal_notation_kind(alias)
+        if alias == canonical or alias_kind == canonical_kind:
+            continue
+        alias_pair = min(
+            mention_events.get(alias, []),
+            key=lambda pair: pair[0],
+            default=None,
+        )
+        if alias_pair is None:
+            raise CharacterRosterError(
+                f"ordinal alias lacks event lineage in {sequence_id}: {alias}"
+            )
+        alias_position, alias_event = alias_pair
+        descriptor = (
+            parse_human_reference_descriptor(canonical)
+            or parse_human_reference_descriptor(alias)
+        )
+        event_refs = [
+            _event_ref(alias_event, alias_position),
+            _event_ref(canonical_event, canonical_position),
+        ]
+        evidence = {
+            "sequence_id": sequence_id,
+            "ordinal": ordinal,
+            "ordinal_base": _ordinal_base(
+                canonical,
+                include_arabic_suffix=True,
+            ),
+            "declaration_event_ref": declaration["event_ref"],
+            "event_refs": event_refs,
+            "source_excerpt_sha256": [
+                _source_evidence(alias_event, alias_position)[
+                    "source_excerpt_sha256"
+                ],
+                _source_evidence(canonical_event, canonical_position)[
+                    "source_excerpt_sha256"
+                ],
+            ],
+        }
+        record = {
+            "canonical_mention": canonical,
+            "source_mention": alias,
+            "sequence_id": sequence_id,
+            "event_refs": event_refs,
+            "evidence_kind": "ordinal_notation_equivalence",
+            "controlled_gender": descriptor.gender if descriptor else "unknown",
+            "evidence_sha256": _canonical_json_sha256(evidence),
+        }
+        mention_reconciliations.setdefault(canonical, []).append(record)
+        mention_reconciliations.setdefault(alias, []).append(record)
+
+
 def compile_character_roster(
     events: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -627,34 +774,34 @@ def compile_character_roster(
     grouped_mentions: set[str] = set()
     records: list[dict[str, Any]] = []
     for sequence_id, sequence_mentions in mentions_by_sequence.items():
-        ordinal_mentions: dict[int, list[str]] = defaultdict(list)
-        for mention in sequence_mentions:
-            ordinal = _identity_ordinal(mention)
-            if ordinal is not None:
-                ordinal_mentions[ordinal].append(mention)
-        if not ordinal_mentions:
-            continue
-        duplicate_ordinals = {
-            ordinal: names
-            for ordinal, names in ordinal_mentions.items()
-            if len({_ordinal_base(name) for name in names}) > 1
-        }
-        if duplicate_ordinals:
-            raise CharacterRosterError(
-                f"duplicate ordinal identity in {sequence_id}: {duplicate_ordinals}"
-            )
         candidates = [
             declaration
             for declaration in declarations
             if declaration["sequence_id"] == sequence_id
         ]
+        explicit_ordinals = {
+            mention: ordinal
+            for mention in sequence_mentions
+            if (ordinal := _identity_ordinal(mention)) is not None
+        }
+        suffix_ordinals = {
+            mention: suffix
+            for mention in sequence_mentions
+            if (suffix := _arabic_suffix_identity_ordinal(mention)) is not None
+            and _plausible_group_label(suffix[1])
+        }
+        if not explicit_ordinals and not suffix_ordinals:
+            continue
         if not candidates:
             continue
-        bases = {_ordinal_base(names[0]) for names in ordinal_mentions.values()}
+        candidate_bases = {
+            _ordinal_base(mention)
+            for mention in explicit_ordinals
+        } | {base for _ordinal, base in suffix_ordinals.values()}
         exact = [
             candidate
             for candidate in candidates
-            if _ordinal_base(candidate["label"]) in bases
+            if _ordinal_base(candidate["label"]) in candidate_bases
         ]
         viable_pool = exact or candidates
         if len(viable_pool) != 1:
@@ -663,12 +810,52 @@ def compile_character_roster(
                 f"{[item['label'] for item in viable_pool]}"
             )
         declaration = viable_pool[0]
+
+        resolved_ordinals = dict(explicit_ordinals)
+        for mention, (ordinal, _base) in suffix_ordinals.items():
+            event_pairs = mention_events.get(mention, [])
+            if event_pairs and all(
+                position >= declaration["event_position"]
+                for position, _event in event_pairs
+            ):
+                resolved_ordinals[mention] = ordinal
+        ordinal_mentions: dict[int, list[str]] = defaultdict(list)
+        for mention in sequence_mentions:
+            if mention in resolved_ordinals:
+                ordinal_mentions[resolved_ordinals[mention]].append(mention)
+        if not ordinal_mentions:
+            continue
+        duplicate_ordinals = {
+            ordinal: names
+            for ordinal, names in ordinal_mentions.items()
+            if len({
+                _ordinal_base(name, include_arabic_suffix=True)
+                for name in names
+            }) > 1
+        }
+        if duplicate_ordinals:
+            raise CharacterRosterError(
+                f"duplicate ordinal identity in {sequence_id}: {duplicate_ordinals}"
+            )
+        bases = {
+            _ordinal_base(names[0], include_arabic_suffix=True)
+            for names in ordinal_mentions.values()
+        }
         expected = list(range(1, int(declaration["count"]) + 1))
         observed = sorted(ordinal_mentions)
         if observed != expected:
             raise CharacterRosterError(
                 f"group count conflict in {sequence_id}: "
                 f"declared={declaration['count']} observed_ordinals={observed}"
+            )
+        for ordinal in expected:
+            _record_ordinal_notation_reconciliations(
+                names=ordinal_mentions[ordinal],
+                ordinal=ordinal,
+                sequence_id=sequence_id,
+                declaration=declaration,
+                mention_events=mention_events,
+                mention_reconciliations=mention_reconciliations,
             )
         instance_mentions = [
             _ordered_unique(
@@ -687,9 +874,12 @@ def compile_character_roster(
         group_generic_aliases: list[str] = []
         for mention in sequence_mentions:
             if (
-                _identity_ordinal(mention) is not None
+                mention in resolved_ordinals
                 or mention == declaration["label"]
-                or _ordinal_base(mention) not in bases
+                or _ordinal_base(
+                    mention,
+                    include_arabic_suffix=True,
+                ) not in bases
             ):
                 continue
             event_pairs = mention_events.get(mention, [])

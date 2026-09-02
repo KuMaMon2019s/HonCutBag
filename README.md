@@ -211,6 +211,12 @@ before transport, and cannot resume or retry a failed or uncertain attempt.
 This single-request gate does not authorize the separate 36-second full-chain
 acceptance.
 
+Character Roster context schema v16 treats Chinese ordinal words, `第1名`-style
+Arabic ordinals, and Arabic suffixes on a Chinese person-role label as the same
+numbered instance only when a unique counted group, complete ordinal set,
+sequence lineage, declaration order, and non-co-occurrence prove the match.
+Numeric suffixes outside that bounded group evidence remain independent labels.
+
 Event Flow schema v32 changes the deterministic scheduling and body-staging
 reconciliation contract. Phase 1 segment caches produced by v31 or earlier are
 audit-only for this path and are not reused by a new production run; budget the
