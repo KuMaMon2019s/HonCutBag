@@ -21,9 +21,13 @@ import json
 import re
 
 from quality.character_reference_qa import (
+    PROP_DETAIL_INPUT_SCHEMA,
+    PROP_DETAIL_QA_SCHEMA,
     file_sha256,
+    validate_identity_detail_input_contract,
     validate_character_reference_qa_receipt,
 )
+from utils.canonical_visual_contracts import CanonicalVisualContractError
 from utils.character_identity import is_declared_character_reference
 from utils.video_capabilities import (
     capabilities_for,
@@ -384,14 +388,39 @@ def _check_red_line(rule_id: str, output_dir: Path,
                     )
                     detail_input = detail_report["inputs"]["prop_detail_board"]
                     canonical_inputs = detail_report["inputs"]["canonical_references"]
+                    input_contract = detail_report["input_contract"]
                 except (OSError, json.JSONDecodeError, KeyError, TypeError):
                     return False
                 if (
-                    detail_report.get("schema") != "honcut.prop-detail-board-qa.v1"
+                    detail_report.get("schema") != PROP_DETAIL_QA_SCHEMA
                     or detail_report.get("status") != "passed"
+                    or detail_report.get("qa_verdict")
+                    not in {"pass", "acceptable_deviation"}
+                    or input_contract.get("schema") != PROP_DETAIL_INPUT_SCHEMA
                     or not detail_path.is_file()
                     or detail_input.get("path") != detail_path.name
                     or detail_input.get("sha256") != file_sha256(detail_path)
+                    or detail_input.get("media_role")
+                    != "identity_prop_geometry_reference"
+                ):
+                    return False
+                try:
+                    validate_identity_detail_input_contract(
+                        output_dir=output_dir,
+                        canonical_paths=[
+                            cd / str(value.get("path") or "")
+                            for value in canonical_inputs
+                            if isinstance(value, dict)
+                        ],
+                        input_contract=input_contract,
+                    )
+                except (CanonicalVisualContractError, RuntimeError, TypeError):
+                    return False
+                final = detail_report.get("final")
+                if (
+                    not isinstance(final, dict)
+                    or not final.get("qa_observation_id")
+                    or not final.get("qa_decision_id")
                 ):
                     return False
                 if not isinstance(canonical_inputs, list) or not canonical_inputs:

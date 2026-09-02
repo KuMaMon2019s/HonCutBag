@@ -22,7 +22,10 @@ from phases.phase3 import character_factory
 from phases.phase4 import scene_consistency
 from phases.phase6.video_generator import build_video_prompt
 from quality import video_qa
-from quality.character_reference_qa import parse_identity_detail_qa
+from quality.character_reference_qa import (
+    PROP_DETAIL_OBSERVATION_SCHEMA,
+    parse_identity_detail_qa,
+)
 from quality.quality_gate import run_quality_check
 from tools.asset_packager import collect_character_reference_assets
 from utils.character_reference_contracts import (
@@ -37,6 +40,47 @@ from utils.temporal_visual_contracts import (
 )
 from utils.video_generation_contracts import render_video_generation_contract
 from utils.visual_style_spec import VisualStyle
+
+
+def _prop_detail_observation(
+    *,
+    item_id: str = "camera_a",
+    passed: bool = True,
+    topology_consistent: bool = True,
+    semantic_confidence: float = 0.95,
+    semantic_evidence: list[str] | None = None,
+) -> str:
+    evidence = semantic_evidence or [
+        "front, side, and three-quarter views share one black body, silver lens, and red strap"
+    ]
+    return json.dumps({
+        "schema": PROP_DETAIL_OBSERVATION_SCHEMA,
+        "passed": passed,
+        "character_identity_consistent": True,
+        "character_identity_confidence": 0.95,
+        "character_identity_evidence": [
+            "the board preserves the approved navy helmet and beige vest"
+        ],
+        "items": [{
+            "logical_item_id": item_id,
+            "logical_identity_present": True,
+            "depiction_count": 3,
+            "depictions_mutually_consistent": True,
+            "topology_consistent": topology_consistent,
+            "colors_materials_consistent": True,
+            "attachment_mode_correct": True,
+            "undeclared_logical_item_evidence": [],
+            "semantic_confidence": semantic_confidence,
+            "semantic_evidence": evidence,
+            "issues": [] if topology_consistent else ["topology concern"],
+        }],
+        "no_undeclared_logical_items": True,
+        "undeclared_items_confidence": 0.95,
+        "undeclared_items_evidence": [
+            "only the declared camera appears in three permitted views"
+        ],
+        "issues": [],
+    })
 
 
 def test_generic_day_becomes_clock_window_with_observable_light_guards():
@@ -173,22 +217,47 @@ def test_identity_props_are_visual_details_not_neutral_handheld_props():
     ] == "derived_board_body_attached_or_isolated"
 
 
-def test_identity_detail_qa_recomputes_declared_item_failure():
+def test_identity_detail_qa_treats_three_views_as_one_logical_item():
     result = parse_identity_detail_qa(
-        json.dumps({
-            "passed": True,
-            "character_identity_consistent": True,
-            "declared_items_present": False,
-            "item_geometry_consistent": True,
-            "colors_materials_consistent": True,
-            "attachment_modes_correct": True,
-            "undeclared_items_absent": True,
-            "issues": ["red wrist strap is missing"],
-        })
+        _prop_detail_observation(passed=False),
+        [{"logical_item_id": "camera_a"}],
+    )
+
+    assert result["model_passed_diagnostic"] is False
+    assert result["passed"] is True
+    assert result["qa_verdict"] == "pass"
+    assert result["items"][0]["depiction_count"] == 3
+
+
+def test_identity_detail_qa_blocks_only_evidenced_high_confidence_mismatch():
+    result = parse_identity_detail_qa(
+        _prop_detail_observation(
+            passed=True,
+            topology_consistent=False,
+            semantic_confidence=0.91,
+            semantic_evidence=["the side view has two lens barrels while the front has one"],
+        ),
+        [{"logical_item_id": "camera_a"}],
     )
 
     assert result["passed"] is False
-    assert result["declared_items_present"] is False
+    assert result["qa_verdict"] == "block"
+    assert result["policy_decision"]["blocking_categories"] == ["prop_topology"]
+
+
+def test_identity_detail_qa_accepts_low_confidence_negative_as_deviation():
+    result = parse_identity_detail_qa(
+        _prop_detail_observation(
+            passed=False,
+            topology_consistent=False,
+            semantic_confidence=0.70,
+            semantic_evidence=["the blurred side view may show a second lens edge"],
+        ),
+        [{"logical_item_id": "camera_a"}],
+    )
+
+    assert result["passed"] is True
+    assert result["qa_verdict"] == "acceptable_deviation"
 
 
 def test_phase3_derives_prop_board_and_disables_state_variant_pixels(
@@ -215,16 +284,7 @@ def test_phase3_derives_prop_board_and_disables_state_variant_pixels(
     class Reviewer:
         def review(self, paths, _prompt):
             if len(paths) == 3:
-                return json.dumps({
-                    "passed": True,
-                    "character_identity_consistent": True,
-                    "declared_items_present": True,
-                    "item_geometry_consistent": True,
-                    "colors_materials_consistent": True,
-                    "attachment_modes_correct": True,
-                    "undeclared_items_absent": True,
-                    "issues": [],
-                })
+                return _prop_detail_observation()
             common = {
                 "passed": True,
                 "view_match": True,
