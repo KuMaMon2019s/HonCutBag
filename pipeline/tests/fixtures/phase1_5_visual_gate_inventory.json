@@ -1,0 +1,49 @@
+{
+  "schema": "honcut.phase1-5-visual-gate-inventory.v1",
+  "scope": "production visual observations that can advance or block Phase 1 through Phase 5",
+  "graph_evidence": {
+    "prop_detail_owner_path": "run_phase3 -> batch_generate -> generate_character -> _quality_control_identity_detail -> review_identity_detail_reference",
+    "phase5_supervision_path": "run_storyboard_supervision -> run_supervision",
+    "graph": "graphify-out/graph.json",
+    "depth": 2
+  },
+  "entries": [
+    {
+      "owner": "phase2.storyboard_assets",
+      "path": "pipeline/src/phases/phase2/storyboard_assets.py",
+      "classification": "deterministic_validation",
+      "action": "allowed",
+      "reason": "local pixel dimensions, sharpness, brightness and file integrity; no model verdict"
+    },
+    {
+      "owner": "phase3.character_reference_qa",
+      "path": "pipeline/src/quality/character_reference_qa.py",
+      "classification": "ledgered_policy",
+      "action": "current_change",
+      "reason": "typed identity and prop-detail Observations feed QALedger and visual policy"
+    },
+    {
+      "owner": "phase3.character_performance_qa",
+      "path": "pipeline/src/quality/character_performance_qa.py",
+      "classification": "ledgered_policy",
+      "action": "separate_owner_no_change",
+      "reason": "typed performance Observations already feed QALedger and visual policy"
+    },
+    {
+      "owner": "phase5.storyboard_qa_gate",
+      "path": "pipeline/src/phases/phase5/storyboard_qa_gate.py",
+      "classification": "ledgered_policy",
+      "action": "separate_owner_no_change",
+      "reason": "Phase 5 L3/L4 Observations and Decisions use the existing ledger owner"
+    },
+    {
+      "owner": "phase5.optional_supervision",
+      "path": "pipeline/src/quality/supervision_agent.py",
+      "classification": "out_of_contract_raw_probabilistic_gate",
+      "action": "follow_up_openspec_change",
+      "follow_up_change": "stabilize-phase5-optional-supervision-gate",
+      "source_sha256": "5fb6e767d8b7646448966b4b90d9a8efb120dcc3b4b4f4b26161de9caf698e84",
+      "reason": "explicit supervision_blocking mode can raise directly from model verdict; default is non-blocking and this owner is outside the Phase 3 change"
+    }
+  ]
+}

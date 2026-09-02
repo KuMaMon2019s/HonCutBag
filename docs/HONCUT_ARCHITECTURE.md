@@ -123,7 +123,7 @@ Graph node 必须只完成三件事：读取 State、调用一个窄 owner、返
 |---|---|---|
 | 1 | 文本解析、源事件发现、按 sequence 的导演意图、调用前确定性 `CHARACTER_ROSTER.json`、名册绑定的角色视觉 Observation、`SEMANTIC_LEDGER.json`、时长缩放后的 `SCREENPLAY_PLAN.json`、canonical `STORYBOARD.json` 与唯一视觉事实源 `CANONICAL_VISUAL_CONTRACT.json`；`CHARACTERS.json` 只是实例级兼容投影 | 输入/LLM/结构无效即停止；零角色合法；人数与归属只归 Character Roster owner；必要视觉缺省只允许在此按稳定 ID 补全一次 |
 | 2 | Pxx PREVIS、每个 Sxx 独有的带标识 3×3 审核九宫格、Gxx→Pxx 分配，以及本地绘制的身份中立导航图 v2 | 生产图片、格子分配、canonical hash 或导航血缘证据缺失时 fail closed |
-| 3 | 角色卡、四视图、单图四视图参考板、道具细节板、run-local 多姿态动作板、身份锁定，以及显式项目角色库的精确导入/批准 | 生产模式要求真实四视图/动作板 QA；参考板只能由已验收四视图确定性派生；历史状态图仅审计；角色库证据缺失、篡改或冲突时 fail closed；dry-run 只写明确的 dry-run receipt |
+| 3 | 角色卡、四视图、单图四视图参考板、逻辑道具细节板、run-local 多姿态动作板、身份锁定，以及显式项目角色库的精确导入/批准 | 生产模式要求真实四视图/动作板 QA；同一道具的多视角 depiction 不增加逻辑物品数；参考板只能由已验收四视图确定性派生；历史状态图与 v1 道具 QA 仅审计；角色库证据缺失、篡改或冲突时 fail closed；dry-run 只写明确的 dry-run receipt |
 | 4 | 原生 shot 目录与 `SHOT_META.json`、场景一致性、continuity plan、每个 Sxx 唯一 cinematic first-frame | P02+ 不得生成或声明新的 cinematic frame；Phase 4 不运行视频生成子进程 |
 | 5 | storyboard QA、生成容量、variation/slideshow、监督与进入视频生成前的硬门 | C/D 或 blocking supervision 阻止 Phase 6；dry-run 不做像素/模型监督 |
 | 6 | 视频生成与 continuity chunk 执行 | 所有长请求经过 Runtime task ledger；相同输入恢复不得重复提交 |
@@ -131,6 +131,8 @@ Graph node 必须只完成三件事：读取 State、调用一个窄 owner、返
 | 8 | inventory、顺序复核、连续性裁决、逐镜像素 QA、有限补拍、转场、受审剪辑和时长闸门 | 补拍最多两轮；连续边界使用硬切；无法安全应用 trim/QA 时禁止 raw concat 降级 |
 | 9 | ASR、音频/TTS/ducking、字幕、视觉后期、节奏编辑和最终编码 | 最终时长/编码失败即停止；可选 QA 必须在 receipt 中明确标记 |
 | 9.5 | 成片交付 QA | 不通过则顶层 run failed，不交付伪成功 |
+
+Phase 3 道具细节板使用 `honcut.prop-detail-board-input.v2`、`honcut.prop-detail-observation.v2` 和 `honcut.prop-detail-board-qa.v2`。输入合同把 canonical `logical_items` 与 front/side/three-quarter、attachment crop、material detail 等 `depictions` 分开计数；多个一致视角仍只绑定一个 `logical_item_id`，不得拿可见视图数量和 canonical `component_count` 比较。VLM 的汇总 `passed` 和自然语言 issue 仅作诊断，类型化逐物品证据必须先按媒体哈希、canonical hash、Prompt、模型与 schema 指纹写入 `QALedger`，再由统一视觉 Policy 生成 Decision。语义分数达到 0.65 可通过或接受偏差；负面发现只有在置信度至少 0.85、受控类别与具体证据同时存在时才能阻断。schema、逻辑物品 ID 覆盖、内容哈希、父血缘与媒体职责始终严格。`manual_review`、低置信度、超时、不确定与阻断 Decision 都不能授权自动重画、复审、重试或扩预算；Phase owner 保存终态收据后停止。已知 v1 收据保持原文件 audit-only，未知版本 fail closed。
 
 Phase 1 的时长合同采用三账本：`story clock` 记录一级 `Sxx` 与其二级 `Pxx` 共同表示的有效叙事时长，二者不得相加；`Provider request` 记录实际请求/计费时长；`padding/context` 记录 Provider 最低请求、尾段上下文或重叠中不属于新故事时钟的部分。每个 Pxx 必须分别持久化 `effective_story_duration_s`、`provider_request_duration_s` 与 `provider_minimum_padding_duration_s`，Runtime 按请求帧生成后规范化到 `expected_unique_frames`。Provider 的 8 秒/6 秒最低请求不得反向成为故事时钟的最低镜长或首次编剧的压缩阻塞条件。跨一级镜头的 bridge 是独立 Provider 请求开销，只进入请求账本；其可见部分按 `replace_boundary_handles` 替换等长边界把手。`honcut.material-budget.v4` 必须记录 nominal、ceiling、planned 故事时钟、Pxx 分区校验、内容请求与 padding、bridge 请求实际/规划区间、总 Provider 请求及比率。`max_material_padding_ratio` 与 `delivery_overrun_ratio` 的合法区间均为 0–25%；前者默认 25%，后者默认 0。欠时只允许两帧编码误差，不能用交付超时窗口掩盖素材不足。历史 v2/v3 只可迁移用于成本审计，不得作为当前 Phase 5 成功证据；历史 `1.3` 仍只作成本参考，不是容量硬上限。Phase 8 的安全变速区间是独立编辑合同，不得从 Provider 请求比率反推。
 
@@ -357,6 +359,8 @@ Phase 4 dry-run result 必须显式标记 `evidence_scope=dry_run_structural_onl
 - 已完成验收的恢复运行复用并校验最终媒体，不重新编码后再宣称哈希稳定。
 
 默认测试永远不得发起付费请求。Phase 1～Phase 9 的每个独立修复统一采用持久化双门验收，且两门都通过才可宣告验收成功：`regression` 门包含目标回归、完整测试和与改动相应的零请求离线验收；`live_paid_provider` 门只调用与本次修复生产路径直接相关的真实 Provider 接口一次，并要求传输、严格 DTO、Artifact/receipt 和该修复声明的业务断言全部通过。真实 Provider smoke 先运行无 `--submit` 预检，只有用户当次明确批准费用后才能提交。专用 live acceptance 必须从 canonical 待恢复收据和 Artifact hash 解析范围，不接受普通生产 CLI 的假 Provider 开关；每个 acceptance receipt 在调用前原子写入 `submission_uncertain`，并在 Runtime owner 和原始传输边界同时硬限制为最多一次真实请求。失败、进程中断、schema 拒绝或结果不确定均禁止自动重试，须保留收据并由用户另行授权或人工裁决。缺少当次授权时整体状态只能是 `pending_live_acceptance`，真实门失败时只能是 `live_acceptance_failed`，均不得写成验收成功。真实调用链是否完成 strict DTO 验收与模型给出的业务 pass/block verdict 必须分栏记录，禁止把可达性成功伪装成 QA 通过。
+
+Phase 3 道具细节 QA 的止损回归使用 `pipeline/scripts/phase3_prop_detail_replay_acceptance.py`。入口只能读取哈希清单所绑定的历史失败 run、canonical 合同、身份参考、道具板、v1 审计收据和显式标注为 stored fixture 的当前类型化 Observation；它必须把新 `QALedger` 与 `honcut.prop-detail-replay-acceptance.v1` 写到历史 run 之外。执行期间 Runtime Provider guard 与 TOS upload guard 均为 deny，Ark、Seedream、VLM、Seedance 或权威上传边界一旦被触达即失败；十次复演必须保持零请求、同一 Observation/Decision ID 和源媒体哈希。当前 Policy 接受旧板也不得修改历史 `live_acceptance_failed`。该复演、目标/完整回归、lint、diff 和视觉硬门盘点都绑定同一提交后，才能生成 `paid_admission`；它只允许准备有限预算的 no-submit preflight，不能替代后续独立费用授权。
 
 Character Roster 修复使用独立的 `pipeline/scripts/character_roster_live_acceptance.py`。其输入只能是哈希验证后的外部 `honcut.character-roster-live-input.v1` 事件合同和来源锚定的 expectations v2；零提交预检先由 Roster owner 固化 entity/instance 数量并验证当前提交与 regression receipt。获当次费用授权后，它在隔离目录中最多发起一次真实 Ark Character Discoverer Observation：Runtime 设 `max_retries=0`，Ark POST 前原子写入只含模型、规格与 Prompt/schema hash 的 `submission_uncertain` 收据，模型 hash 错误、结构失败、超时或中断都不得重提。业务 verdict 必须针对 reconciliation 后的 `characters` 再次验证 roster 的 entity/instance 集合；模型遗漏 alias、错误定位或漏掉可确定实体可在默认语义模式下记录诊断并恢复，但不允许通过更改人数、来源血缘或 roster hash。该单请求门与后续 36 秒全链路是两个独立费用范围，必须分别授权。
 

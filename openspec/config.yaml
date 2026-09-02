@@ -1,0 +1,23 @@
+schema: spec-driven
+
+context: |
+  AGENTS.md is HonCut's highest development-process authority.
+  OpenSpec owns requirements, behavioral specifications, acceptance criteria, design, and tasks.
+  Serena owns semantic code investigation: symbols, references, implementations, types, diagnostics, and durable project memory.
+  Graphify owns architecture and impact analysis: dependencies, call chains, data flow, and cross-module effects.
+  docs/HONCUT_ARCHITECTURE.md and verified Graphify/source evidence remain the architecture facts; OpenSpec must not create a competing architecture source.
+  Before production-code implementation, complete the Serena and Graphify preflight required by AGENTS.md. After changes, run Serena validation, tests, applicable OpenSpec verify, and keep Graphify synchronized.
+
+rules:
+  proposal:
+    - State the scope and explicit non-goals.
+    - Identify API, database, frontend/backend, pipeline, configuration, and architecture impact, marking non-applicable areas.
+  specs:
+    - Make every requirement verifiable with explicit acceptance scenarios.
+    - Give every behavior change a regression expectation.
+  design:
+    - Reuse existing HonCut owners, contracts, and architecture before introducing a new path.
+    - Ground cross-module impact claims in the required Graphify analysis and verified source evidence.
+  tasks:
+    - Include Serena preflight and Graphify impact analysis before implementation.
+    - Include implementation, regression tests, Serena post-validation, applicable OpenSpec verify, and Graphify synchronization.

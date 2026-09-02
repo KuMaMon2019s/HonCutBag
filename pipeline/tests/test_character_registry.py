@@ -11,7 +11,13 @@ import pytest
 from PIL import Image
 
 from phases.phase3.phase3_character import run_phase3
-from quality.character_reference_qa import build_character_reference_qa_receipt
+from quality.character_reference_qa import (
+    PROP_DETAIL_QA_SCHEMA,
+    build_character_reference_qa_receipt,
+    build_identity_detail_input_contract,
+    file_sha256,
+    resolve_identity_detail_logical_items,
+)
 from runtime.character_registry import (
     CHARACTER_REGISTRY_SCHEMA_VERSION,
     CharacterRegistry,
@@ -181,6 +187,84 @@ def test_registry_promotes_only_a_grade_and_reuses_exact_pack(tmp_path):
     assert imported == destination / "characters" / "agent"
     assert (imported / "reference_board.png").is_file()
     assert (imported / "character_reference_qa.json").is_file()
+
+
+def test_registry_accepts_current_prop_detail_qa_contract(
+    tmp_path,
+    canonical_run_contract,
+):
+    character = _character()
+    character["appearance"]["identity_props"] = [{
+        "id": "device_a",
+        "name": "device",
+        "description": "one black rectangular device with a silver lens",
+        "attachment_mode": "isolated_handheld",
+        "persistence": "role_active",
+        "reference_required": True,
+    }]
+    spec = _phase3_spec(character)
+    source = tmp_path / "source"
+    canonical_run_contract(source, {"characters": [character]})
+    char_dir = _write_approved_pack(source, spec)
+    detail_path = char_dir / "prop_detail_board.png"
+    _write_png(detail_path, 9)
+    canonical_hash, logical_items = resolve_identity_detail_logical_items(
+        source,
+        character["id"],
+        character["appearance"]["identity_props"],
+    )
+    canonical_paths = [
+        char_dir / "face_closeup.png",
+        char_dir / "full_body.png",
+    ]
+    input_contract = build_identity_detail_input_contract(
+        char_id=character["id"],
+        character_description=spec["description"],
+        identity_props=character["appearance"]["identity_props"],
+        canonical_contract_sha256=canonical_hash,
+        logical_items=logical_items,
+        prompt_sha256="b" * 64,
+        canonical_paths=canonical_paths,
+    )
+    receipt_path = char_dir / "prop_detail_board_qa_v2.json"
+    receipt_path.write_text(json.dumps({
+        "schema": PROP_DETAIL_QA_SCHEMA,
+        "status": "passed",
+        "qa_verdict": "pass",
+        "character_id": character["id"],
+        "input_contract": input_contract,
+        "inputs": {
+            "canonical_references": input_contract["canonical_references"],
+            "prop_detail_board": {
+                "path": detail_path.name,
+                "sha256": file_sha256(detail_path),
+                "media_role": "identity_prop_geometry_reference",
+            },
+        },
+    }), encoding="utf-8")
+    card_path = char_dir / "character_card.json"
+    card = json.loads(card_path.read_text(encoding="utf-8"))
+    card.update({
+        "identity_props": character["appearance"]["identity_props"],
+        "prop_detail_board": f"characters/{character['id']}/{detail_path.name}",
+        "prop_detail_board_qa_report": (
+            f"characters/{character['id']}/{receipt_path.name}"
+        ),
+    })
+    card_path.write_text(json.dumps(card), encoding="utf-8")
+    registry = CharacterRegistry(tmp_path / "library", project_id="series-a")
+
+    approved = registry.promote_from_run(
+        source,
+        spec,
+        quality_grade="A",
+        source_run_id="run-a",
+    )
+
+    assert {asset.role for asset in approved.assets} >= {
+        "prop_detail_board",
+        "prop_detail_board_qa",
+    }
 
 
 def test_registry_exact_lookup_is_project_scoped_and_spec_exact(tmp_path):

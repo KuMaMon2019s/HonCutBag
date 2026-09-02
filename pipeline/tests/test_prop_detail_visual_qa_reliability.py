@@ -396,6 +396,93 @@ def test_prop_detail_retry_budget_overflow_fails_before_any_provider(
     assert reviewer.calls == 0
 
 
+def test_future_prop_detail_receipt_fails_before_any_provider(
+    tmp_path,
+    canonical_run_contract,
+):
+    props, character_dir, canonical_paths, detail_path, _ = _run_inputs(
+        tmp_path,
+        canonical_run_contract,
+    )
+    (character_dir / "prop_detail_board_qa_v2.json").write_text(
+        json.dumps({"schema": "honcut.prop-detail-board-qa.v999"}),
+        encoding="utf-8",
+    )
+    reviewer = _Reviewer(_observation())
+
+    class ImageClient:
+        calls = 0
+
+        def image_to_image(self, **_kwargs):
+            self.calls += 1
+
+    image_client = ImageClient()
+    with pytest.raises(CharacterReferenceQAError, match="schema is unsupported"):
+        character_factory._quality_control_identity_detail(
+            char_id="photographer",
+            character_description="navy helmet and beige vest",
+            identity_props=props,
+            style="",
+            char_dir=character_dir,
+            canonical_paths=canonical_paths,
+            detail_path=detail_path,
+            image_client=image_client,
+            review_client=reviewer,
+            max_retries=0,
+        )
+    assert image_client.calls == 0
+    assert reviewer.calls == 0
+
+
+def test_legacy_receipt_is_immutable_audit_evidence(
+    tmp_path,
+    canonical_run_contract,
+):
+    props, character_dir, canonical_paths, detail_path, _ = _run_inputs(
+        tmp_path,
+        canonical_run_contract,
+    )
+    legacy_path = character_dir / "prop_detail_board_qa.json"
+    _write_json(legacy_path, {
+        "schema": "honcut.prop-detail-board-qa.v1",
+        "status": "failed",
+        "inputs": {
+            "prop_detail_board": {
+                "path": detail_path.name,
+                "sha256": file_sha256(detail_path),
+            },
+        },
+    })
+    legacy_hash = file_sha256(legacy_path)
+    reviewer = _Reviewer(_observation())
+
+    class ImageClient:
+        calls = 0
+
+        def image_to_image(self, **_kwargs):
+            self.calls += 1
+
+    image_client = ImageClient()
+    receipt = character_factory._quality_control_identity_detail(
+        char_id="photographer",
+        character_description="navy helmet and beige vest",
+        identity_props=props,
+        style="",
+        char_dir=character_dir,
+        canonical_paths=canonical_paths,
+        detail_path=detail_path,
+        image_client=image_client,
+        review_client=reviewer,
+        max_retries=0,
+    )
+
+    assert receipt["status"] == "passed"
+    assert receipt["legacy_evidence"]["status"] == "audit_only"
+    assert image_client.calls == 0
+    assert reviewer.calls == 1
+    assert file_sha256(legacy_path) == legacy_hash
+
+
 def test_policy_identity_is_stable():
     assert POLICY_ID == "honcut.visual-qa-policy.v1"
     assert len(policy_sha256()) == 64

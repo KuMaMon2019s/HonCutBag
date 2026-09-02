@@ -23,9 +23,12 @@ from typing import Any
 
 from quality.character_reference_qa import (
     CHARACTER_REFERENCE_QA_SCHEMA,
+    PROP_DETAIL_QA_SCHEMA,
     SEEDANCE_REFERENCE_VIEWS,
+    CharacterReferenceQAError,
     file_sha256,
     validate_character_reference_qa_receipt,
+    validate_identity_detail_input_contract,
 )
 from tools.character_reference_board import (
     CHARACTER_REFERENCE_BOARD_SCHEMA,
@@ -238,11 +241,27 @@ def _asset_records(output_dir: Path, character: Mapping[str, Any]) -> list[tuple
         try:
             detail_qa = json.loads(detail_qa_path.read_text(encoding="utf-8"))
             detail_input = detail_qa["inputs"]["prop_detail_board"]
-        except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
+            validate_identity_detail_input_contract(
+                output_dir=output_dir,
+                canonical_paths=[
+                    view_paths["face_closeup"],
+                    view_paths["full_body"],
+                ],
+                input_contract=detail_qa["input_contract"],
+            )
+        except (
+            OSError,
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            CharacterReferenceQAError,
+        ) as error:
             raise CharacterRegistryError("prop-detail-board QA receipt is invalid") from error
         if (
-            detail_qa.get("schema") != "honcut.prop-detail-board-qa.v1"
+            detail_qa.get("schema") != PROP_DETAIL_QA_SCHEMA
             or detail_qa.get("status") != "passed"
+            or detail_qa.get("qa_verdict") not in {"pass", "acceptable_deviation"}
+            or detail_input.get("media_role") != "identity_prop_geometry_reference"
             or detail_input.get("sha256") != file_sha256(detail_path)
         ):
             raise CharacterRegistryError("prop-detail-board QA receipt is stale or failed")
