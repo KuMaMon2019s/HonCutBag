@@ -38,17 +38,19 @@ from prompt.prompt_validator import validate_prompt
 from prompt.seedream_image_prompt import bind_reference_roles
 from quality.character_reference_qa import (
     CHARACTER_REFERENCE_QA_SCHEMA,
+    PROP_DETAIL_QA_SCHEMA,
     CharacterReferenceQAError,
+    build_identity_detail_input_contract,
     build_character_reference_qa_receipt,
     file_sha256,
     review_character_reference_pack,
     review_identity_detail_reference,
+    resolve_identity_detail_logical_items,
     validate_character_reference_qa_receipt,
 )
 from utils.character_reference_contracts import (
     IDENTITY_DETAIL_ASSET_POLICY,
     STATIC_REFERENCE_ASSET_POLICY,
-    identity_detail_prompt_items,
     normalize_identity_props,
 )
 from utils.character_body_contracts import character_visual_description
@@ -327,9 +329,6 @@ FULL_BODY_IMAGE_RULES = (
 FULL_BODY_REFERENCE_SIZE = "2K"
 REFERENCE_CONTRACT_VERSION = 7
 REFERENCE_GENERATION_CONTRACT_SCHEMA = "honcut.character-reference-generation.v1"
-PROP_DETAIL_QA_SCHEMA = "honcut.prop-detail-board-qa.v1"
-
-
 def _canonical_json_sha256(value: Any) -> str:
     encoded = json.dumps(
         value,
@@ -464,6 +463,7 @@ def build_identity_detail_prompt(
     identity_props: list[dict[str, Any]],
     style: str = "",
     correction: str = "",
+    logical_items: list[dict[str, Any]] | None = None,
 ) -> str:
     """Build a four-view-derived detail board without polluting neutral poses."""
     rendering = _reference_rendering_clause(style)
@@ -472,16 +472,32 @@ def build_identity_detail_prompt(
         if correction
         else ""
     )
+    if logical_items is None:
+        logical_items = [
+            {
+                "logical_item_id": item["id"],
+                "display_name": item["name"],
+                "attachment_mode": item["attachment_mode"],
+                "depiction_roles": (
+                    ["front", "side", "three_quarter"]
+                    if item["attachment_mode"] == "isolated_handheld"
+                    else ["attachment_context", "material_detail"]
+                ),
+            }
+            for item in identity_props
+        ]
     return (
         f"{correction_clause}Create one professional identity-detail reference board for the exact "
         "same fictional character shown in the supplied approved face and full-body references. "
         f"Static identity: {character_desc}. Rendering medium: {rendering}. "
-        f"Declared identity items: {identity_detail_prompt_items(identity_props)}. "
+        "Declared logical-item contract: "
+        f"{json.dumps(logical_items, ensure_ascii=False, sort_keys=True)}. "
         f"Policy: {IDENTITY_DETAIL_ASSET_POLICY} "
         "Use a clean 2x2 detail-board layout on neutral gray #E8E8E8 with even studio light. "
         "For body_attached items, show a close crop on the same attachment point plus one isolated "
         "material/color detail. For isolated_handheld items, show the item alone from front, side, "
-        "and three-quarter angles at a stable scale; no hand touches it and the character does not "
+        "and three-quarter angles at a stable scale. Those views are depictions of one logical "
+        "item, never duplicate items; no hand touches it and the character does not "
         "operate it. Preserve exact authored primary/secondary colors, material finish, geometry, "
         "markings, straps and left/right orientation. Do not add a scene, action pose, another person, "
         "an undeclared object, captions, labels, watermark, border text or logo."
@@ -783,6 +799,7 @@ def _generate_identity_detail(
     identity_props: list[dict[str, Any]],
     style: str,
     canonical_paths: list[Path],
+    logical_items: list[dict[str, Any]],
     output_path: Path,
     correction: str = "",
 ) -> None:
@@ -798,6 +815,7 @@ def _generate_identity_detail(
                     identity_props,
                     style,
                     correction,
+                    logical_items,
                 ),
                 ["character_face_identity_only", "character_body_identity_only"],
             ),
@@ -826,62 +844,129 @@ def _quality_control_identity_detail(
     review_client: Any,
     max_retries: int,
 ) -> dict[str, Any]:
-    """Block Phase 3 until the supplemental item board matches the four views."""
-    report_path = char_dir / "prop_detail_board_qa.json"
-    input_contract = {
-        "schema": "honcut.prop-detail-board-input.v1",
-        "character_description_sha256": hashlib.sha256(
-            character_description.encode("utf-8")
-        ).hexdigest(),
-        "prompt_sha256": hashlib.sha256(
-            build_identity_detail_prompt(
-                character_description,
-                identity_props,
-                style,
-            ).encode("utf-8")
-        ).hexdigest(),
-        "identity_props_sha256": _canonical_json_sha256(identity_props),
-        "canonical_references": [
-            {"path": path.name, "sha256": file_sha256(path)}
-            for path in canonical_paths
-        ],
-    }
-    try:
-        cached = json.loads(report_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    """Evaluate one prop board once; policy never authorizes automatic redraw."""
+    if max_retries < 0 or max_retries > 2:
+        raise ValueError("prop detail QA retries must be between 0 and 2")
+
+    output_dir = char_dir.parent.parent
+    canonical_hash, logical_items = resolve_identity_detail_logical_items(
+        output_dir,
+        char_id,
+        identity_props,
+    )
+    generation_prompt = bind_reference_roles(
+        build_identity_detail_prompt(
+            character_description,
+            identity_props,
+            style,
+            logical_items=logical_items,
+        ),
+        ["character_face_identity_only", "character_body_identity_only"],
+    )
+    input_contract = build_identity_detail_input_contract(
+        char_id=char_id,
+        character_description=character_description,
+        identity_props=identity_props,
+        canonical_contract_sha256=canonical_hash,
+        logical_items=logical_items,
+        prompt_sha256=hashlib.sha256(generation_prompt.encode("utf-8")).hexdigest(),
+        canonical_paths=canonical_paths,
+    )
+    report_path = char_dir / "prop_detail_board_qa_v2.json"
+    legacy_report_path = char_dir / "prop_detail_board_qa.json"
+
+    if report_path.exists():
+        try:
+            cached = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CharacterReferenceQAError(
+                f"{char_id} current prop detail receipt is unreadable"
+            ) from exc
+        if not isinstance(cached, dict) or cached.get("schema") != PROP_DETAIL_QA_SCHEMA:
+            raise CharacterReferenceQAError(
+                f"{char_id} prop detail receipt schema is unsupported"
+            )
+    else:
         cached = None
     if (
         isinstance(cached, dict)
         and cached.get("schema") == PROP_DETAIL_QA_SCHEMA
-        and cached.get("status") == "passed"
         and cached.get("input_contract") == input_contract
         and detail_path.is_file()
         and cached.get("inputs", {}).get("prop_detail_board", {}).get("sha256")
         == file_sha256(detail_path)
     ):
-        print(f"  [prop-detail-qa] {char_id} ✓ exact cache, zero Provider requests")
-        return cached
-    attempts: list[dict[str, Any]] = []
-    _generate_identity_detail(
-        image_client,
-        character_description=character_description,
-        identity_props=identity_props,
-        style=style,
-        canonical_paths=canonical_paths,
-        output_path=detail_path,
-    )
-    for attempt in range(1, max_retries + 2):
+        if cached.get("status") == "passed" and cached.get("qa_verdict") in {
+            "pass",
+            "acceptable_deviation",
+        }:
+            print(f"  [prop-detail-qa] {char_id} ✓ exact cache, zero Provider requests")
+            return cached
+        raise CharacterReferenceQAError(
+            f"{char_id} prop detail has terminal QA status "
+            f"{cached.get('qa_verdict') or cached.get('status')}; "
+            "automatic re-review and redraw are disabled"
+        )
+
+    legacy_audit: dict[str, Any] | None = None
+    legacy_board_reusable = False
+    if legacy_report_path.exists():
+        try:
+            legacy = json.loads(legacy_report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CharacterReferenceQAError(
+                f"{char_id} legacy prop detail receipt is unreadable"
+            ) from exc
+        if (
+            not isinstance(legacy, dict)
+            or legacy.get("schema") != "honcut.prop-detail-board-qa.v1"
+        ):
+            raise CharacterReferenceQAError(
+                f"{char_id} legacy prop detail receipt schema is unsupported"
+            )
+    else:
+        legacy = None
+    if (
+        isinstance(legacy, dict)
+        and legacy.get("schema") == "honcut.prop-detail-board-qa.v1"
+        and detail_path.is_file()
+        and legacy.get("inputs", {}).get("prop_detail_board", {}).get("sha256")
+        == file_sha256(detail_path)
+    ):
+        legacy_audit = {
+            "path": legacy_report_path.name,
+            "sha256": file_sha256(legacy_report_path),
+            "schema": legacy["schema"],
+            "status": "audit_only",
+        }
+        legacy_board_reusable = True
+
+    image_generated = False
+    if not legacy_board_reusable:
+        _generate_identity_detail(
+            image_client,
+            character_description=character_description,
+            identity_props=identity_props,
+            style=style,
+            canonical_paths=canonical_paths,
+            logical_items=logical_items,
+            output_path=detail_path,
+        )
+        image_generated = True
+
+    try:
         result = review_identity_detail_reference(
             review_client,
             canonical_paths,
             detail_path,
-            identity_props,
+            input_contract,
         )
-        attempts.append({"attempt": attempt, **result})
+    except Exception as exc:
         receipt = {
             "schema": PROP_DETAIL_QA_SCHEMA,
             "character_id": char_id,
-            "status": "passed" if result["passed"] else "failed",
+            "status": "failed",
+            "qa_verdict": "block",
             "identity_props": identity_props,
             "input_contract": input_contract,
             "inputs": {
@@ -889,32 +974,55 @@ def _quality_control_identity_detail(
                 "prop_detail_board": {
                     "path": detail_path.name,
                     "sha256": file_sha256(detail_path),
+                    "media_role": "identity_prop_geometry_reference",
                 },
             },
-            "attempts": attempts,
+            "legacy_evidence": legacy_audit,
+            "image_generated": image_generated,
+            "automatic_provider_corrections": False,
+            "safe_error": f"{type(exc).__name__}: structured prop detail review failed",
         }
         _write_json_atomic(report_path, receipt)
-        if result["passed"]:
-            print(f"  [prop-detail-qa] {char_id} ✓ attempt {attempt}")
-            return receipt
-        if attempt > max_retries:
-            raise CharacterReferenceQAError(
-                f"{char_id} identity detail failed after {attempt} QA attempt(s): "
-                + "; ".join(result.get("issues") or ["detail contract violation"])
-            )
-        archive = char_dir / "prop_detail_board_qa_attempts" / f"attempt_{attempt:02d}"
-        archive.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(detail_path, archive / detail_path.name)
-        _generate_identity_detail(
-            image_client,
-            character_description=character_description,
-            identity_props=identity_props,
-            style=style,
-            canonical_paths=canonical_paths,
-            output_path=detail_path,
-            correction="; ".join(result.get("issues") or ["item or identity mismatch"]),
+        raise CharacterReferenceQAError(
+            f"{char_id} prop detail review failed; no automatic re-review or redraw: "
+            f"{type(exc).__name__}"
+        ) from exc
+
+    receipt = {
+        "schema": PROP_DETAIL_QA_SCHEMA,
+        "character_id": char_id,
+        "status": "passed" if result["passed"] else (
+            "manual_review" if result["qa_verdict"] == "manual_review" else "failed"
+        ),
+        "qa_verdict": result["qa_verdict"],
+        "identity_props": identity_props,
+        "input_contract": input_contract,
+        "inputs": {
+            "canonical_references": input_contract["canonical_references"],
+            "prop_detail_board": {
+                "path": detail_path.name,
+                "sha256": file_sha256(detail_path),
+                "media_role": "identity_prop_geometry_reference",
+            },
+        },
+        "legacy_evidence": legacy_audit,
+        "image_generated": image_generated,
+        "automatic_provider_corrections": False,
+        "attempts": [{"attempt": 1, "attempt_kind": "ledgered_observation", **result}],
+        "final": result,
+    }
+    _write_json_atomic(report_path, receipt)
+    if result["passed"]:
+        print(f"  [prop-detail-qa] {char_id} ✓ {result['qa_verdict']}")
+        return receipt
+    if result["qa_verdict"] == "manual_review":
+        raise CharacterReferenceQAError(
+            f"{char_id} prop detail requires manual review; no Provider retry was submitted"
         )
-    raise AssertionError("unreachable prop-detail QA state")
+    raise CharacterReferenceQAError(
+        f"{char_id} prop detail blocked by high-confidence evidence; "
+        "automatic redraw is disabled"
+    )
 
 
 def _archive_reference_attempt(
@@ -1442,7 +1550,7 @@ def generate_character(
         else None
     )
     card["prop_detail_board_qa_report"] = (
-        f"characters/{char_id}/prop_detail_board_qa.json"
+        f"characters/{char_id}/prop_detail_board_qa_v2.json"
         if prop_detail_board_receipt is not None
         else None
     )

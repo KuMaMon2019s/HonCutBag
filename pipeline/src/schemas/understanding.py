@@ -590,14 +590,33 @@ class CharacterReferenceUnderstanding(StrictUnderstandingModel):
     summary: str = ""
 
 
+class IdentityDetailItemUnderstanding(StrictUnderstandingModel):
+    logical_item_id: str
+    logical_identity_present: bool
+    depiction_count: int = Field(ge=0)
+    depictions_mutually_consistent: bool
+    topology_consistent: bool
+    colors_materials_consistent: bool
+    attachment_mode_correct: bool
+    undeclared_logical_item_evidence: list[str] = Field(default_factory=list)
+    semantic_confidence: float = Field(ge=0.0, le=1.0)
+    semantic_evidence: list[str]
+    issues: list[str]
+
+
 class IdentityDetailUnderstanding(StrictUnderstandingModel):
+    observation_schema: Literal["honcut.prop-detail-observation.v2"] = Field(
+        alias="schema",
+        serialization_alias="schema",
+    )
     passed: bool
     character_identity_consistent: bool
-    declared_items_present: bool
-    item_geometry_consistent: bool
-    colors_materials_consistent: bool
-    attachment_modes_correct: bool
-    undeclared_items_absent: bool
+    character_identity_confidence: float = Field(ge=0.0, le=1.0)
+    character_identity_evidence: list[str]
+    items: list[IdentityDetailItemUnderstanding]
+    no_undeclared_logical_items: bool
+    undeclared_items_confidence: float = Field(ge=0.0, le=1.0)
+    undeclared_items_evidence: list[str]
     issues: list[str]
 
 
@@ -833,6 +852,7 @@ __all__ = [
     "DurationScaledActionSelectionBatch",
     "SourceIndexedScreenplayRewriteBatch",
     "FirstFrameUnderstanding",
+    "IdentityDetailItemUnderstanding",
     "IdentityDetailUnderstanding",
     "HairGeometryUnderstanding",
     "IdentityPropGeometryUnderstanding",

@@ -16,10 +16,12 @@ from schemas.understanding import (
 from utils.character_reference_contracts import (
     IDENTITY_DETAIL_ASSET_POLICY,
     STATIC_REFERENCE_QA_POLICY,
-    identity_detail_prompt_items,
 )
 
 CHARACTER_REFERENCE_QA_SCHEMA = "honcut.character-reference-qa.v5"
+PROP_DETAIL_INPUT_SCHEMA = "honcut.prop-detail-board-input.v2"
+PROP_DETAIL_OBSERVATION_SCHEMA = "honcut.prop-detail-observation.v2"
+PROP_DETAIL_QA_SCHEMA = "honcut.prop-detail-board-qa.v2"
 SEEDANCE_REFERENCE_VIEWS = ("face_closeup", "full_body", "side", "back")
 
 
@@ -180,68 +182,562 @@ cross-view mismatch is localized, list the suspect filenames in failed_views; ot
 all supplied filenames. Do not excuse a wrong angle because identity is consistent."""
 
 
-def build_identity_detail_qa_prompt(items: list[dict[str, Any]]) -> str:
-    """Build the blocking review contract for a four-view-derived detail board."""
+def _canonical_json_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def resolve_identity_detail_logical_items(
+    output_dir: Path,
+    char_id: str,
+    items: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]]]:
+    """Bind authored Phase 3 items to canonical logical identities and view roles."""
+    from utils.canonical_visual_contracts import load_canonical_visual_contract
+
+    contract = load_canonical_visual_contract(output_dir)
+    record = next(
+        (
+            candidate
+            for candidate in contract["characters"]
+            if char_id in {
+                str(candidate["character_id"]),
+                str(candidate["entity_id"]),
+                *(
+                    str(instance["instance_id"])
+                    for instance in candidate["instances"]
+                ),
+            }
+        ),
+        None,
+    )
+    if record is None:
+        raise CharacterReferenceQAError(
+            f"{char_id} is absent from the canonical visual contract"
+        )
+    canonical_by_id = {
+        str(item["prop_id"]): item
+        for item in record["identity_props"]
+    }
+    authored_by_id: dict[str, dict[str, Any]] = {}
+    for item in items:
+        item_id = str(item.get("id") or "").strip()
+        if not item_id or item_id in authored_by_id:
+            raise CharacterReferenceQAError(
+                f"{char_id} identity props require unique non-empty IDs"
+            )
+        authored_by_id[item_id] = item
+    if set(authored_by_id) != set(canonical_by_id):
+        raise CharacterReferenceQAError(
+            f"{char_id} identity props disagree with canonical item IDs"
+        )
+
+    logical_items: list[dict[str, Any]] = []
+    for item_id, item in authored_by_id.items():
+        canonical = canonical_by_id[item_id]
+        attachment_mode = str(item["attachment_mode"])
+        depiction_roles = (
+            ["front", "side", "three_quarter"]
+            if attachment_mode == "isolated_handheld"
+            else ["attachment_context", "material_detail"]
+        )
+        geometry = {
+            key: (
+                value["value"]
+                if isinstance(value, dict) and "value" in value
+                else value
+            )
+            for key, value in canonical["geometry"].items()
+        }
+        logical_items.append({
+            "logical_item_id": item_id,
+            "display_name": str(item["name"]),
+            "attachment_mode": attachment_mode,
+            "persistence": str(item["persistence"]),
+            "depiction_roles": depiction_roles,
+            "canonical_geometry": geometry,
+        })
+    return str(contract["contract_sha256"]), logical_items
+
+
+def build_identity_detail_input_contract(
+    *,
+    char_id: str,
+    character_description: str,
+    identity_props: list[dict[str, Any]],
+    canonical_contract_sha256: str,
+    logical_items: list[dict[str, Any]],
+    prompt_sha256: str,
+    canonical_paths: list[Path],
+) -> dict[str, Any]:
+    """Create the deterministic authority consumed by generation, QA, and replay."""
+    if not logical_items:
+        raise CharacterReferenceQAError("prop detail contract requires logical items")
+    expected_reference_roles = (
+        "character_face_identity",
+        "character_body_identity",
+    )
+    if len(canonical_paths) != len(expected_reference_roles):
+        raise CharacterReferenceQAError(
+            "prop detail contract requires face and body identity references"
+        )
+    references = []
+    for path, media_role in zip(
+        canonical_paths,
+        expected_reference_roles,
+        strict=True,
+    ):
+        if not path.is_file():
+            raise CharacterReferenceQAError(
+                f"canonical reference is missing: {path.name}"
+            )
+        references.append({
+            "path": path.name,
+            "sha256": file_sha256(path),
+            "media_role": media_role,
+        })
+    depictions = [
+        {
+            "depiction_id": (
+                f"{item['logical_item_id']}:{view_role}"
+            ),
+            "logical_item_id": item["logical_item_id"],
+            "view_role": view_role,
+        }
+        for item in logical_items
+        for view_role in item["depiction_roles"]
+    ]
+    lineage = [
+        {
+            "parent_role": "canonical_visual_contract",
+            "sha256": canonical_contract_sha256,
+        },
+        *(
+            {
+                "parent_role": reference["media_role"],
+                "sha256": reference["sha256"],
+            }
+            for reference in references
+        ),
+    ]
+    return {
+        "schema": PROP_DETAIL_INPUT_SCHEMA,
+        "character_id": char_id,
+        "canonical_visual_contract_sha256": canonical_contract_sha256,
+        "character_description_sha256": hashlib.sha256(
+            character_description.encode("utf-8")
+        ).hexdigest(),
+        "prompt_sha256": prompt_sha256,
+        "identity_props_sha256": _canonical_json_sha256(identity_props),
+        "logical_item_count": len(logical_items),
+        "logical_items_sha256": _canonical_json_sha256(logical_items),
+        "logical_items": logical_items,
+        "depiction_count": len(depictions),
+        "depictions_sha256": _canonical_json_sha256(depictions),
+        "depictions": depictions,
+        "detail_media_role": "identity_prop_geometry_reference",
+        "canonical_references": references,
+        "parent_lineage_sha256": _canonical_json_sha256(lineage),
+        "parent_lineage": lineage,
+    }
+
+
+def validate_identity_detail_input_contract(
+    *,
+    output_dir: Path,
+    canonical_paths: list[Path],
+    input_contract: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Fail closed on every deterministic v2 prop-detail authority field."""
+    from utils.canonical_visual_contracts import load_canonical_visual_contract
+
+    if input_contract.get("schema") != PROP_DETAIL_INPUT_SCHEMA:
+        raise CharacterReferenceQAError("prop detail input schema is not current")
+    contract = load_canonical_visual_contract(output_dir)
+    if input_contract.get("canonical_visual_contract_sha256") != contract.get(
+        "contract_sha256"
+    ):
+        raise CharacterReferenceQAError("prop detail canonical contract hash mismatch")
+
+    logical_items = input_contract.get("logical_items")
+    if (
+        not isinstance(logical_items, list)
+        or not logical_items
+        or input_contract.get("logical_item_count") != len(logical_items)
+        or input_contract.get("logical_items_sha256")
+        != _canonical_json_sha256(logical_items)
+    ):
+        raise CharacterReferenceQAError("prop detail logical item contract is invalid")
+    logical_ids = [str(item.get("logical_item_id") or "") for item in logical_items]
+    if not all(logical_ids) or len(logical_ids) != len(set(logical_ids)):
+        raise CharacterReferenceQAError("prop detail logical item IDs are invalid")
+
+    char_id = str(input_contract.get("character_id") or "")
+    canonical_record = next(
+        (
+            record
+            for record in contract["characters"]
+            if char_id in {
+                str(record["character_id"]),
+                str(record["entity_id"]),
+                *(str(value["instance_id"]) for value in record["instances"]),
+            }
+        ),
+        None,
+    )
+    canonical_ids = (
+        [str(item["prop_id"]) for item in canonical_record["identity_props"]]
+        if canonical_record is not None
+        else []
+    )
+    if set(logical_ids) != set(canonical_ids) or len(logical_ids) != len(canonical_ids):
+        raise CharacterReferenceQAError(
+            "prop detail logical item IDs disagree with canonical authority"
+        )
+
+    expected_depictions = [
+        {
+            "depiction_id": f"{item['logical_item_id']}:{view_role}",
+            "logical_item_id": item["logical_item_id"],
+            "view_role": view_role,
+        }
+        for item in logical_items
+        for view_role in item.get("depiction_roles") or []
+    ]
+    if (
+        input_contract.get("depictions") != expected_depictions
+        or input_contract.get("depiction_count") != len(expected_depictions)
+        or input_contract.get("depictions_sha256")
+        != _canonical_json_sha256(expected_depictions)
+    ):
+        raise CharacterReferenceQAError("prop detail depiction contract is invalid")
+    if input_contract.get("detail_media_role") != "identity_prop_geometry_reference":
+        raise CharacterReferenceQAError("prop detail media role is invalid")
+
+    expected_roles = (
+        "character_face_identity",
+        "character_body_identity",
+    )
+    canonical_references = input_contract.get("canonical_references")
+    if (
+        len(canonical_paths) != len(expected_roles)
+        or not isinstance(canonical_references, list)
+        or len(canonical_references) != len(expected_roles)
+    ):
+        raise CharacterReferenceQAError("prop detail canonical references are incomplete")
+    for path, expected_role, reference in zip(
+        canonical_paths,
+        expected_roles,
+        canonical_references,
+        strict=True,
+    ):
+        if (
+            not isinstance(reference, dict)
+            or not path.is_file()
+            or reference.get("path") != path.name
+            or reference.get("media_role") != expected_role
+            or reference.get("sha256") != file_sha256(path)
+        ):
+            raise CharacterReferenceQAError(
+                "prop detail canonical reference hash or media role mismatch"
+            )
+    expected_lineage = [
+        {
+            "parent_role": "canonical_visual_contract",
+            "sha256": contract["contract_sha256"],
+        },
+        *(
+            {
+                "parent_role": reference["media_role"],
+                "sha256": reference["sha256"],
+            }
+            for reference in canonical_references
+        ),
+    ]
+    if (
+        input_contract.get("parent_lineage") != expected_lineage
+        or input_contract.get("parent_lineage_sha256")
+        != _canonical_json_sha256(expected_lineage)
+    ):
+        raise CharacterReferenceQAError("prop detail parent lineage mismatch")
+    return contract, logical_items
+
+
+def build_identity_detail_qa_prompt(logical_items: list[dict[str, Any]]) -> str:
+    """Build a typed review contract where logical items and views are distinct."""
     return f"""You are the blocking Phase 3 identity-detail inspector.
 Images 1 and 2 are the approved canonical face and full-body references. Image 3 is the
 supplemental identity-detail board derived from them.
 
-Declared identity-detail items:
-{identity_detail_prompt_items(items)}
+Declared logical items and their permitted depictions:
+{json.dumps(logical_items, ensure_ascii=False, sort_keys=True)}
 
 Detail-board policy:
 {IDENTITY_DETAIL_ASSET_POLICY}
 
 Verify that the character identity, outfit base colors, and body-worn markers match images 1-2;
-every declared item is visible with its exact authored geometry, colors, materials, markings and
-attachment mode; isolated_handheld items are shown detached and are not held or operated; and no
-undeclared prop, location, action pose, second character, text, watermark or logo was introduced.
+every declared logical item is visible with its exact canonical geometry, colors, materials and
+attachment mode; and no undeclared logical item, location, action pose, second character, text,
+watermark or logo was introduced. A front, side, three-quarter, crop, or material view is a
+depiction of its declared logical_item_id, not another logical item. Count logical identities,
+not repeated views. Multiple depictions are valid only when they are mutually consistent.
 
 Return one JSON object only:
-{{"passed":true,"character_identity_consistent":true,"declared_items_present":true,
-"item_geometry_consistent":true,"colors_materials_consistent":true,
-"attachment_modes_correct":true,"undeclared_items_absent":true,"issues":[]}}
-Set passed=false whenever any required item or consistency fact is uncertain."""
+{{"schema":"{PROP_DETAIL_OBSERVATION_SCHEMA}","passed":true,
+"character_identity_consistent":true,"character_identity_confidence":0.95,
+"character_identity_evidence":["visible comparison"],"items":[{{
+"logical_item_id":"declared ID","logical_identity_present":true,"depiction_count":3,
+"depictions_mutually_consistent":true,"topology_consistent":true,
+"colors_materials_consistent":true,"attachment_mode_correct":true,
+"undeclared_logical_item_evidence":[],"semantic_confidence":0.95,
+"semantic_evidence":["concrete visible item evidence"],"issues":[]}}],
+"no_undeclared_logical_items":true,"undeclared_items_confidence":0.95,
+"undeclared_items_evidence":["visible inventory comparison"],"issues":[]}}
+
+Return exactly one item entry for every declared logical_item_id and no unknown IDs. The aggregate
+passed value is diagnostic only. Confidence is confidence in visible evidence. Low-confidence
+uncertainty must remain evidence-based; do not convert the expected depiction count into an item
+count mismatch."""
 
 
-def parse_identity_detail_qa(raw: str) -> dict[str, Any]:
-    """Parse and recompute the identity-detail verdict from explicit evidence."""
+def parse_identity_detail_qa(
+    raw: str,
+    logical_items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Parse a typed Observation and compute policy inputs without trusting passed."""
     payload = parse_structured_output(
         raw,
         IdentityDetailUnderstanding,
-    ).model_dump()
-    fields = (
-        "character_identity_consistent",
-        "declared_items_present",
-        "item_geometry_consistent",
-        "colors_materials_consistent",
-        "attachment_modes_correct",
-        "undeclared_items_absent",
-    )
-    evidence = {field: payload.get(field) is True for field in fields}
-    issues = payload.get("issues")
-    issues = issues if isinstance(issues, list) else [str(issues or "")]
-    return {
-        "passed": payload.get("passed") is True and all(evidence.values()),
-        **evidence,
-        "issues": [str(item) for item in issues if str(item).strip()],
+    ).model_dump(by_alias=True)
+    expected_ids = [str(item["logical_item_id"]) for item in logical_items]
+    actual_ids = [str(item["logical_item_id"]) for item in payload["items"]]
+    deterministic_errors: list[dict[str, Any]] = []
+    if len(actual_ids) != len(set(actual_ids)):
+        deterministic_errors.append({
+            "category": "schema",
+            "evidence": "duplicate logical_item_id in typed observation",
+        })
+    if set(actual_ids) != set(expected_ids) or len(actual_ids) != len(expected_ids):
+        deterministic_errors.append({
+            "category": "canonical_contract",
+            "evidence": {
+                "expected_logical_item_ids": expected_ids,
+                "observed_logical_item_ids": actual_ids,
+            },
+        })
+
+    findings: list[dict[str, Any]] = []
+    confidences = [
+        float(payload["character_identity_confidence"]),
+        float(payload["undeclared_items_confidence"]),
+    ]
+    if payload["character_identity_consistent"] is not True:
+        findings.append({
+            "blocking_category": "character_identity",
+            "confidence": payload["character_identity_confidence"],
+            "evidence": payload["character_identity_evidence"],
+        })
+    category_by_field = {
+        "logical_identity_present": "logical_item_identity",
+        "depictions_mutually_consistent": "logical_item_identity",
+        "topology_consistent": "prop_topology",
+        "colors_materials_consistent": "prop_appearance",
+        "attachment_mode_correct": "attachment_mode",
     }
+    for item in payload["items"]:
+        confidences.append(float(item["semantic_confidence"]))
+        for field, category in category_by_field.items():
+            if item[field] is not True:
+                findings.append({
+                    "blocking_category": category,
+                    "confidence": item["semantic_confidence"],
+                    "evidence": item["semantic_evidence"],
+                    "logical_item_id": item["logical_item_id"],
+                    "field": field,
+                })
+        if item["depiction_count"] < 1:
+            findings.append({
+                "blocking_category": "logical_item_identity",
+                "confidence": item["semantic_confidence"],
+                "evidence": item["semantic_evidence"],
+                "logical_item_id": item["logical_item_id"],
+                "field": "depiction_count",
+            })
+        if item["undeclared_logical_item_evidence"]:
+            findings.append({
+                "blocking_category": "undeclared_logical_item",
+                "confidence": item["semantic_confidence"],
+                "evidence": item["undeclared_logical_item_evidence"],
+                "logical_item_id": item["logical_item_id"],
+            })
+    if payload["no_undeclared_logical_items"] is not True:
+        findings.append({
+            "blocking_category": "undeclared_logical_item",
+            "confidence": payload["undeclared_items_confidence"],
+            "evidence": payload["undeclared_items_evidence"],
+        })
+
+    from quality.visual_qa_policy import decide_visual_qa
+
+    semantic_score = min(confidences) if confidences else None
+    policy = decide_visual_qa(
+        semantic_score=semantic_score,
+        findings=findings,
+        deterministic_errors=deterministic_errors,
+    )
+    return {
+        **payload,
+        "model_passed_diagnostic": payload["passed"],
+        "passed": policy.verdict in {"pass", "acceptable_deviation"},
+        "qa_verdict": policy.verdict,
+        "semantic_score": policy.semantic_score,
+        "deterministic_errors": deterministic_errors,
+        "findings": findings,
+        "policy_decision": policy.as_dict(),
+    }
+
+
+def evaluate_identity_detail_observation(
+    *,
+    output_dir: Path,
+    character_id: str,
+    evidence: list[dict[str, Any]],
+    canonical_contract_sha256: str,
+    evaluator_model: str,
+    prompt_sha256: str,
+    logical_items: list[dict[str, Any]],
+    observation_payload: dict[str, Any] | None,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Persist or reuse typed evidence and apply policy without any Provider call."""
+    from quality.visual_qa_policy import POLICY_ID, policy_sha256
+    from runtime.qa_ledger import QALedger, observation_fingerprint
+
+    fingerprint = observation_fingerprint(
+        evidence=evidence,
+        canonical_contract_sha256=canonical_contract_sha256,
+        evaluator_model=evaluator_model,
+        prompt_sha256=prompt_sha256,
+        observation_schema=PROP_DETAIL_OBSERVATION_SCHEMA,
+    )
+    ledger = QALedger(output_dir / "runtime.db")
+    observation = ledger.find_observation(fingerprint)
+    observation_reused = observation is not None
+    if observation is None:
+        if observation_payload is None:
+            raise CharacterReferenceQAError(
+                "prop detail Observation is missing for immutable evidence"
+            )
+        validated = IdentityDetailUnderstanding.model_validate(observation_payload)
+        observation, _ = ledger.record_observation(
+            run_id=run_id or output_dir.name,
+            phase="phase3",
+            resource_id=character_id,
+            evidence_fingerprint=fingerprint,
+            canonical_contract_sha256=canonical_contract_sha256,
+            evaluator_model=evaluator_model,
+            prompt_sha256=prompt_sha256,
+            observation_schema=PROP_DETAIL_OBSERVATION_SCHEMA,
+            observation=validated.model_dump(mode="json", by_alias=True),
+        )
+    parsed = parse_identity_detail_qa(
+        IdentityDetailUnderstanding.model_validate(
+            observation.observation
+        ).model_dump_json(by_alias=True),
+        logical_items,
+    )
+    decision, decision_reused = ledger.record_decision(
+        observation_id=observation.observation_id,
+        phase_owner="phase3.prop_detail_qa",
+        policy_id=POLICY_ID,
+        policy_sha256=policy_sha256(),
+        verdict=parsed["qa_verdict"],
+        semantic_score=parsed["semantic_score"],
+        decision=parsed["policy_decision"],
+    )
+    parsed.update({
+        "qa_observation_id": observation.observation_id,
+        "qa_observation_reused": observation_reused,
+        "qa_decision_id": decision.decision_id,
+        "qa_decision_reused": decision_reused,
+        "qa_prompt_sha256": prompt_sha256,
+    })
+    return parsed
 
 
 def review_identity_detail_reference(
     reviewer: CharacterReferenceReviewer,
     canonical_paths: list[Path],
     detail_path: Path,
-    items: list[dict[str, Any]],
+    input_contract: dict[str, Any],
 ) -> dict[str, Any]:
-    """Review one detail board against the approved neutral identity references."""
-    result = review_as(
-        reviewer,
-        [*canonical_paths, detail_path],
-        build_identity_detail_qa_prompt(items),
-        IdentityDetailUnderstanding,
+    """Persist one typed Observation, then apply the current deterministic policy."""
+    output_dir = next(
+        (
+            parent
+            for parent in detail_path.parents
+            if (parent / "CANONICAL_VISUAL_CONTRACT.json").is_file()
+        ),
+        None,
     )
-    return parse_identity_detail_qa(result.model_dump_json())
+    if output_dir is None:
+        raise CharacterReferenceQAError(
+            "prop detail QA cannot resolve the canonical run boundary"
+        )
+    contract, logical_items = validate_identity_detail_input_contract(
+        output_dir=output_dir,
+        canonical_paths=canonical_paths,
+        input_contract=input_contract,
+    )
+    prompt = build_identity_detail_qa_prompt(logical_items)
+    prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    evaluator_model = str(getattr(reviewer, "model", "unknown-vlm"))
+    image_paths = [*canonical_paths, detail_path]
+    evidence = [
+        {"path": path.relative_to(output_dir).as_posix(), "sha256": file_sha256(path)}
+        for path in image_paths
+    ]
+    from runtime.qa_ledger import QALedger, observation_fingerprint
+
+    fingerprint = observation_fingerprint(
+        evidence=evidence,
+        canonical_contract_sha256=contract["contract_sha256"],
+        evaluator_model=evaluator_model,
+        prompt_sha256=prompt_sha256,
+        observation_schema=PROP_DETAIL_OBSERVATION_SCHEMA,
+    )
+    existing = QALedger(output_dir / "runtime.db").find_observation(fingerprint)
+    observation_payload: dict[str, Any] | None = None
+    if existing is None:
+        result = review_as(
+            reviewer,
+            image_paths,
+            prompt,
+            IdentityDetailUnderstanding,
+        )
+        observation_payload = result.model_dump(mode="json", by_alias=True)
+    try:
+        run_id = str(json.loads(
+            (output_dir / "RUN_MANIFEST.json").read_text(encoding="utf-8")
+        )["run_fingerprint"])
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        run_id = output_dir.name
+    return evaluate_identity_detail_observation(
+        output_dir=output_dir,
+        character_id=str(input_contract["character_id"]),
+        evidence=evidence,
+        canonical_contract_sha256=contract["contract_sha256"],
+        evaluator_model=evaluator_model,
+        prompt_sha256=prompt_sha256,
+        logical_items=logical_items,
+        observation_payload=observation_payload,
+        run_id=run_id,
+    )
 
 
 def parse_character_reference_qa(
