@@ -1,0 +1,53 @@
+{
+  "schema": "honcut.storyboard-guide-pose-regression.v1",
+  "status": "passed",
+  "source": {
+    "git_commit": "8133a64fafc0d9bf8ace16dd9c708f9e2a8d5719",
+    "baseline_commit": "2807f4612d81216a9a241ed731548019aa290ef0",
+    "openspec_change": "align-storyboard-guide-pose-semantics"
+  },
+  "gates": {
+    "focused_tests": {
+      "status": "passed",
+      "passed": 21
+    },
+    "full_test_suite": {
+      "status": "passed",
+      "passed": 1389,
+      "warnings": 2
+    },
+    "lint": {
+      "status": "passed"
+    },
+    "diff_check": {
+      "status": "passed"
+    },
+    "offline_recovery": {
+      "status": "passed",
+      "rounds": 10,
+      "provider_request_count": 0,
+      "run_id": "442e63bbaaa70e2776bdaa7d45e17a1f5f3aed4028dd05baf2feec29d7108e92"
+    },
+    "run17_legacy_replay": {
+      "status": "passed",
+      "source_guide_count": 7,
+      "redrawn_guide_count": 7,
+      "recovery_rounds": 10,
+      "provider_request_count": 0,
+      "legacy_source_assets_modified": false,
+      "migration_receipt_sha256": "fb9fc6f556c4e4a1d91e9d8c18971dc41ccbdc18d503d5fbb584c0a55e7729de"
+    },
+    "pipeline_core_unchanged": {
+      "status": "passed"
+    },
+    "openspec": {
+      "status": "verified",
+      "strict_validation": "passed"
+    }
+  },
+  "provider_request_count": 0,
+  "live_paid_provider": {
+    "status": "pending_live_acceptance",
+    "reason": "requires a new explicit authorization"
+  }
+}

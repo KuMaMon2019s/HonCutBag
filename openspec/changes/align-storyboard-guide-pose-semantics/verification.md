@@ -20,7 +20,7 @@
 ### Evidence
 
 - Focused suite: 21 passed.
-- Full suite: 1388 passed, with two pre-existing multiprocessing deprecation warnings.
+- Full suite: 1389 passed, with two pre-existing multiprocessing deprecation warnings.
 - Lint and `git diff --check`: passed.
 - Ten-round offline lifecycle recovery: passed with zero Provider requests.
 - run-17 legacy evidence replay: seven v2 guides redrawn as v3, ten recoveries stable, zero Provider requests, and original seven guide files byte-identical.

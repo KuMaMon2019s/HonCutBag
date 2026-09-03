@@ -43,4 +43,4 @@
 - [x] 6.5 Perform Serena post-change symbol/reference/type/diagnostics validation and verify no caller, DTO field or invalid reference is omitted.
 - [x] 6.6 Run `openspec verify align-storyboard-guide-pose-semantics`, resolve every spec/task mismatch, and leave the change unarchived until all implementation and regression evidence is complete.
 - [x] 6.7 Run `graphify update .`, focused `graphify affected` checks, save the verified result without secrets, and refresh reflections; verify Graphify hooks and community labels remain intact.
-- [ ] 6.8 Write a regression receipt bound to the candidate commit with the provider-deny evidence. Mark the live gate `pending_live_acceptance`; do not run a paid Phase 6 acceptance without a new explicit authorization.
+- [x] 6.8 Write a regression receipt bound to the candidate commit with the provider-deny evidence. Mark the live gate `pending_live_acceptance`; do not run a paid Phase 6 acceptance without a new explicit authorization.
