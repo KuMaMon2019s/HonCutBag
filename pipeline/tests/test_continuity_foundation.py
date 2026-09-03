@@ -110,6 +110,7 @@ from sam3_runtime.policy import (
 from schemas.continuity import ContinuityPlan, GenerationChunk
 from tools.asset_packager import build_content_for_shot, inject_reference_instruction
 from utils.artifact_chain import can_resume_from
+from utils.privacy_visual_policy import synthetic_stylized_prompt_contract
 
 
 def _signed_tos_url(monkeypatch, object_key):
@@ -2778,6 +2779,36 @@ def test_provider_uses_canonical_synthetic_policy_not_legacy_environment(
     assert "珍珠生体瓷妆" in content[0]["text"]
     assert "完整无遮挡的协调五官" in content[0]["text"]
     assert "不得把不同角色统一改成同款头盔" in content[0]["text"]
+
+
+def test_asset_packager_does_not_duplicate_existing_synthetic_contract(
+    monkeypatch,
+    tmp_path,
+    canonical_run_contract,
+):
+    canonical_run_contract(
+        tmp_path,
+        {"characters": [{"id": "agent", "name": "特工"}]},
+        requested_policy="synthetic_stylized_character_v3",
+    )
+    _write_cinematic_first_frame(tmp_path)
+    monkeypatch.setattr(
+        tos_uploader,
+        "upload_image_required",
+        lambda *_args, **_kwargs: "https://assets.test/reference.png",
+    )
+
+    content = build_content_for_shot(
+        tmp_path,
+        "S01",
+        {
+            "prompt": f"{synthetic_stylized_prompt_contract()}\n执行当前动作",
+            "gen_strategy": "i2v",
+            "who": ["agent"],
+        },
+    )
+
+    assert content[0]["text"].count("【非真人视觉硬约束】") == 1
 
 
 def test_storyboard_beat_planner_discards_quote_only_fragments():

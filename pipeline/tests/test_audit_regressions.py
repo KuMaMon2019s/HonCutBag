@@ -6813,7 +6813,8 @@ def _phase6_live_acceptance_preflight(tmp_path, **_kwargs):
         "p_count": 2,
         "visible_character_ids": ["CHAR_01"],
         "synthetic_identity": {
-            "visual_identity_policy": "synthetic_stylized_character_v3",
+            "character_visual_policy": "synthetic_stylized_character_v3",
+            "canonical_visual_contract_sha256": "c" * 64,
             "aesthetic_profile_id": SYNTHETIC_MAKEUP_PROFILE_ID,
             "aesthetic_profile_sha256": synthetic_makeup_profile_sha256(),
             "identity_contract_complete": True,
@@ -6852,6 +6853,61 @@ def _phase6_live_acceptance_preflight(tmp_path, **_kwargs):
         "seed": 7,
     }
     return preflight, runtime
+
+
+def _current_synthetic_acceptance_contract():
+    policy = phase6_storyboard_guide_live_acceptance.SYNTHETIC_STYLIZED_CHARACTER_POLICY
+    return (
+        {
+            "character_visual_policy": policy,
+            "resolved_character_visual_policies": [policy],
+            "canonical_visual_contract_sha256": "c" * 64,
+            "characters": [
+                {
+                    "id": "CHAR_01",
+                    "visual_identity_policy": policy,
+                }
+            ],
+        },
+        {
+            "all_characters_policy_tagged": True,
+            "identity_contract_complete": True,
+            "synthetic_character_ids": ["CHAR_01"],
+        },
+    )
+
+
+def test_phase6_live_acceptance_uses_current_canonical_character_policy():
+    characters, evidence = _current_synthetic_acceptance_contract()
+
+    assert phase6_storyboard_guide_live_acceptance._is_current_synthetic_identity_contract(
+        characters,
+        evidence,
+    )
+
+
+def test_phase6_live_acceptance_rejects_legacy_top_level_character_policy():
+    characters, evidence = _current_synthetic_acceptance_contract()
+    characters["visual_identity_policy"] = characters.pop("character_visual_policy")
+
+    assert not phase6_storyboard_guide_live_acceptance._is_current_synthetic_identity_contract(
+        characters,
+        evidence,
+    )
+
+
+def test_phase6_live_acceptance_uses_current_p01_media_order():
+    assert phase6_storyboard_guide_live_acceptance._expected_p01_media_responsibilities(
+        visible_character_count=2,
+        performance_guide_count=2,
+    ) == [
+        "character_identity_board",
+        "character_identity_board",
+        "cinematic_composition",
+        "character_performance_guide",
+        "character_performance_guide",
+        "storyboard_narrative_guide",
+    ]
 
 
 def test_phase6_live_acceptance_preflight_is_zero_submit(tmp_path):

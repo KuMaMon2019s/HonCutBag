@@ -263,6 +263,62 @@ def _content_prompt(content: list[dict[str, Any]]) -> str:
     )
 
 
+def _is_current_synthetic_identity_contract(
+    characters_payload: dict[str, Any],
+    synthetic_evidence: dict[str, Any],
+) -> bool:
+    """Validate the current canonical policy projection without legacy aliases."""
+    character_records = characters_payload.get("characters")
+    resolved_policies = characters_payload.get("resolved_character_visual_policies")
+    canonical_hash = str(
+        characters_payload.get("canonical_visual_contract_sha256") or ""
+    ).strip()
+    character_ids = [
+        str(character.get("id") or "").strip()
+        for character in character_records or []
+        if isinstance(character, dict)
+    ]
+    evidence_ids = [
+        str(value).strip()
+        for value in synthetic_evidence.get("synthetic_character_ids") or []
+        if str(value).strip()
+    ]
+    return bool(
+        characters_payload.get("character_visual_policy")
+        == SYNTHETIC_STYLIZED_CHARACTER_POLICY
+        and resolved_policies == [SYNTHETIC_STYLIZED_CHARACTER_POLICY]
+        and len(canonical_hash) == 64
+        and all(character in "0123456789abcdef" for character in canonical_hash)
+        and isinstance(character_records, list)
+        and character_records
+        and len(character_ids) == len(character_records)
+        and all(character_ids)
+        and all(
+            isinstance(character, dict)
+            and character.get("visual_identity_policy")
+            == SYNTHETIC_STYLIZED_CHARACTER_POLICY
+            for character in character_records
+        )
+        and synthetic_evidence.get("all_characters_policy_tagged") is True
+        and synthetic_evidence.get("identity_contract_complete") is True
+        and evidence_ids == character_ids
+    )
+
+
+def _expected_p01_media_responsibilities(
+    *,
+    visible_character_count: int,
+    performance_guide_count: int,
+) -> list[str]:
+    """Mirror the current Phase 6 P01 authority order in the live gate."""
+    return [
+        *(["character_identity_board"] * visible_character_count),
+        "cinematic_composition",
+        *(["character_performance_guide"] * performance_guide_count),
+        "storyboard_narrative_guide",
+    ]
+
+
 def _preflight_contract(
     output_dir: Path,
     *,
@@ -309,21 +365,9 @@ def _preflight_contract(
         shot_id,
     )
     synthetic_evidence = synthetic_character_review_evidence(output_dir)
-    character_records = characters_payload.get("characters") or []
-    if (
-        characters_payload.get("visual_identity_policy")
-        != SYNTHETIC_STYLIZED_CHARACTER_POLICY
-        or not isinstance(character_records, list)
-        or not character_records
-        or any(
-            not isinstance(character, dict)
-            or character.get("visual_identity_policy")
-            != SYNTHETIC_STYLIZED_CHARACTER_POLICY
-            for character in character_records
-        )
-        or synthetic_evidence.get("top_level_policy_match") is not True
-        or synthetic_evidence.get("all_characters_policy_tagged") is not True
-        or synthetic_evidence.get("identity_contract_complete") is not True
+    if not _is_current_synthetic_identity_contract(
+        characters_payload,
+        synthetic_evidence,
     ):
         raise RuntimeError(
             "selected run does not satisfy the current synthetic porcelain identity contract"
@@ -435,12 +479,10 @@ def _preflight_contract(
         for item in image_media
         if item.get("responsibility") == "character_performance_guide"
     ]
-    expected_responsibilities = [
-        "cinematic_composition",
-        *(["character_identity_board"] * len(visible_character_ids)),
-        "storyboard_narrative_guide",
-        *(["character_performance_guide"] * len(performance_guides)),
-    ]
+    expected_responsibilities = _expected_p01_media_responsibilities(
+        visible_character_count=len(visible_character_ids),
+        performance_guide_count=len(performance_guides),
+    )
     required_prompt_fragments = (
         "珍珠生体瓷妆",
         "温润透亮",
@@ -461,7 +503,6 @@ def _preflight_contract(
     )
     if (
         not image_media
-        or image_media[0].get("responsibility") != "cinematic_composition"
         or len(image_media) > 9
         or video_media
         or len(guides) != 1
@@ -501,7 +542,10 @@ def _preflight_contract(
         "p_count": len(shot.get("storyboard_beats") or []),
         "visible_character_ids": visible_character_ids,
         "synthetic_identity": {
-            "visual_identity_policy": SYNTHETIC_STYLIZED_CHARACTER_POLICY,
+            "character_visual_policy": SYNTHETIC_STYLIZED_CHARACTER_POLICY,
+            "canonical_visual_contract_sha256": characters_payload[
+                "canonical_visual_contract_sha256"
+            ],
             "aesthetic_profile_id": SYNTHETIC_MAKEUP_PROFILE_ID,
             "aesthetic_profile_sha256": synthetic_makeup_profile_sha256(),
             "identity_contract_complete": True,

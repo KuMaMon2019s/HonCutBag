@@ -969,7 +969,9 @@ def build_content_for_shot(
     ):
         from utils.privacy_visual_policy import synthetic_stylized_prompt_contract
 
-        synthetic_contract = synthetic_stylized_prompt_contract()
+        candidate_contract = synthetic_stylized_prompt_contract()
+        if candidate_contract not in prompt_text:
+            synthetic_contract = candidate_contract
     prompt_text = "\n".join(
         part for part in (canonical_prompt, synthetic_contract, prompt_text) if part
     ).strip()
