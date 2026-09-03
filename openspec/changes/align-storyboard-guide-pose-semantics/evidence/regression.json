@@ -2,18 +2,18 @@
   "schema": "honcut.storyboard-guide-pose-regression.v1",
   "status": "passed",
   "source": {
-    "git_commit": "8133a64fafc0d9bf8ace16dd9c708f9e2a8d5719",
+    "git_commit": "6227bf10704ab766d9ef9db8f4556722f71a9489",
     "baseline_commit": "2807f4612d81216a9a241ed731548019aa290ef0",
     "openspec_change": "align-storyboard-guide-pose-semantics"
   },
   "gates": {
     "focused_tests": {
       "status": "passed",
-      "passed": 21
+      "passed": 433
     },
     "full_test_suite": {
       "status": "passed",
-      "passed": 1389,
+      "passed": 1391,
       "warnings": 2
     },
     "lint": {
@@ -26,7 +26,7 @@
       "status": "passed",
       "rounds": 10,
       "provider_request_count": 0,
-      "run_id": "442e63bbaaa70e2776bdaa7d45e17a1f5f3aed4028dd05baf2feec29d7108e92"
+      "run_id": "f3ee3431253b102aedbb4e487f4a1b605206103e8e729f97b738e75847301cfa"
     },
     "run17_legacy_replay": {
       "status": "passed",
@@ -39,6 +39,11 @@
     },
     "pipeline_core_unchanged": {
       "status": "passed"
+    },
+    "canonical_lineage_only": {
+      "status": "passed",
+      "production_test_fallbacks": 0,
+      "missing_lineage_behavior": "fail_closed"
     },
     "openspec": {
       "status": "verified",
