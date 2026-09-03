@@ -134,6 +134,14 @@ def test_day_contract_overrides_night_style_in_storyboard_scene_and_video(monkey
                 "duration_s": 8,
                 "start_state": "车辆在远处",
                 "action": "车辆驶近",
+                "generation_action_units": [{
+                    "unit_id": "GAU001",
+                    "actions": ["车辆驶近"],
+                    "performers": ["车辆"],
+                    "source_event_id": 1,
+                    "source_generation_unit_indexes": [1],
+                    "ledger_indexes": [0],
+                }],
                 "end_state": "车辆抵达桥下",
             }
         ],

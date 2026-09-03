@@ -1733,6 +1733,17 @@ def test_storyboard_output_safety_rejection_gets_one_non_contact_retry(tmp_path)
                         "duration_s": 5,
                         "generation_mode": "fresh",
                         "action": "双方进行膝击攻防",
+                        "generation_action_units": [
+                            {
+                                "unit_id": "GAU001",
+                                "actions": ["双方进行膝击攻防"],
+                                "performers": ["agent", "guard"],
+                                "targets": ["agent", "guard"],
+                                "source_event_id": 1,
+                                "source_generation_unit_indexes": [1],
+                                "ledger_indexes": [0],
+                            }
+                        ],
                         "start_state": "双方悬浮对峙",
                         "end_state": "完成格挡",
                     }
@@ -1787,12 +1798,28 @@ def test_storyboard_input_safety_rejection_keeps_known_identity_references(tmp_p
                     "duration_s": 5,
                     "generation_mode": "multi_image",
                     "action": "synthetic agent stabilizes in zero gravity",
+                    "generation_action_units": [{
+                        "unit_id": "GAU001",
+                        "actions": ["synthetic agent stabilizes in zero gravity"],
+                        "performers": ["CHAR_A"],
+                        "source_event_id": 1,
+                        "source_generation_unit_indexes": [1],
+                        "ledger_indexes": [0],
+                    }],
                 },
                 {
                     "beat_id": "S06_P02",
                     "duration_s": 4,
                     "generation_mode": "tail_video_extend",
                     "action": "synthetic agent holds the final pose",
+                    "generation_action_units": [{
+                        "unit_id": "GAU002",
+                        "actions": ["synthetic agent holds the final pose"],
+                        "performers": ["CHAR_A"],
+                        "source_event_id": 2,
+                        "source_generation_unit_indexes": [1],
+                        "ledger_indexes": [1],
+                    }],
                 },
             ],
         }]
@@ -1886,6 +1913,14 @@ def test_storyboard_input_safety_rejection_has_bounded_text_fallback(tmp_path):
                 "duration_s": 5,
                 "generation_mode": "multi_image",
                 "action": "synthetic agent enters the corridor",
+                "generation_action_units": [{
+                    "unit_id": "GAU001",
+                    "actions": ["synthetic agent enters the corridor"],
+                    "performers": ["CHAR_A"],
+                    "source_event_id": 1,
+                    "source_generation_unit_indexes": [1],
+                    "ledger_indexes": [0],
+                }],
             }],
         }]
     }
@@ -1946,6 +1981,14 @@ def test_storyboard_reference_transport_failure_retries_same_request_twice(tmp_p
                         "duration_s": 5,
                         "generation_mode": "fresh",
                         "action": "mechanical training motion",
+                        "generation_action_units": [{
+                            "unit_id": "GAU001",
+                            "actions": ["mechanical training motion"],
+                            "performers": ["training mechanism"],
+                            "source_event_id": 1,
+                            "source_generation_unit_indexes": [1],
+                            "ledger_indexes": [0],
+                        }],
                     }
                 ],
             }

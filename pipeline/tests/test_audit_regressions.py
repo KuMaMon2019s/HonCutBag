@@ -2457,6 +2457,14 @@ def test_explicit_empty_who_is_a_hard_no_character_storyboard_contract():
                     "beat_id": "S01_P01",
                     "duration_s": 5,
                     "action": "cloud shadow crosses the ground",
+                    "generation_action_units": [{
+                        "unit_id": "GAU001",
+                        "actions": ["cloud shadow crosses the ground"],
+                        "performers": ["cloud shadow"],
+                        "source_event_id": 1,
+                        "source_generation_unit_indexes": [1],
+                        "ledger_indexes": [0],
+                    }],
                 }
             ],
         },
@@ -2541,6 +2549,14 @@ def test_character_references_refresh_the_canonical_pxx_chain(tmp_path):
                         "beat_id": "S01_P01",
                         "duration_s": 5,
                         "action": "turns toward the window",
+                        "generation_action_units": [{
+                            "unit_id": "GAU001",
+                            "actions": ["turns toward the window"],
+                            "performers": ["CHAR_A"],
+                            "source_event_id": 1,
+                            "source_generation_unit_indexes": [1],
+                            "ledger_indexes": [0],
+                        }],
                     }
                 ],
             }
@@ -8714,6 +8730,14 @@ def test_phase5_real_redraw_reuses_generator_and_archives_failed_shot(tmp_path):
                     "duration_s": 5,
                     "generation_mode": "fresh",
                     "action": "Agent 进入走廊",
+                    "generation_action_units": [{
+                        "unit_id": "GAU001",
+                        "actions": ["Agent 进入走廊"],
+                        "performers": ["Agent"],
+                        "source_event_id": 1,
+                        "source_generation_unit_indexes": [1],
+                        "ledger_indexes": [0],
+                    }],
                     "end_state": "Agent 看向前方",
                 }],
             },
@@ -8725,6 +8749,15 @@ def test_phase5_real_redraw_reuses_generator_and_archives_failed_shot(tmp_path):
                     "duration_s": 5,
                     "generation_mode": "fresh",
                     "action": "Agent 将保安扔向观察窗",
+                    "generation_action_units": [{
+                        "unit_id": "GAU001",
+                        "actions": ["Agent 将保安扔向观察窗"],
+                        "performers": ["Agent"],
+                        "targets": ["保安", "观察窗"],
+                        "source_event_id": 2,
+                        "source_generation_unit_indexes": [1],
+                        "ledger_indexes": [1],
+                    }],
                     "end_state": "观察窗保持完整，Agent 稳定定格",
                 }],
             },
@@ -9046,7 +9079,7 @@ def test_phase2_v2_migration_derives_guides_without_provider_calls(tmp_path):
     legacy_manifest_bytes = manifest_path.read_bytes()
     source_sha256 = hashlib.sha256(legacy_manifest_bytes).hexdigest()
 
-    with pytest.raises(ValueError, match="missing generation action units"):
+    with pytest.raises(ValueError, match="missing canonical generation action units"):
         migrate_shot_storyboard_narrative_guides(tmp_path, audit_storyboard)
 
     audit_receipt = json.loads(

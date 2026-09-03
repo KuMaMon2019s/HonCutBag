@@ -279,14 +279,25 @@ def test_tampered_geometry_and_missing_lineage_fail_closed():
         pose_owner.compile_pose_contracts(_beat(no_lineage), [_cell()])
 
 
-def test_current_planner_without_action_units_fails_closed():
+@pytest.mark.parametrize(
+    "planner_version",
+    ["honcut.secondary-storyboard.v16", None],
+)
+def test_storyboard_beat_without_canonical_action_units_fails_closed(planner_version):
     beat = {
         "beat_id": "S01_P01",
-        "planner_version": "honcut.secondary-storyboard.v16",
         "action": "actor-alpha moves",
     }
-    with pytest.raises(ValueError, match="missing generation action units"):
+    if planner_version is not None:
+        beat["planner_version"] = planner_version
+    with pytest.raises(ValueError, match="missing canonical generation action units"):
         pose_owner.compile_pose_contracts(beat, [_cell()])
+
+
+def test_pose_owner_has_no_test_only_lineage_fallback():
+    source = inspect.getsource(pose_owner)
+    assert "TEST-COMPAT" not in source
+    assert "unversioned_test_compatibility" not in source
 
 
 def test_pose_owner_has_no_provider_phase3_or_pipeline_core_dependency():

@@ -44,3 +44,4 @@
 - [x] 6.6 Run `openspec verify align-storyboard-guide-pose-semantics`, resolve every spec/task mismatch, and leave the change unarchived until all implementation and regression evidence is complete.
 - [x] 6.7 Run `graphify update .`, focused `graphify affected` checks, save the verified result without secrets, and refresh reflections; verify Graphify hooks and community labels remain intact.
 - [x] 6.8 Write a regression receipt bound to the candidate commit with the provider-deny evidence. Mark the live gate `pending_live_acceptance`; do not run a paid Phase 6 acceptance without a new explicit authorization.
+- [ ] 6.9 Remove the production-reachable unversioned test compatibility lineage, update affected fixtures to canonical generation action units, rerun verification, and replace the regression receipt with evidence bound to the corrected candidate commit.

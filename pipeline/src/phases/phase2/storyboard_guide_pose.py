@@ -501,26 +501,7 @@ def _validated_units(beat: Mapping[str, Any]) -> tuple[list[dict[str, Any]], str
             if len(ledger_indexes) != len(set(ledger_indexes)):
                 raise ValueError(f"{unit['unit_id']} has duplicate ledger_indexes lineage")
         return units, "canonical"
-    planner_version = str(beat.get("planner_version") or "").strip()
-    if planner_version:
-        raise ValueError("current storyboard beat is missing generation action units")
-    action = str(beat.get("action") or "").strip()
-    beat_id = str(beat.get("beat_id") or "TEST_P00")
-    if not action:
-        raise ValueError("unversioned compatibility beat has no action")
-    return (
-        [
-            {
-                "unit_id": f"TEST-COMPAT-{beat_id}",
-                "actions": [action],
-                "performers": _strings(beat.get("who") or beat.get("character_ids")),
-                "targets": [],
-                "source_event_id": 1,
-                "source_generation_unit_indexes": [1],
-            }
-        ],
-        "unversioned_test_compatibility",
-    )
+    raise ValueError("storyboard beat is missing canonical generation action units")
 
 
 def _partition_units(units: list[dict[str, Any]], cell_count: int) -> list[list[dict[str, Any]]]:
