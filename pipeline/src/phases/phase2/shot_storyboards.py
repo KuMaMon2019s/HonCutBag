@@ -43,6 +43,15 @@ from utils.temporal_visual_contracts import (
     temporal_visual_negative_prompt,
     temporal_visual_prompt,
 )
+from phases.phase2.storyboard_guide_pose import (
+    POSE_CONTRACT_SCHEMA,
+    POSE_POLICY_SHA256,
+    compile_pose_contracts,
+    pose_contracts_sha256,
+    pose_fingerprints,
+    render_pose_cell,
+    validate_pose_sequence,
+)
 
 SHOT_STORYBOARD_SIZE = "2K"
 SHOT_STORYBOARD_GRID_COLUMNS = 3
@@ -50,16 +59,15 @@ SHOT_STORYBOARD_GRID_ROWS = 3
 SHOT_STORYBOARD_GRID_CELLS = (
     SHOT_STORYBOARD_GRID_COLUMNS * SHOT_STORYBOARD_GRID_ROWS
 )
-SHOT_STORYBOARDS_SCHEMA = "honcut.shot_storyboards.v4"
-SHOT_STORYBOARD_GRID_SCHEMA = "honcut.shot-storyboard-grid.v2"
-STORYBOARD_NARRATIVE_GUIDE_SCHEMA = "honcut.storyboard-narrative-guide.v2"
+SHOT_STORYBOARDS_SCHEMA = "honcut.shot_storyboards.v5"
+SHOT_STORYBOARD_GRID_SCHEMA = "honcut.shot-storyboard-grid.v3"
+STORYBOARD_NARRATIVE_GUIDE_SCHEMA = "honcut.storyboard-narrative-guide.v3"
 STORYBOARD_NARRATIVE_GUIDE_USAGE = "phase6_story_narrative_guide_not_output_pixels"
-STORYBOARD_NARRATIVE_GUIDE_RENDERER = (
-    "honcut.identity-neutral-story-guide-renderer.v1"
-)
-LEGACY_STORYBOARD_NARRATIVE_GUIDE_SCHEMA = (
-    "honcut.storyboard-narrative-guide.v1"
-)
+STORYBOARD_NARRATIVE_GUIDE_RENDERER = "honcut.identity-neutral-story-guide-renderer.v2"
+LEGACY_STORYBOARD_NARRATIVE_GUIDE_SCHEMAS = {
+    "honcut.storyboard-narrative-guide.v1",
+    "honcut.storyboard-narrative-guide.v2",
+}
 PANEL_PROMPT_TEMPLATE_ID = "honcut.storyboard-panel-prompt"
 PANEL_PROMPT_TEMPLATE_VERSION = "2"
 PANEL_CORRECTION_PROMPT_POLICY = "canonical-positive-projection-v2"
@@ -284,12 +292,26 @@ def _narrative_grid_contract(
         )
     base, remainder = divmod(SHOT_STORYBOARD_GRID_CELLS, len(beats))
     cells: list[dict[str, Any]] = []
+    raw_shot_who = shot.get("who") or []
+    if isinstance(raw_shot_who, str):
+        raw_shot_who = [raw_shot_who]
+    known_actor_roles = tuple(
+        dict.fromkeys(
+            [str(value).strip() for value in raw_shot_who if str(value).strip()]
+            + [
+                str(reference.get("mention") or "").strip()
+                for reference in (shot.get("participant_refs") or [])
+                if isinstance(reference, dict) and str(reference.get("mention") or "").strip()
+            ]
+        )
+    )
     for beat_index, beat in enumerate(beats):
         cell_count = base + (1 if beat_index < remainder else 0)
         beat_id = str(beat.get("beat_id") or f"{shot_id}_P{beat_index + 1:02d}")
         start_state = _compact(beat.get("start_state"), 320)
         action = _compact(beat.get("action"), 520)
         end_state = _compact(beat.get("end_state"), 320)
+        beat_cells: list[dict[str, Any]] = []
         for local_index in range(cell_count):
             if local_index == 0:
                 stage = "start"
@@ -304,42 +326,64 @@ def _narrative_grid_contract(
                     f"仅演绎本格既有动作的 {progress:.0%} 进度：{action}；"
                     "不得增加新事件、角色、道具或结果"
                 )
-            cells.append({
-                "cell": len(cells) + 1,
-                "label": f"{shot_id}_G{len(cells) + 1:02d}",
-                "primary_shot_id": shot_id,
-                "secondary_beat_id": beat_id,
-                "secondary_beat_position": beat_index + 1,
-                "stage": stage,
-                "visible_fact": visible_fact,
-                "camera_movement": beat.get("camera_movement")
-                or shot.get("camera_movement")
-                or "steadicam",
-                "neutral_subject_count": min(
-                    3,
-                    len({
-                        str(value).strip()
-                        for value in (
-                            beat.get("character_ids")
-                            or beat.get("who")
-                            or shot.get("who")
-                            or []
-                        )
-                        if str(value).strip()
-                    }),
-                ),
-                "rendered_annotations": [
-                    "cell_label",
-                    "action_direction_arrow_red",
-                    "camera_motion_arrow_blue",
-                    "spatial_gaze_action_instruction_markers",
-                ],
-            })
+            global_cell_index = len(cells) + len(beat_cells) + 1
+            beat_cells.append(
+                {
+                    "cell": global_cell_index,
+                    "label": f"{shot_id}_G{global_cell_index:02d}",
+                    "primary_shot_id": shot_id,
+                    "secondary_beat_id": beat_id,
+                    "secondary_beat_position": beat_index + 1,
+                    "stage": stage,
+                    "visible_fact": visible_fact,
+                    "camera_movement": beat.get("camera_movement")
+                    or shot.get("camera_movement")
+                    or "steadicam",
+                    "neutral_subject_count": min(
+                        3,
+                        len(
+                            {
+                                str(value).strip()
+                                for value in (
+                                    beat.get("character_ids")
+                                    or beat.get("who")
+                                    or shot.get("who")
+                                    or []
+                                )
+                                if str(value).strip()
+                            }
+                        ),
+                    ),
+                    "rendered_annotations": [
+                        "cell_label",
+                        "action_direction_arrow_red",
+                        "camera_motion_arrow_blue",
+                        "spatial_gaze_action_instruction_markers",
+                    ],
+                }
+            )
+        cells.extend(
+            compile_pose_contracts(
+                beat,
+                beat_cells,
+                known_actor_roles=known_actor_roles,
+            )
+        )
     if len(cells) != SHOT_STORYBOARD_GRID_CELLS:
         raise RuntimeError(
             f"{shot_id} narrative grid produced {len(cells)} cells, expected "
             f"{SHOT_STORYBOARD_GRID_CELLS}"
         )
+    unit_owners: dict[str, str] = {}
+    for cell in cells:
+        beat_id = str(cell.get("secondary_beat_id") or "")
+        for binding in (cell.get("pose_contract") or {}).get("action_bindings", []):
+            unit_id = str(binding.get("unit_id") or "")
+            prior_owner = unit_owners.setdefault(unit_id, beat_id)
+            if prior_owner != beat_id:
+                raise RuntimeError(
+                    f"{shot_id} action unit {unit_id} is bound to multiple Pxx beats"
+                )
     return cells
 
 
@@ -428,20 +472,28 @@ def _guide_semantic_payload(
         cell = cells_by_label.get(cell_id)
         if cell is None:
             raise ValueError(f"{beat_id} narrative guide references unknown {cell_id}")
-        cells.append({
-            "label": cell_id,
-            "primary_shot_id": str(cell.get("primary_shot_id") or ""),
-            "secondary_beat_id": str(cell.get("secondary_beat_id") or ""),
-            "stage": str(cell.get("stage") or ""),
-            "camera_movement": str(cell.get("camera_movement") or ""),
-            "visible_fact": str(cell.get("visible_fact") or ""),
-            "neutral_subject_count": int(cell.get("neutral_subject_count") or 0),
-            "rendered_annotations": list(cell.get("rendered_annotations") or []),
-        })
+        cells.append(
+            {
+                "label": cell_id,
+                "primary_shot_id": str(cell.get("primary_shot_id") or ""),
+                "secondary_beat_id": str(cell.get("secondary_beat_id") or ""),
+                "stage": str(cell.get("stage") or ""),
+                "camera_movement": str(cell.get("camera_movement") or ""),
+                "visible_fact": str(cell.get("visible_fact") or ""),
+                "neutral_subject_count": int(cell.get("neutral_subject_count") or 0),
+                "rendered_annotations": list(cell.get("rendered_annotations") or []),
+                "pose_contract": dict(cell.get("pose_contract") or {}),
+            }
+        )
+    validate_pose_sequence(cells, beat_id=beat_id)
     return {
         "renderer": STORYBOARD_NARRATIVE_GUIDE_RENDERER,
+        "pose_contract_schema": POSE_CONTRACT_SCHEMA,
+        "pose_policy_sha256": POSE_POLICY_SHA256,
         "beat_id": beat_id,
         "cell_ids": cell_ids,
+        "pose_contracts_sha256": pose_contracts_sha256(cells),
+        "pose_fingerprints": pose_fingerprints(cells),
         "cells": cells,
     }
 
@@ -456,35 +508,6 @@ def _semantic_payload_sha256(payload: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _draw_arrow(
-    draw: ImageDraw.ImageDraw,
-    start: tuple[int, int],
-    end: tuple[int, int],
-    *,
-    fill: tuple[int, int, int],
-    width: int,
-) -> None:
-    draw.line((*start, *end), fill=fill, width=width)
-    dx, dy = end[0] - start[0], end[1] - start[1]
-    length = max(math.hypot(dx, dy), 1.0)
-    ux, uy = dx / length, dy / length
-    perpendicular = (-uy, ux)
-    size = max(10, width * 3)
-    base = (end[0] - ux * size, end[1] - uy * size)
-    draw.polygon(
-        [
-            end,
-            (
-                round(base[0] + perpendicular[0] * size * 0.55),
-                round(base[1] + perpendicular[1] * size * 0.55),
-            ),
-            (
-                round(base[0] - perpendicular[0] * size * 0.55),
-                round(base[1] - perpendicular[1] * size * 0.55),
-            ),
-        ],
-        fill=fill,
-    )
 
 
 def _render_neutral_guide_cell(
@@ -493,106 +516,13 @@ def _render_neutral_guide_cell(
     width: int = 480,
     height: int = 270,
 ) -> Image.Image:
-    """Render fixed geometry without reading any source storyboard pixels."""
-    background = (247, 247, 244)
-    neutral = (116, 121, 126)
-    faint = (196, 199, 201)
-    action_red = (205, 48, 54)
-    camera_blue = (42, 104, 190)
-    image = Image.new("RGB", (width, height), background)
-    draw = ImageDraw.Draw(image)
-    border = max(3, round(min(width, height) / 90))
-    draw.rectangle((2, 2, width - 3, height - 3), outline=faint, width=border)
-    label = str(cell.get("label") or "G??")
-    draw.rounded_rectangle(
-        (14, 12, 186, 52),
-        radius=9,
-        fill=(231, 232, 230),
-        outline=neutral,
-        width=2,
+    """Render source-bound pose geometry without source storyboard pixels."""
+    return render_pose_cell(
+        cell,
+        width=width,
+        height=height,
+        font_factory=_font,
     )
-    draw.text((25, 19), label, fill=(52, 55, 58), font=_font(24))
-
-    semantic_seed = _semantic_payload_sha256({
-        "camera_movement": str(cell.get("camera_movement") or ""),
-        "label": label,
-        "stage": str(cell.get("stage") or ""),
-        "visible_fact": str(cell.get("visible_fact") or ""),
-    })
-    direction = 1 if int(semantic_seed[:2], 16) % 2 == 0 else -1
-    subject_count = max(0, min(3, int(cell.get("neutral_subject_count") or 0)))
-    if subject_count:
-        spacing = width // (subject_count + 1)
-        for index in range(subject_count):
-            center_x = spacing * (index + 1)
-            center_y = 145 + (int(semantic_seed[2 + index * 2:4 + index * 2], 16) % 21 - 10)
-            head_radius = 16
-            draw.ellipse(
-                (
-                    center_x - head_radius,
-                    center_y - 72 - head_radius,
-                    center_x + head_radius,
-                    center_y - 72 + head_radius,
-                ),
-                fill=(211, 213, 213),
-                outline=neutral,
-                width=3,
-            )
-            draw.line(
-                (center_x, center_y - 54, center_x, center_y + 17),
-                fill=neutral,
-                width=8,
-            )
-            draw.line(
-                (
-                    center_x,
-                    center_y - 32,
-                    center_x + direction * (28 + index * 5),
-                    center_y - 8,
-                ),
-                fill=neutral,
-                width=7,
-            )
-            draw.line(
-                (center_x, center_y - 31, center_x - direction * 25, center_y - 5),
-                fill=neutral,
-                width=7,
-            )
-            draw.line(
-                (center_x, center_y + 14, center_x + 27, center_y + 67),
-                fill=neutral,
-                width=8,
-            )
-            draw.line(
-                (center_x, center_y + 14, center_x - 24, center_y + 67),
-                fill=neutral,
-                width=8,
-            )
-    else:
-        draw.rectangle((150, 94, 330, 205), outline=neutral, width=5)
-        draw.line((170, 184, 310, 115), fill=faint, width=4)
-
-    action_y = 191 if subject_count else 219
-    _draw_arrow(
-        draw,
-        (92 if direction > 0 else width - 92, action_y),
-        (width - 92 if direction > 0 else 92, action_y - 20),
-        fill=action_red,
-        width=6,
-    )
-    _draw_arrow(
-        draw,
-        (width - 74, 76),
-        (width - 205, 76 + direction * 18),
-        fill=camera_blue,
-        width=6,
-    )
-    # Fixed non-text markers for gaze, spatial relation, and contact.
-    draw.line((66, 111, 136, 132), fill=neutral, width=3)
-    draw.ellipse((59, 104, 73, 118), outline=neutral, width=3)
-    draw.line((width - 58, height - 50, width - 30, height - 22), fill=neutral, width=4)
-    draw.line((width - 30, height - 50, width - 58, height - 22), fill=neutral, width=4)
-    return image
 
 
 def _derive_narrative_guides(
@@ -600,9 +530,11 @@ def _derive_narrative_guides(
     board_path: Path,
     grid_contract: dict[str, Any],
     assignments: list[dict[str, Any]],
+    *,
+    relative_guide_dir: str = "storyboard_guides",
 ) -> list[dict[str, Any]]:
     """Render identity-neutral Pxx guides locally without Provider requests."""
-    guide_dir = output_dir / "storyboard_guides"
+    guide_dir = output_dir / relative_guide_dir
     guide_dir.mkdir(parents=True, exist_ok=True)
     source_sha256 = hashlib.sha256(board_path.read_bytes()).hexdigest()
     cells_by_label = {
@@ -620,15 +552,10 @@ def _derive_narrative_guides(
             cells_by_label=cells_by_label,
         )
         semantic_sha256 = _semantic_payload_sha256(payload)
-        rendered_cells = [
-            _render_neutral_guide_cell(cell)
-            for cell in payload["cells"]
-        ]
+        rendered_cells = [_render_neutral_guide_cell(cell) for cell in payload["cells"]]
         cell_width = rendered_cells[0].width
         cell_height = rendered_cells[0].height
-        columns, rows = _guide_layout(
-            len(rendered_cells), cell_width / cell_height
-        )
+        columns, rows = _guide_layout(len(rendered_cells), cell_width / cell_height)
         canvas = Image.new(
             "RGB",
             (columns * cell_width, rows * cell_height),
@@ -647,7 +574,7 @@ def _derive_narrative_guides(
         receipt_path = guide_dir / f"{beat_id}.json"
         record = {
             "kind": STORYBOARD_NARRATIVE_GUIDE_SCHEMA,
-            "version": 2,
+            "version": 3,
             "status": "done",
             "usage": STORYBOARD_NARRATIVE_GUIDE_USAGE,
             "renderer": STORYBOARD_NARRATIVE_GUIDE_RENDERER,
@@ -659,6 +586,10 @@ def _derive_narrative_guides(
             "source_board": _portable_path(output_dir, board_path),
             "source_board_sha256": source_sha256,
             "cell_ids": cell_ids,
+            "pose_contract_schema": payload["pose_contract_schema"],
+            "pose_policy_sha256": payload["pose_policy_sha256"],
+            "pose_contracts_sha256": payload["pose_contracts_sha256"],
+            "pose_fingerprints": payload["pose_fingerprints"],
             "semantic_payload": payload,
             "semantic_payload_sha256": semantic_sha256,
             "layout": {
@@ -669,8 +600,8 @@ def _derive_narrative_guides(
             },
             "annotation_policy": {
                 "cell_labels": "renderer_drawn",
-                "action_direction_arrows": "fixed_red_renderer_geometry",
-                "camera_motion_arrows": "fixed_blue_renderer_geometry",
+                "action_direction_arrows": "pose_vector_red_renderer_geometry",
+                "camera_motion_arrows": "camera_contract_blue_renderer_geometry",
                 "instruction_markers": "fixed_neutral_renderer_geometry",
                 "video_output_policy": "understand_only_never_render",
             },
@@ -1890,6 +1821,10 @@ def _guide_reference(guide: dict[str, Any]) -> dict[str, Any]:
             "source_board",
             "source_board_sha256",
             "cell_ids",
+            "pose_contract_schema",
+            "pose_policy_sha256",
+            "pose_contracts_sha256",
+            "pose_fingerprints",
             "semantic_payload_sha256",
             "authority_roles",
             "non_authority_roles",
@@ -1899,32 +1834,30 @@ def _guide_reference(guide: dict[str, Any]) -> dict[str, Any]:
 
 
 def _bind_guide_to_beat(beat: dict[str, Any], guide: dict[str, Any]) -> None:
-    beat.update({
-        "storyboard_narrative_guide": guide["image"],
-        "storyboard_narrative_guide_kind": guide["kind"],
-        "storyboard_narrative_guide_usage": guide["usage"],
-        "storyboard_narrative_guide_renderer": guide["renderer"],
-        "storyboard_narrative_guide_source_pixel_usage": guide[
-            "source_pixel_usage"
-        ],
-        "storyboard_narrative_guide_cell_ids": guide["cell_ids"],
-        "storyboard_narrative_guide_sha256": guide["image_sha256"],
-        "storyboard_narrative_guide_semantic_payload_sha256": guide[
-            "semantic_payload_sha256"
-        ],
-        "storyboard_narrative_guide_source_board": guide["source_board"],
-        "storyboard_narrative_guide_source_board_sha256": guide[
-            "source_board_sha256"
-        ],
-        "storyboard_narrative_guide_authority_roles": guide["authority_roles"],
-        "storyboard_narrative_guide_non_authority_roles": guide[
-            "non_authority_roles"
-        ],
-        "storyboard_narrative_guide_receipt": guide["receipt"],
-    })
+    beat.update(
+        {
+            "storyboard_narrative_guide": guide["image"],
+            "storyboard_narrative_guide_kind": guide["kind"],
+            "storyboard_narrative_guide_usage": guide["usage"],
+            "storyboard_narrative_guide_renderer": guide["renderer"],
+            "storyboard_narrative_guide_source_pixel_usage": guide["source_pixel_usage"],
+            "storyboard_narrative_guide_cell_ids": guide["cell_ids"],
+            "storyboard_narrative_guide_pose_contract_schema": guide["pose_contract_schema"],
+            "storyboard_narrative_guide_pose_policy_sha256": guide["pose_policy_sha256"],
+            "storyboard_narrative_guide_pose_contracts_sha256": guide["pose_contracts_sha256"],
+            "storyboard_narrative_guide_pose_fingerprints": guide["pose_fingerprints"],
+            "storyboard_narrative_guide_sha256": guide["image_sha256"],
+            "storyboard_narrative_guide_semantic_payload_sha256": guide["semantic_payload_sha256"],
+            "storyboard_narrative_guide_source_board": guide["source_board"],
+            "storyboard_narrative_guide_source_board_sha256": guide["source_board_sha256"],
+            "storyboard_narrative_guide_authority_roles": guide["authority_roles"],
+            "storyboard_narrative_guide_non_authority_roles": guide["non_authority_roles"],
+            "storyboard_narrative_guide_receipt": guide["receipt"],
+        }
+    )
 
 
-def _archive_verified_v1_guides(
+def _archive_verified_legacy_guides(
     output_dir: Path,
     record: dict[str, Any],
     assignments: list[dict[str, Any]],
@@ -1939,7 +1872,11 @@ def _archive_verified_v1_guides(
     expected_beats = [str(item.get("beat_id") or "") for item in assignments]
     if set(guides) != set(expected_beats):
         raise RuntimeError("v1 guide coverage is incomplete")
-    audit_dir = output_dir / "storyboard_guides" / "audit_v1"
+    guide_kinds = {str(guide.get("kind") or "") for guide in guides.values()}
+    if len(guide_kinds) != 1 or not guide_kinds.issubset(LEGACY_STORYBOARD_NARRATIVE_GUIDE_SCHEMAS):
+        raise RuntimeError("legacy guide provenance kind is not supported")
+    legacy_kind = next(iter(guide_kinds))
+    audit_dir = output_dir / "storyboard_guides" / ("audit_" + legacy_kind.rsplit(".v", 1)[-1])
     audit_dir.mkdir(parents=True, exist_ok=True)
     for assignment in assignments:
         beat_id = str(assignment["beat_id"])
@@ -1952,8 +1889,8 @@ def _archive_verified_v1_guides(
         except (OSError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"{beat_id} v1 guide evidence is unreadable") from exc
         if (
-            guide.get("kind") != LEGACY_STORYBOARD_NARRATIVE_GUIDE_SCHEMA
-            or receipt.get("kind") != LEGACY_STORYBOARD_NARRATIVE_GUIDE_SCHEMA
+            guide.get("kind") != legacy_kind
+            or receipt.get("kind") != legacy_kind
             or receipt.get("status") != "done"
             or guide.get("cell_ids") != assignment.get("cell_ids")
             or receipt.get("cell_ids") != assignment.get("cell_ids")
@@ -1962,38 +1899,36 @@ def _archive_verified_v1_guides(
             or guide.get("source_board_sha256") != board_sha256
             or receipt.get("source_board_sha256") != board_sha256
         ):
-            raise RuntimeError(f"{beat_id} v1 guide receipt/hash binding is invalid")
+            raise RuntimeError(f"{beat_id} legacy guide receipt/hash binding is invalid")
         shutil.copy2(guide_path, audit_dir / f"{beat_id}.png")
         shutil.copy2(receipt_path, audit_dir / f"{beat_id}.json")
 
 
-def migrate_shot_storyboard_narrative_guides(
+def _migrate_shot_storyboard_narrative_guides(
     output_dir: Path,
     storyboard: dict[str, Any],
 ) -> dict[str, Any]:
-    """Locally migrate verified board semantics into identity-neutral v2 guides."""
+    """Locally redraw verified legacy semantics as source-bound v3 guides."""
     output_dir = Path(output_dir)
     manifest_path = output_dir / "SHOT_STORYBOARDS.json"
     raw_manifest = manifest_path.read_bytes()
     manifest = json.loads(raw_manifest.decode("utf-8"))
     kind = str(manifest.get("kind") or "")
     version = int(manifest.get("version") or 0)
-    if kind == SHOT_STORYBOARDS_SCHEMA and version == 4:
+    if kind == SHOT_STORYBOARDS_SCHEMA and version == 5:
         errors = validate_shot_storyboard_artifacts(output_dir, storyboard)
         if errors:
             raise RuntimeError(
-                "current narrative-guide artifacts failed validation: "
-                + "; ".join(errors[:8])
+                "current narrative-guide artifacts failed validation: " + "; ".join(errors[:8])
             )
         return manifest
     supported_sources = {
         ("honcut.shot_storyboards.v2", 2),
         ("honcut.shot_storyboards.v3", 3),
+        ("honcut.shot_storyboards.v4", 4),
     }
     if (kind, version) not in supported_sources:
-        raise RuntimeError(
-            f"unsupported storyboard migration source: {kind or '<missing>'}"
-        )
+        raise RuntimeError(f"unsupported storyboard migration source: {kind or '<missing>'}")
     if manifest.get("status") != "done":
         raise RuntimeError("storyboard migration requires a completed manifest")
 
@@ -2003,6 +1938,7 @@ def migrate_shot_storyboard_narrative_guides(
         if isinstance(record, dict) and record.get("shot_id")
     }
     migrated_records: list[dict[str, Any]] = []
+    legacy_guide_evidence: list[dict[str, str]] = []
     for shot_index, shot in enumerate(storyboard.get("shots") or [], 1):
         if not isinstance(shot, dict):
             continue
@@ -2020,31 +1956,45 @@ def migrate_shot_storyboard_narrative_guides(
         if board_sha256 != str(record.get("board_sha256") or ""):
             raise RuntimeError(f"{shot_id} storyboard board hash mismatch")
 
-        beats = [
-            beat
-            for beat in (shot.get("storyboard_beats") or [])
-            if isinstance(beat, dict)
-        ]
+        beats = [beat for beat in (shot.get("storyboard_beats") or []) if isinstance(beat, dict)]
         narrative_grid = _narrative_grid_contract(shot, shot_id, beats)
+        if any(
+            (cell.get("pose_contract") or {}).get("lineage_status") != "canonical"
+            for cell in narrative_grid
+        ):
+            raise RuntimeError(f"{shot_id} cannot migrate without canonical action-unit lineage")
         grid_contract = _bind_narrative_grid_contract(
             dict(record.get("grid_contract") or {}),
             narrative_grid,
         )
         assignments = _beat_cell_assignments(narrative_grid)
-        if kind == "honcut.shot_storyboards.v3":
+        if kind in {
+            "honcut.shot_storyboards.v3",
+            "honcut.shot_storyboards.v4",
+        }:
             if record.get("beat_cell_assignments") != assignments:
-                raise RuntimeError(f"{shot_id} v1 guide assignment is not canonical")
-            _archive_verified_v1_guides(
+                raise RuntimeError(f"{shot_id} legacy guide assignment is not canonical")
+            _archive_verified_legacy_guides(
                 output_dir,
                 record,
                 assignments,
                 board_sha256=board_sha256,
+            )
+            legacy_guide_evidence.extend(
+                {
+                    "beat_id": str(guide["beat_id"]),
+                    "kind": str(guide["kind"]),
+                    "image_sha256": str(guide["image_sha256"]),
+                }
+                for guide in (record.get("narrative_guides") or [])
+                if isinstance(guide, dict)
             )
         guides = _derive_narrative_guides(
             output_dir,
             board_path,
             grid_contract,
             assignments,
+            relative_guide_dir="storyboard_guides/v3",
         )
         guides_by_beat = {str(guide["beat_id"]): guide for guide in guides}
         panels_by_beat = {
@@ -2066,14 +2016,16 @@ def migrate_shot_storyboard_narrative_guides(
                     sidecar = json.loads(panel_sidecar.read_text(encoding="utf-8"))
                     sidecar["storyboard_narrative_guide"] = _guide_reference(guide)
                     _write_json(panel_sidecar, sidecar)
-        record.update({
-            "usage": STORYBOARD_NARRATIVE_GUIDE_USAGE,
-            "narrative_grid": narrative_grid,
-            "grid_contract": grid_contract,
-            "beat_cell_assignments": assignments,
-            "narrative_guides": guides,
-            "board_sha256": board_sha256,
-        })
+        record.update(
+            {
+                "usage": STORYBOARD_NARRATIVE_GUIDE_USAGE,
+                "narrative_grid": narrative_grid,
+                "grid_contract": grid_contract,
+                "beat_cell_assignments": assignments,
+                "narrative_guides": guides,
+                "board_sha256": board_sha256,
+            }
+        )
         shot["storyboard_board"] = record["board"]
         shot["storyboard_beats"] = beats
         _write_json(output_dir / "shot_storyboards" / f"{shot_id}.json", record)
@@ -2082,31 +2034,102 @@ def migrate_shot_storyboard_narrative_guides(
     migrated_ids = {str(record.get("shot_id") or "") for record in migrated_records}
     if set(records_by_shot) != migrated_ids:
         raise RuntimeError("storyboard manifest contains unowned shot records")
-    manifest.update({
-        "kind": SHOT_STORYBOARDS_SCHEMA,
-        "version": 4,
-        "shots": migrated_records,
-        "total_boards": len(migrated_records),
-        "total_panels": sum(
-            int(record.get("panel_count") or 0) for record in migrated_records
-        ),
-        "migration": {
-            "from_kind": kind,
-            "source_manifest_sha256": hashlib.sha256(raw_manifest).hexdigest(),
-            "policy": "verified_semantics_render_identity_neutral_guides_locally",
-            "source_pixel_usage": "none",
-            "provider_request_count": 0,
-        },
-    })
+    manifest.update(
+        {
+            "kind": SHOT_STORYBOARDS_SCHEMA,
+            "version": 5,
+            "shots": migrated_records,
+            "total_boards": len(migrated_records),
+            "total_panels": sum(int(record.get("panel_count") or 0) for record in migrated_records),
+            "migration": {
+                "from_kind": kind,
+                "source_manifest_sha256": hashlib.sha256(raw_manifest).hexdigest(),
+                "policy": "verified_semantics_render_identity_neutral_guides_locally",
+                "source_pixel_usage": "none",
+                "provider_request_count": 0,
+            },
+        }
+    )
+    migration_receipt = {
+        "kind": "honcut.storyboard-guide-migration.v1",
+        "status": "done",
+        "source_manifest_kind": kind,
+        "source_manifest_sha256": hashlib.sha256(raw_manifest).hexdigest(),
+        "target_manifest_kind": SHOT_STORYBOARDS_SCHEMA,
+        "provider_request_count": 0,
+        "source_pixel_usage": "none",
+        "legacy_guides": legacy_guide_evidence,
+        "guides": [
+            {
+                "beat_id": guide["beat_id"],
+                "image": guide["image"],
+                "image_sha256": guide["image_sha256"],
+                "pose_contracts_sha256": guide["pose_contracts_sha256"],
+            }
+            for record in migrated_records
+            for guide in record.get("narrative_guides") or []
+        ],
+    }
+    migration_receipt["receipt_sha256"] = _semantic_payload_sha256(migration_receipt)
+    migration_dir = output_dir / "storyboard_guides" / "migrations"
+    migration_dir.mkdir(parents=True, exist_ok=True)
+    migration_path = migration_dir / (f"{migration_receipt['source_manifest_sha256']}.json")
+    _write_json(migration_path, migration_receipt)
+    manifest["migration"]["receipt"] = _portable_path(output_dir, migration_path)
+    manifest["migration"]["receipt_sha256"] = migration_receipt["receipt_sha256"]
     _write_json(output_dir / "STORYBOARD.json", storyboard)
     _write_json(manifest_path, manifest)
     errors = validate_shot_storyboard_artifacts(output_dir, storyboard)
     if errors:
         raise RuntimeError(
-            "migrated narrative-guide artifacts failed validation: "
-            + "; ".join(errors[:8])
+            "migrated narrative-guide artifacts failed validation: " + "; ".join(errors[:8])
         )
     return manifest
+
+
+def migrate_shot_storyboard_narrative_guides(
+    output_dir: Path,
+    storyboard: dict[str, Any],
+) -> dict[str, Any]:
+    """Migrate verified guides, or persist an audit-only rejection receipt."""
+    output_dir = Path(output_dir)
+    manifest_path = output_dir / "SHOT_STORYBOARDS.json"
+    try:
+        return _migrate_shot_storyboard_narrative_guides(output_dir, storyboard)
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+        try:
+            raw_manifest = manifest_path.read_bytes()
+            manifest = json.loads(raw_manifest.decode("utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            raise
+        source = (
+            str(manifest.get("kind") or ""),
+            int(manifest.get("version") or 0),
+        )
+        if source in {
+            ("honcut.shot_storyboards.v2", 2),
+            ("honcut.shot_storyboards.v3", 3),
+            ("honcut.shot_storyboards.v4", 4),
+        }:
+            source_sha256 = hashlib.sha256(raw_manifest).hexdigest()
+            audit_dir = output_dir / "storyboard_guides" / "migrations"
+            audit_dir.mkdir(parents=True, exist_ok=True)
+            receipt = {
+                "kind": "honcut.storyboard-guide-migration.v1",
+                "status": "audit_only",
+                "source_manifest_kind": source[0],
+                "source_manifest_version": source[1],
+                "source_manifest_sha256": source_sha256,
+                "provider_request_count": 0,
+                "legacy_source_assets_modified": False,
+                "reason_category": type(exc).__name__,
+            }
+            receipt["receipt_sha256"] = _semantic_payload_sha256(receipt)
+            _write_json(
+                audit_dir / f"{source_sha256}.audit-only.json",
+                receipt,
+            )
+        raise
 
 
 def validate_shot_storyboard_artifacts(
@@ -2176,18 +2199,14 @@ def validate_shot_storyboard_artifacts(
         try:
             document = json.loads(manifest.read_text(encoding="utf-8"))
             if document.get("kind") != SHOT_STORYBOARDS_SCHEMA:
-                errors.append("SHOT_STORYBOARDS.json is not the narrative-guide v4 contract")
-            if int(document.get("version") or 0) != 4:
+                errors.append("SHOT_STORYBOARDS.json is not the narrative-guide v5 contract")
+            if int(document.get("version") or 0) != 5:
                 errors.append("SHOT_STORYBOARDS.json has an invalid contract version")
             if document.get("status") != "done":
                 errors.append("SHOT_STORYBOARDS.json is not complete")
             if int(document.get("total_panels") or 0) != authored_count:
-                errors.append(
-                    "SHOT_STORYBOARDS.json panel count does not match STORYBOARD.json"
-                )
-            if int(document.get("total_transition_panels") or 0) != len(
-                bridge_specs
-            ):
+                errors.append("SHOT_STORYBOARDS.json panel count does not match STORYBOARD.json")
+            if int(document.get("total_transition_panels") or 0) != len(bridge_specs):
                 errors.append(
                     "SHOT_STORYBOARDS.json transition count does not match STORYBOARD.json"
                 )
@@ -2196,13 +2215,9 @@ def validate_shot_storyboard_artifacts(
                 for record in (document.get("bridges") or [])
                 if isinstance(record, dict) and record.get("status") == "done"
             }
-            expected_bridge_ids = {
-                str(bridge.get("bridge_id") or "") for bridge in bridge_specs
-            }
+            expected_bridge_ids = {str(bridge.get("bridge_id") or "") for bridge in bridge_specs}
             if bridge_count != len(bridge_specs) or manifest_bridge_ids != expected_bridge_ids:
-                errors.append(
-                    "SHOT_STORYBOARDS.json has incomplete post-primary transitions"
-                )
+                errors.append("SHOT_STORYBOARDS.json has incomplete post-primary transitions")
             manifest_shots = {
                 str(record.get("shot_id") or ""): record
                 for record in (document.get("shots") or [])
@@ -2277,29 +2292,44 @@ def validate_shot_storyboard_artifacts(
                         source_path = _artifact_path(output_dir, guide.get("source_board"))
                         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
                         observed = hashlib.sha256(guide_path.read_bytes()).hexdigest()
-                        source_observed = hashlib.sha256(
-                            source_path.read_bytes()
-                        ).hexdigest()
+                        source_observed = hashlib.sha256(source_path.read_bytes()).hexdigest()
                         semantic_payload = receipt.get("semantic_payload")
                         if not isinstance(semantic_payload, dict):
                             raise ValueError("guide semantic payload is missing")
-                        semantic_observed = _semantic_payload_sha256(
-                            semantic_payload
-                        )
+                        semantic_observed = _semantic_payload_sha256(semantic_payload)
+                        semantic_cells = semantic_payload.get("cells")
+                        if not isinstance(semantic_cells, list):
+                            raise ValueError("guide pose semantic cells are missing")
+                        validate_pose_sequence(semantic_cells, beat_id=beat_id)
+                        semantic_pose_contracts_sha256 = pose_contracts_sha256(semantic_cells)
+                        semantic_pose_fingerprints = pose_fingerprints(semantic_cells)
                         beat = authored_beats.get(beat_id) or {}
                         if (
                             guide.get("kind") != STORYBOARD_NARRATIVE_GUIDE_SCHEMA
                             or guide.get("usage") != STORYBOARD_NARRATIVE_GUIDE_USAGE
-                            or guide.get("renderer")
-                            != STORYBOARD_NARRATIVE_GUIDE_RENDERER
+                            or guide.get("renderer") != STORYBOARD_NARRATIVE_GUIDE_RENDERER
                             or guide.get("source_pixel_usage") != "none"
                             or guide.get("cell_ids") != assignment.get("cell_ids")
                             or receipt.get("kind") != STORYBOARD_NARRATIVE_GUIDE_SCHEMA
-                            or int(receipt.get("version") or 0) != 2
+                            or int(receipt.get("version") or 0) != 3
                             or receipt.get("status") != "done"
                             or receipt.get("usage") != STORYBOARD_NARRATIVE_GUIDE_USAGE
-                            or receipt.get("renderer")
-                            != STORYBOARD_NARRATIVE_GUIDE_RENDERER
+                            or receipt.get("renderer") != STORYBOARD_NARRATIVE_GUIDE_RENDERER
+                            or guide.get("pose_contract_schema") != POSE_CONTRACT_SCHEMA
+                            or receipt.get("pose_contract_schema") != POSE_CONTRACT_SCHEMA
+                            or semantic_payload.get("pose_contract_schema") != POSE_CONTRACT_SCHEMA
+                            or guide.get("pose_policy_sha256") != POSE_POLICY_SHA256
+                            or receipt.get("pose_policy_sha256") != POSE_POLICY_SHA256
+                            or semantic_payload.get("pose_policy_sha256") != POSE_POLICY_SHA256
+                            or guide.get("pose_contracts_sha256") != semantic_pose_contracts_sha256
+                            or receipt.get("pose_contracts_sha256")
+                            != semantic_pose_contracts_sha256
+                            or semantic_payload.get("pose_contracts_sha256")
+                            != semantic_pose_contracts_sha256
+                            or guide.get("pose_fingerprints") != semantic_pose_fingerprints
+                            or receipt.get("pose_fingerprints") != semantic_pose_fingerprints
+                            or semantic_payload.get("pose_fingerprints")
+                            != semantic_pose_fingerprints
                             or receipt.get("source_pixel_usage") != "none"
                             or receipt.get("beat_id") != beat_id
                             or receipt.get("primary_shot_id") != shot_id
@@ -2310,18 +2340,14 @@ def validate_shot_storyboard_artifacts(
                             or int(receipt.get("provider_request_count") or 0) != 0
                             or guide.get("image_sha256") != observed
                             or guide.get("source_board_sha256") != source_observed
-                            or receipt.get("semantic_payload_sha256")
-                            != semantic_observed
-                            or guide.get("semantic_payload_sha256")
-                            != semantic_observed
+                            or receipt.get("semantic_payload_sha256") != semantic_observed
+                            or guide.get("semantic_payload_sha256") != semantic_observed
                             or guide.get("semantic_payload") != semantic_payload
-                            or guide.get("authority_roles")
-                            != receipt.get("authority_roles")
+                            or guide.get("authority_roles") != receipt.get("authority_roles")
                             or guide.get("non_authority_roles")
                             != receipt.get("non_authority_roles")
-                            or "character_identity" not in (
-                                receipt.get("non_authority_roles") or []
-                            )
+                            or "character_identity"
+                            not in (receipt.get("non_authority_roles") or [])
                             or beat.get("storyboard_narrative_guide") != guide_value
                             or beat.get("storyboard_narrative_guide_kind")
                             != STORYBOARD_NARRATIVE_GUIDE_SCHEMA
@@ -2329,25 +2355,25 @@ def validate_shot_storyboard_artifacts(
                             != STORYBOARD_NARRATIVE_GUIDE_USAGE
                             or beat.get("storyboard_narrative_guide_renderer")
                             != STORYBOARD_NARRATIVE_GUIDE_RENDERER
-                            or beat.get(
-                                "storyboard_narrative_guide_source_pixel_usage"
-                            )
-                            != "none"
+                            or beat.get("storyboard_narrative_guide_pose_contract_schema")
+                            != POSE_CONTRACT_SCHEMA
+                            or beat.get("storyboard_narrative_guide_pose_policy_sha256")
+                            != POSE_POLICY_SHA256
+                            or beat.get("storyboard_narrative_guide_pose_contracts_sha256")
+                            != semantic_pose_contracts_sha256
+                            or beat.get("storyboard_narrative_guide_pose_fingerprints")
+                            != semantic_pose_fingerprints
+                            or beat.get("storyboard_narrative_guide_source_pixel_usage") != "none"
                             or beat.get("storyboard_narrative_guide_cell_ids")
                             != assignment.get("cell_ids")
                             or beat.get("storyboard_narrative_guide_sha256") != observed
-                            or beat.get(
-                                "storyboard_narrative_guide_semantic_payload_sha256"
-                            )
+                            or beat.get("storyboard_narrative_guide_semantic_payload_sha256")
                             != semantic_observed
                             or beat.get("storyboard_narrative_guide_source_board")
                             != guide.get("source_board")
-                            or beat.get(
-                                "storyboard_narrative_guide_source_board_sha256"
-                            )
+                            or beat.get("storyboard_narrative_guide_source_board_sha256")
                             != source_observed
-                            or beat.get("storyboard_narrative_guide_receipt")
-                            != receipt_value
+                            or beat.get("storyboard_narrative_guide_receipt") != receipt_value
                         ):
                             raise ValueError("guide receipt/hash/cell binding mismatch")
                     except (OSError, ValueError, json.JSONDecodeError) as exc:
@@ -2366,9 +2392,7 @@ def validate_shot_storyboard_artifacts(
                     if observed_sha != str(record.get("board_sha256") or ""):
                         raise ValueError("board hash mismatch")
                 except (OSError, ValueError) as exc:
-                    errors.append(
-                        f"{shot_id} invalid nine-grid storyboard {board_value}: {exc}"
-                    )
+                    errors.append(f"{shot_id} invalid nine-grid storyboard {board_value}: {exc}")
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             errors.append(f"SHOT_STORYBOARDS.json unreadable: {exc}")
     return errors
@@ -2413,6 +2437,7 @@ def generate_shot_storyboards(
         if prior_kind in {
             "honcut.shot_storyboards.v2",
             "honcut.shot_storyboards.v3",
+            "honcut.shot_storyboards.v4",
         }:
             if previous_manifest.get("status") == "done":
                 previous_manifest = migrate_shot_storyboard_narrative_guides(
@@ -2420,13 +2445,11 @@ def generate_shot_storyboards(
                     storyboard,
                 )
             elif target_shot_ids:
-                raise RuntimeError(
-                    "targeted regeneration cannot use an incomplete legacy manifest"
-                )
+                raise RuntimeError("targeted regeneration cannot use an incomplete legacy manifest")
             else:
                 previous_manifest = {}
         elif prior_kind == SHOT_STORYBOARDS_SCHEMA:
-            if prior_version != 4:
+            if prior_version != 5:
                 raise RuntimeError("unsupported prior storyboard manifest version")
         elif previous_manifest:
             raise RuntimeError("unsupported prior storyboard manifest schema")
@@ -2500,7 +2523,7 @@ def generate_shot_storyboards(
     )
     contract: dict[str, Any] = {
         "kind": SHOT_STORYBOARDS_SCHEMA,
-        "version": 4,
+        "version": 5,
         "status": "running",
         "provider": "seedream",
         "model": model,

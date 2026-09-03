@@ -937,6 +937,18 @@ def _base_content(
             "_storyboard_narrative_guide_renderer": (
                 request.chunk.storyboard_narrative_guide_renderer
             ),
+            "_storyboard_narrative_guide_pose_contract_schema": (
+                request.chunk.storyboard_narrative_guide_pose_contract_schema
+            ),
+            "_storyboard_narrative_guide_pose_policy_sha256": (
+                request.chunk.storyboard_narrative_guide_pose_policy_sha256
+            ),
+            "_storyboard_narrative_guide_pose_contracts_sha256": (
+                request.chunk.storyboard_narrative_guide_pose_contracts_sha256
+            ),
+            "_storyboard_narrative_guide_pose_fingerprints": list(
+                request.chunk.storyboard_narrative_guide_pose_fingerprints
+            ),
             "_storyboard_narrative_guide_source_pixel_usage": (
                 request.chunk.storyboard_narrative_guide_source_pixel_usage
             ),
@@ -1568,6 +1580,18 @@ def _task_payload(
         "storyboard_narrative_guide_renderer": (
             request.chunk.storyboard_narrative_guide_renderer
         ),
+        "storyboard_narrative_guide_pose_contract_schema": (
+            request.chunk.storyboard_narrative_guide_pose_contract_schema
+        ),
+        "storyboard_narrative_guide_pose_policy_sha256": (
+            request.chunk.storyboard_narrative_guide_pose_policy_sha256
+        ),
+        "storyboard_narrative_guide_pose_contracts_sha256": (
+            request.chunk.storyboard_narrative_guide_pose_contracts_sha256
+        ),
+        "storyboard_narrative_guide_pose_fingerprints": list(
+            request.chunk.storyboard_narrative_guide_pose_fingerprints
+        ),
         "storyboard_narrative_guide_source_pixel_usage": (
             request.chunk.storyboard_narrative_guide_source_pixel_usage
         ),
@@ -1647,6 +1671,8 @@ def _provider_input_context(
     storyboard_image: str | None = None,
     storyboard_narrative_guide: str | None = None,
     storyboard_narrative_guide_cell_ids: Sequence[str] = (),
+    storyboard_narrative_guide_pose_contracts_sha256: str | None = None,
+    storyboard_narrative_guide_pose_fingerprints: Sequence[str] = (),
     character_performance_guides: Sequence[Any] = (),
     bridge_target_storyboard_image: str | None = None,
 ) -> dict[str, Any]:
@@ -1691,6 +1717,12 @@ def _provider_input_context(
         ),
         "storyboard_narrative_guide_cell_ids": list(
             storyboard_narrative_guide_cell_ids
+        ),
+        "storyboard_narrative_guide_pose_contracts_sha256": (
+            storyboard_narrative_guide_pose_contracts_sha256
+        ),
+        "storyboard_narrative_guide_pose_fingerprints": list(
+            storyboard_narrative_guide_pose_fingerprints
         ),
         "character_performance_guides": [
             {
@@ -3098,6 +3130,12 @@ def execute_phase6_auto_continuity(
             storyboard_narrative_guide=chunk.storyboard_narrative_guide,
             storyboard_narrative_guide_cell_ids=(
                 chunk.storyboard_narrative_guide_cell_ids
+            ),
+            storyboard_narrative_guide_pose_contracts_sha256=(
+                chunk.storyboard_narrative_guide_pose_contracts_sha256
+            ),
+            storyboard_narrative_guide_pose_fingerprints=(
+                chunk.storyboard_narrative_guide_pose_fingerprints
             ),
             character_performance_guides=chunk.character_performance_guides,
             bridge_target_storyboard_image=chunk.bridge_target_storyboard_image,

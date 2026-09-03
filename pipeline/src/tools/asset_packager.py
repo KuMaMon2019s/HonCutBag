@@ -23,10 +23,13 @@ from tools.character_reference_board import (
 )
 
 CINEMATIC_FIRST_FRAME_SCHEMA = "honcut.cinematic-first-frame.v1"
-STORYBOARD_NARRATIVE_GUIDE_SCHEMA = "honcut.storyboard-narrative-guide.v2"
+STORYBOARD_NARRATIVE_GUIDE_SCHEMA = "honcut.storyboard-narrative-guide.v3"
 STORYBOARD_NARRATIVE_GUIDE_USAGE = "phase6_story_narrative_guide_not_output_pixels"
 STORYBOARD_NARRATIVE_GUIDE_RENDERER = (
-    "honcut.identity-neutral-story-guide-renderer.v1"
+    "honcut.identity-neutral-story-guide-renderer.v2"
+)
+STORYBOARD_GUIDE_POSE_CONTRACT_SCHEMA = (
+    "honcut.storyboard-guide-pose-contract.v1"
 )
 CHARACTER_PERFORMANCE_GUIDE_SCHEMA = "honcut.character-performance-guide.v2"
 CHARACTER_PERFORMANCE_GUIDE_USAGE = "current_pxx_motion_reference_only"
@@ -92,6 +95,10 @@ def _assert_narrative_guide_provenance(
     declared_cell_ids: Any,
     declared_sha256: Any,
     declared_renderer: Any,
+    declared_pose_contract_schema: Any,
+    declared_pose_policy_sha256: Any,
+    declared_pose_contracts_sha256: Any,
+    declared_pose_fingerprints: Any,
     declared_source_pixel_usage: Any,
     declared_semantic_payload_sha256: Any,
     declared_source_board: Any,
@@ -140,16 +147,95 @@ def _assert_narrative_guide_provenance(
     non_authority_roles = [
         str(value) for value in (declared_non_authority_roles or [])
     ]
+    pose_fingerprints = [
+        str(value) for value in (declared_pose_fingerprints or [])
+    ]
+    semantic_cells = semantic_payload.get("cells")
+    if not isinstance(semantic_cells, list):
+        raise ValueError("storyboard narrative guide semantic cells are missing")
+    semantic_pose_fingerprints = [
+        str((cell.get("pose_contract") or {}).get("pose_fingerprint") or "")
+        for cell in semantic_cells
+        if isinstance(cell, dict)
+    ]
+    semantic_pose_contracts = [
+        cell.get("pose_contract")
+        for cell in semantic_cells
+        if isinstance(cell, dict)
+    ]
+    semantic_pose_contracts_sha256 = hashlib.sha256(
+        json.dumps(
+            semantic_pose_contracts,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    if len(semantic_pose_contracts) != len(cell_ids):
+        raise ValueError("storyboard narrative guide pose coverage is incomplete")
+    for cell_id, contract in zip(
+        cell_ids, semantic_pose_contracts, strict=True
+    ):
+        if not isinstance(contract, dict):
+            raise ValueError("storyboard narrative guide pose contract is missing")
+        unhashed = dict(contract)
+        stored_contract_sha256 = str(unhashed.pop("contract_sha256", ""))
+        observed_contract_sha256 = hashlib.sha256(
+            json.dumps(
+                unhashed,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if (
+            contract.get("schema") != STORYBOARD_GUIDE_POSE_CONTRACT_SCHEMA
+            or contract.get("pose_policy_sha256")
+            != str(declared_pose_policy_sha256 or "")
+            or contract.get("cell_id") != cell_id
+            or contract.get("secondary_beat_id") != beat_id
+            or stored_contract_sha256 != observed_contract_sha256
+        ):
+            raise ValueError(
+                "storyboard narrative guide pose contract binding is invalid"
+            )
     if (
         str(declared_sha256 or "") != observed
         or str(declared_renderer or "") != STORYBOARD_NARRATIVE_GUIDE_RENDERER
+        or str(declared_pose_contract_schema or "")
+        != STORYBOARD_GUIDE_POSE_CONTRACT_SCHEMA
+        or re.fullmatch(r"[0-9a-f]{64}", str(declared_pose_policy_sha256 or ""))
+        is None
+        or re.fullmatch(
+            r"[0-9a-f]{64}", str(declared_pose_contracts_sha256 or "")
+        )
+        is None
+        or str(declared_pose_contracts_sha256 or "")
+        != semantic_pose_contracts_sha256
+        or len(pose_fingerprints) != len(cell_ids)
+        or any(re.fullmatch(r"[0-9a-f]{64}", value) is None for value in pose_fingerprints)
         or str(declared_source_pixel_usage or "") != "none"
         or str(declared_semantic_payload_sha256 or "") != semantic_observed
         or str(declared_source_board_sha256 or "") != source_observed
         or receipt.get("kind") != STORYBOARD_NARRATIVE_GUIDE_SCHEMA
-        or receipt.get("version") != 2
+        or receipt.get("version") != 3
         or receipt.get("usage") != STORYBOARD_NARRATIVE_GUIDE_USAGE
         or receipt.get("renderer") != STORYBOARD_NARRATIVE_GUIDE_RENDERER
+        or receipt.get("pose_contract_schema")
+        != STORYBOARD_GUIDE_POSE_CONTRACT_SCHEMA
+        or receipt.get("pose_contract_schema") != declared_pose_contract_schema
+        or receipt.get("pose_policy_sha256") != declared_pose_policy_sha256
+        or receipt.get("pose_contracts_sha256")
+        != declared_pose_contracts_sha256
+        or receipt.get("pose_fingerprints") != pose_fingerprints
+        or semantic_payload.get("pose_contract_schema")
+        != STORYBOARD_GUIDE_POSE_CONTRACT_SCHEMA
+        or semantic_payload.get("pose_policy_sha256")
+        != declared_pose_policy_sha256
+        or semantic_payload.get("pose_contracts_sha256")
+        != declared_pose_contracts_sha256
+        or semantic_payload.get("pose_fingerprints") != pose_fingerprints
+        or semantic_pose_fingerprints != pose_fingerprints
         or receipt.get("source_pixel_usage") != "none"
         or receipt.get("semantic_payload_sha256") != semantic_observed
         or receipt.get("status") != "done"
@@ -1053,6 +1139,18 @@ def build_content_for_shot(
                 declared_renderer=shot_meta.get(
                     "_storyboard_narrative_guide_renderer"
                 ),
+                declared_pose_contract_schema=shot_meta.get(
+                    "_storyboard_narrative_guide_pose_contract_schema"
+                ),
+                declared_pose_policy_sha256=shot_meta.get(
+                    "_storyboard_narrative_guide_pose_policy_sha256"
+                ),
+                declared_pose_contracts_sha256=shot_meta.get(
+                    "_storyboard_narrative_guide_pose_contracts_sha256"
+                ),
+                declared_pose_fingerprints=shot_meta.get(
+                    "_storyboard_narrative_guide_pose_fingerprints"
+                ),
                 declared_source_pixel_usage=shot_meta.get(
                     "_storyboard_narrative_guide_source_pixel_usage"
                 ),
@@ -1094,6 +1192,12 @@ def build_content_for_shot(
                 "semantic_payload_sha256": guide_receipt[
                     "semantic_payload_sha256"
                 ],
+                "pose_contract_schema": guide_receipt["pose_contract_schema"],
+                "pose_policy_sha256": guide_receipt["pose_policy_sha256"],
+                "pose_contracts_sha256": guide_receipt[
+                    "pose_contracts_sha256"
+                ],
+                "pose_fingerprints": list(guide_receipt["pose_fingerprints"]),
                 "reference_description": (
                     f"{guide_receipt['beat_id']}剧情导航图，只按"
                     + "→".join(cell_ids)

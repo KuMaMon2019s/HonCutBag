@@ -579,6 +579,36 @@ def build_continuity_plan(
                     storyboard_narrative_guide_renderer=(
                         beat.get("storyboard_narrative_guide_renderer") or None
                     ),
+                    storyboard_narrative_guide_pose_contract_schema=(
+                        beat.get(
+                            "storyboard_narrative_guide_pose_contract_schema"
+                        )
+                        or None
+                    ),
+                    storyboard_narrative_guide_pose_policy_sha256=(
+                        str(
+                            beat.get(
+                                "storyboard_narrative_guide_pose_policy_sha256"
+                            )
+                            or ""
+                        )
+                        or None
+                    ),
+                    storyboard_narrative_guide_pose_contracts_sha256=(
+                        str(
+                            beat.get(
+                                "storyboard_narrative_guide_pose_contracts_sha256"
+                            )
+                            or ""
+                        )
+                        or None
+                    ),
+                    storyboard_narrative_guide_pose_fingerprints=list(
+                        beat.get(
+                            "storyboard_narrative_guide_pose_fingerprints"
+                        )
+                        or []
+                    ),
                     storyboard_narrative_guide_source_pixel_usage=(
                         beat.get(
                             "storyboard_narrative_guide_source_pixel_usage"

@@ -8873,24 +8873,41 @@ def test_phase2_v2_migration_derives_guides_without_provider_calls(tmp_path):
     from PIL import Image
 
     storyboard = {
-        "shots": [{
-            "id": "S01",
-            "where": "雨夜站台",
+            "shots": [{
+                "id": "S01",
+                "where": "雨夜站台",
+                "character_ids": [],
             "storyboard_beats": [
-                {
-                    "beat_id": "S01_P01",
-                    "duration_s": 5,
-                    "generation_mode": "fresh",
-                    "action": "角色抬头",
-                    "end_state": "角色看向列车",
-                },
-                {
-                    "beat_id": "S01_P02",
-                    "duration_s": 5,
-                    "generation_mode": "extend",
-                    "action": "角色走向列车",
-                    "end_state": "角色抵达车门",
-                },
+                    {
+                        "beat_id": "S01_P01",
+                        "planner_version": "honcut.secondary-storyboard.v16",
+                        "duration_s": 5,
+                        "generation_mode": "fresh",
+                        "character_ids": [],
+                        "action": "角色抬头",
+                        "generation_action_units": [{
+                            "unit_id": "GAU001",
+                            "actions": ["角色抬头"],
+                            "performers": ["角色"],
+                            "ledger_indexes": [0],
+                        }],
+                        "end_state": "角色看向列车",
+                    },
+                    {
+                        "beat_id": "S01_P02",
+                        "planner_version": "honcut.secondary-storyboard.v16",
+                        "duration_s": 5,
+                        "generation_mode": "extend",
+                        "character_ids": [],
+                        "action": "角色走向列车",
+                        "generation_action_units": [{
+                            "unit_id": "GAU002",
+                            "actions": ["角色走向列车"],
+                            "performers": ["角色"],
+                            "ledger_indexes": [1],
+                        }],
+                        "end_state": "角色抵达车门",
+                    },
             ],
         }],
     }
@@ -8925,11 +8942,47 @@ def test_phase2_v2_migration_derives_guides_without_provider_calls(tmp_path):
     manifest_path = tmp_path / "SHOT_STORYBOARDS.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     board_sha256 = manifest["shots"][0]["board_sha256"]
+    v4_manifest = json.loads(json.dumps(manifest))
+    v4_manifest.update(kind="honcut.shot_storyboards.v4", version=4)
+    legacy_guide_hashes = {}
+    for record in v4_manifest["shots"]:
+        for guide in record["narrative_guides"]:
+            guide["kind"] = "honcut.storyboard-narrative-guide.v2"
+            guide_path = tmp_path / guide["image"]
+            legacy_guide_hashes[guide["image"]] = hashlib.sha256(
+                guide_path.read_bytes()
+            ).hexdigest()
+            receipt_path = tmp_path / guide["receipt"]
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["kind"] = "honcut.storyboard-narrative-guide.v2"
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    manifest_path.write_text(json.dumps(v4_manifest), encoding="utf-8")
+
+    v4_migrated = migrate_shot_storyboard_narrative_guides(tmp_path, storyboard)
+
+    assert all(
+        hashlib.sha256((tmp_path / relative_path).read_bytes()).hexdigest() == digest
+        for relative_path, digest in legacy_guide_hashes.items()
+    )
+    assert all(
+        guide["image"].startswith("storyboard_guides/v3/")
+        for record in v4_migrated["shots"]
+        for guide in record["narrative_guides"]
+    )
+    assert all(
+        hashlib.sha256(
+            (tmp_path / "storyboard_guides" / "audit_2" / Path(relative_path).name).read_bytes()
+        ).hexdigest()
+        == digest
+        for relative_path, digest in legacy_guide_hashes.items()
+    )
+
     manifest.update(kind="honcut.shot_storyboards.v2", version=2)
     for record in manifest["shots"]:
         record.pop("beat_cell_assignments", None)
         record.pop("narrative_guides", None)
         record["grid_contract"]["schema"] = "honcut.shot-storyboard-grid.v1"
+    legacy_manifest = json.loads(json.dumps(manifest))
     guide_fields = (
         "storyboard_narrative_guide",
         "storyboard_narrative_guide_kind",
@@ -8957,10 +9010,14 @@ def test_phase2_v2_migration_derives_guides_without_provider_calls(tmp_path):
     repeated = migrate_shot_storyboard_narrative_guides(tmp_path, storyboard)
 
     assert calls == provider_calls_before
-    assert migrated["kind"] == "honcut.shot_storyboards.v4"
+    assert migrated["kind"] == "honcut.shot_storyboards.v5"
     assert migrated["migration"]["source_pixel_usage"] == "none"
     assert migrated["migration"]["provider_request_count"] == 0
     assert migrated["shots"][0]["board_sha256"] == board_sha256
+    assert all(
+        guide["image"].startswith("storyboard_guides/v3/")
+        for guide in migrated["shots"][0]["narrative_guides"]
+    )
     assert migrated["shots"][0]["beat_cell_assignments"] == [
         {"beat_id": "S01_P01", "cell_ids": [
             "S01_G01", "S01_G02", "S01_G03", "S01_G04", "S01_G05"
@@ -8981,6 +9038,30 @@ def test_phase2_v2_migration_derives_guides_without_provider_calls(tmp_path):
     )
     with pytest.raises(RuntimeError, match="unsupported storyboard migration source"):
         migrate_shot_storyboard_narrative_guides(tmp_path, storyboard)
+
+    manifest_path.write_text(json.dumps(legacy_manifest), encoding="utf-8")
+    audit_storyboard = json.loads(json.dumps(storyboard))
+    for beat in audit_storyboard["shots"][0]["storyboard_beats"]:
+        beat.pop("generation_action_units", None)
+    legacy_manifest_bytes = manifest_path.read_bytes()
+    source_sha256 = hashlib.sha256(legacy_manifest_bytes).hexdigest()
+
+    with pytest.raises(ValueError, match="missing generation action units"):
+        migrate_shot_storyboard_narrative_guides(tmp_path, audit_storyboard)
+
+    audit_receipt = json.loads(
+        (
+            tmp_path
+            / "storyboard_guides"
+            / "migrations"
+            / f"{source_sha256}.audit-only.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert manifest_path.read_bytes() == legacy_manifest_bytes
+    assert audit_receipt["status"] == "audit_only"
+    assert audit_receipt["source_manifest_sha256"] == source_sha256
+    assert audit_receipt["provider_request_count"] == 0
+    assert audit_receipt["legacy_source_assets_modified"] is False
 
 
 def test_phase4_v1_migration_reuses_p01_and_disables_p02(tmp_path):
@@ -9115,19 +9196,33 @@ def test_phase5_correction_redraws_only_evidenced_pxx_with_identity_references(
                     "beat_id": "S01_P01",
                     "planner_version": SECONDARY_STORYBOARD_VERSION,
                     "character_ids": ["agent"],
-                    "duration_s": 4,
-                    "generation_mode": "fresh",
-                    "action": "Agent 抓住扶手稳定身体",
-                    "end_state": "Agent 已抓稳扶手",
+                        "duration_s": 4,
+                        "generation_mode": "fresh",
+                        "action": "Agent 抓住扶手稳定身体",
+                        "generation_action_units": [{
+                            "unit_id": "GAU001",
+                            "actions": ["Agent 抓住扶手稳定身体"],
+                            "performers": ["agent"],
+                            "targets": ["扶手"],
+                            "ledger_indexes": [0],
+                        }],
+                        "end_state": "Agent 已抓稳扶手",
                 },
                 {
                     "beat_id": "S01_P02",
                     "planner_version": SECONDARY_STORYBOARD_VERSION,
                     "character_ids": ["agent"],
-                    "duration_s": 4,
-                    "generation_mode": "extend",
-                    "action": "Agent 松开扶手并站稳",
-                    "end_state": "Agent 已独立站稳",
+                        "duration_s": 4,
+                        "generation_mode": "extend",
+                        "action": "Agent 松开扶手并站稳",
+                        "generation_action_units": [{
+                            "unit_id": "GAU002",
+                            "actions": ["Agent 松开扶手并站稳"],
+                            "performers": ["agent"],
+                            "targets": ["扶手"],
+                            "ledger_indexes": [1],
+                        }],
+                        "end_state": "Agent 已独立站稳",
                 },
             ],
         }],

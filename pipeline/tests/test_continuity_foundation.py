@@ -156,7 +156,7 @@ def _narrative_guide_fields(
     return {
         "storyboard_narrative_guide": f"storyboard_guides/{beat_id}.png",
         "storyboard_narrative_guide_kind": (
-            "honcut.storyboard-narrative-guide.v2"
+            "honcut.storyboard-narrative-guide.v3"
         ),
         "storyboard_narrative_guide_usage": (
             "phase6_story_narrative_guide_not_output_pixels"
@@ -164,8 +164,16 @@ def _narrative_guide_fields(
         "storyboard_narrative_guide_cell_ids": ordered_cells,
         "storyboard_narrative_guide_sha256": "a" * 64,
         "storyboard_narrative_guide_renderer": (
-            "honcut.identity-neutral-story-guide-renderer.v1"
+            "honcut.identity-neutral-story-guide-renderer.v2"
         ),
+        "storyboard_narrative_guide_pose_contract_schema": (
+            "honcut.storyboard-guide-pose-contract.v1"
+        ),
+        "storyboard_narrative_guide_pose_policy_sha256": "d" * 64,
+        "storyboard_narrative_guide_pose_contracts_sha256": "e" * 64,
+        "storyboard_narrative_guide_pose_fingerprints": [
+            f"{index:064x}" for index, _cell in enumerate(ordered_cells, 1)
+        ],
         "storyboard_narrative_guide_source_pixel_usage": "none",
         "storyboard_narrative_guide_semantic_payload_sha256": "c" * 64,
         "storyboard_narrative_guide_source_board": (
@@ -1300,7 +1308,7 @@ def test_complex_shot_maps_to_three_secondary_generation_strategies(tmp_path):
         "S01_P01 invalid narrative guide" in error
         for error in validate_shot_storyboard_artifacts(tmp_path, storyboard)
     )
-    guide_receipt["kind"] = "honcut.storyboard-narrative-guide.v2"
+    guide_receipt["kind"] = "honcut.storyboard-narrative-guide.v3"
     guide_receipt_path.write_text(json.dumps(guide_receipt), encoding="utf-8")
     assert validate_shot_storyboard_artifacts(tmp_path, storyboard) == []
     assert (tmp_path / "storyboard_beats/S01_P01.png").is_file()
@@ -1332,6 +1340,15 @@ def test_complex_shot_maps_to_three_secondary_generation_strategies(tmp_path):
     assert first.chunks[1].storyboard_narrative_guide_cell_ids == [
         f"S01_G{index:02d}" for index in range(6, 10)
     ]
+    for chunk in first.chunks:
+        assert chunk.storyboard_narrative_guide_pose_contract_schema == (
+            "honcut.storyboard-guide-pose-contract.v1"
+        )
+        assert len(chunk.storyboard_narrative_guide_pose_policy_sha256 or "") == 64
+        assert len(chunk.storyboard_narrative_guide_pose_contracts_sha256 or "") == 64
+        assert len(chunk.storyboard_narrative_guide_pose_fingerprints) == len(
+            chunk.storyboard_narrative_guide_cell_ids
+        )
     assert [chunk.requested_frames for chunk in first.chunks] == [192, 192]
     assert [chunk.expected_unique_frames for chunk in first.chunks] == [192, 192]
     assert [chunk.expected_provider_padding_frames for chunk in first.chunks] == [0, 0]
@@ -2591,6 +2608,10 @@ def test_phase6_fails_closed_when_mandatory_reference_images_exceed_nine(
                 "cinematic_pixels",
             ],
             "semantic_payload_sha256": "c" * 64,
+            "pose_contract_schema": "honcut.storyboard-guide-pose-contract.v1",
+            "pose_policy_sha256": "d" * 64,
+            "pose_contracts_sha256": "e" * 64,
+            "pose_fingerprints": ["1" * 64],
         },
     )
 
@@ -2609,7 +2630,7 @@ def test_phase6_fails_closed_when_mandatory_reference_images_exceed_nine(
                     "storyboard_guides/S01_P01.png"
                 ),
                 "_storyboard_narrative_guide_kind": (
-                    "honcut.storyboard-narrative-guide.v2"
+                    "honcut.storyboard-narrative-guide.v3"
                 ),
             },
         )

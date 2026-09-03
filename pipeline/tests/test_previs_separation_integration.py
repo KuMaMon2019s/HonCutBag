@@ -181,6 +181,15 @@ def test_previs_pixels_are_separated_end_to_end_before_video_transport(
     previs_sha256 = _sha256(previs_path)
     nine_grid_sha256 = _sha256(nine_grid_path)
     narrative_guide_sha256 = _sha256(narrative_guide_path)
+    recovered_provider_calls = len(client.image_to_image_calls)
+    generate_shot_storyboards(tmp_path, storyboard, characters, client=client)
+    recovered_manifest_sha256 = _sha256(tmp_path / "SHOT_STORYBOARDS.json")
+    for _ in range(10):
+        generate_shot_storyboards(tmp_path, storyboard, characters, client=client)
+        assert validate_shot_storyboard_artifacts(tmp_path, storyboard) == []
+        assert _sha256(narrative_guide_path) == narrative_guide_sha256
+        assert _sha256(tmp_path / "SHOT_STORYBOARDS.json") == recovered_manifest_sha256
+    assert len(client.image_to_image_calls) == recovered_provider_calls
     phase2_alias_receipt = json.loads(
         (tmp_path / "storyboard_images" / "S02.json").read_text(encoding="utf-8")
     )
@@ -249,6 +258,10 @@ def test_previs_pixels_are_separated_end_to_end_before_video_transport(
         f"S02_G{index:02d}" for index in range(1, 10)
     ]
 
+    assert chunk["storyboard_narrative_guide_pose_contract_schema"] == (
+        "honcut.storyboard-guide-pose-contract.v1"
+    )
+    assert len(chunk["storyboard_narrative_guide_pose_fingerprints"]) == 9
     l4_issues, l4 = run_l4_first_frame_review(
         storyboard,
         (tmp_path / "visual-style.md").read_text(encoding="utf-8"),

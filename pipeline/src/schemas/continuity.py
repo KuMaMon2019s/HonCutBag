@@ -99,7 +99,7 @@ class GenerationChunk(BaseModel):
         default=None, exclude_if=lambda value: value is None
     )
     storyboard_narrative_guide_kind: Literal[
-        "honcut.storyboard-narrative-guide.v2"
+        "honcut.storyboard-narrative-guide.v3"
     ] | None = Field(default=None, exclude_if=lambda value: value is None)
     storyboard_narrative_guide_usage: Literal[
         "phase6_story_narrative_guide_not_output_pixels"
@@ -114,8 +114,25 @@ class GenerationChunk(BaseModel):
         exclude_if=lambda value: value is None,
     )
     storyboard_narrative_guide_renderer: Literal[
-        "honcut.identity-neutral-story-guide-renderer.v1"
+        "honcut.identity-neutral-story-guide-renderer.v2"
     ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    storyboard_narrative_guide_pose_contract_schema: Literal[
+        "honcut.storyboard-guide-pose-contract.v1"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    storyboard_narrative_guide_pose_policy_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+        exclude_if=lambda value: value is None,
+    )
+    storyboard_narrative_guide_pose_contracts_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+        exclude_if=lambda value: value is None,
+    )
+    storyboard_narrative_guide_pose_fingerprints: list[str] = Field(
+        default_factory=list,
+        exclude_if=lambda value: not value,
+    )
     storyboard_narrative_guide_source_pixel_usage: Literal["none"] | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
@@ -210,6 +227,9 @@ class GenerationChunk(BaseModel):
             self.storyboard_narrative_guide_usage,
             self.storyboard_narrative_guide_sha256,
             self.storyboard_narrative_guide_renderer,
+            self.storyboard_narrative_guide_pose_contract_schema,
+            self.storyboard_narrative_guide_pose_policy_sha256,
+            self.storyboard_narrative_guide_pose_contracts_sha256,
             self.storyboard_narrative_guide_source_pixel_usage,
             self.storyboard_narrative_guide_semantic_payload_sha256,
             self.storyboard_narrative_guide_source_board,
@@ -218,6 +238,7 @@ class GenerationChunk(BaseModel):
         )
         guide_declared = any(value is not None for value in guide_fields) or bool(
             self.storyboard_narrative_guide_cell_ids
+            or self.storyboard_narrative_guide_pose_fingerprints
             or self.storyboard_narrative_guide_authority_roles
             or self.storyboard_narrative_guide_non_authority_roles
         )
@@ -242,6 +263,15 @@ class GenerationChunk(BaseModel):
                 expected_numbers.append(int(suffix))
             if expected_numbers != sorted(set(expected_numbers)):
                 raise ValueError("narrative guide cell IDs must be unique and ordered")
+            if len(self.storyboard_narrative_guide_pose_fingerprints) != len(
+                self.storyboard_narrative_guide_cell_ids
+            ) or any(
+                re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+                for fingerprint in self.storyboard_narrative_guide_pose_fingerprints
+            ):
+                raise ValueError(
+                    "narrative guide pose fingerprints must bind every ordered Gxx cell"
+                )
             if self.storyboard_narrative_guide_authority_roles != [
                 "narrative_order",
                 "action_direction",
