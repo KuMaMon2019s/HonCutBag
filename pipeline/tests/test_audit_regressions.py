@@ -6910,6 +6910,39 @@ def test_phase6_live_acceptance_uses_current_p01_media_order():
     ]
 
 
+def test_phase6_live_acceptance_can_timebox_current_guide_motion():
+    content = [{"type": "text", "text": "base prompt"}]
+
+    pacing = phase6_storyboard_guide_live_acceptance._apply_action_window_contract(
+        content,
+        action_window_seconds=4,
+        duration_seconds=9,
+        beat_id="S01_P01",
+        cell_ids=["S01_G01", "S01_G02", "S01_G03"],
+    )
+
+    assert pacing == {
+        "action_window_seconds": 4.0,
+        "end_state_hold_seconds": 5.0,
+    }
+    assert "前4秒内" in content[0]["text"]
+    assert "S01_G01→S01_G02→S01_G03" in content[0]["text"]
+    assert "约5秒保持当前Pxx" in content[0]["text"]
+    assert content[0]["text"].count("[honcut.live-paced-action-window.v1]") == 1
+
+
+@pytest.mark.parametrize("window", [0, -1, 9, 10, float("inf")])
+def test_phase6_live_acceptance_rejects_invalid_action_window(window):
+    with pytest.raises(ValueError, match="action window"):
+        phase6_storyboard_guide_live_acceptance._apply_action_window_contract(
+            [{"type": "text", "text": "base prompt"}],
+            action_window_seconds=window,
+            duration_seconds=9,
+            beat_id="S01_P01",
+            cell_ids=["S01_G01"],
+        )
+
+
 def test_phase6_live_acceptance_preflight_is_zero_submit(tmp_path):
     result = phase6_storyboard_guide_live_acceptance.run_acceptance(
         tmp_path,

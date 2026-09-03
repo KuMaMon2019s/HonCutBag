@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import subprocess
 import sys
 from collections.abc import Callable
@@ -263,6 +264,48 @@ def _content_prompt(content: list[dict[str, Any]]) -> str:
     )
 
 
+def _apply_action_window_contract(
+    content: list[dict[str, Any]],
+    *,
+    action_window_seconds: float | None,
+    duration_seconds: float,
+    beat_id: str,
+    cell_ids: list[str],
+) -> dict[str, float] | None:
+    """Time-box current-guide motion for an isolated live pacing experiment."""
+    if action_window_seconds is None:
+        return None
+    window = float(action_window_seconds)
+    duration = float(duration_seconds)
+    if not math.isfinite(window) or window <= 0 or window >= duration:
+        raise ValueError(
+            "action window must be finite, positive, and shorter than output duration"
+        )
+    text_items = [item for item in content if item.get("type") == "text"]
+    if len(text_items) != 1:
+        raise ValueError("paced live acceptance requires exactly one text prompt")
+    ordered_cells = [str(value).strip() for value in cell_ids if str(value).strip()]
+    if not ordered_cells:
+        raise ValueError("paced live acceptance requires ordered narrative cells")
+    hold_seconds = duration - window
+    pacing_contract = (
+        f"[honcut.live-paced-action-window.v1] 在输出的前{window:g}秒内，严格按"
+        + "→".join(ordered_cells)
+        + f"完成{beat_id}当前动作全过程；节奏紧凑但符合人体惯性，不得慢动作、"
+        f"拖长单拍或用静止持姿代替动作。完成后约{hold_seconds:g}秒保持当前Pxx"
+        "要求的终态，只允许自然呼吸、衣物余势、光影和环境运动，不得重播动作、"
+        "提前演绎后续Pxx或新增剧情。"
+    )
+    prompt = str(text_items[0].get("text") or "").strip()
+    if "[honcut.live-paced-action-window.v1]" in prompt:
+        raise ValueError("paced action-window contract was injected more than once")
+    text_items[0]["text"] = f"{prompt}\n{pacing_contract}".strip()
+    return {
+        "action_window_seconds": window,
+        "end_state_hold_seconds": hold_seconds,
+    }
+
+
 def _is_current_synthetic_identity_contract(
     characters_payload: dict[str, Any],
     synthetic_evidence: dict[str, Any],
@@ -324,6 +367,7 @@ def _preflight_contract(
     *,
     shot_id: str | None,
     require_clean_source: bool,
+    action_window_seconds: float | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     output_dir = output_dir.resolve()
     storyboard = _read_json_object(output_dir / "STORYBOARD.json")
@@ -455,7 +499,22 @@ def _preflight_contract(
         memory_context="",
     )
     content, shot_meta, seed, duration = _provider_content(output_dir, request)
+    pacing = _apply_action_window_contract(
+        content,
+        action_window_seconds=action_window_seconds,
+        duration_seconds=duration,
+        beat_id=str(chunk.storyboard_beat_id),
+        cell_ids=list(chunk.storyboard_narrative_guide_cell_ids),
+    )
     prompt = _content_prompt(content)
+    from utils.prompt_budget import enforce_prompt_budget
+
+    enforce_prompt_budget(
+        prompt,
+        provider="seedance",
+        model=SEEDANCE_MODEL,
+        purpose="video_generation",
+    )
     prompt_path.write_text(prompt + "\n", encoding="utf-8")
     media_manifest = _media_index_manifest(content)
     image_media = [
@@ -570,6 +629,7 @@ def _preflight_contract(
         "image_count": len(image_media),
         "video_count": len(video_media),
         "duration": duration,
+        "pacing": pacing,
         "ratio": ratio,
         "resolution": resolution,
         "generation_fingerprint": payload["generation_fingerprint"],
@@ -688,6 +748,7 @@ def _preflight_replay_contract(preflight: dict[str, Any]) -> dict[str, Any]:
         "image_count",
         "video_count",
         "duration",
+        "pacing",
         "ratio",
         "resolution",
         "generation_fingerprint",
@@ -765,6 +826,7 @@ def run_acceptance(
     business_verdict: str | None = None,
     verdict_notes: str = "",
     regression_evidence: Path | None = None,
+    action_window_seconds: float | None = None,
     poll_attempts: int = 80,
     poll_interval: int = 15,
     preflight_builder: Callable[..., tuple[dict[str, Any], dict[str, Any]]] = (
@@ -829,6 +891,7 @@ def run_acceptance(
             output_dir,
             shot_id=shot_id,
             require_clean_source=submit,
+            action_window_seconds=action_window_seconds,
         )
         replace_failed_preflight = bool(
             existing is not None and existing.get("status") == "preflight_failed"
@@ -1136,6 +1199,14 @@ def main() -> int:
     parser.add_argument("--business-verdict", choices=("pass", "fail"))
     parser.add_argument("--verdict-notes", default="")
     parser.add_argument("--regression-evidence", type=Path)
+    parser.add_argument(
+        "--action-window-seconds",
+        type=float,
+        help=(
+            "Live-test-only time box for completing the current Gxx sequence; "
+            "the remaining output holds the current Pxx end state"
+        ),
+    )
     parser.add_argument("--poll-attempts", type=int, default=80)
     parser.add_argument("--poll-interval", type=int, default=15)
     args = parser.parse_args()
@@ -1149,6 +1220,7 @@ def main() -> int:
         business_verdict=args.business_verdict,
         verdict_notes=args.verdict_notes,
         regression_evidence=args.regression_evidence,
+        action_window_seconds=args.action_window_seconds,
         poll_attempts=args.poll_attempts,
         poll_interval=args.poll_interval,
     )
