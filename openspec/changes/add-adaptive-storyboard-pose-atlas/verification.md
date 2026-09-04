@@ -21,13 +21,12 @@
 - The run-02 no-submit replay validated old pose policy `1088004f…e971`, locally recompiled both Pxx guides and atlases under source manifest `99af959b…c07f`, verified 16 audit-only asset copies, remained idempotent on replay and recorded zero model Provider requests. Media packaging reused three TOS objects and uploaded one new atlas object without submitting Seedance.
 - Provider-deny replay against the saved failed live-run evidence resolved all 27 pose samples to canonical actor `lanli`, produced non-empty actor geometry in every sample, and measured 3350 changed body-region pixels between the first and last pose while issuing zero Provider requests.
 - Seven-second no-submit receipt is bound to code commit `779fbad`, freezes the Seedance model, 480p media order, paged-atlas strategy, timing/camera hashes and one-request hard limit, and records zero Provider requests.
+- The final v7 policy-refresh regression and no-submit preflight are bound to commit `5c37b01`. The authorized live gate made exactly one Seedance submission (`cgt-20260904190835-r88cj`) and completed its call chain, but the visual verdict failed: the clip preserved identity and clean output while remaining dominated by a camera push and near-static transverse guard instead of clearly executing the canonical block-then-evade action groups. The receipt is `live_acceptance_failed`; no retry or reshoot was attempted.
 
 ### Issues
 
-No critical implementation issue or uncovered specification scenario remains.
-
-The refreshed Seedance preflight remains `pending_live_acceptance`. This repair turn issued no Ark, Seedream, VLM or Seedance request and does not represent the paid visual gate as passed; its one TOS atlas upload is recorded separately above.
+The deterministic v7→v7 migration is regression-complete, but the paid visual gate exposes a remaining Phase 6 execution-quality issue: the Provider can attend to the long identity/camera prompt while under-executing the atlas action groups. The migration must not be represented as full live visual acceptance.
 
 ### Final Assessment
 
-All zero-cost implementation checks passed. The change is ready for review; do not claim live visual acceptance until the separately authorized one-request gate passes.
+All zero-cost implementation checks passed. The authorized one-request call chain passed and the business visual verdict failed, so this change remains unarchived pending a separately scoped repair; the failed request is final and must not be retried.
