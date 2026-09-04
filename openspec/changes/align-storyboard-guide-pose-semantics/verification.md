@@ -32,6 +32,7 @@
 - The saved live run remains unmodified; replay output exists only as temporary provider-deny evidence.
 - `pipeline/src/phases/pipeline_core.py`: unchanged from baseline.
 - OpenSpec CLI 1.11.0 does not expose a literal `verify` subcommand; verification followed the generated `openspec-verify-change` workflow and `openspec validate --strict` passed.
+- One authorized 4-second Seedance live request passed the call-chain gate with no retry. Compared with the prior approximately 1.8-second ready hold, the new output shows continuous change from the first decoded interval and clear full-body motion by approximately 0.75 seconds, followed by readable evade, diagonal swing and raised block actions. The final instant relaxes toward a horizontal defensive hold and is recorded as an acceptable deviation.
 
 ### Issues
 
@@ -41,4 +42,4 @@
 
 ### Final assessment
 
-All checks passed. The change is ready for a separately authorized live Phase 6 acceptance, but remains unarchived until that gate is requested and completed.
+All regression and authorized live checks passed. The change is ready for review and archive.

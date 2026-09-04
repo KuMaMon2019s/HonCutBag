@@ -79,7 +79,16 @@
   },
   "provider_request_count": 0,
   "live_paid_provider": {
-    "status": "pending_live_acceptance",
-    "reason": "requires a new explicit authorization"
+    "status": "passed_with_acceptable_deviation",
+    "provider_request_count": 1,
+    "provider_request_attempt_count": 1,
+    "automatic_retry_count": 0,
+    "model": "doubao-seedance-2.0-fast",
+    "duration_s": 4,
+    "output_sha256": "03db95a9d93bf205610930a03cd1078c586a32f7ff6ceda5a67322d9b8eeda39",
+    "receipt_path": "/Users/soda/Documents/Codex/2026-09-04/honcut-storyboard-guide-zero-time-ready-live-run-02/storyboard_guide_zero_time_ready_live_acceptance.json",
+    "receipt_sha256": "4d6a9813005818f3b7680d331131bf958633d84bd358b05220ce5eccf17e4578",
+    "verified_behavior": "the prior 1.8-second ready hold no longer consumes most of the clip; clear full-body motion is visible by 0.75 seconds and the dynamic evade, swing, and block sequence is completed",
+    "acceptable_deviation": "the final instant relaxes toward a horizontal defensive hold after reaching the raised block"
   }
 }
