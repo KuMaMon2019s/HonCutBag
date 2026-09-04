@@ -313,6 +313,7 @@ def _narrative_grid_contract(
         end_state = _compact(beat.get("end_state"), 320)
         beat_cells: list[dict[str, Any]] = []
         for local_index in range(cell_count):
+            action_progress = round(local_index / max(cell_count - 1, 1), 3)
             if local_index == 0:
                 stage = "start"
                 visible_fact = start_state or action
@@ -321,9 +322,8 @@ def _narrative_grid_contract(
                 visible_fact = end_state or action
             else:
                 stage = "action_progress"
-                progress = round(local_index / max(cell_count - 1, 1), 3)
                 visible_fact = (
-                    f"仅演绎本格既有动作的 {progress:.0%} 进度：{action}；"
+                    f"仅演绎本格既有动作的 {action_progress:.0%} 进度：{action}；"
                     "不得增加新事件、角色、道具或结果"
                 )
             global_cell_index = len(cells) + len(beat_cells) + 1
@@ -335,6 +335,7 @@ def _narrative_grid_contract(
                     "secondary_beat_id": beat_id,
                     "secondary_beat_position": beat_index + 1,
                     "stage": stage,
+                    "action_progress": action_progress,
                     "visible_fact": visible_fact,
                     "camera_movement": beat.get("camera_movement")
                     or shot.get("camera_movement")

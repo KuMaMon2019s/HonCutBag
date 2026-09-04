@@ -117,7 +117,7 @@ class GenerationChunk(BaseModel):
         "honcut.identity-neutral-story-guide-renderer.v2"
     ] | None = Field(default=None, exclude_if=lambda value: value is None)
     storyboard_narrative_guide_pose_contract_schema: Literal[
-        "honcut.storyboard-guide-pose-contract.v1"
+        "honcut.storyboard-guide-pose-contract.v2"
     ] | None = Field(default=None, exclude_if=lambda value: value is None)
     storyboard_narrative_guide_pose_policy_sha256: str | None = Field(
         default=None,

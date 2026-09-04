@@ -45,3 +45,10 @@
 - [x] 6.7 Run `graphify update .`, focused `graphify affected` checks, save the verified result without secrets, and refresh reflections; verify Graphify hooks and community labels remain intact.
 - [x] 6.8 Write a regression receipt bound to the candidate commit with the provider-deny evidence. Mark the live gate `pending_live_acceptance`; do not run a paid Phase 6 acceptance without a new explicit authorization.
 - [x] 6.9 Remove the production-reachable unversioned test compatibility lineage, update affected fixtures to canonical generation action units, rerun verification, and replace the regression receipt with evidence bound to the corrected candidate commit.
+
+## 7. Live-evidence Follow-up: Negation and Motion Fidelity
+
+- [x] 7.1 Reproduce the live run misclassification where a negated contact phrase overrides positive evade mechanics; add Chinese and English regression cases.
+- [x] 7.2 Make pose-family classification field- and polarity-aware, persist rejected negated matches, and prevent unmatched body-action beats from drifting across action units.
+- [x] 7.3 Add monotonic per-action Gxx progress plus deterministic root, torso, center-of-gravity, stance and two-hand-hold geometry; reject arrow-only progress.
+- [ ] 7.4 Upgrade the pose contract version, redraw the saved live structure with zero Provider calls, run focused/full regression and post-change Serena/Graphify/OpenSpec validation, then replace the regression evidence.

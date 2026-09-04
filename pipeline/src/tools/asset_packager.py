@@ -29,7 +29,7 @@ STORYBOARD_NARRATIVE_GUIDE_RENDERER = (
     "honcut.identity-neutral-story-guide-renderer.v2"
 )
 STORYBOARD_GUIDE_POSE_CONTRACT_SCHEMA = (
-    "honcut.storyboard-guide-pose-contract.v1"
+    "honcut.storyboard-guide-pose-contract.v2"
 )
 CHARACTER_PERFORMANCE_GUIDE_SCHEMA = "honcut.character-performance-guide.v2"
 CHARACTER_PERFORMANCE_GUIDE_USAGE = "current_pxx_motion_reference_only"

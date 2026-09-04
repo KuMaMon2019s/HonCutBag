@@ -26,6 +26,22 @@
 - **WHEN** Gxx 分别绑定移动、闪避、格挡、踢击、抓控或持用道具等不同动作
 - **THEN** 对应骨架的关节、躯干或重心至少一项发生与动作相符的结构变化，并生成不同姿态指纹
 
+#### Scenario: 否定的接触描述不得覆盖正向动作
+- **WHEN** technique、footwork、torso、weight shift、end pose 或 canonical action 明确描述闪避、挥击等动作，而 contact 说明“无格挡”“未击中”“without blocking”或同类否定事实
+- **THEN** 分类器必须采用正向动作证据，持久化被排除的否定匹配，且不得把否定词误判成格挡或攻击
+
+#### Scenario: 身体动作拍只绑定匹配的动作单元
+- **WHEN** 一个 Pxx 含多个动作单元，而身体动作拍只通过 source micro-action index 对应其中一项
+- **THEN** 该动作拍的技术、步法、躯干、重心和接触字段只能影响匹配的动作单元，不得漂移到同一 Pxx 的其他动作
+
+#### Scenario: 多格展开形成连续身体进度
+- **WHEN** 同一动作单元被展开到多个 Gxx
+- **THEN** 每格必须持久化单调且互异的动作进度，并使根位移、躯干、重心、步幅或关节产生达到确定性最小位移的连续变化
+
+#### Scenario: 连续动作不得回到中立姿态重置
+- **WHEN** 一个 Pxx 的相邻 Gxx 从一个 canonical action unit 进入下一个 action unit
+- **THEN** 后一动作必须从前一动作的最终关节与累计根位置开始，并持久化前一 action unit 的 transition origin，不得在动作边界瞬间重置为默认站姿
+
 #### Scenario: 多人交互
 - **WHEN** 当前动作具有多个执行者或明确目标与接触关系
 - **THEN** 导航图使用相应数量的中性骨架表达角色位置、相对朝向和接触关系，不把多个角色压缩成一个站立骨架

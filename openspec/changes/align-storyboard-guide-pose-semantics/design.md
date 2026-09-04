@@ -24,7 +24,7 @@ The run-17 `S01_P01` evidence contains three materially different cells but iden
 
 ### 1. Add a Phase 2 pose-semantics compiler before rendering
 
-Phase 2 will compile a `honcut.storyboard-guide-pose-contract.v1` for each assigned Gxx. The compiler consumes, in authority order:
+Phase 2 will compile a `honcut.storyboard-guide-pose-contract.v2` for each assigned Gxx. The compiler consumes, in authority order:
 
 1. current Pxx `generation_action_units` and their `unit_id`, `source_action_unit_id`, source indexes, performers, targets and ordered actions;
 2. matching valid `body_action_contract.beats` fields (`performer`, `technique`, `side`, `limbs`, `footwork`, `torso`, `weight_shift`, `direction`, `contact`, `end_pose`);
@@ -33,6 +33,8 @@ Phase 2 will compile a `honcut.storyboard-guide-pose-contract.v1` for each assig
 The compiler partitions ordered generation units across the Gxx allocated to that Pxx. When a unit spans multiple cells, stage/progress produces preparation, execution and recovery/terminal variants of the same action. When units outnumber cells, a cell may bind an ordered group, but the source IDs remain explicit and no unit is silently dropped. When cells outnumber units, the unit is expanded into monotonic phase samples rather than duplicated as identical geometry.
 
 Controlled lexical classification over the canonical action strings is allowed only to select a generic pose family when typed mechanics are absent. It is versioned, deterministic, multilingual and auditable; it does not create source IDs, characters, props or plot outcomes. This is preferable to hashing prose (which has no semantic meaning) and to adding a Provider call (which would be probabilistic and costly).
+
+Lexical evidence is field-aware and polarity-aware. Positive technique, footwork, torso, weight-shift, end-pose and canonical-action evidence outranks contact prose. Local Chinese and English negation scopes reject matches such as “无实际格挡”, “未击中” and “without blocking”, and the rejected evidence remains in the contract for audit. A body-action beat may only modify units whose source micro-action indexes match; the old single-beat fallback is permitted only when the unit has no source index at all.
 
 Alternative considered: require every upstream beat to have a fully typed body contract. Rejected because non-combat and existing valid Pxx frequently carry usable structured action units without full body mechanics, and forcing upstream regeneration would broaden this owner and add probabilistic failure.
 
@@ -46,7 +48,7 @@ Introduce a Phase 2-local pure geometry module, expected at `pipeline/src/phases
 - multi-subject layout driven by bound performers/targets, using generic actor slots rather than character identity;
 - abstract object/space glyphs for non-human performers and non-body events.
 
-Each actor geometry and each cell receive a canonical JSON pose fingerprint. The raster renderer draws only from that geometry. Red action arrows derive from the same resolved movement/contact vector; blue camera arrows derive only from the camera-motion contract. Randomness and prose hashes are prohibited from pose or arrow direction.
+Each actor geometry and each cell receive a canonical JSON pose fingerprint. Repeated cells for one action receive monotonic progress samples that drive root translation and joint interpolation. A following action interpolates from the preceding canonical action's terminal joints and accumulated root position instead of resetting to the neutral template; the transition origin action-unit IDs are persisted and validated. Typed mechanics additionally modify center drop, torso lean, stance width, lead step and two-hand hold geometry. The raster renderer draws only from that geometry and structural validation rejects progress samples whose body displacement remains below the deterministic minimum. Red action arrows derive from the same resolved movement/contact vector; blue camera arrows derive only from the camera-motion contract. Randomness and prose hashes are prohibited from pose or arrow direction.
 
 Alternative considered: import the Phase 3 performance-board renderer. Rejected because that module owns character-specific run-local reference assets and its dependency direction would couple Phase 2 production to a later Phase. Common concepts may be mirrored as a small pure vocabulary, but Phase 2 retains guide ownership.
 

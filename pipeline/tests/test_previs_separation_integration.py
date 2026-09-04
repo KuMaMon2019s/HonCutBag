@@ -259,7 +259,7 @@ def test_previs_pixels_are_separated_end_to_end_before_video_transport(
     ]
 
     assert chunk["storyboard_narrative_guide_pose_contract_schema"] == (
-        "honcut.storyboard-guide-pose-contract.v1"
+        "honcut.storyboard-guide-pose-contract.v2"
     )
     assert len(chunk["storyboard_narrative_guide_pose_fingerprints"]) == 9
     l4_issues, l4 = run_l4_first_frame_review(

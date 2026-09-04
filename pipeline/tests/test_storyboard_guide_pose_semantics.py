@@ -137,6 +137,269 @@ def test_pose_progress_changes_joint_geometry_and_fingerprint():
     pose_owner.validate_pose_sequence(cells, beat_id="S01_P01")
 
 
+@pytest.mark.parametrize(
+    ("contact", "action"),
+    [
+        ("双手保持握持短棍，无实际格挡或击中接触", "actor-alpha 向右滑步后仰闪避"),
+        ("keeps both hands on the prop without blocking or striking", "actor-alpha dodges right and leans back"),
+    ],
+)
+def test_negated_contact_cannot_override_positive_pose_evidence(contact, action):
+    unit = _unit("GAU001", action)
+    beat = _beat(unit)
+    beat["body_action_contract"] = {
+        "beats": [
+            {
+                "micro_action_index": 1,
+                "performer": "actor-alpha",
+                "technique": action,
+                "footwork": "右脚向右侧滑步，左脚支撑" if "闪避" in action else "right foot side-steps while the left foot supports",
+                "torso": "降低重心并向后仰" if "闪避" in action else "lower the center of gravity and lean back",
+                "weight_shift": "向右、向后转移" if "闪避" in action else "shift weight right and backward",
+                "contact": contact,
+                "end_pose": "低重心后倾闪避姿态" if "闪避" in action else "low backward-leaning evade pose",
+            }
+        ]
+    }
+
+    contract = pose_owner.compile_pose_contracts(beat, [_cell()])[0]["pose_contract"]
+
+    assert contract["pose_family"] == "evade"
+    assert contract["classification_evidence"]["field"] == "technique"
+    assert contract["classification_evidence"]["polarity"] == "positive"
+    assert any(
+        item["field"] == "contact" and item["family"] in {"block", "strike"}
+        for item in contract["classification_evidence"]["rejected_negated_matches"]
+    )
+
+
+def test_repeated_action_cells_form_monotonic_distinct_pose_samples():
+    unit = _unit("GAU001", "actor-alpha dodges right and leans back")
+    cells = pose_owner.compile_pose_contracts(
+        _beat(unit),
+        [
+            _cell("S01_G01", "start"),
+            _cell("S01_G02", "action_progress"),
+            _cell("S01_G03", "action_progress"),
+            _cell("S01_G04", "action_progress"),
+            _cell("S01_G05", "end"),
+        ],
+    )
+
+    progress = [cell["pose_contract"]["pose_progress"] for cell in cells]
+    fingerprints = pose_owner.pose_fingerprints(cells)
+    hips = [
+        tuple(cell["pose_contract"]["geometry"]["actors"][0]["joints"]["left_hip"])
+        for cell in cells
+    ]
+
+    assert progress == sorted(progress)
+    assert progress[0] < progress[-1]
+    assert len(set(progress)) == len(progress)
+    assert len(set(fingerprints)) == len(fingerprints)
+    assert len(set(hips)) >= 3
+    pose_owner.validate_pose_sequence(cells, beat_id="S01_P01")
+
+
+def test_single_action_can_progress_across_all_nine_cells_without_false_block():
+    unit = _unit("GAU001", "actor-alpha pivots and swings a staff right")
+    cells = pose_owner.compile_pose_contracts(
+        _beat(unit),
+        [
+            _cell(f"S01_G{index:02d}", "action_progress")
+            for index in range(1, 10)
+        ],
+    )
+
+    assert [cell["pose_contract"]["pose_progress"] for cell in cells] == [
+        0.0,
+        0.125,
+        0.25,
+        0.375,
+        0.5,
+        0.625,
+        0.75,
+        0.875,
+        1.0,
+    ]
+    assert len(set(pose_owner.pose_fingerprints(cells))) == 9
+    pose_owner.validate_pose_sequence(cells, beat_id="S01_P01")
+
+
+def test_unclassified_actor_action_gets_generic_weight_shift_not_arrow_only_motion():
+    cells = pose_owner.compile_pose_contracts(
+        _beat(_unit("GAU001", "actor-alpha makes an unfamiliar transition")),
+        [_cell("S01_G01", "start"), _cell("S01_G02", "end")],
+    )
+
+    assert [cell["pose_contract"]["pose_family"] for cell in cells] == [
+        "spatial",
+        "spatial",
+    ]
+    roots = [
+        tuple(cell["pose_contract"]["geometry"]["actors"][0]["root_translation"])
+        for cell in cells
+    ]
+    assert roots[0] != roots[1]
+    pose_owner.validate_pose_sequence(cells, beat_id="S01_P01")
+
+
+def test_next_action_starts_from_previous_canonical_end_pose_without_neutral_reset():
+    ready = _unit("GAU001", "actor-alpha takes a ready stance", ledger_index=0)
+    evade = _unit("GAU002", "actor-alpha dodges right", ledger_index=1)
+    cells = pose_owner.compile_pose_contracts(
+        _beat(ready, evade),
+        [
+            _cell("S01_G01", "start"),
+            _cell("S01_G02", "end"),
+            _cell("S01_G03", "start"),
+            _cell("S01_G04", "end"),
+        ],
+    )
+
+    previous_end = cells[1]["pose_contract"]
+    next_start = cells[2]["pose_contract"]
+    assert next_start["transition_origin"] == {
+        "source": "previous_canonical_action",
+        "unit_ids": ["GAU001"],
+        "pose_family": "ready",
+        "direction": "right",
+    }
+    assert previous_end["geometry"]["actors"][0]["joints"] == (
+        next_start["geometry"]["actors"][0]["joints"]
+    )
+    assert previous_end["geometry"]["actors"][0]["root_translation"] == (
+        next_start["geometry"]["actors"][0]["root_translation"]
+    )
+    pose_owner.validate_pose_sequence(cells, beat_id="S01_P01")
+
+
+def test_new_actor_does_not_inherit_previous_actors_pose_or_root_motion():
+    first = _unit(
+        "GAU001",
+        "actor-alpha runs right",
+        performers=("actor-alpha",),
+        ledger_index=0,
+    )
+    second = _unit(
+        "GAU002",
+        "actor-beta blocks right",
+        performers=("actor-beta",),
+        ledger_index=1,
+    )
+    cells = pose_owner.compile_pose_contracts(
+        _beat(first, second),
+        [
+            _cell("S01_G01", "start"),
+            _cell("S01_G02", "end"),
+            _cell("S01_G03", "start"),
+            _cell("S01_G04", "end"),
+        ],
+    )
+
+    assert cells[1]["pose_contract"]["geometry"]["actors"][0]["root_translation"] == [
+        110,
+        0,
+    ]
+    second_start = cells[2]["pose_contract"]["geometry"]["actors"][0]
+    assert second_start["role_ref"] == "actor-beta"
+    assert second_start["root_origin"] == [0, 0]
+    assert second_start["root_translation"] == [0, 0]
+    pose_owner.validate_pose_sequence(cells, beat_id="S01_P01")
+
+
+def test_body_mechanics_modify_torso_weight_and_foot_geometry():
+    unit = _unit("GAU001", "actor-alpha dodges right")
+    plain = pose_owner.compile_pose_contracts(_beat(unit), [_cell()])[0]["pose_contract"]
+    detailed_beat = _beat(unit)
+    detailed_beat["body_action_contract"] = {
+        "beats": [
+            {
+                "micro_action_index": 1,
+                "performer": "actor-alpha",
+                "technique": "向右滑步后倾闪避",
+                "footwork": "右脚向右侧滑步，左脚支撑并维持稳定",
+                "torso": "躯干降低重心并向后仰倾",
+                "weight_shift": "重心下沉，并向右、向后转移",
+                "contact": "没有格挡或击中接触",
+                "end_pose": "低重心、躯干后倾的闪避姿态",
+            }
+        ]
+    }
+    detailed = pose_owner.compile_pose_contracts(detailed_beat, [_cell()])[0]["pose_contract"]
+
+    assert detailed["pose_family"] == "evade"
+    assert detailed["mechanics_modifiers"]["center_drop"] > 0
+    assert detailed["mechanics_modifiers"]["torso_lean"] < 0
+    assert detailed["mechanics_modifiers"]["stance_width"] > 0
+    plain_joints = plain["geometry"]["actors"][0]["joints"]
+    detailed_joints = detailed["geometry"]["actors"][0]["joints"]
+    assert detailed_joints["neck"][1] > plain_joints["neck"][1]
+    assert detailed_joints["head"][0] < plain_joints["head"][0]
+    assert (
+        detailed_joints["right_foot"][0] - detailed_joints["left_foot"][0]
+        > plain_joints["right_foot"][0] - plain_joints["left_foot"][0]
+    )
+
+
+def test_body_mechanics_do_not_drift_to_an_unmatched_action_unit():
+    ready = _unit("GAU001", "actor-alpha takes a ready stance", ledger_index=0)
+    ready["source_micro_action_indexes"] = [1]
+    evade = _unit("GAU002", "actor-alpha dodges right", ledger_index=1)
+    evade["source_micro_action_indexes"] = [2]
+    beat = _beat(ready, evade)
+    beat["body_action_contract"] = {
+        "beats": [
+            {
+                "micro_action_index": 2,
+                "performer": "actor-alpha",
+                "technique": "right side-step evade",
+                "footwork": "right foot side-steps",
+                "torso": "lower and lean back",
+                "weight_shift": "right and backward",
+                "contact": "without blocking",
+                "end_pose": "low evade pose",
+            }
+        ]
+    }
+
+    cells = pose_owner.compile_pose_contracts(
+        beat,
+        [_cell("S01_G01", "start"), _cell("S01_G02", "end")],
+    )
+
+    assert [cell["pose_contract"]["pose_family"] for cell in cells] == [
+        "ready",
+        "evade",
+    ]
+    assert cells[0]["pose_contract"]["matched_body_action_beats"] == []
+    assert cells[1]["pose_contract"]["matched_body_action_beats"] == [
+        {
+            "micro_action_index": 2,
+            "body_action_sha256": cells[1]["pose_contract"]["matched_body_action_beats"][0][
+                "body_action_sha256"
+            ],
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("action", "expected_family"),
+    [
+        ("actor-alpha 双手握住道具并进入战斗戒备", "ready"),
+        ("actor-alpha 走进训练区域", "locomotion"),
+        ("actor-alpha 上步斜挥短棍", "strike"),
+        ("actor-alpha plants the rear foot and swings a staff", "strike"),
+    ],
+)
+def test_specific_action_semantics_beat_ambiguous_motion_words(action, expected_family):
+    contract = pose_owner.compile_pose_contracts(
+        _beat(_unit("GAU001", action)),
+        [_cell()],
+    )[0]["pose_contract"]
+    assert contract["pose_family"] == expected_family
+
+
 def test_action_units_partition_in_source_order_without_loss():
     units = (
         _unit("GAU001", "actor-alpha runs forward", ledger_index=0),
@@ -317,7 +580,7 @@ def test_phase6_task_fingerprint_binds_ordered_pose_fingerprints(tmp_path):
         "storyboard_narrative_guide_sha256": "a" * 64,
         "storyboard_narrative_guide_renderer": ("honcut.identity-neutral-story-guide-renderer.v2"),
         "storyboard_narrative_guide_pose_contract_schema": (
-            "honcut.storyboard-guide-pose-contract.v1"
+            "honcut.storyboard-guide-pose-contract.v2"
         ),
         "storyboard_narrative_guide_pose_policy_sha256": "b" * 64,
         "storyboard_narrative_guide_pose_contracts_sha256": "c" * 64,
@@ -395,7 +658,7 @@ def test_continuity_chunk_rejects_incomplete_pose_fingerprint_binding():
             storyboard_narrative_guide_sha256="a" * 64,
             storyboard_narrative_guide_renderer=("honcut.identity-neutral-story-guide-renderer.v2"),
             storyboard_narrative_guide_pose_contract_schema=(
-                "honcut.storyboard-guide-pose-contract.v1"
+                "honcut.storyboard-guide-pose-contract.v2"
             ),
             storyboard_narrative_guide_pose_policy_sha256="b" * 64,
             storyboard_narrative_guide_pose_contracts_sha256="c" * 64,

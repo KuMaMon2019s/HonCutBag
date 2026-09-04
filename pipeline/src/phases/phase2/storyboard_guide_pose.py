@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Callable, Mapping, Sequence
 from itertools import pairwise
 from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
 
-POSE_CONTRACT_SCHEMA = "honcut.storyboard-guide-pose-contract.v1"
+POSE_CONTRACT_SCHEMA = "honcut.storyboard-guide-pose-contract.v2"
 
 _POSE_CLASSIFIERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("throw", ("摔", "投掷", "甩向", "throw", "toss")),
@@ -23,7 +24,22 @@ _POSE_CLASSIFIERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         "strike",
-        ("攻击", "挥砍", "挥拳", "刺", "重击", "反击", "attack", "strike", "punch", "swing"),
+        (
+            "攻击",
+            "挥砍",
+            "挥击",
+            "挥棍",
+            "斜挥",
+            "挥出",
+            "挥拳",
+            "刺",
+            "重击",
+            "反击",
+            "attack",
+            "strike",
+            "punch",
+            "swing",
+        ),
     ),
     ("fall_land", ("跌倒", "倒地", "落地", "跃下", "坠落", "fall", "land", "drop")),
     (
@@ -37,7 +53,8 @@ _POSE_CLASSIFIERS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "跑",
             "冲刺",
             "靠近",
-            "进入",
+            "走进",
+            "跑进",
             "踏入",
             "移动",
             "滑入",
@@ -51,8 +68,8 @@ _POSE_CLASSIFIERS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     ("reveal", ("现身", "出现", "显现", "暴露", "reveal", "appear", "emerge")),
-    ("prop_hold", ("手持", "握", "持", "拿", "举起", "hold", "wield", "carry")),
     ("ready", ("准备", "戒备", "对峙", "架势", "站稳", "ready", "stance")),
+    ("prop_hold", ("手持", "握", "持", "拿", "举起", "hold", "wield", "carry")),
 )
 
 _DIRECTION_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -88,14 +105,53 @@ _ACTOR_MARKERS = (
     "fighter",
 )
 
+_POSE_EVIDENCE_FIELDS = (
+    "technique",
+    "footwork",
+    "torso",
+    "weight_shift",
+    "end_pose",
+    "action_text",
+    "contact",
+)
+
+_CHINESE_NEGATION_PREFIXES = (
+    "无",
+    "无实际",
+    "没有",
+    "未",
+    "并无",
+    "并未",
+    "不",
+    "并不",
+    "非",
+    "并非",
+    "无需",
+    "禁止",
+    "避免",
+)
+
+_MECHANICS_MARKERS = {
+    "center_drop": ("降低重心", "低重心", "重心下沉", "下沉", "crouch", "lower the center"),
+    "lean_back": ("后仰", "后倾", "向后倾", "lean back", "backward-leaning"),
+    "lean_forward": ("前倾", "向前倾", "lean forward", "forward-leaning"),
+    "wide_stance": ("滑步", "侧步", "支撑", "站稳", "side-step", "sidestep", "wide stance"),
+    "two_hand_hold": ("双手", "两手", "both hands", "two-handed"),
+}
+
 _POSE_POLICY = {
-    "schema": "honcut.storyboard-guide-pose-policy.v1",
+    "schema": "honcut.storyboard-guide-pose-policy.v2",
     "classifiers": _POSE_CLASSIFIERS,
     "direction_markers": _DIRECTION_MARKERS,
     "actor_markers": _ACTOR_MARKERS,
+    "evidence_fields": _POSE_EVIDENCE_FIELDS,
+    "negation_prefixes": _CHINESE_NEGATION_PREFIXES,
+    "mechanics_markers": _MECHANICS_MARKERS,
     "role_resolution": "source_actor_roster_then_controlled_actor_markers_v1",
-    "geometry": "normalized_joint_templates_v1",
-    "phase_samples": {"start": 0.55, "action_progress": 1.0, "end": 0.76},
+    "geometry": "normalized_joint_templates_with_mechanics_v2",
+    "phase_samples": {"start": 0.2, "action_progress": 0.7, "end": 1.0},
+    "minimum_adjacent_joint_delta": 2,
+    "minimum_action_span_joint_delta": 12,
 }
 
 
@@ -134,17 +190,83 @@ def _is_explicit_actor_role(value: str) -> bool:
     return any(marker in folded for marker in _ACTOR_MARKERS)
 
 
-def _pose_family(action_text: str, mechanics: Mapping[str, Any]) -> tuple[str, str]:
-    structured = " ".join(
-        str(mechanics.get(key) or "")
-        for key in ("technique", "footwork", "torso", "weight_shift", "contact", "end_pose")
+def _match_is_negated(text: str, marker_start: int) -> bool:
+    """Return whether a lexical match is governed by a local negation clause."""
+    prefix = text[max(0, marker_start - 64) : marker_start].casefold()
+    prefix = re.split(r"(?:但是|但|而是|however|\bbut\b)", prefix)[-1]
+    chinese_clause = re.split(r"[，。；！？,.;!?]", prefix)[-1]
+    compact = re.sub(r"\s+", "", chinese_clause)
+    if any(
+        re.search(re.escape(negation) + r"[^，。；！？,.;!?]{0,12}$", compact)
+        for negation in _CHINESE_NEGATION_PREFIXES
+    ):
+        return True
+    english_clause = re.split(r"[,.;!?]", prefix)[-1]
+    return bool(
+        re.search(
+            r"(?:\bno\b|\bnot\b|\bwithout\b|\bnever\b|\bneither\b|\bnor\b|"
+            r"\bdo not\b|\bdoes not\b|\bdid not\b|\bis not\b|\bwas not\b|"
+            r"\bdon't\b|\bdoesn't\b|\bdidn't\b)"
+            r"(?:\s+[\w-]+){0,5}\s*$",
+            english_clause,
+        )
     )
-    haystack = f"{structured} {action_text}".casefold()
-    for family, markers in _POSE_CLASSIFIERS:
-        marker = next((item for item in markers if item.casefold() in haystack), None)
-        if marker is not None:
-            return family, marker
-    return "spatial", "no_controlled_marker"
+
+
+def _marker_occurrences(text: str, marker: str) -> list[tuple[int, bool]]:
+    folded = text.casefold()
+    result: list[tuple[int, bool]] = []
+    start = 0
+    needle = marker.casefold()
+    while True:
+        index = folded.find(needle, start)
+        if index < 0:
+            return result
+        result.append((index, _match_is_negated(folded, index)))
+        start = index + max(1, len(needle))
+
+
+def _pose_family(action_text: str, mechanics: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
+    sources = {
+        **{field: str(mechanics.get(field) or "") for field in _POSE_EVIDENCE_FIELDS},
+        "action_text": action_text,
+    }
+    rejected: list[dict[str, str]] = []
+    for field in _POSE_EVIDENCE_FIELDS:
+        text = sources[field]
+        for family, markers in _POSE_CLASSIFIERS:
+            for marker in markers:
+                rejected.extend(
+                    {
+                        "field": field,
+                        "family": family,
+                        "marker": marker,
+                        "polarity": "negated",
+                    }
+                    for _index, negated in _marker_occurrences(text, marker)
+                    if negated
+                )
+    for field in _POSE_EVIDENCE_FIELDS:
+        text = sources[field]
+        for family, markers in _POSE_CLASSIFIERS:
+            for marker in markers:
+                occurrences = _marker_occurrences(text, marker)
+                positive = next((index for index, negated in occurrences if not negated), None)
+                if positive is not None:
+                    return family, {
+                        "field": field,
+                        "family": family,
+                        "marker": marker,
+                        "polarity": "positive",
+                        "rejected_negated_matches": rejected,
+                    }
+    return "spatial", {
+        "field": "none",
+        "family": "spatial",
+        "marker": "no_controlled_marker",
+        "polarity": "none",
+        "rejected_negated_matches": rejected,
+    }
 
 
 def _direction(action_text: str, mechanics: Mapping[str, Any]) -> tuple[str, str]:
@@ -334,26 +456,170 @@ _POSES: dict[str, dict[str, tuple[int, int]]] = {
 }
 
 
-def _phase_geometry(family: str, stage: str, direction: str) -> dict[str, tuple[int, int]]:
-    target = _POSES[family]
-    factor = float(_POSE_POLICY["phase_samples"].get(stage, 1.0))
+def _has_positive_marker(text: str, markers: Sequence[str]) -> bool:
+    return any(
+        not negated
+        for marker in markers
+        for _index, negated in _marker_occurrences(text, marker)
+    )
+
+
+def _mechanics_modifiers(mechanics: Mapping[str, Any], direction: str) -> dict[str, Any]:
+    movement_text = " ".join(
+        str(mechanics.get(key) or "")
+        for key in ("technique", "footwork", "torso", "weight_shift", "direction", "end_pose")
+    )
+    contact_text = str(mechanics.get("contact") or "")
+    center_drop = 18 if _has_positive_marker(movement_text, _MECHANICS_MARKERS["center_drop"]) else 0
+    lean_back = _has_positive_marker(movement_text, _MECHANICS_MARKERS["lean_back"])
+    lean_forward = _has_positive_marker(movement_text, _MECHANICS_MARKERS["lean_forward"])
+    torso_lean = -24 if lean_back and not lean_forward else 18 if lean_forward and not lean_back else 0
+    stance_width = 16 if _has_positive_marker(movement_text, _MECHANICS_MARKERS["wide_stance"]) else 0
+    lead_step = 24 if stance_width and direction in {"right", "forward"} else -24 if stance_width else 0
+    two_hand_hold = _has_positive_marker(
+        f"{movement_text} {contact_text}",
+        _MECHANICS_MARKERS["two_hand_hold"],
+    )
+    return {
+        "center_drop": center_drop,
+        "torso_lean": torso_lean,
+        "stance_width": stance_width,
+        "lead_step": lead_step,
+        "two_hand_hold": two_hand_hold,
+    }
+
+
+def _mechanics_target(
+    family: str,
+    mechanics_modifiers: Mapping[str, Any],
+) -> dict[str, tuple[int, int]]:
+    target = dict(_POSES[family])
+    center_drop = int(mechanics_modifiers.get("center_drop") or 0)
+    torso_lean = int(mechanics_modifiers.get("torso_lean") or 0)
+    stance_width = int(mechanics_modifiers.get("stance_width") or 0)
+    lead_step = int(mechanics_modifiers.get("lead_step") or 0)
+
+    upper_joints = (
+        "head",
+        "neck",
+        "left_shoulder",
+        "right_shoulder",
+        "left_elbow",
+        "right_elbow",
+        "left_hand",
+        "right_hand",
+    )
+    for joint in upper_joints:
+        x, y = target[joint]
+        target[joint] = (x + torso_lean, y + center_drop)
+    for joint in ("left_hip", "right_hip"):
+        x, y = target[joint]
+        target[joint] = (x + round(lead_step * 0.25), y + center_drop)
+    for joint in ("left_knee", "right_knee"):
+        x, y = target[joint]
+        target[joint] = (x, y + round(center_drop * 0.6))
+    left_x, left_y = target["left_foot"]
+    right_x, right_y = target["right_foot"]
+    target["left_foot"] = (left_x - stance_width, left_y)
+    target["right_foot"] = (right_x + stance_width + lead_step, right_y)
+
+    if mechanics_modifiers.get("two_hand_hold") and family in {
+        "ready",
+        "evade",
+        "locomotion",
+        "prop_hold",
+        "prop_use",
+    }:
+        target["left_hand"] = (-13 + torso_lean, -5 + center_drop)
+        target["right_hand"] = (13 + torso_lean, -5 + center_drop)
+    return target
+
+
+def _phase_geometry(
+    family: str,
+    stage: str,
+    direction: str,
+    *,
+    pose_progress: float,
+    mechanics_modifiers: Mapping[str, Any],
+    origin_family: str | None = None,
+    origin_direction: str = "right",
+    origin_mechanics_modifiers: Mapping[str, Any] | None = None,
+) -> dict[str, tuple[int, int]]:
+    target = _mechanics_target(family, mechanics_modifiers)
+    if direction in {"left", "backward"}:
+        target = {joint: (-point[0], point[1]) for joint, point in target.items()}
+    if origin_family is None:
+        origin = _NEUTRAL
+    else:
+        origin = _mechanics_target(
+            origin_family,
+            origin_mechanics_modifiers or {},
+        )
+        if origin_direction in {"left", "backward"}:
+            origin = {joint: (-point[0], point[1]) for joint, point in origin.items()}
+    factor = max(0.0, min(1.0, pose_progress))
     geometry: dict[str, tuple[int, int]] = {}
-    for joint, neutral in _NEUTRAL.items():
+    for joint, origin_point in origin.items():
         target_point = target[joint]
-        x = round(neutral[0] + (target_point[0] - neutral[0]) * factor)
-        y = round(neutral[1] + (target_point[1] - neutral[1]) * factor)
-        if direction in {"left", "backward"}:
-            x = -x
+        x = round(origin_point[0] + (target_point[0] - origin_point[0]) * factor)
+        y = round(origin_point[1] + (target_point[1] - origin_point[1]) * factor)
         geometry[joint] = (x, y)
     return geometry
+
+
+def _root_motion(family: str, direction: str, pose_progress: float) -> tuple[int, int]:
+    magnitude = {
+        "locomotion": 110,
+        "evade": 90,
+        "strike": 42,
+        "kick": 48,
+        "grab_control": 38,
+        "throw": 54,
+        "fall_land": 82,
+        "reveal": 24,
+        "ready": 16,
+        "block": 18,
+        "prop_use": 20,
+        "prop_hold": 12,
+        # An unresolved actor action still needs a small, auditable pose-to-pose
+        # weight shift. Environment-only spatial cells have no actors and remain
+        # static, so this never fabricates a person for object/camera motion.
+        "spatial": 16,
+    }[family]
+    travel = round(magnitude * max(0.0, min(1.0, pose_progress)))
+    if direction == "left":
+        return -travel, 0
+    if direction in {"right", "forward"}:
+        return travel, 0
+    if direction == "backward":
+        return -travel, 0
+    if direction == "up":
+        return 0, -travel
+    if direction == "down":
+        return 0, travel
+    return 0, 0
+
+
+def _actor_pose_for_slot(family: str, direction: str, slot_index: int) -> tuple[str, str]:
+    if slot_index <= 0 or family not in {"strike", "kick", "grab_control", "throw"}:
+        return family, direction
+    actor_family = "evade" if family != "throw" else "fall_land"
+    actor_direction = "left" if direction in {"right", "forward"} else "right"
+    return actor_family, actor_direction
 
 
 def _global_geometry(
     family: str,
     stage: str,
     direction: str,
-    actor_count: int,
+    actor_roles: Sequence[str],
+    *,
+    pose_progress: float,
+    mechanics_modifiers: Mapping[str, Any],
+    prior_actions: Sequence[Mapping[str, Any]] = (),
 ) -> list[dict[str, Any]]:
+    actor_count = len(actor_roles)
     if actor_count <= 0:
         return []
     span = 700
@@ -364,17 +630,63 @@ def _global_geometry(
     )
     scale = max(0.42, min(0.88, 2.2 / actor_count))
     actors = []
-    for index, center_x in enumerate(centers):
-        actor_family = family
-        actor_direction = direction
-        if index > 0 and family in {"strike", "kick", "grab_control", "throw"}:
-            actor_family = "evade" if family != "throw" else "fall_land"
-            actor_direction = "left" if direction in {"right", "forward"} else "right"
-        local = _phase_geometry(actor_family, stage, actor_direction)
+    for index, (center_x, actor_role) in enumerate(zip(centers, actor_roles, strict=True)):
+        actor_family, actor_direction = _actor_pose_for_slot(family, direction, index)
+        role_prior_actions: list[tuple[Mapping[str, Any], int]] = []
+        for prior_action in reversed(prior_actions):
+            prior_actor_roles = list(prior_action.get("actor_roles") or [])
+            if actor_role not in prior_actor_roles:
+                break
+            role_prior_actions.append((prior_action, prior_actor_roles.index(actor_role)))
+        role_prior_actions.reverse()
+        origin_entry = role_prior_actions[-1] if role_prior_actions else None
+        origin_action = origin_entry[0] if origin_entry else None
+        origin_slot_index = origin_entry[1] if origin_entry else 0
+        if origin_action is None:
+            origin_family = None
+            origin_direction = "right"
+            origin_modifiers: Mapping[str, Any] = {}
+        else:
+            origin_family, origin_direction = _actor_pose_for_slot(
+                str(origin_action["family"]),
+                str(origin_action["direction"]),
+                origin_slot_index,
+            )
+            origin_modifiers = (
+                origin_action["mechanics_modifiers"] if origin_slot_index == 0 else {}
+            )
+        local = _phase_geometry(
+            actor_family,
+            stage,
+            actor_direction,
+            pose_progress=pose_progress,
+            mechanics_modifiers=mechanics_modifiers if index == 0 else {},
+            origin_family=origin_family,
+            origin_direction=origin_direction,
+            origin_mechanics_modifiers=origin_modifiers,
+        )
+        root_origin_x = 0
+        root_origin_y = 0
+        for prior_action, prior_slot_index in role_prior_actions:
+            prior_family, prior_direction = _actor_pose_for_slot(
+                str(prior_action["family"]),
+                str(prior_action["direction"]),
+                prior_slot_index,
+            )
+            prior_x, prior_y = _root_motion(prior_family, prior_direction, 1.0)
+            root_origin_x += prior_x
+            root_origin_y += prior_y
+        root_delta_x, root_delta_y = _root_motion(
+            actor_family,
+            actor_direction,
+            pose_progress,
+        )
+        root_x = root_origin_x + root_delta_x
+        root_y = root_origin_y + root_delta_y
         joints = {
             joint: [
-                max(35, min(965, round(center_x + point[0] * scale))),
-                max(180, min(925, round(520 + point[1] * scale * 3.1))),
+                max(35, min(965, round(center_x + root_x + point[0] * scale))),
+                max(180, min(925, round(520 + root_y + point[1] * scale * 3.1))),
             ]
             for joint, point in local.items()
         }
@@ -383,6 +695,8 @@ def _global_geometry(
                 "slot": index + 1,
                 "pose_family": actor_family,
                 "facing": actor_direction,
+                "root_origin": [root_origin_x, root_origin_y],
+                "root_translation": [root_x, root_y],
                 "joints": joints,
             }
         )
@@ -407,7 +721,12 @@ def _matching_mechanics(
         for item in body_beats
         if isinstance(item, Mapping) and int(item.get("micro_action_index") or 0) in source_indexes
     ]
-    if not matches and len(body_beats) == 1 and isinstance(body_beats[0], Mapping):
+    if (
+        not matches
+        and not source_indexes
+        and len(body_beats) == 1
+        and isinstance(body_beats[0], Mapping)
+    ):
         matches = [body_beats[0]]
     combined: dict[str, Any] = {}
     for key in (
@@ -521,6 +840,35 @@ def _partition_units(units: list[dict[str, Any]], cell_count: int) -> list[list[
     return groups
 
 
+def _pose_progress_samples(
+    cells: Sequence[Mapping[str, Any]],
+    groups: Sequence[Sequence[Mapping[str, Any]]],
+) -> list[float]:
+    group_keys = [tuple(str(unit["unit_id"]) for unit in group) for group in groups]
+    positions: dict[tuple[str, ...], list[int]] = {}
+    for index, key in enumerate(group_keys):
+        positions.setdefault(key, []).append(index)
+    samples: list[float] = []
+    for index, (cell, key) in enumerate(zip(cells, group_keys, strict=True)):
+        occurrences = positions[key]
+        if len(occurrences) > 1:
+            ordinal = occurrences.index(index)
+            progress = ordinal / (len(occurrences) - 1)
+        else:
+            explicit = cell.get("action_progress")
+            if isinstance(explicit, (int, float)) and not isinstance(explicit, bool):
+                progress = float(explicit)
+            else:
+                progress = float(
+                    _POSE_POLICY["phase_samples"].get(
+                        str(cell.get("stage") or "action_progress"),
+                        0.7,
+                    )
+                )
+        samples.append(round(max(0.0, min(1.0, progress)), 3))
+    return samples
+
+
 def compile_pose_contracts(
     beat: Mapping[str, Any],
     cells: list[dict[str, Any]],
@@ -530,14 +878,20 @@ def compile_pose_contracts(
     """Attach one source-bound, deterministic pose contract to every Gxx cell."""
     units, lineage_status = _validated_units(beat)
     groups = _partition_units(units, len(cells))
+    progress_samples = _pose_progress_samples(cells, groups)
     source_actor_roles = {value.casefold() for value in known_actor_roles if value}
     result: list[dict[str, Any]] = []
-    for cell, group in zip(cells, groups, strict=True):
+    active_group_key: tuple[str, ...] | None = None
+    active_action: dict[str, Any] | None = None
+    prior_actions: list[dict[str, Any]] = []
+    for cell, group, pose_progress in zip(cells, groups, progress_samples, strict=True):
         actions = [action for unit in group for action in _strings(unit.get("actions"))]
         action_text = " → ".join(actions)
         mechanics, matched_body_action_beats = _matching_mechanics(beat, group)
         family, family_evidence = _pose_family(action_text, mechanics)
         direction, direction_evidence = _direction(action_text, mechanics)
+        mechanics_modifiers = _mechanics_modifiers(mechanics, direction)
+        group_key = tuple(str(unit["unit_id"]) for unit in group)
         performers = _dedupe(
             [value for unit in group for value in _strings(unit.get("performers"))]
         )
@@ -564,11 +918,28 @@ def compile_pose_contracts(
             [value for value in performers + targets if value not in actor_roles]
         )
         static_spatial_state = family == "spatial" and not actor_roles
+        current_action = {
+            "unit_ids": list(group_key),
+            "family": family,
+            "direction": direction,
+            "mechanics_modifiers": mechanics_modifiers,
+            "actor_roles": actor_roles,
+        }
+        if active_group_key != group_key:
+            if active_action is not None:
+                prior_actions.append(active_action)
+            active_group_key = group_key
+            active_action = current_action
+        elif active_action != current_action:
+            raise ValueError("one action-unit group resolved to inconsistent pose semantics")
         actors = _global_geometry(
             family,
             str(cell.get("stage") or "action_progress"),
             direction,
-            len(actor_roles),
+            actor_roles,
+            pose_progress=pose_progress,
+            mechanics_modifiers=mechanics_modifiers,
+            prior_actions=prior_actions,
         )
         for actor, role in zip(actors, actor_roles, strict=True):
             actor["role_ref"] = role
@@ -595,11 +966,29 @@ def compile_pose_contracts(
         ]
         action_vector = _action_vector(direction, static=static_spatial_state)
         camera_vector = _camera_vector(str(cell.get("camera_movement") or ""))
+        transition_origin = (
+            {
+                "source": "previous_canonical_action",
+                "unit_ids": list(prior_actions[-1]["unit_ids"]),
+                "pose_family": str(prior_actions[-1]["family"]),
+                "direction": str(prior_actions[-1]["direction"]),
+            }
+            if prior_actions
+            else {
+                "source": "neutral",
+                "unit_ids": [],
+                "pose_family": "neutral",
+                "direction": "right",
+            }
+        )
         pose_fingerprint = _canonical_sha256(
             {
                 "family": family,
                 "stage": str(cell.get("stage") or ""),
+                "pose_progress": pose_progress,
                 "direction": direction,
+                "mechanics_modifiers": mechanics_modifiers,
+                "transition_origin": transition_origin,
                 "actors": actors,
                 "objects": geometry["objects"],
                 "action_vector": action_vector,
@@ -623,9 +1012,12 @@ def compile_pose_contracts(
             "matched_body_action_beats": matched_body_action_beats,
             "pose_family": family,
             "pose_phase": str(cell.get("stage") or ""),
+            "pose_progress": pose_progress,
             "classification_evidence": family_evidence,
             "direction": direction,
             "direction_evidence": direction_evidence,
+            "mechanics_modifiers": mechanics_modifiers,
+            "transition_origin": transition_origin,
             "actor_roles": actor_roles,
             "object_roles": object_roles,
             "action_vector": action_vector,
@@ -655,6 +1047,54 @@ def validate_pose_contract(contract: Mapping[str, Any], *, cell_id: str, beat_id
     unhashed.pop("contract_sha256", None)
     if stored_contract_sha != _canonical_sha256(unhashed):
         raise ValueError("story guide pose contract hash mismatch")
+    evidence = contract.get("classification_evidence")
+    if not isinstance(evidence, Mapping) or evidence.get("polarity") not in {
+        "positive",
+        "none",
+    }:
+        raise ValueError("story guide pose classification evidence is invalid")
+    progress = contract.get("pose_progress")
+    if (
+        not isinstance(progress, (int, float))
+        or isinstance(progress, bool)
+        or not 0.0 <= float(progress) <= 1.0
+    ):
+        raise ValueError("story guide pose progress is invalid")
+    modifiers = contract.get("mechanics_modifiers")
+    if not isinstance(modifiers, Mapping) or set(modifiers) != {
+        "center_drop",
+        "torso_lean",
+        "stance_width",
+        "lead_step",
+        "two_hand_hold",
+    }:
+        raise ValueError("story guide mechanics modifiers are invalid")
+    transition_origin = contract.get("transition_origin")
+    if not isinstance(transition_origin, Mapping):
+        raise ValueError("story guide transition origin is missing")
+    origin_source = transition_origin.get("source")
+    origin_unit_ids = transition_origin.get("unit_ids")
+    if (
+        origin_source not in {"neutral", "previous_canonical_action"}
+        or not isinstance(origin_unit_ids, list)
+        or any(not isinstance(unit_id, str) or not unit_id for unit_id in origin_unit_ids)
+    ):
+        raise ValueError("story guide transition origin is invalid")
+    if origin_source == "neutral":
+        if (
+            origin_unit_ids
+            or transition_origin.get("pose_family") != "neutral"
+            or transition_origin.get("direction") != "right"
+        ):
+            raise ValueError("story guide neutral transition origin is invalid")
+    elif (
+        not origin_unit_ids
+        or transition_origin.get("pose_family") not in {family for family, _ in _POSE_CLASSIFIERS}
+        | {"spatial"}
+        or transition_origin.get("direction")
+        not in {direction for direction, _ in _DIRECTION_MARKERS}
+    ):
+        raise ValueError("story guide canonical transition origin is invalid")
     geometry = contract.get("geometry")
     if not isinstance(geometry, Mapping):
         raise ValueError("story guide pose geometry is missing")
@@ -682,7 +1122,10 @@ def validate_pose_contract(contract: Mapping[str, Any], *, cell_id: str, beat_id
         {
             "family": contract.get("pose_family"),
             "stage": contract.get("stage"),
+            "pose_progress": progress,
             "direction": contract.get("direction"),
+            "mechanics_modifiers": modifiers,
+            "transition_origin": transition_origin,
             "actors": actors,
             "objects": geometry.get("objects") or [],
             "action_vector": contract.get("action_vector"),
@@ -835,6 +1278,12 @@ def validate_pose_sequence(cells: list[Mapping[str, Any]], *, beat_id: str) -> N
             cell_id=str(cell.get("label") or ""),
             beat_id=beat_id,
         )
+    progress_groups: dict[str, list[Mapping[str, Any]]] = {}
+    for cell in cells:
+        contract = cell["pose_contract"]
+        if not contract["static_spatial_state"]:
+            binding_key = _canonical_sha256(contract["action_bindings"])
+            progress_groups.setdefault(binding_key, []).append(contract)
     for previous, current in pairwise(cells):
         previous_contract = previous["pose_contract"]
         current_contract = current["pose_contract"]
@@ -851,3 +1300,63 @@ def validate_pose_sequence(cells: list[Mapping[str, Any]], *, beat_id: str) -> N
             and previous_contract["pose_fingerprint"] == current_contract["pose_fingerprint"]
         ):
             raise ValueError(f"{beat_id} has distinct action semantics collapsed to one pose")
+        if previous_contract["action_bindings"] != current_contract["action_bindings"]:
+            expected_origin_ids = [
+                str(binding["unit_id"])
+                for binding in previous_contract["action_bindings"]
+            ]
+            current_origin = current_contract["transition_origin"]
+            if (
+                current_origin["source"] != "previous_canonical_action"
+                or current_origin["unit_ids"] != expected_origin_ids
+                or current_origin["pose_family"] != previous_contract["pose_family"]
+                or current_origin["direction"] != previous_contract["direction"]
+            ):
+                raise ValueError(f"{beat_id} action transition lost its canonical origin")
+        same_action = previous_contract["action_bindings"] == current_contract["action_bindings"]
+        progress_changed = previous_contract["pose_progress"] != current_contract["pose_progress"]
+        if same_action and progress_changed and not both_static:
+            previous_actors = previous_contract["geometry"]["actors"]
+            current_actors = current_contract["geometry"]["actors"]
+            if not previous_actors or len(previous_actors) != len(current_actors):
+                continue
+            maximum_delta = max(
+                (
+                    abs(previous_point[0] - current_point[0])
+                    + abs(previous_point[1] - current_point[1])
+                    for previous_actor, current_actor in zip(
+                        previous_actors, current_actors, strict=True
+                    )
+                    for joint, previous_point in previous_actor["joints"].items()
+                    for current_point in [current_actor["joints"][joint]]
+                ),
+                default=0,
+            )
+            if maximum_delta < int(_POSE_POLICY["minimum_adjacent_joint_delta"]):
+                raise ValueError(
+                    f"{beat_id} adjacent action progress lacks visible joint displacement"
+                )
+    for contracts in progress_groups.values():
+        if len(contracts) < 2:
+            continue
+        ordered = sorted(contracts, key=lambda item: float(item["pose_progress"]))
+        first = ordered[0]
+        last = ordered[-1]
+        if first["pose_progress"] == last["pose_progress"]:
+            continue
+        first_actors = first["geometry"]["actors"]
+        last_actors = last["geometry"]["actors"]
+        if not first_actors or len(first_actors) != len(last_actors):
+            continue
+        maximum_span_delta = max(
+            (
+                abs(first_point[0] - last_point[0])
+                + abs(first_point[1] - last_point[1])
+                for first_actor, last_actor in zip(first_actors, last_actors, strict=True)
+                for joint, first_point in first_actor["joints"].items()
+                for last_point in [last_actor["joints"][joint]]
+            ),
+            default=0,
+        )
+        if maximum_span_delta < int(_POSE_POLICY["minimum_action_span_joint_delta"]):
+            raise ValueError(f"{beat_id} action span lacks meaningful joint displacement")
