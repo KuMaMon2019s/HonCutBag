@@ -99,12 +99,16 @@ class GenerationChunk(BaseModel):
         default=None, exclude_if=lambda value: value is None
     )
     storyboard_narrative_guide_kind: Literal[
-        "honcut.storyboard-narrative-guide.v3"
+        "honcut.storyboard-narrative-guide.v4"
     ] | None = Field(default=None, exclude_if=lambda value: value is None)
     storyboard_narrative_guide_usage: Literal[
         "phase6_story_narrative_guide_not_output_pixels"
     ] | None = Field(default=None, exclude_if=lambda value: value is None)
     storyboard_narrative_guide_cell_ids: list[str] = Field(
+        default_factory=list,
+        exclude_if=lambda value: not value,
+    )
+    storyboard_narrative_guide_zero_time_anchor_cell_ids: list[str] = Field(
         default_factory=list,
         exclude_if=lambda value: not value,
     )
@@ -117,7 +121,7 @@ class GenerationChunk(BaseModel):
         "honcut.identity-neutral-story-guide-renderer.v2"
     ] | None = Field(default=None, exclude_if=lambda value: value is None)
     storyboard_narrative_guide_pose_contract_schema: Literal[
-        "honcut.storyboard-guide-pose-contract.v2"
+        "honcut.storyboard-guide-pose-contract.v3"
     ] | None = Field(default=None, exclude_if=lambda value: value is None)
     storyboard_narrative_guide_pose_policy_sha256: str | None = Field(
         default=None,
@@ -238,6 +242,7 @@ class GenerationChunk(BaseModel):
         )
         guide_declared = any(value is not None for value in guide_fields) or bool(
             self.storyboard_narrative_guide_cell_ids
+            or self.storyboard_narrative_guide_zero_time_anchor_cell_ids
             or self.storyboard_narrative_guide_pose_fingerprints
             or self.storyboard_narrative_guide_authority_roles
             or self.storyboard_narrative_guide_non_authority_roles
@@ -263,6 +268,15 @@ class GenerationChunk(BaseModel):
                 expected_numbers.append(int(suffix))
             if expected_numbers != sorted(set(expected_numbers)):
                 raise ValueError("narrative guide cell IDs must be unique and ordered")
+            anchor_cells = self.storyboard_narrative_guide_zero_time_anchor_cell_ids
+            if anchor_cells and anchor_cells != [self.storyboard_narrative_guide_cell_ids[0]]:
+                raise ValueError(
+                    "narrative guide zero-time anchor must be exactly the first Gxx cell"
+                )
+            if anchor_cells and len(self.storyboard_narrative_guide_cell_ids) < 2:
+                raise ValueError(
+                    "narrative guide zero-time anchor must precede a story-action cell"
+                )
             if len(self.storyboard_narrative_guide_pose_fingerprints) != len(
                 self.storyboard_narrative_guide_cell_ids
             ) or any(

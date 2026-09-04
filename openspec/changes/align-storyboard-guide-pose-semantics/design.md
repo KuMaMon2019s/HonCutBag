@@ -24,13 +24,15 @@ The run-17 `S01_P01` evidence contains three materially different cells but iden
 
 ### 1. Add a Phase 2 pose-semantics compiler before rendering
 
-Phase 2 will compile a `honcut.storyboard-guide-pose-contract.v2` for each assigned Gxx. The compiler consumes, in authority order:
+Phase 2 will compile a versioned `honcut.storyboard-guide-pose-contract` for each assigned Gxx. The compiler consumes, in authority order:
 
 1. current Pxx `generation_action_units` and their `unit_id`, `source_action_unit_id`, source indexes, performers, targets and ordered actions;
 2. matching valid `body_action_contract.beats` fields (`performer`, `technique`, `side`, `limbs`, `footwork`, `torso`, `weight_shift`, `direction`, `contact`, `end_pose`);
 3. the Gxx stage and current camera-motion contract.
 
 The compiler partitions ordered generation units across the Gxx allocated to that Pxx. When a unit spans multiple cells, stage/progress produces preparation, execution and recovery/terminal variants of the same action. When units outnumber cells, a cell may bind an ordered group, but the source IDs remain explicit and no unit is silently dropped. When cells outnumber units, the unit is expanded into monotonic phase samples rather than duplicated as identical geometry.
+
+The P01 first unit receives a special timing role only when controlled pose classification resolves it to the pure `ready` family and at least one later unit resolves to a dynamic family. In that case Phase 2 emits exactly one completed-pose cell with `timing_role=initial_anchor` and `story_time_weight=0`; it is a t=0 state already established by the Phase 4 cinematic first frame. The remaining cells are reallocated to later dynamic units. This does not remove the source action or change ordering. A lone ready action, P02+ without a cinematic first frame, and other low-motion families such as prop hold or spatial state remain ordinary timed actions. Phase 4 transports the explicit timing metadata and Phase 6 tells the Provider to begin the next Gxx immediately; neither downstream owner reclassifies the action.
 
 Controlled lexical classification over the canonical action strings is allowed only to select a generic pose family when typed mechanics are absent. It is versioned, deterministic, multilingual and auditable; it does not create source IDs, characters, props or plot outcomes. This is preferable to hashing prose (which has no semantic meaning) and to adding a Provider call (which would be probabilistic and costly).
 
@@ -54,13 +56,14 @@ Alternative considered: import the Phase 3 performance-board renderer. Rejected 
 
 ### 3. Version the complete observable contract
 
-Upgrade the guide to `honcut.storyboard-narrative-guide.v3` and renderer to `honcut.identity-neutral-story-guide-renderer.v2`. The semantic payload and receipt add:
+Upgrade the timing-bearing pose contract and enclosing guide/shot-storyboard manifests together while retaining renderer `honcut.identity-neutral-story-guide-renderer.v2`. The semantic payload and receipt add:
 
 - `pose_contract_schema` and `pose_policy_sha256`;
 - per-cell ordered action bindings and source lineage;
 - actor/object role slots, pose family, phase and normalized joint geometry;
 - per-actor and per-cell pose fingerprints;
 - resolved action-vector and camera-vector fields.
+- per-cell `timing_role` and `story_time_weight`, plus the ordered zero-time anchor cell IDs propagated to Phase 6.
 
 The shot-storyboard manifest version is bumped because it embeds the new guide contract. `STORYBOARD.json`, the continuity DTO, Phase 4 projection, asset packager and Phase 6 request fingerprint carry the current guide kind/renderer plus pose-contract hash and ordered pose fingerprints. Existing authority/non-authority roles and `source_pixel_usage=none` remain unchanged.
 

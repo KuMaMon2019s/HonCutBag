@@ -38,6 +38,26 @@
 - **WHEN** 同一动作单元被展开到多个 Gxx
 - **THEN** 每格必须持久化单调且互异的动作进度，并使根位移、躯干、重心、步幅或关节产生达到确定性最小位移的连续变化
 
+#### Scenario: 首个纯戒备是零时长初始锚点
+- **WHEN** 当前 P01 的首个 canonical 动作单元只表达 ready/guard 姿态、其后至少存在一个可执行的动态动作单元，且 Phase 4 成片首帧负责建立该初始姿态
+- **THEN** 系统必须只分配一个 Gxx 给该戒备动作，将其标记为 `initial_anchor`、`story_time_weight=0` 和完成态姿势，并把其余 Gxx 分配给后续动态动作
+
+#### Scenario: 首帧后立即开始动态动作
+- **WHEN** Phase 6 消费含 `initial_anchor` 的当前 Pxx 导航图
+- **THEN** 最终媒体合同和提示词必须声明该 Gxx 是 t=0 已成立状态、不占动作时长，并要求首帧后立即从下一 Gxx 开始运动，禁止追加站立、准备或持姿停顿
+
+#### Scenario: 单独戒备仍是有时长动作
+- **WHEN** 当前 Pxx 只有戒备动作，或戒备之后没有可执行的动态动作
+- **THEN** 系统不得将其标记为零时长锚点，仍按普通 story action 分配与演绎
+
+#### Scenario: 非戒备静态状态不得被压缩
+- **WHEN** 首个动作是持道具、环境、空间、注视或其他非 ready/guard 动作
+- **THEN** 系统不得仅因其运动幅度小而把它推断为零时长锚点
+
+#### Scenario: P02+ 不推断首帧锚点
+- **WHEN** P02 或后续片段以戒备姿态开始，但没有独立的 Phase 4 cinematic first frame 证明该姿态已经成立
+- **THEN** 系统必须保留其正常故事时长，不得把前序视频自行解释为零时长戒备证据
+
 #### Scenario: 连续动作不得回到中立姿态重置
 - **WHEN** 一个 Pxx 的相邻 Gxx 从一个 canonical action unit 进入下一个 action unit
 - **THEN** 后一动作必须从前一动作的最终关节与累计根位置开始，并持久化前一 action unit 的 transition origin，不得在动作边界瞬间重置为默认站姿

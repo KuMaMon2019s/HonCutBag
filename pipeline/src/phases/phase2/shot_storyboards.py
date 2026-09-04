@@ -51,6 +51,7 @@ from phases.phase2.storyboard_guide_pose import (
     pose_fingerprints,
     render_pose_cell,
     validate_pose_sequence,
+    zero_time_anchor_cell_ids,
 )
 
 SHOT_STORYBOARD_SIZE = "2K"
@@ -59,14 +60,15 @@ SHOT_STORYBOARD_GRID_ROWS = 3
 SHOT_STORYBOARD_GRID_CELLS = (
     SHOT_STORYBOARD_GRID_COLUMNS * SHOT_STORYBOARD_GRID_ROWS
 )
-SHOT_STORYBOARDS_SCHEMA = "honcut.shot_storyboards.v5"
+SHOT_STORYBOARDS_SCHEMA = "honcut.shot_storyboards.v6"
 SHOT_STORYBOARD_GRID_SCHEMA = "honcut.shot-storyboard-grid.v3"
-STORYBOARD_NARRATIVE_GUIDE_SCHEMA = "honcut.storyboard-narrative-guide.v3"
+STORYBOARD_NARRATIVE_GUIDE_SCHEMA = "honcut.storyboard-narrative-guide.v4"
 STORYBOARD_NARRATIVE_GUIDE_USAGE = "phase6_story_narrative_guide_not_output_pixels"
 STORYBOARD_NARRATIVE_GUIDE_RENDERER = "honcut.identity-neutral-story-guide-renderer.v2"
 LEGACY_STORYBOARD_NARRATIVE_GUIDE_SCHEMAS = {
     "honcut.storyboard-narrative-guide.v1",
     "honcut.storyboard-narrative-guide.v2",
+    "honcut.storyboard-narrative-guide.v3",
 }
 PANEL_PROMPT_TEMPLATE_ID = "honcut.storyboard-panel-prompt"
 PANEL_PROMPT_TEMPLATE_VERSION = "2"
@@ -495,6 +497,7 @@ def _guide_semantic_payload(
         "cell_ids": cell_ids,
         "pose_contracts_sha256": pose_contracts_sha256(cells),
         "pose_fingerprints": pose_fingerprints(cells),
+        "zero_time_anchor_cell_ids": zero_time_anchor_cell_ids(cells),
         "cells": cells,
     }
 
@@ -575,7 +578,7 @@ def _derive_narrative_guides(
         receipt_path = guide_dir / f"{beat_id}.json"
         record = {
             "kind": STORYBOARD_NARRATIVE_GUIDE_SCHEMA,
-            "version": 3,
+            "version": 4,
             "status": "done",
             "usage": STORYBOARD_NARRATIVE_GUIDE_USAGE,
             "renderer": STORYBOARD_NARRATIVE_GUIDE_RENDERER,
@@ -591,6 +594,7 @@ def _derive_narrative_guides(
             "pose_policy_sha256": payload["pose_policy_sha256"],
             "pose_contracts_sha256": payload["pose_contracts_sha256"],
             "pose_fingerprints": payload["pose_fingerprints"],
+            "zero_time_anchor_cell_ids": payload["zero_time_anchor_cell_ids"],
             "semantic_payload": payload,
             "semantic_payload_sha256": semantic_sha256,
             "layout": {
@@ -1826,6 +1830,7 @@ def _guide_reference(guide: dict[str, Any]) -> dict[str, Any]:
             "pose_policy_sha256",
             "pose_contracts_sha256",
             "pose_fingerprints",
+            "zero_time_anchor_cell_ids",
             "semantic_payload_sha256",
             "authority_roles",
             "non_authority_roles",
@@ -1847,6 +1852,9 @@ def _bind_guide_to_beat(beat: dict[str, Any], guide: dict[str, Any]) -> None:
             "storyboard_narrative_guide_pose_policy_sha256": guide["pose_policy_sha256"],
             "storyboard_narrative_guide_pose_contracts_sha256": guide["pose_contracts_sha256"],
             "storyboard_narrative_guide_pose_fingerprints": guide["pose_fingerprints"],
+            "storyboard_narrative_guide_zero_time_anchor_cell_ids": guide[
+                "zero_time_anchor_cell_ids"
+            ],
             "storyboard_narrative_guide_sha256": guide["image_sha256"],
             "storyboard_narrative_guide_semantic_payload_sha256": guide["semantic_payload_sha256"],
             "storyboard_narrative_guide_source_board": guide["source_board"],
@@ -1909,14 +1917,14 @@ def _migrate_shot_storyboard_narrative_guides(
     output_dir: Path,
     storyboard: dict[str, Any],
 ) -> dict[str, Any]:
-    """Locally redraw verified legacy semantics as source-bound v3 guides."""
+    """Locally redraw verified legacy semantics as source-bound v4 guides."""
     output_dir = Path(output_dir)
     manifest_path = output_dir / "SHOT_STORYBOARDS.json"
     raw_manifest = manifest_path.read_bytes()
     manifest = json.loads(raw_manifest.decode("utf-8"))
     kind = str(manifest.get("kind") or "")
     version = int(manifest.get("version") or 0)
-    if kind == SHOT_STORYBOARDS_SCHEMA and version == 5:
+    if kind == SHOT_STORYBOARDS_SCHEMA and version == 6:
         errors = validate_shot_storyboard_artifacts(output_dir, storyboard)
         if errors:
             raise RuntimeError(
@@ -1927,6 +1935,7 @@ def _migrate_shot_storyboard_narrative_guides(
         ("honcut.shot_storyboards.v2", 2),
         ("honcut.shot_storyboards.v3", 3),
         ("honcut.shot_storyboards.v4", 4),
+        ("honcut.shot_storyboards.v5", 5),
     }
     if (kind, version) not in supported_sources:
         raise RuntimeError(f"unsupported storyboard migration source: {kind or '<missing>'}")
@@ -1972,6 +1981,7 @@ def _migrate_shot_storyboard_narrative_guides(
         if kind in {
             "honcut.shot_storyboards.v3",
             "honcut.shot_storyboards.v4",
+            "honcut.shot_storyboards.v5",
         }:
             if record.get("beat_cell_assignments") != assignments:
                 raise RuntimeError(f"{shot_id} legacy guide assignment is not canonical")
@@ -1995,7 +2005,7 @@ def _migrate_shot_storyboard_narrative_guides(
             board_path,
             grid_contract,
             assignments,
-            relative_guide_dir="storyboard_guides/v3",
+            relative_guide_dir="storyboard_guides/v4",
         )
         guides_by_beat = {str(guide["beat_id"]): guide for guide in guides}
         panels_by_beat = {
@@ -2038,7 +2048,7 @@ def _migrate_shot_storyboard_narrative_guides(
     manifest.update(
         {
             "kind": SHOT_STORYBOARDS_SCHEMA,
-            "version": 5,
+            "version": 6,
             "shots": migrated_records,
             "total_boards": len(migrated_records),
             "total_panels": sum(int(record.get("panel_count") or 0) for record in migrated_records),
@@ -2111,6 +2121,7 @@ def migrate_shot_storyboard_narrative_guides(
             ("honcut.shot_storyboards.v2", 2),
             ("honcut.shot_storyboards.v3", 3),
             ("honcut.shot_storyboards.v4", 4),
+            ("honcut.shot_storyboards.v5", 5),
         }:
             source_sha256 = hashlib.sha256(raw_manifest).hexdigest()
             audit_dir = output_dir / "storyboard_guides" / "migrations"
@@ -2200,8 +2211,8 @@ def validate_shot_storyboard_artifacts(
         try:
             document = json.loads(manifest.read_text(encoding="utf-8"))
             if document.get("kind") != SHOT_STORYBOARDS_SCHEMA:
-                errors.append("SHOT_STORYBOARDS.json is not the narrative-guide v5 contract")
-            if int(document.get("version") or 0) != 5:
+                errors.append("SHOT_STORYBOARDS.json is not the narrative-guide v6 contract")
+            if int(document.get("version") or 0) != 6:
                 errors.append("SHOT_STORYBOARDS.json has an invalid contract version")
             if document.get("status") != "done":
                 errors.append("SHOT_STORYBOARDS.json is not complete")
@@ -2304,6 +2315,7 @@ def validate_shot_storyboard_artifacts(
                         validate_pose_sequence(semantic_cells, beat_id=beat_id)
                         semantic_pose_contracts_sha256 = pose_contracts_sha256(semantic_cells)
                         semantic_pose_fingerprints = pose_fingerprints(semantic_cells)
+                        semantic_anchor_cells = zero_time_anchor_cell_ids(semantic_cells)
                         beat = authored_beats.get(beat_id) or {}
                         if (
                             guide.get("kind") != STORYBOARD_NARRATIVE_GUIDE_SCHEMA
@@ -2312,7 +2324,7 @@ def validate_shot_storyboard_artifacts(
                             or guide.get("source_pixel_usage") != "none"
                             or guide.get("cell_ids") != assignment.get("cell_ids")
                             or receipt.get("kind") != STORYBOARD_NARRATIVE_GUIDE_SCHEMA
-                            or int(receipt.get("version") or 0) != 3
+                            or int(receipt.get("version") or 0) != 4
                             or receipt.get("status") != "done"
                             or receipt.get("usage") != STORYBOARD_NARRATIVE_GUIDE_USAGE
                             or receipt.get("renderer") != STORYBOARD_NARRATIVE_GUIDE_RENDERER
@@ -2331,6 +2343,12 @@ def validate_shot_storyboard_artifacts(
                             or receipt.get("pose_fingerprints") != semantic_pose_fingerprints
                             or semantic_payload.get("pose_fingerprints")
                             != semantic_pose_fingerprints
+                            or guide.get("zero_time_anchor_cell_ids")
+                            != semantic_anchor_cells
+                            or receipt.get("zero_time_anchor_cell_ids")
+                            != semantic_anchor_cells
+                            or semantic_payload.get("zero_time_anchor_cell_ids")
+                            != semantic_anchor_cells
                             or receipt.get("source_pixel_usage") != "none"
                             or receipt.get("beat_id") != beat_id
                             or receipt.get("primary_shot_id") != shot_id
@@ -2364,6 +2382,10 @@ def validate_shot_storyboard_artifacts(
                             != semantic_pose_contracts_sha256
                             or beat.get("storyboard_narrative_guide_pose_fingerprints")
                             != semantic_pose_fingerprints
+                            or beat.get(
+                                "storyboard_narrative_guide_zero_time_anchor_cell_ids"
+                            )
+                            != semantic_anchor_cells
                             or beat.get("storyboard_narrative_guide_source_pixel_usage") != "none"
                             or beat.get("storyboard_narrative_guide_cell_ids")
                             != assignment.get("cell_ids")
@@ -2439,6 +2461,7 @@ def generate_shot_storyboards(
             "honcut.shot_storyboards.v2",
             "honcut.shot_storyboards.v3",
             "honcut.shot_storyboards.v4",
+            "honcut.shot_storyboards.v5",
         }:
             if previous_manifest.get("status") == "done":
                 previous_manifest = migrate_shot_storyboard_narrative_guides(
@@ -2450,7 +2473,7 @@ def generate_shot_storyboards(
             else:
                 previous_manifest = {}
         elif prior_kind == SHOT_STORYBOARDS_SCHEMA:
-            if prior_version != 5:
+            if prior_version != 6:
                 raise RuntimeError("unsupported prior storyboard manifest version")
         elif previous_manifest:
             raise RuntimeError("unsupported prior storyboard manifest schema")
@@ -2524,7 +2547,7 @@ def generate_shot_storyboards(
     )
     contract: dict[str, Any] = {
         "kind": SHOT_STORYBOARDS_SCHEMA,
-        "version": 5,
+        "version": 6,
         "status": "running",
         "provider": "seedream",
         "model": model,

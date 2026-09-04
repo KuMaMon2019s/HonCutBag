@@ -201,6 +201,109 @@ def test_repeated_action_cells_form_monotonic_distinct_pose_samples():
     pose_owner.validate_pose_sequence(cells, beat_id="S01_P01")
 
 
+def test_initial_ready_is_one_zero_time_anchor_before_dynamic_action():
+    ready = _unit("GAU001", "actor-alpha takes a ready guard stance", ledger_index=0)
+    evade = _unit("GAU002", "actor-alpha side-steps and dodges right", ledger_index=1)
+    cells = pose_owner.compile_pose_contracts(
+        _beat(ready, evade),
+        [
+            _cell("S01_G01", "start"),
+            _cell("S01_G02", "action_progress"),
+            _cell("S01_G03", "action_progress"),
+            _cell("S01_G04", "action_progress"),
+            _cell("S01_G05", "end"),
+        ],
+    )
+
+    contracts = [cell["pose_contract"] for cell in cells]
+    assert [
+        [binding["unit_id"] for binding in contract["action_bindings"]]
+        for contract in contracts
+    ] == [["GAU001"], ["GAU002"], ["GAU002"], ["GAU002"], ["GAU002"]]
+    assert contracts[0]["timing_role"] == "initial_anchor"
+    assert contracts[0]["story_time_weight"] == 0
+    assert contracts[0]["pose_progress"] == 1.0
+    assert all(contract["timing_role"] == "story_action" for contract in contracts[1:])
+    assert all(contract["story_time_weight"] == 1 for contract in contracts[1:])
+    pose_owner.validate_pose_sequence(cells, beat_id="S01_P01")
+
+
+@pytest.mark.parametrize(
+    "actions",
+    [
+        ("actor-alpha takes a ready guard stance",),
+        ("actor-alpha holds a staff", "actor-alpha strikes right"),
+        ("light remains fixed", "actor-alpha strikes right"),
+    ],
+)
+def test_non_eligible_initial_state_remains_timed(actions):
+    units = tuple(
+        _unit(f"GAU{index:03d}", action, ledger_index=index - 1)
+        for index, action in enumerate(actions, 1)
+    )
+    cells = pose_owner.compile_pose_contracts(
+        _beat(*units),
+        [_cell("S01_G01", "start"), _cell("S01_G02", "end")],
+    )
+
+    assert all(
+        cell["pose_contract"]["timing_role"] == "story_action" for cell in cells
+    )
+    assert all(cell["pose_contract"]["story_time_weight"] == 1 for cell in cells)
+
+
+def test_p02_ready_is_not_zero_time_without_a_cinematic_first_frame():
+    beat = _beat(
+        _unit("GAU001", "actor-alpha takes a ready guard stance", ledger_index=0),
+        _unit("GAU002", "actor-alpha dodges right", ledger_index=1),
+    )
+    beat["beat_id"] = "S01_P02"
+    cells = [_cell("S01_G06", "start"), _cell("S01_G07", "end")]
+    for cell in cells:
+        cell["secondary_beat_id"] = "S01_P02"
+
+    compiled = pose_owner.compile_pose_contracts(beat, cells)
+
+    assert all(
+        cell["pose_contract"]["timing_role"] == "story_action"
+        for cell in compiled
+    )
+
+
+def test_initial_anchor_weight_tamper_fails_closed_after_rehash():
+    cells = pose_owner.compile_pose_contracts(
+        _beat(
+            _unit("GAU001", "actor-alpha takes a ready stance", ledger_index=0),
+            _unit("GAU002", "actor-alpha runs right", ledger_index=1),
+        ),
+        [_cell("S01_G01", "start"), _cell("S01_G02", "end")],
+    )
+    contract = cells[0]["pose_contract"]
+    contract["story_time_weight"] = 1.0
+    fingerprint_payload = {
+        "family": contract["pose_family"],
+        "stage": contract["stage"],
+        "pose_progress": contract["pose_progress"],
+        "direction": contract["direction"],
+        "mechanics_modifiers": contract["mechanics_modifiers"],
+        "transition_origin": contract["transition_origin"],
+        "actors": contract["geometry"]["actors"],
+        "objects": contract["geometry"]["objects"],
+        "action_vector": contract["action_vector"],
+        "camera_vector": contract["camera_vector"],
+        "static_spatial_state": contract["static_spatial_state"],
+        "timing_role": contract["timing_role"],
+        "story_time_weight": contract["story_time_weight"],
+    }
+    contract["pose_fingerprint"] = pose_owner._canonical_sha256(fingerprint_payload)
+    unhashed = dict(contract)
+    unhashed.pop("contract_sha256")
+    contract["contract_sha256"] = pose_owner._canonical_sha256(unhashed)
+
+    with pytest.raises(ValueError, match="initial pose anchor is invalid"):
+        pose_owner.validate_pose_sequence(cells, beat_id="S01_P01")
+
+
 def test_single_action_can_progress_across_all_nine_cells_without_false_block():
     unit = _unit("GAU001", "actor-alpha pivots and swings a staff right")
     cells = pose_owner.compile_pose_contracts(
@@ -257,8 +360,8 @@ def test_next_action_starts_from_previous_canonical_end_pose_without_neutral_res
         ],
     )
 
-    previous_end = cells[1]["pose_contract"]
-    next_start = cells[2]["pose_contract"]
+    previous_end = cells[0]["pose_contract"]
+    next_start = cells[1]["pose_contract"]
     assert next_start["transition_origin"] == {
         "source": "previous_canonical_action",
         "unit_ids": ["GAU001"],
@@ -570,17 +673,18 @@ def test_pose_owner_has_no_provider_phase3_or_pipeline_core_dependency():
     assert "pipeline_core" not in source
 
 
-def test_phase6_task_fingerprint_binds_ordered_pose_fingerprints(tmp_path):
+def test_phase6_task_fingerprint_binds_pose_fingerprints_and_zero_time_anchor(tmp_path):
     guide_fields = {
         "storyboard_beat_id": "S01_P01",
         "storyboard_narrative_guide": "storyboard_guides/S01_P01.png",
-        "storyboard_narrative_guide_kind": "honcut.storyboard-narrative-guide.v3",
+        "storyboard_narrative_guide_kind": "honcut.storyboard-narrative-guide.v4",
         "storyboard_narrative_guide_usage": ("phase6_story_narrative_guide_not_output_pixels"),
         "storyboard_narrative_guide_cell_ids": ["S01_G01", "S01_G02"],
+        "storyboard_narrative_guide_zero_time_anchor_cell_ids": ["S01_G01"],
         "storyboard_narrative_guide_sha256": "a" * 64,
         "storyboard_narrative_guide_renderer": ("honcut.identity-neutral-story-guide-renderer.v2"),
         "storyboard_narrative_guide_pose_contract_schema": (
-            "honcut.storyboard-guide-pose-contract.v2"
+            "honcut.storyboard-guide-pose-contract.v3"
         ),
         "storyboard_narrative_guide_pose_policy_sha256": "b" * 64,
         "storyboard_narrative_guide_pose_contracts_sha256": "c" * 64,
@@ -599,7 +703,7 @@ def test_phase6_task_fingerprint_binds_ordered_pose_fingerprints(tmp_path):
         "storyboard_narrative_guide_non_authority_roles": ["character_identity"],
     }
 
-    def payload(fingerprints: list[str]) -> dict:
+    def payload(fingerprints: list[str], anchor_cells: list[str]) -> dict:
         chunk = GenerationChunk(
             chunk_id="S01_C01",
             sequence=1,
@@ -610,6 +714,7 @@ def test_phase6_task_fingerprint_binds_ordered_pose_fingerprints(tmp_path):
             **{
                 **guide_fields,
                 "storyboard_narrative_guide_pose_fingerprints": fingerprints,
+                "storyboard_narrative_guide_zero_time_anchor_cell_ids": anchor_cells,
             },
         )
         request = ChunkExecutionRequest(
@@ -633,13 +738,18 @@ def test_phase6_task_fingerprint_binds_ordered_pose_fingerprints(tmp_path):
             seed=7,
         )
 
-    first = payload(["d" * 64, "e" * 64])
-    second = payload(["d" * 64, "9" * 64])
+    first = payload(["d" * 64, "e" * 64], ["S01_G01"])
+    second = payload(["d" * 64, "9" * 64], ["S01_G01"])
+    no_anchor = payload(["d" * 64, "e" * 64], [])
     assert first["storyboard_narrative_guide_pose_fingerprints"] == [
         "d" * 64,
         "e" * 64,
     ]
     assert first["input_fingerprint"] != second["input_fingerprint"]
+    assert first["storyboard_narrative_guide_zero_time_anchor_cell_ids"] == [
+        "S01_G01"
+    ]
+    assert first["input_fingerprint"] != no_anchor["input_fingerprint"]
 
 
 def test_continuity_chunk_rejects_incomplete_pose_fingerprint_binding():
@@ -652,13 +762,13 @@ def test_continuity_chunk_rejects_incomplete_pose_fingerprint_binding():
             execution_strategy="multi_image",
             storyboard_beat_id="S01_P01",
             storyboard_narrative_guide="storyboard_guides/S01_P01.png",
-            storyboard_narrative_guide_kind="honcut.storyboard-narrative-guide.v3",
+            storyboard_narrative_guide_kind="honcut.storyboard-narrative-guide.v4",
             storyboard_narrative_guide_usage=("phase6_story_narrative_guide_not_output_pixels"),
             storyboard_narrative_guide_cell_ids=["S01_G01", "S01_G02"],
             storyboard_narrative_guide_sha256="a" * 64,
             storyboard_narrative_guide_renderer=("honcut.identity-neutral-story-guide-renderer.v2"),
             storyboard_narrative_guide_pose_contract_schema=(
-                "honcut.storyboard-guide-pose-contract.v2"
+                "honcut.storyboard-guide-pose-contract.v3"
             ),
             storyboard_narrative_guide_pose_policy_sha256="b" * 64,
             storyboard_narrative_guide_pose_contracts_sha256="c" * 64,

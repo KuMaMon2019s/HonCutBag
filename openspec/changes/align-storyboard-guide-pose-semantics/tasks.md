@@ -52,3 +52,13 @@
 - [x] 7.2 Make pose-family classification field- and polarity-aware, persist rejected negated matches, and prevent unmatched body-action beats from drifting across action units.
 - [x] 7.3 Add monotonic per-action Gxx progress plus deterministic root, torso, center-of-gravity, stance and two-hand-hold geometry; reject arrow-only progress.
 - [x] 7.4 Upgrade the pose contract version, redraw the saved live structure with zero Provider calls, run focused/full regression and post-change Serena/Graphify/OpenSpec validation, then replace the regression evidence.
+
+## 8. Live-evidence Follow-up: Zero-time Initial Ready Anchor
+
+- [x] 8.1 Add generic regression fixtures proving an initial pure ready/guard unit followed by dynamic action receives one completed-pose `initial_anchor` cell with zero story-time weight, while lone ready, prop hold and spatial states remain timed.
+- [x] 8.2 Update the Phase 2 partition/compiler and deterministic validator so the anchor preserves canonical lineage and ordering but cannot consume multiple Gxx or appear after the first cell.
+- [x] 8.3 Version and propagate anchor metadata through the guide receipt, shot-storyboard manifest, `GenerationChunk`, asset validation, media manifest and Phase 6 task fingerprint.
+- [x] 8.4 Add the Phase 6 prompt contract that treats the anchor as the t=0 first-frame state and requires motion to begin immediately with the next Gxx; verify bridge requests and anchor-free Pxx remain unchanged.
+- [x] 8.5 Add verified local migration/redraw behavior for the previous current guide version and fail closed on incomplete, corrupt or future timing contracts.
+- [x] 8.6 Run focused tests, provider-deny Graph/sequential integration, ten recovery rounds, lint, diff check and full tests; confirm `pipeline_core.py` is unchanged.
+- [ ] 8.7 Complete Serena post-validation, OpenSpec Verify and Graphify incremental sync, then replace regression evidence and leave the paid live gate pending a new explicit authorization.

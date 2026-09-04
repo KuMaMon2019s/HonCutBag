@@ -572,6 +572,12 @@ def build_continuity_plan(
                     storyboard_narrative_guide_cell_ids=list(
                         beat.get("storyboard_narrative_guide_cell_ids") or []
                     ),
+                    storyboard_narrative_guide_zero_time_anchor_cell_ids=list(
+                        beat.get(
+                            "storyboard_narrative_guide_zero_time_anchor_cell_ids"
+                        )
+                        or []
+                    ),
                     storyboard_narrative_guide_sha256=(
                         str(beat.get("storyboard_narrative_guide_sha256") or "")
                         or None

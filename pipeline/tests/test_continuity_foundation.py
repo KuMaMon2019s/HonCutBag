@@ -151,24 +151,28 @@ def _phase6_storyboard_contract(tmp_path, canonical_run_contract):
 def _narrative_guide_fields(
     beat_id: str,
     cell_ids: tuple[str, ...] | None = None,
+    zero_time_anchor_cell_ids: tuple[str, ...] = (),
 ) -> dict[str, object]:
     shot_id = beat_id.split("_P", 1)[0]
     ordered_cells = list(cell_ids or (f"{shot_id}_G01",))
     return {
         "storyboard_narrative_guide": f"storyboard_guides/{beat_id}.png",
         "storyboard_narrative_guide_kind": (
-            "honcut.storyboard-narrative-guide.v3"
+            "honcut.storyboard-narrative-guide.v4"
         ),
         "storyboard_narrative_guide_usage": (
             "phase6_story_narrative_guide_not_output_pixels"
         ),
         "storyboard_narrative_guide_cell_ids": ordered_cells,
+        "storyboard_narrative_guide_zero_time_anchor_cell_ids": list(
+            zero_time_anchor_cell_ids
+        ),
         "storyboard_narrative_guide_sha256": "a" * 64,
         "storyboard_narrative_guide_renderer": (
             "honcut.identity-neutral-story-guide-renderer.v2"
         ),
         "storyboard_narrative_guide_pose_contract_schema": (
-            "honcut.storyboard-guide-pose-contract.v2"
+            "honcut.storyboard-guide-pose-contract.v3"
         ),
         "storyboard_narrative_guide_pose_policy_sha256": "d" * 64,
         "storyboard_narrative_guide_pose_contracts_sha256": "e" * 64,
@@ -204,6 +208,7 @@ def _narrative_guide_fields(
 def _narrative_guide_media(
     beat_id: str,
     cell_ids: tuple[str, ...] | None = None,
+    zero_time_anchor_cell_ids: tuple[str, ...] = (),
 ) -> dict[str, object]:
     shot_id = beat_id.split("_P", 1)[0]
     ordered_cells = list(cell_ids or (f"{shot_id}_G01",))
@@ -215,6 +220,9 @@ def _narrative_guide_media(
         "_reference_description": f"{beat_id} current narrative guide",
         "_narrative_beat_id": beat_id,
         "_narrative_cell_ids": ordered_cells,
+        "_narrative_zero_time_anchor_cell_ids": list(
+            zero_time_anchor_cell_ids
+        ),
         "_authority_roles": [
             "narrative_order",
             "action_direction",
@@ -1309,7 +1317,7 @@ def test_complex_shot_maps_to_three_secondary_generation_strategies(tmp_path):
         "S01_P01 invalid narrative guide" in error
         for error in validate_shot_storyboard_artifacts(tmp_path, storyboard)
     )
-    guide_receipt["kind"] = "honcut.storyboard-narrative-guide.v3"
+    guide_receipt["kind"] = "honcut.storyboard-narrative-guide.v4"
     guide_receipt_path.write_text(json.dumps(guide_receipt), encoding="utf-8")
     assert validate_shot_storyboard_artifacts(tmp_path, storyboard) == []
     assert (tmp_path / "storyboard_beats/S01_P01.png").is_file()
@@ -1343,7 +1351,7 @@ def test_complex_shot_maps_to_three_secondary_generation_strategies(tmp_path):
     ]
     for chunk in first.chunks:
         assert chunk.storyboard_narrative_guide_pose_contract_schema == (
-            "honcut.storyboard-guide-pose-contract.v2"
+            "honcut.storyboard-guide-pose-contract.v3"
         )
         assert len(chunk.storyboard_narrative_guide_pose_policy_sha256 or "") == 64
         assert len(chunk.storyboard_narrative_guide_pose_contracts_sha256 or "") == 64
@@ -2530,6 +2538,63 @@ def test_p02_media_indices_bind_after_predecessor_character_guide_and_tail_order
     assert "当前姿态、握持关系和道具几何只以图片2" in prompt
     assert "发生冲突时必须按上述职责覆盖图片3" in prompt
     assert "禁止生长、缩短、变形、增减端部" in prompt
+    assert "初始姿态锚点" not in prompt
+
+
+def test_initial_ready_anchor_consumes_no_story_time_in_phase6_prompt():
+    cells = ("S01_G01", "S01_G02", "S01_G03")
+    request = ChunkExecutionRequest(
+        resource_id="S01_C01",
+        shot_id="S01",
+        chunk=GenerationChunk(
+            chunk_id="S01_C01",
+            sequence=1,
+            target_duration_s=4,
+            mode="fresh",
+            execution_strategy="multi_image",
+            storyboard_beat_id="S01_P01",
+            action_prompt="perform the current movement",
+            **_narrative_guide_fields(
+                "S01_P01",
+                cells,
+                zero_time_anchor_cell_ids=("S01_G01",),
+            ),
+        ),
+        anchors={},
+        output_path=Path("S01_C01.mp4"),
+        previous_output_path=None,
+        input_fingerprint="zero-time-anchor",
+        memory_context="",
+    )
+    content, manifest = _bind_final_media_index_prompt(
+        [
+            {"type": "text", "text": "只完成当前 Pxx。"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "https://image.test/frame.png"},
+                "role": "first_frame",
+                "_reference_kind": "cinematic_composition",
+                "_reference_description": "当前一级分镜首帧",
+                "_mandatory_reference": True,
+            },
+            _narrative_guide_media(
+                "S01_P01",
+                cells,
+                zero_time_anchor_cell_ids=("S01_G01",),
+            ),
+        ],
+        request,
+    )
+
+    guide = next(
+        item for item in manifest if item["responsibility"] == "storyboard_narrative_guide"
+    )
+    assert guide["narrative_zero_time_anchor_cell_ids"] == ["S01_G01"]
+    prompt = content[0]["text"]
+    assert "S01_G01是t=0首帧已经成立的初始姿态锚点" in prompt
+    assert "不占视频动作时长" in prompt
+    assert "首帧后立即从S01_G02开始运动" in prompt
+    assert "不得为S01_G01追加站立、准备、抬手、停顿或持姿时长" in prompt
 
 
 def test_seedance_transport_contract_rejects_invalid_limits(monkeypatch):
@@ -2652,10 +2717,11 @@ def test_phase6_fails_closed_when_mandatory_reference_images_exceed_nine(
                 "cinematic_pixels",
             ],
             "semantic_payload_sha256": "c" * 64,
-            "pose_contract_schema": "honcut.storyboard-guide-pose-contract.v2",
+            "pose_contract_schema": "honcut.storyboard-guide-pose-contract.v3",
             "pose_policy_sha256": "d" * 64,
             "pose_contracts_sha256": "e" * 64,
             "pose_fingerprints": ["1" * 64],
+            "zero_time_anchor_cell_ids": [],
         },
     )
 
@@ -2674,7 +2740,7 @@ def test_phase6_fails_closed_when_mandatory_reference_images_exceed_nine(
                     "storyboard_guides/S01_P01.png"
                 ),
                 "_storyboard_narrative_guide_kind": (
-                    "honcut.storyboard-narrative-guide.v3"
+                    "honcut.storyboard-narrative-guide.v4"
                 ),
             },
         )

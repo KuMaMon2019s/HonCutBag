@@ -6,6 +6,7 @@ Phase 2 的身份中立 `storyboard_guides` 当前只根据格子文本改变箭
 
 - 为每个 Gxx 增加来源绑定的结构化姿态语义：动作单元、身体动作拍、执行者/目标、阶段、方向、接触与终态。
 - 将每个 Pxx 获得的 Gxx 按 canonical 动作顺序确定性分配；不得根据自由文本哈希随机选择姿态。
+- 当且仅当 P01 的首个 canonical 动作是纯戒备姿态、后面存在动态动作且 Phase 4 成片首帧已经建立该姿态时，将其压缩为一个 `t=0` 零时长初始锚点；首帧后必须立即进入下一动态动作，不能让准备姿态消耗成片叙事时间。
 - 将身份中立 renderer 升级为可绘制不同关节、躯干、重心和多人交互的确定性骨架 renderer；红色动作箭头必须与姿态运动方向一致，蓝色箭头仍只表达运镜。
 - 导航图继续只使用灰色中性骨架和抽象关系标识，不复制审核九宫格像素，不包含脸、发型、服装纹理、道具外观或剧情文字。
 - 版本化升级导航图语义合同、renderer、收据和哈希；旧版只有在完整 canonical 动作血缘可验证时才能零 Provider 重绘，否则标记 audit-only 并要求从 Phase 2 重建。
@@ -15,6 +16,7 @@ Non-goals:
 
 - 不让 Phase 2 重新编剧情、调用 LLM/VLM/图像 Provider 或推断新的角色身份。
 - 不改变 Phase 4 首帧、Phase 3 动作参考板、Phase 6 媒体优先级、Graph 拓扑、Provider 重试或任务账本。
+- 不删除、改写或重排 Phase 1 的来源动作；单独存在、没有后续动态动作的戒备仍是正常有时长动作。
 - 不修复 run-17 的 Phase 3 `inconsistent source action-unit lineage`；该失败属于独立 owner，run-17 继续 audit-only。
 - 不向 `pipeline_core.py` 增加任何生产逻辑。
 

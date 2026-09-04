@@ -931,6 +931,9 @@ def _base_content(
             "_storyboard_narrative_guide_cell_ids": list(
                 request.chunk.storyboard_narrative_guide_cell_ids
             ),
+            "_storyboard_narrative_guide_zero_time_anchor_cell_ids": list(
+                request.chunk.storyboard_narrative_guide_zero_time_anchor_cell_ids
+            ),
             "_storyboard_narrative_guide_sha256": (
                 request.chunk.storyboard_narrative_guide_sha256
             ),
@@ -1144,6 +1147,9 @@ def _media_index_manifest(content: Sequence[dict[str, Any]]) -> list[dict[str, A
             "character_id": item.get("_character_id"),
             "narrative_beat_id": item.get("_narrative_beat_id"),
             "narrative_cell_ids": list(item.get("_narrative_cell_ids") or []),
+            "narrative_zero_time_anchor_cell_ids": list(
+                item.get("_narrative_zero_time_anchor_cell_ids") or []
+            ),
             "authority_roles": list(item.get("_authority_roles") or []),
             "non_authority_roles": list(
                 item.get("_non_authority_roles") or []
@@ -1205,6 +1211,8 @@ def _bind_final_media_index_prompt(
         if (
             guide.get("narrative_beat_id") != request.chunk.storyboard_beat_id
             or guide.get("narrative_cell_ids") != expected_cells
+            or guide.get("narrative_zero_time_anchor_cell_ids")
+            != list(request.chunk.storyboard_narrative_guide_zero_time_anchor_cell_ids)
         ):
             raise ValueError(
                 f"{request.resource_id} narrative guide does not match its persisted Gxx assignment"
@@ -1306,6 +1314,23 @@ def _bind_final_media_index_prompt(
             "Gxx 序号、文字、箭头、轨迹线、指示标识、边框和九宫格只供理解，"
             "严禁渲染进视频画面。"
         )
+        zero_time_anchors = [
+            str(value)
+            for value in guide.get("narrative_zero_time_anchor_cell_ids") or []
+        ]
+        if zero_time_anchors:
+            next_cells = [cell for cell in cells if cell not in zero_time_anchors]
+            if len(zero_time_anchors) != 1 or not next_cells:
+                raise ValueError(
+                    f"{request.resource_id} narrative guide has an invalid zero-time anchor"
+                )
+            anchor_cell = zero_time_anchors[0]
+            next_cell = next_cells[0]
+            guide_contract += (
+                f"{anchor_cell}是t=0首帧已经成立的初始姿态锚点，不占视频动作时长；"
+                f"首帧后立即从{next_cell}开始运动，不得为{anchor_cell}追加站立、准备、"
+                "抬手、停顿或持姿时长。"
+            )
     performance_contract = ""
     if performance_guides:
         directives = []
@@ -1574,6 +1599,9 @@ def _task_payload(
         "storyboard_narrative_guide_cell_ids": list(
             request.chunk.storyboard_narrative_guide_cell_ids
         ),
+        "storyboard_narrative_guide_zero_time_anchor_cell_ids": list(
+            request.chunk.storyboard_narrative_guide_zero_time_anchor_cell_ids
+        ),
         "storyboard_narrative_guide_sha256": (
             request.chunk.storyboard_narrative_guide_sha256
         ),
@@ -1671,6 +1699,7 @@ def _provider_input_context(
     storyboard_image: str | None = None,
     storyboard_narrative_guide: str | None = None,
     storyboard_narrative_guide_cell_ids: Sequence[str] = (),
+    storyboard_narrative_guide_zero_time_anchor_cell_ids: Sequence[str] = (),
     storyboard_narrative_guide_pose_contracts_sha256: str | None = None,
     storyboard_narrative_guide_pose_fingerprints: Sequence[str] = (),
     character_performance_guides: Sequence[Any] = (),
@@ -1717,6 +1746,9 @@ def _provider_input_context(
         ),
         "storyboard_narrative_guide_cell_ids": list(
             storyboard_narrative_guide_cell_ids
+        ),
+        "storyboard_narrative_guide_zero_time_anchor_cell_ids": list(
+            storyboard_narrative_guide_zero_time_anchor_cell_ids
         ),
         "storyboard_narrative_guide_pose_contracts_sha256": (
             storyboard_narrative_guide_pose_contracts_sha256
@@ -3130,6 +3162,9 @@ def execute_phase6_auto_continuity(
             storyboard_narrative_guide=chunk.storyboard_narrative_guide,
             storyboard_narrative_guide_cell_ids=(
                 chunk.storyboard_narrative_guide_cell_ids
+            ),
+            storyboard_narrative_guide_zero_time_anchor_cell_ids=(
+                chunk.storyboard_narrative_guide_zero_time_anchor_cell_ids
             ),
             storyboard_narrative_guide_pose_contracts_sha256=(
                 chunk.storyboard_narrative_guide_pose_contracts_sha256

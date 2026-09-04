@@ -11,7 +11,7 @@ from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
 
-POSE_CONTRACT_SCHEMA = "honcut.storyboard-guide-pose-contract.v2"
+POSE_CONTRACT_SCHEMA = "honcut.storyboard-guide-pose-contract.v3"
 
 _POSE_CLASSIFIERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("throw", ("摔", "投掷", "甩向", "throw", "toss")),
@@ -140,7 +140,7 @@ _MECHANICS_MARKERS = {
 }
 
 _POSE_POLICY = {
-    "schema": "honcut.storyboard-guide-pose-policy.v2",
+    "schema": "honcut.storyboard-guide-pose-policy.v3",
     "classifiers": _POSE_CLASSIFIERS,
     "direction_markers": _DIRECTION_MARKERS,
     "actor_markers": _ACTOR_MARKERS,
@@ -152,6 +152,13 @@ _POSE_POLICY = {
     "phase_samples": {"start": 0.2, "action_progress": 0.7, "end": 1.0},
     "minimum_adjacent_joint_delta": 2,
     "minimum_action_span_joint_delta": 12,
+    "initial_anchor": {
+        "eligible_family": "ready",
+        "requires_later_dynamic_family": True,
+        "cell_count": 1,
+        "pose_progress": 1.0,
+        "story_time_weight": 0.0,
+    },
 }
 
 
@@ -823,7 +830,53 @@ def _validated_units(beat: Mapping[str, Any]) -> tuple[list[dict[str, Any]], str
     raise ValueError("storyboard beat is missing canonical generation action units")
 
 
-def _partition_units(units: list[dict[str, Any]], cell_count: int) -> list[list[dict[str, Any]]]:
+def _initial_anchor_unit_ids(
+    beat: Mapping[str, Any],
+    units: Sequence[Mapping[str, Any]],
+    *,
+    cell_count: int,
+) -> frozenset[str]:
+    """Identify a ready pose already established by the first cinematic frame."""
+    if (
+        len(units) < 2
+        or cell_count < 2
+        or not str(beat.get("beat_id") or "").endswith("_P01")
+    ):
+        return frozenset()
+    first_mechanics, _ = _matching_mechanics(beat, [units[0]])
+    first_actions = " → ".join(_strings(units[0].get("actions")))
+    first_family, _ = _pose_family(first_actions, first_mechanics)
+    if first_family != "ready":
+        return frozenset()
+    dynamic_families = {
+        family for family, _markers in _POSE_CLASSIFIERS
+        if family not in {"ready", "prop_hold"}
+    }
+    for unit in units[1:]:
+        mechanics, _ = _matching_mechanics(beat, [unit])
+        action_text = " → ".join(_strings(unit.get("actions")))
+        family, _ = _pose_family(action_text, mechanics)
+        if family in dynamic_families:
+            return frozenset({str(units[0]["unit_id"])})
+    return frozenset()
+
+
+def _partition_units(
+    units: list[dict[str, Any]],
+    cell_count: int,
+    *,
+    initial_anchor_unit_ids: frozenset[str] = frozenset(),
+) -> list[list[dict[str, Any]]]:
+    if initial_anchor_unit_ids:
+        first_id = str(units[0]["unit_id"])
+        if initial_anchor_unit_ids != {first_id} or cell_count < 2 or len(units) < 2:
+            raise ValueError("initial pose anchor must bind only the first canonical unit")
+        groups = [[units[0]]] + _partition_units(units[1:], cell_count - 1)
+        covered = {str(unit["unit_id"]) for group in groups for unit in group}
+        expected = {str(unit["unit_id"]) for unit in units}
+        if covered != expected:
+            raise ValueError("Gxx initial-anchor partition lost canonical generation units")
+        return groups
     groups: list[list[dict[str, Any]]] = []
     unit_count = len(units)
     for cell_index in range(cell_count):
@@ -843,6 +896,8 @@ def _partition_units(units: list[dict[str, Any]], cell_count: int) -> list[list[
 def _pose_progress_samples(
     cells: Sequence[Mapping[str, Any]],
     groups: Sequence[Sequence[Mapping[str, Any]]],
+    *,
+    initial_anchor_unit_ids: frozenset[str] = frozenset(),
 ) -> list[float]:
     group_keys = [tuple(str(unit["unit_id"]) for unit in group) for group in groups]
     positions: dict[tuple[str, ...], list[int]] = {}
@@ -850,6 +905,9 @@ def _pose_progress_samples(
         positions.setdefault(key, []).append(index)
     samples: list[float] = []
     for index, (cell, key) in enumerate(zip(cells, group_keys, strict=True)):
+        if index == 0 and initial_anchor_unit_ids == frozenset(key):
+            samples.append(1.0)
+            continue
         occurrences = positions[key]
         if len(occurrences) > 1:
             ordinal = occurrences.index(index)
@@ -877,8 +935,21 @@ def compile_pose_contracts(
 ) -> list[dict[str, Any]]:
     """Attach one source-bound, deterministic pose contract to every Gxx cell."""
     units, lineage_status = _validated_units(beat)
-    groups = _partition_units(units, len(cells))
-    progress_samples = _pose_progress_samples(cells, groups)
+    initial_anchor_unit_ids = _initial_anchor_unit_ids(
+        beat,
+        units,
+        cell_count=len(cells),
+    )
+    groups = _partition_units(
+        units,
+        len(cells),
+        initial_anchor_unit_ids=initial_anchor_unit_ids,
+    )
+    progress_samples = _pose_progress_samples(
+        cells,
+        groups,
+        initial_anchor_unit_ids=initial_anchor_unit_ids,
+    )
     source_actor_roles = {value.casefold() for value in known_actor_roles if value}
     result: list[dict[str, Any]] = []
     active_group_key: tuple[str, ...] | None = None
@@ -892,6 +963,12 @@ def compile_pose_contracts(
         direction, direction_evidence = _direction(action_text, mechanics)
         mechanics_modifiers = _mechanics_modifiers(mechanics, direction)
         group_key = tuple(str(unit["unit_id"]) for unit in group)
+        timing_role = (
+            "initial_anchor"
+            if initial_anchor_unit_ids == frozenset(group_key)
+            else "story_action"
+        )
+        story_time_weight = 0.0 if timing_role == "initial_anchor" else 1.0
         performers = _dedupe(
             [value for unit in group for value in _strings(unit.get("performers"))]
         )
@@ -994,6 +1071,8 @@ def compile_pose_contracts(
                 "action_vector": action_vector,
                 "camera_vector": camera_vector,
                 "static_spatial_state": static_spatial_state,
+                "timing_role": timing_role,
+                "story_time_weight": story_time_weight,
             }
         )
         contract = {
@@ -1023,6 +1102,8 @@ def compile_pose_contracts(
             "action_vector": action_vector,
             "camera_vector": camera_vector,
             "static_spatial_state": static_spatial_state,
+            "timing_role": timing_role,
+            "story_time_weight": story_time_weight,
             "geometry": geometry,
             "pose_fingerprint": pose_fingerprint,
         }
@@ -1060,6 +1141,24 @@ def validate_pose_contract(contract: Mapping[str, Any], *, cell_id: str, beat_id
         or not 0.0 <= float(progress) <= 1.0
     ):
         raise ValueError("story guide pose progress is invalid")
+    timing_role = contract.get("timing_role")
+    story_time_weight = contract.get("story_time_weight")
+    if timing_role not in {"initial_anchor", "story_action"}:
+        raise ValueError("story guide pose timing role is invalid")
+    if (
+        not isinstance(story_time_weight, (int, float))
+        or isinstance(story_time_weight, bool)
+    ):
+        raise ValueError("story guide pose story-time weight is invalid")
+    if timing_role == "initial_anchor":
+        if (
+            float(story_time_weight) != 0.0
+            or contract.get("pose_family") != "ready"
+            or float(progress) != 1.0
+        ):
+            raise ValueError("story guide initial pose anchor is invalid")
+    elif float(story_time_weight) != 1.0:
+        raise ValueError("story guide story action must retain story-time weight")
     modifiers = contract.get("mechanics_modifiers")
     if not isinstance(modifiers, Mapping) or set(modifiers) != {
         "center_drop",
@@ -1131,6 +1230,8 @@ def validate_pose_contract(contract: Mapping[str, Any], *, cell_id: str, beat_id
             "action_vector": contract.get("action_vector"),
             "camera_vector": contract.get("camera_vector"),
             "static_spatial_state": bool(contract.get("static_spatial_state")),
+            "timing_role": timing_role,
+            "story_time_weight": float(story_time_weight),
         }
     )
     if contract.get("pose_fingerprint") != expected_fingerprint:
@@ -1268,6 +1369,14 @@ def pose_fingerprints(cells: list[Mapping[str, Any]]) -> list[str]:
     return [str(cell["pose_contract"]["pose_fingerprint"]) for cell in cells]
 
 
+def zero_time_anchor_cell_ids(cells: list[Mapping[str, Any]]) -> list[str]:
+    return [
+        str(cell.get("label") or "")
+        for cell in cells
+        if (cell.get("pose_contract") or {}).get("timing_role") == "initial_anchor"
+    ]
+
+
 def validate_pose_sequence(cells: list[Mapping[str, Any]], *, beat_id: str) -> None:
     for cell in cells:
         contract = cell.get("pose_contract")
@@ -1278,6 +1387,16 @@ def validate_pose_sequence(cells: list[Mapping[str, Any]], *, beat_id: str) -> N
             cell_id=str(cell.get("label") or ""),
             beat_id=beat_id,
         )
+    anchors = [
+        index
+        for index, cell in enumerate(cells)
+        if cell["pose_contract"]["timing_role"] == "initial_anchor"
+    ]
+    if anchors:
+        if anchors != [0] or len(cells) < 2:
+            raise ValueError(f"{beat_id} initial pose anchor must be the first of multiple cells")
+        if cells[1]["pose_contract"]["timing_role"] != "story_action":
+            raise ValueError(f"{beat_id} initial pose anchor must precede story action")
     progress_groups: dict[str, list[Mapping[str, Any]]] = {}
     for cell in cells:
         contract = cell["pose_contract"]

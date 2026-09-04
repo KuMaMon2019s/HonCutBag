@@ -23,13 +23,13 @@ from tools.character_reference_board import (
 )
 
 CINEMATIC_FIRST_FRAME_SCHEMA = "honcut.cinematic-first-frame.v1"
-STORYBOARD_NARRATIVE_GUIDE_SCHEMA = "honcut.storyboard-narrative-guide.v3"
+STORYBOARD_NARRATIVE_GUIDE_SCHEMA = "honcut.storyboard-narrative-guide.v4"
 STORYBOARD_NARRATIVE_GUIDE_USAGE = "phase6_story_narrative_guide_not_output_pixels"
 STORYBOARD_NARRATIVE_GUIDE_RENDERER = (
     "honcut.identity-neutral-story-guide-renderer.v2"
 )
 STORYBOARD_GUIDE_POSE_CONTRACT_SCHEMA = (
-    "honcut.storyboard-guide-pose-contract.v2"
+    "honcut.storyboard-guide-pose-contract.v3"
 )
 CHARACTER_PERFORMANCE_GUIDE_SCHEMA = "honcut.character-performance-guide.v2"
 CHARACTER_PERFORMANCE_GUIDE_USAGE = "current_pxx_motion_reference_only"
@@ -93,6 +93,7 @@ def _assert_narrative_guide_provenance(
     declared_kind: Any,
     declared_usage: Any,
     declared_cell_ids: Any,
+    declared_zero_time_anchor_cell_ids: Any,
     declared_sha256: Any,
     declared_renderer: Any,
     declared_pose_contract_schema: Any,
@@ -129,9 +130,18 @@ def _assert_narrative_guide_provenance(
     observed = hashlib.sha256(path.read_bytes()).hexdigest()
     source_observed = hashlib.sha256(source_board.read_bytes()).hexdigest()
     cell_ids = [str(value) for value in (declared_cell_ids or [])]
+    zero_time_anchor_cell_ids = [
+        str(value) for value in (declared_zero_time_anchor_cell_ids or [])
+    ]
     beat_id = str(declared_beat_id or "").strip()
     if not cell_ids or len(cell_ids) != len(set(cell_ids)):
         raise ValueError("storyboard narrative guide needs ordered unique Gxx cells")
+    if zero_time_anchor_cell_ids and (
+        zero_time_anchor_cell_ids != [cell_ids[0]] or len(cell_ids) < 2
+    ):
+        raise ValueError(
+            "storyboard narrative guide zero-time anchor must be the first Gxx cell"
+        )
     semantic_payload = receipt.get("semantic_payload")
     if not isinstance(semantic_payload, dict):
         raise ValueError("storyboard narrative guide semantic payload is missing")
@@ -162,6 +172,12 @@ def _assert_narrative_guide_provenance(
         cell.get("pose_contract")
         for cell in semantic_cells
         if isinstance(cell, dict)
+    ]
+    semantic_anchor_cells = [
+        str(cell.get("label") or "")
+        for cell in semantic_cells
+        if isinstance(cell, dict)
+        and (cell.get("pose_contract") or {}).get("timing_role") == "initial_anchor"
     ]
     semantic_pose_contracts_sha256 = hashlib.sha256(
         json.dumps(
@@ -199,6 +215,18 @@ def _assert_narrative_guide_provenance(
             raise ValueError(
                 "storyboard narrative guide pose contract binding is invalid"
             )
+        timing_role = contract.get("timing_role")
+        story_time_weight = contract.get("story_time_weight")
+        if timing_role == "initial_anchor":
+            if (
+                cell_id not in zero_time_anchor_cell_ids
+                or story_time_weight != 0.0
+                or contract.get("pose_family") != "ready"
+                or contract.get("pose_progress") != 1.0
+            ):
+                raise ValueError("storyboard narrative guide initial anchor is invalid")
+        elif timing_role != "story_action" or story_time_weight != 1.0:
+            raise ValueError("storyboard narrative guide timing contract is invalid")
     if (
         str(declared_sha256 or "") != observed
         or str(declared_renderer or "") != STORYBOARD_NARRATIVE_GUIDE_RENDERER
@@ -218,7 +246,7 @@ def _assert_narrative_guide_provenance(
         or str(declared_semantic_payload_sha256 or "") != semantic_observed
         or str(declared_source_board_sha256 or "") != source_observed
         or receipt.get("kind") != STORYBOARD_NARRATIVE_GUIDE_SCHEMA
-        or receipt.get("version") != 3
+        or receipt.get("version") != 4
         or receipt.get("usage") != STORYBOARD_NARRATIVE_GUIDE_USAGE
         or receipt.get("renderer") != STORYBOARD_NARRATIVE_GUIDE_RENDERER
         or receipt.get("pose_contract_schema")
@@ -236,6 +264,9 @@ def _assert_narrative_guide_provenance(
         != declared_pose_contracts_sha256
         or semantic_payload.get("pose_fingerprints") != pose_fingerprints
         or semantic_pose_fingerprints != pose_fingerprints
+        or zero_time_anchor_cell_ids != semantic_anchor_cells
+        or receipt.get("zero_time_anchor_cell_ids") != semantic_anchor_cells
+        or semantic_payload.get("zero_time_anchor_cell_ids") != semantic_anchor_cells
         or receipt.get("source_pixel_usage") != "none"
         or receipt.get("semantic_payload_sha256") != semantic_observed
         or receipt.get("status") != "done"
@@ -1135,6 +1166,9 @@ def build_content_for_shot(
                 declared_cell_ids=shot_meta.get(
                     "_storyboard_narrative_guide_cell_ids"
                 ),
+                declared_zero_time_anchor_cell_ids=shot_meta.get(
+                    "_storyboard_narrative_guide_zero_time_anchor_cell_ids"
+                ),
                 declared_sha256=shot_meta.get(
                     "_storyboard_narrative_guide_sha256"
                 ),
@@ -1186,6 +1220,9 @@ def build_content_for_shot(
                 "mandatory": True,
                 "reference_kind": "storyboard_narrative_guide",
                 "narrative_cell_ids": cell_ids,
+                "narrative_zero_time_anchor_cell_ids": list(
+                    guide_receipt["zero_time_anchor_cell_ids"]
+                ),
                 "narrative_beat_id": guide_receipt["beat_id"],
                 "authority_roles": list(guide_receipt["authority_roles"]),
                 "non_authority_roles": list(
@@ -1345,6 +1382,9 @@ def build_content_for_shot(
             "_reference_description": asset.get("reference_description"),
             "_character_id": asset.get("char_id"),
             "_narrative_cell_ids": asset.get("narrative_cell_ids"),
+            "_narrative_zero_time_anchor_cell_ids": asset.get(
+                "narrative_zero_time_anchor_cell_ids"
+            ),
             "_narrative_beat_id": asset.get("narrative_beat_id"),
             "_authority_roles": asset.get("authority_roles"),
             "_non_authority_roles": asset.get("non_authority_roles"),
