@@ -9064,6 +9064,56 @@ def test_phase2_v2_migration_derives_guides_without_provider_calls(tmp_path):
     manifest_path = tmp_path / "SHOT_STORYBOARDS.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     board_sha256 = manifest["shots"][0]["board_sha256"]
+    v6_manifest = json.loads(json.dumps(manifest))
+    v6_manifest.update(kind="honcut.shot_storyboards.v6", version=6)
+    v6_guide_hashes = {
+        guide["image"]: hashlib.sha256(
+            (tmp_path / guide["image"]).read_bytes()
+        ).hexdigest()
+        for record in v6_manifest["shots"]
+        for guide in record["narrative_guides"]
+    }
+    manifest_path.write_text(json.dumps(v6_manifest), encoding="utf-8")
+    provider_calls_before_v6 = list(calls)
+
+    v6_migrated = migrate_shot_storyboard_narrative_guides(tmp_path, storyboard)
+
+    assert calls == provider_calls_before_v6
+    assert v6_migrated["kind"] == "honcut.shot_storyboards.v7"
+    assert v6_migrated["migration"]["from_kind"] == "honcut.shot_storyboards.v6"
+    assert all(
+        hashlib.sha256(
+            (
+                tmp_path
+                / "storyboard_guides"
+                / "audit_4"
+                / Path(relative_path).name
+            ).read_bytes()
+        ).hexdigest()
+        == digest
+        for relative_path, digest in v6_guide_hashes.items()
+    )
+    corrupt_v6 = json.loads(json.dumps(v6_manifest))
+    corrupt_v6["shots"][0]["narrative_guides"][0][
+        "semantic_payload_sha256"
+    ] = "0" * 64
+    manifest_path.write_text(json.dumps(corrupt_v6), encoding="utf-8")
+    corrupt_v6_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+
+    with pytest.raises(RuntimeError, match="v6 guide receipt/hash binding"):
+        migrate_shot_storyboard_narrative_guides(tmp_path, storyboard)
+
+    corrupt_v6_audit = json.loads(
+        (
+            tmp_path
+            / "storyboard_guides"
+            / "migrations"
+            / f"{corrupt_v6_sha256}.audit-only.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert corrupt_v6_audit["status"] == "audit_only"
+    assert corrupt_v6_audit["legacy_source_assets_modified"] is False
+
     v5_manifest = json.loads(json.dumps(manifest))
     v5_manifest.update(kind="honcut.shot_storyboards.v5", version=5)
     legacy_guide_hashes = {}
@@ -9088,7 +9138,7 @@ def test_phase2_v2_migration_derives_guides_without_provider_calls(tmp_path):
         for relative_path, digest in legacy_guide_hashes.items()
     )
     assert all(
-        guide["image"].startswith("storyboard_guides/v4/")
+        guide["image"].startswith("storyboard_guides/adaptive-v1/")
         for record in v5_migrated["shots"]
         for guide in record["narrative_guides"]
     )
@@ -9133,12 +9183,12 @@ def test_phase2_v2_migration_derives_guides_without_provider_calls(tmp_path):
     repeated = migrate_shot_storyboard_narrative_guides(tmp_path, storyboard)
 
     assert calls == provider_calls_before
-    assert migrated["kind"] == "honcut.shot_storyboards.v6"
+    assert migrated["kind"] == "honcut.shot_storyboards.v7"
     assert migrated["migration"]["source_pixel_usage"] == "none"
     assert migrated["migration"]["provider_request_count"] == 0
     assert migrated["shots"][0]["board_sha256"] == board_sha256
     assert all(
-        guide["image"].startswith("storyboard_guides/v4/")
+        guide["image"].startswith("storyboard_guides/adaptive-v1/")
         for guide in migrated["shots"][0]["narrative_guides"]
     )
     assert migrated["shots"][0]["beat_cell_assignments"] == [

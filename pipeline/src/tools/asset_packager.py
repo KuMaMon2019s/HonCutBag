@@ -17,6 +17,7 @@ from typing import Any, List, Optional, Tuple
 from utils.storyboard_motion_policy import apply_storyboard_motion_policy
 from utils.video_generation_contracts import ensure_video_generation_contract
 from utils.video_capabilities import SEEDANCE_2_CAPABILITIES
+from phases.phase2.storyboard_pose_atlas import select_pose_atlas_candidate
 from tools.character_reference_board import (
     ensure_character_reference_board,
     resolve_character_reference_board,
@@ -25,22 +26,21 @@ from tools.character_reference_board import (
 CINEMATIC_FIRST_FRAME_SCHEMA = "honcut.cinematic-first-frame.v1"
 STORYBOARD_NARRATIVE_GUIDE_SCHEMA = "honcut.storyboard-narrative-guide.v4"
 STORYBOARD_NARRATIVE_GUIDE_USAGE = "phase6_story_narrative_guide_not_output_pixels"
-STORYBOARD_NARRATIVE_GUIDE_RENDERER = (
-    "honcut.identity-neutral-story-guide-renderer.v2"
-)
-STORYBOARD_GUIDE_POSE_CONTRACT_SCHEMA = (
-    "honcut.storyboard-guide-pose-contract.v3"
-)
+STORYBOARD_NARRATIVE_GUIDE_RENDERER = "honcut.identity-neutral-story-guide-renderer.v2"
+STORYBOARD_GUIDE_POSE_CONTRACT_SCHEMA = "honcut.storyboard-guide-pose-contract.v3"
 CHARACTER_PERFORMANCE_GUIDE_SCHEMA = "honcut.character-performance-guide.v2"
 CHARACTER_PERFORMANCE_GUIDE_USAGE = "current_pxx_motion_reference_only"
-PREVIS_FRAME_PATH_PARTS = frozenset({
-    "director_panels",
-    "storyboard_beats",
-    "shot_storyboards",
-    "storyboard_groups",
-    "storyboard_bridges",
-    "phase5_reference_boards",
-})
+STORYBOARD_POSE_ATLAS_PLAN_SCHEMA = "honcut.storyboard-pose-atlas-plan.v1"
+PREVIS_FRAME_PATH_PARTS = frozenset(
+    {
+        "director_panels",
+        "storyboard_beats",
+        "shot_storyboards",
+        "storyboard_groups",
+        "storyboard_bridges",
+        "phase5_reference_boards",
+    }
+)
 
 
 def _frame_receipt(path: Path) -> dict[str, Any] | None:
@@ -59,14 +59,10 @@ def _assert_video_frame_provenance(path: Path, declared_kind: Any = None) -> Non
         "director_storyboard.png",
         "storyboard.png",
     }:
-        raise ValueError(
-            f"PREVIS/director board cannot be used as a video frame: {path}"
-        )
+        raise ValueError(f"PREVIS/director board cannot be used as a video frame: {path}")
     kind = str(declared_kind or "").strip()
     if kind and kind != CINEMATIC_FIRST_FRAME_SCHEMA:
-        raise ValueError(
-            f"video frame has non-cinematic provenance kind {kind}: {path}"
-        )
+        raise ValueError(f"video frame has non-cinematic provenance kind {kind}: {path}")
     receipt = _frame_receipt(path)
     # A path named ``storyboard_images/Sxx.png`` is not trustworthy by itself:
     # Phase 2 deliberately writes a PREVIS compatibility placeholder there and
@@ -76,9 +72,7 @@ def _assert_video_frame_provenance(path: Path, declared_kind: Any = None) -> Non
     if not receipt or receipt.get("status") != "done":
         raise ValueError(f"cinematic video frame has no completed receipt: {path}")
     if receipt.get("kind") != CINEMATIC_FIRST_FRAME_SCHEMA:
-        raise ValueError(
-            f"video frame receipt marks the asset as non-cinematic: {path}"
-        )
+        raise ValueError(f"video frame receipt marks the asset as non-cinematic: {path}")
     expected = str(receipt.get("image_sha256") or "")
     observed = hashlib.sha256(path.read_bytes()).hexdigest()
     if expected != observed:
@@ -130,18 +124,14 @@ def _assert_narrative_guide_provenance(
     observed = hashlib.sha256(path.read_bytes()).hexdigest()
     source_observed = hashlib.sha256(source_board.read_bytes()).hexdigest()
     cell_ids = [str(value) for value in (declared_cell_ids or [])]
-    zero_time_anchor_cell_ids = [
-        str(value) for value in (declared_zero_time_anchor_cell_ids or [])
-    ]
+    zero_time_anchor_cell_ids = [str(value) for value in (declared_zero_time_anchor_cell_ids or [])]
     beat_id = str(declared_beat_id or "").strip()
     if not cell_ids or len(cell_ids) != len(set(cell_ids)):
         raise ValueError("storyboard narrative guide needs ordered unique Gxx cells")
     if zero_time_anchor_cell_ids and (
         zero_time_anchor_cell_ids != [cell_ids[0]] or len(cell_ids) < 2
     ):
-        raise ValueError(
-            "storyboard narrative guide zero-time anchor must be the first Gxx cell"
-        )
+        raise ValueError("storyboard narrative guide zero-time anchor must be the first Gxx cell")
     semantic_payload = receipt.get("semantic_payload")
     if not isinstance(semantic_payload, dict):
         raise ValueError("storyboard narrative guide semantic payload is missing")
@@ -154,12 +144,8 @@ def _assert_narrative_guide_provenance(
         ).encode("utf-8")
     ).hexdigest()
     authority_roles = [str(value) for value in (declared_authority_roles or [])]
-    non_authority_roles = [
-        str(value) for value in (declared_non_authority_roles or [])
-    ]
-    pose_fingerprints = [
-        str(value) for value in (declared_pose_fingerprints or [])
-    ]
+    non_authority_roles = [str(value) for value in (declared_non_authority_roles or [])]
+    pose_fingerprints = [str(value) for value in (declared_pose_fingerprints or [])]
     semantic_cells = semantic_payload.get("cells")
     if not isinstance(semantic_cells, list):
         raise ValueError("storyboard narrative guide semantic cells are missing")
@@ -169,9 +155,7 @@ def _assert_narrative_guide_provenance(
         if isinstance(cell, dict)
     ]
     semantic_pose_contracts = [
-        cell.get("pose_contract")
-        for cell in semantic_cells
-        if isinstance(cell, dict)
+        cell.get("pose_contract") for cell in semantic_cells if isinstance(cell, dict)
     ]
     semantic_anchor_cells = [
         str(cell.get("label") or "")
@@ -189,9 +173,7 @@ def _assert_narrative_guide_provenance(
     ).hexdigest()
     if len(semantic_pose_contracts) != len(cell_ids):
         raise ValueError("storyboard narrative guide pose coverage is incomplete")
-    for cell_id, contract in zip(
-        cell_ids, semantic_pose_contracts, strict=True
-    ):
+    for cell_id, contract in zip(cell_ids, semantic_pose_contracts, strict=True):
         if not isinstance(contract, dict):
             raise ValueError("storyboard narrative guide pose contract is missing")
         unhashed = dict(contract)
@@ -206,15 +188,12 @@ def _assert_narrative_guide_provenance(
         ).hexdigest()
         if (
             contract.get("schema") != STORYBOARD_GUIDE_POSE_CONTRACT_SCHEMA
-            or contract.get("pose_policy_sha256")
-            != str(declared_pose_policy_sha256 or "")
+            or contract.get("pose_policy_sha256") != str(declared_pose_policy_sha256 or "")
             or contract.get("cell_id") != cell_id
             or contract.get("secondary_beat_id") != beat_id
             or stored_contract_sha256 != observed_contract_sha256
         ):
-            raise ValueError(
-                "storyboard narrative guide pose contract binding is invalid"
-            )
+            raise ValueError("storyboard narrative guide pose contract binding is invalid")
         timing_role = contract.get("timing_role")
         story_time_weight = contract.get("story_time_weight")
         if timing_role == "initial_anchor":
@@ -230,16 +209,10 @@ def _assert_narrative_guide_provenance(
     if (
         str(declared_sha256 or "") != observed
         or str(declared_renderer or "") != STORYBOARD_NARRATIVE_GUIDE_RENDERER
-        or str(declared_pose_contract_schema or "")
-        != STORYBOARD_GUIDE_POSE_CONTRACT_SCHEMA
-        or re.fullmatch(r"[0-9a-f]{64}", str(declared_pose_policy_sha256 or ""))
-        is None
-        or re.fullmatch(
-            r"[0-9a-f]{64}", str(declared_pose_contracts_sha256 or "")
-        )
-        is None
-        or str(declared_pose_contracts_sha256 or "")
-        != semantic_pose_contracts_sha256
+        or str(declared_pose_contract_schema or "") != STORYBOARD_GUIDE_POSE_CONTRACT_SCHEMA
+        or re.fullmatch(r"[0-9a-f]{64}", str(declared_pose_policy_sha256 or "")) is None
+        or re.fullmatch(r"[0-9a-f]{64}", str(declared_pose_contracts_sha256 or "")) is None
+        or str(declared_pose_contracts_sha256 or "") != semantic_pose_contracts_sha256
         or len(pose_fingerprints) != len(cell_ids)
         or any(re.fullmatch(r"[0-9a-f]{64}", value) is None for value in pose_fingerprints)
         or str(declared_source_pixel_usage or "") != "none"
@@ -249,19 +222,14 @@ def _assert_narrative_guide_provenance(
         or receipt.get("version") != 4
         or receipt.get("usage") != STORYBOARD_NARRATIVE_GUIDE_USAGE
         or receipt.get("renderer") != STORYBOARD_NARRATIVE_GUIDE_RENDERER
-        or receipt.get("pose_contract_schema")
-        != STORYBOARD_GUIDE_POSE_CONTRACT_SCHEMA
+        or receipt.get("pose_contract_schema") != STORYBOARD_GUIDE_POSE_CONTRACT_SCHEMA
         or receipt.get("pose_contract_schema") != declared_pose_contract_schema
         or receipt.get("pose_policy_sha256") != declared_pose_policy_sha256
-        or receipt.get("pose_contracts_sha256")
-        != declared_pose_contracts_sha256
+        or receipt.get("pose_contracts_sha256") != declared_pose_contracts_sha256
         or receipt.get("pose_fingerprints") != pose_fingerprints
-        or semantic_payload.get("pose_contract_schema")
-        != STORYBOARD_GUIDE_POSE_CONTRACT_SCHEMA
-        or semantic_payload.get("pose_policy_sha256")
-        != declared_pose_policy_sha256
-        or semantic_payload.get("pose_contracts_sha256")
-        != declared_pose_contracts_sha256
+        or semantic_payload.get("pose_contract_schema") != STORYBOARD_GUIDE_POSE_CONTRACT_SCHEMA
+        or semantic_payload.get("pose_policy_sha256") != declared_pose_policy_sha256
+        or semantic_payload.get("pose_contracts_sha256") != declared_pose_contracts_sha256
         or semantic_payload.get("pose_fingerprints") != pose_fingerprints
         or semantic_pose_fingerprints != pose_fingerprints
         or zero_time_anchor_cell_ids != semantic_anchor_cells
@@ -279,7 +247,8 @@ def _assert_narrative_guide_provenance(
         or receipt.get("cell_ids") != cell_ids
         or receipt.get("authority_roles") != authority_roles
         or receipt.get("non_authority_roles") != non_authority_roles
-        or authority_roles != [
+        or authority_roles
+        != [
             "narrative_order",
             "action_direction",
             "camera_motion",
@@ -290,6 +259,90 @@ def _assert_narrative_guide_provenance(
     ):
         raise ValueError("storyboard narrative guide receipt/hash/cell binding mismatch")
     return receipt
+
+
+def _assert_pose_atlas_provenance(
+    output_dir: Path,
+    shot_meta: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Validate every locally rendered atlas candidate before media selection."""
+
+    if (
+        str(shot_meta.get("_storyboard_pose_atlas_plan_schema") or "")
+        != STORYBOARD_POSE_ATLAS_PLAN_SCHEMA
+    ):
+        raise ValueError("storyboard pose atlas has an unknown plan schema")
+    receipt_path = Path(str(shot_meta.get("_storyboard_pose_atlas_receipt") or ""))
+    if not receipt_path.is_absolute():
+        receipt_path = output_dir / receipt_path
+    try:
+        raw = receipt_path.read_bytes()
+        receipt = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("storyboard pose atlas receipt is unreadable") from exc
+    if hashlib.sha256(raw).hexdigest() != str(
+        shot_meta.get("_storyboard_pose_atlas_receipt_sha256") or ""
+    ):
+        raise ValueError("storyboard pose atlas receipt hash mismatch")
+    if (
+        receipt.get("kind") != "honcut.storyboard-pose-atlas-receipt.v1"
+        or receipt.get("version") != 1
+        or receipt.get("status") != "done"
+        or receipt.get("source_pixel_usage") != "none"
+        or receipt.get("plan_sha256") != shot_meta.get("_storyboard_pose_atlas_plan_sha256")
+    ):
+        raise ValueError("storyboard pose atlas receipt contract is invalid")
+    plan = receipt.get("plan")
+    if not isinstance(plan, dict):
+        raise ValueError("storyboard pose atlas plan is missing")
+    plan_copy = dict(plan)
+    stored_plan_sha = str(plan_copy.pop("plan_sha256", ""))
+    if (
+        stored_plan_sha != shot_meta.get("_storyboard_pose_atlas_plan_sha256")
+        or stored_plan_sha
+        != hashlib.sha256(
+            json.dumps(
+                plan_copy,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        or plan.get("timing_contract") != shot_meta.get("_storyboard_pose_atlas_timing_contract")
+        or plan.get("camera_motion_contract_sha256")
+        != shot_meta.get("_storyboard_pose_atlas_camera_motion_contract_sha256")
+        or plan.get("action_groups") != shot_meta.get("_storyboard_pose_atlas_action_groups")
+        or plan.get("pose_samples") != shot_meta.get("_storyboard_pose_atlas_pose_samples")
+    ):
+        raise ValueError("storyboard pose atlas plan hash or lineage mismatch")
+    declared_candidates = shot_meta.get("_storyboard_pose_atlas_candidates")
+    candidates = receipt.get("candidates")
+    if not isinstance(candidates, list) or candidates != declared_candidates:
+        raise ValueError("storyboard pose atlas candidates do not match their receipt")
+    expected_samples = [
+        str(sample.get("sample_id") or "")
+        for sample in (shot_meta.get("_storyboard_pose_atlas_pose_samples") or [])
+        if isinstance(sample, dict)
+    ]
+    for candidate in candidates:
+        pages = candidate.get("pages") if isinstance(candidate, dict) else None
+        if not isinstance(pages, list):
+            raise ValueError("storyboard pose atlas candidate pages are missing")
+        covered: list[str] = []
+        for page in pages:
+            if not isinstance(page, dict):
+                raise ValueError("storyboard pose atlas page is malformed")
+            page_path = Path(str(page.get("image") or ""))
+            if not page_path.is_absolute():
+                page_path = output_dir / page_path
+            if not page_path.is_file() or hashlib.sha256(page_path.read_bytes()).hexdigest() != str(
+                page.get("image_sha256") or ""
+            ):
+                raise ValueError("storyboard pose atlas page hash mismatch")
+            covered.extend(str(value) for value in (page.get("sample_ids") or []))
+        if covered != expected_samples:
+            raise ValueError("storyboard pose atlas page allocation is incomplete")
+    return [dict(candidate) for candidate in candidates]
 
 
 def _assert_performance_guide_provenance(
@@ -331,9 +384,7 @@ def _assert_performance_guide_provenance(
         "source_board": receipt["source_board"],
         "source_board_sha256": receipt["source_board_sha256"],
         "source_board_receipt": receipt["source_board_receipt"],
-        "source_board_receipt_sha256": receipt[
-            "source_board_receipt_sha256"
-        ],
+        "source_board_receipt_sha256": receipt["source_board_receipt_sha256"],
     }
     if any(declared.get(key) != value for key, value in expected.items()):
         raise ValueError("character performance guide declaration does not match receipt")
@@ -354,23 +405,23 @@ def package_shot_assets(
 ) -> Tuple[Optional[str], List[str]]:
     """
     Package shot assets into a zip file with metadata.
-    
+
     Args:
         output_dir: Project output directory
         shot_id: Shot identifier (e.g., "S01")
         shot_meta: Shot metadata dict with prompt, duration, seed, width, height
-    
+
     Returns:
         Tuple of (zip_path_or_None, base64_list)
         - zip_path: Path to zip file if assets found, None otherwise
         - base64_list: List of base64-encoded images (sorted by priority, max 9)
-    
+
     Zip structure:
         assets.zip
         ├─ meta.json
         ├─ character_refs/      (static reference_board or canonical views)
         └─ shot_frames/         (Phase 4 cinematic storyboard_images/{shot_id}.png)
-    
+
     meta.json structure:
         {
             "shot_id": "S01",
@@ -386,10 +437,10 @@ def package_shot_assets(
         }
     """
     output_dir = Path(output_dir)
-    
+
     # Collect assets with metadata
     assets = []
-    
+
     # 1. Character reference images (priority 1, role=identity)
     # Try both directory structures: characters/{char_id}/ and characters/characters/{char_id}/
     char_bases = [output_dir / "characters", output_dir / "characters" / "characters"]
@@ -416,27 +467,31 @@ def package_shot_assets(
                     )
                     for reference_path in reference_paths:
                         if reference_path.exists():
-                            assets.append({
-                                "src_path": reference_path,
-                                "zip_path": f"character_refs/{char_dir.name}_{reference_path.name}",
-                                "role": "identity",
-                                "priority": 1,
-                            })
-    
+                            assets.append(
+                                {
+                                    "src_path": reference_path,
+                                    "zip_path": f"character_refs/{char_dir.name}_{reference_path.name}",
+                                    "role": "identity",
+                                    "priority": 1,
+                                }
+                            )
+
     # 2. Shot frame from storyboard_images (priority 1, role=composition)
     shot_frame_path = output_dir / "storyboard_images" / f"{shot_id}.png"
     if shot_frame_path.exists():
         _assert_video_frame_provenance(shot_frame_path)
-        assets.append({
-            "src_path": shot_frame_path,
-            "zip_path": f"shot_frames/{shot_id}.png",
-            "role": "composition",
-            "priority": 1,
-        })
-    
+        assets.append(
+            {
+                "src_path": shot_frame_path,
+                "zip_path": f"shot_frames/{shot_id}.png",
+                "role": "composition",
+                "priority": 1,
+            }
+        )
+
     if not assets:
         return None, []
-    
+
     # Build meta.json
     meta = {
         "shot_id": shot_id,
@@ -454,32 +509,32 @@ def package_shot_assets(
             for asset in assets
         ],
     }
-    
+
     # Create zip file
     zip_path = output_dir / "shots" / shot_id / "assets.zip"
     zip_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         # Write meta.json
         zf.writestr("meta.json", json.dumps(meta, indent=2, ensure_ascii=False))
-        
+
         # Write image files
         for asset in assets:
             zf.write(asset["src_path"], asset["zip_path"])
-    
+
     # Build base64 fallback list (sorted by priority, then by role, max 9)
     # Priority order: identity (character) > cinematic composition frame.
     sorted_assets = sorted(assets, key=lambda a: (a["priority"], a["role"]))
     base64_list = []
-    
+
     for asset in sorted_assets[:9]:
         try:
             img_data = asset["src_path"].read_bytes()
-            b64 = base64.b64encode(img_data).decode('utf-8')
+            b64 = base64.b64encode(img_data).decode("utf-8")
             base64_list.append(b64)
         except Exception as e:
             print(f"  ⚠ Failed to encode {asset['src_path']}: {e}")
-    
+
     return str(zip_path), base64_list
 
 
@@ -510,9 +565,7 @@ def _resolve_char_ids(output_dir: Path, raw_ids: List[str]) -> List[str]:
     resolved: list[str] = []
     for raw_id in raw_ids:
         candidates = (
-            [raw_id]
-            if raw_id in valid_ids
-            else name_to_ids.get(str(raw_id).casefold(), [raw_id])
+            [raw_id] if raw_id in valid_ids else name_to_ids.get(str(raw_id).casefold(), [raw_id])
         )
         for candidate in candidates:
             if candidate not in resolved:
@@ -574,6 +627,7 @@ def _detect_shot_characters(
 
     try:
         import json as _json
+
         chars_data = _json.loads(characters_json.read_text())
     except Exception:
         return []
@@ -637,36 +691,36 @@ def collect_character_reference_assets(
         reference_paths = [identity_reference] if identity_reference is not None else []
         for reference_path in reference_paths:
             if reference_path.exists() and reference_path.stat().st_size > 1024:
-                references.append({
-                    "path": reference_path,
-                    "char_id": char_id,
-                    "character_name": character_name,
-                    "prompt_definition": character_definitions.get(char_id, ""),
-                    "role": "reference_image",
-                    "priority": "high",
-                    "reference_kind": (
-                        "character_identity_board"
-                        if reference_path.name == "reference_board.png"
-                        else "character_identity"
-                    ),
-                    "bind_subject": True,
-                    "identity_props": identity_props,
-                    "reference_description": (
-                        f"{character_name}的四视图身份参考板（面部特写、正面全身、侧面全身、背面全身）"
-                        if reference_path.name == "reference_board.png"
-                        else f"{character_name}的面部特写"
-                        if reference_path.name == "face_closeup.png"
-                        else f"{character_name}的全身照"
-                        if reference_path.name == "full_body.png"
-                        else f"{character_name}的静态身份参考"
-                    ),
-                })
+                references.append(
+                    {
+                        "path": reference_path,
+                        "char_id": char_id,
+                        "character_name": character_name,
+                        "prompt_definition": character_definitions.get(char_id, ""),
+                        "role": "reference_image",
+                        "priority": "high",
+                        "reference_kind": (
+                            "character_identity_board"
+                            if reference_path.name == "reference_board.png"
+                            else "character_identity"
+                        ),
+                        "bind_subject": True,
+                        "identity_props": identity_props,
+                        "reference_description": (
+                            f"{character_name}的四视图身份参考板（面部特写、正面全身、侧面全身、背面全身）"
+                            if reference_path.name == "reference_board.png"
+                            else f"{character_name}的面部特写"
+                            if reference_path.name == "face_closeup.png"
+                            else f"{character_name}的全身照"
+                            if reference_path.name == "full_body.png"
+                            else f"{character_name}的静态身份参考"
+                        ),
+                    }
+                )
     return references
 
 
-_CANONICAL_PROMPT_MARKER = (
-    "[CANONICAL_VISUAL_CONTRACT — HIGHEST IDENTITY AUTHORITY]"
-)
+_CANONICAL_PROMPT_MARKER = "[CANONICAL_VISUAL_CONTRACT — HIGHEST IDENTITY AUTHORITY]"
 _CANONICAL_PROMPT_SUFFIX = "其他图片只承担其声明职责，不得改写这些事实。"
 
 
@@ -676,10 +730,7 @@ def _insert_after_canonical_authority(prompt_text: str, instruction: str) -> str
         boundary = prompt_text.find(_CANONICAL_PROMPT_SUFFIX)
         if boundary >= 0:
             boundary += len(_CANONICAL_PROMPT_SUFFIX)
-            return (
-                f"{prompt_text[:boundary]}\n{instruction}"
-                f"{prompt_text[boundary:]}"
-            )
+            return f"{prompt_text[:boundary]}\n{instruction}{prompt_text[boundary:]}"
     return f"{instruction}{prompt_text}"
 
 
@@ -688,7 +739,9 @@ def inject_reference_instruction(prompt_text: str, descriptions: List[Any]) -> s
     if not descriptions:
         return prompt_text
     normalized = [
-        item if isinstance(item, dict) else {"reference_description": str(item), "char_id": str(index)}
+        item
+        if isinstance(item, dict)
+        else {"reference_description": str(item), "char_id": str(index)}
         for index, item in enumerate(descriptions, start=1)
     ]
     references = "，".join(
@@ -717,7 +770,9 @@ def inject_reference_instruction(prompt_text: str, descriptions: List[Any]) -> s
             f"将{{图片N}}中的[{item.get('reference_description', char_id)}]定义为{{主体N}}"
         )
         subject_bindings.append(
-            definition.replace("{图片N}", f"图片{image_number}").replace("{主体N}", f"<主体{subject_number}>")
+            definition.replace("{图片N}", f"图片{image_number}").replace(
+                "{主体N}", f"<主体{subject_number}>"
+            )
         )
 
     reference_role_bindings = []
@@ -773,6 +828,7 @@ def inject_reference_instruction(prompt_text: str, descriptions: List[Any]) -> s
         reference_role_bindings.append("，".join(role_parts))
 
     image_replacements = iter(subject_numbers.values())
+
     def replace_image_placeholder(match: re.Match) -> str:
         try:
             image_number, _ = next(image_replacements)
@@ -782,12 +838,14 @@ def inject_reference_instruction(prompt_text: str, descriptions: List[Any]) -> s
 
     prompt_text = re.sub(r"\{图片N\}", replace_image_placeholder, prompt_text)
     subject_replacements = iter(subject_numbers.values())
+
     def replace_subject_placeholder(match: re.Match) -> str:
         try:
             _, subject_number = next(subject_replacements)
         except StopIteration:
             return match.group(0)
         return f"<主体{subject_number}>"
+
     prompt_text = re.sub(r"\{主体N\}", replace_subject_placeholder, prompt_text)
     binding_text = "；".join([*reference_role_bindings, *subject_bindings])
     instruction = references + "。"
@@ -822,8 +880,7 @@ def inject_omni_reference_instruction(
         (
             index
             for index, asset in enumerate(descriptions, start=1)
-            if isinstance(asset, dict)
-            and asset.get("reference_kind") == "cinematic_composition"
+            if isinstance(asset, dict) and asset.get("reference_kind") == "cinematic_composition"
         ),
         None,
     )
@@ -934,6 +991,13 @@ def build_content_for_shot(
     """
     output_dir = Path(output_dir)
     content = []
+    max_reference_images = shot_meta.get("_max_reference_images")
+    provider_budget = int(SEEDANCE_2_CAPABILITIES.max_reference_images or 9)
+    effective_budget = (
+        provider_budget
+        if max_reference_images is None
+        else min(provider_budget, max(0, int(max_reference_images)))
+    )
 
     # 1. Text prompt (always first)
     prompt_text = apply_storyboard_motion_policy(shot_meta.get("prompt", ""))
@@ -957,9 +1021,7 @@ def build_content_for_shot(
     if choreography_prompt and choreography_prompt not in prompt_text:
         prompt_text = f"{prompt_text}\n{choreography_prompt}".strip()
     try:
-        characters_data = json.loads(
-            (output_dir / "CHARACTERS.json").read_text(encoding="utf-8")
-        )
+        characters_data = json.loads((output_dir / "CHARACTERS.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         characters_data = {}
     prompt_text = ensure_video_generation_contract(
@@ -994,8 +1056,7 @@ def build_content_for_shot(
     ]
     synthetic_contract = ""
     if selected_contract_characters and all(
-        character.get("visual_identity_policy")
-        == "synthetic_stylized_character_v3"
+        character.get("visual_identity_policy") == "synthetic_stylized_character_v3"
         for character in selected_contract_characters
     ):
         from utils.privacy_visual_policy import synthetic_stylized_prompt_contract
@@ -1042,46 +1103,40 @@ def build_content_for_shot(
             shot_meta.get("_storyboard_frame_kind"),
         )
         beat_label = shot_meta.get("_storyboard_beat_id")
-        frame_label = (
-            f"{beat_label}成片质感第一帧"
-            if beat_label
-            else f"{shot_id}成片质感第一帧"
+        frame_label = f"{beat_label}成片质感第一帧" if beat_label else f"{shot_id}成片质感第一帧"
+        cinematic_assets.append(
+            {
+                "path": shot_frame_path,
+                "role": ("first_frame" if strategy == "flf2v" else "reference_image"),
+                "priority": "high",
+                "bind_subject": False,
+                "mandatory": True,
+                "reference_kind": "cinematic_composition",
+                "reference_description": (
+                    f"{frame_label}，用于锁定本生成片段的构图、角色站位、"
+                    "场景结构、项目美术风格、时间天气和光影；该资产已经过"
+                    "无文字、无箭头、无分格的像素洁净检查"
+                ),
+            }
         )
-        cinematic_assets.append({
-            "path": shot_frame_path,
-            "role": (
-                "first_frame"
-                if strategy == "flf2v"
-                else "reference_image"
-            ),
-            "priority": "high",
-            "bind_subject": False,
-            "mandatory": True,
-            "reference_kind": "cinematic_composition",
-            "reference_description": (
-                f"{frame_label}，用于锁定本生成片段的构图、角色站位、"
-                "场景结构、项目美术风格、时间天气和光影；该资产已经过"
-                "无文字、无箭头、无分格的像素洁净检查"
-            ),
-        })
 
     if strategy == "flf2v":
         image_assets.extend(cinematic_assets)
         end_frame_path = storyboard_images_dir / f"{shot_id}_end.png"
         if end_frame_path.exists() and end_frame_path.stat().st_size > 1024:
-            image_assets.append({
-                "path": end_frame_path,
-                "role": "last_frame",
-                "priority": "high",
-                "bind_subject": False,
-                "reference_description": (
-                    f"{shot_id}分镜尾帧，用于锁定镜头结束时的动作、构图和光影"
-                ),
-            })
-        else:
-            raise FileNotFoundError(
-                f"FLF2V end frame missing or too small: {end_frame_path}"
+            image_assets.append(
+                {
+                    "path": end_frame_path,
+                    "role": "last_frame",
+                    "priority": "high",
+                    "bind_subject": False,
+                    "reference_description": (
+                        f"{shot_id}分镜尾帧，用于锁定镜头结束时的动作、构图和光影"
+                    ),
+                }
             )
+        else:
+            raise FileNotFoundError(f"FLF2V end frame missing or too small: {end_frame_path}")
     elif strategy == "i2v":
         image_assets.extend(cinematic_assets)
         if not image_assets:
@@ -1104,9 +1159,7 @@ def build_content_for_shot(
                 "Phantom character references missing for shot "
                 f"{shot_id}: {', '.join(missing_characters)}"
             )
-        guide_value = str(
-            shot_meta.get("_storyboard_narrative_guide_path") or ""
-        ).strip()
+        guide_value = str(shot_meta.get("_storyboard_narrative_guide_path") or "").strip()
         if not guide_value:
             # Compatibility for direct/legacy callers that do not declare a
             # current authored beat. Preserve their historical reference order;
@@ -1119,15 +1172,13 @@ def build_content_for_shot(
                         (
                             asset
                             for asset in candidates
-                            if asset.get("reference_kind")
-                            == "character_identity_board"
+                            if asset.get("reference_kind") == "character_identity_board"
                         ),
                         next(
                             (
                                 asset
                                 for asset in candidates
-                                if Path(asset.get("path", "")).name
-                                == "full_body.png"
+                                if Path(asset.get("path", "")).name == "full_body.png"
                             ),
                             candidates[0] if candidates else None,
                         ),
@@ -1148,8 +1199,7 @@ def build_content_for_shot(
                     (
                         asset
                         for asset in candidates
-                        if asset.get("reference_kind")
-                        == "character_identity_board"
+                        if asset.get("reference_kind") == "character_identity_board"
                     ),
                     candidates[0],
                 )
@@ -1163,18 +1213,12 @@ def build_content_for_shot(
                 guide_path,
                 declared_kind=shot_meta.get("_storyboard_narrative_guide_kind"),
                 declared_usage=shot_meta.get("_storyboard_narrative_guide_usage"),
-                declared_cell_ids=shot_meta.get(
-                    "_storyboard_narrative_guide_cell_ids"
-                ),
+                declared_cell_ids=shot_meta.get("_storyboard_narrative_guide_cell_ids"),
                 declared_zero_time_anchor_cell_ids=shot_meta.get(
                     "_storyboard_narrative_guide_zero_time_anchor_cell_ids"
                 ),
-                declared_sha256=shot_meta.get(
-                    "_storyboard_narrative_guide_sha256"
-                ),
-                declared_renderer=shot_meta.get(
-                    "_storyboard_narrative_guide_renderer"
-                ),
+                declared_sha256=shot_meta.get("_storyboard_narrative_guide_sha256"),
+                declared_renderer=shot_meta.get("_storyboard_narrative_guide_renderer"),
                 declared_pose_contract_schema=shot_meta.get(
                     "_storyboard_narrative_guide_pose_contract_schema"
                 ),
@@ -1193,15 +1237,11 @@ def build_content_for_shot(
                 declared_semantic_payload_sha256=shot_meta.get(
                     "_storyboard_narrative_guide_semantic_payload_sha256"
                 ),
-                declared_source_board=shot_meta.get(
-                    "_storyboard_narrative_guide_source_board"
-                ),
+                declared_source_board=shot_meta.get("_storyboard_narrative_guide_source_board"),
                 declared_source_board_sha256=shot_meta.get(
                     "_storyboard_narrative_guide_source_board_sha256"
                 ),
-                declared_receipt=shot_meta.get(
-                    "_storyboard_narrative_guide_receipt"
-                ),
+                declared_receipt=shot_meta.get("_storyboard_narrative_guide_receipt"),
                 declared_authority_roles=shot_meta.get(
                     "_storyboard_narrative_guide_authority_roles"
                 ),
@@ -1225,17 +1265,11 @@ def build_content_for_shot(
                 ),
                 "narrative_beat_id": guide_receipt["beat_id"],
                 "authority_roles": list(guide_receipt["authority_roles"]),
-                "non_authority_roles": list(
-                    guide_receipt["non_authority_roles"]
-                ),
-                "semantic_payload_sha256": guide_receipt[
-                    "semantic_payload_sha256"
-                ],
+                "non_authority_roles": list(guide_receipt["non_authority_roles"]),
+                "semantic_payload_sha256": guide_receipt["semantic_payload_sha256"],
                 "pose_contract_schema": guide_receipt["pose_contract_schema"],
                 "pose_policy_sha256": guide_receipt["pose_policy_sha256"],
-                "pose_contracts_sha256": guide_receipt[
-                    "pose_contracts_sha256"
-                ],
+                "pose_contracts_sha256": guide_receipt["pose_contracts_sha256"],
                 "pose_fingerprints": list(guide_receipt["pose_fingerprints"]),
                 "reference_description": (
                     f"{guide_receipt['beat_id']}剧情导航图，只按"
@@ -1245,13 +1279,9 @@ def build_content_for_shot(
                 ),
             }
             performance_guides = shot_meta.get("_character_performance_guides") or []
-            performance_required = bool(
-                shot_meta.get("_character_performance_required")
-            )
+            performance_required = bool(shot_meta.get("_character_performance_required"))
             if performance_required != bool(performance_guides):
-                raise ValueError(
-                    f"{shot_id} performance-guide requirement is incomplete"
-                )
+                raise ValueError(f"{shot_id} performance-guide requirement is incomplete")
             for declared in performance_guides:
                 guide_value = str(
                     declared.get("image") if isinstance(declared, dict) else ""
@@ -1266,34 +1296,117 @@ def build_content_for_shot(
                     output_dir=output_dir,
                 )
                 performance_cells = list(performance_receipt["cell_ids"])
-                image_assets.append({
-                    "path": performance_path,
-                    "role": "reference_image",
-                    "priority": "high",
-                    "bind_subject": False,
-                    "mandatory": True,
-                    "reference_kind": "character_performance_guide",
-                    "char_id": performance_receipt["character_id"],
-                    "performance_beat_id": performance_receipt["beat_id"],
-                    "performance_cell_ids": performance_cells,
-                    "performance_source_action_unit_ids": list(
-                        performance_receipt["source_action_unit_ids"]
-                    ),
-                    "performance_prop_ids": list(
-                        performance_receipt["prop_ids"]
-                    ),
-                    "performance_source_board_sha256": (
-                        performance_receipt["source_board_sha256"]
-                    ),
-                    "reference_description": (
-                        f"{performance_receipt['beat_id']}中"
-                        f"{performance_receipt['character_id']}的当前动作姿态图，仅按"
-                        + "→".join(performance_cells)
-                        + "理解同一角色的姿态与道具握持；不得生成克隆、分栏、"
-                        "网格或板中其他动作"
-                    ),
-                })
-            image_assets.append(narrative_asset)
+                image_assets.append(
+                    {
+                        "path": performance_path,
+                        "role": "reference_image",
+                        "priority": "high",
+                        "bind_subject": False,
+                        "mandatory": True,
+                        "reference_kind": "character_performance_guide",
+                        "char_id": performance_receipt["character_id"],
+                        "performance_beat_id": performance_receipt["beat_id"],
+                        "performance_cell_ids": performance_cells,
+                        "performance_source_action_unit_ids": list(
+                            performance_receipt["source_action_unit_ids"]
+                        ),
+                        "performance_prop_ids": list(performance_receipt["prop_ids"]),
+                        "performance_source_board_sha256": (
+                            performance_receipt["source_board_sha256"]
+                        ),
+                        "reference_description": (
+                            f"{performance_receipt['beat_id']}中"
+                            f"{performance_receipt['character_id']}的当前动作姿态图，仅按"
+                            + "→".join(performance_cells)
+                            + "理解同一角色的姿态与道具握持；不得生成克隆、分栏、"
+                            "网格或板中其他动作"
+                        ),
+                    }
+                )
+            terminal_mode = str(shot_meta.get("_terminal_reference_mode") or "semantic_hold")
+            terminal_value = str(shot_meta.get("_terminal_pose_reference") or "").strip()
+            if terminal_mode == "exact_pose":
+                terminal_path = Path(terminal_value)
+                if not terminal_path.is_absolute():
+                    terminal_path = output_dir / terminal_path
+                if not terminal_path.is_file() or hashlib.sha256(
+                    terminal_path.read_bytes()
+                ).hexdigest() != str(shot_meta.get("_terminal_pose_reference_sha256") or ""):
+                    raise ValueError("exact terminal pose reference is missing or corrupt")
+                image_assets.append(
+                    {
+                        "path": terminal_path,
+                        "role": "reference_image",
+                        "priority": "high",
+                        "bind_subject": False,
+                        "mandatory": True,
+                        "reference_kind": "terminal_pose_reference",
+                        "reference_description": (
+                            "当前 Pxx 的精确终态姿态参考；只约束结束姿态，不得提前停止动作"
+                        ),
+                    }
+                )
+            elif terminal_value:
+                raise ValueError("semantic terminal hold must not carry exact-pose media")
+
+            if shot_meta.get("_storyboard_pose_atlas_plan_schema"):
+                atlas_candidates = _assert_pose_atlas_provenance(
+                    output_dir,
+                    shot_meta,
+                )
+                available_slots = effective_budget - len(image_assets)
+                selected_atlas = select_pose_atlas_candidate(
+                    atlas_candidates,
+                    available_image_slots=available_slots,
+                )
+                timing = dict(shot_meta.get("_storyboard_pose_atlas_timing_contract") or {})
+                for page in selected_atlas["pages"]:
+                    atlas_path = Path(str(page["image"]))
+                    if not atlas_path.is_absolute():
+                        atlas_path = output_dir / atlas_path
+                    image_assets.append(
+                        {
+                            "path": atlas_path,
+                            "role": "reference_image",
+                            "priority": "high",
+                            "bind_subject": False,
+                            "mandatory": True,
+                            "reference_kind": "storyboard_pose_atlas",
+                            "narrative_cell_ids": list(page["sample_ids"]),
+                            "narrative_zero_time_anchor_cell_ids": (
+                                [page["sample_ids"][0]]
+                                if page.get("sample_ids") and page["sample_ids"][0] == "G01"
+                                else []
+                            ),
+                            "narrative_beat_id": shot_meta.get("_storyboard_beat_id"),
+                            "authority_roles": list(selected_atlas["authority_roles"]),
+                            "non_authority_roles": list(selected_atlas["non_authority_roles"]),
+                            "pose_atlas_strategy": selected_atlas["strategy"],
+                            "pose_atlas_page_index": page["page_index"],
+                            "pose_atlas_page_count": selected_atlas["page_count"],
+                            "pose_atlas_plan_sha256": shot_meta.get(
+                                "_storyboard_pose_atlas_plan_sha256"
+                            ),
+                            "pose_atlas_timing_contract": timing,
+                            "pose_atlas_camera_motion_contract_sha256": shot_meta.get(
+                                "_storyboard_pose_atlas_camera_motion_contract_sha256"
+                            ),
+                            "reference_description": (
+                                f"{shot_meta.get('_storyboard_beat_id')}动作姿态图集"
+                                f"第{page['page_index']}/{selected_atlas['page_count']}页，"
+                                "按"
+                                + "→".join(page["sample_ids"])
+                                + "理解连续运动包络；同一动作组的相邻格是姿态采样，"
+                                "不是新增剧情；序号、箭头、边框和网格不得进入视频"
+                            ),
+                        }
+                    )
+                shot_meta["_selected_storyboard_pose_atlas_strategy"] = selected_atlas["strategy"]
+                shot_meta["_selected_storyboard_pose_atlas_sha256"] = selected_atlas[
+                    "rendered_candidate_sha256"
+                ]
+            else:
+                image_assets.append(narrative_asset)
         if not image_assets:
             raise FileNotFoundError(
                 "Phantom references missing for shot "
@@ -1305,13 +1418,6 @@ def build_content_for_shot(
             "mandatory image(s)"
         )
 
-    max_reference_images = shot_meta.get("_max_reference_images")
-    provider_budget = int(SEEDANCE_2_CAPABILITIES.max_reference_images or 9)
-    effective_budget = (
-        provider_budget
-        if max_reference_images is None
-        else min(provider_budget, max(0, int(max_reference_images)))
-    )
     mandatory_assets = [asset for asset in image_assets if asset.get("mandatory")]
     optional_assets = [asset for asset in image_assets if not asset.get("mandatory")]
     if len(mandatory_assets) > effective_budget:
@@ -1320,9 +1426,7 @@ def build_content_for_shot(
             f"above the available Seedance budget {effective_budget}"
         )
     optional_capacity = effective_budget - len(mandatory_assets)
-    selected_optional_ids = {
-        id(asset) for asset in optional_assets[:optional_capacity]
-    }
+    selected_optional_ids = {id(asset) for asset in optional_assets[:optional_capacity]}
     image_assets = [
         asset
         for asset in image_assets
@@ -1335,22 +1439,18 @@ def build_content_for_shot(
         )
 
     route_label = (
-        f"{requested_strategy}->{strategy}"
-        if requested_strategy != strategy
-        else strategy
+        f"{requested_strategy}->{strategy}" if requested_strategy != strategy else strategy
     )
     print(f"  [assets] {route_label}: images_used={len(image_assets)}")
-    
+
     # Upload each image to TOS and add to content
     uploaded_count = 0
     uploaded_reference_descriptions = []
     try:
         from clients import tos_uploader
     except ImportError as exc:
-        raise RuntimeError(
-            "TOS uploader is required for every Seedance image input"
-        ) from exc
-    
+        raise RuntimeError("TOS uploader is required for every Seedance image input") from exc
+
     for asset in image_assets:
         # M5: fit first_frame/last_frame to video aspect ratio before upload (no stretching)
         video_w = shot_meta.get("width", 1280)
@@ -1360,6 +1460,7 @@ def build_content_for_shot(
             try:
                 import tempfile
                 from pipeline_runner import fit_to_aspect
+
                 with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
                     tmp_path = Path(tmp.name)
                 fit_to_aspect(asset["path"], video_w, video_h, tmp_path)
@@ -1388,37 +1489,35 @@ def build_content_for_shot(
             "_narrative_beat_id": asset.get("narrative_beat_id"),
             "_authority_roles": asset.get("authority_roles"),
             "_non_authority_roles": asset.get("non_authority_roles"),
-            "_semantic_payload_sha256": asset.get(
-                "semantic_payload_sha256"
+            "_semantic_payload_sha256": asset.get("semantic_payload_sha256"),
+            "_pose_atlas_strategy": asset.get("pose_atlas_strategy"),
+            "_pose_atlas_page_index": asset.get("pose_atlas_page_index"),
+            "_pose_atlas_page_count": asset.get("pose_atlas_page_count"),
+            "_pose_atlas_plan_sha256": asset.get("pose_atlas_plan_sha256"),
+            "_pose_atlas_timing_contract": asset.get("pose_atlas_timing_contract"),
+            "_pose_atlas_camera_motion_contract_sha256": asset.get(
+                "pose_atlas_camera_motion_contract_sha256"
             ),
             "_performance_beat_id": asset.get("performance_beat_id"),
             "_performance_cell_ids": asset.get("performance_cell_ids"),
-            "_performance_source_action_unit_ids": asset.get(
-                "performance_source_action_unit_ids"
-            ),
+            "_performance_source_action_unit_ids": asset.get("performance_source_action_unit_ids"),
             "_performance_prop_ids": asset.get("performance_prop_ids"),
-            "_performance_source_board_sha256": asset.get(
-                "performance_source_board_sha256"
-            ),
+            "_performance_source_board_sha256": asset.get("performance_source_board_sha256"),
             "_mandatory_reference": asset.get("mandatory") is True,
             "_reference_path": (
                 str(asset["path"].relative_to(output_dir))
                 if asset["path"].is_relative_to(output_dir)
                 else str(asset["path"])
             ),
-            "_reference_sha256": hashlib.sha256(
-                asset["path"].read_bytes()
-            ).hexdigest(),
+            "_reference_sha256": hashlib.sha256(asset["path"].read_bytes()).hexdigest(),
         }
         content.append(content_item)
         uploaded_count += 1
         if asset["role"] == "reference_image":
             uploaded_reference_descriptions.append(asset)
-    
+
     if strategy in {"phantom", "i2v"} and uploaded_reference_descriptions and content:
-        text_item = next(
-            (item for item in content if item.get("type") == "text"), None
-        )
+        text_item = next((item for item in content if item.get("type") == "text"), None)
         if text_item is not None:
             text_item["text"] = inject_omni_reference_instruction(
                 text_item["text"], uploaded_reference_descriptions
@@ -1426,12 +1525,9 @@ def build_content_for_shot(
 
     if strategy in {"i2v", "flf2v"} and content:
         frame_descriptions = [
-            asset for asset in image_assets
-            if asset.get("role") in {"first_frame", "last_frame"}
+            asset for asset in image_assets if asset.get("role") in {"first_frame", "last_frame"}
         ]
-        text_item = next(
-            (item for item in content if item.get("type") == "text"), None
-        )
+        text_item = next((item for item in content if item.get("type") == "text"), None)
         if text_item is not None and frame_descriptions:
             frame_contract = "；".join(
                 f"图片{index}为{asset['reference_description']}"
@@ -1446,22 +1542,22 @@ def build_content_for_shot(
 if __name__ == "__main__":
     # Quick test
     import tempfile
-    
+
     with tempfile.TemporaryDirectory() as tmpdir:
         output_dir = Path(tmpdir)
-        
+
         # Create test structure
         char_dir = output_dir / "characters" / "characters" / "char_001"
         char_dir.mkdir(parents=True)
         (char_dir / "front.png").write_bytes(b"fake_front")
         (char_dir / "side.png").write_bytes(b"fake_side")
-        
+
         storyboard_img_dir = output_dir / "storyboard_images"
         storyboard_img_dir.mkdir()
         (storyboard_img_dir / "S01.png").write_bytes(b"fake_shot_frame")
-        
+
         (output_dir / "storyboard.png").write_bytes(b"fake_storyboard")
-        
+
         shot_meta = {
             "prompt": "Test shot",
             "duration": 5,
@@ -1469,23 +1565,23 @@ if __name__ == "__main__":
             "width": 1280,
             "height": 720,
         }
-        
+
         # Test old package_shot_assets
         zip_path, base64_list = package_shot_assets(output_dir, "S01", shot_meta)
-        
+
         if zip_path is None:
             print("✗ No zip created (no assets found)")
             exit(1)
-        
+
         print(f"✓ Created zip: {zip_path}")
         print(f"✓ Base64 list length: {len(base64_list)}")
-        
+
         # Verify zip contents
-        with zipfile.ZipFile(zip_path, 'r') as zf:
+        with zipfile.ZipFile(zip_path, "r") as zf:
             print(f"✓ Zip contents: {zf.namelist()}")
             meta = json.loads(zf.read("meta.json"))
             print(f"✓ Meta: {json.dumps(meta, indent=2)}")
-        
+
         # Test new build_content_for_shot (will fail TOS upload without credentials, but structure should be correct)
         print("\n--- Testing build_content_for_shot ---")
         content = build_content_for_shot(output_dir, "S01", shot_meta)
@@ -1494,4 +1590,6 @@ if __name__ == "__main__":
             if item["type"] == "text":
                 print(f"  [{i}] text: {item['text'][:50]}...")
             else:
-                print(f"  [{i}] image_url: role={item.get('role')}, priority={item.get('priority')}")
+                print(
+                    f"  [{i}] image_url: role={item.get('role')}, priority={item.get('priority')}"
+                )

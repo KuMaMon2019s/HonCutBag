@@ -319,6 +319,47 @@ def _action_vector(direction: str, *, static: bool) -> dict[str, int]:
     }[direction]
 
 
+def _project_actors_for_camera(
+    actors: list[dict[str, Any]],
+    projection: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Apply a deterministic 2D projection sampled from one camera path."""
+
+    if not projection:
+        return actors
+    horizontal_scale = float(projection.get("horizontal_joint_scale") or 1.0)
+    focal_length = float(projection.get("focal_length_mm") or 50.0)
+    translation = float(projection.get("translation_m") or 0.0)
+    pitch = float(projection.get("pitch_degrees") or 0.0)
+    view_scale = max(0.65, min(1.45, focal_length / 50.0 + translation * 0.08))
+    projected: list[dict[str, Any]] = []
+    for actor in actors:
+        actor_copy = dict(actor)
+        joints = actor.get("joints") or {}
+        hip_points = [joints.get("left_hip"), joints.get("right_hip")]
+        valid_hips = [point for point in hip_points if isinstance(point, list)]
+        center_x = (
+            sum(float(point[0]) for point in valid_hips) / len(valid_hips) if valid_hips else 500.0
+        )
+        center_y = 500.0
+        projected_joints: dict[str, list[int]] = {}
+        for joint, point in joints.items():
+            x = center_x + (float(point[0]) - center_x) * horizontal_scale * view_scale
+            y = center_y + (float(point[1]) - center_y) * view_scale
+            y += pitch * (float(point[1]) - center_y) / 180.0
+            projected_joints[str(joint)] = [
+                round(max(0.0, min(1000.0, x))),
+                round(max(0.0, min(1000.0, y))),
+            ]
+        actor_copy["joints"] = projected_joints
+        actor_copy["view"] = str(projection.get("view") or "front")
+        actor_copy["occlusion_order"] = str(projection.get("occlusion_order") or "right_over_left")
+        actor_copy.pop("pose_fingerprint", None)
+        actor_copy["pose_fingerprint"] = _canonical_sha256(actor_copy)
+        projected.append(actor_copy)
+    return projected
+
+
 _NEUTRAL = {
     "head": (0, -72),
     "neck": (0, -52),
@@ -465,9 +506,7 @@ _POSES: dict[str, dict[str, tuple[int, int]]] = {
 
 def _has_positive_marker(text: str, markers: Sequence[str]) -> bool:
     return any(
-        not negated
-        for marker in markers
-        for _index, negated in _marker_occurrences(text, marker)
+        not negated for marker in markers for _index, negated in _marker_occurrences(text, marker)
     )
 
 
@@ -477,12 +516,20 @@ def _mechanics_modifiers(mechanics: Mapping[str, Any], direction: str) -> dict[s
         for key in ("technique", "footwork", "torso", "weight_shift", "direction", "end_pose")
     )
     contact_text = str(mechanics.get("contact") or "")
-    center_drop = 18 if _has_positive_marker(movement_text, _MECHANICS_MARKERS["center_drop"]) else 0
+    center_drop = (
+        18 if _has_positive_marker(movement_text, _MECHANICS_MARKERS["center_drop"]) else 0
+    )
     lean_back = _has_positive_marker(movement_text, _MECHANICS_MARKERS["lean_back"])
     lean_forward = _has_positive_marker(movement_text, _MECHANICS_MARKERS["lean_forward"])
-    torso_lean = -24 if lean_back and not lean_forward else 18 if lean_forward and not lean_back else 0
-    stance_width = 16 if _has_positive_marker(movement_text, _MECHANICS_MARKERS["wide_stance"]) else 0
-    lead_step = 24 if stance_width and direction in {"right", "forward"} else -24 if stance_width else 0
+    torso_lean = (
+        -24 if lean_back and not lean_forward else 18 if lean_forward and not lean_back else 0
+    )
+    stance_width = (
+        16 if _has_positive_marker(movement_text, _MECHANICS_MARKERS["wide_stance"]) else 0
+    )
+    lead_step = (
+        24 if stance_width and direction in {"right", "forward"} else -24 if stance_width else 0
+    )
     two_hand_hold = _has_positive_marker(
         f"{movement_text} {contact_text}",
         _MECHANICS_MARKERS["two_hand_hold"],
@@ -837,11 +884,7 @@ def _initial_anchor_unit_ids(
     cell_count: int,
 ) -> frozenset[str]:
     """Identify a ready pose already established by the first cinematic frame."""
-    if (
-        len(units) < 2
-        or cell_count < 2
-        or not str(beat.get("beat_id") or "").endswith("_P01")
-    ):
+    if len(units) < 2 or cell_count < 2 or not str(beat.get("beat_id") or "").endswith("_P01"):
         return frozenset()
     first_mechanics, _ = _matching_mechanics(beat, [units[0]])
     first_actions = " → ".join(_strings(units[0].get("actions")))
@@ -849,8 +892,7 @@ def _initial_anchor_unit_ids(
     if first_family != "ready":
         return frozenset()
     dynamic_families = {
-        family for family, _markers in _POSE_CLASSIFIERS
-        if family not in {"ready", "prop_hold"}
+        family for family, _markers in _POSE_CLASSIFIERS if family not in {"ready", "prop_hold"}
     }
     for unit in units[1:]:
         mechanics, _ = _matching_mechanics(beat, [unit])
@@ -964,9 +1006,7 @@ def compile_pose_contracts(
         mechanics_modifiers = _mechanics_modifiers(mechanics, direction)
         group_key = tuple(str(unit["unit_id"]) for unit in group)
         timing_role = (
-            "initial_anchor"
-            if initial_anchor_unit_ids == frozenset(group_key)
-            else "story_action"
+            "initial_anchor" if initial_anchor_unit_ids == frozenset(group_key) else "story_action"
         )
         story_time_weight = 0.0 if timing_role == "initial_anchor" else 1.0
         performers = _dedupe(
@@ -1021,6 +1061,12 @@ def compile_pose_contracts(
         for actor, role in zip(actors, actor_roles, strict=True):
             actor["role_ref"] = role
             actor["pose_fingerprint"] = _canonical_sha256(actor)
+        camera_projection = (
+            cell.get("camera_projection")
+            if isinstance(cell.get("camera_projection"), Mapping)
+            else None
+        )
+        actors = _project_actors_for_camera(actors, camera_projection)
         geometry = {
             "actors": actors,
             "objects": [
@@ -1073,6 +1119,11 @@ def compile_pose_contracts(
                 "static_spatial_state": static_spatial_state,
                 "timing_role": timing_role,
                 "story_time_weight": story_time_weight,
+                **(
+                    {"camera_projection": camera_projection}
+                    if camera_projection is not None
+                    else {}
+                ),
             }
         )
         contract = {
@@ -1107,6 +1158,8 @@ def compile_pose_contracts(
             "geometry": geometry,
             "pose_fingerprint": pose_fingerprint,
         }
+        if camera_projection is not None:
+            contract["camera_projection"] = dict(camera_projection)
         contract["contract_sha256"] = _canonical_sha256(contract)
         enriched = dict(cell)
         enriched["neutral_subject_count"] = len(actor_roles)
@@ -1145,10 +1198,7 @@ def validate_pose_contract(contract: Mapping[str, Any], *, cell_id: str, beat_id
     story_time_weight = contract.get("story_time_weight")
     if timing_role not in {"initial_anchor", "story_action"}:
         raise ValueError("story guide pose timing role is invalid")
-    if (
-        not isinstance(story_time_weight, (int, float))
-        or isinstance(story_time_weight, bool)
-    ):
+    if not isinstance(story_time_weight, (int, float)) or isinstance(story_time_weight, bool):
         raise ValueError("story guide pose story-time weight is invalid")
     if timing_role == "initial_anchor":
         if (
@@ -1188,8 +1238,8 @@ def validate_pose_contract(contract: Mapping[str, Any], *, cell_id: str, beat_id
             raise ValueError("story guide neutral transition origin is invalid")
     elif (
         not origin_unit_ids
-        or transition_origin.get("pose_family") not in {family for family, _ in _POSE_CLASSIFIERS}
-        | {"spatial"}
+        or transition_origin.get("pose_family")
+        not in {family for family, _ in _POSE_CLASSIFIERS} | {"spatial"}
         or transition_origin.get("direction")
         not in {direction for direction, _ in _DIRECTION_MARKERS}
     ):
@@ -1232,6 +1282,11 @@ def validate_pose_contract(contract: Mapping[str, Any], *, cell_id: str, beat_id
             "static_spatial_state": bool(contract.get("static_spatial_state")),
             "timing_role": timing_role,
             "story_time_weight": float(story_time_weight),
+            **(
+                {"camera_projection": contract.get("camera_projection")}
+                if isinstance(contract.get("camera_projection"), Mapping)
+                else {}
+            ),
         }
     )
     if contract.get("pose_fingerprint") != expected_fingerprint:
@@ -1421,8 +1476,7 @@ def validate_pose_sequence(cells: list[Mapping[str, Any]], *, beat_id: str) -> N
             raise ValueError(f"{beat_id} has distinct action semantics collapsed to one pose")
         if previous_contract["action_bindings"] != current_contract["action_bindings"]:
             expected_origin_ids = [
-                str(binding["unit_id"])
-                for binding in previous_contract["action_bindings"]
+                str(binding["unit_id"]) for binding in previous_contract["action_bindings"]
             ]
             current_origin = current_contract["transition_origin"]
             if (
@@ -1469,8 +1523,7 @@ def validate_pose_sequence(cells: list[Mapping[str, Any]], *, beat_id: str) -> N
             continue
         maximum_span_delta = max(
             (
-                abs(first_point[0] - last_point[0])
-                + abs(first_point[1] - last_point[1])
+                abs(first_point[0] - last_point[0]) + abs(first_point[1] - last_point[1])
                 for first_actor, last_actor in zip(first_actors, last_actors, strict=True)
                 for joint, first_point in first_actor["joints"].items()
                 for last_point in [last_actor["joints"][joint]]

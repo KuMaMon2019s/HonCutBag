@@ -7,10 +7,28 @@ independent camera vocabularies.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 from collections.abc import Mapping, MutableMapping
 from typing import Any
 
-CAMERA_MOTION_SCHEMA_VERSION = 2
+CAMERA_MOTION_SCHEMA_VERSION = 3
+
+_CAMERA_PARAMETER_KEYS = (
+    "camera_height_m",
+    "translation_distance_m",
+    "translation_speed_m_per_s",
+    "focal_length_start_mm",
+    "focal_length_end_mm",
+    "focal_length_speed_mm_per_s",
+    "pan_degrees",
+    "pan_speed_degrees_per_s",
+    "tilt_degrees",
+    "tilt_speed_degrees_per_s",
+    "segment_count",
+    "segment_pause_s",
+)
 
 # Keep ``rack_focus`` last: parser diagnostics and contract tests historically
 # use it as the visible end of the legal vocabulary.
@@ -265,7 +283,37 @@ def build_camera_motion_contract(
     lens_mm = lens_for_shot(shot.get("shot_size") or shot.get("shot_type"), has_human=human)
     shot_size = str(shot.get("shot_size") or shot.get("shot_type") or "medium")
     spec = CAMERA_MOVEMENT_SPECS[movement]
-    return {
+    raw_parameters = shot.get("camera_motion_parameters")
+    if raw_parameters is not None and not isinstance(raw_parameters, Mapping):
+        raise ValueError("camera_motion_parameters must be an object")
+    parameters: dict[str, float | int] = {}
+    for key in _CAMERA_PARAMETER_KEYS:
+        if not isinstance(raw_parameters, Mapping) or key not in raw_parameters:
+            continue
+        value = raw_parameters[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"camera motion parameter {key} must be numeric")
+        if key == "segment_count":
+            integer = int(value)
+            if integer != value or integer < 1:
+                raise ValueError("camera segment_count must be a positive integer")
+            parameters[key] = integer
+        else:
+            parameters[key] = round(float(value), 6)
+    for key in (
+        "translation_speed_m_per_s",
+        "focal_length_start_mm",
+        "focal_length_end_mm",
+        "focal_length_speed_mm_per_s",
+        "pan_speed_degrees_per_s",
+        "tilt_speed_degrees_per_s",
+    ):
+        if key in parameters and float(parameters[key]) <= 0:
+            raise ValueError(f"camera motion parameter {key} must be positive")
+    for key in ("camera_height_m", "translation_distance_m", "segment_pause_s"):
+        if key in parameters and float(parameters[key]) < 0:
+            raise ValueError(f"camera motion parameter {key} cannot be negative")
+    contract = {
         "schema_version": CAMERA_MOTION_SCHEMA_VERSION,
         "movement": movement,
         "movement_label": spec["label"],
@@ -281,7 +329,14 @@ def build_camera_motion_contract(
             for part in (BASE_CAMERA_NEGATIVE, HUMAN_PERSPECTIVE_NEGATIVE if human else "")
             if part
         ),
+        "technical_parameters": parameters,
     }
+    contract["contract_sha256"] = hashlib.sha256(
+        json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    return contract
 
 
 def apply_camera_motion_contract(shot: MutableMapping[str, Any]) -> MutableMapping[str, Any]:
@@ -289,11 +344,134 @@ def apply_camera_motion_contract(shot: MutableMapping[str, Any]) -> MutableMappi
     contract = build_camera_motion_contract(shot)
     shot["camera_movement"] = contract["movement"]
     shot["camera_motion_contract"] = contract
+    shot["camera_motion_contract_sha256"] = contract["contract_sha256"]
     if contract["lens_mm"] is not None:
         shot["lens_mm"] = contract["lens_mm"]
     else:
         shot.pop("lens_mm", None)
     return shot
+
+
+def camera_motion_minimum_duration_s(contract: Mapping[str, Any]) -> float:
+    """Return the deterministic minimum time required by authored camera parameters."""
+
+    parameters = contract.get("technical_parameters")
+    if not isinstance(parameters, Mapping):
+        return 0.0
+    requirements: list[float] = []
+    pairs = (
+        ("translation_distance_m", "translation_speed_m_per_s"),
+        ("pan_degrees", "pan_speed_degrees_per_s"),
+        ("tilt_degrees", "tilt_speed_degrees_per_s"),
+    )
+    for amount_key, speed_key in pairs:
+        if amount_key not in parameters:
+            continue
+        if speed_key not in parameters:
+            raise ValueError(f"{amount_key} requires {speed_key}")
+        speed = float(parameters[speed_key])
+        if speed <= 0:
+            raise ValueError(f"{speed_key} must be positive")
+        requirements.append(abs(float(parameters[amount_key])) / speed)
+    focal_keys = {"focal_length_start_mm", "focal_length_end_mm"}
+    if focal_keys.intersection(parameters):
+        if not focal_keys.issubset(parameters):
+            raise ValueError("focal-length motion requires both start and end values")
+        speed_key = "focal_length_speed_mm_per_s"
+        if speed_key not in parameters:
+            raise ValueError("focal-length motion requires focal_length_speed_mm_per_s")
+        requirements.append(
+            abs(
+                float(parameters["focal_length_end_mm"])
+                - float(parameters["focal_length_start_mm"])
+            )
+            / float(parameters[speed_key])
+        )
+    movement_duration = max(requirements, default=0.0)
+    segment_count = int(parameters.get("segment_count") or 1)
+    pause_s = float(parameters.get("segment_pause_s") or 0.0)
+    return round(movement_duration + max(0, segment_count - 1) * pause_s, 6)
+
+
+def validate_camera_motion_duration(
+    contract: Mapping[str, Any],
+    duration_s: float | int,
+    *,
+    resource_id: str = "shot",
+) -> float:
+    """Fail before Provider work when Adaptation authored an impossible path."""
+
+    available = float(duration_s)
+    required = camera_motion_minimum_duration_s(contract)
+    if required > available + 1e-6:
+        raise ValueError(
+            f"{resource_id} camera path requires at least {required:g}s, "
+            f"but only {available:g}s is available; return to Adaptation"
+        )
+    return required
+
+
+def camera_projection_at_progress(
+    contract: Mapping[str, Any],
+    progress: float,
+) -> dict[str, Any]:
+    """Project one sample along the authored continuous camera path.
+
+    This function never selects or repairs a camera movement.  It only samples
+    the Adaptation-owned contract so Phase 2 cannot introduce a second path.
+    """
+
+    normalized = max(0.0, min(1.0, float(progress)))
+    movement = canonical_camera_movement(contract.get("movement"))
+    raw_parameters = contract.get("technical_parameters")
+    parameters = raw_parameters if isinstance(raw_parameters, Mapping) else {}
+    default_pan = {
+        "pan_left": -30.0,
+        "pan_right": 30.0,
+        "whip_pan_left": -60.0,
+        "whip_pan_right": 60.0,
+        "orbital": 45.0,
+        "orbit_semicircle": 120.0,
+    }.get(movement, 0.0)
+    default_tilt = {
+        "tilt_up": -25.0,
+        "tilt_down": 25.0,
+        "crane_up": -15.0,
+        "crane_down": 15.0,
+    }.get(movement, 0.0)
+    yaw = float(parameters.get("pan_degrees", default_pan)) * normalized
+    pitch = float(parameters.get("tilt_degrees", default_tilt)) * normalized
+    translation = float(parameters.get("translation_distance_m", 0.0)) * normalized
+    if movement in {"dolly_out", "tracking_front"}:
+        translation *= -1
+    start_focal = float(parameters.get("focal_length_start_mm") or contract.get("lens_mm") or 50.0)
+    end_focal = float(parameters.get("focal_length_end_mm") or start_focal)
+    focal = start_focal + (end_focal - start_focal) * normalized
+    view_angle = abs(yaw) % 360.0
+    if view_angle > 180:
+        view_angle = 360 - view_angle
+    if view_angle < 20:
+        view = "front"
+    elif view_angle < 65:
+        view = "front_three_quarter"
+    elif view_angle < 115:
+        view = "profile"
+    elif view_angle < 160:
+        view = "rear_three_quarter"
+    else:
+        view = "rear"
+    return {
+        "schema": "honcut.camera-pose-projection.v1",
+        "path_progress": round(normalized, 6),
+        "yaw_degrees": round(yaw, 6),
+        "pitch_degrees": round(pitch, 6),
+        "translation_m": round(translation, 6),
+        "focal_length_mm": round(focal, 6),
+        "camera_height_m": round(float(parameters.get("camera_height_m", 1.6)), 6),
+        "view": view,
+        "horizontal_joint_scale": round(max(0.28, abs(math.cos(math.radians(yaw)))), 6),
+        "occlusion_order": "right_over_left" if yaw >= 0 else "left_over_right",
+    }
 
 
 def camera_motion_prompt(shot: Mapping[str, Any]) -> str:

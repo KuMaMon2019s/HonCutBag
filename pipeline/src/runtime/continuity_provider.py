@@ -11,7 +11,7 @@ import os
 import re
 import shutil
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -51,9 +51,7 @@ CONTINUITY_BRIDGE_MODES = {"off", "auto"}
 SEAM_DECISIONS_KIND = "honcut.continuity_seam_decisions.v1"
 SEEDANCE_MAX_REFERENCE_IMAGES = SEEDANCE_2_CAPABILITIES.max_reference_images or 9
 CONTINUITY_ANCHOR_FRAME_COUNT = SEEDANCE_2_CAPABILITIES.continuity_anchor_frame_count
-STORYBOARD_GUIDE_BASE_IMAGE_BUDGET = (
-    SEEDANCE_MAX_REFERENCE_IMAGES - CONTINUITY_ANCHOR_FRAME_COUNT
-)
+STORYBOARD_GUIDE_BASE_IMAGE_BUDGET = SEEDANCE_MAX_REFERENCE_IMAGES - CONTINUITY_ANCHOR_FRAME_COUNT
 SEEDANCE_MIN_IMAGE_ASPECT = 0.40
 SEEDANCE_MAX_IMAGE_ASPECT = 2.50
 SEEDANCE_IMAGE_ASPECT_MARGIN = 0.01
@@ -62,9 +60,7 @@ COPYRIGHT_POLICY_REPAIR_VERSION = "original_audio_frame_fallback_v1"
 MAX_PRIVACY_POLICY_REPAIRS = SEEDANCE_MAX_REFERENCE_IMAGES + 1
 PRIVACY_POLICY_REPAIR_VERSION = "provider_indexed_media_fallback_v2"
 MEDIA_ROLE_ISOLATION_CONTRACT = "honcut.phase6-media-role-isolation.v1"
-SEEDANCE_ALL_MODAL_PROMPT_CONTRACT = (
-    "all_modal_reference_with_role_isolation_v4"
-)
+SEEDANCE_ALL_MODAL_PROMPT_CONTRACT = "all_modal_reference_with_role_isolation_v4"
 _COPYRIGHT_SAFE_AUDIO_CONTRACT = (
     "[copyright-safe audio contract] Generate original ambient location sounds only: "
     "natural footsteps, clothing movement, crowd presence, and location ambience. "
@@ -130,9 +126,7 @@ def probe_continuity_frames(path: Path, timeline_fps: int) -> dict[str, Any]:
     if frames in (None, "N/A"):
         duration = float(stream.get("duration") or 0.0)
         frames = round(duration * timeline_fps)
-    numerator, denominator = str(stream.get("avg_frame_rate") or f"{timeline_fps}/1").split(
-        "/", 1
-    )
+    numerator, denominator = str(stream.get("avg_frame_rate") or f"{timeline_fps}/1").split("/", 1)
     source_fps = float(numerator) / max(float(denominator), 1.0)
     return {
         "frames": int(frames),
@@ -240,9 +234,7 @@ def normalize_provider_minimum_padding(
             "provider_padding_frames": 0,
         }
     if chunk.expected_unique_frames is None:
-        raise ValueError(
-            f"{chunk.chunk_id} provider padding requires expected_unique_frames"
-        )
+        raise ValueError(f"{chunk.chunk_id} provider padding requires expected_unique_frames")
     before = probe_continuity_frames(input_path, timeline_fps)
     source_duration = float(before["duration_s"])
     target_frames = int(chunk.expected_unique_frames)
@@ -250,12 +242,8 @@ def normalize_provider_minimum_padding(
     if source_duration <= 0:
         raise RuntimeError(f"{chunk.chunk_id} provider output has no positive duration")
     speed_ratio = target_duration / source_duration
-    destination = input_path.with_name(
-        f"{input_path.stem}.story_clock{input_path.suffix}"
-    )
-    temporary = destination.with_name(
-        f"{destination.stem}.tmp{destination.suffix}"
-    )
+    destination = input_path.with_name(f"{input_path.stem}.story_clock{input_path.suffix}")
+    temporary = destination.with_name(f"{destination.stem}.tmp{destination.suffix}")
     completed = subprocess.run(
         [
             "ffmpeg",
@@ -370,20 +358,12 @@ def _validate_seedance_continuity_plan(plan: ContinuityPlan) -> None:
             except ValueError as exc:
                 errors.append(str(exc))
             if chunk.storyboard_beat_id and not chunk.storyboard_narrative_guide:
-                errors.append(
-                    f"{chunk.chunk_id} has no validated storyboard narrative guide"
-                )
-            if chunk.character_performance_required and not (
-                chunk.character_performance_guides
-            ):
-                errors.append(
-                    f"{chunk.chunk_id} has no validated character performance guide"
-                )
+                errors.append(f"{chunk.chunk_id} has no validated storyboard narrative guide")
+            if chunk.character_performance_required and not (chunk.character_performance_guides):
+                errors.append(f"{chunk.chunk_id} has no validated character performance guide")
             if chunk.sequence == 1 and chunk.execution_strategy == "multi_image":
                 if not chunk.storyboard_image:
-                    errors.append(
-                        f"{chunk.chunk_id} has no primary-shot cinematic composition"
-                    )
+                    errors.append(f"{chunk.chunk_id} has no primary-shot cinematic composition")
             elif chunk.sequence > 1 and chunk.storyboard_image:
                 errors.append(
                     f"{chunk.chunk_id} must extend predecessor video without a new cinematic frame"
@@ -428,7 +408,8 @@ def _storyboard_group_for_shot(
     group_id = (contract.get("shot_to_group") or {}).get(shot_id)
     group = next(
         (
-            item for item in contract.get("groups", [])
+            item
+            for item in contract.get("groups", [])
             if isinstance(item, dict) and item.get("group_id") == group_id
         ),
         None,
@@ -448,7 +429,9 @@ def _storyboard_group_prompt(
     if not group:
         return ""
     beats = [beat for beat in group.get("beats", []) if isinstance(beat, dict)]
-    position = next((index for index, beat in enumerate(beats) if beat.get("shot_id") == shot_id), None)
+    position = next(
+        (index for index, beat in enumerate(beats) if beat.get("shot_id") == shot_id), None
+    )
     if position is None:
         return ""
     current = beats[position]
@@ -488,7 +471,9 @@ def _storyboard_group_prompt(
             else f"Execute only this current shot action contract: {actions or 'no authored body action'}"
         ),
         f"Current shot required result: {current.get('end_state', '')}",
-        f"Next shot will begin from: {following.get('start_state', '')}" if following else "This is the final shot in the group.",
+        f"Next shot will begin from: {following.get('start_state', '')}"
+        if following
+        else "This is the final shot in the group.",
         "Do not jump to a later panel, combine later actions, replay the previous panel, or render a collage.",
     ]
     return "\n".join(line for line in lines if not line.endswith(": "))
@@ -504,11 +489,7 @@ def _chunk_scoped_shot_meta(
     scoped = copy.deepcopy(shot_meta)
     beat_id = str(request.chunk.storyboard_beat_id or "").strip()
     action = str(request.chunk.action_prompt or "").strip()
-    if (
-        request.chunk.execution_strategy != "first_last_frame_bridge"
-        and not beat_id
-        and not action
-    ):
+    if request.chunk.execution_strategy != "first_last_frame_bridge" and not beat_id and not action:
         return scoped
     scoped.pop("prompt", None)
     scoped.pop("storyboard_beats", None)
@@ -537,9 +518,7 @@ def _chunk_scoped_shot_meta(
         return scoped
 
     source_beats = [
-        beat
-        for beat in (shot_meta.get("storyboard_beats") or [])
-        if isinstance(beat, dict)
+        beat for beat in (shot_meta.get("storyboard_beats") or []) if isinstance(beat, dict)
     ]
     matched = next(
         (beat for beat in source_beats if str(beat.get("beat_id") or "") == beat_id),
@@ -553,11 +532,7 @@ def _chunk_scoped_shot_meta(
             if isinstance(values, str):
                 values = [values]
             if isinstance(values, list):
-                terms.update(
-                    str(value).strip()
-                    for value in values
-                    if len(str(value).strip()) >= 3
-                )
+                terms.update(str(value).strip() for value in values if len(str(value).strip()) >= 3)
         for body_beat in beat.get("body_action_choreography") or []:
             if not isinstance(body_beat, dict):
                 continue
@@ -577,20 +552,19 @@ def _chunk_scoped_shot_meta(
     offbeat_terms.difference_update(current_terms)
     scoped["_forbidden_offbeat_action_terms"] = sorted(offbeat_terms)
 
-    action = action or str(
-        matched.get("action")
-        or matched.get("action_prompt")
-        or matched.get("visual")
-        or ""
+    action = (
+        action
+        or str(
+            matched.get("action") or matched.get("action_prompt") or matched.get("visual") or ""
     ).strip()
+    )
     choreography = copy.deepcopy(matched.get("body_action_choreography") or [])
     if not choreography and action:
         choreography = [
             copy.deepcopy(beat)
             for beat in (shot_meta.get("body_action_choreography") or [])
             if isinstance(beat, dict)
-            and str(beat.get("micro_action") or beat.get("description") or "").strip()
-            == action
+            and str(beat.get("micro_action") or beat.get("description") or "").strip() == action
         ]
     if not choreography and beat_id:
         match = re.search(r"_P(\d+)$", beat_id, re.IGNORECASE)
@@ -600,8 +574,7 @@ def _chunk_scoped_shot_meta(
                 copy.deepcopy(beat)
                 for beat in (shot_meta.get("body_action_choreography") or [])
                 if isinstance(beat, dict)
-                and int(beat.get("micro_action_index") or beat.get("beat") or 0)
-                == position
+                and int(beat.get("micro_action_index") or beat.get("beat") or 0) == position
             ]
 
     scoped["generation_actions"] = [action] if action else []
@@ -617,9 +590,7 @@ def _chunk_scoped_shot_meta(
     if isinstance(source_fact_echoes, str):
         source_fact_echoes = [source_fact_echoes]
     scoped["source_fact_echoes"] = [
-        str(value).strip()
-        for value in source_fact_echoes
-        if str(value).strip()
+        str(value).strip() for value in source_fact_echoes if str(value).strip()
     ]
     scoped["source_generation_unit_indexes"] = list(
         matched.get("source_generation_unit_indexes") or []
@@ -641,10 +612,7 @@ def _chunk_scoped_shot_meta(
         feedback["issues"] = [
             issue
             for issue in issues
-            if not any(
-                term.casefold() in str(issue).casefold()
-                for term in offbeat_terms
-            )
+            if not any(term.casefold() in str(issue).casefold() for term in offbeat_terms)
         ]
         if not feedback["issues"]:
             scoped.pop("phase8_reshoot", None)
@@ -709,20 +677,14 @@ def _chunk_prompt(
             or "continue the supplied state"
         ).strip()
         current_end = str(
-            request.chunk.end_state
-            or shot_meta.get("end_state")
-            or "complete that action"
+            request.chunk.end_state or shot_meta.get("end_state") or "complete that action"
         ).strip()
         source_fact_echoes = shot_meta.get("source_fact_echoes") or []
         if isinstance(source_fact_echoes, str):
             source_fact_echoes = [source_fact_echoes]
         source_fact_contract = (
             " Source facts that must remain visibly represented in this Pxx: "
-            + " | ".join(
-                str(value).strip()
-                for value in source_fact_echoes
-                if str(value).strip()
-            )
+            + " | ".join(str(value).strip() for value in source_fact_echoes if str(value).strip())
             + "."
             if source_fact_echoes
             else ""
@@ -796,10 +758,7 @@ def _seedance_reference_image_payload(board_path: Path) -> tuple[bytes, str]:
             image.getpixel((0, height - 1)),
             image.getpixel((width - 1, height - 1)),
         )
-        fill = tuple(
-            round(sum(pixel[channel] for pixel in corners) / 4)
-            for channel in range(3)
-        )
+        fill = tuple(round(sum(pixel[channel] for pixel in corners) / 4) for channel in range(3))
         canvas = Image.new("RGB", (target_width, target_height), fill)
         canvas.paste(image, ((target_width - width) // 2, (target_height - height) // 2))
 
@@ -849,9 +808,7 @@ def _base_content(
     content_meta = _chunk_scoped_shot_meta(request, shot_meta)
     group, _ = _storyboard_group_for_shot(output_dir, request.shot_id)
     try:
-        characters_data = json.loads(
-            (output_dir / "CHARACTERS.json").read_text(encoding="utf-8")
-        )
+        characters_data = json.loads((output_dir / "CHARACTERS.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         characters_data = {}
     try:
@@ -898,10 +855,12 @@ def _base_content(
         canonical_prompt = render_canonical_visual_prompt_contract(
             canonical_contract,
         )
-        return [{
+        return [
+            {
             "type": "text",
             "text": f"{canonical_prompt}\n{content_meta['prompt']}".strip(),
-        }]
+            }
+        ]
     content_meta["_include_cinematic_frame"] = request.chunk.sequence == 1
     if request.chunk.storyboard_beat_id:
         content_meta["_storyboard_beat_id"] = request.chunk.storyboard_beat_id
@@ -915,16 +874,11 @@ def _base_content(
             content_meta["gen_strategy"] = "i2v"
     if request.chunk.storyboard_beat_id:
         if not request.chunk.storyboard_narrative_guide:
-            raise ValueError(
-                f"{request.resource_id} has no storyboard narrative guide"
-            )
-        content_meta.update({
-            "_storyboard_narrative_guide_path": (
-                request.chunk.storyboard_narrative_guide
-            ),
-            "_storyboard_narrative_guide_kind": (
-                request.chunk.storyboard_narrative_guide_kind
-            ),
+            raise ValueError(f"{request.resource_id} has no storyboard narrative guide")
+        content_meta.update(
+            {
+                "_storyboard_narrative_guide_path": (request.chunk.storyboard_narrative_guide),
+                "_storyboard_narrative_guide_kind": (request.chunk.storyboard_narrative_guide_kind),
             "_storyboard_narrative_guide_usage": (
                 request.chunk.storyboard_narrative_guide_usage
             ),
@@ -973,13 +927,41 @@ def _base_content(
             "_storyboard_narrative_guide_non_authority_roles": list(
                 request.chunk.storyboard_narrative_guide_non_authority_roles
             ),
-        })
+                "_storyboard_pose_atlas_plan_schema": (
+                    request.chunk.storyboard_pose_atlas_plan_schema
+                ),
+                "_storyboard_pose_atlas_plan_sha256": (
+                    request.chunk.storyboard_pose_atlas_plan_sha256
+                ),
+                "_storyboard_pose_atlas_timing_contract": dict(
+                    request.chunk.storyboard_pose_atlas_timing_contract
+                ),
+                "_storyboard_pose_atlas_camera_motion_contract_sha256": (
+                    request.chunk.storyboard_pose_atlas_camera_motion_contract_sha256
+                ),
+                "_storyboard_pose_atlas_action_groups": list(
+                    request.chunk.storyboard_pose_atlas_action_groups
+                ),
+                "_storyboard_pose_atlas_pose_samples": list(
+                    request.chunk.storyboard_pose_atlas_pose_samples
+                ),
+                "_storyboard_pose_atlas_candidates": list(
+                    request.chunk.storyboard_pose_atlas_candidates
+                ),
+                "_storyboard_pose_atlas_receipt": (request.chunk.storyboard_pose_atlas_receipt),
+                "_storyboard_pose_atlas_receipt_sha256": (
+                    request.chunk.storyboard_pose_atlas_receipt_sha256
+                ),
+                "_terminal_reference_mode": request.chunk.terminal_reference_mode,
+                "_terminal_pose_reference": request.chunk.terminal_pose_reference,
+                "_terminal_pose_reference_sha256": (request.chunk.terminal_pose_reference_sha256),
+            }
+        )
         content_meta["_character_performance_required"] = (
             request.chunk.character_performance_required
         )
         content_meta["_character_performance_guides"] = [
-            guide.model_dump(mode="json")
-            for guide in request.chunk.character_performance_guides
+            guide.model_dump(mode="json") for guide in request.chunk.character_performance_guides
         ]
     if request.chunk.storyboard_beat_id:
         # Keep the mandatory cinematic/identity/guide set, then admit optional
@@ -987,11 +969,15 @@ def _base_content(
         # the three P02+ tail anchors are appended. This deterministic priority
         # bound also prevents optional media descriptions from exhausting the
         # Seedance prompt budget.
-        content_meta["_max_reference_images"] = SEEDANCE_MAX_REFERENCE_IMAGES
+        content_meta["_max_reference_images"] = (
+            STORYBOARD_GUIDE_BASE_IMAGE_BUDGET
+            if request.chunk.mode == "native_extend"
+            and request.chunk.execution_strategy == "tail_video_extend"
+            else SEEDANCE_MAX_REFERENCE_IMAGES
+        )
     if request.chunk.mode == "native_extend":
         content_meta["_max_reference_images"] = (
-            SEEDANCE_MAX_REFERENCE_IMAGES
-            - CONTINUITY_ANCHOR_FRAME_COUNT
+            SEEDANCE_MAX_REFERENCE_IMAGES - CONTINUITY_ANCHOR_FRAME_COUNT
         )
     content = build_content_for_shot(
         output_dir=output_dir,
@@ -1040,9 +1026,7 @@ def _extension_content(
         )
 
     base_images = [dict(item) for item in content if item.get("type") == "image_url"]
-    base_images = base_images[
-        : SEEDANCE_MAX_REFERENCE_IMAGES - CONTINUITY_ANCHOR_FRAME_COUNT
-    ]
+    base_images = base_images[: SEEDANCE_MAX_REFERENCE_IMAGES - CONTINUITY_ANCHOR_FRAME_COUNT]
     first_anchor_number = len(base_images) + 1
     anchor_numbers = tuple(
         range(first_anchor_number, first_anchor_number + CONTINUITY_ANCHOR_FRAME_COUNT)
@@ -1061,24 +1045,21 @@ def _extension_content(
     if text_item is not None:
         text_item["text"] = f"{directive}{text_item.get('text', '')}"
     identity_images = [
-        item
-        for item in base_images
-        if item.get("_reference_kind") == "character_identity_board"
+        item for item in base_images if item.get("_reference_kind") == "character_identity_board"
     ]
     performance_images = [
-        item
-        for item in base_images
-        if item.get("_reference_kind") == "character_performance_guide"
+        item for item in base_images if item.get("_reference_kind") == "character_performance_guide"
     ]
     narrative_images = [
         item
         for item in base_images
-        if item.get("_reference_kind") == "storyboard_narrative_guide"
-    ]
-    ordered_ids = {
-        id(item)
-        for item in [*identity_images, *performance_images, *narrative_images]
+        if item.get("_reference_kind")
+        in {
+            "storyboard_narrative_guide",
+            "storyboard_pose_atlas",
     }
+    ]
+    ordered_ids = {id(item) for item in [*identity_images, *performance_images, *narrative_images]}
     supplemental_images = [item for item in base_images if id(item) not in ordered_ids]
     # P02+ authority order: identity boards, predecessor video, current pose,
     # identity-neutral story guide, optional supplemental images, tail anchors.
@@ -1095,9 +1076,7 @@ def _extension_content(
             "_reference_kind": "predecessor_tail_video",
             "_reference_description": "上一 Pxx 已完成视频的末段",
             "_reference_path": str(tail_video_path),
-            "_reference_sha256": hashlib.sha256(
-                tail_video_path.read_bytes()
-            ).hexdigest(),
+            "_reference_sha256": hashlib.sha256(tail_video_path.read_bytes()).hexdigest(),
         }
     )
     for item in [*performance_images, *narrative_images, *supplemental_images]:
@@ -1130,49 +1109,49 @@ def _media_index_manifest(content: Sequence[dict[str, Any]]) -> list[dict[str, A
         if media_type not in counters:
             continue
         counters[media_type] += 1
-        manifest.append({
-            "content_index": content_index,
-            "media_type": media_type,
-            "media_index": counters[media_type],
-            "prompt_index": f"{labels[media_type]}{counters[media_type]}",
-            "role": item.get("role"),
-            "responsibility": (
-                item.get("_reference_kind")
-                or item.get("_continuity_role")
-                or item.get("role")
-            ),
-            "description": item.get("_reference_description"),
-            "path": item.get("_reference_path"),
-            "sha256": item.get("_reference_sha256"),
-            "character_id": item.get("_character_id"),
-            "narrative_beat_id": item.get("_narrative_beat_id"),
-            "narrative_cell_ids": list(item.get("_narrative_cell_ids") or []),
-            "narrative_zero_time_anchor_cell_ids": list(
-                item.get("_narrative_zero_time_anchor_cell_ids") or []
-            ),
-            "authority_roles": list(item.get("_authority_roles") or []),
-            "non_authority_roles": list(
-                item.get("_non_authority_roles") or []
-            ),
-            "semantic_payload_sha256": item.get(
-                "_semantic_payload_sha256"
-            ),
-            "performance_beat_id": item.get("_performance_beat_id"),
-            "performance_cell_ids": list(
-                item.get("_performance_cell_ids") or []
-            ),
-            "performance_source_action_unit_ids": list(
-                item.get("_performance_source_action_unit_ids") or []
-            ),
-            "performance_prop_ids": list(
-                item.get("_performance_prop_ids") or []
-            ),
-            "performance_source_board_sha256": item.get(
-                "_performance_source_board_sha256"
-            ),
-            "mandatory": item.get("_mandatory_reference") is True
-            or bool(item.get("_continuity_role")),
-        })
+        manifest.append(
+            {
+                "content_index": content_index,
+                "media_type": media_type,
+                "media_index": counters[media_type],
+                "prompt_index": f"{labels[media_type]}{counters[media_type]}",
+                "role": item.get("role"),
+                "responsibility": (
+                    item.get("_reference_kind")
+                    or item.get("_continuity_role")
+                    or item.get("role")
+                ),
+                "description": item.get("_reference_description"),
+                "path": item.get("_reference_path"),
+                "sha256": item.get("_reference_sha256"),
+                "character_id": item.get("_character_id"),
+                "narrative_beat_id": item.get("_narrative_beat_id"),
+                "narrative_cell_ids": list(item.get("_narrative_cell_ids") or []),
+                "narrative_zero_time_anchor_cell_ids": list(
+                    item.get("_narrative_zero_time_anchor_cell_ids") or []
+                ),
+                "authority_roles": list(item.get("_authority_roles") or []),
+                "non_authority_roles": list(item.get("_non_authority_roles") or []),
+                "semantic_payload_sha256": item.get("_semantic_payload_sha256"),
+                "pose_atlas_strategy": item.get("_pose_atlas_strategy"),
+                "pose_atlas_page_index": item.get("_pose_atlas_page_index"),
+                "pose_atlas_page_count": item.get("_pose_atlas_page_count"),
+                "pose_atlas_plan_sha256": item.get("_pose_atlas_plan_sha256"),
+                "pose_atlas_timing_contract": item.get("_pose_atlas_timing_contract"),
+                "pose_atlas_camera_motion_contract_sha256": item.get(
+                    "_pose_atlas_camera_motion_contract_sha256"
+                ),
+                "performance_beat_id": item.get("_performance_beat_id"),
+                "performance_cell_ids": list(item.get("_performance_cell_ids") or []),
+                "performance_source_action_unit_ids": list(
+                    item.get("_performance_source_action_unit_ids") or []
+                ),
+                "performance_prop_ids": list(item.get("_performance_prop_ids") or []),
+                "performance_source_board_sha256": item.get("_performance_source_board_sha256"),
+                "mandatory": item.get("_mandatory_reference") is True
+                or bool(item.get("_continuity_role")),
+            }
+        )
     return manifest
 
 
@@ -1185,8 +1164,10 @@ def _bind_final_media_index_prompt(
     manifest = _media_index_manifest(normalized)
     if request.chunk.execution_strategy == "first_last_frame_bridge":
         if any(
-            item.get("responsibility") in {
+            item.get("responsibility")
+            in {
                 "storyboard_narrative_guide",
+                "storyboard_pose_atlas",
                 "character_performance_guide",
             }
             for item in manifest
@@ -1196,41 +1177,85 @@ def _bind_final_media_index_prompt(
             )
         return normalized, manifest
 
-    guides = [
-        item
-        for item in manifest
-        if item.get("responsibility") == "storyboard_narrative_guide"
+    legacy_guides = [
+        item for item in manifest if item.get("responsibility") == "storyboard_narrative_guide"
     ]
+    atlas_guides = [
+        item for item in manifest if item.get("responsibility") == "storyboard_pose_atlas"
+    ]
+    guides = atlas_guides or legacy_guides
     if request.chunk.storyboard_beat_id:
-        if len(guides) != 1:
-            raise ValueError(
-                f"{request.resource_id} must contain exactly one current narrative guide"
-            )
-        guide = guides[0]
-        expected_cells = list(request.chunk.storyboard_narrative_guide_cell_ids)
+        if request.chunk.storyboard_pose_atlas_plan_schema:
+            if not atlas_guides or legacy_guides:
+                raise ValueError(
+                    f"{request.resource_id} must select exactly one pose-atlas strategy"
+                )
+            strategies = {guide.get("pose_atlas_strategy") for guide in atlas_guides}
+            page_indexes = [guide.get("pose_atlas_page_index") for guide in atlas_guides]
+            page_counts = {guide.get("pose_atlas_page_count") for guide in atlas_guides}
+            expected_samples = [
+                str(sample.get("sample_id") or "")
+                for sample in request.chunk.storyboard_pose_atlas_pose_samples
+            ]
+            observed_samples = [
+                str(cell_id)
+                for guide in atlas_guides
+                for cell_id in guide.get("narrative_cell_ids") or []
+            ]
+            if (
+                len(strategies) != 1
+                or page_counts != {len(atlas_guides)}
+                or page_indexes != list(range(1, len(atlas_guides) + 1))
+                or observed_samples != expected_samples
+                or any(
+                    guide.get("narrative_beat_id") != request.chunk.storyboard_beat_id
+                    or guide.get("pose_atlas_plan_sha256")
+                    != request.chunk.storyboard_pose_atlas_plan_sha256
+                    or guide.get("pose_atlas_camera_motion_contract_sha256")
+                    != request.chunk.storyboard_pose_atlas_camera_motion_contract_sha256
+                    for guide in atlas_guides
+                )
+            ):
+                raise ValueError(
+                    f"{request.resource_id} pose atlas does not match persisted sample lineage"
+                )
+        else:
+            if len(legacy_guides) != 1 or atlas_guides:
+                raise ValueError(
+                    f"{request.resource_id} must contain exactly one current narrative guide"
+                )
+            guide = legacy_guides[0]
+            expected_cells = list(request.chunk.storyboard_narrative_guide_cell_ids)
+            if (
+                guide.get("narrative_beat_id") != request.chunk.storyboard_beat_id
+                or guide.get("narrative_cell_ids") != expected_cells
+                or guide.get("narrative_zero_time_anchor_cell_ids")
+                != list(request.chunk.storyboard_narrative_guide_zero_time_anchor_cell_ids)
+            ):
+                raise ValueError(
+                    f"{request.resource_id} narrative guide does not match its persisted Gxx assignment"
+                )
+    performance_guides = [
+        item for item in manifest if item.get("responsibility") == "character_performance_guide"
+    ]
+    terminal_guides = [
+        item for item in manifest if item.get("responsibility") == "terminal_pose_reference"
+    ]
+    if request.chunk.terminal_reference_mode == "exact_pose":
         if (
-            guide.get("narrative_beat_id") != request.chunk.storyboard_beat_id
-            or guide.get("narrative_cell_ids") != expected_cells
-            or guide.get("narrative_zero_time_anchor_cell_ids")
-            != list(request.chunk.storyboard_narrative_guide_zero_time_anchor_cell_ids)
+            len(terminal_guides) != 1
+            or terminal_guides[0].get("sha256") != request.chunk.terminal_pose_reference_sha256
         ):
             raise ValueError(
-                f"{request.resource_id} narrative guide does not match its persisted Gxx assignment"
+                f"{request.resource_id} exact terminal pose evidence is missing or changed"
             )
-    performance_guides = [
-        item
-        for item in manifest
-        if item.get("responsibility") == "character_performance_guide"
-    ]
+    elif terminal_guides:
+        raise ValueError(f"{request.resource_id} semantic terminal hold must not use pose pixels")
     expected_performance = request.chunk.character_performance_guides
     if bool(performance_guides) != request.chunk.character_performance_required:
-        raise ValueError(
-            f"{request.resource_id} performance-guide requirement is not satisfied"
-        )
+        raise ValueError(f"{request.resource_id} performance-guide requirement is not satisfied")
     if len(performance_guides) != len(expected_performance):
-        raise ValueError(
-            f"{request.resource_id} performance-guide count does not match its plan"
-        )
+        raise ValueError(f"{request.resource_id} performance-guide count does not match its plan")
     for observed, expected in zip(
         performance_guides,
         expected_performance,
@@ -1240,25 +1265,23 @@ def _bind_final_media_index_prompt(
             observed.get("character_id") != expected.character_id
             or observed.get("performance_beat_id") != expected.beat_id
             or observed.get("performance_cell_ids") != expected.cell_ids
-            or observed.get("performance_source_action_unit_ids")
-            != expected.source_action_unit_ids
+            or observed.get("performance_source_action_unit_ids") != expected.source_action_unit_ids
             or observed.get("performance_prop_ids") != expected.prop_ids
-            or observed.get("performance_source_board_sha256")
-            != expected.source_board_sha256
+            or observed.get("performance_source_board_sha256") != expected.source_board_sha256
         ):
             raise ValueError(
                 f"{request.resource_id} performance guide does not match persisted Axx lineage"
             )
     if request.chunk.storyboard_beat_id:
-        responsibilities = [
-            str(item.get("responsibility") or "") for item in manifest
-        ]
+        responsibilities = [str(item.get("responsibility") or "") for item in manifest]
         if request.chunk.sequence == 1:
             allowed_rank = {
                 "character_identity_board": 0,
                 "cinematic_composition": 1,
                 "character_performance_guide": 2,
+                "terminal_pose_reference": 3,
                 "storyboard_narrative_guide": 3,
+                "storyboard_pose_atlas": 3,
             }
             if responsibilities.count("cinematic_composition") != 1:
                 raise ValueError(
@@ -1269,30 +1292,24 @@ def _bind_final_media_index_prompt(
                 "character_identity_board": 0,
                 "predecessor_tail_video": 1,
                 "character_performance_guide": 2,
+                "terminal_pose_reference": 3,
                 "storyboard_narrative_guide": 3,
+                "storyboard_pose_atlas": 3,
                 "ordered_tail_frame": 4,
             }
         if any(role not in allowed_rank for role in responsibilities):
-            unexpected = [
-                role for role in responsibilities if role not in allowed_rank
-            ]
+            unexpected = [role for role in responsibilities if role not in allowed_rank]
             raise ValueError(
                 f"{request.resource_id} contains non-canonical media roles: "
                 + ", ".join(unexpected)
             )
         ranks = [allowed_rank[role] for role in responsibilities]
         if ranks != sorted(ranks):
-            raise ValueError(
-                f"{request.resource_id} media authority order is not canonical"
-            )
+            raise ValueError(f"{request.resource_id} media authority order is not canonical")
     if request.chunk.mode == "native_extend":
-        videos = [
-            item for item in manifest if item.get("media_type") == "video_url"
-        ]
+        videos = [item for item in manifest if item.get("media_type") == "video_url"]
         if len(videos) != 1 or videos[0].get("prompt_index") != "视频1":
-            raise ValueError(
-                f"{request.resource_id} must extend exactly one predecessor as 视频1"
-            )
+            raise ValueError(f"{request.resource_id} must extend exactly one predecessor as 视频1")
 
     index_lines = []
     for item in manifest:
@@ -1303,19 +1320,32 @@ def _bind_final_media_index_prompt(
         index_lines.append(f"{item['prompt_index']}：{description}")
     guide_contract = ""
     if guides:
-        guide = guides[0]
-        cells = [str(value) for value in guide["narrative_cell_ids"]]
-        guide_contract = (
-            f"\n当前剧情导航图是{guide['prompt_index']}；本次只按"
-            + "→".join(cells)
-            + "的顺序演绎，不得提前演绎其他 Gxx 或后续 Pxx。"
-            "红色箭头表示主体或物体运动方向；蓝色箭头表示摄影机运动；"
-            "其他指示标识表示空间、视线、接触点和动作接续关系。"
-            "Gxx 序号、文字、箭头、轨迹线、指示标识、边框和九宫格只供理解，"
-            "严禁渲染进视频画面。"
-        )
+        cells = [str(value) for guide in guides for value in guide["narrative_cell_ids"]]
+        guide_indexes = "、".join(guide["prompt_index"] for guide in guides)
+        if atlas_guides:
+            guide_contract = (
+                f"\n当前动作姿态图集是{guide_indexes}；本次只按"
+                + "→".join(cells)
+                + "理解一个连续运动包络。相邻 Gxx 可以是同一语义动作的不同姿态采样，"
+                "不得擅自增加为独立剧情动作，也不得提前演绎后续 Pxx。"
+                "红色箭头表示主体或物体运动方向；蓝色箭头表示同一条连续摄影机路径；"
+                "其他指示标识表示空间、视线、接触点和动作接续关系。"
+                "Gxx 序号、文字、箭头、轨迹线、指示标识、边框和图集网格只供理解，"
+                "严禁渲染进视频画面。"
+            )
+        else:
+            guide_contract = (
+                f"\n当前剧情导航图是{guide_indexes}；本次只按"
+                + "→".join(cells)
+                + "的顺序演绎，不得提前演绎其他 Gxx 或后续 Pxx。"
+                "红色箭头表示主体或物体运动方向；蓝色箭头表示摄影机运动；"
+                "其他指示标识表示空间、视线、接触点和动作接续关系。"
+                "Gxx 序号、文字、箭头、轨迹线、指示标识、边框和九宫格只供理解，"
+                "严禁渲染进视频画面。"
+            )
         zero_time_anchors = [
             str(value)
+            for guide in guides
             for value in guide.get("narrative_zero_time_anchor_cell_ids") or []
         ]
         if zero_time_anchors:
@@ -1331,6 +1361,17 @@ def _bind_final_media_index_prompt(
                 f"首帧后立即从{next_cell}开始运动，不得为{anchor_cell}追加站立、准备、"
                 "抬手、停顿或持姿时长。"
             )
+        if atlas_guides:
+            timing = request.chunk.storyboard_pose_atlas_timing_contract
+            completion_window = (timing.get("story_action") or {}).get("completion_window_s")
+            terminal = timing.get("terminal_hold") or {}
+            if not isinstance(completion_window, list) or len(completion_window) != 2:
+                raise ValueError(f"{request.resource_id} pose atlas timing is incomplete")
+            guide_contract += (
+                f"动态动作须在{completion_window[0]:g}～{completion_window[1]:g}秒完成；"
+                f"随后仅稳定保持 canonical 终态语义{terminal.get('target_duration_s'):g}秒左右。"
+                "终态保持不是新动作，不得回放初始姿态或重新演绎已完成动作。"
+            )
     performance_contract = ""
     if performance_guides:
         directives = []
@@ -1338,8 +1379,7 @@ def _bind_final_media_index_prompt(
             cells = [str(value) for value in guide["performance_cell_ids"]]
             directives.append(
                 f"{guide['prompt_index']}是角色{guide['character_id']}在当前"
-                f"{guide['performance_beat_id']}的动作姿态图，只允许参考"
-                + "→".join(cells)
+                f"{guide['performance_beat_id']}的动作姿态图，只允许参考" + "→".join(cells)
             )
         performance_contract = (
             "\n当前动作姿态图中的多个人形是同一个角色的不同参考姿态，不是多个角色。"
@@ -1348,39 +1388,37 @@ def _bind_final_media_index_prompt(
             "不得生成角色克隆、分栏、拼贴、网格、文字、序号、箭头、边框或参考板布局。"
             "道具只属于其绑定角色，并保持声明的几何、材质、颜色与握持关系。"
         )
+    terminal_contract = ""
+    if terminal_guides:
+        terminal_contract = (
+            f"\n{terminal_guides[0]['prompt_index']}只约束当前 Pxx 的精确结束姿态；"
+            "必须先完成完整动态动作，再自然落入该终态。不得把终态参考当作开场姿态，"
+            "不得提前停止、长时间冻结或回放已经完成的动作。"
+        )
     role_isolation_contract = ""
     if guides:
-        narrative_index = guides[0]["prompt_index"]
+        narrative_index = "、".join(guide["prompt_index"] for guide in guides)
         identity_indices = [
             item["prompt_index"]
             for item in manifest
             if item.get("responsibility") == "character_identity_board"
         ]
-        performance_indices = [
-            item["prompt_index"] for item in performance_guides
-        ]
+        performance_indices = [item["prompt_index"] for item in performance_guides]
         boundary_indices = [
             item["prompt_index"]
             for item in manifest
-            if item.get("responsibility") in {
+            if item.get("responsibility")
+            in {
                 "cinematic_composition",
                 "predecessor_tail_video",
                 "ordered_tail_frame",
             }
         ]
-        identity_authority = (
-            "、".join(identity_indices) if identity_indices else "结构化角色合同"
-        )
+        identity_authority = "、".join(identity_indices) if identity_indices else "结构化角色合同"
         performance_authority = (
-            "、".join(performance_indices)
-            if performance_indices
-            else "结构化动作与道具合同"
+            "、".join(performance_indices) if performance_indices else "结构化动作与道具合同"
         )
-        boundary_authority = (
-            "、".join(boundary_indices)
-            if boundary_indices
-            else "结构化起始状态"
-        )
+        boundary_authority = "、".join(boundary_indices) if boundary_indices else "结构化起始状态"
         role_isolation_contract = (
             f"\n[{MEDIA_ROLE_ISOLATION_CONTRACT}] "
             f"{narrative_index}只负责 Gxx 动作顺序、关节与重心轨迹、红蓝箭头和空间关系；"
@@ -1398,6 +1436,7 @@ def _bind_final_media_index_prompt(
         + "\n".join(index_lines)
         + guide_contract
         + performance_contract
+        + terminal_contract
         + role_isolation_contract
         + "\n"
     )
@@ -1434,16 +1473,12 @@ def _first_last_bridge_content(
         predecessor_hash = hashlib.file_digest(predecessor, "sha256").hexdigest()
     anchor_dir = previous_output_path.parent / "continuity_anchors"
     anchor_dir.mkdir(parents=True, exist_ok=True)
-    tail_frame = anchor_dir / (
-        f"{previous_output_path.stem}_{predecessor_hash[:16]}_final.jpg"
-    )
+    tail_frame = anchor_dir / (f"{previous_output_path.stem}_{predecessor_hash[:16]}_final.jpg")
     if not tail_frame.is_file() or tail_frame.stat().st_size == 0:
         extract_video_tail_frame(previous_output_path, tail_frame)
     with target_output_path.open("rb") as target:
         target_hash = hashlib.file_digest(target, "sha256").hexdigest()
-    head_frame = anchor_dir / (
-        f"{target_output_path.parent.name}_{target_hash[:16]}_first.jpg"
-    )
+    head_frame = anchor_dir / (f"{target_output_path.parent.name}_{target_hash[:16]}_first.jpg")
     if not head_frame.is_file() or head_frame.stat().st_size == 0:
         extract_video_head_frame(target_output_path, head_frame)
 
@@ -1478,9 +1513,7 @@ def _first_last_bridge_content(
             "_reference_kind": "cross_shot_source_tail_frame",
             "_reference_description": "上一一级分镜视频真实尾帧",
             "_reference_path": str(tail_frame),
-            "_reference_sha256": hashlib.sha256(
-                tail_frame.read_bytes()
-            ).hexdigest(),
+            "_reference_sha256": hashlib.sha256(tail_frame.read_bytes()).hexdigest(),
         },
         {
             "type": "image_url",
@@ -1491,9 +1524,7 @@ def _first_last_bridge_content(
             "_reference_kind": "cross_shot_target_head_frame",
             "_reference_description": "下一一级分镜视频真实首帧",
             "_reference_path": str(head_frame),
-            "_reference_sha256": hashlib.sha256(
-                head_frame.read_bytes()
-            ).hexdigest(),
+            "_reference_sha256": hashlib.sha256(head_frame.read_bytes()).hexdigest(),
         },
     ]
 
@@ -1521,9 +1552,7 @@ def _provider_content(
         content = _extension_content(content, request.previous_output_path)
     content, _media_manifest = _bind_final_media_index_prompt(content, request)
     prompt = "\n".join(
-        str(item.get("text") or "")
-        for item in content
-        if item.get("type") == "text"
+        str(item.get("text") or "") for item in content if item.get("type") == "text"
     )
     from utils.config import SEEDANCE_MODEL
     from utils.prompt_budget import enforce_prompt_budget
@@ -1590,24 +1619,16 @@ def _task_payload(
         ),
         "bridge_target_beat_id": request.chunk.bridge_target_beat_id,
         "storyboard_narrative_guide": request.chunk.storyboard_narrative_guide,
-        "storyboard_narrative_guide_kind": (
-            request.chunk.storyboard_narrative_guide_kind
-        ),
-        "storyboard_narrative_guide_usage": (
-            request.chunk.storyboard_narrative_guide_usage
-        ),
+        "storyboard_narrative_guide_kind": (request.chunk.storyboard_narrative_guide_kind),
+        "storyboard_narrative_guide_usage": (request.chunk.storyboard_narrative_guide_usage),
         "storyboard_narrative_guide_cell_ids": list(
             request.chunk.storyboard_narrative_guide_cell_ids
         ),
         "storyboard_narrative_guide_zero_time_anchor_cell_ids": list(
             request.chunk.storyboard_narrative_guide_zero_time_anchor_cell_ids
         ),
-        "storyboard_narrative_guide_sha256": (
-            request.chunk.storyboard_narrative_guide_sha256
-        ),
-        "storyboard_narrative_guide_renderer": (
-            request.chunk.storyboard_narrative_guide_renderer
-        ),
+        "storyboard_narrative_guide_sha256": (request.chunk.storyboard_narrative_guide_sha256),
+        "storyboard_narrative_guide_renderer": (request.chunk.storyboard_narrative_guide_renderer),
         "storyboard_narrative_guide_pose_contract_schema": (
             request.chunk.storyboard_narrative_guide_pose_contract_schema
         ),
@@ -1632,21 +1653,38 @@ def _task_payload(
         "storyboard_narrative_guide_source_board": (
             request.chunk.storyboard_narrative_guide_source_board
         ),
-        "storyboard_narrative_guide_receipt": (
-            request.chunk.storyboard_narrative_guide_receipt
-        ),
+        "storyboard_narrative_guide_receipt": (request.chunk.storyboard_narrative_guide_receipt),
         "storyboard_narrative_guide_authority_roles": list(
             request.chunk.storyboard_narrative_guide_authority_roles
         ),
         "storyboard_narrative_guide_non_authority_roles": list(
             request.chunk.storyboard_narrative_guide_non_authority_roles
         ),
-        "character_performance_required": (
-            request.chunk.character_performance_required
+        "storyboard_pose_atlas_plan_schema": (request.chunk.storyboard_pose_atlas_plan_schema),
+        "storyboard_pose_atlas_plan_sha256": (request.chunk.storyboard_pose_atlas_plan_sha256),
+        "storyboard_pose_atlas_timing_contract": dict(
+            request.chunk.storyboard_pose_atlas_timing_contract
         ),
+        "storyboard_pose_atlas_camera_motion_contract_sha256": (
+            request.chunk.storyboard_pose_atlas_camera_motion_contract_sha256
+        ),
+        "storyboard_pose_atlas_action_groups": list(
+            request.chunk.storyboard_pose_atlas_action_groups
+        ),
+        "storyboard_pose_atlas_pose_samples": list(
+            request.chunk.storyboard_pose_atlas_pose_samples
+        ),
+        "storyboard_pose_atlas_candidates": list(request.chunk.storyboard_pose_atlas_candidates),
+        "storyboard_pose_atlas_receipt": request.chunk.storyboard_pose_atlas_receipt,
+        "storyboard_pose_atlas_receipt_sha256": (
+            request.chunk.storyboard_pose_atlas_receipt_sha256
+        ),
+        "terminal_reference_mode": request.chunk.terminal_reference_mode,
+        "terminal_pose_reference": request.chunk.terminal_pose_reference,
+        "terminal_pose_reference_sha256": (request.chunk.terminal_pose_reference_sha256),
+        "character_performance_required": (request.chunk.character_performance_required),
         "character_performance_guides": [
-            guide.model_dump(mode="json")
-            for guide in request.chunk.character_performance_guides
+            guide.model_dump(mode="json") for guide in request.chunk.character_performance_guides
         ],
         "duration": duration,
         "provider_request_duration_s": duration,
@@ -1660,23 +1698,16 @@ def _task_payload(
     }
     upstream_fingerprint = str(request.input_fingerprint)
     if not re.fullmatch(r"[0-9a-f]{64}", upstream_fingerprint):
-        upstream_fingerprint = hashlib.sha256(
-            upstream_fingerprint.encode("utf-8")
-        ).hexdigest()
+        upstream_fingerprint = hashlib.sha256(upstream_fingerprint.encode("utf-8")).hexdigest()
     fingerprint = build_generation_fingerprint(
-        prompt_text=(
-            str(request.chunk.action_prompt or "").strip()
-            or request.memory_context
-        ),
+        prompt_text=(str(request.chunk.action_prompt or "").strip() or request.memory_context),
         prompt_template_id=PHASE6_VIDEO_PROMPT_TEMPLATE_ID,
         prompt_template_version=PHASE6_VIDEO_PROMPT_TEMPLATE_VERSION,
         provider_id=provider_id,
         provider_version=provider_version,
         model_id=model,
         model_version=model,
-        parameters={
-            key: value for key, value in payload.items() if key != "output_path"
-        },
+        parameters={key: value for key, value in payload.items() if key != "output_path"},
         input_artifact_hashes={"continuity_input": upstream_fingerprint},
     )
     cache_key = generation_cache_key(
@@ -1702,6 +1733,15 @@ def _provider_input_context(
     storyboard_narrative_guide_zero_time_anchor_cell_ids: Sequence[str] = (),
     storyboard_narrative_guide_pose_contracts_sha256: str | None = None,
     storyboard_narrative_guide_pose_fingerprints: Sequence[str] = (),
+    storyboard_pose_atlas_plan_sha256: str | None = None,
+    storyboard_pose_atlas_timing_contract: Mapping[str, Any] | None = None,
+    storyboard_pose_atlas_camera_motion_contract_sha256: str | None = None,
+    storyboard_pose_atlas_action_groups: Sequence[Mapping[str, Any]] = (),
+    storyboard_pose_atlas_pose_samples: Sequence[Mapping[str, Any]] = (),
+    storyboard_pose_atlas_candidates: Sequence[Mapping[str, Any]] = (),
+    storyboard_pose_atlas_receipt_sha256: str | None = None,
+    terminal_reference_mode: str = "semantic_hold",
+    terminal_pose_reference: str | None = None,
     character_performance_guides: Sequence[Any] = (),
     bridge_target_storyboard_image: str | None = None,
 ) -> dict[str, Any]:
@@ -1741,12 +1781,8 @@ def _provider_input_context(
         ),
         "chunk_id": chunk_id,
         "secondary_storyboard_image_sha256": optional_hash(storyboard_image),
-        "storyboard_narrative_guide_sha256": optional_hash(
-            storyboard_narrative_guide
-        ),
-        "storyboard_narrative_guide_cell_ids": list(
-            storyboard_narrative_guide_cell_ids
-        ),
+        "storyboard_narrative_guide_sha256": optional_hash(storyboard_narrative_guide),
+        "storyboard_narrative_guide_cell_ids": list(storyboard_narrative_guide_cell_ids),
         "storyboard_narrative_guide_zero_time_anchor_cell_ids": list(
             storyboard_narrative_guide_zero_time_anchor_cell_ids
         ),
@@ -1756,6 +1792,43 @@ def _provider_input_context(
         "storyboard_narrative_guide_pose_fingerprints": list(
             storyboard_narrative_guide_pose_fingerprints
         ),
+        "storyboard_pose_atlas_plan_sha256": storyboard_pose_atlas_plan_sha256,
+        "storyboard_pose_atlas_timing_contract": dict(storyboard_pose_atlas_timing_contract or {}),
+        "storyboard_pose_atlas_camera_motion_contract_sha256": (
+            storyboard_pose_atlas_camera_motion_contract_sha256
+        ),
+        "storyboard_pose_atlas_action_groups": [
+            dict(group) for group in storyboard_pose_atlas_action_groups
+        ],
+        "storyboard_pose_atlas_pose_samples": [
+            {
+                "sample_id": sample.get("sample_id"),
+                "action_group_id": sample.get("action_group_id"),
+                "timing_role": sample.get("timing_role"),
+                "pose_fingerprint": sample.get("pose_fingerprint"),
+            }
+            for sample in storyboard_pose_atlas_pose_samples
+        ],
+        "storyboard_pose_atlas_candidates": [
+            {
+                "strategy": candidate.get("strategy"),
+                "candidate_sha256": candidate.get("candidate_sha256"),
+                "rendered_candidate_sha256": candidate.get("rendered_candidate_sha256"),
+                "pages": [
+                    {
+                        "page_index": page.get("page_index"),
+                        "sample_ids": list(page.get("sample_ids") or []),
+                        "image_sha256": page.get("image_sha256"),
+                    }
+                    for page in (candidate.get("pages") or [])
+                    if isinstance(page, Mapping)
+                ],
+            }
+            for candidate in storyboard_pose_atlas_candidates
+        ],
+        "storyboard_pose_atlas_receipt_sha256": (storyboard_pose_atlas_receipt_sha256),
+        "terminal_reference_mode": terminal_reference_mode,
+        "terminal_pose_reference_sha256": optional_hash(terminal_pose_reference),
         "character_performance_guides": [
             {
                 "character_id": guide.character_id,
@@ -1768,16 +1841,12 @@ def _provider_input_context(
             }
             for guide in character_performance_guides
         ],
-        "bridge_target_storyboard_image_sha256": optional_hash(
-            bridge_target_storyboard_image
-        ),
+        "bridge_target_storyboard_image_sha256": optional_hash(bridge_target_storyboard_image),
         "generation_seed_strategy": "scene_chunk_repair_v1",
         "continuation_contract": "tail_window_ordered_frames_v1",
         "tail_window_seconds": "2.0",
         "ordered_frame_fractions": "0.2,0.6,0.95",
-        "canonical_visual_contract_sha256": canonical_contract[
-            "contract_sha256"
-        ],
+        "canonical_visual_contract_sha256": canonical_contract["contract_sha256"],
     }
 
 
@@ -1834,9 +1903,7 @@ def _provider_ready_content(
 
 def _privacy_policy_repair_budget(content: Sequence[dict[str, Any]]) -> int:
     """Bound progressive privacy repairs by the original addressable media set."""
-    media_items = sum(
-        item.get("type") in {"image_url", "video_url"} for item in content
-    )
+    media_items = sum(item.get("type") in {"image_url", "video_url"} for item in content)
     return min(media_items, MAX_PRIVACY_POLICY_REPAIRS)
 
 
@@ -1863,9 +1930,7 @@ def _privacy_repair_content(
             + ", ".join(f"content[{index}]" for index in required_endpoints)
         )
     required_references = [
-        index
-        for index in rejected
-        if content[index].get("_mandatory_reference") is True
+        index for index in rejected if content[index].get("_mandatory_reference") is True
     ]
     if required_references:
         raise RuntimeError(
@@ -1877,13 +1942,9 @@ def _privacy_repair_content(
     corrected = _without_content_indices(content, rejected)
     native_extend = request.chunk.mode == "native_extend"
     if native_extend:
-        remaining_continuity = [
-            item for item in corrected if item.get("_continuity_role")
-        ]
+        remaining_continuity = [item for item in corrected if item.get("_continuity_role")]
         if not remaining_continuity:
-            raise RuntimeError(
-                "privacy fallback would remove every tail continuity anchor"
-            )
+            raise RuntimeError("privacy fallback would remove every tail continuity anchor")
 
     removed_types = sorted({str(item.get("type") or "unknown") for item in removed})
     removed_video = any(item.get("type") == "video_url" for item in removed)
@@ -1975,11 +2036,7 @@ def _copyright_repair_content(
     """Build a bounded compliant retry without reusing a rejected video item."""
     corrected = _without_content_indices(content, rejected_video_indices)
     if rejected_video_indices:
-        removed = [
-            content[index]
-            for index in rejected_video_indices
-            if 0 <= index < len(content)
-        ]
+        removed = [content[index] for index in rejected_video_indices if 0 <= index < len(content)]
         if not removed or any(item.get("type") != "video_url" for item in removed):
             raise RuntimeError("copyright fallback did not resolve a rejected video item")
     frame_only = bool(rejected_video_indices) or any(
@@ -1987,9 +2044,8 @@ def _copyright_repair_content(
         for item in content
         if item.get("type") == "text"
     )
-    text_contract = (
-        (_FRAME_ONLY_CONTINUITY_CONTRACT if frame_only else "")
-        + (_COPYRIGHT_SAFE_AUDIO_CONTRACT if audio_safe else "")
+    text_contract = (_FRAME_ONLY_CONTINUITY_CONTRACT if frame_only else "") + (
+        _COPYRIGHT_SAFE_AUDIO_CONTRACT if audio_safe else ""
     )
     for item in corrected:
         if item.get("type") != "text":
@@ -2189,13 +2245,9 @@ def _direct_seedance_executor(
     def execute(request: ChunkExecutionRequest) -> ChunkExecutionResult:
         seed = _generation_seed(request)
         duration = _chunk_duration(request)
-        ratio, _width, _height = _video_geometry(
-            _read_shot_meta(output_dir, request.shot_id)
-        )
+        ratio, _width, _height = _video_geometry(_read_shot_meta(output_dir, request.shot_id))
         provider_ratio = (
-            "adaptive"
-            if request.chunk.execution_strategy == "first_last_frame_bridge"
-            else ratio
+            "adaptive" if request.chunk.execution_strategy == "first_last_frame_bridge" else ratio
         )
         generation_parameters = {
             "ratio": provider_ratio,
@@ -2240,14 +2292,11 @@ def _direct_seedance_executor(
                             content = [dict(item) for item in content_override]
                     except Exception as exc:
                         raise ProviderPreparationError(
-                            "cannot prepare provider content for "
-                            f"{request.resource_id}: {exc}"
+                            f"cannot prepare provider content for {request.resource_id}: {exc}"
                         ) from exc
                     if privacy_repair_budget is None:
                         privacy_repair_budget = (
-                            _privacy_policy_repair_budget(content)
-                            if allow_policy_repairs
-                            else 0
+                            _privacy_policy_repair_budget(content) if allow_policy_repairs else 0
                         )
                     assert privacy_repair_budget is not None
 
@@ -2290,32 +2339,22 @@ def _direct_seedance_executor(
                                     COPYRIGHT_POLICY_REPAIR_VERSION
                                 ),
                                 "copyright_policy_repair_attempt": policy_attempt,
-                                "copyright_policy_repairs": [
-                                    dict(item) for item in repairs
-                                ],
+                                "copyright_policy_repairs": [dict(item) for item in repairs],
                             }
                         )
                     if privacy_resubmission_attempt:
                         attempt_payload.update(
                             {
-                                "privacy_policy_repair_version": (
-                                    PRIVACY_POLICY_REPAIR_VERSION
-                                ),
-                                "privacy_policy_repair_attempt": (
-                                    privacy_resubmission_attempt
-                                ),
-                                "privacy_policy_repairs": [
-                                    dict(item) for item in privacy_repairs
-                                ],
+                                "privacy_policy_repair_version": (PRIVACY_POLICY_REPAIR_VERSION),
+                                "privacy_policy_repair_attempt": (privacy_resubmission_attempt),
+                                "privacy_policy_repairs": [dict(item) for item in privacy_repairs],
                             }
                         )
                     attempt_suffixes: list[str] = []
                     if policy_attempt:
                         attempt_suffixes.append(f"CP{policy_attempt:02d}")
                     if privacy_resubmission_attempt:
-                        attempt_suffixes.append(
-                            f"PP{privacy_resubmission_attempt:02d}"
-                        )
+                        attempt_suffixes.append(f"PP{privacy_resubmission_attempt:02d}")
                     attempt_resource_id = request.resource_id
                     if attempt_suffixes:
                         attempt_resource_id += "_" + "_".join(attempt_suffixes)
@@ -2341,9 +2380,7 @@ def _direct_seedance_executor(
                                     resolution=resolution,
                                     seed=current_seed,
                                     return_last_frame=True,
-                                    timeout=(
-                                        provider_policy.submit_timeout_seconds
-                                    ),
+                                    timeout=(provider_policy.submit_timeout_seconds),
                                 )
                             )
 
@@ -2358,8 +2395,7 @@ def _direct_seedance_executor(
                                 )
                                 if (
                                     not rejected_indices
-                                    or len(privacy_repairs)
-                                    >= current_privacy_budget
+                                    or len(privacy_repairs) >= current_privacy_budget
                                 ):
                                     raise
                                 try:
@@ -2369,7 +2405,8 @@ def _direct_seedance_executor(
                                         request=request,
                                     )
                                 except RequiredContinuityEndpointPrivacyError as endpoint_exc:
-                                    privacy_repairs.append({
+                                    privacy_repairs.append(
+                                        {
                                         "attempt": len(privacy_repairs) + 1,
                                         "reason_code": (
                                             "InputImageSensitiveContentDetected."
@@ -2380,10 +2417,9 @@ def _direct_seedance_executor(
                                             "local_handle_fallback_v1"
                                         ),
                                         "removed_content_indices": [],
-                                        "rejected_content_indices": list(
-                                            rejected_indices
-                                        ),
-                                    })
+                                            "rejected_content_indices": list(rejected_indices),
+                                        }
+                                    )
                                     raise endpoint_exc from submit_exc
                                 repair = {
                                     "attempt": len(privacy_repairs) + 1,
@@ -2394,10 +2430,7 @@ def _direct_seedance_executor(
                                 print(
                                     "  🛡 Seedance 隐私合规降级："
                                     f"{repair['policy']}，移除 "
-                                    + ", ".join(
-                                        f"content[{index}]"
-                                        for index in rejected_indices
-                                    )
+                                    + ", ".join(f"content[{index}]" for index in rejected_indices)
                                     + f" ({len(privacy_repairs)}/"
                                     f"{current_privacy_budget})",
                                     flush=True,
@@ -2424,12 +2457,11 @@ def _direct_seedance_executor(
                         )
                         if failed is not None:
                             failed_error = RuntimeError(failed.error_message or "")
-                            if (
-                                _copyright_policy_violation_kind(failed_error)
-                                or _privacy_rejected_media_indices(
+                            if _copyright_policy_violation_kind(
+                                failed_error
+                            ) or _privacy_rejected_media_indices(
                                     content,
                                     failed_error,
-                                )
                             ):
                                 raise failed_error
                         execution = execute_seedance_video_task(
@@ -2470,17 +2502,14 @@ def _direct_seedance_executor(
                                     {
                                         "attempt": len(privacy_repairs) + 1,
                                         "reason_code": (
-                                            "InputImageSensitiveContentDetected."
-                                            "PrivacyInformation"
+                                            "InputImageSensitiveContentDetected.PrivacyInformation"
                                         ),
                                         "policy": (
                                             "required_endpoints_inseparable_"
                                             "local_handle_fallback_v1"
                                         ),
                                         "removed_content_indices": [],
-                                        "rejected_content_indices": list(
-                                            rejected_indices
-                                        ),
+                                        "rejected_content_indices": list(rejected_indices),
                                     }
                                 )
                                 exc = endpoint_exc
@@ -2495,10 +2524,7 @@ def _direct_seedance_executor(
                                 print(
                                     "  🛡 Seedance 异步隐私审核合规重生成："
                                     f"{repair['policy']}，移除 "
-                                    + ", ".join(
-                                        f"content[{index}]"
-                                        for index in rejected_indices
-                                    )
+                                    + ", ".join(f"content[{index}]" for index in rejected_indices)
                                     + f" ({len(privacy_repairs)}/"
                                     f"{privacy_repair_budget})",
                                     flush=True,
@@ -2569,8 +2595,8 @@ def _direct_seedance_executor(
                                 "removed_content_indices": [],
                             }
                         else:
-                            rejected_video_indices = (
-                                _copyright_rejected_video_indices(submitted, exc)
+                            rejected_video_indices = _copyright_rejected_video_indices(
+                                submitted, exc
                             )
                             if not rejected_video_indices:
                                 raise
@@ -2585,12 +2611,9 @@ def _direct_seedance_executor(
                                     "InputVideoSensitiveContentDetected.PolicyViolation"
                                 ),
                                 "policy": "drop_rejected_video_keep_ordered_frames_v1",
-                                "removed_content_indices": list(
-                                    rejected_video_indices
-                                ),
+                                "removed_content_indices": list(rejected_video_indices),
                                 "retained_reference_images": sum(
-                                    item.get("type") == "image_url"
-                                    for item in content_override
+                                    item.get("type") == "image_url" for item in content_override
                                 ),
                             }
                         repairs.append(repair)
@@ -2608,9 +2631,7 @@ def _direct_seedance_executor(
             output_path=Path(execution.output_path),
             provider_task_id=execution.provider_job_id,
             copyright_policy_repairs=tuple(dict(item) for item in repairs),
-            privacy_policy_repairs=tuple(
-                dict(item) for item in privacy_repairs
-            ),
+            privacy_policy_repairs=tuple(dict(item) for item in privacy_repairs),
         )
 
     return execute
@@ -2637,9 +2658,7 @@ def _bridge_seedance_executor(
         seed = _generation_seed(request)
         duration = _chunk_duration(request)
         model = "seedance"
-        ratio, width, height = _video_geometry(
-            _read_shot_meta(output_dir, request.shot_id)
-        )
+        ratio, width, height = _video_geometry(_read_shot_meta(output_dir, request.shot_id))
         content, _shot_meta, _seed, _duration = _provider_content(
             output_dir,
             request,
@@ -2662,9 +2681,7 @@ def _bridge_seedance_executor(
                 "width": width,
                 "height": height,
                 "media_index_manifest": _media_index_manifest(content),
-                "provider_prompt_sha256": hashlib.sha256(
-                    prompt.encode("utf-8")
-                ).hexdigest(),
+                "provider_prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
             },
         )
 
@@ -2958,11 +2975,7 @@ def _continuity_bridge_preparer(
                     baseline = float(trial["baseline_boundary_frame_mae"])
                     selected = float(trial["selected_boundary_frame_mae"])
                     trimmed = float(trial["trimmed_boundary_frame_mae"])
-                    if (
-                        trial.get("improved")
-                        and selected <= baseline * 0.5
-                        and trimmed < baseline
-                    ):
+                    if trial.get("improved") and selected <= baseline * 0.5 and trimmed < baseline:
                         # The interpolation result is evidence that the planned
                         # cut point is useful, not necessarily a safe output.
                         # With an uncertain trajectory, synthesized in-betweens
@@ -3061,16 +3074,13 @@ def execute_phase6_auto_continuity(
             executor_factory = _direct_seedance_executor
             parameters = inspect.signature(executor_factory).parameters
             accepts_kwargs = any(
-                parameter.kind is inspect.Parameter.VAR_KEYWORD
-                for parameter in parameters.values()
+                parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
             )
             executor_factory_kwargs = {}
             if "media_profile" in parameters or accepts_kwargs:
                 executor_factory_kwargs["media_profile"] = media_profile
             if "allow_policy_repairs" in parameters or accepts_kwargs:
-                executor_factory_kwargs["allow_policy_repairs"] = (
-                    allow_policy_repairs
-                )
+                executor_factory_kwargs["allow_policy_repairs"] = allow_policy_repairs
         elif provider == "bridge":
             executor_factory = _bridge_seedance_executor
             executor_factory_kwargs = {}
@@ -3160,9 +3170,7 @@ def execute_phase6_auto_continuity(
             chunk.chunk_id,
             storyboard_image=chunk.storyboard_image,
             storyboard_narrative_guide=chunk.storyboard_narrative_guide,
-            storyboard_narrative_guide_cell_ids=(
-                chunk.storyboard_narrative_guide_cell_ids
-            ),
+            storyboard_narrative_guide_cell_ids=(chunk.storyboard_narrative_guide_cell_ids),
             storyboard_narrative_guide_zero_time_anchor_cell_ids=(
                 chunk.storyboard_narrative_guide_zero_time_anchor_cell_ids
             ),
@@ -3172,12 +3180,21 @@ def execute_phase6_auto_continuity(
             storyboard_narrative_guide_pose_fingerprints=(
                 chunk.storyboard_narrative_guide_pose_fingerprints
             ),
+            storyboard_pose_atlas_plan_sha256=(chunk.storyboard_pose_atlas_plan_sha256),
+            storyboard_pose_atlas_timing_contract=(chunk.storyboard_pose_atlas_timing_contract),
+            storyboard_pose_atlas_camera_motion_contract_sha256=(
+                chunk.storyboard_pose_atlas_camera_motion_contract_sha256
+            ),
+            storyboard_pose_atlas_action_groups=(chunk.storyboard_pose_atlas_action_groups),
+            storyboard_pose_atlas_pose_samples=(chunk.storyboard_pose_atlas_pose_samples),
+            storyboard_pose_atlas_candidates=(chunk.storyboard_pose_atlas_candidates),
+            storyboard_pose_atlas_receipt_sha256=(chunk.storyboard_pose_atlas_receipt_sha256),
+            terminal_reference_mode=chunk.terminal_reference_mode,
+            terminal_pose_reference=chunk.terminal_pose_reference,
             character_performance_guides=chunk.character_performance_guides,
             bridge_target_storyboard_image=chunk.bridge_target_storyboard_image,
         ),
-        seam_calibration=(
-            calibration.model_dump(mode="json") if calibration is not None else None
-        ),
+        seam_calibration=(calibration.model_dump(mode="json") if calibration is not None else None),
         max_seam_repairs=max_repairs,
         max_duration_topups=max_duration_topups,
         max_workers=workers,

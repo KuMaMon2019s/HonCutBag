@@ -42,6 +42,42 @@ class VideoModelCapabilities:
     max_tail_extend_duration_s: float | None = None
     min_primary_story_duration_s: float | None = None
     max_primary_story_duration_s: float | None = None
+    pose_sample_steps: tuple[tuple[float, int], ...] = ()
+    reliable_action_group_steps: tuple[tuple[float, int], ...] = ()
+    atlas_page_cell_count: int = 9
+    single_atlas_max_cells: int = 36
+    single_atlas_high_fidelity_group_limit: int = 6
+    terminal_hold_ratio: float = 0.15
+    terminal_hold_min_s: float = 0.8
+    terminal_hold_max_s: float = 1.5
+
+    def __post_init__(self) -> None:
+        for name, steps in (
+            ("action_budget_steps", self.action_budget_steps),
+            ("pose_sample_steps", self.pose_sample_steps),
+            ("reliable_action_group_steps", self.reliable_action_group_steps),
+        ):
+            previous_duration = 0.0
+            for duration, count in steps:
+                if duration <= previous_duration or count <= 0:
+                    raise ValueError(
+                        f"{self.name} {name} must contain positive, increasing durations "
+                        "and positive capacities"
+                    )
+                previous_duration = float(duration)
+        if self.atlas_page_cell_count <= 0:
+            raise ValueError("atlas_page_cell_count must be positive")
+        if (
+            self.single_atlas_max_cells < self.atlas_page_cell_count
+            or self.single_atlas_max_cells % self.atlas_page_cell_count
+        ):
+            raise ValueError(
+                "single_atlas_max_cells must be a positive multiple of atlas_page_cell_count"
+            )
+        if not 0 < self.terminal_hold_ratio < 1:
+            raise ValueError("terminal_hold_ratio must be between zero and one")
+        if not 0 <= self.terminal_hold_min_s <= self.terminal_hold_max_s:
+            raise ValueError("terminal hold bounds are invalid")
 
     @property
     def temporal_slice_limit(self) -> int:
@@ -67,6 +103,105 @@ class VideoModelCapabilities:
             if duration <= upper_bound:
                 return limit
         return self.action_budget_steps[-1][1]
+
+    @staticmethod
+    def _step_capacity(
+        steps: tuple[tuple[float, int], ...],
+        duration_seconds: float,
+        *,
+        fallback: int,
+    ) -> int:
+        duration = max(0.0, float(duration_seconds))
+        if not steps:
+            return fallback
+        for upper_bound, limit in steps:
+            if duration <= upper_bound:
+                return int(limit)
+        return int(steps[-1][1])
+
+    def storyboard_pose_capacity(
+        self,
+        duration_seconds: float | int,
+    ) -> dict[str, int]:
+        """Return deterministic pose-atlas planning limits for one Pxx.
+
+        Pose samples describe motion geometry; reliable action groups describe
+        provider choreography capacity.  Keeping them separate prevents a dense
+        atlas from pretending that the model can execute one action per cell.
+        """
+
+        duration = float(duration_seconds)
+        minimum_story_duration = min(self.min_unique_beat_s, self.min_shot_duration_s)
+        if not minimum_story_duration <= duration <= self.max_shot_duration_s:
+            raise ValueError(
+                f"storyboard duration {duration:g}s is outside {self.name}'s "
+                f"{minimum_story_duration:g}-{self.max_shot_duration_s:g}s range"
+            )
+        pose_samples = self._step_capacity(
+            self.pose_sample_steps,
+            duration,
+            fallback=max(self.atlas_page_cell_count, math.ceil(duration * 2)),
+        )
+        action_groups = self._step_capacity(
+            self.reliable_action_group_steps,
+            duration,
+            fallback=self.action_limit(duration),
+        )
+        if pose_samples > self.single_atlas_max_cells:
+            raise ValueError(f"{self.name} pose sample capacity exceeds its single-atlas maximum")
+        return {
+            "pose_sample_count": pose_samples,
+            "reliable_action_group_limit": action_groups,
+            "atlas_page_cell_count": self.atlas_page_cell_count,
+            "single_atlas_max_cells": self.single_atlas_max_cells,
+            "single_atlas_high_fidelity_group_limit": (self.single_atlas_high_fidelity_group_limit),
+        }
+
+    def storyboard_timing_contract(
+        self,
+        duration_seconds: float | int,
+        *,
+        has_initial_anchor: bool,
+        terminal_mode: str = "semantic_hold",
+    ) -> dict[str, Any]:
+        """Build a JSON-safe action clock without exact provider timecodes."""
+
+        duration = float(duration_seconds)
+        self.storyboard_pose_capacity(duration)
+        if terminal_mode not in {"semantic_hold", "exact_pose"}:
+            raise ValueError(f"unsupported terminal mode: {terminal_mode}")
+        target_hold = min(
+            self.terminal_hold_max_s,
+            max(self.terminal_hold_min_s, duration * self.terminal_hold_ratio),
+        )
+        target_completion = duration - target_hold
+        earliest_completion = duration - self.terminal_hold_max_s
+        latest_completion = duration - self.terminal_hold_min_s
+        return {
+            "schema": "honcut.storyboard-action-timing.v1",
+            "duration_s": round(duration, 3),
+            "initial_anchor": {
+                "present": bool(has_initial_anchor),
+                "story_time_s": 0.0,
+                "execution": "start_immediately_after_reference_frame",
+            },
+            "story_action": {
+                "target_completion_s": round(target_completion, 3),
+                "completion_window_s": [
+                    round(max(0.0, earliest_completion), 3),
+                    round(max(0.0, latest_completion), 3),
+                ],
+                "dynamic_budget_s": round(target_completion, 3),
+            },
+            "terminal_hold": {
+                "mode": terminal_mode,
+                "target_duration_s": round(target_hold, 3),
+                "allowed_duration_s": [
+                    round(self.terminal_hold_min_s, 3),
+                    round(self.terminal_hold_max_s, 3),
+                ],
+            },
+        }
 
     def request_duration_bounds(self, execution_strategy: str) -> tuple[float, float]:
         """Return provider-request limits for one execution strategy.
@@ -114,9 +249,7 @@ class VideoModelCapabilities:
         complete generated clip as visible transition time.
         """
         if execution_strategy in {"multi_image", "tail_video_extend"}:
-            _request_minimum, request_maximum = self.request_duration_bounds(
-                execution_strategy
-            )
+            _request_minimum, request_maximum = self.request_duration_bounds(execution_strategy)
             return self.min_unique_beat_s, request_maximum
         if execution_strategy == "first_last_frame_bridge":
             return self.request_duration_bounds(execution_strategy)
@@ -130,18 +263,14 @@ class VideoModelCapabilities:
         """Select the smallest valid request that can carry visible story time."""
 
         effective = float(effective_story_duration_s)
-        effective_minimum, effective_maximum = self.effective_duration_bounds(
-            execution_strategy
-        )
+        effective_minimum, effective_maximum = self.effective_duration_bounds(execution_strategy)
         if not effective_minimum - 1e-6 <= effective <= effective_maximum + 1e-6:
             raise ValueError(
                 f"effective story duration {effective:g}s is outside {self.name}'s "
                 f"{effective_minimum:g}-{effective_maximum:g}s "
                 f"{execution_strategy} range"
             )
-        request_minimum, request_maximum = self.request_duration_bounds(
-            execution_strategy
-        )
+        request_minimum, request_maximum = self.request_duration_bounds(execution_strategy)
         quantum = self.duration_quantum_s
         requested = max(request_minimum, effective)
         requested = math.ceil(requested / quantum - 1e-9) * quantum
@@ -180,13 +309,9 @@ class VideoModelCapabilities:
                 f"{quantized:g}s is outside {self.name}'s {minimum:g}-{maximum:g}s "
                 "request range"
             )
-        effective_minimum, effective_maximum = self.effective_duration_bounds(
-            execution_strategy
-        )
+        effective_minimum, effective_maximum = self.effective_duration_bounds(execution_strategy)
         if execution_strategy != "legacy" and not (
-            effective_minimum - 1e-6
-            <= unique_duration
-            <= effective_maximum + 1e-6
+            effective_minimum - 1e-6 <= unique_duration <= effective_maximum + 1e-6
         ):
             raise ValueError(
                 f"{resource_id} effective story duration {unique_duration:g}s is outside "
@@ -228,6 +353,14 @@ SEEDANCE_2_CAPABILITIES = VideoModelCapabilities(
     max_tail_extend_duration_s=10,
     min_primary_story_duration_s=3,
     max_primary_story_duration_s=35,
+    pose_sample_steps=((4, 9), (7, 18), (11, 27), (15, 36)),
+    reliable_action_group_steps=((4, 6), (7, 10), (11, 15), (15, 20)),
+    atlas_page_cell_count=9,
+    single_atlas_max_cells=36,
+    single_atlas_high_fidelity_group_limit=6,
+    terminal_hold_ratio=0.15,
+    terminal_hold_min_s=0.8,
+    terminal_hold_max_s=1.5,
 )
 
 
@@ -287,12 +420,13 @@ def get_video_capabilities(
     if explicit_model and "seedance" not in explicit_model:
         return GENERIC_VIDEO_CAPABILITIES
 
-    selected_provider = explicit_provider or str(
-        os.environ.get("VIDEO_PROVIDER") or "seedance"
-    ).lower()
-    selected_model = explicit_model or str(
-        os.environ.get("SEEDANCE_MODEL") or "doubao-seedance-2.0-fast"
-    ).lower()
+    selected_provider = (
+        explicit_provider or str(os.environ.get("VIDEO_PROVIDER") or "seedance").lower()
+    )
+    selected_model = (
+        explicit_model
+        or str(os.environ.get("SEEDANCE_MODEL") or "doubao-seedance-2.0-fast").lower()
+    )
     identity = f"{selected_provider} {selected_model}"
     if "seedance" in identity:
         return SEEDANCE_2_CAPABILITIES

@@ -308,13 +308,22 @@ def test_previs_pixels_are_separated_end_to_end_before_video_transport(
     identity_board_sha256 = _sha256(
         tmp_path / "characters" / "puppet" / "reference_board.png"
     )
-    assert uploaded_sha256[:3] == [
+    pose_atlas_candidates = chunk["storyboard_pose_atlas_candidates"]
+    selected_pose_atlas = next(
+        candidate
+        for candidate in pose_atlas_candidates
+        if candidate["preferred"] is True
+    )
+    pose_atlas_sha256 = [
+        page["image_sha256"] for page in selected_pose_atlas["pages"]
+    ]
+    assert uploaded_sha256 == [
         identity_board_sha256,
         cinematic_sha256,
-        narrative_guide_sha256,
+        *pose_atlas_sha256,
     ]
     assert cinematic_sha256 in uploaded_sha256
-    assert narrative_guide_sha256 in uploaded_sha256
+    assert narrative_guide_sha256 not in uploaded_sha256
     assert director_sha256 not in uploaded_sha256
     assert previs_sha256 not in uploaded_sha256
     assert nine_grid_sha256 not in uploaded_sha256
@@ -323,10 +332,10 @@ def test_previs_pixels_are_separated_end_to_end_before_video_transport(
     )
     assert "首帧为图片2" in prompt
     assert "成片质感第一帧" in prompt
-    assert "当前剧情导航图是图片" in prompt
-    assert "S02_G01→S02_G02→S02_G03" in prompt
-    assert "红色箭头表示主体或物体运动方向" in prompt
-    assert "蓝色箭头表示摄影机运动" in prompt
+    assert "当前动作姿态图集是图片3" in prompt
+    assert "G01是t=0首帧已经成立的初始姿态锚点" in prompt
+    assert "首帧后立即从G02开始运动" in prompt
+    assert "相邻 Gxx 可以是同一语义动作的不同姿态采样" in prompt
     assert "严禁渲染进视频画面" in prompt
     assert "honcut.phase6-media-role-isolation.v1" in prompt
-    assert "剧情导航图" in prompt and "非权威占位像素" in prompt
+    assert "动作姿态图集" in prompt and "非权威占位像素" in prompt

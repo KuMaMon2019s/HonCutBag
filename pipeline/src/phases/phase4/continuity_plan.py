@@ -659,6 +659,54 @@ def build_continuity_plan(
                         )
                         or []
                     ),
+                    storyboard_pose_atlas_plan_schema=(
+                        beat.get("storyboard_pose_atlas_plan_schema") or None
+                    ),
+                    storyboard_pose_atlas_plan_sha256=(
+                        str(beat.get("storyboard_pose_atlas_plan_sha256") or "")
+                        or None
+                    ),
+                    storyboard_pose_atlas_timing_contract=dict(
+                        beat.get("storyboard_pose_atlas_timing_contract") or {}
+                    ),
+                    storyboard_pose_atlas_camera_motion_contract_sha256=(
+                        str(
+                            beat.get(
+                                "storyboard_pose_atlas_camera_motion_contract_sha256"
+                            )
+                            or ""
+                        )
+                        or None
+                    ),
+                    storyboard_pose_atlas_action_groups=list(
+                        beat.get("storyboard_pose_atlas_action_groups") or []
+                    ),
+                    storyboard_pose_atlas_pose_samples=list(
+                        beat.get("storyboard_pose_atlas_pose_samples") or []
+                    ),
+                    storyboard_pose_atlas_candidates=list(
+                        beat.get("storyboard_pose_atlas_candidates") or []
+                    ),
+                    storyboard_pose_atlas_receipt=(
+                        str(beat.get("storyboard_pose_atlas_receipt") or "")
+                        or None
+                    ),
+                    storyboard_pose_atlas_receipt_sha256=(
+                        str(
+                            beat.get("storyboard_pose_atlas_receipt_sha256") or ""
+                        )
+                        or None
+                    ),
+                    terminal_reference_mode=str(
+                        beat.get("terminal_reference_mode") or "semantic_hold"
+                    ),
+                    terminal_pose_reference=(
+                        str(beat.get("terminal_pose_reference") or "") or None
+                    ),
+                    terminal_pose_reference_sha256=(
+                        str(beat.get("terminal_pose_reference_sha256") or "")
+                        or None
+                    ),
                     character_performance_required=bool(
                         beat.get("character_performance_required")
                     ),

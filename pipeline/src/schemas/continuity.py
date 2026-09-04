@@ -86,24 +86,18 @@ class GenerationChunk(BaseModel):
     execution_strategy: ChunkExecutionStrategy = Field(
         default="legacy", exclude_if=lambda value: value == "legacy"
     )
-    storyboard_beat_id: str | None = Field(
-        default=None, exclude_if=lambda value: value is None
-    )
-    storyboard_image: str | None = Field(
-        default=None, exclude_if=lambda value: value is None
-    )
-    storyboard_image_kind: str | None = Field(
-        default=None, exclude_if=lambda value: value is None
-    )
+    storyboard_beat_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    storyboard_image: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    storyboard_image_kind: str | None = Field(default=None, exclude_if=lambda value: value is None)
     storyboard_narrative_guide: str | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
-    storyboard_narrative_guide_kind: Literal[
-        "honcut.storyboard-narrative-guide.v4"
-    ] | None = Field(default=None, exclude_if=lambda value: value is None)
-    storyboard_narrative_guide_usage: Literal[
-        "phase6_story_narrative_guide_not_output_pixels"
-    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    storyboard_narrative_guide_kind: Literal["honcut.storyboard-narrative-guide.v4"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    storyboard_narrative_guide_usage: (
+        Literal["phase6_story_narrative_guide_not_output_pixels"] | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
     storyboard_narrative_guide_cell_ids: list[str] = Field(
         default_factory=list,
         exclude_if=lambda value: not value,
@@ -117,12 +111,12 @@ class GenerationChunk(BaseModel):
         pattern=r"^[0-9a-f]{64}$",
         exclude_if=lambda value: value is None,
     )
-    storyboard_narrative_guide_renderer: Literal[
-        "honcut.identity-neutral-story-guide-renderer.v2"
-    ] | None = Field(default=None, exclude_if=lambda value: value is None)
-    storyboard_narrative_guide_pose_contract_schema: Literal[
-        "honcut.storyboard-guide-pose-contract.v3"
-    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    storyboard_narrative_guide_renderer: (
+        Literal["honcut.identity-neutral-story-guide-renderer.v2"] | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
+    storyboard_narrative_guide_pose_contract_schema: (
+        Literal["honcut.storyboard-guide-pose-contract.v3"] | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
     storyboard_narrative_guide_pose_policy_sha256: str | None = Field(
         default=None,
         pattern=r"^[0-9a-f]{64}$",
@@ -164,6 +158,55 @@ class GenerationChunk(BaseModel):
         default_factory=list,
         exclude_if=lambda value: not value,
     )
+    storyboard_pose_atlas_plan_schema: Literal["honcut.storyboard-pose-atlas-plan.v1"] | None = (
+        Field(default=None, exclude_if=lambda value: value is None)
+    )
+    storyboard_pose_atlas_plan_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+        exclude_if=lambda value: value is None,
+    )
+    storyboard_pose_atlas_timing_contract: dict[str, Any] = Field(
+        default_factory=dict,
+        exclude_if=lambda value: not value,
+    )
+    storyboard_pose_atlas_camera_motion_contract_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+        exclude_if=lambda value: value is None,
+    )
+    storyboard_pose_atlas_action_groups: list[dict[str, Any]] = Field(
+        default_factory=list,
+        exclude_if=lambda value: not value,
+    )
+    storyboard_pose_atlas_pose_samples: list[dict[str, Any]] = Field(
+        default_factory=list,
+        exclude_if=lambda value: not value,
+    )
+    storyboard_pose_atlas_candidates: list[dict[str, Any]] = Field(
+        default_factory=list,
+        exclude_if=lambda value: not value,
+    )
+    storyboard_pose_atlas_receipt: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    storyboard_pose_atlas_receipt_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+        exclude_if=lambda value: value is None,
+    )
+    terminal_reference_mode: Literal["semantic_hold", "exact_pose"] = Field(
+        default="semantic_hold",
+        exclude_if=lambda value: value == "semantic_hold",
+    )
+    terminal_pose_reference: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    terminal_pose_reference_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+        exclude_if=lambda value: value is None,
+    )
     character_performance_required: bool = Field(
         default=False, exclude_if=lambda value: value is False
     )
@@ -171,12 +214,8 @@ class GenerationChunk(BaseModel):
         default_factory=list,
         exclude_if=lambda value: not value,
     )
-    bridge_target_shot_id: str | None = Field(
-        default=None, exclude_if=lambda value: value is None
-    )
-    bridge_target_beat_id: str | None = Field(
-        default=None, exclude_if=lambda value: value is None
-    )
+    bridge_target_shot_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    bridge_target_beat_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     bridge_target_storyboard_image: str | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
@@ -198,17 +237,11 @@ class GenerationChunk(BaseModel):
             raise ValueError("tail_video_extend chunks must use native_extend dependency")
         if self.execution_strategy == "first_last_frame_bridge":
             if self.mode != "native_extend":
-                raise ValueError(
-                    "first_last_frame_bridge chunks must use native_extend dependency"
-                )
+                raise ValueError("first_last_frame_bridge chunks must use native_extend dependency")
             if not self.bridge_target_shot_id:
-                raise ValueError(
-                    "first_last_frame_bridge requires the target primary shot"
-                )
+                raise ValueError("first_last_frame_bridge requires the target primary shot")
             if self.expected_overlap_frames:
-                raise ValueError(
-                    "first_last_frame_bridge must not reserve reference-video replay"
-                )
+                raise ValueError("first_last_frame_bridge must not reserve reference-video replay")
         if self.expected_provider_padding_frames and (
             self.requested_frames is None or self.expected_unique_frames is None
         ):
@@ -293,32 +326,123 @@ class GenerationChunk(BaseModel):
                 "spatial_relationship",
             ]:
                 raise ValueError("narrative guide authority roles are not canonical")
-            if "character_identity" not in (
-                self.storyboard_narrative_guide_non_authority_roles
+            if "character_identity" not in (self.storyboard_narrative_guide_non_authority_roles):
+                raise ValueError("narrative guide must be non-authoritative for character identity")
+        atlas_fields = (
+            self.storyboard_pose_atlas_plan_schema,
+            self.storyboard_pose_atlas_plan_sha256,
+            self.storyboard_pose_atlas_camera_motion_contract_sha256,
+            self.storyboard_pose_atlas_receipt,
+            self.storyboard_pose_atlas_receipt_sha256,
+        )
+        atlas_declared = any(value is not None for value in atlas_fields) or bool(
+            self.storyboard_pose_atlas_timing_contract
+            or self.storyboard_pose_atlas_action_groups
+            or self.storyboard_pose_atlas_pose_samples
+            or self.storyboard_pose_atlas_candidates
+        )
+        if atlas_declared:
+            if (
+                any(value is None for value in atlas_fields)
+                or not self.storyboard_pose_atlas_timing_contract
+                or not self.storyboard_pose_atlas_action_groups
+                or not self.storyboard_pose_atlas_pose_samples
+                or not self.storyboard_pose_atlas_candidates
             ):
-                raise ValueError(
-                    "narrative guide must be non-authoritative for character identity"
-                )
-        if self.character_performance_required != bool(
-            self.character_performance_guides
-        ):
-            raise ValueError(
-                "character performance requirement and guide list must agree"
-            )
+                raise ValueError("pose atlas provenance fields must be declared together")
+            if not self.storyboard_beat_id:
+                raise ValueError("pose atlas requires storyboard_beat_id")
+            timing = self.storyboard_pose_atlas_timing_contract
+            if timing.get("schema") != "honcut.storyboard-action-timing.v1":
+                raise ValueError("pose atlas timing contract is not current")
+            if (timing.get("terminal_hold") or {}).get("mode") != (self.terminal_reference_mode):
+                raise ValueError("pose atlas timing and terminal-reference mode disagree")
+            group_ids = [
+                str(group.get("action_group_id") or "")
+                for group in self.storyboard_pose_atlas_action_groups
+            ]
+            if any(not value for value in group_ids) or len(group_ids) != len(set(group_ids)):
+                raise ValueError("pose atlas action groups must be unique and ordered")
+            group_orders = [
+                group.get("order") for group in self.storyboard_pose_atlas_action_groups
+            ]
+            if any(
+                not isinstance(order, int) or isinstance(order, bool)
+                for order in group_orders
+            ):
+                raise ValueError("pose atlas action-group orders must be integers")
+            if group_orders != list(range(1, len(group_ids) + 1)):
+                raise ValueError("pose atlas action-group order must be contiguous")
+            sample_ids = [
+                str(sample.get("sample_id") or "")
+                for sample in self.storyboard_pose_atlas_pose_samples
+            ]
+            expected_samples = [f"G{index:02d}" for index in range(1, len(sample_ids) + 1)]
+            if sample_ids != expected_samples or len(sample_ids) > 36:
+                raise ValueError("pose atlas samples must be contiguous G01-G36")
+            if any(
+                str(sample.get("action_group_id") or "") not in group_ids
+                for sample in self.storyboard_pose_atlas_pose_samples
+            ):
+                raise ValueError("pose atlas sample references an unknown action group")
+            sample_group_orders: list[int] = []
+            for sample in self.storyboard_pose_atlas_pose_samples:
+                order = sample.get("action_group_order")
+                if not isinstance(order, int) or isinstance(order, bool):
+                    raise ValueError("pose atlas sample group orders must be integers")
+                sample_group_orders.append(order)
+            if sample_group_orders != sorted(sample_group_orders):
+                raise ValueError("pose atlas samples must preserve action-group order")
+            if any(
+                re.fullmatch(r"[0-9a-f]{64}", str(sample.get("pose_fingerprint") or "")) is None
+                for sample in self.storyboard_pose_atlas_pose_samples
+            ):
+                raise ValueError("pose atlas samples require deterministic fingerprints")
+            strategies = [
+                str(candidate.get("strategy") or "")
+                for candidate in self.storyboard_pose_atlas_candidates
+            ]
+            if "single_atlas" not in strategies or len(strategies) != len(set(strategies)):
+                raise ValueError("pose atlas candidates require one unique single atlas")
+            for candidate in self.storyboard_pose_atlas_candidates:
+                if candidate.get(
+                    "schema"
+                ) != "honcut.storyboard-pose-atlas-candidate.v1" or not isinstance(
+                    candidate.get("preferred"), bool
+                ):
+                    raise ValueError("pose atlas candidate contract is not current")
+                pages = candidate.get("pages")
+                if not isinstance(pages, list) or len(pages) != int(
+                    candidate.get("page_count") or 0
+                ):
+                    raise ValueError("pose atlas candidate page count mismatch")
+                covered = [
+                    str(sample_id)
+                    for page in pages
+                    if isinstance(page, dict)
+                    for sample_id in (page.get("sample_ids") or [])
+                ]
+                if covered != sample_ids:
+                    raise ValueError(
+                        "pose atlas candidate must cover every sample exactly once in order"
+                    )
+        if self.terminal_reference_mode == "exact_pose":
+            if not self.terminal_pose_reference or not self.terminal_pose_reference_sha256:
+                raise ValueError("exact_pose terminal mode requires hashed reference evidence")
+        elif self.terminal_pose_reference or self.terminal_pose_reference_sha256:
+            raise ValueError("semantic_hold must not carry exact terminal pose media")
+        if self.character_performance_required != bool(self.character_performance_guides):
+            raise ValueError("character performance requirement and guide list must agree")
         if self.character_performance_guides:
             if not self.storyboard_beat_id:
                 raise ValueError("character performance guides require storyboard_beat_id")
             character_ids = []
             for guide in self.character_performance_guides:
                 if guide.beat_id != self.storyboard_beat_id:
-                    raise ValueError(
-                        "character performance guide must belong to the current Pxx"
-                    )
+                    raise ValueError("character performance guide must belong to the current Pxx")
                 character_ids.append(guide.character_id)
             if len(character_ids) != len(set(character_ids)):
-                raise ValueError(
-                    "one Pxx may contain at most one guide per character"
-                )
+                raise ValueError("one Pxx may contain at most one guide per character")
         return self
 
 
@@ -361,7 +485,9 @@ class ContinuityShot(BaseModel):
         unique_frames = [chunk.expected_unique_frames for chunk in self.chunks]
         if self.target_frames is not None and all(value is not None for value in unique_frames):
             if sum(int(value) for value in unique_frames) != self.target_frames:
-                raise ValueError("chunk unique frames must add up to the editorial shot frame budget")
+                raise ValueError(
+                    "chunk unique frames must add up to the editorial shot frame budget"
+                )
         elif not math.isclose(
             sum(chunk.target_duration_s for chunk in self.chunks),
             self.target_duration_s,
@@ -389,9 +515,7 @@ class PrimaryShotBridge(BaseModel):
         "append",
         "replace_boundary_handles",
     ] = "append"
-    execution_strategy: Literal["first_last_frame_bridge"] = (
-        "first_last_frame_bridge"
-    )
+    execution_strategy: Literal["first_last_frame_bridge"] = "first_last_frame_bridge"
     boundary_kind: Literal["continuous"] = "continuous"
     continuity_reason: str = ""
     action_prompt: str = ""
@@ -414,9 +538,9 @@ class PrimaryShotBridge(BaseModel):
     storyboard_transition_prompt: str | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
-    storyboard_transition_usage: Literal[
-        "visual_continuity_plan_not_video_endpoint"
-    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    storyboard_transition_usage: Literal["visual_continuity_plan_not_video_endpoint"] | None = (
+        Field(default=None, exclude_if=lambda value: value is None)
+    )
     generation_phase: Literal["post_primary_shots"] = "post_primary_shots"
     first_frame_source: Literal["source_primary_video_tail_frame"] = (
         "source_primary_video_tail_frame"
@@ -435,9 +559,7 @@ class PrimaryShotBridge(BaseModel):
             visible,
             abs_tol=1e-6,
         ):
-            raise ValueError(
-                "bridge replacement handles must add up to visible bridge duration"
-            )
+            raise ValueError("bridge replacement handles must add up to visible bridge duration")
         return self
 
 
@@ -543,7 +665,9 @@ class ContinuityPlan(BaseModel):
                 if chunk.requested_frames is not None:
                     expected_requested = round(chunk.target_duration_s * self.timeline_fps)
                     if chunk.requested_frames != expected_requested:
-                        raise ValueError(f"{chunk.chunk_id} requested frames disagree with duration")
+                        raise ValueError(
+                            f"{chunk.chunk_id} requested frames disagree with duration"
+                        )
                 if chunk.chunk_id in chunk_ids:
                     raise ValueError(f"duplicate chunk_id: {chunk.chunk_id}")
                 chunk_ids.add(chunk.chunk_id)
@@ -555,26 +679,20 @@ class ContinuityPlan(BaseModel):
             bridge_ids.add(bridge.bridge_id)
             if bridge.source_shot_id not in shot_positions:
                 raise ValueError(
-                    f"{bridge.bridge_id} references unknown source shot "
-                    f"{bridge.source_shot_id}"
+                    f"{bridge.bridge_id} references unknown source shot {bridge.source_shot_id}"
                 )
             if bridge.target_shot_id not in shot_positions:
                 raise ValueError(
-                    f"{bridge.bridge_id} references unknown target shot "
-                    f"{bridge.target_shot_id}"
+                    f"{bridge.bridge_id} references unknown target shot {bridge.target_shot_id}"
                 )
             source_position = shot_positions[bridge.source_shot_id]
             if source_position + 1 >= len(ordered_shot_ids) or (
                 ordered_shot_ids[source_position + 1] != bridge.target_shot_id
             ):
-                raise ValueError(
-                    f"{bridge.bridge_id} must connect adjacent primary shots"
-                )
+                raise ValueError(f"{bridge.bridge_id} must connect adjacent primary shots")
             expected_frames = round(bridge.target_duration_s * self.timeline_fps)
             if bridge.requested_frames != expected_frames:
-                raise ValueError(
-                    f"{bridge.bridge_id} requested frames disagree with duration"
-                )
+                raise ValueError(f"{bridge.bridge_id} requested frames disagree with duration")
             target_shot = self.shots[source_position + 1]
             if target_shot.boundary_before != "continuous":
                 raise ValueError(

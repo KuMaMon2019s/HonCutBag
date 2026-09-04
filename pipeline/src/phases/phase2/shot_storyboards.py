@@ -53,14 +53,16 @@ from phases.phase2.storyboard_guide_pose import (
     validate_pose_sequence,
     zero_time_anchor_cell_ids,
 )
+from phases.phase2.storyboard_pose_atlas import (
+    build_pose_atlas_plan,
+    render_pose_atlas_candidates,
+)
 
 SHOT_STORYBOARD_SIZE = "2K"
 SHOT_STORYBOARD_GRID_COLUMNS = 3
 SHOT_STORYBOARD_GRID_ROWS = 3
-SHOT_STORYBOARD_GRID_CELLS = (
-    SHOT_STORYBOARD_GRID_COLUMNS * SHOT_STORYBOARD_GRID_ROWS
-)
-SHOT_STORYBOARDS_SCHEMA = "honcut.shot_storyboards.v6"
+SHOT_STORYBOARD_GRID_CELLS = SHOT_STORYBOARD_GRID_COLUMNS * SHOT_STORYBOARD_GRID_ROWS
+SHOT_STORYBOARDS_SCHEMA = "honcut.shot_storyboards.v7"
 SHOT_STORYBOARD_GRID_SCHEMA = "honcut.shot-storyboard-grid.v3"
 STORYBOARD_NARRATIVE_GUIDE_SCHEMA = "honcut.storyboard-narrative-guide.v4"
 STORYBOARD_NARRATIVE_GUIDE_USAGE = "phase6_story_narrative_guide_not_output_pixels"
@@ -124,17 +126,18 @@ LEGACY_BEAT_CAST_PLANNER_VERSION = "honcut.secondary-storyboard.v11"
 
 def _contains_complete_character_reference(text: str, reference: str) -> bool:
     normalized_text = unicodedata.normalize("NFKC", text).casefold()
-    normalized_reference = (
-        unicodedata.normalize("NFKC", reference).casefold().strip()
-    )
+    normalized_reference = unicodedata.normalize("NFKC", reference).casefold().strip()
     if not normalized_reference:
         return False
     if re.search(r"[\u3400-\u9fff]", normalized_reference):
         return normalized_reference in normalized_text
-    return re.search(
+    return (
+        re.search(
         rf"(?<![a-z0-9]){re.escape(normalized_reference)}(?![a-z0-9])",
         normalized_text,
-    ) is not None
+        )
+        is not None
+    )
 
 
 def _character_names(
@@ -150,8 +153,7 @@ def _character_names(
         ]
         if len(matches) != 1:
             raise ValueError(
-                "beat character_id must resolve to exactly one character asset: "
-                f"{character_id}"
+                f"beat character_id must resolve to exactly one character asset: {character_id}"
             )
         names.append(str(matches[0].get("name") or character_id).strip())
     return names
@@ -167,8 +169,7 @@ def _legacy_v11_beat_character_ids(
     if not who:
         return []
     semantic_text = "\n".join(
-        str(beat.get(field) or "")
-        for field in ("start_state", "action", "end_state")
+        str(beat.get(field) or "") for field in ("start_state", "action", "end_state")
     )
     visible_ids = []
     for requested in who:
@@ -188,8 +189,7 @@ def _legacy_v11_beat_character_ids(
                 matches.append((character, references))
         if len(matches) != 1:
             raise ValueError(
-                "legacy v11 beat cast cannot resolve shot participant exactly once: "
-                f"{requested}"
+                f"legacy v11 beat cast cannot resolve shot participant exactly once: {requested}"
             )
         character, references = matches[0]
         if any(
@@ -219,29 +219,22 @@ def _beat_cast_contract(
             "who": _character_names(characters, character_ids),
         }
     if planner_version and planner_version != SECONDARY_STORYBOARD_VERSION:
-        raise ValueError(
-            f"unsupported storyboard beat planner version: {planner_version}"
-        )
+        raise ValueError(f"unsupported storyboard beat planner version: {planner_version}")
     if "character_ids" in beat:
         raw_ids = beat.get("character_ids")
         if not isinstance(raw_ids, list):
             raise ValueError("beat character_ids must be an array")
-        character_ids = [
-            str(value).strip() for value in raw_ids if str(value).strip()
-        ]
+        character_ids = [str(value).strip() for value in raw_ids if str(value).strip()]
         if character_ids != list(dict.fromkeys(character_ids)):
             raise ValueError("beat character_ids must be unique and ordered")
         raw_shot_ids = shot.get("character_ids") or []
         if isinstance(raw_shot_ids, str):
             raw_shot_ids = [raw_shot_ids]
-        shot_ids = {
-            str(value).strip() for value in raw_shot_ids if str(value).strip()
-        }
+        shot_ids = {str(value).strip() for value in raw_shot_ids if str(value).strip()}
         unknown = [value for value in character_ids if value not in shot_ids]
         if unknown:
             raise ValueError(
-                "beat character_ids are outside the parent shot cast: "
-                + ", ".join(unknown)
+                "beat character_ids are outside the parent shot cast: " + ", ".join(unknown)
             )
         names = _character_names(characters, character_ids) if character_ids else []
         return {
@@ -251,9 +244,7 @@ def _beat_cast_contract(
             "who": names,
         }
     if planner_version == SECONDARY_STORYBOARD_VERSION:
-        raise ValueError(
-            f"{SECONDARY_STORYBOARD_VERSION} beat is missing canonical character_ids"
-        )
+        raise ValueError(f"{SECONDARY_STORYBOARD_VERSION} beat is missing canonical character_ids")
     return {
         "schema": BEAT_CAST_CONTRACT_SCHEMA,
         "source": "unversioned_test_compatibility",
@@ -267,13 +258,9 @@ def _edge_handle_contract(beat: dict[str, Any]) -> str:
     outgoing = float(beat.get("outgoing_bridge_handle_s") or 0)
     clauses = []
     if incoming > 0:
-        clauses.append(
-            f"开头{incoming:g}秒保持起始状态，仅自然微动，之后才开始新动作"
-        )
+        clauses.append(f"开头{incoming:g}秒保持起始状态，仅自然微动，之后才开始新动作")
     if outgoing > 0:
-        clauses.append(
-            f"结尾前完成全部剧情动作，最后{outgoing:g}秒稳定保持结束状态"
-        )
+        clauses.append(f"结尾前完成全部剧情动作，最后{outgoing:g}秒稳定保持结束状态")
     return "；".join(clauses) or "无跨一级分镜边界把手"
 
 
@@ -399,9 +386,7 @@ def _bind_narrative_grid_contract(
     if len(pixel_cells) != SHOT_STORYBOARD_GRID_CELLS:
         raise ValueError("nine-grid pixel contract does not contain nine cells")
     narrative_by_label = {
-        str(cell.get("label") or ""): cell
-        for cell in narrative_grid
-        if isinstance(cell, dict)
+        str(cell.get("label") or ""): cell for cell in narrative_grid if isinstance(cell, dict)
     }
     bound_cells: list[dict[str, Any]] = []
     for pixel_cell in pixel_cells:
@@ -455,9 +440,7 @@ def _guide_layout(cell_count: int, cell_aspect: float) -> tuple[int, int]:
         rows = math.ceil(cell_count / columns)
         aspect = columns * cell_aspect / rows
         if 0.4 <= aspect <= 2.5:
-            candidates.append(
-                (abs(aspect - (16 / 9)), rows * columns - cell_count, columns, rows)
-            )
+            candidates.append((abs(aspect - (16 / 9)), rows * columns - cell_count, columns, rows))
     if not candidates:
         raise ValueError(f"cannot lay out {cell_count} narrative cells within media limits")
     _distance, _blanks, columns, rows = min(candidates)
@@ -512,8 +495,6 @@ def _semantic_payload_sha256(payload: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-
-
 def _render_neutral_guide_cell(
     cell: dict[str, Any],
     *,
@@ -535,6 +516,7 @@ def _derive_narrative_guides(
     grid_contract: dict[str, Any],
     assignments: list[dict[str, Any]],
     *,
+    beats_by_id: dict[str, dict[str, Any]] | None = None,
     relative_guide_dir: str = "storyboard_guides",
 ) -> list[dict[str, Any]]:
     """Render identity-neutral Pxx guides locally without Provider requests."""
@@ -626,6 +608,37 @@ def _derive_narrative_guides(
             ],
             "provider_request_count": 0,
         }
+        beat = (beats_by_id or {}).get(beat_id)
+        if beat is not None:
+            actor_roles = tuple(
+                str(value).strip()
+                for value in (beat.get("character_ids") or beat.get("who") or [])
+                if str(value).strip()
+            )
+            atlas_plan = build_pose_atlas_plan(
+                beat,
+                known_actor_roles=actor_roles,
+            )
+            atlas_receipt = render_pose_atlas_candidates(
+                output_dir,
+                atlas_plan,
+                font_factory=_font,
+            )
+            record.update(
+                {
+                    "pose_atlas_plan_schema": atlas_plan["schema"],
+                    "pose_atlas_plan_sha256": atlas_plan["plan_sha256"],
+                    "pose_atlas_timing_contract": atlas_plan["timing_contract"],
+                    "pose_atlas_camera_motion_contract_sha256": atlas_plan[
+                        "camera_motion_contract_sha256"
+                    ],
+                    "pose_atlas_action_groups": atlas_plan["action_groups"],
+                    "pose_atlas_pose_samples": atlas_plan["pose_samples"],
+                    "pose_atlas_candidates": atlas_receipt["candidates"],
+                    "pose_atlas_receipt": atlas_receipt["receipt"],
+                    "pose_atlas_receipt_sha256": atlas_receipt["receipt_sha256"],
+                }
+            )
         _write_json(receipt_path, record)
         record["receipt"] = _portable_path(output_dir, receipt_path)
         records.append(record)
@@ -669,9 +682,7 @@ def _character_contract(
         identity_items = character_identity_detail_items(character)
         if identity_items:
             has_identity_items = True
-            lines.append(
-                f"  身份道具细节参考：{identity_detail_prompt_items(identity_items)}。"
-            )
+            lines.append(f"  身份道具细节参考：{identity_detail_prompt_items(identity_items)}。")
     if has_identity_items:
         lines.append(
             "- body_attached 道具保持固定佩挂点；isolated_handheld 道具只有本格动作明确调用时才出现，"
@@ -706,11 +717,7 @@ def build_shot_storyboard_prompt(
         if temporal_contract
         else ""
     )
-    beats = [
-        dict(beat)
-        for beat in (shot.get("storyboard_beats") or [])
-        if isinstance(beat, dict)
-    ]
+    beats = [dict(beat) for beat in (shot.get("storyboard_beats") or []) if isinstance(beat, dict)]
     if not beats:
         raise ValueError(f"{shot_id} has no storyboard_beats")
     narrative_grid = _narrative_grid_contract(shot, shot_id, beats)
@@ -718,9 +725,7 @@ def build_shot_storyboard_prompt(
     beat_lines = []
     for position, beat in enumerate(beats, 1):
         beat_id = str(beat.get("beat_id") or f"{shot_id}_P{position:02d}")
-        generation_mode = str(
-            beat.get("generation_mode") or ""
-        ).strip().lower()
+        generation_mode = str(beat.get("generation_mode") or "").strip().lower()
         mode = {
             "multi_image": "MULTI_IMAGE",
             "tail_video_extend": "TAIL_VIDEO_EXTEND",
@@ -770,7 +775,7 @@ def build_shot_storyboard_prompt(
 - 换场、跳时、主体切换、回忆、梦境或其他 cut/fade/dissolve 边界不生成桥接视频，由 Phase 8 添加转场特效。
 - 每格只能细分当前 Sxx 已写明的动作与状态，不得新增角色、道具、冲突、伤亡或剧情结果。
 
-场景：{_compact(shot.get('where') or shot.get('visual'), 260)}
+场景：{_compact(shot.get("where") or shot.get("visual"), 260)}
 {temporal_section}
 角色：
 {_character_contract(characters, who)}
@@ -833,16 +838,12 @@ def _negative_correction_observation(value: Any) -> str:
     if not text:
         return ""
     clauses = [
-        clause.strip()
-        for clause in re.split(r"(?<=[.!?。！？；;])\s*", text)
-        if clause.strip()
+        clause.strip() for clause in re.split(r"(?<=[.!?。！？；;])\s*", text) if clause.strip()
     ]
     negative_clauses: list[str] = []
     for clause in clauses:
         normalized = f" {clause.casefold()} "
-        is_negated = any(
-            marker in normalized for marker in _NEGATED_AFFIRMATIVE_MARKERS
-        )
+        is_negated = any(marker in normalized for marker in _NEGATED_AFFIRMATIVE_MARKERS)
         has_contrast = any(marker in normalized for marker in _CONTRAST_MARKERS)
         is_affirmative = bool(
             re.search(r"\b(?:match|matches|matched|matching)\b", normalized)
@@ -871,18 +872,12 @@ def _panel_correction_directives(
     """
     directives: list[dict[str, Any]] = []
     for issue in issues:
-        details = (
-            issue.get("details")
-            if isinstance(issue.get("details"), dict)
-            else {}
-        )
+        details = issue.get("details") if isinstance(issue.get("details"), dict) else {}
         raw_storyboard_ids = details.get("storyboard_ids") or []
         if not isinstance(raw_storyboard_ids, list):
             raw_storyboard_ids = [raw_storyboard_ids]
         source_storyboard_ids = [
-            str(value).strip()
-            for value in raw_storyboard_ids
-            if str(value).strip()
+            str(value).strip() for value in raw_storyboard_ids if str(value).strip()
         ]
         if source_storyboard_ids and beat_id not in source_storyboard_ids:
             continue
@@ -906,7 +901,8 @@ def _panel_correction_directives(
             observed_error = _negative_correction_observation(
                 details.get("observed") or issue.get("message") or ""
             )
-        directives.append({
+        directives.append(
+            {
             "schema": PANEL_CORRECTION_DIRECTIVE_SCHEMA,
             "target_board_id": beat_id,
             "issue_code": str(issue.get("code") or "QA").upper(),
@@ -916,7 +912,8 @@ def _panel_correction_directives(
             "observed_error": observed_error,
             "source_expected_context": str(details.get("expected") or "").strip(),
             "source_storyboard_ids": source_storyboard_ids,
-        })
+            }
+        )
     return directives
 
 
@@ -942,15 +939,9 @@ def _render_correction_contract(
                 "只画主合同的 canonical cast、动作、对象和位置；"
                 "不得增加格外人物、攻击、效果或场外事件"
             ),
-            "end_state": (
-                "必须到达主合同结束状态；不得停留、回退或复制前一格动作状态"
-            ),
-            "clothing_color": (
-                "人物外观只服从绑定身份参考与主合同；不得改变服装基础色或角色归属"
-            ),
-            "identity": (
-                "人物身份只服从绑定 canonical 参考；不得合并、复制、替换或交换角色"
-            ),
+            "end_state": ("必须到达主合同结束状态；不得停留、回退或复制前一格动作状态"),
+            "clothing_color": ("人物外观只服从绑定身份参考与主合同；不得改变服装基础色或角色归属"),
+            "identity": ("人物身份只服从绑定 canonical 参考；不得合并、复制、替换或交换角色"),
         }.get(
             mismatch_type.casefold(),
             "只画主合同内的人物、动作、道具、场景和结束状态；不得增加格外事实",
@@ -1011,8 +1002,7 @@ _EXPLICIT_INJURY_MARKERS = (
 def _first_request_safety_contract(beat: dict[str, Any]) -> str:
     """Render safe staging when conflict exists but injury is not canonical."""
     semantic_text = " ".join(
-        str(beat.get(field) or "")
-        for field in ("start_state", "action", "end_state")
+        str(beat.get(field) or "") for field in ("start_state", "action", "end_state")
     ).casefold()
     if not any(marker in semantic_text for marker in _STAGED_CONFLICT_MARKERS):
         return ""
@@ -1048,9 +1038,7 @@ def _panel_choreography_prompt(
         and str(item.get("micro_action") or item.get("description") or "").strip()
     ]
     if authored_beats and all(
-        re.sub(r"\s+", "", item) in normalized_action
-        for item in authored_beats
-        if item
+        re.sub(r"\s+", "", item) in normalized_action for item in authored_beats if item
     ):
         return ""
     contract_prompt = re.sub(r"\s+", "", str(contract.get("prompt") or ""))
@@ -1107,8 +1095,7 @@ def _build_panel_prompt(
             "不得复制旧姿态或引入其他格事实。"
         )
         if is_correction
-        else
-        (
+        else (
             "这是当前一级分镜内的后续剧情格。严格继承上一参考图的角色身份、服装、场景、"
             "机位轴线和动作方向，但姿态必须推进到本格的新状态；不得复制上一格。"
         )
@@ -1131,8 +1118,7 @@ def _build_panel_prompt(
             "动作、场景与状态只读本格主合同。"
         )
         if is_correction
-        else
-        "上一参考图不得作为姿势模板；只继承仍然成立的场景事实与相对空间关系、机位轴线和"
+        else "上一参考图不得作为姿势模板；只继承仍然成立的场景事实与相对空间关系、机位轴线和"
         "画面方向。所有人物必须从上一状态推进到本格动作完成后的新姿态，禁止复制上一格的"
         "关节角度、动作进度或中间状态。项目角色参考与下方角色合同始终优先于上一格；若上一格"
         "的发型、服装基础色、身份、武器归属或动作结果有偏差，本格必须纠正，不得继续放大偏差。"
@@ -1169,10 +1155,7 @@ def _build_panel_prompt(
     semantic_text = f"{action_text} {end_state_text}".casefold()
     disarm_requested = bool(
         ("解除" in semantic_text and "武器" in semantic_text)
-        or any(
-            marker in semantic_text
-            for marker in ("缴械", "disarm", "weapon removed")
-        )
+        or any(marker in semantic_text for marker in ("缴械", "disarm", "weapon removed"))
     )
     disarm_contract = (
         "- 本格要求的是解除武器的完成态：结束画面中敌方不得继续握持武器，双方不得仍共同争夺"
@@ -1181,9 +1164,7 @@ def _build_panel_prompt(
         if disarm_requested
         else ""
     )
-    canonical_cast = list(dict.fromkeys(
-        str(name) for name in (who or []) if str(name).strip()
-    ))
+    canonical_cast = list(dict.fromkeys(str(name) for name in (who or []) if str(name).strip()))
     cast_contract = (
         f"- 画面中恰好出现 {len(canonical_cast)} 个具名角色实体："
         f"{'、'.join(canonical_cast) if canonical_cast else '零个角色'}。"
@@ -1227,12 +1208,12 @@ Phase 5 定向纠偏合同：
 {director_reference}
 {previous_state_contract}
 {bridge_contract}
-{safety_section}本格起始状态：{_compact(beat.get('start_state'))}
+{safety_section}本格起始状态：{_compact(beat.get("start_state"))}
 本格唯一可见动作：{action_text}
-{choreography_line}本格必须到达的结束状态：{_compact(beat.get('end_state'))}
-场景：{_compact(shot.get('where') or shot.get('visual'), 260)}
-{temporal_section}景别：{beat.get('shot_size') or shot.get('shot_size') or 'medium'}
-运镜意图：{beat.get('camera_movement') or shot.get('camera_movement') or 'steadicam'}
+{choreography_line}本格必须到达的结束状态：{_compact(beat.get("end_state"))}
+场景：{_compact(shot.get("where") or shot.get("visual"), 260)}
+{temporal_section}景别：{beat.get("shot_size") or shot.get("shot_size") or "medium"}
+运镜意图：{beat.get("camera_movement") or shot.get("camera_movement") or "steadicam"}
 运镜物理硬合同：{camera_motion_prompt({**shot, **beat})}
 边界把手合同：{_edge_handle_contract(beat)}
 
@@ -1307,9 +1288,7 @@ def _normalize_nine_grid_board(board_path: Path, shot_id: str) -> dict[str, Any]
         board = source.convert("RGB")
     width, height = board.size
     if width < 300 or height < 180:
-        raise RuntimeError(
-            f"{shot_id} nine-grid storyboard is too small: {width}x{height}"
-        )
+        raise RuntimeError(f"{shot_id} nine-grid storyboard is too small: {width}x{height}")
     draw = ImageDraw.Draw(board)
     gutter = max(8, round(min(width / 3, height / 3) * 0.025))
     border = max(3, gutter // 3)
@@ -1331,13 +1310,15 @@ def _normalize_nine_grid_board(board_path: Path, shot_id: str) -> dict[str, Any]
                 (0, top - gutter // 2, width, top + math.ceil(gutter / 2)),
                 fill="white",
             )
-        cells.append({
+        cells.append(
+            {
             "cell": index + 1,
             "label": f"{shot_id}_G{index + 1:02d}",
             "grid_row": row,
             "grid_column": column,
             "bbox_px": [left, top, right, bottom],
-        })
+            }
+        )
     for cell in cells:
         left, top, right, bottom = cell["bbox_px"]
         inset = max(2, gutter // 2)
@@ -1388,11 +1369,7 @@ def _artifact_path(output_dir: Path, value: Any) -> Path:
 
 
 def _portable_path(output_dir: Path, path: Path) -> str:
-    return (
-        str(path.relative_to(output_dir))
-        if path.is_relative_to(output_dir)
-        else str(path)
-    )
+    return str(path.relative_to(output_dir)) if path.is_relative_to(output_dir) else str(path)
 
 
 def _build_primary_bridge_storyboard_prompt(
@@ -1415,9 +1392,9 @@ def _build_primary_bridge_storyboard_prompt(
 
 过渡任务：
 - 只画图片1到图片2之间一个时间点的连续过渡姿态与摄影机路径；不得照抄任一端点，也不得做拼贴、叠化、双重曝光或左右对比图。
-- 上一状态：{_compact(bridge.get('start_state') or source_beat.get('end_state'), 420)}
-- 过渡动作：{_compact(bridge.get('action_prompt'), 520)}
-- 下一状态：{_compact(bridge.get('end_state') or target_beat.get('start_state'), 420)}
+- 上一状态：{_compact(bridge.get("start_state") or source_beat.get("end_state"), 420)}
+- 过渡动作：{_compact(bridge.get("action_prompt"), 520)}
+- 下一状态：{_compact(bridge.get("end_state") or target_beat.get("start_state"), 420)}
 - 角色若处于连续身体动作中，必须通过躯干、四肢、关节、重心、接触关系与道具运动画出物理上可达的中间姿态；不得让角色保持图片1原姿势，只让背景、光影或摄影机移动。
 - 不得提前执行 {target_shot_id} 的新剧情动作，不得重复 {source_shot_id} 已完成的动作，不得新增角色、道具、事件或剧情结果。
 
@@ -1479,12 +1456,8 @@ def _generate_primary_bridge_storyboards(
             )
         source_beat = source_beats[-1]
         target_beat = target_beats[0]
-        source_image = _artifact_path(
-            output_dir, source_beat.get("storyboard_image")
-        )
-        target_image = _artifact_path(
-            output_dir, target_beat.get("storyboard_image")
-        )
+        source_image = _artifact_path(output_dir, source_beat.get("storyboard_image"))
+        target_image = _artifact_path(output_dir, target_beat.get("storyboard_image"))
         for label, path in (
             ("source final Pxx", source_image),
             ("target P01", target_image),
@@ -1509,8 +1482,7 @@ def _generate_primary_bridge_storyboards(
         prompt_path.write_text(prompt, encoding="utf-8")
         reference_paths = [source_image, target_image]
         reference_hashes = [
-            hashlib.sha256(path.read_bytes()).hexdigest()
-            for path in reference_paths
+            hashlib.sha256(path.read_bytes()).hexdigest() for path in reference_paths
         ]
         prompt_sha = image_request_fingerprint(
             prompt=prompt,
@@ -1532,16 +1504,12 @@ def _generate_primary_bridge_storyboards(
             "request_contract_id": IMAGE_REQUEST_CONTRACT_ID,
             "request_contract_version": IMAGE_REQUEST_CONTRACT_VERSION,
             "reference_contract_template_id": REFERENCE_CONTRACT_TEMPLATE_ID,
-            "reference_contract_template_version": (
-                REFERENCE_CONTRACT_TEMPLATE_VERSION
-            ),
+            "reference_contract_template_version": (REFERENCE_CONTRACT_TEMPLATE_VERSION),
             "reference_roles": [
                 "bridge_source_final_state",
                 "bridge_target_opening_state",
             ],
-            "reference_images": [
-                _portable_path(output_dir, path) for path in reference_paths
-            ],
+            "reference_images": [_portable_path(output_dir, path) for path in reference_paths],
             "reference_image_sha256": reference_hashes,
             "generation_phase": "post_primary_storyboards",
             "usage": "visual_continuity_plan_not_video_endpoint",
@@ -1722,9 +1690,7 @@ def _director_panel_references(
         or not isinstance(extraction, dict)
         or extraction.get("schema") != "honcut.director-panels.v1"
     ):
-        raise RuntimeError(
-            "director storyboard has no completed exact-panel extraction receipt"
-        )
+        raise RuntimeError("director storyboard has no completed exact-panel extraction receipt")
     source_sha = hashlib.sha256(director_board.read_bytes()).hexdigest()
     if extraction.get("source_image_sha256") != source_sha:
         raise RuntimeError("director panel extraction belongs to different overview bytes")
@@ -1750,9 +1716,7 @@ def _director_panel_references(
         references[shot_id] = crop
     missing = [shot_id for shot_id in shot_ids if shot_id not in references]
     if missing:
-        raise RuntimeError(
-            "director storyboard is missing exact crops for: " + ", ".join(missing)
-        )
+        raise RuntimeError("director storyboard is missing exact crops for: " + ", ".join(missing))
     return references
 
 
@@ -1814,7 +1778,7 @@ def _character_reference_paths(
 
 
 def _guide_reference(guide: dict[str, Any]) -> dict[str, Any]:
-    return {
+    reference = {
         key: guide[key]
         for key in (
             "kind",
@@ -1837,6 +1801,20 @@ def _guide_reference(guide: dict[str, Any]) -> dict[str, Any]:
             "receipt",
         )
     }
+    for key in (
+        "pose_atlas_plan_schema",
+        "pose_atlas_plan_sha256",
+        "pose_atlas_timing_contract",
+        "pose_atlas_camera_motion_contract_sha256",
+        "pose_atlas_action_groups",
+        "pose_atlas_pose_samples",
+        "pose_atlas_candidates",
+        "pose_atlas_receipt",
+        "pose_atlas_receipt_sha256",
+    ):
+        if key in guide:
+            reference[key] = guide[key]
+    return reference
 
 
 def _bind_guide_to_beat(beat: dict[str, Any], guide: dict[str, Any]) -> None:
@@ -1864,6 +1842,22 @@ def _bind_guide_to_beat(beat: dict[str, Any], guide: dict[str, Any]) -> None:
             "storyboard_narrative_guide_receipt": guide["receipt"],
         }
     )
+    if guide.get("pose_atlas_plan_schema"):
+        beat.update(
+            {
+                "storyboard_pose_atlas_plan_schema": guide["pose_atlas_plan_schema"],
+                "storyboard_pose_atlas_plan_sha256": guide["pose_atlas_plan_sha256"],
+                "storyboard_pose_atlas_timing_contract": guide["pose_atlas_timing_contract"],
+                "storyboard_pose_atlas_camera_motion_contract_sha256": guide[
+                    "pose_atlas_camera_motion_contract_sha256"
+                ],
+                "storyboard_pose_atlas_action_groups": guide["pose_atlas_action_groups"],
+                "storyboard_pose_atlas_pose_samples": guide["pose_atlas_pose_samples"],
+                "storyboard_pose_atlas_candidates": guide["pose_atlas_candidates"],
+                "storyboard_pose_atlas_receipt": guide["pose_atlas_receipt"],
+                "storyboard_pose_atlas_receipt_sha256": guide["pose_atlas_receipt_sha256"],
+            }
+        )
 
 
 def _archive_verified_legacy_guides(
@@ -1913,18 +1907,108 @@ def _archive_verified_legacy_guides(
         shutil.copy2(receipt_path, audit_dir / f"{beat_id}.json")
 
 
+def _archive_verified_v6_guides(
+    output_dir: Path,
+    record: dict[str, Any],
+    assignments: list[dict[str, Any]],
+    *,
+    board_sha256: str,
+) -> list[dict[str, str]]:
+    """Validate current v4 guide evidence before a v6 manifest is migrated."""
+
+    guides = {
+        str(guide.get("beat_id") or ""): guide
+        for guide in (record.get("narrative_guides") or [])
+        if isinstance(guide, dict)
+    }
+    expected_beats = [str(item.get("beat_id") or "") for item in assignments]
+    if set(guides) != set(expected_beats):
+        raise RuntimeError("v6 guide coverage is incomplete")
+    audit_dir = output_dir / "storyboard_guides" / "audit_4"
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    evidence: list[dict[str, str]] = []
+    for assignment in assignments:
+        beat_id = str(assignment["beat_id"])
+        guide = guides[beat_id]
+        guide_path = _artifact_path(output_dir, guide.get("image"))
+        receipt_path = _artifact_path(output_dir, guide.get("receipt"))
+        source_path = _artifact_path(output_dir, guide.get("source_board"))
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            image_sha256 = hashlib.sha256(guide_path.read_bytes()).hexdigest()
+            source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"{beat_id} v6 guide evidence is unreadable") from exc
+        semantic_payload = receipt.get("semantic_payload")
+        if not isinstance(semantic_payload, dict):
+            raise RuntimeError(f"{beat_id} v6 guide semantic payload is missing")
+        semantic_cells = semantic_payload.get("cells")
+        if not isinstance(semantic_cells, list):
+            raise RuntimeError(f"{beat_id} v6 guide semantic cells are missing")
+        try:
+            validate_pose_sequence(semantic_cells, beat_id=beat_id)
+        except ValueError as exc:
+            raise RuntimeError(f"{beat_id} v6 guide pose lineage is invalid") from exc
+        contracts_sha256 = pose_contracts_sha256(semantic_cells)
+        fingerprints = pose_fingerprints(semantic_cells)
+        anchors = zero_time_anchor_cell_ids(semantic_cells)
+        expected_cells = assignment.get("cell_ids")
+        if (
+            guide.get("kind") != STORYBOARD_NARRATIVE_GUIDE_SCHEMA
+            or guide.get("usage") != STORYBOARD_NARRATIVE_GUIDE_USAGE
+            or guide.get("renderer") != STORYBOARD_NARRATIVE_GUIDE_RENDERER
+            or guide.get("source_pixel_usage") != "none"
+            or guide.get("cell_ids") != expected_cells
+            or guide.get("image_sha256") != image_sha256
+            or guide.get("source_board_sha256") != source_sha256
+            or source_sha256 != board_sha256
+            or guide.get("semantic_payload_sha256") != _semantic_payload_sha256(semantic_payload)
+            or guide.get("pose_contract_schema") != POSE_CONTRACT_SCHEMA
+            or guide.get("pose_policy_sha256") != POSE_POLICY_SHA256
+            or guide.get("pose_contracts_sha256") != contracts_sha256
+            or guide.get("pose_fingerprints") != fingerprints
+            or guide.get("zero_time_anchor_cell_ids") != anchors
+            or receipt.get("kind") != STORYBOARD_NARRATIVE_GUIDE_SCHEMA
+            or int(receipt.get("version") or 0) != 4
+            or receipt.get("status") != "done"
+            or receipt.get("beat_id") != beat_id
+            or receipt.get("cell_ids") != expected_cells
+            or receipt.get("image_sha256") != image_sha256
+            or receipt.get("source_board_sha256") != source_sha256
+            or receipt.get("semantic_payload_sha256") != _semantic_payload_sha256(semantic_payload)
+            or receipt.get("pose_contracts_sha256") != contracts_sha256
+            or receipt.get("pose_fingerprints") != fingerprints
+            or receipt.get("zero_time_anchor_cell_ids") != anchors
+            or receipt.get("authority_roles") != guide.get("authority_roles")
+            or receipt.get("non_authority_roles") != guide.get("non_authority_roles")
+            or "character_identity" not in (guide.get("non_authority_roles") or [])
+            or int(receipt.get("provider_request_count") or 0) != 0
+        ):
+            raise RuntimeError(f"{beat_id} v6 guide receipt/hash binding is invalid")
+        shutil.copy2(guide_path, audit_dir / f"{beat_id}.png")
+        shutil.copy2(receipt_path, audit_dir / f"{beat_id}.json")
+        evidence.append(
+            {
+                "beat_id": beat_id,
+                "kind": STORYBOARD_NARRATIVE_GUIDE_SCHEMA,
+                "image_sha256": image_sha256,
+            }
+        )
+    return evidence
+
+
 def _migrate_shot_storyboard_narrative_guides(
     output_dir: Path,
     storyboard: dict[str, Any],
 ) -> dict[str, Any]:
-    """Locally redraw verified legacy semantics as source-bound v4 guides."""
+    """Locally redraw verified legacy semantics as source-bound adaptive guides."""
     output_dir = Path(output_dir)
     manifest_path = output_dir / "SHOT_STORYBOARDS.json"
     raw_manifest = manifest_path.read_bytes()
     manifest = json.loads(raw_manifest.decode("utf-8"))
     kind = str(manifest.get("kind") or "")
     version = int(manifest.get("version") or 0)
-    if kind == SHOT_STORYBOARDS_SCHEMA and version == 6:
+    if kind == SHOT_STORYBOARDS_SCHEMA and version == 7:
         errors = validate_shot_storyboard_artifacts(output_dir, storyboard)
         if errors:
             raise RuntimeError(
@@ -1936,6 +2020,7 @@ def _migrate_shot_storyboard_narrative_guides(
         ("honcut.shot_storyboards.v3", 3),
         ("honcut.shot_storyboards.v4", 4),
         ("honcut.shot_storyboards.v5", 5),
+        ("honcut.shot_storyboards.v6", 6),
     }
     if (kind, version) not in supported_sources:
         raise RuntimeError(f"unsupported storyboard migration source: {kind or '<missing>'}")
@@ -2000,12 +2085,24 @@ def _migrate_shot_storyboard_narrative_guides(
                 for guide in (record.get("narrative_guides") or [])
                 if isinstance(guide, dict)
             )
+        elif kind == "honcut.shot_storyboards.v6":
+            if record.get("beat_cell_assignments") != assignments:
+                raise RuntimeError(f"{shot_id} v6 guide assignment is not canonical")
+            legacy_guide_evidence.extend(
+                _archive_verified_v6_guides(
+                    output_dir,
+                    record,
+                    assignments,
+                    board_sha256=board_sha256,
+                )
+            )
         guides = _derive_narrative_guides(
             output_dir,
             board_path,
             grid_contract,
             assignments,
-            relative_guide_dir="storyboard_guides/v4",
+            beats_by_id={str(beat.get("beat_id") or ""): beat for beat in beats},
+            relative_guide_dir="storyboard_guides/adaptive-v1",
         )
         guides_by_beat = {str(guide["beat_id"]): guide for guide in guides}
         panels_by_beat = {
@@ -2048,7 +2145,7 @@ def _migrate_shot_storyboard_narrative_guides(
     manifest.update(
         {
             "kind": SHOT_STORYBOARDS_SCHEMA,
-            "version": 6,
+            "version": 7,
             "shots": migrated_records,
             "total_boards": len(migrated_records),
             "total_panels": sum(int(record.get("panel_count") or 0) for record in migrated_records),
@@ -2122,6 +2219,7 @@ def migrate_shot_storyboard_narrative_guides(
             ("honcut.shot_storyboards.v3", 3),
             ("honcut.shot_storyboards.v4", 4),
             ("honcut.shot_storyboards.v5", 5),
+            ("honcut.shot_storyboards.v6", 6),
         }:
             source_sha256 = hashlib.sha256(raw_manifest).hexdigest()
             audit_dir = output_dir / "storyboard_guides" / "migrations"
@@ -2142,6 +2240,80 @@ def migrate_shot_storyboard_narrative_guides(
                 receipt,
             )
         raise
+
+
+def _validate_pose_atlas_record(
+    output_dir: Path,
+    beat: dict[str, Any],
+    guide: dict[str, Any],
+) -> None:
+    if guide.get("pose_atlas_plan_schema") != "honcut.storyboard-pose-atlas-plan.v1":
+        raise ValueError("pose atlas plan schema is missing or unknown")
+    receipt_path = _artifact_path(output_dir, guide.get("pose_atlas_receipt"))
+    raw = receipt_path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != guide.get("pose_atlas_receipt_sha256"):
+        raise ValueError("pose atlas receipt hash mismatch")
+    receipt = json.loads(raw.decode("utf-8"))
+    plan = receipt.get("plan")
+    if (
+        receipt.get("kind") != "honcut.storyboard-pose-atlas-receipt.v1"
+        or receipt.get("version") != 1
+        or receipt.get("status") != "done"
+        or receipt.get("source_pixel_usage") != "none"
+        or not isinstance(plan, dict)
+    ):
+        raise ValueError("pose atlas receipt is not current")
+    plan_copy = dict(plan)
+    stored_plan_sha = str(plan_copy.pop("plan_sha256", ""))
+    if (
+        stored_plan_sha != _semantic_payload_sha256(plan_copy)
+        or stored_plan_sha != guide.get("pose_atlas_plan_sha256")
+        or receipt.get("plan_sha256") != stored_plan_sha
+        or guide.get("pose_atlas_timing_contract") != plan.get("timing_contract")
+        or guide.get("pose_atlas_camera_motion_contract_sha256")
+        != plan.get("camera_motion_contract_sha256")
+        or guide.get("pose_atlas_action_groups") != plan.get("action_groups")
+        or guide.get("pose_atlas_pose_samples") != plan.get("pose_samples")
+        or guide.get("pose_atlas_candidates") != receipt.get("candidates")
+    ):
+        raise ValueError("pose atlas plan lineage or hash mismatch")
+    samples = [
+        str(sample.get("sample_id") or "")
+        for sample in (plan.get("pose_samples") or [])
+        if isinstance(sample, dict)
+    ]
+    if samples != [f"G{index:02d}" for index in range(1, len(samples) + 1)]:
+        raise ValueError("pose atlas samples are not contiguous")
+    candidates = receipt.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        raise ValueError("pose atlas candidates are missing")
+    for candidate in candidates:
+        pages = candidate.get("pages") if isinstance(candidate, dict) else None
+        if not isinstance(pages, list):
+            raise ValueError("pose atlas candidate pages are invalid")
+        covered: list[str] = []
+        for page in pages:
+            path = _artifact_path(output_dir, page.get("image"))
+            if hashlib.sha256(path.read_bytes()).hexdigest() != page.get("image_sha256"):
+                raise ValueError("pose atlas page hash mismatch")
+            covered.extend(str(value) for value in (page.get("sample_ids") or []))
+        if covered != samples:
+            raise ValueError("pose atlas candidate coverage is incomplete")
+    beat_bindings = {
+        "storyboard_pose_atlas_plan_schema": guide["pose_atlas_plan_schema"],
+        "storyboard_pose_atlas_plan_sha256": guide["pose_atlas_plan_sha256"],
+        "storyboard_pose_atlas_timing_contract": guide["pose_atlas_timing_contract"],
+        "storyboard_pose_atlas_camera_motion_contract_sha256": guide[
+            "pose_atlas_camera_motion_contract_sha256"
+        ],
+        "storyboard_pose_atlas_action_groups": guide["pose_atlas_action_groups"],
+        "storyboard_pose_atlas_pose_samples": guide["pose_atlas_pose_samples"],
+        "storyboard_pose_atlas_candidates": guide["pose_atlas_candidates"],
+        "storyboard_pose_atlas_receipt": guide["pose_atlas_receipt"],
+        "storyboard_pose_atlas_receipt_sha256": guide["pose_atlas_receipt_sha256"],
+    }
+    if any(beat.get(key) != value for key, value in beat_bindings.items()):
+        raise ValueError("pose atlas beat binding mismatch")
 
 
 def validate_shot_storyboard_artifacts(
@@ -2187,9 +2359,7 @@ def validate_shot_storyboard_artifacts(
             errors.append(f"{bridge_id} has no post-primary storyboard transition")
             continue
         if transition.get("generation_phase") != "post_primary_storyboards":
-            errors.append(
-                f"{bridge_id} storyboard transition has invalid generation phase"
-            )
+            errors.append(f"{bridge_id} storyboard transition has invalid generation phase")
         image_value = str(transition.get("image") or "").strip()
         if not image_value:
             errors.append(f"{bridge_id} storyboard transition has no image")
@@ -2201,9 +2371,7 @@ def validate_shot_storyboard_artifacts(
             with Image.open(image_path) as image:
                 image.verify()
         except (OSError, ValueError) as exc:
-            errors.append(
-                f"{bridge_id} invalid storyboard transition {image_value}: {exc}"
-            )
+            errors.append(f"{bridge_id} invalid storyboard transition {image_value}: {exc}")
             continue
         bridge_count += 1
     if authored_count or bridge_specs:
@@ -2211,8 +2379,8 @@ def validate_shot_storyboard_artifacts(
         try:
             document = json.loads(manifest.read_text(encoding="utf-8"))
             if document.get("kind") != SHOT_STORYBOARDS_SCHEMA:
-                errors.append("SHOT_STORYBOARDS.json is not the narrative-guide v6 contract")
-            if int(document.get("version") or 0) != 6:
+                errors.append("SHOT_STORYBOARDS.json is not the adaptive-guide v7 contract")
+            if int(document.get("version") or 0) != 7:
                 errors.append("SHOT_STORYBOARDS.json has an invalid contract version")
             if document.get("status") != "done":
                 errors.append("SHOT_STORYBOARDS.json is not complete")
@@ -2343,10 +2511,8 @@ def validate_shot_storyboard_artifacts(
                             or receipt.get("pose_fingerprints") != semantic_pose_fingerprints
                             or semantic_payload.get("pose_fingerprints")
                             != semantic_pose_fingerprints
-                            or guide.get("zero_time_anchor_cell_ids")
-                            != semantic_anchor_cells
-                            or receipt.get("zero_time_anchor_cell_ids")
-                            != semantic_anchor_cells
+                            or guide.get("zero_time_anchor_cell_ids") != semantic_anchor_cells
+                            or receipt.get("zero_time_anchor_cell_ids") != semantic_anchor_cells
                             or semantic_payload.get("zero_time_anchor_cell_ids")
                             != semantic_anchor_cells
                             or receipt.get("source_pixel_usage") != "none"
@@ -2382,9 +2548,7 @@ def validate_shot_storyboard_artifacts(
                             != semantic_pose_contracts_sha256
                             or beat.get("storyboard_narrative_guide_pose_fingerprints")
                             != semantic_pose_fingerprints
-                            or beat.get(
-                                "storyboard_narrative_guide_zero_time_anchor_cell_ids"
-                            )
+                            or beat.get("storyboard_narrative_guide_zero_time_anchor_cell_ids")
                             != semantic_anchor_cells
                             or beat.get("storyboard_narrative_guide_source_pixel_usage") != "none"
                             or beat.get("storyboard_narrative_guide_cell_ids")
@@ -2399,6 +2563,7 @@ def validate_shot_storyboard_artifacts(
                             or beat.get("storyboard_narrative_guide_receipt") != receipt_value
                         ):
                             raise ValueError("guide receipt/hash/cell binding mismatch")
+                        _validate_pose_atlas_record(output_dir, beat, guide)
                     except (OSError, ValueError, json.JSONDecodeError) as exc:
                         errors.append(f"{beat_id} invalid narrative guide: {exc}")
                 board_value = str(record.get("board") or "").strip()
@@ -2462,6 +2627,7 @@ def generate_shot_storyboards(
             "honcut.shot_storyboards.v3",
             "honcut.shot_storyboards.v4",
             "honcut.shot_storyboards.v5",
+            "honcut.shot_storyboards.v6",
         }:
             if previous_manifest.get("status") == "done":
                 previous_manifest = migrate_shot_storyboard_narrative_guides(
@@ -2473,19 +2639,16 @@ def generate_shot_storyboards(
             else:
                 previous_manifest = {}
         elif prior_kind == SHOT_STORYBOARDS_SCHEMA:
-            if prior_version != 6:
+            if prior_version != 7:
                 raise RuntimeError("unsupported prior storyboard manifest version")
         elif previous_manifest:
             raise RuntimeError("unsupported prior storyboard manifest schema")
     normalized_targets = {
-        str(shot_id).strip() for shot_id in (target_shot_ids or set())
-        if str(shot_id).strip()
+        str(shot_id).strip() for shot_id in (target_shot_ids or set()) if str(shot_id).strip()
     }
     correction_context_by_shot = correction_context_by_shot or {}
     normalized_target_beats = {
-        str(beat_id).strip()
-        for beat_id in (target_beat_ids or set())
-        if str(beat_id).strip()
+        str(beat_id).strip() for beat_id in (target_beat_ids or set()) if str(beat_id).strip()
     }
     if correction_context_by_shot and normalized_targets and not normalized_target_beats:
         normalized_target_beats = {
@@ -2511,9 +2674,13 @@ def generate_shot_storyboards(
         for index, shot in enumerate(storyboard.get("shots", []), 1)
         if isinstance(shot, dict)
     }
-    valid_target_beats = set().union(
+    valid_target_beats = (
+        set().union(
         *(authored_beat_ids_by_shot.get(shot_id, set()) for shot_id in normalized_targets)
-    ) if normalized_targets else set()
+        )
+        if normalized_targets
+        else set()
+    )
     unknown_target_beats = normalized_target_beats - valid_target_beats
     if unknown_target_beats:
         raise RuntimeError(
@@ -2547,7 +2714,7 @@ def generate_shot_storyboards(
     )
     contract: dict[str, Any] = {
         "kind": SHOT_STORYBOARDS_SCHEMA,
-        "version": 6,
+        "version": 7,
         "status": "running",
         "provider": "seedream",
         "model": model,
@@ -2596,7 +2763,9 @@ def generate_shot_storyboards(
     contract["director_storyboard"] = (
         str(director_board.relative_to(output_dir))
         if director_board is not None and director_board.is_relative_to(output_dir)
-        else str(director_board) if director_board is not None else None
+        else str(director_board)
+        if director_board is not None
+        else None
     )
     authored_shot_ids = [
         _shot_id(shot, index)
@@ -2612,9 +2781,7 @@ def generate_shot_storyboards(
         if director_board is not None and authored_shot_ids
         else {}
     )
-    contract["director_panel_schema"] = (
-        "honcut.director-panels.v1" if director_panels else None
-    )
+    contract["director_panel_schema"] = "honcut.director-panels.v1" if director_panels else None
 
     previous_storyboard_panel: Path | None = None
     accepted_reference_hashes: set[str] = set()
@@ -2631,13 +2798,11 @@ def generate_shot_storyboards(
                         f"targeted storyboard regeneration has no prior record for {shot_id}"
                     )
                 authored_beats = [
-                    beat for beat in (shot.get("storyboard_beats") or [])
-                    if isinstance(beat, dict)
+                    beat for beat in (shot.get("storyboard_beats") or []) if isinstance(beat, dict)
                 ]
                 if authored_beats:
                     last_beat_id = str(
-                        authored_beats[-1].get("beat_id")
-                        or f"{shot_id}_P{len(authored_beats):02d}"
+                        authored_beats[-1].get("beat_id") or f"{shot_id}_P{len(authored_beats):02d}"
                     )
                     candidate = beats_dir / f"{last_beat_id}.png"
                     if not candidate.is_file() or candidate.stat().st_size == 0:
@@ -2662,21 +2827,22 @@ def generate_shot_storyboards(
                     board_path,
                     grid_contract,
                     assignments,
+                    beats_by_id={str(beat.get("beat_id") or ""): beat for beat in authored_beats},
                 )
-                guides_by_beat = {
-                    str(guide["beat_id"]): guide for guide in guides
-                }
+                guides_by_beat = {str(guide["beat_id"]): guide for guide in guides}
                 for beat in authored_beats:
                     beat_id = str(beat.get("beat_id") or "")
                     guide = guides_by_beat[beat_id]
                     _bind_guide_to_beat(beat, guide)
-                preserved.update({
+                preserved.update(
+                    {
                     "usage": STORYBOARD_NARRATIVE_GUIDE_USAGE,
                     "narrative_grid": narrative_grid,
                     "grid_contract": grid_contract,
                     "beat_cell_assignments": assignments,
                     "narrative_guides": guides,
-                })
+                    }
+                )
                 _write_json(boards_dir / f"{shot_id}.json", preserved)
                 continue
             prompt, beats = build_shot_storyboard_prompt(
@@ -2705,7 +2871,9 @@ def generate_shot_storyboards(
                 "director_panel": (
                     str(director_panel.relative_to(output_dir))
                     if director_panel is not None and director_panel.is_relative_to(output_dir)
-                    else str(director_panel) if director_panel is not None else None
+                    else str(director_panel)
+                    if director_panel is not None
+                    else None
                 ),
                 "status": "planned",
             }
@@ -2735,8 +2903,7 @@ def generate_shot_storyboards(
             panel_paths: list[Path] = []
             previous_panel = (
                 previous_storyboard_panel
-                if str(shot.get("boundary_before") or "").strip().lower()
-                == "continuous"
+                if str(shot.get("boundary_before") or "").strip().lower() == "continuous"
                 else None
             )
             content_positions = [
@@ -2758,9 +2925,7 @@ def generate_shot_storyboards(
                     }
                     previous_panel_record = previous_panels.get(beat_id)
                     try:
-                        preserved_record = json.loads(
-                            panel_sidecar.read_text(encoding="utf-8")
-                        )
+                        preserved_record = json.loads(panel_sidecar.read_text(encoding="utf-8"))
                         with Image.open(panel_path) as preserved_image:
                             preserved_image.verify()
                     except (OSError, ValueError, json.JSONDecodeError) as exc:
@@ -2771,11 +2936,9 @@ def generate_shot_storyboards(
                         not previous_panel_record
                         or preserved_record.get("status") != "done"
                         or preserved_record.get("beat_id") != beat_id
-                        or preserved_record.get("image")
-                        != str(panel_path.relative_to(output_dir))
+                        or preserved_record.get("image") != str(panel_path.relative_to(output_dir))
                         or any(
-                            preserved_record.get(field)
-                            != previous_panel_record.get(field)
+                            preserved_record.get(field) != previous_panel_record.get(field)
                             for field in (
                                 "prompt_sha256",
                                 "model",
@@ -2792,9 +2955,7 @@ def generate_shot_storyboards(
                     previous_panel = panel_path
                     accepted_reference_hashes.update(
                         str(value)
-                        for value in (
-                            preserved_record.get("reference_image_sha256") or []
-                        )
+                        for value in (preserved_record.get("reference_image_sha256") or [])
                         if str(value)
                     )
                     preserved_panel_ids.append(beat_id)
@@ -2807,14 +2968,8 @@ def generate_shot_storyboards(
                 )
                 beat_correction_issues = []
                 for issue in correction_issues:
-                    details = (
-                        issue.get("details")
-                        if isinstance(issue.get("details"), dict)
-                        else {}
-                    )
-                    storyboard_ids = [
-                        str(value) for value in (details.get("storyboard_ids") or [])
-                    ]
+                    details = issue.get("details") if isinstance(issue.get("details"), dict) else {}
+                    storyboard_ids = [str(value) for value in (details.get("storyboard_ids") or [])]
                     if not storyboard_ids or beat_id in storyboard_ids:
                         beat_correction_issues.append(issue)
                 correction_directives = _panel_correction_directives(
@@ -2841,15 +2996,11 @@ def generate_shot_storyboards(
                     position,
                     len(beats),
                     characters,
-                    uses_director_board=(
-                        director_panel is not None and not correction_directives
-                    ),
+                    uses_director_board=(director_panel is not None and not correction_directives),
                     aspect_ratio=aspect_ratio,
                     correction_contract=correction_contract,
                     is_last_content_beat=position == last_content_position,
-                    referenced_character_ids={
-                        path.parent.name for path in character_references
-                    },
+                    referenced_character_ids={path.parent.name for path in character_references},
                 )
                 panel_prompt_path = beats_dir / f"{beat_id}_prompt.txt"
                 panel_path = beats_dir / f"{beat_id}.png"
@@ -2866,33 +3017,25 @@ def generate_shot_storyboards(
                     if director_panel is not None:
                         reference_paths.append(director_panel)
                 reference_hashes = [
-                    hashlib.sha256(path.read_bytes()).hexdigest()
-                    for path in reference_paths
+                    hashlib.sha256(path.read_bytes()).hexdigest() for path in reference_paths
                 ]
                 requested_reference_roles = []
                 for reference_path in reference_paths:
                     if reference_path in character_references:
-                        requested_reference_roles.append(
-                            character_reference_role(reference_path)
-                        )
+                        requested_reference_roles.append(character_reference_role(reference_path))
                     elif reference_path == previous_panel:
                         requested_reference_roles.append("prior_storyboard_state")
                     elif reference_path == director_panel:
-                        requested_reference_roles.append(
-                            "director_single_panel_composition_only"
-                        )
+                        requested_reference_roles.append("director_single_panel_composition_only")
                     else:
                         raise RuntimeError(
-                            "unowned Seedream storyboard reference: "
-                            f"{reference_path}"
+                            f"unowned Seedream storyboard reference: {reference_path}"
                         )
                 provider_contract_prompt = bind_reference_roles(
                     panel_prompt,
                     requested_reference_roles,
                 )
-                provider_contract_metrics = prompt_guidance_metrics(
-                    provider_contract_prompt
-                )
+                provider_contract_metrics = prompt_guidance_metrics(provider_contract_prompt)
                 panel_prompt_path.write_text(provider_contract_prompt, encoding="utf-8")
                 panel_sha = image_request_fingerprint(
                     prompt=provider_contract_prompt,
@@ -2919,21 +3062,15 @@ def generate_shot_storyboards(
                     "panel_prompt_template_id": PANEL_PROMPT_TEMPLATE_ID,
                     "panel_prompt_template_version": PANEL_PROMPT_TEMPLATE_VERSION,
                     "correction_prompt_policy": (
-                        PANEL_CORRECTION_PROMPT_POLICY
-                        if correction_directives
-                        else None
+                        PANEL_CORRECTION_PROMPT_POLICY if correction_directives else None
                     ),
                     "first_request_safety_policy": (
                         "non_graphic_staged_conflict_v1"
                         if _first_request_safety_contract(beat)
                         else None
                     ),
-                    "reference_contract_template_id": (
-                        REFERENCE_CONTRACT_TEMPLATE_ID
-                    ),
-                    "reference_contract_template_version": (
-                        REFERENCE_CONTRACT_TEMPLATE_VERSION
-                    ),
+                    "reference_contract_template_id": (REFERENCE_CONTRACT_TEMPLATE_ID),
+                    "reference_contract_template_version": (REFERENCE_CONTRACT_TEMPLATE_VERSION),
                     "reference_roles": requested_reference_roles,
                     "beat_cast": beat_cast,
                     "character_references": [
@@ -2959,9 +3096,7 @@ def generate_shot_storyboards(
                 cached = False
                 if panel_sidecar.is_file() and panel_path.is_file():
                     try:
-                        previous_record = json.loads(
-                            panel_sidecar.read_text(encoding="utf-8")
-                        )
+                        previous_record = json.loads(panel_sidecar.read_text(encoding="utf-8"))
                         if (
                             previous_record.get("status") == "done"
                             and previous_record.get("prompt_sha256") == panel_sha
@@ -2976,6 +3111,7 @@ def generate_shot_storyboards(
                     except (OSError, ValueError, json.JSONDecodeError):
                         cached = False
                 if not cached:
+
                     def reference_value(path: Path) -> str:
                         return (
                             str(path.relative_to(output_dir))
@@ -2996,28 +3132,21 @@ def generate_shot_storyboards(
                         reference_roles = []
                         for reference_path in selected_references:
                             if reference_path in character_references:
-                                reference_roles.append(
-                                    character_reference_role(reference_path)
-                                )
+                                reference_roles.append(character_reference_role(reference_path))
                             elif reference_path == previous_panel:
                                 reference_roles.append("prior_storyboard_state")
                             elif reference_path == director_panel:
-                                reference_roles.append(
-                                    "director_single_panel_composition_only"
-                                )
+                                reference_roles.append("director_single_panel_composition_only")
                             else:
                                 raise RuntimeError(
-                                    "unowned Seedream storyboard reference: "
-                                    f"{reference_path}"
+                                    f"unowned Seedream storyboard reference: {reference_path}"
                                 )
                         provider_prompt = bind_reference_roles(
                             generation_prompt,
                             reference_roles,
                         )
                         provider_metrics = prompt_guidance_metrics(provider_prompt)
-                        _panel_record["provider_prompt_sha256"] = provider_metrics[
-                            "sha256"
-                        ]
+                        _panel_record["provider_prompt_sha256"] = provider_metrics["sha256"]
                         _panel_record["provider_prompt_guidance"] = provider_metrics
                         _panel_record["reference_contract_template_id"] = (
                             REFERENCE_CONTRACT_TEMPLATE_ID
@@ -3081,9 +3210,7 @@ def generate_shot_storyboards(
                         generation_prompt: str,
                         starting_references: list[Path],
                         *,
-                        _character_references: tuple[Path, ...] = tuple(
-                            character_references
-                        ),
+                        _character_references: tuple[Path, ...] = tuple(character_references),
                         _previous_panel: Path | None = previous_panel,
                         _director_panel: Path | None = director_panel,
                         _trace: list[dict[str, Any]] = input_safety_trace,
@@ -3108,16 +3235,14 @@ def generate_shot_storyboards(
                             except Exception as exc:
                                 if not _is_input_image_safety_rejection(exc):
                                     if _is_output_image_safety_rejection(exc):
-                                        provider_accepted_references = list(
-                                            selected_references
-                                        )
+                                        provider_accepted_references = list(selected_references)
                                         accepted_reference_hashes.update(
-                                            reference_hash(path)
-                                            for path in selected_references
+                                            reference_hash(path) for path in selected_references
                                         )
                                     raise
                                 last_input_error = exc
-                                _trace.append({
+                                _trace.append(
+                                    {
                                     "attempt": attempt,
                                     "status": "rejected",
                                     "mode": (
@@ -3126,18 +3251,17 @@ def generate_shot_storyboards(
                                         else "text_to_image"
                                     ),
                                     "reference_images": [
-                                        reference_value(path)
-                                        for path in selected_references
+                                            reference_value(path) for path in selected_references
                                     ],
                                     "provider_code": str(
                                         getattr(exc, "provider_code", "")
                                         or "InputImageSensitiveContentDetected"
                                     ),
                                     "request_id": (
-                                        str(getattr(exc, "request_id", "") or "")
-                                        or None
+                                            str(getattr(exc, "request_id", "") or "") or None
                                     ),
-                                })
+                                    }
+                                )
                                 if attempt < len(candidates):
                                     print(
                                         f"  [seedream] {_beat_id} 输入参考图被服务商拒绝；"
@@ -3151,7 +3275,8 @@ def generate_shot_storyboards(
                                 reference_hash(path) for path in selected_references
                             )
                             if _trace:
-                                _trace.append({
+                                _trace.append(
+                                    {
                                     "attempt": attempt,
                                     "status": "accepted",
                                     "mode": (
@@ -3160,24 +3285,20 @@ def generate_shot_storyboards(
                                         else "text_to_image"
                                     ),
                                     "reference_images": [
-                                        reference_value(path)
-                                        for path in selected_references
+                                            reference_value(path) for path in selected_references
                                     ],
-                                })
+                                    }
+                                )
                             return result, list(selected_references)
                         if last_input_error is not None:
                             raise last_input_error
-                        raise RuntimeError(
-                            f"{_beat_id} exhausted storyboard reference fallbacks"
-                        )
+                        raise RuntimeError(f"{_beat_id} exhausted storyboard reference fallbacks")
 
                     try:
-                        result_url, used_reference_paths = (
-                            generate_with_input_safety_fallback(
+                        result_url, used_reference_paths = generate_with_input_safety_fallback(
                                 panel_prompt,
                                 list(reference_paths),
                             )
-                        )
                     except Exception as exc:
                         if not _is_output_image_safety_rejection(exc):
                             raise
@@ -3188,12 +3309,10 @@ def generate_shot_storyboards(
                             f"  [seedream] {beat_id} 输出安全拒绝；改为非接触机械特技预演，限次重试 1 次",
                             flush=True,
                         )
-                        result_url, used_reference_paths = (
-                            generate_with_input_safety_fallback(
+                        result_url, used_reference_paths = generate_with_input_safety_fallback(
                                 safety_prompt,
                                 provider_accepted_references,
                             )
-                        )
                         panel_record["safety_retry"] = {
                             "reason": "output_image_sensitive_content",
                             "attempts": 1,
@@ -3203,18 +3322,13 @@ def generate_shot_storyboards(
                                 safety_prompt.encode("utf-8")
                             ).hexdigest(),
                         }
-                    used_reference_hashes = [
-                        reference_hash(path) for path in used_reference_paths
-                    ]
-                    used_reference_values = [
-                        reference_value(path) for path in used_reference_paths
-                    ]
+                    used_reference_hashes = [reference_hash(path) for path in used_reference_paths]
+                    used_reference_values = [reference_value(path) for path in used_reference_paths]
                     if input_safety_trace:
                         panel_record["input_safety_fallback"] = {
                             "reason": "input_image_sensitive_content",
                             "attempts": sum(
-                                item.get("status") == "rejected"
-                                for item in input_safety_trace
+                                item.get("status") == "rejected" for item in input_safety_trace
                             ),
                             "policy": "role_preserving_reference_reduction_v1",
                             "trace": input_safety_trace,
@@ -3235,12 +3349,14 @@ def generate_shot_storyboards(
                         raise RuntimeError(f"Seedream returned without {panel_path.name}")
                     with Image.open(panel_path) as image:
                         image.verify()
-                    panel_record.update({
+                    panel_record.update(
+                        {
                         "status": "done",
                         "result_url": result_url,
                         "requested_reference_image_sha256": reference_hashes,
                         "reference_image_sha256": used_reference_hashes,
-                    })
+                        }
+                    )
                 accepted_reference_hashes.update(
                     str(value)
                     for value in (panel_record.get("reference_image_sha256") or [])
@@ -3260,37 +3376,27 @@ def generate_shot_storyboards(
             if (
                 previous_record
                 and previous_record.get("status") == "done"
-                and previous_record.get("generation_fingerprint")
-                == board_generation_fingerprint
+                and previous_record.get("generation_fingerprint") == board_generation_fingerprint
                 and previous_record.get("prompt_sha256") == prompt_sha
                 and previous_record.get("model") == contract["model"]
                 and previous_manifest.get("size_requested") == size
                 and previous_manifest.get("aspect_ratio") == aspect_ratio
-                and previous_manifest.get("request_contract_id")
-                == IMAGE_REQUEST_CONTRACT_ID
+                and previous_manifest.get("request_contract_id") == IMAGE_REQUEST_CONTRACT_ID
                 and previous_manifest.get("request_contract_version")
                 == IMAGE_REQUEST_CONTRACT_VERSION
             ):
                 try:
                     with Image.open(board_path) as board_image:
                         board_image.verify()
-                    observed_board_sha256 = hashlib.sha256(
-                        board_path.read_bytes()
-                    ).hexdigest()
-                    if observed_board_sha256 != str(
-                        previous_record.get("board_sha256") or ""
-                    ):
+                    observed_board_sha256 = hashlib.sha256(board_path.read_bytes()).hexdigest()
+                    if observed_board_sha256 != str(previous_record.get("board_sha256") or ""):
                         raise ValueError("board hash mismatch")
                     previous_grid = previous_record.get("grid_contract") or {}
                     if (
-                        previous_grid.get("columns")
-                        != SHOT_STORYBOARD_GRID_COLUMNS
-                        or previous_grid.get("rows")
-                        != SHOT_STORYBOARD_GRID_ROWS
-                        or previous_grid.get("cell_count")
-                        != SHOT_STORYBOARD_GRID_CELLS
-                        or len(previous_grid.get("cells") or [])
-                        != SHOT_STORYBOARD_GRID_CELLS
+                        previous_grid.get("columns") != SHOT_STORYBOARD_GRID_COLUMNS
+                        or previous_grid.get("rows") != SHOT_STORYBOARD_GRID_ROWS
+                        or previous_grid.get("cell_count") != SHOT_STORYBOARD_GRID_CELLS
+                        or len(previous_grid.get("cells") or []) != SHOT_STORYBOARD_GRID_CELLS
                     ):
                         raise ValueError("invalid cached grid contract")
                     board_result_url = previous_record.get("result_url")
@@ -3322,10 +3428,9 @@ def generate_shot_storyboards(
                 board_path,
                 grid_contract,
                 assignments,
+                beats_by_id={str(beat.get("beat_id") or ""): beat for beat in beats},
             )
-            guides_by_beat = {
-                str(guide["beat_id"]): guide for guide in guide_records
-            }
+            guides_by_beat = {str(guide["beat_id"]): guide for guide in guide_records}
             panels_by_beat = {
                 str(panel.get("beat_id") or ""): panel
                 for panel in panel_records
@@ -3350,14 +3455,13 @@ def generate_shot_storyboards(
                     "status": "previs_only",
                     "usage": "phase2_review_placeholder_never_video_reference",
                     "image": str(legacy_preview_path.relative_to(output_dir)),
-                    "image_sha256": hashlib.sha256(
-                        legacy_preview_path.read_bytes()
-                    ).hexdigest(),
+                    "image_sha256": hashlib.sha256(legacy_preview_path.read_bytes()).hexdigest(),
                     "source": str(panel_paths[0].relative_to(output_dir)),
                     "replaced_by_phase": "phase4_cinematic_first_frames",
                 },
             )
-            record.update({
+            record.update(
+                {
                 "status": "done",
                 "model": contract["model"],
                 "panels": panel_records,
@@ -3368,7 +3472,8 @@ def generate_shot_storyboards(
                 "grid_contract": grid_contract,
                 "beat_cell_assignments": assignments,
                 "narrative_guides": guide_records,
-            })
+                }
+            )
             if board_cached:
                 record["cache_hit"] = True
             shot["storyboard_board"] = record["board"]
@@ -3376,9 +3481,11 @@ def generate_shot_storyboards(
             _write_json(boards_dir / f"{shot_id}.json", record)
             contract["shots"].append(record)
             contract["shots"].sort(
-                key=lambda item: authored_shot_ids.index(str(item.get("shot_id")))
+                key=lambda item: (
+                    authored_shot_ids.index(str(item.get("shot_id")))
                 if str(item.get("shot_id")) in authored_shot_ids
                 else len(authored_shot_ids)
+            )
             )
             if panel_paths:
                 previous_storyboard_panel = panel_paths[-1]
@@ -3399,12 +3506,8 @@ def generate_shot_storyboards(
         )
         contract["total_transition_panels"] = len(bridge_records)
         if contract.get("correction"):
-            contract["correction"]["regenerated_storyboard_ids"] = sorted(
-                regenerated_panel_ids
-            )
-            contract["correction"]["preserved_storyboard_ids"] = sorted(
-                preserved_panel_ids
-            )
+            contract["correction"]["regenerated_storyboard_ids"] = sorted(regenerated_panel_ids)
+            contract["correction"]["preserved_storyboard_ids"] = sorted(preserved_panel_ids)
         contract["regenerated_panel_count"] = len(regenerated_panel_ids)
         _write_json(manifest_path, contract)
         return contract

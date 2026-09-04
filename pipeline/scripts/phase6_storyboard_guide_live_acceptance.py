@@ -67,9 +67,9 @@ from utils.privacy_visual_policy import (
     synthetic_makeup_profile_sha256,
 )
 
-RECEIPT_SCHEMA = "honcut.phase3-performance-board-live-acceptance.v1"
-REGRESSION_SCHEMA = "honcut.phase3-performance-board-regression.v1"
-RECEIPT_NAME = "phase3_performance_board_live_acceptance.json"
+RECEIPT_SCHEMA = "honcut.phase6-storyboard-pose-atlas-live-acceptance.v1"
+REGRESSION_SCHEMA = "honcut.phase6-storyboard-pose-atlas-regression.v1"
+RECEIPT_NAME = "phase6_storyboard_pose_atlas_live_acceptance.json"
 ACCEPTANCE_DIRECTORY = Path("live_acceptance") / "phase3_performance_board"
 MAX_PAID_PROVIDER_REQUESTS = 1
 REQUIRED_ACCEPTANCE_GATES = ["regression", "live_paid_provider"]
@@ -352,13 +352,14 @@ def _expected_p01_media_responsibilities(
     *,
     visible_character_count: int,
     performance_guide_count: int,
+    guide_responsibilities: list[str] | None = None,
 ) -> list[str]:
     """Mirror the current Phase 6 P01 authority order in the live gate."""
     return [
         *(["character_identity_board"] * visible_character_count),
         "cinematic_composition",
         *(["character_performance_guide"] * performance_guide_count),
-        "storyboard_narrative_guide",
+        *(guide_responsibilities or ["storyboard_narrative_guide"]),
     ]
 
 
@@ -417,8 +418,11 @@ def _preflight_contract(
             "selected run does not satisfy the current synthetic porcelain identity contract"
         )
     selected_shot_id = str(chunk.storyboard_beat_id).split("_P", 1)[0]
-    if not chunk.storyboard_image or not chunk.storyboard_narrative_guide:
-        raise RuntimeError("selected P01 lacks cinematic or narrative-guide provenance")
+    if not chunk.storyboard_image or not (
+        chunk.storyboard_pose_atlas_plan_schema
+        or chunk.storyboard_narrative_guide
+    ):
+        raise RuntimeError("selected P01 lacks cinematic or pose-guide provenance")
     if any(
         later.storyboard_image
         for continuity_shot in plan.shots
@@ -504,7 +508,14 @@ def _preflight_contract(
         action_window_seconds=action_window_seconds,
         duration_seconds=duration,
         beat_id=str(chunk.storyboard_beat_id),
-        cell_ids=list(chunk.storyboard_narrative_guide_cell_ids),
+        cell_ids=(
+            [
+                str(sample.get("sample_id") or "")
+                for sample in chunk.storyboard_pose_atlas_pose_samples
+            ]
+            if chunk.storyboard_pose_atlas_plan_schema
+            else list(chunk.storyboard_narrative_guide_cell_ids)
+        ),
     )
     prompt = _content_prompt(content)
     from utils.prompt_budget import enforce_prompt_budget
@@ -526,7 +537,8 @@ def _preflight_contract(
     guides = [
         item
         for item in image_media
-        if item.get("responsibility") == "storyboard_narrative_guide"
+        if item.get("responsibility")
+        in {"storyboard_narrative_guide", "storyboard_pose_atlas"}
     ]
     character_media = [
         item
@@ -541,15 +553,14 @@ def _preflight_contract(
     expected_responsibilities = _expected_p01_media_responsibilities(
         visible_character_count=len(visible_character_ids),
         performance_guide_count=len(performance_guides),
+        guide_responsibilities=[
+            str(item.get("responsibility") or "") for item in guides
+        ],
     )
-    required_prompt_fragments = (
+    required_prompt_fragments = [
         "珍珠生体瓷妆",
         "温润透亮",
         "尸体般灰白",
-        "当前剧情导航图是图片",
-        "红色箭头表示主体或物体运动方向",
-        "蓝色箭头表示摄影机运动",
-        "不得提前演绎其他 Gxx 或后续 Pxx",
         "严禁渲染进视频画面",
         "当前动作姿态图中的多个人形是同一个角色的不同参考姿态",
         "只执行本次明确列出的 Axx",
@@ -559,12 +570,28 @@ def _preflight_contract(
         "道具外形、总长度、端部数量",
         "严禁带入成片",
         "禁止生长、缩短、变形、增减端部",
-    )
+    ]
+    if chunk.storyboard_pose_atlas_plan_schema:
+        required_prompt_fragments.extend((
+            "当前动作姿态图集是图片",
+            "同一语义动作的不同姿态采样",
+            "同一条连续摄影机路径",
+            "不占视频动作时长",
+            "动态动作须在",
+            "终态保持不是新动作",
+        ))
+    else:
+        required_prompt_fragments.extend((
+            "当前剧情导航图是图片",
+            "红色箭头表示主体或物体运动方向",
+            "蓝色箭头表示摄影机运动",
+            "不得提前演绎其他 Gxx 或后续 Pxx",
+        ))
     if (
         not image_media
         or len(image_media) > 9
         or video_media
-        or len(guides) != 1
+        or not guides
         or len(character_media) != len(visible_character_ids)
         or len(performance_media) != len(performance_guides)
         or [item.get("responsibility") for item in image_media]
@@ -582,7 +609,7 @@ def _preflight_contract(
         "media_index_manifest": media_manifest,
         "provider_prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
     }
-    run_id = f"{output_dir.name}:phase3-performance-board-live-v1"
+    run_id = f"{output_dir.name}:phase6-storyboard-pose-atlas-live-v1"
     payload = _task_payload(
         request,
         model=SEEDANCE_MODEL,
@@ -613,11 +640,39 @@ def _preflight_contract(
                 for character in synthetic_evidence.get("characters") or []
             ],
         },
-        "narrative_cell_ids": list(chunk.storyboard_narrative_guide_cell_ids),
+        "narrative_cell_ids": (
+            [
+                str(sample.get("sample_id") or "")
+                for sample in chunk.storyboard_pose_atlas_pose_samples
+            ]
+            if chunk.storyboard_pose_atlas_plan_schema
+            else list(chunk.storyboard_narrative_guide_cell_ids)
+        ),
         "narrative_guide_sha256": chunk.storyboard_narrative_guide_sha256,
         "narrative_source_board_sha256": (
             chunk.storyboard_narrative_guide_source_board_sha256
         ),
+        "pose_atlas": {
+            "plan_schema": chunk.storyboard_pose_atlas_plan_schema,
+            "plan_sha256": chunk.storyboard_pose_atlas_plan_sha256,
+            "timing_contract": chunk.storyboard_pose_atlas_timing_contract,
+            "camera_motion_contract_sha256": (
+                chunk.storyboard_pose_atlas_camera_motion_contract_sha256
+            ),
+            "selected_strategy": (
+                guides[0].get("pose_atlas_strategy")
+                if chunk.storyboard_pose_atlas_plan_schema
+                else None
+            ),
+            "page_count": (
+                len(guides) if chunk.storyboard_pose_atlas_plan_schema else 0
+            ),
+            "page_sha256": (
+                [item.get("sha256") for item in guides]
+                if chunk.storyboard_pose_atlas_plan_schema
+                else []
+            ),
+        },
         "cinematic_sha256": _sha256_file(output_dir / chunk.storyboard_image),
         "performance_guides": performance_guides,
         "performance_prompt_optimization": (
@@ -740,6 +795,7 @@ def _preflight_replay_contract(preflight: dict[str, Any]) -> dict[str, Any]:
         "narrative_cell_ids",
         "narrative_guide_sha256",
         "narrative_source_board_sha256",
+        "pose_atlas",
         "cinematic_sha256",
         "performance_guides",
         "performance_prompt_optimization",
