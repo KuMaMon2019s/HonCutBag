@@ -28,25 +28,25 @@
 - [x] 4.2 Fail closed before submission when the media preamble plus mandatory action/identity projection cannot fit; verify GenerationTaskStore has no `SubmissionAttempted` event for budget failure.
 - [x] 4.3 Add action brief schema/hash, ordered group IDs, source lineage, media-role indexes/hashes, projection policy hash, final prompt hash, and canonical hash to task identity and receipts; verify each relevant input change invalidates the fingerprint.
 - [x] 4.4 Verify cold start plus ten recoveries preserve task count, prompt hash, brief hash, media hashes, and Provider request count zero.
-- [ ] 4.5 Commit budgeting and task identity as `fix: make phase6 prompt projection deterministic` after recovery tests pass.
+- [x] 4.5 Commit budgeting and task identity as `fix: make phase6 prompt projection deterministic` after recovery tests pass.
 
 ## 5. Zero-Cost Replay and Regression
 
-- [ ] 5.1 Add a Provider-deny run-02 replay that reconstructs the new request from hash-verified persisted evidence and writes a separate replay receipt; verify the original run and receipts remain byte-for-byte unchanged.
-- [ ] 5.2 Assert the replay prompt is within the capability limit, contains all action groups near the front, has no duplicate camera/motion contract, and preserves all media/canonical hashes; verify Provider request count is zero.
-- [ ] 5.3 Add parameterized tests for one/many action groups, contact/no-contact, prop/no-prop, P01/P02+, short/long durations, optional detail overflow, and mandatory content overflow.
-- [ ] 5.4 Verify Phase 6 Graph and sequential execution produce identical briefs, prompts, fingerprints, media order, and fail-closed behavior.
-- [ ] 5.5 Verify `pipeline_core.py`, Phase 2 pose-atlas output/hashes, Provider transport, Runtime retry policy, Graph topology, and database schemas are unchanged.
-- [ ] 5.6 Commit replay and regression coverage as `test: enforce action-first provider requests` after focused tests pass.
+- [x] 5.1 Add a Provider-deny run-02 replay that reconstructs the new request from hash-verified persisted evidence and writes a separate replay receipt; verify the original run and receipts remain byte-for-byte unchanged.
+- [x] 5.2 Assert the replay prompt is within the capability limit, contains all action groups near the front, has no duplicate camera/motion contract, and preserves all media/canonical hashes; verify Provider request count is zero.
+- [x] 5.3 Add parameterized tests for one/many action groups, contact/no-contact, prop/no-prop, P01/P02+, short/long durations, optional detail overflow, and mandatory content overflow.
+- [x] 5.4 Verify Phase 6 Graph and sequential execution produce identical briefs, prompts, fingerprints, media order, and fail-closed behavior.
+- [x] 5.5 Verify `pipeline_core.py`, Phase 2 pose-atlas output/hashes, Provider transport, Runtime retry policy, Graph topology, and database schemas are unchanged.
+- [x] 5.6 Commit replay and regression coverage as `test: enforce action-first provider requests` after focused tests pass.
 
 ## 6. Validation and Knowledge Sync
 
-- [ ] 6.1 Run all focused Phase 6 prompt, continuity, packaging, fingerprint, recovery, and live-acceptance tests and verify Provider requests remain zero.
-- [ ] 6.2 Run the Phase 1–9 zero-Provider acceptance, Graph/sequential parity, and recovery matrix; verify no paid client is reachable.
-- [ ] 6.3 Run `make lint`, `git diff --check`, and `make test`; verify all required gates pass without modifying unrelated files.
-- [ ] 6.4 Perform Serena post-change validation on every modified symbol, caller, implementation, type, and file diagnostic; verify no stale reference or parallel prompt path remains.
+- [x] 6.1 Run all focused Phase 6 prompt, continuity, packaging, fingerprint, recovery, and live-acceptance tests and verify Provider requests remain zero.
+- [x] 6.2 Run the Phase 1–9 zero-Provider acceptance, Graph/sequential parity, and recovery matrix; verify no paid client is reachable.
+- [x] 6.3 Run `make lint`, `git diff --check`, and `make test`; verify all required gates pass without modifying unrelated files.
+- [x] 6.4 Perform Serena post-change validation on every modified symbol, caller, implementation, type, and file diagnostic; verify no stale reference or parallel prompt path remains.
 - [ ] 6.5 Run `openspec verify prioritize-storyboard-action-execution` (or the installed equivalent) and strict OpenSpec validation; verify implementation and acceptance evidence satisfy every scenario.
-- [ ] 6.6 Run `graphify update .`, query affected depth two, save a sanitized useful result, and refresh reflections if stale; verify the graph resolves all changed source locations.
+- [x] 6.6 Run `graphify update .`, query affected depth two, save a sanitized useful result, and refresh reflections if stale; verify the graph resolves all changed source locations.
 - [ ] 6.7 Update `docs/HONCUT_ARCHITECTURE.md` only for the verified Provider-facing projection and replay semantics, and update Serena memory only if the completed change creates durable architectural knowledge.
 
 ## 7. Paid Admission and Future One-Shot Gate

@@ -99,3 +99,63 @@ def test_action_execution_brief_rejects_foreign_pose_lineage() -> None:
             ],
             canonical_visual_contract_sha256="b" * 64,
         )
+
+
+@pytest.mark.parametrize(
+    ("action", "targets", "expected_contact"),
+    [
+        ("actor sidesteps and lowers weight", [], False),
+        ("actor grips blue baton and strikes target", ["blue baton"], True),
+    ],
+)
+def test_action_execution_brief_preserves_contact_and_prop_semantics(
+    action,
+    targets,
+    expected_contact,
+) -> None:
+    plan = build_pose_atlas_plan(
+        {
+            "beat_id": "S01_P01",
+            "duration_s": 7,
+            "planner_version": "honcut.secondary-storyboard.v16",
+            "generation_action_units": [
+                {
+                    "unit_id": "GAU001",
+                    "source_action_unit_id": "AU001",
+                    "source_event_id": 1,
+                    "source_generation_unit_indexes": [1],
+                    "source_micro_action_indexes": [1],
+                    "ledger_indexes": [0],
+                    "actions": [action],
+                    "performers": ["actor"],
+                    "targets": targets,
+                }
+            ],
+            "character_ids": ["actor"],
+        }
+    )
+    brief = compile_action_execution_brief(
+        beat_id="S01_P01",
+        action_prompt=action,
+        start_state="already moving",
+        end_state="balanced completion",
+        target_duration_s=7,
+        action_groups=plan["action_groups"],
+        pose_samples=plan["pose_samples"],
+        timing_contract=plan["timing_contract"],
+        media_manifest=[
+            {
+                "prompt_index": "图片1",
+                "responsibility": "storyboard_pose_atlas",
+                "sha256": "a" * 64,
+            }
+        ],
+        canonical_visual_contract_sha256="b" * 64,
+    )
+
+    contact = brief["action_groups"][0]["observable_mechanics"]["contact_profile"]
+    assert bool(contact["required_targets"]) is expected_contact
+    if expected_contact:
+        assert contact["required_targets"] == targets
+    else:
+        assert contact["mode"] == "no invented target contact"

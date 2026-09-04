@@ -224,11 +224,11 @@ def _camera_summary(context: Mapping[str, Any], samples: Sequence[Mapping[str, A
             return camera_movement_description(movement)
         except (KeyError, TypeError, ValueError):
             return str(movement).strip()
-    projections = [
-        sample.get("camera_projection")
-        for sample in samples
-        if isinstance(sample.get("camera_projection"), Mapping)
-    ]
+    projections: list[Mapping[str, Any]] = []
+    for sample in samples:
+        projection = sample.get("camera_projection")
+        if isinstance(projection, Mapping):
+            projections.append(projection)
     if not projections:
         return "保持单一连续摄影机路径，运镜只辅助主体动作"
     first = projections[0]
@@ -413,11 +413,11 @@ def compile_action_execution_brief(
     for index, (group, group_id) in enumerate(zip(ordered_groups, group_ids, strict=True)):
         group_samples = [sample for sample in samples if sample.get("action_group_id") == group_id]
         timing_roles = _ordered_unique([sample.get("timing_role") for sample in group_samples])
-        pose_contracts = [
-            sample.get("pose_contract")
-            for sample in group_samples
-            if isinstance(sample.get("pose_contract"), Mapping)
-        ]
+        pose_contracts: list[Mapping[str, Any]] = []
+        for sample in group_samples:
+            pose_contract = sample.get("pose_contract")
+            if isinstance(pose_contract, Mapping):
+                pose_contracts.append(pose_contract)
         mechanics: dict[str, Any] = {}
         for pose_contract in pose_contracts:
             candidate = pose_contract.get("body_mechanics")

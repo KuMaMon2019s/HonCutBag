@@ -1,0 +1,25 @@
+{
+  "schema": "honcut.phase6-action-execution-replay-expectation.v1",
+  "source_run": "honcut-adaptive-storyboard-pose-atlas-live-run-02",
+  "source_receipt_sha256": "f62875bceba0bcba62faacb0c1e4625b26b1345049323427fa51a4335f733f45",
+  "continuity_plan_sha256": "a8d2adce2d7e34797565588c1c394810046277b9d767874e0a9e8f090f503cdb",
+  "canonical_visual_contract_sha256": "289265fdddfbd97ad243031e331b98bc84094dabbe04441a5e80706a4b30acfe",
+  "action_execution_brief_sha256": "2cc5686fdea6087994024e9d3d0de8597b4e2af2e6483304be87c4f606dc3d33",
+  "provider_prompt_sha256": "d4c03eaced95e4c6b1ba0e4323d0d5ec7789192b61981a485a8995e65291ee0f",
+  "prompt_chars": 3812,
+  "action_brief_position": 710,
+  "identity_projection_position": 2040,
+  "canonical_action_group_ids": [
+    "S01_P01_A01",
+    "S01_P01_A02"
+  ],
+  "media_sha256": [
+    "ceaee4a2a81914de8fe84dfdc369870bb27d6a4f665e1f6908fe07da3c69284c",
+    "9f32ce1bbb15cea955436ef91d74a7d969a6f36cbe099be1030bdd9c9ac3bb32",
+    "bc9caf4ace3c3e43500e1521ae0abb6522ef96fe8c385ea7db47d241745d55c3",
+    "16f11ee43fb705313a6de2561532890ca9c0c0dbd20b95024ba15a88e4d41d33"
+  ],
+  "recovery_replay_count": 10,
+  "provider_request_count": 0,
+  "contains_provider_url_or_secret": false
+}

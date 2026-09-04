@@ -16,12 +16,15 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import phase6_action_execution_replay
+from graph import composition as graph_composition
 from runtime import continuity_provider
+from runtime import pipeline_execution
 from phases.phase2.storyboard_pose_atlas import (
     build_pose_atlas_plan,
     render_pose_atlas_candidates,
 )
 from phases.phase6 import action_execution_prompt as action_prompt_owner
+from phases.phase6 import phase6_video_gen
 from runtime.continuity_chunks import ChunkExecutionRequest
 from runtime.continuity_provider import (
     _bind_final_media_index_prompt,
@@ -65,9 +68,7 @@ def _request_and_content(tmp_path, *, duration: float = 7) -> tuple:
         plan,
         font_factory=lambda _size: ImageFont.load_default(),
     )
-    selected = next(
-        candidate for candidate in receipt["candidates"] if candidate["preferred"]
-    )
+    selected = next(candidate for candidate in receipt["candidates"] if candidate["preferred"])
     chunk = GenerationChunk(
         chunk_id="S01_C01",
         sequence=1,
@@ -80,9 +81,7 @@ def _request_and_content(tmp_path, *, duration: float = 7) -> tuple:
         storyboard_pose_atlas_plan_schema=plan["schema"],
         storyboard_pose_atlas_plan_sha256=plan["plan_sha256"],
         storyboard_pose_atlas_timing_contract=plan["timing_contract"],
-        storyboard_pose_atlas_camera_motion_contract_sha256=plan[
-            "camera_motion_contract_sha256"
-        ],
+        storyboard_pose_atlas_camera_motion_contract_sha256=plan["camera_motion_contract_sha256"],
         storyboard_pose_atlas_action_groups=plan["action_groups"],
         storyboard_pose_atlas_pose_samples=plan["pose_samples"],
         storyboard_pose_atlas_candidates=receipt["candidates"],
@@ -110,7 +109,8 @@ def _request_and_content(tmp_path, *, duration: float = 7) -> tuple:
             "_canonical_identity_projection": (
                 "[honcut.phase6-identity-projection.v1]\n"
                 '{"canonical_visual_contract_sha256":"'
-                + "a" * 64
+                + "a"
+                * 64
                 + '","characters":[{"instance_count":1,"face":"stable"}],'
                 '"required_character_count":1,'
                 '"schema":"honcut.phase6-identity-projection.v1"}'
@@ -156,9 +156,7 @@ def _request_and_content(tmp_path, *, duration: float = 7) -> tuple:
             "_pose_atlas_page_count": 1,
             "_pose_atlas_plan_sha256": plan["plan_sha256"],
             "_pose_atlas_timing_contract": plan["timing_contract"],
-            "_pose_atlas_camera_motion_contract_sha256": plan[
-                "camera_motion_contract_sha256"
-            ],
+            "_pose_atlas_camera_motion_contract_sha256": plan["camera_motion_contract_sha256"],
             "_mandatory_reference": True,
         },
     ]
@@ -184,18 +182,21 @@ def test_action_first_projection_replaces_conflicting_legacy_prompt(tmp_path) ->
         "[honcut.phase6-identity-projection.v1]"
     )
     assert first[0]["_action_execution_group_ids"] == [
-        group["action_group_id"]
-        for group in request.chunk.storyboard_pose_atlas_action_groups
+        group["action_group_id"] for group in request.chunk.storyboard_pose_atlas_action_groups
     ]
-    assert all(
-        prompt.count(group_id) == 1
-        for group_id in first[0]["_action_execution_group_ids"]
-    )
+    assert all(prompt.count(group_id) == 1 for group_id in first[0]["_action_execution_group_ids"])
     assert [item["sha256"] for item in manifest] == [
         "1" * 64,
         "2" * 64,
         content[-1]["_reference_sha256"],
     ]
+
+
+def test_graph_and_sequential_execution_share_phase6_owner() -> None:
+    """Both orchestration paths must reach the same production Phase owner."""
+
+    assert pipeline_execution.run_phase6 is phase6_video_gen.run_phase6
+    assert graph_composition._resolve_phase_owner(None).run_phase6 is (phase6_video_gen.run_phase6)
 
 
 def test_action_brief_metadata_changes_with_action_lineage(tmp_path) -> None:
@@ -212,12 +213,11 @@ def test_action_brief_metadata_changes_with_action_lineage(tmp_path) -> None:
     changed, _manifest = _bind_final_media_index_prompt(content, changed_request)
     changed_metadata = _provider_prompt_metadata(changed)
 
-    assert metadata["action_execution_brief_sha256"] != changed_metadata[
-        "action_execution_brief_sha256"
-    ]
-    assert metadata["provider_prompt_sha256"] == changed_metadata[
-        "provider_prompt_sha256"
-    ]
+    assert (
+        metadata["action_execution_brief_sha256"]
+        != changed_metadata["action_execution_brief_sha256"]
+    )
+    assert metadata["provider_prompt_sha256"] == changed_metadata["provider_prompt_sha256"]
     assert metadata["action_execution_source_action_unit_ids"] == ["AU001", "AU002"]
     assert changed_metadata["action_execution_source_action_unit_ids"] == [
         "AU999",
@@ -245,9 +245,7 @@ def test_action_brief_metadata_changes_with_action_lineage(tmp_path) -> None:
         seed=1,
         generation_parameters=changed_metadata,
     )
-    assert base_payload["generation_fingerprint"] != changed_payload[
-        "generation_fingerprint"
-    ]
+    assert base_payload["generation_fingerprint"] != changed_payload["generation_fingerprint"]
 
 
 @pytest.mark.parametrize(
@@ -279,18 +277,14 @@ def test_action_brief_rejects_invalid_deterministic_inputs(
         groups[0]["order"] = 2
         request = replace(
             request,
-            chunk=request.chunk.model_copy(
-                update={"storyboard_pose_atlas_action_groups": groups}
-            ),
+            chunk=request.chunk.model_copy(update={"storyboard_pose_atlas_action_groups": groups}),
         )
     elif mutation == "future_beat":
         samples = copy.deepcopy(request.chunk.storyboard_pose_atlas_pose_samples)
         samples[0]["pose_contract"]["secondary_beat_id"] = "S01_P02"
         request = replace(
             request,
-            chunk=request.chunk.model_copy(
-                update={"storyboard_pose_atlas_pose_samples": samples}
-            ),
+            chunk=request.chunk.model_copy(update={"storyboard_pose_atlas_pose_samples": samples}),
         )
     else:
         content[-1].pop("_reference_sha256")
@@ -387,13 +381,15 @@ def test_action_brief_supports_provider_durations_and_later_beats(
     beat_id,
 ) -> None:
     action = "actor-alpha steps through contact and transfers weight"
-    plan = build_pose_atlas_plan({
-        "beat_id": beat_id,
-        "duration_s": duration,
-        "planner_version": "honcut.secondary-storyboard.v16",
-        "generation_action_units": [_unit(1, action)],
-        "character_ids": ["actor-alpha"],
-    })
+    plan = build_pose_atlas_plan(
+        {
+            "beat_id": beat_id,
+            "duration_s": duration,
+            "planner_version": "honcut.secondary-storyboard.v16",
+            "generation_action_units": [_unit(1, action)],
+            "character_ids": ["actor-alpha"],
+        }
+    )
     brief = action_prompt_owner.compile_action_execution_brief(
         beat_id=beat_id,
         action_prompt=action,
@@ -412,9 +408,7 @@ def test_action_brief_supports_provider_durations_and_later_beats(
             {
                 "prompt_index": "图片2",
                 "responsibility": "storyboard_pose_atlas",
-                "narrative_cell_ids": [
-                    sample["sample_id"] for sample in plan["pose_samples"]
-                ],
+                "narrative_cell_ids": [sample["sample_id"] for sample in plan["pose_samples"]],
                 "sha256": "2" * 64,
             },
         ],
@@ -435,16 +429,12 @@ def test_run02_provider_deny_replay_matches_sanitized_evidence(tmp_path) -> None
     failure = json.loads((fixture_dir / "run02_evidence.json").read_text())
     expected = json.loads((fixture_dir / "run02_replay_expected.json").read_text())
     assert failure["action_priority_first_char"] > failure["prompt_chars"] * 0.9
-    assert failure["timing_window_first_char"] > failure[
-        "camera_execution_first_char"
-    ]
+    assert failure["timing_window_first_char"] > failure["camera_execution_first_char"]
     assert failure["business_verdict"] == "failed_static_opening_pose"
     assert failure["contains_prompt_or_media_body"] is False
     assert failure["contains_provider_url_or_secret"] is False
     assert failure["source_receipt_sha256"] == expected["source_receipt_sha256"]
-    assert failure["source_continuity_plan_sha256"] == expected[
-        "continuity_plan_sha256"
-    ]
+    assert failure["source_continuity_plan_sha256"] == expected["continuity_plan_sha256"]
     assert expected["action_brief_position"] < expected["identity_projection_position"]
     assert expected["prompt_chars"] < failure["prompt_chars"]
     assert expected["provider_request_count"] == 0
@@ -465,19 +455,32 @@ def test_run02_provider_deny_replay_matches_sanitized_evidence(tmp_path) -> None
     after = hashlib.sha256(source_receipt.read_bytes()).hexdigest()
 
     assert before == after == expected["source_receipt_sha256"]
-    assert receipt["continuity_plan_sha256"] == expected[
-        "continuity_plan_sha256"
-    ]
+    assert receipt["continuity_plan_sha256"] == expected["continuity_plan_sha256"]
     assert receipt["prompt_chars"] == expected["prompt_chars"]
     assert receipt["action_brief_position"] == expected["action_brief_position"]
-    assert receipt["identity_projection_position"] == expected[
-        "identity_projection_position"
-    ]
-    assert receipt["prompt_metadata"]["provider_prompt_sha256"] == expected[
-        "provider_prompt_sha256"
-    ]
-    assert receipt["prompt_metadata"]["action_execution_brief_sha256"] == expected[
-        "action_execution_brief_sha256"
-    ]
+    assert receipt["identity_projection_position"] == expected["identity_projection_position"]
+    assert (
+        receipt["prompt_metadata"]["provider_prompt_sha256"] == expected["provider_prompt_sha256"]
+    )
+    assert (
+        receipt["prompt_metadata"]["action_execution_brief_sha256"]
+        == expected["action_execution_brief_sha256"]
+    )
+    assert (
+        receipt["prompt_metadata"]["action_execution_group_ids"]
+        == expected["canonical_action_group_ids"]
+    )
+    checks = receipt["prompt_contract_checks"]
+    assert all(
+        receipt["action_brief_position"] <= position < receipt["identity_projection_position"]
+        for position in checks["action_group_positions"].values()
+    )
+    assert checks["marker_counts"] == {
+        "action_execution_brief": 1,
+        "identity_projection": 1,
+        "primary_camera": 1,
+        "legacy_live_pacing": 0,
+        "legacy_video_contract": 0,
+    }
     assert receipt["media_sha256"] == expected["media_sha256"]
     assert receipt["provider_request_count"] == 0
