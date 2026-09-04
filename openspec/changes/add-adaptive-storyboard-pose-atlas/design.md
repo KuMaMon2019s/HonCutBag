@@ -65,6 +65,12 @@ Phase 2 从当前 Pxx 的 canonical instance ID 出发，只吸收角色资产�
 
 像素回归必须在排除标签、动作箭头和运镜箭头的演员区域比较实际栅格，证明关节/根位移变化确实进入图像；仅比较 JSON fingerprint 不能满足该门禁。
 
+### 8. v7 pose policy 刷新采用验证后并排重绘
+
+当前 v7 manifest 若仅因 pose policy 过期而失效，Phase 2 migration 先验证审核九宫格的九格几何、源板内容哈希、Gxx→Pxx 分配、每个 guide/atlas 的文件与收据哈希，以及 action binding 对当前 beat canonical generation units 的完整覆盖。验证阶段不得写生产状态。
+
+验证通过后，当前 policy 的 guide 与 atlas 写入以源 manifest hash 隔离的新目录；旧 guide、receipt、atlas page 和 atlas receipt 复制到 audit-only 目录并在迁移收据中逐项记录原路径、审计路径和内容哈希。manifest、beat 和 panel sidecar 只在全部新资产生成完成后切换引用。来源任一证据损坏时写独立 audit-only 失败收据并停止，旧 manifest 和旧资产保持原样。该路径不调用图像或视频 Provider，也不重新生成审核九宫格。
+
 ## Risks / Trade-offs
 
 - [单张高密度 atlas 仍可能被模型忽略部分姿态] → 将其定义为运动包络；媒体允许时优先分页，并以 action-group 语义而非逐格像素复现验收。
@@ -80,7 +86,8 @@ Phase 2 从当前 Pxx 的 canonical instance ID 出发，只吸收角色资产�
 2. 升级 Phase 2 pose/action-group 和单页/分页 renderer，写新版本 sidecar；旧资产不覆盖。
 3. 升级 continuity 和 Phase 6 消费/fingerprint，保持 bridge 与其他媒体职责不变。
 4. 更新旧版迁移、架构文档和 acceptance 预检；运行完整零请求回归后才允许生成 paid-admission 预检。
-5. 回滚时撤销新版本消费者；新资产保留审计，旧 v4 生产路径由上一提交继续读取。
+5. 对 schema 已是 v7、但 pose policy 过期的产物执行严格验证后的 side-by-side policy refresh；损坏来源只写 audit-only 失败收据。
+6. 回滚时撤销新版本消费者；新资产保留审计，旧 v4 生产路径由上一提交继续读取。
 
 ## Open Questions
 

@@ -108,6 +108,14 @@ pose、guide、shot-storyboard、continuity、camera 和任务合同的当前版
 - **WHEN** 单九宫格旧合同具有完整 canonical action lineage、Gxx 分配、源板、renderer 和内容哈希
 - **THEN** 系统可零 Provider 生成并排的新版本合同和迁移收据，不覆盖旧文件
 
+#### Scenario: 同版本旧 pose policy 确定性刷新
+- **WHEN** v7 shot-storyboard 的 schema 仍为当前版本，但其 pose policy 已过期，并且九格合同、源板哈希、Gxx→Pxx 分配、guide/atlas 内容哈希及 canonical action lineage 全部可验证
+- **THEN** Phase 2 只在本地用当前 policy 重新编译 pose contract、身份中立导航图和 atlas，将旧 guide/atlas 作为 audit-only 证据保留在独立目录，并写入绑定旧新 policy/hash 的迁移收据
+
+#### Scenario: 同版本旧 pose policy 证据被篡改
+- **WHEN** v7 policy-refresh 来源的网格、源板、动作血缘、guide 或 atlas 任一哈希不可验证
+- **THEN** 系统保留旧生产文件不变、写入 audit-only 失败收据并 fail closed，不得部分刷新或调用 Provider
+
 #### Scenario: 损坏或未来版本
 - **WHEN** 旧合同血缘或哈希不完整，或 schema 高于当前支持版本
 - **THEN** 旧资产只能 audit-only，并要求从对应 owner 重建或 fail closed

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from PIL import Image
+
 from phases.phase2.storyboard_guide_pose import compile_pose_contracts, render_pose_cell
 from utils.camera_motion_contracts import (
     build_camera_motion_contract,
@@ -319,6 +320,20 @@ def build_pose_atlas_plan(
     return payload
 
 
+def validate_pose_atlas_action_lineage(
+    plan: Mapping[str, Any],
+    *,
+    beat: Mapping[str, Any],
+) -> None:
+    """Verify persisted atlas action groups against their canonical Pxx units."""
+
+    beat_id = str(beat.get("beat_id") or "")
+    if plan.get("beat_id") != beat_id:
+        raise ValueError("pose atlas beat identity mismatch")
+    if plan.get("action_groups") != _action_groups(_canonical_units(beat), beat_id):
+        raise ValueError("pose atlas action groups do not match canonical lineage")
+
+
 def select_pose_atlas_candidate(
     candidates: Sequence[Mapping[str, Any]],
     *,
@@ -375,6 +390,7 @@ def render_pose_atlas_candidates(
     plan: Mapping[str, Any],
     *,
     font_factory: Any,
+    relative_atlas_dir: str | Path = "storyboard_pose_atlases",
 ) -> dict[str, Any]:
     """Render every Phase 2 candidate locally from the same pose payload."""
 
@@ -389,7 +405,7 @@ def render_pose_atlas_candidates(
     if expected_plan_sha != _canonical_sha256(unhashed_plan):
         raise ValueError("pose atlas plan hash mismatch")
     samples_by_id = {str(sample.get("sample_id") or ""): sample for sample in samples}
-    atlas_dir = output_dir / "storyboard_pose_atlases" / beat_id
+    atlas_dir = output_dir / relative_atlas_dir / beat_id
     atlas_dir.mkdir(parents=True, exist_ok=True)
     rendered_candidates: list[dict[str, Any]] = []
     for candidate in candidates:
@@ -503,4 +519,5 @@ __all__ = [
     "build_pose_atlas_plan",
     "render_pose_atlas_candidates",
     "select_pose_atlas_candidate",
+    "validate_pose_atlas_action_lineage",
 ]

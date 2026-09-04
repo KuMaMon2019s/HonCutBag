@@ -1188,10 +1188,17 @@ def compile_pose_contracts(
     return result
 
 
-def validate_pose_contract(contract: Mapping[str, Any], *, cell_id: str, beat_id: str) -> None:
+def validate_pose_contract(
+    contract: Mapping[str, Any],
+    *,
+    cell_id: str,
+    beat_id: str,
+    expected_policy_sha256: str | None = None,
+) -> None:
+    expected_policy = expected_policy_sha256 or POSE_POLICY_SHA256
     if (
         contract.get("schema") != POSE_CONTRACT_SCHEMA
-        or contract.get("pose_policy_sha256") != POSE_POLICY_SHA256
+        or contract.get("pose_policy_sha256") != expected_policy
         or contract.get("cell_id") != cell_id
         or contract.get("secondary_beat_id") != beat_id
     ):
@@ -1452,7 +1459,66 @@ def zero_time_anchor_cell_ids(cells: list[Mapping[str, Any]]) -> list[str]:
     ]
 
 
-def validate_pose_sequence(cells: list[Mapping[str, Any]], *, beat_id: str) -> None:
+def validate_pose_action_lineage(
+    cells: Sequence[Mapping[str, Any]],
+    *,
+    beat: Mapping[str, Any],
+) -> None:
+    """Bind persisted pose evidence to the exact canonical action-unit ledger."""
+
+    units, _lineage_status = _validated_units(beat)
+    expected_by_id = {
+        str(unit["unit_id"]): {
+            "unit_id": str(unit["unit_id"]),
+            "source_action_unit_id": (
+                str(unit.get("source_action_unit_id") or "") or None
+            ),
+            "source_event_id": int(unit.get("source_event_id") or 0) or None,
+            "source_micro_action_indexes": list(
+                unit.get("source_micro_action_indexes") or []
+            ),
+            "source_generation_unit_indexes": list(
+                unit.get("source_generation_unit_indexes") or []
+            ),
+            "source_ledger_indexes": list(unit.get("ledger_indexes") or []),
+            "action_sha256": _canonical_sha256(_strings(unit.get("actions"))),
+        }
+        for unit in units
+    }
+    observed_order: list[str] = []
+    for cell in cells:
+        contract = cell.get("pose_contract")
+        if not isinstance(contract, Mapping):
+            raise ValueError("pose lineage cell lacks a pose contract")
+        bindings = contract.get("action_bindings")
+        if not isinstance(bindings, list) or not bindings:
+            raise ValueError("pose lineage cell has no action-unit bindings")
+        action_text: list[str] = []
+        for binding in bindings:
+            if not isinstance(binding, Mapping):
+                raise ValueError("pose action-unit binding must be an object")
+            unit_id = str(binding.get("unit_id") or "")
+            expected = expected_by_id.get(unit_id)
+            if expected is None or dict(binding) != expected:
+                raise ValueError(f"pose action-unit lineage mismatch: {unit_id or '<missing>'}")
+            if not observed_order or observed_order[-1] != unit_id:
+                if unit_id in observed_order:
+                    raise ValueError("pose action-unit lineage order is non-contiguous")
+                observed_order.append(unit_id)
+            unit = next(item for item in units if str(item["unit_id"]) == unit_id)
+            action_text.extend(_strings(unit.get("actions")))
+        if contract.get("action_text_sha256") != _canonical_sha256(action_text):
+            raise ValueError("pose action text hash does not match canonical action units")
+    if observed_order != list(expected_by_id):
+        raise ValueError("pose action-unit lineage coverage is incomplete")
+
+
+def validate_pose_sequence(
+    cells: list[Mapping[str, Any]],
+    *,
+    beat_id: str,
+    expected_policy_sha256: str | None = None,
+) -> None:
     for cell in cells:
         contract = cell.get("pose_contract")
         if not isinstance(contract, Mapping):
@@ -1461,6 +1527,7 @@ def validate_pose_sequence(cells: list[Mapping[str, Any]], *, beat_id: str) -> N
             contract,
             cell_id=str(cell.get("label") or ""),
             beat_id=beat_id,
+            expected_policy_sha256=expected_policy_sha256,
         )
     anchors = [
         index

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -14,7 +15,25 @@ from typing import Any, Protocol
 
 import requests
 from PIL import Image, ImageDraw, ImageFont, ImageOps
+
 from phases.phase1.storyboard_beats import SECONDARY_STORYBOARD_VERSION
+from phases.phase2.storyboard_guide_pose import (
+    POSE_CONTRACT_SCHEMA,
+    POSE_POLICY_SHA256,
+    compile_pose_contracts,
+    pose_contracts_sha256,
+    pose_fingerprints,
+    render_pose_cell,
+    validate_pose_action_lineage,
+    validate_pose_contract,
+    validate_pose_sequence,
+    zero_time_anchor_cell_ids,
+)
+from phases.phase2.storyboard_pose_atlas import (
+    build_pose_atlas_plan,
+    render_pose_atlas_candidates,
+    validate_pose_atlas_action_lineage,
+)
 from prompt.seedream_image_prompt import (
     IMAGE_REQUEST_CONTRACT_ID,
     IMAGE_REQUEST_CONTRACT_VERSION,
@@ -25,38 +44,24 @@ from prompt.seedream_image_prompt import (
     prompt_guidance_metrics,
     single_image_request_parameters,
 )
-from utils.character_body_contracts import character_visual_description
-from utils.body_action_contracts import body_action_prompt
-from utils.character_reference_contracts import (
-    character_identity_detail_items,
-    identity_detail_prompt_items,
-)
 from tools.character_reference_board import (
     character_reference_role,
     resolve_character_reference_board,
 )
+from utils.body_action_contracts import body_action_prompt
 from utils.camera_motion_contracts import (
     camera_motion_negative_prompt,
     camera_motion_prompt,
+)
+from utils.character_body_contracts import character_visual_description
+from utils.character_reference_contracts import (
+    character_identity_detail_items,
+    identity_detail_prompt_items,
 )
 from utils.temporal_visual_contracts import (
     apply_temporal_visual_contract,
     temporal_visual_negative_prompt,
     temporal_visual_prompt,
-)
-from phases.phase2.storyboard_guide_pose import (
-    POSE_CONTRACT_SCHEMA,
-    POSE_POLICY_SHA256,
-    compile_pose_contracts,
-    pose_contracts_sha256,
-    pose_fingerprints,
-    render_pose_cell,
-    validate_pose_sequence,
-    zero_time_anchor_cell_ids,
-)
-from phases.phase2.storyboard_pose_atlas import (
-    build_pose_atlas_plan,
-    render_pose_atlas_candidates,
 )
 
 SHOT_STORYBOARD_SIZE = "2K"
@@ -609,6 +614,7 @@ def _derive_narrative_guides(
     shot: Mapping[str, Any] | None = None,
     characters: Sequence[Mapping[str, Any]] = (),
     relative_guide_dir: str = "storyboard_guides",
+    relative_atlas_dir: str = "storyboard_pose_atlases",
 ) -> list[dict[str, Any]]:
     """Render identity-neutral Pxx guides locally without Provider requests."""
     guide_dir = output_dir / relative_guide_dir
@@ -710,6 +716,7 @@ def _derive_narrative_guides(
                 output_dir,
                 atlas_plan,
                 font_factory=_font,
+                relative_atlas_dir=relative_atlas_dir,
             )
             record.update(
                 {
@@ -2084,6 +2091,434 @@ def _archive_verified_v6_guides(
     return evidence
 
 
+def _load_migration_characters(output_dir: Path) -> list[dict[str, Any]]:
+    path = output_dir / "CHARACTERS.json"
+    if not path.is_file():
+        return []
+    document = json.loads(path.read_text(encoding="utf-8"))
+    records = document.get("characters") if isinstance(document, dict) else None
+    if not isinstance(records, list) or any(not isinstance(item, dict) for item in records):
+        raise RuntimeError("CHARACTERS.json cannot supply canonical actor aliases")
+    return [dict(item) for item in records]
+
+
+def _verified_v7_policy_refresh_source(
+    output_dir: Path,
+    storyboard: dict[str, Any],
+    manifest: dict[str, Any],
+) -> tuple[str, list[dict[str, str]]]:
+    """Validate every old-policy byte and lineage before a local v7 refresh."""
+
+    if manifest.get("status") != "done":
+        raise RuntimeError("v7 policy refresh requires a completed manifest")
+    records_by_shot = {
+        str(record.get("shot_id") or ""): record
+        for record in (manifest.get("shots") or [])
+        if isinstance(record, dict) and record.get("shot_id")
+    }
+    expected_shot_ids = [
+        _shot_id(shot, index)
+        for index, shot in enumerate(storyboard.get("shots") or [], 1)
+        if isinstance(shot, dict)
+    ]
+    if set(records_by_shot) != set(expected_shot_ids):
+        raise RuntimeError("v7 policy refresh shot coverage is incomplete")
+    source_policies: set[str] = set()
+    assets: dict[str, dict[str, str]] = {}
+
+    def register_asset(path: Path, role: str) -> str:
+        display_path = str(path)
+        try:
+            resolved = path.resolve(strict=True)
+            relative = str(resolved.relative_to(output_dir.resolve()))
+            digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                f"v7 policy refresh source asset is unreadable or outside the run: {display_path}"
+            ) from exc
+        previous = assets.get(relative)
+        if previous is not None and previous["sha256"] != digest:
+            raise RuntimeError(f"v7 policy refresh source asset changed while reading: {relative}")
+        assets.setdefault(relative, {"source_path": relative, "sha256": digest, "role": role})
+        return digest
+
+    for shot_index, shot in enumerate(storyboard.get("shots") or [], 1):
+        if not isinstance(shot, dict):
+            continue
+        shot_id = _shot_id(shot, shot_index)
+        record = records_by_shot[shot_id]
+        if record.get("status") != "done":
+            raise RuntimeError(f"{shot_id} v7 policy refresh source is incomplete")
+        board_path = _artifact_path(output_dir, record.get("board"))
+        board_sha256 = register_asset(board_path, "review_storyboard_source")
+        try:
+            with Image.open(board_path) as board_image:
+                board_size = board_image.size
+                board_image.verify()
+        except OSError as exc:
+            raise RuntimeError(f"{shot_id} v7 storyboard board is invalid") from exc
+        if board_sha256 != str(record.get("board_sha256") or ""):
+            raise RuntimeError(f"{shot_id} v7 storyboard board hash mismatch")
+
+        narrative = record.get("narrative_grid")
+        grid = record.get("grid_contract")
+        if not isinstance(narrative, list) or not isinstance(grid, dict):
+            raise RuntimeError(f"{shot_id} v7 grid evidence is missing")
+        labels = [f"{shot_id}_G{index:02d}" for index in range(1, 10)]
+        grid_cells = grid.get("cells")
+        if (
+            grid.get("schema") != SHOT_STORYBOARD_GRID_SCHEMA
+            or grid.get("columns") != 3
+            or grid.get("rows") != 3
+            or grid.get("cell_count") != 9
+            or grid.get("reading_order") != "left_to_right_top_to_bottom"
+            or not isinstance(grid_cells, list)
+            or [str(cell.get("label") or "") for cell in narrative] != labels
+            or [str(cell.get("label") or "") for cell in grid_cells] != labels
+        ):
+            raise RuntimeError(f"{shot_id} v7 grid contract is invalid")
+        for index, (narrative_cell, grid_cell) in enumerate(
+            zip(narrative, grid_cells, strict=True)
+        ):
+            if not isinstance(narrative_cell, dict) or not isinstance(grid_cell, dict):
+                raise RuntimeError(f"{shot_id} v7 grid cells must be objects")
+            row, column = divmod(index, 3)
+            expected_bbox = [
+                round(column * board_size[0] / 3),
+                round(row * board_size[1] / 3),
+                round((column + 1) * board_size[0] / 3),
+                round((row + 1) * board_size[1] / 3),
+            ]
+            if (
+                grid_cell.get("cell") != index + 1
+                or grid_cell.get("grid_row") != row
+                or grid_cell.get("grid_column") != column
+                or grid_cell.get("bbox_px") != expected_bbox
+                or any(grid_cell.get(key) != value for key, value in narrative_cell.items())
+            ):
+                raise RuntimeError(f"{shot_id} v7 grid semantic binding is invalid")
+        assignments = _beat_cell_assignments(narrative)
+        if record.get("beat_cell_assignments") != assignments:
+            raise RuntimeError(f"{shot_id} v7 Gxx assignment is not canonical")
+
+        beats = [beat for beat in (shot.get("storyboard_beats") or []) if isinstance(beat, dict)]
+        beats_by_id = {str(beat.get("beat_id") or ""): beat for beat in beats}
+        if [item["beat_id"] for item in assignments] != list(beats_by_id):
+            raise RuntimeError(f"{shot_id} v7 Pxx order does not match source storyboard")
+        guides = {
+            str(guide.get("beat_id") or ""): guide
+            for guide in (record.get("narrative_guides") or [])
+            if isinstance(guide, dict)
+        }
+        if set(guides) != set(beats_by_id):
+            raise RuntimeError(f"{shot_id} v7 guide coverage is incomplete")
+        for assignment in assignments:
+            beat_id = str(assignment["beat_id"])
+            beat = beats_by_id[beat_id]
+            guide = guides[beat_id]
+            guide_path = _artifact_path(output_dir, guide.get("image"))
+            receipt_path = _artifact_path(output_dir, guide.get("receipt"))
+            guide_sha256 = register_asset(guide_path, "storyboard_narrative_guide")
+            try:
+                with Image.open(guide_path) as guide_image:
+                    guide_image.verify()
+            except OSError as exc:
+                raise RuntimeError(f"{beat_id} v7 guide image is invalid") from exc
+            register_asset(receipt_path, "storyboard_narrative_guide_receipt")
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            source_path = _artifact_path(output_dir, guide.get("source_board"))
+            source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
+            semantic_payload = receipt.get("semantic_payload")
+            if not isinstance(semantic_payload, dict):
+                raise RuntimeError(f"{beat_id} v7 semantic payload is missing")
+            cells = semantic_payload.get("cells")
+            if not isinstance(cells, list):
+                raise RuntimeError(f"{beat_id} v7 semantic cells are missing")
+            narrative_by_label = {
+                str(cell.get("label") or ""): cell
+                for cell in narrative
+                if isinstance(cell, dict)
+            }
+            expected_semantic_cells = []
+            for cell_id in assignment["cell_ids"]:
+                source_cell = narrative_by_label.get(str(cell_id))
+                if source_cell is None:
+                    raise RuntimeError(f"{beat_id} v7 grid action cell is missing")
+                expected_semantic_cells.append(
+                    {
+                        "label": str(cell_id),
+                        "primary_shot_id": str(source_cell.get("primary_shot_id") or ""),
+                        "secondary_beat_id": str(source_cell.get("secondary_beat_id") or ""),
+                        "stage": str(source_cell.get("stage") or ""),
+                        "camera_movement": str(source_cell.get("camera_movement") or ""),
+                        "visible_fact": str(source_cell.get("visible_fact") or ""),
+                        "neutral_subject_count": int(
+                            source_cell.get("neutral_subject_count") or 0
+                        ),
+                        "rendered_annotations": list(
+                            source_cell.get("rendered_annotations") or []
+                        ),
+                        "pose_contract": dict(source_cell.get("pose_contract") or {}),
+                    }
+                )
+            if cells != expected_semantic_cells:
+                raise RuntimeError(f"{beat_id} v7 guide is not bound to its source grid")
+            policy_values = {
+                str(guide.get("pose_policy_sha256") or ""),
+                str(receipt.get("pose_policy_sha256") or ""),
+                str(semantic_payload.get("pose_policy_sha256") or ""),
+                *{
+                    str((cell.get("pose_contract") or {}).get("pose_policy_sha256") or "")
+                    for cell in cells
+                    if isinstance(cell, Mapping)
+                },
+            }
+            if len(policy_values) != 1:
+                raise RuntimeError(f"{beat_id} v7 pose policy binding is inconsistent")
+            source_policy = next(iter(policy_values))
+            if re.fullmatch(r"[0-9a-f]{64}", source_policy) is None:
+                raise RuntimeError(f"{beat_id} v7 pose policy hash is invalid")
+            source_policies.add(source_policy)
+            try:
+                validate_pose_sequence(
+                    cells,
+                    beat_id=beat_id,
+                    expected_policy_sha256=source_policy,
+                )
+                validate_pose_action_lineage(cells, beat=beat)
+            except ValueError as exc:
+                raise RuntimeError(f"{beat_id} v7 action lineage is invalid") from exc
+            contracts_sha256 = pose_contracts_sha256(cells)
+            fingerprints = pose_fingerprints(cells)
+            anchors = zero_time_anchor_cell_ids(cells)
+            semantic_sha256 = _semantic_payload_sha256(semantic_payload)
+            if (
+                guide.get("kind") != STORYBOARD_NARRATIVE_GUIDE_SCHEMA
+                or receipt.get("kind") != STORYBOARD_NARRATIVE_GUIDE_SCHEMA
+                or int(receipt.get("version") or 0) != 4
+                or receipt.get("status") != "done"
+                or guide.get("source_pixel_usage") != "none"
+                or receipt.get("source_pixel_usage") != "none"
+                or guide.get("cell_ids") != assignment["cell_ids"]
+                or receipt.get("cell_ids") != assignment["cell_ids"]
+                or guide.get("image_sha256") != guide_sha256
+                or receipt.get("image_sha256") != guide_sha256
+                or source_path != board_path
+                or source_sha256 != board_sha256
+                or guide.get("source_board_sha256") != board_sha256
+                or receipt.get("source_board_sha256") != board_sha256
+                or guide.get("semantic_payload") != semantic_payload
+                or guide.get("semantic_payload_sha256") != semantic_sha256
+                or receipt.get("semantic_payload_sha256") != semantic_sha256
+                or guide.get("pose_contracts_sha256") != contracts_sha256
+                or receipt.get("pose_contracts_sha256") != contracts_sha256
+                or semantic_payload.get("pose_contracts_sha256") != contracts_sha256
+                or guide.get("pose_fingerprints") != fingerprints
+                or receipt.get("pose_fingerprints") != fingerprints
+                or guide.get("zero_time_anchor_cell_ids") != anchors
+                or receipt.get("zero_time_anchor_cell_ids") != anchors
+                or int(receipt.get("provider_request_count") or 0) != 0
+            ):
+                raise RuntimeError(f"{beat_id} v7 guide hash/source binding is invalid")
+            try:
+                _validate_pose_atlas_record(
+                    output_dir,
+                    beat,
+                    guide,
+                    expected_policy_sha256=source_policy,
+                )
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError(f"{beat_id} v7 pose atlas evidence is invalid") from exc
+            atlas_receipt_path = _artifact_path(output_dir, guide.get("pose_atlas_receipt"))
+            register_asset(atlas_receipt_path, "storyboard_pose_atlas_receipt")
+            atlas_receipt = json.loads(atlas_receipt_path.read_text(encoding="utf-8"))
+            for candidate in atlas_receipt.get("candidates") or []:
+                for page in candidate.get("pages") or []:
+                    register_asset(
+                        _artifact_path(output_dir, page.get("image")),
+                        "storyboard_pose_atlas_page",
+                    )
+    if len(source_policies) != 1:
+        raise RuntimeError("v7 policy refresh requires one source pose policy")
+    return next(iter(source_policies)), list(assets.values())
+
+
+def _refresh_v7_pose_policy(
+    output_dir: Path,
+    storyboard: dict[str, Any],
+    manifest: dict[str, Any],
+    raw_manifest: bytes,
+) -> dict[str, Any]:
+    source_manifest_sha256 = hashlib.sha256(raw_manifest).hexdigest()
+    source_policy, source_assets = _verified_v7_policy_refresh_source(
+        output_dir,
+        storyboard,
+        manifest,
+    )
+    if source_policy == POSE_POLICY_SHA256:
+        raise RuntimeError("v7 artifacts use the current pose policy but failed validation")
+    characters = _load_migration_characters(output_dir)
+    refreshed_storyboard = copy.deepcopy(storyboard)
+    refreshed_records: list[dict[str, Any]] = []
+    source_records = {
+        str(record.get("shot_id") or ""): record for record in manifest.get("shots") or []
+    }
+    guide_root = f"storyboard_guides/policy-refresh/{source_manifest_sha256}"
+    atlas_root = f"storyboard_pose_atlases/policy-refresh/{source_manifest_sha256}"
+    for shot_index, shot in enumerate(refreshed_storyboard.get("shots") or [], 1):
+        if not isinstance(shot, dict):
+            continue
+        shot_id = _shot_id(shot, shot_index)
+        source_record = source_records[shot_id]
+        board_path = _artifact_path(output_dir, source_record.get("board"))
+        beats = [beat for beat in (shot.get("storyboard_beats") or []) if isinstance(beat, dict)]
+        narrative_grid = _narrative_grid_contract(shot, shot_id, beats, characters)
+        grid_contract = _bind_narrative_grid_contract(
+            dict(source_record.get("grid_contract") or {}),
+            narrative_grid,
+        )
+        assignments = _beat_cell_assignments(narrative_grid)
+        guides = _derive_narrative_guides(
+            output_dir,
+            board_path,
+            grid_contract,
+            assignments,
+            beats_by_id={str(beat.get("beat_id") or ""): beat for beat in beats},
+            shot=shot,
+            characters=characters,
+            relative_guide_dir=guide_root,
+            relative_atlas_dir=atlas_root,
+        )
+        guides_by_beat = {str(guide["beat_id"]): guide for guide in guides}
+        panels = copy.deepcopy(source_record.get("panels") or [])
+        panels_by_beat = {
+            str(panel.get("beat_id") or ""): panel
+            for panel in panels
+            if isinstance(panel, dict)
+        }
+        for beat in beats:
+            beat_id = str(beat.get("beat_id") or "")
+            guide = guides_by_beat[beat_id]
+            _bind_guide_to_beat(beat, guide)
+            panel = panels_by_beat.get(beat_id)
+            if panel is not None:
+                panel["storyboard_narrative_guide"] = _guide_reference(guide)
+        refreshed_record = copy.deepcopy(source_record)
+        refreshed_record.update(
+            {
+                "narrative_grid": narrative_grid,
+                "grid_contract": grid_contract,
+                "beat_cell_assignments": assignments,
+                "narrative_guides": guides,
+                "panels": panels,
+            }
+        )
+        refreshed_records.append(refreshed_record)
+
+    audit_root = output_dir / "storyboard_guides" / "audit-policy-refresh" / source_manifest_sha256
+    audit_only_assets: list[dict[str, str]] = []
+    for asset in source_assets:
+        source_path = _artifact_path(output_dir, asset["source_path"])
+        audit_path = audit_root / asset["source_path"]
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, audit_path)
+        if hashlib.sha256(audit_path.read_bytes()).hexdigest() != asset["sha256"]:
+            raise RuntimeError("v7 policy refresh audit copy hash mismatch")
+        audit_only_assets.append(
+            {
+                **asset,
+                "audit_path": _portable_path(output_dir, audit_path),
+            }
+        )
+    source_manifest_audit = audit_root / "SHOT_STORYBOARDS.json"
+    source_manifest_audit.parent.mkdir(parents=True, exist_ok=True)
+    source_manifest_audit.write_bytes(raw_manifest)
+    audit_only_assets.append(
+        {
+            "source_path": "SHOT_STORYBOARDS.json",
+            "audit_path": _portable_path(output_dir, source_manifest_audit),
+            "sha256": source_manifest_sha256,
+            "role": "shot_storyboards_manifest",
+        }
+    )
+
+    refreshed_manifest = copy.deepcopy(manifest)
+    refreshed_manifest["shots"] = refreshed_records
+    migration = {
+        "from_kind": SHOT_STORYBOARDS_SCHEMA,
+        "source_manifest_sha256": source_manifest_sha256,
+        "policy": "verified_v7_pose_policy_refresh_v1",
+        "source_pose_policy_sha256": source_policy,
+        "target_pose_policy_sha256": POSE_POLICY_SHA256,
+        "source_pixel_usage": "none",
+        "provider_request_count": 0,
+    }
+    receipt = {
+        "kind": "honcut.storyboard-guide-policy-refresh.v1",
+        "version": 1,
+        "status": "done",
+        "source_manifest_kind": SHOT_STORYBOARDS_SCHEMA,
+        "source_manifest_sha256": source_manifest_sha256,
+        "source_pose_policy_sha256": source_policy,
+        "target_manifest_kind": SHOT_STORYBOARDS_SCHEMA,
+        "target_pose_policy_sha256": POSE_POLICY_SHA256,
+        "legacy_source_assets_modified": False,
+        "source_pixel_usage": "none",
+        "provider_request_count": 0,
+        "audit_only_assets": audit_only_assets,
+        "guides": [
+            {
+                "beat_id": guide["beat_id"],
+                "image": guide["image"],
+                "image_sha256": guide["image_sha256"],
+                "pose_contracts_sha256": guide["pose_contracts_sha256"],
+                "pose_atlas_receipt": guide["pose_atlas_receipt"],
+                "pose_atlas_receipt_sha256": guide["pose_atlas_receipt_sha256"],
+            }
+            for record in refreshed_records
+            for guide in record.get("narrative_guides") or []
+        ],
+    }
+    receipt["receipt_sha256"] = _semantic_payload_sha256(receipt)
+    receipt_path = (
+        output_dir
+        / "storyboard_guides"
+        / "migrations"
+        / f"{source_manifest_sha256}.policy-refresh.json"
+    )
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(receipt_path, receipt)
+    migration["receipt"] = _portable_path(output_dir, receipt_path)
+    migration["receipt_sha256"] = receipt["receipt_sha256"]
+    refreshed_manifest["migration"] = migration
+
+    for record in refreshed_records:
+        _write_json(
+            output_dir / "shot_storyboards" / f"{record['shot_id']}.json",
+            record,
+        )
+        for panel in record.get("panels") or []:
+            if not isinstance(panel, dict):
+                continue
+            beat_id = str(panel.get("beat_id") or "")
+            sidecar_path = output_dir / "storyboard_beats" / f"{beat_id}.json"
+            if sidecar_path.is_file():
+                sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+                sidecar["storyboard_narrative_guide"] = panel["storyboard_narrative_guide"]
+                _write_json(sidecar_path, sidecar)
+    storyboard.clear()
+    storyboard.update(refreshed_storyboard)
+    _write_json(output_dir / "STORYBOARD.json", storyboard)
+    _write_json(output_dir / "SHOT_STORYBOARDS.json", refreshed_manifest)
+    errors = validate_shot_storyboard_artifacts(output_dir, storyboard)
+    if errors:
+        raise RuntimeError(
+            "refreshed v7 narrative-guide artifacts failed validation: "
+            + "; ".join(errors[:8])
+        )
+    return refreshed_manifest
+
+
 def _migrate_shot_storyboard_narrative_guides(
     output_dir: Path,
     storyboard: dict[str, Any],
@@ -2097,11 +2532,9 @@ def _migrate_shot_storyboard_narrative_guides(
     version = int(manifest.get("version") or 0)
     if kind == SHOT_STORYBOARDS_SCHEMA and version == 7:
         errors = validate_shot_storyboard_artifacts(output_dir, storyboard)
-        if errors:
-            raise RuntimeError(
-                "current narrative-guide artifacts failed validation: " + "; ".join(errors[:8])
-            )
-        return manifest
+        if not errors:
+            return manifest
+        return _refresh_v7_pose_policy(output_dir, storyboard, manifest, raw_manifest)
     supported_sources = {
         ("honcut.shot_storyboards.v2", 2),
         ("honcut.shot_storyboards.v3", 3),
@@ -2308,12 +2741,17 @@ def migrate_shot_storyboard_narrative_guides(
             ("honcut.shot_storyboards.v4", 4),
             ("honcut.shot_storyboards.v5", 5),
             ("honcut.shot_storyboards.v6", 6),
+            (SHOT_STORYBOARDS_SCHEMA, 7),
         }:
             source_sha256 = hashlib.sha256(raw_manifest).hexdigest()
             audit_dir = output_dir / "storyboard_guides" / "migrations"
             audit_dir.mkdir(parents=True, exist_ok=True)
             receipt = {
-                "kind": "honcut.storyboard-guide-migration.v1",
+                "kind": (
+                    "honcut.storyboard-guide-policy-refresh.v1"
+                    if source == (SHOT_STORYBOARDS_SCHEMA, 7)
+                    else "honcut.storyboard-guide-migration.v1"
+                ),
                 "status": "audit_only",
                 "source_manifest_kind": source[0],
                 "source_manifest_version": source[1],
@@ -2334,6 +2772,8 @@ def _validate_pose_atlas_record(
     output_dir: Path,
     beat: dict[str, Any],
     guide: dict[str, Any],
+    *,
+    expected_policy_sha256: str | None = None,
 ) -> None:
     if guide.get("pose_atlas_plan_schema") != "honcut.storyboard-pose-atlas-plan.v1":
         raise ValueError("pose atlas plan schema is missing or unknown")
@@ -2365,6 +2805,13 @@ def _validate_pose_atlas_record(
         or guide.get("pose_atlas_candidates") != receipt.get("candidates")
     ):
         raise ValueError("pose atlas plan lineage or hash mismatch")
+    validate_pose_atlas_action_lineage(plan, beat=beat)
+    plan_payload = dict(plan)
+    plan_payload.pop("plan_sha256", None)
+    plan_payload.pop("plan_payload_sha256", None)
+    plan_payload.pop("atlas_candidates", None)
+    if _semantic_payload_sha256(plan_payload) != plan.get("plan_payload_sha256"):
+        raise ValueError("pose atlas source payload hash mismatch")
     samples = [
         str(sample.get("sample_id") or "")
         for sample in (plan.get("pose_samples") or [])
@@ -2372,6 +2819,26 @@ def _validate_pose_atlas_record(
     ]
     if samples != [f"G{index:02d}" for index in range(1, len(samples) + 1)]:
         raise ValueError("pose atlas samples are not contiguous")
+    sample_cells = [
+        {
+            "label": str(sample.get("cell_id") or ""),
+            "pose_contract": sample.get("pose_contract"),
+        }
+        for sample in (plan.get("pose_samples") or [])
+        if isinstance(sample, dict)
+    ]
+    beat_id = str(beat.get("beat_id") or "")
+    for cell in sample_cells:
+        contract = cell.get("pose_contract")
+        if not isinstance(contract, Mapping):
+            raise ValueError("pose atlas sample lacks a pose contract")
+        validate_pose_contract(
+            contract,
+            cell_id=str(cell.get("label") or ""),
+            beat_id=beat_id,
+            expected_policy_sha256=expected_policy_sha256,
+        )
+    validate_pose_action_lineage(sample_cells, beat=beat)
     candidates = receipt.get("candidates")
     if not isinstance(candidates, list) or not candidates:
         raise ValueError("pose atlas candidates are missing")
@@ -2379,11 +2846,39 @@ def _validate_pose_atlas_record(
         pages = candidate.get("pages") if isinstance(candidate, dict) else None
         if not isinstance(pages, list):
             raise ValueError("pose atlas candidate pages are invalid")
+        rendered_candidate = dict(candidate)
+        rendered_candidate_sha = str(
+            rendered_candidate.pop("rendered_candidate_sha256", "")
+        )
+        if rendered_candidate_sha != _semantic_payload_sha256(rendered_candidate):
+            raise ValueError("pose atlas rendered candidate hash mismatch")
+        source_candidate = {
+            key: candidate.get(key)
+            for key in (
+                "schema",
+                "strategy",
+                "page_count",
+                "preferred",
+                "pages",
+                "plan_payload_sha256",
+            )
+        }
+        source_candidate["pages"] = [
+            {
+                key: page.get(key)
+                for key in ("page_index", "sample_ids", "sample_range")
+            }
+            for page in pages
+        ]
+        if candidate.get("candidate_sha256") != _semantic_payload_sha256(source_candidate):
+            raise ValueError("pose atlas source candidate hash mismatch")
         covered: list[str] = []
         for page in pages:
             path = _artifact_path(output_dir, page.get("image"))
             if hashlib.sha256(path.read_bytes()).hexdigest() != page.get("image_sha256"):
                 raise ValueError("pose atlas page hash mismatch")
+            with Image.open(path) as atlas_page:
+                atlas_page.verify()
             covered.extend(str(value) for value in (page.get("sample_ids") or []))
         if covered != samples:
             raise ValueError("pose atlas candidate coverage is incomplete")

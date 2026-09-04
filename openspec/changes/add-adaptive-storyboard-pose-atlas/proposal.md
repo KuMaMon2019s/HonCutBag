@@ -9,6 +9,7 @@
 - 在媒体预算允许且动作密度较高时使用分页九宫格，在预算只容纳一张导航图时使用单张 18/27/36 格 atlas；两种布局都由 Phase 2 本地确定性渲染。
 - 扩展 canonical camera-motion contract 的受控参数和时长可行性验证；Adaptation 仍是运镜选择 owner，Phase 2 只沿同一连续摄影机路径投影各姿态视角。
 - 版本化升级 pose、guide、shot-storyboard、continuity 和任务 fingerprint 合同；旧资产只在完整血缘可验证时零请求迁移。
+- 对 schema 已是 v7、但 pose policy 过期的资产增加严格的同版本 policy-refresh：验证旧网格、源板、动作血缘和 guide/atlas 哈希后并排本地重绘，旧产物转为 audit-only。
 - 补充单元、Graph/顺序一致性、零 Provider 恢复、媒体预算和版本迁移测试，并记录真实实验只作为校准证据、不作为生产验收通过。
 
 ### Scope

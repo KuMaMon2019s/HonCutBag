@@ -51,3 +51,11 @@
 - [x] 7.3 Enforce that a recognized canonical performer cannot produce an empty `actor_roles`/actor geometry contract.
 - [x] 7.4 Add an actual raster test that masks annotation regions and proves high-amplitude pose stages change body pixels rather than arrows alone.
 - [x] 7.5 Run target tests, full regression, Serena validation, OpenSpec Verify and Graphify incremental sync; keep paid acceptance pending and do not submit a Provider request in this repair turn.
+
+## 8. Same-Version Pose Policy Refresh
+
+- [x] 8.1 Add failing tests for a valid v7 old-policy refresh, idempotent replay, audit-only preservation, and corrupted grid/source/action/atlas evidence failing closed with zero Provider requests.
+- [x] 8.2 Extend pose/atlas validation so a migration can validate a self-consistent source policy while still requiring current policy on all production reads.
+- [x] 8.3 Implement v7→v7 side-by-side policy refresh in the Phase 2 migration owner, with isolated guide/atlas destinations and a hash-bound migration/audit receipt.
+- [x] 8.4 Re-run the failed run-02 no-submit preflight and verify current canonical actor roles, new guide/atlas hashes, preserved old assets and zero Provider requests.
+- [x] 8.5 Run target/full regression, Serena post-validation, OpenSpec Verify and Graphify incremental sync; do not cross the paid boundary until every zero-cost gate passes.
