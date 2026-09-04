@@ -39,6 +39,23 @@ def _unit(index: int, action: str) -> dict:
     }
 
 
+def _provider_text(text: str) -> dict:
+    return {
+        "type": "text",
+        "text": text,
+        "_canonical_identity_projection": (
+            "[honcut.phase6-identity-projection.v1]\n"
+            '{"canonical_visual_contract_sha256":"'
+            + "a" * 64
+            + '","characters":[{"instance_count":1}],'
+            '"required_character_count":1,'
+            '"schema":"honcut.phase6-identity-projection.v1"}'
+        ),
+        "_canonical_visual_contract_sha256": "a" * 64,
+        "_phase6_prompt_context": {"camera_movement": "static"},
+    }
+
+
 def test_phase2_maps_instance_name_and_source_mention_to_one_actor_role() -> None:
     beat = {
         "beat_id": "S01_P01",
@@ -494,6 +511,7 @@ def test_phase6_binds_two_page_atlas_after_authoritative_media(tmp_path) -> None
             "_pose_atlas_plan_sha256": plan["plan_sha256"],
             "_pose_atlas_timing_contract": plan["timing_contract"],
             "_pose_atlas_camera_motion_contract_sha256": plan["camera_motion_contract_sha256"],
+            "_reference_sha256": page["image_sha256"],
             "_mandatory_reference": True,
         }
         for index, page in enumerate(paged["pages"], 1)
@@ -501,13 +519,14 @@ def test_phase6_binds_two_page_atlas_after_authoritative_media(tmp_path) -> None
 
     content, manifest = _bind_final_media_index_prompt(
         [
-            {"type": "text", "text": "execute current action"},
+            _provider_text("execute current action"),
             {
                 "type": "image_url",
                 "image_url": {"url": "https://example.invalid/identity.png"},
                 "role": "reference_image",
                 "_reference_kind": "character_identity_board",
                 "_reference_description": "identity board",
+                "_reference_sha256": "1" * 64,
                 "_mandatory_reference": True,
             },
             {
@@ -516,6 +535,7 @@ def test_phase6_binds_two_page_atlas_after_authoritative_media(tmp_path) -> None
                 "role": "reference_image",
                 "_reference_kind": "cinematic_composition",
                 "_reference_description": "first frame",
+                "_reference_sha256": "2" * 64,
                 "_mandatory_reference": True,
             },
             *atlas_media,
@@ -529,9 +549,14 @@ def test_phase6_binds_two_page_atlas_after_authoritative_media(tmp_path) -> None
         "storyboard_pose_atlas",
         "storyboard_pose_atlas",
     ]
-    assert "当前动作姿态图集是图片3、图片4" in content[0]["text"]
-    assert "5.5～6.2秒完成" in content[0]["text"]
-    assert "首帧后立即从G02开始运动" in content[0]["text"]
+    prompt = content[0]["text"]
+    assert "[honcut.action-execution-brief.v1]" in prompt
+    assert "图片3、图片4是当前动作顺序、根位移和重心轨迹权威" in prompt
+    assert "5.5～6.2秒完成" in prompt
+    assert "零时长初始锚点" in prompt
+    assert prompt.index("[honcut.action-execution-brief.v1]") < prompt.index(
+        "[honcut.phase6-identity-projection.v1]"
+    )
 
 
 def test_exact_terminal_reference_is_hashed_and_prompt_bound(tmp_path) -> None:
@@ -584,13 +609,14 @@ def test_exact_terminal_reference_is_hashed_and_prompt_bound(tmp_path) -> None:
     )
     atlas_page = selected["pages"][0]
     media = [
-        {"type": "text", "text": "execute current action"},
+        _provider_text("execute current action"),
         {
             "type": "image_url",
             "image_url": {"url": "https://example.invalid/identity.png"},
             "role": "reference_image",
             "_reference_kind": "character_identity_board",
             "_reference_description": "identity board",
+            "_reference_sha256": "1" * 64,
             "_mandatory_reference": True,
         },
         {
@@ -599,6 +625,7 @@ def test_exact_terminal_reference_is_hashed_and_prompt_bound(tmp_path) -> None:
             "role": "reference_image",
             "_reference_kind": "cinematic_composition",
             "_reference_description": "first frame",
+            "_reference_sha256": "2" * 64,
             "_mandatory_reference": True,
         },
         {
@@ -625,6 +652,7 @@ def test_exact_terminal_reference_is_hashed_and_prompt_bound(tmp_path) -> None:
             "_pose_atlas_plan_sha256": plan["plan_sha256"],
             "_pose_atlas_timing_contract": plan["timing_contract"],
             "_pose_atlas_camera_motion_contract_sha256": plan["camera_motion_contract_sha256"],
+            "_reference_sha256": atlas_page["image_sha256"],
             "_mandatory_reference": True,
         },
     ]
@@ -637,7 +665,7 @@ def test_exact_terminal_reference_is_hashed_and_prompt_bound(tmp_path) -> None:
         "terminal_pose_reference",
         "storyboard_pose_atlas",
     ]
-    assert "图片3只约束当前 Pxx 的精确结束姿态" in content[0]["text"]
+    assert "图片3只约束完整动作后的精确终态" in content[0]["text"]
     with pytest.raises(ValueError, match="exact terminal pose evidence"):
         _bind_final_media_index_prompt(
             [item for item in media if item.get("_reference_kind") != "terminal_pose_reference"],

@@ -11,15 +11,15 @@
 - [x] 2.2 Compile the brief from only current-Pxx action groups, source action-unit lineage, shot timing, terminal state, resolved media indexes, and the primary camera technique; verify later-Pxx actions and cells are rejected or excluded.
 - [x] 2.3 Render ordered observable body displacement, contact, weight transfer, prop interaction, immediate-start, completion-window, and semantic-terminal instructions; verify every canonical group appears exactly once and in order.
 - [x] 2.4 Add deterministic validation for missing/duplicate groups, broken lineage, unresolved media indexes, impossible timing, and future schema; verify each fails before task submission.
-- [ ] 2.5 Commit the independent brief contract as `feat: add phase6 action execution brief` after its focused tests pass.
+- [x] 2.5 Commit the independent brief contract as `feat: add phase6 action execution brief` after its focused tests pass.
 
 ## 3. Action-First Prompt Projection
 
-- [ ] 3.1 Resolve and validate the final media list before rendering Provider prose, preserving the established media order and authority roles; verify Graph and sequential paths produce identical media indexes and hashes.
-- [ ] 3.2 Render the media-role preamble followed immediately by the complete action brief, explicitly separating identity/composition references from motion authority; verify the action brief begins before identity, continuity, style, negative, and camera support sections.
-- [ ] 3.3 Add deterministic compact projections for canonical identity, continuity, spatial/prop locks, camera, style, and negative constraints while retaining their complete source contracts in fingerprint/receipt metadata; verify exact-one identity and distinguishing signatures remain present.
-- [ ] 3.4 Deduplicate camera and motion instructions so the submitted prompt contains one primary camera instruction and one motion authority; verify camera support does not precede or contradict ordered body action.
-- [ ] 3.5 Remove the late duplicate motion-priority/action-window suffix from the final request path; verify equivalent markers cannot appear twice in the Provider payload.
+- [x] 3.1 Resolve and validate the final media list before rendering Provider prose, preserving the established media order and authority roles; verify Graph and sequential paths produce identical media indexes and hashes.
+- [x] 3.2 Render the media-role preamble followed immediately by the complete action brief, explicitly separating identity/composition references from motion authority; verify the action brief begins before identity, continuity, style, negative, and camera support sections.
+- [x] 3.3 Add deterministic compact projections for canonical identity, continuity, spatial/prop locks, camera, style, and negative constraints while retaining their complete source contracts in fingerprint/receipt metadata; verify exact-one identity and distinguishing signatures remain present.
+- [x] 3.4 Deduplicate camera and motion instructions so the submitted prompt contains one primary camera instruction and one motion authority; verify camera support does not precede or contradict ordered body action.
+- [x] 3.5 Remove the late duplicate motion-priority/action-window suffix from the final request path; verify equivalent markers cannot appear twice in the Provider payload.
 - [ ] 3.6 Commit prompt ordering and media-role isolation as `fix: prioritize current-shot action execution` after prompt, continuity, and packaging tests pass.
 
 ## 4. Prompt Budget, Fingerprints, and Recovery

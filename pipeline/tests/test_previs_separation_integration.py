@@ -330,12 +330,12 @@ def test_previs_pixels_are_separated_end_to_end_before_video_transport(
     assert chunk["storyboard_narrative_guide_source_board_sha256"] == (
         nine_grid_sha256
     )
-    assert "首帧为图片2" in prompt
+    assert "图片2只锁定t=0构图，不得冻结动作" in prompt
     assert "成片质感第一帧" in prompt
-    assert "当前动作姿态图集是图片3" in prompt
-    assert "G01是t=0首帧已经成立的初始姿态锚点" in prompt
-    assert "首帧后立即从G02开始运动" in prompt
-    assert "相邻 Gxx 可以是同一语义动作的不同姿态采样" in prompt
-    assert "严禁渲染进视频画面" in prompt
+    assert "图片3是当前动作顺序、根位移和重心轨迹权威" in prompt
+    assert "零时长初始锚点=G01" in prompt
+    assert "视频时间从紧随其后的动态姿态开始" in prompt
+    assert "唯一允许动作组数量=" in prompt
+    assert "不得把多姿态画成克隆" in prompt
     assert "honcut.phase6-media-role-isolation.v1" in prompt
-    assert "动作姿态图集" in prompt and "非权威占位像素" in prompt
+    assert "非权威占位像素" in prompt

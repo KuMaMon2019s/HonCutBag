@@ -6931,6 +6931,41 @@ def test_phase6_live_acceptance_can_timebox_current_guide_motion():
     assert content[0]["text"].count("[honcut.live-paced-action-window.v1]") == 1
 
 
+def test_phase6_live_acceptance_does_not_append_a_second_atlas_clock():
+    content = [{
+        "type": "text",
+        "text": "[honcut.action-execution-brief.v1]\naction-first prompt",
+        "_action_execution_brief": {
+            "duration_s": 9.0,
+            "completion_window_s": [7.5, 8.2],
+            "target_completion_s": 7.65,
+            "terminal_hold": {"target_duration_s": 1.35},
+        },
+    }]
+
+    pacing = phase6_storyboard_guide_live_acceptance._apply_action_window_contract(
+        content,
+        action_window_seconds=8,
+        duration_seconds=9,
+        beat_id="S01_P01",
+        cell_ids=["G01", "G02"],
+    )
+
+    assert pacing == {
+        "action_window_seconds": 7.65,
+        "end_state_hold_seconds": 1.35,
+    }
+    assert "[honcut.live-paced-action-window.v1]" not in content[0]["text"]
+    with pytest.raises(ValueError, match="conflicts with the canonical"):
+        phase6_storyboard_guide_live_acceptance._apply_action_window_contract(
+            content,
+            action_window_seconds=5.5,
+            duration_seconds=9,
+            beat_id="S01_P01",
+            cell_ids=["G01", "G02"],
+        )
+
+
 @pytest.mark.parametrize("window", [0, -1, 9, 10, float("inf")])
 def test_phase6_live_acceptance_rejects_invalid_action_window(window):
     with pytest.raises(ValueError, match="action window"):

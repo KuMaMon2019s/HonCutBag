@@ -1155,6 +1155,55 @@ def _media_index_manifest(content: Sequence[dict[str, Any]]) -> list[dict[str, A
     return manifest
 
 
+def _provider_prompt_metadata(content: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Return hash-only action/projection metadata for task identity and receipts."""
+    text_item = next(
+        (item for item in content if item.get("type") == "text"),
+        {},
+    )
+    prompt = str(text_item.get("text") or "")
+    metadata: dict[str, Any] = {
+        "provider_prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+    }
+    brief_schema = text_item.get("_action_execution_brief_schema")
+    if brief_schema:
+        projection = text_item.get("_phase6_prompt_projection") or {}
+        metadata.update(
+            {
+                "action_execution_brief_schema": brief_schema,
+                "action_execution_brief_sha256": text_item.get(
+                    "_action_execution_brief_sha256"
+                ),
+                "action_execution_group_ids": list(
+                    text_item.get("_action_execution_group_ids") or []
+                ),
+                "action_execution_source_action_unit_ids": list(
+                    text_item.get("_action_execution_source_action_unit_ids") or []
+                ),
+                "canonical_visual_contract_sha256": text_item.get(
+                    "_canonical_visual_contract_sha256"
+                ),
+                "canonical_identity_projection_sha256": text_item.get(
+                    "_canonical_identity_projection_sha256"
+                ),
+                "phase6_prompt_projection_schema": projection.get("schema"),
+                "phase6_prompt_projection_policy_sha256": text_item.get(
+                    "_phase6_prompt_projection_policy_sha256"
+                ),
+                "phase6_prompt_projection_sha256": projection.get(
+                    "projection_sha256"
+                ),
+                "phase6_prompt_section_chars": dict(
+                    projection.get("section_chars") or {}
+                ),
+                "phase6_prompt_omitted_optional_sections": list(
+                    projection.get("omitted_optional_sections") or []
+                ),
+            }
+        )
+    return metadata
+
+
 def _bind_final_media_index_prompt(
     content: Sequence[dict[str, Any]],
     request: ChunkExecutionRequest,
@@ -1431,9 +1480,12 @@ def _bind_final_media_index_prompt(
             "数量不变；逐帧保持同一道具的总长度、端部数量、握柄与发光部位分段不变；"
             "禁止生长、缩短、变形、增减端部或在参考职责之间渐变。"
         )
-    prefix = (
+    media_index_preamble = (
         "【参考素材索引｜顺序不可交换】\n"
         + "\n".join(index_lines)
+    )
+    prefix = (
+        media_index_preamble
         + guide_contract
         + performance_contract
         + terminal_contract
@@ -1447,7 +1499,74 @@ def _bind_final_media_index_prompt(
     if text_item is None:
         normalized.insert(0, {"type": "text", "text": prefix})
     else:
-        text_item["text"] = prefix + str(text_item.get("text") or "")
+        if atlas_guides:
+            from phases.phase6.action_execution_prompt import (
+                compile_action_execution_brief,
+                project_action_first_prompt,
+                render_action_execution_brief,
+                validate_canonical_identity_projection,
+            )
+            from utils.config import SEEDANCE_MODEL
+
+            canonical_hash = str(
+                text_item.get("_canonical_visual_contract_sha256") or ""
+            ).strip()
+            identity_projection = str(
+                text_item.get("_canonical_identity_projection") or ""
+            ).strip()
+            if not canonical_hash or not identity_projection:
+                raise ValueError(
+                    f"{request.resource_id} action-first prompt lacks canonical identity evidence"
+                )
+            validate_canonical_identity_projection(
+                identity_projection,
+                expected_contract_sha256=canonical_hash,
+            )
+            brief = compile_action_execution_brief(
+                beat_id=str(request.chunk.storyboard_beat_id or ""),
+                action_prompt=str(request.chunk.action_prompt or ""),
+                start_state=str(request.chunk.start_state or ""),
+                end_state=str(request.chunk.end_state or ""),
+                target_duration_s=float(request.chunk.target_duration_s),
+                action_groups=request.chunk.storyboard_pose_atlas_action_groups,
+                pose_samples=request.chunk.storyboard_pose_atlas_pose_samples,
+                timing_contract=request.chunk.storyboard_pose_atlas_timing_contract,
+                media_manifest=manifest,
+                prompt_context=text_item.get("_phase6_prompt_context") or {},
+                canonical_visual_contract_sha256=canonical_hash,
+            )
+            prompt, projection = project_action_first_prompt(
+                media_index_preamble=media_index_preamble,
+                media_role_isolation=role_isolation_contract,
+                action_brief_text=render_action_execution_brief(brief),
+                identity_projection=identity_projection,
+                prompt_context=text_item.get("_phase6_prompt_context") or {},
+                provider="seedance",
+                model=SEEDANCE_MODEL,
+            )
+            text_item["text"] = prompt
+            text_item["_action_execution_brief"] = brief
+            text_item["_action_execution_brief_schema"] = brief["schema"]
+            text_item["_action_execution_brief_sha256"] = brief["brief_sha256"]
+            text_item["_action_execution_group_ids"] = list(
+                brief["ordered_action_group_ids"]
+            )
+            text_item["_action_execution_source_action_unit_ids"] = list(
+                dict.fromkeys(
+                    str(source_id)
+                    for group in brief["action_groups"]
+                    for source_id in group["lineage"]["source_action_unit_ids"]
+                )
+            )
+            text_item["_phase6_prompt_projection"] = projection
+            text_item["_canonical_identity_projection_sha256"] = hashlib.sha256(
+                identity_projection.encode("utf-8")
+            ).hexdigest()
+            text_item["_phase6_prompt_projection_policy_sha256"] = projection[
+                "policy_sha256"
+            ]
+        else:
+            text_item["text"] = prefix + str(text_item.get("text") or "")
     return normalized, manifest
 
 
@@ -2301,14 +2420,7 @@ def _direct_seedance_executor(
                     assert privacy_repair_budget is not None
 
                     media_index_manifest = _media_index_manifest(content)
-                    provider_prompt = next(
-                        (
-                            str(item.get("text") or "")
-                            for item in content
-                            if item.get("type") == "text"
-                        ),
-                        "",
-                    )
+                    prompt_metadata = _provider_prompt_metadata(content)
                     payload = _task_payload(
                         request,
                         model=model,
@@ -2321,9 +2433,7 @@ def _direct_seedance_executor(
                         generation_parameters={
                             **generation_parameters,
                             "media_index_manifest": media_index_manifest,
-                            "provider_prompt_sha256": hashlib.sha256(
-                                provider_prompt.encode("utf-8")
-                            ).hexdigest(),
+                            **prompt_metadata,
                         },
                     )
 
@@ -2667,6 +2777,7 @@ def _bridge_seedance_executor(
             (str(item.get("text")) for item in content if item.get("type") == "text"),
             "",
         )
+        prompt_metadata = _provider_prompt_metadata(content)
         payload = _task_payload(
             request,
             model=model,
@@ -2681,7 +2792,7 @@ def _bridge_seedance_executor(
                 "width": width,
                 "height": height,
                 "media_index_manifest": _media_index_manifest(content),
-                "provider_prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                **prompt_metadata,
             },
         )
 

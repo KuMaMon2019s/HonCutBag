@@ -1038,11 +1038,22 @@ def build_content_for_shot(
         output_dir,
         characters_data=characters_data,
     )
-    canonical_prompt = render_canonical_visual_prompt_contract(
-        canonical_contract,
-        character_ids=_detect_shot_characters(output_dir, shot_meta),
-    )
     selected_character_ids = set(_detect_shot_characters(output_dir, shot_meta))
+    pose_atlas_request = bool(shot_meta.get("_storyboard_pose_atlas_plan_schema"))
+    if pose_atlas_request:
+        from phases.phase6.action_execution_prompt import (
+            render_canonical_identity_projection,
+        )
+
+        canonical_prompt = render_canonical_identity_projection(
+            canonical_contract,
+            character_ids=sorted(selected_character_ids),
+        )
+    else:
+        canonical_prompt = render_canonical_visual_prompt_contract(
+            canonical_contract,
+            character_ids=sorted(selected_character_ids),
+        )
     selected_contract_characters = [
         character
         for character in canonical_contract.get("characters", [])
@@ -1055,7 +1066,7 @@ def build_content_for_shot(
         )
     ]
     synthetic_contract = ""
-    if selected_contract_characters and all(
+    if not pose_atlas_request and selected_contract_characters and all(
         character.get("visual_identity_policy") == "synthetic_stylized_character_v3"
         for character in selected_contract_characters
     ):
@@ -1068,7 +1079,33 @@ def build_content_for_shot(
         part for part in (canonical_prompt, synthetic_contract, prompt_text) if part
     ).strip()
     if prompt_text:
-        content.append({"type": "text", "text": prompt_text})
+        content.append(
+            {
+                "type": "text",
+                "text": prompt_text,
+                "_canonical_identity_projection": canonical_prompt,
+                "_canonical_visual_contract_sha256": canonical_contract[
+                    "contract_sha256"
+                ],
+                "_phase6_prompt_context": {
+                    key: shot_meta.get(key)
+                    for key in (
+                        "where",
+                        "visual",
+                        "lighting_description",
+                        "camera_movement",
+                        "emotion",
+                        "dialogue",
+                        "sound_effect",
+                        "background_music",
+                        "music",
+                        "audio",
+                        "sound",
+                    )
+                    if shot_meta.get(key) not in (None, "", [], {})
+                },
+            }
+        )
 
     # The Phase 4 cinematic frame is a numbered all-modal reference for ordinary
     # generation. Identity boards precede it; the prompt binds its final index

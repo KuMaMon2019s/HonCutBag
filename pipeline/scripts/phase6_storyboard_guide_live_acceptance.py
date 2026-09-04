@@ -33,22 +33,23 @@ from phases.phase2.shot_storyboards import (
     migrate_shot_storyboard_narrative_guides,
     validate_shot_storyboard_artifacts,
 )
-from phases.phase4.cinematic_first_frames import (
-    migrate_cinematic_first_frames,
-    validate_cinematic_first_frame_artifacts,
-)
-from phases.phase4.continuity_plan import write_continuity_plan
 from phases.phase3.performance_reference_board import (
     performance_prompt_optimization_contract,
     validate_character_performance_board,
     validate_character_performance_guide,
 )
+from phases.phase4.cinematic_first_frames import (
+    migrate_cinematic_first_frames,
+    validate_cinematic_first_frame_artifacts,
+)
+from phases.phase4.continuity_plan import write_continuity_plan
 from runtime.continuity_chunks import ChunkExecutionRequest
 from runtime.continuity_provider import (
     MEDIA_ROLE_ISOLATION_CONTRACT,
     SEEDANCE_ALL_MODAL_PROMPT_CONTRACT,
     _media_index_manifest,
     _provider_content,
+    _provider_prompt_metadata,
     _provider_ready_content,
     _task_payload,
     _video_geometry,
@@ -59,13 +60,13 @@ from runtime.security_boundaries import redact_text
 from runtime.seedance_execution import execute_seedance_video_task
 from schemas.continuity import ContinuityPlan, GenerationChunk
 from utils.config import ARK_AGENT_CREDENTIAL_SOURCE, SEEDANCE_MODEL, get_api_key
-from utils.video_validation import is_valid_video
 from utils.privacy_visual_policy import (
-    SYNTHETIC_STYLIZED_CHARACTER_POLICY,
     SYNTHETIC_MAKEUP_PROFILE_ID,
+    SYNTHETIC_STYLIZED_CHARACTER_POLICY,
     synthetic_character_review_evidence,
     synthetic_makeup_profile_sha256,
 )
+from utils.video_validation import is_valid_video
 
 RECEIPT_SCHEMA = "honcut.phase6-storyboard-pose-atlas-live-acceptance.v1"
 REGRESSION_SCHEMA = "honcut.phase6-storyboard-pose-atlas-regression.v1"
@@ -273,17 +274,43 @@ def _apply_action_window_contract(
     cell_ids: list[str],
 ) -> dict[str, float] | None:
     """Time-box current-guide motion for an isolated live pacing experiment."""
+    duration = float(duration_seconds)
+    text_items = [item for item in content if item.get("type") == "text"]
+    if len(text_items) != 1:
+        raise ValueError("paced live acceptance requires exactly one text prompt")
+    action_brief = text_items[0].get("_action_execution_brief")
+    if isinstance(action_brief, dict):
+        if not math.isclose(float(action_brief.get("duration_s") or 0), duration):
+            raise ValueError("action brief duration differs from live output duration")
+        completion = action_brief.get("completion_window_s") or []
+        terminal = action_brief.get("terminal_hold") or {}
+        if len(completion) != 2:
+            raise ValueError("action brief completion window is invalid")
+        target = float(terminal.get("target_duration_s") or 0)
+        canonical_window = float(action_brief.get("target_completion_s") or 0)
+        if not math.isclose(canonical_window + target, duration, abs_tol=0.05):
+            raise ValueError("action brief timing budget differs from live output duration")
+        if action_window_seconds is not None:
+            requested = float(action_window_seconds)
+            if (
+                not math.isfinite(requested)
+                or requested < float(completion[0])
+                or requested > float(completion[1])
+            ):
+                raise ValueError(
+                    "action window conflicts with the canonical action brief completion window"
+                )
+        return {
+            "action_window_seconds": canonical_window,
+            "end_state_hold_seconds": target,
+        }
     if action_window_seconds is None:
         return None
     window = float(action_window_seconds)
-    duration = float(duration_seconds)
     if not math.isfinite(window) or window <= 0 or window >= duration:
         raise ValueError(
             "action window must be finite, positive, and shorter than output duration"
         )
-    text_items = [item for item in content if item.get("type") == "text"]
-    if len(text_items) != 1:
-        raise ValueError("paced live acceptance requires exactly one text prompt")
     ordered_cells = [str(value).strip() for value in cell_ids if str(value).strip()]
     if not ordered_cells:
         raise ValueError("paced live acceptance requires ordered narrative cells")
@@ -557,31 +584,24 @@ def _preflight_contract(
             str(item.get("responsibility") or "") for item in guides
         ],
     )
-    required_prompt_fragments = [
-        "珍珠生体瓷妆",
-        "温润透亮",
-        "尸体般灰白",
-        "严禁渲染进视频画面",
-        "当前动作姿态图中的多个人形是同一个角色的不同参考姿态",
-        "只执行本次明确列出的 Axx",
-        "不得生成角色克隆、分栏、拼贴、网格、文字、序号、箭头、边框",
-        MEDIA_ROLE_ISOLATION_CONTRACT,
-        "人物脸、头发长度与发型轮廓",
-        "道具外形、总长度、端部数量",
-        "严禁带入成片",
-        "禁止生长、缩短、变形、增减端部",
-    ]
+    required_prompt_fragments = [MEDIA_ROLE_ISOLATION_CONTRACT]
     if chunk.storyboard_pose_atlas_plan_schema:
         required_prompt_fragments.extend((
-            "当前动作姿态图集是图片",
-            "同一语义动作的不同姿态采样",
-            "同一条连续摄影机路径",
-            "不占视频动作时长",
-            "动态动作须在",
-            "终态保持不是新动作",
+            "[honcut.action-execution-brief.v1]",
+            "[honcut.phase6-identity-projection.v1]",
+            "媒体执行职责",
+            "是当前动作顺序、根位移和重心轨迹权威",
+            "零时长初始锚点",
+            "所有动态动作必须在",
+            "唯一主运镜",
+            "不得把多姿态画成克隆、分栏、拼贴、网格、文字、序号、箭头或边框",
         ))
     else:
         required_prompt_fragments.extend((
+            "珍珠生体瓷妆",
+            "严禁渲染进视频画面",
+            "当前动作姿态图中的多个人形是同一个角色的不同参考姿态",
+            "只执行本次明确列出的 Axx",
             "当前剧情导航图是图片",
             "红色箭头表示主体或物体运动方向",
             "蓝色箭头表示摄影机运动",
@@ -607,7 +627,7 @@ def _preflight_contract(
         "return_last_frame": True,
         "seedance_prompt_contract": SEEDANCE_ALL_MODAL_PROMPT_CONTRACT,
         "media_index_manifest": media_manifest,
-        "provider_prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        **_provider_prompt_metadata(content),
     }
     run_id = f"{output_dir.name}:phase6-storyboard-pose-atlas-live-v1"
     payload = _task_payload(
