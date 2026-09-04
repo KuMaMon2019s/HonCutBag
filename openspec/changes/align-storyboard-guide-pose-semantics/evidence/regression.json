@@ -2,18 +2,19 @@
   "schema": "honcut.storyboard-guide-pose-regression.v1",
   "status": "passed",
   "source": {
-    "git_commit": "6227bf10704ab766d9ef9db8f4556722f71a9489",
+    "git_commit": "f127dbdbfcad584993fa2878809c57a87c659ec2",
     "baseline_commit": "2807f4612d81216a9a241ed731548019aa290ef0",
+    "followup_parent_commit": "82a7ac25ca3048050196c3e82ce84b5bcc65382f",
     "openspec_change": "align-storyboard-guide-pose-semantics"
   },
   "gates": {
     "focused_tests": {
       "status": "passed",
-      "passed": 433
+      "passed": 456
     },
     "full_test_suite": {
       "status": "passed",
-      "passed": 1391,
+      "passed": 1414,
       "warnings": 2
     },
     "lint": {
@@ -22,20 +23,17 @@
     "diff_check": {
       "status": "passed"
     },
-    "offline_recovery": {
+    "saved_live_structure_replay": {
       "status": "passed",
       "rounds": 10,
       "provider_request_count": 0,
-      "run_id": "f3ee3431253b102aedbb4e487f4a1b605206103e8e729f97b738e75847301cfa"
-    },
-    "run17_legacy_replay": {
-      "status": "passed",
-      "source_guide_count": 7,
-      "redrawn_guide_count": 7,
-      "recovery_rounds": 10,
-      "provider_request_count": 0,
-      "legacy_source_assets_modified": false,
-      "migration_receipt_sha256": "fb9fc6f556c4e4a1d91e9d8c18971dc41ccbdc18d503d5fbb584c0a55e7729de"
+      "cell_count": 9,
+      "distinct_pose_fingerprints": 9,
+      "unique_fingerprint_sequences": 1,
+      "unique_render_hashes": 1,
+      "render_sha256": "5db0e6c394889d8781a9a02a5b14dce147713416bf8037cfb7c16308e2e50896",
+      "pose_fingerprints_sha256": "2eba41d6eee60d5dce44dfd04fdefc110b1905ed092b14fccc600f8cad40a57b",
+      "legacy_source_assets_modified": false
     },
     "pipeline_core_unchanged": {
       "status": "passed"
@@ -48,6 +46,15 @@
     "openspec": {
       "status": "verified",
       "strict_validation": "passed"
+    },
+    "serena_post_validation": {
+      "status": "completed",
+      "new_diagnostics": 0,
+      "environment_diagnostic": "PIL import resolution differs from the project virtualenv"
+    },
+    "graphify": {
+      "status": "incremental",
+      "affected_depth": 2
     }
   },
   "provider_request_count": 0,

@@ -51,4 +51,4 @@
 - [x] 7.1 Reproduce the live run misclassification where a negated contact phrase overrides positive evade mechanics; add Chinese and English regression cases.
 - [x] 7.2 Make pose-family classification field- and polarity-aware, persist rejected negated matches, and prevent unmatched body-action beats from drifting across action units.
 - [x] 7.3 Add monotonic per-action Gxx progress plus deterministic root, torso, center-of-gravity, stance and two-hand-hold geometry; reject arrow-only progress.
-- [ ] 7.4 Upgrade the pose contract version, redraw the saved live structure with zero Provider calls, run focused/full regression and post-change Serena/Graphify/OpenSpec validation, then replace the regression evidence.
+- [x] 7.4 Upgrade the pose contract version, redraw the saved live structure with zero Provider calls, run focused/full regression and post-change Serena/Graphify/OpenSpec validation, then replace the regression evidence.
