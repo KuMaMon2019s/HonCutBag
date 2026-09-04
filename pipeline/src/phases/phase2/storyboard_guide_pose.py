@@ -147,7 +147,7 @@ _POSE_POLICY = {
     "evidence_fields": _POSE_EVIDENCE_FIELDS,
     "negation_prefixes": _CHINESE_NEGATION_PREFIXES,
     "mechanics_markers": _MECHANICS_MARKERS,
-    "role_resolution": "source_actor_roster_then_controlled_actor_markers_v1",
+    "role_resolution": "canonical_actor_alias_map_then_controlled_actor_markers_v2",
     "geometry": "normalized_joint_templates_with_mechanics_v2",
     "phase_samples": {"start": 0.2, "action_progress": 0.7, "end": 1.0},
     "minimum_adjacent_joint_delta": 2,
@@ -974,6 +974,7 @@ def compile_pose_contracts(
     cells: list[dict[str, Any]],
     *,
     known_actor_roles: tuple[str, ...] = (),
+    actor_role_aliases: Mapping[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Attach one source-bound, deterministic pose contract to every Gxx cell."""
     units, lineage_status = _validated_units(beat)
@@ -992,7 +993,27 @@ def compile_pose_contracts(
         groups,
         initial_anchor_unit_ids=initial_anchor_unit_ids,
     )
-    source_actor_roles = {value.casefold() for value in known_actor_roles if value}
+    source_actor_roles: dict[str, str] = {}
+    for value in known_actor_roles:
+        role = str(value).strip()
+        if role:
+            source_actor_roles[role.casefold()] = role
+    for alias, canonical_role in (actor_role_aliases or {}).items():
+        normalized_alias = str(alias).strip().casefold()
+        normalized_role = str(canonical_role).strip()
+        if not normalized_alias or not normalized_role:
+            raise ValueError("canonical actor-role alias map contains an empty value")
+        previous = source_actor_roles.get(normalized_alias)
+        if previous is not None and previous != normalized_role:
+            raise ValueError("canonical actor-role alias map contains a conflicting alias")
+        source_actor_roles[normalized_alias] = normalized_role
+
+    def resolved_actor_role(value: str) -> str | None:
+        canonical = source_actor_roles.get(value.casefold())
+        if canonical is not None:
+            return canonical
+        return value if _is_explicit_actor_role(value) else None
+
     result: list[dict[str, Any]] = []
     active_group_key: tuple[str, ...] | None = None
     active_action: dict[str, Any] | None = None
@@ -1013,26 +1034,25 @@ def compile_pose_contracts(
             [value for unit in group for value in _strings(unit.get("performers"))]
         )
         targets = _dedupe([value for unit in group for value in _strings(unit.get("targets"))])
+        canonical_performers = [
+            canonical
+            for value in performers
+            if (canonical := source_actor_roles.get(value.casefold())) is not None
+        ]
         actor_roles = _dedupe(
-            [
-                value
-                for value in performers
-                if value.casefold() in source_actor_roles or _is_explicit_actor_role(value)
-            ]
+            [role for value in performers if (role := resolved_actor_role(value)) is not None]
         )
         if family in {"strike", "kick", "grab_control", "throw", "block", "evade"}:
             actor_roles = _dedupe(
                 actor_roles
-                + [
-                    value
-                    for value in targets
-                    if value.casefold() in source_actor_roles or _is_explicit_actor_role(value)
-                ]
+                + [role for value in targets if (role := resolved_actor_role(value)) is not None]
             )
+        if canonical_performers and not actor_roles:
+            raise ValueError("canonical performer produced empty actor_roles")
         if family != "spatial" and not actor_roles and not performers and not targets:
             actor_roles = _dedupe(_strings(beat.get("character_ids") or beat.get("who")))
         object_roles = _dedupe(
-            [value for value in performers + targets if value not in actor_roles]
+            [value for value in performers + targets if resolved_actor_role(value) is None]
         )
         static_spatial_state = family == "spatial" and not actor_roles
         current_action = {

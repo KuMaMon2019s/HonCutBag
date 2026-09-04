@@ -59,6 +59,12 @@ Adaptation 根据镜头时长选择并解析完整合同；可行性验证使用
 
 旧单页九宫格只有在其动作血缘、分配、renderer 和哈希完整时才能并排迁移；未知未来版本和不完整合同保持 fail closed。Graph 与顺序执行器通过共同 Phase owner 自动获得同一行为，不增加节点逻辑。
 
+### 7. 演员别名只在 Phase 2 边界做确定性投影
+
+Phase 2 从当前 Pxx 的 canonical instance ID 出发，只吸收角色资产中的显示名/已登记 aliases/source mentions，以及 shot/beat `participant_refs` 中明确绑定该 instance 的 mention。别名映射冲突直接阻断；没有身份血缘的相似文本不参与归并。pose compiler 将匹配到的 performer 规范为 canonical actor role，使普通九宫格与 adaptive atlas 共用同一映射，而不把身份推断下沉到 renderer 或 Phase 6。
+
+像素回归必须在排除标签、动作箭头和运镜箭头的演员区域比较实际栅格，证明关节/根位移变化确实进入图像；仅比较 JSON fingerprint 不能满足该门禁。
+
 ## Risks / Trade-offs
 
 - [单张高密度 atlas 仍可能被模型忽略部分姿态] → 将其定义为运动包络；媒体允许时优先分页，并以 action-group 语义而非逐格像素复现验收。

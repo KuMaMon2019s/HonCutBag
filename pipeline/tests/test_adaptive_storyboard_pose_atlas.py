@@ -4,16 +4,18 @@ import hashlib
 from dataclasses import replace
 
 import pytest
-from PIL import Image, ImageFont
+from PIL import Image, ImageChops, ImageFont
 
+from phases.phase2 import shot_storyboards as storyboard_owner
+from phases.phase2 import storyboard_guide_pose as pose_owner
 from phases.phase2.storyboard_pose_atlas import (
     build_pose_atlas_plan,
     render_pose_atlas_candidates,
     select_pose_atlas_candidate,
 )
-from schemas.continuity import GenerationChunk
 from runtime.continuity_chunks import ChunkExecutionRequest
 from runtime.continuity_provider import _bind_final_media_index_prompt
+from schemas.continuity import GenerationChunk
 from utils.camera_motion_contracts import (
     apply_camera_motion_contract,
     build_camera_motion_contract,
@@ -35,6 +37,121 @@ def _unit(index: int, action: str) -> dict:
         "performers": ["actor-alpha"],
         "targets": ["actor-beta"],
     }
+
+
+def test_phase2_maps_instance_name_and_source_mention_to_one_actor_role() -> None:
+    beat = {
+        "beat_id": "S01_P01",
+        "duration_s": 4,
+        "planner_version": "honcut.secondary-storyboard.v16",
+        "generation_action_units": [
+            {
+                **_unit(1, "澜璃快速向右闪避"),
+                "performers": ["澜璃"],
+                "targets": ["蓝色短棍"],
+            }
+        ],
+        "character_ids": ["lead_I01"],
+    }
+    shot = {
+        "id": "S01",
+        "character_ids": ["lead_I01"],
+        "who": ["Lan Li"],
+        "participant_refs": [
+            {
+                "mention": "澜璃",
+                "character_id": "lead_I01",
+                "instance_id": "lead_I01",
+            }
+        ],
+    }
+    characters = [
+        {
+            "id": "lead_I01",
+            "instance_id": "lead_I01",
+            "name": "Lan Li",
+            "aliases": ["L. Li"],
+            "source_mentions": ["澜璃"],
+        }
+    ]
+
+    aliases = storyboard_owner._actor_role_aliases(shot, beat, characters)
+    review_grid = storyboard_owner._narrative_grid_contract(
+        shot,
+        "S01",
+        [beat],
+        characters,
+    )
+    plan = build_pose_atlas_plan(beat, actor_role_aliases=aliases)
+
+    assert aliases == {
+        "lead_I01": "lead_I01",
+        "Lan Li": "lead_I01",
+        "L. Li": "lead_I01",
+        "澜璃": "lead_I01",
+    }
+    assert all(
+        sample["pose_contract"]["actor_roles"] == ["lead_I01"] for sample in plan["pose_samples"]
+    )
+    assert all(cell["pose_contract"]["actor_roles"] == ["lead_I01"] for cell in review_grid)
+    assert all(sample["pose_contract"]["geometry"]["actors"] for sample in plan["pose_samples"])
+
+
+def test_phase2_rejects_ambiguous_source_mention_actor_mapping() -> None:
+    beat = {"beat_id": "S01_P01", "character_ids": ["lead_I01", "lead_I02"]}
+    shot = {
+        "id": "S01",
+        "character_ids": ["lead_I01", "lead_I02"],
+        "participant_refs": [
+            {"mention": "队员", "instance_id": "lead_I01"},
+            {"mention": "队员", "instance_id": "lead_I02"},
+        ],
+    }
+
+    with pytest.raises(ValueError, match="ambiguous canonical actor alias"):
+        storyboard_owner._actor_role_aliases(shot, beat, [])
+
+
+def test_canonical_performer_changes_actual_body_raster_not_only_arrows() -> None:
+    beat = {
+        "beat_id": "S01_P01",
+        "duration_s": 4,
+        "planner_version": "honcut.secondary-storyboard.v16",
+        "generation_action_units": [
+            {
+                **_unit(1, "澜璃大幅向右闪避并后仰"),
+                "performers": ["澜璃"],
+                "targets": [],
+            }
+        ],
+        "character_ids": ["lead_I01"],
+    }
+    plan = build_pose_atlas_plan(
+        beat,
+        actor_role_aliases={"lead_I01": "lead_I01", "澜璃": "lead_I01"},
+    )
+    samples = plan["pose_samples"]
+
+    def body_crop(sample: dict) -> Image.Image:
+        rendered = pose_owner.render_pose_cell(
+            {
+                "label": sample["cell_id"],
+                "secondary_beat_id": beat["beat_id"],
+                "pose_contract": sample["pose_contract"],
+            },
+            font_factory=lambda _size: ImageFont.load_default(),
+        )
+        # Excludes the label and both annotation-arrow lanes; only actor pixels remain.
+        return rendered.crop((150, 82, 305, 188))
+
+    first = body_crop(samples[0])
+    last = body_crop(samples[-1])
+    difference = ImageChops.difference(first, last)
+
+    assert samples[0]["pose_contract"]["actor_roles"] == ["lead_I01"]
+    assert samples[-1]["pose_contract"]["actor_roles"] == ["lead_I01"]
+    assert difference.getbbox() is not None
+    assert sum(difference.convert("L").histogram()[1:]) >= 80
 
 
 @pytest.mark.parametrize(

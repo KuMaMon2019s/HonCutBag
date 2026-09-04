@@ -172,6 +172,7 @@ def build_pose_atlas_plan(
     beat: Mapping[str, Any],
     *,
     known_actor_roles: tuple[str, ...] = (),
+    actor_role_aliases: Mapping[str, str] | None = None,
     capabilities: VideoModelCapabilities | None = None,
 ) -> dict[str, Any]:
     """Compile ordered action groups and camera-projected pose samples."""
@@ -218,7 +219,35 @@ def build_pose_atlas_plan(
         beat,
         cells,
         known_actor_roles=known_actor_roles,
+        actor_role_aliases=actor_role_aliases,
     )
+    canonical_aliases = {
+        str(value).strip().casefold(): str(value).strip()
+        for value in known_actor_roles
+        if str(value).strip()
+    }
+    canonical_aliases.update(
+        {
+            str(alias).strip().casefold(): str(role).strip()
+            for alias, role in (actor_role_aliases or {}).items()
+            if str(alias).strip() and str(role).strip()
+        }
+    )
+    units_by_id = {str(unit["unit_id"]): unit for unit in units}
+    for cell in compiled:
+        contract = cell["pose_contract"]
+        expected_roles = {
+            canonical_aliases[performer.casefold()]
+            for binding in contract["action_bindings"]
+            for performer in (
+                str(value).strip()
+                for value in (units_by_id[str(binding["unit_id"])].get("performers") or [])
+                if str(value).strip()
+            )
+            if performer.casefold() in canonical_aliases
+        }
+        if expected_roles and not expected_roles.issubset(set(contract["actor_roles"])):
+            raise ValueError(f"{beat_id} canonical performer produced empty actor_roles")
     groups_by_units = {tuple(group["lineage"]["unit_ids"]): group for group in groups}
     has_initial_anchor = beat_id.endswith("_P01")
     timing = selected_capabilities.storyboard_timing_contract(

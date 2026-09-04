@@ -30,6 +30,21 @@
 - **WHEN** 图集分组尝试把另一 Pxx 的动作或未来动作放入当前 Pxx
 - **THEN** 系统在媒体生成前 fail closed
 
+### Requirement: Phase 2 必须以 canonical 身份映射演员角色
+Phase 2 MUST 将当前 Pxx 的 canonical instance ID、角色显示名和具有明确 instance/character 血缘的 source mention 确定性映射到同一个 actor role。该映射只能消费 Phase 1 已建立的身份事实，不得推断、合并或增加人物。只要当前动作组包含可由该映射识别的 canonical performer，其 `actor_roles` 与实际人物栅格几何 MUST 非空。
+
+#### Scenario: 动作使用 source mention 而 Pxx 保存 instance ID
+- **WHEN** 当前 Pxx 的 `character_ids` 保存 canonical instance ID，而 generation action unit 的 performer 使用与该实例绑定的中文或英文 source mention
+- **THEN** Phase 2 将两者解析为同一个 canonical actor role，人物不得被误画成 object
+
+#### Scenario: 同一演员的姿态在栅格中真实变化
+- **WHEN** 同一 canonical performer 的连续 pose samples 表示不同动作阶段或大幅度动作
+- **THEN** 实际渲染像素中的人体骨架随关节和根位移变化，不能只有红色动作箭头或蓝色运镜箭头变化
+
+#### Scenario: 别名映射存在冲突
+- **WHEN** 同一个显示名或 source mention 同时明确绑定多个当前 canonical instance
+- **THEN** Phase 2 在生成图集前 fail closed，不得自行选择人物或降低为 object
+
 ### Requirement: 图集容量必须由时长和 Provider 能力确定
 系统 SHALL 使用版本化 Provider capability profile，根据有效动态时长确定 pose sample 和 reliable action-group 上限。4～15 秒范围内的规划 MUST 确定、可审计且与剧情词汇无关；超过可靠动作容量时 MUST 拆分 Pxx，而不是通过增加格子伪装可执行。
 

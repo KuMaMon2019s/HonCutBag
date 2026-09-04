@@ -8,6 +8,7 @@ import math
 import re
 import shutil
 import unicodedata
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -159,6 +160,105 @@ def _character_names(
     return names
 
 
+def _actor_role_aliases(
+    shot: Mapping[str, Any],
+    beat: Mapping[str, Any],
+    characters: Sequence[Mapping[str, Any]] = (),
+) -> dict[str, str]:
+    """Project explicit Phase 1 identity aliases onto canonical Pxx actor roles."""
+
+    def ordered_strings(value: Any) -> list[str]:
+        if isinstance(value, str):
+            candidates = [value]
+        elif isinstance(value, (list, tuple)):
+            candidates = list(value)
+        else:
+            candidates = []
+        return list(
+            dict.fromkeys(
+                str(candidate).strip() for candidate in candidates if str(candidate).strip()
+            )
+        )
+
+    if "character_instance_ids" in beat:
+        canonical_ids = ordered_strings(beat.get("character_instance_ids"))
+    elif "character_ids" in beat:
+        canonical_ids = ordered_strings(beat.get("character_ids"))
+    elif "character_instance_ids" in shot:
+        canonical_ids = ordered_strings(shot.get("character_instance_ids"))
+    else:
+        canonical_ids = ordered_strings(shot.get("character_ids"))
+
+    aliases: dict[str, str] = {}
+    normalized_owners: dict[str, str] = {}
+
+    def bind(alias: Any, canonical_id: str) -> None:
+        value = str(alias or "").strip()
+        if not value:
+            return
+        normalized = value.casefold()
+        previous = normalized_owners.get(normalized)
+        if previous is not None and previous != canonical_id:
+            raise ValueError(
+                f"ambiguous canonical actor alias {value!r}: {previous} and {canonical_id}"
+            )
+        normalized_owners[normalized] = canonical_id
+        aliases.setdefault(value, canonical_id)
+
+    for canonical_id in canonical_ids:
+        bind(canonical_id, canonical_id)
+
+    canonical_id_set = set(canonical_ids)
+    for character in characters:
+        record_ids = {
+            str(character.get(field) or "").strip()
+            for field in ("instance_id", "id")
+            if str(character.get(field) or "").strip()
+        }
+        matches = canonical_id_set & record_ids
+        if not matches:
+            continue
+        if len(matches) != 1:
+            raise ValueError("character asset resolves to multiple canonical actor instances")
+        canonical_id = next(iter(matches))
+        bind(character.get("name"), canonical_id)
+        for field in ("aliases", "source_mentions"):
+            for alias in ordered_strings(character.get(field)):
+                bind(alias, canonical_id)
+
+    for owner in (shot, beat):
+        references = owner.get("participant_refs") or []
+        if not isinstance(references, list):
+            raise ValueError("participant_refs must be an array")
+        for reference in references:
+            if not isinstance(reference, Mapping):
+                raise ValueError("participant_refs entries must be objects")
+            reference_id = str(
+                reference.get("instance_id") or reference.get("character_id") or ""
+            ).strip()
+            if reference_id in canonical_id_set:
+                bind(reference.get("mention"), reference_id)
+
+    for owner in (shot, beat):
+        owner_ids = ordered_strings(
+            owner.get("character_instance_ids")
+            if "character_instance_ids" in owner
+            else owner.get("character_ids")
+        )
+        owner_names = ordered_strings(owner.get("who"))
+        if owner_ids and len(owner_ids) == len(owner_names):
+            for owner_id, display_name in zip(owner_ids, owner_names, strict=True):
+                if owner_id in canonical_id_set:
+                    bind(display_name, owner_id)
+
+    if not canonical_ids:
+        # Explicitly unversioned fixtures have no Phase 1 instance IDs to project.
+        for owner in (beat, shot):
+            for value in ordered_strings(owner.get("who")):
+                bind(value, value)
+    return aliases
+
+
 def _legacy_v11_beat_character_ids(
     shot: dict[str, Any],
     beat: dict[str, Any],
@@ -268,6 +368,7 @@ def _narrative_grid_contract(
     shot: dict[str, Any],
     shot_id: str,
     beats: list[dict[str, Any]],
+    characters: Sequence[Mapping[str, Any]] = (),
 ) -> list[dict[str, Any]]:
     """Expand one primary Sxx plus its ordered Pxx beats into nine review cells.
 
@@ -281,20 +382,8 @@ def _narrative_grid_contract(
         )
     base, remainder = divmod(SHOT_STORYBOARD_GRID_CELLS, len(beats))
     cells: list[dict[str, Any]] = []
-    raw_shot_who = shot.get("who") or []
-    if isinstance(raw_shot_who, str):
-        raw_shot_who = [raw_shot_who]
-    known_actor_roles = tuple(
-        dict.fromkeys(
-            [str(value).strip() for value in raw_shot_who if str(value).strip()]
-            + [
-                str(reference.get("mention") or "").strip()
-                for reference in (shot.get("participant_refs") or [])
-                if isinstance(reference, dict) and str(reference.get("mention") or "").strip()
-            ]
-        )
-    )
     for beat_index, beat in enumerate(beats):
+        actor_role_aliases = _actor_role_aliases(shot, beat, characters)
         cell_count = base + (1 if beat_index < remainder else 0)
         beat_id = str(beat.get("beat_id") or f"{shot_id}_P{beat_index + 1:02d}")
         start_state = _compact(beat.get("start_state"), 320)
@@ -356,7 +445,7 @@ def _narrative_grid_contract(
             compile_pose_contracts(
                 beat,
                 beat_cells,
-                known_actor_roles=known_actor_roles,
+                actor_role_aliases=actor_role_aliases,
             )
         )
     if len(cells) != SHOT_STORYBOARD_GRID_CELLS:
@@ -517,6 +606,8 @@ def _derive_narrative_guides(
     assignments: list[dict[str, Any]],
     *,
     beats_by_id: dict[str, dict[str, Any]] | None = None,
+    shot: Mapping[str, Any] | None = None,
+    characters: Sequence[Mapping[str, Any]] = (),
     relative_guide_dir: str = "storyboard_guides",
 ) -> list[dict[str, Any]]:
     """Render identity-neutral Pxx guides locally without Provider requests."""
@@ -610,14 +701,10 @@ def _derive_narrative_guides(
         }
         beat = (beats_by_id or {}).get(beat_id)
         if beat is not None:
-            actor_roles = tuple(
-                str(value).strip()
-                for value in (beat.get("character_ids") or beat.get("who") or [])
-                if str(value).strip()
-            )
+            actor_role_aliases = _actor_role_aliases(shot or {}, beat, characters)
             atlas_plan = build_pose_atlas_plan(
                 beat,
-                known_actor_roles=actor_roles,
+                actor_role_aliases=actor_role_aliases,
             )
             atlas_receipt = render_pose_atlas_candidates(
                 output_dir,
@@ -720,7 +807,7 @@ def build_shot_storyboard_prompt(
     beats = [dict(beat) for beat in (shot.get("storyboard_beats") or []) if isinstance(beat, dict)]
     if not beats:
         raise ValueError(f"{shot_id} has no storyboard_beats")
-    narrative_grid = _narrative_grid_contract(shot, shot_id, beats)
+    narrative_grid = _narrative_grid_contract(shot, shot_id, beats, characters)
     who = _shot_who(shot)
     beat_lines = []
     for position, beat in enumerate(beats, 1):
@@ -2102,6 +2189,7 @@ def _migrate_shot_storyboard_narrative_guides(
             grid_contract,
             assignments,
             beats_by_id={str(beat.get("beat_id") or ""): beat for beat in beats},
+            shot=shot,
             relative_guide_dir="storyboard_guides/adaptive-v1",
         )
         guides_by_beat = {str(guide["beat_id"]): guide for guide in guides}
@@ -2816,6 +2904,7 @@ def generate_shot_storyboards(
                     shot,
                     shot_id,
                     authored_beats,
+                    characters,
                 )
                 grid_contract = _bind_narrative_grid_contract(
                     dict(preserved.get("grid_contract") or {}),
@@ -2828,6 +2917,8 @@ def generate_shot_storyboards(
                     grid_contract,
                     assignments,
                     beats_by_id={str(beat.get("beat_id") or ""): beat for beat in authored_beats},
+                    shot=shot,
+                    characters=characters,
                 )
                 guides_by_beat = {str(guide["beat_id"]): guide for guide in guides}
                 for beat in authored_beats:
@@ -2855,7 +2946,7 @@ def generate_shot_storyboards(
             board_path = boards_dir / f"{shot_id}.png"
             prompt_path.write_text(prompt, encoding="utf-8")
             prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-            narrative_grid = _narrative_grid_contract(shot, shot_id, beats)
+            narrative_grid = _narrative_grid_contract(shot, shot_id, beats, characters)
             director_panel = director_panels.get(shot_id)
             correction_issues = correction_context_by_shot.get(shot_id, [])
             record = {
@@ -3429,6 +3520,8 @@ def generate_shot_storyboards(
                 grid_contract,
                 assignments,
                 beats_by_id={str(beat.get("beat_id") or ""): beat for beat in beats},
+                shot=shot,
+                characters=characters,
             )
             guides_by_beat = {str(guide["beat_id"]): guide for guide in guide_records}
             panels_by_beat = {
