@@ -20,14 +20,14 @@
 - [x] 3.3 Add deterministic compact projections for canonical identity, continuity, spatial/prop locks, camera, style, and negative constraints while retaining their complete source contracts in fingerprint/receipt metadata; verify exact-one identity and distinguishing signatures remain present.
 - [x] 3.4 Deduplicate camera and motion instructions so the submitted prompt contains one primary camera instruction and one motion authority; verify camera support does not precede or contradict ordered body action.
 - [x] 3.5 Remove the late duplicate motion-priority/action-window suffix from the final request path; verify equivalent markers cannot appear twice in the Provider payload.
-- [ ] 3.6 Commit prompt ordering and media-role isolation as `fix: prioritize current-shot action execution` after prompt, continuity, and packaging tests pass.
+- [x] 3.6 Commit prompt ordering and media-role isolation as `fix: prioritize current-shot action execution` after prompt, continuity, and packaging tests pass.
 
 ## 4. Prompt Budget, Fingerprints, and Recovery
 
-- [ ] 4.1 Add named deterministic section budgets derived from the existing Provider capability limit, reserving mandatory action and identity content before optional support clauses; verify no arbitrary tail truncation occurs.
-- [ ] 4.2 Fail closed before submission when the media preamble plus mandatory action/identity projection cannot fit; verify GenerationTaskStore has no `SubmissionAttempted` event for budget failure.
-- [ ] 4.3 Add action brief schema/hash, ordered group IDs, source lineage, media-role indexes/hashes, projection policy hash, final prompt hash, and canonical hash to task identity and receipts; verify each relevant input change invalidates the fingerprint.
-- [ ] 4.4 Verify cold start plus ten recoveries preserve task count, prompt hash, brief hash, media hashes, and Provider request count zero.
+- [x] 4.1 Add named deterministic section budgets derived from the existing Provider capability limit, reserving mandatory action and identity content before optional support clauses; verify no arbitrary tail truncation occurs.
+- [x] 4.2 Fail closed before submission when the media preamble plus mandatory action/identity projection cannot fit; verify GenerationTaskStore has no `SubmissionAttempted` event for budget failure.
+- [x] 4.3 Add action brief schema/hash, ordered group IDs, source lineage, media-role indexes/hashes, projection policy hash, final prompt hash, and canonical hash to task identity and receipts; verify each relevant input change invalidates the fingerprint.
+- [x] 4.4 Verify cold start plus ten recoveries preserve task count, prompt hash, brief hash, media hashes, and Provider request count zero.
 - [ ] 4.5 Commit budgeting and task identity as `fix: make phase6 prompt projection deterministic` after recovery tests pass.
 
 ## 5. Zero-Cost Replay and Regression
