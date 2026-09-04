@@ -2,7 +2,7 @@
   "schema": "honcut.storyboard-guide-pose-regression.v1",
   "status": "passed",
   "source": {
-    "git_commit": "f127dbdbfcad584993fa2878809c57a87c659ec2",
+    "git_commit": "c9a14b16833e73df900b5bb3cd49af533943a60d",
     "baseline_commit": "2807f4612d81216a9a241ed731548019aa290ef0",
     "followup_parent_commit": "82a7ac25ca3048050196c3e82ce84b5bcc65382f",
     "openspec_change": "align-storyboard-guide-pose-semantics"
@@ -10,11 +10,11 @@
   "gates": {
     "focused_tests": {
       "status": "passed",
-      "passed": 456
+      "passed": 463
     },
     "full_test_suite": {
       "status": "passed",
-      "passed": 1414,
+      "passed": 1421,
       "warnings": 2
     },
     "lint": {
@@ -25,6 +25,7 @@
     },
     "saved_live_structure_replay": {
       "status": "passed",
+      "evidence_commit": "f127dbdbfcad584993fa2878809c57a87c659ec2",
       "rounds": 10,
       "provider_request_count": 0,
       "cell_count": 9,
@@ -35,6 +36,12 @@
       "pose_fingerprints_sha256": "2eba41d6eee60d5dce44dfd04fdefc110b1905ed092b14fccc600f8cad40a57b",
       "legacy_source_assets_modified": false
     },
+    "zero_time_anchor_provider_deny_recovery": {
+      "status": "passed",
+      "rounds": 10,
+      "provider_request_count": 0,
+      "graph_and_sequential_paths": "passed"
+    },
     "pipeline_core_unchanged": {
       "status": "passed"
     },
@@ -43,6 +50,19 @@
       "production_test_fallbacks": 0,
       "missing_lineage_behavior": "fail_closed"
     },
+    "zero_time_initial_anchor": {
+      "status": "passed",
+      "eligible_scope": "P01 pure ready followed by a later dynamic action",
+      "anchor_cell_count": 1,
+      "story_time_weight": 0.0,
+      "phase6_start_behavior": "begin_next_gxx_immediately",
+      "non_eligible_states": [
+        "lone_ready",
+        "prop_hold",
+        "spatial_state",
+        "P02_plus"
+      ]
+    },
     "openspec": {
       "status": "verified",
       "strict_validation": "passed"
@@ -50,7 +70,7 @@
     "serena_post_validation": {
       "status": "completed",
       "new_diagnostics": 0,
-      "environment_diagnostic": "PIL import resolution differs from the project virtualenv"
+      "environment_diagnostic": "Serena LSP does not inherit the project virtualenv; existing PIL, pydantic and requests import diagnostics remain outside changed symbols"
     },
     "graphify": {
       "status": "incremental",

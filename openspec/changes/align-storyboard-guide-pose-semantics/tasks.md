@@ -61,4 +61,4 @@
 - [x] 8.4 Add the Phase 6 prompt contract that treats the anchor as the t=0 first-frame state and requires motion to begin immediately with the next Gxx; verify bridge requests and anchor-free Pxx remain unchanged.
 - [x] 8.5 Add verified local migration/redraw behavior for the previous current guide version and fail closed on incomplete, corrupt or future timing contracts.
 - [x] 8.6 Run focused tests, provider-deny Graph/sequential integration, ten recovery rounds, lint, diff check and full tests; confirm `pipeline_core.py` is unchanged.
-- [ ] 8.7 Complete Serena post-validation, OpenSpec Verify and Graphify incremental sync, then replace regression evidence and leave the paid live gate pending a new explicit authorization.
+- [x] 8.7 Complete Serena post-validation, OpenSpec Verify and Graphify incremental sync, then replace regression evidence and leave the paid live gate pending a new explicit authorization.
