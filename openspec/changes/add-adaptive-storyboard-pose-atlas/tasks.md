@@ -35,11 +35,11 @@
 - [x] 5.3 Run the relevant Phase 1–9 provider-deny acceptance and ten recovery rounds; verify Provider request count is zero and pages, observations, tasks and media hashes remain stable.
 - [x] 5.4 Update `docs/HONCUT_ARCHITECTURE.md`, README migration entry and source guards with the versioned timing/atlas/camera contracts; verify `pipeline_core.py` is unchanged and has no new production references.
 - [x] 5.5 Run Serena post-change symbol/reference/type/diagnostics validation and resolve every introduced stale reference or contract mismatch.
-- [ ] 5.6 Run target pytest, `make lint`, `git diff --check` and `make test`; bind the zero-request regression receipt to the final candidate commit.
-- [ ] 5.7 Run `openspec validate add-adaptive-storyboard-pose-atlas --strict` and OpenSpec Verify; leave any incomplete requirement/task unchecked and record unresolved risks.
-- [ ] 5.8 Run `graphify update .`, inspect affected owners at depth 2, save the verified result and refresh lessons; update Serena Memory only if a durable architectural rule changed.
+- [x] 5.6 Run target pytest, `make lint`, `git diff --check` and `make test`; bind the zero-request regression receipt to the final candidate commit.
+- [x] 5.7 Run `openspec validate add-adaptive-storyboard-pose-atlas --strict` and OpenSpec Verify; leave any incomplete requirement/task unchecked and record unresolved risks.
+- [x] 5.8 Run `graphify update .`, inspect affected owners at depth 2, save the verified result and refresh lessons; update Serena Memory only if a durable architectural rule changed.
 
 ## 6. Paid Admission Boundary
 
-- [ ] 6.1 After all zero-cost gates pass, prepare a no-submit seven-second acceptance payload with frozen model, media order, atlas strategy, timing/camera contract, fingerprint and one-request hard limit; verify no Provider call occurs.
+- [x] 6.1 After all zero-cost gates pass, prepare a no-submit seven-second acceptance payload with frozen model, media order, atlas strategy, timing/camera contract, fingerprint and one-request hard limit; verify no Provider call occurs.
 - [x] 6.2 Keep status `pending_live_acceptance` until a new explicit fee authorization is provided; any later live run must allow at most one Seedance submission, no retry/reshoot/budget expansion, and must record call-chain and human visual verdict separately.
