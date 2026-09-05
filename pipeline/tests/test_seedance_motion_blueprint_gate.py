@@ -7,6 +7,7 @@ import sys
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -23,6 +24,7 @@ from acceptance.motion_blueprint import (
     measure_output_motion,
     measure_rendered_blueprint_motion,
     measure_semantic_frames,
+    technique_registry_sha256,
 )
 from utils.canonical_visual_contracts import build_canonical_visual_contract
 
@@ -84,7 +86,9 @@ def test_compiler_is_deterministic_and_seedance_compatible(tmp_path: Path) -> No
     assert first["measurements"]["fps"] == 24
     assert first["measurements"]["duration_s"] == 4.0
     assert first["identity_authority"] is False
-    assert inspect_identity_neutral_pixels(tmp_path / "first.mp4")["forbidden_annotation_pixels"] == 0
+    assert (
+        inspect_identity_neutral_pixels(tmp_path / "first.mp4")["forbidden_annotation_pixels"] == 0
+    )
     assert measure_output_motion(tmp_path / "first.mp4")["deterministic_motion_pass"] is True
 
 
@@ -101,6 +105,151 @@ def test_compiler_records_order_large_motion_contact_and_camera() -> None:
     assert all(event["apex_fraction"] <= 0.72 for event in dynamic)
     assert any(frame["prop_contact"] for frame in frames)
     assert frames[-1]["camera"]["zoom"] > frames[0]["camera"]["zoom"]
+
+
+@pytest.mark.parametrize(
+    ("primitive", "expected_phases"),
+    [
+        ("locomotion", ["push_off", "flight", "lead_plant", "weight_pass", "terminal_stride"]),
+        ("evade", ["threat_read", "weight_load", "escape_peak", "counterbalance", "recovery"]),
+        ("strike", ["chamber", "drive", "contact_extension", "recoil", "guard_return"]),
+        (
+            "attack",
+            ["weapon_chamber", "body_drive", "attack_contact", "follow_through", "combat_recovery"],
+        ),
+        (
+            "kick",
+            ["support_load", "knee_chamber", "foot_contact", "leg_retraction", "landing_guard"],
+        ),
+        ("block", ["guard_raise", "brace", "contact_absorb", "redirect", "guard_settle"]),
+        ("grapple", ["reach", "grip_contact", "base_drop", "control_pull", "control_hold"]),
+        ("throw", ["load", "pivot", "release_contact", "follow_through", "balanced_finish"]),
+        ("jump", ["crouch_load", "takeoff", "airborne_apex", "landing_absorb", "settle"]),
+        ("crouch", ["level_drop", "compression", "lateral_ready", "rise_control", "low_finish"]),
+        ("lean_back", ["base_set", "torso_arc", "maximum_lean", "counterbalance", "recenter"]),
+        (
+            "lean_forward",
+            ["rear_foot_load", "torso_hinge", "forward_peak", "base_catch", "recenter"],
+        ),
+        (
+            "prop_use",
+            ["acquire_line", "aim", "activation_contact", "follow_through", "safe_finish"],
+        ),
+        ("spatial", ["orient", "reach", "indicate_apex", "retract", "settle"]),
+    ],
+)
+def test_dynamic_primitives_have_code_owned_technique_phases(
+    primitive: str,
+    expected_phases: list[str],
+) -> None:
+    contract = _contract(primitive)
+    frames, intervals = compile_semantic_frames(contract)
+    measurements = measure_semantic_frames(contract, frames, intervals)
+    interval = intervals[0]
+    assert interval["technique_phase_ids"] == expected_phases
+    assert measurements["events"][0]["observed_technique_phase_ids"] == expected_phases
+    assert measurements["events"][0]["technique_phase_order_valid"] is True
+    assert len(interval["technique_keyframes_sha256"]) == 64
+
+
+def _frame_for_phase(
+    frames: list[dict[str, Any]],
+    phase_id: str,
+) -> dict[str, Any]:
+    return next(frame for frame in frames if frame["technique_phase_id"] == phase_id)
+
+
+def test_representative_techniques_have_distinct_biomechanics() -> None:
+    fingerprints: set[str] = set()
+    for primitive in ("evade", "kick", "block", "strike"):
+        frames, intervals = compile_semantic_frames(_contract(primitive))
+        fingerprints.add(intervals[0]["technique_keyframes_sha256"])
+        if primitive == "evade":
+            loaded = _frame_for_phase(frames, "weight_load")
+            peak = _frame_for_phase(frames, "escape_peak")
+            assert peak["root"][0] - loaded["root"][0] > 0.25
+            assert peak["joints"]["head"][0] < loaded["joints"]["head"][0]
+        elif primitive == "kick":
+            chamber = _frame_for_phase(frames, "knee_chamber")
+            contact = _frame_for_phase(frames, "foot_contact")
+            assert chamber["joints"]["right_knee"][1] < 0.08
+            assert contact["joints"]["right_ankle"][0] > chamber["joints"]["right_ankle"][0] + 0.30
+        elif primitive == "block":
+            brace = _frame_for_phase(frames, "brace")
+            contact = _frame_for_phase(frames, "contact_absorb")
+            assert brace["joints"]["left_wrist"][1] < -0.20
+            assert contact["joints"]["right_wrist"][1] < -0.30
+        else:
+            chamber = _frame_for_phase(frames, "chamber")
+            contact = _frame_for_phase(frames, "contact_extension")
+            assert contact["joints"]["left_wrist"][0] > chamber["joints"]["left_wrist"][0] + 0.50
+    assert len(fingerprints) == 4
+
+
+def test_contact_geometry_is_limited_to_declared_technique_phase() -> None:
+    contract = _contract("strike")
+    frames, intervals = compile_semantic_frames(contract)
+    event_frames = [frame for frame in frames if frame["event_id"] == "S01_P01_M01"]
+    contact_frames = [frame for frame in event_frames if frame["prop_contact"]]
+    assert 0 < len(contact_frames) < len(event_frames)
+    assert {frame["technique_phase_id"] for frame in contact_frames} == {"contact_extension"}
+    assert intervals[0]["technique_contact_phase_ids"] == ["contact_extension"]
+
+
+def test_manifest_binds_technique_registry_and_keyframes(tmp_path: Path) -> None:
+    manifest = compile_motion_blueprint(_contract("evade"), tmp_path / "motion.mp4")
+    assert manifest["technique_registry_sha256"] == technique_registry_sha256()
+    event = manifest["measurements"]["events"][0]
+    assert event["technique_id"] == "lateral_slip_v1"
+    assert event["technique_phase_ids"][2] == "escape_peak"
+    assert len(event["technique_keyframes_sha256"]) == 64
+
+
+def test_rendered_evade_visibly_changes_at_each_technique_phase(
+    tmp_path: Path,
+) -> None:
+    import cv2
+    import numpy as np
+
+    contract = _contract("evade")
+    semantic_frames, _intervals = compile_semantic_frames(contract)
+    video_path = tmp_path / "evade-technique.mp4"
+    compile_motion_blueprint(contract, video_path)
+    capture = cv2.VideoCapture(str(video_path))
+    rendered_masks = []
+    while True:
+        ok, frame = capture.read()
+        if not ok:
+            break
+        rendered_masks.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) > 70)
+    capture.release()
+
+    phase_centres = []
+    for phase_id in dict.fromkeys(frame["technique_phase_id"] for frame in semantic_frames):
+        indexes = [
+            index
+            for index, frame in enumerate(semantic_frames)
+            if frame["technique_phase_id"] == phase_id
+        ]
+        phase_centres.append((phase_id, indexes[len(indexes) // 2]))
+    assert [phase_id for phase_id, _index in phase_centres] == [
+        "threat_read",
+        "weight_load",
+        "escape_peak",
+        "counterbalance",
+        "recovery",
+    ]
+    phase_changes = []
+    for (_previous_phase, previous_index), (_phase, current_index) in zip(
+        phase_centres[:-1],
+        phase_centres[1:],
+        strict=True,
+    ):
+        previous = rendered_masks[previous_index]
+        current = rendered_masks[current_index]
+        union = int(np.logical_or(previous, current).sum())
+        phase_changes.append(float(np.logical_xor(previous, current).sum() / max(1, union)))
+    assert min(phase_changes) >= 0.20
 
 
 def test_setup_pose_cannot_consume_the_dynamic_action_window() -> None:
@@ -203,9 +352,20 @@ def test_rendered_blueprint_requires_visible_full_scale_motion(tmp_path: Path) -
     tiny = tmp_path / "tiny.mp4"
     subprocess.run(
         [
-            "ffmpeg", "-y", "-loglevel", "error", "-i", str(path),
-            "-vf", "scale=214:120,pad=854:480:(ow-iw)/2:(oh-ih)/2:color=0x121418",
-            "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(tiny),
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-i",
+            str(path),
+            "-vf",
+            "scale=214:120,pad=854:480:(ow-iw)/2:(oh-ih)/2:color=0x121418",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(tiny),
         ],
         check=True,
     )
@@ -252,27 +412,128 @@ def test_legacy_slow_drift_is_audit_only_and_rejected_without_upload(tmp_path: P
         MotionBlueprintManifest.model_validate(legacy)
 
 
+def test_v2_common_curve_blueprint_is_audit_only(tmp_path: Path) -> None:
+    media = tmp_path / "v2.mp4"
+    legacy = compile_motion_blueprint(_contract("evade"), media)
+    legacy["schema"] = "honcut.seedance-motion-blueprint.v2"
+    legacy["policy_schema"] = "honcut.motion-blueprint-policy.v2"
+    legacy["renderer_id"] = "honcut.identity-neutral-motion-renderer.v2"
+    legacy.pop("technique_registry_sha256")
+    for event in legacy["measurements"]["events"]:
+        for field in (
+            "technique_id",
+            "technique_phase_ids",
+            "technique_contact_phase_ids",
+            "technique_keyframes_sha256",
+            "observed_technique_phase_ids",
+            "technique_phase_order_valid",
+            "contact_frame_count",
+            "observed_contact_phase_ids",
+        ):
+            event.pop(field, None)
+    path = tmp_path / "v2-manifest.json"
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+    assessment = assess_legacy_blueprint_manifest(path)
+    assert assessment["source_schema"] == "honcut.seedance-motion-blueprint.v2"
+    assert assessment["audit_only"] is True
+    assert assessment["admission_status"] == "paid_admission_blocked"
+    assert "v3 technique choreography" in assessment["reason"]
+
+
 def _fixture_run(tmp_path: Path) -> tuple[Path, Path]:
-    run = tmp_path / "source"; run.mkdir()
+    run = tmp_path / "source"
+    run.mkdir()
     canonical = build_canonical_visual_contract(
-        {"characters": [{"id": "actor_01", "name": "Actor", "visual_identity_policy": "fictional_cinematic_human_v1", "appearance": {"hair": "short black", "build": "athletic", "face": "fictional", "clothing": "neutral"}}]},
+        {
+            "characters": [
+                {
+                    "id": "actor_01",
+                    "name": "Actor",
+                    "visual_identity_policy": "fictional_cinematic_human_v1",
+                    "appearance": {
+                        "hair": "short black",
+                        "build": "athletic",
+                        "face": "fictional",
+                        "clothing": "neutral",
+                    },
+                }
+            ]
+        },
         requested_policy="fictional_cinematic_human_v1",
     )
     (run / "CANONICAL_VISUAL_CONTRACT.json").write_text(json.dumps(canonical), encoding="utf-8")
     media = []
-    for name, responsibility in (("identity.png", "character_identity_board"), ("first.png", "cinematic_composition"), ("atlas.png", "storyboard_pose_atlas")):
-        path = run / name; path.write_bytes((name * 20).encode())
-        media.append({"content_index": len(media) + 1, "media_type": "image_url", "prompt_index": f"图片{len(media)+1}", "role": "reference_image", "responsibility": responsibility, "path": name, "sha256": _sha(path)})
+    for name, responsibility in (
+        ("identity.png", "character_identity_board"),
+        ("first.png", "cinematic_composition"),
+        ("atlas.png", "storyboard_pose_atlas"),
+    ):
+        path = run / name
+        path.write_bytes((name * 20).encode())
+        media.append(
+            {
+                "content_index": len(media) + 1,
+                "media_type": "image_url",
+                "prompt_index": f"图片{len(media) + 1}",
+                "role": "reference_image",
+                "responsibility": responsibility,
+                "path": name,
+                "sha256": _sha(path),
+            }
+        )
     prompt = "图片1锁定身份；图片2锁定开场；图片3负责动作。"
     (run / "prompt.txt").write_text(prompt + "\n", encoding="utf-8")
     samples = []
     for index, family in enumerate(("ready", "evade"), 1):
-        samples.append({"sample_id": f"G{index:02d}", "action_group_id": f"S01_P01_A{index:02d}", "pose_contract": {"pose_family": family, "direction": "right", "actor_roles": ["actor_01"], "object_roles": ["prop"] if index == 2 else [], "camera_vector": {"x": 1, "y": 0}}})
-    plan = {"shots": [{"chunks": [{"storyboard_beat_id": "S01_P01", "target_duration_s": 7, "storyboard_pose_atlas_pose_samples": samples, "storyboard_pose_atlas_action_groups": [{"action_group_id": f"S01_P01_A{index:02d}", "order": index, "lineage": {"source_action_unit_ids": [f"AU{index:03d}"]}} for index in (1, 2)]}]}]}
+        samples.append(
+            {
+                "sample_id": f"G{index:02d}",
+                "action_group_id": f"S01_P01_A{index:02d}",
+                "pose_contract": {
+                    "pose_family": family,
+                    "direction": "right",
+                    "actor_roles": ["actor_01"],
+                    "object_roles": ["prop"] if index == 2 else [],
+                    "camera_vector": {"x": 1, "y": 0},
+                },
+            }
+        )
+    plan = {
+        "shots": [
+            {
+                "chunks": [
+                    {
+                        "storyboard_beat_id": "S01_P01",
+                        "target_duration_s": 7,
+                        "storyboard_pose_atlas_pose_samples": samples,
+                        "storyboard_pose_atlas_action_groups": [
+                            {
+                                "action_group_id": f"S01_P01_A{index:02d}",
+                                "order": index,
+                                "lineage": {"source_action_unit_ids": [f"AU{index:03d}"]},
+                            }
+                            for index in (1, 2)
+                        ],
+                    }
+                ]
+            }
+        ]
+    }
     (run / "CONTINUITY_PLAN.json").write_text(json.dumps(plan), encoding="utf-8")
     receipt = {
         "schema": gate.SOURCE_RECEIPT_SCHEMA,
-        "preflight": {"beat_id": "S01_P01", "duration": 7, "ratio": "16:9", "resolution": "480p", "prompt_path": "prompt.txt", "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(), "media_index_manifest": media, "synthetic_identity": {"canonical_visual_contract_sha256": canonical["contract_sha256"]}},
+        "preflight": {
+            "beat_id": "S01_P01",
+            "duration": 7,
+            "ratio": "16:9",
+            "resolution": "480p",
+            "prompt_path": "prompt.txt",
+            "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+            "media_index_manifest": media,
+            "synthetic_identity": {
+                "canonical_visual_contract_sha256": canonical["contract_sha256"]
+            },
+        },
         "task_payload": {
             "model": "doubao-seedance-2.0-fast",
             "duration": 7,
@@ -290,25 +551,42 @@ def _fixture_run(tmp_path: Path) -> tuple[Path, Path]:
     return run, receipt_path
 
 
-def test_no_submit_projection_is_single_variable_seedance_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_no_submit_projection_is_single_variable_seedance_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     run, receipt = _fixture_run(tmp_path)
     monkeypatch.setattr(gate, "SEEDANCE_MODEL", "doubao-seedance-2.0-fast")
     result = gate.prepare_gate(run, tmp_path / "gate", source_receipt_path=receipt)
     assert result["status"] == "pending_live_acceptance"
     assert result["provider_request_count"] == result["tos_put_count"] == 0
-    assert result["budgets"] == {"tos_put_ceiling": 3, "video_submission_ceiling": 1, "automatic_retry_ceiling": 0, "alternate_provider_submission_ceiling": 0}
+    assert result["budgets"] == {
+        "tos_put_ceiling": 3,
+        "video_submission_ceiling": 1,
+        "automatic_retry_ceiling": 0,
+        "alternate_provider_submission_ceiling": 0,
+    }
     projected = result["request_projection"]["generation"]
     assert projected["model"] == "doubao-seedance-2.0-fast"
     assert projected["duration"] == 4
     assert result["request_projection"]["equivalence"]["source_duration"] == 7
     assert result["request_projection"]["equivalence"]["control_duration"] == 4
     assert result["request_projection"]["equivalence"]["candidate_duration"] == 4
-    assert [item["responsibility"] for item in projected["media"]] == ["character_identity_board", "cinematic_composition", "motion_blueprint"]
+    assert [item["responsibility"] for item in projected["media"]] == [
+        "character_identity_board",
+        "cinematic_composition",
+        "motion_blueprint",
+    ]
     assert projected["media"][-1]["media_type"] == "video_url"
     assert projected["media"][-1]["prompt_index"] == "视频1"
-    assert "视频1仅负责当前Pxx的动作时序" in (tmp_path / "gate" / "seedance_prompt.txt").read_text()
-    assert "0.15秒内结束准备" in (tmp_path / "gate" / "seedance_prompt.txt").read_text()
+    prompt = (tmp_path / "gate" / "seedance_prompt.txt").read_text()
+    assert "[honcut.motion-blueprint-reference.v3]" in prompt
+    assert "视频1仅负责当前Pxx的动作时序" in prompt
+    for tuning_phrase in ("0.15秒", "爆发峰值", "预备反向", "越位与回收", "慢速匀速漂移"):
+        assert tuning_phrase not in prompt
     assert "图片3负责动作" not in (tmp_path / "gate" / "seedance_prompt.txt").read_text()
+    assert projected["motion_blueprint_schema"] == "honcut.seedance-motion-blueprint.v3"
+    assert len(projected["motion_technique_registry_sha256"]) == 64
+    assert projected["motion_techniques"][1]["technique_id"] == "lateral_slip_v1"
 
 
 @pytest.mark.parametrize("model", ["wan2.2", "kling-v2", "doubao-seedance-1.5-pro"])
@@ -326,7 +604,8 @@ def test_changed_identity_or_duration_breaks_equivalence(tmp_path: Path) -> None
     with pytest.raises(gate.GateEvidenceError, match="frozen model/output profile"):
         gate._project_request(run, receipt, blueprint)
     receipt["preflight"]["duration"] = 7
-    identity = run / "identity.png"; identity.write_bytes(b"changed")
+    identity = run / "identity.png"
+    identity.write_bytes(b"changed")
     with pytest.raises(gate.GateEvidenceError, match="sha256 mismatch"):
         gate._project_request(run, receipt, blueprint)
 
@@ -337,7 +616,9 @@ def test_submit_requires_authorization_and_passing_regression(tmp_path: Path) ->
     with pytest.raises(gate.GateEvidenceError, match="fee authorization"):
         gate.submit_gate(tmp_path / "gate", fee_authorization="")
     with pytest.raises(gate.GateEvidenceError, match="passing bound regression"):
-        gate.submit_gate(tmp_path / "gate", fee_authorization="authorized-seedance-motion-blueprint-once")
+        gate.submit_gate(
+            tmp_path / "gate", fee_authorization="authorized-seedance-motion-blueprint-once"
+        )
 
 
 def test_provider_success_alone_cannot_pass_capability(tmp_path: Path) -> None:
@@ -353,8 +634,13 @@ def test_provider_success_alone_cannot_pass_capability(tmp_path: Path) -> None:
         "output_sha256": manifest["media_sha256"],
     }
     gate._write_object(tmp_path / "gate" / "seedance_motion_blueprint_gate.json", receipt)
-    assert gate._read_object(tmp_path / "gate" / "seedance_motion_blueprint_gate.json")["status"] != "capability_gate_passed"
-    finalized = gate.record_human_verdict(tmp_path / "gate", verdict="pass", notes="ordered motion observed")
+    assert (
+        gate._read_object(tmp_path / "gate" / "seedance_motion_blueprint_gate.json")["status"]
+        != "capability_gate_passed"
+    )
+    finalized = gate.record_human_verdict(
+        tmp_path / "gate", verdict="pass", notes="ordered motion observed"
+    )
     assert finalized["status"] == "capability_gate_passed"
     assert finalized["business_motion_verdict"]["production_activation_authorized"] is False
 
@@ -363,21 +649,42 @@ def test_conclusive_human_failure_pauses_route_without_retry(tmp_path: Path) -> 
     contract = _contract("locomotion", "strike")
     output = tmp_path / "gate" / "seedance_output.mp4"
     manifest = compile_motion_blueprint(contract, output)
-    gate._write_object(tmp_path / "gate" / "seedance_motion_blueprint_gate.json", {"schema": gate.RECEIPT_SCHEMA, "status": "pending_human_verdict", "submitted": True, "call_chain_verdict": "passed", "output_path": str(output), "output_sha256": manifest["media_sha256"]})
-    finalized = gate.record_human_verdict(tmp_path / "gate", verdict="fail", notes="motion did not transfer")
+    gate._write_object(
+        tmp_path / "gate" / "seedance_motion_blueprint_gate.json",
+        {
+            "schema": gate.RECEIPT_SCHEMA,
+            "status": "pending_human_verdict",
+            "submitted": True,
+            "call_chain_verdict": "passed",
+            "output_path": str(output),
+            "output_sha256": manifest["media_sha256"],
+        },
+    )
+    finalized = gate.record_human_verdict(
+        tmp_path / "gate", verdict="fail", notes="motion did not transfer"
+    )
     assert finalized["status"] == "capability_route_paused"
     assert all(value is False for value in finalized["enforcement"].values())
 
 
-def test_ten_no_submit_resumes_are_hash_stable_and_never_upload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ten_no_submit_resumes_are_hash_stable_and_never_upload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     run, receipt = _fixture_run(tmp_path)
-    monkeypatch.setattr(gate, "upload_media_file_required", lambda *_a, **_k: pytest.fail("upload attempted"))
+    monkeypatch.setattr(
+        gate, "upload_media_file_required", lambda *_a, **_k: pytest.fail("upload attempted")
+    )
     hashes = []
     results = []
     for _ in range(10):
         result = gate.prepare_gate(run, tmp_path / "gate", source_receipt_path=receipt)
         results.append(result)
-        hashes.append((result["blueprint"]["media_sha256"], result["request_projection"]["generation"]["task_fingerprint"]))
+        hashes.append(
+            (
+                result["blueprint"]["media_sha256"],
+                result["request_projection"]["generation"]["task_fingerprint"],
+            )
+        )
     assert len(set(hashes)) == 1
     assert results[-1]["provider_request_count"] == 0
 
@@ -393,10 +700,16 @@ def test_optional_submit_uses_existing_task_ledger_and_blocks_duplicate(
     receipt = gate._read_object(receipt_file)
     receipt["regression"] = {"status": "passed"}
     gate._write_object(receipt_file, receipt)
-    monkeypatch.setattr(gate, "upload_media_file_required", lambda *_a, **_k: "https://invalid.local/signed")
+    monkeypatch.setattr(
+        gate, "upload_media_file_required", lambda *_a, **_k: "https://invalid.local/signed"
+    )
     monkeypatch.setattr(gate, "get_api_key", lambda *_a, **_k: "test-key")
-    monkeypatch.setattr(gate.seedance_client, "_validate_content_media_roles", lambda *_a, **_k: None)
-    monkeypatch.setattr(gate.seedance_client, "poll", lambda *_a, **_k: "https://download.invalid/video.mp4")
+    monkeypatch.setattr(
+        gate.seedance_client, "_validate_content_media_roles", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        gate.seedance_client, "poll", lambda *_a, **_k: "https://download.invalid/video.mp4"
+    )
 
     def fake_download(_url: str, destination: str) -> str:
         shutil.copy2(output_dir / "motion_blueprint.mp4", destination)
@@ -411,9 +724,13 @@ def test_optional_submit_uses_existing_task_ledger_and_blocks_duplicate(
         @staticmethod
         def json() -> dict[str, str]:
             events = gate.GenerationTaskStore(output_dir / "runtime.db")
-            rows = events._connect().execute(  # noqa: SLF001 - verifies durable boundary
-                "SELECT event_type FROM generation_task_events ORDER BY event_sequence"
-            ).fetchall()
+            rows = (
+                events._connect()
+                .execute(  # noqa: SLF001 - verifies durable boundary
+                    "SELECT event_type FROM generation_task_events ORDER BY event_sequence"
+                )
+                .fetchall()
+            )
             assert [row["event_type"] for row in rows][-1] == "SubmissionAttempted"
             return {"id": "seedance-job-1"}
 
@@ -451,6 +768,10 @@ def test_optional_submit_uses_existing_task_ledger_and_blocks_duplicate(
 
 def test_acceptance_module_is_not_imported_by_production_entrypoints() -> None:
     root = Path(__file__).parents[1] / "src"
-    forbidden = [root / "pipeline_runner.py", root / "runtime" / "pipeline_execution.py", root / "graph" / "workflow.py"]
+    forbidden = [
+        root / "pipeline_runner.py",
+        root / "runtime" / "pipeline_execution.py",
+        root / "graph" / "workflow.py",
+    ]
     for path in forbidden:
         assert "acceptance.motion_blueprint" not in path.read_text(encoding="utf-8")

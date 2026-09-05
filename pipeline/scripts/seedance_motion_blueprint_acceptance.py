@@ -34,6 +34,7 @@ from acceptance.motion_blueprint import (  # noqa: E402
     inspect_identity_neutral_pixels,
     measure_output_motion,
     sha256_file,
+    technique_supports_contact,
 )
 from clients import seedance_client  # noqa: E402
 from clients.tos_uploader import upload_media_file_required  # noqa: E402
@@ -45,7 +46,7 @@ from utils.config import SEEDANCE_MODEL, get_api_key  # noqa: E402
 from utils.prompt_budget import enforce_prompt_budget  # noqa: E402
 from utils.video_validation import is_valid_video  # noqa: E402
 
-RECEIPT_SCHEMA = "honcut.seedance-motion-blueprint-gate.v2"
+RECEIPT_SCHEMA = "honcut.seedance-motion-blueprint-gate.v3"
 SOURCE_RECEIPT_SCHEMA = "honcut.phase6-storyboard-pose-atlas-live-acceptance.v1"
 REGRESSION_SCHEMA = "honcut.seedance-motion-blueprint-regression.v1"
 MAX_VIDEO_SUBMISSIONS = 1
@@ -86,7 +87,9 @@ class GateEvidenceError(RuntimeError):
 
 
 def _canonical_json(value: Any) -> bytes:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
 
 
 def _hash(value: Any) -> str:
@@ -106,7 +109,9 @@ def _read_object(path: Path) -> dict[str, Any]:
 def _write_object(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     temporary.replace(path)
 
 
@@ -133,8 +138,16 @@ def _validate_hash(path: Path, expected: object, *, label: str) -> str:
 
 
 def _source_identity() -> dict[str, Any]:
-    commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, capture_output=True, text=True, check=True).stdout.strip()
-    dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=REPO_ROOT, capture_output=True, text=True, check=True).stdout.strip()
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=no"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
     return {"git_commit": commit, "tracked_worktree_clean": not bool(dirty)}
 
 
@@ -156,7 +169,9 @@ def _camera_from_samples(samples: list[dict[str, Any]]) -> CameraTrack:
     return CameraTrack(primitive=primitive, magnitude=0.35 if primitive != "static" else 0.0)
 
 
-def _build_contract(source_run: Path, source_receipt_path: Path) -> tuple[MotionBlueprintInput, dict[str, Any], dict[str, Any]]:
+def _build_contract(
+    source_run: Path, source_receipt_path: Path
+) -> tuple[MotionBlueprintInput, dict[str, Any], dict[str, Any]]:
     receipt = _read_object(source_receipt_path)
     if receipt.get("schema") != SOURCE_RECEIPT_SCHEMA:
         raise GateEvidenceError("unsupported source live-receipt schema")
@@ -164,14 +179,23 @@ def _build_contract(source_run: Path, source_receipt_path: Path) -> tuple[Motion
     beat_id = str(preflight.get("beat_id") or "")
     if not beat_id:
         raise GateEvidenceError("source receipt lacks canonical beat id")
-    canonical_path = _contained_file(source_run, "CANONICAL_VISUAL_CONTRACT.json", label="canonical visual contract")
+    canonical_path = _contained_file(
+        source_run, "CANONICAL_VISUAL_CONTRACT.json", label="canonical visual contract"
+    )
     canonical = validate_canonical_visual_contract(_read_object(canonical_path))
-    receipt_contract_hash = ((preflight.get("synthetic_identity") or {}).get("canonical_visual_contract_sha256"))
+    receipt_contract_hash = (preflight.get("synthetic_identity") or {}).get(
+        "canonical_visual_contract_sha256"
+    )
     if receipt_contract_hash and canonical["contract_sha256"] != receipt_contract_hash:
         raise GateEvidenceError("source receipt canonical contract hash mismatch")
     plan_path = _contained_file(source_run, "CONTINUITY_PLAN.json", label="continuity plan")
     plan = _read_object(plan_path)
-    chunks = [chunk for shot in plan.get("shots") or [] for chunk in shot.get("chunks") or [] if chunk.get("storyboard_beat_id") == beat_id]
+    chunks = [
+        chunk
+        for shot in plan.get("shots") or []
+        for chunk in shot.get("chunks") or []
+        if chunk.get("storyboard_beat_id") == beat_id
+    ]
     if len(chunks) != 1:
         raise GateEvidenceError("source beat does not resolve uniquely in continuity plan")
     chunk = chunks[0]
@@ -179,23 +203,41 @@ def _build_contract(source_run: Path, source_receipt_path: Path) -> tuple[Motion
     groups = chunk.get("storyboard_pose_atlas_action_groups") or []
     if not samples or not groups:
         raise GateEvidenceError("source beat lacks canonical action groups or pose evidence")
-    actors = sorted({str(actor) for sample in samples for actor in ((sample.get("pose_contract") or {}).get("actor_roles") or []) if str(actor)})
+    actors = sorted(
+        {
+            str(actor)
+            for sample in samples
+            for actor in ((sample.get("pose_contract") or {}).get("actor_roles") or [])
+            if str(actor)
+        }
+    )
     events: list[MotionEvent] = []
-    for order, group in enumerate(sorted(groups, key=lambda item: int(item.get("order") or 0)), start=1):
+    for order, group in enumerate(
+        sorted(groups, key=lambda item: int(item.get("order") or 0)), start=1
+    ):
         group_id = str(group.get("action_group_id") or "")
         group_samples = [sample for sample in samples if sample.get("action_group_id") == group_id]
         if not group_samples:
             raise GateEvidenceError(f"action group {group_id} lacks pose classification evidence")
         contract = group_samples[-1].get("pose_contract") or {}
         lineage = group.get("lineage") or {}
-        events.append(MotionEvent(
-            event_id=f"{beat_id}_M{order:02d}", order=order, actor_ids=tuple(actors),
-            primitive=_primitive_for_family(str(contract.get("pose_family") or "")),
-            direction=str(contract.get("direction") or "right"),
-            source_action_group_id=group_id,
-            source_action_unit_ids=tuple(str(value) for value in lineage.get("source_action_unit_ids") or []),
-            prop_contact=bool(contract.get("object_roles")),
-        ))
+        events.append(
+            MotionEvent(
+                event_id=f"{beat_id}_M{order:02d}",
+                order=order,
+                actor_ids=tuple(actors),
+                primitive=_primitive_for_family(str(contract.get("pose_family") or "")),
+                direction=str(contract.get("direction") or "right"),
+                source_action_group_id=group_id,
+                source_action_unit_ids=tuple(
+                    str(value) for value in lineage.get("source_action_unit_ids") or []
+                ),
+                prop_contact=bool(contract.get("object_roles"))
+                and technique_supports_contact(
+                    _primitive_for_family(str(contract.get("pose_family") or ""))
+                ),
+            )
+        )
     lineage = SourceLineage(
         canonical_visual_contract_path=str(canonical_path.relative_to(source_run)),
         canonical_visual_contract_sha256=sha256_file(canonical_path),
@@ -205,8 +247,12 @@ def _build_contract(source_run: Path, source_receipt_path: Path) -> tuple[Motion
         source_receipt_sha256=sha256_file(source_receipt_path),
     )
     contract = MotionBlueprintInput(
-        beat_id=beat_id, duration_s=4.0,
-        actor_ids=tuple(actors), events=tuple(events), camera=_camera_from_samples(samples), lineage=lineage,
+        beat_id=beat_id,
+        duration_s=4.0,
+        actor_ids=tuple(actors),
+        events=tuple(events),
+        camera=_camera_from_samples(samples),
+        lineage=lineage,
     )
     return contract, receipt, chunk
 
@@ -225,17 +271,20 @@ def _verified_source_media(source_run: Path, receipt: dict[str, Any]) -> list[di
     return verified
 
 
-def _project_request(source_run: Path, receipt: dict[str, Any], blueprint: dict[str, Any]) -> dict[str, Any]:
+def _project_request(
+    source_run: Path, receipt: dict[str, Any], blueprint: dict[str, Any]
+) -> dict[str, Any]:
     preflight = receipt.get("preflight") or {}
     source_task = receipt.get("task_payload") or {}
     if not source_task:
         raise GateEvidenceError("source receipt lacks a persisted production Phase 6 task")
     if source_task:
-        if source_task.get("phase6_prompt_projection_schema") != "honcut.phase6-prompt-projection.v1":
-            raise GateEvidenceError("source request lacks the supported Phase 6 prompt projection")
-        if source_task.get("media_index_manifest") != preflight.get(
-            "media_index_manifest"
+        if (
+            source_task.get("phase6_prompt_projection_schema")
+            != "honcut.phase6-prompt-projection.v1"
         ):
+            raise GateEvidenceError("source request lacks the supported Phase 6 prompt projection")
+        if source_task.get("media_index_manifest") != preflight.get("media_index_manifest"):
             raise GateEvidenceError("source Phase 6 media projection changed after persistence")
         expected_source_fields = {
             "model": source_task.get("model"),
@@ -256,7 +305,9 @@ def _project_request(source_run: Path, receipt: dict[str, Any], blueprint: dict[
     source_media = _verified_source_media(source_run, receipt)
     atlas = [item for item in source_media if item.get("responsibility") == "storyboard_pose_atlas"]
     if len(atlas) != 1:
-        raise GateEvidenceError("single-variable gate requires exactly one failed pose-atlas control")
+        raise GateEvidenceError(
+            "single-variable gate requires exactly one failed pose-atlas control"
+        )
     prompt_path = _contained_file(source_run, preflight.get("prompt_path"), label="source prompt")
     prompt = prompt_path.read_text(encoding="utf-8").strip()
     expected_prompt_hash = preflight.get("prompt_sha256")
@@ -267,54 +318,122 @@ def _project_request(source_run: Path, receipt: dict[str, Any], blueprint: dict[
     videos = [item for item in kept if item.get("media_type") == "video_url"]
     if len(images) > MAX_REFERENCE_IMAGES or len(videos) + 1 > MAX_REFERENCE_VIDEOS:
         raise GateEvidenceError("projected Seedance reference-media budget exceeded")
-    total_reference_bytes = sum(Path(item["absolute_path"]).stat().st_size for item in kept) + int(blueprint["media_size_bytes"])
+    total_reference_bytes = sum(Path(item["absolute_path"]).stat().st_size for item in kept) + int(
+        blueprint["media_size_bytes"]
+    )
     if total_reference_bytes > MAX_TOTAL_REFERENCE_BYTES:
         raise GateEvidenceError("projected Seedance request exceeds the 64 MB media ceiling")
     old_index = str(atlas[0].get("prompt_index") or "")
     new_index = f"视频{len(videos) + 1}"
     prompt = prompt.replace(old_index, new_index)
     prompt += (
-        "\n[honcut.motion-blueprint-reference.v2] "
+        "\n[honcut.motion-blueprint-reference.v3] "
         f"{new_index}仅负责当前Pxx的动作时序、身体运动学、接触时点与运镜轨迹；"
-        "其中中性骨架和道具线条不具有角色身份、服装、脸、发型、材质或成片像素权威。"
-        "本次四秒能力门在0.15秒内结束准备并立即执行完整有序动作；动作须包含预备反向、爆发峰值、"
-        "越位与回收，不得慢速匀速漂移，不得把蓝图画面、骨架、控制标记或背景复制进成片。"
+        "其中中性骨架和道具线条不具有角色身份、服装、脸、发型、材质或成片像素权威；"
+        "不得把蓝图画面、骨架、控制标记或背景复制进成片。"
     )
-    enforce_prompt_budget(prompt, provider="seedance", model=SEEDANCE_MODEL, purpose="video_generation")
+    enforce_prompt_budget(
+        prompt, provider="seedance", model=SEEDANCE_MODEL, purpose="video_generation"
+    )
     media = []
     image_index = video_index = 0
     for item in kept:
-        if item.get("media_type") == "image_url": image_index += 1; index = f"图片{image_index}"
-        else: video_index += 1; index = f"视频{video_index}"
-        media.append({"media_type": item.get("media_type"), "role": item.get("role"), "responsibility": item.get("responsibility"), "prompt_index": index, "path": item.get("path"), "absolute_path": item["absolute_path"], "sha256": item.get("sha256")})
+        if item.get("media_type") == "image_url":
+            image_index += 1
+            index = f"图片{image_index}"
+        else:
+            video_index += 1
+            index = f"视频{video_index}"
+        media.append(
+            {
+                "media_type": item.get("media_type"),
+                "role": item.get("role"),
+                "responsibility": item.get("responsibility"),
+                "prompt_index": index,
+                "path": item.get("path"),
+                "absolute_path": item["absolute_path"],
+                "sha256": item.get("sha256"),
+            }
+        )
     video_index += 1
-    media.append({"media_type": "video_url", "role": "reference_video", "responsibility": "motion_blueprint", "prompt_index": f"视频{video_index}", "path": "motion_blueprint.mp4", "absolute_path": blueprint["media_path"], "sha256": blueprint["media_sha256"]})
+    media.append(
+        {
+            "media_type": "video_url",
+            "role": "reference_video",
+            "responsibility": "motion_blueprint",
+            "prompt_index": f"视频{video_index}",
+            "path": "motion_blueprint.mp4",
+            "absolute_path": blueprint["media_path"],
+            "sha256": blueprint["media_sha256"],
+        }
+    )
     if new_index != f"视频{video_index}":
         raise GateEvidenceError("projected prompt/video index mismatch")
     generation = {
-        "model": SEEDANCE_MODEL, "duration": int(round(float(blueprint["measurements"]["duration_s"]))),
-        "ratio": preflight.get("ratio"), "resolution": preflight.get("resolution"), "return_last_frame": True,
+        "model": SEEDANCE_MODEL,
+        "duration": int(round(float(blueprint["measurements"]["duration_s"]))),
+        "ratio": preflight.get("ratio"),
+        "resolution": preflight.get("resolution"),
+        "return_last_frame": True,
         "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
         "production_projection_schema": source_task.get(
             "phase6_prompt_projection_schema",
             "honcut.phase6-prompt-projection.v1",
         ),
         "source_generation_fingerprint": source_task.get("generation_fingerprint"),
-        "source_prompt_projection_sha256": source_task.get(
-            "phase6_prompt_projection_sha256"
-        ),
-        "media": [{key: item[key] for key in ("media_type", "role", "responsibility", "prompt_index", "path", "sha256")} for item in media],
+        "source_prompt_projection_sha256": source_task.get("phase6_prompt_projection_sha256"),
+        "motion_blueprint_schema": blueprint["schema"],
+        "motion_technique_registry_sha256": blueprint["technique_registry_sha256"],
+        "motion_semantic_frames_sha256": blueprint["semantic_frames_sha256"],
+        "motion_techniques": [
+            {
+                key: event[key]
+                for key in (
+                    "event_id",
+                    "technique_id",
+                    "technique_phase_ids",
+                    "technique_contact_phase_ids",
+                    "technique_keyframes_sha256",
+                )
+            }
+            for event in blueprint["measurements"]["events"]
+        ],
+        "media": [
+            {
+                key: item[key]
+                for key in (
+                    "media_type",
+                    "role",
+                    "responsibility",
+                    "prompt_index",
+                    "path",
+                    "sha256",
+                )
+            }
+            for item in media
+        ],
     }
     generation["task_fingerprint"] = _hash(generation)
     equivalence = {
-        "identity_media_sha256": [item["sha256"] for item in media if item["responsibility"] == "character_identity_board"],
-        "start_frame_sha256": [item["sha256"] for item in media if item["responsibility"] == "cinematic_composition"],
+        "identity_media_sha256": [
+            item["sha256"] for item in media if item["responsibility"] == "character_identity_board"
+        ],
+        "start_frame_sha256": [
+            item["sha256"] for item in media if item["responsibility"] == "cinematic_composition"
+        ],
         "source_duration": int(round(float(preflight.get("duration") or 0))),
         "control_duration": generation["duration"],
         "candidate_duration": generation["duration"],
-        "ratio": generation["ratio"], "resolution": generation["resolution"],
-        "removed_control": {"responsibility": "storyboard_pose_atlas", "sha256": atlas[0]["sha256"]},
-        "added_control": {"responsibility": "motion_blueprint", "sha256": blueprint["media_sha256"]},
+        "ratio": generation["ratio"],
+        "resolution": generation["resolution"],
+        "removed_control": {
+            "responsibility": "storyboard_pose_atlas",
+            "sha256": atlas[0]["sha256"],
+        },
+        "added_control": {
+            "responsibility": "motion_blueprint",
+            "sha256": blueprint["media_sha256"],
+        },
         "source_task_input_fingerprint": source_task.get("input_fingerprint"),
     }
     return {
@@ -357,75 +476,162 @@ def prepare_gate(
     regression_receipt: Path | None = None,
     legacy_manifest_path: Path | None = None,
 ) -> dict[str, Any]:
-    source_run = source_run.resolve(); output_dir = output_dir.resolve(); output_dir.mkdir(parents=True, exist_ok=True)
-    source_receipt_path = (source_receipt_path or source_run / "phase6_storyboard_pose_atlas_live_acceptance.json").resolve()
-    try: source_receipt_path.relative_to(source_run)
-    except ValueError as error: raise GateEvidenceError("source receipt must remain inside source run") from error
+    source_run = source_run.resolve()
+    output_dir = output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    source_receipt_path = (
+        source_receipt_path or source_run / "phase6_storyboard_pose_atlas_live_acceptance.json"
+    ).resolve()
+    try:
+        source_receipt_path.relative_to(source_run)
+    except ValueError as error:
+        raise GateEvidenceError("source receipt must remain inside source run") from error
     _assert_seedance_only(SEEDANCE_MODEL)
     contract, source_receipt, _chunk = _build_contract(source_run, source_receipt_path)
     contract_path = output_dir / "motion_blueprint_contract.json"
     _write_object(contract_path, contract.model_dump(mode="json"))
     blueprint = compile_motion_blueprint(contract, output_dir / "motion_blueprint.mp4")
     blueprint["pixel_guard"] = inspect_identity_neutral_pixels(Path(blueprint["media_path"]))
-    manifest_path = output_dir / "motion_blueprint_manifest.json"; _write_object(manifest_path, blueprint)
+    manifest_path = output_dir / "motion_blueprint_manifest.json"
+    _write_object(manifest_path, blueprint)
     projection = _project_request(source_run, source_receipt, blueprint)
-    prompt_path = output_dir / "seedance_prompt.txt"; prompt_path.write_text(projection["prompt"] + "\n", encoding="utf-8")
-    source = _source_identity(); regression = _validate_regression(regression_receipt, source["git_commit"])
+    prompt_path = output_dir / "seedance_prompt.txt"
+    prompt_path.write_text(projection["prompt"] + "\n", encoding="utf-8")
+    source = _source_identity()
+    regression = _validate_regression(regression_receipt, source["git_commit"])
     legacy_assessment = (
         assess_legacy_blueprint_manifest(legacy_manifest_path)
         if legacy_manifest_path is not None
         else None
     )
     receipt = {
-        "schema": RECEIPT_SCHEMA, "status": "pending_live_acceptance", "submitted": False,
-        "provider": "seedance", "model": SEEDANCE_MODEL, "evidence_scope": "single_actor_choreography_only",
-        "source": {**source, "run_dir": str(source_run), "receipt_path": str(source_receipt_path), "receipt_sha256": sha256_file(source_receipt_path)},
-        "blueprint": {**blueprint, "contract_path": str(contract_path), "manifest_path": str(manifest_path)},
-        "request_projection": {"generation": projection["generation"], "equivalence": projection["equivalence"], "capabilities": projection["capabilities"], "prompt_path": str(prompt_path), "prompt_sha256": projection["generation"]["prompt_sha256"]},
-        "budgets": {"tos_put_ceiling": len(projection["media_runtime"]), "video_submission_ceiling": 1, "automatic_retry_ceiling": 0, "alternate_provider_submission_ceiling": 0},
+        "schema": RECEIPT_SCHEMA,
+        "status": "pending_live_acceptance",
+        "submitted": False,
+        "provider": "seedance",
+        "model": SEEDANCE_MODEL,
+        "evidence_scope": "single_actor_choreography_only",
+        "source": {
+            **source,
+            "run_dir": str(source_run),
+            "receipt_path": str(source_receipt_path),
+            "receipt_sha256": sha256_file(source_receipt_path),
+        },
+        "blueprint": {
+            **blueprint,
+            "contract_path": str(contract_path),
+            "manifest_path": str(manifest_path),
+        },
+        "request_projection": {
+            "generation": projection["generation"],
+            "equivalence": projection["equivalence"],
+            "capabilities": projection["capabilities"],
+            "prompt_path": str(prompt_path),
+            "prompt_sha256": projection["generation"]["prompt_sha256"],
+        },
+        "budgets": {
+            "tos_put_ceiling": len(projection["media_runtime"]),
+            "video_submission_ceiling": 1,
+            "automatic_retry_ceiling": 0,
+            "alternate_provider_submission_ceiling": 0,
+        },
         "regression": regression,
-        "call_chain_verdict": "pending", "business_motion_verdict": {"status": "pending_human_verdict"},
-        "provider_request_count": 0, "tos_put_count": 0,
+        "call_chain_verdict": "pending",
+        "business_motion_verdict": {"status": "pending_human_verdict"},
+        "provider_request_count": 0,
+        "tos_put_count": 0,
     }
     if legacy_assessment is not None:
         receipt["legacy_blueprint_assessment"] = legacy_assessment
-    receipt["preflight_fingerprint"] = _hash({key: value for key, value in receipt.items() if key not in {"preflight_fingerprint"}})
+    receipt["preflight_fingerprint"] = _hash(
+        {key: value for key, value in receipt.items() if key not in {"preflight_fingerprint"}}
+    )
     _write_object(output_dir / "seedance_motion_blueprint_gate.json", receipt)
-    _write_object(output_dir / "request_projection.runtime.json", {"prompt": projection["prompt"], "media": projection["media_runtime"], "generation": projection["generation"]})
+    _write_object(
+        output_dir / "request_projection.runtime.json",
+        {
+            "prompt": projection["prompt"],
+            "media": projection["media_runtime"],
+            "generation": projection["generation"],
+        },
+    )
     return receipt
 
 
 def submit_gate(output_dir: Path, *, fee_authorization: str) -> dict[str, Any]:
     """Submit the already-frozen projection exactly once through existing owners."""
     if fee_authorization != "authorized-seedance-motion-blueprint-once":
-        raise GateEvidenceError("current explicit Seedance motion-blueprint fee authorization is required")
-    output_dir = output_dir.resolve(); receipt_path = output_dir / "seedance_motion_blueprint_gate.json"
-    receipt = _read_object(receipt_path); runtime = _read_object(output_dir / "request_projection.runtime.json")
-    if receipt.get("schema") != RECEIPT_SCHEMA or receipt.get("submitted") or receipt.get("provider_request_count"):
+        raise GateEvidenceError(
+            "current explicit Seedance motion-blueprint fee authorization is required"
+        )
+    output_dir = output_dir.resolve()
+    receipt_path = output_dir / "seedance_motion_blueprint_gate.json"
+    receipt = _read_object(receipt_path)
+    runtime = _read_object(output_dir / "request_projection.runtime.json")
+    if (
+        receipt.get("schema") != RECEIPT_SCHEMA
+        or receipt.get("submitted")
+        or receipt.get("provider_request_count")
+    ):
         raise GateEvidenceError("gate was already submitted or is not current")
     if (receipt.get("regression") or {}).get("status") != "passed":
         raise GateEvidenceError("live submission requires a passing bound regression receipt")
-    generation = runtime["generation"]; _assert_seedance_only(str(generation["model"]))
+    generation = runtime["generation"]
+    _assert_seedance_only(str(generation["model"]))
     content: list[dict[str, Any]] = [{"type": "text", "text": runtime["prompt"]}]
     for item in runtime["media"]:
-        url = upload_media_file_required(item["absolute_path"], prefix=f"honcut/motion-blueprint/{generation['task_fingerprint']}", label=item["responsibility"])
-        content.append({"type": item["media_type"], item["media_type"]: {"url": url}, "role": item["role"]})
+        url = upload_media_file_required(
+            item["absolute_path"],
+            prefix=f"honcut/motion-blueprint/{generation['task_fingerprint']}",
+            label=item["responsibility"],
+        )
+        content.append(
+            {"type": item["media_type"], item["media_type"]: {"url": url}, "role": item["role"]}
+        )
     payload = {**generation, "media": generation["media"]}
     store = GenerationTaskStore(output_dir / "runtime.db")
     api_key = get_api_key("ARK_AGENT")
-    receipt.update({"status": "submission_uncertain", "submitted": True}); _write_object(receipt_path, receipt)
+    receipt.update({"status": "submission_uncertain", "submitted": True})
+    _write_object(receipt_path, receipt)
     with provider_attempt_scope(max_retries=0), SingleSeedancePost() as transport:
         execution = execute_seedance_video_task(
-            store, run_id=f"{output_dir.name}:motion-blueprint-v2", resource_id=f"MOTION_{receipt['blueprint']['schema']}",
-            payload=payload, provider_endpoint=seedance_client.SUBMIT_ENDPOINT, output_path=output_dir / "seedance_output.mp4",
-            submit=lambda: seedance_client.submit_content(content, api_key=api_key, model=generation["model"], duration=generation["duration"], ratio=generation["ratio"], resolution=generation["resolution"], return_last_frame=True, timeout=30),
-            poll=lambda job_id: seedance_client.poll(job_id, api_key=api_key, max_attempts=80, interval=15),
-            download=seedance_client.download, validate_output=is_valid_video,
+            store,
+            run_id=f"{output_dir.name}:motion-blueprint-v3",
+            resource_id=f"MOTION_{receipt['blueprint']['schema']}",
+            payload=payload,
+            provider_endpoint=seedance_client.SUBMIT_ENDPOINT,
+            output_path=output_dir / "seedance_output.mp4",
+            submit=lambda: seedance_client.submit_content(
+                content,
+                api_key=api_key,
+                model=generation["model"],
+                duration=generation["duration"],
+                ratio=generation["ratio"],
+                resolution=generation["resolution"],
+                return_last_frame=True,
+                timeout=30,
+            ),
+            poll=lambda job_id: seedance_client.poll(
+                job_id, api_key=api_key, max_attempts=80, interval=15
+            ),
+            download=seedance_client.download,
+            validate_output=is_valid_video,
         )
     if transport.count != 1:
         raise GateEvidenceError("live gate did not perform exactly one Seedance POST")
-    receipt.update({"status": "pending_human_verdict", "provider_request_count": 1, "call_chain_verdict": "passed", "generation_task_id": execution.task_id, "provider_job_id": execution.provider_job_id, "output_path": execution.output_path, "output_sha256": sha256_file(Path(execution.output_path))})
-    _write_object(receipt_path, receipt); return receipt
+    receipt.update(
+        {
+            "status": "pending_human_verdict",
+            "provider_request_count": 1,
+            "call_chain_verdict": "passed",
+            "generation_task_id": execution.task_id,
+            "provider_job_id": execution.provider_job_id,
+            "output_path": execution.output_path,
+            "output_sha256": sha256_file(Path(execution.output_path)),
+        }
+    )
+    _write_object(receipt_path, receipt)
+    return receipt
 
 
 def record_human_verdict(

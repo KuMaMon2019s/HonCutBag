@@ -83,6 +83,18 @@ Policy v2 requires all of the following for every dynamic event: a perceptible o
 
 The encoded blueprint is decoded again before admission. The gate measures foreground occupancy, foreground-centroid travel, frame-difference activity, and a high-percentile transition magnitude. Semantic and rendered measurements must both pass. This prevents a normalized joint value, camera motion, or one moving wrist from passing a visually static blueprint.
 
+### 10. Make action technique a versioned code contract
+
+The v2 amplitude correction still applies the same normalized anticipation/peak/recovery curve to every dynamic primitive. Different endpoint poses produce larger motion, but they do not prove that an evade, kick, strike, block, grapple, throw, or locomotion sequence is being demonstrated as a recognizable technique.
+
+Policy v3 replaces that shared curve with a data-driven technique registry. Each dynamic primitive owns an ordered set of named key phases with normalized time, root translation, pose progression, joint-specific offsets, and optional contact state. The compiler interpolates between those immutable key phases and records the registry hash plus each event's ordered phase IDs and keyframe fingerprint. Generic thresholds remain a separate admission layer; they cannot stand in for technique correctness.
+
+The registry may only articulate the canonical primitive already selected by upstream evidence. It cannot create another action, actor, target, prop, contact relationship, or event order. Setup primitives remain bounded anchors and do not become dynamic techniques.
+
+### 11. Keep prompt text declarative
+
+Seedance prompt text will identify the reference video as the sole authority for current-Pxx motion timing, body kinematics, contact timing, and camera trajectory, while denying identity, costume, scene-pixel, or annotation authority. It will not prescribe numeric setup timing, explosive amplitude, anticipation, overshoot, recovery, or similar tuning language. Those facts belong to the v3 compiler, manifest, and pixels. This makes behavior reproducible from code and prevents conversational wording changes from acting as an undocumented control plane.
+
 ## Risks / Trade-offs
 
 - **[Seedance treats a neutral rig video as loose inspiration]** → The single request directly tests this; failure pauses the route rather than spawning prompt iterations.

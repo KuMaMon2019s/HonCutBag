@@ -51,3 +51,12 @@
 - [x] 7.3 Replace endpoint-only admission with semantic peak-speed, apex-timing, multi-major-joint, and perceptible-onset checks plus decoded foreground occupancy, centroid travel, transition-activity, and terminal-hold checks.
 - [x] 7.4 Add regression fixtures for slow endpoint drift, single-joint false positives, setup-heavy clips, insufficient actor occupancy, deterministic four-second encoding, and a visibly large single-action blueprint; run a ten-resume Provider-deny replay with stable hashes.
 - [x] 7.5 Complete Serena post-validation, target and full tests, lint, diff check, OpenSpec strict verification, Graphify refresh, and a fresh no-submit receipt bound to the corrected final commit; leave tasks 6.5 and 6.6 pending.
+
+## 8. Technique-specific choreography correction
+
+- [x] 8.1 Re-run Serena and Graphify preflight for the acceptance compiler, request projection, legacy audit path, and tests; confirm the change remains acceptance-only and does not alter production Graph, Phase owners, Provider policy, or `pipeline_core.py`.
+- [x] 8.2 Upgrade the blueprint, policy, renderer, and gate receipt contracts to v3 and add a deterministic technique registry hash plus per-event technique ID, ordered phase IDs, contact phases, and keyframe fingerprint.
+- [x] 8.3 Replace the shared dynamic phase curve with technique-specific key poses and interpolation for every supported dynamic primitive, keeping setup anchors separate and rejecting incomplete registry entries before rendering.
+- [x] 8.4 Add deterministic technique assertions and regression coverage proving distinct primitives have distinct temporal/geometric signatures, contact is phase-local, and representative evade/kick/block/strike biomechanics are visible in semantic frames and rendered pixels.
+- [x] 8.5 Remove choreography tuning language from the Seedance prompt projection, retain only media authority/non-authority instructions, and prove prompt wording cannot change the compiled blueprint contract or measurements.
+- [ ] 8.6 Preserve v1/v2 blueprints as audit-only, run ten Provider-deny resumes, target/full tests, lint, diff check, Serena validation, strict OpenSpec verification, Graphify incremental sync, and generate a fresh v3 no-submit receipt in a new isolated directory; leave paid/human tasks 6.5 and 6.6 pending.

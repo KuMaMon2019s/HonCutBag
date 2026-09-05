@@ -56,6 +56,26 @@ The initial capability gate SHALL compile and project exactly four seconds for o
 - **WHEN** the compiler would need to add a strike, kick, contact, actor, or target absent from canonical lineage to make the clip appear busier
 - **THEN** the gate rejects that mapping instead of inventing choreography
 
+### Requirement: Technique-specific code-owned choreography
+Every supported dynamic primitive SHALL be compiled from a versioned code registry containing an ordered, technique-specific sequence of key poses, root/weight transfer, optional contact window, follow-through, and terminal recovery. A single generic interpolation curve with only different endpoint poses MUST NOT satisfy this requirement. The manifest MUST record the technique identifier, ordered phase identifiers, contact phases, registry hash, and deterministic keyframe fingerprint for every dynamic event.
+
+#### Scenario: Distinct action techniques
+- **WHEN** two different supported primitives are compiled from otherwise equivalent actor and timing inputs
+- **THEN** their ordered phase identifiers and keyframe pose fingerprints differ, and each satisfies its own deterministic biomechanics assertions
+
+#### Scenario: Contact is phase-local
+- **WHEN** a canonical action declares prop or target contact
+- **THEN** contact is visible only in the technique's declared contact phase or phases rather than throughout the whole event
+
+#### Scenario: Prompt cannot substitute for choreography
+- **WHEN** the Seedance request is projected
+- **THEN** the prompt declares the blueprint's media responsibility and non-authority boundaries but contains no setup-duration, amplitude, peak, overshoot, or recovery tuning instruction
+- **AND** removing those tuning phrases does not change the compiled blueprint, technique registry hash, or semantic measurements
+
+#### Scenario: Legacy common-curve blueprint
+- **WHEN** a v1 or v2 blueprint lacks the current technique registry and per-event keyframe evidence
+- **THEN** it remains immutable audit-only evidence and cannot satisfy paid admission
+
 ### Requirement: Seedance media-contract preflight
 The gate MUST validate the blueprint against the current Seedance 2.0 reference-video limits and MUST freeze the exact model, duration, resolution, prompt hash, media order, media roles, source hashes, upload budget, submission budget, and task fingerprint before authorization can be consumed.
 
