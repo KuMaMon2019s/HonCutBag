@@ -19,9 +19,9 @@ from typing import Annotated, Any, Literal
 from PIL import Image, ImageDraw
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-BLUEPRINT_SCHEMA = "honcut.seedance-motion-blueprint.v3"
-POLICY_SCHEMA = "honcut.motion-blueprint-policy.v3"
-RENDERER_ID = "honcut.identity-neutral-motion-renderer.v3"
+BLUEPRINT_SCHEMA = "honcut.seedance-motion-blueprint.v5"
+POLICY_SCHEMA = "honcut.motion-blueprint-policy.v5"
+RENDERER_ID = "honcut.identity-neutral-motion-renderer.v5"
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
 
 
@@ -54,7 +54,7 @@ class MotionEvent(StrictModel):
     prop_contact: bool = False
 
     @model_validator(mode="after")
-    def validate_event(self) -> "MotionEvent":
+    def validate_event(self) -> MotionEvent:
         if not self.event_id.strip() or not self.source_action_group_id.strip():
             raise ValueError("motion event ids must be non-empty")
         if not self.actor_ids or any(not value.strip() for value in self.actor_ids):
@@ -72,7 +72,7 @@ class CameraTrack(StrictModel):
 
 
 class MotionBlueprintInput(StrictModel):
-    schema_id: Literal["honcut.seedance-motion-blueprint.v3"] = Field(
+    schema_id: Literal["honcut.seedance-motion-blueprint.v5"] = Field(
         default=BLUEPRINT_SCHEMA,
         alias="schema",
     )
@@ -87,7 +87,7 @@ class MotionBlueprintInput(StrictModel):
     lineage: SourceLineage
 
     @model_validator(mode="after")
-    def validate_contract(self) -> "MotionBlueprintInput":
+    def validate_contract(self) -> MotionBlueprintInput:
         if not self.beat_id.strip():
             raise ValueError("beat_id must be non-empty")
         if len(self.actor_ids) != 1:
@@ -106,13 +106,18 @@ class MotionBlueprintInput(StrictModel):
 
 
 class MotionPolicy(StrictModel):
-    schema_id: Literal["honcut.motion-blueprint-policy.v3"] = Field(
+    schema_id: Literal["honcut.motion-blueprint-policy.v5"] = Field(
         default=POLICY_SCHEMA,
         alias="schema",
     )
     action_onset_max_s: float = 0.5
     setup_anchor_max_s: float = 0.15
-    terminal_hold_max_fraction: float = 0.10
+    terminal_hold_max_fraction: float = 0.08
+    minimum_combination_actions: int = 3
+    minimum_distinct_combination_primitives: int = 2
+    minimum_combination_density_per_s: float = 0.75
+    maximum_dynamic_event_duration_s: float = 1.25
+    maximum_inter_action_gap_frames: int = 0
     minimum_root_displacement: float = 0.20
     minimum_joint_displacement: float = 0.25
     minimum_peak_root_speed: float = 0.60
@@ -131,10 +136,10 @@ class MotionPolicy(StrictModel):
 
 
 class MotionBlueprintManifest(StrictModel):
-    schema_id: Literal["honcut.seedance-motion-blueprint.v3"] = Field(alias="schema")
-    policy_schema: Literal["honcut.motion-blueprint-policy.v3"]
+    schema_id: Literal["honcut.seedance-motion-blueprint.v5"] = Field(alias="schema")
+    policy_schema: Literal["honcut.motion-blueprint-policy.v5"]
     policy_sha256: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    renderer_id: Literal["honcut.identity-neutral-motion-renderer.v3"]
+    renderer_id: Literal["honcut.identity-neutral-motion-renderer.v5"]
     technique_registry_sha256: Annotated[str, Field(pattern=SHA256_PATTERN)]
     identity_authority: Literal[False]
     authority_roles: tuple[
@@ -446,8 +451,8 @@ TECHNIQUE_REGISTRY: dict[str, dict[str, Any]] = {
             0.58,
             0.16,
             joint_offsets={
-                "right_knee": (0.02, -0.22),
-                "right_ankle": (-0.18, -0.14),
+                "right_knee": (0.02, -0.26),
+                "right_ankle": (-0.18, -0.18),
                 "left_wrist": (-0.10, -0.08),
             },
         ),
@@ -900,7 +905,7 @@ def sha256_file(path: Path) -> str:
 
 
 def assess_legacy_blueprint_manifest(path: Path) -> dict[str, Any]:
-    """Classify a v1/v2 manifest as audit-only without promoting or rewriting it."""
+    """Classify a v1-v4 manifest as audit-only without promoting or rewriting it."""
     manifest_path = path.resolve()
     try:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -914,9 +919,11 @@ def assess_legacy_blueprint_manifest(path: Path) -> dict[str, Any]:
     expected_policy = {
         "honcut.seedance-motion-blueprint.v1": "honcut.motion-blueprint-policy.v1",
         "honcut.seedance-motion-blueprint.v2": "honcut.motion-blueprint-policy.v2",
+        "honcut.seedance-motion-blueprint.v3": "honcut.motion-blueprint-policy.v3",
+        "honcut.seedance-motion-blueprint.v4": "honcut.motion-blueprint-policy.v4",
     }.get(source_schema)
     if expected_policy is None:
-        raise ValueError("legacy motion blueprint audit requires schema v1 or v2")
+        raise ValueError("legacy motion blueprint audit requires schema v1, v2, v3, or v4")
     if payload.get("policy_schema") != expected_policy:
         raise ValueError("legacy motion blueprint policy is not auditable")
     media_path = Path(str(payload.get("media_path") or "")).resolve()
@@ -962,6 +969,10 @@ def assess_legacy_blueprint_manifest(path: Path) -> dict[str, Any]:
             "legacy endpoint-only policy lacks v2 perceptual kinetics"
             if source_schema == "honcut.seedance-motion-blueprint.v1"
             else "legacy common-curve policy lacks v3 technique choreography"
+            if source_schema == "honcut.seedance-motion-blueprint.v2"
+            else "legacy single-action policy lacks v4 combination density"
+            if source_schema == "honcut.seedance-motion-blueprint.v3"
+            else "legacy two-action policy lacks v5 fast-combination cadence"
         ),
     }
 
@@ -977,6 +988,35 @@ def technique_registry_sha256() -> str:
 def technique_supports_contact(primitive: str) -> bool:
     technique = TECHNIQUE_REGISTRY.get(primitive)
     return bool(technique and any(phase["contact"] for phase in technique.get("phases") or ()))
+
+
+def combination_eligibility(
+    contract: MotionBlueprintInput,
+    policy: MotionPolicy = MOTION_POLICY,
+) -> dict[str, Any]:
+    """Classify canonical events without inventing or duplicating choreography."""
+    dynamic = [event for event in contract.events if event.primitive not in _SETUP_PRIMITIVES]
+    primitive_ids = [event.primitive for event in dynamic]
+    group_ids = [event.source_action_group_id for event in dynamic]
+    density = len(dynamic) / contract.duration_s
+    reasons: list[str] = []
+    if len(dynamic) < policy.minimum_combination_actions:
+        reasons.append("insufficient_dynamic_actions")
+    if len(set(primitive_ids)) < policy.minimum_distinct_combination_primitives:
+        reasons.append("insufficient_distinct_techniques")
+    if len(set(group_ids)) != len(group_ids):
+        reasons.append("duplicate_action_group_lineage")
+    if density < policy.minimum_combination_density_per_s:
+        reasons.append("insufficient_action_density")
+    return {
+        "eligible": not reasons,
+        "dynamic_action_count": len(dynamic),
+        "distinct_dynamic_primitive_count": len(set(primitive_ids)),
+        "dynamic_action_density_per_s": round(density, 6),
+        "ordered_dynamic_event_ids": [event.event_id for event in dynamic],
+        "ordered_source_action_group_ids": group_ids,
+        "reasons": reasons,
+    }
 
 
 def _validate_technique_registry() -> None:
@@ -1527,7 +1567,33 @@ def measure_semantic_frames(
             }
         )
     terminal_frames = len(frames) - 1 - intervals[-1]["end_frame"]
+    combination = combination_eligibility(contract, policy)
+    dynamic_durations = [
+        item["duration_s"]
+        for item in event_measurements
+        if item["admission_role"] == "dynamic_action"
+    ]
+    inter_action_gaps = [
+        current["start_frame"] - previous["end_frame"] - 1
+        for previous, current in itertools.pairwise(dynamic_intervals)
+    ]
+    maximum_dynamic_duration = max(dynamic_durations)
+    maximum_gap = max(inter_action_gaps, default=0)
+    combination.update(
+        {
+            "maximum_dynamic_event_duration_s": round(maximum_dynamic_duration, 6),
+            "inter_action_gap_frames": inter_action_gaps,
+            "maximum_inter_action_gap_frames": maximum_gap,
+            "tempo_pass": bool(
+                combination["eligible"]
+                and maximum_dynamic_duration <= policy.maximum_dynamic_event_duration_s
+                + (1 / contract.fps)
+                and maximum_gap <= policy.maximum_inter_action_gap_frames
+            ),
+        }
+    )
     result = {
+        "beat_id": contract.beat_id,
         "duration_s": contract.duration_s,
         "fps": contract.fps,
         "frame_count": len(frames),
@@ -1535,6 +1601,7 @@ def measure_semantic_frames(
         "terminal_hold_frames": terminal_frames,
         "terminal_hold_fraction": round(terminal_frames / len(frames), 6),
         "ordered_event_ids": [item["event_id"] for item in event_measurements],
+        "combination": combination,
         "events": event_measurements,
     }
     if result["action_onset_s"] > policy.action_onset_max_s:

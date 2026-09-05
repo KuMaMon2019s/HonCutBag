@@ -64,7 +64,7 @@ The same fingerprint may produce at most one paid Seedance 2.0 submission. A tec
 
 The first renderer allocated almost the entire nine-second duration to one smooth transition from `ready` to an `evade` endpoint. Its endpoint displacement passed, but the contact sheet and decoded video showed low perceived velocity and little full-body articulation. The original blueprint, manifest, regression receipt, and no-submit receipt remain immutable audit evidence. They cannot satisfy the revised paid-admission policy.
 
-The corrected single-action gate uses a four-second experiment window. This is an acceptance projection, not a rewrite of the source Pxx story clock. The equivalence checker compares a frozen four-second control projection and candidate projection that are identical except for replacing the static motion-control atlas with one blueprint `reference_video`. Identity, initial composition, output profile, prompt semantics, and all unrelated media remain unchanged.
+The corrected v2 local blueprint uses a four-second experiment window. This is an acceptance projection, not a rewrite of the source Pxx story clock. The equivalence checker compares a frozen four-second control projection and candidate projection that are identical except for replacing the static motion-control atlas with one blueprint `reference_video`. Identity, initial composition, output profile, prompt semantics, and all unrelated media remain unchanged. Decision 12 supersedes its former single-action paid-admission scope.
 
 ### 8. Compile each dynamic primitive as a phase curve
 
@@ -75,7 +75,7 @@ Setup primitives (`ready`, `prop_hold`) are zero-story-time anchors capped at 0.
 3. overshoot or counterbalance;
 4. canonical terminal pose.
 
-The phase coefficients are generic, versioned policy data. They may amplify an existing canonical action class but cannot invent another action, actor, target, contact, or order. A source contract with one dynamic action remains a single-action capability test.
+The phase coefficients are generic, versioned policy data. They may amplify an existing canonical action class but cannot invent another action, actor, target, contact, or order. A source contract with one dynamic action remains locally inspectable but, under Decision 12, cannot satisfy the paid combination gate.
 
 ### 9. Admit perceptible kinetics, not endpoint distance
 
@@ -95,6 +95,20 @@ The registry may only articulate the canonical primitive already selected by ups
 
 Seedance prompt text will identify the reference video as the sole authority for current-Pxx motion timing, body kinematics, contact timing, and camera trajectory, while denying identity, costume, scene-pixel, or annotation authority. It will not prescribe numeric setup timing, explosive amplitude, anticipation, overshoot, recovery, or similar tuning language. Those facts belong to the v3 compiler, manifest, and pixels. This makes behavior reproducible from code and prevents conversational wording changes from acting as an undocumented control plane.
 
+### 12. Make combination density an admission contract
+
+The v3 gate was structurally incapable of proving a combination because its source receipt selected P01, whose canonical atlas contained one setup anchor and one dynamic evade. The compiler correctly refused to invent a second move, but the admission policy still treated that single move as sufficient and distributed almost all active frames to it.
+
+Policy v4 separates local compilation from paid combination admission. A source Pxx is combination-eligible only when it contains at least two ordered dynamic groups with distinct group IDs, source-action lineage, and technique primitives. Setup anchors remain zero-story-time and do not count. Candidate selection is deterministic: retain the receipt-bound Pxx when it is eligible; otherwise identify the strongest eligible canonical Pxx for local inspection, but block the paid projection until an independently persisted production-equivalent request receipt for that exact Pxx exists. This prevents reusing a P01 prompt/media projection for P02.
+
+Dynamic windows are contiguous and use the full active interval without inter-action pauses. Policy records maximum dynamic-event duration, minimum action density, distinct-technique count, and zero-gap transition evidence. Single-action sources are classified `combination_ineligible`; they are not repeated, duplicated, or padded with fabricated moves.
+
+### 13. Reject mathematically slow combinations
+
+The two-action v4 candidate remained slow because the four-second Provider minimum forced each action to occupy about 1.8 seconds. Faster interpolation cannot fix that allocation without creating a long idle tail, and repeating or inventing an action would corrupt canonical lineage.
+
+Policy v5 therefore admits a fast-combination candidate only when the same Pxx supplies at least three ordered dynamic groups, at least two distinct techniques, a density of at least 0.75 actions per second, zero inter-action gap, and no dynamic interval longer than 1.25 seconds. One- and two-action evidence remains locally auditable but cannot produce a paid request. The v4 two-action artifact is audit-only. If verified source evidence has no eligible Pxx, the gate stops before rendering a paid-admission projection and identifies upstream action decomposition as the missing capability; it does not compensate in the renderer or prompt.
+
 ## Risks / Trade-offs
 
 - **[Seedance treats a neutral rig video as loose inspiration]** → The single request directly tests this; failure pauses the route rather than spawning prompt iterations.
@@ -102,6 +116,7 @@ Seedance prompt text will identify the reference video as the sole authority for
 - **[Motion transfers but identity degrades]** → Identity/composition checks remain part of the business verdict and separate from motion measurements.
 - **[One actor passes but combat still fails]** → Evidence scope is explicitly single actor; multi-actor motion requires its own later gate.
 - **[Local encoding varies across FFmpeg builds]** → Fingerprint semantic frames separately and pin encoding parameters; byte identity is required within the supported test environment.
+- **[The best canonical combination lacks a matching persisted Phase 6 request]** → Compile it only as zero-provider local evidence and stop at `pending_source_request_projection`; never substitute another Pxx's prompt or media.
 - **[Dirty current workspace contaminates implementation]** → Apply work must use a clean worktree based on an explicitly recorded commit and must not mix unrelated infrastructure or prototype files.
 
 ## Migration Plan

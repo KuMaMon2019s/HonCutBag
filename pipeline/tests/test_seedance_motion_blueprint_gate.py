@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import itertools
 import json
-import sys
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ from acceptance.motion_blueprint import (
     MotionEvent,
     SourceLineage,
     assess_legacy_blueprint_manifest,
+    combination_eligibility,
     compile_motion_blueprint,
     compile_semantic_frames,
     inspect_identity_neutral_pixels,
@@ -27,7 +29,6 @@ from acceptance.motion_blueprint import (
     technique_registry_sha256,
 )
 from utils.canonical_visual_contracts import build_canonical_visual_contract
-
 
 SCRIPT_PATH = Path(__file__).parents[1] / "scripts" / "seedance_motion_blueprint_acceptance.py"
 SPEC = importlib.util.spec_from_file_location("seedance_motion_blueprint_acceptance", SCRIPT_PATH)
@@ -105,6 +106,80 @@ def test_compiler_records_order_large_motion_contact_and_camera() -> None:
     assert all(event["apex_fraction"] <= 0.72 for event in dynamic)
     assert any(frame["prop_contact"] for frame in frames)
     assert frames[-1]["camera"]["zoom"] > frames[0]["camera"]["zoom"]
+
+
+def test_combination_tempo_uses_distinct_contiguous_bounded_actions() -> None:
+    contract = _contract("ready", "strike", "evade", "block")
+    frames, intervals = compile_semantic_frames(contract)
+    result = measure_semantic_frames(contract, frames, intervals)
+    combination = result["combination"]
+    assert combination["eligible"] is True
+    assert combination["tempo_pass"] is True
+    assert combination["dynamic_action_count"] == 3
+    assert combination["distinct_dynamic_primitive_count"] == 3
+    assert combination["dynamic_action_density_per_s"] == 0.75
+    assert combination["maximum_dynamic_event_duration_s"] <= 1.25 + (1 / 24)
+    assert combination["inter_action_gap_frames"] == [0, 0]
+    assert combination["ordered_source_action_group_ids"] == [
+        "S01_P01_A02",
+        "S01_P01_A03",
+        "S01_P01_A04",
+    ]
+
+
+def test_rendered_combination_has_visibly_distinct_successive_techniques(
+    tmp_path: Path,
+) -> None:
+    import cv2
+    import numpy as np
+
+    manifest = compile_motion_blueprint(
+        _contract("ready", "strike", "evade", "block"),
+        tmp_path / "combination.mp4",
+    )
+    dynamic = [
+        event
+        for event in manifest["measurements"]["events"]
+        if event["admission_role"] == "dynamic_action"
+    ]
+    capture = cv2.VideoCapture(str(tmp_path / "combination.mp4"))
+    masks = []
+    while True:
+        ok, frame = capture.read()
+        if not ok:
+            break
+        masks.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) > 70)
+    capture.release()
+    apex_masks = [masks[event["apex_frame"]] for event in dynamic]
+    visible_changes = []
+    for first, second in itertools.pairwise(apex_masks):
+        union = int(np.logical_or(first, second).sum())
+        visible_changes.append(float(np.logical_xor(first, second).sum() / max(1, union)))
+    assert min(visible_changes) >= 0.65
+    assert [event["technique_id"] for event in dynamic] == [
+        "linear_hand_strike_v1",
+        "lateral_slip_v1",
+        "two_arm_high_block_v1",
+    ]
+
+
+def test_single_action_is_explicitly_ineligible_for_combination_gate() -> None:
+    eligibility = combination_eligibility(_contract("ready", "evade"))
+    assert eligibility["eligible"] is False
+    assert eligibility["dynamic_action_count"] == 1
+    assert "insufficient_dynamic_actions" in eligibility["reasons"]
+    assert "insufficient_action_density" in eligibility["reasons"]
+    two_action = combination_eligibility(_contract("ready", "strike", "block"))
+    assert two_action["eligible"] is False
+    assert two_action["dynamic_action_count"] == 2
+    assert two_action["distinct_dynamic_primitive_count"] == 2
+    assert two_action["dynamic_action_density_per_s"] == 0.5
+    assert "insufficient_dynamic_actions" in two_action["reasons"]
+    assert "insufficient_action_density" in two_action["reasons"]
+    repeated = combination_eligibility(_contract("strike", "strike", "strike"))
+    assert repeated["eligible"] is False
+    assert repeated["dynamic_action_count"] == 3
+    assert "insufficient_distinct_techniques" in repeated["reasons"]
 
 
 @pytest.mark.parametrize(
@@ -240,10 +315,8 @@ def test_rendered_evade_visibly_changes_at_each_technique_phase(
         "recovery",
     ]
     phase_changes = []
-    for (_previous_phase, previous_index), (_phase, current_index) in zip(
-        phase_centres[:-1],
-        phase_centres[1:],
-        strict=True,
+    for (_previous_phase, previous_index), (_phase, current_index) in itertools.pairwise(
+        phase_centres
     ):
         previous = rendered_masks[previous_index]
         current = rendered_masks[current_index]
@@ -271,7 +344,7 @@ def test_setup_pose_cannot_consume_the_dynamic_action_window() -> None:
 
 
 def test_unknown_primitive_fails_before_render(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="unsupported motion primitives.*S01_P01_A01"):
+    with pytest.raises(ValueError, match=r"unsupported motion primitives.*S01_P01_A01"):
         compile_motion_blueprint(_contract("teleport_spin"), tmp_path / "never.mp4")
     assert not (tmp_path / "never.mp4").exists()
 
@@ -280,7 +353,7 @@ def test_zero_or_multiple_actor_scope_fails_closed() -> None:
     payload = _contract("evade").model_dump(mode="json")
     payload["actor_ids"] = []
     payload["events"][0]["actor_ids"] = []
-    with pytest.raises(ValueError, match="canonical actors|exactly one"):
+    with pytest.raises(ValueError, match=r"canonical actors|exactly one"):
         MotionBlueprintInput.model_validate(payload)
     payload = _contract("evade").model_dump(mode="json")
     payload["actor_ids"] = ["a", "b"]
@@ -314,7 +387,7 @@ def test_static_and_low_amplitude_semantics_fail_measurement() -> None:
     for frame in frames:
         frame["root"] = list(frames[0]["root"])
         frame["joints"] = json.loads(json.dumps(frames[0]["joints"]))
-    with pytest.raises(ValueError, match="action onset|sub-threshold kinetics"):
+    with pytest.raises(ValueError, match=r"action onset|sub-threshold kinetics"):
         measure_semantic_frames(contract, frames, intervals)
 
 
@@ -327,7 +400,7 @@ def test_slow_endpoint_drift_and_single_joint_motion_fail_kinetics() -> None:
         progress = index / total
         frame["root"] = [start["root"][0] + 0.21 * progress, start["root"][1]]
         frame["joints"] = json.loads(json.dumps(start["joints"]))
-    with pytest.raises(ValueError, match="action onset|sub-threshold kinetics"):
+    with pytest.raises(ValueError, match=r"action onset|sub-threshold kinetics"):
         measure_semantic_frames(contract, frames, intervals)
 
     frames, intervals = compile_semantic_frames(contract)
@@ -337,7 +410,7 @@ def test_slow_endpoint_drift_and_single_joint_motion_fail_kinetics() -> None:
         frame["joints"] = json.loads(json.dumps(start["joints"]))
     peak = intervals[0]["start_frame"] + 2
     frames[peak]["joints"]["right_wrist"][0] += 0.8
-    with pytest.raises(ValueError, match="action onset|sub-threshold kinetics"):
+    with pytest.raises(ValueError, match=r"action onset|sub-threshold kinetics"):
         measure_semantic_frames(contract, frames, intervals)
 
 
@@ -440,6 +513,36 @@ def test_v2_common_curve_blueprint_is_audit_only(tmp_path: Path) -> None:
     assert "v3 technique choreography" in assessment["reason"]
 
 
+def test_v3_single_action_policy_is_audit_only(tmp_path: Path) -> None:
+    media = tmp_path / "v3.mp4"
+    legacy = compile_motion_blueprint(_contract("ready", "strike", "block"), media)
+    legacy["schema"] = "honcut.seedance-motion-blueprint.v3"
+    legacy["policy_schema"] = "honcut.motion-blueprint-policy.v3"
+    legacy["renderer_id"] = "honcut.identity-neutral-motion-renderer.v3"
+    path = tmp_path / "v3-manifest.json"
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+    assessment = assess_legacy_blueprint_manifest(path)
+    assert assessment["source_schema"] == "honcut.seedance-motion-blueprint.v3"
+    assert assessment["audit_only"] is True
+    assert assessment["admission_status"] == "paid_admission_blocked"
+    assert "v4 combination density" in assessment["reason"]
+
+
+def test_v4_two_action_policy_is_audit_only(tmp_path: Path) -> None:
+    media = tmp_path / "v4.mp4"
+    legacy = compile_motion_blueprint(_contract("ready", "strike", "block"), media)
+    legacy["schema"] = "honcut.seedance-motion-blueprint.v4"
+    legacy["policy_schema"] = "honcut.motion-blueprint-policy.v4"
+    legacy["renderer_id"] = "honcut.identity-neutral-motion-renderer.v4"
+    path = tmp_path / "v4-manifest.json"
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+    assessment = assess_legacy_blueprint_manifest(path)
+    assert assessment["source_schema"] == "honcut.seedance-motion-blueprint.v4"
+    assert assessment["audit_only"] is True
+    assert assessment["admission_status"] == "paid_admission_blocked"
+    assert "v5 fast-combination cadence" in assessment["reason"]
+
+
 def _fixture_run(tmp_path: Path) -> tuple[Path, Path]:
     run = tmp_path / "source"
     run.mkdir()
@@ -484,7 +587,7 @@ def _fixture_run(tmp_path: Path) -> tuple[Path, Path]:
     prompt = "图片1锁定身份；图片2锁定开场；图片3负责动作。"
     (run / "prompt.txt").write_text(prompt + "\n", encoding="utf-8")
     samples = []
-    for index, family in enumerate(("ready", "evade"), 1):
+    for index, family in enumerate(("ready", "strike", "evade", "block"), 1):
         samples.append(
             {
                 "sample_id": f"G{index:02d}",
@@ -512,7 +615,7 @@ def _fixture_run(tmp_path: Path) -> tuple[Path, Path]:
                                 "order": index,
                                 "lineage": {"source_action_unit_ids": [f"AU{index:03d}"]},
                             }
-                            for index in (1, 2)
+                            for index in (1, 2, 3, 4)
                         ],
                     }
                 ]
@@ -579,19 +682,98 @@ def test_no_submit_projection_is_single_variable_seedance_only(
     assert projected["media"][-1]["media_type"] == "video_url"
     assert projected["media"][-1]["prompt_index"] == "视频1"
     prompt = (tmp_path / "gate" / "seedance_prompt.txt").read_text()
-    assert "[honcut.motion-blueprint-reference.v3]" in prompt
+    assert "[honcut.motion-blueprint-reference.v5]" in prompt
     assert "视频1仅负责当前Pxx的动作时序" in prompt
     for tuning_phrase in ("0.15秒", "爆发峰值", "预备反向", "越位与回收", "慢速匀速漂移"):
         assert tuning_phrase not in prompt
     assert "图片3负责动作" not in (tmp_path / "gate" / "seedance_prompt.txt").read_text()
-    assert projected["motion_blueprint_schema"] == "honcut.seedance-motion-blueprint.v3"
+    assert projected["motion_blueprint_schema"] == "honcut.seedance-motion-blueprint.v5"
     assert len(projected["motion_technique_registry_sha256"]) == 64
-    assert projected["motion_techniques"][1]["technique_id"] == "lateral_slip_v1"
+    assert projected["motion_techniques"][1]["technique_id"] == "linear_hand_strike_v1"
+    assert projected["motion_techniques"][2]["technique_id"] == "lateral_slip_v1"
+    assert projected["motion_techniques"][3]["technique_id"] == "two_arm_high_block_v1"
+
+
+def test_gate_selects_canonical_combo_but_never_borrows_another_pxx_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run, receipt_path = _fixture_run(tmp_path)
+    plan_path = run / "CONTINUITY_PLAN.json"
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    p01 = plan["shots"][0]["chunks"][0]
+    p01["storyboard_pose_atlas_pose_samples"] = p01[
+        "storyboard_pose_atlas_pose_samples"
+    ][:3]
+    p01["storyboard_pose_atlas_action_groups"] = p01[
+        "storyboard_pose_atlas_action_groups"
+    ][:3]
+    p02 = json.loads(json.dumps(plan["shots"][0]["chunks"][0]))
+    p02["storyboard_beat_id"] = "S01_P02"
+    for index, (sample, family) in enumerate(
+        zip(
+            p02["storyboard_pose_atlas_pose_samples"],
+            ("strike", "evade", "block"),
+            strict=True,
+        ),
+        1,
+    ):
+        sample["action_group_id"] = f"S01_P02_A{index:02d}"
+        sample["pose_contract"]["pose_family"] = family
+    for index, group in enumerate(p02["storyboard_pose_atlas_action_groups"], 1):
+        group["action_group_id"] = f"S01_P02_A{index:02d}"
+        group["lineage"] = {"source_action_unit_ids": [f"AU{index + 10:03d}"]}
+    plan["shots"][0]["chunks"].append(p02)
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    monkeypatch.setattr(gate, "SEEDANCE_MODEL", "doubao-seedance-2.0-fast")
+
+    result = gate.prepare_gate(run, tmp_path / "gate", source_receipt_path=receipt_path)
+
+    assert result["status"] == "pending_source_request_projection"
+    assert result["call_chain_verdict"] == "not_submittable"
+    assert result["business_motion_verdict"] == {"status": "not_admitted"}
+    assert result["candidate_selection"] == {
+        "selected_beat_id": "S01_P02",
+        "source_receipt_beat_id": "S01_P01",
+        "combination": result["blueprint"]["measurements"]["combination"],
+        "exact_production_request_available": False,
+    }
+    assert result["request_projection"]["status"] == "missing_exact_pxx_receipt"
+    assert result["budgets"]["video_submission_ceiling"] == 0
+    unavailable = gate._read_object(tmp_path / "gate" / "request_projection.runtime.json")
+    assert unavailable == {
+        "schema": "honcut.seedance-motion-blueprint-request-unavailable.v1",
+        "status": "missing_exact_pxx_receipt",
+        "selected_beat_id": "S01_P02",
+        "provider_request_count": 0,
+    }
+    with pytest.raises(gate.GateEvidenceError, match="already submitted or is not current"):
+        gate.submit_gate(
+            tmp_path / "gate",
+            fee_authorization="authorized-seedance-motion-blueprint-once",
+        )
+
+
+def test_no_canonical_combination_fails_before_projection(tmp_path: Path) -> None:
+    run, receipt_path = _fixture_run(tmp_path)
+    plan_path = run / "CONTINUITY_PLAN.json"
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    chunk = plan["shots"][0]["chunks"][0]
+    chunk["storyboard_pose_atlas_pose_samples"] = chunk[
+        "storyboard_pose_atlas_pose_samples"
+    ][:2]
+    chunk["storyboard_pose_atlas_action_groups"] = chunk[
+        "storyboard_pose_atlas_action_groups"
+    ][:2]
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    with pytest.raises(gate.GateEvidenceError, match="three canonical dynamic actions"):
+        gate.prepare_gate(run, tmp_path / "gate", source_receipt_path=receipt_path)
+    assert not (tmp_path / "gate" / "request_projection.runtime.json").exists()
 
 
 @pytest.mark.parametrize("model", ["wan2.2", "kling-v2", "doubao-seedance-1.5-pro"])
 def test_alternate_or_unsupported_model_is_rejected(model: str) -> None:
-    with pytest.raises(gate.GateEvidenceError, match="Seedance 2.0"):
+    with pytest.raises(gate.GateEvidenceError, match=r"Seedance 2.0"):
         gate._assert_seedance_only(model)
 
 
@@ -726,7 +908,7 @@ def test_optional_submit_uses_existing_task_ledger_and_blocks_duplicate(
             events = gate.GenerationTaskStore(output_dir / "runtime.db")
             rows = (
                 events._connect()
-                .execute(  # noqa: SLF001 - verifies durable boundary
+                .execute(
                     "SELECT event_type FROM generation_task_events ORDER BY event_sequence"
                 )
                 .fetchall()

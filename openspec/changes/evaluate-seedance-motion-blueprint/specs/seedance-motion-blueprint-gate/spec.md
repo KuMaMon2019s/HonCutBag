@@ -45,12 +45,12 @@ Before a live request, the system MUST verify from the blueprint itself that eve
 - **WHEN** only one distal joint moves materially while the torso and required major-joint set remain static
 - **THEN** preflight fails with zero uploads and zero Provider submissions
 
-### Requirement: Four-second single-action capability window
-The initial capability gate SHALL compile and project exactly four seconds for one canonical dynamic action. A setup pose MAY appear only as a zero-story-time anchor capped by policy and MUST NOT consume a material share of the action window. The action phases MUST complete within the configured apex/recovery window and terminal hold MUST remain bounded.
+### Requirement: Four-second capability window
+The capability gate SHALL compile and project exactly four seconds. A setup pose MAY appear only as a zero-story-time anchor capped by policy and MUST NOT consume a material share of the action window. Dynamic phases MUST complete within their configured contiguous windows and terminal hold MUST remain bounded.
 
-#### Scenario: One canonical dynamic action
-- **WHEN** the selected Pxx contains one supported dynamic action plus setup state
-- **THEN** the gate compiles one four-second blueprint whose setup anchor is at most 0.15 seconds and whose remaining motion contains anticipation, peak, recovery, and terminal pose phases
+#### Scenario: Canonical action combination
+- **WHEN** the selected Pxx contains an eligible ordered action combination plus optional setup state
+- **THEN** the gate compiles one four-second blueprint whose setup anchor is at most 0.15 seconds and whose dynamic actions execute consecutively without idle gaps
 
 #### Scenario: Additional action invention
 - **WHEN** the compiler would need to add a strike, kick, contact, actor, or target absent from canonical lineage to make the clip appear busier
@@ -75,6 +75,25 @@ Every supported dynamic primitive SHALL be compiled from a versioned code regist
 #### Scenario: Legacy common-curve blueprint
 - **WHEN** a v1 or v2 blueprint lacks the current technique registry and per-event keyframe evidence
 - **THEN** it remains immutable audit-only evidence and cannot satisfy paid admission
+
+### Requirement: Canonical combination density
+The paid capability gate SHALL require at least three ordered dynamic actions, including at least two distinct techniques, from one hash-verified canonical Pxx. Setup anchors SHALL NOT count as actions. Dynamic intervals MUST be contiguous, each action duration MUST NOT exceed 1.25 seconds, the combination MUST sustain at least 0.75 actions per second, and the compiler MUST NOT invent, repeat, or stretch an action to fill time.
+
+#### Scenario: Ordered combination candidate
+- **WHEN** one canonical Pxx contains at least three ordered dynamic action groups with valid source-action lineage and at least two distinct techniques
+- **THEN** the blueprint preserves their order, assigns contiguous bounded windows, records zero inter-action gap and combination density, and may proceed to request-equivalence preflight
+
+#### Scenario: Insufficient dynamic cadence
+- **WHEN** the receipt-bound Pxx contains fewer than three dynamic actions plus any setup anchors
+- **THEN** it is classified `combination_ineligible` and cannot satisfy paid admission, regardless of its amplitude
+
+#### Scenario: Another canonical Pxx is eligible
+- **WHEN** the receipt-bound Pxx is ineligible but another Pxx in the same verified continuity plan contains a valid combination
+- **THEN** the system may compile that Pxx as zero-provider local evidence but MUST stop at `pending_source_request_projection` until a production-equivalent request receipt for that exact Pxx exists
+
+#### Scenario: Artificial combination
+- **WHEN** a combination would require duplicating one action, inventing another primitive, or borrowing an action from another Pxx
+- **THEN** the gate fails before upload and records no paid-admission projection
 
 ### Requirement: Seedance media-contract preflight
 The gate MUST validate the blueprint against the current Seedance 2.0 reference-video limits and MUST freeze the exact model, duration, resolution, prompt hash, media order, media roles, source hashes, upload budget, submission budget, and task fingerprint before authorization can be consumed.

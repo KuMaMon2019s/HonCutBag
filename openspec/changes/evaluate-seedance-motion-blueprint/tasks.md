@@ -60,3 +60,18 @@
 - [x] 8.4 Add deterministic technique assertions and regression coverage proving distinct primitives have distinct temporal/geometric signatures, contact is phase-local, and representative evade/kick/block/strike biomechanics are visible in semantic frames and rendered pixels.
 - [x] 8.5 Remove choreography tuning language from the Seedance prompt projection, retain only media authority/non-authority instructions, and prove prompt wording cannot change the compiled blueprint contract or measurements.
 - [x] 8.6 Preserve v1/v2 blueprints as audit-only, run ten Provider-deny resumes, target/full tests, lint, diff check, Serena validation, strict OpenSpec verification, Graphify incremental sync, and generate a fresh v3 no-submit receipt in a new isolated directory; leave paid/human tasks 6.5 and 6.6 pending.
+
+## 9. Combination-density and tempo correction
+
+- [x] 9.1 Re-run Serena and Graphify preflight for source candidate selection, event-window allocation, request equivalence, legacy audit, and target tests; confirm the scope remains acceptance-only.
+- [x] 9.2 Upgrade blueprint, policy, renderer, and gate receipt contracts to v4; add minimum dynamic-action count, distinct-technique count, action-density, maximum per-action duration, and zero-gap transition evidence.
+- [x] 9.3 Select combination candidates deterministically from verified Pxx lineage, reject single-action paid admission, and stop at `pending_source_request_projection` when the selected Pxx lacks an exact persisted production request instead of borrowing another Pxx's projection.
+- [x] 9.4 Compile canonical combination actions into contiguous bounded windows, preserve technique order and lineage, and add semantic/rendered tests proving visibly distinct successive moves without duplicated or invented actions.
+- [ ] 9.5 Preserve v1/v2/v3 artifacts as audit-only; run target/full regression, lint, diff check, Serena post-validation, OpenSpec strict verify, Graphify incremental sync, and generate a fresh zero-provider local combination candidate.
+
+## 10. Fast-combination cadence correction
+
+- [x] 10.1 Classify the two-action v4 candidate as audit-only after visual review showed that its four-second allocation remained slow.
+- [x] 10.2 Upgrade the blueprint, policy, renderer, and receipt contracts to v5; require at least three canonical dynamic groups, at least two distinct techniques, 0.75 actions per second, zero gaps, and a maximum 1.25-second dynamic interval.
+- [x] 10.3 Reject one- and two-action source evidence before paid projection without duplicating, inventing, or borrowing actions; preserve the exact source lineage and Pxx boundary.
+- [ ] 10.4 Run target/full regression, lint, diff check, Serena post-validation, OpenSpec strict verify, Graphify incremental sync, and generate a fresh zero-provider fast-combination fixture plus a source-run rejection receipt.
