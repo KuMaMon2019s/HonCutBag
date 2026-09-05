@@ -1,0 +1,61 @@
+{
+  "schema": "honcut.canonical-action-kinematics-regression.v1",
+  "status": "passed",
+  "source": {
+    "git_commit": "3daf51e8ea054b75dfe8bfaafb2d2f3ffc92c1ee",
+    "baseline_commit": "eca457698de925a35446a36fbef129654cf16fe3",
+    "branch": "codex/canonical-kinematic-channel-decomposition-fix",
+    "openspec_change": "decompose-canonical-action-kinematics"
+  },
+  "gates": {
+    "focused_tests": {
+      "status": "passed",
+      "passed": 420,
+      "skipped": 1
+    },
+    "full_test_suite": {
+      "status": "passed",
+      "passed": 1544,
+      "skipped": 1,
+      "warnings": 2
+    },
+    "lint": {
+      "status": "passed"
+    },
+    "diff_check": {
+      "status": "passed"
+    },
+    "provider_deny_recovery": {
+      "status": "passed",
+      "rounds": 10,
+      "provider_request_count": 0,
+      "stable_contract_hashes": true,
+      "stable_pose_hashes": true,
+      "stable_task_fingerprints": true
+    },
+    "graph_and_sequential_paths": {
+      "status": "passed"
+    },
+    "pipeline_core_unchanged": {
+      "status": "passed"
+    },
+    "openspec": {
+      "status": "verified",
+      "strict_validation": "passed"
+    },
+    "serena_post_validation": {
+      "status": "completed",
+      "new_changed_symbol_diagnostics": 0
+    },
+    "graphify": {
+      "status": "incremental",
+      "affected_depth": 2
+    }
+  },
+  "provider_request_count": 0,
+  "live_paid_provider": {
+    "status": "pending_live_acceptance",
+    "provider_request_count": 0,
+    "authorization_required": "separate_explicit_fee_authorization"
+  }
+}

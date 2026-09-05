@@ -65,4 +65,4 @@
 - [x] 8.4 Run strict OpenSpec validation and OpenSpec Verify; verify implementation, tests and docs satisfy every requirement and task before marking the change complete.
 - [x] 8.5 Run `graphify update .`, affected-path review, `graphify save-result` and `graphify reflect --if-stale`; verify the graph records the new owner/consumer paths without storing secrets or Provider evidence.
 - [x] 8.6 Update Serena Memory only if the final verified owner/schema/consumer boundary is durable project knowledge; verify no one-off bug, Prompt, media or temporary path is stored.
-- [ ] 8.7 Write a regression receipt bound to the final commit and mark live acceptance `pending_live_acceptance`; verify no paid request occurred and any later real Provider gate requires a separate explicit fee authorization.
+- [x] 8.7 Write a regression receipt bound to the final commit and mark live acceptance `pending_live_acceptance`; verify no paid request occurred and any later real Provider gate requires a separate explicit fee authorization.
