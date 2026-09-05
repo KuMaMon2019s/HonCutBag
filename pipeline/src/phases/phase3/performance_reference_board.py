@@ -31,13 +31,18 @@ from quality.character_performance_qa import (
     review_character_performance_cell,
 )
 from quality.character_reference_qa import file_sha256
+from utils.action_kinematics import (
+    KINEMATICS_PROJECTION_SCHEMA,
+    sample_projection,
+    validate_generation_kinematics_projection,
+)
 
-CHARACTER_PERFORMANCE_BOARD_SCHEMA = "honcut.character-performance-board.v2"
-CHARACTER_PERFORMANCE_GUIDE_SCHEMA = "honcut.character-performance-guide.v2"
-CHARACTER_PERFORMANCE_CELL_SCHEMA = "honcut.character-performance-cell.v2"
-CHARACTER_PERFORMANCE_POSE_GUIDE_SCHEMA = "honcut.character-performance-pose-guide.v2"
+CHARACTER_PERFORMANCE_BOARD_SCHEMA = "honcut.character-performance-board.v3"
+CHARACTER_PERFORMANCE_GUIDE_SCHEMA = "honcut.character-performance-guide.v3"
+CHARACTER_PERFORMANCE_CELL_SCHEMA = "honcut.character-performance-cell.v3"
+CHARACTER_PERFORMANCE_POSE_GUIDE_SCHEMA = "honcut.character-performance-pose-guide.v3"
 CHARACTER_PERFORMANCE_POSE_CONSTRAINTS_SCHEMA = (
-    "honcut.character-performance-pose-constraints.v1"
+    "honcut.character-performance-pose-constraints.v2"
 )
 PERFORMANCE_PROMPT_OPTIMIZATION_SCHEMA = (
     "honcut.character-performance-prompt-optimization.v3"
@@ -516,6 +521,95 @@ def _pose_constraints(action_text: str, pose_category: str) -> dict[str, str]:
     }
 
 
+def _character_identity_tokens(character: Mapping[str, Any]) -> set[str]:
+    values: list[Any] = [
+        character.get("id"),
+        character.get("instance_id"),
+        character.get("entity_id"),
+        character.get("name"),
+    ]
+    for field in ("aliases", "source_mentions"):
+        extra = character.get(field) or []
+        values.extend(extra if isinstance(extra, list) else [extra])
+    evidence = character.get("identity_evidence")
+    if isinstance(evidence, Mapping):
+        values.extend(evidence.get("source_mentions") or [])
+    return {str(value).strip().casefold() for value in values if str(value or "").strip()}
+
+
+def _sample_character_kinematics(
+    projection: Mapping[str, Any],
+    character: Mapping[str, Any],
+    *,
+    progress: float,
+) -> dict[str, Any]:
+    sampled = sample_projection(projection, progress)
+    tracks = list(sampled["actor_tracks"])
+    tokens = _character_identity_tokens(character)
+    matched = [
+        track
+        for track in tracks
+        if str(track.get("performer_id") or "").strip().casefold() in tokens
+    ]
+    if len(matched) == 1:
+        selected = matched[0]
+    elif len(tracks) == 1:
+        selected = tracks[0]
+    else:
+        raise ValueError(
+            f"{character.get('id')} cannot resolve one canonical performer track"
+        )
+    return {
+        "schema": sampled["schema"],
+        "projection_sha256": sampled["projection_sha256"],
+        "progress_milli": sampled["progress_milli"],
+        "actor_tracks": [selected],
+    }
+
+
+def _kinematic_pose_constraints(sample: Mapping[str, Any]) -> dict[str, Any]:
+    track = sample["actor_tracks"][0]
+    channels = track["channels"]
+    root = channels["root"]["translation_milli"]
+    waist_rotation = channels["waist_torso"]["rotation_mdeg"]
+    active = [
+        name
+        for name, state in channels.items()
+        if state["role"] == "active" and int(state["activation_milli"]) >= 500
+    ]
+    active_feet = [name for name in ("left_foot", "right_foot") if name in active]
+    movement_direction = "unspecified"
+    if abs(int(root[0])) >= 60:
+        movement_direction = "left" if int(root[0]) < 0 else "right"
+    elif abs(int(root[2])) >= 60:
+        movement_direction = "backward" if int(root[2]) < 0 else "forward"
+    torso_lean = "unspecified"
+    if abs(int(waist_rotation[0])) >= 4_000:
+        torso_lean = "forward" if int(waist_rotation[0]) < 0 else "backward"
+    return {
+        "schema": CHARACTER_PERFORMANCE_POSE_CONSTRAINTS_SCHEMA,
+        "stance": "action" if active else "neutral",
+        "knees": "bent" if any(name.endswith("leg") for name in active) else "unspecified",
+        "center_of_gravity": "displaced" if any(root) else "unspecified",
+        "torso_lean": torso_lean,
+        "lead_foot": active_feet[0].removesuffix("_foot") if len(active_feet) == 1 else "unspecified",
+        "moving_foot": active_feet[0].removesuffix("_foot") if len(active_feet) == 1 else "unspecified",
+        "movement_direction": movement_direction,
+        "prop_orientation": "unspecified",
+        "prop_side": "unspecified",
+        "prop_start": "unspecified",
+        "prop_end": "unspecified",
+        "kinematics_projection_sha256": sample["projection_sha256"],
+        "kinematics_progress_milli": sample["progress_milli"],
+        "kinematics_phase_id": track["phase_id"],
+        "performer_id": track["performer_id"],
+        "relative_yaw_mdeg": track["relative_yaw_mdeg"],
+        "transform": track["transform"],
+        "active_channels": active,
+        "channel_states": channels,
+    }
+
+
 def _eligible_beat(shot: Mapping[str, Any], beat: Mapping[str, Any], props: list[dict[str, Any]]) -> bool:
     text = " ".join(
         str(value or "")
@@ -574,6 +668,31 @@ def build_character_performance_plan(
                 if not action_text:
                     raise ValueError(f"{beat_id} has an empty authored action")
                 category_text = _unit_source_fact_text(units) or action_text
+                projections = [
+                    unit.get("kinematics_projection")
+                    for unit in units
+                    if isinstance(unit.get("kinematics_projection"), Mapping)
+                ]
+                body_contract = beat.get("body_action_contract")
+                canonical_kinematics_required = (
+                    isinstance(body_contract, Mapping)
+                    and body_contract.get("schema")
+                    == "honcut.body-action-choreography.v2"
+                    and body_contract.get("required") is True
+                )
+                if canonical_kinematics_required and len(projections) != len(units):
+                    raise ValueError(
+                        f"{beat_id} lacks final canonical kinematics projection"
+                    )
+                if len(projections) > 1:
+                    raise ValueError(
+                        f"{beat_id} performance binding spans multiple kinematics projections"
+                    )
+                projection = (
+                    validate_generation_kinematics_projection(projections[0])
+                    if projections
+                    else None
+                )
                 source_bindings.append({
                     "source_action_unit_id": source_id,
                     "source_lineage_kind": lineage["source_lineage_kind"],
@@ -588,6 +707,7 @@ def build_character_performance_plan(
                         category_text,
                         _prop_ids_for_action(props, action_text),
                     ),
+                    "kinematics_projection": projection,
                 })
             beat_bindings.append({
                 "beat_id": beat_id,
@@ -711,6 +831,26 @@ def build_character_performance_plan(
         current_binding_key = binding_key(binding)
         occurrence = occurrence_by_binding.get(current_binding_key, 0)
         occurrence_by_binding[current_binding_key] = occurrence + 1
+        sample_progress = (0.55, 0.75, 0.90)[
+            occurrence % len(PERFORMANCE_KEY_POSE_PHASES)
+        ]
+        projection = binding.get("kinematics_projection")
+        kinematics_sample = (
+            _sample_character_kinematics(
+                projection,
+                character,
+                progress=sample_progress,
+            )
+            if isinstance(projection, Mapping)
+            else None
+        )
+        pose_constraints = (
+            _kinematic_pose_constraints(kinematics_sample)
+            if kinematics_sample is not None
+            else _pose_constraints(
+                binding["action_description"], binding["pose_category"]
+            )
+        )
         cells.append({
             "cell_id": cell_id,
             "grid_position": {"row": index // 3 + 1, "column": index % 3 + 1},
@@ -726,9 +866,18 @@ def build_character_performance_plan(
                 occurrence % len(PERFORMANCE_KEY_POSE_PHASES)
             ],
             "action_description": binding["action_description"],
-            "pose_constraints": _pose_constraints(
-                binding["action_description"], binding["pose_category"]
+            "kinematics_schema": (
+                KINEMATICS_PROJECTION_SCHEMA
+                if kinematics_sample is not None
+                else None
             ),
+            "kinematics_projection_sha256": (
+                kinematics_sample["projection_sha256"]
+                if kinematics_sample is not None
+                else None
+            ),
+            "kinematics_sample": kinematics_sample,
+            "pose_constraints": pose_constraints,
         })
     return {
         "schema": CHARACTER_PERFORMANCE_BOARD_SCHEMA,
@@ -838,6 +987,25 @@ def _compact_pose_constraints_text(constraints: Any) -> str:
         for key in ordered_keys
         if str(constraints.get(key) or "unspecified") not in {"unspecified", "neutral"}
     ]
+    phase_id = str(constraints.get("kinematics_phase_id") or "").strip()
+    active_channels = [
+        str(value)
+        for value in constraints.get("active_channels") or []
+        if str(value).strip()
+    ]
+    if phase_id:
+        declared.append(f"phase={phase_id}")
+    if active_channels:
+        declared.append("active_channels=" + "+".join(active_channels))
+    transform = constraints.get("transform")
+    if isinstance(transform, Mapping) and transform.get("kind") != "none":
+        declared.append(
+            "transform="
+            + ":".join(
+                str(transform.get(key) or "")
+                for key in ("kind", "axis", "direction")
+            )
+        )
     return ",".join(declared) or "no additional directional fact"
 
 
@@ -923,8 +1091,71 @@ feedback or the internal cell ID in the image.
 """
 
 
+def _kinematic_pose_guide_geometry(cell: Mapping[str, Any]) -> dict[str, Any]:
+    sample = cell.get("kinematics_sample")
+    if not isinstance(sample, Mapping) or len(sample.get("actor_tracks") or []) != 1:
+        raise CharacterPerformanceQAError("performance cell lacks one kinematics actor track")
+    track = sample["actor_tracks"][0]
+    channels = track.get("channels")
+    if not isinstance(channels, Mapping):
+        raise CharacterPerformanceQAError("performance kinematics channels are missing")
+    base = {
+        "head": (512, 150),
+        "neck": (512, 225),
+        "left_shoulder": (610, 275),
+        "right_shoulder": (414, 275),
+        "left_elbow": (650, 430),
+        "right_elbow": (374, 430),
+        "left_hand": (620, 545),
+        "right_hand": (404, 545),
+        "left_hip": (570, 530),
+        "right_hip": (454, 530),
+        "left_knee": (620, 710),
+        "right_knee": (404, 710),
+        "left_foot": (660, 900),
+        "right_foot": (364, 900),
+    }
+
+    def shifted(point: tuple[int, int], channel: str, scale: float) -> tuple[int, int]:
+        translation = channels[channel]["translation_milli"]
+        return (
+            max(90, min(934, point[0] - round(int(translation[0]) * scale))),
+            max(90, min(940, point[1] - round(int(translation[2]) * scale))),
+        )
+
+    root = channels["root"]["translation_milli"]
+    root_shift = (-round(int(root[0]) * 0.18), -round(int(root[2]) * 0.06))
+    geometry: dict[str, Any] = {
+        name: (point[0] + root_shift[0], point[1] + root_shift[1])
+        for name, point in base.items()
+    }
+    mapping = {
+        "head": ("head", 0.30),
+        "left_elbow": ("left_arm", 0.34),
+        "left_hand": ("left_hand", 0.38),
+        "right_elbow": ("right_arm", 0.34),
+        "right_hand": ("right_hand", 0.38),
+        "left_knee": ("left_leg", 0.30),
+        "left_foot": ("left_foot", 0.34),
+        "right_knee": ("right_leg", 0.30),
+        "right_foot": ("right_foot", 0.34),
+    }
+    for joint, (channel, scale) in mapping.items():
+        geometry[joint] = shifted(geometry[joint], channel, scale)
+    active = tuple(
+        name
+        for name, state in channels.items()
+        if state["role"] == "active" and int(state["activation_milli"]) >= 500
+    )
+    geometry["prop"] = (geometry["right_hand"], geometry["left_hand"])
+    geometry["emphasis"] = active
+    return geometry
+
+
 def _pose_guide_geometry(cell: Mapping[str, Any]) -> dict[str, Any]:
     """Project one authored action into a deterministic front-facing pose skeleton."""
+    if cell.get("kinematics_schema") == KINEMATICS_PROJECTION_SCHEMA:
+        return _kinematic_pose_guide_geometry(cell)
     role = str(cell.get("pose_category") or "combat_ready")
     constraints = cell.get("pose_constraints")
     if (
@@ -1086,7 +1317,11 @@ def _ensure_performance_pose_guide(
         "cell_sha256": cell_hash,
         "pose_constraints_sha256": _canonical_hash(cell["pose_constraints"]),
         "geometry_sha256": geometry_hash,
-        "generator": "honcut.front-facing-action-skeleton.v2",
+        "generator": (
+            "honcut.canonical-kinematics-action-skeleton.v1"
+            if cell.get("kinematics_schema") == KINEMATICS_PROJECTION_SCHEMA
+            else "honcut.front-facing-action-skeleton.v2"
+        ),
         "image": guide_path.relative_to(output_dir).as_posix(),
         "provider_requests": 0,
     }
@@ -1271,6 +1506,21 @@ def validate_character_performance_board(
         )
     ):
         return False
+    for cell in cells:
+        schema = cell.get("kinematics_schema")
+        sample = cell.get("kinematics_sample")
+        if schema is None and sample is None:
+            continue
+        if (
+            schema != KINEMATICS_PROJECTION_SCHEMA
+            or not isinstance(sample, dict)
+            or sample.get("projection_sha256")
+            != cell.get("kinematics_projection_sha256")
+            or sample.get("projection_sha256")
+            != cell["pose_constraints"].get("kinematics_projection_sha256")
+            or len(sample.get("actor_tracks") or []) != 1
+        ):
+            return False
     plan_hash = _canonical_hash(plan)
     if receipt.get("plan_sha256") != plan_hash or qa.get("plan_sha256") != plan_hash:
         return False

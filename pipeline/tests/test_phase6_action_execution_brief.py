@@ -10,6 +10,10 @@ from phases.phase6.action_execution_prompt import (
     compile_action_execution_brief,
     render_action_execution_brief,
 )
+from utils.action_kinematics import (
+    apply_generation_kinematics_projection,
+    compile_source_kinematics,
+)
 
 
 def _plan() -> dict:
@@ -17,7 +21,7 @@ def _plan() -> dict:
         {
             "beat_id": "S01_P01",
             "duration_s": 7,
-            "planner_version": "honcut.secondary-storyboard.v16",
+            "planner_version": "honcut.secondary-storyboard.v17",
             "generation_action_units": [
                 {
                     "unit_id": "GAU001",
@@ -117,7 +121,7 @@ def test_action_execution_brief_preserves_contact_and_prop_semantics(
         {
             "beat_id": "S01_P01",
             "duration_s": 7,
-            "planner_version": "honcut.secondary-storyboard.v16",
+            "planner_version": "honcut.secondary-storyboard.v17",
             "generation_action_units": [
                 {
                     "unit_id": "GAU001",
@@ -159,3 +163,120 @@ def test_action_execution_brief_preserves_contact_and_prop_semantics(
         assert contact["required_targets"] == targets
     else:
         assert contact["mode"] == "no invented target contact"
+
+
+def test_action_execution_brief_projects_canonical_phase_and_channels() -> None:
+    mechanics = {
+        "micro_action_index": 1,
+        "micro_action": "actor lunges and strikes",
+        "performer": "actor",
+        "technique": "right-hand forward strike",
+        "side": "right",
+        "limbs": ["right arm", "right hand", "left leg", "left foot", "waist", "head"],
+        "footwork": "left foot supports while right foot advances",
+        "torso": "waist leans forward",
+        "weight_shift": "weight shifts forward",
+        "direction": "forward",
+        "contact": "right hand reaches contact",
+        "end_pose": "right foot forward",
+    }
+    beat = {
+        "beat_id": "S01_P01",
+        "duration_s": 7,
+        "planner_version": "honcut.secondary-storyboard.v17",
+        "character_ids": ["actor"],
+        "body_action_contract": {
+            "schema": "honcut.body-action-choreography.v2",
+            "required": True,
+            "valid": True,
+            "beats": [{**mechanics, "kinematics": compile_source_kinematics(mechanics)}],
+        },
+        "generation_action_units": [
+            {
+                "unit_id": "GAU001",
+                "source_action_unit_id": "AU001",
+                "source_event_id": 1,
+                "source_generation_unit_indexes": [1],
+                "source_micro_action_indexes": [1],
+                "ledger_indexes": [0],
+                "actions": ["actor lunges and strikes"],
+                "performers": ["actor"],
+                "targets": ["target"],
+            }
+        ],
+    }
+    apply_generation_kinematics_projection(beat)
+    plan = build_pose_atlas_plan(beat, known_actor_roles=("actor",))
+
+    brief = _compile(plan)
+    group = brief["action_groups"][0]["canonical_kinematics"]
+    rendered = render_action_execution_brief(brief)
+
+    assert group["projection_sha256s"] == brief["kinematics_projection_sha256s"]
+    assert group["ordered_phase_ids"]
+    assert "right_arm" in group["performer_active_channels"]["actor"]
+    assert "运动学执行=" in rendered
+    assert "不得增添翻转或旋转" in rendered
+    assert brief["media_roles"] == _compile(plan)["media_roles"]
+
+
+def test_ten_recoveries_keep_pose_and_phase6_fingerprints_stable() -> None:
+    mechanics = {
+        "micro_action_index": 1,
+        "micro_action": "actor lunges and strikes",
+        "performer": "actor",
+        "technique": "right-hand forward strike",
+        "side": "right",
+        "limbs": ["right arm", "right hand", "left leg", "left foot", "waist", "head"],
+        "footwork": "left foot supports while right foot advances",
+        "torso": "waist leans forward",
+        "weight_shift": "weight shifts forward",
+        "direction": "forward",
+        "contact": "right hand reaches contact",
+        "end_pose": "right foot forward",
+    }
+    source = {
+        "beat_id": "S01_P01",
+        "duration_s": 7,
+        "planner_version": "honcut.secondary-storyboard.v17",
+        "character_ids": ["actor"],
+        "body_action_contract": {
+            "schema": "honcut.body-action-choreography.v2",
+            "required": True,
+            "valid": True,
+            "beats": [{**mechanics, "kinematics": compile_source_kinematics(mechanics)}],
+        },
+        "generation_action_units": [
+            {
+                "unit_id": "GAU001",
+                "source_action_unit_id": "AU001",
+                "source_event_id": 1,
+                "source_generation_unit_indexes": [1],
+                "source_micro_action_indexes": [1],
+                "ledger_indexes": [0],
+                "actions": ["actor lunges and strikes"],
+                "performers": ["actor"],
+                "targets": ["target"],
+            }
+        ],
+    }
+    fingerprints = []
+
+    for _ in range(10):
+        beat = copy.deepcopy(source)
+        projection = apply_generation_kinematics_projection(beat)
+        plan = build_pose_atlas_plan(beat, known_actor_roles=("actor",))
+        brief = _compile(plan)
+        fingerprints.append(
+            (
+                projection["projection_sha256"],
+                plan["plan_sha256"],
+                tuple(
+                    sample["pose_contract"]["pose_fingerprint"]
+                    for sample in plan["pose_samples"]
+                ),
+                brief["brief_sha256"],
+            )
+        )
+
+    assert len(set(fingerprints)) == 1

@@ -23,7 +23,7 @@ class CharacterPerformanceGuide(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["honcut.character-performance-guide.v2"]
+    kind: Literal["honcut.character-performance-guide.v3"]
     usage: Literal["current_pxx_motion_reference_only"]
     character_id: str = Field(min_length=1)
     beat_id: str = Field(pattern=r"^S\d+_P\d+$")
@@ -115,7 +115,7 @@ class GenerationChunk(BaseModel):
         Literal["honcut.identity-neutral-story-guide-renderer.v2"] | None
     ) = Field(default=None, exclude_if=lambda value: value is None)
     storyboard_narrative_guide_pose_contract_schema: (
-        Literal["honcut.storyboard-guide-pose-contract.v3"] | None
+        Literal["honcut.storyboard-guide-pose-contract.v4"] | None
     ) = Field(default=None, exclude_if=lambda value: value is None)
     storyboard_narrative_guide_pose_policy_sha256: str | None = Field(
         default=None,

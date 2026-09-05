@@ -11,10 +11,11 @@ from typing import Any
 
 from utils.camera_motion_contracts import camera_movement_description
 from utils.canonical_visual_contracts import validate_canonical_visual_contract
+from utils.action_kinematics import KINEMATICS_PROJECTION_SCHEMA
 from utils.prompt_budget import PromptBudgetExceededError, resolve_prompt_budget
 
-ACTION_EXECUTION_BRIEF_SCHEMA = "honcut.action-execution-brief.v1"
-ACTION_EXECUTION_BRIEF_MARKER = "[honcut.action-execution-brief.v1]"
+ACTION_EXECUTION_BRIEF_SCHEMA = "honcut.action-execution-brief.v2"
+ACTION_EXECUTION_BRIEF_MARKER = "[honcut.action-execution-brief.v2]"
 IDENTITY_PROJECTION_SCHEMA = "honcut.phase6-identity-projection.v1"
 IDENTITY_PROJECTION_MARKER = "[honcut.phase6-identity-projection.v1]"
 PROMPT_PROJECTION_SCHEMA = "honcut.phase6-prompt-projection.v1"
@@ -309,6 +310,78 @@ def _trajectory_summary(
     }
 
 
+def _kinematics_summary(
+    pose_contracts: Sequence[Mapping[str, Any]],
+    *,
+    group_id: str,
+) -> dict[str, Any] | None:
+    current = [
+        contract
+        for contract in pose_contracts
+        if contract.get("kinematics_schema") is not None
+    ]
+    if not current:
+        return None
+    if len(current) != len(pose_contracts):
+        raise ValueError(f"{group_id} mixes canonical and legacy pose contracts")
+    hashes: list[str] = []
+    phase_ids: list[str] = []
+    performer_channels: dict[str, list[str]] = {}
+    orientation_and_transforms: list[dict[str, Any]] = []
+    for contract in current:
+        if contract.get("kinematics_schema") != KINEMATICS_PROJECTION_SCHEMA:
+            raise ValueError(f"{group_id} kinematics schema is unsupported")
+        projection_hashes = contract.get("kinematics_projection_sha256s")
+        sample = contract.get("kinematics_sample")
+        if (
+            not isinstance(projection_hashes, list)
+            or not projection_hashes
+            or any(not _SHA256_RE.fullmatch(str(value)) for value in projection_hashes)
+            or not isinstance(sample, Mapping)
+            or sample.get("group_projection_sha256s") != projection_hashes
+        ):
+            raise ValueError(f"{group_id} kinematics lineage is invalid")
+        hashes.extend(str(value) for value in projection_hashes if str(value) not in hashes)
+        tracks = sample.get("actor_tracks")
+        if not isinstance(tracks, list) or not tracks:
+            raise ValueError(f"{group_id} kinematics actor tracks are missing")
+        for track in tracks:
+            if not isinstance(track, Mapping):
+                raise ValueError(f"{group_id} kinematics actor track is invalid")
+            performer = str(track.get("performer_id") or "").strip()
+            phase_id = str(track.get("phase_id") or "").strip()
+            channels = track.get("channels")
+            if not performer or not phase_id or not isinstance(channels, Mapping):
+                raise ValueError(f"{group_id} kinematics actor track is invalid")
+            if phase_id not in phase_ids:
+                phase_ids.append(phase_id)
+            active = performer_channels.setdefault(performer, [])
+            for channel_name, state in channels.items():
+                if (
+                    isinstance(state, Mapping)
+                    and state.get("role") == "active"
+                    and int(state.get("activation_milli") or 0) >= 500
+                    and str(channel_name) not in active
+                ):
+                    active.append(str(channel_name))
+            relation = {
+                "performer_id": performer,
+                "phase_id": phase_id,
+                "relative_yaw_mdeg": int(track.get("relative_yaw_mdeg") or 0),
+                "camera_relation": str(track.get("camera_relation") or "unspecified"),
+                "transform": dict(track.get("transform") or {}),
+            }
+            if relation not in orientation_and_transforms:
+                orientation_and_transforms.append(relation)
+    return {
+        "schema": KINEMATICS_PROJECTION_SCHEMA,
+        "projection_sha256s": hashes,
+        "ordered_phase_ids": phase_ids,
+        "performer_active_channels": performer_channels,
+        "orientation_and_transforms": orientation_and_transforms,
+    }
+
+
 def compile_action_execution_brief(
     *,
     beat_id: str,
@@ -460,6 +533,7 @@ def compile_action_execution_brief(
         )
         for key, value in trajectory.items():
             mechanics.setdefault(key, value)
+        kinematics = _kinematics_summary(pose_contracts, group_id=group_id)
         rendered_groups.append(
             {
                 "action_group_id": group_id,
@@ -477,6 +551,7 @@ def compile_action_execution_brief(
                 "performers": performers,
                 "targets": targets,
                 "observable_mechanics": mechanics,
+                "canonical_kinematics": kinematics,
                 "lineage": _validate_lineage(group, group_id=group_id),
                 "actions_sha256": group["actions_sha256"],
                 "group_sha256": group["group_sha256"],
@@ -529,6 +604,18 @@ def compile_action_execution_brief(
         ],
         "ordered_action_group_ids": group_ids,
         "action_groups": rendered_groups,
+        "kinematics_projection_sha256s": _ordered_unique(
+            [
+                value
+                for group in rendered_groups
+                for value in (
+                    (group.get("canonical_kinematics") or {}).get(
+                        "projection_sha256s"
+                    )
+                    or []
+                )
+            ]
+        ),
         "primary_camera": _camera_summary(prompt_context or {}, samples),
         "media_roles": manifest_projection,
         "canonical_visual_contract_sha256": canonical_visual_contract_sha256,
@@ -604,6 +691,31 @@ def render_action_execution_brief(brief: Mapping[str, Any]) -> str:
             f"{group['action_group_id']}（{sample_range}）必须完整可见执行："
             f"{group['action']}" + (f"；{observable}" if observable else "") + "。"
         )
+        kinematics = group.get("canonical_kinematics")
+        if isinstance(kinematics, Mapping):
+            phase_ids = "→".join(kinematics.get("ordered_phase_ids") or [])
+            channel_text = "；".join(
+                f"{performer}=" + "+".join(channels)
+                for performer, channels in (
+                    kinematics.get("performer_active_channels") or {}
+                ).items()
+            )
+            transforms = [
+                item
+                for item in kinematics.get("orientation_and_transforms") or []
+                if (item.get("transform") or {}).get("kind") != "none"
+            ]
+            lines.append(
+                "运动学执行="
+                + phase_ids
+                + (f"；主动链={channel_text}" if channel_text else "")
+                + (
+                    "；明确转体=" + _canonical_json(transforms)
+                    if transforms
+                    else "；不得增添翻转或旋转"
+                )
+                + "；连续衔接，不插入戒备停顿或复位。"
+            )
     completion = brief["completion_window_s"]
     terminal = brief["terminal_hold"]
     lines.extend(

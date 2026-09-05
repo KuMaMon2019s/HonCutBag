@@ -193,7 +193,7 @@ def replay_persisted_action_request(
         raise RuntimeError("action request replay is not deterministic")
     if rebuilt_manifest != media_manifest:
         raise RuntimeError("replay changed persisted media order or hashes")
-    action_position = prompt.find("[honcut.action-execution-brief.v1]")
+    action_position = prompt.find("[honcut.action-execution-brief.v2]")
     identity_position = prompt.find("[honcut.phase6-identity-projection.v1]")
     if action_position < 0 or identity_position < 0 or action_position >= identity_position:
         raise RuntimeError("replay prompt is not action-first")
@@ -205,7 +205,7 @@ def replay_persisted_action_request(
     ):
         raise RuntimeError("replay action group is missing from the front action brief")
     marker_counts = {
-        "action_execution_brief": prompt.count("[honcut.action-execution-brief.v1]"),
+        "action_execution_brief": prompt.count("[honcut.action-execution-brief.v2]"),
         "identity_projection": prompt.count("[honcut.phase6-identity-projection.v1]"),
         "primary_camera": prompt.count("唯一主运镜"),
         "legacy_live_pacing": prompt.count("[honcut.live-paced-action-window.v1]"),

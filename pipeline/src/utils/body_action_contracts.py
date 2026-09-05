@@ -15,7 +15,12 @@ import json
 import re
 from typing import Any, Iterable
 
-BODY_ACTION_CONTRACT_SCHEMA = "honcut.body-action-choreography.v1"
+from utils.action_kinematics import (
+    apply_generation_kinematics_projection,
+    compile_source_kinematics,
+)
+
+BODY_ACTION_CONTRACT_SCHEMA = "honcut.body-action-choreography.v2"
 BODY_ACTION_PLACEHOLDER_RECONCILIATION_SCHEMA = (
     "honcut.body-action-placeholder-reconciliation.v1"
 )
@@ -882,6 +887,18 @@ def build_body_action_contract(record: dict[str, Any]) -> dict[str, Any] | None:
         })
     if not required and not beats:
         return None
+    if not errors:
+        beats = [
+            {
+                **beat,
+                **(
+                    {"kinematics": compile_source_kinematics(beat)}
+                    if not _missing_structured_mechanics(beat)
+                    else {}
+                ),
+            }
+            for beat in beats
+        ]
     return {
         "schema": BODY_ACTION_CONTRACT_SCHEMA,
         "required": required,
@@ -923,6 +940,14 @@ def apply_body_action_contract(record: dict[str, Any]) -> dict[str, Any] | None:
         record.pop("body_action_choreography", None)
     record["body_action_contract"] = contract
     return contract
+
+
+def apply_body_action_kinematics_projection(
+    record: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Project the owner-authored source mechanics onto finalized GAU/Pxx lineage."""
+
+    return apply_generation_kinematics_projection(record)
 
 
 def body_action_contract_errors(record: dict[str, Any]) -> list[dict[str, Any]]:

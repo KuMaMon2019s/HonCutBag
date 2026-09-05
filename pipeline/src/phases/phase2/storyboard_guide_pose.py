@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from collections.abc import Callable, Mapping, Sequence
 from itertools import pairwise
@@ -11,7 +12,13 @@ from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
 
-POSE_CONTRACT_SCHEMA = "honcut.storyboard-guide-pose-contract.v3"
+from utils.action_kinematics import (
+    CHANNEL_ORDER,
+    KINEMATICS_PROJECTION_SCHEMA,
+    sample_generation_units,
+)
+
+POSE_CONTRACT_SCHEMA = "honcut.storyboard-guide-pose-contract.v4"
 
 _POSE_CLASSIFIERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("throw", ("摔", "投掷", "甩向", "throw", "toss")),
@@ -140,7 +147,7 @@ _MECHANICS_MARKERS = {
 }
 
 _POSE_POLICY = {
-    "schema": "honcut.storyboard-guide-pose-policy.v3",
+    "schema": "honcut.storyboard-guide-pose-policy.v4",
     "classifiers": _POSE_CLASSIFIERS,
     "direction_markers": _DIRECTION_MARKERS,
     "actor_markers": _ACTOR_MARKERS,
@@ -148,7 +155,7 @@ _POSE_POLICY = {
     "negation_prefixes": _CHINESE_NEGATION_PREFIXES,
     "mechanics_markers": _MECHANICS_MARKERS,
     "role_resolution": "canonical_actor_alias_map_then_controlled_actor_markers_v2",
-    "geometry": "normalized_joint_templates_with_mechanics_v2",
+    "geometry": "canonical_fixed_point_kinematic_projection_v1",
     "phase_samples": {"start": 0.2, "action_progress": 0.7, "end": 1.0},
     "minimum_adjacent_joint_delta": 2,
     "minimum_action_span_joint_delta": 12,
@@ -757,6 +764,115 @@ def _global_geometry(
     return actors
 
 
+def _kinematic_geometry(
+    sampled_tracks: Sequence[Mapping[str, Any]],
+    actor_roles: Sequence[str],
+) -> list[dict[str, Any]]:
+    """Project canonical fixed-point channels into the identity-neutral skeleton."""
+    actor_count = len(actor_roles)
+    if actor_count != len(sampled_tracks):
+        raise ValueError("canonical kinematics actor-track count is inconsistent")
+    span = 700
+    centers = (
+        [500]
+        if actor_count == 1
+        else [round(150 + span * index / (actor_count - 1)) for index in range(actor_count)]
+    )
+    scale = max(0.42, min(0.88, 2.2 / max(1, actor_count)))
+    channel_joints = {
+        "waist_torso": (
+            "neck",
+            "left_shoulder",
+            "right_shoulder",
+            "left_hip",
+            "right_hip",
+        ),
+        "head": ("head",),
+        "left_arm": ("left_shoulder", "left_elbow"),
+        "left_hand": ("left_hand",),
+        "right_arm": ("right_shoulder", "right_elbow"),
+        "right_hand": ("right_hand",),
+        "left_leg": ("left_hip", "left_knee"),
+        "left_foot": ("left_foot",),
+        "right_leg": ("right_hip", "right_knee"),
+        "right_foot": ("right_foot",),
+    }
+    actors: list[dict[str, Any]] = []
+    for slot, (center_x, role, track) in enumerate(
+        zip(centers, actor_roles, sampled_tracks, strict=True),
+        1,
+    ):
+        channels = track.get("channels")
+        if not isinstance(channels, Mapping):
+            raise ValueError("canonical kinematics sampled channels are missing")
+        root = channels.get("root")
+        if not isinstance(root, Mapping):
+            raise ValueError("canonical kinematics root channel is missing")
+        root_vector = root.get("translation_milli")
+        if not isinstance(root_vector, list) or len(root_vector) != 3:
+            raise ValueError("canonical kinematics root translation is invalid")
+        root_x = round((float(root_vector[0]) + float(root_vector[2]) * 0.35) * 0.16)
+        root_y = round(-float(root_vector[1]) * 0.12)
+        local = {joint: [float(point[0]), float(point[1])] for joint, point in _NEUTRAL.items()}
+        for channel_name, joints in channel_joints.items():
+            state = channels.get(channel_name)
+            if not isinstance(state, Mapping):
+                raise ValueError(f"canonical kinematics {channel_name} channel is missing")
+            translation = state.get("translation_milli")
+            rotation = state.get("rotation_mdeg")
+            if not isinstance(translation, list) or not isinstance(rotation, list):
+                raise ValueError(f"canonical kinematics {channel_name} geometry is invalid")
+            dx = (float(translation[0]) + float(translation[2]) * 0.22) * 0.075
+            dy = (-float(translation[1]) - float(rotation[0]) / 1000 * 2.2) * 0.075
+            yaw_dx = float(rotation[1]) / 1000 * 0.38
+            for joint_index, joint in enumerate(joints, 1):
+                weight = joint_index / len(joints)
+                local[joint][0] += (dx + yaw_dx) * weight
+                local[joint][1] += dy * weight
+        relation = str(track.get("camera_relation") or "unspecified")
+        relation_scale = {
+            "front": 1.0,
+            "back": 0.92,
+            "left_profile": 0.32,
+            "right_profile": 0.32,
+            "left_three_quarter": 0.68,
+            "right_three_quarter": 0.68,
+            "unspecified": 1.0,
+        }.get(relation, 1.0)
+        for point in local.values():
+            point[0] *= relation_scale
+        transform = track.get("transform")
+        if isinstance(transform, Mapping) and transform.get("kind") == "flip":
+            amount_mdeg = transform.get("amount_mdeg")
+            if isinstance(amount_mdeg, int) and transform.get("axis") in {"pitch", "roll"}:
+                radians = math.radians(amount_mdeg / 1000.0)
+                hip_y = (local["left_hip"][1] + local["right_hip"][1]) / 2
+                for point in local.values():
+                    x, y = point[0], point[1] - hip_y
+                    point[0] = x * math.cos(radians) - y * math.sin(radians)
+                    point[1] = x * math.sin(radians) + y * math.cos(radians) + hip_y
+        joints = {
+            joint: [
+                max(35, min(965, round(center_x + root_x + point[0] * scale))),
+                max(180, min(925, round(520 + root_y + point[1] * scale * 3.1))),
+            ]
+            for joint, point in local.items()
+        }
+        actors.append(
+            {
+                "slot": slot,
+                "pose_family": "canonical_kinematics",
+                "facing": str(track.get("camera_relation") or "unspecified"),
+                "root_origin": [0, 0],
+                "root_translation": [root_x, root_y],
+                "relative_yaw_mdeg": int(track.get("relative_yaw_mdeg") or 0),
+                "kinematic_phase_id": str(track.get("phase_id") or ""),
+                "joints": joints,
+            }
+        )
+    return actors
+
+
 def _matching_mechanics(
     beat: Mapping[str, Any],
     units: Sequence[Mapping[str, Any]],
@@ -1022,6 +1138,45 @@ def compile_pose_contracts(
         actions = [action for unit in group for action in _strings(unit.get("actions"))]
         action_text = " → ".join(actions)
         mechanics, matched_body_action_beats = _matching_mechanics(beat, group)
+        body_contract = beat.get("body_action_contract")
+        group_source_indexes = {
+            int(index)
+            for unit in group
+            for index in (unit.get("source_micro_action_indexes") or [])
+            if isinstance(index, int) and not isinstance(index, bool) and index > 0
+        }
+        source_requires_kinematics = (
+            isinstance(body_contract, Mapping)
+            and body_contract.get("schema") == "honcut.body-action-choreography.v2"
+            and any(
+                isinstance(item, Mapping)
+                and int(item.get("micro_action_index") or 0) in group_source_indexes
+                and isinstance(item.get("kinematics"), Mapping)
+                for item in (body_contract.get("beats") or [])
+            )
+        )
+        current_kinematics = any(
+            isinstance(unit.get("kinematics_projection"), Mapping) for unit in group
+        )
+        if source_requires_kinematics and not current_kinematics:
+            raise ValueError("canonical kinematics projection group is missing")
+        camera_projection = (
+            cell.get("camera_projection")
+            if isinstance(cell.get("camera_projection"), Mapping)
+            else None
+        )
+        kinematic_sample: dict[str, Any] | None = None
+        if current_kinematics:
+            camera_yaw_mdeg = (
+                round(float(camera_projection.get("yaw_degrees") or 0) * 1000)
+                if camera_projection is not None
+                else None
+            )
+            kinematic_sample = sample_generation_units(
+                group,
+                pose_progress,
+                camera_yaw_mdeg=camera_yaw_mdeg,
+            )
         family, family_evidence = _pose_family(action_text, mechanics)
         direction, direction_evidence = _direction(action_text, mechanics)
         mechanics_modifiers = _mechanics_modifiers(mechanics, direction)
@@ -1042,10 +1197,24 @@ def compile_pose_contracts(
         actor_roles = _dedupe(
             [role for value in performers if (role := resolved_actor_role(value)) is not None]
         )
-        if family in {"strike", "kick", "grab_control", "throw", "block", "evade"}:
+        if (
+            kinematic_sample is None
+            and family in {"strike", "kick", "grab_control", "throw", "block", "evade"}
+        ):
             actor_roles = _dedupe(
                 actor_roles
                 + [role for value in targets if (role := resolved_actor_role(value)) is not None]
+            )
+        if kinematic_sample is not None:
+            actor_roles = _dedupe(
+                [
+                    role
+                    for track in kinematic_sample["actor_tracks"]
+                    if (
+                        role := resolved_actor_role(str(track.get("performer_id") or ""))
+                    )
+                    is not None
+                ]
             )
         if canonical_performers and not actor_roles:
             raise ValueError("canonical performer produced empty actor_roles")
@@ -1069,23 +1238,22 @@ def compile_pose_contracts(
             active_action = current_action
         elif active_action != current_action:
             raise ValueError("one action-unit group resolved to inconsistent pose semantics")
-        actors = _global_geometry(
-            family,
-            str(cell.get("stage") or "action_progress"),
-            direction,
-            actor_roles,
-            pose_progress=pose_progress,
-            mechanics_modifiers=mechanics_modifiers,
-            prior_actions=prior_actions,
+        actors = (
+            _kinematic_geometry(kinematic_sample["actor_tracks"], actor_roles)
+            if kinematic_sample is not None
+            else _global_geometry(
+                family,
+                str(cell.get("stage") or "action_progress"),
+                direction,
+                actor_roles,
+                pose_progress=pose_progress,
+                mechanics_modifiers=mechanics_modifiers,
+                prior_actions=prior_actions,
+            )
         )
         for actor, role in zip(actors, actor_roles, strict=True):
             actor["role_ref"] = role
             actor["pose_fingerprint"] = _canonical_sha256(actor)
-        camera_projection = (
-            cell.get("camera_projection")
-            if isinstance(cell.get("camera_projection"), Mapping)
-            else None
-        )
         actors = _project_actors_for_camera(actors, camera_projection)
         geometry = {
             "actors": actors,
@@ -1140,6 +1308,16 @@ def compile_pose_contracts(
                 "timing_role": timing_role,
                 "story_time_weight": story_time_weight,
                 **(
+                    {
+                        "kinematics_group_sha256": kinematic_sample[
+                            "group_kinematics_sha256"
+                        ],
+                        "kinematics_sample": kinematic_sample,
+                    }
+                    if kinematic_sample is not None
+                    else {}
+                ),
+                **(
                     {"camera_projection": camera_projection}
                     if camera_projection is not None
                     else {}
@@ -1178,6 +1356,19 @@ def compile_pose_contracts(
             "geometry": geometry,
             "pose_fingerprint": pose_fingerprint,
         }
+        if kinematic_sample is not None:
+            contract.update(
+                {
+                    "kinematics_schema": KINEMATICS_PROJECTION_SCHEMA,
+                    "kinematics_projection_sha256s": list(
+                        kinematic_sample["group_projection_sha256s"]
+                    ),
+                    "kinematics_group_sha256": kinematic_sample[
+                        "group_kinematics_sha256"
+                    ],
+                    "kinematics_sample": kinematic_sample,
+                }
+            )
         if camera_projection is not None:
             contract["camera_projection"] = dict(camera_projection)
         contract["contract_sha256"] = _canonical_sha256(contract)
@@ -1294,6 +1485,32 @@ def validate_pose_contract(
         actor_fingerprint = str(actor_payload.pop("pose_fingerprint", ""))
         if actor_fingerprint != _canonical_sha256(actor_payload):
             raise ValueError("story guide actor pose fingerprint mismatch")
+    kinematics_schema = contract.get("kinematics_schema")
+    kinematics_fingerprint_fields: dict[str, Any] = {}
+    if kinematics_schema is not None:
+        hashes = contract.get("kinematics_projection_sha256s")
+        sample = contract.get("kinematics_sample")
+        if (
+            kinematics_schema != KINEMATICS_PROJECTION_SCHEMA
+            or not isinstance(hashes, list)
+            or not hashes
+            or any(not re.fullmatch(r"[0-9a-f]{64}", str(value)) for value in hashes)
+            or not isinstance(sample, Mapping)
+            or sample.get("group_projection_sha256s") != hashes
+            or sample.get("group_kinematics_sha256") != _canonical_sha256(hashes)
+        ):
+            raise ValueError("story guide canonical kinematics lineage is invalid")
+        sampled_tracks = sample.get("actor_tracks")
+        if not isinstance(sampled_tracks, list) or not sampled_tracks:
+            raise ValueError("story guide canonical kinematics tracks are missing")
+        for track in sampled_tracks:
+            channels = track.get("channels") if isinstance(track, Mapping) else None
+            if not isinstance(channels, Mapping) or tuple(channels) != CHANNEL_ORDER:
+                raise ValueError("story guide canonical kinematics channels are invalid")
+        kinematics_fingerprint_fields = {
+            "kinematics_group_sha256": contract.get("kinematics_group_sha256"),
+            "kinematics_sample": sample,
+        }
     expected_fingerprint = _canonical_sha256(
         {
             "family": contract.get("pose_family"),
@@ -1309,6 +1526,7 @@ def validate_pose_contract(
             "static_spatial_state": bool(contract.get("static_spatial_state")),
             "timing_role": timing_role,
             "story_time_weight": float(story_time_weight),
+            **kinematics_fingerprint_fields,
             **(
                 {"camera_projection": contract.get("camera_projection")}
                 if isinstance(contract.get("camera_projection"), Mapping)

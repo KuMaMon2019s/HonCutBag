@@ -587,7 +587,7 @@ def _preflight_contract(
     required_prompt_fragments = [MEDIA_ROLE_ISOLATION_CONTRACT]
     if chunk.storyboard_pose_atlas_plan_schema:
         required_prompt_fragments.extend((
-            "[honcut.action-execution-brief.v1]",
+            "[honcut.action-execution-brief.v2]",
             "[honcut.phase6-identity-projection.v1]",
             "媒体执行职责",
             "是当前动作顺序、根位移和重心轨迹权威",

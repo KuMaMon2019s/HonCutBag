@@ -172,7 +172,7 @@ def _narrative_guide_fields(
             "honcut.identity-neutral-story-guide-renderer.v2"
         ),
         "storyboard_narrative_guide_pose_contract_schema": (
-            "honcut.storyboard-guide-pose-contract.v3"
+            "honcut.storyboard-guide-pose-contract.v4"
         ),
         "storyboard_narrative_guide_pose_policy_sha256": "d" * 64,
         "storyboard_narrative_guide_pose_contracts_sha256": "e" * 64,
@@ -250,7 +250,7 @@ def _performance_guide_fields(
     return {
         "character_performance_required": True,
         "character_performance_guides": [{
-            "kind": "honcut.character-performance-guide.v2",
+            "kind": "honcut.character-performance-guide.v3",
             "usage": "current_pxx_motion_reference_only",
             "character_id": character_id,
             "beat_id": beat_id,
@@ -1351,7 +1351,7 @@ def test_complex_shot_maps_to_three_secondary_generation_strategies(tmp_path):
     ]
     for chunk in first.chunks:
         assert chunk.storyboard_narrative_guide_pose_contract_schema == (
-            "honcut.storyboard-guide-pose-contract.v3"
+            "honcut.storyboard-guide-pose-contract.v4"
         )
         assert len(chunk.storyboard_narrative_guide_pose_policy_sha256 or "") == 64
         assert len(chunk.storyboard_narrative_guide_pose_contracts_sha256 or "") == 64
@@ -2717,7 +2717,7 @@ def test_phase6_fails_closed_when_mandatory_reference_images_exceed_nine(
                 "cinematic_pixels",
             ],
             "semantic_payload_sha256": "c" * 64,
-            "pose_contract_schema": "honcut.storyboard-guide-pose-contract.v3",
+            "pose_contract_schema": "honcut.storyboard-guide-pose-contract.v4",
             "pose_policy_sha256": "d" * 64,
             "pose_contracts_sha256": "e" * 64,
             "pose_fingerprints": ["1" * 64],

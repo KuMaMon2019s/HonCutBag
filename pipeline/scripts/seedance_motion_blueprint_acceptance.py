@@ -24,16 +24,15 @@ if str(PIPELINE_SRC) not in sys.path:
 
 from acceptance.motion_blueprint import (  # noqa: E402
     CameraTrack,
-    MotionBlueprintInput,
+    CanonicalMotionBlueprintInput,
     MotionEvent,
     SourceLineage,
     assess_legacy_blueprint_manifest,
     combination_eligibility,
-    compile_motion_blueprint,
+    compile_canonical_motion_blueprint,
     inspect_identity_neutral_pixels,
     measure_output_motion,
     sha256_file,
-    technique_supports_contact,
 )
 from clients import seedance_client  # noqa: E402
 from clients.tos_uploader import upload_media_file_required  # noqa: E402
@@ -45,7 +44,7 @@ from utils.config import SEEDANCE_MODEL, get_api_key  # noqa: E402
 from utils.prompt_budget import enforce_prompt_budget  # noqa: E402
 from utils.video_validation import is_valid_video  # noqa: E402
 
-RECEIPT_SCHEMA = "honcut.seedance-motion-blueprint-gate.v5"
+RECEIPT_SCHEMA = "honcut.seedance-motion-blueprint-gate.v6"
 SOURCE_RECEIPT_SCHEMA = "honcut.phase6-storyboard-pose-atlas-live-acceptance.v1"
 REGRESSION_SCHEMA = "honcut.seedance-motion-blueprint-regression.v1"
 MAX_VIDEO_SUBMISSIONS = 1
@@ -170,7 +169,7 @@ def _camera_from_samples(samples: list[dict[str, Any]]) -> CameraTrack:
 
 def _build_contract(
     source_run: Path, source_receipt_path: Path
-) -> tuple[MotionBlueprintInput, dict[str, Any], dict[str, Any]]:
+) -> tuple[CanonicalMotionBlueprintInput, dict[str, Any], dict[str, Any]]:
     receipt = _read_object(source_receipt_path)
     if receipt.get("schema") != SOURCE_RECEIPT_SCHEMA:
         raise GateEvidenceError("unsupported source live-receipt schema")
@@ -205,7 +204,9 @@ def _build_contract(
         source_receipt_path=str(source_receipt_path.relative_to(source_run)),
         source_receipt_sha256=sha256_file(source_receipt_path),
     )
-    candidates: list[tuple[MotionBlueprintInput, dict[str, Any], dict[str, Any]]] = []
+    candidates: list[
+        tuple[CanonicalMotionBlueprintInput, dict[str, Any], dict[str, Any]]
+    ] = []
     for chunk in chunks:
         beat_id = str(chunk.get("storyboard_beat_id") or "")
         samples = chunk.get("storyboard_pose_atlas_pose_samples") or []
@@ -223,9 +224,9 @@ def _build_contract(
         if len(actors) != 1:
             continue
         events: list[MotionEvent] = []
-        for order, group in enumerate(
-            sorted(groups, key=lambda item: int(item.get("order") or 0)), start=1
-        ):
+        generation_unit_ids: list[str] = []
+        projections: list[dict[str, Any]] = []
+        for group in sorted(groups, key=lambda item: int(item.get("order") or 0)):
             group_id = str(group.get("action_group_id") or "")
             group_samples = [
                 sample for sample in samples if sample.get("action_group_id") == group_id
@@ -235,12 +236,40 @@ def _build_contract(
                     f"action group {group_id} lacks pose classification evidence"
                 )
             pose_contract = group_samples[-1].get("pose_contract") or {}
+            if (
+                pose_contract.get("timing_role") == "initial_anchor"
+                or pose_contract.get("pose_family") == "ready"
+            ):
+                continue
             group_lineage = group.get("lineage") or {}
             primitive = _primitive_for_family(str(pose_contract.get("pose_family") or ""))
+            projection = group.get("kinematics_projection")
+            projection_hash = str(group.get("kinematics_projection_sha256") or "")
+            if (
+                not isinstance(projection, dict)
+                or projection.get("projection_sha256") != projection_hash
+            ):
+                raise GateEvidenceError(
+                    f"action group {group_id} lacks current canonical kinematics"
+                )
+            generation_unit_id = str(
+                projection.get("generation_action_unit_id") or ""
+            )
+            if not generation_unit_id:
+                raise GateEvidenceError(
+                    f"action group {group_id} lacks generation-unit lineage"
+                )
+            prop_contact = any(
+                state.get("contact") is True
+                for track in projection.get("actor_tracks") or []
+                for phase in track.get("phases") or []
+                for state in (phase.get("channels") or {}).values()
+                if isinstance(state, dict)
+            )
             events.append(
                 MotionEvent(
-                    event_id=f"{beat_id}_M{order:02d}",
-                    order=order,
+                    event_id=f"{beat_id}_M{len(events) + 1:02d}",
+                    order=len(events) + 1,
                     actor_ids=tuple(actors),
                     primitive=primitive,
                     direction=str(pose_contract.get("direction") or "right"),
@@ -249,15 +278,18 @@ def _build_contract(
                         str(value)
                         for value in group_lineage.get("source_action_unit_ids") or []
                     ),
-                    prop_contact=bool(pose_contract.get("object_roles"))
-                    and technique_supports_contact(primitive),
+                    prop_contact=prop_contact,
                 )
             )
-        candidate = MotionBlueprintInput(
+            generation_unit_ids.append(generation_unit_id)
+            projections.append(dict(projection))
+        candidate = CanonicalMotionBlueprintInput(
             beat_id=beat_id,
             duration_s=4.0,
             actor_ids=tuple(actors),
             events=tuple(events),
+            generation_action_unit_ids=tuple(generation_unit_ids),
+            kinematics_projections=tuple(projections),
             camera=_camera_from_samples(samples),
             lineage=lineage,
         )
@@ -356,7 +388,7 @@ def _project_request(
     new_index = f"视频{len(videos) + 1}"
     prompt = prompt.replace(old_index, new_index)
     prompt += (
-        "\n[honcut.motion-blueprint-reference.v5] "
+        "\n[honcut.motion-blueprint-reference.v6] "
         f"{new_index}仅负责当前Pxx的动作时序、身体运动学、接触时点与运镜轨迹；"
         "其中中性骨架和道具线条不具有角色身份、服装、脸、发型、材质或成片像素权威；"
         "不得把蓝图画面、骨架、控制标记或背景复制进成片。"
@@ -412,7 +444,9 @@ def _project_request(
         "source_generation_fingerprint": source_task.get("generation_fingerprint"),
         "source_prompt_projection_sha256": source_task.get("phase6_prompt_projection_sha256"),
         "motion_blueprint_schema": blueprint["schema"],
-        "motion_technique_registry_sha256": blueprint["technique_registry_sha256"],
+        "motion_kinematics_projection_sha256s": blueprint[
+            "kinematics_projection_sha256s"
+        ],
         "motion_semantic_frames_sha256": blueprint["semantic_frames_sha256"],
         "motion_techniques": [
             {
@@ -519,7 +553,9 @@ def prepare_gate(
     contract, source_receipt, _chunk = _build_contract(source_run, source_receipt_path)
     contract_path = output_dir / "motion_blueprint_contract.json"
     _write_object(contract_path, contract.model_dump(mode="json"))
-    blueprint = compile_motion_blueprint(contract, output_dir / "motion_blueprint.mp4")
+    blueprint = compile_canonical_motion_blueprint(
+        contract, output_dir / "motion_blueprint.mp4"
+    )
     if blueprint["measurements"]["combination"]["tempo_pass"] is not True:
         raise GateEvidenceError("selected canonical combination does not satisfy tempo policy")
     blueprint["pixel_guard"] = inspect_identity_neutral_pixels(Path(blueprint["media_path"]))

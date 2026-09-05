@@ -98,6 +98,11 @@ def _action_groups(units: Sequence[Mapping[str, Any]], beat_id: str) -> list[dic
             "lineage": lineage,
             "actions_sha256": _canonical_sha256(list(unit.get("actions") or [])),
         }
+        if isinstance(unit.get("kinematics_projection"), Mapping):
+            group["kinematics_projection"] = dict(unit["kinematics_projection"])
+            group["kinematics_projection_sha256"] = str(
+                unit.get("kinematics_projection_sha256") or ""
+            )
         group["group_sha256"] = _canonical_sha256(group)
         groups.append(group)
     return groups
@@ -305,6 +310,14 @@ def build_pose_atlas_plan(
         "camera_motion_contract_sha256": camera_hash,
         "action_groups": groups,
         "pose_samples": samples,
+        "kinematics_projection_sha256s": list(dict.fromkeys(
+            str(value)
+            for sample in samples
+            for value in (
+                sample["pose_contract"].get("kinematics_projection_sha256s")
+                or []
+            )
+        )),
         "source_pixel_usage": "none",
     }
     plan_payload_sha256 = _canonical_sha256(payload)

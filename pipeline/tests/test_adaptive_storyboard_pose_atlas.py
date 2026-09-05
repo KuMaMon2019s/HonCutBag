@@ -60,7 +60,7 @@ def test_phase2_maps_instance_name_and_source_mention_to_one_actor_role() -> Non
     beat = {
         "beat_id": "S01_P01",
         "duration_s": 4,
-        "planner_version": "honcut.secondary-storyboard.v16",
+        "planner_version": "honcut.secondary-storyboard.v17",
         "generation_action_units": [
             {
                 **_unit(1, "澜璃快速向右闪避"),
@@ -133,7 +133,7 @@ def test_canonical_performer_changes_actual_body_raster_not_only_arrows() -> Non
     beat = {
         "beat_id": "S01_P01",
         "duration_s": 4,
-        "planner_version": "honcut.secondary-storyboard.v16",
+        "planner_version": "honcut.secondary-storyboard.v17",
         "generation_action_units": [
             {
                 **_unit(1, "澜璃大幅向右闪避并后仰"),
@@ -230,7 +230,7 @@ def test_pose_plan_separates_action_groups_from_pose_samples() -> None:
     beat = {
         "beat_id": "S01_P01",
         "duration_s": 7,
-        "planner_version": "honcut.secondary-storyboard.v16",
+        "planner_version": "honcut.secondary-storyboard.v17",
         "generation_action_units": [
             _unit(1, "actor-alpha advances"),
             _unit(2, "actor-alpha blocks actor-beta"),
@@ -262,7 +262,7 @@ def test_pose_plan_rejects_action_groups_above_capability() -> None:
     beat = {
         "beat_id": "S01_P02",
         "duration_s": 4,
-        "planner_version": "honcut.secondary-storyboard.v16",
+        "planner_version": "honcut.secondary-storyboard.v17",
         "generation_action_units": [
             _unit(index, f"actor-alpha performs distinct movement {index}") for index in range(1, 8)
         ],
@@ -306,7 +306,7 @@ def test_low_density_plan_prefers_single_atlas_even_when_pages_fit() -> None:
         {
             "beat_id": "S01_P01",
             "duration_s": 7,
-            "planner_version": "honcut.secondary-storyboard.v16",
+            "planner_version": "honcut.secondary-storyboard.v17",
             "generation_action_units": [_unit(1, "actor-alpha advances")],
             "character_ids": ["actor-alpha"],
         }
@@ -342,7 +342,7 @@ def test_adaptation_persists_camera_hash_and_phase2_samples_same_path() -> None:
     beat = {
         "beat_id": "S04_P01",
         "duration_s": 7,
-        "planner_version": "honcut.secondary-storyboard.v16",
+        "planner_version": "honcut.secondary-storyboard.v17",
         "generation_action_units": [_unit(1, "actor-alpha advances")],
         "character_ids": ["actor-alpha"],
         "camera_movement": "pan_left",
@@ -368,7 +368,7 @@ def test_phase2_renders_deterministic_single_and_paged_atlas_candidates(tmp_path
     beat = {
         "beat_id": "S03_P01",
         "duration_s": 7,
-        "planner_version": "honcut.secondary-storyboard.v16",
+        "planner_version": "honcut.secondary-storyboard.v17",
         "generation_action_units": [
             _unit(index, f"actor-alpha performs movement {index}") for index in range(1, 8)
         ],
@@ -416,7 +416,7 @@ def test_generation_chunk_rejects_tampered_atlas_coverage(tmp_path) -> None:
     beat = {
         "beat_id": "S01_P01",
         "duration_s": 4,
-        "planner_version": "honcut.secondary-storyboard.v16",
+        "planner_version": "honcut.secondary-storyboard.v17",
         "generation_action_units": [_unit(1, "actor-alpha blocks actor-beta")],
         "character_ids": ["actor-alpha", "actor-beta"],
     }
@@ -454,7 +454,7 @@ def test_phase6_binds_two_page_atlas_after_authoritative_media(tmp_path) -> None
     beat = {
         "beat_id": "S01_P01",
         "duration_s": 7,
-        "planner_version": "honcut.secondary-storyboard.v16",
+        "planner_version": "honcut.secondary-storyboard.v17",
         "generation_action_units": [
             _unit(index, f"actor-alpha performs movement {index}") for index in range(1, 8)
         ],
@@ -550,11 +550,11 @@ def test_phase6_binds_two_page_atlas_after_authoritative_media(tmp_path) -> None
         "storyboard_pose_atlas",
     ]
     prompt = content[0]["text"]
-    assert "[honcut.action-execution-brief.v1]" in prompt
+    assert "[honcut.action-execution-brief.v2]" in prompt
     assert "图片3、图片4是当前动作顺序、根位移和重心轨迹权威" in prompt
     assert "5.5～6.2秒完成" in prompt
     assert "零时长初始锚点" in prompt
-    assert prompt.index("[honcut.action-execution-brief.v1]") < prompt.index(
+    assert prompt.index("[honcut.action-execution-brief.v2]") < prompt.index(
         "[honcut.phase6-identity-projection.v1]"
     )
 
@@ -566,7 +566,7 @@ def test_exact_terminal_reference_is_hashed_and_prompt_bound(tmp_path) -> None:
     beat = {
         "beat_id": "S05_P01",
         "duration_s": 7,
-        "planner_version": "honcut.secondary-storyboard.v16",
+        "planner_version": "honcut.secondary-storyboard.v17",
         "generation_action_units": [_unit(1, "actor-alpha blocks actor-beta")],
         "character_ids": ["actor-alpha", "actor-beta"],
         "terminal_reference_mode": "exact_pose",

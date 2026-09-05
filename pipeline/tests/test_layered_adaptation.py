@@ -583,7 +583,7 @@ def test_layered_resume_skips_cached_skeleton_and_batches(monkeypatch, tmp_path)
     assert json.loads((tmp_path / "shots_partial.json").read_text())["completed_batches"] == [1, 2]
 
 
-def test_v18_layered_checkpoints_migrate_without_overwriting_source(tmp_path):
+def test_v19_layered_checkpoints_migrate_without_overwriting_source(tmp_path):
     public_beat = _beat(1)
     public_beat.pop("_source_event_details")
     legacy_metadata = {
@@ -632,7 +632,7 @@ def test_v18_layered_checkpoints_migrate_without_overwriting_source(tmp_path):
         legacy_metadata
     )
     receipt = json.loads(
-        (tmp_path / "layered_checkpoint_migration_v18_to_v19.json").read_text()
+        (tmp_path / "layered_checkpoint_migration_v19_to_v20.json").read_text()
     )
     assert receipt["status"] == "migrated"
     assert receipt["provider_request_count"] == 0
@@ -650,7 +650,7 @@ def test_future_layered_checkpoint_schema_fails_closed():
         engine._checkpoint_match_kind(
             {
                 "_checkpoint": {
-                    "schema": "honcut.layered-adaptation.v20",
+                    "schema": "honcut.layered-adaptation.v21",
                     "input_fingerprint": "future",
                 }
             },

@@ -18,8 +18,14 @@ from typing import Annotated, Any, Literal
 
 from PIL import Image, ImageDraw
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from utils.action_kinematics import (
+    KINEMATICS_PROJECTION_SCHEMA,
+    sample_projection,
+    validate_generation_kinematics_projection,
+)
 
 BLUEPRINT_SCHEMA = "honcut.seedance-motion-blueprint.v5"
+CANONICAL_BLUEPRINT_SCHEMA = "honcut.seedance-motion-blueprint.v6"
 POLICY_SCHEMA = "honcut.motion-blueprint-policy.v5"
 RENDERER_ID = "honcut.identity-neutral-motion-renderer.v5"
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
@@ -102,6 +108,58 @@ class MotionBlueprintInput(StrictModel):
             raise ValueError("event actors must match the single-actor gate scope")
         if len({event.event_id for event in self.events}) != len(self.events):
             raise ValueError("motion event ids must be unique")
+        return self
+
+
+class CanonicalMotionBlueprintInput(StrictModel):
+    schema_id: Literal["honcut.seedance-motion-blueprint.v6"] = Field(
+        default=CANONICAL_BLUEPRINT_SCHEMA,
+        alias="schema",
+    )
+    beat_id: str
+    duration_s: Annotated[float, Field(ge=4.0, le=4.0)] = 4.0
+    fps: Literal[24] = 24
+    width: Literal[854] = 854
+    height: Literal[480] = 480
+    actor_ids: tuple[str, ...]
+    events: tuple[MotionEvent, ...]
+    generation_action_unit_ids: tuple[str, ...]
+    kinematics_projections: tuple[dict[str, Any], ...]
+    camera: CameraTrack
+    lineage: SourceLineage
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> CanonicalMotionBlueprintInput:
+        if not self.beat_id.strip() or len(self.actor_ids) != 1:
+            raise ValueError("canonical motion blueprint requires one actor and beat id")
+        if (
+            not self.events
+            or len(self.events) != len(self.kinematics_projections)
+            or len(self.events) != len(self.generation_action_unit_ids)
+        ):
+            raise ValueError("canonical motion events and projections must align")
+        orders = [event.order for event in self.events]
+        if orders != list(range(1, len(orders) + 1)):
+            raise ValueError("canonical motion events must be contiguous and ordered")
+        for event, generation_unit_id, raw_projection in zip(
+            self.events,
+            self.generation_action_unit_ids,
+            self.kinematics_projections,
+            strict=True,
+        ):
+            projection = validate_generation_kinematics_projection(raw_projection)
+            if (
+                projection["scope"] != "generation_action_unit"
+                or projection["beat_id"] != self.beat_id
+                or projection["generation_action_unit_id"]
+                != generation_unit_id
+            ):
+                raise ValueError("canonical motion projection lineage is invalid")
+            performers = {
+                str(track["performer_id"]) for track in projection["actor_tracks"]
+            }
+            if not performers.intersection(self.actor_ids):
+                raise ValueError("canonical motion projection actor is invalid")
         return self
 
 
@@ -1357,6 +1415,132 @@ def compile_semantic_frames(
     return frames, intervals
 
 
+def _canonical_joint_frame(track: dict[str, Any]) -> tuple[list[float], dict[str, list[float]], bool]:
+    channels = track["channels"]
+    root_translation = channels["root"]["translation_milli"]
+    root = [
+        round(0.5 + int(root_translation[0]) / 2000, 6),
+        round(0.55 - int(root_translation[2]) / 6000, 6),
+    ]
+    channel_by_joint = {
+        "head": "head",
+        "neck": "waist_torso",
+        "left_shoulder": "left_arm",
+        "left_elbow": "left_arm",
+        "left_wrist": "left_hand",
+        "right_shoulder": "right_arm",
+        "right_elbow": "right_arm",
+        "right_wrist": "right_hand",
+        "hip": "waist_torso",
+        "left_knee": "left_leg",
+        "left_ankle": "left_foot",
+        "right_knee": "right_leg",
+        "right_ankle": "right_foot",
+    }
+    joints: dict[str, list[float]] = {}
+    for joint, base in _BASE_POSE.items():
+        translation = channels[channel_by_joint[joint]]["translation_milli"]
+        expanded_y = 0.05 + (base[1] - 0.05) * 1.08
+        joints[joint] = [
+            round(base[0] + int(translation[0]) / 1450, 6),
+            round(expanded_y - int(translation[2]) / 1700, 6),
+        ]
+    contact = any(
+        state.get("contact") is True for state in channels.values()
+    )
+    return root, joints, contact
+
+
+def compile_canonical_semantic_frames(
+    contract: CanonicalMotionBlueprintInput,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Render acceptance frames from production canonical kinematics only."""
+    total_frames = round(contract.duration_s * contract.fps)
+    terminal_frames = max(1, math.floor(total_frames * MOTION_POLICY.terminal_hold_max_fraction))
+    active_frames = total_frames - terminal_frames
+    counts = [active_frames // len(contract.events)] * len(contract.events)
+    for index in range(active_frames % len(contract.events)):
+        counts[index] += 1
+    if min(counts) < 5:
+        raise ValueError("duration cannot expose every canonical kinematics phase")
+    boundaries = [0]
+    for count in counts:
+        boundaries.append(boundaries[-1] + count)
+    projections = [
+        validate_generation_kinematics_projection(value)
+        for value in contract.kinematics_projections
+    ]
+    frames: list[dict[str, Any]] = []
+    intervals: list[dict[str, Any]] = []
+    for frame_index in range(total_frames):
+        if frame_index >= boundaries[-1]:
+            event_index = len(contract.events) - 1
+            progress = 1.0
+        else:
+            event_index = next(
+                index
+                for index in range(len(contract.events))
+                if boundaries[index] <= frame_index < boundaries[index + 1]
+            )
+            start, end = boundaries[event_index], boundaries[event_index + 1]
+            progress = (frame_index - start) / max(1, end - start - 1)
+        sampled = sample_projection(projections[event_index], progress)
+        matching = [
+            track
+            for track in sampled["actor_tracks"]
+            if track["performer_id"] in contract.actor_ids
+        ]
+        if len(matching) != 1:
+            raise ValueError("canonical blueprint cannot resolve one actor track")
+        track = matching[0]
+        root, joints, contact = _canonical_joint_frame(track)
+        frames.append(
+            {
+                "frame": frame_index,
+                "event_id": contract.events[event_index].event_id,
+                "technique_id": "canonical:" + projections[event_index]["projection_sha256"],
+                "technique_phase_id": track["phase_id"],
+                "root": root,
+                "joints": joints,
+                "camera": _camera_transform(
+                    contract.camera, frame_index / max(1, total_frames - 1)
+                ),
+                "prop_contact": contact,
+            }
+        )
+    for index, (event, projection) in enumerate(
+        zip(contract.events, projections, strict=True)
+    ):
+        track = next(
+            track
+            for track in projection["actor_tracks"]
+            if track["performer_id"] in contract.actor_ids
+        )
+        phase_ids = [str(phase["phase_id"]) for phase in track["phases"]]
+        contact_phase_ids = [
+            str(phase["phase_id"])
+            for phase in track["phases"]
+            if any(state.get("contact") is True for state in phase["channels"].values())
+        ]
+        intervals.append(
+            {
+                "event_id": event.event_id,
+                "order": event.order,
+                "primitive": event.primitive,
+                "start_frame": boundaries[index],
+                "end_frame": boundaries[index + 1] - 1,
+                "source_action_group_id": event.source_action_group_id,
+                "source_action_unit_ids": list(event.source_action_unit_ids),
+                "admission_role": "dynamic_action",
+                "technique_id": "canonical:" + projection["projection_sha256"],
+                "technique_phase_ids": phase_ids,
+                "technique_contact_phase_ids": contact_phase_ids,
+                "technique_keyframes_sha256": projection["projection_sha256"],
+            }
+        )
+    return frames, intervals
+
+
 def _camera_transform(camera: CameraTrack, progress: float) -> dict[str, float]:
     x = y = 0.0
     zoom = 1.0
@@ -1633,20 +1817,23 @@ def measure_semantic_frames(
     return result
 
 
-def compile_motion_blueprint(
-    contract: MotionBlueprintInput, output_path: Path, policy: MotionPolicy = MOTION_POLICY
-) -> dict[str, Any]:
-    """Compile a deterministic H.264 MP4 and return its strict manifest payload."""
+def _encode_blueprint_video(
+    frames: list[dict[str, Any]],
+    *,
+    output_path: Path,
+    width: int,
+    height: int,
+    fps: int,
+    policy: MotionPolicy,
+) -> tuple[Path, dict[str, Any], dict[str, Any]]:
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
         raise RuntimeError("motion blueprint compilation requires ffmpeg and ffprobe")
-    frames, intervals = compile_semantic_frames(contract, policy)
-    measurements = measure_semantic_frames(contract, frames, intervals, policy)
     output = Path(output_path).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="honcut-motion-blueprint-") as temporary:
         frame_dir = Path(temporary)
         for frame in frames:
-            _render_frame(frame, contract.width, contract.height).save(
+            _render_frame(frame, width, height).save(
                 frame_dir / f"{frame['frame']:06d}.png", optimize=False, compress_level=9
             )
         command = [
@@ -1655,7 +1842,7 @@ def compile_motion_blueprint(
             "-loglevel",
             "error",
             "-framerate",
-            str(contract.fps),
+            str(fps),
             "-i",
             str(frame_dir / "%06d.png"),
             "-an",
@@ -1668,9 +1855,9 @@ def compile_motion_blueprint(
             "-pix_fmt",
             "yuv420p",
             "-r",
-            str(contract.fps),
+            str(fps),
             "-g",
-            str(contract.fps * 2),
+            str(fps * 2),
             "-sc_threshold",
             "0",
             "-map_metadata",
@@ -1712,6 +1899,27 @@ def compile_motion_blueprint(
     rendered_motion = measure_rendered_blueprint_motion(output, policy)
     if rendered_motion["deterministic_motion_pass"] is not True:
         raise ValueError("rendered motion blueprint has sub-threshold perceptual kinetics")
+    return output, technical, rendered_motion
+
+
+def compile_motion_blueprint(
+    contract: MotionBlueprintInput, output_path: Path, policy: MotionPolicy = MOTION_POLICY
+) -> dict[str, Any]:
+    """Compile an audit-compatible registry blueprint.
+
+    Current paid admission uses :func:`compile_canonical_motion_blueprint`;
+    this compatibility path is retained only to read and reproduce v5 evidence.
+    """
+    frames, intervals = compile_semantic_frames(contract, policy)
+    measurements = measure_semantic_frames(contract, frames, intervals, policy)
+    output, technical, rendered_motion = _encode_blueprint_video(
+        frames,
+        output_path=output_path,
+        width=contract.width,
+        height=contract.height,
+        fps=contract.fps,
+        policy=policy,
+    )
     measurements["rendered_motion"] = rendered_motion
     semantic_sha256 = hashlib.sha256(
         canonical_json({"frames": frames, "events": intervals})
@@ -1744,6 +1952,68 @@ def compile_motion_blueprint(
         "provider_request_count": 0,
     }
     return MotionBlueprintManifest.model_validate(manifest).model_dump(mode="json")
+
+
+def compile_canonical_motion_blueprint(
+    contract: CanonicalMotionBlueprintInput,
+    output_path: Path,
+    policy: MotionPolicy = MOTION_POLICY,
+) -> dict[str, Any]:
+    """Compile the current acceptance blueprint from canonical kinematics."""
+    frames, intervals = compile_canonical_semantic_frames(contract)
+    measurements = measure_semantic_frames(contract, frames, intervals, policy)  # type: ignore[arg-type]
+    output, technical, rendered_motion = _encode_blueprint_video(
+        frames,
+        output_path=output_path,
+        width=contract.width,
+        height=contract.height,
+        fps=contract.fps,
+        policy=policy,
+    )
+    measurements["rendered_motion"] = rendered_motion
+    semantic_sha256 = hashlib.sha256(
+        canonical_json({"frames": frames, "events": intervals})
+    ).hexdigest()
+    contract_sha256 = hashlib.sha256(
+        canonical_json(contract.model_dump(mode="json"))
+    ).hexdigest()
+    projection_hashes = [
+        validate_generation_kinematics_projection(value)["projection_sha256"]
+        for value in contract.kinematics_projections
+    ]
+    return {
+        "schema": CANONICAL_BLUEPRINT_SCHEMA,
+        "policy_schema": policy.schema_id,
+        "policy_sha256": policy_sha256(policy),
+        "renderer_id": "honcut.canonical-kinematics-motion-renderer.v1",
+        "kinematics_schema": KINEMATICS_PROJECTION_SCHEMA,
+        "kinematics_projection_sha256s": projection_hashes,
+        "legacy_technique_registry_used": False,
+        "identity_authority": False,
+        "authority_roles": [
+            "motion_timing",
+            "body_kinematics",
+            "camera_motion",
+            "contact_timing",
+        ],
+        "non_authority_roles": [
+            "character_identity",
+            "face_geometry",
+            "hair_geometry",
+            "wardrobe",
+            "prop_appearance",
+            "cinematic_pixels",
+        ],
+        "contract_sha256": contract_sha256,
+        "semantic_frames_sha256": semantic_sha256,
+        "media_path": str(output),
+        "media_sha256": sha256_file(output),
+        "media_size_bytes": output.stat().st_size,
+        "measurements": measurements,
+        "technical_probe": technical,
+        "lineage": contract.lineage.model_dump(mode="json"),
+        "provider_request_count": 0,
+    }
 
 
 def inspect_identity_neutral_pixels(video_path: Path) -> dict[str, Any]:

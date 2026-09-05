@@ -38,6 +38,7 @@ from runtime.continuity_provider import (
 from schemas.continuity import GenerationChunk
 from prompt.seedream_image_prompt import bind_reference_roles, prompt_guidance_metrics
 from utils import privacy_visual_policy
+from utils.action_kinematics import apply_generation_kinematics_projection
 from utils.body_action_contracts import (
     apply_body_action_contract,
     body_action_contract_errors,
@@ -172,7 +173,7 @@ def test_event_normalization_persists_structured_body_action_contract():
 
     _normalize_event(event, "舞者完成街舞托马斯。")
 
-    assert event["body_action_contract"]["schema"] == "honcut.body-action-choreography.v1"
+    assert event["body_action_contract"]["schema"] == "honcut.body-action-choreography.v2"
     assert event["body_action_contract"]["valid"] is True
     assert event["body_action_choreography"][0]["weight_shift"]
 
@@ -436,6 +437,7 @@ def test_storyboard_and_video_prompts_keep_full_unabstracted_choreography():
             "actions": [shot["generation_actions"][0]],
             "performers": ["舞者"],
             "source_event_id": 1,
+            "source_micro_action_indexes": [1],
             "source_generation_unit_indexes": [1],
             "ledger_indexes": [0],
         }],
@@ -446,6 +448,7 @@ def test_storyboard_and_video_prompts_keep_full_unabstracted_choreography():
         "camera_movement": "tracking",
     }
     apply_body_action_contract(beat)
+    apply_generation_kinematics_projection(beat)
     shot["storyboard_beats"] = [beat]
 
     board_prompt, _beats = build_shot_storyboard_prompt(

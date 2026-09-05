@@ -20,6 +20,7 @@ from acceptance.motion_blueprint import (
     SourceLineage,
     assess_legacy_blueprint_manifest,
     combination_eligibility,
+    compile_canonical_motion_blueprint,
     compile_motion_blueprint,
     compile_semantic_frames,
     inspect_identity_neutral_pixels,
@@ -29,6 +30,10 @@ from acceptance.motion_blueprint import (
     technique_registry_sha256,
 )
 from utils.canonical_visual_contracts import build_canonical_visual_contract
+from utils.action_kinematics import (
+    apply_generation_kinematics_projection,
+    compile_source_kinematics,
+)
 
 SCRIPT_PATH = Path(__file__).parents[1] / "scripts" / "seedance_motion_blueprint_acceptance.py"
 SPEC = importlib.util.spec_from_file_location("seedance_motion_blueprint_acceptance", SCRIPT_PATH)
@@ -586,6 +591,54 @@ def _fixture_run(tmp_path: Path) -> tuple[Path, Path]:
         )
     prompt = "图片1锁定身份；图片2锁定开场；图片3负责动作。"
     (run / "prompt.txt").write_text(prompt + "\n", encoding="utf-8")
+    action_specs = (
+        ("ready", "actor_01 holds ready stance", "ready guard", ""),
+        ("strike", "actor_01 drives a right-hand strike", "right-hand strike", "right hand contacts"),
+        ("evade", "actor_01 lunges left to evade", "leftward evade", ""),
+        ("block", "actor_01 raises both arms to block", "two-arm block", "arms absorb contact"),
+    )
+    mechanics_beats = []
+    units = []
+    for index, (_family, action, technique, contact) in enumerate(action_specs, 1):
+        mechanics = {
+            "micro_action_index": index,
+            "micro_action": action,
+            "performer": "actor_01",
+            "technique": technique,
+            "side": "right" if index == 2 else "bilateral",
+            "limbs": ["right arm", "right hand", "left leg", "left foot", "waist", "head"],
+            "footwork": "left foot supports while right foot advances",
+            "torso": "waist coordinates the movement",
+            "weight_shift": "weight moves through the stance",
+            "direction": "left" if index == 3 else "forward",
+            "contact": contact,
+            "end_pose": "balanced completion",
+        }
+        mechanics_beats.append(
+            {**mechanics, "kinematics": compile_source_kinematics(mechanics)}
+        )
+        units.append(
+            {
+                "unit_id": f"GAU{index:03d}",
+                "source_action_unit_id": f"AU{index:03d}",
+                "source_micro_action_indexes": [index],
+                "actions": [action],
+            }
+        )
+    kinematics_record = {
+        "beat_id": "S01_P01",
+        "body_action_contract": {
+            "schema": "honcut.body-action-choreography.v2",
+            "required": True,
+            "valid": True,
+            "beats": mechanics_beats,
+        },
+        "generation_action_units": units,
+    }
+    apply_generation_kinematics_projection(kinematics_record)
+    projected_units = {
+        unit["unit_id"]: unit for unit in kinematics_record["generation_action_units"]
+    }
     samples = []
     for index, family in enumerate(("ready", "strike", "evade", "block"), 1):
         samples.append(
@@ -598,6 +651,7 @@ def _fixture_run(tmp_path: Path) -> tuple[Path, Path]:
                     "actor_roles": ["actor_01"],
                     "object_roles": ["prop"] if index == 2 else [],
                     "camera_vector": {"x": 1, "y": 0},
+                    "timing_role": "initial_anchor" if index == 1 else "story_action",
                 },
             }
         )
@@ -613,8 +667,17 @@ def _fixture_run(tmp_path: Path) -> tuple[Path, Path]:
                             {
                                 "action_group_id": f"S01_P01_A{index:02d}",
                                 "order": index,
-                                "lineage": {"source_action_unit_ids": [f"AU{index:03d}"]},
-                            }
+                        "lineage": {
+                            "unit_ids": [f"GAU{index:03d}"],
+                            "source_action_unit_ids": [f"AU{index:03d}"],
+                        },
+                        "kinematics_projection": projected_units[f"GAU{index:03d}"][
+                            "kinematics_projection"
+                        ],
+                        "kinematics_projection_sha256": projected_units[
+                            f"GAU{index:03d}"
+                        ]["kinematics_projection_sha256"],
+                    }
                             for index in (1, 2, 3, 4)
                         ],
                     }
@@ -682,16 +745,21 @@ def test_no_submit_projection_is_single_variable_seedance_only(
     assert projected["media"][-1]["media_type"] == "video_url"
     assert projected["media"][-1]["prompt_index"] == "视频1"
     prompt = (tmp_path / "gate" / "seedance_prompt.txt").read_text()
-    assert "[honcut.motion-blueprint-reference.v5]" in prompt
+    assert "[honcut.motion-blueprint-reference.v6]" in prompt
     assert "视频1仅负责当前Pxx的动作时序" in prompt
     for tuning_phrase in ("0.15秒", "爆发峰值", "预备反向", "越位与回收", "慢速匀速漂移"):
         assert tuning_phrase not in prompt
     assert "图片3负责动作" not in (tmp_path / "gate" / "seedance_prompt.txt").read_text()
-    assert projected["motion_blueprint_schema"] == "honcut.seedance-motion-blueprint.v5"
-    assert len(projected["motion_technique_registry_sha256"]) == 64
-    assert projected["motion_techniques"][1]["technique_id"] == "linear_hand_strike_v1"
-    assert projected["motion_techniques"][2]["technique_id"] == "lateral_slip_v1"
-    assert projected["motion_techniques"][3]["technique_id"] == "two_arm_high_block_v1"
+    assert projected["motion_blueprint_schema"] == "honcut.seedance-motion-blueprint.v6"
+    assert len(projected["motion_kinematics_projection_sha256s"]) == 3
+    assert all(
+        item["technique_id"].startswith("canonical:")
+        for item in projected["motion_techniques"]
+    )
+    assert all(
+        item["technique_phase_ids"]
+        for item in projected["motion_techniques"]
+    )
 
 
 def test_gate_selects_canonical_combo_but_never_borrows_another_pxx_request(
@@ -702,27 +770,34 @@ def test_gate_selects_canonical_combo_but_never_borrows_another_pxx_request(
     plan_path = run / "CONTINUITY_PLAN.json"
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     p01 = plan["shots"][0]["chunks"][0]
+    p02 = json.loads(json.dumps(p01))
     p01["storyboard_pose_atlas_pose_samples"] = p01[
         "storyboard_pose_atlas_pose_samples"
     ][:3]
     p01["storyboard_pose_atlas_action_groups"] = p01[
         "storyboard_pose_atlas_action_groups"
     ][:3]
-    p02 = json.loads(json.dumps(plan["shots"][0]["chunks"][0]))
     p02["storyboard_beat_id"] = "S01_P02"
-    for index, (sample, family) in enumerate(
-        zip(
-            p02["storyboard_pose_atlas_pose_samples"],
-            ("strike", "evade", "block"),
-            strict=True,
-        ),
-        1,
-    ):
+    for index, sample in enumerate(p02["storyboard_pose_atlas_pose_samples"], 1):
         sample["action_group_id"] = f"S01_P02_A{index:02d}"
-        sample["pose_contract"]["pose_family"] = family
     for index, group in enumerate(p02["storyboard_pose_atlas_action_groups"], 1):
         group["action_group_id"] = f"S01_P02_A{index:02d}"
-        group["lineage"] = {"source_action_unit_ids": [f"AU{index + 10:03d}"]}
+        group["lineage"] = {
+            "unit_ids": [f"GAU{index:03d}"],
+            "source_action_unit_ids": [f"AU{index + 10:03d}"],
+        }
+        projection = group["kinematics_projection"]
+        projection["beat_id"] = "S01_P02"
+        projection.pop("projection_sha256")
+        projection["projection_sha256"] = hashlib.sha256(
+            json.dumps(
+                projection,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        group["kinematics_projection_sha256"] = projection["projection_sha256"]
     plan["shots"][0]["chunks"].append(p02)
     plan_path.write_text(json.dumps(plan), encoding="utf-8")
     monkeypatch.setattr(gate, "SEEDANCE_MODEL", "doubao-seedance-2.0-fast")
@@ -780,7 +855,7 @@ def test_alternate_or_unsupported_model_is_rejected(model: str) -> None:
 def test_changed_identity_or_duration_breaks_equivalence(tmp_path: Path) -> None:
     run, receipt_path = _fixture_run(tmp_path)
     contract, receipt, _ = gate._build_contract(run, receipt_path)
-    blueprint = compile_motion_blueprint(contract, tmp_path / "motion.mp4")
+    blueprint = compile_canonical_motion_blueprint(contract, tmp_path / "motion.mp4")
     gate._project_request(run, receipt, blueprint)
     receipt["preflight"]["duration"] = 8
     with pytest.raises(gate.GateEvidenceError, match="frozen model/output profile"):

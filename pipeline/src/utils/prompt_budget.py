@@ -14,7 +14,7 @@ SINGLETON_PROMPT_MARKERS = (
     "[storyboard-motion-notation]",
     "[honcut-video-generation-contract-v2]",
     "[逐拍肢体动作谱｜不可摘要]",
-    "[honcut.action-execution-brief.v1]",
+    "[honcut.action-execution-brief.v2]",
     "[honcut.phase6-identity-projection.v1]",
     "[honcut.phase6-media-role-isolation.v1]",
     "【非真人视觉硬约束】",

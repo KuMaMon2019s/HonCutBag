@@ -30,6 +30,10 @@ from quality.character_performance_qa import (
     review_character_performance_cell,
 )
 from utils.canonical_visual_contracts import persist_canonical_visual_contract
+from utils.action_kinematics import (
+    apply_generation_kinematics_projection,
+    compile_source_kinematics,
+)
 
 
 def _character() -> dict:
@@ -370,6 +374,51 @@ def test_plan_prefers_source_facts_and_projects_generic_pose_constraints():
     assert attack["pose_constraints"]["lead_foot"] == "left"
     assert attack["pose_constraints"]["prop_start"] == "right_lower"
     assert attack["pose_constraints"]["prop_end"] == "left_upper"
+
+
+def test_current_performance_plan_consumes_canonical_kinematics_not_prose() -> None:
+    mechanics = {
+        "micro_action_index": 1,
+        "micro_action": "领队向前跨步挥击",
+        "performer": "领队",
+        "technique": "右手挥击",
+        "side": "右侧",
+        "limbs": ["右臂", "右手", "左腿", "左脚", "腰", "头"],
+        "footwork": "左脚支撑，右脚向前跨步",
+        "torso": "腰部前倾",
+        "weight_shift": "重心前移",
+        "direction": "向前",
+        "contact": "右手完成接触",
+        "end_pose": "右脚在前",
+    }
+    record = {
+        "beat_id": "S01_P01",
+        "character_ids": ["lead"],
+        "body_action_contract": {
+            "schema": "honcut.body-action-choreography.v2",
+            "required": True,
+            "valid": True,
+            "beats": [{**mechanics, "kinematics": compile_source_kinematics(mechanics)}],
+        },
+        "source_action_unit_ids": ["AU001"],
+        "generation_action_units": [
+            {
+                **_unit("GAU001", "AU001", "领队向前跨步挥击"),
+                "source_micro_action_indexes": [1],
+            }
+        ],
+    }
+    apply_generation_kinematics_projection(record)
+    storyboard = {"shots": [{"id": "S01", "shot_intent": "action", "storyboard_beats": [record]}]}
+
+    first = build_character_performance_plan(storyboard, _character())
+    record["generation_action_units"][0]["source_fact_echoes"] = ["完全不同的显示文案"]
+    second = build_character_performance_plan(storyboard, _character())
+
+    assert first is not None and second is not None
+    assert first["cells"][0]["kinematics_projection_sha256"]
+    assert first["cells"][0]["pose_constraints"] == second["cells"][0]["pose_constraints"]
+    assert "right_arm" in first["cells"][0]["pose_constraints"]["active_channels"]
 
 
 def test_six_pose_roles_specialize_only_existing_prop_action_lineage():
@@ -881,7 +930,7 @@ def test_failed_whole_board_uses_six_cached_components_then_passes(tmp_path):
         pose_receipt = json.loads(
             (tmp_path / pose_reference["path"]).with_suffix(".json").read_text()
         )
-        assert pose_receipt["schema"] == "honcut.character-performance-pose-guide.v2"
+        assert pose_receipt["schema"] == "honcut.character-performance-pose-guide.v3"
         assert pose_receipt["provider_requests"] == 0
         assert (tmp_path / component["image"]).with_suffix(".qa.json").is_file()
 

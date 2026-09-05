@@ -7338,8 +7338,8 @@ LEGACY_SCREENPLAY_PLAN_SCHEMAS = frozenset({
     "honcut.screenplay-plan.v5",
     "honcut.screenplay-plan.v6",
 })
-LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v19"
-LEGACY_LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v18"
+LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v20"
+LEGACY_LAYERED_CHECKPOINT_SCHEMA = "honcut.layered-adaptation.v19"
 LAYERED_CHECKPOINT_MIGRATION_SCHEMA = (
     "honcut.layered-adaptation-checkpoint-migration.v1"
 )
@@ -8071,10 +8071,10 @@ def _checkpoint_match_kind(
         return "current" if fingerprint == input_fingerprint else "invalid"
     if schema == LEGACY_LAYERED_CHECKPOINT_SCHEMA:
         if legacy_input_fingerprint and fingerprint == legacy_input_fingerprint:
-            return "legacy_v18"
-        return "legacy_v18_audit_only"
+            return "legacy_v19"
+        return "legacy_v19_audit_only"
     version_match = re.fullmatch(r"honcut\.layered-adaptation\.v(\d+)", schema)
-    if version_match and int(version_match.group(1)) > 19:
+    if version_match and int(version_match.group(1)) > 20:
         raise UnsupportedLayeredCheckpointSchemaError(
             f"layered checkpoint schema {schema} is newer than supported "
             f"version {LAYERED_CHECKPOINT_SCHEMA}"
@@ -8108,7 +8108,7 @@ def _write_layered_checkpoint_migration_receipt(
     if reason:
         receipt["reason"] = reason
     _atomic_write_json(
-        output_dir / "layered_checkpoint_migration_v18_to_v19.json",
+        output_dir / "layered_checkpoint_migration_v19_to_v20.json",
         receipt,
     )
 
@@ -8139,7 +8139,7 @@ def _load_layered_checkpoints(
                 input_fingerprint,
                 legacy_input_fingerprint,
             )
-            if match_kind == "legacy_v18_audit_only":
+            if match_kind == "legacy_v19_audit_only":
                 _write_layered_checkpoint_migration_receipt(
                     output_dir,
                     status="audit_only",
@@ -8154,7 +8154,7 @@ def _load_layered_checkpoints(
                     reason="legacy checkpoint fingerprint or lineage mismatch",
                 )
                 raise ValueError("legacy layered skeleton is audit-only")
-            if match_kind not in {"current", "legacy_v18"}:
+            if match_kind not in {"current", "legacy_v19"}:
                 raise ValueError("layered skeleton belongs to a different input")
             _parse_beat_skeleton(json.dumps(candidate, ensure_ascii=False), expected_beats, len(events))
             _validate_beat_action_capacity(
@@ -8193,7 +8193,7 @@ def _load_layered_checkpoints(
             event_by_id = {i: dict(event, event_id=i) for i, event in enumerate(events, 1)}
             for beat in candidate["beats"]:
                 beat["_source_event_details"] = [event_by_id[event_id] for event_id in beat["source_events"]]
-            if match_kind == "legacy_v18":
+            if match_kind == "legacy_v19":
                 migrated_artifacts.append({
                     "path": skeleton_path.name,
                     "sha256": hashlib.sha256(
@@ -8221,9 +8221,9 @@ def _load_layered_checkpoints(
                 input_fingerprint,
                 legacy_input_fingerprint,
             )
-            if match_kind == "legacy_v18_audit_only":
+            if match_kind == "legacy_v19_audit_only":
                 raise ValueError("legacy partial checkpoint is audit-only")
-            if match_kind not in {"current", "legacy_v18"}:
+            if match_kind not in {"current", "legacy_v19"}:
                 raise ValueError("partial shots belong to a different input")
             candidate_shots = partial.get("shots", [])
             completed = partial.get("completed_batches", [])
@@ -8238,7 +8238,7 @@ def _load_layered_checkpoints(
                 candidate_shots,
                 skeleton["beats"],
             )
-            if match_kind == "legacy_v18":
+            if match_kind == "legacy_v19":
                 migrated_artifacts.append({
                     "path": partial_path.name,
                     "sha256": hashlib.sha256(

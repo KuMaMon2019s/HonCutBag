@@ -56,7 +56,7 @@ def _request_and_content(tmp_path, *, duration: float = 7) -> tuple:
     beat = {
         "beat_id": "S01_P01",
         "duration_s": duration,
-        "planner_version": "honcut.secondary-storyboard.v16",
+        "planner_version": "honcut.secondary-storyboard.v17",
         "generation_action_units": [
             _unit(index, action) for index, action in enumerate(actions, 1)
         ],
@@ -176,9 +176,9 @@ def test_action_first_projection_replaces_conflicting_legacy_prompt(tmp_path) ->
     assert "真人皮肤" not in prompt
     assert "先保持戒备姿态" not in prompt
     assert "[honcut-video-generation-contract-v2]" not in prompt
-    assert prompt.count("[honcut.action-execution-brief.v1]") == 1
+    assert prompt.count("[honcut.action-execution-brief.v2]") == 1
     assert prompt.count("唯一主运镜") == 1
-    assert prompt.index("[honcut.action-execution-brief.v1]") < prompt.index(
+    assert prompt.index("[honcut.action-execution-brief.v2]") < prompt.index(
         "[honcut.phase6-identity-projection.v1]"
     )
     assert first[0]["_action_execution_group_ids"] == [
@@ -385,7 +385,7 @@ def test_action_brief_supports_provider_durations_and_later_beats(
         {
             "beat_id": beat_id,
             "duration_s": duration,
-            "planner_version": "honcut.secondary-storyboard.v16",
+            "planner_version": "honcut.secondary-storyboard.v17",
             "generation_action_units": [_unit(1, action)],
             "character_ids": ["actor-alpha"],
         }

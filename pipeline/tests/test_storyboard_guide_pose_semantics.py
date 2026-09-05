@@ -47,7 +47,7 @@ def _unit(
 def _beat(*units: dict, character_ids: tuple[str, ...] = ()) -> dict:
     return {
         "beat_id": "S01_P01",
-        "planner_version": "honcut.secondary-storyboard.v16",
+        "planner_version": "honcut.secondary-storyboard.v17",
         "generation_action_units": list(units),
         "character_ids": list(character_ids),
         "action": " then ".join(unit["actions"][0] for unit in units),
@@ -647,7 +647,7 @@ def test_tampered_geometry_and_missing_lineage_fail_closed():
 
 @pytest.mark.parametrize(
     "planner_version",
-    ["honcut.secondary-storyboard.v16", None],
+    ["honcut.secondary-storyboard.v17", None],
 )
 def test_storyboard_beat_without_canonical_action_units_fails_closed(planner_version):
     beat = {
@@ -684,7 +684,7 @@ def test_phase6_task_fingerprint_binds_pose_fingerprints_and_zero_time_anchor(tm
         "storyboard_narrative_guide_sha256": "a" * 64,
         "storyboard_narrative_guide_renderer": ("honcut.identity-neutral-story-guide-renderer.v2"),
         "storyboard_narrative_guide_pose_contract_schema": (
-            "honcut.storyboard-guide-pose-contract.v3"
+            "honcut.storyboard-guide-pose-contract.v4"
         ),
         "storyboard_narrative_guide_pose_policy_sha256": "b" * 64,
         "storyboard_narrative_guide_pose_contracts_sha256": "c" * 64,
@@ -768,7 +768,7 @@ def test_continuity_chunk_rejects_incomplete_pose_fingerprint_binding():
             storyboard_narrative_guide_sha256="a" * 64,
             storyboard_narrative_guide_renderer=("honcut.identity-neutral-story-guide-renderer.v2"),
             storyboard_narrative_guide_pose_contract_schema=(
-                "honcut.storyboard-guide-pose-contract.v3"
+                "honcut.storyboard-guide-pose-contract.v4"
             ),
             storyboard_narrative_guide_pose_policy_sha256="b" * 64,
             storyboard_narrative_guide_pose_contracts_sha256="c" * 64,

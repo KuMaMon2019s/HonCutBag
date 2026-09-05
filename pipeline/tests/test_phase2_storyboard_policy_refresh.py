@@ -21,7 +21,7 @@ def _storyboard() -> dict:
                 "storyboard_beats": [
                     {
                         "beat_id": "S01_P01",
-                        "planner_version": "honcut.secondary-storyboard.v16",
+                        "planner_version": "honcut.secondary-storyboard.v17",
                         "duration_s": 5,
                         "generation_mode": "fresh",
                         "character_ids": [],
@@ -38,7 +38,7 @@ def _storyboard() -> dict:
                     },
                     {
                         "beat_id": "S01_P02",
-                        "planner_version": "honcut.secondary-storyboard.v16",
+                        "planner_version": "honcut.secondary-storyboard.v17",
                         "duration_s": 5,
                         "generation_mode": "extend",
                         "character_ids": [],

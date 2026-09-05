@@ -12,7 +12,10 @@ from typing import Any
 
 from schemas.replanning import PADDING_LOSS_ERROR_CODE
 from utils.action_units import ACTION_TIMELINE_SCHEMA, normalize_action_units
-from utils.body_action_contracts import apply_body_action_contract
+from utils.body_action_contracts import (
+    apply_body_action_contract,
+    apply_body_action_kinematics_projection,
+)
 from utils.material_budget import (
     BRIDGE_TIMELINE_POLICY,
     attach_material_budget,
@@ -26,8 +29,8 @@ from utils.video_capabilities import (
     min_primary_story_duration,
 )
 
-SECONDARY_STORYBOARD_VERSION = "honcut.secondary-storyboard.v16"
-SECONDARY_EXECUTION = "canonical_timeline_post_primary_bridge_v16"
+SECONDARY_STORYBOARD_VERSION = "honcut.secondary-storyboard.v17"
+SECONDARY_EXECUTION = "canonical_timeline_post_primary_bridge_v17"
 SECONDARY_GENERATION_MODES = frozenset({
     "multi_image",
     "tail_video_extend",
@@ -2607,7 +2610,9 @@ def plan_storyboard_beats(
             ]
             if source_choreography:
                 normalized["body_action_choreography"] = source_choreography
-            apply_body_action_contract(normalized)
+            body_contract = apply_body_action_contract(normalized)
+            if body_contract is not None and body_contract.get("valid") is True:
+                apply_body_action_kinematics_projection(normalized)
             beats.append(normalized)
         if bridge_required:
             next_shot, next_requirement = planned[index + 1]

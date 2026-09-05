@@ -1222,7 +1222,7 @@ def test_event_extractor_requests_bounded_nonduplicative_structured_output():
     assert "不得删减来源动作" in contract
     assert "不得拆成额外请求" in contract
     assert "有界结构化输出" in event_extractor.USER_PROMPT_TEMPLATE
-    assert event_extractor.EVENT_FLOW_SCHEMA_VERSION == "32.0"
+    assert event_extractor.EVENT_FLOW_SCHEMA_VERSION == "33.0"
 
 
 def test_director_uses_runtime_long_structured_stream_policy():
@@ -6934,7 +6934,7 @@ def test_phase6_live_acceptance_can_timebox_current_guide_motion():
 def test_phase6_live_acceptance_does_not_append_a_second_atlas_clock():
     content = [{
         "type": "text",
-        "text": "[honcut.action-execution-brief.v1]\naction-first prompt",
+        "text": "[honcut.action-execution-brief.v2]\naction-first prompt",
         "_action_execution_brief": {
             "duration_s": 9.0,
             "completion_window_s": [7.5, 8.2],
@@ -9037,7 +9037,7 @@ def test_phase2_v2_migration_derives_guides_without_provider_calls(tmp_path):
             "storyboard_beats": [
                     {
                         "beat_id": "S01_P01",
-                        "planner_version": "honcut.secondary-storyboard.v16",
+                        "planner_version": "honcut.secondary-storyboard.v17",
                         "duration_s": 5,
                         "generation_mode": "fresh",
                         "character_ids": [],
@@ -9052,7 +9052,7 @@ def test_phase2_v2_migration_derives_guides_without_provider_calls(tmp_path):
                     },
                     {
                         "beat_id": "S01_P02",
-                        "planner_version": "honcut.secondary-storyboard.v16",
+                        "planner_version": "honcut.secondary-storyboard.v17",
                         "duration_s": 5,
                         "generation_mode": "extend",
                         "character_ids": [],
