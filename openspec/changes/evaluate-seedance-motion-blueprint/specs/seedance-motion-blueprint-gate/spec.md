@@ -27,7 +27,7 @@ Blueprint generation SHALL run on the supported Mac mini environment without CUD
 - **THEN** preflight blocks the live gate
 
 ### Requirement: Observable large-motion evidence
-Before a live request, the system MUST verify from the blueprint itself that every required action event has an ordered active interval, the configured minimum joint or root displacement is observable, action begins within the configured onset bound, and terminal hold stays within the configured fraction. Thresholds MUST be versioned policy values rather than story-specific constants.
+Before a live request, the system MUST verify from the blueprint itself that every required dynamic action event has an ordered active interval, perceptible onset, a multi-phase motion curve, sufficient apex pose distance, sufficient peak root/joint speed, participation by the configured number of major joints, and an apex within the configured completion window. The encoded video MUST independently satisfy foreground occupancy, centroid travel, transition activity, and terminal-hold limits. Setup anchors MUST NOT satisfy a dynamic-action requirement. Thresholds MUST be versioned policy values rather than story-specific constants.
 
 #### Scenario: Meaningful temporal action
 - **WHEN** the compiled blueprint satisfies all versioned motion-amplitude, ordering, onset, and terminal-hold thresholds
@@ -36,6 +36,25 @@ Before a live request, the system MUST verify from the blueprint itself that eve
 #### Scenario: Static or low-amplitude blueprint
 - **WHEN** actor poses differ only by arrows, labels, camera motion, or sub-threshold joint movement
 - **THEN** preflight fails with zero uploads and zero Provider submissions
+
+#### Scenario: Slow endpoint drift
+- **WHEN** a joint or actor root eventually crosses the displacement threshold but the movement is spread across the clip below the peak-speed or apex-timing threshold
+- **THEN** preflight fails with zero uploads and zero Provider submissions
+
+#### Scenario: Single-joint false positive
+- **WHEN** only one distal joint moves materially while the torso and required major-joint set remain static
+- **THEN** preflight fails with zero uploads and zero Provider submissions
+
+### Requirement: Four-second single-action capability window
+The initial capability gate SHALL compile and project exactly four seconds for one canonical dynamic action. A setup pose MAY appear only as a zero-story-time anchor capped by policy and MUST NOT consume a material share of the action window. The action phases MUST complete within the configured apex/recovery window and terminal hold MUST remain bounded.
+
+#### Scenario: One canonical dynamic action
+- **WHEN** the selected Pxx contains one supported dynamic action plus setup state
+- **THEN** the gate compiles one four-second blueprint whose setup anchor is at most 0.15 seconds and whose remaining motion contains anticipation, peak, recovery, and terminal pose phases
+
+#### Scenario: Additional action invention
+- **WHEN** the compiler would need to add a strike, kick, contact, actor, or target absent from canonical lineage to make the clip appear busier
+- **THEN** the gate rejects that mapping instead of inventing choreography
 
 ### Requirement: Seedance media-contract preflight
 The gate MUST validate the blueprint against the current Seedance 2.0 reference-video limits and MUST freeze the exact model, duration, resolution, prompt hash, media order, media roles, source hashes, upload budget, submission budget, and task fingerprint before authorization can be consumed.
@@ -49,7 +68,7 @@ The gate MUST validate the blueprint against the current Seedance 2.0 reference-
 - **THEN** the gate stops without silently converting the video to images, removing media, changing the model, or submitting a request
 
 ### Requirement: Single-variable production-equivalent request
-The live request SHALL preserve the approved identity, initial composition, duration, output profile, and current-Pxx semantic prompt while replacing the failed static motion-control responsibility with exactly one `reference_video` motion-blueprint input. The final prompt media indices MUST match the actual submitted media sequence.
+The live request SHALL preserve the approved identity, initial composition, frozen four-second experimental duration, output profile, and current-Pxx semantic prompt while replacing the failed static motion-control responsibility with exactly one `reference_video` motion-blueprint input. The local control and candidate projections MUST use the same four-second duration. The final prompt media indices MUST match the actual submitted media sequence.
 
 #### Scenario: Production-equivalent projection
 - **WHEN** the live payload is built from the approved gate inputs

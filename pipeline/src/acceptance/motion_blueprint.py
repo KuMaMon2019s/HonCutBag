@@ -7,6 +7,7 @@ by the production CLI, Lifecycle, Graph, or Phase owners.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import math
 import shutil
@@ -18,9 +19,9 @@ from typing import Annotated, Any, Literal
 from PIL import Image, ImageDraw
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-BLUEPRINT_SCHEMA = "honcut.seedance-motion-blueprint.v1"
-POLICY_SCHEMA = "honcut.motion-blueprint-policy.v1"
-RENDERER_ID = "honcut.identity-neutral-motion-renderer.v1"
+BLUEPRINT_SCHEMA = "honcut.seedance-motion-blueprint.v2"
+POLICY_SCHEMA = "honcut.motion-blueprint-policy.v2"
+RENDERER_ID = "honcut.identity-neutral-motion-renderer.v2"
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
 
 
@@ -69,12 +70,12 @@ class CameraTrack(StrictModel):
 
 
 class MotionBlueprintInput(StrictModel):
-    schema_id: Literal["honcut.seedance-motion-blueprint.v1"] = Field(
+    schema_id: Literal["honcut.seedance-motion-blueprint.v2"] = Field(
         default=BLUEPRINT_SCHEMA,
         alias="schema",
     )
     beat_id: str
-    duration_s: Annotated[float, Field(ge=2.0, le=15.0)]
+    duration_s: Annotated[float, Field(ge=4.0, le=4.0)] = 4.0
     fps: Literal[24] = 24
     width: Literal[854] = 854
     height: Literal[480] = 480
@@ -103,22 +104,35 @@ class MotionBlueprintInput(StrictModel):
 
 
 class MotionPolicy(StrictModel):
-    schema_id: Literal["honcut.motion-blueprint-policy.v1"] = Field(
+    schema_id: Literal["honcut.motion-blueprint-policy.v2"] = Field(
         default=POLICY_SCHEMA,
         alias="schema",
     )
     action_onset_max_s: float = 0.5
-    terminal_hold_max_fraction: float = 0.15
-    minimum_root_displacement: float = 0.12
-    minimum_joint_displacement: float = 0.18
-    minimum_event_duration_s: float = 0.35
+    setup_anchor_max_s: float = 0.15
+    terminal_hold_max_fraction: float = 0.10
+    minimum_root_displacement: float = 0.20
+    minimum_joint_displacement: float = 0.25
+    minimum_peak_root_speed: float = 0.60
+    minimum_peak_joint_speed: float = 0.80
+    minimum_major_joint_participants: int = 4
+    major_joint_displacement: float = 0.10
+    perceptible_root_onset: float = 0.025
+    perceptible_joint_onset: float = 0.045
+    apex_max_fraction: float = 0.72
+    minimum_event_duration_s: float = 0.30
+    minimum_actor_height_fraction: float = 0.46
+    maximum_actor_height_fraction: float = 0.95
+    minimum_centroid_travel_fraction: float = 0.045
+    minimum_p90_foreground_change: float = 0.07
+    minimum_active_transition_fraction: float = 0.25
 
 
 class MotionBlueprintManifest(StrictModel):
-    schema_id: Literal["honcut.seedance-motion-blueprint.v1"] = Field(alias="schema")
-    policy_schema: Literal["honcut.motion-blueprint-policy.v1"]
+    schema_id: Literal["honcut.seedance-motion-blueprint.v2"] = Field(alias="schema")
+    policy_schema: Literal["honcut.motion-blueprint-policy.v2"]
     policy_sha256: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    renderer_id: Literal["honcut.identity-neutral-motion-renderer.v1"]
+    renderer_id: Literal["honcut.identity-neutral-motion-renderer.v2"]
     identity_authority: Literal[False]
     authority_roles: tuple[
         Literal["motion_timing", "body_kinematics", "camera_motion", "contact_timing"],
@@ -198,6 +212,58 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def assess_legacy_blueprint_manifest(path: Path) -> dict[str, Any]:
+    """Classify a v1 manifest as audit-only without promoting or rewriting it."""
+    manifest_path = path.resolve()
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("legacy motion blueprint manifest is unreadable") from error
+    if not isinstance(payload, dict) or payload.get("schema") != "honcut.seedance-motion-blueprint.v1":
+        raise ValueError("legacy motion blueprint audit requires schema v1")
+    if payload.get("policy_schema") != "honcut.motion-blueprint-policy.v1":
+        raise ValueError("legacy motion blueprint policy is not auditable")
+    media_path = Path(str(payload.get("media_path") or "")).resolve()
+    expected_media_hash = str(payload.get("media_sha256") or "")
+    if not media_path.is_file() or sha256_file(media_path) != expected_media_hash:
+        raise ValueError("legacy motion blueprint media hash mismatch")
+    measurements = payload.get("measurements") or {}
+    fps = float(measurements.get("fps") or 0)
+    if fps <= 0:
+        raise ValueError("legacy motion blueprint lacks a valid frame rate")
+    slow_events: list[dict[str, Any]] = []
+    for event in measurements.get("events") or []:
+        if event.get("primitive") in _SETUP_PRIMITIVES:
+            continue
+        duration_s = (
+            int(event.get("end_frame") or 0) - int(event.get("start_frame") or 0) + 1
+        ) / fps
+        if duration_s <= 0:
+            raise ValueError("legacy motion blueprint has invalid event timing")
+        root_velocity = float(event.get("root_displacement") or 0) / duration_s
+        joint_velocity = float(event.get("max_joint_displacement") or 0) / duration_s
+        if (
+            root_velocity < MOTION_POLICY.minimum_peak_root_speed
+            and joint_velocity < MOTION_POLICY.minimum_peak_joint_speed
+        ):
+            slow_events.append({
+                "event_id": str(event.get("event_id") or ""),
+                "root_endpoint_velocity": round(root_velocity, 6),
+                "joint_endpoint_velocity": round(joint_velocity, 6),
+            })
+    return {
+        "schema": "honcut.motion-blueprint-legacy-assessment.v1",
+        "manifest_path": str(manifest_path),
+        "manifest_sha256": sha256_file(manifest_path),
+        "media_sha256": expected_media_hash,
+        "source_schema": payload["schema"],
+        "slow_dynamic_events": slow_events,
+        "admission_status": "paid_admission_blocked",
+        "audit_only": True,
+        "reason": "legacy endpoint-only policy lacks v2 perceptual kinetics",
+    }
+
+
 def policy_sha256(policy: MotionPolicy = MOTION_POLICY) -> str:
     return hashlib.sha256(canonical_json(policy.model_dump(mode="json"))).hexdigest()
 
@@ -227,6 +293,66 @@ def _mirrored(value: tuple[float, float], direction: str) -> tuple[float, float]
     return value
 
 
+_SETUP_PRIMITIVES = frozenset({"ready", "prop_hold"})
+_MAJOR_JOINTS = (
+    "neck",
+    "left_shoulder",
+    "right_shoulder",
+    "left_wrist",
+    "right_wrist",
+    "hip",
+    "left_knee",
+    "right_knee",
+    "left_ankle",
+    "right_ankle",
+)
+
+
+def _interpolate_pair(
+    first: tuple[float, float],
+    second: tuple[float, float],
+    progress: float,
+) -> tuple[float, float]:
+    eased = _ease(min(1.0, max(0.0, progress)))
+    return (
+        first[0] + (second[0] - first[0]) * eased,
+        first[1] + (second[1] - first[1]) * eased,
+    )
+
+
+def _phase_value(
+    start: tuple[float, float],
+    target: tuple[float, float],
+    progress: float,
+    *,
+    root: bool = False,
+) -> tuple[float, float]:
+    """Compile anticipation, explosive apex, overshoot and recovery.
+
+    The curve only exaggerates the source-derived primitive vector.  It never
+    introduces a second action or a new actor/object relationship.
+    """
+    delta = (target[0] - start[0], target[1] - start[1])
+    anticipation_scale = -0.30 if not root else -0.16
+    apex_scale = 1.55
+    recovery_scale = 0.35 if not root else 0.55
+    terminal_scale = 1.0
+    knots = (
+        (0.0, start),
+        (0.08, (start[0] + delta[0] * anticipation_scale, start[1] + delta[1] * anticipation_scale)),
+        (0.35, (start[0] + delta[0] * apex_scale, start[1] + delta[1] * apex_scale)),
+        (0.70, (start[0] + delta[0] * recovery_scale, start[1] + delta[1] * recovery_scale)),
+        (1.0, (start[0] + delta[0] * terminal_scale, start[1] + delta[1] * terminal_scale)),
+    )
+    for index in range(1, len(knots)):
+        previous_fraction, previous_value = knots[index - 1]
+        fraction, value = knots[index]
+        if progress <= fraction:
+            local = (progress - previous_fraction) / max(1e-9, fraction - previous_fraction)
+            return _interpolate_pair(previous_value, value, local)
+    return knots[-1][1]
+
+
 def compile_semantic_frames(
     contract: MotionBlueprintInput,
     policy: MotionPolicy = MOTION_POLICY,
@@ -234,53 +360,50 @@ def compile_semantic_frames(
     """Compile ordered events to normalized, measurable actor/camera frames."""
     validate_supported_actions(contract)
     total_frames = round(contract.duration_s * contract.fps)
-    onset_frames = max(1, round(min(policy.action_onset_max_s * 0.5, 0.2) * contract.fps))
-    terminal_frames = max(1, int(total_frames * min(policy.terminal_hold_max_fraction, 0.08)))
+    onset_frames = max(1, round(0.08 * contract.fps))
+    terminal_frames = max(1, math.floor(total_frames * policy.terminal_hold_max_fraction))
     active_frames = total_frames - onset_frames - terminal_frames
-    minimum_event_frames = round(policy.minimum_event_duration_s * contract.fps)
-    if active_frames < len(contract.events) * minimum_event_frames:
-        raise ValueError("duration cannot represent all ordered motion events")
-    setup_primitives = {"ready", "prop_hold"}
+    minimum_event_frames = max(2, math.ceil(policy.minimum_event_duration_s * contract.fps))
     setup_indexes = [
         index
         for index, event in enumerate(contract.events)
-        if event.primitive in setup_primitives
+        if event.primitive in _SETUP_PRIMITIVES
     ]
     dynamic_indexes = [
         index for index in range(len(contract.events)) if index not in setup_indexes
     ]
-    counts = [minimum_event_frames] * len(contract.events)
+    if not dynamic_indexes:
+        raise ValueError("motion blueprint capability gate requires a dynamic event")
+    setup_cap = max(1, math.floor(policy.setup_anchor_max_s * contract.fps))
+    if len(setup_indexes) > setup_cap:
+        raise ValueError("setup anchors cannot fit the 0.15 second capability window")
+    counts = [1 if index in setup_indexes else minimum_event_frames for index in range(len(contract.events))]
+    if setup_indexes:
+        for offset in range(setup_cap - len(setup_indexes)):
+            counts[setup_indexes[offset % len(setup_indexes)]] += 1
+    if active_frames < sum(counts):
+        raise ValueError("duration cannot represent all ordered motion events")
     remaining = active_frames - sum(counts)
-    if dynamic_indexes:
-        setup_cap = max(minimum_event_frames, round(0.5 * contract.fps))
-        for index in setup_indexes:
-            addition = min(setup_cap - counts[index], remaining)
-            counts[index] += addition
-            remaining -= addition
-        for offset in range(remaining):
-            counts[dynamic_indexes[offset % len(dynamic_indexes)]] += 1
-    else:
-        for offset in range(remaining):
-            counts[offset % len(counts)] += 1
+    for offset in range(remaining):
+        counts[dynamic_indexes[offset % len(dynamic_indexes)]] += 1
     boundaries = [onset_frames]
     for count in counts:
         boundaries.append(boundaries[-1] + count)
     frames: list[dict[str, Any]] = []
     intervals: list[dict[str, Any]] = []
-    previous_pose = dict(_BASE_POSE)
     previous_root = (0.28, 0.55)
     event_targets: list[tuple[dict[str, tuple[float, float]], tuple[float, float]]] = []
     for event in contract.events:
         primitive = MOTION_PRIMITIVES[event.primitive]
         pose = {joint: _mirrored(value, event.direction) for joint, value in primitive["pose"].items()}
         delta = _mirrored(primitive["root"], event.direction)
+        terminal_scale = 1.0 if event.primitive in _SETUP_PRIMITIVES else 1.18
         target_root = (
-            min(0.78, max(0.20, previous_root[0] + delta[0])),
-            min(0.72, max(0.38, previous_root[1] + delta[1])),
+            min(0.80, max(0.16, previous_root[0] + delta[0] * terminal_scale)),
+            min(0.76, max(0.32, previous_root[1] + delta[1] * terminal_scale)),
         )
         event_targets.append((pose, target_root))
         previous_root = target_root
-    previous_pose = dict(_BASE_POSE)
     previous_root = (0.28, 0.55)
     for frame_index in range(total_frames):
         if frame_index < onset_frames:
@@ -290,15 +413,28 @@ def compile_semantic_frames(
         else:
             event_index = min(len(contract.events) - 1, next(i for i in range(len(contract.events)) if boundaries[i] <= frame_index < boundaries[i + 1]))
             start, end = boundaries[event_index], boundaries[event_index + 1]
-            progress = _ease((frame_index - start + 1) / max(1, end - start))
+            progress = (frame_index - start + 1) / max(1, end - start)
         start_pose = dict(_BASE_POSE) if event_index == 0 else event_targets[event_index - 1][0]
         start_root = (0.28, 0.55) if event_index == 0 else event_targets[event_index - 1][1]
         target_pose, target_root = event_targets[event_index]
-        joints = {
-            joint: [round(start_pose[joint][axis] + (target_pose[joint][axis] - start_pose[joint][axis]) * progress, 6) for axis in (0, 1)]
-            for joint in _BASE_POSE
-        }
-        root = [round(start_root[axis] + (target_root[axis] - start_root[axis]) * progress, 6) for axis in (0, 1)]
+        is_setup = contract.events[event_index].primitive in _SETUP_PRIMITIVES
+        joints = {}
+        for joint in _BASE_POSE:
+            value = (
+                _interpolate_pair(start_pose[joint], target_pose[joint], progress)
+                if is_setup
+                else _phase_value(start_pose[joint], target_pose[joint], progress)
+            )
+            joints[joint] = [round(value[0], 6), round(value[1], 6)]
+        root_value = (
+            _interpolate_pair(start_root, target_root, progress)
+            if is_setup
+            else _phase_value(start_root, target_root, progress, root=True)
+        )
+        root = [
+            round(min(0.84, max(0.12, root_value[0])), 6),
+            round(min(0.80, max(0.28, root_value[1])), 6),
+        ]
         camera_progress = frame_index / max(1, total_frames - 1)
         frames.append({
             "frame": frame_index,
@@ -317,6 +453,7 @@ def compile_semantic_frames(
             "end_frame": boundaries[index + 1] - 1,
             "source_action_group_id": event.source_action_group_id,
             "source_action_unit_ids": list(event.source_action_unit_ids),
+            "admission_role": "setup_anchor" if event.primitive in _SETUP_PRIMITIVES else "dynamic_action",
         })
     return frames, intervals
 
@@ -372,29 +509,97 @@ def _distance(first: list[float], second: list[float]) -> float:
     return math.hypot(second[0] - first[0], second[1] - first[1])
 
 
-def measure_semantic_frames(contract: MotionBlueprintInput, frames: list[dict[str, Any]], intervals: list[dict[str, Any]], policy: MotionPolicy = MOTION_POLICY) -> dict[str, Any]:
+def measure_semantic_frames(
+    contract: MotionBlueprintInput,
+    frames: list[dict[str, Any]],
+    intervals: list[dict[str, Any]],
+    policy: MotionPolicy = MOTION_POLICY,
+) -> dict[str, Any]:
     if not frames:
         raise ValueError("blueprint has no frames")
-    onset_frame = next(
-        (
-            index
-            for index, frame in enumerate(frames[1:], start=1)
-            if _distance(frames[0]["root"], frame["root"]) >= 1e-6
-            or max(
-                _distance(frames[0]["joints"][joint], frame["joints"][joint])
-                for joint in _BASE_POSE
-            )
-            >= 1e-6
-        ),
-        len(frames),
-    )
-    event_measurements = []
+    dynamic_intervals = [
+        interval for interval in intervals if interval["admission_role"] == "dynamic_action"
+    ]
+    if not dynamic_intervals:
+        raise ValueError("motion blueprint has no dynamic action")
+    first_dynamic = dynamic_intervals[0]
+    dynamic_baseline_index = max(0, first_dynamic["start_frame"] - 1)
+    dynamic_baseline = frames[dynamic_baseline_index]
+    onset_frame = next((
+        index
+        for index in range(first_dynamic["start_frame"], len(frames))
+        if _distance(dynamic_baseline["root"], frames[index]["root"])
+        >= policy.perceptible_root_onset
+        or sum(
+            _distance(dynamic_baseline["joints"][joint], frames[index]["joints"][joint])
+            >= policy.perceptible_joint_onset
+            for joint in _MAJOR_JOINTS
+        )
+        >= 2
+    ), len(frames))
+    event_measurements: list[dict[str, Any]] = []
     for interval in intervals:
-        start = frames[interval["start_frame"]]
-        end = frames[interval["end_frame"]]
-        root_delta = _distance(start["root"], end["root"])
-        joint_delta = max(_distance(start["joints"][joint], end["joints"][joint]) for joint in _BASE_POSE)
-        event_measurements.append({**interval, "root_displacement": round(root_delta, 6), "max_joint_displacement": round(joint_delta, 6), "passes_amplitude": root_delta >= policy.minimum_root_displacement or joint_delta >= policy.minimum_joint_displacement})
+        baseline_index = max(0, interval["start_frame"] - 1)
+        baseline = frames[baseline_index]
+        event_frames = frames[interval["start_frame"]:interval["end_frame"] + 1]
+        duration_s = len(event_frames) / contract.fps
+        root_displacements = [
+            _distance(baseline["root"], frame["root"]) for frame in event_frames
+        ]
+        joint_displacements = {
+            joint: max(
+                _distance(baseline["joints"][joint], frame["joints"][joint])
+                for frame in event_frames
+            )
+            for joint in _MAJOR_JOINTS
+        }
+        root_speeds: list[float] = []
+        joint_speeds: list[float] = []
+        previous = baseline
+        for frame in event_frames:
+            root_speeds.append(_distance(previous["root"], frame["root"]) * contract.fps)
+            joint_speeds.append(max(
+                _distance(previous["joints"][joint], frame["joints"][joint]) * contract.fps
+                for joint in _MAJOR_JOINTS
+            ))
+            previous = frame
+        scores = [
+            root_displacements[index] / max(policy.minimum_root_displacement, 1e-9)
+            + max(
+                _distance(baseline["joints"][joint], frame["joints"][joint])
+                for joint in _MAJOR_JOINTS
+            ) / max(policy.minimum_joint_displacement, 1e-9)
+            for index, frame in enumerate(event_frames)
+        ]
+        apex_offset = max(range(len(scores)), key=scores.__getitem__)
+        apex_fraction = (apex_offset + 1) / len(event_frames)
+        root_delta = max(root_displacements)
+        joint_delta = max(joint_displacements.values())
+        participant_count = sum(
+            displacement >= policy.major_joint_displacement
+            for displacement in joint_displacements.values()
+        )
+        is_setup = interval["admission_role"] == "setup_anchor"
+        passes_amplitude = is_setup or (
+            (root_delta >= policy.minimum_root_displacement or joint_delta >= policy.minimum_joint_displacement)
+            and (max(root_speeds) >= policy.minimum_peak_root_speed or max(joint_speeds) >= policy.minimum_peak_joint_speed)
+            and participant_count >= policy.minimum_major_joint_participants
+            and apex_fraction <= policy.apex_max_fraction
+        )
+        event_measurements.append({
+            **interval,
+            "duration_s": round(duration_s, 6),
+            "peak_root_displacement": round(root_delta, 6),
+            "peak_joint_displacement": round(joint_delta, 6),
+            "peak_root_speed": round(max(root_speeds), 6),
+            "peak_joint_speed": round(max(joint_speeds), 6),
+            "major_joint_participants": participant_count,
+            "apex_frame": interval["start_frame"] + apex_offset,
+            "apex_fraction": round(apex_fraction, 6),
+            "passes_kinetics": passes_amplitude,
+            # Kept as a compatibility projection for existing acceptance readers.
+            "passes_amplitude": passes_amplitude,
+        })
     terminal_frames = len(frames) - 1 - intervals[-1]["end_frame"]
     result = {
         "duration_s": contract.duration_s,
@@ -410,9 +615,28 @@ def measure_semantic_frames(contract: MotionBlueprintInput, frames: list[dict[st
         raise ValueError("motion blueprint action onset exceeds policy")
     if result["terminal_hold_fraction"] > policy.terminal_hold_max_fraction:
         raise ValueError("motion blueprint terminal hold exceeds policy")
-    failed = [item["event_id"] for item in event_measurements if not item["passes_amplitude"]]
+    setup_overruns = [
+        item["event_id"]
+        for item in event_measurements
+        if item["admission_role"] == "setup_anchor"
+        and item["duration_s"] > policy.setup_anchor_max_s + (1 / contract.fps)
+    ]
+    if setup_overruns:
+        raise ValueError(f"motion blueprint setup anchors exceed policy: {setup_overruns}")
+    setup_duration = sum(
+        item["duration_s"]
+        for item in event_measurements
+        if item["admission_role"] == "setup_anchor"
+    )
+    if setup_duration > policy.setup_anchor_max_s + 1e-9:
+        raise ValueError("motion blueprint total setup window exceeds policy")
+    failed = [
+        item["event_id"]
+        for item in event_measurements
+        if item["admission_role"] == "dynamic_action" and not item["passes_kinetics"]
+    ]
     if failed:
-        raise ValueError(f"motion blueprint events have sub-threshold amplitude: {failed}")
+        raise ValueError(f"motion blueprint events have sub-threshold kinetics: {failed}")
     return result
 
 
@@ -445,6 +669,10 @@ def compile_motion_blueprint(contract: MotionBlueprintInput, output_path: Path, 
     if probe.returncode != 0:
         raise RuntimeError("motion blueprint ffprobe validation failed")
     technical = json.loads(probe.stdout)
+    rendered_motion = measure_rendered_blueprint_motion(output, policy)
+    if rendered_motion["deterministic_motion_pass"] is not True:
+        raise ValueError("rendered motion blueprint has sub-threshold perceptual kinetics")
+    measurements["rendered_motion"] = rendered_motion
     semantic_sha256 = hashlib.sha256(canonical_json({"frames": frames, "events": intervals})).hexdigest()
     contract_sha256 = hashlib.sha256(canonical_json(contract.model_dump(mode="json"))).hexdigest()
     manifest = {
@@ -489,6 +717,71 @@ def inspect_identity_neutral_pixels(video_path: Path) -> dict[str, Any]:
     if sampled == 0 or non_background == 0 or forbidden:
         raise ValueError("motion blueprint pixel guard rejected the rendered media")
     return {"sampled_frames": sampled, "forbidden_annotation_pixels": forbidden, "non_background_pixels": non_background}
+
+
+def measure_rendered_blueprint_motion(
+    video_path: Path,
+    policy: MotionPolicy = MOTION_POLICY,
+) -> dict[str, Any]:
+    """Measure whether the encoded neutral actor visibly moves at playback scale."""
+    import cv2
+    import numpy as np
+
+    capture = cv2.VideoCapture(str(video_path))
+    fps = float(capture.get(cv2.CAP_PROP_FPS) or 0)
+    masks: list[Any] = []
+    heights: list[float] = []
+    centroids: list[tuple[float, float]] = []
+    while True:
+        ok, frame = capture.read()
+        if not ok:
+            break
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        mask = gray > 70
+        points = np.argwhere(mask)
+        if points.size == 0:
+            capture.release()
+            raise ValueError("rendered motion blueprint has an empty actor frame")
+        y_min, _x_min = points.min(axis=0)
+        y_max, _x_max = points.max(axis=0)
+        heights.append(float((y_max - y_min + 1) / frame.shape[0]))
+        centroids.append((float(points[:, 1].mean()), float(points[:, 0].mean())))
+        masks.append(mask)
+    capture.release()
+    if fps <= 0 or len(masks) < 2:
+        raise ValueError("rendered motion blueprint has no measurable frames")
+    changes: list[float] = []
+    for previous, current in itertools.pairwise(masks):
+        union = int(np.logical_or(previous, current).sum())
+        changes.append(float(np.logical_xor(previous, current).sum() / max(1, union)))
+    width = masks[0].shape[1]
+    height = masks[0].shape[0]
+    diagonal = math.hypot(width, height)
+    first_centroid = centroids[0]
+    centroid_travel = max(
+        math.hypot(point[0] - first_centroid[0], point[1] - first_centroid[1]) / diagonal
+        for point in centroids
+    )
+    active = [value >= 0.025 for value in changes]
+    p90 = float(np.percentile(np.asarray(changes), 90))
+    result = {
+        "schema": "honcut.motion-blueprint-rendered-measurement.v2",
+        "fps": round(fps, 6),
+        "frame_count": len(masks),
+        "median_actor_height_fraction": round(float(np.median(np.asarray(heights))), 6),
+        "max_actor_height_fraction": round(max(heights), 6),
+        "centroid_travel_fraction": round(centroid_travel, 6),
+        "p90_foreground_change": round(p90, 6),
+        "active_transition_fraction": round(sum(active) / len(active), 6),
+    }
+    result["deterministic_motion_pass"] = bool(
+        result["median_actor_height_fraction"] >= policy.minimum_actor_height_fraction
+        and result["max_actor_height_fraction"] <= policy.maximum_actor_height_fraction
+        and result["centroid_travel_fraction"] >= policy.minimum_centroid_travel_fraction
+        and result["p90_foreground_change"] >= policy.minimum_p90_foreground_change
+        and result["active_transition_fraction"] >= policy.minimum_active_transition_fraction
+    )
+    return result
 
 
 def measure_output_motion(video_path: Path) -> dict[str, Any]:

@@ -5,6 +5,7 @@ import importlib.util
 import json
 import sys
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -15,10 +16,12 @@ from acceptance.motion_blueprint import (
     MotionBlueprintManifest,
     MotionEvent,
     SourceLineage,
+    assess_legacy_blueprint_manifest,
     compile_motion_blueprint,
     compile_semantic_frames,
     inspect_identity_neutral_pixels,
     measure_output_motion,
+    measure_rendered_blueprint_motion,
     measure_semantic_frames,
 )
 from utils.canonical_visual_contracts import build_canonical_visual_contract
@@ -51,7 +54,7 @@ def _lineage() -> SourceLineage:
 def _contract(*primitives: str) -> MotionBlueprintInput:
     return MotionBlueprintInput(
         beat_id="S01_P01",
-        duration_s=7,
+        duration_s=4.0,
         actor_ids=("actor_01",),
         events=tuple(
             MotionEvent(
@@ -79,7 +82,7 @@ def test_compiler_is_deterministic_and_seedance_compatible(tmp_path: Path) -> No
     assert first["media_sha256"] == second["media_sha256"]
     assert first["technical_probe"]["streams"][0]["codec_name"] == "h264"
     assert first["measurements"]["fps"] == 24
-    assert first["measurements"]["duration_s"] == 7
+    assert first["measurements"]["duration_s"] == 4.0
     assert first["identity_authority"] is False
     assert inspect_identity_neutral_pixels(tmp_path / "first.mp4")["forbidden_annotation_pixels"] == 0
     assert measure_output_motion(tmp_path / "first.mp4")["deterministic_motion_pass"] is True
@@ -92,7 +95,10 @@ def test_compiler_records_order_large_motion_contact_and_camera() -> None:
     assert result["ordered_event_ids"] == [event.event_id for event in contract.events]
     assert result["action_onset_s"] <= 0.5
     assert result["terminal_hold_fraction"] <= 0.15
-    assert all(event["passes_amplitude"] for event in result["events"])
+    dynamic = [event for event in result["events"] if event["admission_role"] == "dynamic_action"]
+    assert all(event["passes_kinetics"] for event in dynamic)
+    assert all(event["major_joint_participants"] >= 4 for event in dynamic)
+    assert all(event["apex_fraction"] <= 0.72 for event in dynamic)
     assert any(frame["prop_contact"] for frame in frames)
     assert frames[-1]["camera"]["zoom"] > frames[0]["camera"]["zoom"]
 
@@ -102,8 +108,17 @@ def test_setup_pose_cannot_consume_the_dynamic_action_window() -> None:
     _frames, intervals = compile_semantic_frames(contract)
     setup_frames = intervals[0]["end_frame"] - intervals[0]["start_frame"] + 1
     dynamic_frames = intervals[1]["end_frame"] - intervals[1]["start_frame"] + 1
-    assert setup_frames <= round(0.5 * contract.fps)
-    assert dynamic_frames > setup_frames * 5
+    assert setup_frames <= int(0.15 * contract.fps)
+    assert dynamic_frames > setup_frames * 20
+
+    crowded = _contract("ready", "prop_hold", "evade")
+    _frames, crowded_intervals = compile_semantic_frames(crowded)
+    total_setup_frames = sum(
+        interval["end_frame"] - interval["start_frame"] + 1
+        for interval in crowded_intervals
+        if interval["admission_role"] == "setup_anchor"
+    )
+    assert total_setup_frames <= int(0.15 * crowded.fps)
 
 
 def test_unknown_primitive_fails_before_render(tmp_path: Path) -> None:
@@ -130,6 +145,10 @@ def test_future_schema_and_incomplete_lineage_fail_closed(tmp_path: Path) -> Non
     payload["schema"] = "honcut.seedance-motion-blueprint.v99"
     with pytest.raises(ValueError):
         MotionBlueprintInput.model_validate(payload)
+    payload = _contract("evade").model_dump(mode="json")
+    payload["duration_s"] = 7
+    with pytest.raises(ValueError):
+        MotionBlueprintInput.model_validate(payload)
     manifest = compile_motion_blueprint(_contract("evade"), tmp_path / "schema-test.mp4")
     manifest["schema"] = "honcut.seedance-motion-blueprint.v99"
     with pytest.raises(ValueError):
@@ -146,8 +165,91 @@ def test_static_and_low_amplitude_semantics_fail_measurement() -> None:
     for frame in frames:
         frame["root"] = list(frames[0]["root"])
         frame["joints"] = json.loads(json.dumps(frames[0]["joints"]))
-    with pytest.raises(ValueError, match="action onset|sub-threshold amplitude"):
+    with pytest.raises(ValueError, match="action onset|sub-threshold kinetics"):
         measure_semantic_frames(contract, frames, intervals)
+
+
+def test_slow_endpoint_drift_and_single_joint_motion_fail_kinetics() -> None:
+    contract = _contract("evade")
+    frames, intervals = compile_semantic_frames(contract)
+    start = frames[0]
+    total = len(frames) - 1
+    for index, frame in enumerate(frames):
+        progress = index / total
+        frame["root"] = [start["root"][0] + 0.21 * progress, start["root"][1]]
+        frame["joints"] = json.loads(json.dumps(start["joints"]))
+    with pytest.raises(ValueError, match="action onset|sub-threshold kinetics"):
+        measure_semantic_frames(contract, frames, intervals)
+
+    frames, intervals = compile_semantic_frames(contract)
+    start = frames[0]
+    for frame in frames:
+        frame["root"] = list(start["root"])
+        frame["joints"] = json.loads(json.dumps(start["joints"]))
+    peak = intervals[0]["start_frame"] + 2
+    frames[peak]["joints"]["right_wrist"][0] += 0.8
+    with pytest.raises(ValueError, match="action onset|sub-threshold kinetics"):
+        measure_semantic_frames(contract, frames, intervals)
+
+
+def test_rendered_blueprint_requires_visible_full_scale_motion(tmp_path: Path) -> None:
+    path = tmp_path / "visible.mp4"
+    manifest = compile_motion_blueprint(_contract("ready", "evade"), path)
+    rendered = measure_rendered_blueprint_motion(path)
+    assert rendered == manifest["measurements"]["rendered_motion"]
+    assert rendered["deterministic_motion_pass"] is True
+    assert rendered["median_actor_height_fraction"] >= 0.46
+
+    tiny = tmp_path / "tiny.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "error", "-i", str(path),
+            "-vf", "scale=214:120,pad=854:480:(ow-iw)/2:(oh-ih)/2:color=0x121418",
+            "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(tiny),
+        ],
+        check=True,
+    )
+    assert measure_rendered_blueprint_motion(tiny)["deterministic_motion_pass"] is False
+
+
+def test_legacy_slow_drift_is_audit_only_and_rejected_without_upload(tmp_path: Path) -> None:
+    media = tmp_path / "legacy.mp4"
+    current = compile_motion_blueprint(_contract("ready", "evade"), media)
+    legacy = {
+        **current,
+        "schema": "honcut.seedance-motion-blueprint.v1",
+        "policy_schema": "honcut.motion-blueprint-policy.v1",
+        "renderer_id": "honcut.identity-neutral-motion-renderer.v1",
+        "measurements": {
+            "fps": 24,
+            "events": [
+                {
+                    "event_id": "S01_P01_M01",
+                    "primitive": "ready",
+                    "start_frame": 5,
+                    "end_frame": 16,
+                    "root_displacement": 0.08,
+                    "max_joint_displacement": 0.20,
+                },
+                {
+                    "event_id": "S01_P01_M02",
+                    "primitive": "evade",
+                    "start_frame": 17,
+                    "end_frame": 198,
+                    "root_displacement": 0.316,
+                    "max_joint_displacement": 0.49,
+                },
+            ],
+        },
+    }
+    path = tmp_path / "legacy-manifest.json"
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+    assessment = assess_legacy_blueprint_manifest(path)
+    assert assessment["audit_only"] is True
+    assert assessment["admission_status"] == "paid_admission_blocked"
+    assert assessment["slow_dynamic_events"][0]["event_id"] == "S01_P01_M02"
+    with pytest.raises(ValueError):
+        MotionBlueprintManifest.model_validate(legacy)
 
 
 def _fixture_run(tmp_path: Path) -> tuple[Path, Path]:
@@ -197,10 +299,15 @@ def test_no_submit_projection_is_single_variable_seedance_only(tmp_path: Path, m
     assert result["budgets"] == {"tos_put_ceiling": 3, "video_submission_ceiling": 1, "automatic_retry_ceiling": 0, "alternate_provider_submission_ceiling": 0}
     projected = result["request_projection"]["generation"]
     assert projected["model"] == "doubao-seedance-2.0-fast"
+    assert projected["duration"] == 4
+    assert result["request_projection"]["equivalence"]["source_duration"] == 7
+    assert result["request_projection"]["equivalence"]["control_duration"] == 4
+    assert result["request_projection"]["equivalence"]["candidate_duration"] == 4
     assert [item["responsibility"] for item in projected["media"]] == ["character_identity_board", "cinematic_composition", "motion_blueprint"]
     assert projected["media"][-1]["media_type"] == "video_url"
     assert projected["media"][-1]["prompt_index"] == "视频1"
     assert "视频1仅负责当前Pxx的动作时序" in (tmp_path / "gate" / "seedance_prompt.txt").read_text()
+    assert "0.15秒内结束准备" in (tmp_path / "gate" / "seedance_prompt.txt").read_text()
     assert "图片3负责动作" not in (tmp_path / "gate" / "seedance_prompt.txt").read_text()
 
 

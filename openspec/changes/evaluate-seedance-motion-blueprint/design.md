@@ -60,6 +60,29 @@ Thresholds will be expressed in normalized actor/body or frame coordinates so th
 
 The same fingerprint may produce at most one paid Seedance 2.0 submission. A technically valid output that fails motion transfer pauses this route. A timeout or uncertain transport state is not a capability result, but it still forbids resubmission under the same authorization and fingerprint. No alternate Provider is attempted after any outcome.
 
+### 7. Treat the first local blueprint as a failed admission candidate
+
+The first renderer allocated almost the entire nine-second duration to one smooth transition from `ready` to an `evade` endpoint. Its endpoint displacement passed, but the contact sheet and decoded video showed low perceived velocity and little full-body articulation. The original blueprint, manifest, regression receipt, and no-submit receipt remain immutable audit evidence. They cannot satisfy the revised paid-admission policy.
+
+The corrected single-action gate uses a four-second experiment window. This is an acceptance projection, not a rewrite of the source Pxx story clock. The equivalence checker compares a frozen four-second control projection and candidate projection that are identical except for replacing the static motion-control atlas with one blueprint `reference_video`. Identity, initial composition, output profile, prompt semantics, and all unrelated media remain unchanged.
+
+### 8. Compile each dynamic primitive as a phase curve
+
+Setup primitives (`ready`, `prop_hold`) are zero-story-time anchors capped at 0.15 seconds and do not satisfy the dynamic-motion requirement. Every dynamic primitive is represented by deterministic normalized phases:
+
+1. anticipation/counter-motion;
+2. explosive peak with amplified root and joint excursion;
+3. overshoot or counterbalance;
+4. canonical terminal pose.
+
+The phase coefficients are generic, versioned policy data. They may amplify an existing canonical action class but cannot invent another action, actor, target, contact, or order. A source contract with one dynamic action remains a single-action capability test.
+
+### 9. Admit perceptible kinetics, not endpoint distance
+
+Policy v2 requires all of the following for every dynamic event: a perceptible onset threshold, minimum peak root or joint speed, minimum count of participating major joints, minimum apex pose distance, apex before the configured completion fraction, and a bounded terminal hold. Setup anchors are measured separately and cannot rescue a failed dynamic event.
+
+The encoded blueprint is decoded again before admission. The gate measures foreground occupancy, foreground-centroid travel, frame-difference activity, and a high-percentile transition magnitude. Semantic and rendered measurements must both pass. This prevents a normalized joint value, camera motion, or one moving wrist from passing a visually static blueprint.
+
 ## Risks / Trade-offs
 
 - **[Seedance treats a neutral rig video as loose inspiration]** → The single request directly tests this; failure pauses the route rather than spawning prompt iterations.

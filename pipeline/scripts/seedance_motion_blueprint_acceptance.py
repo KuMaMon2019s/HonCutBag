@@ -29,6 +29,7 @@ from acceptance.motion_blueprint import (  # noqa: E402
     MotionBlueprintInput,
     MotionEvent,
     SourceLineage,
+    assess_legacy_blueprint_manifest,
     compile_motion_blueprint,
     inspect_identity_neutral_pixels,
     measure_output_motion,
@@ -44,7 +45,7 @@ from utils.config import SEEDANCE_MODEL, get_api_key  # noqa: E402
 from utils.prompt_budget import enforce_prompt_budget  # noqa: E402
 from utils.video_validation import is_valid_video  # noqa: E402
 
-RECEIPT_SCHEMA = "honcut.seedance-motion-blueprint-gate.v1"
+RECEIPT_SCHEMA = "honcut.seedance-motion-blueprint-gate.v2"
 SOURCE_RECEIPT_SCHEMA = "honcut.phase6-storyboard-pose-atlas-live-acceptance.v1"
 REGRESSION_SCHEMA = "honcut.seedance-motion-blueprint-regression.v1"
 MAX_VIDEO_SUBMISSIONS = 1
@@ -204,7 +205,7 @@ def _build_contract(source_run: Path, source_receipt_path: Path) -> tuple[Motion
         source_receipt_sha256=sha256_file(source_receipt_path),
     )
     contract = MotionBlueprintInput(
-        beat_id=beat_id, duration_s=float(preflight.get("duration") or chunk.get("target_duration_s") or 0),
+        beat_id=beat_id, duration_s=4.0,
         actor_ids=tuple(actors), events=tuple(events), camera=_camera_from_samples(samples), lineage=lineage,
     )
     return contract, receipt, chunk
@@ -273,10 +274,11 @@ def _project_request(source_run: Path, receipt: dict[str, Any], blueprint: dict[
     new_index = f"视频{len(videos) + 1}"
     prompt = prompt.replace(old_index, new_index)
     prompt += (
-        "\n[honcut.motion-blueprint-reference.v1] "
+        "\n[honcut.motion-blueprint-reference.v2] "
         f"{new_index}仅负责当前Pxx的动作时序、身体运动学、接触时点与运镜轨迹；"
         "其中中性骨架和道具线条不具有角色身份、服装、脸、发型、材质或成片像素权威。"
-        "从首帧后立即执行完整有序动作，不得把蓝图画面、骨架、控制标记或背景复制进成片。"
+        "本次四秒能力门在0.15秒内结束准备并立即执行完整有序动作；动作须包含预备反向、爆发峰值、"
+        "越位与回收，不得慢速匀速漂移，不得把蓝图画面、骨架、控制标记或背景复制进成片。"
     )
     enforce_prompt_budget(prompt, provider="seedance", model=SEEDANCE_MODEL, purpose="video_generation")
     media = []
@@ -290,7 +292,7 @@ def _project_request(source_run: Path, receipt: dict[str, Any], blueprint: dict[
     if new_index != f"视频{video_index}":
         raise GateEvidenceError("projected prompt/video index mismatch")
     generation = {
-        "model": SEEDANCE_MODEL, "duration": int(round(float(preflight.get("duration") or 0))),
+        "model": SEEDANCE_MODEL, "duration": int(round(float(blueprint["measurements"]["duration_s"]))),
         "ratio": preflight.get("ratio"), "resolution": preflight.get("resolution"), "return_last_frame": True,
         "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
         "production_projection_schema": source_task.get(
@@ -307,7 +309,10 @@ def _project_request(source_run: Path, receipt: dict[str, Any], blueprint: dict[
     equivalence = {
         "identity_media_sha256": [item["sha256"] for item in media if item["responsibility"] == "character_identity_board"],
         "start_frame_sha256": [item["sha256"] for item in media if item["responsibility"] == "cinematic_composition"],
-        "duration": generation["duration"], "ratio": generation["ratio"], "resolution": generation["resolution"],
+        "source_duration": int(round(float(preflight.get("duration") or 0))),
+        "control_duration": generation["duration"],
+        "candidate_duration": generation["duration"],
+        "ratio": generation["ratio"], "resolution": generation["resolution"],
         "removed_control": {"responsibility": "storyboard_pose_atlas", "sha256": atlas[0]["sha256"]},
         "added_control": {"responsibility": "motion_blueprint", "sha256": blueprint["media_sha256"]},
         "source_task_input_fingerprint": source_task.get("input_fingerprint"),
@@ -344,7 +349,14 @@ def _validate_regression(path: Path | None, commit: str) -> dict[str, Any]:
     return {"status": "passed", "path": str(path.resolve()), "sha256": sha256_file(path.resolve())}
 
 
-def prepare_gate(source_run: Path, output_dir: Path, *, source_receipt_path: Path | None = None, regression_receipt: Path | None = None) -> dict[str, Any]:
+def prepare_gate(
+    source_run: Path,
+    output_dir: Path,
+    *,
+    source_receipt_path: Path | None = None,
+    regression_receipt: Path | None = None,
+    legacy_manifest_path: Path | None = None,
+) -> dict[str, Any]:
     source_run = source_run.resolve(); output_dir = output_dir.resolve(); output_dir.mkdir(parents=True, exist_ok=True)
     source_receipt_path = (source_receipt_path or source_run / "phase6_storyboard_pose_atlas_live_acceptance.json").resolve()
     try: source_receipt_path.relative_to(source_run)
@@ -359,6 +371,11 @@ def prepare_gate(source_run: Path, output_dir: Path, *, source_receipt_path: Pat
     projection = _project_request(source_run, source_receipt, blueprint)
     prompt_path = output_dir / "seedance_prompt.txt"; prompt_path.write_text(projection["prompt"] + "\n", encoding="utf-8")
     source = _source_identity(); regression = _validate_regression(regression_receipt, source["git_commit"])
+    legacy_assessment = (
+        assess_legacy_blueprint_manifest(legacy_manifest_path)
+        if legacy_manifest_path is not None
+        else None
+    )
     receipt = {
         "schema": RECEIPT_SCHEMA, "status": "pending_live_acceptance", "submitted": False,
         "provider": "seedance", "model": SEEDANCE_MODEL, "evidence_scope": "single_actor_choreography_only",
@@ -370,6 +387,8 @@ def prepare_gate(source_run: Path, output_dir: Path, *, source_receipt_path: Pat
         "call_chain_verdict": "pending", "business_motion_verdict": {"status": "pending_human_verdict"},
         "provider_request_count": 0, "tos_put_count": 0,
     }
+    if legacy_assessment is not None:
+        receipt["legacy_blueprint_assessment"] = legacy_assessment
     receipt["preflight_fingerprint"] = _hash({key: value for key, value in receipt.items() if key not in {"preflight_fingerprint"}})
     _write_object(output_dir / "seedance_motion_blueprint_gate.json", receipt)
     _write_object(output_dir / "request_projection.runtime.json", {"prompt": projection["prompt"], "media": projection["media_runtime"], "generation": projection["generation"]})
@@ -397,7 +416,7 @@ def submit_gate(output_dir: Path, *, fee_authorization: str) -> dict[str, Any]:
     receipt.update({"status": "submission_uncertain", "submitted": True}); _write_object(receipt_path, receipt)
     with provider_attempt_scope(max_retries=0), SingleSeedancePost() as transport:
         execution = execute_seedance_video_task(
-            store, run_id=f"{output_dir.name}:motion-blueprint-v1", resource_id=f"MOTION_{receipt['blueprint']['schema']}",
+            store, run_id=f"{output_dir.name}:motion-blueprint-v2", resource_id=f"MOTION_{receipt['blueprint']['schema']}",
             payload=payload, provider_endpoint=seedance_client.SUBMIT_ENDPOINT, output_path=output_dir / "seedance_output.mp4",
             submit=lambda: seedance_client.submit_content(content, api_key=api_key, model=generation["model"], duration=generation["duration"], ratio=generation["ratio"], resolution=generation["resolution"], return_last_frame=True, timeout=30),
             poll=lambda job_id: seedance_client.poll(job_id, api_key=api_key, max_attempts=80, interval=15),
@@ -458,6 +477,7 @@ def main() -> int:
     parser.add_argument("output_dir", type=Path)
     parser.add_argument("--source-receipt", type=Path)
     parser.add_argument("--regression-receipt", type=Path)
+    parser.add_argument("--legacy-manifest", type=Path)
     parser.add_argument("--submit", action="store_true")
     parser.add_argument("--fee-authorization", default="")
     parser.add_argument("--business-verdict", choices=("pass", "fail"))
@@ -474,7 +494,13 @@ def main() -> int:
     else:
         if args.source_run is None:
             parser.error("source_run is required for no-submit preflight")
-        result = prepare_gate(args.source_run, args.output_dir, source_receipt_path=args.source_receipt, regression_receipt=args.regression_receipt)
+        result = prepare_gate(
+            args.source_run,
+            args.output_dir,
+            source_receipt_path=args.source_receipt,
+            regression_receipt=args.regression_receipt,
+            legacy_manifest_path=args.legacy_manifest,
+        )
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 

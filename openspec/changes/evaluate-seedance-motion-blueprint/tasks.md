@@ -43,3 +43,11 @@
 - [x] 6.4 Generate a fresh isolated Seedance 2.0 no-submit preflight bound to the final candidate commit and regression receipt, verify it records zero Provider submissions and `pending_live_acceptance`, and report the exact finite paid scope to the user.
 - [ ] 6.5 After a separate explicit fee authorization, perform at most one Seedance 2.0 video submission, persist its terminal call-chain evidence, and stop without retry on failure, rejection, timeout, uncertainty, or inadequate motion.
 - [ ] 6.6 Obtain and record the explicit human motion verdict; on pass prepare a separate production-integration OpenSpec proposal, and on failure record `capability_route_paused` with no production activation.
+
+## 7. Perceptual-amplitude correction after local falsification
+
+- [x] 7.1 Preserve the first nine-second blueprint and receipts as audit-only evidence, record its slow-drift measurements, and ensure the revised paid-admission policy rejects it without upload.
+- [x] 7.2 Upgrade the motion policy and renderer contracts to v2, freeze a four-second single-action gate, cap setup anchors at 0.15 seconds, and compile dynamic primitives as deterministic anticipation/peak/recovery/terminal phase curves without inventing canonical actions.
+- [x] 7.3 Replace endpoint-only admission with semantic peak-speed, apex-timing, multi-major-joint, and perceptible-onset checks plus decoded foreground occupancy, centroid travel, transition-activity, and terminal-hold checks.
+- [x] 7.4 Add regression fixtures for slow endpoint drift, single-joint false positives, setup-heavy clips, insufficient actor occupancy, deterministic four-second encoding, and a visibly large single-action blueprint; run a ten-resume Provider-deny replay with stable hashes.
+- [x] 7.5 Complete Serena post-validation, target and full tests, lint, diff check, OpenSpec strict verification, Graphify refresh, and a fresh no-submit receipt bound to the corrected final commit; leave tasks 6.5 and 6.6 pending.
