@@ -34,3 +34,11 @@
 ## Remaining Gate
 
 The live paid Provider gate is not part of this Apply run. The regression result permits a later no-submit preflight, but no real request may be issued without a separate explicit fee authorization.
+
+## Falsification Follow-up
+
+- Strict validators now reject internally inconsistent phase IDs, source indexes, yaw values, camera relations, performer/unit identity and aggregate child hashes even if an input recomputes its outer hash.
+- Phase 2 now requires every body-action GAU in a sampled cell group to carry a valid projection and binds each action row to its exact projection hash before rendering.
+- Legacy compilation is reachable through the existing `ArtifactManifestStore` boundary and a supported module entrypoint; it verifies parent bytes, authority and downstream ancestry, writes sidecar artifacts atomically and never mutates the parent.
+- Relevant suite: `98 passed`; Phase 3/6/blueprint suite: `110 passed`; full suite: `1556 passed, 1 skipped`; lint and diff checks: PASS; Provider request count: `0`.
+- The earlier regression receipt remains immutable audit evidence and is superseded by a new external receipt bound to the corrected implementation commit. Live acceptance remains `pending_live_acceptance`.

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import inspect
+import json
 
 import pytest
 from PIL import ImageChops, ImageFont
 
-from phases.phase2.storyboard_guide_pose import render_pose_cell
+from phases.phase2.storyboard_guide_pose import (
+    compile_pose_contracts,
+    render_pose_cell,
+    validate_pose_contract,
+)
 from phases.phase2.storyboard_pose_atlas import build_pose_atlas_plan
 from schemas.understanding import BodyActionUnderstanding
 from utils.action_kinematics import (
@@ -48,6 +54,19 @@ def _beat(index: int, performer: str, *, side: str = "右侧") -> dict:
         if left
         else "右脚在前，双膝弯曲，保持平衡",
     }
+
+
+def _rehash(payload: dict, field: str) -> None:
+    unhashed = copy.deepcopy(payload)
+    unhashed.pop(field, None)
+    payload[field] = hashlib.sha256(
+        json.dumps(
+            unhashed,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _record() -> dict:
@@ -211,6 +230,120 @@ def test_source_schema_rejects_unknown_fields_and_hash_drift() -> None:
     with pytest.raises(ValueError, match="hash|window"):
         validate_source_kinematics(payload)
 
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        (lambda phase: phase.__setitem__("source_micro_action_index", 99), "source index"),
+        (lambda phase: phase.__setitem__("phase_id", ""), "phase ID"),
+        (lambda phase: phase.__setitem__("relative_yaw_mdeg", "0"), "yaw"),
+        (lambda phase: phase.__setitem__("camera_relation", "diagonal"), "camera relation"),
+    ),
+)
+def test_source_schema_rejects_rehashed_internal_lineage_drift(mutation, message) -> None:
+    payload = compile_source_kinematics(_beat(1, "actor-alpha"))
+    mutation(payload["actor_tracks"][0]["phases"][0])
+    _rehash(payload, "kinematics_sha256")
+
+    with pytest.raises(ValueError, match=message):
+        validate_source_kinematics(payload)
+
+
+def test_projection_rejects_duplicate_generation_unit_identity_after_rehash() -> None:
+    record = _record()
+    template = record["generation_action_units"][0]
+    record["generation_action_units"] = [
+        {**copy.deepcopy(template), "unit_id": "GAU001", "source_micro_action_indexes": [1]},
+        {**copy.deepcopy(template), "unit_id": "GAU002", "source_micro_action_indexes": [2]},
+    ]
+    projection = apply_generation_kinematics_projection(record)
+    projection["action_units"][1]["generation_action_unit_id"] = "GAU001"
+    _rehash(projection, "projection_sha256")
+
+    with pytest.raises(ValueError, match="unique"):
+        validate_generation_kinematics_projection(projection)
+
+
+def test_projection_rejects_phase_source_index_outside_projection_after_rehash() -> None:
+    projection = apply_generation_kinematics_projection(_record())
+    projection["actor_tracks"][0]["phases"][0]["source_micro_action_index"] = 99
+    _rehash(projection, "projection_sha256")
+
+    with pytest.raises(ValueError, match="source index"):
+        validate_generation_kinematics_projection(projection)
+
+
+def test_projection_rejects_source_kinematics_detached_from_body_evidence() -> None:
+    record = _record()
+    record["body_action_contract"]["beats"][0]["technique"] = "篡改后的动作"
+
+    with pytest.raises(ValueError, match="evidence"):
+        apply_generation_kinematics_projection(record)
+
+
+def test_phase2_rejects_partial_kinematics_coverage_within_one_cell_group() -> None:
+    record = _record()
+    template = record["generation_action_units"][0]
+    record["generation_action_units"] = [
+        {**copy.deepcopy(template), "unit_id": "GAU001", "source_micro_action_indexes": [1]},
+        {**copy.deepcopy(template), "unit_id": "GAU002", "source_micro_action_indexes": [2]},
+    ]
+    apply_generation_kinematics_projection(record)
+    record["generation_action_units"][1].pop("kinematics_projection")
+    record["generation_action_units"][1].pop("kinematics_projection_sha256")
+
+    with pytest.raises(ValueError, match="coverage"):
+        compile_pose_contracts(
+            record,
+            [
+                {
+                    "label": "S01_G01",
+                    "primary_shot_id": "S01",
+                    "secondary_beat_id": "S01_P01",
+                    "stage": "action_progress",
+                    "camera_movement": "static",
+                }
+            ],
+            known_actor_roles=("actor-alpha", "actor-beta"),
+        )
+
+
+def test_phase2_rejects_pxx_child_projection_hash_drift() -> None:
+    record = _record()
+    record.update(
+        duration_s=4,
+        planner_version="honcut.secondary-storyboard.v17",
+        character_ids=["actor-alpha", "actor-beta"],
+    )
+    apply_generation_kinematics_projection(record)
+    record["kinematics_projection"]["action_units"][0]["projection_sha256"] = "f" * 64
+    _rehash(record["kinematics_projection"], "projection_sha256")
+
+    with pytest.raises(ValueError, match="child lineage"):
+        build_pose_atlas_plan(
+            record,
+            known_actor_roles=("actor-alpha", "actor-beta"),
+        )
+
+
+def test_pose_contract_rejects_action_binding_projection_hash_drift() -> None:
+    record = _single_actor_record(_beat(1, "actor-alpha"))
+    apply_generation_kinematics_projection(record)
+    contract = copy.deepcopy(
+        build_pose_atlas_plan(
+            record,
+            known_actor_roles=("actor-alpha",),
+        )["pose_samples"][0]["pose_contract"]
+    )
+    contract["action_bindings"][0]["kinematics_projection_sha256"] = "f" * 64
+    _rehash(contract, "contract_sha256")
+
+    with pytest.raises(ValueError, match="binding lineage"):
+        validate_pose_contract(
+            contract,
+            cell_id=contract["cell_id"],
+            beat_id=contract["secondary_beat_id"],
+        )
 
 def test_body_action_provider_dto_remains_unchanged() -> None:
     assert tuple(BodyActionUnderstanding.model_fields) == (

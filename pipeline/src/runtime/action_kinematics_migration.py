@@ -9,10 +9,15 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import re
+import tempfile
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
+from runtime.artifact_manifest import ArtifactManifestStore
+from runtime.security_boundaries import resolve_within_workspace
 from utils.action_kinematics import (
     KINEMATICS_POLICY_SHA256,
     apply_generation_kinematics_projection,
@@ -213,9 +218,154 @@ def migrate_parent_action_kinematics(
     return receipt
 
 
+def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _validate_downstream_lineage(
+    store: ArtifactManifestStore,
+    *,
+    parent_artifact_id: str,
+    downstream_artifact_ids: Sequence[str],
+) -> None:
+    manifest = store.load()
+    by_id = {artifact.artifact_id: artifact for artifact in manifest.artifacts}
+
+    def descends_from_parent(artifact_id: str) -> bool:
+        pending = list(by_id[artifact_id].parent_artifact_ids)
+        visited: set[str] = set()
+        while pending:
+            current = pending.pop()
+            if current == parent_artifact_id:
+                return True
+            if current in visited:
+                continue
+            visited.add(current)
+            pending.extend(by_id[current].parent_artifact_ids)
+        return False
+
+    for artifact_id in downstream_artifact_ids:
+        if artifact_id == parent_artifact_id:
+            raise RuntimeError("migration downstream artifact cannot be its parent")
+        store.resolve(artifact_id, verify_content=True)
+        if artifact_id not in by_id or not descends_from_parent(artifact_id):
+            raise RuntimeError(
+                f"migration downstream artifact does not descend from parent: {artifact_id}"
+            )
+
+
+def migrate_action_kinematics_artifact(
+    store: ArtifactManifestStore,
+    *,
+    parent_artifact_id: str,
+    downstream_artifact_ids: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Resolve, compile and register a zero-provider migration through Artifact v2."""
+    if len(set(downstream_artifact_ids)) != len(downstream_artifact_ids):
+        raise ValueError("migration downstream artifact IDs must be unique")
+    parent = store.resolve(
+        parent_artifact_id,
+        verify_content=True,
+        required_authority_roles=("story_action",),
+    )
+    _validate_downstream_lineage(
+        store,
+        parent_artifact_id=parent_artifact_id,
+        downstream_artifact_ids=downstream_artifact_ids,
+    )
+    parent_path = resolve_within_workspace(
+        store.run_directory,
+        parent.relative_path,
+        must_exist=True,
+    )
+    try:
+        parent_payload = json.loads(parent_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("action kinematics migration parent is not valid JSON") from exc
+    if not isinstance(parent_payload, Mapping):
+        raise RuntimeError("action kinematics migration parent must be a JSON object")
+    receipt = migrate_parent_action_kinematics(
+        parent_payload,
+        parent_artifact_id=parent_artifact_id,
+        parent_content_sha256=parent.content_sha256,
+        downstream_artifact_ids=downstream_artifact_ids,
+    )
+    migration_key = _canonical_sha256(
+        {
+            "parent_artifact_id": parent_artifact_id,
+            "parent_content_sha256": parent.content_sha256,
+            "downstream_artifact_ids": list(downstream_artifact_ids),
+            "policy_sha256": KINEMATICS_POLICY_SHA256,
+        }
+    )[:20]
+    output_directory = resolve_within_workspace(
+        store.run_directory,
+        Path("migrations") / "action_kinematics" / migration_key,
+    )
+    registered_parent_ids = [parent_artifact_id]
+    sidecar_artifact_id: str | None = None
+    sidecar = receipt.get("sidecar")
+    if isinstance(sidecar, Mapping):
+        sidecar_path = output_directory / "sidecar.json"
+        _write_json_atomic(sidecar_path, sidecar)
+        sidecar_ref = store.register_file(
+            sidecar_path,
+            artifact_type="action_kinematics_sidecar",
+            producer_node="runtime.action_kinematics_migration",
+            parent_artifact_ids=(parent_artifact_id,),
+            semantic_fingerprint=str(sidecar["sidecar_sha256"]),
+            canonical_contract_sha256=parent.canonical_contract_sha256,
+            authority_roles=("story_action",),
+        )
+        sidecar_artifact_id = sidecar_ref.artifact_id
+        registered_parent_ids.append(sidecar_artifact_id)
+    receipt_path = output_directory / "receipt.json"
+    _write_json_atomic(receipt_path, receipt)
+    receipt_ref = store.register_file(
+        receipt_path,
+        artifact_type="action_kinematics_migration_receipt",
+        producer_node="runtime.action_kinematics_migration",
+        parent_artifact_ids=registered_parent_ids,
+        semantic_fingerprint=str(receipt["receipt_sha256"]),
+        canonical_contract_sha256=parent.canonical_contract_sha256,
+    )
+    return {
+        "receipt": receipt,
+        "sidecar_artifact_id": sidecar_artifact_id,
+        "receipt_artifact_id": receipt_ref.artifact_id,
+        "provider_request_count": 0,
+    }
+
+
 __all__ = [
     "CURRENT_BODY_ACTION_SCHEMA",
     "LEGACY_BODY_ACTION_SCHEMA",
     "MIGRATION_SCHEMA",
+    "migrate_action_kinematics_artifact",
     "migrate_parent_action_kinematics",
 ]

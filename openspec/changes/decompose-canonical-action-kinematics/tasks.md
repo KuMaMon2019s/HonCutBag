@@ -66,3 +66,10 @@
 - [x] 8.5 Run `graphify update .`, affected-path review, `graphify save-result` and `graphify reflect --if-stale`; verify the graph records the new owner/consumer paths without storing secrets or Provider evidence.
 - [x] 8.6 Update Serena Memory only if the final verified owner/schema/consumer boundary is durable project knowledge; verify no one-off bug, Prompt, media or temporary path is stored.
 - [x] 8.7 Write a regression receipt bound to the final commit and mark live acceptance `pending_live_acceptance`; verify no paid request occurred and any later real Provider gate requires a separate explicit fee authorization.
+
+## 9. Falsification Follow-up
+
+- [x] 9.1 Tighten source and projection validation so phase IDs, source indexes, yaw, camera relation, performer identity, GAU identity and child hashes are internally consistent even when an input recomputes its outer hash; add negative tests for every rejected shape.
+- [x] 9.2 Require complete canonical-kinematics coverage for every body-action GAU in a Phase 2 cell group; reject mixed complete/missing projections and bind sampled projection lineage to every action binding before rendering.
+- [x] 9.3 Connect the strict legacy sidecar compiler through the existing Artifact migration boundary without adding a new service; validate parent content/lineage evidence, preserve immutable parents, and prove the supported entrypoint is reachable outside its unit test.
+- [x] 9.4 Run the falsification suite, target and full regression, Serena post-validation, strict OpenSpec Verify and Graphify sync; preserve the previous receipt as superseded audit evidence and write a new receipt bound to the corrected implementation commit with live status `pending_live_acceptance`.

@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 import copy
+import json
 
-from runtime.action_kinematics_migration import migrate_parent_action_kinematics
+import pytest
+
+from runtime.action_kinematics_migration import (
+    migrate_action_kinematics_artifact,
+    migrate_parent_action_kinematics,
+)
+from runtime.artifact_manifest import ArtifactManifestStore
 
 
 def _legacy_parent() -> dict:
@@ -97,3 +104,80 @@ def test_incomplete_or_future_parent_is_audit_only_without_guessing() -> None:
     assert future_receipt["reason"] == "future_body_action_schema"
     assert incomplete_receipt["provider_request_count"] == 0
     assert future_receipt["provider_request_count"] == 0
+
+
+def test_artifact_migration_registers_immutable_sidecar_and_receipt(tmp_path) -> None:
+    (tmp_path / "CANONICAL_VISUAL_CONTRACT.json").write_text(
+        json.dumps({"contract_sha256": "d" * 64}),
+        encoding="utf-8",
+    )
+    parent_path = tmp_path / "legacy_action.json"
+    parent_path.write_text(json.dumps(_legacy_parent()), encoding="utf-8")
+    store = ArtifactManifestStore(tmp_path, run_id="run-1", project_id="project-1")
+    parent = store.register_file(
+        parent_path,
+        artifact_type="legacy_action_contract",
+        producer_node="phase1.action_contract",
+        authority_roles=("story_action",),
+    )
+    downstream_path = tmp_path / "legacy_pose.json"
+    downstream_path.write_text("{}", encoding="utf-8")
+    downstream = store.register_file(
+        downstream_path,
+        artifact_type="legacy_pose_contract",
+        producer_node="phase2.storyboard_pose",
+        parent_artifact_ids=(parent.artifact_id,),
+        non_authority_roles=("story_action",),
+    )
+    parent_before = parent_path.read_bytes()
+
+    first = migrate_action_kinematics_artifact(
+        store,
+        parent_artifact_id=parent.artifact_id,
+        downstream_artifact_ids=(downstream.artifact_id,),
+    )
+    second = migrate_action_kinematics_artifact(
+        store,
+        parent_artifact_id=parent.artifact_id,
+        downstream_artifact_ids=(downstream.artifact_id,),
+    )
+
+    assert parent_path.read_bytes() == parent_before
+    assert first == second
+    assert first["receipt"]["status"] == "migrated_sidecar"
+    assert first["provider_request_count"] == 0
+    sidecar = store.resolve(first["sidecar_artifact_id"])
+    receipt = store.resolve(first["receipt_artifact_id"])
+    assert sidecar.parent_artifact_ids == (parent.artifact_id,)
+    assert receipt.parent_artifact_ids == (parent.artifact_id, sidecar.artifact_id)
+    assert sidecar.authority_roles == ("story_action",)
+
+
+def test_artifact_migration_rejects_unrelated_downstream_lineage(tmp_path) -> None:
+    (tmp_path / "CANONICAL_VISUAL_CONTRACT.json").write_text(
+        json.dumps({"contract_sha256": "e" * 64}),
+        encoding="utf-8",
+    )
+    store = ArtifactManifestStore(tmp_path, run_id="run-1", project_id="project-1")
+    parent_path = tmp_path / "legacy_action.json"
+    parent_path.write_text(json.dumps(_legacy_parent()), encoding="utf-8")
+    parent = store.register_file(
+        parent_path,
+        artifact_type="legacy_action_contract",
+        producer_node="phase1.action_contract",
+        authority_roles=("story_action",),
+    )
+    unrelated_path = tmp_path / "unrelated.json"
+    unrelated_path.write_text("{}", encoding="utf-8")
+    unrelated = store.register_file(
+        unrelated_path,
+        artifact_type="unrelated",
+        producer_node="test",
+    )
+
+    with pytest.raises(RuntimeError, match="does not descend"):
+        migrate_action_kinematics_artifact(
+            store,
+            parent_artifact_id=parent.artifact_id,
+            downstream_artifact_ids=(unrelated.artifact_id,),
+        )

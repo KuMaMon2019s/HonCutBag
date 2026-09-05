@@ -93,6 +93,31 @@ _TRANSFORM_FIELDS = frozenset(
         "landing_state",
     }
 )
+_CAMERA_RELATIONS = frozenset(
+    {
+        "unspecified",
+        "front",
+        "back",
+        "left_profile",
+        "right_profile",
+        "left_three_quarter",
+        "right_three_quarter",
+    }
+)
+_SOURCE_EVIDENCE_FIELDS = (
+    "micro_action_index",
+    "micro_action",
+    "performer",
+    "technique",
+    "side",
+    "limbs",
+    "footwork",
+    "torso",
+    "weight_shift",
+    "direction",
+    "contact",
+    "end_pose",
+)
 _POLICY = {
     "schema": "honcut.canonical-action-kinematics-policy.v1",
     "coordinate_space": "actor_local_pxx_start_yaw_zero",
@@ -118,6 +143,10 @@ def _canonical_json(value: Any) -> bytes:
 
 def _sha256(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value)).hexdigest()
+
+
+def _source_evidence_sha256(beat: Mapping[str, Any]) -> str:
+    return _sha256({key: beat.get(key) for key in _SOURCE_EVIDENCE_FIELDS})
 
 
 KINEMATICS_POLICY_SHA256 = _sha256(_POLICY)
@@ -444,28 +473,11 @@ def compile_source_kinematics(beat: Mapping[str, Any]) -> dict[str, Any]:
                 "phases": phases,
             }
         )
-    evidence = {
-        key: beat.get(key)
-        for key in (
-            "micro_action_index",
-            "micro_action",
-            "performer",
-            "technique",
-            "side",
-            "limbs",
-            "footwork",
-            "torso",
-            "weight_shift",
-            "direction",
-            "contact",
-            "end_pose",
-        )
-    }
     payload: dict[str, Any] = {
         "schema": SOURCE_KINEMATICS_SCHEMA,
         "micro_action_index": index,
         "actor_tracks": tracks,
-        "source_evidence_sha256": _sha256(evidence),
+        "source_evidence_sha256": _source_evidence_sha256(beat),
         "policy_sha256": KINEMATICS_POLICY_SHA256,
     }
     payload["kinematics_sha256"] = _sha256(payload)
@@ -492,10 +504,15 @@ def _validate_channel(channel: Mapping[str, Any], *, name: str) -> None:
         raise ValueError(f"{name} support/contact flags are invalid")
 
 
-def _validate_tracks(tracks: Any) -> None:
+def _validate_tracks(
+    tracks: Any,
+    *,
+    allowed_source_indexes: set[int],
+) -> None:
     if not isinstance(tracks, list) or not tracks:
         raise ValueError("kinematics actor tracks are missing")
     performer_ids: list[str] = []
+    covered_source_indexes: set[int] = set()
     for track in tracks:
         if not isinstance(track, Mapping) or set(track) != {"performer_id", "orientation_anchor", "phases"}:
             raise ValueError("kinematics actor track fields are invalid")
@@ -507,6 +524,7 @@ def _validate_tracks(tracks: Any) -> None:
         if not isinstance(phases, list) or not phases:
             raise ValueError("kinematics phases are missing")
         previous_end = 0
+        phase_ids: set[str] = set()
         for phase in phases:
             required = {
                 "phase_id",
@@ -520,6 +538,23 @@ def _validate_tracks(tracks: Any) -> None:
             }
             if not isinstance(phase, Mapping) or set(phase) != required:
                 raise ValueError("kinematics phase fields are invalid")
+            phase_id = phase.get("phase_id")
+            if not isinstance(phase_id, str) or not phase_id.strip() or phase_id in phase_ids:
+                raise ValueError("kinematics phase ID must be unique and non-empty")
+            phase_ids.add(phase_id)
+            source_index = phase.get("source_micro_action_index")
+            if (
+                isinstance(source_index, bool)
+                or not isinstance(source_index, int)
+                or source_index not in allowed_source_indexes
+            ):
+                raise ValueError("kinematics phase source index is invalid")
+            covered_source_indexes.add(source_index)
+            yaw = phase.get("relative_yaw_mdeg")
+            if isinstance(yaw, bool) or not isinstance(yaw, int):
+                raise ValueError("kinematics relative yaw is invalid")
+            if phase.get("camera_relation") not in _CAMERA_RELATIONS:
+                raise ValueError("kinematics camera relation is invalid")
             start, end = phase.get("start_milli"), phase.get("end_milli")
             if (
                 isinstance(start, bool)
@@ -606,6 +641,8 @@ def _validate_tracks(tracks: Any) -> None:
             raise ValueError("kinematics phase timeline is incomplete")
     if performer_ids != sorted(set(performer_ids)):
         raise ValueError("kinematics performers must be unique and sorted")
+    if covered_source_indexes != allowed_source_indexes:
+        raise ValueError("kinematics source index coverage is invalid")
 
 
 def validate_source_kinematics(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -616,9 +653,12 @@ def validate_source_kinematics(payload: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("source kinematics schema is unsupported")
     if data.get("policy_sha256") != KINEMATICS_POLICY_SHA256:
         raise ValueError("source kinematics policy hash is invalid")
+    source_index = data.get("micro_action_index")
+    if isinstance(source_index, bool) or not isinstance(source_index, int) or source_index < 1:
+        raise ValueError("source kinematics micro-action index is invalid")
     if not _SHA256_RE.fullmatch(str(data.get("source_evidence_sha256") or "")):
         raise ValueError("source kinematics evidence hash is invalid")
-    _validate_tracks(data.get("actor_tracks"))
+    _validate_tracks(data.get("actor_tracks"), allowed_source_indexes={source_index})
     expected = str(data.pop("kinematics_sha256", ""))
     if not _SHA256_RE.fullmatch(expected) or expected != _sha256(data):
         raise ValueError("source kinematics hash is invalid")
@@ -793,6 +833,14 @@ def apply_generation_kinematics_projection(
             continue
         source = validate_source_kinematics(beat["kinematics"])
         index = int(source["micro_action_index"])
+        beat_index = beat.get("micro_action_index")
+        if (
+            isinstance(beat_index, bool)
+            or not isinstance(beat_index, int)
+            or beat_index != index
+            or source["source_evidence_sha256"] != _source_evidence_sha256(beat)
+        ):
+            raise ValueError(f"{beat_id} source kinematics evidence mismatch at index {index}")
         if index in source_by_index:
             raise ValueError(f"{beat_id} has duplicate source kinematics index {index}")
         source_by_index[index] = source
@@ -892,25 +940,39 @@ def validate_generation_kinematics_projection(payload: Mapping[str, Any]) -> dic
         raise ValueError("generation kinematics projection scope is invalid")
     if data.get("policy_sha256") != KINEMATICS_POLICY_SHA256:
         raise ValueError("generation kinematics projection policy hash is invalid")
+    if not re.fullmatch(r"S\d+_P\d+", str(data.get("beat_id") or "")):
+        raise ValueError("generation kinematics beat identity is invalid")
     indexes = data.get("source_micro_action_indexes")
-    if not isinstance(indexes, list) or not indexes or indexes != sorted(set(indexes)):
+    if (
+        not isinstance(indexes, list)
+        or not indexes
+        or any(isinstance(index, bool) or not isinstance(index, int) or index < 1 for index in indexes)
+        or indexes != sorted(set(indexes))
+    ):
         raise ValueError("generation kinematics source indexes are invalid")
     hashes = data.get("source_kinematics_sha256s")
     if not isinstance(hashes, list) or len(hashes) != len(indexes) or any(
         not _SHA256_RE.fullmatch(str(value)) for value in hashes
     ):
         raise ValueError("generation kinematics source hashes are invalid")
-    _validate_tracks(data.get("actor_tracks"))
+    _validate_tracks(data.get("actor_tracks"), allowed_source_indexes=set(indexes))
     action_units = data.get("action_units")
     if not isinstance(action_units, list):
         raise ValueError("generation kinematics action units are invalid")
     if data["scope"] == "generation_action_unit":
-        if data.get("generation_action_unit_id") in (None, "") or action_units:
+        generation_unit_id = data.get("generation_action_unit_id")
+        if (
+            not isinstance(generation_unit_id, str)
+            or not generation_unit_id.strip()
+            or action_units
+        ):
             raise ValueError("generation-unit kinematics scope is invalid")
     else:
         if data.get("generation_action_unit_id") is not None or not action_units:
             raise ValueError("Pxx kinematics scope is invalid")
         unit_indexes: list[int] = []
+        unit_ids: list[str] = []
+        unit_hashes: list[str] = []
         for unit in action_units:
             if not isinstance(unit, Mapping) or set(unit) != {
                 "generation_action_unit_id",
@@ -926,10 +988,20 @@ def validate_generation_kinematics_projection(payload: Mapping[str, Any]) -> dic
                 or not _SHA256_RE.fullmatch(unit_hash)
                 or not isinstance(child_indexes, list)
                 or not child_indexes
+                or any(
+                    isinstance(index, bool) or not isinstance(index, int) or index < 1
+                    for index in child_indexes
+                )
                 or child_indexes != sorted(set(child_indexes))
             ):
                 raise ValueError("generation kinematics action-unit lineage is invalid")
             unit_indexes.extend(child_indexes)
+            unit_ids.append(unit_id)
+            unit_hashes.append(unit_hash)
+        if unit_ids != list(dict.fromkeys(unit_ids)):
+            raise ValueError("Pxx kinematics action-unit identities must be unique")
+        if unit_hashes != list(dict.fromkeys(unit_hashes)):
+            raise ValueError("Pxx kinematics child projection hashes must be unique")
         if unit_indexes != indexes:
             raise ValueError("Pxx kinematics action-unit coverage is invalid")
     expected = str(data.pop("projection_sha256", ""))

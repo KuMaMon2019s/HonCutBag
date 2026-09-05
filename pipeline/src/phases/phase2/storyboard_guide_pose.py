@@ -16,6 +16,7 @@ from utils.action_kinematics import (
     CHANNEL_ORDER,
     KINEMATICS_PROJECTION_SCHEMA,
     sample_generation_units,
+    validate_generation_kinematics_projection,
 )
 
 POSE_CONTRACT_SCHEMA = "honcut.storyboard-guide-pose-contract.v4"
@@ -156,6 +157,7 @@ _POSE_POLICY = {
     "mechanics_markers": _MECHANICS_MARKERS,
     "role_resolution": "canonical_actor_alias_map_then_controlled_actor_markers_v2",
     "geometry": "canonical_fixed_point_kinematic_projection_v1",
+    "kinematic_binding_lineage": "per_generation_action_unit_projection_sha256_v1",
     "phase_samples": {"start": 0.2, "action_progress": 0.7, "end": 1.0},
     "minimum_adjacent_joint_delta": 2,
     "minimum_action_span_joint_delta": 12,
@@ -1094,6 +1096,55 @@ def compile_pose_contracts(
 ) -> list[dict[str, Any]]:
     """Attach one source-bound, deterministic pose contract to every Gxx cell."""
     units, lineage_status = _validated_units(beat)
+    body_contract = beat.get("body_action_contract")
+    body_beats: list[Any] = []
+    if (
+        isinstance(body_contract, Mapping)
+        and body_contract.get("schema") == "honcut.body-action-choreography.v2"
+    ):
+        candidate_body_beats = body_contract.get("beats")
+        if isinstance(candidate_body_beats, list):
+            body_beats = candidate_body_beats
+    canonical_body_indexes = {
+        int(item.get("micro_action_index") or 0)
+        for item in body_beats
+        if isinstance(item, Mapping)
+        and isinstance(item.get("kinematics"), Mapping)
+        and isinstance(item.get("micro_action_index"), int)
+        and not isinstance(item.get("micro_action_index"), bool)
+        and int(item["micro_action_index"]) > 0
+    }
+    if canonical_body_indexes:
+        raw_aggregate = beat.get("kinematics_projection")
+        if not isinstance(raw_aggregate, Mapping):
+            raise ValueError("canonical Pxx kinematics projection is missing")
+        aggregate = validate_generation_kinematics_projection(raw_aggregate)
+        expected_children = []
+        for unit in units:
+            body_indexes = [
+                index
+                for index in (unit.get("source_micro_action_indexes") or [])
+                if index in canonical_body_indexes
+            ]
+            if not body_indexes:
+                continue
+            projection = unit.get("kinematics_projection")
+            if not isinstance(projection, Mapping):
+                raise ValueError("canonical Pxx kinematics child coverage is missing")
+            expected_children.append(
+                {
+                    "generation_action_unit_id": str(unit["unit_id"]),
+                    "projection_sha256": str(projection.get("projection_sha256") or ""),
+                    "source_micro_action_indexes": body_indexes,
+                }
+            )
+        if (
+            aggregate["scope"] != "pxx"
+            or aggregate["beat_id"] != str(beat.get("beat_id") or "")
+            or aggregate["source_micro_action_indexes"] != sorted(canonical_body_indexes)
+            or aggregate["action_units"] != expected_children
+        ):
+            raise ValueError("canonical Pxx kinematics child lineage is invalid")
     initial_anchor_unit_ids = _initial_anchor_unit_ids(
         beat,
         units,
@@ -1138,28 +1189,45 @@ def compile_pose_contracts(
         actions = [action for unit in group for action in _strings(unit.get("actions"))]
         action_text = " → ".join(actions)
         mechanics, matched_body_action_beats = _matching_mechanics(beat, group)
-        body_contract = beat.get("body_action_contract")
         group_source_indexes = {
             int(index)
             for unit in group
             for index in (unit.get("source_micro_action_indexes") or [])
             if isinstance(index, int) and not isinstance(index, bool) and index > 0
         }
-        source_requires_kinematics = (
-            isinstance(body_contract, Mapping)
-            and body_contract.get("schema") == "honcut.body-action-choreography.v2"
-            and any(
-                isinstance(item, Mapping)
-                and int(item.get("micro_action_index") or 0) in group_source_indexes
-                and isinstance(item.get("kinematics"), Mapping)
-                for item in (body_contract.get("beats") or [])
-            )
-        )
-        current_kinematics = any(
-            isinstance(unit.get("kinematics_projection"), Mapping) for unit in group
-        )
-        if source_requires_kinematics and not current_kinematics:
-            raise ValueError("canonical kinematics projection group is missing")
+        expected_group_body_indexes = group_source_indexes & canonical_body_indexes
+        covered_group_body_indexes: list[int] = []
+        validated_group_projections: list[dict[str, Any]] = []
+        for unit in group:
+            unit_indexes = list(unit.get("source_micro_action_indexes") or [])
+            expected_unit_body_indexes = [
+                index for index in unit_indexes if index in canonical_body_indexes
+            ]
+            raw_projection = unit.get("kinematics_projection")
+            if expected_unit_body_indexes:
+                if not isinstance(raw_projection, Mapping):
+                    raise ValueError("canonical kinematics projection group coverage is missing")
+                projection = validate_generation_kinematics_projection(raw_projection)
+                if (
+                    projection["scope"] != "generation_action_unit"
+                    or projection["beat_id"] != str(beat.get("beat_id") or "")
+                    or projection["generation_action_unit_id"] != str(unit["unit_id"])
+                    or projection["source_micro_action_indexes"]
+                    != expected_unit_body_indexes
+                    or unit.get("kinematics_projection_sha256")
+                    != projection["projection_sha256"]
+                ):
+                    raise ValueError("canonical kinematics projection group lineage is invalid")
+                covered_group_body_indexes.extend(expected_unit_body_indexes)
+                validated_group_projections.append(projection)
+            elif raw_projection is not None or unit.get("kinematics_projection_sha256") is not None:
+                raise ValueError("non-body action unit has stale kinematics projection")
+        if (
+            covered_group_body_indexes != sorted(expected_group_body_indexes)
+            or len(covered_group_body_indexes) != len(set(covered_group_body_indexes))
+        ):
+            raise ValueError("canonical kinematics projection group coverage is invalid")
+        current_kinematics = bool(validated_group_projections)
         camera_projection = (
             cell.get("camera_projection")
             if isinstance(cell.get("camera_projection"), Mapping)
@@ -1272,6 +1340,11 @@ def compile_pose_contracts(
                 ),
                 "source_ledger_indexes": list(unit.get("ledger_indexes") or []),
                 "action_sha256": _canonical_sha256(_strings(unit.get("actions"))),
+                "kinematics_projection_sha256": (
+                    str(unit.get("kinematics_projection_sha256"))
+                    if isinstance(unit.get("kinematics_projection"), Mapping)
+                    else None
+                ),
             }
             for unit in group
         ]
@@ -1500,6 +1573,19 @@ def validate_pose_contract(
             or sample.get("group_kinematics_sha256") != _canonical_sha256(hashes)
         ):
             raise ValueError("story guide canonical kinematics lineage is invalid")
+        action_bindings = contract.get("action_bindings")
+        if not isinstance(action_bindings, list):
+            raise ValueError("story guide canonical kinematics bindings are invalid")
+        binding_hashes = [
+            binding.get("kinematics_projection_sha256")
+            for binding in action_bindings
+            if isinstance(binding, Mapping)
+            and binding.get("kinematics_projection_sha256") is not None
+        ]
+        if binding_hashes and binding_hashes != hashes:
+            raise ValueError("story guide canonical kinematics binding lineage is invalid")
+        if not binding_hashes and expected_policy == POSE_POLICY_SHA256:
+            raise ValueError("story guide canonical kinematics binding lineage is missing")
         sampled_tracks = sample.get("actor_tracks")
         if not isinstance(sampled_tracks, list) or not sampled_tracks:
             raise ValueError("story guide canonical kinematics tracks are missing")
@@ -1700,6 +1786,11 @@ def validate_pose_action_lineage(
             ),
             "source_ledger_indexes": list(unit.get("ledger_indexes") or []),
             "action_sha256": _canonical_sha256(_strings(unit.get("actions"))),
+            "kinematics_projection_sha256": (
+                str(unit.get("kinematics_projection_sha256"))
+                if isinstance(unit.get("kinematics_projection"), Mapping)
+                else None
+            ),
         }
         for unit in units
     }
@@ -1717,7 +1808,14 @@ def validate_pose_action_lineage(
                 raise ValueError("pose action-unit binding must be an object")
             unit_id = str(binding.get("unit_id") or "")
             expected = expected_by_id.get(unit_id)
-            if expected is None or dict(binding) != expected:
+            legacy_expected = (
+                {key: value for key, value in expected.items() if key != "kinematics_projection_sha256"}
+                if expected is not None
+                else None
+            )
+            if expected is None or (
+                dict(binding) != expected and dict(binding) != legacy_expected
+            ):
                 raise ValueError(f"pose action-unit lineage mismatch: {unit_id or '<missing>'}")
             if not observed_order or observed_order[-1] != unit_id:
                 if unit_id in observed_order:
